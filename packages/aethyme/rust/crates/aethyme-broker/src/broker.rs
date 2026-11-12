@@ -3350,41 +3350,6 @@ fn push_environment_minimum_advice(view: &mut StatusView, deadline: std::time::I
     }
 }
 
-/// The `status` row for an integration branch this very call advanced (#352):
-/// the action the old `fast-forward-available` notice asked an operator for,
-/// reported as done.
-fn push_integration_refresh_advice(
-    view: &mut StatusView,
-    refresh: Option<crate::IntegrationRefresh>,
-) {
-    let Some(refresh) = refresh else {
-        return;
-    };
-    view.advice.insert(
-        0,
-        StatusAdvice {
-            id: "integration.refreshed",
-            severity: StatusAdviceSeverity::Notice,
-            reason: "a verify-only integration branch carried nothing of its own and had fallen behind",
-            summary: format!(
-                "{} advanced from {} to {} ({}): {}",
-                refresh.branch,
-                short_commit(&refresh.from),
-                short_commit(&refresh.to),
-                refresh.upstream_ref,
-                refresh.explanation
-            ),
-            session_id: None,
-            queue_entry_id: None,
-            evidence: vec![
-                format!("from: {}", short_commit(&refresh.from)),
-                format!("{}: {}", refresh.upstream_ref, short_commit(&refresh.to)),
-            ],
-            commands: Vec::new(),
-        },
-    );
-}
-
 fn leftover_integration_advice(
     repo: &GitRepo,
     integration_head: &str,

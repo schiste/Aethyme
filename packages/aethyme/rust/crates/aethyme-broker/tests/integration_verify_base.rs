@@ -1,15 +1,14 @@
-//! In a verify-only repository `aethyme/integration` is a disposable
-//! verification base (#352): nothing lands through it, so whenever it carries
-//! nothing the fetched default branch lacks and has fallen behind it,
-//! `status`, `submit` and `sync` advance it, and record the move as
-//! `broker.integration.refreshed`. An integration holding work of its own is
-//! never moved, and promoting repositories keep today's behaviour. Startup
-//! selects the fresh default without reconciling disposable integration.
+//! In a verify-only repository with a fetched default branch, `aethyme/integration`
+//! is not maintained: nothing lands through it, so `status`, `submit`, `sync`
+//! and `start` neither create nor move it, and an existing ref is left where
+//! it is, never deleted. Readers compare against the fetched default branch
+//! instead. Promoting repositories, and verify-only repositories with no
+//! fetched default branch, keep today's behaviour.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use aethyme_broker::{Broker, IntegrationRefreshTrigger};
+use aethyme_broker::Broker;
 
 mod common;
 
@@ -144,32 +143,30 @@ fn refresh_triggers(broker: &mut Broker) -> Vec<String> {
         .collect()
 }
 
+/// Integration used to be advanced onto the default branch here (#352); a
+/// repository that does not promote no longer maintains it, and status reads
+/// the fetched default branch instead.
 #[test]
-fn status_advances_a_verify_only_integration_that_is_strictly_behind() {
+fn status_leaves_a_verify_only_integration_where_it_is() {
     let fixture = Fixture::new("verify-only", 3);
     let upstream = fixture.upstream_head();
+    let before = fixture.integration();
+    assert_ne!(before, upstream);
     let mut broker = fixture.broker();
 
     let status = broker.status_current(0).unwrap();
 
-    assert_eq!(fixture.integration(), upstream);
-    let row = status
-        .advice
-        .iter()
-        .find(|row| row.id == "integration.refreshed")
-        .expect("the refresh is reported in status");
-    assert!(row.summary.contains("fast-forwarded"), "{}", row.summary);
-    assert_eq!(refresh_triggers(&mut broker), ["status"]);
-
-    // Already current: nothing to do, nothing recorded twice.
-    let again = broker.status_current(0).unwrap();
+    assert_eq!(fixture.integration(), before, "integration is not moved");
+    assert_eq!(status.summary.integration_head, upstream);
     assert!(
-        !again
+        !status
             .advice
             .iter()
-            .any(|row| row.id == "integration.refreshed")
+            .any(|row| row.id.starts_with("integration.")),
+        "no integration advice in a repository that does not promote: {:?}",
+        status.advice
     );
-    assert_eq!(refresh_triggers(&mut broker), ["status"]);
+    assert!(refresh_triggers(&mut broker).is_empty());
 }
 
 #[test]
@@ -210,25 +207,20 @@ fn an_integration_holding_work_of_its_own_is_never_reset() {
     let mut broker = fixture.broker();
 
     let status = broker.status_current(0).unwrap();
-    for trigger in [
-        IntegrationRefreshTrigger::Start,
-        IntegrationRefreshTrigger::Submit,
-        IntegrationRefreshTrigger::Sync,
-    ] {
-        assert_eq!(broker.refresh_disposable_integration(trigger), None);
-    }
 
     assert_eq!(
         fixture.integration(),
         diverged,
         "unique work is never moved"
     );
+    // Status no longer tells agents to reconcile an integration branch the
+    // repository does not use; `doctor` still reports the leftover work.
     assert!(
-        status
+        !status
             .advice
             .iter()
             .any(|row| row.id == "integration.leftover-work"),
-        "the reviewed path is still named: {:?}",
+        "{:?}",
         status.advice
     );
     assert!(refresh_triggers(&mut broker).is_empty());
@@ -517,26 +509,22 @@ done
     );
 }
 
+/// Submit used to advance integration before planning (#352); it now
+/// verifies against the fetched default branch and leaves integration alone.
 #[test]
-fn submit_refreshes_integration_before_planning() {
+fn submit_leaves_a_verify_only_integration_where_it_is() {
     let fixture = Fixture::new("verify-only", 1);
     let mut broker = fixture.broker();
     let session = broker.start_worktree("verify base submit", None).unwrap();
     let upstream = fixture.merge_upstream(2);
-    assert_ne!(
-        fixture.integration(),
-        upstream,
-        "a merge left it behind again"
-    );
+    let before = fixture.integration();
+    assert_ne!(before, upstream, "a merge left it behind again");
 
-    // Whatever the gates conclude, the refresh happens before planning.
+    // Whatever the gates conclude, integration does not move.
     let _outcome = broker.submit(session.id);
 
-    assert_eq!(fixture.integration(), upstream);
-    assert_eq!(
-        refresh_triggers(&mut broker).last().map(String::as_str),
-        Some("submit")
-    );
+    assert_eq!(fixture.integration(), before);
+    assert!(refresh_triggers(&mut broker).is_empty());
 }
 
 /// A diverged integration is left for the reviewed path, so reaching that
@@ -652,21 +640,55 @@ fn integration_status_does_not_diff_upstream_to_assess_drift() {
     );
 }
 
+/// Sync used to advance integration after its fetch (#352); it now leaves
+/// integration where it is.
 #[test]
-fn sync_refreshes_integration_after_its_fetch() {
+fn sync_leaves_a_verify_only_integration_where_it_is() {
     let fixture = Fixture::new("verify-only", 1);
     let mut broker = fixture.broker();
     let session = broker.start_worktree("verify base sync", None).unwrap();
     let upstream = fixture.merge_upstream(1);
-    assert_ne!(fixture.integration(), upstream);
+    let before = fixture.integration();
+    assert_ne!(before, upstream);
 
     let _report = broker.sync_session(session.id);
 
-    assert_eq!(fixture.integration(), upstream);
+    assert_eq!(fixture.integration(), before);
+    assert!(refresh_triggers(&mut broker).is_empty());
+}
+
+/// With no fetched default branch, integration is the only local base, so a
+/// verify-only repository still creates it and keeps it on the checkout.
+#[test]
+fn a_verify_only_repository_without_a_remote_still_maintains_integration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    std::fs::write(root.join(".gitignore"), "/.aethyme/\n").unwrap();
+    std::fs::write(
+        root.join(".aethyme/config.toml"),
+        "[promote]\nmode = \"verify-only\"\n",
+    )
+    .unwrap();
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-qm", "init"]);
+    let base = git(&root, &["rev-parse", "HEAD"]);
+    let mut broker = common::open_fixture_broker(&root, tmp.path()).unwrap();
+
+    assert_eq!(broker.integration_head().unwrap().1, base);
+    assert_eq!(git(&root, &["rev-parse", INTEGRATION]), base, "created");
+
+    git(&root, &["commit", "--allow-empty", "-qm", "next"]);
+    let next = git(&root, &["rev-parse", "HEAD"]);
+    let status = broker.status_current(0).unwrap();
+
     assert_eq!(
-        refresh_triggers(&mut broker).last().map(String::as_str),
-        Some("sync")
+        git(&root, &["rev-parse", INTEGRATION]),
+        next,
+        "fast-forwarded"
     );
+    assert_eq!(status.summary.integration_head, next);
 }
 
 /// Proposal G: a session whose work merged upstream has nothing pending,

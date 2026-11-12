@@ -926,7 +926,16 @@ impl Broker {
     /// Ensure the integration branch exists (created from the main
     /// checkout's HEAD with an explanatory event — issue #20) and return
     /// its current commit.
+    ///
+    /// A non-promoting repository with a fetched default branch does not
+    /// maintain integration: nothing lands through it, so the ref is neither
+    /// created nor moved, and an existing one is reported where it is.
+    /// Without a fetched default branch, integration is still the only local
+    /// base, and is maintained as before.
     pub fn integration_head(&mut self) -> Result<(String, String), BrokerOpError> {
+        if self.upstream_verification_head().is_some() {
+            return self.integration_head_snapshot();
+        }
         let config = PromoteConfig::load(&self.main_root_path());
         let repo = self.repo_handle();
         if let Some(commit) = repo.resolve_ref(&config.branch) {
@@ -986,6 +995,38 @@ impl Broker {
             fallback_reason: (config.mode == PromoteMode::VerifyOnly)
                 .then(|| VERIFY_ONLY_FALLBACK_REASON.to_string()),
         })
+    }
+
+    /// The fetched default branch, in a non-promoting repository: the base
+    /// such a repository compares sessions against in place of integration,
+    /// which nothing there moves. `None` in a promoting repository or when no
+    /// default branch is fetched. Never fetches.
+    pub(crate) fn upstream_verification_head(&self) -> Option<(String, String)> {
+        if PromoteConfig::load(&self.main_root_path())
+            .mode
+            .promotes_at_all()
+        {
+            return None;
+        }
+        self.repo_handle().upstream_default()
+    }
+
+    /// The base a status or drift report compares against:
+    /// [`Self::upstream_verification_head`] when there is one, otherwise
+    /// [`Self::integration_head`].
+    pub(crate) fn verification_head(&mut self) -> Result<(String, String), BrokerOpError> {
+        match self.upstream_verification_head() {
+            Some(head) => Ok(head),
+            None => self.integration_head(),
+        }
+    }
+
+    /// [`Self::verification_head`] without creating or moving any ref.
+    pub(crate) fn verification_head_snapshot(&self) -> Result<(String, String), BrokerOpError> {
+        match self.upstream_verification_head() {
+            Some(head) => Ok(head),
+            None => self.integration_head_snapshot(),
+        }
     }
 
     fn upstream_verification_base(&self) -> Option<VerificationBase> {
@@ -1075,10 +1116,6 @@ impl Broker {
                 actual: head.into_boxed_str(),
             });
         }
-        // Planning uses the same policy-aware base as submit: fetched upstream
-        // in verify-only mode, integration otherwise. This prevents upstream-only
-        // commits from being counted as session work when integration is stale (#352).
-        self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Submit);
         // Most submissions on a repository that lands work through pull
         // requests arrive after the work has merged, and have nothing left to
         // verify. Learn that before the lease audit, which scans every live

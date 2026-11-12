@@ -110,20 +110,28 @@ fn run_merge(
 
 #[test]
 fn successful_coordinated_pr_merge_cleans_a_fully_landed_integration_layer() {
-    run_landing_case(None);
+    run_landing_case(None, false);
 }
 
 #[test]
 fn concurrent_exact_target_advance_finishes_the_prepared_reconciliation() {
-    run_landing_case(Some(true));
+    run_landing_case(Some(true), false);
 }
 
 #[test]
 fn concurrent_different_target_keeps_its_ref_and_queue_unchanged() {
-    run_landing_case(Some(false));
+    run_landing_case(Some(false), false);
 }
 
-fn run_landing_case(same_target_race: Option<bool>) {
+/// A repository that stopped promoting keeps no integration layer: the merge
+/// still refreshes the default branch, but integration is left exactly where
+/// it was, never cleaned or advanced.
+#[test]
+fn a_non_promoting_repository_leaves_integration_alone_after_a_merge() {
+    run_landing_case(None, true);
+}
+
+fn run_landing_case(same_target_race: Option<bool>, verify_only_at_merge: bool) {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let fake_bin = temp.path().join("fake-bin");
@@ -194,6 +202,13 @@ exit 64
     let upstream = git(&repo, &["rev-parse", "HEAD"]);
     git(&repo, &["switch", "main"]);
     drop(broker);
+    if verify_only_at_merge {
+        std::fs::write(
+            repo.join(".aethyme/config.toml"),
+            "[promote]\nmode = \"verify-only\"\n",
+        )
+        .unwrap();
+    }
 
     write_executable(
         &fake_bin.join("gh"),
@@ -249,6 +264,16 @@ exec "$AETHYME_TEST_REAL_GIT" "$@"
         same_target_race.is_some(),
         "the requested interleaving must actually run"
     );
+    if verify_only_at_merge {
+        assert_eq!(report["post_merge_cleanup"]["state"], "not_needed");
+        assert_eq!(git(&repo, &["rev-parse", "origin/main"]), upstream);
+        assert_eq!(
+            git(&repo, &["rev-parse", "aethyme/integration"]),
+            promotion,
+            "integration stays at the last promotion"
+        );
+        return;
+    }
     if same_target_race == Some(false) {
         assert_eq!(report["post_merge_cleanup"]["state"], "deferred");
         assert_eq!(git(&repo, &["rev-parse", "aethyme/integration"]), initial);

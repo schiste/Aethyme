@@ -239,8 +239,6 @@ impl Broker {
         let started = std::time::Instant::now();
         let deadline = started + status_inspection_budget();
         let _git_deadline = crate::git::limit_git_until(deadline);
-        let integration_refresh =
-            self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Status);
         let leases_started = std::time::Instant::now();
         let overlaps = match self.refresh_leases() {
             Ok(overlaps) => overlaps,
@@ -250,7 +248,7 @@ impl Broker {
         let lease_refresh_complete = std::time::Instant::now() < deadline;
         let leases_ms = leases_started.elapsed().as_millis() as u64;
         let agents = self.agents(now_ms)?;
-        let integration = match self.integration_head() {
+        let integration = match self.verification_head() {
             Ok(integration) => integration,
             Err(_) if std::time::Instant::now() >= deadline => {
                 (PromoteConfig::load(&self.main_root).branch, String::new())
@@ -268,7 +266,6 @@ impl Broker {
                 view.deferred_checks.push("lease_refresh".into());
             }
         }
-        push_integration_refresh_advice(&mut view, integration_refresh);
         let auto_cleanup = self.last_auto_cleanup_report();
         push_auto_cleanup_advice(&mut view, auto_cleanup);
         push_environment_minimum_advice(&mut view, deadline);
@@ -540,7 +537,7 @@ impl Broker {
         let overlaps = self.lease_overlaps_snapshot()?;
         let agents = self.agents_snapshot(now_ms)?;
         let branch = PromoteConfig::load(&self.main_root).branch;
-        let observed_integration = self.integration_head_snapshot();
+        let observed_integration = self.verification_head_snapshot();
         let integration = if std::time::Instant::now() >= deadline {
             (branch, String::new())
         } else {
@@ -567,7 +564,7 @@ impl Broker {
         let overlaps = self.lease_overlaps_snapshot()?;
         let agents = self.agents_snapshot(now_ms)?;
         let branch = PromoteConfig::load(&self.main_root).branch;
-        let observed_integration = self.integration_head_snapshot();
+        let observed_integration = self.verification_head_snapshot();
         let integration = if std::time::Instant::now() >= deadline {
             (branch, String::new())
         } else {
@@ -583,14 +580,12 @@ impl Broker {
         let started = std::time::Instant::now();
         let deadline = started + status_inspection_budget();
         let _git_deadline = crate::git::limit_git_until(deadline);
-        let integration_refresh =
-            self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Status);
         let overlaps = self.lease_overlaps_snapshot()?;
         let leases_ms = started.elapsed().as_millis() as u64;
         let sessions_started = std::time::Instant::now();
         let agents = self.agents(now_ms)?;
         let sessions_ms = sessions_started.elapsed().as_millis() as u64;
-        let integration = match self.integration_head() {
+        let integration = match self.verification_head() {
             Ok(integration) => integration,
             Err(_) if std::time::Instant::now() >= deadline => {
                 (PromoteConfig::load(&self.main_root).branch, String::new())
@@ -600,7 +595,6 @@ impl Broker {
         self.record_gone_lease_holders()?;
         self.grant_stale_lease_requests()?;
         let mut view = self.build_status(agents, overlaps, integration, now_ms, false)?;
-        push_integration_refresh_advice(&mut view, integration_refresh);
         let auto_cleanup = self.last_auto_cleanup_report();
         push_auto_cleanup_advice(&mut view, auto_cleanup);
         push_environment_minimum_advice(&mut view, deadline);
