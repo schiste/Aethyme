@@ -767,9 +767,20 @@ fn write_generated(worktree: &Path, relative: &str) -> Vec<u8> {
 fn bulk_cleanup_removes_checkouts_whose_only_ignored_content_is_unmodified_generated_files() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
-    // The harness directory is ignored the way deployed repositories ignore it.
-    std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n.claude/*\n").unwrap();
-    sh(tmp.path(), &["add", ".gitignore"]);
+    // Claude Code's runtime files are ignored the way deployed repositories
+    // ignore them; the tracked skill keeps `.claude/` from collapsing into
+    // one ignored root, so each runtime path is classified on its own.
+    std::fs::write(
+        tmp.path().join(".gitignore"),
+        "/.aethyme/\n.claude/*\n!.claude/skills/\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.path().join(".claude/skills/team")).unwrap();
+    std::fs::write(tmp.path().join(".claude/skills/team/SKILL.md"), "team\n").unwrap();
+    sh(
+        tmp.path(),
+        &["add", ".gitignore", ".claude/skills/team/SKILL.md"],
+    );
     sh(
         tmp.path(),
         &["commit", "-qm", "ignore harness runtime files"],

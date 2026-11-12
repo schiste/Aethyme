@@ -478,14 +478,25 @@ fn standalone_ignored_root_files_still_keep_the_checkout() {
     assert!(worktree.exists());
 }
 
-/// Ignore the harness directory for every checkout of the fixture, the way
-/// deployed repositories ignore Claude Code's per-project runtime files.
+/// Ignore Claude Code's per-project runtime files the way deployed
+/// repositories do: everything under `.claude/` except the tracked skills.
+/// The tracked file keeps Git from collapsing `.claude/` into one ignored
+/// root, so each runtime path is classified, and reported, on its own.
 fn ignore_harness_runtime_files(fx: &Fixture) {
-    let exclude = fx.repo.join(".git/info/exclude");
-    std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
-    let mut text = std::fs::read_to_string(&exclude).unwrap_or_default();
-    text.push_str(".claude/*\n");
-    std::fs::write(&exclude, text).unwrap();
+    let gitignore = fx.publisher.join(".gitignore");
+    let mut text = std::fs::read_to_string(&gitignore).unwrap();
+    text.push_str(".claude/*\n!.claude/skills/\n");
+    std::fs::write(&gitignore, text).unwrap();
+    let skill = fx.publisher.join(".claude/skills/team/SKILL.md");
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(&skill, "team skill\n").unwrap();
+    git(&fx.publisher, &["add", "-A"]);
+    git(
+        &fx.publisher,
+        &["commit", "-qm", "track skills, ignore runtime"],
+    );
+    git(&fx.publisher, &["push", "-q", "origin", "main"]);
+    git(&fx.repo, &["pull", "-q", "--ff-only", "origin", "main"]);
 }
 
 /// Write the bytes Aethyme's deploy writes at `relative`.
