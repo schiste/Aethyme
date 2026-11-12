@@ -410,6 +410,19 @@ pub(super) fn run_supervise(options: &Options) -> Result<Output, Failure> {
     let mut work = supervisor::Services(services);
     let reason = supervisor::run(&config, &mut work, &|| false)
         .map_err(|error| environment_failure(format!("supervisor: {error}")))?;
+    if reason == supervisor::ExitReason::Replaced {
+        // The record is withdrawn and the lock released, so this starts the
+        // new build. A failure leaves no supervisor, which the next command
+        // that needs one repairs; it is still said in the log.
+        if let Some(executable) = &config.executable {
+            match supervisor::ensure_running(&config.root, executable) {
+                Ok(successor) => eprintln!("aethyme env supervisor: {}", successor.describe()),
+                Err(error) => {
+                    eprintln!("aethyme env supervisor: successor did not start: {error}")
+                }
+            }
+        }
+    }
     let value = json!({ "schema": SUPERVISE_SCHEMA, "exit_reason": reason });
     Ok((
         value,
