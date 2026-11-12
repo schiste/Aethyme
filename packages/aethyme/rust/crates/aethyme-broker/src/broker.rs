@@ -446,16 +446,6 @@ pub enum BrokerOpError {
     NestedWorktreePath { path: PathBuf, owner: PathBuf },
     #[error("cannot capture repository contract at {path}: {reason}")]
     RepositoryContract { path: String, reason: String },
-    #[error(
-        "lease claim for {path} by session {session_id} overlaps {blocker_count} active lease(s): {}",
-        describe_lease_blockers(blockers)
-    )]
-    LeaseClaimConflict {
-        session_id: i64,
-        path: String,
-        blocker_count: usize,
-        blockers: Vec<LeaseBlocker>,
-    },
     #[error("invalid lease path {path:?}: {reason}")]
     InvalidLeasePath { path: String, reason: String },
     #[error(
@@ -983,7 +973,7 @@ pub struct AdoptReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_freshness: Option<AdoptBaseFreshness>,
     pub planned_explicit_leases: Vec<crate::Lease>,
-    /// Other sessions' leases on the planned paths that did not refuse them.
+    /// Other sessions' leases on the planned paths. They never refuse them.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub lease_overlaps: Vec<LeaseBlocker>,
     pub preparation: crate::PreparationStatus,
@@ -1017,7 +1007,7 @@ pub struct StartReport {
     pub start_base: SessionStartBase,
     pub worktree_placement: WorktreePlacement,
     pub planned_explicit_leases: Vec<crate::Lease>,
-    /// Other sessions' leases on the planned paths that did not refuse them.
+    /// Other sessions' leases on the planned paths. They never refuse them.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub lease_overlaps: Vec<LeaseBlocker>,
     pub preparation: crate::PreparationStatus,
@@ -2133,61 +2123,13 @@ pub struct IntegrationMovementNotice {
     pub commands: Vec<String>,
 }
 
-/// Render lease blockers as "session N (status) holds <path> [kind]".
-///
-/// The blockers were always attached to this error; only the count was printed,
-/// so a reader had to query the JSON to learn whether the holder was even
-/// working. Naming the holder and its status is what makes the refusal
-/// actionable — a lease held by a stale session is a different problem from one
-/// held by a live editor.
-fn describe_lease_blockers(blockers: &[LeaseBlocker]) -> String {
-    if blockers.is_empty() {
-        return "no holder recorded".into();
-    }
-    let mut shown: Vec<String> = blockers
-        .iter()
-        .take(4)
-        .map(|blocker| {
-            let holder = match (
-                blocker.holder_context.as_deref(),
-                blocker.holder_status.as_deref(),
-            ) {
-                (Some(context), Some(status)) => format!("{context}; {status}"),
-                (Some(context), None) => context.to_string(),
-                (None, Some(status)) => status.to_string(),
-                (None, None) => "status unknown".to_string(),
-            };
-            format!(
-                "session {} ({}) holds {} [{}]",
-                blocker.session_id,
-                holder,
-                blocker.path,
-                blocker.kind.as_str()
-            )
-        })
-        .collect();
-    if blockers.len() > shown.len() {
-        shown.push(format!("and {} more", blockers.len() - shown.len()));
-    }
-    let mut text = shown.join("; ");
-    for changes in blockers
-        .iter()
-        .filter_map(|blocker| blocker.other_changes.as_ref())
-    {
-        text.push('\n');
-        text.push_str(&crate::overlap_diff::render(changes, "  "));
-    }
-    text
-}
-
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LeaseBlocker {
     pub session_id: i64,
     pub path: String,
     pub kind: LeaseKind,
-    /// Holder's session status. Only an explicit lease held by a session that
-    /// is actively working can refuse (see `LeaseRefusalPolicy`), so the reader
-    /// needs the status to tell a live editor from a stale holder.
+    /// Holder's session status, so the reader can tell a live editor from a
+    /// stale holder. A lease never refuses; it informs.
     pub holder_status: Option<String>,
     /// Repository, Chau7 tab, and AI provider when the holder supplied them.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2196,7 +2138,7 @@ pub struct LeaseBlocker {
     /// (`high`) or merge cleanly (`low`). Absent where it was not assessed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub severity: Option<String>,
-    /// Why this lease blocks, or why it only warns.
+    /// Why this lease is worth knowing about.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// What the holder changed in the overlapping files, on the row reporting
@@ -2209,37 +2151,29 @@ pub struct LeaseBlocker {
 pub struct LeaseClaimReport {
     pub session_id: i64,
     pub path: String,
+    /// Always true and `blockers` always empty: a lease never refuses a
+    /// claim. Both are kept so the JSON shape of `leases claim` stays stable.
     pub accepted: bool,
     pub blockers: Vec<LeaseBlocker>,
-    /// Other live sessions' leases on the claimed path that did not refuse
-    /// the claim, each with the reason and how to coordinate.
+    /// Other live sessions' leases on the claimed path, each with the reason
+    /// and how to coordinate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<LeaseBlocker>,
 }
 
-/// Which other sessions' leases may refuse a lease claim, a submit or a
-/// guarded exec. One rule for all three so they cannot drift apart again:
-/// #475 made submit inform under verify-only while `leases claim` kept
-/// refusing on any overlapping lease, including leases held by stale
-/// sessions and implicit leases derived from edits.
-pub(crate) struct LeaseRefusalPolicy {
-    /// Under verify-only every session delivers through its own pull
-    /// request, so a lease informs and never refuses.
-    verify_only: bool,
+/// The live holders of other sessions' leases, for a lease claim, a submit
+/// audit, a guarded exec and the leases a new session plans. Another
+/// session's lease never refuses any of them: every session delivers through
+/// its own pull request, so an overlapping lease informs, with how to
+/// coordinate.
+pub(crate) struct LeaseHolders {
     /// Derived status of each live session (active or idle).
     live: std::collections::HashMap<i64, SessionStatus>,
 }
 
-impl LeaseRefusalPolicy {
-    pub(crate) fn new(
-        verify_only: bool,
-        live: std::collections::HashMap<i64, SessionStatus>,
-    ) -> Self {
-        Self { verify_only, live }
-    }
-
-    pub(crate) fn is_verify_only(&self) -> bool {
-        self.verify_only
+impl LeaseHolders {
+    pub(crate) fn new(live: std::collections::HashMap<i64, SessionStatus>) -> Self {
+        Self { live }
     }
 
     /// The derived status of a live holder; `None` once it is not live.
@@ -2247,63 +2181,24 @@ impl LeaseRefusalPolicy {
         self.live.get(&session_id).copied()
     }
 
-    /// Only an explicit lease held by a session that is actively working may
-    /// refuse, and never under verify-only. Implicit leases are telemetry
-    /// derived from edits; stale, exited and closed holders are not working.
-    pub(crate) fn may_block(&self, blocker: &LeaseBlocker) -> bool {
-        Self::refuses(
-            self.verify_only,
-            blocker.kind,
-            self.live.get(&blocker.session_id).copied(),
-        )
-    }
-
-    /// The rule itself, for callers that already know the holder's derived
-    /// status (planned leases at start). The store's transactional recheck
-    /// mirrors it in SQL against the stored status.
-    pub(crate) fn refuses(
-        verify_only: bool,
-        kind: LeaseKind,
-        holder: Option<SessionStatus>,
-    ) -> bool {
-        !verify_only && kind == LeaseKind::Explicit && holder == Some(SessionStatus::Active)
-    }
-
-    /// Whether this repository delivers through pull requests (verify-only),
-    /// read from the configuration committed on the default branch.
-    pub(crate) fn verify_only_at(main_root: &Path) -> bool {
-        crate::merge::PromoteConfig::load(main_root).mode == crate::merge::PromoteMode::VerifyOnly
-    }
-
     pub(crate) fn is_live(&self, session_id: i64) -> bool {
         self.live.contains_key(&session_id)
     }
 
-    /// Why a lease that does not refuse is still worth knowing about.
-    pub(crate) fn non_blocking_reason(&self, session_id: i64, blocker: &LeaseBlocker) -> String {
-        let coordinate = format!(
-            "coordinate: aethyme broker advanced note send --session {session_id} \
-             --to-session {} --message \"…\"",
-            blocker.session_id
-        );
+    /// Why an overlapping lease is still worth knowing about.
+    pub(crate) fn overlap_reason(&self, session_id: i64, blocker: &LeaseBlocker) -> String {
         if !self.is_live(blocker.session_id) {
             return format!(
                 "held by a session that is not live ({}); its leases never block",
                 blocker.holder_status.as_deref().unwrap_or("unknown")
             );
         }
-        if self.verify_only {
-            return format!(
-                "this repository delivers through pull requests (verify-only), so a lease \
-                 informs rather than blocks; {coordinate}"
-            );
-        }
-        if blocker.kind == LeaseKind::Implicit {
-            return format!(
-                "the holder is editing this path; implicit leases never block; {coordinate}"
-            );
-        }
-        format!("the holder is not actively working; {coordinate}")
+        format!(
+            "this repository delivers through pull requests (verify-only), so a lease \
+             informs rather than blocks; coordinate: aethyme broker advanced note send \
+             --session {session_id} --to-session {} --message \"…\"",
+            blocker.session_id
+        )
     }
 }
 
@@ -2345,9 +2240,10 @@ pub struct LeasePlanOverlap {
 pub struct LeasePathPlan {
     pub path: String,
     pub owned: Vec<LeasePlanOverlap>,
-    /// Every other session's lease on this path, refusing or not.
+    /// Every other session's lease on this path. None refuses a claim.
     pub conflicts: Vec<LeasePlanOverlap>,
-    /// Whether a claim would be refused now under `LeaseRefusalPolicy`.
+    /// Always false: a lease never refuses a claim. Kept so the JSON shape of
+    /// `leases plan` stays stable.
     pub would_conflict: bool,
 }
 
@@ -2356,6 +2252,7 @@ pub struct LeasePlan {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<i64>,
     pub paths: Vec<LeasePathPlan>,
+    /// Always false; see [`LeasePathPlan::would_conflict`].
     pub would_conflict: bool,
 }
 
@@ -2422,10 +2319,12 @@ pub struct OwnershipAuditReport {
     pub head_commit: String,
     pub changed_paths: Vec<String>,
     pub missing_lease_paths: Vec<String>,
+    /// Always empty: another session's lease never fails the audit. Kept so
+    /// the JSON shape stays stable; overlaps are in `warned_leases`.
     pub conflicting_leases: Vec<LeaseBlocker>,
-    /// Other sessions' leases on changed paths that do not block: their
-    /// edits merge cleanly, or their holder is not actively working. Each
-    /// carries the severity and reason it was judged by.
+    /// Other sessions' leases on changed paths. They never block; each
+    /// carries the reason it is reported, and on submit the severity of the
+    /// overlap (whether the two sessions' edits conflict).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warned_leases: Vec<LeaseBlocker>,
     pub foreign_paths: Vec<String>,
@@ -2439,12 +2338,6 @@ impl OwnershipAuditReport {
             parts.push(format!(
                 "{} path(s) without a session lease",
                 self.missing_lease_paths.len()
-            ));
-        }
-        if !self.conflicting_leases.is_empty() {
-            parts.push(format!(
-                "{} overlapping lease(s) held by other sessions",
-                self.conflicting_leases.len()
             ));
         }
         if !self.foreign_paths.is_empty() {
@@ -2479,8 +2372,9 @@ pub struct GuardedExecReport {
     pub command_timed_out: bool,
     /// The post-execution ownership audit, independent of the child exit status.
     pub ownership_ok: bool,
+    /// Always empty; see [`OwnershipAuditReport::conflicting_leases`].
     pub conflicting_leases: Vec<LeaseBlocker>,
-    /// Other sessions' leases on touched paths that did not refuse them.
+    /// Other sessions' leases on touched paths. They never refuse them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warned_leases: Vec<LeaseBlocker>,
     pub before_dirty_paths: Vec<String>,

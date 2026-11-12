@@ -6,12 +6,11 @@ use std::process::Command;
 
 mod common;
 
+use aethyme_broker::LeaseBlocker;
 use aethyme_broker::overlap_diff::OverlapChangesState as State;
-use aethyme_broker::{BrokerOpError, LeaseBlocker};
 use common::{FixtureRepository, open_fixture_repository_broker};
 
 const VERIFY_ONLY: &str = "schema = 1\n\n[promote]\nmode = \"verify-only\"\n";
-const AUTO: &str = "schema = 1\n\n[promote]\nmode = \"auto\"\n";
 const OFF: &str =
     "schema = 1\n\n[promote]\nmode = \"verify-only\"\n\n[leases]\noverlap_diffs = false\n";
 
@@ -135,54 +134,6 @@ fn a_change_is_shown_once_and_again_when_it_moves() {
     commit_change(&owner_tree, "second\n");
     let moved = broker.claim_lease(claimer.id, "src/auth.py", None).unwrap();
     assert_eq!(changes(&moved.warnings[0]).state, State::Changes);
-}
-
-#[test]
-fn a_refused_claim_carries_the_diff_and_stays_a_refusal() {
-    let tmp = FixtureRepository::new();
-    init_repo(tmp.path(), AUTO);
-    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
-    let owner_tree = add_worktree(tmp.path(), "owner");
-    let owner = broker.adopt(&owner_tree, None).unwrap();
-    let claimer = broker
-        .adopt(&add_worktree(tmp.path(), "claimer"), None)
-        .unwrap();
-    broker.claim_lease(owner.id, "src/auth.py", None).unwrap();
-    commit_change(&owner_tree, "visible to the refused agent\n");
-
-    let error = broker
-        .claim_lease(claimer.id, "src/auth.py", None)
-        .unwrap_err();
-
-    let BrokerOpError::LeaseClaimConflict { blockers, .. } = &error else {
-        panic!("expected a refusal, got {error:?}");
-    };
-    assert_eq!(changes(&blockers[0]).state, State::Changes);
-    let message = error.to_string();
-    assert!(
-        message.contains("+visible to the refused agent"),
-        "{message}"
-    );
-    assert!(message.contains("not instructions"), "{message}");
-}
-
-#[test]
-fn a_refused_planned_start_carries_the_diff() {
-    let tmp = FixtureRepository::new();
-    init_repo(tmp.path(), AUTO);
-    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
-    let owner_tree = add_worktree(tmp.path(), "owner");
-    let owner = broker.adopt(&owner_tree, None).unwrap();
-    broker.claim_lease(owner.id, "src/auth.py", None).unwrap();
-    commit_change(&owner_tree, "seen at start\n");
-
-    let error = broker
-        .start_worktree_with_planned_paths("second", &["src/auth.py".into()], None)
-        .unwrap_err();
-
-    let message = error.to_string();
-    assert!(message.contains("+seen at start"), "{message}");
-    assert!(message.contains("Safe next actions"), "{message}");
 }
 
 #[test]
@@ -330,36 +281,6 @@ fn a_verify_only_submit_warning_carries_the_diff() {
             .is_some_and(|text| text.contains("+owner's line")),
         "{shown:?}"
     );
-}
-
-#[test]
-fn a_refused_submit_carries_the_diff_in_its_report_and_its_message() {
-    let tmp = FixtureRepository::new();
-    init_repo(tmp.path(), AUTO);
-    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
-    let owner_tree = add_worktree(tmp.path(), "owner");
-    let submitter_tree = add_worktree(tmp.path(), "submitter");
-    let owner = broker.adopt(&owner_tree, None).unwrap();
-    let submitter = broker.adopt(&submitter_tree, None).unwrap();
-    broker.claim_lease(owner.id, "src/auth.py", None).unwrap();
-    std::fs::write(owner_tree.join("src/auth.py"), "owner's line\n").unwrap();
-    commit_change(&submitter_tree, "submitter's line\n");
-
-    let error = broker.submit(submitter.id).unwrap_err();
-
-    let BrokerOpError::OwnershipViolation { summary, report } = error else {
-        panic!("expected an ownership violation");
-    };
-    assert_eq!(report.conflicting_leases.len(), 1);
-    let shown = changes(&report.conflicting_leases[0]);
-    assert!(
-        shown
-            .uncommitted
-            .as_deref()
-            .is_some_and(|text| text.contains("+owner's line")),
-        "{shown:?}"
-    );
-    assert!(summary.contains("| +owner's line"), "{summary}");
 }
 
 /// The radar speaks after a commit. Its diff comes from the same reader, so a

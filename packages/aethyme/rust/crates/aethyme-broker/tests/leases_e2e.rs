@@ -55,17 +55,8 @@ fn add_worktree_at(root: &Path, name: &str, path: &Path) -> std::path::PathBuf {
     path.to_path_buf()
 }
 
-fn managed_worktree_names(root: &Path) -> Vec<String> {
-    let mut names = std::fs::read_dir(root)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    names.sort();
-    names
-}
-
 #[test]
-fn planned_start_claims_before_any_diff_and_refuses_a_second_rewrite() {
+fn planned_start_claims_before_any_diff_and_reports_a_second_rewrite_overlap() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     let mut broker = Broker::open(tmp.path()).unwrap();
@@ -76,69 +67,25 @@ fn planned_start_claims_before_any_diff_and_refuses_a_second_rewrite() {
     assert_eq!(first.planned_explicit_leases.len(), 1);
     assert_eq!(first.planned_explicit_leases[0].path, "generated/");
     assert_eq!(first.planned_explicit_leases[0].kind, LeaseKind::Explicit);
-    let worktrees_before = managed_worktree_names(&first.worktree_placement.root);
 
-    let error = broker
+    let second = broker
         .start_worktree_with_planned_paths("second rewrite", &["generated/policy.md".into()], None)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("planned lease"), "{error}");
-    assert!(error.contains("generated/"), "{error}");
-    assert!(error.contains("(active)"), "{error}");
-    assert!(error.contains(&first.session.worktree_path), "{error}");
-    assert!(
-        error.contains("aethyme broker start --adopt")
-            && error.contains("--reuse --path generated/policy.md"),
-        "{error}"
-    );
-    assert!(!error.contains("--reuse --session"), "{error}");
-    assert_eq!(broker.store().live_sessions().unwrap().len(), 1);
+        .expect("another session's planned lease informs and never refuses");
+    assert_eq!(second.planned_explicit_leases.len(), 1);
     assert_eq!(
-        managed_worktree_names(&first.worktree_placement.root),
-        worktrees_before,
-        "a refused plan must not leave a worktree behind"
+        second.planned_explicit_leases[0].path,
+        "generated/policy.md"
     );
-}
-
-#[test]
-fn planned_reuse_is_all_or_nothing_and_does_not_retask_on_conflict() {
-    let tmp = tempfile::tempdir().unwrap();
-    init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
-    let owner_worktree = add_worktree(tmp.path(), "plan-owner");
-    let reuse_worktree = add_worktree(tmp.path(), "plan-reuse");
-    let owner = broker.adopt(&owner_worktree, Some("owner")).unwrap();
-    let reused = broker
-        .adopt(&reuse_worktree, Some("original task"))
-        .unwrap();
-    broker.claim_lease(owner.id, "src/", None).unwrap();
-
-    let error = broker
-        .adopt_with_options(
-            &reuse_worktree,
-            Some("must not persist"),
-            AdoptOptions {
-                mode: AdoptMode::Reuse,
-                sync_integration: false,
-                planned_paths: vec!["docs/new.md".into(), "src/auth.py".into()],
-            },
-            None,
-        )
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("src/auth.py"), "{error}");
-    assert_eq!(
-        broker.store().session(reused.id).unwrap().task.as_deref(),
-        Some("original task")
-    );
-    assert!(
-        broker
-            .store()
-            .active_leases()
-            .unwrap()
-            .iter()
-            .all(|lease| { lease.session_id != reused.id || lease.kind != LeaseKind::Explicit })
-    );
+    let overlap = second
+        .lease_overlaps
+        .iter()
+        .find(|overlap| overlap.session_id == first.session.id)
+        .expect("the first session's planned lease is reported");
+    assert_eq!(overlap.path, "generated/");
+    assert_eq!(overlap.kind, LeaseKind::Explicit);
+    let reason = overlap.reason.as_deref().unwrap_or_default();
+    assert!(reason.contains("informs rather than blocks"), "{reason}");
+    assert_eq!(broker.store().live_sessions().unwrap().len(), 2);
 }
 
 #[test]
@@ -278,7 +225,7 @@ fn explicit_directory_claim_overlaps_other_sessions_files() {
 }
 
 #[test]
-fn explicit_claim_blocks_paths_explicitly_claimed_by_a_working_session() {
+fn explicit_claim_reports_paths_explicitly_claimed_by_a_working_session() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     let mut broker = Broker::open(tmp.path()).unwrap();
@@ -293,16 +240,19 @@ fn explicit_claim_blocks_paths_explicitly_claimed_by_a_working_session() {
     broker
         .claim_lease(session_b.id, "src/auth.py", None)
         .unwrap();
-    let err = broker.claim_lease(session_a.id, "src/", None).unwrap_err();
+    let report = broker.claim_lease(session_a.id, "src/", None).unwrap();
 
-    assert!(matches!(
-        err,
-        BrokerOpError::LeaseClaimConflict {
-            blocker_count: 1,
-            ..
-        }
-    ));
-    assert!(err.to_string().contains("overlaps 1 active lease"));
+    assert!(report.accepted);
+    assert!(report.blockers.is_empty(), "{report:?}");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.session_id == session_b.id
+                && warning.path == "src/auth.py"
+                && warning.kind == LeaseKind::Explicit),
+        "{report:?}"
+    );
 }
 
 #[test]
@@ -368,7 +318,7 @@ fn lease_plan_reports_all_overlap_shapes_and_never_mutates_state() {
             "src/new.py"
         ]
     );
-    assert!(report.would_conflict);
+    assert!(!report.would_conflict, "a lease never refuses a claim");
     let auth = report
         .paths
         .iter()
@@ -426,7 +376,7 @@ fn lease_plan_reports_all_overlap_shapes_and_never_mutates_state() {
     let anonymous = broker.plan_leases(&["src/auth.py".into()], None).unwrap();
     assert!(anonymous.paths[0].owned.is_empty());
     assert_eq!(anonymous.paths[0].conflicts.len(), 3);
-    assert!(anonymous.paths[0].would_conflict);
+    assert!(!anonymous.paths[0].would_conflict);
 
     assert_eq!(
         serde_json::to_value(broker.store().active_leases().unwrap()).unwrap(),
@@ -553,36 +503,6 @@ fn guarded_exec_requires_explicit_lease_for_new_dirty_paths() {
         .unwrap();
     assert!(!blocked.ok, "{blocked:?}");
     assert_eq!(blocked.outside_lease_paths, vec!["src/other.py"]);
-}
-
-#[test]
-fn submit_blocks_paths_explicitly_owned_by_another_session() {
-    let tmp = tempfile::tempdir().unwrap();
-    init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
-
-    let wt_a = add_worktree(tmp.path(), "owner");
-    let wt_b = add_worktree(tmp.path(), "intruder");
-    let session_a = broker.adopt(&wt_a, None).unwrap();
-    let session_b = broker.adopt(&wt_b, None).unwrap();
-    broker
-        .claim_lease(session_a.id, "src/auth.py", None)
-        .unwrap();
-
-    // A claim alone no longer blocks: the owner must be actively working on
-    // an edit Git says conflicts with the submission (overlap_severity_e2e).
-    std::fs::write(wt_a.join("src/auth.py"), "owner\n").unwrap();
-    std::fs::write(wt_b.join("src/auth.py"), "intruder\n").unwrap();
-    sh(&wt_b, &["add", "-A"]);
-    sh(&wt_b, &["commit", "-qm", "intruder"]);
-
-    let err = broker.submit(session_b.id).unwrap_err();
-    let BrokerOpError::OwnershipViolation { report, .. } = err else {
-        panic!("expected ownership violation");
-    };
-    assert_eq!(report.conflicting_leases.len(), 1);
-    assert_eq!(report.conflicting_leases[0].session_id, session_a.id);
-    assert_eq!(report.conflicting_leases[0].path, "src/auth.py");
 }
 
 #[test]

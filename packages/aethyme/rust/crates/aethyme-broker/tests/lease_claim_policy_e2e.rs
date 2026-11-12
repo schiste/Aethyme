@@ -1,15 +1,12 @@
-//! One lease refusal rule for claims, planned leases, submit and guarded
-//! exec: only an explicit lease held by a session that is actively working
-//! refuses, and nothing refuses under verify-only. On Mockup every
-//! `leases claim` was refused by leases of stale sessions and by implicit
-//! leases derived from other sessions' edits.
+//! Claims, planned leases, submit and guarded exec are never refused by
+//! another session's lease: an overlap informs, with how to coordinate.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod common;
 
-use aethyme_broker::{Broker, BrokerOpError, LeaseKind};
+use aethyme_broker::{Broker, LeaseKind};
 use common::{FixtureRepository, open_fixture_repository_broker};
 
 const HOUR_MS: i64 = 60 * 60 * 1_000;
@@ -29,14 +26,12 @@ fn sh(cwd: &Path, args: &[&str]) {
 
 fn init_repo(root: &Path, config: Option<&str>) {
     sh(root, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/auth.py"), "a\n").unwrap();
     std::fs::write(root.join("src/other.py"), "b\n").unwrap();
     if let Some(config) = config {
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
         std::fs::write(root.join(".aethyme/config.toml"), config).unwrap();
-        aethyme_testkit::promote_on_submit(root);
     }
     sh(root, &["add", "-A"]);
     sh(root, &["commit", "-qm", "init"]);
@@ -128,36 +123,6 @@ fn a_verify_only_claim_over_a_working_sessions_explicit_lease_succeeds_with_a_wa
 }
 
 #[test]
-fn outside_verify_only_a_working_sessions_explicit_lease_still_refuses() {
-    let tmp = FixtureRepository::new();
-    init_repo(tmp.path(), None);
-    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
-    let owner = broker
-        .adopt(&add_worktree(tmp.path(), "owner"), None)
-        .unwrap();
-    let claimer = broker
-        .adopt(&add_worktree(tmp.path(), "claimer"), None)
-        .unwrap();
-    broker.claim_lease(owner.id, "src/auth.py", None).unwrap();
-
-    let error = broker.claim_lease(claimer.id, "src/", None).unwrap_err();
-
-    let BrokerOpError::LeaseClaimConflict { blockers, .. } = &error else {
-        panic!("expected a refusal, got {error:?}");
-    };
-    assert_eq!(blockers.len(), 1, "{blockers:?}");
-    assert_eq!(blockers[0].session_id, owner.id);
-    assert!(
-        blockers[0]
-            .reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("actively working"),
-        "{blockers:?}"
-    );
-}
-
-#[test]
 fn a_stale_sessions_explicit_lease_never_refuses_a_claim() {
     let tmp = FixtureRepository::new();
     init_repo(tmp.path(), None);
@@ -215,7 +180,7 @@ fn an_implicit_lease_never_refuses_an_explicit_claim() {
             .reason
             .as_deref()
             .unwrap_or_default()
-            .contains("implicit leases never block"),
+            .contains("informs rather than blocks"),
         "{warning:?}"
     );
 }
@@ -241,8 +206,8 @@ fn leases_implied_by_a_stale_sessions_old_edits_are_not_reported() {
 }
 
 #[test]
-fn a_planned_start_is_not_refused_by_a_stale_holder_or_under_verify_only() {
-    // auto: a stale holder's explicit lease does not refuse a planned start.
+fn a_planned_start_is_not_refused_by_a_stale_or_working_holder() {
+    // A stale holder's explicit lease does not refuse a planned start.
     let tmp = FixtureRepository::new();
     init_repo(tmp.path(), None);
     let mut broker = open_fixture_repository_broker(&tmp).unwrap();
@@ -257,7 +222,7 @@ fn a_planned_start_is_not_refused_by_a_stale_holder_or_under_verify_only() {
         .start_worktree_with_planned_paths("rewrite", &["generated/policy.md".into()], None)
         .expect("a stale holder must not refuse a planned lease");
 
-    // verify-only: even a working holder's explicit lease only informs.
+    // Even a working holder's explicit lease only informs.
     let tmp = FixtureRepository::new();
     init_repo(tmp.path(), Some(VERIFY_ONLY));
     let mut broker = open_fixture_repository_broker(&tmp).unwrap();
@@ -266,7 +231,7 @@ fn a_planned_start_is_not_refused_by_a_stale_holder_or_under_verify_only() {
         .unwrap();
     broker
         .start_worktree_with_planned_paths("second rewrite", &["generated/policy.md".into()], None)
-        .expect("verify-only must not refuse a planned lease");
+        .expect("a working holder must not refuse a planned lease");
 }
 
 #[test]

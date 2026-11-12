@@ -48,7 +48,6 @@ use crate::types::{
 };
 
 pub(crate) struct SessionReuseOptions<'a> {
-    pub(crate) verify_only: bool,
     pub(crate) id: i64,
     pub(crate) task: Option<&'a str>,
     pub(crate) diff_base: Option<&'a str>,
@@ -59,7 +58,6 @@ pub(crate) struct SessionReuseOptions<'a> {
 }
 
 pub(crate) struct SessionReplacementOptions<'a> {
-    pub(crate) verify_only: bool,
     pub(crate) replaced_id: i64,
     pub(crate) new: &'a NewSession,
     pub(crate) context: &'a SessionContext,
@@ -218,71 +216,6 @@ fn insert_session_context_event(
         Some(session_id),
         Some(&crate::events::session_context_updated_payload(context)),
     )?;
-    Ok(())
-}
-
-/// Recheck planned leases inside the registering transaction so two
-/// concurrent planners cannot both claim one path. Mirrors
-/// `LeaseRefusalPolicy::refuses` against the stored status: only an explicit
-/// lease of an active session refuses, and nothing refuses under verify-only.
-fn validate_planned_lease_conflicts(
-    tx: &Transaction<'_>,
-    owner_session_id: Option<i64>,
-    planned_paths: &[String],
-    now: i64,
-    verify_only: bool,
-) -> Result<(), BrokerError> {
-    if verify_only {
-        return Ok(());
-    }
-    let leases = {
-        let mut stmt = tx.prepare(&format!(
-            "{LEASE_SELECT}
-             WHERE released_at IS NULL
-               AND (expires_at IS NULL OR expires_at > ?1)
-               AND kind = 'explicit'
-               AND session_id IN (SELECT id FROM sessions WHERE status = 'active')
-             ORDER BY session_id, path, kind"
-        ))?;
-        let rows = stmt.query_map([now], lease_from_row)?;
-        let mut leases = Vec::new();
-        for row in rows {
-            leases.push(row??);
-        }
-        leases
-    };
-    for path in planned_paths {
-        if let Some(blocker) = leases.iter().find(|lease| {
-            Some(lease.session_id) != owner_session_id
-                && crate::leases::paths_overlap(path, &lease.path)
-        }) {
-            let (blocker_worktree, blocker_status): (String, String) = tx.query_row(
-                "SELECT worktree_path, status FROM sessions WHERE id = ?1",
-                [blocker.session_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            let blocker_status_value = SessionStatus::parse(&blocker_status)?;
-            let remediation = crate::leases::planned_lease_next_actions(
-                &blocker_worktree,
-                blocker.session_id,
-                blocker_status_value,
-                path,
-            )
-            .join("\n  ");
-            return Err(BrokerError::PlannedLeaseConflict(Box::new(
-                crate::error::PlannedLeaseConflict {
-                    path: path.clone(),
-                    blocker_session_id: blocker.session_id,
-                    blocker_path: blocker.path.clone(),
-                    blocker_kind: blocker.kind.as_str().to_string(),
-                    blocker_status,
-                    blocker_worktree,
-                    remediation,
-                    other_changes: String::new(),
-                },
-            )));
-        }
-    }
     Ok(())
 }
 

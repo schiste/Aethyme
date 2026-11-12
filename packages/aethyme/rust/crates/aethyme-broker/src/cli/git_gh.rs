@@ -488,13 +488,9 @@ fn exec_ownership_next_actions(report: &crate::GuardedExecReport) -> Vec<String>
     let mut actions = Vec::new();
     for path in &report.outside_lease_paths {
         if report
-            .conflicting_leases
+            .foreign_paths
             .iter()
-            .any(|blocker| crate::leases::paths_overlap(&blocker.path, path))
-            || report
-                .foreign_paths
-                .iter()
-                .any(|foreign| crate::leases::paths_overlap(foreign, path))
+            .any(|foreign| crate::leases::paths_overlap(foreign, path))
         {
             continue;
         }
@@ -510,13 +506,6 @@ fn exec_ownership_next_actions(report: &crate::GuardedExecReport) -> Vec<String>
                 report.session_id,
             ));
         }
-    }
-    for blocker in &report.conflicting_leases {
-        actions.push(format!(
-            "Coordinate with session {} before changing {} again; preserve the existing edits.",
-            blocker.session_id,
-            crate::broker::shell_quote(&blocker.path),
-        ));
     }
     for path in &report.foreign_paths {
         actions.push(format!(
@@ -599,11 +588,7 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
         );
         out!("  command ran: yes");
         out!("  execution receipt: {receipt_id}");
-        for lease in report
-            .conflicting_leases
-            .iter()
-            .chain(&report.warned_leases)
-        {
+        for lease in &report.warned_leases {
             out!(
                 "  lease overlap: session {} holds {}: {}",
                 lease.session_id,
@@ -1724,7 +1709,7 @@ mod exec_report_tests {
     }
 
     #[test]
-    fn blocking_and_foreign_directory_owners_receive_coordination_instead_of_claims() {
+    fn foreign_directory_owners_receive_coordination_instead_of_claims() {
         let mut report = completed_report();
         report.outside_lease_paths = vec![
             "generated/new.txt".into(),
@@ -1732,16 +1717,6 @@ mod exec_report_tests {
             "foreign/edited.txt".into(),
         ];
         report.foreign_paths = vec!["foreign/".into()];
-        report.conflicting_leases.push(crate::LeaseBlocker {
-            session_id: 2,
-            path: "generated/".into(),
-            kind: crate::LeaseKind::Explicit,
-            holder_status: Some("working".into()),
-            holder_context: None,
-            severity: None,
-            reason: None,
-            other_changes: None,
-        });
         let actions = exec_ownership_next_actions(&report);
         assert_eq!(actions.len(), 3);
         assert_eq!(
@@ -1749,11 +1724,11 @@ mod exec_report_tests {
                 .iter()
                 .filter(|action| action.contains("leases claim"))
                 .count(),
-            1
+            2
         );
-        assert!(actions[0].contains("generated-sibling.txt"));
-        assert!(actions[1].contains("session 2"));
-        assert!(actions[1].contains("generated/"));
+        assert!(actions[0].contains("generated/new.txt"));
+        assert!(actions[1].contains("generated-sibling.txt"));
+        assert!(!actions[2].contains("leases claim"));
         assert!(actions[2].contains("foreign/"));
     }
 }

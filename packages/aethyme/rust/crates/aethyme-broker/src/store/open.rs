@@ -455,15 +455,14 @@ impl BrokerStore {
     }
 
     /// Register a session and materialize its planned explicit leases in one
-    /// immediate transaction. Directory overlap is rechecked after the write
-    /// lock is acquired, so concurrent planners cannot both succeed.
+    /// immediate transaction. Another session's overlapping lease never
+    /// refuses a planned lease; the broker reports it instead.
     pub fn register_session_with_leases(
         &mut self,
         new: &NewSession,
         planned_paths: &[String],
     ) -> Result<Session, BrokerError> {
         self.register_session_with_context_and_leases(
-            false,
             new,
             &SessionContext::default(),
             planned_paths,
@@ -472,31 +471,21 @@ impl BrokerStore {
 
     pub fn register_session_with_context_and_leases(
         &mut self,
-        verify_only: bool,
         new: &NewSession,
         context: &SessionContext,
         planned_paths: &[String],
     ) -> Result<Session, BrokerError> {
-        self.register_session_with_optional_spawn_witness(
-            verify_only,
-            new,
-            context,
-            planned_paths,
-            None,
-            None,
-        )
+        self.register_session_with_optional_spawn_witness(new, context, planned_paths, None, None)
     }
 
     pub(crate) fn register_session_with_context_and_leases_and_base_observation(
         &mut self,
-        verify_only: bool,
         new: &NewSession,
         context: &SessionContext,
         planned_paths: &[String],
         base_observation: &crate::broker::SessionBaseObservation,
     ) -> Result<Session, BrokerError> {
         self.register_session_with_optional_spawn_witness(
-            verify_only,
             new,
             context,
             planned_paths,
@@ -511,7 +500,6 @@ impl BrokerStore {
     /// session ineligible for automatic checkout removal.
     pub(crate) fn register_spawned_session_with_context_and_leases_and_base_observation(
         &mut self,
-        verify_only: bool,
         new: &NewSession,
         context: &SessionContext,
         planned_paths: &[String],
@@ -536,7 +524,6 @@ impl BrokerStore {
             ));
         }
         self.register_session_with_optional_spawn_witness(
-            verify_only,
             new,
             context,
             planned_paths,
@@ -547,7 +534,6 @@ impl BrokerStore {
 
     fn register_session_with_optional_spawn_witness(
         &mut self,
-        verify_only: bool,
         new: &NewSession,
         context: &SessionContext,
         planned_paths: &[String],
@@ -558,7 +544,6 @@ impl BrokerStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_planned_lease_conflicts(&tx, None, planned_paths, now, verify_only)?;
         let id = insert_session(&tx, new, context, now)?;
         if let Some(base_observation) = base_observation {
             write_session_base_observation(&tx, id, base_observation)?;
@@ -678,7 +663,6 @@ impl BrokerStore {
         planned_paths: &[String],
     ) -> Result<Session, BrokerError> {
         self.reuse_session_with_context_and_leases(
-            false,
             id,
             task,
             diff_base,
@@ -688,12 +672,9 @@ impl BrokerStore {
         )
     }
 
-    // `verify_only` decides whether planned leases may be refused; see
-    // `validate_planned_lease_conflicts`.
     #[allow(clippy::too_many_arguments)]
     pub fn reuse_session_with_context_and_leases(
         &mut self,
-        verify_only: bool,
         id: i64,
         task: Option<&str>,
         diff_base: Option<&str>,
@@ -703,7 +684,6 @@ impl BrokerStore {
     ) -> Result<Session, BrokerError> {
         self.reuse_session_with_context_and_leases_and_base_observation(
             super::SessionReuseOptions {
-                verify_only,
                 id,
                 task,
                 diff_base,
@@ -720,7 +700,6 @@ impl BrokerStore {
         options: super::SessionReuseOptions<'_>,
     ) -> Result<Session, BrokerError> {
         let super::SessionReuseOptions {
-            verify_only,
             id,
             task,
             diff_base,
@@ -733,7 +712,6 @@ impl BrokerStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_planned_lease_conflicts(&tx, Some(id), planned_paths, now, verify_only)?;
         let changed = tx.execute(
             "UPDATE sessions SET task = COALESCE(?2, task), diff_base = COALESCE(?3, diff_base),
                                  agent_identity = COALESCE(?4, agent_identity),
@@ -829,8 +807,7 @@ impl BrokerStore {
 
     /// Atomically close one stale session, register its replacement, and
     /// claim the reviewed path plan. The replaced session's leases are
-    /// excluded from conflict checks because they are deleted in this same
-    /// transaction; every other session remains authoritative.
+    /// deleted in this same transaction.
     pub fn replace_session_with_leases(
         &mut self,
         replaced_id: i64,
@@ -838,7 +815,6 @@ impl BrokerStore {
         planned_paths: &[String],
     ) -> Result<Session, BrokerError> {
         self.replace_session_with_context_and_leases(
-            false,
             replaced_id,
             new,
             &SessionContext::default(),
@@ -848,7 +824,6 @@ impl BrokerStore {
 
     pub fn replace_session_with_context_and_leases(
         &mut self,
-        verify_only: bool,
         replaced_id: i64,
         new: &NewSession,
         context: &SessionContext,
@@ -856,7 +831,6 @@ impl BrokerStore {
     ) -> Result<Session, BrokerError> {
         self.replace_session_with_context_and_leases_and_base_observation(
             super::SessionReplacementOptions {
-                verify_only,
                 replaced_id,
                 new,
                 context,
@@ -871,7 +845,6 @@ impl BrokerStore {
         options: super::SessionReplacementOptions<'_>,
     ) -> Result<Session, BrokerError> {
         let super::SessionReplacementOptions {
-            verify_only,
             replaced_id,
             new,
             context,
@@ -882,7 +855,6 @@ impl BrokerStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_planned_lease_conflicts(&tx, Some(replaced_id), planned_paths, now, verify_only)?;
         let changed = tx.execute(
             "UPDATE sessions
              SET status = 'cleaned', cleanup_state = 'cleaned', closed_at = ?2,

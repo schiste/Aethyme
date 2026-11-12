@@ -347,7 +347,7 @@ pub use delivery::{
 };
 pub use duplicate_work::{DuplicateWork, DuplicateWorkReason, pr_numbers_in_task};
 pub use enrollment_publication::{EnrollmentPublication, EnrollmentPublicationRequest};
-pub use error::{BrokerError, PlannedLeaseConflict};
+pub use error::BrokerError;
 pub use exposures::{
     AdvisoryReconciliationItem, EXPOSURE_RECONCILIATION_SCHEMA_VERSION,
     ExposureReconciliationApplyReport, ExposureReconciliationPlan, ExposureRemainingItem,

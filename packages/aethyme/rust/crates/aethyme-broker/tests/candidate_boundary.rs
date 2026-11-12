@@ -451,37 +451,9 @@ fn a_checkout_on_another_branch_is_refused_as_submit_refuses_it() {
     }
 }
 
-/// Another active session explicitly claimed the path and is editing it in a
-/// way Git cannot merge: submit refuses on ownership, and so does the
-/// adapter, judging the leases a refresh would set without setting them.
-#[test]
-fn a_path_another_active_session_owns_is_refused_as_submit_refuses_it() {
-    let (tmp, mut broker) = fixture(None);
-    let root = tmp.path();
-    let (a, a_path) = start(&mut broker, "a");
-    let (b, b_path) = start(&mut broker, "b");
-    broker.claim_lease(a, "shared.txt", None).unwrap();
-    std::fs::write(a_path.join("shared.txt"), "owner\n").unwrap();
-    commit(&b_path, "shared.txt", "intruder\n");
-
-    let before = world(root, &mut broker, &[&a_path, &b_path]);
-    let outcome = broker.legacy_candidate(b).unwrap();
-    assert_eq!(world(root, &mut broker, &[&a_path, &b_path]), before);
-    let CompositionOutcome::Refused { reason, detail } = &outcome else {
-        panic!("expected a refusal, got {outcome:?}");
-    };
-    assert_eq!(*reason, Refusal::OwnershipViolation);
-    assert!(detail.contains("overlapping lease"), "{detail}");
-
-    match broker.submit(b) {
-        Err(BrokerOpError::OwnershipViolation { .. }) => {}
-        other => panic!("submit should refuse on ownership: {other:?}"),
-    }
-}
-
-/// The same claim without a conflicting edit does not refuse submit, and
-/// does not refuse the adapter either: the read-only audit classifies the
-/// pair instead of refusing on any overlap.
+/// Another session's claim on the path does not refuse submit, and does not
+/// refuse the adapter either: the read-only audit classifies the pair and
+/// reports it, never refusing on an overlap.
 #[test]
 fn a_claimed_path_that_merges_cleanly_is_not_refused() {
     let (tmp, mut broker) = fixture(None);

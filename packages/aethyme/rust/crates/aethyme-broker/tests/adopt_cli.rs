@@ -184,22 +184,30 @@ fn start_cli_returns_deterministic_planned_leases_and_status_exposes_them() {
         2
     );
 
-    let conflict = run(
+    let overlapping = run(
         tmp.path(),
         &[
             "start",
             "--task",
-            "conflicting rewrite",
+            "overlapping rewrite",
             "--path",
             "generated/policy.md",
             "--json",
         ],
     );
-    assert!(!conflict.status.success());
     assert!(
-        json_error::message(&conflict).contains("planned lease"),
-        "{}",
-        json_error::message(&conflict)
+        overlapping.status.success(),
+        "another session's planned lease never refuses a start: {}",
+        json_error::message(&overlapping)
+    );
+    let overlapping: serde_json::Value = serde_json::from_slice(&overlapping.stdout).unwrap();
+    assert!(
+        overlapping["lease_overlaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|overlap| overlap["path"] == "generated/" && overlap["session_id"] == value["id"]),
+        "{overlapping}"
     );
 }
 
