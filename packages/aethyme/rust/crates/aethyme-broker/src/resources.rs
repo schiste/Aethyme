@@ -3529,6 +3529,34 @@ impl HostResourceCoordinator {
         Ok(lease)
     }
 
+    /// [`Self::reconcile`] without a reviewer, for a lease whose recorded
+    /// holder process no longer exists. `None` when the lease records no
+    /// holder or the holder may still be alive: those keep the reviewed path.
+    ///
+    /// Only for callers whose resources tolerate an interrupted holder. The
+    /// preparation cache does: package stores are written to survive an
+    /// interrupted install, and the next preparation probes the cache for
+    /// unfinished rotation before it shares it.
+    pub(crate) fn reconcile_dead_holder(
+        &mut self,
+        lease_id: &str,
+        confirmed: u64,
+    ) -> Result<Option<HostResourceLease>, HostResourceError> {
+        let holder: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT holder_pid FROM resource_leases WHERE lease_id=?1 AND generation=?2",
+                params![lease_id, confirmed as i64],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if !holder.is_some_and(holder_process_is_gone) {
+            return Ok(None);
+        }
+        self.reconcile(lease_id, confirmed).map(Some)
+    }
+
     /// Read-only inventory; expired active rows render as quarantined.
     pub fn list(
         &self,
