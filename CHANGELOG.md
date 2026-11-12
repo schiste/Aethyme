@@ -4,6 +4,12 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.71] - 2026-11-12
+
+### Fixed
+
+- Stop `broker status` and the other commands that inspect every session from starting one Git process per session worktree to check that it belongs to the repository. A linked worktree is now recognised from its own registration files, and Git is asked only when those are missing or inconsistent. On a repository with 373 sessions this took one `status` from about 640 Git processes to about 95 (#1596).
+
 ## [0.8.70] - 2026-11-11
 
 ### Added
