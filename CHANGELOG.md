@@ -4,6 +4,17 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.83] - 2026-11-12
+
+### Fixed
+
+- A coordinated fetch of a single branch no longer write-blocks the repository. A failure or timeout is recorded `failed` (`repeatable_fetch_failed`), and a fetch left behind by a crash is closed automatically at the next broker open or overlapping write (`repeatable_fetch_auto_resolved`, event `operation.fetch_reconciled`). Pushes, tag pushes, deletions and pruning fetches still block until reconciled (#1637).
+- `broker advanced gh` writes that name a missing, empty or directory file argument (`--body-file`, `--notes-file`, `-F <file>`, `--input`, `-F key=@file`) are refused before the operation is journaled, so a local mistake no longer write-blocks the repository (#1637).
+
+### Added
+
+- `finish --json` reports `cleanup.reclaim_deferred` and `cleanup.reclaim_worker_pid` when a running reclaim worker holds the GC lock (#1637).
+
 ## [0.8.82] - 2026-11-12
 
 ### Fixed
