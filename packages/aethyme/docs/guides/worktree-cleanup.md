@@ -29,10 +29,8 @@ work and reports the blocker.
 `finish`, the cleanup audit and cleanup plan use that proof to explain whether
 a session is represented. Automatic worktree cleanup and reviewed GC apply use
 the same worktree eligibility checks, then revalidate ownership, liveness,
-cleanliness and the expected branch tip immediately before removal. In repositories that still use the local landing
-path (being retired in favour of pull requests), `ship` publishes a reviewed
-integration entry and integration reconciliation updates that entry from the
-fetched upstream and pending queue. Neither operation alone authorizes
+cleanliness and the expected branch tip immediately before removal. Integration reconciliation updates the integration
+entry from the fetched upstream and pending queue; it alone does not authorize
 deletion: cleanup checks the resulting delivery target again. Host storage
 planning adds a read-only view of roots, caches and broker branch refs; it
 reports unknown ownership for review rather than turning it into a deletion

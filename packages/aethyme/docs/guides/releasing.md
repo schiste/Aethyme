@@ -58,8 +58,8 @@ the requested version change.
    redeploys.
 4. Run `cargo fmt --check --all`, `cargo test --workspace`, release contract
    checks, and `git diff --check`.
-5. Submit the release series, inspect `broker advanced ship plan`, and execute only the
-   exact confirmed integration SHA.
+5. Push the release series with `aethyme broker push --session <id> --pr` and
+   merge the pull request on GitHub; tag only the exact merged commit.
 6. Create and push the matching annotated tag through the coordinated Git
    lane. Wait for the release workflow and verify the signed manifest,
    checksums, installer, and every supported archive.

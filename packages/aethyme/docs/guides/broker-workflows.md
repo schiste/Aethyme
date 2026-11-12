@@ -33,8 +33,7 @@ Each workflow separates observation from mutation:
 
 These commands coordinate local repository state. Work lands through GitHub
 pull requests (`broker push --pr`); `broker submit` verifies and, with the
-default `[promote] mode = "verify-only"`, promotes nothing. The local
-promotion and `broker advanced ship` lane is being retired.
+default `[promote] mode = "verify-only"`, promotes nothing.
 
 ## Inspect a Running Coordinated Operation
 
@@ -452,35 +451,6 @@ generation history. Abandonment makes the lifecycle inactive so a later
 session can register a fresh lifecycle for the same pull request. Reason text
 is not persisted; the broker records only its digest in a redacted event.
 
-## Require Review Evidence at Publication
-
-The local `ship` publication lane described here is being retired in favour of pull requests.
-
-Review coordination and publication authorization are separate controls. The
-default ship lane remains direct and requires the exact planned SHA. To make
-unlocked review evidence mandatory, commit the policy in the promoted series:
-
-```toml
-[publication]
-schema_version = 1
-mode = "review_gated"
-allow_break_glass = false
-```
-
-`broker advanced ship plan --entry <id> --json` then explains coverage for every queue
-entry included in the selected prefix. Coverage binds the registered canonical
-repository, target branch, session commit, promoted queue entry, and review
-lifecycle. `broker advanced ship execute` revalidates the provider evidence immediately
-before its normal fetch, fast-forward, exact-push, and verify sequence. Missing,
-stale, mismatched, ambiguous, or unavailable evidence refuses publication; it
-never silently falls back to direct publication.
-
-For repositories that explicitly permit an emergency lane, set
-`allow_break_glass = true`, review the normal ship plan, and execute with both
-`--break-glass` and `--reason`. This is a separately authorized action. The
-broker persists only the reason digest and still enforces the full confirmed
-SHA, remote freshness, non-force push, and unknown-outcome barriers.
-
 ### When a target path moved under a session
 
 A session branched before another session renamed the files it edits will fail
@@ -559,11 +529,7 @@ its duration, and leaves the current repository-wide lock policy unchanged.
 
 ### Reconciling a local default branch
 
-This local landing path is being retired in favour of pull requests.
-
-`ship` publishes an exact promoted prefix and refuses to discard local work the
-prefix omits. When the local default branch carries commits integration does
-not, `broker advanced main reconcile` decides whether moving it is safe:
+When the local default branch carries commits integration does not, `broker advanced main reconcile` decides whether moving it is safe:
 
 ```bash
 aethyme broker advanced main reconcile plan
@@ -578,8 +544,7 @@ already represented when integration holds its content for every path the
 commit touched; a deletion counts when the path is absent there.
 
 The apply refuses unless every local-only commit is represented and no tracked
-path is dirty. Untracked files are ignored: they survive the move, the same way
-`ship` preserves them. Before moving anything it creates
+path is dirty. Untracked files are ignored: they survive the move. Before moving anything it creates
 `aethyme/preserve/<branch>-<sha>` at the pre-move tip, so the commits left
 behind remain recoverable even though their content is already on integration.
 
@@ -611,25 +576,6 @@ decision rather than waiving the check. `already_represented` cannot be chosen,
 because asserting it would defeat the content check that makes the move safe.
 Each entry requires a reason, and the decisions are bound into the plan digest,
 so an edited file no longer matches a reviewed plan.
-
-### Synchronizing local main from another worktree
-
-This local landing path is being retired in favour of pull requests.
-
-`ship execute --sync-main` is safe to run from any session worktree, which is
-the normal case: the primary checkout almost always has the default branch
-checked out, and sessions run elsewhere. Synchronization runs
-`git merge --ff-only` **in the primary checkout**, so that checkout's index and
-working tree advance with the ref. Before doing so it refuses if the primary
-checkout is on another branch, has tracked changes a fast-forward would
-overwrite, has untracked paths that would collide, or has diverged from the
-confirmed publication.
-
-Do not substitute `git update-ref refs/heads/<default>` for this. It moves the
-ref without touching the primary checkout's index or working tree, which leaves
-every file changed by the published commits looking locally modified when it is
-only stale. `git fetch . origin/<default>:<default>` refuses this case on its
-own; `update-ref` does not.
 
 ## Choose Gate Cache Policy Deliberately
 
