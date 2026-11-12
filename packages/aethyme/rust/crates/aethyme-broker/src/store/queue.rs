@@ -742,44 +742,6 @@ impl BrokerStore {
         Ok(())
     }
 
-    /// Read the structured candidate saved with a queue verdict.
-    pub(crate) fn verification_candidate(
-        &self,
-        entry_id: i64,
-    ) -> Result<Option<crate::types::VerificationCandidate>, BrokerError> {
-        let row = self
-            .conn
-            .query_row(
-                "SELECT base_commit, inputs_json, tree_id, commit_id
-                 FROM verification_candidates WHERE queue_entry_id = ?1",
-                [entry_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((base, inputs_json, tree, commit)) = row else {
-            return Ok(None);
-        };
-        let inputs = serde_json::from_str(&inputs_json).map_err(|source| {
-            BrokerError::InvalidVerificationCandidateInputsJson {
-                id: entry_id,
-                source,
-            }
-        })?;
-        Ok(Some(crate::types::VerificationCandidate {
-            base,
-            inputs,
-            tree,
-            commit,
-        }))
-    }
-
     /// Mark one verified queue entry promoted and advance its session's
     /// accepted contribution checkpoint in the same SQLite transaction.
     pub fn record_merge_promotion(

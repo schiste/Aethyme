@@ -278,7 +278,7 @@ pub(super) fn render_start_base(base: &crate::SessionStartBase) {
                 }
             }
             crate::IntegrationBypassReason::VerifyOnly => out!(
-                "note: [promote] mode is verify-only, so the session starts from {} rather \
+                "note: local promotion was removed, so the session starts from {} rather \
                  than {} ({counts})",
                 default_ref(),
                 bypassed.ref_name

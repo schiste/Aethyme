@@ -5978,6 +5978,16 @@ mod registered_removal_failure_tests {
         broker: &mut crate::Broker,
         label: &str,
     ) -> (crate::Session, std::path::PathBuf) {
+        start_landed_cleanup_session(broker, label, aethyme_testkit::MergeStyle::MergeCommit)
+    }
+
+    /// A squash landing represents the session head without making it
+    /// reachable, so cleanup still needs an archive to remove the checkout.
+    fn start_landed_cleanup_session(
+        broker: &mut crate::Broker,
+        label: &str,
+        style: aethyme_testkit::MergeStyle,
+    ) -> (crate::Session, std::path::PathBuf) {
         let session = broker.start_worktree(label, None).unwrap();
         let worktree = Path::new(&session.worktree_path).to_path_buf();
         std::fs::write(worktree.join("session-change.txt"), "represented\n").unwrap();
@@ -5985,11 +5995,7 @@ mod registered_removal_failure_tests {
         git(&worktree, &["commit", "-qm", "represented cleanup head"]);
         // The recovery fixture must represent the session head before
         // cleanup starts: land it the way work lands, by pull request.
-        aethyme_testkit::land_as_pull_request(
-            broker.main_root(),
-            &session.branch,
-            aethyme_testkit::MergeStyle::MergeCommit,
-        );
+        aethyme_testkit::land_as_pull_request(broker.main_root(), &session.branch, style);
         (session, worktree)
     }
 
@@ -6203,8 +6209,11 @@ mod registered_removal_failure_tests {
         let root = repository_with_ignored_cleanup_fixture(tmp.path());
         let storage = crate::test_storage::TestStorage::new();
         let mut broker = storage.open(&root).unwrap();
-        let (session, worktree) =
-            start_represented_cleanup_session(&mut broker, "archive intent pending cleanup");
+        let (session, worktree) = start_landed_cleanup_session(
+            &mut broker,
+            "archive intent pending cleanup",
+            aethyme_testkit::MergeStyle::Squash,
+        );
         broker.close(session.id).unwrap();
         let intent_path = create_pending_archive_cleanup_intent(&broker, &session, &worktree);
         assert!(

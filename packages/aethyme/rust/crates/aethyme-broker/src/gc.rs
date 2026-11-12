@@ -15342,7 +15342,7 @@ mod tests {
         aethyme_testkit::land_as_pull_request(
             broker.main_root(),
             &session.branch,
-            aethyme_testkit::MergeStyle::MergeCommit,
+            aethyme_testkit::MergeStyle::Squash,
         );
         assert!(
             broker

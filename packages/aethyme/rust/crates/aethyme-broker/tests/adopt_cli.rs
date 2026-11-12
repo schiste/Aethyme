@@ -575,10 +575,6 @@ fn start_is_silent_when_its_base_carries_nothing_extra() {
     let tmp = fixture();
     let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
     track_origin_main(tmp.path(), &main);
-    git(
-        tmp.path(),
-        &["update-ref", "refs/heads/aethyme/integration", &main],
-    );
 
     let rendered = stdout(&run(tmp.path(), &["start", "--task", "level with default"]));
     assert!(!rendered.contains("commit(s) ahead of"), "{rendered}");

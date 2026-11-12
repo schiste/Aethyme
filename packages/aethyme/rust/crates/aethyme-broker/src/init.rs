@@ -1953,7 +1953,7 @@ mod config_template_tests {
             CONFIG_TEMPLATE
                 .contains("#   [delivery] push_session_branches  true | false (default false")
         );
-        assert!(CONFIG_TEMPLATE.contains("`[promote] mode = \"verify-only\"`"));
+        assert!(CONFIG_TEMPLATE.contains("mode = \"verify-only\""));
 
         let opted_in = CONFIG_TEMPLATE
             .replace("# [delivery]\n", "[delivery]\n")

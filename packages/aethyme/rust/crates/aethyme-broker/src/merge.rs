@@ -995,6 +995,9 @@ impl Broker {
                 report: Box::new(ownership),
             });
         }
+        // #42: where integration stood before the follows-main refresh below,
+        // which a main-checkout session's gate selection must diff against.
+        let pre_refresh = self.integration_tip();
         let base = self.submission_base()?.commit;
         // The base's gates judge this submission. Refuse an untrusted policy
         // before any queue row exists, so the refusal leaves no residue.
@@ -1059,6 +1062,7 @@ impl Broker {
         let mut outcome = self.simulate_and_gate_with_policy(
             entry.id,
             cache_policy,
+            pre_refresh,
             Some(&progress),
             prepared_plan,
         )?;
@@ -1229,18 +1233,27 @@ impl Broker {
     /// CURRENT integration head. Rebinds the entry's base if the branch
     /// moved since submission.
     pub fn simulate_and_gate(&mut self, entry_id: i64) -> Result<SubmitOutcome, BrokerOpError> {
-        self.simulate_and_gate_with_policy(entry_id, crate::gates::CachePolicy::Use, None, None)
+        let pre_refresh = self.integration_tip();
+        self.simulate_and_gate_with_policy(
+            entry_id,
+            crate::gates::CachePolicy::Use,
+            pre_refresh,
+            None,
+            None,
+        )
     }
 
     fn simulate_and_gate_with_policy(
         &mut self,
         entry_id: i64,
         cache_policy: crate::gates::CachePolicy,
+        pre_refresh: Option<String>,
         progress: Option<&crate::submit_progress::SubmitProgress>,
         prepared_plan: Option<PreparedSubmissionReuse>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
-        // #42: remember where the integration branch stood BEFORE the
-        // follows-main refresh. Gate selection must diff against this —
+        // #42: `pre_refresh` is where the integration branch stood BEFORE the
+        // follows-main refresh, read by the caller before its first refresh.
+        // Gate selection must diff against this —
         // for a main-checkout session the refresh fast-forwards the base
         // onto the session's own commits, and diffing against the
         // refreshed base yields an empty set (the observed `gates:[]`
@@ -1248,11 +1261,6 @@ impl Broker {
         // gates for the work actually being accepted; for worktree
         // sessions the two are equal (or the pre-refresh diff is a safe
         // superset when integration lagged main).
-        let pre_refresh = {
-            let branch = PromoteConfig::load(&self.main_root_path()).branch;
-            self.repo_handle()
-                .resolve_ref(&format!("refs/heads/{branch}"))
-        };
         let verification = self.submission_base()?;
         // The follows-main refresh only concerns integration. Verified against
         // the default branch, the base is the base: nothing was refreshed.
