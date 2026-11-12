@@ -434,11 +434,10 @@ pub use measurement::{
     BudgetVerdict, MeasuredTotal, SizeRecord, SizeRecords, SizeScan, budget_verdict,
 };
 pub use merge::{
-    ACTION_REQUIRED_RELPATH, PromoteConfig, PromoteMode, PromotionIntent,
-    SubmissionCommitOwnership, SubmissionCommitProvenance, SubmissionConflict,
-    SubmissionGateVerification, SubmissionGateVerificationStatus, SubmissionIntegrationState,
-    SubmissionPlan, SubmitOutcome, VERIFIED_AGAINST_INTEGRATION, VERIFIED_AGAINST_UPSTREAM,
-    VerificationBase,
+    ACTION_REQUIRED_RELPATH, PromoteConfig, SubmissionCommitOwnership, SubmissionCommitProvenance,
+    SubmissionConflict, SubmissionGateVerification, SubmissionGateVerificationStatus,
+    SubmissionIntegrationState, SubmissionPlan, SubmitOutcome, VERIFIED_AGAINST_INTEGRATION,
+    VERIFIED_AGAINST_UPSTREAM, VerificationBase,
 };
 pub use operation_stats::{
     DEFAULT_OPERATION_STATS_LIMIT, HooksOutsideLockStats, MAX_OPERATION_STATS_LIMIT,
@@ -662,10 +661,7 @@ pub use session_push::{
 pub use session_sync::{SessionSyncReport, SyncOutcome, SyncStrategy};
 pub use ship::{
     PUBLICATION_POLICY_SCHEMA_VERSION, REPOSITORY_DELIVERY_POLICY_SCHEMA_VERSION,
-    RepositoryDeliveryConfig, ShipExecutionReport, ShipFreshness, ShipFreshnessResult,
-    ShipLocalMainSync, ShipPlan, ShipPublicationAssessment, ShipPublicationAuthorization,
-    ShipPublicationAuthorizationKind, ShipPublicationMode, ShipPublicationPolicy, ShipPush,
-    ShipReviewEvidence,
+    RepositoryDeliveryConfig, ShipPublicationMode, ShipPublicationPolicy,
 };
 pub use storage::{
     STORAGE_ATTRIBUTION_SCHEMA_VERSION, STORAGE_PLAN_SCHEMA_VERSION,

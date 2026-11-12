@@ -14703,7 +14703,6 @@ mod tests {
     fn a_health_check_counts_worktrees_it_had_no_budget_to_scan() {
         let tmp = tempfile::tempdir().unwrap();
         git(tmp.path(), &["init", "-q", "-b", "main"]);
-        aethyme_testkit::promote_on_submit(tmp.path());
         std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
         std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
         git(tmp.path(), &["add", "-A"]);
@@ -14722,7 +14721,11 @@ mod tests {
         std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
         git(&worktree, &["add", "done.txt"]);
         git(&worktree, &["commit", "-qm", "done"]);
-        assert!(broker.submit(session.id).unwrap().promoted);
+        aethyme_testkit::land_as_pull_request(
+            broker.main_root(),
+            &session.branch,
+            aethyme_testkit::MergeStyle::MergeCommit,
+        );
         assert!(
             broker
                 .finish_with_options(
@@ -15316,7 +15319,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         git(root, &["init", "-q", "-b", "main"]);
-        aethyme_testkit::promote_on_submit(root);
         std::fs::write(root.join("README.md"), "fixture\n").unwrap();
         std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
         git(root, &["add", "README.md", ".gitignore"]);
@@ -15337,7 +15339,9 @@ mod tests {
         std::fs::write(worktree.join("landed.txt"), "landed\n").unwrap();
         git(&worktree, &["add", "landed.txt"]);
         git(&worktree, &["commit", "-qm", "landed"]);
-        assert!(broker.submit(session.id).unwrap().promoted);
+        // Land it on the local default branch: this fixture has no remote,
+        // and the sweep below must see the same repository it always has.
+        git(root, &["merge", "-q", "--ff-only", &session.branch]);
         assert!(
             broker
                 .finish_with_options(
@@ -15517,7 +15521,11 @@ mod tests {
                 std::fs::write(closed_worktree.join("landed.txt"), "landed\n").unwrap();
                 git(&closed_worktree, &["add", "landed.txt"]);
                 git(&closed_worktree, &["commit", "-qm", "landed"]);
-                assert!(broker.submit(closed.id).unwrap().promoted);
+                aethyme_testkit::land_as_pull_request(
+                    broker.main_root(),
+                    &closed.branch,
+                    aethyme_testkit::MergeStyle::MergeCommit,
+                );
                 assert!(
                     broker
                         .finish_with_options(
@@ -15915,7 +15923,6 @@ mod tests {
         let root_path = tmp.path().canonicalize().unwrap();
         let root = root_path.as_path();
         git(root, &["init", "-q", "-b", "main"]);
-        aethyme_testkit::promote_on_submit(root);
         std::fs::write(root.join("README.md"), "fixture\n").unwrap();
         std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
         git(root, &["add", "README.md", ".gitignore"]);
@@ -17529,7 +17536,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         git(root, &["init", "-q", "-b", "main"]);
-        aethyme_testkit::promote_on_submit(root);
         std::fs::write(root.join("README.md"), "fixture\n").unwrap();
         std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
         git(root, &["add", "README.md", ".gitignore"]);
@@ -17549,7 +17555,11 @@ mod tests {
             std::fs::write(worktree.join("landed.txt"), format!("{label}\n")).unwrap();
             git(&worktree, &["add", "landed.txt"]);
             git(&worktree, &["commit", "-qm", label]);
-            assert!(broker.submit(session.id).unwrap().promoted);
+            aethyme_testkit::land_as_pull_request(
+                broker.main_root(),
+                &session.branch,
+                aethyme_testkit::MergeStyle::MergeCommit,
+            );
             assert!(
                 broker
                     .finish_with_options(
@@ -17665,7 +17675,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         git(root, &["init", "-q", "-b", "main"]);
-        aethyme_testkit::promote_on_submit(root);
         std::fs::write(root.join("README.md"), "fixture\n").unwrap();
         std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
         git(root, &["add", "README.md", ".gitignore"]);
@@ -17685,7 +17694,11 @@ mod tests {
             std::fs::write(worktree.join("landed.txt"), format!("{label}\n")).unwrap();
             git(&worktree, &["add", "landed.txt"]);
             git(&worktree, &["commit", "-qm", label]);
-            assert!(broker.submit(session.id).unwrap().promoted);
+            aethyme_testkit::land_as_pull_request(
+                broker.main_root(),
+                &session.branch,
+                aethyme_testkit::MergeStyle::MergeCommit,
+            );
             assert!(
                 broker
                     .finish_with_options(

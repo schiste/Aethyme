@@ -181,8 +181,6 @@ mod reclaim_ordering;
 mod reconcile_tracked_elsewhere_cli;
 #[path = "reconcile_usage_cli.rs"]
 mod reconcile_usage_cli;
-#[path = "reconciliation_external_main.rs"]
-mod reconciliation_external_main;
 #[path = "recovery_archive_gc_cli.rs"]
 mod recovery_archive_gc_cli;
 #[path = "reftable_git.rs"]
@@ -233,8 +231,6 @@ mod session_repository_cli;
 mod session_sync_cli;
 #[path = "shared_edit_advice_cli.rs"]
 mod shared_edit_advice_cli;
-#[path = "ship_e2e.rs"]
-mod ship_e2e;
 #[path = "simulated_free_space_cli.rs"]
 mod simulated_free_space_cli;
 #[path = "start_base_cli.rs"]
@@ -265,8 +261,6 @@ mod submit_progress_status;
 mod submit_retry_idempotence;
 #[path = "unpushed_work_cli.rs"]
 mod unpushed_work_cli;
-#[path = "v0_scenario.rs"]
-mod v0_scenario;
 #[path = "verify_only_main_cli.rs"]
 mod verify_only_main_cli;
 #[path = "worktree_reconcile.rs"]

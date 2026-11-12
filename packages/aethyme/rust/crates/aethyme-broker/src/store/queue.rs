@@ -742,44 +742,6 @@ impl BrokerStore {
         Ok(())
     }
 
-    /// Read the structured candidate saved with a queue verdict.
-    pub(crate) fn verification_candidate(
-        &self,
-        entry_id: i64,
-    ) -> Result<Option<crate::types::VerificationCandidate>, BrokerError> {
-        let row = self
-            .conn
-            .query_row(
-                "SELECT base_commit, inputs_json, tree_id, commit_id
-                 FROM verification_candidates WHERE queue_entry_id = ?1",
-                [entry_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((base, inputs_json, tree, commit)) = row else {
-            return Ok(None);
-        };
-        let inputs = serde_json::from_str(&inputs_json).map_err(|source| {
-            BrokerError::InvalidVerificationCandidateInputsJson {
-                id: entry_id,
-                source,
-            }
-        })?;
-        Ok(Some(crate::types::VerificationCandidate {
-            base,
-            inputs,
-            tree,
-            commit,
-        }))
-    }
-
     /// Mark one verified queue entry promoted and advance its session's
     /// accepted contribution checkpoint in the same SQLite transaction.
     pub fn record_merge_promotion(
@@ -841,73 +803,6 @@ impl BrokerStore {
             &session_head,
             integration_commit,
             &integration_tree,
-            entry_id,
-            now,
-        )?;
-        insert_event(
-            &tx,
-            now,
-            "merge.promoted",
-            Some(session_id),
-            Some(details_json),
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Claim an integration commit this session already produced, for an entry
-    /// that is still mid-flight.
-    ///
-    /// A submit whose response was lost can leave the ref advanced while its row
-    /// is `simulating`, and queue revalidation may then supersede that row -- so
-    /// the commit ends up on integration with nothing claiming it (issue #135).
-    /// Unlike [`Self::record_merge_promotion`] this accepts a row that is not
-    /// `verified`, because the verification already happened in the attempt that
-    /// produced the commit.
-    pub fn record_recovered_promotion(
-        &mut self,
-        entry_id: i64,
-        integration_commit: &str,
-        integration_tree: &str,
-        integration_ref: &str,
-        promoted_paths: &[String],
-        details_json: &str,
-    ) -> Result<(), BrokerError> {
-        let now = now_ms();
-        let tx = self.conn.transaction()?;
-        let entry = tx
-            .query_row(
-                "SELECT session_id, head_commit
-                 FROM merge_queue
-                 WHERE id = ?1 AND status IN ('simulating', 'verified', 'superseded')",
-                [entry_id],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?;
-        let Some((session_id, session_head)) = entry else {
-            return Err(BrokerError::SessionNotFound(entry_id));
-        };
-        tx.execute(
-            "UPDATE merge_queue
-             SET status = 'promoted', merged_tree = ?2, details_json = ?3, updated_at = ?4
-             WHERE id = ?1",
-            params![entry_id, integration_tree, details_json, now],
-        )?;
-        Self::record_promotion_representation(
-            &tx,
-            session_id,
-            &session_head,
-            integration_commit,
-            integration_ref,
-            promoted_paths,
-            now,
-        )?;
-        update_accepted_checkpoint(
-            &tx,
-            session_id,
-            &session_head,
-            integration_commit,
-            integration_tree,
             entry_id,
             now,
         )?;
@@ -1038,19 +933,6 @@ impl BrokerStore {
             entries.push(row??);
         }
         Ok(entries)
-    }
-
-    /// Startup recovery only needs these states. Keep terminal history out of
-    /// row decoding while preserving queue order and errors in eligible rows.
-    pub(crate) fn promotion_recovery_entries(
-        &self,
-        status: MergeStatus,
-    ) -> Result<Vec<MergeQueueEntry>, BrokerError> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("{MERGE_SELECT} WHERE status = ?1 ORDER BY id"))?;
-        let rows = stmt.query_map([status.as_str()], merge_from_row)?;
-        rows.map(|row| row?).collect()
     }
 
     /// One exact merge queue entry for read-only projections.

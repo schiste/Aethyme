@@ -170,27 +170,6 @@ fn status_leaves_a_verify_only_integration_where_it_is() {
 }
 
 #[test]
-fn a_promoting_repository_keeps_its_integration_and_the_notice() {
-    let fixture = Fixture::new("auto", 2);
-    let before = fixture.integration();
-    let mut broker = fixture.broker();
-
-    // The refreshing view, the only one that assesses drift and names it.
-    let status = broker.status(0).unwrap();
-
-    assert_eq!(fixture.integration(), before, "promote mode is unchanged");
-    assert!(
-        status
-            .advice
-            .iter()
-            .any(|row| row.id == "integration.fast-forward-available"),
-        "{:?}",
-        status.advice
-    );
-    assert!(refresh_triggers(&mut broker).is_empty());
-}
-
-#[test]
 fn an_integration_holding_work_of_its_own_is_never_reset() {
     let fixture = Fixture::new("verify-only", 2);
     let root = &fixture.root;

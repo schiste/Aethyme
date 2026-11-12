@@ -54,20 +54,7 @@ fn ref_exists(cwd: &Path, reference: &str) -> bool {
 }
 
 fn init_repo(root: &Path) {
-    init_repo_with(root, false);
-}
-
-/// [`init_repo`] in a repository that promotes to integration, for the cases
-/// whose subject is promotion itself; they go with the promotion engine.
-fn init_promoting_repo(root: &Path) {
-    init_repo_with(root, true);
-}
-
-fn init_repo_with(root: &Path, promote: bool) {
     sh(root, &["init", "-q", "-b", "main"]);
-    if promote {
-        aethyme_testkit::promote_on_submit(root);
-    }
     std::fs::write(root.join("README.md"), "hello\n").unwrap();
     std::fs::write(root.join(".gitignore"), "/.aethyme/\n").unwrap();
     sh(root, &["add", "-A"]);
@@ -2070,74 +2057,6 @@ fn finish_missing_worktree_persists_an_explicitly_incomplete_snapshot() {
     assert_eq!(handoff["pending_work"]["worktree_missing"], true);
 }
 
-/// Issue #141: local `main` advanced repeatedly while sessions were live, and
-/// `status` could not associate the writes with any session or flag them at all.
-#[test]
-fn status_flags_default_branch_commits_that_never_passed_through_submit() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
-    let remote = tmp.path().join("remote.git");
-    std::fs::create_dir_all(&repo).unwrap();
-    std::fs::create_dir_all(&remote).unwrap();
-    sh(&remote, &["init", "--bare", "-q", "-b", "main"]);
-    init_promoting_repo(&repo);
-    sh(
-        &repo,
-        &["remote", "add", "origin", remote.to_str().unwrap()],
-    );
-    sh(&repo, &["push", "-qu", "origin", "main"]);
-    // A clone would set this; `remote add` does not. Without it the check is
-    // skipped rather than guessing a default branch name.
-    sh(&repo, &["remote", "set-head", "origin", "main"]);
-
-    let mut broker = open_fixture_broker(&repo).unwrap();
-    let session = broker.start_worktree("promote something", None).unwrap();
-    let worktree = std::path::PathBuf::from(&session.worktree_path);
-    std::fs::write(worktree.join("owned.txt"), "work\n").unwrap();
-    sh(&worktree, &["add", "-A"]);
-    sh(&worktree, &["commit", "-qm", "session work"]);
-    assert!(broker.submit(session.id).unwrap().promoted);
-
-    // Integration now contains every accounted commit, so nothing is external.
-    let clean = broker.status(now_ms()).unwrap();
-    assert!(
-        !clean
-            .advice
-            .iter()
-            .any(|item| item.id == "main.external-writes"),
-        "a default branch with no unaccounted work must stay quiet: {:?}",
-        clean.advice.iter().map(|item| item.id).collect::<Vec<_>>()
-    );
-
-    // A writer that is not a broker session advances main directly.
-    std::fs::write(repo.join("outside.txt"), "written outside a session\n").unwrap();
-    sh(&repo, &["add", "-A"]);
-    sh(
-        &repo,
-        &["commit", "-qm", "feat: written outside the broker"],
-    );
-
-    let flagged = broker.status(now_ms()).unwrap();
-    let advice = flagged
-        .advice
-        .iter()
-        .find(|item| item.id == "main.external-writes")
-        .expect("an unaccounted default-branch commit must be surfaced");
-    assert!(
-        advice.summary.contains("never passed through submit"),
-        "{}",
-        advice.summary
-    );
-    assert!(
-        advice
-            .commands
-            .iter()
-            .any(|command| command.starts_with("git log --oneline")),
-        "the operator needs a bounded way to list them: {:?}",
-        advice.commands
-    );
-}
-
 /// Issue #144: adopting a worktree that already has commits records the current
 /// HEAD as the baseline, so those commits are not session-owned. That was
 /// silent, and only visible as `no_changes` plus an ownership field in the
@@ -2686,67 +2605,6 @@ fn a_finished_session_stops_colliding_on_its_declared_targets() {
     assert!(
         after.is_empty(),
         "a finished session must not keep colliding: {after:?}"
-    );
-}
-
-/// The #374 field report, end to end: integration is ahead of `origin/main`,
-/// local main is fast-forwarded to integration and not pushed. The local
-/// checkout is then 0 commits behind integration, and the summary used to
-/// report "ahead of main by N" with no refs, which read as a stale
-/// contradiction. The summary must carry the local-main count and name the
-/// baseline its own count is against.
-#[test]
-fn refreshed_summary_names_its_baseline_after_an_unpushed_fast_forward() {
-    let tmp = common::FixtureRepository::new();
-    init_promoting_repo(tmp.path());
-    sh(
-        tmp.path(),
-        &["update-ref", "refs/remotes/origin/main", "HEAD"],
-    );
-    sh(
-        tmp.path(),
-        &[
-            "symbolic-ref",
-            "refs/remotes/origin/HEAD",
-            "refs/remotes/origin/main",
-        ],
-    );
-    let published = rev(tmp.path(), "HEAD");
-    set_integration_at_head(tmp.path());
-    let mut broker = open_fixture_broker(tmp.path()).unwrap();
-
-    // Two commits land on integration without touching main.
-    sh(tmp.path(), &["switch", "-q", "aethyme/integration"]);
-    for (index, body) in ["one\n", "two\n"].iter().enumerate() {
-        std::fs::write(tmp.path().join(format!("landed-{index}.txt")), body).unwrap();
-        sh(tmp.path(), &["add", "-A"]);
-        sh(tmp.path(), &["commit", "-qm", "landed"]);
-    }
-    let integration = rev(tmp.path(), "HEAD");
-    sh(tmp.path(), &["switch", "-q", "main"]);
-    sh(
-        tmp.path(),
-        &["merge", "-q", "--ff-only", "aethyme/integration"],
-    );
-    assert_eq!(rev(tmp.path(), "HEAD"), integration);
-    assert_eq!(rev(tmp.path(), "refs/remotes/origin/main"), published);
-
-    let summary = broker.status(now_ms()).unwrap().summary;
-
-    assert_eq!(summary.integration_head, integration);
-    assert_eq!(summary.main_head, integration);
-    assert_eq!(summary.integration_ahead_local_main_commits, 0);
-    // Publishing would still add both commits: that count is correct, and
-    // now says what it is counted against.
-    assert_eq!(summary.baseline_ref, "refs/remotes/origin/main");
-    assert_eq!(summary.baseline_head, published);
-    assert_eq!(summary.integration_ahead_main_commits, 2);
-    assert!(
-        summary.message.contains(
-            "aethyme/integration ahead of origin/main by 2 commits (local checkout matches integration)"
-        ),
-        "{}",
-        summary.message
     );
 }
 

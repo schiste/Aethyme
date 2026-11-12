@@ -161,7 +161,6 @@ impl Broker {
                 let fence = self.collaboration_fence_state(FenceTrigger::Open);
                 (promote_config, promote_config_warning, fence)
             });
-        let promotes = promote_config.mode.promotes_at_all();
         let summary = status_summary(
             &agents,
             overlaps.len(),
@@ -184,7 +183,6 @@ impl Broker {
                 main_head: String::new(),
                 main_is_ancestor: false,
                 ahead_main_commits: 0,
-                promotes,
             },
         );
         phase_timings_ms.insert("summary".into(), phase_started.elapsed().as_millis() as u64);
@@ -201,7 +199,10 @@ impl Broker {
             &[],
             &latest,
             ("", ""),
-            (promotes, promote_config_warning),
+            (
+                promote_config.ignored_promotion_setting.clone(),
+                promote_config_warning,
+            ),
             None,
         );
         phase_timings_ms.insert(
@@ -406,7 +407,6 @@ impl Broker {
                 let collaboration_fence = self.collaboration_fence_state(FenceTrigger::Open);
                 (promote_config, promote_config_warning, collaboration_fence)
             });
-        let promotes = promote_config.mode.promotes_at_all();
         // One deadline for every phase below whose cost grows with sessions
         // and history; each phase that runs out names what it skipped.
         let budget = status_inspection_budget();
@@ -648,7 +648,6 @@ impl Broker {
                 main_head: main_head.clone(),
                 main_is_ancestor,
                 ahead_main_commits,
-                promotes,
             },
         );
         let mut advice = self.status_advice(
@@ -656,7 +655,10 @@ impl Broker {
             &promoted_conflicts,
             &latest_live_queue,
             (&integration_branch, &integration_head),
-            (promotes, promote_config_warning),
+            (
+                promote_config.ignored_promotion_setting.clone(),
+                promote_config_warning,
+            ),
             checkouts.as_ref(),
         );
         if collaboration_fence
@@ -727,96 +729,7 @@ impl Broker {
             "integration_drift".into(),
             drift_started.elapsed().as_millis() as u64,
         );
-        if promotes
-            && upstream_head.is_some()
-            && integration_contains_upstream.is_some()
-            && (main_behind_upstream_commits > 0 || !integration_contains_upstream.unwrap_or(false))
-        {
-            let upstream = upstream_ref.as_deref().unwrap_or("@{upstream}");
-            let stale_only = integration_reconciliation
-                .as_ref()
-                .filter(|assessment| assessment.stale_only);
-            // Integration strictly behind upstream is not ambiguity: it holds
-            // nothing upstream lacks, so advancing it discards no work and
-            // rewrites no history. Reporting that as `blocked` alongside
-            // genuine divergence taught operators to reach for a reviewed
-            // reconciliation when a fast-forward was the whole answer, and to
-            // wait for the block rather than keeping the ref current (#290
-            // phase 3.2). Divergence still blocks.
-            let fast_forward_available = before_deadline()
-                && !integration_contains_upstream.unwrap_or(false)
-                && upstream_head
-                    .as_deref()
-                    .is_some_and(|upstream| self.repo.is_ancestor(&integration_head, upstream));
-            if !before_deadline() && !budget_cut.contains(&"branch_drift") {
-                budget_cut.push("branch_drift");
-            }
-            advice.insert(
-                0,
-                StatusAdvice {
-                    id: if stale_only.is_some() {
-                        "integration.stale-promotions"
-                    } else if fast_forward_available {
-                        "integration.fast-forward-available"
-                    } else {
-                        "integration.upstream-main-ahead"
-                    },
-                    severity: if integration_contains_upstream.unwrap_or(false)
-                        || stale_only.is_some()
-                        || fast_forward_available
-                    {
-                        StatusAdviceSeverity::Notice
-                    } else {
-                        StatusAdviceSeverity::Blocked
-                    },
-                    reason: if stale_only.is_some() {
-                        "all recorded integration promotions have conclusive upstream landing evidence"
-                    } else if fast_forward_available {
-                        "integration holds nothing upstream lacks, so it can be advanced without review"
-                    } else {
-                        "configured upstream moved outside broker-managed integration"
-                    },
-                    summary: if integration_contains_upstream.unwrap_or(false) {
-                        format!(
-                            "local main is {main_behind_upstream_commits} commits behind {upstream}; integration already contains upstream, so broker operations remain safe"
-                        )
-                    } else if let Some(assessment) = stale_only {
-                        assessment.explanation.clone()
-                    } else if fast_forward_available {
-                        // Keeps the external-movement signal verbatim: what
-                        // changes is the severity and the named repair, not
-                        // whether the operator is told main moved outside the
-                        // broker.
-                        format!(
-                            "external main movement detected: integration is behind {upstream} \
-                             and carries nothing of its own, so it can be fast-forwarded without \
-                             review; do it so new sessions stop inheriting the gap"
-                        )
-                    } else {
-                        format!(
-                            "external main movement detected: integration does not contain {upstream}; unresolved or unrecorded work requires reviewed reconciliation"
-                        )
-                    },
-                    session_id: None,
-                    queue_entry_id: None,
-                    evidence: vec![
-                        format!(
-                            "{baseline_ref}: {}",
-                            short_commit(&baseline_head)
-                        ),
-                        format!("{upstream}: {}", short_commit(upstream_head.as_deref().unwrap_or(""))),
-                    ],
-                    commands: if integration_contains_upstream.unwrap_or(false) {
-                        Vec::new()
-                    } else {
-                        vec![format!(
-                            "aethyme broker advanced integration reconcile --upstream {upstream} --dry-run"
-                        )]
-                    },
-                },
-                );
-        }
-        if !promotes && before_deadline() {
+        if before_deadline() {
             match leftover_integration_advice(
                 &self.repo,
                 &integration_head,
@@ -828,60 +741,7 @@ impl Broker {
                 Ok(None) => {}
                 Err(_) => budget_cut.push("branch_drift"),
             }
-        } else if !promotes {
-            budget_cut.push("branch_drift");
-        }
-        // "Never passed through submit" is every commit under verify-only,
-        // where landing goes through pull requests and integration stays put.
-        let external_writes = if promotes && before_deadline() {
-            match self.external_default_branch_writes(&integration_head) {
-                Ok(writes) => writes,
-                Err(_) => {
-                    budget_cut.push("branch_drift");
-                    None
-                }
-            }
         } else {
-            if promotes && refresh {
-                budget_cut.push("branch_drift");
-            }
-            None
-        };
-        if promotes && refresh && !before_deadline() {
-            budget_cut.push("branch_drift");
-        }
-        if let Some((branch, commits)) = external_writes {
-            let count = commits.len();
-            advice.push(StatusAdvice {
-                id: "main.external-writes",
-                severity: StatusAdviceSeverity::Warning,
-                reason: "local default branch carries commits integration does not contain",
-                summary: format!(
-                    "{count} {} on {branch} never passed through submit; no session accounts for {}",
-                    plural_word(count, "commit", "commits"),
-                    if count == 1 { "it" } else { "them" }
-                ),
-                session_id: None,
-                queue_entry_id: None,
-                evidence: vec![
-                    format!("integration head {}", &integration_head[..12.min(integration_head.len())]),
-                    format!(
-                        "unaccounted commits: {}",
-                        commits
-                            .iter()
-                            .take(3)
-                            .map(|commit| commit[..12.min(commit.len())].to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                ],
-                commands: vec![
-                    format!("git log --oneline {}..{branch}", integration_head),
-                    "aethyme broker start --task \"replay local default-branch work\" --short-name \"Replay work\"".into(),
-                ],
-            });
-        }
-        if refresh && promotes && !before_deadline() && !budget_cut.contains(&"branch_drift") {
             budget_cut.push("branch_drift");
         }
         phase_timings_ms.insert("coordination".into(), started.elapsed().as_millis() as u64);
@@ -1210,12 +1070,7 @@ impl Broker {
         ) {
             advice.push(row);
         }
-        advice.extend(unpushed_work_advice(&unpushed_work, now_ms, !promotes));
-        if refresh && before_deadline() {
-            advice.extend(self.integration_behind_upstream_advice());
-        } else if refresh && !budget_cut.contains(&"branch_drift") {
-            budget_cut.push("branch_drift");
-        }
+        advice.extend(unpushed_work_advice(&unpushed_work, now_ms, true));
         advice.extend(overlap_pair_advice(&overlap_pairs));
         // Cached listing and local refs only: `status` never calls GitHub.
         if refresh && before_deadline() {
@@ -1864,48 +1719,18 @@ impl Broker {
         Ok((branch, local_ref, local_sha))
     }
 
-    /// Commits sitting on the local default branch that integration does not
-    /// contain. They reached the branch without passing through submit, so no
-    /// session accounts for them and `status` would otherwise say nothing
-    /// (issue #141).
-    ///
-    /// Resolution is offline: `origin/HEAD` is written at clone time. When it is
-    /// unset the check is skipped rather than guessing a branch name, because a
-    /// wrong guess would report every repository as having external writes.
-    pub(super) fn external_default_branch_writes(
-        &self,
-        integration_head: &str,
-    ) -> Result<Option<(String, Vec<String>)>, BrokerOpError> {
-        let repo = self.repo_handle();
-        let Some(head_ref) = repo.symbolic_ref("refs/remotes/origin/HEAD") else {
-            return Ok(None);
-        };
-        let Some(branch) = head_ref.rsplit('/').next().map(str::to_string) else {
-            return Ok(None);
-        };
-        let local_ref = format!("refs/heads/{branch}");
-        let Some(local_sha) = repo.resolve_ref(&local_ref) else {
-            return Ok(None);
-        };
-        let commits = repo.commits_between_oldest(integration_head, &local_sha)?;
-        if commits.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some((branch, commits)))
-    }
-
     pub(super) fn status_advice(
         &self,
         agents: &[AgentView],
         promoted_conflicts: &[PromotedConflict],
         queue: &[MergeQueueEntry],
         integration: (&str, &str),
-        promotion: (bool, Option<String>),
+        promotion: (Option<String>, Option<String>),
         checkouts: Option<&std::collections::BTreeMap<i64, CheckoutInspection>>,
     ) -> Vec<StatusAdvice> {
         use std::collections::BTreeMap;
-        let (promotes, promote_config_warning) = promotion;
-        let (integration_branch, integration_head) = integration;
+        let (ignored_promotion_setting, promote_config_warning) = promotion;
+        let (integration_branch, _) = integration;
 
         let mut advice = self.base_failure_incident_status_advice(Some(agents));
         advice.extend(self.object_store_advice());
@@ -1913,13 +1738,16 @@ impl Broker {
             advice.push(StatusAdvice {
                 id: "promote.mode-invalid",
                 severity: StatusAdviceSeverity::Warning,
-                reason: "unknown promotion mode is forced to the safe verify-only mode",
+                reason: "unknown promotion mode is ignored; local promotion was removed",
                 summary: warning,
                 session_id: None,
                 queue_entry_id: None,
                 evidence: vec![".aethyme/config.toml [promote].mode".into()],
                 commands: Vec::new(),
             });
+        }
+        if let Some(setting) = ignored_promotion_setting {
+            advice.push(promotion_removed_advice(&setting));
         }
         let mut latest_queue_by_session = BTreeMap::new();
         for entry in queue {
@@ -2008,14 +1836,6 @@ impl Broker {
             }) {
                 advice.push(promoted_clean_finish_advice(agent, entry));
             }
-        }
-
-        if promotes && !agents.is_empty() {
-            advice.push(integration_movement_advice(
-                integration_branch,
-                integration_head,
-                agents,
-            ));
         }
 
         advice
@@ -2199,21 +2019,8 @@ impl Broker {
         } else {
             None
         };
-        let movement_started = std::time::Instant::now();
-        let integration_movement = if std::time::Instant::now() < deadline {
-            match self.integration_movement_notice_from_sessions(&live_sessions) {
-                Ok(notice) => notice,
-                Err(_) if std::time::Instant::now() >= deadline => {
-                    budget_cut.push("integration_movement".into());
-                    None
-                }
-                Err(error) => return Err(error),
-            }
-        } else {
-            budget_cut.push("integration_movement".into());
-            None
-        };
-        phase("integration_movement", movement_started);
+        // No session moves integration any more: submit never promotes.
+        let integration_movement = None;
         let unpushed_started = std::time::Instant::now();
         let unpushed_work = match self.unpushed_work_within(now_ms(), Some(deadline)) {
             Ok(report) => report,
@@ -2312,9 +2119,6 @@ impl Broker {
     /// health check moves no refs. A repository with no integration branch
     /// has nothing left over.
     pub(super) fn leftover_integration_work(&self) -> Result<Option<StatusAdvice>, BrokerOpError> {
-        if PromoteConfig::load(&self.main_root).mode.promotes_at_all() {
-            return Ok(None);
-        }
         let Some(integration_head) = self.integration_tip() else {
             return Ok(None);
         };
@@ -2342,30 +2146,6 @@ impl Broker {
             .iter()
             .filter_map(recent_command_failure)
             .collect())
-    }
-
-    pub(super) fn integration_movement_notice_from_sessions(
-        &mut self,
-        sessions: &[Session],
-    ) -> Result<Option<IntegrationMovementNotice>, BrokerOpError> {
-        // Verify-only: sessions never submit into integration, so there is no
-        // movement to wait out.
-        if sessions.is_empty() || !PromoteConfig::load(&self.main_root).mode.promotes_at_all() {
-            return Ok(None);
-        }
-        let (branch, head) = self.integration_head()?;
-        let live_sessions = integration_live_sessions(sessions.to_vec());
-        Ok(Some(IntegrationMovementNotice {
-            branch: branch.clone(),
-            head,
-            message: format!(
-                "{} live {} may submit and move {branch}; re-read the integration head after long checks before treating them as current-tip proof",
-                live_sessions.len(),
-                plural_word(live_sessions.len(), "session", "sessions")
-            ),
-            live_sessions,
-            commands: vec!["aethyme broker status".into()],
-        }))
     }
 
     pub(super) fn repair_local_cli_version(

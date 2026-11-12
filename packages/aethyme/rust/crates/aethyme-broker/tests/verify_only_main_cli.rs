@@ -289,23 +289,6 @@ fn outcome_branch(fixture: &Fixture, session: i64) -> String {
 }
 
 #[test]
-fn a_promoting_repository_still_verifies_against_integration() {
-    let fixture = Fixture::new("auto");
-    let (session, _) = fixture.session_changing("tracked.txt", "session\n");
-    fixture.land_on_origin("tracked.txt", "upstream\n");
-
-    let outcome = fixture.broker().submit(session).unwrap();
-
-    let base = outcome.verified_against.expect("verification base");
-    assert_eq!(base.source, aethyme_broker::VERIFIED_AGAINST_INTEGRATION);
-    assert!(
-        outcome.conflicts.is_empty(),
-        "integration does not hold the upstream change: {:?}",
-        outcome.conflicts
-    );
-}
-
-#[test]
 fn push_reports_a_default_branch_change_that_would_conflict() {
     let fixture = Fixture::new("verify-only");
     let (session, _) = fixture.session_changing("tracked.txt", "session\n");
@@ -489,28 +472,6 @@ fn verify_only_status_tells_no_session_that_integration_moves() {
 
     let doctor = json(&fixture.run(&["status", "doctor", "--json"], &fixture.remote));
     assert!(doctor.get("integration_movement").is_none(), "{doctor:#}");
-}
-
-/// The same repository promoting: every condition is real there, so every
-/// row still appears. Without this the test above would pass on a fixture
-/// that never raised any of them.
-#[test]
-fn a_promoting_repository_still_reports_integration_movement() {
-    let fixture = Fixture::with_integration_left_behind("auto");
-
-    let status = fixture.status_offline();
-
-    for (condition, ids) in INTEGRATION_MOVEMENT_ADVICE {
-        assert!(
-            ids.iter().any(|id| !advice_rows(&status, id).is_empty()),
-            "{condition}: none of {ids:?} in an auto repository: {status:#}"
-        );
-    }
-    let summary = &status["summary"];
-    assert_eq!(summary["may_move_integration"], true, "{summary:#}");
-
-    let doctor = json(&fixture.run(&["status", "doctor", "--json"], &fixture.remote));
-    assert!(doctor["integration_movement"].is_object(), "{doctor:#}");
 }
 
 #[test]

@@ -1305,12 +1305,9 @@ const CONFIG_TEMPLATE: &str = "\
 schema = 1
 
 [promote]
-# \"verify-only\" (default): verifies and promotes nothing -- the repository ships
-# through pull requests, where a second copy of the work on an integration
-# branch costs drift and contributes nothing. \"auto\": verified submissions
-# promote to the local integration branch immediately. \"manual\" holds them for
-# `aethyme broker submit promote`. An unrecognised value warns and falls back to
-# \"verify-only\".
+# Submit verifies and promotes nothing: the repository ships through pull
+# requests. \"verify-only\" is the only mode; local promotion was removed, and an
+# old \"auto\" or \"manual\" value is ignored with a status warning to delete it.
 mode = \"verify-only\"
 # branch = \"aethyme/integration\"
 
@@ -1319,9 +1316,7 @@ mode = \"verify-only\"
 # branch (`aethyme broker push`) and open a pull request
 # (`aethyme broker push --pr`) while they work, so no work exists only in a
 # worktree. It authorizes nothing else: no merging and no other refs. For a
-# repository that delivers through pull requests, pair it with
-# `[promote] mode = \"verify-only\"` so verified work does not accumulate,
-# unpublished, on the local integration branch.
+# repository that delivers through pull requests.
 # push_session_branches = true
 
 # How broker push --pr opens a new pull request. Read from the trusted default
@@ -1958,7 +1953,7 @@ mod config_template_tests {
             CONFIG_TEMPLATE
                 .contains("#   [delivery] push_session_branches  true | false (default false")
         );
-        assert!(CONFIG_TEMPLATE.contains("`[promote] mode = \"verify-only\"`"));
+        assert!(CONFIG_TEMPLATE.contains("mode = \"verify-only\""));
 
         let opted_in = CONFIG_TEMPLATE
             .replace("# [delivery]\n", "[delivery]\n")

@@ -91,8 +91,8 @@ pub enum QuickTestError {
         expected: PathBuf,
         resolved: PathBuf,
     },
-    #[error("broker submit did not promote the smoke commit: {reason}")]
-    SubmitNotPromoted { reason: String },
+    #[error("broker submit did not verify the smoke commit: {reason}")]
+    SubmitNotVerified { reason: String },
     #[error("broker gated quick test did not run the fixture gate")]
     GateNotRun,
     #[error("broker gated quick test fixture gate did not pass")]
@@ -160,15 +160,6 @@ pub fn run_broker_quick_test_with_options(
     if !init.certified() {
         return Err(QuickTestError::InitNotCertified);
     }
-    // This check proves the path from a verified submission to the integration
-    // branch, which a repository has to opt into.
-    let config = temp_repo.path().join(".aethyme/config.toml");
-    let scaffold = std::fs::read_to_string(&config)?;
-    let promoting = scaffold.replace("\nmode = \"verify-only\"\n", "\nmode = \"auto\"\n");
-    if promoting == scaffold {
-        return Err(std::io::Error::other("the scaffold no longer sets a promote mode").into());
-    }
-    std::fs::write(&config, promoting)?;
     git(temp_repo.path(), &["add", "-A"])?;
     git(
         temp_repo.path(),
@@ -239,9 +230,9 @@ pub fn run_broker_quick_test_with_options(
     ));
 
     let outcome = broker.submit(session.id)?;
-    if !outcome.promoted || !outcome.conflicts.is_empty() {
-        return Err(QuickTestError::SubmitNotPromoted {
-            reason: describe_unpromoted(&outcome.conflicts, &outcome.gate_outcomes),
+    if outcome.entry.status != MergeStatus::Verified || !outcome.conflicts.is_empty() {
+        return Err(QuickTestError::SubmitNotVerified {
+            reason: describe_unverified(&outcome.conflicts, &outcome.gate_outcomes),
         });
     }
     if options.with_gate {
@@ -256,11 +247,11 @@ pub fn run_broker_quick_test_with_options(
         "pass",
         if options.with_gate {
             format!(
-                "entry {} promoted after {FIXTURE_GATE_NAME} pass",
+                "entry {} verified after {FIXTURE_GATE_NAME} pass",
                 outcome.entry.id
             )
         } else {
-            format!("entry {} promoted", outcome.entry.id)
+            format!("entry {} verified", outcome.entry.id)
         },
     ));
 
@@ -283,10 +274,7 @@ pub fn run_broker_quick_test_with_options(
         ));
 
         let failing = broker.submit(session.id)?;
-        if failing.promoted
-            || !failing.conflicts.is_empty()
-            || failing.entry.status != MergeStatus::Rejected
-        {
+        if !failing.conflicts.is_empty() || failing.entry.status != MergeStatus::Rejected {
             return Err(QuickTestError::GateFailureNotRejected);
         }
         let failing_gate =
@@ -383,15 +371,15 @@ cache = false
     Ok(())
 }
 
-/// Why a submission did not promote, in the terms a caller needs.
+/// Why a submission did not verify, in the terms a caller needs.
 ///
 /// A gate that refuses *before spawning* -- disk headroom under
 /// `DEFAULT_GATE_HEADROOM_BYTES`, a resource lease it could not take -- records
 /// `error` with a failure class and never runs the command. Reported as a bare
-/// "did not promote", that is indistinguishable from a gate that ran and failed
+/// "did not verify", that is indistinguishable from a gate that ran and failed
 /// the change, so a full disk reads as a broken diff (#270). The evidence is
 /// already on the outcome; this states it.
-fn describe_unpromoted(conflicts: &[String], gates: &[GateRunOutcome]) -> String {
+fn describe_unverified(conflicts: &[String], gates: &[GateRunOutcome]) -> String {
     let mut parts = Vec::new();
     if !conflicts.is_empty() {
         parts.push(format!("conflicts: {}", conflicts.join(", ")));
@@ -552,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_quick_test_promotes_in_disposable_repo() {
+    fn generic_quick_test_verifies_in_disposable_repo() {
         let report = run_broker_quick_test(QuickTestMode::Generic).unwrap();
 
         assert!(report.ok);
@@ -568,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn gated_quick_test_promotes_pass_and_rejects_fail() {
+    fn gated_quick_test_verifies_pass_and_rejects_fail() {
         let report = run_broker_quick_test_with_options(
             QuickTestMode::Generic,
             QuickTestOptions { with_gate: true },
@@ -720,7 +708,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod not_promoted_tests {
+mod not_verified_tests {
     use super::*;
 
     fn gate(name: &str, status: GateStatus, class: Option<GateFailureClass>) -> GateRunOutcome {
@@ -749,11 +737,11 @@ mod not_promoted_tests {
 
     /// The case that cost the diagnosis: a gate refused before spawning because
     /// the disk was under the headroom the gates enforce. Reported as a bare
-    /// "did not promote", that is indistinguishable from a gate that ran and
+    /// "did not verify", that is indistinguishable from a gate that ran and
     /// failed the change (#270).
     #[test]
     fn a_gate_that_refused_to_start_is_named_with_its_class() {
-        let reason = describe_unpromoted(
+        let reason = describe_unverified(
             &[],
             &[gate(
                 "cargo-test",
@@ -772,7 +760,7 @@ mod not_promoted_tests {
 
     #[test]
     fn conflicts_are_reported_and_passing_gates_are_not_noise() {
-        let reason = describe_unpromoted(
+        let reason = describe_unverified(
             &["src/a.rs".to_string()],
             &[
                 gate("fast", GateStatus::Pass, None),
@@ -795,7 +783,7 @@ mod not_promoted_tests {
     /// evidence was missing, rather than printing nothing after the colon.
     #[test]
     fn an_outcome_with_no_evidence_still_says_so() {
-        let reason = describe_unpromoted(&[], &[]);
+        let reason = describe_unverified(&[], &[]);
         assert!(reason.contains("no conflict or gate evidence"), "{reason}");
     }
 }

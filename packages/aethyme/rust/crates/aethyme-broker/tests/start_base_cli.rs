@@ -58,22 +58,8 @@ fn json(output: &Output) -> serde_json::Value {
 }
 
 fn fixture() -> tempfile::TempDir {
-    fixture_with(false)
-}
-
-/// [`fixture`] in a repository that promotes to integration, for the cases
-/// about choosing integration as the start base; they go with the promotion
-/// engine.
-fn promoting_fixture() -> tempfile::TempDir {
-    fixture_with(true)
-}
-
-fn fixture_with(promote: bool) -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
-    if promote {
-        aethyme_testkit::promote_on_submit(tmp.path());
-    }
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "README.md", ".gitignore"]);
@@ -186,76 +172,6 @@ fn verify_only_starts_from_the_fetched_default_branch() {
     assert_eq!(base["bypassed_integration"]["commit"], integration);
     assert_eq!(base["bypassed_integration"]["ahead_default_commits"], 2);
     assert!(base["bypassed_integration"]["recovery_command"].is_null());
-}
-
-/// The Mockup shape: integration stopped moving while upstream advanced. The
-/// session starts from upstream, the JSON names what it skipped and how to
-/// recover, and `status` keeps saying so.
-#[test]
-fn a_promoting_repository_skips_an_integration_that_fell_behind() {
-    let tmp = promoting_fixture();
-    let (integration, upstream) = integration_behind_upstream(tmp.path());
-
-    let value = json(&run(tmp.path(), &["start", "--task", "behind", "--json"]));
-    let base = &value["start_base"];
-    assert_eq!(base["commit"], upstream, "{value:#}");
-    assert_eq!(base["evidence"], "fetched_default_branch");
-    let bypassed = &base["bypassed_integration"];
-    assert_eq!(bypassed["reason"], "behind_upstream");
-    assert_eq!(bypassed["commit"], integration);
-    assert_eq!(bypassed["behind_default_commits"], 1);
-    assert_eq!(bypassed["ahead_default_commits"], 2);
-    assert_eq!(
-        bypassed["recovery_command"],
-        "aethyme broker advanced integration reconcile --upstream origin/main"
-    );
-
-    let human = stdout(&run(tmp.path(), &["start", "--task", "behind again"]));
-    assert!(
-        human.contains(
-            "is 1 commit(s) behind and 2 ahead of origin/main; started from origin/main instead"
-        ),
-        "{human}"
-    );
-    assert!(
-        human.contains("integration reconcile --upstream origin/main"),
-        "{human}"
-    );
-
-    let status = json(&run(tmp.path(), &["status", "--refresh", "--json"]));
-    let advice = status["advice"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["id"] == "integration.behind-upstream")
-        .unwrap_or_else(|| panic!("no integration.behind-upstream advice: {status:#}"));
-    assert_eq!(advice["severity"], "warning");
-}
-
-/// Integration that contains upstream is still the base in a promoting
-/// repository: sessions build on verified promotions, as before.
-#[test]
-fn a_current_integration_is_still_the_base() {
-    let tmp = promoting_fixture();
-    let upstream = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-    track_origin_main(tmp.path(), &upstream);
-    let integration = promote_onto(tmp.path(), &upstream, 2);
-
-    let value = json(&run(tmp.path(), &["start", "--task", "current", "--json"]));
-    let base = &value["start_base"];
-    assert_eq!(base["commit"], integration, "{value:#}");
-    assert_eq!(base["evidence"], "integration_tip");
-    assert!(base["bypassed_integration"].is_null());
-
-    let status = json(&run(tmp.path(), &["status", "--refresh", "--json"]));
-    assert!(
-        !status["advice"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["id"] == "integration.behind-upstream"),
-        "{status:#}"
-    );
 }
 
 /// Without integration, a local `main` that has not pulled is not the base;
@@ -400,35 +316,12 @@ fn start_attributes_post_checkout_hook_delay_to_git_worktree_add() {
     );
 }
 
-/// The committed policy on the default branch outranks the working-tree file,
-/// the same trust rule the push lane uses.
-#[test]
-fn promote_mode_is_read_from_the_default_branch_before_the_working_tree() {
-    let tmp = fixture();
-    write_promote_mode(tmp.path(), "verify-only");
-    git(tmp.path(), &["add", "-f", ".aethyme/config.toml"]);
-    git(tmp.path(), &["commit", "-qm", "verify-only policy"]);
-    let upstream = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-    track_origin_main(tmp.path(), &upstream);
-    promote_onto(tmp.path(), &upstream, 1);
-    // The working tree says auto; the default branch says verify-only.
-    write_promote_mode(tmp.path(), "auto");
-
-    let value = json(&run(
-        tmp.path(),
-        &["start", "--task", "committed wins", "--json"],
-    ));
-    let base = &value["start_base"];
-    assert_eq!(base["commit"], upstream, "{value:#}");
-    assert_eq!(base["bypassed_integration"]["reason"], "verify_only");
-}
-
 /// A session cut from upstream while integration lagged must not count
 /// everything upstream merged since integration last moved as its own
 /// changes: those would become leases and overlaps it never touched.
 #[test]
 fn a_session_started_from_upstream_leases_only_its_own_changes() {
-    let tmp = promoting_fixture();
+    let tmp = fixture();
     integration_behind_upstream(tmp.path());
 
     let value = json(&run(

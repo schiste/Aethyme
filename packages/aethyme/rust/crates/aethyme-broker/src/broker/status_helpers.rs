@@ -958,7 +958,8 @@ pub(super) fn status_summary(
         .iter()
         .filter(|agent| agent.derived_status == SessionStatus::Stale)
         .count();
-    let may_move_integration = integration.promotes && live_sessions > 0;
+    // No session moves integration: submit verifies and never promotes.
+    let may_move_integration = false;
 
     let sessions = session_summary_phrase(
         live_sessions,
@@ -976,15 +977,7 @@ pub(super) fn status_summary(
             plural_word(dirty_sessions, "session", "sessions")
         ));
     }
-    notes.push(if !integration.promotes {
-        "verify-only: submit does not move integration".to_string()
-    } else if active_sessions > 0 {
-        "active session may promote new integration work".to_string()
-    } else if live_sessions > 0 {
-        "live session may promote new integration work".to_string()
-    } else {
-        "no active submitters".to_string()
-    });
+    notes.push("verify-only: submit does not move integration".to_string());
 
     let commands = Vec::new();
 
@@ -1146,63 +1139,24 @@ pub(super) fn integration_summary_phrase(integration: &SummaryIntegration) -> St
     phrase
 }
 
-pub(super) fn integration_movement_advice(
-    integration_branch: &str,
-    integration_head: &str,
-    agents: &[AgentView],
-) -> StatusAdvice {
-    let count = agents.len();
-    let summary = format!(
-        "{} live {} may submit and move {integration_branch}; re-read the integration head after long checks before treating them as current-tip proof",
-        count,
-        plural_word(count, "session", "sessions")
-    );
-    let mut evidence: Vec<String> = agents
-        .iter()
-        .take(5)
-        .map(|agent| {
-            format!(
-                "session {} {} {}",
-                agent.session.id,
-                agent.derived_status.as_str(),
-                agent.session.branch
-            )
-        })
-        .collect();
-    if count > evidence.len() {
-        evidence.push(format!(
-            "and {} more {}",
-            count - evidence.len(),
-            plural_word(count - evidence.len(), "session", "sessions")
-        ));
-    }
-    evidence.push(format!(
-        "integration head {}",
-        short_commit(integration_head)
-    ));
-
+/// The `status` row for a configuration that still carries a promoting
+/// setting. Local promotion was removed; the setting is ignored and the
+/// repository verifies only, so the operator should delete it.
+pub(super) fn promotion_removed_advice(setting: &str) -> StatusAdvice {
     StatusAdvice {
-        id: "integration.may-move",
-        severity: StatusAdviceSeverity::Notice,
-        reason: "live_sessions_can_submit",
-        summary,
+        id: "promote.mode-removed",
+        severity: StatusAdviceSeverity::Warning,
+        reason: "local promotion was removed; the promoting setting is ignored",
+        summary: format!(
+            "[promote] {setting} is ignored: local promotion was removed, so submit verifies \
+             and the work lands through the session's pull request. Delete the setting from \
+             .aethyme/config.toml"
+        ),
         session_id: None,
         queue_entry_id: None,
-        evidence,
-        commands: vec!["aethyme broker advanced agents".into()],
+        evidence: vec![format!(".aethyme/config.toml [promote] {setting}")],
+        commands: Vec::new(),
     }
-}
-
-pub(super) fn integration_live_sessions(sessions: Vec<Session>) -> Vec<IntegrationLiveSession> {
-    sessions
-        .into_iter()
-        .map(|session| IntegrationLiveSession {
-            id: session.id,
-            status: session.status,
-            branch: session.branch,
-            task: session.task,
-        })
-        .collect()
 }
 
 /// One advice row per session holding unpushed commits, plus one for an

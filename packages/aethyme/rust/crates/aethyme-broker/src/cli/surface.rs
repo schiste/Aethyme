@@ -3,7 +3,7 @@
 //!
 //! This module only translates spellings. Each public form resolves to the
 //! internal subcommand that already implemented it, and that implementation
-//! runs unchanged: `submit`, `promote`, gates and cleanup keep their exact
+//! runs unchanged: `submit`, gates and cleanup keep their exact
 //! code paths. The internal names are what `run_inner`, `FLAG_RULES`, command
 //! metrics and the router's compatibility policy continue to key on.
 
@@ -27,10 +27,7 @@ pub const PUBLIC_VERBS: &[(&str, &str)] = &[
         "status",
         "sessions, overlaps, queue and integration; readiness and doctor views",
     ),
-    (
-        "submit",
-        "simulate, gate and promote a session; preparation",
-    ),
+    ("submit", "simulate and gate a session; preparation"),
     (
         "push",
         "publish this session's own branch as you work; --pr opens a draft PR",
@@ -60,7 +57,6 @@ const MERGED_FORMS: &[(&str, &str, &[&str])] = &[
     ("status", "readiness", &["readiness"]),
     ("status", "doctor", &["doctor"]),
     ("submit", "prepare", &["prepare"]),
-    ("submit", "promote", &["promote"]),
     ("finish", "close", &["close"]),
     ("finish", "cleanup", &["cleanup"]),
     ("gc", "reclaim", &["reclaim"]),
@@ -432,7 +428,7 @@ pub(super) fn public_help() -> String {
         "\nEverything else (leases, git, gh, review, operations, exec, ...):\n\
          \x20 aethyme broker advanced --help\n\n\
          Run `aethyme broker <verb> --help` for a verb's forms and flags.\n\
-         In verify-only mode overlaps warn; other modes can refuse claims against active explicit leases.\n",
+         Overlaps with another session's explicit lease warn.\n",
     );
     text
 }
@@ -571,7 +567,6 @@ mod tests {
             ("status readiness plan --json", "readiness plan --json"),
             ("status doctor", "doctor"),
             ("submit prepare --session 3", "prepare --session 3"),
-            ("submit promote --entry 4", "promote --entry 4"),
             ("finish close --session 3", "close --session 3"),
             ("finish cleanup 3 --force", "cleanup 3 --force"),
             ("gc reclaim plan", "reclaim plan"),
@@ -623,10 +618,6 @@ mod tests {
             (
                 "advanced status readiness recover",
                 "status readiness recover",
-            ),
-            (
-                "advanced submit promote --entry 1",
-                "submit promote --entry 1",
             ),
             (
                 "advanced submit prepare --session 1",

@@ -83,10 +83,10 @@ contracts, so any future delivery surface is a client, not a rewrite.
   that is the only place *semantic* conflicts are detectable. A repo with
   no `gates.toml` is a valid conflict-only deployment: textual simulation
   and promotion on clean merges, zero verification, recorded as such.
-- **Promotion is opt-in; verify-only by default** (changed 2026-11-05: every
-  repository delivers through pull requests, so a second copy on an integration
-  branch only adds drift). `[promote] mode = "auto"` promotes as soon as gates
-  pass; `"manual"` adds an explicit `broker submit promote` step.
+- **Local promotion was removed; submit verifies only** (verify-only by
+  default since 2026-11-05; the promoting modes and `broker submit promote`
+  were deleted on 2026-11-12). An old `[promote] mode = "auto"` or `"manual"`
+  still parses, is ignored, and `broker status` warns to delete it.
 - **Pull requests are the only landing path** (decided 2026-11-11). The
   local `broker advanced ship plan|execute` lane and its `[delivery] default`
   route selector were removed on 2026-11-12; an existing `[delivery] default`

@@ -1,4 +1,4 @@
-//! `broker submit`, `repair`, `promote`, `queue`, `checkpoint` and `representation`: integrating a session's work.
+//! `broker submit`, `repair`, `queue`, `checkpoint` and `representation`: integrating a session's work.
 
 use super::*;
 
@@ -391,11 +391,6 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
         } else {
             crate::CachePolicy::Use
         },
-        if parsed.verify_only {
-            crate::PromotionIntent::VerifyOnly
-        } else {
-            crate::PromotionIntent::Configured
-        },
     );
     let mut phases = crate::submit_progress::take_phase_timings().unwrap_or_default();
     phases.insert("broker_open".into(), open_ms);
@@ -601,23 +596,17 @@ fn render_submit_text(
             )
         {
             out!(
-                "entry {} → conflict-checked (eligible for manual promotion; no gate verification)",
+                "entry {} → conflict-checked (no gate verification)",
                 outcome.entry.id
             );
         } else {
             out!(
-                "entry {} → {}{}",
+                "entry {} → {}",
                 outcome.entry.id,
                 outcome.entry.status.as_str(),
-                if outcome.promoted {
-                    " (auto-promoted)"
-                } else {
-                    ""
-                }
             );
-            // A verified entry that did not move is the normal outcome
-            // where promotion is off, and reads as a silent failure
-            // without the reason (#290 phase 2.2).
+            // A verified entry never moves anything, and reads as a silent
+            // failure without the reason (#290 phase 2.2).
             if let Some(reason) = &outcome.promotion_suppressed {
                 out!("  {reason}");
             }
@@ -709,40 +698,14 @@ fn render_submit_text(
         }
         // "What now?" — the next expected human action was
         // implicit (dogfood feedback 2026-07-14).
-        if outcome.promoted {
-            let integration = broker
-                .integration_head()
-                .map(|(_, commit)| commit[..12.min(commit.len())].to_string())
-                .unwrap_or_else(|_| "?".into());
-            out!(
-                "What now: aethyme/integration is at {integration} and contains this work. \
-                 Your checkout and branches are untouched — keep working, or start \
-                 a follow-up with `aethyme broker start --reuse --task \"...\" --short-name \"<short name>\"`, or \
-                 finish safely with `aethyme broker finish --session {}`.",
-                outcome.entry.session_id,
-            );
-        } else if crate::PromoteConfig::load(broker.main_root()).mode
-            == crate::PromoteMode::VerifyOnly
-        {
-            // Telling an operator to promote in a repository that has
-            // opted out contradicts the line printed directly above it,
-            // and names a command whose whole point is that it is not
-            // wanted here (#290 phase 2.2).
-            out!(
-                "What now: entry {} is verified and nothing moved, which is what this \
-                 repository is configured for. Ship the work its usual way, or finish \
-                 with `aethyme broker finish --session {}`.",
-                outcome.entry.id,
-                outcome.entry.session_id,
-            );
-        } else {
-            out!(
-                "What now: entry {} is verified but not promoted (manual mode). \
-                 Promote with `aethyme broker submit promote --entry {}`.",
-                outcome.entry.id,
-                outcome.entry.id,
-            );
-        }
+        out!(
+            "What now: entry {} is verified and nothing moved locally. Land the work \
+             through the session's pull request (`aethyme broker push --session {} --pr`), \
+             or finish with `aethyme broker finish --session {}`.",
+            outcome.entry.id,
+            outcome.entry.session_id,
+            outcome.entry.session_id,
+        );
     }
     // `--json` used to exit 0 for a rejected or conflicted entry, so a
     // caller reading only the exit code saw a failed gate as success.
@@ -1403,21 +1366,6 @@ pub(super) fn run_queue(parsed: Parsed) -> Result<(), UsageError> {
                 &entry.head_commit[..12.min(entry.head_commit.len())]
             );
         }
-    }
-    Ok(())
-}
-
-/// `broker promote`.
-pub(super) fn run_promote(parsed: Parsed) -> Result<(), UsageError> {
-    let entry = parsed
-        .entry
-        .ok_or(UsageError::Message("promote requires --entry <id>".into()))?;
-    let mut broker = open_broker(parsed.read_only_snapshot)?;
-    broker.promote(entry)?;
-    if parsed.json {
-        out!("{{\"promoted\":{entry}}}");
-    } else {
-        out!("Promoted entry {entry} to the local integration branch.");
     }
     Ok(())
 }

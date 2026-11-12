@@ -95,8 +95,8 @@ inspect external state and reconcile the recorded operation; never blindly retry
 ## 4. Prove recovery
 
 After authorized repair, repeat version, readiness, and integration inspections.
-Then run `aethyme broker quick-test --with-gate --json` to prove promotion and
-failing-gate rejection in a disposable repository. Preserve the exact revision,
+Then run `aethyme broker quick-test --with-gate --json` to prove a verified
+submit and failing-gate rejection in a disposable repository. Preserve the exact revision,
 test result, outstanding warnings and next action in the handoff. A successful
 smoke does not certify pending integration changes or authorize publication.
 

@@ -8,7 +8,7 @@ Usage: aethyme broker <verb> [args...]
 Verbs:
   start     create an isolated worktree + session, or adopt/reuse an existing one
   status    sessions, overlaps, queue and integration; readiness and doctor views
-  submit    simulate, gate and promote a session; preparation
+  submit    simulate and gate a session; preparation
   push      publish this session's own branch as you work; --pr opens a draft PR
   commit    commit session-owned changes locally while hooks run outside the repository lock
   sync      catch this session up to the latest default branch when it is safe
@@ -20,4 +20,4 @@ Everything else (leases, git, gh, review, operations, exec, ...):
   aethyme broker advanced --help
 
 Run `aethyme broker <verb> --help` for a verb's forms and flags.
-In verify-only mode overlaps warn; other modes can refuse claims against active explicit leases.
+Overlaps with another session's explicit lease warn.

@@ -570,17 +570,6 @@ pub enum BrokerOpError {
         captured: Box<str>,
         actual: Box<str>,
     },
-    /// `[collaboration] capture = "required"` and the entry's head has no
-    /// acknowledged required capture, so promoting it would integrate code
-    /// that was never retained.
-    #[error(
-        "refusing to promote entry {entry}: this repository requires collaboration capture and head {head} has no acknowledged required capture ({reason}); resubmit the session with `aethyme broker submit --session <id>` to capture and verify it"
-    )]
-    CaptureRequiredForPromotion {
-        entry: i64,
-        head: Box<str>,
-        reason: String,
-    },
     #[error("session {session_id}'s branch {branch} does not exist in this repository")]
     SessionBranchMissing { session_id: i64, branch: String },
     /// `broker sync` declined before changing anything: the worktree is
@@ -628,8 +617,6 @@ pub enum BrokerOpError {
     RetentionConfig(#[from] crate::RetentionConfigError),
     #[error(transparent)]
     PrePush(#[from] crate::gates::PrePushValidationError),
-    #[error("queue entry {entry} is not verified (status: {status}) — submit/simulate first")]
-    NotVerified { entry: i64, status: &'static str },
     #[error("refusing submission for session {session_id}: unsafe submission plan: {reason}")]
     UnsafeSubmissionPlan { session_id: i64, reason: String },
     #[error(
@@ -2091,8 +2078,6 @@ struct SummaryIntegration {
     main_head: String,
     main_is_ancestor: bool,
     ahead_main_commits: u64,
-    /// False in a verify-only repository, where no session moves integration.
-    promotes: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]

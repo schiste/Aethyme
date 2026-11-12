@@ -48,22 +48,8 @@ fn stdout(output: &Output) -> String {
 }
 
 fn fixture() -> common::FixtureRepository {
-    fixture_with(false)
-}
-
-/// [`fixture`] in a repository that promotes to integration, for the cases
-/// about integration as a start or reuse base; they go with the promotion
-/// engine.
-fn promoting_fixture() -> common::FixtureRepository {
-    fixture_with(true)
-}
-
-fn fixture_with(promote: bool) -> common::FixtureRepository {
     let tmp = common::FixtureRepository::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
-    if promote {
-        aethyme_testkit::promote_on_submit(tmp.path());
-    }
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "README.md", ".gitignore"]);
@@ -124,16 +110,6 @@ fn overwrite_stored_base_observation(
         changed, 1,
         "the malformed-observation control must replace an existing row"
     );
-}
-
-fn set_promote_branch(repo: &Path, branch: &str) {
-    let aethyme = repo.join(".aethyme");
-    std::fs::create_dir_all(&aethyme).unwrap();
-    std::fs::write(
-        aethyme.join("config.toml"),
-        format!("[promote]\nbranch = \"{branch}\"\nmode = \"auto\"\n"),
-    )
-    .unwrap();
 }
 
 fn set_integration_at_head(repo: &Path) -> String {
@@ -557,51 +533,6 @@ fn reuse_persists_a_new_short_name_but_keeps_tab_attribution() {
     assert_eq!(reused["tab_name"], "Original tab");
 }
 
-#[test]
-fn start_selects_integration_or_default_branch_without_using_checkout_head() {
-    for checkout in ["main", "feature", "detached"] {
-        let tmp = promoting_fixture();
-        let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-        if checkout != "main" {
-            git(tmp.path(), &["switch", "-qc", "feature"]);
-            std::fs::write(tmp.path().join("feature.txt"), checkout).unwrap();
-            git(tmp.path(), &["add", "feature.txt"]);
-            git(tmp.path(), &["commit", "-qm", "throwaway feature"]);
-        }
-        if checkout == "detached" {
-            git(tmp.path(), &["checkout", "--detach", "HEAD"]);
-        }
-
-        let started = stdout(&run(tmp.path(), &["start", "--task", checkout, "--json"]));
-        let value: serde_json::Value = serde_json::from_str(&started).unwrap();
-        assert_eq!(value["start_base"]["ref_name"], "refs/heads/main");
-        assert_eq!(value["start_base"]["commit"], main);
-        assert_eq!(value["diff_base"], main);
-    }
-
-    let tmp = promoting_fixture();
-    git(tmp.path(), &["switch", "-qc", "promoted"]);
-    std::fs::write(tmp.path().join("promoted.txt"), "integration\n").unwrap();
-    git(tmp.path(), &["add", "promoted.txt"]);
-    git(tmp.path(), &["commit", "-qm", "promoted work"]);
-    let integration = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-    git(
-        tmp.path(),
-        &["update-ref", "refs/heads/aethyme/integration", &integration],
-    );
-    let started = stdout(&run(
-        tmp.path(),
-        &["start", "--task", "from integration", "--json"],
-    ));
-    let value: serde_json::Value = serde_json::from_str(&started).unwrap();
-    assert_eq!(
-        value["start_base"]["ref_name"],
-        "refs/heads/aethyme/integration"
-    );
-    assert_eq!(value["start_base"]["commit"], integration);
-    assert_eq!(value["start_base"]["evidence"], "integration_tip");
-}
-
 /// Point `main` at a tracking upstream without needing a real remote, so
 /// `@{upstream}` resolves and the start base can be compared against it.
 fn track_origin_main(repo: &Path, commit: &str) {
@@ -637,80 +568,17 @@ fn integration_ahead_of_main(repo: &Path, commits: usize) -> String {
     integration
 }
 
-/// A branch cut from integration inherits everything integration carries that
-/// the default branch does not, and opening a pull request from it presents
-/// those commits as the session's own (#283, #290). Being *ahead* is the
-/// normal state, so it is the one that was never reported.
-#[test]
-fn start_reports_the_commits_its_base_carries_ahead_of_the_default_branch() {
-    let tmp = promoting_fixture();
-    let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-    track_origin_main(tmp.path(), &main);
-    integration_ahead_of_main(tmp.path(), 2);
-
-    let started = stdout(&run(
-        tmp.path(),
-        &["start", "--task", "ahead of default", "--json"],
-    ));
-    let value: serde_json::Value = serde_json::from_str(&started).unwrap();
-    assert_eq!(value["start_base"]["evidence"], "integration_tip");
-    assert_eq!(value["start_base"]["ahead_default_commits"], 2);
-    assert_eq!(value["start_base"]["behind_default_commits"], 0);
-
-    let human = promoting_fixture();
-    let main = git_output(human.path(), &["rev-parse", "HEAD"]);
-    track_origin_main(human.path(), &main);
-    integration_ahead_of_main(human.path(), 2);
-    let rendered = stdout(&run(human.path(), &["start", "--task", "ahead of default"]));
-    assert!(
-        rendered.contains("note: this base is 2 commit(s) ahead of"),
-        "{rendered}"
-    );
-    assert!(
-        rendered.contains("carries them alongside your own work"),
-        "{rendered}"
-    );
-}
-
 /// A base level with the default branch inherits nothing, so the note would be
 /// noise. Guards the threshold in the other direction.
 #[test]
 fn start_is_silent_when_its_base_carries_nothing_extra() {
-    let tmp = promoting_fixture();
+    let tmp = fixture();
     let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
     track_origin_main(tmp.path(), &main);
-    git(
-        tmp.path(),
-        &["update-ref", "refs/heads/aethyme/integration", &main],
-    );
 
     let rendered = stdout(&run(tmp.path(), &["start", "--task", "level with default"]));
     assert!(!rendered.contains("commit(s) ahead of"), "{rendered}");
     assert!(!rendered.contains("commit(s) behind"), "{rendered}");
-}
-
-/// `start --cmd` selects a base exactly as `start` does and reported nothing
-/// about it, which is the worse half of the gap: a detached agent has no one
-/// reading its terminal, and it opens pull requests from that base (#290).
-#[test]
-fn start_with_cmd_reports_its_base_and_what_it_carries() {
-    let tmp = promoting_fixture();
-    let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-    track_origin_main(tmp.path(), &main);
-    integration_ahead_of_main(tmp.path(), 3);
-
-    let rendered = stdout(&run(
-        tmp.path(),
-        &["start", "--cmd", "true", "--task", "detached"],
-    ));
-    assert!(
-        rendered.contains("Start base: refs/heads/aethyme/integration"),
-        "{rendered}"
-    );
-    assert!(
-        rendered.contains("note: this base is 3 commit(s) ahead of"),
-        "{rendered}"
-    );
 }
 
 /// #290 phase 1.1: an explicit base is honored, recorded as its own evidence so
@@ -718,19 +586,8 @@ fn start_with_cmd_reports_its_base_and_what_it_carries() {
 /// naming a base does not stop its inherited commits landing in a pull request.
 #[test]
 fn start_cuts_from_an_explicit_base_when_one_is_given() {
-    let tmp = promoting_fixture();
-    let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-    track_origin_main(tmp.path(), &main);
-    let integration = integration_ahead_of_main(tmp.path(), 2);
-
-    // Without --base the integration tip wins, and carries 2 inherited commits.
-    let default_base = stdout(&run(tmp.path(), &["start", "--task", "implicit", "--json"]));
-    let value: serde_json::Value = serde_json::from_str(&default_base).unwrap();
-    assert_eq!(value["start_base"]["commit"], integration);
-    assert_eq!(value["start_base"]["ahead_default_commits"], 2);
-
-    // Naming the default branch cuts from it instead, inheriting nothing.
-    let chosen = promoting_fixture();
+    // Naming the default branch cuts from it, inheriting nothing.
+    let chosen = fixture();
     let main = git_output(chosen.path(), &["rev-parse", "HEAD"]);
     track_origin_main(chosen.path(), &main);
     integration_ahead_of_main(chosen.path(), 2);
@@ -823,93 +680,10 @@ fn reuse_revalidates_and_fast_forwards_a_clean_conventional_base() {
 }
 
 #[test]
-fn reuse_refuses_an_unconfirmed_integration_base_without_changing_the_session() {
-    let tmp = promoting_fixture();
-    let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-    track_origin_main(tmp.path(), &main);
-    set_integration_at_head(tmp.path());
-    stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
-    let session = stored_session(&tmp, 1);
-    let previous_observation = stored_base_observation(&tmp, session.id);
-    let worktree = Path::new(&session.worktree_path);
-    let before = git_output(worktree, &["rev-parse", "HEAD"]);
-    let unavailable_remote = tmp.path().join("unavailable-remote");
-    git(
-        tmp.path(),
-        &[
-            "config",
-            "remote.origin.url",
-            unavailable_remote.to_str().unwrap(),
-        ],
-    );
-    for sync in [false, true] {
-        let mut args = vec![
-            "start",
-            "--reuse",
-            session.worktree_path.as_str(),
-            "--task",
-            "offline follow-up",
-            "--json",
-        ];
-        if sync {
-            args.push("--sync-integration");
-        }
-        let output = run(tmp.path(), &args);
-        assert!(!output.status.success());
-        let error = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(error.contains("not freshly confirmed"), "{error}");
-        assert_eq!(git_output(worktree, &["rev-parse", "HEAD"]), before);
-        assert_eq!(stored_session(&tmp, 1).task.as_deref(), Some("initial"));
-        assert_eq!(stored_base_observation(&tmp, 1), previous_observation);
-    }
-}
-
-#[test]
-fn reuse_refuses_a_stale_integration_even_with_unknown_provenance() {
-    let tmp = promoting_fixture();
-    let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-    track_origin_main(tmp.path(), &main);
-    set_integration_at_head(tmp.path());
-    stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
-    let session = stored_session(&tmp, 1);
-    delete_stored_base_observation(&tmp, session.id);
-    let worktree = Path::new(&session.worktree_path);
-    let before = git_output(worktree, &["rev-parse", "HEAD"]);
-    advance_main(tmp.path(), "remote-advance.txt");
-    for sync in [false, true] {
-        let mut args = vec![
-            "start",
-            "--reuse",
-            session.worktree_path.as_str(),
-            "--task",
-            "stale follow-up",
-            "--json",
-        ];
-        if sync {
-            args.push("--sync-integration");
-        }
-        let output = run(tmp.path(), &args);
-        assert!(!output.status.success());
-        let error = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(error.contains("freshly fetched default branch"), "{error}");
-        assert_eq!(git_output(worktree, &["rev-parse", "HEAD"]), before);
-        assert_eq!(stored_session(&tmp, 1).task.as_deref(), Some("initial"));
-    }
-}
-
-#[test]
 fn unavailable_remote_default_ref_is_not_treated_as_local_only() {
     let cases = [("origin", true), ("origin", false), ("upstream", false)];
     for (remote, symbolic_default) in cases {
-        let tmp = promoting_fixture();
+        let tmp = fixture();
         let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
         track_origin_main(tmp.path(), &main);
         if remote != "origin" {
@@ -1132,161 +906,6 @@ fn reuse_keeps_an_explicit_base_pinned_when_its_branch_advances() {
     assert_eq!(
         git_output(Path::new(&session.worktree_path), &["rev-parse", "HEAD"]),
         original_base
-    );
-}
-
-#[test]
-fn reuse_refuses_changed_promote_policy_without_changing_checkout_or_task() {
-    let tmp = fixture();
-    let initial = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-    let recorded_branch = "aethyme/integration-recorded";
-    git(
-        tmp.path(),
-        &[
-            "update-ref",
-            &format!("refs/heads/{recorded_branch}"),
-            &initial,
-        ],
-    );
-    set_promote_branch(tmp.path(), recorded_branch);
-    stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
-    let session = stored_session(&tmp, 1);
-    assert_eq!(session.diff_base.as_deref(), Some(initial.as_str()));
-    let original_head = git_output(Path::new(&session.worktree_path), &["rev-parse", "HEAD"]);
-
-    set_promote_branch(tmp.path(), "aethyme/integration-new-policy");
-    let worktree_arg = session.worktree_path.as_str();
-    let refused = run(
-        tmp.path(),
-        &[
-            "start",
-            "--reuse",
-            worktree_arg,
-            "--task",
-            "new policy must not be recorded",
-            "--json",
-        ],
-    );
-    assert!(!refused.status.success());
-    assert!(
-        json_error::message(&refused).contains("configured integration branch changed"),
-        "{}",
-        json_error::message(&refused)
-    );
-    assert_eq!(
-        git_output(Path::new(&session.worktree_path), &["rev-parse", "HEAD"]),
-        original_head
-    );
-    let unchanged = stored_session(&tmp, session.id);
-    assert_eq!(unchanged.task.as_deref(), Some("initial"));
-    assert_eq!(unchanged.diff_base.as_deref(), session.diff_base.as_deref());
-}
-
-#[test]
-fn reuse_refuses_a_missing_recorded_integration_ref_without_fallback() {
-    let tmp = fixture();
-    let initial = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-    let recorded_branch = "aethyme/integration-recorded";
-    let recorded_ref = format!("refs/heads/{recorded_branch}");
-    git(tmp.path(), &["update-ref", &recorded_ref, &initial]);
-    set_promote_branch(tmp.path(), recorded_branch);
-    stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
-    let session = stored_session(&tmp, 1);
-    let original_head = git_output(Path::new(&session.worktree_path), &["rev-parse", "HEAD"]);
-    git(tmp.path(), &["update-ref", "-d", &recorded_ref]);
-
-    let worktree_arg = session.worktree_path.as_str();
-    let refused = run(
-        tmp.path(),
-        &[
-            "start",
-            "--reuse",
-            worktree_arg,
-            "--task",
-            "missing ref must not be recorded",
-            "--json",
-        ],
-    );
-    assert!(!refused.status.success());
-    assert!(
-        json_error::message(&refused).contains(
-            "recorded integration ref refs/heads/aethyme/integration-recorded is missing"
-        ),
-        "{}",
-        json_error::message(&refused)
-    );
-    assert_eq!(
-        git_output(Path::new(&session.worktree_path), &["rev-parse", "HEAD"]),
-        original_head
-    );
-    let unchanged = stored_session(&tmp, session.id);
-    assert_eq!(unchanged.task.as_deref(), Some("initial"));
-    assert_eq!(unchanged.diff_base, session.diff_base);
-}
-
-#[test]
-fn unknown_adopted_base_tracks_current_integration_and_requires_explicit_sync() {
-    let tmp = promoting_fixture();
-    let initial = set_integration_at_head(tmp.path());
-    stdout(&run(
-        tmp.path(),
-        &["start", "--adopt", "--task", "initial", "--json"],
-    ));
-    let session = stored_session(&tmp, 1);
-
-    let contained = stdout(&run(
-        tmp.path(),
-        &["start", "--reuse", "--task", "contained base", "--json"],
-    ));
-    let contained: serde_json::Value = serde_json::from_str(&contained).unwrap();
-    assert_eq!(contained["base_freshness"]["target_commit"], initial);
-    assert_eq!(contained["base_freshness"]["relation"], "current");
-    assert!(contained["base_freshness"].get("source").is_none());
-
-    let advanced_integration = integration_ahead_of_main(tmp.path(), 1);
-    let refused = run(
-        tmp.path(),
-        &[
-            "start",
-            "--reuse",
-            "--task",
-            "must require explicit sync",
-            "--json",
-        ],
-    );
-    assert!(!refused.status.success());
-    assert!(
-        json_error::message(&refused).contains("automatic movement is disabled"),
-        "{}",
-        json_error::message(&refused)
-    );
-    assert_eq!(git_output(tmp.path(), &["rev-parse", "HEAD"]), initial);
-    let unchanged = stored_session(&tmp, session.id);
-    assert_eq!(unchanged.task.as_deref(), Some("contained base"));
-
-    let synchronized = stdout(&run(
-        tmp.path(),
-        &[
-            "start",
-            "--reuse",
-            "--sync-integration",
-            "--task",
-            "explicitly synchronized",
-            "--json",
-        ],
-    ));
-    let synchronized: serde_json::Value = serde_json::from_str(&synchronized).unwrap();
-    assert_eq!(
-        synchronized["integration_sync"]["outcome"],
-        "fast_forwarded"
-    );
-    assert_eq!(
-        git_output(tmp.path(), &["rev-parse", "HEAD"]),
-        advanced_integration
-    );
-    assert_eq!(
-        stored_session(&tmp, session.id).task.as_deref(),
-        Some("explicitly synchronized")
     );
 }
 
@@ -1524,48 +1143,6 @@ fn unknown_base_without_integration_does_not_move_a_session_off_the_default_bran
         assert_eq!(git_output(worktree, &["rev-parse", "HEAD"]), before);
         assert_eq!(stored_session(&tmp, session.id).task, session.task);
     }
-}
-
-/// Integration going away after this session was checked against it is not the
-/// same as nothing having been promoted yet, so it is reported, not stepped over.
-#[test]
-fn unknown_adopted_base_refuses_when_the_integration_it_was_checked_against_is_gone() {
-    let tmp = promoting_fixture();
-    set_integration_at_head(tmp.path());
-    stdout(&run(
-        tmp.path(),
-        &["start", "--adopt", "--task", "initial", "--json"],
-    ));
-    let session = stored_session(&tmp, 1);
-    stdout(&run(
-        tmp.path(),
-        &["start", "--reuse", "--task", "checked", "--json"],
-    ));
-    let original_head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-    git(
-        tmp.path(),
-        &["update-ref", "-d", "refs/heads/aethyme/integration"],
-    );
-
-    let refused = run(
-        tmp.path(),
-        &["start", "--reuse", "--task", "must refuse", "--json"],
-    );
-    assert!(!refused.status.success());
-    assert!(
-        json_error::message(&refused)
-            .contains("configured integration ref refs/heads/aethyme/integration, which this session was last checked against, is missing"),
-        "{}",
-        json_error::message(&refused)
-    );
-    assert_eq!(
-        git_output(tmp.path(), &["rev-parse", "HEAD"]),
-        original_head
-    );
-    assert_eq!(
-        stored_session(&tmp, session.id).task.as_deref(),
-        Some("checked")
-    );
 }
 
 /// `start --adopt` registers an existing worktree, so there is no base to choose. The
@@ -1940,7 +1517,6 @@ fn adopt_cli_requires_reuse_for_integration_sync() {
 fn adopt_warns_about_uncommitted_paths_it_did_not_create() {
     let repo = tempfile::tempdir().unwrap();
     git(repo.path(), &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(repo.path());
     std::fs::write(repo.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
     git(repo.path(), &["add", "-A"]);

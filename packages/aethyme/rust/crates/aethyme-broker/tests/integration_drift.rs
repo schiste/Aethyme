@@ -5,6 +5,9 @@
 //! merely *behind* it, which is a fast-forward that discards nothing. Treating
 //! the second as the first meant every pull-request merge left the gap in
 //! place, and every session started afterwards inherited it.
+//!
+//! Local promotion was removed; these cases cover the integration ref a
+//! repository may still carry from before, and the read-only doctor report.
 
 use std::path::Path;
 use std::process::Command;
@@ -39,7 +42,6 @@ fn fixture(ahead: usize) -> (isolation::FixtureRepo, Broker) {
     let tmp = isolation::FixtureRepo::new();
     let root = tmp.path();
     git(root, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(root);
     std::fs::write(root.join("README.md"), "fixture\n").unwrap();
     std::fs::write(root.join(".gitignore"), "/.aethyme/\n").unwrap();
     git(root, &["add", "-A"]);
@@ -107,37 +109,6 @@ fn automatic_cleanup_fast_forwards_when_integration_carries_nothing_of_its_own()
     assert_eq!(
         git(tmp.path(), &["rev-parse", "refs/heads/aethyme/integration"]),
         upstream
-    );
-}
-
-/// Phase 3.2. Behind-but-clean is a notice naming the repair, not a block:
-/// blocking taught operators to wait for the block instead of keeping the ref
-/// current, and to reach for a reviewed reconciliation when a fast-forward was
-/// the whole answer.
-#[test]
-fn status_reports_a_clean_lag_as_a_notice_rather_than_a_block() {
-    let (_tmp, broker) = fixture(2);
-    let status = broker.status_snapshot(0).unwrap();
-
-    let advice = status
-        .advice
-        .iter()
-        .find(|entry| entry.id == "integration.fast-forward-available")
-        .expect("a clean lag must be reported");
-
-    assert_eq!(advice.severity, StatusAdviceSeverity::Notice);
-    assert!(
-        advice.summary.contains("fast-forward"),
-        "{}",
-        advice.summary
-    );
-    assert!(
-        !status
-            .advice
-            .iter()
-            .any(|entry| entry.severity == StatusAdviceSeverity::Blocked),
-        "a clean lag must not block: {:?}",
-        status.advice
     );
 }
 
@@ -242,25 +213,6 @@ fn verify_only_status_does_not_report_leftover_integration_work() {
 fn verify_only_status_is_silent_when_integration_holds_nothing_of_its_own() {
     let (tmp, _broker) = fixture(2);
     set_promote_mode(tmp.path(), "verify-only");
-    let mut broker = isolation::open(tmp.path());
-
-    let status = broker.status_current(0).unwrap();
-    assert!(
-        !status
-            .advice
-            .iter()
-            .any(|entry| entry.id == "integration.leftover-work"),
-        "{:?}",
-        status.advice
-    );
-}
-
-/// Promoting repositories keep their own integration rows: work on
-/// integration ahead of the published branch is the normal pending layer.
-#[test]
-fn promoting_status_does_not_report_pending_layer_as_leftover() {
-    let (tmp, _broker) = fixture(1);
-    add_leftover_integration_work(tmp.path(), 1);
     let mut broker = isolation::open(tmp.path());
 
     let status = broker.status_current(0).unwrap();
@@ -417,17 +369,6 @@ fn verify_only_doctor_is_silent_when_integration_holds_nothing_of_its_own() {
     let json: serde_json::Value =
         serde_json::from_str(&doctor_cli(tmp.path(), &["--json"])).expect("doctor --json");
     assert!(json.get("leftover_integration_work").is_none(), "{json}");
-}
-
-/// Promoting repositories keep their pending layer on integration; `doctor`
-/// follows `status` and does not call it leftover.
-#[test]
-fn promoting_doctor_does_not_report_pending_layer_as_leftover() {
-    let (tmp, _broker) = fixture(1);
-    add_leftover_integration_work(tmp.path(), 1);
-    let mut broker = isolation::open(tmp.path());
-
-    assert!(broker.doctor().unwrap().leftover_integration_work.is_none());
 }
 
 /// Trace real doctor phases without a wall-clock race or a deliberately slow Git.

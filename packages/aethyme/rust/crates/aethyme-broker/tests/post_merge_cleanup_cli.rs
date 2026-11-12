@@ -4,8 +4,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::MergeStatus;
-
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 mod common;
 
@@ -108,39 +106,21 @@ fn run_merge(
     .unwrap()
 }
 
-#[test]
-fn successful_coordinated_pr_merge_cleans_a_fully_landed_integration_layer() {
-    run_landing_case(None, false);
-}
-
-#[test]
-fn concurrent_exact_target_advance_finishes_the_prepared_reconciliation() {
-    run_landing_case(Some(true), false);
-}
-
-#[test]
-fn concurrent_different_target_keeps_its_ref_and_queue_unchanged() {
-    run_landing_case(Some(false), false);
-}
-
 /// A repository that does not promote keeps no integration layer: the merge
 /// refreshes the default branch, and no integration ref is created, cleaned
 /// or advanced.
 #[test]
 fn a_non_promoting_repository_leaves_integration_alone_after_a_merge() {
-    run_landing_case(None, true);
+    run_landing_case();
 }
 
-fn run_landing_case(same_target_race: Option<bool>, verify_only: bool) {
+fn run_landing_case() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let fake_bin = temp.path().join("fake-bin");
     std::fs::create_dir(&repo).unwrap();
     std::fs::create_dir(&fake_bin).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
-    if !verify_only {
-        aethyme_testkit::promote_on_submit(&repo);
-    }
     git(&repo, &["config", "user.name", "Aethyme Test"]);
     git(
         &repo,
@@ -188,15 +168,8 @@ exit 64
     std::fs::write(worktree.join("src/service.txt"), "feature=on\n").unwrap();
     git(&worktree, &["add", "src/service.txt"]);
     git(&worktree, &["commit", "-qm", "enable feature"]);
-    let promoted = broker.submit(session.id).unwrap();
-    assert_eq!(promoted.promoted, !verify_only);
-    let promotion = (!verify_only).then(|| {
-        serde_json::from_str::<serde_json::Value>(promoted.entry.details_json.as_deref().unwrap())
-            .unwrap()["commit"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    });
+    let submitted = broker.submit(session.id).unwrap();
+    assert!(!submitted.promoted);
 
     git(&repo, &["switch", "-qc", "upstream-landing", "main"]);
     std::fs::write(repo.join("src/service.txt"), "feature=on\n").unwrap();
@@ -232,21 +205,7 @@ exec "$AETHYME_TEST_REAL_GIT" "$@"
 "#,
     );
 
-    let race_target = same_target_race.map(|same| {
-        if same {
-            upstream.as_str()
-        } else {
-            initial.as_str()
-        }
-    });
-    let output = run_merge(
-        &repo,
-        &fake_bin,
-        temp.path(),
-        session.id,
-        &upstream,
-        race_target,
-    );
+    let output = run_merge(&repo, &fake_bin, temp.path(), session.id, &upstream, None);
     assert!(
         output.status.success(),
         "stdout: {}\nstderr: {}",
@@ -255,66 +214,20 @@ exec "$AETHYME_TEST_REAL_GIT" "$@"
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["operation"]["status"], "succeeded");
-    assert_eq!(
-        temp.path().join("cas-raced").exists(),
-        same_target_race.is_some(),
-        "the requested interleaving must actually run"
-    );
-    if verify_only {
-        assert_eq!(report["post_merge_cleanup"]["state"], "not_needed");
-        assert_eq!(git(&repo, &["rev-parse", "origin/main"]), upstream);
-        assert!(
-            !Command::new("git")
-                .args([
-                    "rev-parse",
-                    "--verify",
-                    "-q",
-                    "refs/heads/aethyme/integration"
-                ])
-                .current_dir(&repo)
-                .status()
-                .unwrap()
-                .success(),
-            "a repository that does not promote never creates integration"
-        );
-        return;
-    }
-    let promotion = promotion.expect("a promoting repository records its promotion");
-    if same_target_race == Some(false) {
-        assert_eq!(report["post_merge_cleanup"]["state"], "deferred");
-        assert_eq!(git(&repo, &["rev-parse", "aethyme/integration"]), initial);
-        let mut broker = common::open_fixture_broker(&repo, temp.path()).unwrap();
-        let entry = broker
-            .store()
-            .merge_queue()
-            .unwrap()
-            .into_iter()
-            .find(|entry| entry.id == promoted.entry.id)
-            .unwrap();
-        assert_eq!(entry.status, MergeStatus::Promoted);
-        return;
-    }
-    assert_eq!(report["post_merge_cleanup"]["state"], "cleaned");
-    assert_eq!(
-        report["post_merge_cleanup"]["cleanup"]["cleaned_queue_entry_ids"],
-        serde_json::json!([promoted.entry.id])
-    );
-    assert!(
-        report["post_merge_cleanup"]["fetch_operation_id"]
-            .as_i64()
-            .is_some()
-    );
-
+    assert_eq!(report["post_merge_cleanup"]["state"], "not_needed");
     assert_eq!(git(&repo, &["rev-parse", "origin/main"]), upstream);
-    assert_eq!(git(&repo, &["rev-parse", "aethyme/integration"]), upstream);
-    assert_ne!(promotion, upstream);
-    let mut broker = common::open_fixture_broker(&repo, temp.path()).unwrap();
-    let entry = broker
-        .store()
-        .merge_queue()
-        .unwrap()
-        .into_iter()
-        .find(|entry| entry.id == promoted.entry.id)
-        .unwrap();
-    assert_eq!(entry.status, MergeStatus::ExternallyLanded);
+    assert!(
+        !Command::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                "-q",
+                "refs/heads/aethyme/integration"
+            ])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success(),
+        "a repository that does not promote never creates integration"
+    );
 }

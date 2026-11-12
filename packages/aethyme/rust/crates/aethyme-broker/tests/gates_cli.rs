@@ -1133,7 +1133,7 @@ fn submit_cli_bypasses_and_then_refreshes_the_merged_tree_cache() {
     let counter = tmp.path().join("submit-runs.txt");
     std::fs::write(
         tmp.path().join(".aethyme/config.toml"),
-        "[promote]\nmode = \"manual\"\n",
+        "[promote]\nmode = \"verify-only\"\n",
     )
     .unwrap();
     std::fs::write(

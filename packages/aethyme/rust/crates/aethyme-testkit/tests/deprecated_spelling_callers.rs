@@ -478,7 +478,7 @@ fn the_matcher_ignores_current_spellings_and_machine_entry_points() {
         "aethyme broker advanced leases claim a --session 1",
         "aethyme broker start --adopt --task x",
         "aethyme broker status readiness --json",
-        "aethyme broker submit promote --session 1",
+        "aethyme broker submit prepare --session 1",
         "aethyme broker finish cleanup 7",
         "aethyme broker gc storage plan",
         "aethyme broker unblock --json",

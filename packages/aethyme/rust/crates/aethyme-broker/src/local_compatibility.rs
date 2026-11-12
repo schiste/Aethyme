@@ -4,7 +4,7 @@ use crate::collaboration_state::{
     CollaborationRoot, CollaborationStateError, CollaborationStore, ProjectKey,
 };
 use crate::collaboration_submit::{self as capture, CaptureStatus, CaptureSubmit, Setting};
-use crate::{Broker, CachePolicy, PromotionIntent};
+use crate::{Broker, CachePolicy};
 use std::path::{Path, PathBuf};
 
 fn git(repo: &Path, args: &[&str]) -> String {
@@ -90,13 +90,7 @@ impl Fixture {
         }
     }
     fn submit(&mut self) -> CaptureSubmit {
-        capture::submit(
-            &mut self.broker,
-            self.session,
-            CachePolicy::Use,
-            PromotionIntent::Configured,
-        )
-        .unwrap()
+        capture::submit(&mut self.broker, self.session, CachePolicy::Use).unwrap()
     }
 }
 #[test]

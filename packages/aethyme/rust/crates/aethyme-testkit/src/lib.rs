@@ -54,7 +54,6 @@ pub use landing::{
     merge_on_remote, push_branch,
 };
 pub use paths::{package_root, repo_root, rust_workspace_root};
-pub use repos::promote_on_submit;
 
 pub use serde_json;
 pub use tempfile;

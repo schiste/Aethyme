@@ -760,29 +760,10 @@ impl Broker {
             .filter(|_| !delivery.head_is_delivered)
         {
             match entry.status {
-                MergeStatus::Promoted | MergeStatus::ExternallyLanded => {}
-                // A repository that never promotes leaves every entry
-                // `Verified`, so demanding a promotion before finish would
-                // block every session in it permanently (#290 phase 2.2).
-                MergeStatus::Verified
-                    if !crate::PromoteConfig::load(&self.main_root_path())
-                        .mode
-                        .promotes_at_all() => {}
-                MergeStatus::Verified => {
-                    report.warnings.push(format!(
-                        "queue entry {} is verified but not promoted; promote it before finish",
-                        entry.id
-                    ));
-                    report.next_commands.push(format!(
-                        "aethyme broker submit promote --entry {}",
-                        entry.id
-                    ));
-                    report
-                        .next_commands
-                        .push(format!("aethyme broker finish --session {session_id}"));
-                    self.finalize_finish_report(&mut report);
-                    return Ok(report);
-                }
+                // Nothing promotes, so every verified entry stays `Verified`;
+                // demanding a promotion before finish would block every
+                // session permanently (#290 phase 2.2).
+                MergeStatus::Promoted | MergeStatus::ExternallyLanded | MergeStatus::Verified => {}
                 MergeStatus::Conflict => {
                     report.warnings.push(format!(
                         "latest submit qid {} conflicted; repair and resubmit before finish",
@@ -866,49 +847,34 @@ impl Broker {
             // this branch, and closing a session holding the only copy is what
             // #222 exists to prevent. What differs is the remedy.
             //
-            // Where the repository does not promote, `submit` has already run
-            // and can never satisfy this: it verifies and moves nothing by
-            // design (#290 phase 2.2). Naming it anyway sends the operator
+            // `submit` has already run and can never satisfy this: it verifies
+            // and moves nothing by design (#290 phase 2.2). Naming it anyway sends the operator
             // round a loop with no exit, which is the shape of the engine-pin
             // refusal in #254. The reachable path is to land the work by pull
             // request: finish recognises it once the fetched default branch
             // holds it.
-            let promotes = crate::PromoteConfig::load(&self.main_root)
-                .mode
-                .promotes_at_all();
             let has_default = self.repo.upstream_default().is_some();
-            if promotes {
-                report.warnings.push(format!(
-                    "HEAD has {} committed {} not yet represented in promoted integration; submit before finish",
-                    report.unsubmitted_commits,
-                    plural_word(report.unsubmitted_commits as usize, "change", "changes")
-                ));
-                report
-                    .next_commands
-                    .push(format!("aethyme broker submit --session {session_id}"));
+            // With no fetched default branch there is nothing to push to,
+            // so name the landing that this repository can actually do.
+            let land = if has_default {
+                "push the session branch and merge its pull request; finish recognises the \
+                 work once the fetched default branch holds it"
             } else {
-                // With no fetched default branch there is nothing to push to,
-                // so name the landing that this repository can actually do.
-                let land = if has_default {
-                    "push the session branch and merge its pull request; finish recognises the \
-                     work once the fetched default branch holds it"
-                } else {
-                    "merge the session branch into the local default branch, then prove it landed"
-                };
-                report.warnings.push(format!(
-                    "HEAD has {} committed {} not represented on any delivery target. This \
-                     repository does not promote, so submitting again cannot change that — {land}; \
-                     or close without it with --abandon --reason",
-                    report.unsubmitted_commits,
-                    plural_word(report.unsubmitted_commits as usize, "change", "changes")
-                ));
-            }
+                "merge the session branch into the local default branch, then prove it landed"
+            };
+            report.warnings.push(format!(
+                "HEAD has {} committed {} not represented on any delivery target. This \
+                 repository does not promote, so submitting again cannot change that — {land}; \
+                 or close without it with --abandon --reason",
+                report.unsubmitted_commits,
+                plural_word(report.unsubmitted_commits as usize, "change", "changes")
+            ));
             // Every command named here can change the state it reports. Where
             // the work lands by pull request, `push --pr` publishes it (and
             // fetches the default branch, so a merged one is then seen);
             // elsewhere `scan` is read-only and its output names `record` with
             // the real digest, which a placeholder could not.
-            if !promotes && has_default && crate::session_push::session_push_enabled(&self.repo) {
+            if has_default && crate::session_push::session_push_enabled(&self.repo) {
                 report
                     .next_commands
                     .push(format!("aethyme broker push --session {session_id} --pr"));
@@ -917,11 +883,9 @@ impl Broker {
                     "aethyme broker advanced representation scan --session {session_id}"
                 ));
             }
-            if !promotes {
-                report.next_commands.push(format!(
-                    "aethyme broker finish --session {session_id} --abandon --reason \"<why>\""
-                ));
-            }
+            report.next_commands.push(format!(
+                "aethyme broker finish --session {session_id} --abandon --reason \"<why>\""
+            ));
             self.finalize_finish_report(&mut report);
             return Ok(report);
         }

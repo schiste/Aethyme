@@ -8,7 +8,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use aethyme_broker::collaboration_archive::{CommitOid, snapshot_of_commit};
+use aethyme_broker::collaboration_archive::snapshot_of_commit;
 use aethyme_broker::composition::{
     CompositionMode, CompositionOutcome, Producer, Refusal, Unsupported,
 };
@@ -36,7 +36,6 @@ fn fixture(promote_mode: Option<&str>) -> (common::FixtureRepository, Broker) {
     let tmp = common::FixtureRepository::from_tempdir(tempfile::tempdir().unwrap());
     let root = tmp.path();
     git(root, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(root);
     git(root, &["config", "user.name", "Aethyme Test"]);
     git(
         root,
@@ -169,14 +168,13 @@ fn database_dump(path: &Path) -> String {
 }
 
 #[test]
-fn a_clean_merge_builds_the_tree_submit_gates_and_promotes() {
+fn a_clean_merge_builds_the_tree_submit_gates_and_verifies() {
     let (tmp, mut broker) = fixture(None);
     let root = tmp.path();
     let (a, a_path) = start(&mut broker, "a");
-    let (b, b_path) = start(&mut broker, "b");
+    let (_b, b_path) = start(&mut broker, "b");
     let a_head = commit(&a_path, "a.txt", "from a\n");
     commit(&b_path, "b.txt", "from b\n");
-    assert!(broker.submit(b).unwrap().promoted);
 
     let before = world(root, &mut broker, &[&a_path, &b_path]);
     let outcome = broker.legacy_candidate(a).unwrap();
@@ -209,7 +207,12 @@ fn a_clean_merge_builds_the_tree_submit_gates_and_promotes() {
     );
 
     let submitted = broker.submit(a).unwrap();
-    assert!(submitted.promoted, "{submitted:?}");
+    assert_eq!(
+        submitted.entry.status,
+        MergeStatus::Verified,
+        "{submitted:?}"
+    );
+    assert!(!submitted.promoted);
     let verified = submitted.verified_against.expect("a verification base");
     assert_eq!(verified.commit, candidate.baseline.as_str());
     assert_eq!(verified.source, candidate.baseline_source);
@@ -217,10 +220,8 @@ fn a_clean_merge_builds_the_tree_submit_gates_and_promotes() {
         submitted.entry.merged_tree.as_deref(),
         Some(candidate.tree.as_str())
     );
-    let promoted = git(root, &["rev-parse", "aethyme/integration"]);
-    let promoted = CommitOid::parse(&promoted).unwrap();
     assert_eq!(
-        snapshot_of_commit(root, &promoted).unwrap().id(),
+        snapshot_of_commit(root, &candidate.commit).unwrap().id(),
         candidate.subject
     );
 }
@@ -230,11 +231,17 @@ fn a_conflict_names_the_path_and_input_submit_rejects_and_no_source() {
     let (tmp, mut broker) = fixture(None);
     let root = tmp.path();
     let (a, a_path) = start(&mut broker, "a");
-    let (b, b_path) = start(&mut broker, "b");
+    let (_b, b_path) = start(&mut broker, "b");
     let a_head = commit(&a_path, "shared.txt", "from a\n");
     commit(&b_path, "shared.txt", "from b\n");
-    assert!(broker.submit(b).unwrap().promoted);
-    let integration = git(root, &["rev-parse", "aethyme/integration"]);
+    // The other session's work lands the way work lands, by pull request.
+    let b_branch = git(&b_path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    aethyme_testkit::land_as_pull_request(
+        root,
+        &b_branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
+    let landed = git(root, &["rev-parse", "origin/main"]);
 
     let before = world(root, &mut broker, &[&a_path, &b_path]);
     let outcome = broker.legacy_candidate(a).unwrap();
@@ -249,7 +256,7 @@ fn a_conflict_names_the_path_and_input_submit_rejects_and_no_source() {
     };
     assert_eq!(outcome.code(), "conflict");
     assert!(outcome.candidate().is_none());
-    assert_eq!(baseline.as_str(), integration);
+    assert_eq!(baseline.as_str(), landed);
     assert_eq!(conflicts.len(), 1);
     assert_eq!(conflicts[0].path, "shared.txt");
     assert_eq!(conflicts[0].input.as_str(), a_head);
@@ -300,7 +307,11 @@ fn a_fully_owned_merge_candidate_matches_the_tree_submit_gates() {
     assert_eq!(candidate.mode.code(), "preserved");
     let tree = candidate.tree.to_string();
     let submitted = broker.submit(a).unwrap();
-    assert!(submitted.promoted, "{submitted:?}");
+    assert_eq!(
+        submitted.entry.status,
+        MergeStatus::Verified,
+        "{submitted:?}"
+    );
     assert_eq!(submitted.entry.merged_tree.as_deref(), Some(tree.as_str()));
 }
 
@@ -346,20 +357,20 @@ fn verify_only_builds_against_the_fetched_default_branch_like_submit() {
     );
 }
 
-/// A session whose base is behind a main checkout that moved on: submit
-/// fast-forwards integration first, and the adapter computes the same base
-/// without moving it.
+/// A session whose base is behind a main checkout that moved on: without a
+/// fetched default branch submit fast-forwards integration first, and the
+/// adapter computes the same base without moving it.
 #[test]
 fn the_follows_main_refresh_is_computed_not_performed() {
     let (tmp, mut broker) = fixture(None);
     let root = tmp.path();
     let (a, a_path) = start(&mut broker, "a");
     commit(&a_path, "a.txt", "a\n");
-    // Integration exists at init; main then moves.
-    let (b, b_path) = start(&mut broker, "b");
-    commit(&b_path, "b.txt", "b\n");
-    assert!(broker.submit(b).unwrap().promoted);
-    git(root, &["merge", "-q", "--ff-only", "aethyme/integration"]);
+    // Integration exists where main started; main then moves.
+    git(
+        root,
+        &["update-ref", "refs/heads/aethyme/integration", "HEAD"],
+    );
     commit(root, "main.txt", "main\n");
     let main_head = git(root, &["rev-parse", "HEAD"]);
     let integration = git(root, &["rev-parse", "aethyme/integration"]);
@@ -423,7 +434,10 @@ fn a_candidate_a_snapshot_cannot_name_is_unsupported_not_unnamed() {
     assert!(detail.contains("vendor/sub"), "{detail}");
     assert!(outcome.candidate().is_none());
     // The known divergence: Git merges a gitlink, so submit proceeds.
-    assert!(broker.submit(a).unwrap().promoted);
+    assert_eq!(
+        broker.submit(a).unwrap().entry.status,
+        MergeStatus::Verified
+    );
 }
 
 /// Submit refuses a checkout that left its recorded branch; so does the
@@ -466,7 +480,11 @@ fn a_claimed_path_that_merges_cleanly_is_not_refused() {
     let outcome = broker.legacy_candidate(b).unwrap();
     let candidate = outcome.candidate().expect("a candidate").clone();
     let submitted = broker.submit(b).unwrap();
-    assert!(submitted.promoted, "{submitted:?}");
+    assert_eq!(
+        submitted.entry.status,
+        MergeStatus::Verified,
+        "{submitted:?}"
+    );
     assert_eq!(
         submitted.entry.merged_tree.as_deref(),
         Some(candidate.tree.as_str())
@@ -508,7 +526,10 @@ fn a_partial_clone_is_unsupported_where_submit_proceeds() {
     assert_eq!(world(root, &mut broker, &[&a_path]), before);
     assert_eq!(outcome.code(), "partial_clone", "{outcome:?}");
 
-    assert!(broker.submit(a).unwrap().promoted);
+    assert_eq!(
+        broker.submit(a).unwrap().entry.status,
+        MergeStatus::Verified
+    );
 }
 
 /// A pending root commit (brought in by merging an unrelated history) has no

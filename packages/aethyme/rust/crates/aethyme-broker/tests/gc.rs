@@ -2,8 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use aethyme_broker::{
-    Broker, BrokerOpenOptions, EntryExposureResolutionKind, EntryExposureState, FinishOptions,
-    GateStatus, GcFileAction, GcRowKind, NewGateResult,
+    Broker, BrokerOpenOptions, FinishOptions, GateStatus, GcFileAction, GcRowKind, NewGateResult,
 };
 
 mod common;
@@ -56,30 +55,13 @@ impl Fixture {
 
 /// A closed session whose work landed by pull request, worktree kept.
 fn fixture() -> (Fixture, Broker, i64, PathBuf) {
-    fixture_with(false)
-}
-
-/// [`fixture`] with the work promoted to integration instead. Accepted
-/// checkpoints, their pins, publication exposures and terminal queue rows
-/// exist only where a repository promotes; those cases go with the
-/// promotion engine.
-fn promoting_fixture() -> (Fixture, Broker, i64, PathBuf) {
-    fixture_with(true)
-}
-
-fn fixture_with(promote: bool) -> (Fixture, Broker, i64, PathBuf) {
     let tmp = Fixture::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
-    if promote {
-        aethyme_testkit::promote_on_submit(tmp.path());
-    }
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
-    if !promote {
-        aethyme_testkit::ensure_origin(tmp.path());
-    }
+    aethyme_testkit::ensure_origin(tmp.path());
     std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
     std::fs::write(
         tmp.path().join(".aethyme/broker.toml"),
@@ -94,14 +76,12 @@ fn fixture_with(promote: bool) -> (Fixture, Broker, i64, PathBuf) {
     git(&worktree, &["add", "done.txt"]);
     git(&worktree, &["commit", "-qm", "done"]);
     let submitted = broker.submit(delivered.id).unwrap();
-    assert_eq!(submitted.promoted, promote);
-    if !promote {
-        aethyme_testkit::land_as_pull_request(
-            broker.main_root(),
-            &delivered.branch,
-            aethyme_testkit::MergeStyle::MergeCommit,
-        );
-    }
+    assert!(!submitted.promoted);
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &delivered.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
     assert!(
         broker
             .finish_with_options(
@@ -173,181 +153,6 @@ fn gc_fixture_worktree_stays_under_owned_root_and_is_removed_with_fixture() {
     let removed_path = PathBuf::from(std::fs::read_to_string(report_path).unwrap());
     assert!(!removed_path.exists());
     assert!(!poison_root.exists());
-}
-
-#[test]
-fn closing_session_releases_checkpoint_pin_without_erasing_provenance() {
-    let (tmp, mut broker, delivered_id, _worktree) = promoting_fixture();
-    let session = broker.store().session(delivered_id).unwrap();
-    let queue_entry_id = session.accepted_queue_entry_id.unwrap();
-
-    assert!(
-        broker
-            .store()
-            .gc_checkpoint_pin_candidates()
-            .unwrap()
-            .is_empty(),
-        "the terminal close transaction should release the pin immediately"
-    );
-    let cleanup = broker.cleanup_plan().unwrap();
-    assert!(
-        cleanup
-            .worktrees
-            .iter()
-            .any(|item| item.session_id == delivered_id && item.eligible()),
-        "pin release must not remove cleanup representation proof"
-    );
-    drop(broker);
-
-    let db = rusqlite::Connection::open(tmp.path().join(".aethyme/broker.db")).unwrap();
-    let released: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM gc_checkpoint_pin_releases
-             WHERE session_id = ?1 AND queue_entry_id = ?2",
-            rusqlite::params![delivered_id, queue_entry_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(released, 1);
-    let accepted_queue_still_exists: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM merge_queue WHERE id = ?1",
-            [queue_entry_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(accepted_queue_still_exists, 1);
-}
-
-#[test]
-fn reviewed_gc_plan_releases_legacy_pin_and_keeps_provenance_and_files() {
-    let (tmp, mut broker, delivered_id, worktree) = promoting_fixture();
-    let session = broker.store().session(delivered_id).unwrap();
-    let queue_entry_id = session.accepted_queue_entry_id.unwrap();
-    drop(broker);
-
-    std::fs::write(worktree.join("pending.txt"), "keep me\n").unwrap();
-    let db_path = tmp.path().join(".aethyme/broker.db");
-    let db = rusqlite::Connection::open(&db_path).unwrap();
-    db.execute(
-        "DELETE FROM gc_checkpoint_pin_releases
-         WHERE session_id = ?1 AND queue_entry_id = ?2",
-        rusqlite::params![delivered_id, queue_entry_id],
-    )
-    .unwrap();
-    drop(db);
-
-    let mut broker = tmp.open();
-    let plan = broker.gc_plan().unwrap();
-    assert_eq!(plan.checkpoint_pin_releases.len(), 1);
-    assert_eq!(plan.checkpoint_pin_releases[0].session_id, delivered_id);
-    assert_eq!(
-        plan.checkpoint_pin_releases[0].queue_entry_id,
-        queue_entry_id
-    );
-    assert!(
-        plan.blockers
-            .iter()
-            .any(|blocker| blocker.kind == "accepted_checkpoint"
-                && blocker.id == Some(queue_entry_id))
-    );
-    let accepted_summary = plan
-        .blocker_summary
-        .iter()
-        .find(|summary| summary.kind == "accepted_checkpoint")
-        .unwrap();
-    assert_eq!(accepted_summary.count, 1);
-    assert_eq!(accepted_summary.oldest_id, Some(queue_entry_id));
-    assert!(accepted_summary.age_exceeded);
-
-    let applied = broker.gc_apply(&plan.digest).unwrap();
-    assert!(
-        applied.complete,
-        "reviewed metadata release should finish: {applied:?}"
-    );
-    assert_eq!(applied.checkpoint_pins_released, vec![delivered_id]);
-    assert!(worktree.join("done.txt").exists());
-    assert!(worktree.join("pending.txt").exists());
-    assert!(
-        broker
-            .store()
-            .gc_checkpoint_pin_candidates()
-            .unwrap()
-            .is_empty()
-    );
-    let preserved = broker.store().session(delivered_id).unwrap();
-    assert_eq!(preserved.accepted_queue_entry_id, Some(queue_entry_id));
-    assert!(
-        broker
-            .cleanup_plan()
-            .unwrap()
-            .worktrees
-            .iter()
-            .any(|item| item.session_id == delivered_id && !item.eligible()),
-        "the dirty worktree remains protected after pin release"
-    );
-}
-
-#[test]
-fn reviewed_gc_plan_expires_old_publication_exposure_to_terminal_state() {
-    let (tmp, mut broker, _delivered_id, _worktree) = promoting_fixture();
-    let exposure = broker
-        .store()
-        .outstanding_entry_path_exposures()
-        .unwrap()
-        .pop()
-        .unwrap();
-    drop(broker);
-
-    let db_path = tmp.path().join(".aethyme/broker.db");
-    let db = rusqlite::Connection::open(&db_path).unwrap();
-    db.execute(
-        "UPDATE entry_path_exposures SET created_at = 1 WHERE id = ?1",
-        [exposure.id],
-    )
-    .unwrap();
-    drop(db);
-
-    let mut broker = tmp.open();
-    let plan = broker.gc_plan().unwrap();
-    assert_eq!(plan.publication_exposure_expiries.len(), 1);
-    assert_eq!(
-        plan.publication_exposure_expiries[0].exposure_id,
-        exposure.id
-    );
-    let summary = plan
-        .blocker_summary
-        .iter()
-        .find(|summary| summary.kind == "publication_exposure")
-        .unwrap();
-    assert_eq!(summary.count, 1);
-    assert_eq!(summary.oldest_id, Some(exposure.id));
-    assert!(summary.age_exceeded);
-
-    let applied = broker.gc_apply(&plan.digest).unwrap();
-    assert!(
-        applied.complete,
-        "reviewed expiry should finish: {applied:?}"
-    );
-    assert_eq!(applied.publication_exposures_expired, vec![exposure.id]);
-    let expired = broker
-        .store()
-        .entry_path_exposure(exposure.queue_entry_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(expired.state, EntryExposureState::Expired);
-    assert_eq!(
-        expired.resolution_kind,
-        Some(EntryExposureResolutionKind::Expired)
-    );
-    assert!(
-        broker
-            .gc_plan()
-            .unwrap()
-            .blockers
-            .iter()
-            .all(|blocker| blocker.kind != "publication_exposure")
-    );
 }
 
 #[test]
@@ -474,152 +279,6 @@ fn plan_is_exact_deterministic_and_protects_live_or_unresolved_state() {
     assert!(worktree.exists(), "planning must not remove the worktree");
     assert!(gate_log.exists(), "planning must not remove gate logs");
     assert!(metrics.exists(), "planning must not rewrite metrics");
-}
-
-#[test]
-fn digest_confirmed_apply_resumes_a_deadline_and_preserves_monotonic_ids() {
-    let (tmp, mut broker, delivered_id, worktree) = promoting_fixture();
-    let main_root = broker.main_root().to_path_buf();
-    let gate_dir = main_root.join(".aethyme/logs/gates");
-    std::fs::create_dir_all(&gate_dir).unwrap();
-    let gate_log = gate_dir.join("old.log");
-    std::fs::write(&gate_log, "old gate output\n").unwrap();
-    broker
-        .store()
-        .record_gate_result(&NewGateResult {
-            gate_name: "old-gate".into(),
-            tree_hash: "tree".into(),
-            definition_hash: "definition".into(),
-            status: GateStatus::Pass,
-            failure_class: None,
-            exit_code: Some(0),
-            duration_ms: Some(1),
-            wait_duration_ms: None,
-            first_output_ms: None,
-            output_bytes: Some(16),
-            log_path: Some(gate_log.to_string_lossy().into_owned()),
-            session_id: Some(delivered_id),
-        })
-        .unwrap();
-    broker
-        .store()
-        .append_event("test.old", Some(delivered_id), None)
-        .unwrap();
-    drop(broker);
-
-    let db_path = tmp.path().join(".aethyme/broker.db");
-    let db = rusqlite::Connection::open(&db_path).unwrap();
-    db.execute("UPDATE events SET ts = 1", []).unwrap();
-    db.execute("UPDATE gate_results SET created_at = 1", [])
-        .unwrap();
-    db.execute("UPDATE merge_queue SET created_at = 1, updated_at = 1", [])
-        .unwrap();
-    db.execute(
-        "UPDATE sessions SET closed_at = 1, updated_at = 1 WHERE id = ?1",
-        [delivered_id],
-    )
-    .unwrap();
-    db.execute(
-        "UPDATE entry_path_exposures
-         SET state = 'resolved', resolved_at = 1,
-             resolution_kind = 'ship_verified', resolution_sha = 'remote',
-             resolution_evidence = 'fixture'",
-        [],
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO merge_queue (
-             session_id, head_commit, base_commit, status, created_at, updated_at
-         ) VALUES (?1, 'superseded-head', 'superseded-base', 'superseded', 1, 1)",
-        [delivered_id],
-    )
-    .unwrap();
-    let max_event_before: i64 = db
-        .query_row("SELECT MAX(id) FROM events", [], |row| row.get(0))
-        .unwrap();
-    drop(db);
-    let metrics = main_root.join(".aethyme/logs/command-metrics.jsonl");
-    std::fs::create_dir_all(metrics.parent().unwrap()).unwrap();
-    std::fs::write(
-        &metrics,
-        "{\"ts\":1,\"command\":\"old\"}\n{\"ts\":9999999999999,\"command\":\"new\"}\nmalformed\n",
-    )
-    .unwrap();
-
-    let mut broker = tmp.open();
-    let plan = broker.gc_plan().unwrap();
-    // No journal yet, so this is ordinary staleness: send the operator back to
-    // `gc plan` rather than offering a digest to paste (issue #140).
-    let mismatch = broker.gc_apply(&"0".repeat(64)).unwrap_err().to_string();
-    assert!(
-        mismatch.contains("no longer matches current state")
-            && mismatch.contains("aethyme broker gc plan"),
-        "stale confirmation must direct to a fresh plan: {mismatch}"
-    );
-    assert!(
-        !mismatch.contains("expected"),
-        "a freshly computed digest must not be offered as a value to confirm: {mismatch}"
-    );
-    assert!(gate_log.exists());
-
-    let paused = broker.gc_apply_bounded(&plan.digest, Some(0)).unwrap();
-    assert!(!paused.complete);
-    assert!(paused.deadline_reached);
-    assert!(main_root.join(".aethyme/gc-journal.json").exists());
-
-    // With a journal present the expectation comes from the interrupted run, and
-    // no fresh plan can reproduce it -- so the message must say so instead of
-    // sending the operator to `gc plan`, which would loop them (issue #140).
-    let resume = broker.gc_apply(&"1".repeat(64)).unwrap_err().to_string();
-    assert!(
-        resume.contains("interrupted GC run is pending") && resume.contains(&plan.digest),
-        "a pending run must be named with its own digest: {resume}"
-    );
-    assert!(
-        resume.contains("cannot reproduce"),
-        "the message must explain why re-planning will not help: {resume}"
-    );
-
-    std::fs::write(&gate_log, "changed after confirmation\n").unwrap();
-    let drift = broker.gc_apply(&plan.digest).unwrap_err();
-    assert!(
-        drift.to_string().contains("reviewed artifact drifted"),
-        "unexpected drift error: {drift}"
-    );
-    assert!(gate_log.exists());
-    assert!(main_root.join(".aethyme/gc-journal.json").exists());
-    std::fs::write(&gate_log, "old gate output\n").unwrap();
-
-    drop(broker);
-    let mut broker = tmp.open();
-    assert!(!gate_log.exists());
-    if main_root.join(".aethyme/gc-journal.json").exists() {
-        let applied = broker.gc_apply(&plan.digest).unwrap();
-        assert!(applied.complete);
-    }
-    assert!(!worktree.exists());
-    let metrics = std::fs::read_to_string(&metrics).unwrap();
-    assert!(!metrics.contains("\"old\""));
-    assert!(metrics.contains("\"new\""));
-    assert!(metrics.contains("malformed"));
-    assert!(!main_root.join(".aethyme/gc-journal.json").exists());
-
-    let db = rusqlite::Connection::open(&db_path).unwrap();
-    let max_event_after: i64 = db
-        .query_row("SELECT MAX(id) FROM events", [], |row| row.get(0))
-        .unwrap();
-    assert!(max_event_after > max_event_before);
-    let gate_rows: i64 = db
-        .query_row("SELECT COUNT(*) FROM gate_results", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(gate_rows, 0);
-    let queue_rows: i64 = db
-        .query_row("SELECT COUNT(*) FROM merge_queue", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(
-        queue_rows, 0,
-        "released accepted checkpoints may age out safely"
-    );
 }
 
 #[cfg(unix)]
