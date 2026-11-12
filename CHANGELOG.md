@@ -4,6 +4,13 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.84] - 2026-11-13
+
+### Fixed
+
+- `broker push` metrics now record the pre-push hook split (`push_git_process_before_hook`, `push_git_process_hook`, `push_git_process_after_hook`). It was always empty because Git's trace gives a hook's start no relative clock. New counters `push_git_trace_without_hook` and `push_git_process_split_unavailable` separate a push with no hook from a trace that could not be split (#1639).
+- A closed session's build output that `finish` could not reclaim while a background worker held the GC lock is now reclaimed by that worker's next sweep or the next broker open, instead of up to a day later (counter `closed_session_artifact_reclaim_deferred_gc_locked`). The grace period before a kept checkout itself is removed is unchanged (#1639).
+
 ## [0.8.83] - 2026-11-12
 
 ### Fixed
