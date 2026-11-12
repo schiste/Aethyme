@@ -646,6 +646,73 @@ fn cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees() {
 }
 
 #[test]
+fn bulk_cleanup_apply_reclaims_build_output_of_closed_kept_worktrees_only() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    std::fs::write(
+        tmp.path().join(".gitignore"),
+        "/.aethyme/\n/target/\n/.claude/settings.local.json\n",
+    )
+    .unwrap();
+    sh(tmp.path(), &["add", ".gitignore"]);
+    sh(tmp.path(), &["commit", "-qm", "ignore build output"]);
+    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/broker.toml"),
+        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n",
+    )
+    .unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
+    let populate = |worktree: &Path| {
+        std::fs::create_dir_all(worktree.join(".claude")).unwrap();
+        std::fs::write(worktree.join(".claude/settings.local.json"), "{}\n").unwrap();
+        std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
+        std::fs::write(
+            worktree.join("target/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        std::fs::write(worktree.join("target/debug/cache.bin"), vec![7_u8; 4096]).unwrap();
+    };
+
+    let closed = broker.start_worktree("already closed kept", None).unwrap();
+    let closed_path = std::path::PathBuf::from(&closed.worktree_path);
+    broker.close(closed.id).unwrap();
+    // Build output that outlived the close models checkouts that were
+    // already closed, caches intact, before this sweep reclaimed them.
+    populate(&closed_path);
+    let live = broker.start_worktree("live with a build", None).unwrap();
+    let live_path = std::path::PathBuf::from(&live.worktree_path);
+    populate(&live_path);
+    std::fs::write(
+        tmp.path().join(".aethyme/broker.toml"),
+        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\n",
+    )
+    .unwrap();
+
+    let plan = broker.cleanup_cleaned_worktrees(false, None).unwrap();
+    assert_eq!(plan.artifact_bytes_reclaimed, 0, "a plan is read-only");
+    assert!(closed_path.join("target/debug/cache.bin").is_file());
+    let applied = broker
+        .cleanup_cleaned_worktrees(true, Some(&plan.plan.digest))
+        .unwrap();
+
+    assert!(closed_path.exists(), "the kept checkout must stay");
+    assert!(
+        !closed_path.join("target").exists(),
+        "apply must reclaim a closed kept worktree's build output: {:?}",
+        applied.failures
+    );
+    assert!(applied.artifact_directories_reclaimed >= 1);
+    assert!(applied.artifact_bytes_reclaimed >= 4096);
+    assert!(closed_path.join(".claude/settings.local.json").is_file());
+    assert!(
+        live_path.join("target/debug/cache.bin").is_file(),
+        "a live session's build output must never be touched"
+    );
+}
+
+#[test]
 fn cleanup_recovers_after_worktree_removal_and_prunes_only_the_exact_branch_tip() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
