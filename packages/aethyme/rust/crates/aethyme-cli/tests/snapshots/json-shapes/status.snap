@@ -23,11 +23,11 @@
   },
   "agents": [
     {
-      "accepted_at": "integer",
-      "accepted_integration_commit": "string",
-      "accepted_integration_tree": "string",
-      "accepted_queue_entry_id": "integer",
-      "accepted_session_head": "string",
+      "accepted_at": "null",
+      "accepted_integration_commit": "null",
+      "accepted_integration_tree": "null",
+      "accepted_queue_entry_id": "null",
+      "accepted_session_head": "null",
       "activity_at": "integer",
       "adopted_head": "string",
       "adoption_base": "string",
@@ -166,22 +166,7 @@
   "main_behind_upstream_commits": "integer",
   "main_head": "string",
   "outstanding_advisories": [],
-  "outstanding_entry_exposures": [
-    {
-      "created_at": "integer",
-      "id": "integer",
-      "paths": [
-        "string"
-      ],
-      "promotion_sha": "string",
-      "queue_entry_id": "integer",
-      "resolution_evidence": "null",
-      "resolution_kind": "null",
-      "resolution_sha": "null",
-      "resolved_at": "null",
-      "state": "string"
-    }
-  ],
+  "outstanding_entry_exposures": [],
   "overlap_pairs": [],
   "overlaps": [],
   "ownership_claims": [],
@@ -204,16 +189,23 @@
   "promoted_conflicts": [],
   "publication_baseline_head": "string",
   "publication_baseline_ref": "string",
-  "queue": [],
+  "queue": [
+    {
+      "base_commit": "string",
+      "created_at": "integer",
+      "details_json": "string",
+      "head_commit": "string",
+      "id": "integer",
+      "merged_tree": "string",
+      "session_id": "integer",
+      "status": "string",
+      "updated_at": "integer"
+    }
+  ],
   "queue_history": {
     "command": "string",
     "schema_version": "integer",
-    "terminal_counts": [
-      {
-        "count": "integer",
-        "status": "string"
-      }
-    ]
+    "terminal_counts": []
   },
   "review_refusals": [],
   "summary": {

@@ -33,11 +33,11 @@ fn run(repo: &Path, args: &[&str]) -> Output {
 
 fn init_repo(repo: &Path) {
     git(repo, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(repo);
     std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "-qm", "init"]);
+    aethyme_testkit::ensure_origin(repo);
 }
 
 fn finished_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf, i64) {
@@ -68,7 +68,12 @@ fn finished_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf, i64) {
         .store()
         .claim_lease(session.id, "src/", None)
         .unwrap();
-    assert!(broker.submit(session.id).unwrap().promoted);
+    broker.submit(session.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &session.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
     let tree = git(&worktree, &["rev-parse", "HEAD^{tree}"]);
     broker
         .store()
@@ -150,8 +155,8 @@ fn handoff_json_by_session_has_a_stable_read_only_contract() {
     );
     assert_eq!(report["session_id"], session_id);
     assert_eq!(report["status"], "closed");
-    assert_eq!(report["delivery"]["promoted"], true);
-    assert_eq!(report["delivery"]["published"], false);
+    assert_eq!(report["delivery"]["promoted"], false);
+    assert_eq!(report["delivery"]["published"], true);
     assert_eq!(report["last_gate"]["gate"], "handoff-cli-gate");
     assert!(report["last_graph_integrity"].is_null());
     assert!(
@@ -202,14 +207,13 @@ fn handoff_by_worktree_returns_the_latest_completed_session() {
         "{text}"
     );
     assert!(
-        text.contains("delivery: submitted=no, promoted=no, published=no"),
+        text.contains("delivery: submitted=no, promoted=no, published=yes"),
         "{text}"
     );
     assert!(text.contains("leases: 0 recorded"), "{text}");
     assert!(text.contains("last gate: none recorded"), "{text}");
-    // The worktree's only commit was promoted by the first session, so it is
-    // on the integration branch under the promotion's SHA. The shared landing
-    // check (#408) finds it there; ancestry alone used to report "no".
+    // The worktree's only commit landed by the first session's pull request,
+    // so the fetched default branch contains it.
     assert!(text.contains("cleanup safe: yes"), "{text}");
 }
 
@@ -302,7 +306,14 @@ fn re_adopted_session_hands_off_after_submitting_inherited_work() {
     assert_eq!(refused.unsubmitted_commits, 1);
     assert_eq!(
         refused.recommended_next_action.as_deref(),
-        Some(format!("aethyme broker submit --session {}", second.id).as_str())
+        // Submitting again cannot deliver work that lands by pull request.
+        Some(
+            format!(
+                "aethyme broker advanced representation scan --session {}",
+                second.id
+            )
+            .as_str()
+        )
     );
     let none_yet = handoff_for(tmp.path(), &worktree);
     assert!(!none_yet.status.success());
@@ -312,7 +323,12 @@ fn re_adopted_session_hands_off_after_submitting_inherited_work() {
         String::from_utf8_lossy(&none_yet.stderr)
     );
 
-    assert!(broker.submit(second.id).unwrap().promoted);
+    broker.submit(second.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &second.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
     assert!(broker.finish(second.id).unwrap().closed);
     let output = handoff_for(tmp.path(), &worktree);
     let text = String::from_utf8_lossy(&output.stdout);
@@ -322,7 +338,7 @@ fn re_adopted_session_hands_off_after_submitting_inherited_work() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        text.contains("delivery: submitted=yes, promoted=yes"),
+        text.contains("delivery: submitted=yes, promoted=no, published=yes"),
         "{text}"
     );
     assert!(text.contains("cleanup safe: yes"), "{text}");

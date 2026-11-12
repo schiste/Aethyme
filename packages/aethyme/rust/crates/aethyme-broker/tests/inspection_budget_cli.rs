@@ -79,6 +79,16 @@ struct Fixture {
 /// unpushed commit and an uncommitted file -- both things a cut-short status
 /// must not report as absent.
 fn fixture() -> Fixture {
+    fixture_with(false)
+}
+
+/// [`fixture`] in a repository that promotes to integration, for the one
+/// integration-drift case; it goes with the promotion engine.
+fn promoting_fixture() -> Fixture {
+    fixture_with(true)
+}
+
+fn fixture_with(promote: bool) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -87,7 +97,9 @@ fn fixture() -> Fixture {
         &["init", "-q", "--bare", "-b", "main", "origin.git"],
     );
     git(&repo, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(&repo);
+    if promote {
+        aethyme_testkit::promote_on_submit(&repo);
+    }
     std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     git(&repo, &["add", "-A"]);
@@ -243,7 +255,6 @@ fn many_session_fixture(session_count: usize) -> ManySessionFixture {
         &["init", "-q", "--bare", "-b", "main", "origin.git"],
     );
     git(&repo, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(&repo);
     std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     git(&repo, &["add", "-A"]);
@@ -332,7 +343,7 @@ fn interactive_reads_stay_under_ten_seconds_with_sixty_five_sessions() {
 
 #[test]
 fn an_exhausted_ref_budget_does_not_claim_an_integration_drift_assessment() {
-    let fixture = fixture();
+    let fixture = promoting_fixture();
     // Upstream moves past integration, so `--refresh` assesses the drift.
     git(&fixture.repo, &["switch", "-qc", "upstream-side"]);
     std::fs::write(fixture.repo.join("upstream.txt"), "upstream\n").unwrap();

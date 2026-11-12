@@ -66,11 +66,12 @@
   "scope_overlaps_warning": "string",
   "short_name": "string",
   "start_base": {
-    "ahead_default_commits": "null",
-    "behind_default_commits": "null",
+    "ahead_default_commits": "integer",
+    "behind_default_commits": "integer",
     "commit": "string",
-    "default_ref": "null",
+    "default_ref": "string",
     "evidence": "string",
+    "fetched": "bool",
     "ref_name": "string"
   },
   "status": "string",

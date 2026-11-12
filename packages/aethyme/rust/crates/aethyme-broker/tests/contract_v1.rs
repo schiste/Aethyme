@@ -612,7 +612,6 @@ fn sh(cwd: &Path, args: &[&str]) {
 
 fn init_repo(root: &Path) {
     sh(root, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/a.py"), "a = 1\n").unwrap();
     std::fs::write(root.join("src/b.py"), "b = 1\n").unwrap();
@@ -666,16 +665,24 @@ fn merge_lifecycle_payload_field_names_are_frozen_on_the_wire() {
         tmp.path(),
         &["commit", "-qm", "base: gate that rejects b.py"],
     );
+    // Sessions verify against the fetched default branch, so it must hold
+    // that gate policy.
+    aethyme_testkit::ensure_origin(tmp.path());
     let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
 
-    // Verified + promoted: session A lands a clean change through a
-    // passing gate.
+    // Verified, then landed by pull request: session A lands a clean change
+    // through a passing gate.
     let wt_a = agent_worktree(tmp.path(), "a");
     let a = broker.adopt(&wt_a, Some("a")).unwrap();
     commit_edit(&wt_a, "src/a.py", "a = 2\n");
-    assert!(broker.submit(a.id).unwrap().promoted);
+    broker.submit(a.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &a.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
 
-    // Conflict: session B edits the same line A already promoted.
+    // Conflict: session B edits the same line A already landed.
     let wt_b = agent_worktree(tmp.path(), "b");
     let b = broker.adopt(&wt_b, Some("b")).unwrap();
     commit_edit(&wt_b, "src/a.py", "a = 3\n");

@@ -190,11 +190,11 @@ fn world() -> World {
     let fixture = common::FixtureRepository::new();
     let repo = fixture.path().to_path_buf();
     git(&repo, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(&repo);
     std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\ntarget/\n").unwrap();
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-qm", "init"]);
+    aethyme_testkit::ensure_origin(&repo);
     std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
     // A dirty finished checkout is held from whole-worktree removal by age,
     // which is the state whose build output only the build cache lane frees.
@@ -214,7 +214,12 @@ fn world() -> World {
     std::fs::write(finished_path.join("done.txt"), "done\n").unwrap();
     git(&finished_path, &["add", "done.txt"]);
     git(&finished_path, &["commit", "-qm", "done"]);
-    assert!(broker.submit(finished.id).unwrap().promoted);
+    broker.submit(finished.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &finished.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
     assert!(
         broker
             .finish_with_options(

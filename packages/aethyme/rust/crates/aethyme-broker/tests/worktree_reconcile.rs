@@ -34,11 +34,11 @@ fn git(repo: &Path, args: &[&str]) {
 
 fn fixture(tmp: &Path) {
     git(tmp, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(tmp);
     std::fs::write(tmp.join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
     git(tmp, &["add", "-A"]);
     git(tmp, &["commit", "-qm", "init"]);
+    aethyme_testkit::ensure_origin(tmp);
 }
 
 /// A session whose worktree is on disk, plus the root that worktree sits in.
@@ -140,7 +140,12 @@ fn a_closed_sessions_worktree_is_not_drift_merely_because_it_is_closed() {
     let worktree = PathBuf::from(&session.worktree_path);
     git(&worktree, &["add", "done.txt"]);
     git(&worktree, &["commit", "-qm", "done"]);
-    assert!(broker.submit(session.id).unwrap().promoted);
+    broker.submit(session.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &session.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
     broker.close(session.id).unwrap();
 
     // A closed session still owns its worktree until cleanup removes it. If

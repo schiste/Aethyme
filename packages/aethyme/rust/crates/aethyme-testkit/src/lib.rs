@@ -12,6 +12,8 @@
 //!   did.
 //! * [`repos`] — programmatic fixture repositories, the job
 //!   `tests/support/repo_builders.py` did.
+//! * [`landing`] — landing a session's work the way a merged pull request
+//!   does: pushed, merged on a bare `origin`, fetched.
 //! * [`release_notes`] — the CHANGELOG/UPGRADING release-notes contract,
 //!   shared by the release workflow's renderer and `release_contract`.
 //! * [`composition_fixtures`] — provisional FX01–FX07 composition cases
@@ -40,12 +42,17 @@ pub mod composition_fixtures;
 #[cfg(unix)]
 pub mod filesystem;
 pub mod invoke;
+pub mod landing;
 pub mod paths;
 pub mod release_notes;
 pub mod repos;
 
 pub use bins::{aethyme_bin, engine_bin, graph_index_bin};
 pub use invoke::{Invoke, InvokeResult, invoke_aethyme};
+pub use landing::{
+    MergeStyle, delete_remote_branch, ensure_origin, fetch_origin, land_as_pull_request,
+    merge_on_remote, push_branch,
+};
 pub use paths::{package_root, repo_root, rust_workspace_root};
 pub use repos::promote_on_submit;
 

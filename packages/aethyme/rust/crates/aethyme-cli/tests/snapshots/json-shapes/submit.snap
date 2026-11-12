@@ -31,7 +31,7 @@
   },
   "no_changes": "bool",
   "promoted": "bool",
-  "promotion_suppressed": "null",
+  "promotion_suppressed": "string",
   "submission_plan": {
     "commits": [
       {

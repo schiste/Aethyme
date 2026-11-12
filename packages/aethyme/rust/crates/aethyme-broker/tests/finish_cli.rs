@@ -117,33 +117,33 @@ exec "$AETHYME_TEST_REAL_GIT" "$@"
     (output, removal_marker, discovery_marker)
 }
 
-fn promoted_fixture() -> (isolation::FixtureRepo, i64, std::path::PathBuf, String) {
-    promoted_fixture_with_worktree_root(None)
+fn landed_fixture() -> (isolation::FixtureRepo, i64, std::path::PathBuf, String) {
+    landed_fixture_with_worktree_root(None)
 }
 
-fn promoted_fixture_with_worktree_root(
+fn landed_fixture_with_worktree_root(
     worktree_root: Option<&Path>,
 ) -> (isolation::FixtureRepo, i64, std::path::PathBuf, String) {
-    promoted_fixture_with_worktree_root_and_gitignore(worktree_root, "/.aethyme/\n")
+    landed_fixture_with_worktree_root_and_gitignore(worktree_root, "/.aethyme/\n")
 }
 
-fn promoted_fixture_with_gitignore(
+fn landed_fixture_with_gitignore(
     gitignore: &str,
 ) -> (isolation::FixtureRepo, i64, std::path::PathBuf, String) {
-    promoted_fixture_with_worktree_root_and_gitignore(None, gitignore)
+    landed_fixture_with_worktree_root_and_gitignore(None, gitignore)
 }
 
-fn promoted_fixture_with_worktree_root_and_gitignore(
+fn landed_fixture_with_worktree_root_and_gitignore(
     worktree_root: Option<&Path>,
     gitignore: &str,
 ) -> (isolation::FixtureRepo, i64, std::path::PathBuf, String) {
     let tmp = isolation::FixtureRepo::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), gitignore).unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
+    aethyme_testkit::ensure_origin(tmp.path());
 
     let mut broker = match worktree_root {
         Some(worktree_root) => isolation::open_with_worktree_root(tmp.path(), worktree_root),
@@ -158,7 +158,14 @@ fn promoted_fixture_with_worktree_root_and_gitignore(
         .store()
         .claim_lease(session.id, "src/", None)
         .unwrap();
-    assert!(broker.submit(session.id).unwrap().promoted);
+    broker.submit(session.id).unwrap();
+    // The pull request merges on the provider and the default branch is
+    // fetched: the only way work lands.
+    aethyme_testkit::land_as_pull_request(
+        tmp.path(),
+        &session.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
     let tree = git(&worktree, &["rev-parse", "HEAD^{tree}"]);
     broker
         .store()
@@ -207,7 +214,7 @@ fn interrupt_finish_cleanup(tmp: &isolation::FixtureRepo, session_id: i64, workt
 
 #[test]
 fn finish_does_not_decode_unrelated_merge_queue_history() {
-    let (tmp, session_id, worktree, _) = promoted_fixture();
+    let (tmp, session_id, worktree, _) = landed_fixture();
     let mut broker = isolation::open(tmp.path());
     let expected_entry = broker
         .store()
@@ -246,8 +253,9 @@ fn finish_does_not_decode_unrelated_merge_queue_history() {
     assert_eq!(report.status, aethyme_broker::FinishStatus::Closed);
     assert!(report.closed, "{report:#?}");
     assert_eq!(report.latest_queue_entry_id, Some(expected_entry.id));
-    assert_eq!(report.latest_queue_status, Some(MergeStatus::Promoted));
-    assert!(report.delivery.promoted, "{report:#?}");
+    assert_eq!(report.latest_queue_status, Some(MergeStatus::Verified));
+    assert!(!report.delivery.promoted, "{report:#?}");
+    assert!(report.delivery.published, "{report:#?}");
     assert!(report.cleanup.kept, "{report:#?}");
     assert!(
         worktree.exists(),
@@ -257,7 +265,7 @@ fn finish_does_not_decode_unrelated_merge_queue_history() {
 
 #[test]
 fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
-    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    let (tmp, session_id, worktree, branch) = landed_fixture();
     let session = session_id.to_string();
     let output = run(tmp.path(), &["finish", "--session", &session, "--json"]);
     assert!(
@@ -268,8 +276,8 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["status"], "cleaned");
     assert_eq!(report["delivery"]["submitted"], true);
-    assert_eq!(report["delivery"]["promoted"], true);
-    assert_eq!(report["delivery"]["published"], false);
+    assert_eq!(report["delivery"]["promoted"], false);
+    assert_eq!(report["delivery"]["published"], true);
     assert_eq!(report["pending_work"]["present"], false);
     let src_lease = report["leases_held"]
         .as_array()
@@ -335,7 +343,7 @@ fn finish_cli_succeeds_for_a_clean_worktree_root_with_spaces() {
         worktree_root_path.display()
     );
     let (tmp, session_id, worktree, _) =
-        promoted_fixture_with_worktree_root(Some(&worktree_root_path));
+        landed_fixture_with_worktree_root(Some(&worktree_root_path));
     assert!(
         worktree.to_string_lossy().contains(' '),
         "fixture path must contain spaces: {}",
@@ -391,7 +399,6 @@ fn finish_preserves_discovery_errors_before_closing_the_session() {
 
     let tmp = isolation::FixtureRepo::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
@@ -528,7 +535,6 @@ fn finish_timeout_does_not_kill_worktree_removal_after_the_session_closes() {
 
     let tmp = isolation::FixtureRepo::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
@@ -587,13 +593,13 @@ fn finish_timeout_does_not_kill_worktree_removal_after_the_session_closes() {
 
 #[test]
 fn finish_cli_text_summarizes_the_structured_handoff() {
-    let (tmp, session_id, worktree, _) = promoted_fixture();
+    let (tmp, session_id, worktree, _) = landed_fixture();
     let session = session_id.to_string();
     let output = run(tmp.path(), &["finish", "--session", &session]);
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(
-        text.contains("delivery: submitted=yes, promoted=yes, published=no"),
+        text.contains("delivery: submitted=yes, promoted=no, published=yes"),
         "{text}"
     );
     assert!(
@@ -643,7 +649,7 @@ fn finish_guidance_text(report: &serde_json::Value) -> String {
 
 #[test]
 fn dirty_finish_guidance_is_stash_free() {
-    let (tmp, session_id, worktree, _) = promoted_fixture();
+    let (tmp, session_id, worktree, _) = landed_fixture();
     std::fs::write(worktree.join("dirty.txt"), "keep me\n").unwrap();
     let session = session_id.to_string();
     let output = run(tmp.path(), &["finish", "--session", &session, "--json"]);
@@ -696,7 +702,7 @@ fn dirty_finish_guidance_is_stash_free() {
 
 #[test]
 fn finish_cli_keep_worktree_closes_state_without_reclaiming_artifacts() {
-    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    let (tmp, session_id, worktree, branch) = landed_fixture();
     let output = run(
         tmp.path(),
         &[
@@ -718,7 +724,7 @@ fn finish_cli_keep_worktree_closes_state_without_reclaiming_artifacts() {
 
 #[test]
 fn finish_cli_reports_partial_cleanup_and_resumes_idempotently() {
-    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    let (tmp, session_id, worktree, branch) = landed_fixture();
     git(
         tmp.path(),
         &["worktree", "lock", worktree.to_str().unwrap()],
@@ -760,7 +766,7 @@ fn finish_cli_reports_partial_cleanup_and_resumes_idempotently() {
 
 #[test]
 fn finish_cleanup_refuses_partial_deletions_without_a_proof_bearing_intent() {
-    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    let (tmp, session_id, worktree, branch) = landed_fixture();
     {
         let mut broker = isolation::open(tmp.path());
         broker
@@ -785,7 +791,7 @@ fn finish_cleanup_refuses_partial_deletions_without_a_proof_bearing_intent() {
 
 #[test]
 fn finish_cleanup_proof_does_not_authorize_untracked_files() {
-    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    let (tmp, session_id, worktree, branch) = landed_fixture();
     git(
         tmp.path(),
         &["worktree", "lock", worktree.to_str().unwrap()],
@@ -816,7 +822,7 @@ fn finish_cleanup_proof_does_not_authorize_untracked_files() {
 
 #[test]
 fn finish_cleanup_proof_does_not_authorize_a_replacement_checkout_at_the_same_path() {
-    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    let (tmp, session_id, worktree, branch) = landed_fixture();
     git(
         tmp.path(),
         &["worktree", "lock", worktree.to_str().unwrap()],
@@ -867,7 +873,7 @@ fn finish_cleanup_preserves_unproven_ignored_runtime_directory() {
         .collect::<Vec<_>>()
         .join("\n");
     gitignore.push_str("\ntarget/\n");
-    let (tmp, session_id, worktree, branch) = promoted_fixture_with_gitignore(&gitignore);
+    let (tmp, session_id, worktree, branch) = landed_fixture_with_gitignore(&gitignore);
     let managed_status = worktree.join(".aethyme/generated/experience-status.md");
     std::fs::create_dir_all(managed_status.parent().unwrap()).unwrap();
     std::fs::write(&managed_status, "generated status\n").unwrap();
@@ -907,7 +913,7 @@ fn finish_cleanup_preserves_unproven_ignored_runtime_directory() {
 fn finish_cleanup_proof_does_not_authorize_a_same_named_ignored_runtime_file() {
     // The slash-free ignore rule makes a regular file at this name ignored.
     // The runtime catalog permits only the directory form `.aethyme/logs/`.
-    let (tmp, session_id, worktree, branch) = promoted_fixture_with_gitignore("/.aethyme/logs\n");
+    let (tmp, session_id, worktree, branch) = landed_fixture_with_gitignore("/.aethyme/logs\n");
     let log_file = worktree.join(".aethyme/logs");
     std::fs::create_dir_all(log_file.parent().unwrap()).unwrap();
     std::fs::write(&log_file, "preserve this file\n").unwrap();
@@ -931,7 +937,7 @@ fn finish_cleanup_proof_does_not_authorize_a_same_named_ignored_runtime_file() {
 
 #[test]
 fn finish_cleanup_proof_does_not_authorize_arbitrary_ignored_files() {
-    let (tmp, session_id, worktree, branch) = promoted_fixture_with_gitignore("/.env\n");
+    let (tmp, session_id, worktree, branch) = landed_fixture_with_gitignore("/.env\n");
     let secret = worktree.join(".env");
     std::fs::write(&secret, "KEEP=me\n").unwrap();
     interrupt_finish_cleanup(&tmp, session_id, &worktree);
@@ -950,7 +956,7 @@ fn finish_cleanup_proof_does_not_authorize_arbitrary_ignored_files() {
 
 #[test]
 fn finish_cleanup_proof_does_not_authorize_a_staged_deletion() {
-    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    let (tmp, session_id, worktree, branch) = landed_fixture();
     interrupt_finish_cleanup(&tmp, session_id, &worktree);
     std::fs::remove_file(worktree.join("README.md")).unwrap();
     git(&worktree, &["add", "-u", "README.md"]);
@@ -971,7 +977,7 @@ fn finish_cleanup_proof_does_not_authorize_a_staged_deletion() {
 
 #[test]
 fn finish_cleanup_proof_does_not_authorize_a_mixed_modification() {
-    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    let (tmp, session_id, worktree, branch) = landed_fixture();
     interrupt_finish_cleanup(&tmp, session_id, &worktree);
     std::fs::remove_file(worktree.join("README.md")).unwrap();
     std::fs::write(worktree.join("done.txt"), "local edit\n").unwrap();
@@ -992,7 +998,7 @@ fn finish_cleanup_proof_does_not_authorize_a_mixed_modification() {
 
 #[test]
 fn finish_cleanup_proof_does_not_authorize_a_moved_unrepresented_head() {
-    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    let (tmp, session_id, worktree, branch) = landed_fixture();
     interrupt_finish_cleanup(&tmp, session_id, &worktree);
     std::fs::write(worktree.join("late.txt"), "committed after close\n").unwrap();
     git(&worktree, &["add", "late.txt"]);
@@ -1014,7 +1020,7 @@ fn finish_cleanup_proof_does_not_authorize_a_moved_unrepresented_head() {
 
 #[test]
 fn finish_cleanup_proof_does_not_authorize_a_live_replacement_session() {
-    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    let (tmp, session_id, worktree, branch) = landed_fixture();
     interrupt_finish_cleanup(&tmp, session_id, &worktree);
     let live = {
         let mut broker = isolation::open(tmp.path());
@@ -1044,7 +1050,7 @@ fn finish_cleanup_proof_does_not_authorize_a_live_replacement_session() {
 
 #[test]
 fn finish_cli_can_remove_its_current_worktree_after_the_command_starts() {
-    let (tmp, session_id, worktree, _) = promoted_fixture();
+    let (tmp, session_id, worktree, _) = landed_fixture();
     let output = isolation::command(
         CLI,
         tmp.path(),
@@ -1066,7 +1072,7 @@ fn finish_cli_can_remove_its_current_worktree_after_the_command_starts() {
 
 #[test]
 fn finish_cli_recovers_a_branch_only_interruption_after_branch_deletion_fails() {
-    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    let (tmp, session_id, worktree, branch) = landed_fixture();
     git(
         tmp.path(),
         &["worktree", "remove", worktree.to_str().unwrap()],
@@ -1109,14 +1115,13 @@ mod json_error;
 #[cfg(unix)]
 #[test]
 fn invalid_finish_cleanup_proof_keeps_checkout_after_transient_git_errors() {
-    let (tmp, session_id, worktree, branch) = promoted_fixture();
+    let (tmp, session_id, worktree, branch) = landed_fixture();
     std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
     std::fs::write(
         tmp.path().join(".aethyme/config.toml"),
         "[cleanup]\nauto_remove = false\n",
     )
     .unwrap();
-    aethyme_testkit::promote_on_submit(tmp.path());
 
     let session = session_id.to_string();
     let finish = run(
@@ -1172,7 +1177,7 @@ fn invalid_finish_cleanup_proof_keeps_checkout_after_transient_git_errors() {
 
 #[test]
 fn cleaned_ledger_does_not_claim_a_recreated_directory_was_removed() {
-    let (tmp, session_id, worktree, _) = promoted_fixture();
+    let (tmp, session_id, worktree, _) = landed_fixture();
     let first = run(
         tmp.path(),
         &["finish", "--session", &session_id.to_string(), "--json"],
@@ -1217,7 +1222,7 @@ fn cleaned_ledger_does_not_claim_a_recreated_directory_was_removed() {
 #[cfg(unix)]
 #[test]
 fn cleaned_ledger_does_not_treat_a_dangling_symlink_as_absent() {
-    let (tmp, session_id, worktree, _) = promoted_fixture();
+    let (tmp, session_id, worktree, _) = landed_fixture();
     let first = run(
         tmp.path(),
         &["finish", "--session", &session_id.to_string(), "--json"],
@@ -1248,7 +1253,7 @@ fn cleaned_ledger_does_not_treat_a_dangling_symlink_as_absent() {
 
 #[test]
 fn cleaned_ledger_reports_verified_absence_on_repeat_finish() {
-    let (tmp, session_id, worktree, _) = promoted_fixture();
+    let (tmp, session_id, worktree, _) = landed_fixture();
     for _ in 0..2 {
         let output = run(
             tmp.path(),

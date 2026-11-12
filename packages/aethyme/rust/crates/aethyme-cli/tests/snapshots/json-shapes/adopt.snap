@@ -14,6 +14,17 @@
   "closed_at": "null",
   "command": "null",
   "created_at": "integer",
+  "default_branch": {
+    "ahead": "integer",
+    "behind": "integer",
+    "commit": "string",
+    "conflicting_paths": [],
+    "head": "string",
+    "reference": "string",
+    "suggested_command": "null",
+    "sync_impact": "string",
+    "would_conflict": "bool"
+  },
   "diff_base": "string",
   "exit_code": "null",
   "guidance": [
@@ -30,7 +41,7 @@
     "relation": "string",
     "safe_next_action": "string",
     "session_head": "string",
-    "warning": "string"
+    "warning": "null"
   },
   "last_activity_at": "integer",
   "log_path": "null",

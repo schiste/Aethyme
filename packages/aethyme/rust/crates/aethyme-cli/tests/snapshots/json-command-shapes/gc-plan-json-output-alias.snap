@@ -19,12 +19,8 @@
   "blocker_summary": [
     {
       "age_exceeded": "bool",
-      "age_policy_days": "integer",
       "count": "integer",
       "kind": "string",
-      "oldest_age_days": "integer",
-      "oldest_id": "integer",
-      "oldest_recorded_at": "integer",
       "retained_bytes": "integer"
     }
   ],

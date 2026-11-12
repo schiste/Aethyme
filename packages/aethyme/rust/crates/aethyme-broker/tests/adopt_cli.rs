@@ -48,9 +48,22 @@ fn stdout(output: &Output) -> String {
 }
 
 fn fixture() -> common::FixtureRepository {
+    fixture_with(false)
+}
+
+/// [`fixture`] in a repository that promotes to integration, for the cases
+/// about integration as a start or reuse base; they go with the promotion
+/// engine.
+fn promoting_fixture() -> common::FixtureRepository {
+    fixture_with(true)
+}
+
+fn fixture_with(promote: bool) -> common::FixtureRepository {
     let tmp = common::FixtureRepository::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(tmp.path());
+    if promote {
+        aethyme_testkit::promote_on_submit(tmp.path());
+    }
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "README.md", ".gitignore"]);
@@ -547,7 +560,7 @@ fn reuse_persists_a_new_short_name_but_keeps_tab_attribution() {
 #[test]
 fn start_selects_integration_or_default_branch_without_using_checkout_head() {
     for checkout in ["main", "feature", "detached"] {
-        let tmp = fixture();
+        let tmp = promoting_fixture();
         let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
         if checkout != "main" {
             git(tmp.path(), &["switch", "-qc", "feature"]);
@@ -566,7 +579,7 @@ fn start_selects_integration_or_default_branch_without_using_checkout_head() {
         assert_eq!(value["diff_base"], main);
     }
 
-    let tmp = fixture();
+    let tmp = promoting_fixture();
     git(tmp.path(), &["switch", "-qc", "promoted"]);
     std::fs::write(tmp.path().join("promoted.txt"), "integration\n").unwrap();
     git(tmp.path(), &["add", "promoted.txt"]);
@@ -630,7 +643,7 @@ fn integration_ahead_of_main(repo: &Path, commits: usize) -> String {
 /// normal state, so it is the one that was never reported.
 #[test]
 fn start_reports_the_commits_its_base_carries_ahead_of_the_default_branch() {
-    let tmp = fixture();
+    let tmp = promoting_fixture();
     let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
     track_origin_main(tmp.path(), &main);
     integration_ahead_of_main(tmp.path(), 2);
@@ -644,7 +657,7 @@ fn start_reports_the_commits_its_base_carries_ahead_of_the_default_branch() {
     assert_eq!(value["start_base"]["ahead_default_commits"], 2);
     assert_eq!(value["start_base"]["behind_default_commits"], 0);
 
-    let human = fixture();
+    let human = promoting_fixture();
     let main = git_output(human.path(), &["rev-parse", "HEAD"]);
     track_origin_main(human.path(), &main);
     integration_ahead_of_main(human.path(), 2);
@@ -663,7 +676,7 @@ fn start_reports_the_commits_its_base_carries_ahead_of_the_default_branch() {
 /// noise. Guards the threshold in the other direction.
 #[test]
 fn start_is_silent_when_its_base_carries_nothing_extra() {
-    let tmp = fixture();
+    let tmp = promoting_fixture();
     let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
     track_origin_main(tmp.path(), &main);
     git(
@@ -681,7 +694,7 @@ fn start_is_silent_when_its_base_carries_nothing_extra() {
 /// reading its terminal, and it opens pull requests from that base (#290).
 #[test]
 fn start_with_cmd_reports_its_base_and_what_it_carries() {
-    let tmp = fixture();
+    let tmp = promoting_fixture();
     let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
     track_origin_main(tmp.path(), &main);
     integration_ahead_of_main(tmp.path(), 3);
@@ -705,7 +718,7 @@ fn start_with_cmd_reports_its_base_and_what_it_carries() {
 /// naming a base does not stop its inherited commits landing in a pull request.
 #[test]
 fn start_cuts_from_an_explicit_base_when_one_is_given() {
-    let tmp = fixture();
+    let tmp = promoting_fixture();
     let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
     track_origin_main(tmp.path(), &main);
     let integration = integration_ahead_of_main(tmp.path(), 2);
@@ -717,7 +730,7 @@ fn start_cuts_from_an_explicit_base_when_one_is_given() {
     assert_eq!(value["start_base"]["ahead_default_commits"], 2);
 
     // Naming the default branch cuts from it instead, inheriting nothing.
-    let chosen = fixture();
+    let chosen = promoting_fixture();
     let main = git_output(chosen.path(), &["rev-parse", "HEAD"]);
     track_origin_main(chosen.path(), &main);
     integration_ahead_of_main(chosen.path(), 2);
@@ -765,7 +778,6 @@ fn reuse_revalidates_and_fast_forwards_a_clean_conventional_base() {
         "[worktree_freshness]\nmax_age_seconds = 86400\n",
     )
     .unwrap();
-    aethyme_testkit::promote_on_submit(tmp.path());
     let started = stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
     let started: serde_json::Value = serde_json::from_str(&started).unwrap();
     assert_eq!(started["start_base"]["evidence"], "conventional_main");
@@ -812,7 +824,7 @@ fn reuse_revalidates_and_fast_forwards_a_clean_conventional_base() {
 
 #[test]
 fn reuse_refuses_an_unconfirmed_integration_base_without_changing_the_session() {
-    let tmp = fixture();
+    let tmp = promoting_fixture();
     let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
     track_origin_main(tmp.path(), &main);
     set_integration_at_head(tmp.path());
@@ -858,7 +870,7 @@ fn reuse_refuses_an_unconfirmed_integration_base_without_changing_the_session() 
 
 #[test]
 fn reuse_refuses_a_stale_integration_even_with_unknown_provenance() {
-    let tmp = fixture();
+    let tmp = promoting_fixture();
     let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
     track_origin_main(tmp.path(), &main);
     set_integration_at_head(tmp.path());
@@ -897,7 +909,7 @@ fn reuse_refuses_a_stale_integration_even_with_unknown_provenance() {
 fn unavailable_remote_default_ref_is_not_treated_as_local_only() {
     let cases = [("origin", true), ("origin", false), ("upstream", false)];
     for (remote, symbolic_default) in cases {
-        let tmp = fixture();
+        let tmp = promoting_fixture();
         let main = git_output(tmp.path(), &["rev-parse", "HEAD"]);
         track_origin_main(tmp.path(), &main);
         if remote != "origin" {
@@ -1214,7 +1226,7 @@ fn reuse_refuses_a_missing_recorded_integration_ref_without_fallback() {
 
 #[test]
 fn unknown_adopted_base_tracks_current_integration_and_requires_explicit_sync() {
-    let tmp = fixture();
+    let tmp = promoting_fixture();
     let initial = set_integration_at_head(tmp.path());
     stdout(&run(
         tmp.path(),
@@ -1518,7 +1530,7 @@ fn unknown_base_without_integration_does_not_move_a_session_off_the_default_bran
 /// same as nothing having been promoted yet, so it is reported, not stepped over.
 #[test]
 fn unknown_adopted_base_refuses_when_the_integration_it_was_checked_against_is_gone() {
-    let tmp = fixture();
+    let tmp = promoting_fixture();
     set_integration_at_head(tmp.path());
     stdout(&run(
         tmp.path(),

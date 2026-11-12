@@ -60,11 +60,11 @@ fn repository(grace_hours: Option<u32>) -> (Fixture, common::FixtureBroker) {
     let repo = tmp.path();
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(&repo);
     std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-qm", "init"]);
+    aethyme_testkit::ensure_origin(&repo);
     std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
     let grace = grace_hours
         .map(|hours| format!("closed_worktree_grace_hours = {hours}\n"))
@@ -86,7 +86,12 @@ fn session_with_commit(broker: &mut Broker, name: &str, land: bool) -> (i64, Pat
     git(&worktree, &["add", "-A"]);
     git(&worktree, &["commit", "-qm", name]);
     if land {
-        assert!(broker.submit(session.id).unwrap().promoted);
+        broker.submit(session.id).unwrap();
+        aethyme_testkit::land_as_pull_request(
+            broker.main_root(),
+            &session.branch,
+            aethyme_testkit::MergeStyle::MergeCommit,
+        );
     }
     (session.id, worktree)
 }

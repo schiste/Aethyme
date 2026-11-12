@@ -123,22 +123,24 @@ fn concurrent_different_target_keeps_its_ref_and_queue_unchanged() {
     run_landing_case(Some(false), false);
 }
 
-/// A repository that stopped promoting keeps no integration layer: the merge
-/// still refreshes the default branch, but integration is left exactly where
-/// it was, never cleaned or advanced.
+/// A repository that does not promote keeps no integration layer: the merge
+/// refreshes the default branch, and no integration ref is created, cleaned
+/// or advanced.
 #[test]
 fn a_non_promoting_repository_leaves_integration_alone_after_a_merge() {
     run_landing_case(None, true);
 }
 
-fn run_landing_case(same_target_race: Option<bool>, verify_only_at_merge: bool) {
+fn run_landing_case(same_target_race: Option<bool>, verify_only: bool) {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let fake_bin = temp.path().join("fake-bin");
     std::fs::create_dir(&repo).unwrap();
     std::fs::create_dir(&fake_bin).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(&repo);
+    if !verify_only {
+        aethyme_testkit::promote_on_submit(&repo);
+    }
     git(&repo, &["config", "user.name", "Aethyme Test"]);
     git(
         &repo,
@@ -187,13 +189,14 @@ exit 64
     git(&worktree, &["add", "src/service.txt"]);
     git(&worktree, &["commit", "-qm", "enable feature"]);
     let promoted = broker.submit(session.id).unwrap();
-    assert!(promoted.promoted);
-    let promotion =
+    assert_eq!(promoted.promoted, !verify_only);
+    let promotion = (!verify_only).then(|| {
         serde_json::from_str::<serde_json::Value>(promoted.entry.details_json.as_deref().unwrap())
             .unwrap()["commit"]
             .as_str()
             .unwrap()
-            .to_string();
+            .to_string()
+    });
 
     git(&repo, &["switch", "-qc", "upstream-landing", "main"]);
     std::fs::write(repo.join("src/service.txt"), "feature=on\n").unwrap();
@@ -202,13 +205,6 @@ exit 64
     let upstream = git(&repo, &["rev-parse", "HEAD"]);
     git(&repo, &["switch", "main"]);
     drop(broker);
-    if verify_only_at_merge {
-        std::fs::write(
-            repo.join(".aethyme/config.toml"),
-            "[promote]\nmode = \"verify-only\"\n",
-        )
-        .unwrap();
-    }
 
     write_executable(
         &fake_bin.join("gh"),
@@ -264,16 +260,26 @@ exec "$AETHYME_TEST_REAL_GIT" "$@"
         same_target_race.is_some(),
         "the requested interleaving must actually run"
     );
-    if verify_only_at_merge {
+    if verify_only {
         assert_eq!(report["post_merge_cleanup"]["state"], "not_needed");
         assert_eq!(git(&repo, &["rev-parse", "origin/main"]), upstream);
-        assert_eq!(
-            git(&repo, &["rev-parse", "aethyme/integration"]),
-            promotion,
-            "integration stays at the last promotion"
+        assert!(
+            !Command::new("git")
+                .args([
+                    "rev-parse",
+                    "--verify",
+                    "-q",
+                    "refs/heads/aethyme/integration"
+                ])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success(),
+            "a repository that does not promote never creates integration"
         );
         return;
     }
+    let promotion = promotion.expect("a promoting repository records its promotion");
     if same_target_race == Some(false) {
         assert_eq!(report["post_merge_cleanup"]["state"], "deferred");
         assert_eq!(git(&repo, &["rev-parse", "aethyme/integration"]), initial);
