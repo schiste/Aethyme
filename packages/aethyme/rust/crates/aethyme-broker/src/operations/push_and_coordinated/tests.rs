@@ -1873,33 +1873,98 @@ fn failed_pre_push_hook_marks_remote_write_as_not_contacted() {
     );
 }
 
+/// A real `git push` (Git 2.55.0) to a local bare repository whose
+/// `pre-push` hook runs `git rev-parse HEAD` and sleeps one second, captured
+/// with `GIT_TRACE2_EVENT`. Paths are scrubbed; `cmd_ancestry`, `def_repo`,
+/// `version`, `data` and most nested events are dropped, and `thread`, `file`,
+/// `line` and `pid` removed. Kept nested: the hook's own Git command and
+/// `receive-pack`'s child 1, whose id collides with the hook's.
+const PUSH_TRACE_WITH_PRE_PUSH_HOOK: &str = r#"{"event":"start","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda","time":"2026-11-12T21:33:06.463477Z","t_abs":0.003338,"argv":["git","push","-q","origin","HEAD:refs/heads/main"]}
+{"event":"region_enter","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda","time":"2026-11-12T21:33:06.464039Z","repo":1,"nesting":1,"category":"push","label":"transport_push"}
+{"event":"region_enter","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda","time":"2026-11-12T21:33:06.464670Z","repo":1,"nesting":2,"category":"transport_push","label":"get_refs_list"}
+{"event":"child_start","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda","time":"2026-11-12T21:33:06.464695Z","child_id":0,"child_class":"transport/file","use_shell":true,"argv":["git-receive-pack '/tmp/push-trace/remote.git'"]}
+{"event":"region_leave","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda","time":"2026-11-12T21:33:06.476984Z","repo":1,"t_rel":0.01231,"nesting":2,"category":"transport_push","label":"get_refs_list"}
+{"event":"region_enter","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda","time":"2026-11-12T21:33:06.477064Z","nesting":2,"category":"hook","label":"pre-push","msg":"max:1"}
+{"event":"child_start","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda","time":"2026-11-12T21:33:06.477074Z","child_id":1,"child_class":"hook","hook_name":"pre-push","use_shell":false,"argv":[".git/hooks/pre-push","origin","/tmp/push-trace/remote.git"]}
+{"event":"start","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda/20261112T213306.630695Z-H2a4a7172-P00008fdf","time":"2026-11-12T21:33:06.630832Z","t_abs":0.002859,"argv":["git","rev-parse","HEAD"]}
+{"event":"exit","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda/20261112T213306.630695Z-H2a4a7172-P00008fdf","time":"2026-11-12T21:33:06.631266Z","t_abs":0.003294,"code":0}
+{"event":"child_exit","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda","time":"2026-11-12T21:33:07.634784Z","child_id":1,"code":0,"t_rel":1.15769}
+{"event":"region_leave","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda","time":"2026-11-12T21:33:07.634847Z","t_rel":1.157782,"nesting":2,"category":"hook","label":"pre-push"}
+{"event":"region_enter","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda","time":"2026-11-12T21:33:07.634864Z","repo":1,"nesting":2,"category":"transport_push","label":"push_refs"}
+{"event":"child_start","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda","time":"2026-11-12T21:33:07.634981Z","child_id":2,"child_class":"?","use_shell":false,"argv":["git","pack-objects","--all-progress-implied","--revs","--stdout","--thin","--delta-base-offset","-q"]}
+{"event":"child_exit","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda","time":"2026-11-12T21:33:07.650525Z","child_id":2,"code":0,"t_rel":0.015534}
+{"event":"child_start","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda/20261112T213306.475468Z-H2a4a7172-P00008fdb","time":"2026-11-12T21:33:07.665177Z","child_id":1,"child_class":"?","use_shell":false,"argv":["git","rev-list","--objects","--stdin","--not","--exclude-hidden=receive","--all","--quiet","--alternate-refs"]}
+{"event":"child_exit","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda/20261112T213306.475468Z-H2a4a7172-P00008fdb","time":"2026-11-12T21:33:07.691695Z","child_id":1,"code":0,"t_rel":0.026508}
+{"event":"child_exit","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda","time":"2026-11-12T21:33:07.707027Z","child_id":0,"code":0,"t_rel":1.242328}
+{"event":"region_leave","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda","time":"2026-11-12T21:33:07.707066Z","repo":1,"t_rel":0.072202,"nesting":2,"category":"transport_push","label":"push_refs"}
+{"event":"region_leave","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda","time":"2026-11-12T21:33:07.708699Z","repo":1,"t_rel":1.244659,"nesting":1,"category":"push","label":"transport_push"}
+{"event":"exit","sid":"20261112T213306.463315Z-H2a4a7172-P00008fda","time":"2026-11-12T21:33:07.708734Z","t_abs":1.248595,"code":0}
+"#;
+
+/// The same push with no hook installed, top-level events only.
+const PUSH_TRACE_WITHOUT_HOOK: &str = r#"{"event":"start","sid":"20261112T213429.734257Z-H2a4a7172-P0000b227","time":"2026-11-12T21:34:29.734435Z","t_abs":0.004581,"argv":["git","push","-q","origin","HEAD:refs/heads/main"]}
+{"event":"region_enter","sid":"20261112T213429.734257Z-H2a4a7172-P0000b227","time":"2026-11-12T21:34:29.734990Z","repo":1,"nesting":1,"category":"push","label":"transport_push"}
+{"event":"region_enter","sid":"20261112T213429.734257Z-H2a4a7172-P0000b227","time":"2026-11-12T21:34:29.735800Z","repo":1,"nesting":2,"category":"transport_push","label":"get_refs_list"}
+{"event":"child_start","sid":"20261112T213429.734257Z-H2a4a7172-P0000b227","time":"2026-11-12T21:34:29.735843Z","child_id":0,"child_class":"transport/file","use_shell":true,"argv":["git-receive-pack '/tmp/push-trace/remote.git'"]}
+{"event":"region_leave","sid":"20261112T213429.734257Z-H2a4a7172-P0000b227","time":"2026-11-12T21:34:29.755726Z","repo":1,"t_rel":0.019919,"nesting":2,"category":"transport_push","label":"get_refs_list"}
+{"event":"region_enter","sid":"20261112T213429.734257Z-H2a4a7172-P0000b227","time":"2026-11-12T21:34:29.756307Z","repo":1,"nesting":2,"category":"transport_push","label":"push_refs"}
+{"event":"child_start","sid":"20261112T213429.734257Z-H2a4a7172-P0000b227","time":"2026-11-12T21:34:29.756406Z","child_id":1,"child_class":"?","use_shell":false,"argv":["git","pack-objects","--all-progress-implied","--revs","--stdout","--thin","--delta-base-offset","-q"]}
+{"event":"child_exit","sid":"20261112T213429.734257Z-H2a4a7172-P0000b227","time":"2026-11-12T21:34:29.771906Z","child_id":1,"code":0,"t_rel":0.015495}
+{"event":"child_exit","sid":"20261112T213429.734257Z-H2a4a7172-P0000b227","time":"2026-11-12T21:34:29.822451Z","child_id":0,"code":0,"t_rel":0.086597}
+{"event":"region_leave","sid":"20261112T213429.734257Z-H2a4a7172-P0000b227","time":"2026-11-12T21:34:29.822473Z","repo":1,"t_rel":0.066168,"nesting":2,"category":"transport_push","label":"push_refs"}
+{"event":"region_leave","sid":"20261112T213429.734257Z-H2a4a7172-P0000b227","time":"2026-11-12T21:34:29.823483Z","repo":1,"t_rel":0.088493,"nesting":1,"category":"push","label":"transport_push"}
+{"event":"exit","sid":"20261112T213429.734257Z-H2a4a7172-P0000b227","time":"2026-11-12T21:34:29.823504Z","t_abs":0.09365,"code":0}
+"#;
+
 #[test]
-fn push_process_time_splits_at_the_top_level_pre_push_hook() {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(
-        tmp.path(),
-        r#"{"event":"child_start","sid":"20261112-a","t_abs":0.000500,"child_id":0,"argv":["ssh","git@github.com","git-receive-pack 'o/r.git'"]}
-{"event":"child_start","sid":"20261112-a","t_abs":0.400,"child_id":1,"child_class":"hook","hook_name":"pre-push","argv":[".git/hooks/pre-push","origin"]}
-{"event":"child_start","sid":"20261112-a/20261112-b","t_abs":0.010,"child_id":1,"argv":["git","pre-push-helper"]}
-{"event":"child_exit","sid":"20261112-a/20261112-b","t_abs":0.020,"child_id":1,"code":0,"t_rel":0.010}
-{"event":"child_exit","sid":"20261112-a","t_abs":2.900,"child_id":1,"code":0,"t_rel":2.500}
-"#,
-    )
-    .unwrap();
-    let trace = inspect_git_transfer_trace(tmp.path());
-    assert_eq!(trace.pre_push_hook_started_ms, Some(400));
-    assert_eq!(trace.pre_push_hook_ms, Some(2500));
+fn push_process_time_splits_at_the_pre_push_hook_of_a_real_trace() {
+    // Trace2 puts no `t_abs` on `child_start`; the hook's start is its
+    // wall-clock `time` measured from the top-level `start` event:
+    // 06.477074 - 06.463477 + t_abs 0.003338 = 16.935 ms.
+    let trace = parse_git_transfer_trace(PUSH_TRACE_WITH_PRE_PUSH_HOOK);
+    assert!(trace.pre_push_hook);
     assert!(!trace.pre_push_hook_failed);
-    let split = push_process_split(&trace, std::time::Duration::from_millis(3_200)).unwrap();
+    assert!(trace.remote_transport);
+    assert_eq!(trace.pre_push_hook_started_ms, Some(17));
+    assert_eq!(trace.pre_push_hook_ms, Some(1158));
+    assert_eq!(trace.remote_refs_read_ms, Some(17));
+    // The process ran 1.248595 s by its own `exit` event.
+    let split = push_process_split(&trace, std::time::Duration::from_millis(1_249)).unwrap();
     assert_eq!(
         split.map(|(name, elapsed)| (name, elapsed.as_millis())),
         [
-            ("push_git_process_before_hook", 400),
-            ("push_git_process_hook", 2500),
-            ("push_git_process_after_hook", 300),
+            ("push_git_process_before_hook", 17),
+            ("push_git_process_hook", 1158),
+            ("push_git_process_after_hook", 74),
         ]
     );
-    // No hook in the push (hooks ran outside the lock): nothing to split.
+
+    // A nested process's child 1 is not the hook, even when it fails.
+    let nested_failure = PUSH_TRACE_WITH_PRE_PUSH_HOOK.replace(
+        r#""time":"2026-11-12T21:33:07.691695Z","child_id":1,"code":0"#,
+        r#""time":"2026-11-12T21:33:07.691695Z","child_id":1,"code":1"#,
+    );
+    assert_ne!(nested_failure, PUSH_TRACE_WITH_PRE_PUSH_HOOK);
+    assert!(!parse_git_transfer_trace(&nested_failure).pre_push_hook_failed);
+}
+
+#[test]
+fn push_without_a_hook_splits_at_the_ref_read_with_a_zero_hook() {
+    let trace = parse_git_transfer_trace(PUSH_TRACE_WITHOUT_HOOK);
+    assert!(!trace.pre_push_hook);
+    assert_eq!(trace.pre_push_hook_started_ms, None);
+    // get_refs_list left at 29.755726 - 29.734435 + t_abs 0.004581 = 25.872 ms.
+    assert_eq!(trace.remote_refs_read_ms, Some(26));
+    let split = push_process_split(&trace, std::time::Duration::from_millis(94)).unwrap();
+    assert_eq!(
+        split.map(|(name, elapsed)| (name, elapsed.as_millis())),
+        [
+            ("push_git_process_before_hook", 26),
+            ("push_git_process_hook", 0),
+            ("push_git_process_after_hook", 68),
+        ]
+    );
+    // An empty or unreadable trace has no split point at all.
     assert!(
         push_process_split(
             &GitTransferTrace::default(),
@@ -1907,6 +1972,25 @@ fn push_process_time_splits_at_the_top_level_pre_push_hook() {
         )
         .is_none()
     );
+    // A hook whose exit is missing is not split as if it had not run.
+    let unfinished = PUSH_TRACE_WITH_PRE_PUSH_HOOK
+        .lines()
+        .filter(|line| !line.contains(r#""child_id":1,"code":0,"t_rel":1.15769"#))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trace = parse_git_transfer_trace(&unfinished);
+    assert!(trace.pre_push_hook && trace.pre_push_hook_ms.is_none());
+    assert!(push_process_split(&trace, std::time::Duration::from_secs(1)).is_none());
+}
+
+#[test]
+fn trace2_time_parses_as_microseconds_of_the_day() {
+    let time = |text: &str| trace2_time_of_day_us(Some(&serde_json::json!(text)));
+    assert_eq!(time("2026-11-12T00:00:01.000002Z"), Some(1_000_002));
+    assert_eq!(time("2026-11-12T21:33:06.4Z"), Some(77_586_400_000));
+    assert_eq!(time("2026-11-12T00:00:01Z"), Some(1_000_000));
+    assert_eq!(time("2026-11-12T00:00:01.x1Z"), None);
+    assert_eq!(time("21:33:06"), None);
 }
 
 #[test]
