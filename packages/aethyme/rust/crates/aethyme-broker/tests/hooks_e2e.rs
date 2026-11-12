@@ -275,7 +275,8 @@ fn pre_push_blocks_direct_default_branch_updates_and_journals_break_glass() {
         stderr.contains("operation_id_missing_or_invalid"),
         "{stderr}"
     );
-    assert!(stderr.contains("broker advanced ship plan"), "{stderr}");
+    assert!(stderr.contains("broker advanced git --session"), "{stderr}");
+    assert!(!stderr.contains("advanced ship"), "{stderr}");
     assert!(
         stderr.contains("AETHYME_BROKER_BREAK_GLASS_REASON"),
         "{stderr}"

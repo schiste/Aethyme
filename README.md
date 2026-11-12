@@ -210,9 +210,9 @@ mutations. Only committed work can be submitted.
 
 `broker submit` simulates the merge, selects the affected repository gates,
 and promotes a verified result to the local `aethyme/integration` branch. It
-does not publish a remote branch. Use the reviewed `broker advanced ship plan` /
-`broker advanced ship execute` lane, or your normal review flow, when publication is
-authorized.
+does not publish a remote branch. Pull requests are the landing path: publish the
+session branch with `broker push --session <id> --pr` and merge through your
+normal review flow.
 
 ## Explore a repository
 

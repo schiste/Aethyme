@@ -1246,17 +1246,13 @@ pub(super) fn integration_next_action(
         };
     }
 
-    if upstream_head == Some(integration_head)
-        && let Some(entry_id) = latest_delivery_entry_id
-    {
+    if upstream_head == Some(integration_head) && latest_delivery_entry_id.is_some() {
         return IntegrationNextAction {
             state: IntegrationDeliveryState::Published,
             summary: format!(
                 "{branch} is published at {integration_head}; local main is not synchronized"
             ),
-            commands: vec![format!(
-                "aethyme broker advanced ship execute --entry {entry_id} --confirm {integration_head} --sync-main"
-            )],
+            commands: Vec::new(),
         };
     }
 
@@ -1269,28 +1265,18 @@ pub(super) fn integration_next_action(
         };
         let verb = if count == 1 { "is" } else { "are" };
         if main_is_ancestor {
-            let entry_id = latest_delivery_entry_id
-                .expect("visible promoted entries have a delivery queue entry");
             return IntegrationNextAction {
                 state: IntegrationDeliveryState::Promoted,
                 summary: format!(
-                    "{count} {noun} {verb} promoted on {branch} and ready for a ship plan"
+                    "{count} {noun} {verb} promoted on {branch} and not yet published"
                 ),
-                commands: vec![format!(
-                    "aethyme broker advanced ship plan --entry {entry_id}"
-                )],
+                commands: Vec::new(),
             };
         }
-        let entry_id =
-            latest_delivery_entry_id.expect("visible promoted entries have a delivery queue entry");
         return IntegrationNextAction {
             state: IntegrationDeliveryState::Blocked,
-            summary: format!(
-                "{count} {noun} {verb} pending, but main and {branch} have diverged; inspect the blocked ship plan"
-            ),
-            commands: vec![format!(
-                "aethyme broker advanced ship plan --entry {entry_id}"
-            )],
+            summary: format!("{count} {noun} {verb} pending, but main and {branch} have diverged"),
+            commands: Vec::new(),
         };
     }
 
@@ -1404,13 +1390,10 @@ pub(super) fn unpushed_work_advice(
                 format!("{} {}", integration.branch, short_commit(&integration.head)),
                 format!("upstream {}", integration.upstream_ref),
             ],
-            commands: vec![
-                format!(
-                    "git log --oneline --cherry-pick --right-only {}...{}",
-                    integration.upstream_ref, integration.branch
-                ),
-                "aethyme broker advanced ship plan --entry <promoted-entry-id>".into(),
-            ],
+            commands: vec![format!(
+                "git log --oneline --cherry-pick --right-only {}...{}",
+                integration.upstream_ref, integration.branch
+            )],
         });
     }
     advice

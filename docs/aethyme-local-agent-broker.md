@@ -86,19 +86,11 @@ contracts, so any future delivery surface is a client, not a rewrite.
   repository delivers through pull requests, so a second copy on an integration
   branch only adds drift). `[promote] mode = "auto"` promotes as soon as gates
   pass; `"manual"` adds an explicit `broker submit promote` step.
-- **Delivery is explicit and target-aware.** `broker advanced ship plan` reads an
-  optional `[delivery] default = "pull_request" | "local_main_merge"` from
-  the exact remote default-branch commit, never from the pending integration
-  tip. A plan reports the selected route, policy source, compared SHAs,
-  divergence reasons, and a SHA-256 digest. `broker advanced ship execute` must bind
-  configured or overridden routes to that digest. A clean, unchanged local
-  main may use the coordinated non-force publication path; a pull-request
-  route pushes a deterministic branch and verifies the exact GitHub PR head,
-  base, and checks, then stops. An open PR is a proposal, so exposures and
-  publication advisories remain unresolved until the exact commit is verified
-  on the target default branch. Repositories without `[delivery]` retain the
-  legacy route when state is unambiguous, while divergence produces an
-  explicit pull-request recommendation.
+- **Pull requests are the only landing path** (decided 2026-11-11). The
+  local `broker advanced ship plan|execute` lane and its `[delivery] default`
+  route selector were removed on 2026-11-12; an existing `[delivery] default`
+  key is parsed and ignored. `[delivery] push_session_branches` still
+  authorizes `broker push`.
 
 ## Current state (be precise about this)
 

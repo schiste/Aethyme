@@ -172,7 +172,6 @@ const BROKER_ADVANCED: &[&str] = &[
     "merge-chain",
     "operations",
     "exec",
-    "ship",
     "review",
     "gates",
     "hooks",

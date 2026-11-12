@@ -167,8 +167,7 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         (Some("integration"), Some("reconcile")) if args.iter().any(|arg| arg == "--apply") => {
             CommandCapability::RecoveryWrite
         }
-        (Some("ship"), Some("plan"))
-        | (Some("checkpoint"), Some("plan"))
+        (Some("checkpoint"), Some("plan"))
         | (Some("integration"), Some("status" | "reconcile"))
         | (Some("leases" | "ownership"), _)
         | (Some("resources"), Some("plan" | "list"))
@@ -692,7 +691,7 @@ Agent broker:
   broker gc plan|apply        reviewed cleanup of retained state and disk
   broker gc abandon|forget-abandoned
                               archive or retire a pending cleanup journal safely
-  broker advanced <verb>      leases, git, gh, ship, review, operations, exec, ...
+  broker advanced <verb>      leases, git, gh, review, operations, exec, ...
   hook <event>                agent-surface hook entry point (the plugin's only
                               entry point; reads event JSON on stdin)
   plugin install|status|remove
@@ -1259,7 +1258,7 @@ mod compatibility_command_tests {
                 CommandCapability::NewSession,
             ),
             (
-                &["broker", "advanced", "ship", "execute"][..],
+                &["broker", "advanced", "issues", "upsert"][..],
                 CommandCapability::SharedMutation,
             ),
             (&["upgrade", "plan"][..], CommandCapability::Upgrade),

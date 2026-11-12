@@ -978,15 +978,6 @@ pub(super) fn parse_delivery_policy(
     }
 }
 
-pub(super) fn parse_repository_delivery_mode(
-    value: Option<&str>,
-) -> Result<Option<crate::RepositoryDeliveryMode>, UsageError> {
-    value
-        .map(crate::RepositoryDeliveryMode::parse)
-        .transpose()
-        .map_err(UsageError::Message)
-}
-
 pub(super) fn parse_pull_request_event_kinds(
     value: Option<&str>,
 ) -> Result<Vec<crate::PullRequestActivityKind>, UsageError> {
