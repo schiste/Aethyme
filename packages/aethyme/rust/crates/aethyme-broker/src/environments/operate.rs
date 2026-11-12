@@ -1605,31 +1605,50 @@ fn run_budget_outcomes(roots: &std::collections::BTreeSet<std::path::PathBuf>) {
     }
 }
 
+/// How often a busy proxy port is tried again before giving up: a
+/// predecessor that is still exiting frees it within a tick or two, and a
+/// port another program owns never frees.
+const PROXY_BIND_ATTEMPTS: u32 = 8;
+
 /// Start the wake-on-request proxy on loopback in this (supervisor)
 /// process. A port already in use is logged, not fatal: everything except
 /// wake on request keeps working.
-fn start_proxy() {
+///
+/// Returns whether the caller is done with it: `false` only while the port
+/// is busy and worth another try on the next tick.
+fn start_proxy() -> bool {
+    static BUSY_ATTEMPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let (Some(root), Ok(store_path), Ok(host_db)) = (
         environments_directory(),
         super::store::default_store_path(),
         crate::resources::default_host_resource_db_path(),
     ) else {
         eprintln!("warning: aethyme env proxy not started: host state unavailable");
-        return;
+        return true;
     };
     let token = match super::proxy::ensure_token(&root) {
         Ok(token) => token,
         Err(error) => {
             eprintln!("warning: aethyme env proxy not started: token: {error}");
-            return;
+            return true;
         }
     };
     let port = super::proxy::proxy_port();
     let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
         Ok(listener) => listener,
         Err(error) => {
-            eprintln!("warning: aethyme env proxy not started on 127.0.0.1:{port}: {error}");
-            return;
+            let attempt = BUSY_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let retry =
+                error.kind() == std::io::ErrorKind::AddrInUse && attempt < PROXY_BIND_ATTEMPTS;
+            eprintln!(
+                "warning: aethyme env proxy not started on 127.0.0.1:{port}: {error}{}",
+                if retry {
+                    "; trying again next tick"
+                } else {
+                    ""
+                }
+            );
+            return !retry;
         }
     };
     let config = std::sync::Arc::new(super::proxy::ProxyConfig {
@@ -1646,13 +1665,15 @@ fn start_proxy() {
             super::proxy::serve(listener, config, stop),
         );
     });
+    true
 }
 
 impl super::supervisor::SupervisorWork for LifecycleWork {
     fn tick(&mut self) -> super::supervisor::TickOutcome {
         if !self.proxy_started {
-            self.proxy_started = true;
-            start_proxy();
+            // Not started while the port is busy: a supervisor replacing an
+            // older build starts before that build has let go of it.
+            self.proxy_started = start_proxy();
         }
         if let Ok((mut lifecycle, _)) = open("supervisor", false) {
             crate::warn_unrecorded("renew environment leases", lifecycle.renew_leases());

@@ -411,6 +411,11 @@ pub(super) fn run_supervise(options: &Options) -> Result<Output, Failure> {
     let reason = supervisor::run(&config, &mut work, &|| false)
         .map_err(|error| environment_failure(format!("supervisor: {error}")))?;
     if reason == supervisor::ExitReason::Replaced {
+        // Stop the services first: the successor needs what they hold (the
+        // worktree watcher's lock) from its first tick. Started while this
+        // process still held it, the 0.8.75 successor ran without a watcher
+        // for over a minute.
+        drop(work);
         // The record is withdrawn and the lock released, so this starts the
         // new build. A failure leaves no supervisor, which the next command
         // that needs one repairs; it is still said in the log.
