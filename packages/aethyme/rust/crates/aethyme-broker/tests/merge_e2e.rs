@@ -4,7 +4,8 @@
 //! with the agent-facing instruction drop.
 
 use aethyme_broker::{
-    Broker, GitRepo, MergeStatus, StatusAdviceSeverity, SubmissionGateVerificationStatus,
+    Broker, GitRepo, IntegrationReconcileOptions, MergeStatus, StatusAdviceSeverity,
+    SubmissionGateVerificationStatus, VERIFIED_AGAINST_INTEGRATION, VERIFIED_AGAINST_LOCAL_DEFAULT,
 };
 use std::path::Path;
 use std::process::Command;
@@ -95,7 +96,10 @@ fn submit_reuses_its_preflight_patch_history_plan_when_inputs_stay_fixed() {
     // Finish fixture history before opening the broker: its default database
     // lives in the repository and must not be staged by later branch commits.
     // Main and integration each receive an independent commit from the same
-    // initial tree, so the session plan includes both nonempty patch streams.
+    // initial tree. Integration holding a commit main lacks, with no fetched
+    // default branch, submit verifies against main (what sessions are cut
+    // from); the session is cut from main's parent, so its plan includes both
+    // nonempty patch streams: the session's commit and main's.
     sh(tmp.path(), &["switch", "-qc", "integration-only"]);
     std::fs::write(
         tmp.path().join("src/integration-only.py"),
@@ -130,7 +134,7 @@ fn submit_reuses_its_preflight_patch_history_plan_when_inputs_stay_fixed() {
         "fixture integration and main must diverge from their shared initial commit"
     );
 
-    let session_worktree = agent_worktree(tmp.path(), "trace-reuse");
+    let session_worktree = agent_worktree_at(tmp.path(), "trace-reuse", "main^");
     let session = broker
         .adopt(&session_worktree, Some("trace submit plan reuse"))
         .unwrap();
@@ -809,6 +813,352 @@ fn integration_follows_main_without_a_fetched_default_branch() {
             .iter()
             .any(|e| e.kind == "merge.integration_refreshed")
     );
+}
+
+#[test]
+fn integration_follows_main_but_never_clobbers_unmerged_promotions() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    let (_branch, base) = broker.integration_head().unwrap();
+    assert_eq!(base, resolve(tmp.path(), "main"));
+
+    // A commit local promotion left on integration, which main lacks:
+    // advancing main afterwards must NOT clobber it. The no-remote fallback
+    // only fast-forwards a ref that is an ancestor of the main checkout.
+    let promoted_tip = common::commit_onto_integration(
+        tmp.path(),
+        &[("src/promoted.py", "promoted = 1\n")],
+        "work promoted before local promotion was removed",
+    );
+    std::fs::write(tmp.path().join("src/other.py"), "o\n").unwrap();
+    sh(tmp.path(), &["add", "src/other.py"]);
+    sh(tmp.path(), &["commit", "-qm", "main advances again"]);
+    let (_branch, still) = broker.integration_head().unwrap();
+    assert_eq!(
+        still, promoted_tip,
+        "unmerged promotions are never clobbered by a refresh"
+    );
+    assert_eq!(
+        resolve(tmp.path(), "refs/heads/aethyme/integration"),
+        promoted_tip
+    );
+}
+
+/// Formerly promoting, no remote: integration holds commits local main lacks.
+/// Sessions are cut from local main, so submit verifies against local main --
+/// not the stale integration ref -- and says why; status names the leftover
+/// commits and the command that resolves them.
+#[test]
+fn a_formerly_promoting_repository_without_a_remote_verifies_against_local_main() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    broker.integration_head().unwrap();
+    let main = resolve(tmp.path(), "main");
+    let leftover = common::commit_onto_integration(
+        tmp.path(),
+        &[("src/a.py", "a = 99\n")],
+        "leftover promotion",
+    );
+
+    let status = broker.status(0).unwrap();
+    let row = status
+        .advice
+        .iter()
+        .find(|row| row.id == "integration.leftover-work")
+        .expect("a formerly promoting repository without a remote gets the leftover row");
+    assert_eq!(row.severity, StatusAdviceSeverity::Warning);
+    assert!(
+        row.summary.contains("1 commit main lacks"),
+        "{}",
+        row.summary
+    );
+    assert!(
+        row.summary.contains("submit verifies against main"),
+        "{}",
+        row.summary
+    );
+    assert_eq!(
+        row.commands,
+        vec!["aethyme broker advanced integration reconcile --upstream main --dry-run"]
+    );
+
+    // The session holds main's a.py; integration's leftover rewrites the same
+    // line. Judged against integration this would conflict with work the
+    // session does not hold; judged against main it verifies.
+    let wt = agent_worktree(tmp.path(), "after-promotion");
+    let session = broker.adopt(&wt, Some("work after promotion")).unwrap();
+    commit_edit(&wt, "src/a.py", "a = 2\n");
+    let plan = broker.submission_plan(session.id).unwrap();
+    assert_eq!(plan.integration_head, main);
+    let outcome = broker.submit(session.id).unwrap();
+    assert_eq!(outcome.entry.status, MergeStatus::Verified);
+    assert_eq!(outcome.entry.base_commit, main);
+    let base = outcome.verified_against.as_ref().unwrap();
+    assert_eq!(base.source, VERIFIED_AGAINST_LOCAL_DEFAULT);
+    assert_eq!(base.reference, "main");
+    assert_eq!(base.commit, main);
+    assert!(
+        base.fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("aethyme/integration holds 1 commit main lacks")),
+        "{base:?}"
+    );
+    assert_eq!(
+        resolve(tmp.path(), "refs/heads/aethyme/integration"),
+        leftover,
+        "verification never moves the leftover integration ref"
+    );
+}
+
+/// The no-remote fallback is unchanged while integration holds nothing local
+/// main lacks: it follows main and is still the verification base.
+#[test]
+fn a_repository_without_a_remote_still_verifies_against_a_current_integration() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    let wt = agent_worktree(tmp.path(), "current-integration");
+    let session = broker.adopt(&wt, Some("ordinary work")).unwrap();
+    commit_edit(&wt, "src/b.py", "b = 2\n");
+    let outcome = broker.submit(session.id).unwrap();
+    assert_eq!(outcome.entry.status, MergeStatus::Verified);
+    let base = outcome.verified_against.as_ref().unwrap();
+    assert_eq!(base.source, VERIFIED_AGAINST_INTEGRATION);
+    assert_eq!(base.commit, resolve(tmp.path(), "main"));
+    assert!(
+        broker
+            .status(0)
+            .unwrap()
+            .advice
+            .iter()
+            .all(|row| row.id != "integration.leftover-work")
+    );
+}
+
+#[test]
+fn failed_reconciliation_rolls_back_ref_and_database() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    let wt = agent_worktree(tmp.path(), "rollback-promotion");
+    let session = broker.adopt(&wt, Some("rollback proof")).unwrap();
+    commit_edit(&wt, "src/a.py", "a = 2\n");
+    let submitted = broker.submit(session.id).unwrap();
+    assert_eq!(submitted.entry.status, MergeStatus::Verified);
+    common::promote_like_before_removal(tmp.path(), &submitted.entry);
+    let old_integration = resolve(tmp.path(), "aethyme/integration");
+
+    sh(tmp.path(), &["switch", "-qc", "rollback-upstream", "main"]);
+    std::fs::write(tmp.path().join("src/a.py"), "a = 2\n").unwrap();
+    sh(tmp.path(), &["add", "src/a.py"]);
+    sh(tmp.path(), &["commit", "-qm", "external squash"]);
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    sh(tmp.path(), &["switch", "main"]);
+
+    let dry_run = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: None,
+            confirm: None,
+        })
+        .unwrap();
+    assert!(dry_run.safe, "{dry_run:#?}");
+
+    let db =
+        rusqlite::Connection::open(aethyme_broker::broker_db_path(tmp.path()).unwrap()).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER fail_reconcile
+         BEFORE INSERT ON integration_reconciliations
+         BEGIN SELECT RAISE(FAIL, 'injected reconciliation failure'); END;",
+    )
+    .unwrap();
+    drop(db);
+
+    let error = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: true,
+            resolution_file: None,
+            confirm: dry_run.plan_digest,
+        })
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected reconciliation failure")
+    );
+    assert_eq!(resolve(tmp.path(), "aethyme/integration"), old_integration);
+    let queue = broker.store().merge_queue().unwrap();
+    assert_eq!(
+        queue
+            .iter()
+            .find(|entry| entry.id == submitted.entry.id)
+            .unwrap()
+            .status,
+        MergeStatus::Promoted,
+        "failed apply must leave the broker row unchanged"
+    );
+}
+
+#[test]
+fn broker_open_finishes_reconciliation_interrupted_after_ref_move() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    let wt = agent_worktree(tmp.path(), "crash-recovery-promotion");
+    let session = broker.adopt(&wt, Some("crash recovery proof")).unwrap();
+    commit_edit(&wt, "src/a.py", "a = 2\n");
+    let submitted = broker.submit(session.id).unwrap();
+    assert_eq!(submitted.entry.status, MergeStatus::Verified);
+    common::promote_like_before_removal(tmp.path(), &submitted.entry);
+
+    sh(
+        tmp.path(),
+        &["switch", "-qc", "crash-recovery-upstream", "main"],
+    );
+    std::fs::write(tmp.path().join("src/a.py"), "a = 2\n").unwrap();
+    sh(tmp.path(), &["add", "src/a.py"]);
+    sh(tmp.path(), &["commit", "-qm", "external squash"]);
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    sh(tmp.path(), &["switch", "main"]);
+
+    let report = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: None,
+            confirm: None,
+        })
+        .unwrap();
+    assert!(report.safe, "{report:#?}");
+    let entry = &report.entries[0];
+    let details = serde_json::json!({
+        "branch": report.branch,
+        "commit": entry.old_merge_commit,
+        "externally_landed": true,
+        "classification": "already_landed",
+        "upstream_ref": report.upstream_ref,
+        "upstream_landing": entry.upstream_landing,
+    })
+    .to_string();
+    let db_path = aethyme_broker::broker_db_path(tmp.path()).unwrap();
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute(
+        "INSERT INTO integration_reconciliation_intent
+            (id, branch, upstream_ref, local_main_commit, old_integration,
+             upstream_commit, new_integration, created_at)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, 1)",
+        rusqlite::params![
+            report.branch,
+            report.upstream_ref,
+            report.local_main,
+            report.old_integration,
+            report.upstream_head,
+            report.new_integration,
+        ],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO integration_reconciliation_intent_entries
+            (queue_entry_id, status, details_json, classification,
+             old_merge_commit, upstream_landing)
+         VALUES (?1, 'externally_landed', ?2, 'already_landed', ?3, ?4)",
+        rusqlite::params![
+            entry.queue_entry_id,
+            details,
+            entry.old_merge_commit,
+            entry.upstream_landing,
+        ],
+    )
+    .unwrap();
+    drop(db);
+    sh(
+        tmp.path(),
+        &[
+            "update-ref",
+            "refs/heads/aethyme/integration",
+            &report.new_integration,
+            &report.old_integration,
+        ],
+    );
+    drop(broker); // Simulate process death before phase-two SQLite commit.
+
+    let mut recovered = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    let queue = recovered.store().merge_queue().unwrap();
+    assert_eq!(
+        queue
+            .iter()
+            .find(|queue_entry| queue_entry.id == submitted.entry.id)
+            .unwrap()
+            .status,
+        MergeStatus::ExternallyLanded
+    );
+    let db = rusqlite::Connection::open(db_path).unwrap();
+    let pending: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM integration_reconciliation_intent",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 0, "recovery must consume the durable intent");
+}
+
+#[test]
+fn reconcile_refuses_to_discard_unrecorded_integration_commits() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    broker.integration_head().unwrap();
+    let old_integration = common::commit_onto_integration(
+        tmp.path(),
+        &[("src/unrecorded.py", "keep = 1\n")],
+        "unrecorded integration work",
+    );
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+
+    let report = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: true,
+            resolution_file: None,
+            confirm: None,
+        })
+        .unwrap();
+    assert!(!report.safe);
+    assert!(!report.applied);
+    assert!(
+        report.warnings[0].contains("unrecorded work"),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(resolve(tmp.path(), "aethyme/integration"), old_integration);
 }
 
 // ── #42: main-checkout sessions get real (advisory) verification ────────

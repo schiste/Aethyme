@@ -25,7 +25,7 @@ use aethyme_contracts::experimental_v0::SourceSnapshotId;
 use crate::collaboration_archive::{self, ArchiveError, CommitOid};
 use crate::merge::{
     PromoteConfig, SubmissionCommitOwnership, SubmissionIntegrationState,
-    VERIFIED_AGAINST_INTEGRATION, VERIFIED_AGAINST_UPSTREAM,
+    VERIFIED_AGAINST_INTEGRATION, VERIFIED_AGAINST_LOCAL_DEFAULT, VERIFIED_AGAINST_UPSTREAM,
 };
 use crate::{Broker, BrokerOpError};
 
@@ -111,8 +111,8 @@ pub struct Candidate {
     pub commit: CommitOid,
     /// The accepted state the inputs were applied to.
     pub baseline: CommitOid,
-    /// Where `baseline` came from: `integration` or `upstream`, as in a
-    /// submit outcome's `verified_against.source`, or `retained` for a
+    /// Where `baseline` came from: `integration`, `local_default` or
+    /// `upstream`, as in a submit outcome's `verified_against.source`, or `retained` for a
     /// composer's baseline read from the archive.
     pub baseline_source: &'static str,
     /// In application order.
@@ -463,6 +463,9 @@ impl Broker {
         let repo = self.repo_handle();
         if let Some((_, commit)) = repo.upstream_default() {
             return Ok((VERIFIED_AGAINST_UPSTREAM, commit));
+        }
+        if let Some(ahead) = self.integration_ahead_of_local_default() {
+            return Ok((VERIFIED_AGAINST_LOCAL_DEFAULT, ahead.default_commit));
         }
         let config = PromoteConfig::load(&self.main_root_path());
         let head = repo.head_commit()?;

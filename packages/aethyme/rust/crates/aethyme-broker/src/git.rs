@@ -101,9 +101,9 @@ pub(crate) fn without_git_deadline<T>(operation: impl FnOnce() -> T) -> T {
 /// Guard form of the same deadline, for an interactive report that installs
 /// it for the whole command rather than one closure (#460). There is one
 /// deadline per thread: a finish scope (`with_git_deadline`) and a report
-/// scope (`limit_git_until`) nest by taking the earlier instant, and either
-/// way of lifting it (`without_git_deadline`, `suspend_git_deadline`) lifts
-/// both, so a mutation is never cut off by whichever scope it did not lift.
+/// scope (`limit_git_until`) nest by taking the earlier instant, and
+/// lifting it (`without_git_deadline`) lifts both, so a mutation is never cut
+/// off by whichever scope it did not lift.
 pub(crate) struct GitDeadlineGuard {
     _restore: RestoreGitDeadline,
 }
@@ -180,18 +180,6 @@ pub(crate) fn current_git_isolation() -> GitIsolation {
 pub(crate) fn adopt_git_isolation_on_this_thread(isolation: GitIsolation) {
     GRAPH_VERIFICATION_GIT.with(|enabled| enabled.set(isolation.graph_verification));
     DROP_INHERITED_GIT_ENVIRONMENT.with(|flag| flag.set(isolation.drop_inherited_environment));
-}
-
-/// Lift the deadline for a mutation that runs inside a report. The deadline
-/// exists to bound reads; killing a ref or index write midway would leave
-/// the half-applied state it was never meant to produce. Each command keeps
-/// its ordinary timeout, and the caller's deadline returns when the guard is
-/// dropped.
-pub(crate) fn suspend_git_deadline() -> GitDeadlineGuard {
-    let previous = GIT_DEADLINE.with(|slot| slot.replace(None));
-    GitDeadlineGuard {
-        _restore: RestoreGitDeadline(previous),
-    }
 }
 
 /// Errors from git operations. `Git` carries the failing subcommand and
@@ -10388,11 +10376,10 @@ mod timeout_tests {
         let _report = limit_git_until(report);
         with_git_deadline(Duration::from_secs(60), || {
             assert_eq!(active_git_deadline(), Some(report), "the earlier wins");
-            {
-                let _write = suspend_git_deadline();
+            without_git_deadline(|| {
                 assert_eq!(active_git_deadline(), None);
                 assert_eq!(git_timeout(), general);
-            }
+            });
             assert_eq!(active_git_deadline(), Some(report));
         });
         without_git_deadline(|| {

@@ -181,6 +181,8 @@ mod reclaim_ordering;
 mod reconcile_tracked_elsewhere_cli;
 #[path = "reconcile_usage_cli.rs"]
 mod reconcile_usage_cli;
+#[path = "reconciliation_external_main.rs"]
+mod reconciliation_external_main;
 #[path = "recovery_archive_gc_cli.rs"]
 mod recovery_archive_gc_cli;
 #[path = "reftable_git.rs"]

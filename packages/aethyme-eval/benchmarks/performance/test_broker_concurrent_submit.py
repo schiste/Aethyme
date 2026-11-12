@@ -106,7 +106,7 @@ class SyntheticWorkloadTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, 'fixture traversal denied'):
                         tree_function(root)
 
-    def test_seed_content_accepts_merge_linear_and_content_promotions(self):
+    def test_seed_content_accepts_merge_linear_and_squash_landings(self):
         seeds = ['a', 'b', 'c', 'd']
         validate_shared_history(seeds, ['merge'], seeds + ['merge'], 'merge', 'tree', 'tree')
         validate_shared_history(seeds, seeds, seeds, 'd', 'tree', 'tree')
@@ -122,8 +122,10 @@ class SyntheticWorkloadTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'bounded seed content'):
                     validate_shared_history(seeds, first_parent, reachable, tip, 'tree', tree)
 
-    def test_policy_is_manual_without_gate_configuration(self):
-        self.assertIn('[promote]\nmode = "manual"', POLICY_TEXT)
+    def test_policy_is_verify_only_without_gate_configuration(self):
+        self.assertIn('[promote]\nmode = "verify-only"', POLICY_TEXT)
+        self.assertNotIn('"manual"', POLICY_TEXT)
+        self.assertNotIn('"auto"', POLICY_TEXT)
         self.assertNotIn('[gates]', POLICY_TEXT)
         self.assertNotIn('AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS', POLICY_TEXT)
 
@@ -206,7 +208,7 @@ class ProvenanceValidationTests(unittest.TestCase):
             },
         }
 
-    def test_accepts_only_complete_safe_manual_no_gate_plan(self):
+    def test_accepts_only_complete_safe_verify_only_no_gate_plan(self):
         result = validate_submit_outcome(
             self.payload, 17, self.baseline, self.integration, self.session_head)
         self.assertEqual(result, self.plan)

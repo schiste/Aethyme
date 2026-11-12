@@ -698,13 +698,35 @@ fn render_submit_text(
         }
         // "What now?" — the next expected human action was
         // implicit (dogfood feedback 2026-07-14).
+        // The same guard finish and blockers use: `push --pr` refuses without
+        // a fetched default branch or the repository's push opt-in, so name
+        // the step that works there instead.
+        let session_id = outcome.entry.session_id;
+        let has_default = broker.repo_handle().upstream_default().is_some();
+        let land = if has_default && crate::session_push::session_push_enabled(broker.repo_handle())
+        {
+            format!(
+                "Land the work through the session's pull request \
+                 (`aethyme broker push --session {session_id} --pr`)"
+            )
+        } else if has_default {
+            format!(
+                "Session pushes are not enabled here (commit `push_session_branches = true` \
+                 under [delivery] in .aethyme/config.toml to allow them): land the work \
+                 through a pull request, then prove it landed (`aethyme broker advanced \
+                 representation scan --session {session_id}`)"
+            )
+        } else {
+            format!(
+                "With no fetched default branch, land the work by merging the session branch \
+                 into the local default branch, then prove it landed (`aethyme broker advanced \
+                 representation scan --session {session_id}`)"
+            )
+        };
         out!(
-            "What now: entry {} is verified and nothing moved locally. Land the work \
-             through the session's pull request (`aethyme broker push --session {} --pr`), \
-             or finish with `aethyme broker finish --session {}`.",
+            "What now: entry {} is verified and nothing moved locally. {land}, or finish \
+             with `aethyme broker finish --session {session_id}`.",
             outcome.entry.id,
-            outcome.entry.session_id,
-            outcome.entry.session_id,
         );
     }
     // `--json` used to exit 0 for a rejected or conflicted entry, so a

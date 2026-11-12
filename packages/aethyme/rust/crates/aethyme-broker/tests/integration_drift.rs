@@ -12,7 +12,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::{AutomaticIntegrationCleanupState, Broker, StatusAdviceSeverity};
+use aethyme_broker::{Broker, IntegrationReconcileOptions, StatusAdviceSeverity};
 
 #[path = "common/isolation.rs"]
 mod isolation;
@@ -83,35 +83,6 @@ fn fixture(ahead: usize) -> (isolation::FixtureRepo, Broker) {
     (tmp, broker)
 }
 
-/// Phase 3.1. Nothing was promoted, so the reconciliation plan is empty — the
-/// case the previous guard required to be non-empty and therefore refused.
-#[test]
-fn automatic_cleanup_fast_forwards_when_integration_carries_nothing_of_its_own() {
-    let (tmp, mut broker) = fixture(3);
-    let upstream = git(tmp.path(), &["rev-parse", "refs/remotes/origin/main"]);
-
-    let report = broker
-        .auto_cleanup_landed_integration("refs/remotes/origin/main")
-        .unwrap();
-
-    assert_eq!(
-        report.state,
-        AutomaticIntegrationCleanupState::Cleaned,
-        "{}",
-        report.explanation
-    );
-    assert_eq!(report.new_integration, upstream);
-    assert!(
-        report.explanation.contains("fast-forwarded"),
-        "{}",
-        report.explanation
-    );
-    assert_eq!(
-        git(tmp.path(), &["rev-parse", "refs/heads/aethyme/integration"]),
-        upstream
-    );
-}
-
 /// The guard that matters: integration holding work upstream lacks is
 /// divergence, and must still refuse rather than fast-forward over it.
 #[test]
@@ -133,14 +104,15 @@ fn divergence_is_still_refused() {
     git(root, &["switch", "-q", "main"]);
 
     let report = broker
-        .auto_cleanup_landed_integration("refs/remotes/origin/main")
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "refs/remotes/origin/main".into(),
+            apply: true,
+            resolution_file: None,
+            confirm: None,
+        })
         .unwrap();
-    assert_eq!(
-        report.state,
-        AutomaticIntegrationCleanupState::Deferred,
-        "{}",
-        report.explanation
-    );
+    assert!(!report.safe, "{report:#?}");
+    assert!(!report.applied, "{report:#?}");
     assert_eq!(
         git(root, &["rev-parse", "refs/heads/aethyme/integration"]),
         diverged,

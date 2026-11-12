@@ -304,3 +304,192 @@ pub fn open_fixture_repository_path_broker(
         .expect("fixture repository has an owning parent directory");
     open_fixture_broker(repository, owner)
 }
+
+/// Git in `cwd` with a fixed identity, for the legacy-promotion helpers below.
+/// Returns trimmed stdout and fails the test on a nonzero exit.
+#[allow(dead_code)]
+fn legacy_git(cwd: &Path, args: &[&str], index: Option<&Path>, stdin: Option<&[u8]>) -> String {
+    use std::io::Write as _;
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    let mut child = command.spawn().expect("spawn git");
+    {
+        let mut pipe = child.stdin.take().expect("git stdin");
+        if let Some(input) = stdin {
+            pipe.write_all(input).expect("write git stdin");
+        }
+    }
+    let output = child.wait_with_output().expect("wait for git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Where `refs/heads/aethyme/integration` points, or the main checkout's
+/// `HEAD` when the ref does not exist yet: where local promotion started it.
+#[allow(dead_code)]
+fn legacy_integration_parent(root: &Path) -> String {
+    let output = Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/aethyme/integration",
+        ])
+        .current_dir(root)
+        .output()
+        .expect("run git rev-parse");
+    if output.status.success() {
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    } else {
+        legacy_git(root, &["rev-parse", "HEAD"], None, None)
+    }
+}
+
+/// Write one commit straight onto `refs/heads/aethyme/integration` with Git
+/// plumbing, touching no checkout and no index: work that sits on integration
+/// with no queue record, the way an operator's hand-made commit did when local
+/// promotion still existed. The parent is the current integration tip (or
+/// `HEAD` when the ref is absent) and the tree is the parent's with `files`
+/// written. Returns the new commit.
+#[allow(dead_code)]
+pub fn commit_onto_integration(root: &Path, files: &[(&str, &str)], message: &str) -> String {
+    let parent = legacy_integration_parent(root);
+    let index = PathBuf::from(legacy_git(
+        root,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "aethyme-fixture-index",
+        ],
+        None,
+        None,
+    ));
+    if index.exists() {
+        std::fs::remove_file(&index).expect("remove a stale fixture index");
+    }
+    legacy_git(root, &["read-tree", &parent], Some(&index), None);
+    for (path, content) in files {
+        let blob = legacy_git(
+            root,
+            &["hash-object", "-w", "--stdin"],
+            None,
+            Some(content.as_bytes()),
+        );
+        legacy_git(
+            root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{blob},{path}"),
+            ],
+            Some(&index),
+            None,
+        );
+    }
+    let tree = legacy_git(root, &["write-tree"], Some(&index), None);
+    std::fs::remove_file(&index).expect("remove the fixture index");
+    let commit = legacy_git(
+        root,
+        &["commit-tree", &tree, "-p", &parent, "-m", message],
+        None,
+        None,
+    );
+    legacy_git(
+        root,
+        &["update-ref", "refs/heads/aethyme/integration", &commit],
+        None,
+        None,
+    );
+    commit
+}
+
+/// Leave `entry` exactly as local promotion left an entry before it was
+/// removed, without promoting: its merged result committed onto
+/// `refs/heads/aethyme/integration` (parent: the integration tip, or `HEAD`
+/// when the ref is absent), the queue row `promoted` with `details_json.commit`
+/// naming that commit, and an outstanding path exposure for what it changed.
+/// Returns the integration commit.
+#[allow(dead_code)]
+pub fn promote_like_before_removal(root: &Path, entry: &aethyme_broker::MergeQueueEntry) -> String {
+    let parent = legacy_integration_parent(root);
+    let merged = legacy_git(
+        root,
+        &["merge-tree", "--write-tree", &parent, &entry.head_commit],
+        None,
+        None,
+    );
+    let tree = merged.lines().next().expect("merge-tree prints the tree");
+    let commit = legacy_git(
+        root,
+        &[
+            "commit-tree",
+            tree,
+            "-p",
+            &parent,
+            "-m",
+            &format!("Promote session {}", entry.session_id),
+        ],
+        None,
+        None,
+    );
+    legacy_git(
+        root,
+        &["update-ref", "refs/heads/aethyme/integration", &commit],
+        None,
+        None,
+    );
+    let paths: Vec<String> = legacy_git(
+        root,
+        &["diff", "--name-only", "--no-renames", &parent, &commit],
+        None,
+        None,
+    )
+    .lines()
+    .map(str::to_string)
+    .collect();
+    let database = rusqlite::Connection::open(
+        aethyme_broker::broker_db_path(root).expect("resolve the broker database"),
+    )
+    .expect("open the broker database");
+    let changed = database
+        .execute(
+            "UPDATE merge_queue
+                SET status = 'promoted',
+                    details_json = json_set(COALESCE(details_json, '{}'), '$.commit', ?2)
+              WHERE id = ?1",
+            rusqlite::params![entry.id, commit],
+        )
+        .expect("record the legacy promotion");
+    assert_eq!(changed, 1, "queue entry {} must exist", entry.id);
+    database
+        .execute(
+            "INSERT INTO entry_path_exposures
+                 (queue_entry_id, promotion_sha, paths_json, created_at, state)
+             VALUES (?1, ?2, ?3, 1, 'outstanding')",
+            rusqlite::params![
+                entry.id,
+                commit,
+                serde_json::to_string(&paths).expect("encode exposure paths"),
+            ],
+        )
+        .expect("record the legacy promotion's path exposure");
+    commit
+}
