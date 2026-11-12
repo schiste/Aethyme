@@ -101,6 +101,13 @@ impl Fixture {
             "status: {}",
             String::from_utf8_lossy(&status.stderr)
         );
+        // A verify-only repository with a fetched default branch no longer
+        // creates integration as a side effect of `status`; the leftover ref
+        // this case reconciles is one an older broker left behind.
+        git(
+            &fixture.repo,
+            &["update-ref", "refs/heads/aethyme/integration", "HEAD"],
+        );
         fixture
     }
 
