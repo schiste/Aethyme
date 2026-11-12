@@ -54,8 +54,20 @@ fn ref_exists(cwd: &Path, reference: &str) -> bool {
 }
 
 fn init_repo(root: &Path) {
+    init_repo_with(root, false);
+}
+
+/// [`init_repo`] in a repository that promotes to integration, for the cases
+/// whose subject is promotion itself; they go with the promotion engine.
+fn init_promoting_repo(root: &Path) {
+    init_repo_with(root, true);
+}
+
+fn init_repo_with(root: &Path, promote: bool) {
     sh(root, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(root);
+    if promote {
+        aethyme_testkit::promote_on_submit(root);
+    }
     std::fs::write(root.join("README.md"), "hello\n").unwrap();
     std::fs::write(root.join(".gitignore"), "/.aethyme/\n").unwrap();
     sh(root, &["add", "-A"]);
@@ -495,7 +507,13 @@ fn cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees() {
     std::fs::write(safe_path.join("safe.txt"), "safe\n").unwrap();
     sh(&safe_path, &["add", "safe.txt"]);
     sh(&safe_path, &["commit", "-qm", "safe work"]);
-    assert!(broker.submit(safe.id).unwrap().promoted);
+    aethyme_testkit::ensure_origin(broker.main_root());
+    broker.submit(safe.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &safe.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
     let finished = broker
         .finish_with_options(
             safe.id,
@@ -518,7 +536,13 @@ fn cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees() {
     std::fs::write(dirty_path.join("dirty.txt"), "committed\n").unwrap();
     sh(&dirty_path, &["add", "dirty.txt"]);
     sh(&dirty_path, &["commit", "-qm", "delivered work"]);
-    assert!(broker.submit(dirty.id).unwrap().promoted);
+    aethyme_testkit::ensure_origin(broker.main_root());
+    broker.submit(dirty.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &dirty.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
     assert_eq!(
         broker
             .finish_with_options(
@@ -723,7 +747,13 @@ fn cleanup_recovers_after_worktree_removal_and_prunes_only_the_exact_branch_tip(
     std::fs::write(worktree.join("renamed.bin"), [0_u8, 7, 255]).unwrap();
     sh(&worktree, &["add", "renamed.bin"]);
     sh(&worktree, &["commit", "-qm", "represented binary"]);
-    assert!(broker.submit(session.id).unwrap().promoted);
+    aethyme_testkit::ensure_origin(broker.main_root());
+    broker.submit(session.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &session.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
     assert!(
         broker
             .finish_with_options(
@@ -836,23 +866,31 @@ fn cleanup_distinguishes_pending_commits_from_missing_acceptance_provenance() {
     assert!(unproven_item.reason.contains("missing queue"));
 }
 
-/// Deleting a promoted session's acceptance bookkeeping used to leave it
-/// `unproven_provenance` even though its commits sit on the integration
-/// branch. The shared landing check (#408) reads the commits, not the
-/// bookkeeping, so the worktree is eligible and names where the work is.
+/// Deleting a landed session's acceptance bookkeeping used to leave it
+/// `unproven_provenance` even though its content sits on the default branch.
+/// The shared landing check (#408) reads the commits, not the bookkeeping, so
+/// the worktree is eligible and names where the work is. A squash merge whose
+/// branch was deleted on merge leaves content as the only evidence.
 #[test]
-fn missing_acceptance_bookkeeping_does_not_strand_work_on_integration() {
+fn missing_acceptance_bookkeeping_does_not_strand_landed_work() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker
-        .start_worktree("promoted then forgotten", None)
+        .start_worktree("landed then forgotten", None)
         .unwrap();
     let path = std::path::PathBuf::from(&session.worktree_path);
     std::fs::write(path.join("landed.txt"), "landed\n").unwrap();
     sh(&path, &["add", "landed.txt"]);
     sh(&path, &["commit", "-qm", "landed work"]);
-    assert!(broker.submit(session.id).unwrap().promoted);
+    aethyme_testkit::ensure_origin(broker.main_root());
+    broker.submit(session.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &session.branch,
+        aethyme_testkit::MergeStyle::Squash,
+    );
+    aethyme_testkit::delete_remote_branch(broker.main_root(), &session.branch);
     broker.close(session.id).unwrap();
     drop(broker);
 
@@ -1379,7 +1417,13 @@ fn finish_retention_policy_keeps_safe_worktrees_when_disabled_or_invalid() {
         std::fs::write(wt.join("landed.txt"), "delivered\n").unwrap();
         sh(&wt, &["add", "landed.txt"]);
         sh(&wt, &["commit", "-qm", "landed work"]);
-        assert!(broker.submit(session.id).unwrap().promoted);
+        aethyme_testkit::ensure_origin(broker.main_root());
+        broker.submit(session.id).unwrap();
+        aethyme_testkit::land_as_pull_request(
+            broker.main_root(),
+            &session.branch,
+            aethyme_testkit::MergeStyle::MergeCommit,
+        );
 
         let finished = broker.finish(session.id).unwrap();
         assert_eq!(finished.status, FinishStatus::Closed);
@@ -1721,7 +1765,7 @@ fn finish_counts_only_commits_missing_from_the_remote_default_branch() {
 }
 
 #[test]
-fn finish_closes_promoted_session_and_suggests_cleanup_when_integration_contains_it() {
+fn finish_closes_a_landed_session_and_suggests_cleanup_when_the_default_branch_contains_it() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     let wt = tmp.path().join("promoted-finish-wt");
@@ -1742,7 +1786,13 @@ fn finish_closes_promoted_session_and_suggests_cleanup_when_integration_contains
     std::fs::write(wt.join("done.txt"), "done\n").unwrap();
     sh(&wt, &["add", "-A"]);
     sh(&wt, &["commit", "-qm", "done"]);
-    assert!(broker.submit(session.id).unwrap().promoted);
+    aethyme_testkit::ensure_origin(broker.main_root());
+    broker.submit(session.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &session.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
     broker
         .store()
         .claim_lease(session.id, "src/", None)
@@ -1810,8 +1860,8 @@ fn finish_closes_promoted_session_and_suggests_cleanup_when_integration_contains
         vec![format!("aethyme broker finish cleanup {}", session.id)]
     );
     assert!(closed.delivery.submitted);
-    assert!(closed.delivery.promoted);
-    assert!(!closed.delivery.published);
+    assert!(!closed.delivery.promoted);
+    assert!(closed.delivery.published);
     assert!(!closed.pending_work.present);
     assert_eq!(closed.pending_work.dirty_path_count, 0);
     assert_eq!(closed.pending_work.unsubmitted_commits, 0);
@@ -1885,15 +1935,15 @@ fn finish_closes_promoted_session_and_suggests_cleanup_when_integration_contains
     let payload = finished[0].payload_json.as_deref().unwrap();
     let handoff: serde_json::Value = serde_json::from_str(payload).unwrap();
     assert_eq!(handoff["session_id"], session.id);
-    assert_eq!(handoff["delivery"]["promoted"], true);
-    assert_eq!(handoff["delivery"]["published"], false);
+    assert_eq!(handoff["delivery"]["promoted"], false);
+    assert_eq!(handoff["delivery"]["published"], true);
     assert_eq!(handoff["last_gate"]["cache_source"], "cache_hit");
     assert!(handoff["leases_held"].as_array().unwrap().len() >= 3);
     assert!(handoff.get("worktree_path").is_none());
     assert!(!payload.contains(tmp.path().to_str().unwrap()));
     assert!(!payload.contains("must/not/enter"));
 
-    sh(tmp.path(), &["merge", "--ff-only", "aethyme/integration"]);
+    sh(tmp.path(), &["merge", "--ff-only", "origin/main"]);
     let already = broker.finish(session.id).unwrap();
     assert_eq!(already.status, FinishStatus::AlreadyClosed);
     assert!(!already.cleanup_safe);
@@ -1912,7 +1962,7 @@ fn finish_closes_promoted_session_and_suggests_cleanup_when_integration_contains
 }
 
 #[test]
-fn finish_distinguishes_fully_published_work_from_local_promotion() {
+fn finish_reports_pull_request_landed_work_as_published() {
     let tmp = common::FixtureRepository::new();
     let remote = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
@@ -1940,17 +1990,19 @@ fn finish_distinguishes_fully_published_work_from_local_promotion() {
     std::fs::write(wt.join("published.txt"), "published\n").unwrap();
     sh(&wt, &["add", "-A"]);
     sh(&wt, &["commit", "-qm", "published"]);
-    assert!(broker.submit(session.id).unwrap().promoted);
-    sh(
-        tmp.path(),
-        &["push", "-q", "origin", "aethyme/integration:main"],
+    aethyme_testkit::ensure_origin(broker.main_root());
+    broker.submit(session.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &session.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
     );
-    sh(tmp.path(), &["fetch", "-q", "origin", "main"]);
 
     let closed = broker.finish(session.id).unwrap();
     assert_eq!(closed.status, FinishStatus::Closed);
     assert!(closed.delivery.submitted);
-    assert!(closed.delivery.promoted);
+    // Nothing is promoted locally: the pull request is the publication.
+    assert!(!closed.delivery.promoted);
     assert!(closed.delivery.published);
     assert!(closed.last_gate.is_none());
     assert!(closed.cleanup_safe);
@@ -2023,7 +2075,7 @@ fn status_flags_default_branch_commits_that_never_passed_through_submit() {
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::create_dir_all(&remote).unwrap();
     sh(&remote, &["init", "--bare", "-q", "-b", "main"]);
-    init_repo(&repo);
+    init_promoting_repo(&repo);
     sh(
         &repo,
         &["remote", "add", "origin", remote.to_str().unwrap()],

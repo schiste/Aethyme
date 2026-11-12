@@ -57,11 +57,11 @@ impl Fixture {
 fn fixture() -> (Fixture, Broker, i64, PathBuf) {
     let tmp = Fixture::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
+    aethyme_testkit::ensure_origin(tmp.path());
     std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
     std::fs::write(
         tmp.path().join(".aethyme/broker.toml"),
@@ -75,7 +75,12 @@ fn fixture() -> (Fixture, Broker, i64, PathBuf) {
     std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
     git(&worktree, &["add", "done.txt"]);
     git(&worktree, &["commit", "-qm", "done"]);
-    assert!(broker.submit(delivered.id).unwrap().promoted);
+    broker.submit(delivered.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &delivered.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
     assert!(
         broker
             .finish_with_options(
@@ -718,7 +723,6 @@ fn ephemeral_repositories_never_anchor_worktrees_in_durable_host_state() {
     // supplies a library override and therefore cannot exercise that default.
     let tmp = Fixture::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     git(tmp.path(), &["add", "README.md"]);
     git(tmp.path(), &["commit", "-qm", "init"]);

@@ -51,11 +51,11 @@ fn git(repo: &Path, args: &[&str]) {
 
 fn fixture(tmp: &Path) {
     git(tmp, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(tmp);
     std::fs::write(tmp.join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
     git(tmp, &["add", "-A"]);
     git(tmp, &["commit", "-qm", "init"]);
+    aethyme_testkit::ensure_origin(tmp);
 }
 
 /// Start a session and land its work, leaving the worktree on disk.
@@ -65,7 +65,12 @@ fn landed_session(broker: &mut Broker, tmp: &Path) -> i64 {
     std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
     git(&worktree, &["add", "done.txt"]);
     git(&worktree, &["commit", "-qm", "done"]);
-    assert!(broker.submit(session.id).unwrap().promoted);
+    broker.submit(session.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &session.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
     let _ = tmp;
     session.id
 }

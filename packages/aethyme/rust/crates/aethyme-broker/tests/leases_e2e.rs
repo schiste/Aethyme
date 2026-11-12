@@ -24,8 +24,21 @@ fn sh(cwd: &Path, args: &[&str]) {
 }
 
 fn init_repo(root: &Path) {
+    init_repo_with(root, false);
+}
+
+/// [`init_repo`] in a repository that promotes to integration, for the one
+/// case about starting from an integration branch; it goes with the
+/// promotion engine.
+fn init_promoting_repo(root: &Path) {
+    init_repo_with(root, true);
+}
+
+fn init_repo_with(root: &Path, promote: bool) {
     sh(root, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(root);
+    if promote {
+        aethyme_testkit::promote_on_submit(root);
+    }
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/auth.py"), "a\n").unwrap();
     std::fs::write(root.join("src/other.py"), "b\n").unwrap();
@@ -216,7 +229,6 @@ fn explicit_directory_claim_overlaps_other_sessions_files() {
         "[leases]\nignore = [\"src/\"]\n",
     )
     .unwrap();
-    aethyme_testkit::promote_on_submit(tmp.path());
     let overlaps = broker.refresh_leases().unwrap();
     assert!(
         overlaps.is_empty(),
@@ -531,13 +543,16 @@ fn adoption_time_foreign_file_blocks_submit_until_explicitly_claimed() {
     assert_eq!(report.foreign_paths, vec!["foreign.txt"]);
 
     broker.claim_lease(session.id, "foreign.txt", None).unwrap();
-    assert!(broker.submit(session.id).unwrap().promoted);
+    assert_eq!(
+        broker.submit(session.id).unwrap().entry.status,
+        aethyme_broker::MergeStatus::Verified
+    );
 }
 
 // ── #41: leases derive from merge-base, self-healing after rebases ─────
 
 #[test]
-fn rebase_onto_integration_does_not_inflate_leases() {
+fn rebase_onto_the_default_branch_does_not_inflate_leases() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     let worktrees = tempfile::tempdir().unwrap();
@@ -547,21 +562,27 @@ fn rebase_onto_integration_does_not_inflate_leases() {
     assert!(!wt2_path.exists());
     let mut broker = Broker::open(tmp.path()).unwrap();
 
-    // Session 1 promotes work on file_one — integration now contains it.
+    // Session 1 lands work on file_one by pull request — the fetched
+    // default branch now contains it.
+    aethyme_testkit::ensure_origin(tmp.path());
     let wt1 = add_worktree_at(tmp.path(), "one", &wt1_path);
     let s1 = broker.adopt(&wt1, Some("one")).unwrap();
     std::fs::write(wt1.join("file_one.txt"), "one\n").unwrap();
     sh(&wt1, &["add", "-A"]);
     sh(&wt1, &["commit", "-qm", "one"]);
-    assert!(broker.submit(s1.id).unwrap().promoted);
+    broker.submit(s1.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &s1.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
 
-    // Session 2 rebases onto the integration branch (as the
-    // action-required flow instructs), bringing session 1's promoted
-    // commit into its history, then does its own work on file_two.
+    // Session 2 rebases onto the fetched default branch (as `broker sync`
+    // does), bringing session 1's landed commits into its history, then
+    // does its own work on file_two.
     let wt2 = add_worktree_at(tmp.path(), "two", &wt2_path);
     let s2 = broker.adopt(&wt2, Some("two")).unwrap();
-    sh(&wt2, &["fetch", ".", "aethyme/integration"]);
-    sh(&wt2, &["rebase", "FETCH_HEAD"]);
+    sh(&wt2, &["rebase", "origin/main"]);
     std::fs::write(wt2.join("file_two.txt"), "two\n").unwrap();
     sh(&wt2, &["add", "-A"]);
     sh(&wt2, &["commit", "-qm", "two"]);
@@ -579,7 +600,7 @@ fn rebase_onto_integration_does_not_inflate_leases() {
     );
     assert!(
         !s2_paths.contains(&"file_one.txt"),
-        "promoted work brought in by the rebase must NOT appear as a \
+        "landed work brought in by the rebase must NOT appear as a \
          phantom lease (#41): {s2_paths:?}"
     );
 }
@@ -587,7 +608,7 @@ fn rebase_onto_integration_does_not_inflate_leases() {
 #[test]
 fn equivalent_tree_publication_starts_from_integration_without_phantom_leases() {
     let tmp = tempfile::tempdir().unwrap();
-    init_repo(tmp.path());
+    init_promoting_repo(tmp.path());
 
     let integration_builder_owner = tempfile::tempdir().unwrap();
     let integration_builder_path = integration_builder_owner

@@ -52,6 +52,16 @@ struct Fixture {
 /// tracked, so the broker has an upstream to compare against. A non-empty
 /// `config` is committed as `.aethyme/config.toml` before the push.
 fn fixture(config: &str) -> Fixture {
+    fixture_with(config, false)
+}
+
+/// [`fixture`] in a repository that promotes to integration. Only the two
+/// integration-backlog cases need it; they go with the promotion engine.
+fn promoting_fixture() -> Fixture {
+    fixture_with("", true)
+}
+
+fn fixture_with(config: &str, promote: bool) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let origin = tmp.path().join("origin.git");
     let repo = tmp.path().join("repo");
@@ -61,7 +71,9 @@ fn fixture(config: &str) -> Fixture {
         &["init", "-q", "--bare", "-b", "main", "origin.git"],
     );
     git(&repo, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(&repo);
+    if promote {
+        aethyme_testkit::promote_on_submit(&repo);
+    }
     std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     git(&repo, &["add", "-A"]);
@@ -71,7 +83,6 @@ fn fixture(config: &str) -> Fixture {
         // default branch, and finish reads it the same way.
         std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
         std::fs::write(repo.join(".aethyme/config.toml"), config).unwrap();
-        aethyme_testkit::promote_on_submit(&repo);
         git(&repo, &["add", "-f", ".aethyme/config.toml"]);
         git(&repo, &["commit", "-qm", "enable the push lane"]);
     }
@@ -181,7 +192,7 @@ fn a_commit_whose_patch_is_already_upstream_is_not_counted() {
 
 #[test]
 fn integration_ahead_of_upstream_is_reported_with_its_age() {
-    let fixture = fixture("");
+    let fixture = promoting_fixture();
     let (session, _, _) = session_with_commit(&fixture.repo, "work.txt");
     let mut broker = Broker::open(&fixture.repo).unwrap();
     assert!(broker.submit(session).unwrap().promoted);
@@ -212,7 +223,7 @@ fn integration_ahead_of_upstream_is_reported_with_its_age() {
 /// every worktree that started after them.
 #[test]
 fn a_new_session_does_not_inherit_unpublished_integration_work() {
-    let fixture = fixture("");
+    let fixture = promoting_fixture();
     let (first, _, _) = session_with_commit(&fixture.repo, "work.txt");
     let mut broker = Broker::open(&fixture.repo).unwrap();
     assert!(broker.submit(first).unwrap().promoted);
@@ -234,19 +245,21 @@ fn a_new_session_does_not_inherit_unpublished_integration_work() {
 
 const PUSH_LANE: &str = "[delivery]\npush_session_branches = true\n";
 
-/// Promoted work is accepted locally but exists on no remote; under the push
-/// lane that is exactly the pile-up finish must not close over.
-fn promoted_unpushed_session(fixture: &Fixture) -> (i64, PathBuf, String) {
+/// Work merged into the local default branch is delivered there but exists
+/// on no remote; under the push lane that is exactly the pile-up finish must
+/// not close over.
+fn landed_unpushed_session(fixture: &Fixture) -> (i64, PathBuf, String) {
     let (session, worktree, branch) = session_with_commit(&fixture.repo, "work.txt");
     let mut broker = Broker::open(&fixture.repo).unwrap();
-    assert!(broker.submit(session).unwrap().promoted);
+    broker.submit(session).unwrap();
+    git(&fixture.repo, &["merge", "-q", "--ff-only", &branch]);
     (session, worktree, branch)
 }
 
 #[test]
 fn finish_refuses_unpushed_work_under_the_push_lane() {
     let fixture = fixture(PUSH_LANE);
-    let (session, worktree, _) = promoted_unpushed_session(&fixture);
+    let (session, worktree, _) = landed_unpushed_session(&fixture);
     let id = session.to_string();
 
     let output = run(&fixture.repo, &["finish", "--session", &id, "--json"]);
@@ -309,7 +322,7 @@ fn finish_refuses_unpushed_work_under_the_push_lane() {
 #[test]
 fn finish_closes_pushed_work_under_the_push_lane() {
     let fixture = fixture(PUSH_LANE);
-    let (session, worktree, branch) = promoted_unpushed_session(&fixture);
+    let (session, worktree, branch) = landed_unpushed_session(&fixture);
     git(&worktree, &["push", "-q", "origin", &branch]);
 
     let report = json(&run(
@@ -325,7 +338,7 @@ fn finish_closes_pushed_work_under_the_push_lane() {
 #[test]
 fn finish_ignores_unpushed_work_without_the_push_lane() {
     let fixture = fixture("");
-    let (session, _, _) = promoted_unpushed_session(&fixture);
+    let (session, _, _) = landed_unpushed_session(&fixture);
 
     let report = json(&run(
         &fixture.repo,
@@ -338,7 +351,7 @@ fn finish_ignores_unpushed_work_without_the_push_lane() {
 #[test]
 fn abandoning_unpushed_work_needs_a_reason_and_is_recorded() {
     let fixture = fixture(PUSH_LANE);
-    let (session, _, branch) = promoted_unpushed_session(&fixture);
+    let (session, _, branch) = landed_unpushed_session(&fixture);
     let id = session.to_string();
 
     let bare = run(&fixture.repo, &["finish", "--session", &id, "--abandon"]);

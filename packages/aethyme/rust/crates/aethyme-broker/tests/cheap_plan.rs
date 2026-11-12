@@ -55,11 +55,11 @@ fn fixture(
 ) -> (common::FixtureRepository, Broker) {
     let tmp = common::FixtureRepository::from_tempdir(tempfile::tempdir().unwrap());
     git(tmp.path(), &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
+    aethyme_testkit::ensure_origin(tmp.path());
     write_policy(tmp.path(), retained_bytes_budget, routine_size_budget_ms);
     let broker = common::open_fixture_repository_broker(&tmp)
         .unwrap()
@@ -77,7 +77,12 @@ fn deliver(broker: &mut Broker, task: &str, payload_bytes: usize) -> i64 {
     std::fs::write(worktree.join("payload.bin"), vec![b'x'; payload_bytes]).unwrap();
     git(&worktree, &["add", "payload.bin"]);
     git(&worktree, &["commit", "-qm", task]);
-    assert!(broker.submit(session.id).unwrap().promoted);
+    broker.submit(session.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &session.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
     assert!(
         broker
             .finish_with_options(

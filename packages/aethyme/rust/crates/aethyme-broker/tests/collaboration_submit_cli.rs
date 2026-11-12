@@ -48,7 +48,6 @@ impl Fixture {
         };
         let repo = fixture.repo.path();
         git(repo, &["init", "-q", "-b", "main"]);
-        aethyme_testkit::promote_on_submit(repo);
         std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
         std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
         std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
@@ -90,7 +89,6 @@ impl Fixture {
 
     fn configure(&self, config: &str) {
         std::fs::write(self.repo.path().join(".aethyme/config.toml"), config).unwrap();
-        aethyme_testkit::promote_on_submit(self.repo.path());
     }
 
     fn cli(&self, args: &[&str], container: Option<&Path>) -> Output {
@@ -179,7 +177,7 @@ fn off_is_the_legacy_submit() {
 
     for config in [
         None,
-        Some("[promote]\nmode = \"auto\"\n"),
+        Some("[promote]\nmode = \"verify-only\"\n"),
         Some("[collaboration]\nproject = \"proj-test\"\n"),
         Some("[collaboration]\ncapture = \"off\"\nproject = \"proj-test\"\n"),
     ] {
@@ -187,7 +185,7 @@ fn off_is_the_legacy_submit() {
         let session = fixture.session("work");
         let (code, outcome, order) = fixture.submit_raw(&session, None);
         assert_eq!(code, 0, "{config:?}");
-        assert_eq!(outcome["promoted"], true, "{config:?}");
+        assert_eq!(outcome["entry"]["status"], "verified", "{config:?}");
         // The same fields, in the same order, as the outcome inside an
         // advisory report: the legacy object is not restructured.
         assert_eq!(order, legacy_keys, "{config:?}");
@@ -209,7 +207,7 @@ fn advisory_capture_reports_a_receipt_beside_the_legacy_verdict() {
     let session = fixture.session("work");
     let (code, outcome) = fixture.submit_json(&session, None);
     assert_eq!(code, 0);
-    assert_eq!(outcome["promoted"], true);
+    assert_eq!(outcome["entry"]["status"], "verified");
     let capture = &outcome["collaboration_capture"];
     assert_eq!(capture["schema"], "aethyme.submit-capture/experimental-v0");
     assert_eq!(capture["policy"], "advisory");
@@ -238,12 +236,12 @@ fn advisory_capture_reports_a_receipt_beside_the_legacy_verdict() {
 /// nothing about the legacy outcome, in either direction of the verdict.
 #[test]
 fn a_failed_advisory_capture_never_changes_the_legacy_verdict() {
-    // No project: not configured, still promoted with exit 0.
+    // No project: not configured, still verified with exit 0.
     let fixture = Fixture::new(Some("[collaboration]\ncapture = \"advisory\"\n"), false);
     let session = fixture.session("work");
     let (code, outcome) = fixture.submit_json(&session, None);
     assert_eq!(code, 0);
-    assert_eq!(outcome["promoted"], true);
+    assert_eq!(outcome["entry"]["status"], "verified");
     let capture = &outcome["collaboration_capture"];
     assert_eq!(capture["status"], "not_configured");
     assert_eq!(capture["code"], "no_project");
@@ -255,7 +253,7 @@ fn a_failed_advisory_capture_never_changes_the_legacy_verdict() {
     let session = fixture.session("work");
     let (code, outcome) = fixture.submit_json(&session, Some(fixture.state.path()));
     assert_eq!(code, 0);
-    assert_eq!(outcome["promoted"], true);
+    assert_eq!(outcome["entry"]["status"], "verified");
     let capture = &outcome["collaboration_capture"];
     assert_eq!(capture["code"], "overlaps_cleanup_root", "{capture:#}");
     assert!(capture["next_action"].is_string());
@@ -326,7 +324,7 @@ fn an_acknowledged_required_capture_lets_the_submit_proceed() {
     let session = fixture.session("work");
     let (code, outcome) = fixture.submit_json(&session, None);
     assert_eq!(code, 0);
-    assert_eq!(outcome["promoted"], true);
+    assert_eq!(outcome["entry"]["status"], "verified");
     assert_eq!(outcome["collaboration_capture"]["policy"], "required");
     assert_eq!(outcome["collaboration_capture"]["status"], "acknowledged");
 }

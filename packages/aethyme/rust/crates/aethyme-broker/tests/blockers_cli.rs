@@ -46,7 +46,6 @@ impl Fixture {
         let repo = tmp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);
-        aethyme_testkit::promote_on_submit(&repo);
         std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
         std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
         git(&repo, &["add", "-A"]);
@@ -937,7 +936,7 @@ fn status_json_carries_the_blockers_and_advice_names_unblock() {
 /// nowhere else, `finish` refuses, so the blocker and the refusal must name
 /// the step that delivers the work instead.
 #[test]
-fn a_stale_lease_names_submit_not_finish_while_its_session_holds_undelivered_work() {
+fn a_stale_lease_names_delivery_not_finish_while_its_session_holds_undelivered_work() {
     let fixture = Fixture::new();
     let id = fixture.session_id;
     let mut broker = fixture.broker();
@@ -986,7 +985,9 @@ fn a_stale_lease_names_submit_not_finish_while_its_session_holds_undelivered_wor
         &["commit", "-qm", "work awaiting delivery"],
     );
 
-    let submit = format!("aethyme broker submit --session {id}");
+    // Submitting again cannot deliver work in a repository that lands by
+    // pull request; proving it landed can.
+    let submit = format!("aethyme broker advanced representation scan --session {id}");
     assert!(fixture.blocker(&blocker_id).is_none());
     assert!(fixture.blocker(&sibling_id).is_none());
 
@@ -999,7 +1000,7 @@ fn a_stale_lease_names_submit_not_finish_while_its_session_holds_undelivered_wor
         reason.contains("1 committed change not yet delivered")
             && reason.ends_with(&submit)
             && !reason.contains(&finish),
-        "the refusal names submit, not a finish that would refuse: {reason}"
+        "the refusal names the delivery proof, not a finish that would refuse: {reason}"
     );
 
     let sibling_output = fixture.run(&["unblock", &sibling_id, "--json"]);

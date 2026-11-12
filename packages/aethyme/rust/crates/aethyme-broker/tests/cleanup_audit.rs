@@ -76,7 +76,6 @@ fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         tmp.path(),
         &["clone", "-q", origin.to_str().unwrap(), "repo"],
     );
-    aethyme_testkit::promote_on_submit(&repo);
     (tmp, publisher, repo)
 }
 
@@ -333,7 +332,7 @@ fn rebased_tree_mismatch_is_retained_by_scan_audit_and_plan() {
 }
 
 #[test]
-fn unique_dirty_integration_only_and_live_are_distinct_dispositions() {
+fn unique_dirty_remote_branch_only_and_live_are_distinct_dispositions() {
     let (_tmp, _publisher, repo) = fixture();
     let mut broker = isolation::open(&repo);
 
@@ -349,11 +348,8 @@ fn unique_dirty_integration_only_and_live_are_distinct_dispositions() {
     std::fs::write(dirty_path.join("scratch-2.txt"), "y\n").unwrap();
     broker.close(dirty.id).unwrap();
 
-    let promoted = broker.start_worktree("promoted work", None).unwrap();
-    let promoted_path = PathBuf::from(&promoted.worktree_path);
-    commit(&promoted_path, "promoted.txt", "done\n", "promoted commit");
-    assert!(broker.submit(promoted.id).unwrap().promoted);
-    broker.close(promoted.id).unwrap();
+    // No `integration_only` session: nothing is promoted to a local
+    // integration branch any more, so work is either on a remote or not.
 
     // Pushed to its own remote branch (an open pull request's head): not in
     // the target, but not lost with the checkout either.
@@ -382,19 +378,6 @@ fn unique_dirty_integration_only_and_live_are_distinct_dispositions() {
     assert_eq!((item.tracked_changes, item.untracked_files), (1, 2));
     assert!(!item.removable);
 
-    // Promoted to integration, never published upstream.
-    let item = item_for(&audit, promoted.id);
-    assert_eq!(
-        item.disposition,
-        AuditDisposition::IntegrationOnly,
-        "{item:#?}"
-    );
-    assert!(matches!(
-        &item.committed,
-        Some(aethyme_broker::CommittedWork::IntegrationOnly { refs })
-            if refs.iter().any(|name| name.contains("aethyme/integration"))
-    ));
-
     let item = item_for(&audit, pushed.id);
     assert_eq!(
         item.disposition,
@@ -414,7 +397,6 @@ fn unique_dirty_integration_only_and_live_are_distinct_dispositions() {
     for (name, count) in [
         ("worktree_only", 1),
         ("dirty", 1),
-        ("integration_only", 1),
         ("remote_branch_only", 1),
         ("live", 1),
     ] {
@@ -523,7 +505,12 @@ fn target_advancement_after_review_invalidates_the_apply_digest() {
     let session = broker.start_worktree("represented work", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     commit(&worktree, "done.txt", "done\n", "done");
-    assert!(broker.submit(session.id).unwrap().promoted);
+    broker.submit(session.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &session.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
     broker.close(session.id).unwrap();
     drop(broker);
 
@@ -550,7 +537,9 @@ fn target_advancement_after_review_invalidates_the_apply_digest() {
     );
     assert!(reviewed["target"]["proof_commit"].is_string());
 
-    // The target moves after review.
+    // The target moves after review. The publisher first picks up the
+    // merged pull request, as any later contributor's checkout would.
+    git(&publisher, &["pull", "-q", "--ff-only"]);
     commit(&publisher, "other.txt", "other\n", "someone else lands");
     git(&publisher, &["push", "-q", "origin", "main"]);
     git(&repo, &["fetch", "-q", "origin"]);
@@ -617,7 +606,6 @@ fn audit_is_scoped_to_the_named_repository_and_renders_a_summary() {
         "[cleanup]\nauto_remove = false\n",
     )
     .unwrap();
-    aethyme_testkit::promote_on_submit(&repo);
 
     // Run from an unrelated directory, naming the repository explicitly.
     let output = isolation::command(

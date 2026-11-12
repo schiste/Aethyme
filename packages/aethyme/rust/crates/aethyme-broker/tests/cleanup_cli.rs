@@ -49,11 +49,11 @@ fn clear_git_environment(command: &mut Command) {
 fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
+    aethyme_testkit::ensure_origin(tmp.path());
 
     let mut broker = Broker::open(tmp.path()).unwrap();
     let session = broker.start_worktree("cleanup CLI fixture", None).unwrap();
@@ -61,7 +61,12 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
     std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
     git(&worktree, &["add", "done.txt"]);
     git(&worktree, &["commit", "-qm", "done"]);
-    assert!(broker.submit(session.id).unwrap().promoted);
+    broker.submit(session.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &session.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
     assert!(
         broker
             .finish_with_options(
@@ -225,7 +230,6 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
 fn bulk_cleanup_rejects_force_and_session_mixups() {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
@@ -247,7 +251,6 @@ fn bulk_cleanup_rejects_force_and_session_mixups() {
 fn single_session_cleanup_refuses_sweep_only_flags() {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
@@ -274,11 +277,11 @@ fn single_session_cleanup_refuses_sweep_only_flags() {
 fn bulk_cleanup_confirmation_binds_the_exact_reviewed_branch_tip() {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
+    aethyme_testkit::ensure_origin(tmp.path());
 
     let mut broker = Broker::open(tmp.path()).unwrap();
     let session = broker.start_worktree("cleanup confirmation", None).unwrap();
@@ -286,7 +289,12 @@ fn bulk_cleanup_confirmation_binds_the_exact_reviewed_branch_tip() {
     std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
     git(&worktree, &["add", "done.txt"]);
     git(&worktree, &["commit", "-qm", "done"]);
-    assert!(broker.submit(session.id).unwrap().promoted);
+    broker.submit(session.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &session.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
     assert!(
         broker
             .finish_with_options(
@@ -365,11 +373,11 @@ fn an_interrupted_worktree_removal_is_judged_and_completed_rather_than_refused()
     }
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
+    aethyme_testkit::ensure_origin(tmp.path());
 
     let mut broker = Broker::open(tmp.path()).unwrap();
     let session = broker.start_worktree("interrupted removal", None).unwrap();
@@ -381,7 +389,12 @@ fn an_interrupted_worktree_removal_is_judged_and_completed_rather_than_refused()
     std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
     git(&worktree, &["add", "done.txt"]);
     git(&worktree, &["commit", "-qm", "done"]);
-    assert!(broker.submit(session.id).unwrap().promoted);
+    broker.submit(session.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &session.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
     let worktree_text = worktree.to_string_lossy().into_owned();
     git(
         tmp.path(),
@@ -483,7 +496,6 @@ fn a_squash_merged_session_is_eligible_on_its_recorded_representation() {
         &["init", "-q", "--bare", "-b", "main", "origin.git"],
     );
     git(&checkout, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(&checkout);
     std::fs::write(checkout.join("README.md"), "fixture\n").unwrap();
     std::fs::write(checkout.join(".gitignore"), "/.aethyme/\n").unwrap();
     git(&checkout, &["add", "-A"]);
