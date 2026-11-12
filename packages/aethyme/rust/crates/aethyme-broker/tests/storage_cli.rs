@@ -85,7 +85,7 @@ fn fixture() -> (TestRepo, tempfile::TempDir) {
 fn enroll(repo: &Path) {
     std::fs::write(
         repo.join(".aethyme/config.toml"),
-        "[promote]\nmode = \"auto\"\n",
+        "schema = 1\n",
     )
     .unwrap();
     std::fs::write(

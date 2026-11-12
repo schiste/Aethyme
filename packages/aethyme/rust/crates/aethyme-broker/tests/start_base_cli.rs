@@ -58,9 +58,22 @@ fn json(output: &Output) -> serde_json::Value {
 }
 
 fn fixture() -> tempfile::TempDir {
+    fixture_with(false)
+}
+
+/// [`fixture`] in a repository that promotes to integration, for the cases
+/// about choosing integration as the start base; they go with the promotion
+/// engine.
+fn promoting_fixture() -> tempfile::TempDir {
+    fixture_with(true)
+}
+
+fn fixture_with(promote: bool) -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(tmp.path());
+    if promote {
+        aethyme_testkit::promote_on_submit(tmp.path());
+    }
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "README.md", ".gitignore"]);
@@ -180,7 +193,7 @@ fn verify_only_starts_from_the_fetched_default_branch() {
 /// recover, and `status` keeps saying so.
 #[test]
 fn a_promoting_repository_skips_an_integration_that_fell_behind() {
-    let tmp = fixture();
+    let tmp = promoting_fixture();
     let (integration, upstream) = integration_behind_upstream(tmp.path());
 
     let value = json(&run(tmp.path(), &["start", "--task", "behind", "--json"]));
@@ -223,7 +236,7 @@ fn a_promoting_repository_skips_an_integration_that_fell_behind() {
 /// repository: sessions build on verified promotions, as before.
 #[test]
 fn a_current_integration_is_still_the_base() {
-    let tmp = fixture();
+    let tmp = promoting_fixture();
     let upstream = git_output(tmp.path(), &["rev-parse", "HEAD"]);
     track_origin_main(tmp.path(), &upstream);
     let integration = promote_onto(tmp.path(), &upstream, 2);
@@ -415,7 +428,7 @@ fn promote_mode_is_read_from_the_default_branch_before_the_working_tree() {
 /// changes: those would become leases and overlaps it never touched.
 #[test]
 fn a_session_started_from_upstream_leases_only_its_own_changes() {
-    let tmp = fixture();
+    let tmp = promoting_fixture();
     integration_behind_upstream(tmp.path());
 
     let value = json(&run(
