@@ -199,8 +199,10 @@ pub const WRAPPED_COMMAND_FAILED: &str = "wrapped_command_failed";
 pub fn failure_reasons<'a>(
     failures: impl Iterator<Item = (&'a str, u64, &'a str, Option<&'a str>)>,
 ) -> serde_json::Value {
-    let mut commands: BTreeMap<&str, (BTreeMap<(String, &'static str), u64>, u64)> =
-        BTreeMap::new();
+    /// Per command: how often each (reason, exit class) occurred, and how
+    /// many failures were the wrapped command's own.
+    type Tally = (BTreeMap<(String, &'static str), u64>, u64);
+    let mut commands: BTreeMap<&str, Tally> = BTreeMap::new();
     for (command, exit, message, class) in failures {
         let (reasons, wrapped) = commands.entry(command).or_default();
         if class == Some(WRAPPED_COMMAND_FAILED) {
