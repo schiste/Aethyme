@@ -402,6 +402,10 @@ struct GitTransferTrace {
     pre_push_hook: bool,
     pre_push_hook_failed: bool,
     remote_transport: bool,
+    /// When the top-level `git push` finished reading the remote's refs, in
+    /// ms since that process started: the point where Git runs `pre-push`.
+    /// Telemetry only.
+    remote_refs_read_ms: Option<u64>,
     /// When the top-level `git push` started its pre-push hook, in ms since
     /// that process started. Telemetry only.
     pre_push_hook_started_ms: Option<u64>,
@@ -409,22 +413,46 @@ struct GitTransferTrace {
     pre_push_hook_ms: Option<u64>,
 }
 
-/// Trace2 seconds (`t_abs`, `t_rel`) as whole milliseconds.
-fn trace2_ms(value: Option<&serde_json::Value>) -> Option<u64> {
+/// Trace2 seconds (`t_abs`, `t_rel`) as whole microseconds.
+fn trace2_us(value: Option<&serde_json::Value>) -> Option<u64> {
     let seconds = value?.as_f64()?;
-    (seconds.is_finite() && seconds >= 0.0).then(|| (seconds * 1000.0).round() as u64)
+    (seconds.is_finite() && seconds >= 0.0).then(|| (seconds * 1_000_000.0).round() as u64)
+}
+
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+/// A Trace2 `time` field (`2026-11-12T21:33:06.477074Z`, always UTC) as
+/// microseconds since that day's midnight. Differences between two of these
+/// are taken modulo one day, which is exact for any push shorter than a day.
+fn trace2_time_of_day_us(value: Option<&serde_json::Value>) -> Option<i64> {
+    let clock = value?.as_str()?.split_once('T')?.1.strip_suffix('Z')?;
+    let (hms, fraction) = clock.split_once('.').unwrap_or((clock, ""));
+    let mut parts = hms.split(':').map(|part| part.parse::<i64>().ok());
+    let (hours, minutes, seconds) = (parts.next()??, parts.next()??, parts.next()??);
+    if parts.next().is_some() || fraction.len() > 9 || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let micros = format!("{fraction:0<6}")[..6].parse::<i64>().ok()?;
+    Some(((hours * 60 + minutes) * 60 + seconds) * 1_000_000 + micros)
 }
 
 /// Split a push process's wall time at its pre-push hook: before it (Git
 /// connecting and reading the remote's refs), the hook itself, and after it
-/// (sending the pack and the remote updating the ref). `None` when no hook
-/// ran in the top-level process, e.g. with hooks run outside the lock.
+/// (sending the pack and the remote updating the ref). A push that ran no
+/// hook (none installed, or hooks ran outside the lock) splits at the end of
+/// the ref read with a zero hook. `None` when the trace shows neither point.
 fn push_process_split(
     trace: &GitTransferTrace,
     process: std::time::Duration,
 ) -> Option<[(&'static str, std::time::Duration); 3]> {
-    let before = std::time::Duration::from_millis(trace.pre_push_hook_started_ms?);
-    let hook = std::time::Duration::from_millis(trace.pre_push_hook_ms?);
+    let (before, hook) = match trace.pre_push_hook_started_ms {
+        Some(started) => (started, trace.pre_push_hook_ms?),
+        None if !trace.pre_push_hook => (trace.remote_refs_read_ms?, 0),
+        None => return None,
+    };
+    let before = std::time::Duration::from_millis(before);
+    let hook = std::time::Duration::from_millis(hook);
     Some([
         ("push_git_process_before_hook", before),
         ("push_git_process_hook", hook),
@@ -463,8 +491,25 @@ fn inspect_git_transfer_trace(path: &Path) -> GitTransferTrace {
     let Ok(contents) = std::fs::read_to_string(path) else {
         return GitTransferTrace::default();
     };
-    let mut pre_push_child_ids = BTreeSet::new();
+    parse_git_transfer_trace(&contents)
+}
+
+fn parse_git_transfer_trace(contents: &str) -> GitTransferTrace {
+    // Child ids are numbered per process, so a nested Git command's child 1
+    // is not the top-level push's child 1: key them by session id too.
+    let mut pre_push_children = BTreeSet::new();
     let mut trace = GitTransferTrace::default();
+    // The top-level process's start, as (wall clock of day, `t_abs`) in us.
+    // Trace2 puts no process-relative clock on `child_start` or
+    // `region_leave`, only the wall-clock `time`, so offsets are measured
+    // from the `start` event, which carries both.
+    let mut process_start: Option<(i64, u64)> = None;
+    let since_start_ms = |event: &serde_json::Value, start: Option<(i64, u64)>| {
+        let (start_time, start_abs) = start?;
+        let at = trace2_time_of_day_us(event.get("time"))?;
+        let elapsed = u64::try_from((at - start_time).rem_euclid(MICROS_PER_DAY)).ok()?;
+        Some((elapsed.saturating_add(start_abs) + 500) / 1000)
+    };
     for line in contents.lines() {
         let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -472,11 +517,21 @@ fn inspect_git_transfer_trace(path: &Path) -> GitTransferTrace {
         // A hook's own Git commands inherit GIT_TRACE2_EVENT and append to the
         // same file with a nested `parent/child` session id; their clocks
         // start at their own launch, so only top-level events are timed.
-        let top_level = event
-            .get("sid")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(|sid| !sid.contains('/'));
+        let sid = event.get("sid").and_then(serde_json::Value::as_str);
+        let top_level = sid.is_none_or(|sid| !sid.contains('/'));
         match event.get("event").and_then(serde_json::Value::as_str) {
+            Some("start") if top_level && process_start.is_none() => {
+                process_start =
+                    trace2_time_of_day_us(event.get("time")).zip(trace2_us(event.get("t_abs")));
+            }
+            Some("region_leave")
+                if top_level
+                    && trace.remote_refs_read_ms.is_none()
+                    && event.get("label").and_then(serde_json::Value::as_str)
+                        == Some("get_refs_list") =>
+            {
+                trace.remote_refs_read_ms = since_start_ms(&event, process_start);
+            }
             Some("child_start") => {
                 let Some(arguments) = event
                     .get("argv")
@@ -498,10 +553,10 @@ fn inspect_git_transfer_trace(path: &Path) -> GitTransferTrace {
                     if let Some(child_id) =
                         event.get("child_id").and_then(serde_json::Value::as_u64)
                     {
-                        pre_push_child_ids.insert(child_id);
+                        pre_push_children.insert((sid.map(str::to_owned), child_id));
                     }
                     if top_level && trace.pre_push_hook_started_ms.is_none() {
-                        trace.pre_push_hook_started_ms = trace2_ms(event.get("t_abs"));
+                        trace.pre_push_hook_started_ms = since_start_ms(&event, process_start);
                     }
                 }
                 trace.remote_transport |= ["receive-pack", "upload-pack", "git-remote-", "ssh"]
@@ -512,7 +567,9 @@ fn inspect_git_transfer_trace(path: &Path) -> GitTransferTrace {
                 if event
                     .get("child_id")
                     .and_then(serde_json::Value::as_u64)
-                    .is_some_and(|child_id| pre_push_child_ids.contains(&child_id)) =>
+                    .is_some_and(|child_id| {
+                        pre_push_children.contains(&(sid.map(str::to_owned), child_id))
+                    }) =>
             {
                 if event
                     .get("code")
@@ -522,7 +579,8 @@ fn inspect_git_transfer_trace(path: &Path) -> GitTransferTrace {
                     trace.pre_push_hook_failed = true;
                 }
                 if top_level && trace.pre_push_hook_ms.is_none() {
-                    trace.pre_push_hook_ms = trace2_ms(event.get("t_rel"));
+                    trace.pre_push_hook_ms =
+                        trace2_us(event.get("t_rel")).map(|micros| (micros + 500) / 1000);
                 }
             }
             _ => {}
@@ -3548,13 +3606,25 @@ impl Broker {
         let transfer_trace = git_trace
             .as_ref()
             .map(|trace| inspect_git_transfer_trace(trace.path()));
-        if push_stages
-            && let Some(split) = transfer_trace
-                .as_ref()
-                .and_then(|trace| push_process_split(trace, process_elapsed))
-        {
-            for (name, elapsed) in split {
-                crate::phase_telemetry::add(name, elapsed);
+        if push_stages && let Some(trace) = transfer_trace.as_ref() {
+            // Counters, so a missing split reads as "no hook in this push" or
+            // "the trace could not be split", never as a silent zero.
+            if !trace.pre_push_hook {
+                crate::phase_telemetry::add(
+                    "push_git_trace_without_hook",
+                    std::time::Duration::ZERO,
+                );
+            }
+            match push_process_split(trace, process_elapsed) {
+                Some(split) => {
+                    for (name, elapsed) in split {
+                        crate::phase_telemetry::add(name, elapsed);
+                    }
+                }
+                None => crate::phase_telemetry::add(
+                    "push_git_process_split_unavailable",
+                    std::time::Duration::ZERO,
+                ),
             }
         }
         let remote_contact = transfer_trace.and_then(GitTransferTrace::remote_contact);

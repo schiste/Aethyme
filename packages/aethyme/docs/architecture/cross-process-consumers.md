@@ -153,10 +153,20 @@ lock (`.aethyme/gc.lock`), normally the background reclaim worker; the pid is
 that lock's owner when the lock file names one. `reclaim_deferred: true` means
 reclaim was handed off, not skipped: the session's durable cleanup request is
 kept, the running worker re-reads that request after its cache lane, and any
-later broker open re-queues it. Nothing is removed before the request's
-closed-worktree grace period ends either way. `cleanup.attempted` and
-`cleanup.artifact_bytes_reclaimed` keep their meaning. Readers of saved reports
-must treat a missing field as `false` / absent.
+later broker open re-queues it. The checkout itself is not removed before the
+request's closed-worktree grace period ends either way. The kept checkout's
+build output is a separate rule (changed 2026-11-12): it is due under
+`retention.artifact_reclaim_days` (default `0`, at once) whether or not finish
+got the lock. When the lock is held, the closed-session reclaim records a new
+artifact-sweep recovery generation instead of nothing; the holding worker laps
+again for a generation that arrived during its lap (its pages stop at the
+newest session seen when the lap began), and any later broker open admits a
+worker for it. Command metrics count each such hand-off as
+`closed_session_artifact_reclaim_deferred_gc_locked` in `phase_counts`.
+Before this change the build output waited for the next periodic lap
+(`artifact_sweep_interval_hours`, 24 h by default) or for checkout removal.
+`cleanup.attempted` and `cleanup.artifact_bytes_reclaimed` keep their meaning.
+Readers of saved reports must treat a missing field as `false` / absent.
 
 ## Coordinated fetches never write-block (2026-11-12)
 
@@ -1340,7 +1350,20 @@ also carry the span `default_branch_unmoved_check` (comparing the remote
 default branch the push read with the local tracking ref) and the counters
 `default_branch_fetch_skipped_unmoved` (the fetch was skipped because the
 default branch had not moved) and `default_branch_fetch_reused` (a recent
-fetch was reused) in `phase_counts`.
+fetch was reused) in `phase_counts`. The coordinated `git push` process span
+`push_git_process` is split, from Git's own Trace2 events, into
+`push_git_process_before_hook` (connecting and reading the remote's refs),
+`push_git_process_hook` (the `pre-push` hook run by that push; `0` when the
+push ran none, because none is installed or hooks ran outside the lock) and
+`push_git_process_after_hook` (sending the pack and updating the ref). Since
+2026-11-12 these are recorded on every push whose trace has a split point;
+before that the split was never recorded, because Trace2 carries no
+process-relative clock on `child_start`. Two counters say why a split is
+missing or hookless: `push_git_trace_without_hook` (the trace showed no
+`pre-push` hook) and `push_git_process_split_unavailable` (the trace was
+requested but had neither a hook nor an end of the remote ref read, e.g. an
+empty trace file). The three spans nest inside `push_git_process`; do not add
+them to it.
 
 Every command metric line may add span totals to `phase_timings_ms`, and a
 `phase_counts` object with how many times each span ran. Spans are recorded
