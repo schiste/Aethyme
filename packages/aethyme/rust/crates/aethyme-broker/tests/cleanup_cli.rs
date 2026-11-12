@@ -54,6 +54,19 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
     aethyme_testkit::ensure_origin(tmp.path());
+    // `--keep-worktree` retains the checkout only at finish; afterwards the
+    // closed-worktree grace decides. Once this test lowers that grace to zero,
+    // the landed checkout is eligible for unattended removal, and the bounded
+    // inline sweep of any writable broker open (`gc plan`, or the refused
+    // unconfirmed apply) may remove it before the assertions that the plan
+    // and refused applies left it alone. This test is about explicit bulk
+    // cleanup, so turn unattended checkout removal off explicitly.
+    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[cleanup]\nauto_remove = false\n",
+    )
+    .unwrap();
 
     let mut broker = Broker::open(tmp.path()).unwrap();
     let session = broker.start_worktree("cleanup CLI fixture", None).unwrap();
