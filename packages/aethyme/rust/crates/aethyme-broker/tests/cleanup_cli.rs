@@ -640,3 +640,182 @@ fn scoped_cleanup_cli_accepts_a_fixed_cutoff_and_rejects_incomplete_scope() {
     );
     assert!(!incomplete.status.success());
 }
+
+const SWEEP_META_PREFIX: &str = "gc.artifact_sweep.v2.";
+/// What an unspaced inline sweep leaves behind: the finished-lap stamp, the
+/// paused-lap stamp, or (on every pass, finished or not) its last report.
+const SWEEP_WITNESS_SUFFIXES: [&str; 3] = [".last_run_ms", ".last_partial_ms", ".last_report"];
+
+/// Forget earlier sweeps, so the next writable broker open is not spaced out
+/// by a recent stamp and runs its inline pass.
+fn reset_sweep_witnesses(repo: &Path) {
+    let db = rusqlite::Connection::open(repo.join(".aethyme/broker.db")).unwrap();
+    for suffix in SWEEP_WITNESS_SUFFIXES {
+        db.execute(
+            "DELETE FROM meta WHERE substr(key, 1, length(?1)) = ?1 AND substr(key, -length(?2)) = ?2",
+            rusqlite::params![SWEEP_META_PREFIX, suffix],
+        )
+        .unwrap();
+    }
+}
+
+/// Sweep stamps and reports present, plus the number of GC events.
+fn sweep_witnesses(repo: &Path) -> (Vec<String>, i64) {
+    let db = rusqlite::Connection::open(repo.join(".aethyme/broker.db")).unwrap();
+    let mut statement = db
+        .prepare("SELECT key, value FROM meta WHERE substr(key, 1, length(?1)) = ?1")
+        .unwrap();
+    let keys = statement
+        .query_map([SWEEP_META_PREFIX], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|(key, value)| {
+            SWEEP_WITNESS_SUFFIXES
+                .iter()
+                .any(|suffix| key.ends_with(*suffix))
+                && value != "0"
+        })
+        .map(|(key, _)| key)
+        .collect();
+    let gc_events = db
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE substr(kind, 1, 10) = 'broker.gc.'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    (keys, gc_events)
+}
+
+/// Every writable broker open resumes GC maintenance and runs a bounded
+/// inline sweep that may remove an eligible closed checkout. A command refused
+/// for a malformed argument must refuse before that open, so it changes
+/// nothing. Removal itself depends on how much of the 250 ms budget the
+/// runner gets, so the test asserts on what every unspaced inline pass writes
+/// however fast it runs: its last report. The closing control shows that a
+/// writable open in this very fixture writes it.
+#[test]
+fn malformed_commands_refuse_before_the_writable_open_and_change_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
+    std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-qm", "init"]);
+    aethyme_testkit::ensure_origin(tmp.path());
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.start_worktree("refusal fixture", None).unwrap();
+    let worktree = std::path::PathBuf::from(&session.worktree_path);
+    std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
+    git(&worktree, &["add", "done.txt"]);
+    git(&worktree, &["commit", "-qm", "done"]);
+    broker.submit(session.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &session.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
+    assert!(
+        broker
+            .finish_with_options(
+                session.id,
+                FinishOptions {
+                    keep_worktree: true,
+                },
+            )
+            .unwrap()
+            .closed
+    );
+    drop(broker);
+    // Unattended removal stays on (the default): with no grace the landed,
+    // closed checkout is eligible for it on the next writable open.
+    std::fs::write(
+        tmp.path().join(".aethyme/broker.toml"),
+        "[retention]\nclosed_worktree_grace_hours = 0\n",
+    )
+    .unwrap();
+
+    let digest_shaped = "0".repeat(64);
+    let refusals: [(&[&str], &str); 8] = [
+        (
+            &["finish", "cleanup", "--all-cleaned", "--apply"],
+            "must be a full SHA-256 digest",
+        ),
+        (
+            &[
+                "finish",
+                "cleanup",
+                "--all-cleaned",
+                "--apply",
+                "--confirm",
+                "not-a-digest",
+            ],
+            "must be a full SHA-256 digest",
+        ),
+        (&["gc", "apply"], "gc apply requires --confirm"),
+        (&["gc", "frobnicate"], "unknown gc action"),
+        (&["advanced", "leases", "claim"], "claim requires a path"),
+        (
+            &["advanced", "leases", "frobnicate"],
+            "unknown leases action",
+        ),
+        (
+            &["advanced", "representation", "record", "--session", "9999"],
+            "representation record requires --confirm",
+        ),
+        (
+            &["start", "--adopt", "--reuse", "--replace-stale"],
+            "mutually exclusive",
+        ),
+    ];
+    for (args, refusal) in refusals {
+        reset_sweep_witnesses(tmp.path());
+        let (_, gc_events_before) = sweep_witnesses(tmp.path());
+        let output = run(tmp.path(), args);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "{args:?} succeeded: {text}");
+        assert!(text.contains(refusal), "{args:?}: {text}");
+        let (witnesses, gc_events) = sweep_witnesses(tmp.path());
+        assert!(
+            witnesses.is_empty(),
+            "{args:?} was refused after a writable broker open ran its sweep: {witnesses:?}"
+        );
+        assert_eq!(gc_events, gc_events_before, "{args:?} wrote a GC event");
+        assert!(worktree.exists(), "{args:?} removed the eligible checkout");
+    }
+
+    // Control: a well-formed digest passes every argument check, so this
+    // command opens the broker for writing before its plan refuses the stale
+    // digest. That open must write the witness the loop asserts is absent.
+    reset_sweep_witnesses(tmp.path());
+    let control = run(
+        tmp.path(),
+        &[
+            "finish",
+            "cleanup",
+            "--all-cleaned",
+            "--apply",
+            "--confirm",
+            &digest_shaped,
+        ],
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&control.stdout),
+        String::from_utf8_lossy(&control.stderr)
+    );
+    assert!(!control.status.success(), "{text}");
+    assert!(text.contains("no longer matches"), "{text}");
+    let (witnesses, _) = sweep_witnesses(tmp.path());
+    assert!(
+        !witnesses.is_empty(),
+        "a writable open in this fixture must leave a sweep witness"
+    );
+}

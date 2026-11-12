@@ -1171,6 +1171,27 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
             ));
         }
     }
+    // Refuse a malformed action before any writable open below: that open
+    // resumes GC maintenance and runs the bounded sweep, which may remove an
+    // eligible checkout, and a refused command must change nothing.
+    match action {
+        "plan" if parsed.confirm.is_some() => {
+            return Err(UsageError::Message(
+                "gc plan does not accept --confirm; review its emitted digest".into(),
+            ));
+        }
+        "apply" if parsed.confirm.is_none() => {
+            return Err(UsageError::Message(
+                "gc apply requires --confirm <sha256>".into(),
+            ));
+        }
+        "plan" | "apply" | "abandon" | "forget-abandoned" | "sweep" => {}
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown gc action {other:?}; expected `plan`, `apply`, `abandon`, `forget-abandoned` or `sweep`"
+            )));
+        }
+    }
     // A normal Broker::open resumes confirmed GC maintenance at startup. The
     // journal-recovery commands must operate on the pending journal before
     // any startup maintenance can consume it, so use its read-only DB snapshot
@@ -1196,11 +1217,6 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     };
     match action {
         "plan" => {
-            if parsed.confirm.is_some() {
-                return Err(UsageError::Message(
-                    "gc plan does not accept --confirm; review its emitted digest".into(),
-                ));
-            }
             let plan = broker.gc_plan_for_cli(
                 parsed.include_active_gate_cache,
                 parsed.full_scan,

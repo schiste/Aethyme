@@ -105,6 +105,22 @@ pub(super) fn run_representation(parsed: Parsed) -> Result<(), UsageError> {
     let session = parsed.session.ok_or(UsageError::Message(
         "representation requires --session <id>".into(),
     ))?;
+    // Refuse a malformed command before the writable open below, whose
+    // startup maintenance a refused command must not trigger.
+    match action {
+        "scan" | "status" => {}
+        "record" if parsed.confirm.is_none() => {
+            return Err(UsageError::Message(
+                "representation record requires --confirm <sha256>".into(),
+            ));
+        }
+        "record" => {}
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown representation action {other:?}; expected scan, status, or record"
+            )));
+        }
+    }
     // `record` is the only writer; scanning must not take the write lock.
     let mut broker = open_broker(action != "record")?;
     match action {

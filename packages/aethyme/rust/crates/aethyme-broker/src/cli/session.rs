@@ -1187,7 +1187,6 @@ fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// `broker adopt`.
 pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
     let context = session_context(&parsed)?;
-    let mut broker = open_broker(parsed.read_only_snapshot)?;
     let path = parsed
         .positional
         .first()
@@ -1208,6 +1207,9 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
             "--sync-integration requires --reuse".into(),
         ));
     }
+    // Open only after the flags are known to be consistent: a writable open
+    // runs startup maintenance, which a refused command must not trigger.
+    let mut broker = open_broker(parsed.read_only_snapshot)?;
     warn_stale_broker_binary(&broker);
     refuse_new_session_on_main_checkout(&mut broker, &path, parsed.allow_main_checkout)?;
     let previous_session = if mode == crate::AdoptMode::Reuse {
@@ -2576,12 +2578,10 @@ pub(super) fn run_cleanup(parsed: Parsed) -> Result<(), UsageError> {
             "cleanup apply and single-session removal require the current writable repository database; --read-only-snapshot is available only for the --all-cleaned plan".into(),
         ));
     }
-    // The default bulk plan is diagnostic and removes nothing. Read a
-    // compatibility snapshot so an unavailable bound worktree root can be
-    // reported as a blocked item instead of failing before planning. Apply
-    // and single-session cleanup still use the strictly validated writable DB.
-    let mut broker = open_broker(bulk_plan)?;
-    if parsed.all_cleaned {
+    // Every check below reads only the parsed arguments. Each runs before the
+    // broker opens: a writable open resumes GC maintenance and its bounded
+    // sweep, so a command refused for a usage error must not reach it.
+    let scope = if parsed.all_cleaned {
         if !parsed.positional.is_empty() || parsed.force || parsed.dry_run {
             return Err(UsageError::Message(
                 "cleanup --all-cleaned takes no session id, --force, or --dry-run; planning is already the default and --apply removes only revalidated eligible worktrees"
@@ -2599,16 +2599,20 @@ pub(super) fn run_cleanup(parsed: Parsed) -> Result<(), UsageError> {
             (Some(before), after, Some(limit)) if before > 0 && after.unwrap_or(0) >= 0 && (1..=1000).contains(&limit) => Some((before, after.unwrap_or(0), limit)),
             _ => return Err(UsageError::Message("scoped cleanup requires --closed-before-ms and --limit (1-1000), with optional non-negative --after-session".into())),
         };
-        let report = broker.cleanup_cleaned_worktrees_scoped(
-            parsed.apply,
-            parsed.confirm.as_deref(),
-            scope,
-        )?;
-        if parsed.json {
-            out!("{}", serde_json::to_string_pretty(&report)?);
-        } else {
-            render_cleanup_sweep_report(&report, parsed.detail);
+        // Only the digest comparison needs the plan; its shape does not.
+        if parsed.apply
+            && !parsed.confirm.as_deref().is_some_and(|confirm| {
+                confirm.len() == 64 && confirm.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            return Err(crate::BrokerOpError::CleanupConfirmationNotSha256.into());
         }
+        scope
+    } else {
+        None
+    };
+    let single_session = if parsed.all_cleaned {
+        None
     } else {
         if parsed.closed_before_ms.is_some()
             || parsed.cleanup_after_session.is_some()
@@ -2649,11 +2653,30 @@ pub(super) fn run_cleanup(parsed: Parsed) -> Result<(), UsageError> {
             ))?
             .parse()
             .map_err(|_| UsageError::Message("session id must be an integer".into()))?;
+        Some(id)
+    };
+    // The default bulk plan is diagnostic and removes nothing. Read a
+    // compatibility snapshot so an unavailable bound worktree root can be
+    // reported as a blocked item instead of failing before planning. Apply
+    // and single-session cleanup still use the strictly validated writable DB.
+    let mut broker = open_broker(bulk_plan)?;
+    if let Some(id) = single_session {
         broker.cleanup(id, parsed.force)?;
         if parsed.json {
             out!("{{\"cleaned\":{id}}}");
         } else {
             out!("Cleaned session {id}.");
+        }
+    } else {
+        let report = broker.cleanup_cleaned_worktrees_scoped(
+            parsed.apply,
+            parsed.confirm.as_deref(),
+            scope,
+        )?;
+        if parsed.json {
+            out!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            render_cleanup_sweep_report(&report, parsed.detail);
         }
     }
     Ok(())
