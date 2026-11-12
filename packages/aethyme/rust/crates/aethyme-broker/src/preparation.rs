@@ -473,7 +473,14 @@ fn acquire_preparation_cache(
     let deadline = Instant::now() + wait;
     let mut reclaims = 0;
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        // The first attempt gets the caller's budget unchanged, so the wait
+        // it announces is the one that was asked for; a retry after a reclaim
+        // gets what is left of it.
+        let remaining = if reclaims == 0 {
+            wait
+        } else {
+            deadline.saturating_duration_since(Instant::now())
+        };
         let attempt = acquire_preparation_cache_once(
             coordinator,
             request_for,
