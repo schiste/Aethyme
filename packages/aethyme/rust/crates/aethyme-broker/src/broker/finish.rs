@@ -711,7 +711,7 @@ impl Broker {
             report.delivery = self.finish_delivery(Some(entry));
         }
         report.representation = delivery.representation;
-        if delivery.on_remote_default {
+        if delivery.on_remote_default || delivery.default_landing.is_some() {
             report.delivery.published = true;
         }
         report.unsubmitted_commits = delivery.unsubmitted_commits;
@@ -853,7 +853,15 @@ impl Broker {
             }
         }
 
-        if report.unsubmitted_commits > 0 {
+        // `--abandon --reason` closes over undelivered work too, as its help
+        // promises: otherwise a session whose work never lands can only be
+        // closed by a lower-level command.
+        // Recorded only once every refusal check below has passed, so a
+        // refused retry never records an abandonment that did not happen.
+        let abandon_undelivered = abandon_reason
+            .filter(|_| report.unsubmitted_commits > 0)
+            .map(|reason| (report.unsubmitted_commits, reason));
+        if abandon_undelivered.is_none() && report.unsubmitted_commits > 0 {
             // The guard is right either way -- these commits exist nowhere but
             // this branch, and closing a session holding the only copy is what
             // #222 exists to prevent. What differs is the remedy.
@@ -862,11 +870,13 @@ impl Broker {
             // and can never satisfy this: it verifies and moves nothing by
             // design (#290 phase 2.2). Naming it anyway sends the operator
             // round a loop with no exit, which is the shape of the engine-pin
-            // refusal in #254. The reachable path is to land the work and then
-            // prove it landed, and proving it needs `record`, not just `scan`.
+            // refusal in #254. The reachable path is to land the work by pull
+            // request: finish recognises it once the fetched default branch
+            // holds it.
             let promotes = crate::PromoteConfig::load(&self.main_root)
                 .mode
                 .promotes_at_all();
+            let has_default = self.repo.upstream_default().is_some();
             if promotes {
                 report.warnings.push(format!(
                     "HEAD has {} committed {} not yet represented in promoted integration; submit before finish",
@@ -879,26 +889,39 @@ impl Broker {
             } else {
                 // With no fetched default branch there is nothing to push to,
                 // so name the landing that this repository can actually do.
-                let land = if self.repo.upstream_default().is_none() {
-                    "merge the session branch into the local default branch"
+                let land = if has_default {
+                    "push the session branch and merge its pull request; finish recognises the \
+                     work once the fetched default branch holds it"
                 } else {
-                    "land the work"
+                    "merge the session branch into the local default branch, then prove it landed"
                 };
                 report.warnings.push(format!(
                     "HEAD has {} committed {} not represented on any delivery target. This \
-                     repository does not promote, so submitting again cannot change that — {land}, \
-                     then prove it landed",
+                     repository does not promote, so submitting again cannot change that — {land}; \
+                     or close without it with --abandon --reason",
                     report.unsubmitted_commits,
                     plural_word(report.unsubmitted_commits as usize, "change", "changes")
                 ));
             }
-            // `scan` only: it is read-only, and its output names `record` with
-            // the real digest. Listing `record` here would mean printing a
-            // placeholder the operator cannot run -- the same unreachable
-            // remedy this block exists to remove.
-            report.next_commands.push(format!(
-                "aethyme broker advanced representation scan --session {session_id}"
-            ));
+            // Every command named here can change the state it reports. Where
+            // the work lands by pull request, `push --pr` publishes it (and
+            // fetches the default branch, so a merged one is then seen);
+            // elsewhere `scan` is read-only and its output names `record` with
+            // the real digest, which a placeholder could not.
+            if !promotes && has_default && crate::session_push::session_push_enabled(&self.repo) {
+                report
+                    .next_commands
+                    .push(format!("aethyme broker push --session {session_id} --pr"));
+            } else {
+                report.next_commands.push(format!(
+                    "aethyme broker advanced representation scan --session {session_id}"
+                ));
+            }
+            if !promotes {
+                report.next_commands.push(format!(
+                    "aethyme broker finish --session {session_id} --abandon --reason \"<why>\""
+                ));
+            }
             self.finalize_finish_report(&mut report);
             return Ok(report);
         }
@@ -923,7 +946,11 @@ impl Broker {
         // only here: closing it is what turned 94 worktrees into the sole
         // copies of their work (see `unpushed`). Abandoning stays possible,
         // but only on the record.
-        if let Some((unpushed_head, unpushed)) = self.unpushed_close_check(&session) {
+        // Work the fetched default branch already holds is on the remote,
+        // even once a squash merge deleted the branch that carried it.
+        if delivery.default_landing.is_none()
+            && let Some((unpushed_head, unpushed)) = self.unpushed_close_check(&session)
+        {
             report.unpushed_commits = Some(unpushed);
             match abandon_reason {
                 None => {
@@ -941,6 +968,7 @@ impl Broker {
                     self.finalize_finish_report(&mut report);
                     return Ok(report);
                 }
+                Some(_) if abandon_undelivered.is_some() => {}
                 Some(reason) => {
                     self.record_abandoned_unpushed(&session, &unpushed_head, unpushed, reason)?;
                     report.warnings.push(format!(
@@ -951,6 +979,37 @@ impl Broker {
             }
         } else if crate::session_push::session_push_enabled(&self.repo) {
             report.unpushed_commits = Some(0);
+        }
+
+        if let Some((count, reason)) = abandon_undelivered {
+            self.record_abandoned_unpushed(
+                &session,
+                &head,
+                u32::try_from(count).unwrap_or(u32::MAX),
+                reason,
+            )?;
+            report.warnings.push(format!(
+                "closed with {count} undelivered committed {} abandoned: {reason}",
+                plural_word(count as usize, "change", "changes")
+            ));
+        }
+
+        // The landing is established, so this session's verified rows are
+        // terminal: retention prunes them instead of keeping them forever.
+        if let Some(landing) = delivery.default_landing.as_ref() {
+            match self.mark_landed_queue_entries(session_id, &head, landing) {
+                Ok(marked)
+                    if report
+                        .latest_queue_entry_id
+                        .is_some_and(|id| marked.contains(&id)) =>
+                {
+                    report.latest_queue_status = Some(MergeStatus::ExternallyLanded);
+                }
+                Ok(_) => {}
+                Err(error) => report.warnings.push(format!(
+                    "could not mark the landed queue entries terminal; retention keeps them: {error}"
+                )),
+            }
         }
 
         report.status = FinishStatus::Closed;
@@ -1032,7 +1091,9 @@ impl Broker {
         // Finish, cleanup, and integration reconciliation share the same
         // landing proof. Finish keeps #152's explicit confirmation gate for
         // non-ancestry deliveries: a content or patch match is a candidate,
-        // not permission to delete the only worktree, until it is recorded.
+        // not permission to delete the only worktree, until it is recorded --
+        // except on the fetched default branch of a repository that does not
+        // promote, where a merged pull request is the only landing there is.
         // An adopted session can use the primary checkout itself. Its own
         // HEAD must not count as proof that its commits were delivered; only
         // independent integration and upstream refs can establish that.
@@ -1116,12 +1177,26 @@ impl Broker {
         }) || session.accepted_session_head.as_deref() == Some(head);
         // Exact ancestry on a current delivery target proves that this
         // worktree HEAD is already present there. Content/patch matches remain
-        // gated on accepted queue evidence or a recorded representation.
+        // gated on accepted queue evidence, a recorded representation, or (in
+        // a repository that does not promote) the fetched default branch.
         let ancestry_proves_delivery = landing
             .as_ref()
             .is_some_and(|(_, evidence, _)| evidence == &crate::LandingEvidence::Ancestry);
         let submitted_head_is_delivered = ancestry_proves_delivery
             || (queue_accepts_head && accepted_commit_is_current && landing.is_some());
+        // A repository that does not promote lands work only by pull request,
+        // and a squash leaves the content as the only evidence: no queue row
+        // there is ever accepted. The fetched default branch holding the
+        // session's net content is the landing itself, and the work is on the
+        // remote, so it needs no further confirmation. It is asked even when
+        // ancestry already proved delivery, since a merge commit lands work
+        // too and its verified rows become terminal the same way. `landing`
+        // was searched whenever it is consulted here.
+        let default_landing = if representation.is_some() || remotely_durable_no_net {
+            None
+        } else {
+            self.default_branch_landing(head, landing.as_ref(), &delivery_targets)?
+        };
 
         let remote_default_tip = self.remote_tracking_default_tip();
         let on_remote_default = if let Some(tip) = remote_default_tip.as_ref() {
@@ -1132,8 +1207,10 @@ impl Broker {
         } else {
             false
         };
-        let head_is_delivered =
-            submitted_head_is_delivered || representation.is_some() || on_remote_default;
+        let head_is_delivered = submitted_head_is_delivered
+            || representation.is_some()
+            || on_remote_default
+            || default_landing.is_some();
         let unsubmitted_commits = if head_is_delivered || remotely_durable_no_net {
             0
         } else {
@@ -1170,8 +1247,121 @@ impl Broker {
             head_is_delivered,
             representation,
             on_remote_default,
+            default_landing,
             unsubmitted_commits,
         })
+    }
+
+    /// Where `head`'s work landed on the fetched default branch, in a
+    /// repository that does not promote. `None` in a promoting repository,
+    /// without a fetched default branch, when the branch does not hold every
+    /// path the session changed, or when the session changed nothing.
+    ///
+    /// `known` is the landing already found on `searched` targets, which are
+    /// asked in turn and the first holding the work answers: a default branch
+    /// among them with no landing found holds nothing, and is not searched
+    /// again.
+    pub(crate) fn default_branch_landing(
+        &self,
+        head: &str,
+        known: Option<&(String, crate::LandingEvidence, Option<String>)>,
+        searched: &[String],
+    ) -> Result<Option<DefaultBranchLanding>, BrokerOpError> {
+        let Some((reference, tip)) = self.upstream_verification_head() else {
+            return Ok(None);
+        };
+        let found = match known {
+            Some((target, evidence, landed_by)) if *target == tip => {
+                Some((*evidence, landed_by.clone()))
+            }
+            None if searched.contains(&tip) => None,
+            _ => {
+                let _span = crate::phase_telemetry::span("default_branch_landing");
+                self.landing_on_delivery_targets(head, std::slice::from_ref(&tip))?
+                    .map(|(_, evidence, landed_by)| (evidence, landed_by))
+            }
+        };
+        // A head that changes nothing has landed nothing: whether its commits
+        // may be left behind is the remote-durability question `finish`
+        // already asks of a no-net session, not a delivery.
+        let Some(landed_by) = found
+            .filter(|(evidence, _)| *evidence != crate::LandingEvidence::NoNetChange)
+            .map(|(_, landed_by)| landed_by)
+        else {
+            return Ok(None);
+        };
+        let landing = DefaultBranchLanding {
+            reference,
+            tip,
+            landed_by,
+        };
+        // The search above compares the net diff. That is not enough to
+        // stand in for the unpushed and unsubmitted guards: a later commit
+        // that restored a path, or deleted a file an earlier one added,
+        // leaves the net diff matching while its own change exists only
+        // here. The landing must account for every commit.
+        Ok(self.landing_covers(&landing, head)?.then_some(landing))
+    }
+
+    /// Whether `commit`'s every commit is accounted for by `landing`: it is
+    /// on the default branch, or the landing commit holds `commit`'s content
+    /// on every path any session commit since the default branch touched --
+    /// including a path a later commit restored to its base state.
+    pub(crate) fn landing_covers(
+        &self,
+        landing: &DefaultBranchLanding,
+        commit: &str,
+    ) -> Result<bool, BrokerOpError> {
+        if self.repo.is_ancestor_checked(commit, &landing.tip)? {
+            return Ok(true);
+        }
+        let Some(landed_by) = landing.landed_by.as_deref() else {
+            return Ok(false);
+        };
+        let _span = crate::phase_telemetry::span("default_branch_landing_coverage");
+        let base = self.repo.merge_base(commit, &landing.tip)?;
+        let touched = self.repo.paths_touched_between(&base, commit)?;
+        Ok(self.repo.paths_equal(landed_by, commit, &touched)?)
+    }
+
+    /// Make this session's `verified` queue rows terminal once its work has
+    /// landed on the default branch, so retention can prune them. Only rows
+    /// whose head `head` contains and whose every commit the landing
+    /// accounts for are marked: a row whose change the session later
+    /// reverted did not land. Returns the ids marked.
+    pub(crate) fn mark_landed_queue_entries(
+        &mut self,
+        session_id: i64,
+        head: &str,
+        landing: &DefaultBranchLanding,
+    ) -> Result<Vec<i64>, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("mark_landed_queue_entries");
+        let mut marked = Vec::new();
+        for entry in self.store.verified_merge_queue_for_session(session_id)? {
+            if entry.head_commit != head
+                && (!self.repo.is_ancestor(&entry.head_commit, head)
+                    || !self.landing_covers(landing, &entry.head_commit)?)
+            {
+                continue;
+            }
+            let mut details = entry
+                .details_json
+                .as_deref()
+                .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            details["externally_landed"] = true.into();
+            details["classification"] = "already_landed".into();
+            details["upstream_ref"] = landing.reference.clone().into();
+            details["upstream_landing"] = landing.landed_by.clone().into();
+            if self
+                .store
+                .mark_verified_merge_externally_landed(entry.id, &details.to_string())?
+            {
+                marked.push(entry.id);
+            }
+        }
+        Ok(marked)
     }
 
     pub(super) fn finish_cleanup_safe(
@@ -1370,11 +1560,25 @@ pub(crate) struct HeadDelivery<'q> {
     pub(crate) visible_entry: Option<&'q MergeQueueEntry>,
     pub(crate) representation: Option<SessionRepresentation>,
     pub(crate) on_remote_default: bool,
+    /// The fetched default branch holds this head's work, in a repository
+    /// that does not promote: a merged pull request, whatever its style.
+    pub(crate) default_landing: Option<DefaultBranchLanding>,
     /// Promoted, represented, or already on the remote default branch.
     pub(crate) head_is_delivered: bool,
     /// Commits not represented on any delivery target; `finish` refuses
     /// while this is above zero.
     pub(crate) unsubmitted_commits: u64,
+}
+
+/// Where a session's work landed on the fetched default branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DefaultBranchLanding {
+    /// The default branch, e.g. `origin/main`.
+    pub(crate) reference: String,
+    /// The default branch's commit the landing was judged against.
+    pub(crate) tip: String,
+    /// The commit that carried the work, when the evidence names one.
+    pub(crate) landed_by: Option<String>,
 }
 
 #[cfg(test)]

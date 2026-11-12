@@ -1209,6 +1209,57 @@ impl BrokerStore {
         Ok(entries)
     }
 
+    /// A session's `verified` queue rows, oldest first.
+    pub(crate) fn verified_merge_queue_for_session(
+        &self,
+        session_id: i64,
+    ) -> Result<Vec<MergeQueueEntry>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{MERGE_SELECT} WHERE session_id = ?1 AND status = 'verified' ORDER BY id ASC"
+        ))?;
+        let rows = stmt.query_map([session_id], merge_from_row)?;
+        rows.map(|row| row?).collect()
+    }
+
+    /// Make a `verified` entry `externally_landed`: its work reached the
+    /// default branch outside promotion, by a merged pull request. Emits
+    /// `merge.externally_landed` in the same transaction. Unlike a generic
+    /// transition it keeps the verification candidate, and it changes nothing
+    /// (returning false) once the entry is no longer `verified`.
+    pub(crate) fn mark_verified_merge_externally_landed(
+        &mut self,
+        entry_id: i64,
+        details_json: &str,
+    ) -> Result<bool, BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let session_id: Option<i64> = tx
+            .query_row(
+                "SELECT session_id FROM merge_queue WHERE id = ?1 AND status = 'verified'",
+                [entry_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(session_id) = session_id else {
+            return Ok(false);
+        };
+        tx.execute(
+            "UPDATE merge_queue
+             SET status = 'externally_landed', details_json = ?2, updated_at = ?3
+             WHERE id = ?1 AND status = 'verified'",
+            params![entry_id, details_json, now],
+        )?;
+        insert_event(
+            &tx,
+            now,
+            "merge.externally_landed",
+            Some(session_id),
+            Some(details_json),
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn terminal_merge_queue_counts(
         &self,
     ) -> Result<Vec<crate::MergeQueueStatusCount>, BrokerError> {

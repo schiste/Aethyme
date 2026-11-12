@@ -1666,13 +1666,20 @@ fn finish_blocks_dirty_then_unsubmitted_commits() {
     assert_eq!(unsubmitted.pending_work.dirty_path_count, 0);
     assert_eq!(unsubmitted.pending_work.unsubmitted_commits, 1);
     // Submitting again cannot land work in a repository that lands by pull
-    // request; proving it landed is the only cure offered (#152).
+    // request; proving it landed (#152), or abandoning it on the record, are
+    // the cures offered. Without a remote there is no pull request to open.
     assert_eq!(
         unsubmitted.next_commands,
-        vec![format!(
-            "aethyme broker advanced representation scan --session {}",
-            session.id
-        )]
+        vec![
+            format!(
+                "aethyme broker advanced representation scan --session {}",
+                session.id
+            ),
+            format!(
+                "aethyme broker finish --session {} --abandon --reason \"<why>\"",
+                session.id
+            ),
+        ]
     );
     assert_ne!(
         broker.store().session(session.id).unwrap().status,

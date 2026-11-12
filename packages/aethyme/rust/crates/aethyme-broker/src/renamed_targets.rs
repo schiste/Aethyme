@@ -15,7 +15,8 @@ use crate::{Broker, BrokerOpError};
 pub struct RenamedTarget {
     /// The path this session's commits still modify.
     pub from: String,
-    /// Where that content lives on the integration tip.
+    /// Where that content lives on the integration tip, or on the fetched
+    /// default branch where the repository does not promote.
     pub to: String,
     /// The promoted queue entry that introduced the new path, when one owns it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -26,7 +27,9 @@ pub struct RenamedTarget {
 
 impl Broker {
     /// Paths this session's commits touch that no longer exist on the
-    /// integration tip but were renamed there by a later promotion.
+    /// integration tip but were renamed there by a later promotion -- or, in a
+    /// repository that does not promote, on the fetched default branch by a
+    /// merged pull request.
     ///
     /// Deliberately silent about paths that were genuinely deleted: a deletion
     /// is a real conflict the operator must resolve, and reporting it as a
@@ -43,7 +46,14 @@ impl Broker {
         else {
             return Ok(Vec::new());
         };
-        let Some(integration_tip) = self.integration_tip() else {
+        // Where landed work is judged: the fetched default branch in a
+        // repository that lands only by pull request, which nothing promotes
+        // into integration; integration everywhere else, as before.
+        let Some(integration_tip) = self
+            .upstream_verification_head()
+            .map(|(_, tip)| tip)
+            .or_else(|| self.integration_tip())
+        else {
             return Ok(Vec::new());
         };
 

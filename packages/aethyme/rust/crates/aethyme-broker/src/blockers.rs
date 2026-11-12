@@ -623,9 +623,14 @@ impl Broker {
                 .promotes_at_all();
             return StaleLeaseRemedy {
                 // Where the repository does not promote, submitting again
-                // cannot represent the work; proving it landed can.
+                // cannot represent the work; landing it by pull request can,
+                // and without a remote, proving it landed locally can.
                 clear: if promotes {
                     format!("aethyme broker submit --session {id}")
+                } else if self.repo_handle().upstream_default().is_some()
+                    && crate::session_push::session_push_enabled(self.repo_handle())
+                {
+                    format!("aethyme broker push --session {id} --pr")
                 } else {
                     format!("aethyme broker advanced representation scan --session {id}")
                 },

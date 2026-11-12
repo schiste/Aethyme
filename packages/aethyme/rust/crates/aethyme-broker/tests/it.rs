@@ -159,6 +159,8 @@ mod ownership_claims_e2e;
 mod plugin_floor;
 #[path = "post_merge_cleanup_cli.rs"]
 mod post_merge_cleanup_cli;
+#[path = "pr_landed_finish.rs"]
+mod pr_landed_finish;
 #[path = "pr_subscriptions_cli.rs"]
 mod pr_subscriptions_cli;
 #[path = "pr_watch.rs"]

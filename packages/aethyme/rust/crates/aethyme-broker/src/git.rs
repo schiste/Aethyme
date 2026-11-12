@@ -4639,6 +4639,38 @@ impl GitRepo {
             .collect())
     }
 
+    /// Every path any non-merge commit in `from..to` changed, both sides of a
+    /// rename included, sorted and deduplicated. Unlike the net diff, a path
+    /// one commit changed and a later one restored is still listed.
+    pub(crate) fn paths_touched_between(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<String>, GitError> {
+        let range = format!("{from}..{to}");
+        let out = run_git(
+            &self.root,
+            &[
+                "log",
+                "--no-merges",
+                "--no-renames",
+                "--name-only",
+                "--format=",
+                "-z",
+                &range,
+            ],
+        )?;
+        let mut paths = out
+            .split('\0')
+            .map(|path| path.trim_matches('\n'))
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
     /// Commits reachable from `to` but not `from`, oldest first.
     pub fn commits_between_oldest(&self, from: &str, to: &str) -> Result<Vec<String>, GitError> {
         let range = format!("{from}..{to}");

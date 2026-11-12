@@ -5,7 +5,10 @@ exit: 0
       dirty WIP and no committed work waiting for submit/promotion. Where
       the repository sets [delivery] push_session_branches, also refuses
       while HEAD has commits no remote holds; --abandon --reason closes
-      anyway and records a broker.session.abandoned_unpushed event. If it
+      anyway, over unpushed or undelivered work, and records a
+      broker.session.abandoned_unpushed event. Work the fetched default
+      branch already holds counts as delivered, whatever the pull request's
+      merge style. If it
       is not safe, prints the next command; suggests cleanup only when
       cleanup would pass without --force. Git checks share a 60-second
       deadline by default; --timeout changes it, and an expiry names the
