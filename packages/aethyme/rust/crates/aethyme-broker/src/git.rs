@@ -2279,6 +2279,151 @@ fn clear_git_repository_context(command: &mut Command, empty_global: &Path) {
         .env("GIT_CONFIG_GLOBAL", empty_global);
 }
 
+/// Exact remote refs read for a push, and one advisory ref read alongside
+/// them. See [`GitRepo::remote_ref_oids_with_advisory`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteRefObservation {
+    pub(crate) refs: BTreeMap<String, Option<String>>,
+    pub(crate) advisory: Option<Option<String>>,
+}
+
+enum AdvisoryLine {
+    /// The advisory ref itself.
+    Exact,
+    /// A longer ref only the advisory pattern matched by path tail.
+    TailOnly,
+    /// Not the advisory pattern's line: the destinations' rules apply.
+    NotAdvisory,
+}
+
+/// Whether an unrequested `ls-remote` line came from the advisory pattern.
+///
+/// Git prints every ref whose path ends in `/<pattern>`. A line that a
+/// destination pattern could also have produced keeps failing the read as it
+/// always did, so the advisory pattern never changes the destinations' outcome.
+fn advisory_line(advisory: Option<&str>, destinations: &[String], line_ref: &str) -> AdvisoryLine {
+    let Some(advisory) = advisory else {
+        return AdvisoryLine::NotAdvisory;
+    };
+    let tail_of = |pattern: &str| line_ref.ends_with(&format!("/{pattern}"));
+    if destinations
+        .iter()
+        .any(|destination| tail_of(destination.as_str()))
+    {
+        return AdvisoryLine::NotAdvisory;
+    }
+    if line_ref == advisory {
+        AdvisoryLine::Exact
+    } else if tail_of(advisory) {
+        AdvisoryLine::TailOnly
+    } else {
+        AdvisoryLine::NotAdvisory
+    }
+}
+
+#[cfg(test)]
+mod advisory_ref_tests {
+    use super::{AdvisoryLine, GitRepo, advisory_line};
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn only_lines_the_advisory_pattern_alone_could_produce_are_set_aside() {
+        let destinations = ["refs/heads/agent/x".to_string()];
+        let main = Some("refs/heads/main");
+        assert!(matches!(
+            advisory_line(main, &destinations, "refs/heads/main"),
+            AdvisoryLine::Exact
+        ));
+        assert!(matches!(
+            advisory_line(main, &destinations, "refs/heads/y/refs/heads/main"),
+            AdvisoryLine::TailOnly
+        ));
+        // A line a destination pattern produced keeps its old meaning.
+        assert!(matches!(
+            advisory_line(main, &destinations, "refs/heads/y/refs/heads/agent/x"),
+            AdvisoryLine::NotAdvisory
+        ));
+        assert!(matches!(
+            advisory_line(main, &destinations, "refs/heads/other"),
+            AdvisoryLine::NotAdvisory
+        ));
+        assert!(matches!(
+            advisory_line(None, &destinations, "refs/heads/main"),
+            AdvisoryLine::NotAdvisory
+        ));
+    }
+
+    /// The default branch read alongside a push's own refs never changes
+    /// their evidence, and a longer ref that merely ends like it is ignored.
+    #[test]
+    fn the_advisory_ref_rides_the_same_read_without_changing_the_destinations() {
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("remote.git");
+        let local = root.path().join("local");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        git(&remote, &["init", "--bare", "-q", "-b", "main"]);
+        git(&local, &["init", "-q", "-b", "main"]);
+        git(&local, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(
+            &local,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&local, &["push", "-q", "origin", "main"]);
+        let main = git(&local, &["rev-parse", "HEAD"]);
+        git(&local, &["commit", "-q", "--allow-empty", "-m", "session"]);
+        let session = git(&local, &["rev-parse", "HEAD"]);
+        git(&local, &["push", "-q", "origin", "HEAD:refs/heads/agent/x"]);
+        git(
+            &local,
+            &["push", "-q", "origin", "HEAD:refs/heads/y/refs/heads/main"],
+        );
+        let repo = GitRepo::discover(&local).unwrap();
+        let destinations = vec![
+            "refs/heads/agent/x".to_string(),
+            "refs/heads/agent/missing".to_string(),
+        ];
+
+        let plain = repo.remote_ref_oids("origin", &destinations).unwrap();
+        let observed = repo
+            .remote_ref_oids_with_advisory("origin", &destinations, "refs/heads/main")
+            .unwrap();
+        assert_eq!(observed.refs, plain);
+        assert_eq!(
+            plain["refs/heads/agent/x"].as_deref(),
+            Some(session.as_str())
+        );
+        assert_eq!(plain["refs/heads/agent/missing"], None);
+        assert_eq!(observed.advisory, Some(Some(main)));
+
+        git(&remote, &["update-ref", "-d", "refs/heads/main"]);
+        let observed = repo
+            .remote_ref_oids_with_advisory("origin", &destinations, "refs/heads/main")
+            .unwrap();
+        assert_eq!(observed.refs, plain);
+        assert_eq!(observed.advisory, Some(None), "absent, not ambiguous");
+    }
+}
+
 fn exact_push_endpoint_output(
     root: &Path,
     remote: &str,
@@ -3903,6 +4048,34 @@ impl GitRepo {
         self.observe_remote_ref_oids(remote, destinations, true, None)
     }
 
+    /// As [`Self::remote_ref_oids`], and read one `advisory` ref in the same
+    /// `ls-remote`: one more pattern on the call the caller makes anyway, so
+    /// it costs no extra round trip.
+    ///
+    /// The advisory ref can never weaken the evidence for `destinations`.
+    /// Their map is built exactly as [`Self::remote_ref_oids`] builds it; a
+    /// line only the advisory pattern matched (Git matches patterns by path
+    /// tail) is set aside rather than failing the read, and an advisory ref
+    /// that is itself a destination is not asked for twice. The advisory
+    /// value is `None` when it is ambiguous, `Some(None)` when the remote
+    /// does not have it, and `Some(Some(oid))` otherwise.
+    pub(crate) fn remote_ref_oids_with_advisory(
+        &self,
+        remote: &str,
+        destinations: &[String],
+        advisory: &str,
+    ) -> Result<RemoteRefObservation, GitError> {
+        if destinations
+            .iter()
+            .any(|destination| destination == advisory)
+        {
+            let refs = self.observe_remote_ref_oids(remote, destinations, true, None)?;
+            let advisory = refs.get(advisory).cloned();
+            return Ok(RemoteRefObservation { refs, advisory });
+        }
+        self.observe_remote_ref_oids_with_advisory(remote, destinations, true, None, Some(advisory))
+    }
+
     /// Bind the endpoint actually queried to the original operation identity.
     pub(crate) fn checked_push_remote_ref_oids(
         &self,
@@ -3932,7 +4105,31 @@ impl GitRepo {
         push_endpoint: bool,
         recorded_repository: Option<&str>,
     ) -> Result<BTreeMap<String, Option<String>>, GitError> {
-        let display_args = format!("ls-remote --refs <endpoint> {}", destinations.join(" "));
+        self.observe_remote_ref_oids_with_advisory(
+            remote,
+            destinations,
+            push_endpoint,
+            recorded_repository,
+            None,
+        )
+        .map(|observation| observation.refs)
+    }
+
+    fn observe_remote_ref_oids_with_advisory(
+        &self,
+        remote: &str,
+        destinations: &[String],
+        push_endpoint: bool,
+        recorded_repository: Option<&str>,
+        advisory: Option<&str>,
+    ) -> Result<RemoteRefObservation, GitError> {
+        let patterns = destinations
+            .iter()
+            .map(String::as_str)
+            .chain(advisory)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let display_args = format!("ls-remote --refs <endpoint> {}", patterns.join(" "));
         let output = if push_endpoint {
             let push_url = match recorded_repository {
                 Some(repository) => crate::remote_target::inspection_push_url(
@@ -3944,11 +4141,11 @@ impl GitRepo {
                 })?,
                 None => run_git(&self.root, &["remote", "get-url", "--push", remote])?,
             };
-            exact_push_endpoint_output(&self.root, remote, &push_url, destinations, &display_args)?
+            exact_push_endpoint_output(&self.root, remote, &push_url, &patterns, &display_args)?
         } else {
             let mut command = git_command();
             command.args(["ls-remote", "--refs", remote]);
-            command.args(destinations).current_dir(&self.root);
+            command.args(&patterns).current_dir(&self.root);
             run_git_process_output(command, &[&display_args], git_timeout())?
         };
         if !output.status.success() {
@@ -3963,6 +4160,8 @@ impl GitRepo {
             .cloned()
             .map(|destination| (destination, None))
             .collect::<BTreeMap<_, _>>();
+        let mut advisory_value = None;
+        let mut advisory_ambiguous = false;
         for line in output.lines() {
             let Some((sha, destination)) = line.split_once('\t') else {
                 return Err(GitError::Git {
@@ -3977,6 +4176,16 @@ impl GitRepo {
                 });
             }
             let Some(slot) = observed.get_mut(destination) else {
+                match advisory_line(advisory, destinations, destination) {
+                    AdvisoryLine::Exact => {
+                        if advisory_value.replace(sha.to_ascii_lowercase()).is_some() {
+                            advisory_ambiguous = true;
+                        }
+                        continue;
+                    }
+                    AdvisoryLine::TailOnly => continue,
+                    AdvisoryLine::NotAdvisory => {}
+                }
                 return Err(GitError::Git {
                     args: display_args.clone(),
                     stderr: "remote ref evidence contained an unrequested destination".into(),
@@ -3989,7 +4198,10 @@ impl GitRepo {
                 });
             }
         }
-        Ok(observed)
+        Ok(RemoteRefObservation {
+            refs: observed,
+            advisory: (advisory.is_some() && !advisory_ambiguous).then_some(advisory_value),
+        })
     }
 
     /// Query the remote's advertised HEAD without updating any local ref.
