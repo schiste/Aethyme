@@ -41,7 +41,7 @@
     "unsubmitted_commits": "integer",
     "worktree_missing": "bool"
   },
-  "recommended_next_action": "string",
+  "recommended_next_action": "null",
   "representation": {
     "created_at": "integer",
     "discovery": "string",
