@@ -365,6 +365,37 @@ impl Fixture {
             .meta_set(DEFAULT_BRANCH_FETCH_KEY, value)
             .unwrap();
     }
+
+    /// Journaled fetches of the default branch into `origin/main`.
+    fn default_branch_fetches(&self) -> usize {
+        self.broker()
+            .store()
+            .coordinated_operations()
+            .unwrap()
+            .into_iter()
+            .filter(|operation| {
+                operation.command_json.contains("\"fetch\"")
+                    && operation.command_json.contains("refs/remotes/origin/main")
+            })
+            .count()
+    }
+
+    /// The push plan unknown-outcome recovery reads, from the last journaled
+    /// session-branch push.
+    fn last_push_plan(&self) -> serde_json::Value {
+        let operation = self
+            .broker()
+            .store()
+            .coordinated_operations()
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|operation| operation.scope.starts_with("session-push:"))
+            .expect("a session push is journaled");
+        let details: serde_json::Value =
+            serde_json::from_str(operation.details_json.as_deref().unwrap()).unwrap();
+        details["push_reconciliation"].clone()
+    }
 }
 
 /// Where the broker records its last default-branch fetch for `origin/main`.
@@ -1051,9 +1082,19 @@ fn a_push_reuses_a_default_branch_fetch_from_moments_before() {
     let cached = fixture.tracking_main();
     fixture.land_on_remote_only("moved");
 
-    let report = json(&fixture.push(session, &[]));
+    // With its own remote read the push would see the move and fetch; the
+    // reuse is what remains when that read is unavailable or turned off.
+    let id = session.to_string();
+    let report = json(&fixture.run_with_env(
+        &["push", "--session", &id, "--json"],
+        &[("AETHYME_PUSH_FETCH_SKIP_UNMOVED", "off")],
+    ));
 
     assert_eq!(fixture.tracking_main(), cached, "no fetch ran: {report}");
+    assert!(
+        report.get("default_branch_fetch_skipped_unmoved").is_none(),
+        "{report}"
+    );
     let age = report["default_branch_fetch_age_seconds"]
         .as_u64()
         .unwrap_or_else(|| panic!("the report says the fetch was reused: {report}"));
@@ -1198,4 +1239,194 @@ fn sync_fetches_even_right_after_a_push_fetched() {
     fixture.run(&["sync", "--session", &session.to_string(), "--json"]);
 
     assert_eq!(fixture.tracking_main(), landed, "sync fetched");
+}
+
+/// Pushes come minutes apart, so the 60-second reuse almost never fired and
+/// almost every push fetched a default branch that had not moved. The push
+/// already reads the remote under the lock; that read now carries the
+/// default branch too, and a remote default branch exactly where the
+/// tracking ref is leaves nothing to fetch.
+#[test]
+fn a_push_skips_the_default_branch_fetch_when_the_remote_default_has_not_moved() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, worktree) = fixture.session_with_commit();
+    json(&fixture.push(session, &[]));
+    fixture.commit(&worktree, "feature.txt", "two\n", "feat: second step");
+    // An old record: the reuse alone would fetch.
+    fixture.record_default_branch_fetch(&(now_ms() - 600_000).to_string());
+    let fetches = fixture.default_branch_fetches();
+    let before = now_ms();
+
+    let report = json(&fixture.push(session, &[]));
+
+    assert_eq!(
+        report["default_branch_fetch_skipped_unmoved"], true,
+        "{report}"
+    );
+    assert_eq!(
+        fixture.default_branch_fetches(),
+        fetches,
+        "no default-branch fetch was journaled: {report}"
+    );
+    let age = report["default_branch_fetch_age_seconds"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the age counts from the push's remote read: {report}"));
+    assert!(age <= 60, "{report}");
+    assert_eq!(report["default_branch"]["behind"], 0, "{report}");
+    assert!(report.get("default_branch_note").is_none(), "{report}");
+    // The proof stands for a fetch started when the read started.
+    let recorded: i64 = fixture
+        .default_branch_fetch_record()
+        .expect("the proof is recorded")
+        .parse()
+        .expect("as a time");
+    assert!(
+        (before..=now_ms()).contains(&recorded),
+        "recorded the read's start: {recorded}"
+    );
+}
+
+/// A remote read that shows the default branch moved means only a fetch can
+/// bring the comparison up to date, even when a fetch is recent enough to
+/// reuse.
+#[test]
+fn a_push_fetches_when_its_remote_read_shows_the_default_branch_moved() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, _) = fixture.session_with_commit();
+    json(&fixture.push(session, &[]));
+    fixture.record_default_branch_fetch(&now_ms().to_string());
+    let landed = fixture.land_on_remote_only("moved-under-read");
+    let fetches = fixture.default_branch_fetches();
+
+    let report = json(&fixture.push(session, &[]));
+
+    assert_eq!(fixture.tracking_main(), landed, "push fetched: {report}");
+    assert_eq!(fixture.default_branch_fetches(), fetches + 1, "{report}");
+    assert!(
+        report.get("default_branch_fetch_skipped_unmoved").is_none(),
+        "{report}"
+    );
+    assert!(
+        report.get("default_branch_fetch_age_seconds").is_none(),
+        "{report}"
+    );
+    assert_eq!(report["default_branch"]["behind"], 1, "{report}");
+}
+
+/// The push reads its push URL; the fetch reads the fetch URL. When they are
+/// not the same, what the push read proves nothing about the fetch.
+#[test]
+fn a_push_fetches_when_the_push_url_differs_from_the_fetch_url() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    git(
+        &fixture.repo,
+        &[
+            "config",
+            "remote.origin.pushurl",
+            "ssh://git@github.com/acme/project.git",
+        ],
+    );
+    let (session, _) = fixture.session_with_commit();
+    let fetches = fixture.default_branch_fetches();
+
+    let report = json(&fixture.push(session, &[]));
+
+    assert_eq!(fixture.default_branch_fetches(), fetches + 1, "{report}");
+    assert!(
+        report.get("default_branch_fetch_skipped_unmoved").is_none(),
+        "{report}"
+    );
+    assert!(
+        report.get("default_branch_fetch_age_seconds").is_none(),
+        "{report}"
+    );
+}
+
+#[test]
+fn skipping_an_unmoved_default_branch_fetch_can_be_turned_off() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, _) = fixture.session_with_commit();
+    let fetches = fixture.default_branch_fetches();
+
+    let id = session.to_string();
+    let report = json(&fixture.run_with_env(
+        &["push", "--session", &id, "--json"],
+        &[("AETHYME_PUSH_FETCH_SKIP_UNMOVED", "off")],
+    ));
+
+    assert_eq!(fixture.default_branch_fetches(), fetches + 1, "{report}");
+    assert!(
+        report.get("default_branch_fetch_skipped_unmoved").is_none(),
+        "{report}"
+    );
+}
+
+/// `--pr` keeps fetching after it opens the pull request, even when nothing
+/// moved: its size measurement should see the default branch as it is then.
+#[test]
+fn a_push_that_opens_a_pull_request_fetches_even_when_nothing_moved() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, _) = fixture.session_with_commit();
+    let fetches = fixture.default_branch_fetches();
+
+    let report = json(&fixture.push(session, &["--pr"]));
+
+    assert_eq!(report["pr"]["number"], 7, "{report}");
+    assert_eq!(fixture.default_branch_fetches(), fetches + 1, "{report}");
+    assert!(
+        report.get("default_branch_fetch_skipped_unmoved").is_none(),
+        "{report}"
+    );
+}
+
+/// Unknown-outcome recovery compares the remote with the pre-push value the
+/// plan journaled. Reading the default branch in the same `ls-remote` must
+/// leave that plan exactly as it was: one destination, the session branch,
+/// with the remote's value before this push.
+#[test]
+fn reading_the_default_branch_leaves_the_recovery_plan_unchanged() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, worktree) = fixture.session_with_commit();
+    let first = json(&fixture.push(session, &[]));
+    let branch = first["branch"].as_str().unwrap().to_string();
+    let first_oid = first["pushed_oid"].as_str().unwrap().to_string();
+    let plan = fixture.last_push_plan();
+    assert_eq!(plan["planning"], "planned", "{plan}");
+    assert_eq!(
+        plan["plan"]["destinations"],
+        serde_json::json!([{
+            "destination_ref": format!("refs/heads/{branch}"),
+            "pre_push_sha": null,
+            "proposed_sha": first_oid,
+        }]),
+        "{plan}"
+    );
+
+    fixture.commit(&worktree, "feature.txt", "two\n", "feat: second step");
+    let second = json(&fixture.push(session, &[]));
+    assert_eq!(
+        second["default_branch_fetch_skipped_unmoved"], true,
+        "{second}"
+    );
+    let plan = fixture.last_push_plan();
+    assert_eq!(plan["planning"], "planned", "{plan}");
+    assert_eq!(
+        plan["plan"]["destinations"],
+        serde_json::json!([{
+            "destination_ref": format!("refs/heads/{branch}"),
+            "pre_push_sha": first_oid,
+            "proposed_sha": second["pushed_oid"],
+        }]),
+        "the default branch never enters the recovery plan: {plan}"
+    );
+    assert!(
+        !plan.to_string().contains("refs/heads/main"),
+        "the default branch never enters the recovery plan: {plan}"
+    );
 }

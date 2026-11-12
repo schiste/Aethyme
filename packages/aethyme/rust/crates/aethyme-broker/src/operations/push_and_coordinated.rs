@@ -76,6 +76,24 @@ fn plan_exact_push(
     args: &[String],
     target: Option<&crate::ResolvedRemoteTarget>,
 ) -> PushPlanning {
+    plan_exact_push_observing(cwd, args, target, None, &mut None)
+}
+
+/// [`plan_exact_push`], and when `observe_default` names a remote ref, read
+/// it in the same `ls-remote` as the pre-push evidence into `observed`.
+///
+/// The plan -- and so the pre-push value unknown-outcome recovery relies on
+/// -- is exactly what [`plan_exact_push`] returns: the extra ref is one more
+/// pattern whose lines never enter the destinations' evidence. `observed`
+/// stays `None` whenever the plan does not reach the remote read, the read
+/// fails, or the remote's answer for the extra ref is ambiguous.
+fn plan_exact_push_observing(
+    cwd: &Path,
+    args: &[String],
+    target: Option<&crate::ResolvedRemoteTarget>,
+    observe_default: Option<&str>,
+    observed: &mut Option<RemoteDefaultObservation>,
+) -> PushPlanning {
     let Some(args) = git_subcommand_args(args) else {
         return PushPlanning::NotApplicable;
     };
@@ -187,11 +205,28 @@ fn plan_exact_push(
         .iter()
         .map(|destination| destination.destination_ref.clone())
         .collect::<Vec<_>>();
-    let Ok(pre_push) = repo.remote_ref_oids(&target.remote_name, &destination_refs) else {
+    let read_started_at_ms = crate::clock::epoch_ms();
+    let read = match observe_default {
+        Some(default_ref) => repo
+            .remote_ref_oids_with_advisory(&target.remote_name, &destination_refs, default_ref)
+            .map(|observation| (observation.refs, observation.advisory)),
+        None => repo
+            .remote_ref_oids(&target.remote_name, &destination_refs)
+            .map(|refs| (refs, None)),
+    };
+    let Ok((pre_push, default_oid)) = read else {
         return PushPlanning::Unavailable {
             reason: "pre_push_remote_evidence_unavailable",
         };
     };
+    *observed =
+        observe_default
+            .zip(default_oid)
+            .map(|(remote_ref, oid)| RemoteDefaultObservation {
+                remote_ref: remote_ref.to_string(),
+                oid,
+                read_started_at_ms,
+            });
     for destination in &mut destinations {
         destination.pre_push_sha = pre_push
             .get(&destination.destination_ref)
@@ -2264,11 +2299,56 @@ impl Broker {
     /// then durably journal structured successful stdout before success.
     pub(crate) fn run_coordinated_operation_at_with_hooks<P, F>(
         &mut self,
+        request: CoordinatedCommand,
+        cwd: &Path,
+        queue_wait: QueueWait,
+        pre_execute: P,
+        on_success: F,
+    ) -> Result<CoordinatedOperationReport, BrokerOpError>
+    where
+        P: FnOnce() -> Result<(), String>,
+        F: FnOnce(&CapturedOutput, i64) -> Result<Option<serde_json::Value>, String>,
+    {
+        self.run_coordinated_operation_observing(
+            request,
+            cwd,
+            queue_wait,
+            pre_execute,
+            on_success,
+            None,
+        )
+    }
+
+    /// As [`Self::run_coordinated_operation_at_with_wait`] for a `git push`,
+    /// and also read `default_ref` on the remote in the push's own under-lock
+    /// `ls-remote`, reported as
+    /// [`CoordinatedOperationReport::remote_default_observation`]. No extra
+    /// network call: the read the push makes anyway carries one more pattern.
+    pub(crate) fn run_coordinated_push_observing_default(
+        &mut self,
+        request: CoordinatedCommand,
+        cwd: &Path,
+        queue_wait: QueueWait,
+        default_ref: &str,
+    ) -> Result<CoordinatedOperationReport, BrokerOpError> {
+        self.run_coordinated_operation_observing(
+            request,
+            cwd,
+            queue_wait,
+            || Ok(()),
+            |_, _| Ok(None),
+            Some(default_ref),
+        )
+    }
+
+    fn run_coordinated_operation_observing<P, F>(
+        &mut self,
         mut request: CoordinatedCommand,
         cwd: &Path,
         queue_wait: QueueWait,
         pre_execute: P,
         on_success: F,
+        observe_default: Option<&str>,
     ) -> Result<CoordinatedOperationReport, BrokerOpError>
     where
         P: FnOnce() -> Result<(), String>,
@@ -3004,9 +3084,16 @@ impl Broker {
             return Err(BrokerOpError::InvalidCoordinatedOperation { reason });
         }
         drop(locked_checks_span);
+        let mut remote_default_observation = None;
         let push_planning = if request.provider == OperationProvider::Git {
             let _read_span = push_stage_span(push_stages, "push_git_remote_read_under_lock");
-            plan_exact_push(cwd, &request.args, resolved_target.as_ref())
+            plan_exact_push_observing(
+                cwd,
+                &request.args,
+                resolved_target.as_ref(),
+                observe_default,
+                &mut remote_default_observation,
+            )
         } else {
             PushPlanning::NotApplicable
         };
@@ -3537,6 +3624,7 @@ impl Broker {
             post_merge_cleanup: None,
             representing_commit: None,
             created_pull_request: created_pull_request_number,
+            remote_default_observation,
             pushed_refs: if output.status.success() {
                 match &push_planning {
                     PushPlanning::Planned(plan) => plan

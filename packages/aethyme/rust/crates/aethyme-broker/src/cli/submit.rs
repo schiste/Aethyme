@@ -926,7 +926,9 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
     if let Some(note) = &report.default_branch_note {
         out!("  Note: {note}");
     }
-    if let Some(age) = report.default_branch_fetch_age_seconds {
+    if let Some(age) = report.default_branch_fetch_age_seconds
+        && !report.default_branch_fetch_skipped_unmoved
+    {
         out!(
             "  Note: compared with the default branch as fetched {age}s ago by an earlier \
              broker command; set {}=off to always fetch",
@@ -1423,6 +1425,7 @@ mod review_on_push_tests {
             default_branch_note: None,
             default_branch_fetch_age_seconds: None,
             pr_lookup_listing_age_seconds: None,
+            default_branch_fetch_skipped_unmoved: false,
             pr_watch_id: None,
             pr_watch_note: None,
             pr_size: None,

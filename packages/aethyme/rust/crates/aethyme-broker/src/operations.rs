@@ -940,6 +940,27 @@ pub struct CoordinatedOperationReport {
     /// the repository write lock, which is the head-of-line stall of #138.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_pull_request: Option<i64>,
+    /// The remote's default branch, read in the same `ls-remote` as a push's
+    /// pre-push evidence when the caller asked for it. `None` when it was not
+    /// asked for or could not be read unambiguously.
+    #[serde(skip)]
+    pub(crate) remote_default_observation: Option<RemoteDefaultObservation>,
+}
+
+/// The remote default branch as one under-lock push read saw it.
+///
+/// It is read from the push endpoint, so it stands for what a fetch would
+/// bring only when the fetch endpoint is the same; `broker push` checks that
+/// before asking for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteDefaultObservation {
+    /// The ref on the remote, e.g. `refs/heads/main`.
+    pub(crate) remote_ref: String,
+    /// What the remote held; `None` when it had no such ref.
+    pub(crate) oid: Option<String>,
+    /// When the read started, in epoch milliseconds: the remote held `oid`
+    /// at some moment after this.
+    pub(crate) read_started_at_ms: i64,
 }
 
 impl CoordinatedOperationReport {

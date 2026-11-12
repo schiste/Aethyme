@@ -153,6 +153,84 @@ fn listing_age_seconds(listed_at_ms: i64, now_ms: i64) -> u64 {
     u64::try_from(now_ms.saturating_sub(listed_at_ms) / 1000).unwrap_or(0)
 }
 
+/// Set to `off` to make every `push` fetch the default branch even when its
+/// own remote read showed the default branch had not moved.
+pub(crate) const PUSH_FETCH_SKIP_UNMOVED_ENV: &str = "AETHYME_PUSH_FETCH_SKIP_UNMOVED";
+
+/// Whether `push` may skip the default-branch fetch on proof that the remote
+/// default branch is where the tracking ref already is; read once.
+fn push_fetch_skip_unmoved_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var(PUSH_FETCH_SKIP_UNMOVED_ENV),
+            Ok(value) if value.trim().eq_ignore_ascii_case("off")
+        )
+    })
+}
+
+/// Whether a fetch from `remote` reaches the endpoint a push to it reads.
+///
+/// The push's remote read queries the push URL; the default-branch fetch
+/// queries the fetch URL. Only when they are the same string (after Git's own
+/// rewrites, before any redaction) does what the push read stand for what the
+/// fetch would bring. A `pushurl` that differs, several push URLs, or a URL
+/// Git cannot report all mean "not the same".
+fn fetch_and_push_share_endpoint(repo: &GitRepo, remote: &str) -> bool {
+    let Ok(fetch_url) = repo.remote_url(remote) else {
+        return false;
+    };
+    matches!(
+        repo.remote_push_urls(remote).as_deref(),
+        Ok([push_url]) if *push_url == fetch_url
+    )
+}
+
+/// What the push's own remote read says about the default branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefaultBranchProof {
+    /// The remote default branch was where the tracking ref already is, as
+    /// read from the remote at this epoch-millisecond time.
+    Unmoved { read_started_at_ms: i64 },
+    /// The remote default branch was elsewhere (or absent): only a fetch can
+    /// bring the comparison up to date.
+    Moved,
+    /// Nothing was proven either way; today's rules apply.
+    Unavailable,
+}
+
+/// Compare what the push read on the remote with the local tracking ref.
+fn default_branch_proof(
+    observation: Option<&crate::operations::RemoteDefaultObservation>,
+    remote_ref: &str,
+    tracking_oid: Option<&str>,
+) -> DefaultBranchProof {
+    let Some(observation) = observation.filter(|seen| seen.remote_ref == remote_ref) else {
+        return DefaultBranchProof::Unavailable;
+    };
+    match (observation.oid.as_deref(), tracking_oid) {
+        (Some(remote), Some(local)) if remote.eq_ignore_ascii_case(local) => {
+            DefaultBranchProof::Unmoved {
+                read_started_at_ms: observation.read_started_at_ms,
+            }
+        }
+        _ => DefaultBranchProof::Moved,
+    }
+}
+
+/// The fetch record to keep after a proof that the tracking ref matched the
+/// remote at `proven_at_ms`, or `None` to leave `recorded` as it is.
+///
+/// A fetch started at some time leaves the tracking ref at least as new as the
+/// remote was then; the proof says the same of the read's start, so it counts
+/// as a fetch started at that moment. A newer successful record is kept.
+fn record_after_unmoved_proof(recorded: Option<&str>, proven_at_ms: i64) -> Option<String> {
+    match recorded.and_then(|value| value.trim().parse::<i64>().ok()) {
+        Some(started_at_ms) if started_at_ms >= proven_at_ms => None,
+        _ => Some(proven_at_ms.to_string()),
+    }
+}
+
 /// How long one push or GitHub call may queue for the repository write lock.
 fn push_operation_wait() -> QueueWait {
     QueueWait::Seconds(60)
@@ -247,10 +325,12 @@ pub struct SessionPushReport {
     /// and the comparison used the last fetched copy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_branch_note: Option<String>,
-    /// Seconds since the default-branch fetch `default_branch` was measured
-    /// against, when this push reused a fetch another broker command made
-    /// moments before instead of fetching again. Omitted when this push
-    /// fetched itself. `AETHYME_PUSH_FETCH_REUSE=off` always fetches.
+    /// Seconds since the default branch `default_branch` was measured
+    /// against was last known current, when this push did not fetch: it
+    /// reused a fetch another broker command made moments before, or (with
+    /// `default_branch_fetch_skipped_unmoved`) its own remote read showed the
+    /// default branch had not moved. Omitted when this push fetched itself.
+    /// `AETHYME_PUSH_FETCH_REUSE=off` disables the reuse.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_branch_fetch_age_seconds: Option<u64>,
     /// Seconds since the open-PR listing `pr` was read from, when this push
@@ -259,6 +339,14 @@ pub struct SessionPushReport {
     /// came from a lookup, from `--pr`, or is absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_lookup_listing_age_seconds: Option<u64>,
+    /// True when this push did not fetch the default branch because the
+    /// remote read it makes before pushing showed the remote default branch
+    /// at exactly the commit the tracking ref already held: a fetch would
+    /// have changed nothing. `default_branch_fetch_age_seconds` then counts
+    /// from that read. Omitted otherwise;
+    /// `AETHYME_PUSH_FETCH_SKIP_UNMOVED=off` always fetches.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub default_branch_fetch_skipped_unmoved: bool,
     /// With `--pr`: the change measured against `[review] pr_size` (#239).
     /// Advisory only -- a push is never refused for its size. Omitted without
     /// `--pr`, or when the change could not be measured.
@@ -586,6 +674,13 @@ impl Broker {
         let target = repo
             .resolve_remote_target(&default.remote, None)
             .map_err(|error| refused(format!("remote {:?}: {error}", default.remote)))?;
+        // The push reads the remote under the lock anyway; asking it for the
+        // default branch too can prove the fetch after the push unnecessary.
+        // `--pr` keeps fetching after it opens the pull request, as before.
+        let remote_default_ref = format!("refs/heads/{}", default.branch);
+        let observe_default = !open_pr
+            && push_fetch_skip_unmoved_enabled()
+            && fetch_and_push_share_endpoint(repo, &default.remote);
         let branch_ref = format!("refs/heads/{}", session.branch);
         let head =
             repo.resolve_ref(&branch_ref)
@@ -648,25 +743,35 @@ impl Broker {
             phase_started.elapsed().as_millis() as u64,
         );
         let phase_started = std::time::Instant::now();
-        let push = self.run_coordinated_operation_at_with_wait(
-            CoordinatedCommand {
-                session_id,
-                provider: OperationProvider::Git,
-                repository: None,
-                resolved_target: Some(target.clone()),
-                scope: Some(format!("session-push:{branch_ref}")),
-                declared_effect: Some(effect),
-                // The lease is the confirmation: it can only replace this
-                // session's own last push, on this session's own branch.
-                destructive_confirmed: effect == OperationEffect::Destructive,
-                cross_session: None,
-                ref_write_acknowledged: false,
-                authorization_reason: Some(format!("repository policy {SESSION_PUSH_POLICY_KEY}")),
-                args,
-            },
-            session_worktree,
-            push_operation_wait(),
-        )?;
+        let push_command = CoordinatedCommand {
+            session_id,
+            provider: OperationProvider::Git,
+            repository: None,
+            resolved_target: Some(target.clone()),
+            scope: Some(format!("session-push:{branch_ref}")),
+            declared_effect: Some(effect),
+            // The lease is the confirmation: it can only replace this
+            // session's own last push, on this session's own branch.
+            destructive_confirmed: effect == OperationEffect::Destructive,
+            cross_session: None,
+            ref_write_acknowledged: false,
+            authorization_reason: Some(format!("repository policy {SESSION_PUSH_POLICY_KEY}")),
+            args,
+        };
+        let push = if observe_default {
+            self.run_coordinated_push_observing_default(
+                push_command,
+                session_worktree,
+                push_operation_wait(),
+                &remote_default_ref,
+            )?
+        } else {
+            self.run_coordinated_operation_at_with_wait(
+                push_command,
+                session_worktree,
+                push_operation_wait(),
+            )?
+        };
         if !push.ok() {
             return Err(operation_failure("push", &push));
         }
@@ -727,16 +832,51 @@ impl Broker {
 
         // Advisory and best-effort, like the overlap check below: the default
         // branch moved under this session whenever another PR merged, and
-        // that is only visible after fetching it. A fetch any broker command
-        // made within the last minute is reused instead, except with `--pr`,
-        // whose size measurement should see the current default branch.
-        let reused_fetch_age_ms = if open_pr {
-            None
+        // that is only visible after fetching it. When the push's own remote
+        // read showed the remote default branch exactly where the tracking
+        // ref is, there is nothing to fetch. Otherwise, unless that read
+        // proved it moved, a fetch any broker command made within the last
+        // minute is reused, except with `--pr`, whose size measurement should
+        // see the current default branch.
+        let proof = if observe_default {
+            let _span = crate::phase_telemetry::span("default_branch_unmoved_check");
+            let tracking_oid = self.repo_handle().resolve_ref(&default.tracking_ref);
+            default_branch_proof(
+                push.remote_default_observation.as_ref(),
+                &remote_default_ref,
+                tracking_oid.as_deref(),
+            )
         } else {
-            self.reusable_default_branch_fetch_age_ms(&default)
+            DefaultBranchProof::Unavailable
         };
+        let reused_fetch_age_ms = match proof {
+            DefaultBranchProof::Unmoved { read_started_at_ms } => {
+                crate::phase_telemetry::add(
+                    "default_branch_fetch_skipped_unmoved",
+                    std::time::Duration::ZERO,
+                );
+                self.record_default_branch_unmoved(&default, read_started_at_ms);
+                Some(
+                    crate::clock::epoch_ms()
+                        .saturating_sub(read_started_at_ms)
+                        .max(0),
+                )
+            }
+            DefaultBranchProof::Moved => None,
+            DefaultBranchProof::Unavailable if open_pr => None,
+            DefaultBranchProof::Unavailable => {
+                let reused = self.reusable_default_branch_fetch_age_ms(&default);
+                if reused.is_some() {
+                    crate::phase_telemetry::add(
+                        "default_branch_fetch_reused",
+                        std::time::Duration::ZERO,
+                    );
+                }
+                reused
+            }
+        };
+        let skipped_unmoved = matches!(proof, DefaultBranchProof::Unmoved { .. });
         let (default_branch, default_branch_note, _) = if reused_fetch_age_ms.is_some() {
-            crate::phase_telemetry::add("default_branch_fetch_reused", std::time::Duration::ZERO);
             self.measure_default_branch(session_id, &session.branch, &default, &head, None)
         } else {
             self.fetch_and_measure_default_branch(
@@ -853,6 +993,7 @@ impl Broker {
             default_branch_fetch_age_seconds: reused_fetch_age_ms
                 .map(|age_ms| u64::try_from(age_ms / 1000).unwrap_or(0)),
             pr_lookup_listing_age_seconds,
+            default_branch_fetch_skipped_unmoved: skipped_unmoved,
             pr_size,
             review_run: None,
             phase_timings_ms,
@@ -889,6 +1030,19 @@ impl Broker {
                 .meta_set(&default_branch_fetch_key(&default.tracking_ref), &record),
         );
         fetched
+    }
+
+    /// Record that the tracking ref was proven current at `proven_at_ms`, as
+    /// a fetch started then would have: see [`record_after_unmoved_proof`].
+    fn record_default_branch_unmoved(&mut self, default: &TrackedDefault, proven_at_ms: i64) {
+        let key = default_branch_fetch_key(&default.tracking_ref);
+        let recorded = self.store_ref().meta_get(&key).ok().flatten();
+        if let Some(record) = record_after_unmoved_proof(recorded.as_deref(), proven_at_ms) {
+            crate::warn_unrecorded(
+                "record the default-branch proof time",
+                self.store().meta_set(&key, &record),
+            );
+        }
     }
 
     /// How old the last recorded default-branch fetch is, when `push` may
@@ -1358,6 +1512,70 @@ mod tests {
         assert_eq!(listing_age_seconds(10_000, 12_999), 2);
         assert_eq!(listing_age_seconds(10_000, 10_000), 0);
         assert_eq!(listing_age_seconds(10_000, 9_000), 0);
+    }
+
+    #[test]
+    fn only_a_remote_default_at_the_tracking_commit_proves_the_fetch_unneeded() {
+        let seen = |oid: Option<&str>| crate::operations::RemoteDefaultObservation {
+            remote_ref: "refs/heads/main".into(),
+            oid: oid.map(str::to_string),
+            read_started_at_ms: 1_000,
+        };
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        assert_eq!(
+            default_branch_proof(Some(&seen(Some(&a))), "refs/heads/main", Some(&a)),
+            DefaultBranchProof::Unmoved {
+                read_started_at_ms: 1_000
+            }
+        );
+        assert_eq!(
+            default_branch_proof(
+                Some(&seen(Some(&a.to_ascii_uppercase()))),
+                "refs/heads/main",
+                Some(&a)
+            ),
+            DefaultBranchProof::Unmoved {
+                read_started_at_ms: 1_000
+            }
+        );
+        assert_eq!(
+            default_branch_proof(Some(&seen(Some(&b))), "refs/heads/main", Some(&a)),
+            DefaultBranchProof::Moved
+        );
+        // The remote lost its default branch, or nothing was fetched yet.
+        assert_eq!(
+            default_branch_proof(Some(&seen(None)), "refs/heads/main", Some(&a)),
+            DefaultBranchProof::Moved
+        );
+        assert_eq!(
+            default_branch_proof(Some(&seen(Some(&a))), "refs/heads/main", None),
+            DefaultBranchProof::Moved
+        );
+        // A read of another ref, or no read, proves nothing.
+        assert_eq!(
+            default_branch_proof(Some(&seen(Some(&a))), "refs/heads/trunk", Some(&a)),
+            DefaultBranchProof::Unavailable
+        );
+        assert_eq!(
+            default_branch_proof(None, "refs/heads/main", Some(&a)),
+            DefaultBranchProof::Unavailable
+        );
+    }
+
+    #[test]
+    fn an_unmoved_proof_records_its_read_time_unless_a_newer_fetch_is_recorded() {
+        assert_eq!(record_after_unmoved_proof(None, 5_000), Some("5000".into()));
+        assert_eq!(
+            record_after_unmoved_proof(Some(DEFAULT_BRANCH_FETCH_FAILED), 5_000),
+            Some("5000".into())
+        );
+        assert_eq!(
+            record_after_unmoved_proof(Some("4000"), 5_000),
+            Some("5000".into())
+        );
+        assert_eq!(record_after_unmoved_proof(Some("5000"), 5_000), None);
+        assert_eq!(record_after_unmoved_proof(Some("6000"), 5_000), None);
     }
 
     #[test]
