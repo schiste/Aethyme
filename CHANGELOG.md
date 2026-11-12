@@ -4,6 +4,25 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.80] - 2026-11-12
+
+### Changed
+
+- In a repository with no fetched default branch whose integration branch still holds promoted commits, `submit` verifies against the local default branch sessions are cut from (`verified_against.source: local_default`, with a `fallback_reason`), and `status` and `doctor` report `integration.leftover-work` with the commit count and the reconcile command (#1629).
+- `broker push` with `[review] run_on_push` no longer makes a separate GitHub pull-request lookup when the open-PR listing it fetched in the same push already shows the session's pull request (`pr_lookup_listing_age_seconds`, counter `push_pr_lookup_reused`) (#1630).
+
+### Added
+
+- Push telemetry splits the push process into `push_git_process_before_hook`, `push_git_process_hook` and `push_git_process_after_hook`, and times `push_pr_lookup`, `push_overlap_listing`, `push_overlap_provider_diff` and finalization (#1630).
+
+### Fixed
+
+- Submit's next-step line no longer names `push --pr` where it cannot work (no remote, or pushing session branches is not authorized) (#1629).
+
+### Removed
+
+- `auto_cleanup_landed_integration`, which nothing called once promotion was removed. `integration reconcile` remains for repositories that still hold work on a local integration branch (#1629).
+
 ## [0.8.79] - 2026-11-12
 
 ### Removed
