@@ -220,9 +220,7 @@
     "active_sessions": "integer",
     "baseline_head": "string",
     "baseline_ref": "string",
-    "commands": [
-      "string"
-    ],
+    "commands": [],
     "dirty_sessions": "integer",
     "idle_sessions": "integer",
     "integration_ahead_local_main_commits": "integer",

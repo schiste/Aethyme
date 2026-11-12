@@ -135,8 +135,6 @@ mod lease_requests_cli;
 mod leases_cli;
 #[path = "leases_e2e.rs"]
 mod leases_e2e;
-#[path = "main_reconcile.rs"]
-mod main_reconcile;
 #[path = "merge_chain_cli.rs"]
 mod merge_chain_cli;
 #[path = "merge_e2e.rs"]
@@ -169,8 +167,6 @@ mod pr_watch;
 mod preparation_cli;
 #[path = "prepare_draft.rs"]
 mod prepare_draft;
-#[path = "promotion_record.rs"]
-mod promotion_record;
 #[path = "push_source_cli.rs"]
 mod push_source_cli;
 #[path = "queued_operations_cli.rs"]

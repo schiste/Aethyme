@@ -217,7 +217,7 @@ impl Broker {
         } else {
             report.next_commands.first().cloned().or_else(|| {
                 (report.delivery.published && !report.cleanup_safe)
-                    .then(|| "aethyme broker advanced integration status".into())
+                    .then(|| "aethyme broker status".into())
             })
         };
     }

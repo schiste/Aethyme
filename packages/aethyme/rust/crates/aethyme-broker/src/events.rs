@@ -38,7 +38,6 @@ pub const QUALITY_REPORT_PUBLISHED: &str = "quality_report.published";
 pub const QUALITY_REPORT_PUBLICATION_FAILED: &str = "quality_report.publication_failed";
 pub const BROKER_COMMAND_FAILED: &str = "broker.command.failed";
 pub const BROKER_GC_APPLIED: &str = "broker.gc.applied";
-pub const BROKER_PROMOTION_RECORD_RESTORED: &str = "broker.promotion-record.restored";
 pub const BROKER_GC_ARTIFACTS_SWEPT: &str = "broker.gc.artifacts-swept";
 /// A detached non-pruning repack was started because the repository's loose
 /// objects passed the threshold; the payload carries the estimate.

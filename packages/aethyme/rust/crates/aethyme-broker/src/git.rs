@@ -4910,12 +4910,6 @@ impl GitRepo {
             .collect())
     }
 
-    /// Point `name` at `commit`, creating or moving it. Used for preservation
-    /// refs, where the name already encodes the commit it preserves.
-    pub fn create_branch_at(&self, name: &str, commit: &str) -> Result<(), GitError> {
-        run_git(&self.root, &["branch", "--force", name, commit]).map(|_| ())
-    }
-
     /// Blob id of `path` at `rev`, or `None` when the path does not exist there.
     /// Comparing blob ids is how "this change is already present" is decided
     /// without replaying the patch.

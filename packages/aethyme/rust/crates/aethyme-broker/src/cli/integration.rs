@@ -1,222 +1,6 @@
-//! `broker advanced integration`: inspect and reconcile the integration branch.
+//! `broker advanced integration reconcile`: reconcile the integration branch with a fetched upstream.
 
 use super::*;
-
-pub(super) fn upstream_relation(local_only: u64, upstream_only: u64) -> String {
-    match (local_only, upstream_only) {
-        (0, 0) => "fetched upstream matches local main".into(),
-        (local, 0) => format!(
-            "local main ahead by {local} {}",
-            plural(local as usize, "commit", "commits")
-        ),
-        (0, upstream) => format!(
-            "local main behind by {upstream} {}",
-            plural(upstream as usize, "commit", "commits")
-        ),
-        (local, upstream) => format!(
-            "diverged: {local} local-only {}, {upstream} upstream-only {}",
-            plural(local as usize, "commit", "commits"),
-            plural(upstream as usize, "commit", "commits")
-        ),
-    }
-}
-
-pub(super) fn render_integration_status(
-    report: &crate::IntegrationStatusView,
-    json: bool,
-) -> Result<(), UsageError> {
-    if json {
-        out!("{}", serde_json::to_string_pretty(report)?);
-        return Ok(());
-    }
-
-    out!(
-        "Integration: {} @ {}",
-        report.branch,
-        short_commit(&report.head)
-    );
-    let main_relation = if report.head == report.main_head {
-        "current with integration".to_string()
-    } else if report.main_is_ancestor {
-        format!(
-            "{} {} behind integration",
-            report.commits_ahead_main,
-            plural(report.commits_ahead_main as usize, "commit", "commits")
-        )
-    } else {
-        "diverged from integration".into()
-    };
-    out!(
-        "Main:        {} ({main_relation})",
-        short_commit(&report.main_head)
-    );
-    if let (Some(upstream_ref), Some(upstream_head)) = (&report.upstream_ref, &report.upstream_head)
-    {
-        let relation = upstream_relation(
-            report.main_ahead_upstream_commits,
-            report.main_behind_upstream_commits,
-        );
-        out!(
-            "Upstream:    {} @ {} ({relation})",
-            upstream_ref,
-            short_commit(upstream_head)
-        );
-    }
-    out!();
-
-    if report.promoted_entries.is_empty() && report.changed_files.is_empty() {
-        out!("Pending layer: none");
-    } else {
-        out!(
-            "Pending layer: {} promoted {}, {} {} changed, {} {} ahead of main",
-            report.promoted_entries.len(),
-            plural(report.promoted_entries.len(), "entry", "entries"),
-            report.changed_files.len(),
-            plural(report.changed_files.len(), "file", "files"),
-            report.commits_ahead_main,
-            plural(report.commits_ahead_main as usize, "commit", "commits"),
-        );
-    }
-
-    if report.promoted_entries.is_empty() {
-        out!("Promoted entries: none");
-    } else {
-        out!("Promoted entries:");
-        for entry in report.promoted_entries.iter().take(10) {
-            let label = entry
-                .task
-                .as_deref()
-                .or(entry.branch.as_deref())
-                .unwrap_or("-");
-            out!(
-                "  q{} session {} {} -> {}  {}",
-                entry.queue_entry_id,
-                entry.session_id,
-                short_commit(&entry.head_commit),
-                short_commit(&entry.merge_commit),
-                label
-            );
-            if !entry.files.is_empty() {
-                out!("    files: {}", capped_join(&entry.files, 5));
-            }
-        }
-        if report.promoted_entries.len() > 10 {
-            out!(
-                "  and {} more promoted {}",
-                report.promoted_entries.len() - 10,
-                plural(report.promoted_entries.len() - 10, "entry", "entries")
-            );
-        }
-    }
-
-    if report.changed_files.is_empty() {
-        out!("Changed files: none");
-    } else {
-        out!("Changed files:");
-        for path in report.changed_files.iter().take(12) {
-            out!("  - {path}");
-        }
-        if report.changed_files.len() > 12 {
-            out!(
-                "  and {} more {}",
-                report.changed_files.len() - 12,
-                plural(report.changed_files.len() - 12, "file", "files")
-            );
-        }
-    }
-
-    if report.conflicts.is_empty() {
-        out!("Conflicts with pending layer: none");
-    } else {
-        out!("Conflicts with pending layer:");
-        for conflict in report.conflicts.iter().take(12) {
-            out!(
-                "  session {}: {} (session {}, integration {})",
-                conflict.session_id,
-                conflict.path,
-                conflict.session_path,
-                conflict.promoted_path
-            );
-        }
-        if report.conflicts.len() > 12 {
-            out!(
-                "  and {} more {}",
-                report.conflicts.len() - 12,
-                plural(report.conflicts.len() - 12, "conflict", "conflicts")
-            );
-        }
-    }
-
-    if let Some(reconciliation) = &report.reconciliation {
-        out!(
-            "Reconciliation evidence: {} landed, {} ambiguous, {} unresolved, {} unrecorded",
-            reconciliation.landed_entry_count,
-            reconciliation.ambiguous_entry_count,
-            reconciliation.unresolved_entry_count,
-            reconciliation.unrecorded_commits.len()
-        );
-        out!("  {}", reconciliation.explanation);
-    }
-
-    out!("Delivery state: {}", report.next_action.state.as_str());
-    out!("Next action: {}", report.next_action.summary);
-    for command in &report.next_action.commands {
-        out!("  run: {command}");
-    }
-    Ok(())
-}
-
-pub(super) fn render_integration_stability(
-    report: &crate::IntegrationStabilityReport,
-    json: bool,
-) -> Result<(), UsageError> {
-    if json {
-        out!("{}", serde_json::to_string_pretty(report)?);
-        return Ok(());
-    }
-
-    out!(
-        "Integration: {} {} -> {}",
-        report.branch,
-        short_commit(&report.start_head),
-        short_commit(&report.end_head)
-    );
-    out!(
-        "Window:      {}s (observed {}ms)",
-        report.requested_seconds,
-        report.observed_ms
-    );
-    out!(
-        "Result:      {}",
-        if report.stable { "stable" } else { "moved" }
-    );
-    out!("{}", report.message);
-    if report.live_sessions.is_empty() {
-        out!("Live sessions: none");
-    } else {
-        out!("Live sessions:");
-        for session in report.live_sessions.iter().take(10) {
-            out!(
-                "  session {} {} {} {}",
-                session.id,
-                session.status.as_str(),
-                session.branch,
-                session.task.as_deref().unwrap_or("-")
-            );
-        }
-        if report.live_sessions.len() > 10 {
-            out!(
-                "  and {} more {}",
-                report.live_sessions.len() - 10,
-                plural(report.live_sessions.len() - 10, "session", "sessions")
-            );
-        }
-    }
-    for command in &report.commands {
-        out!("run: {command}");
-    }
-    Ok(())
-}
 
 pub(super) fn render_integration_reconcile(
     report: &crate::IntegrationReconcileReport,
@@ -346,36 +130,16 @@ pub(super) fn write_reconciliation_resolution_template(
     Ok(())
 }
 
-/// `broker integration`.
+/// `broker advanced integration reconcile`.
 pub(super) fn run_integration(parsed: Parsed) -> Result<(), UsageError> {
     let action = parsed
         .positional
         .first()
         .map(String::as_str)
         .ok_or(UsageError::Message(
-            "integration requires an action: status or wait-stable".into(),
+            "integration requires an action: reconcile".into(),
         ))?;
     match action {
-        "status" => {
-            let mut broker = open_broker(parsed.read_only_snapshot)?;
-            let report = if parsed.read_only_snapshot {
-                broker.integration_status_snapshot()?
-            } else {
-                broker.integration_status(now_ms())?
-            };
-            render_integration_status(&report, parsed.json)?;
-        }
-        "wait-stable" => {
-            let seconds = parsed.seconds.unwrap_or(30);
-            let mut broker = open_broker(parsed.read_only_snapshot)?;
-            let report = broker.wait_integration_stable(seconds)?;
-            render_integration_stability(&report, parsed.json)?;
-            if !report.stable {
-                return Err(UsageError::Message(
-                    "integration moved during wait-stable window".into(),
-                ));
-            }
-        }
         "reconcile" => {
             if parsed.apply && parsed.dry_run {
                 return Err(UsageError::Message(format!(
@@ -420,7 +184,7 @@ pub(super) fn run_integration(parsed: Parsed) -> Result<(), UsageError> {
         }
         other => {
             return Err(UsageError::Message(format!(
-                "unknown integration action {other:?} — expected status, wait-stable, or reconcile"
+                "unknown integration action {other:?} — expected reconcile"
             )));
         }
     }

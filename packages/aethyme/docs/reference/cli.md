@@ -77,7 +77,7 @@ product surface.
 - `aethyme certify`
 - `aethyme broker start` (its adopt, reuse and spawn forms are in the verb table under Broker Commands)
 - `aethyme broker status` (also `status readiness`, `status doctor`)
-- `aethyme broker submit` (also `submit prepare`, `submit promote`, `submit promotion-record`)
+- `aethyme broker submit` (also `submit prepare`, `submit promote`)
 - `aethyme broker finish` (also `finish close`, `finish cleanup`)
 - `aethyme broker unblock`
 - `aethyme broker gc` (also `gc reclaim`, `gc storage`, `gc reap`)
@@ -114,7 +114,6 @@ use most:
 - `aethyme broker advanced issues upsert`
 - `aethyme broker advanced outcomes report`
 - `aethyme broker advanced owners`
-- `aethyme broker advanced integration status`
 - `aethyme broker advanced integration reconcile`
 - `aethyme broker advanced quick-test`
 - `aethyme broker advanced verify-loop`
@@ -251,7 +250,7 @@ print the replacement command. The migration table names old forms explicitly:
 | `aethyme broker start-agent --cmd <command>` | `aethyme broker start --cmd <command>` |
 | `aethyme broker readiness`, `aethyme readiness` | `aethyme broker status readiness` |
 | `aethyme broker doctor` | `aethyme broker status doctor` |
-| `aethyme broker prepare` / `promote` / `promotion-record` | `aethyme broker submit prepare` / `submit promote` / `submit promotion-record` |
+| `aethyme broker prepare` / `promote` | `aethyme broker submit prepare` / `submit promote` |
 | `aethyme broker close` / `cleanup` | `aethyme broker finish close` / `finish cleanup` |
 | `aethyme broker blockers` | `aethyme broker unblock` (no id lists blockers) |
 | `aethyme broker reclaim` / `storage` / `resources reap` | `aethyme broker gc reclaim` / `gc storage` / `gc reap` |
@@ -896,8 +895,6 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker finish cleanup --all-cleaned [--closed-before-ms <UTC-ms> --limit <1-1000> [--after-session <id>]] [--apply --confirm <sha256>] [--json]`
 - `aethyme broker finish cleanup resolve <session-id>... --archive [--batch] [--retire] [--allow-adopted] [--confirm <sha256>] [--json]`
 - `aethyme broker finish cleanup audit [--repo <path>] [--detail] [--json]`
-- `aethyme broker advanced main reconcile plan [--detail] [--resolution-file <path>] [--write-resolution-template <path>] [--json]`
-- `aethyme broker advanced main reconcile apply --session <id> --confirm <sha256> [--resolution-file <path>] [--json]`
 - `aethyme broker gc plan [--include-active-gate-cache] [--full-scan] [--json]`
 - `aethyme broker gc apply --confirm <sha256> [--include-active-gate-cache] [--full-scan] [--json]`
 - `aethyme broker gc abandon --confirm <pending-digest> [--json]`
@@ -915,7 +912,6 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker advanced issues upsert --repo <owner/name> --fingerprint <key> (--title <title> --body-file <path> [--label <label>]... | --resolve [--body-file <path>]) [--session <id>] [--json]`
 - `aethyme broker advanced outcomes report --source <kind:name> (--failed --title <title> [--commits <from>..<to>] | --recovered) [--body-file <path>] [--key <key>] [--session <id>] [--json]`
 - `aethyme broker advanced owners --commits <from>..<to> [--path <glob>]... [--json]`
-- `aethyme broker advanced integration status [--json]`
 - `aethyme broker advanced integration reconcile --upstream <ref> [--resolution-file <path>] [--write-resolution-template <path>] [--dry-run|--apply --confirm <sha256>] [--json]`
 - `aethyme broker advanced quick-test [--with-gate] [--json]`
 - `aethyme broker advanced verify-loop [--json]`
@@ -2399,8 +2395,7 @@ continues to block duplicate filing for that source report; reconciliation as
 `failed` permits a later, separately confirmed filing command.
 
 Promotion only advances the local integration ref; pull requests are the only
-landing path. `broker advanced integration status` reports whether the
-integration tip is promoted, published, or locally synchronized.
+landing path.
 
 Frozen broker JSON contracts are limited to the commands listed in
 [`../../../../docs/json-contracts.md`](../../../../docs/json-contracts.md).
@@ -2520,7 +2515,7 @@ Entries proven landed or superseded resolve their path exposures in that same
 database transaction. Entries replayed onto the new integration tip retain the
 same exposure with its promoted SHA retargeted to the replayed commit.
 
-`broker status` and `broker advanced integration status` run the conclusive portion of
+`broker status` runs the conclusive portion of
 this classifier without changing refs, queue rows, worktrees, or remote state.
 JSON includes full promotion and upstream landing SHAs. A complete layer whose
 entries are all landed is `reconciliation_ready` with notice severity; any

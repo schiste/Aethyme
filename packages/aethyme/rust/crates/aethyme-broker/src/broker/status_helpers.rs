@@ -986,13 +986,7 @@ pub(super) fn status_summary(
         "no active submitters".to_string()
     });
 
-    let mut commands = Vec::new();
-    if may_move_integration {
-        commands.push("aethyme broker advanced integration wait-stable --seconds 30".into());
-    }
-    if integration.promotes && integration.relation != StatusIntegrationRelation::CurrentWithMain {
-        commands.push("aethyme broker advanced integration status".into());
-    }
+    let commands = Vec::new();
 
     StatusSummary {
         message: format!(
@@ -1112,7 +1106,7 @@ pub(super) fn baseline_label(baseline_ref: &str) -> &str {
 /// The summary's integration clause. It names the baseline it counts
 /// against, and when the local checkout sits somewhere else -- typically a
 /// fast-forward not yet pushed -- it says where, so the clause cannot be read
-/// as contradicting `integration status` (#374).
+/// as contradicting the integration head it reports (#374).
 pub(super) fn integration_summary_phrase(integration: &SummaryIntegration) -> String {
     let branch = &integration.branch;
     let label = baseline_label(&integration.baseline_ref);
@@ -1159,7 +1153,7 @@ pub(super) fn integration_movement_advice(
 ) -> StatusAdvice {
     let count = agents.len();
     let summary = format!(
-        "{} live {} may submit and move {integration_branch}; wait for a stable integration window before treating long checks as current-tip proof",
+        "{} live {} may submit and move {integration_branch}; re-read the integration head after long checks before treating them as current-tip proof",
         count,
         plural_word(count, "session", "sessions")
     );
@@ -1195,105 +1189,7 @@ pub(super) fn integration_movement_advice(
         session_id: None,
         queue_entry_id: None,
         evidence,
-        commands: vec![
-            "aethyme broker advanced integration wait-stable --seconds 30".into(),
-            "aethyme broker advanced agents".into(),
-        ],
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn integration_next_action(
-    branch: &str,
-    integration_head: &str,
-    main_head: &str,
-    upstream_head: Option<&str>,
-    main_is_ancestor: bool,
-    latest_delivery_entry_id: Option<i64>,
-    promoted_entries: &[PromotedIntegrationEntry],
-    changed_files: &[String],
-    conflicts: &[PromotedConflict],
-) -> IntegrationNextAction {
-    use std::collections::BTreeSet;
-
-    let conflict_sessions: BTreeSet<i64> = conflicts
-        .iter()
-        .map(|conflict| conflict.session_id)
-        .collect();
-    if !conflict_sessions.is_empty() {
-        let count = conflict_sessions.len();
-        let noun = if count == 1 { "session" } else { "sessions" };
-        let verb = if count == 1 { "overlaps" } else { "overlap" };
-        let commands = conflict_sessions
-            .iter()
-            .take(5)
-            .map(|session_id| format!("aethyme broker advanced repair --session {session_id}"))
-            .collect();
-        return IntegrationNextAction {
-            state: IntegrationDeliveryState::Blocked,
-            summary: format!(
-                "{count} {noun} {verb} the pending integration layer; repair or rebase before submit"
-            ),
-            commands,
-        };
-    }
-
-    if main_head == integration_head {
-        return IntegrationNextAction {
-            state: IntegrationDeliveryState::LocallySynchronized,
-            summary: format!("local main is synchronized with {branch}"),
-            commands: Vec::new(),
-        };
-    }
-
-    if upstream_head == Some(integration_head) && latest_delivery_entry_id.is_some() {
-        return IntegrationNextAction {
-            state: IntegrationDeliveryState::Published,
-            summary: format!(
-                "{branch} is published at {integration_head}; local main is not synchronized"
-            ),
-            commands: Vec::new(),
-        };
-    }
-
-    if !promoted_entries.is_empty() {
-        let count = promoted_entries.len();
-        let noun = if count == 1 {
-            "promoted entry"
-        } else {
-            "promoted entries"
-        };
-        let verb = if count == 1 { "is" } else { "are" };
-        if main_is_ancestor {
-            return IntegrationNextAction {
-                state: IntegrationDeliveryState::Promoted,
-                summary: format!(
-                    "{count} {noun} {verb} promoted on {branch} and not yet published"
-                ),
-                commands: Vec::new(),
-            };
-        }
-        return IntegrationNextAction {
-            state: IntegrationDeliveryState::Blocked,
-            summary: format!("{count} {noun} {verb} pending, but main and {branch} have diverged"),
-            commands: Vec::new(),
-        };
-    }
-
-    if !changed_files.is_empty() {
-        return IntegrationNextAction {
-            state: IntegrationDeliveryState::Untracked,
-            summary: format!(
-                "{branch} differs from main, but no promoted queue entries describe the pending commits; inspect branch history"
-            ),
-            commands: vec![format!("git log --oneline --left-right HEAD...{branch}")],
-        };
-    }
-
-    IntegrationNextAction {
-        state: IntegrationDeliveryState::Untracked,
-        summary: "no promoted work pending outside main".into(),
-        commands: Vec::new(),
+        commands: vec!["aethyme broker advanced agents".into()],
     }
 }
 

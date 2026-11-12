@@ -865,7 +865,6 @@ fn telemetry_classification_tracks_semantic_mutability() {
         args(&["status", "--refresh"]),
         args(&["agents"]),
         args(&["leases"]),
-        args(&["integration", "status"]),
         args(&["operations", "reconcile", "--operation", "1"]),
         args(&["advisories", "ack", "1"]),
         args(&["advisories", "suppress", "1"]),
@@ -1317,23 +1316,6 @@ fn parse_accepts_quick_test_with_gate() {
 
     assert_eq!(parsed.positional, vec!["quick-test"]);
     assert!(parsed.with_gate);
-}
-
-#[test]
-fn parse_accepts_integration_wait_stable_seconds() {
-    let args = vec![
-        "integration".to_string(),
-        "wait-stable".to_string(),
-        "--seconds".to_string(),
-        "30".to_string(),
-    ];
-    let parsed = match super::parse(&args) {
-        Ok(parsed) => parsed,
-        Err(_) => panic!("integration wait-stable --seconds should parse"),
-    };
-
-    assert_eq!(parsed.positional, vec!["integration", "wait-stable"]);
-    assert_eq!(parsed.seconds, Some(30));
 }
 
 #[test]
@@ -1833,7 +1815,6 @@ fn flags_the_subcommand_reads_are_accepted() {
         ("gates", &["doctor"], &["--probe", "--only"]),
         ("leases", &["claim", "src/"], &["--session", "--ttl"]),
         ("watch", &["pr", "start"], &["--session", "--repo", "--pr"]),
-        ("main", &["reconcile", "apply"], &["--session", "--confirm"]),
         ("exec", &[], &["--session", "--"]),
         ("cleanup", &["12"], &["--force"]),
         ("readiness", &[], &["--require"]),

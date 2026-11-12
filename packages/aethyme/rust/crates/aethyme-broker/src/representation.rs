@@ -42,8 +42,8 @@
 //! - **the branch tip**, for the reason above;
 //! - **a matching subject or author**, which a revert or a reworked commit
 //!   also has;
-//! - **an operator assertion**, for the same reason `already_represented` is
-//!   not a choosable disposition in `main reconcile`: representation is a fact
+//! - **an operator assertion**, for the same reason `already_represented` was
+//!   never a choosable disposition in the retired `main reconcile`: it is a fact
 //!   about content, and letting it be declared would make the check ceremonial.
 
 use std::collections::BTreeMap;

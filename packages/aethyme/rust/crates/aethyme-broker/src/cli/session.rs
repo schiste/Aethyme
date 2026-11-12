@@ -297,7 +297,7 @@ pub(super) fn render_start_base(base: &crate::SessionStartBase) {
             default_ref()
         );
         out!(
-            "         inspect with `aethyme broker advanced integration status`, or start \
+            "         inspect with `aethyme broker status`, or start \
              from the default branch if integration is not the base you want."
         );
     }

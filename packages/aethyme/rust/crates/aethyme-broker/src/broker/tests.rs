@@ -785,7 +785,7 @@ fn active_version_verification_rejects_a_shadowing_path_binary() {
 }
 
 #[test]
-fn integration_movement_advice_points_to_wait_stable() {
+fn integration_movement_advice_points_to_live_sessions() {
     let agent = super::AgentView {
         session: session(56),
         activity_at: 0,
@@ -798,10 +798,9 @@ fn integration_movement_advice_points_to_wait_stable() {
 
     assert_eq!(advice.id, "integration.may-move");
     assert_eq!(advice.severity, super::StatusAdviceSeverity::Notice);
-    assert!(
-        advice
-            .commands
-            .contains(&"aethyme broker advanced integration wait-stable --seconds 30".into())
+    assert_eq!(
+        advice.commands,
+        vec!["aethyme broker advanced agents".to_string()]
     );
 }
 
@@ -846,7 +845,7 @@ fn current_summary_integration() -> super::SummaryIntegration {
 /// and not pushed. The baseline count is right -- publishing would still
 /// add those commits -- but the summary must name what it counts against
 /// and say the local checkout already matches, or it reads as a stale
-/// contradiction of `integration status`.
+/// contradiction of the integration head it reports.
 #[test]
 fn summary_names_its_baseline_after_an_unpushed_local_fast_forward() {
     let integration = super::SummaryIntegration {
@@ -970,10 +969,7 @@ fn status_summary_explains_single_active_session_risk() {
         summary.message,
         "1 active session; no overlaps; aethyme/integration current with main; active session may promote new integration work"
     );
-    assert_eq!(
-        summary.commands,
-        vec!["aethyme broker advanced integration wait-stable --seconds 30"]
-    );
+    assert!(summary.commands.is_empty(), "{:?}", summary.commands);
 }
 
 /// Verify-only: live sessions submit, but nothing they do moves

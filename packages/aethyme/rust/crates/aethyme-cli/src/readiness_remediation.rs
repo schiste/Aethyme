@@ -10,7 +10,7 @@ use crate::repository_upgrade::{
 pub fn is_command(args: &[String]) -> bool {
     // The subcommand has to match too. Testing only the verb captured every
     // other `broker <group> plan|apply`, so `gc plan` and
-    // `promotion-record plan` all returned a readiness plan -- and returned its
+    // `checkpoint plan` all returned a readiness plan -- and returned its
     // digest, which `apply --confirm` would then have accepted.
     args.first().map(String::as_str) == Some("readiness")
         && matches!(
@@ -249,7 +249,7 @@ mod dispatch_tests {
     /// --confirm`, applying something the caller never reviewed.
     #[test]
     fn other_plan_and_apply_commands_are_not_captured() {
-        for group in ["gc", "checkpoint", "promotion-record", "resources"] {
+        for group in ["gc", "checkpoint", "resources"] {
             assert!(
                 !is_command(&args(&[group, "plan"])),
                 "{group} plan must not route to readiness remediation"

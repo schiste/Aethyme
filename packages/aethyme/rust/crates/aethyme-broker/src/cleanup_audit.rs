@@ -1037,7 +1037,7 @@ fn session_blocker(
                 "work is on the integration or local branch but not {}, and the cleanup plan does not call it eligible",
                 target.proof_ref
             ),
-            "aethyme broker advanced integration status; publish integration, then re-run the audit".into(),
+            "aethyme broker status; land the integration work through a pull request, then re-run the audit".into(),
         ),
         AuditDisposition::RemoteBranchOnly => (
             format!(
