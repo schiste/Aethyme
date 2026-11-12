@@ -93,9 +93,29 @@ pub(super) fn resource_scope(args: &[String]) -> Option<String> {
     if let Some(fetch) = fetch_footprint(args) {
         return Some(format!("git-ref/{}", fetch.source_ref));
     }
-    // A literal URL selects an anonymous remote: no configured fetch refmap
-    // can make this push update unrelated local tracking refs. Named remotes,
-    // mutable source names, implicit tags and multi-ref pushes stay wide.
+    strict_push(args).map(|push| format!("git-ref/refs/heads/{}", push.branch))
+}
+
+/// The one push spelling with a closed ref footprint: an exact object ID to
+/// one branch, no implicit tags, options ended before the remote.
+struct StrictPush<'a> {
+    remote: &'a str,
+    branch: &'a str,
+}
+
+impl StrictPush<'_> {
+    /// A literal URL selects an anonymous remote, which updates no local ref.
+    fn named_remote(&self) -> bool {
+        !(self.remote.starts_with("https://") || self.remote.starts_with("ssh://"))
+    }
+}
+
+fn strict_push(args: &[String]) -> Option<StrictPush<'_>> {
+    // A literal URL updates no local ref. A configured remote name also
+    // updates exactly `refs/remotes/<name>/<branch>`, provided its fetch
+    // refmap is the standard one, which `validate_repository` proves under
+    // the lock; that ref is then locked like a fetch destination. Mutable
+    // source names, implicit tags and multi-ref pushes stay wide.
     let [command, no_tags, porcelain, separator, remote, refspec] = args else {
         return None;
     };
@@ -103,7 +123,9 @@ pub(super) fn resource_scope(args: &[String]) -> Option<String> {
         || no_tags != "--no-follow-tags"
         || porcelain != "--porcelain"
         || separator != "--"
-        || !(remote.starts_with("https://") || remote.starts_with("ssh://"))
+        || !(remote.starts_with("https://")
+            || remote.starts_with("ssh://")
+            || (ref_component(remote) && !remote.contains('/')))
     {
         return None;
     }
@@ -112,7 +134,118 @@ pub(super) fn resource_scope(args: &[String]) -> Option<String> {
         return None;
     }
     let branch = destination.strip_prefix("refs/heads/")?;
-    ref_component(branch).then(|| format!("git-ref/{destination}"))
+    ref_component(branch).then_some(StrictPush {
+        remote: remote.as_str(),
+        branch,
+    })
+}
+
+/// Exact spelling `broker push` uses for a session branch when the strict
+/// profile is available.
+pub(crate) fn strict_push_args(remote: &str, source: &str, branch_ref: &str) -> Vec<String> {
+    vec![
+        "push".into(),
+        "--no-follow-tags".into(),
+        "--porcelain".into(),
+        "--".into(),
+        remote.into(),
+        format!("{source}:{branch_ref}"),
+    ]
+}
+
+/// The branch a strict push writes, as `refs/heads/<branch>`.
+pub(super) fn strict_push_destination(args: &[String]) -> Option<String> {
+    strict_push(args).map(|push| format!("refs/heads/{}", push.branch))
+}
+
+/// The one local ref a strictly profiled operation writes besides its lane
+/// ref: a fetch's tracking destination, or the tracking ref a push to a
+/// configured remote name updates. Two operations writing the same local ref
+/// serialise on it even when they reach the remote through different keys.
+pub(super) fn local_destination_ref(args: &[String]) -> Option<String> {
+    if let Some(fetch) = fetch_footprint(args) {
+        return Some(fetch.destination_ref);
+    }
+    strict_push(args)
+        .filter(|push| push.named_remote())
+        .map(|push| format!("refs/remotes/{}/{}", push.remote, push.branch))
+}
+
+/// Recorded-scope prefix of a commit admitted to its session's branch lane.
+///
+/// Reserved: callers cannot declare it (admission refuses), so a record that
+/// carries it was derived by the broker after proving the commit ran in the
+/// session's own linked worktree on the session's own branch.
+pub(super) const SESSION_COMMIT_SCOPE_PREFIX: &str = "session-commit:";
+
+/// Whether `args` is a plain `git commit` with no leading global options.
+/// Global options (`-C`, `--git-dir`, `-c`) could move the commit elsewhere.
+pub(super) fn is_plain_commit(args: &[String]) -> bool {
+    args.first().is_some_and(|command| command == "commit")
+}
+
+/// The audit scope recorded for a session-branch commit.
+pub(super) fn session_commit_record_scope(branch_ref: &str) -> String {
+    format!("{SESSION_COMMIT_SCOPE_PREFIX}{branch_ref}")
+}
+
+/// The lane a journaled session-branch commit holds, recomputed from its
+/// record. `None` keeps any other record repository-wide.
+pub(super) fn recorded_session_commit_scope(args: &[String], scope: &str) -> Option<String> {
+    if !is_plain_commit(args) {
+        return None;
+    }
+    let branch_ref = scope.strip_prefix(SESSION_COMMIT_SCOPE_PREFIX)?;
+    let branch = branch_ref.strip_prefix("refs/heads/")?;
+    ref_component(branch).then(|| format!("git-ref/{branch_ref}"))
+}
+
+/// Prove a commit is confined to `session_branch` in the session's own linked
+/// worktree, and return the branch ref it writes.
+///
+/// A commit writes the checked-out branch ref, that worktree's index and
+/// `HEAD`, and objects. Objects, `packed-refs` and `gc --auto` are protected
+/// by Git's own lock files. Anything not proven here keeps the
+/// repository-wide lane: the main checkout, a detached or foreign `HEAD`, a
+/// closed session, or an ambient override that could reroute the repository.
+pub(super) fn validate_session_commit(
+    cwd: &Path,
+    main_root: &Path,
+    session_worktree: &Path,
+    session_branch: &str,
+    deadline: AdmissionDeadline,
+    repository: &str,
+) -> Result<String, BrokerOpError> {
+    for name in GIT_REPOSITORY_ROUTING_ENV_NAMES {
+        if std::env::var_os(name).is_some() {
+            return Err(unavailable("ambient Git routing override"));
+        }
+    }
+    if !ref_component(session_branch) {
+        return Err(unavailable("session branch is not a plain branch name"));
+    }
+    let canonical = |path: &Path| std::fs::canonicalize(path).ok();
+    let checkout = crate::GitRepo::discover(cwd)?;
+    let root = canonical(checkout.root());
+    if root.is_none() || root != canonical(session_worktree) {
+        return Err(unavailable(
+            "the commit does not run in the session's worktree",
+        ));
+    }
+    if root == canonical(main_root) {
+        return Err(unavailable(
+            "a main-checkout commit keeps the repository lane",
+        ));
+    }
+    if common_lock_key(cwd)? != common_lock_key(main_root)? {
+        return Err(unavailable("the worktree belongs to another repository"));
+    }
+    let head = probe(cwd, &["symbolic-ref", "-q", "HEAD"], deadline, repository)?;
+    let branch_ref = format!("refs/heads/{session_branch}");
+    if !head.status.success() || head.stdout.trim_ascii() != branch_ref.as_bytes() {
+        return Err(unavailable("HEAD is not the session's own branch"));
+    }
+    Ok(branch_ref)
 }
 
 pub(super) fn scopes_conflict(
@@ -269,11 +402,17 @@ pub(super) const GIT_REPOSITORY_ROUTING_ENV_NAMES: &[&str] = &[
 
 /// Reject hidden ref writers and set-expanding refmaps rather than assuming
 /// that command-line operands alone constrain an arbitrary Git configuration.
+///
+/// `session_branch_hooks` is true only for a push of the caller's own session
+/// branch while `coordination.session_hooks_hold_repository_lock` is off: the
+/// repository's hooks still run inside the push exactly as before, but they do
+/// not force the repository-wide lane.
 pub(super) fn validate_repository(
     cwd: &Path,
     args: &[String],
     deadline: AdmissionDeadline,
     repository: &str,
+    session_branch_hooks: bool,
 ) -> Result<(), BrokerOpError> {
     use std::os::unix::fs::MetadataExt;
     for name in GIT_REPOSITORY_ROUTING_ENV_NAMES.iter().copied().chain([
@@ -328,8 +467,11 @@ pub(super) fn validate_repository(
     } else {
         return Err(unavailable("hook directory inventory failed"));
     };
+    let named_push = strict_push(args).is_some_and(|push| push.named_remote());
     let hooks: &[&str] = if fetch_footprint(args).is_some() {
         &["reference-transaction"]
+    } else if session_branch_hooks && strict_push(args).is_some() {
+        &[]
     } else {
         &["reference-transaction", "pre-push"]
     };
@@ -351,7 +493,7 @@ pub(super) fn validate_repository(
             "config",
             "--null",
             "--get-regexp",
-            r"^(remote\..*\.(fetch|vcs|uploadpack|receivepack)|core\.(hookspath|sshcommand)|extensions\..*|url\..*\.(insteadof|pushinsteadof)|protocol\.ext\.allow)$",
+            r"^(remote\..*\.(fetch|vcs|uploadpack|receivepack|mirror|pushurl)|core\.(hookspath|sshcommand)|extensions\..*|url\..*\.(insteadof|pushinsteadof)|protocol\.ext\.allow)$",
         ],
         deadline,
         repository,
@@ -367,6 +509,16 @@ pub(super) fn validate_repository(
         };
         let key = key.to_ascii_lowercase();
         if key == "core.hookspath" {
+            continue;
+        }
+        if key.ends_with(".mirror") || key.ends_with(".pushurl") {
+            // A mirror or a separate push URL changes what a push to a
+            // configured remote name writes; fetches and URL pushes ignore it.
+            if named_push {
+                return Err(unavailable(
+                    "a mirror or push URL changes this remote's push footprint",
+                ));
+            }
             continue;
         }
         if key == "core.sshcommand"
@@ -815,11 +967,87 @@ mod tests {
             resource_scope(&push),
             resource_scope(&canonical_fetch_args("origin", "main").unwrap())
         );
+        // A URL remote updates no local ref.
+        assert_eq!(local_destination_ref(&push), None);
+        // A configured remote name shares the branch lane and also locks the
+        // one tracking ref the push updates, exactly like a fetch of it.
         push[4] = "origin".into();
-        assert!(resource_scope(&push).is_none());
+        assert_eq!(
+            resource_scope(&push).as_deref(),
+            Some("git-ref/refs/heads/main")
+        );
+        assert_eq!(
+            local_destination_ref(&push),
+            local_destination_ref(&canonical_fetch_args("origin", "main").unwrap())
+        );
+        assert_eq!(
+            strict_push_destination(&push).as_deref(),
+            Some("refs/heads/main")
+        );
+        for remote in [
+            "/tmp/remote.git",
+            "git@host:o/r",
+            "../remote",
+            "-origin",
+            "",
+        ] {
+            push[4] = remote.into();
+            assert!(resource_scope(&push).is_none(), "{remote}");
+        }
         push[4] = "https://github.com/example/repo".into();
         push[5] = "HEAD:refs/heads/main".into();
         assert!(resource_scope(&push).is_none());
+        push[5] = format!("{}:refs/tags/v1", "a".repeat(40));
+        assert!(resource_scope(&push).is_none());
+    }
+
+    #[test]
+    fn session_push_uses_the_strict_spelling() {
+        let sha = "b".repeat(40);
+        let args = strict_push_args("origin", &sha, "refs/heads/agent/a");
+        assert_eq!(
+            resource_scope(&args).as_deref(),
+            Some("git-ref/refs/heads/agent/a")
+        );
+        assert_eq!(
+            local_destination_ref(&args).as_deref(),
+            Some("refs/remotes/origin/agent/a")
+        );
+    }
+
+    #[test]
+    fn only_a_reserved_commit_record_recomputes_to_its_branch_lane() {
+        let args = |parts: &[&str]| {
+            parts
+                .iter()
+                .map(|part| (*part).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let scope = session_commit_record_scope("refs/heads/agent/a");
+        assert_eq!(scope, "session-commit:refs/heads/agent/a");
+        assert_eq!(
+            recorded_session_commit_scope(&args(&["commit", "-m", "x"]), &scope).as_deref(),
+            Some("git-ref/refs/heads/agent/a")
+        );
+        // Wrong command, global options, or an unreserved scope stay wide.
+        for (command, recorded) in [
+            (
+                &["-C", "elsewhere", "commit", "-m", "x"][..],
+                scope.as_str(),
+            ),
+            (&["branch", "-f", "agent/a"], scope.as_str()),
+            (&["commit", "-m", "x"], "refs/heads/agent/a"),
+            (&["commit", "-m", "x"], "repository"),
+            (&["commit", "-m", "x"], "session-commit:refs/tags/v1"),
+            (&["commit", "-m", "x"], "session-commit:refs/heads/../main"),
+        ] {
+            assert!(
+                recorded_session_commit_scope(&args(command), recorded).is_none(),
+                "{command:?} {recorded}"
+            );
+        }
+        assert!(is_plain_commit(&args(&["commit"])));
+        assert!(!is_plain_commit(&args(&["-c", "x=y", "commit"])));
     }
 
     #[test]

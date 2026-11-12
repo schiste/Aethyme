@@ -675,6 +675,62 @@ fn anything_not_provably_resource_scoped_stays_repository_wide() {
     );
 }
 
+/// `pr edit <n>` and `pr ready <n>` change one pull request and no ref, so two
+/// pull requests take two lanes; a base change, or a selector that is not the
+/// first operand, keeps the repository lane.
+#[test]
+fn pull_request_edits_take_their_own_lane_only_when_the_number_is_certain() {
+    assert_eq!(
+        scope(&["pr", "edit", "7", "--title", "x"]).as_deref(),
+        Some("pull/7")
+    );
+    assert_eq!(scope(&["pr", "ready", "7"]).as_deref(), Some("pull/7"));
+    assert_eq!(
+        scope(&["pr", "ready", "7", "--undo"]).as_deref(),
+        Some("pull/7")
+    );
+    let repo = "github.com/o/r";
+    assert_ne!(
+        coordination_lock_key(repo, scope(&["pr", "edit", "7"]).as_deref()),
+        coordination_lock_key(repo, scope(&["pr", "edit", "8"]).as_deref()),
+        "edits of two pull requests must not share a lock"
+    );
+    assert!(!git_scopes::scopes_conflict(
+        OperationProvider::Github,
+        Some("pull/7"),
+        Some("pull/8")
+    ));
+    for wide in [
+        &["pr", "edit", "7", "--base", "release"][..],
+        &["pr", "edit", "7", "--base=release"],
+        &["pr", "edit", "7", "-Brelease"],
+        &["pr", "edit", "--title", "5", "6"],
+        &["pr", "edit"],
+        &["pr", "edit", "+7"],
+        &["pr", "edit", "07"],
+        &["pr", "edit", "agent/branch"],
+        &["pr", "edit", "https://github.com/o/r/pull/7"],
+        &["pr", "ready"],
+        &["pr", "create", "--head", "agent/a", "--title", "t"],
+    ] {
+        assert_eq!(scope(wide), None, "{wide:?}");
+    }
+    // The journaled spelling recomputes to the same lane after a restart, so a
+    // running edit is never mistaken for a repository-wide write.
+    let stored: Vec<String> = serde_json::from_str(
+        &redacted_command(
+            OperationProvider::Github,
+            &gh(&["pr", "edit", "7", "--body", "private", "--title", "t"]),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        resource_lock_scope(OperationProvider::Github, &stored[1..]).as_deref(),
+        Some("pull/7")
+    );
+}
+
 /// Repository-wide operations keep the bare canonical key, so #166's
 /// "one repository, one lock" is untouched for anything touching a ref.
 #[test]

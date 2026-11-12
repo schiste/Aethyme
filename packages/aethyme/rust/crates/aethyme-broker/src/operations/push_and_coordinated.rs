@@ -626,7 +626,7 @@ fn gh_pr_topology_write(args: &[String]) -> bool {
 /// Do not inspect body/title values: they are arbitrary content and can contain
 /// flag-looking text. These are the value-taking edit options supported by
 /// `gh`; their values must be skipped while scanning for `--base`.
-fn gh_pr_edit_changes_base(args: &[String]) -> bool {
+pub(super) fn gh_pr_edit_changes_base(args: &[String]) -> bool {
     const VALUE_FLAGS: &[&str] = &[
         "-R",
         "--repo",
@@ -2753,6 +2753,69 @@ impl Broker {
         } else {
             resource_lock_scope(request.provider, &request.args)
         };
+        if request
+            .scope
+            .as_deref()
+            .is_some_and(|scope| scope.starts_with(git_scopes::SESSION_COMMIT_SCOPE_PREFIX))
+        {
+            return Err(BrokerOpError::InvalidCoordinatedOperation {
+                reason: format!(
+                    "scope prefix {:?} is reserved for commits the broker proves are confined to their session branch",
+                    git_scopes::SESSION_COMMIT_SCOPE_PREFIX
+                ),
+            });
+        }
+        let main_root = self.main_root().to_path_buf();
+        let session_hooks_hold_lock = request.provider == OperationProvider::Git
+            && effect != OperationEffect::Read
+            && session_hooks_hold_repository_lock_enabled(&main_root);
+        // The caller's own live session, the only branch a session lane may
+        // name. A missing or closed session keeps the repository lane.
+        let own_session =
+            if request.provider == OperationProvider::Git && effect != OperationEffect::Read {
+                self.store()
+                    .session(request.session_id)
+                    .ok()
+                    .filter(|session| !session.status.is_closed())
+            } else {
+                None
+            };
+        // A commit proven to run in the session's own linked worktree on the
+        // session's own branch writes only that branch: it takes that branch's
+        // lane, hooks included, unless the repository opted out. Anything
+        // unproven (main checkout, detached or foreign HEAD, a declared scope)
+        // keeps the repository-wide lane.
+        let session_commit_ref = match &own_session {
+            Some(session)
+                if !session_hooks_hold_lock
+                    && request.scope.is_none()
+                    && git_scopes::is_plain_commit(&request.args) =>
+            {
+                git_scopes::validate_session_commit(
+                    cwd,
+                    &main_root,
+                    Path::new(&session.worktree_path),
+                    &session.branch,
+                    admission,
+                    &repository,
+                )
+                .ok()
+            }
+            _ => None,
+        };
+        let resource_scope = session_commit_ref
+            .as_deref()
+            .map(|branch_ref| format!("git-ref/{branch_ref}"))
+            .or(resource_scope);
+        // A strict push of the caller's own session branch is not widened by
+        // the repository's hooks unless the repository opted out. The hooks
+        // still run inside the push exactly as before.
+        let session_branch_hooks = !session_hooks_hold_lock
+            && own_session.as_ref().is_some_and(|session| {
+                git_scopes::strict_push_destination(&request.args).is_some_and(|destination| {
+                    destination == format!("refs/heads/{}", session.branch)
+                })
+            });
         let lock_key = coordination_lock_key(&repository, resource_scope.as_deref());
 
         let scope_was_declared = request.scope.is_some();
@@ -2761,6 +2824,11 @@ impl Broker {
         // wins for the record, but never changes which lock is taken.
         let scope = request
             .scope
+            .or_else(|| {
+                session_commit_ref
+                    .as_deref()
+                    .map(git_scopes::session_commit_record_scope)
+            })
             .or_else(|| resource_scope.clone())
             .unwrap_or_else(|| "repository".into());
         validate_scope(&scope)?;
@@ -3002,12 +3070,8 @@ impl Broker {
             None
         };
         let _git_destination_guard =
-            if let Some(footprint) = git_scopes::fetch_footprint(&request.args) {
-                let key = format!(
-                    "{}::{}",
-                    git_scopes::common_lock_key(cwd)?,
-                    footprint.destination_ref
-                );
+            if let Some(destination_ref) = git_scopes::local_destination_ref(&request.args) {
+                let key = format!("{}::{}", git_scopes::common_lock_key(cwd)?, destination_ref);
                 let main_root = self.main_root().to_path_buf();
                 match RepositoryWriteLock::acquire(
                     &main_root,
@@ -3131,13 +3195,43 @@ impl Broker {
         };
         drop(lock_wait_span);
         let locked_checks_span = push_stage_span(push_stages, "push_git_locked_checks");
-        if request.provider == OperationProvider::Git
-            && resource_scope.is_some()
-            && let Err(error) =
-                git_scopes::validate_repository(cwd, &request.args, admission, &repository)
-        {
-            self.resolve_unstarted_operation(queued_operation_id, "resource_profile_unavailable");
-            return Err(error);
+        if request.provider == OperationProvider::Git && resource_scope.is_some() {
+            // Re-prove the footprint under the lane: a session commit's HEAD
+            // or a push's configuration may have changed while it queued.
+            let checked = match (&session_commit_ref, &own_session) {
+                (Some(branch_ref), Some(session)) => git_scopes::validate_session_commit(
+                    cwd,
+                    &main_root,
+                    Path::new(&session.worktree_path),
+                    &session.branch,
+                    admission,
+                    &repository,
+                )
+                .and_then(|proven| {
+                    if &proven == branch_ref {
+                        Ok(())
+                    } else {
+                        Err(BrokerOpError::InvalidCoordinatedOperation {
+                            reason: "the session worktree changed branch while the commit queued"
+                                .into(),
+                        })
+                    }
+                }),
+                _ => git_scopes::validate_repository(
+                    cwd,
+                    &request.args,
+                    admission,
+                    &repository,
+                    session_branch_hooks,
+                ),
+            };
+            if let Err(error) = checked {
+                self.resolve_unstarted_operation(
+                    queued_operation_id,
+                    "resource_profile_unavailable",
+                );
+                return Err(error);
+            }
         }
         if effect != OperationEffect::Read {
             let unresolved = if request.provider == OperationProvider::Git {
@@ -3170,13 +3264,13 @@ impl Broker {
                 {
                     let recorded: Option<Vec<String>> =
                         serde_json::from_str(&operation.command_json).ok();
-                    let recorded_fetch = recorded
+                    let recorded_destination = recorded
                         .as_ref()
                         .and_then(|args| args.get(1..))
-                        .and_then(git_scopes::fetch_footprint);
-                    let requested_fetch = git_scopes::fetch_footprint(&request.args);
-                    if !matches!((recorded_fetch, requested_fetch), (Some(left), Some(right))
-                        if left.destination_ref == right.destination_ref)
+                        .and_then(git_scopes::local_destination_ref);
+                    let requested_destination = git_scopes::local_destination_ref(&request.args);
+                    if !matches!((recorded_destination, requested_destination), (Some(left), Some(right))
+                        if left == right)
                     {
                         continue;
                     }
@@ -3376,15 +3470,21 @@ impl Broker {
         // it names is the whole point -- see `provider_command`.
         let executable = provider_executable(request.provider);
         let mut command = provider_command(request.provider);
-        command.args(pinned_push_args.as_deref().unwrap_or(&request.args));
-        // Appended after the subcommand, where `git push` accepts it. The
-        // repository opted in, the same hook already ran against these exact
-        // commits in the dry run above, and the plan was re-proven unchanged
-        // under the lock. Re-running it here would double the cost the opt-in
-        // exists to avoid (issues #138, #146).
+        let mut provider_args = pinned_push_args
+            .clone()
+            .unwrap_or_else(|| request.args.clone());
+        // Inserted right after the subcommand, before any `--` that ends the
+        // options, where `git push` accepts it. The repository opted in, the
+        // same hook already ran against these exact commits in the dry run
+        // above, and the plan was re-proven unchanged under the lock.
+        // Re-running it here would double the cost the opt-in exists to avoid
+        // (issues #138, #146).
         if hooks_ran_outside_lock {
-            command.arg("--no-verify");
+            let after_subcommand =
+                git_subcommand_index(&provider_args).map_or(provider_args.len(), |index| index + 1);
+            provider_args.insert(after_subcommand, "--no-verify".into());
         }
+        command.args(&provider_args);
         if request.provider == OperationProvider::Git {
             export_push_shape(&mut command, push_shape.as_ref());
         }

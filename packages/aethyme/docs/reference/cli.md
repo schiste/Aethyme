@@ -996,7 +996,9 @@ push evidence; a recorded final decision exposes its provenance as
 `broker advanced operations stats` is a bounded, read-only measurement surface for the
 coordination-lock decision. It reports p50/p99 lock-hold and queue-wait
 durations by operation kind, queue depth, samples that used
-`hooks_outside_lock`, and known disjoint-scope waits. It counts only completed
+`hooks_outside_lock`, samples that held a resource lane instead of the
+repository-wide key (`narrow_lanes`, with `session_branch_sample_count` for
+session-branch commits and pushes), and known disjoint-scope waits. It counts only completed
 rows with timing data; older rows remain visible as `unmeasured`, and
 repository-wide or unknown scopes are not guessed to be unrelated. Use
 `--repo` to isolate one canonical repository and `--limit` (1–500) to choose

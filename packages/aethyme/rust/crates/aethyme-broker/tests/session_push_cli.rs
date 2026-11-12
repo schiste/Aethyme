@@ -525,6 +525,61 @@ fn an_authorized_push_publishes_the_session_branch_and_records_it() {
     assert_eq!(state.remote_oid.as_deref(), Some(head.as_str()));
 }
 
+/// A session push names one exact branch through a configured remote, so it
+/// holds only that branch's lane and still updates the branch's tracking ref
+/// (which the unpushed-commit count reads). A configured `core.sshCommand`
+/// could reroute the transport, so the fixture's other tests keep the
+/// repository-wide spelling; here the fake `ssh` on `PATH` reaches the remote.
+#[test]
+fn a_session_push_holds_only_its_branch_lane_when_the_profile_is_proven() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    git(&fixture.repo, &["config", "--unset", "core.sshCommand"]);
+    let (session, worktree) = fixture.session_with_commit();
+
+    let report = json(&fixture.push(session, &[]));
+    let head = git_output(&worktree, &["rev-parse", "HEAD"]);
+    let branch = report["branch"].as_str().unwrap().to_string();
+    assert_eq!(report["pushed_oid"], head);
+    assert_eq!(
+        fixture.remote_branch(&branch).as_deref(),
+        Some(head.as_str())
+    );
+
+    let mut broker = fixture.broker();
+    let state = broker.session_push_state(session).unwrap();
+    assert_eq!(state.unpushed_commits, 0);
+    assert_eq!(state.remote_oid.as_deref(), Some(head.as_str()));
+    let operation = broker
+        .store()
+        .coordinated_operations()
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|operation| operation.scope.starts_with("session-push:refs/heads/"))
+        .expect("a session push is journaled");
+    let command: Vec<String> = serde_json::from_str(&operation.command_json).unwrap();
+    assert_eq!(
+        command,
+        [
+            "git",
+            "push",
+            "--no-follow-tags",
+            "--porcelain",
+            "--",
+            "origin",
+            &format!("{head}:refs/heads/{branch}"),
+        ]
+    );
+    let details: serde_json::Value =
+        serde_json::from_str(operation.details_json.as_deref().unwrap()).unwrap();
+    let lock_key = details["coordination_timing"]["lock_key"].as_str().unwrap();
+    assert!(
+        lock_key.ends_with(&format!("::git-ref/refs/heads/{branch}")),
+        "{lock_key}"
+    );
+}
+
 /// Rebasing or amending rewrites the branch; the next push replaces only
 /// what this session pushed last.
 #[test]
