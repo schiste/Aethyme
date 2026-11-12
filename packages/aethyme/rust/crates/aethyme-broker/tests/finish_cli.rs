@@ -253,7 +253,11 @@ fn finish_does_not_decode_unrelated_merge_queue_history() {
     assert_eq!(report.status, aethyme_broker::FinishStatus::Closed);
     assert!(report.closed, "{report:#?}");
     assert_eq!(report.latest_queue_entry_id, Some(expected_entry.id));
-    assert_eq!(report.latest_queue_status, Some(MergeStatus::Verified));
+    // The pull request landed the verified entry, so finish made it terminal.
+    assert_eq!(
+        report.latest_queue_status,
+        Some(MergeStatus::ExternallyLanded)
+    );
     assert!(!report.delivery.promoted, "{report:#?}");
     assert!(report.delivery.published, "{report:#?}");
     assert!(report.cleanup.kept, "{report:#?}");

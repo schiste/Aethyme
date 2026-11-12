@@ -1671,8 +1671,34 @@ impl Broker {
             // squash rewrites the SHA, so without this the session's own work
             // would look unsubmitted forever (#152).
             report.representing_commit = self.note_merge_time_representation(session_id, None);
+            self.mark_queue_landed_after_merge(session_id);
         }
         Ok(report)
+    }
+
+    /// Nothing promotes a session's queue rows in a repository that does not
+    /// promote, so the merge just fetched is what makes them terminal: once
+    /// the default branch holds the session's work, its verified rows become
+    /// `externally_landed` and retention can prune them. Best effort: a
+    /// failure leaves the rows verified and is reported on stderr.
+    fn mark_queue_landed_after_merge(&mut self, session_id: i64) {
+        let Ok(session) = self.store().session(session_id) else {
+            return;
+        };
+        let Some(head) = self.repo_handle().resolve_ref(&session.branch) else {
+            return;
+        };
+        match self.default_branch_landing(&head, None, &[]) {
+            Ok(Some(landing)) => crate::warn_unrecorded(
+                "mark the merged session's queue entries landed",
+                self.mark_landed_queue_entries(session_id, &head, &landing),
+            ),
+            Ok(None) => {}
+            Err(error) => crate::warn_unrecorded::<(), _>(
+                "check where the merged session's work landed",
+                Err(error),
+            ),
+        }
     }
 
     fn cleanup_after_github_pull_request_merge(

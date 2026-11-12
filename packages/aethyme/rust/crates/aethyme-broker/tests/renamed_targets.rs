@@ -1,5 +1,7 @@
-//! Issue #145: a session whose target paths were renamed by a later promotion
-//! must be told before its replay fails as a modify/delete conflict.
+//! Issue #145: a session whose target paths were renamed by work that landed
+//! after it started must be told before its replay fails as a modify/delete
+//! conflict. Work lands by merged pull request; a promoting repository keeps
+//! reporting renames promotion made.
 
 use std::path::Path;
 use std::process::Command;
@@ -26,14 +28,26 @@ fn sh(cwd: &Path, args: &[&str]) {
     );
 }
 
-/// A repo where one promoted session has already moved `plugins/old/tool.py`
-/// to `plugins/new/tool.py`, and a second session still targets the old path.
-fn fixture(rename: bool) -> (FixtureRepository, std::path::PathBuf, i64) {
+/// How the moving session's work lands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Landing {
+    /// Promoted to integration on submit.
+    Promotion,
+    /// A squash-merged pull request into the fetched default branch.
+    PullRequest,
+}
+
+/// A repo where one session's landed work has already moved
+/// `plugins/old/tool.py` to `plugins/new/tool.py`, and a second session still
+/// targets the old path.
+fn fixture(rename: bool, landing: Landing) -> (FixtureRepository, std::path::PathBuf, i64) {
     let fixture = FixtureRepository::new();
     let repo = fixture.path().to_path_buf();
     std::fs::create_dir_all(repo.join("plugins/old")).unwrap();
     sh(&repo, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(&repo);
+    if landing == Landing::Promotion {
+        aethyme_testkit::promote_on_submit(&repo);
+    }
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     std::fs::write(
         repo.join("plugins/old/tool.py"),
@@ -42,6 +56,9 @@ fn fixture(rename: bool) -> (FixtureRepository, std::path::PathBuf, i64) {
     .unwrap();
     sh(&repo, &["add", "-A"]);
     sh(&repo, &["commit", "-qm", "init"]);
+    if landing == Landing::PullRequest {
+        aethyme_testkit::ensure_origin(&repo);
+    }
 
     let mut broker = open_fixture_repository_broker(&fixture).unwrap();
 
@@ -56,7 +73,7 @@ fn fixture(rename: bool) -> (FixtureRepository, std::path::PathBuf, i64) {
     sh(&stale_worktree, &["add", "-A"]);
     sh(&stale_worktree, &["commit", "-qm", "tweak the tool"]);
 
-    // A different session generalizes the plugin, and promotes first.
+    // A different session generalizes the plugin, and lands first.
     let mover = broker
         .start_worktree("generalize the plugin", None)
         .unwrap();
@@ -72,14 +89,39 @@ fn fixture(rename: bool) -> (FixtureRepository, std::path::PathBuf, i64) {
     }
     sh(&mover_worktree, &["add", "-A"]);
     sh(&mover_worktree, &["commit", "-qm", "generalize the plugin"]);
-    assert!(broker.submit(mover.id).unwrap().promoted);
+    match landing {
+        Landing::Promotion => assert!(broker.submit(mover.id).unwrap().promoted),
+        Landing::PullRequest => {
+            aethyme_testkit::land_as_pull_request(
+                &repo,
+                &mover.branch,
+                aethyme_testkit::MergeStyle::Squash,
+            );
+        }
+    }
 
     (fixture, repo, stale.id)
 }
 
 #[test]
-fn a_renamed_target_is_named_with_its_new_path_and_owning_entry() {
-    let (fixture, _repo, stale_id) = fixture(true);
+fn a_rename_landed_by_a_pull_request_is_named_with_its_new_path() {
+    let (fixture, _repo, stale_id) = fixture(true, Landing::PullRequest);
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
+
+    let renamed = broker.session_renamed_targets(stale_id).unwrap();
+    assert_eq!(renamed.len(), 1, "expected one renamed target: {renamed:?}");
+    assert_eq!(renamed[0].from, "plugins/old/tool.py");
+    assert_eq!(renamed[0].to, "plugins/new/tool.py");
+    assert_eq!(
+        renamed[0].promoted_entry_id, None,
+        "no promotion moved it: {renamed:?}"
+    );
+}
+
+/// A promoting repository still judges renames against integration.
+#[test]
+fn a_promoted_rename_is_named_with_its_new_path_and_owning_entry() {
+    let (fixture, _repo, stale_id) = fixture(true, Landing::Promotion);
     let mut broker = open_fixture_repository_broker(&fixture).unwrap();
 
     let renamed = broker.session_renamed_targets(stale_id).unwrap();
@@ -96,7 +138,7 @@ fn a_renamed_target_is_named_with_its_new_path_and_owning_entry() {
 /// the operator to a path that does not exist.
 #[test]
 fn a_genuine_deletion_is_not_reported_as_a_rename() {
-    let (fixture, _repo, stale_id) = fixture(false);
+    let (fixture, _repo, stale_id) = fixture(false, Landing::PullRequest);
     let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     assert!(
         broker.session_renamed_targets(stale_id).unwrap().is_empty(),
@@ -110,11 +152,11 @@ fn an_unaffected_session_reports_nothing() {
     let fixture = FixtureRepository::new();
     let repo = fixture.path();
     sh(repo, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(repo);
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     std::fs::write(repo.join("keep.txt"), "stable\n").unwrap();
     sh(repo, &["add", "-A"]);
     sh(repo, &["commit", "-qm", "init"]);
+    aethyme_testkit::ensure_origin(repo);
 
     let mut broker = open_fixture_repository_broker(&fixture).unwrap();
     let session = broker.start_worktree("ordinary work", None).unwrap();
@@ -134,7 +176,7 @@ fn an_unaffected_session_reports_nothing() {
 /// The advisory reaches the operator at adopt, before a replay is attempted.
 #[test]
 fn adopt_surfaces_the_rename_before_a_replay_is_attempted() {
-    let (fixture, repo, _) = fixture(true);
+    let (fixture, repo, _) = fixture(true, Landing::PullRequest);
     let mut broker = open_fixture_repository_broker(&fixture).unwrap();
 
     // A hand-made worktree that still targets the old path.
