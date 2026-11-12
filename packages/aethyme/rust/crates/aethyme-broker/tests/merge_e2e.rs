@@ -96,7 +96,10 @@ fn submit_reuses_its_preflight_patch_history_plan_when_inputs_stay_fixed() {
     // Finish fixture history before opening the broker: its default database
     // lives in the repository and must not be staged by later branch commits.
     // Main and integration each receive an independent commit from the same
-    // initial tree, so the session plan includes both nonempty patch streams.
+    // initial tree. Integration holding a commit main lacks, with no fetched
+    // default branch, submit verifies against main (what sessions are cut
+    // from); the session is cut from main's parent, so its plan includes both
+    // nonempty patch streams: the session's commit and main's.
     sh(tmp.path(), &["switch", "-qc", "integration-only"]);
     std::fs::write(
         tmp.path().join("src/integration-only.py"),
@@ -131,7 +134,7 @@ fn submit_reuses_its_preflight_patch_history_plan_when_inputs_stay_fixed() {
         "fixture integration and main must diverge from their shared initial commit"
     );
 
-    let session_worktree = agent_worktree(tmp.path(), "trace-reuse");
+    let session_worktree = agent_worktree_at(tmp.path(), "trace-reuse", "main^");
     let session = broker
         .adopt(&session_worktree, Some("trace submit plan reuse"))
         .unwrap();
