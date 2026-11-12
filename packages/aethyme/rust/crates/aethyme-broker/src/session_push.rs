@@ -106,6 +106,47 @@ fn pushed_oid_key(session_id: i64) -> String {
     format!("session_push.{session_id}.oid")
 }
 
+/// `meta` key recording when the default branch was last fetched into
+/// `tracking_ref` by [`Broker::fetch_default_branch`]: the start of the last
+/// successful fetch in epoch milliseconds, or [`DEFAULT_BRANCH_FETCH_FAILED`]
+/// after a failed one. The broker database is shared by every session and
+/// command of the repository, so any of them can reuse the record.
+pub(crate) fn default_branch_fetch_key(tracking_ref: &str) -> String {
+    format!("default_branch_fetch.{tracking_ref}.started_at_ms")
+}
+
+/// The record a failed default-branch fetch leaves: it never parses as a time,
+/// so nothing reuses a fetch the last attempt could not repeat.
+const DEFAULT_BRANCH_FETCH_FAILED: &str = "failed";
+
+/// How recent a default-branch fetch `push` reuses instead of fetching again.
+const PUSH_FETCH_REUSE_WINDOW_MS: i64 = 60_000;
+
+/// Set to `off` to make every `push` fetch the default branch itself.
+pub(crate) const PUSH_FETCH_REUSE_ENV: &str = "AETHYME_PUSH_FETCH_REUSE";
+
+/// Whether `push` may reuse a recent default-branch fetch; read once.
+fn push_fetch_reuse_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var(PUSH_FETCH_REUSE_ENV),
+            Ok(value) if value.trim().eq_ignore_ascii_case("off")
+        )
+    })
+}
+
+/// How old the recorded default-branch fetch is, when `push` may reuse it.
+///
+/// `None` without a record, after a failed fetch, for a record in the future
+/// (a clock that stepped back proves nothing about freshness), and for one
+/// older than `window_ms`.
+fn reusable_fetch_age_ms(recorded: Option<&str>, now_ms: i64, window_ms: i64) -> Option<i64> {
+    let started_at_ms = recorded?.trim().parse::<i64>().ok()?;
+    let age_ms = now_ms.checked_sub(started_at_ms)?;
+    (0..=window_ms).contains(&age_ms).then_some(age_ms)
+}
+
 /// How long one push or GitHub call may queue for the repository write lock.
 fn push_operation_wait() -> QueueWait {
     QueueWait::Seconds(60)
@@ -192,13 +233,20 @@ pub struct SessionPushReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub duplicate_work: Vec<crate::DuplicateWork>,
     /// The pushed head compared with the default branch, fetched just before
-    /// the comparison: how far behind it is and whether merging would
-    /// conflict. `None` when Git could not answer. Advisory only.
+    /// the comparison (or moments before by another broker command; see
+    /// `default_branch_fetch_age_seconds`): how far behind it is and whether
+    /// merging would conflict. `None` when Git could not answer. Advisory only.
     pub default_branch: Option<crate::DefaultBranchDrift>,
     /// Why `default_branch` is missing or may be stale, e.g. the fetch failed
     /// and the comparison used the last fetched copy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_branch_note: Option<String>,
+    /// Seconds since the default-branch fetch `default_branch` was measured
+    /// against, when this push reused a fetch another broker command made
+    /// moments before instead of fetching again. Omitted when this push
+    /// fetched itself. `AETHYME_PUSH_FETCH_REUSE=off` always fetches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_branch_fetch_age_seconds: Option<u64>,
     /// With `--pr`: the change measured against `[review] pr_size` (#239).
     /// Advisory only -- a push is never refused for its size. Omitted without
     /// `--pr`, or when the change could not be measured.
@@ -674,15 +722,27 @@ impl Broker {
 
         // Advisory and best-effort, like the overlap check below: the default
         // branch moved under this session whenever another PR merged, and
-        // that is only visible after fetching it.
-        let (default_branch, default_branch_note, _) = self.fetch_and_measure_default_branch(
-            session_id,
-            &session.branch,
-            &default,
-            Some(&target),
-            &head,
-            &main_root,
-        );
+        // that is only visible after fetching it. A fetch any broker command
+        // made within the last minute is reused instead, except with `--pr`,
+        // whose size measurement should see the current default branch.
+        let reused_fetch_age_ms = if open_pr {
+            None
+        } else {
+            self.reusable_default_branch_fetch_age_ms(&default)
+        };
+        let (default_branch, default_branch_note, _) = if reused_fetch_age_ms.is_some() {
+            crate::phase_telemetry::add("default_branch_fetch_reused", std::time::Duration::ZERO);
+            self.measure_default_branch(session_id, &session.branch, &default, &head, None)
+        } else {
+            self.fetch_and_measure_default_branch(
+                session_id,
+                &session.branch,
+                &default,
+                Some(&target),
+                &head,
+                &main_root,
+            )
+        };
 
         phase_timings_ms.insert(
             "push_default_branch".into(),
@@ -747,6 +807,8 @@ impl Broker {
             duplicate_work,
             default_branch,
             default_branch_note,
+            default_branch_fetch_age_seconds: reused_fetch_age_ms
+                .map(|age_ms| u64::try_from(age_ms / 1000).unwrap_or(0)),
             pr_size,
             review_run: None,
             phase_timings_ms,
@@ -761,7 +823,51 @@ impl Broker {
     /// remote read that moves a ref. `Err` carries a note saying why the
     /// caller is working from the last fetched copy; a failed fetch is never
     /// fatal to `push`, `start` or `sync`.
+    ///
+    /// Every outcome is recorded under [`default_branch_fetch_key`], so a
+    /// `push` moments later can reuse a successful fetch and never a failed one.
     pub(crate) fn fetch_default_branch(
+        &mut self,
+        session_id: i64,
+        default: &TrackedDefault,
+        target: Option<&crate::ResolvedRemoteTarget>,
+        main_root: &Path,
+    ) -> Result<(), String> {
+        let started_at_ms = crate::clock::epoch_ms();
+        let fetched = self.run_default_branch_fetch(session_id, default, target, main_root);
+        let record = match &fetched {
+            Ok(()) => started_at_ms.to_string(),
+            Err(_) => DEFAULT_BRANCH_FETCH_FAILED.to_string(),
+        };
+        crate::warn_unrecorded(
+            "record the default-branch fetch time",
+            self.store()
+                .meta_set(&default_branch_fetch_key(&default.tracking_ref), &record),
+        );
+        fetched
+    }
+
+    /// How old the last recorded default-branch fetch is, when `push` may
+    /// compare against the tracking ref it left instead of fetching again.
+    fn reusable_default_branch_fetch_age_ms(&self, default: &TrackedDefault) -> Option<i64> {
+        if !push_fetch_reuse_enabled() {
+            return None;
+        }
+        let recorded = self
+            .store_ref()
+            .meta_get(&default_branch_fetch_key(&default.tracking_ref))
+            .ok()
+            .flatten();
+        let age_ms = reusable_fetch_age_ms(
+            recorded.as_deref(),
+            crate::clock::epoch_ms(),
+            PUSH_FETCH_REUSE_WINDOW_MS,
+        )?;
+        self.repo_handle().resolve_ref(&default.tracking_ref)?;
+        Some(age_ms)
+    }
+
+    fn run_default_branch_fetch(
         &mut self,
         session_id: i64,
         default: &TrackedDefault,
@@ -841,6 +947,25 @@ impl Broker {
         let fetch_error = self
             .fetch_default_branch(session_id, default, target, main_root)
             .err();
+        self.measure_default_branch(session_id, branch, default, head, fetch_error)
+    }
+
+    /// Compare `head` with the default branch's tracking ref as it stands,
+    /// and cache the result for `status`. `fetch_error` says why that ref may
+    /// be stale; `None` means it was just fetched, or `push` reused a fetch
+    /// recent enough to stand for one.
+    fn measure_default_branch(
+        &mut self,
+        session_id: i64,
+        branch: &str,
+        default: &TrackedDefault,
+        head: &str,
+        fetch_error: Option<String>,
+    ) -> (
+        Option<crate::DefaultBranchDrift>,
+        Option<String>,
+        DefaultBranchRefreshEvidence,
+    ) {
         let mut note = fetch_error.clone();
         let repo = self.repo_handle();
         let Some(commit) = repo.resolve_ref(&default.tracking_ref) else {
@@ -1150,6 +1275,47 @@ fn measure_pr_size(main_root: &Path, base_ref: &str, head: &str) -> Option<crate
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_reuses_only_a_successful_default_branch_fetch_inside_the_window() {
+        let now = 1_000_000;
+        let window = PUSH_FETCH_REUSE_WINDOW_MS;
+        let at = |started: i64| started.to_string();
+        assert_eq!(
+            reusable_fetch_age_ms(Some(&at(now - 12_000)), now, window),
+            Some(12_000)
+        );
+        assert_eq!(reusable_fetch_age_ms(Some(&at(now)), now, window), Some(0));
+        assert_eq!(
+            reusable_fetch_age_ms(Some(&at(now - window)), now, window),
+            Some(window)
+        );
+        assert_eq!(
+            reusable_fetch_age_ms(Some(&at(now - window - 1)), now, window),
+            None,
+            "an old fetch is not reused"
+        );
+        assert_eq!(reusable_fetch_age_ms(None, now, window), None, "no record");
+        assert_eq!(
+            reusable_fetch_age_ms(Some(DEFAULT_BRANCH_FETCH_FAILED), now, window),
+            None,
+            "the last fetch failed"
+        );
+        assert_eq!(
+            reusable_fetch_age_ms(Some(&at(now + 1)), now, window),
+            None,
+            "a record in the future proves nothing"
+        );
+        assert_eq!(reusable_fetch_age_ms(Some("garbage"), now, window), None);
+    }
+
+    #[test]
+    fn default_branch_fetch_record_is_keyed_by_the_tracking_ref() {
+        assert_eq!(
+            default_branch_fetch_key("refs/remotes/origin/main"),
+            "default_branch_fetch.refs/remotes/origin/main.started_at_ms"
+        );
+    }
 
     #[test]
     fn default_branch_refresh_has_a_bounded_total_admission_deadline() {
