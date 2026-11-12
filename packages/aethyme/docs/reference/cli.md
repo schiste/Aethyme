@@ -413,8 +413,11 @@ New checkout allocation is limited to 32 registered linked worktrees per
 repository by default, across all placement roots. The primary checkout is
 excluded; prunable registrations and manually created linked worktrees count.
 Set `[worktrees].max_checkouts` to change the limit, or explicitly set it to
-zero to disable it. At the limit, reuse remains available and existing
-checkouts are preserved. Run `broker gc plan` to inspect cleanup candidates.
+zero to disable it. At the limit, `start` first runs the unattended removal of
+closed checkouts it can prove disposable, then refuses if no slot was freed;
+reuse remains available and other checkouts are preserved. Run `broker gc plan`
+to inspect cleanup candidates. `broker status` warns with
+`cleanup.checkout-capacity` from three quarters of the limit.
 A foreground lifecycle command (`start`, adoption, `finish`, `close`, `cleanup`,
 `submit`) waits up to 180 s for the repository's lifecycle claim, or until its
 own `--timeout` if that comes first. After 5 s it says on stderr who holds the

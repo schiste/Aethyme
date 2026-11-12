@@ -724,6 +724,182 @@ fn bulk_cleanup_apply_reclaims_build_output_of_closed_kept_worktrees_only() {
     );
 }
 
+/// A session whose one commit landed as a merged pull request, finished with
+/// its checkout kept, as an agent leaves it.
+fn landed_kept_session(broker: &mut Broker, task: &str, file: &str) -> (i64, std::path::PathBuf) {
+    let session = broker.start_worktree(task, None).unwrap();
+    let path = std::path::PathBuf::from(&session.worktree_path);
+    std::fs::write(path.join(file), "landed\n").unwrap();
+    sh(&path, &["add", file]);
+    sh(&path, &["commit", "-qm", task]);
+    aethyme_testkit::ensure_origin(broker.main_root());
+    broker.submit(session.id).unwrap();
+    aethyme_testkit::land_as_pull_request(
+        broker.main_root(),
+        &session.branch,
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
+    let finished = broker
+        .finish_with_options(
+            session.id,
+            FinishOptions {
+                keep_worktree: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(finished.status, FinishStatus::Closed);
+    (session.id, path)
+}
+
+/// Write the bytes Aethyme's deploy writes at `relative`.
+fn write_generated(worktree: &Path, relative: &str) -> Vec<u8> {
+    let content = aethyme_enhance::deploy::generated_artifact_contents(relative)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("{relative} is not a generated artifact"));
+    let path = worktree.join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &content).unwrap();
+    content.into_bytes()
+}
+
+#[test]
+fn bulk_cleanup_removes_checkouts_whose_only_ignored_content_is_unmodified_generated_files() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    // The harness directory is ignored the way deployed repositories ignore it.
+    std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n.claude/*\n").unwrap();
+    sh(tmp.path(), &["add", ".gitignore"]);
+    sh(
+        tmp.path(),
+        &["commit", "-qm", "ignore harness runtime files"],
+    );
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
+
+    let (generated_id, generated_path) =
+        landed_kept_session(&mut broker, "generated only", "generated.txt");
+    write_generated(&generated_path, ".claude/settings.local.json");
+    write_generated(&generated_path, ".claude/hooks/aethyme-load-context.sh");
+
+    let (edited_id, edited_path) =
+        landed_kept_session(&mut broker, "edited settings", "edited.txt");
+    let mut edited = write_generated(&edited_path, ".claude/settings.local.json");
+    write_generated(&edited_path, ".claude/hooks/aethyme-load-context.sh");
+    // One byte differs, as when a harness records a granted permission.
+    let last = edited.len() - 2;
+    edited[last] = b' ';
+    std::fs::write(edited_path.join(".claude/settings.local.json"), &edited).unwrap();
+
+    let (unrelated_id, unrelated_path) =
+        landed_kept_session(&mut broker, "unrelated ignored", "unrelated.txt");
+    write_generated(&unrelated_path, ".claude/settings.local.json");
+    std::fs::write(unrelated_path.join(".claude/notes.md"), "mine\n").unwrap();
+
+    let plan = broker.cleanup_cleaned_worktrees(false, None).unwrap();
+    let item = |id: i64| {
+        plan.plan
+            .worktrees
+            .iter()
+            .find(|item| item.session_id == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        item(generated_id).disposition,
+        CleanupDisposition::Eligible,
+        "{}",
+        item(generated_id).reason
+    );
+    let edited_item = item(edited_id);
+    assert_eq!(edited_item.disposition, CleanupDisposition::Dirty);
+    assert!(
+        edited_item.reason.contains(
+            "ignored content requires explicit cleanup: ignored path .claude/settings.local.json is not inside a recognised build-output directory"
+        ),
+        "{}",
+        edited_item.reason
+    );
+    let unrelated_item = item(unrelated_id);
+    assert_eq!(unrelated_item.disposition, CleanupDisposition::Dirty);
+    assert!(
+        unrelated_item.reason.contains(".claude/notes.md"),
+        "{}",
+        unrelated_item.reason
+    );
+
+    let applied = broker
+        .cleanup_cleaned_worktrees(true, Some(&plan.plan.digest))
+        .unwrap();
+    assert!(applied.applied);
+    assert_eq!(applied.removed_session_ids, vec![generated_id]);
+    assert!(!generated_path.exists());
+    assert_eq!(
+        std::fs::read(edited_path.join(".claude/settings.local.json")).unwrap(),
+        edited,
+        "a modified settings file is never discarded"
+    );
+    assert!(unrelated_path.join(".claude/notes.md").is_file());
+}
+
+#[test]
+fn status_warns_before_the_linked_checkout_limit_refuses_start() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[worktrees]\nmax_checkouts = 4\n",
+    )
+    .unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
+    let first = broker.start_worktree("first", None).unwrap();
+    broker.start_worktree("second", None).unwrap();
+    let below = broker.status(now_ms()).unwrap();
+    assert!(
+        below
+            .advice
+            .iter()
+            .all(|advice| advice.id != "cleanup.checkout-capacity"),
+        "two of four checkouts is below three quarters"
+    );
+
+    broker.close(first.id).unwrap();
+    broker.start_worktree("third", None).unwrap();
+    for (surface, advice) in [
+        ("refresh", broker.status(now_ms()).unwrap().advice),
+        ("routine", broker.status_current(now_ms()).unwrap().advice),
+        ("compact", broker.status_brief(now_ms()).unwrap().advice),
+    ] {
+        let row = advice
+            .iter()
+            .find(|advice| advice.id == "cleanup.checkout-capacity")
+            .unwrap_or_else(|| panic!("{surface} status has no capacity row: {advice:#?}"));
+        assert_eq!(
+            row.severity,
+            aethyme_broker::StatusAdviceSeverity::Warning,
+            "{surface}"
+        );
+        assert_eq!(
+            row.summary,
+            "3 of 4 linked checkouts are registered; 1 are not held by an open session",
+            "{surface}"
+        );
+        assert!(
+            row.evidence.contains(&"retained checkouts: 1".to_string()),
+            "{surface}: {:?}",
+            row.evidence
+        );
+        assert_eq!(
+            row.commands,
+            vec![
+                "aethyme broker gc sweep --json",
+                "aethyme broker finish cleanup --all-cleaned --json",
+            ],
+            "{surface}"
+        );
+    }
+}
+
 #[test]
 fn cleanup_recovers_after_worktree_removal_and_prunes_only_the_exact_branch_tip() {
     let tmp = common::FixtureRepository::new();

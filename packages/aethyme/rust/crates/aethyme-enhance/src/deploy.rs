@@ -549,6 +549,102 @@ fn session_start_hook_entry() -> Value {
     entry
 }
 
+/// Wire the SessionStart hook into parsed settings, repairing a non-object
+/// `hooks` or non-array `SessionStart` like the Python flow. Returns whether
+/// anything changed; settings that already run the hook are left untouched.
+fn add_session_start_hook(settings: &mut Value) -> bool {
+    // settings.setdefault("hooks", {}) with the non-dict repair.
+    let hooks_ok = settings.get("hooks").map(Value::is_object).unwrap_or(false);
+    if !hooks_ok {
+        settings.set("hooks", Value::object());
+    }
+    let mut hooks = settings.get("hooks").cloned().expect("just ensured");
+    let session_ok = hooks
+        .get("SessionStart")
+        .map(Value::is_array)
+        .unwrap_or(false);
+    if !session_ok {
+        hooks.set("SessionStart", Value::Array(vec![]));
+    }
+    let mut session_start = hooks.get("SessionStart").cloned().expect("just ensured");
+
+    if settings_has_hook_entry(&session_start) {
+        return false;
+    }
+
+    if let Value::Array(entries) = &mut session_start {
+        entries.push(session_start_hook_entry());
+    }
+    hooks.set("SessionStart", session_start);
+    settings.set("hooks", hooks);
+    true
+}
+
+fn settings_text(settings: &Value) -> String {
+    format!("{}\n", pyjson::dumps_indent2(settings))
+}
+
+/// The exact bytes deploy writes to [`SETTINGS_FILE`] when the file did not
+/// exist (or was replaced after its backup): only the SessionStart hook.
+fn generated_settings_text() -> String {
+    let mut settings = Value::object();
+    add_session_start_hook(&mut settings);
+    settings_text(&settings)
+}
+
+/// Every byte-exact content an Aethyme writer (`deploy`, `upgrade` and the
+/// local-only lane) produces at `relative` without reading the checkout it
+/// writes into, or an empty list when the path is not such a file.
+///
+/// Cleanup uses this to prove an ignored file is Aethyme's own unmodified
+/// output and so holds no user data. Only checkout-independent bytes qualify:
+/// [`TARGETS`] other than `CLAUDE.md`, and [`SETTINGS_FILE`] as created fresh.
+/// A settings file deploy merged into, one a harness later added permissions
+/// to, or any file a person edited differs from every entry and is not proven.
+/// Content rendered from the repository (root policy, onboarding skills, the
+/// local policy and marker) is deliberately absent: proving it would mean
+/// re-running repository analysis inside cleanup.
+pub fn generated_artifact_contents(relative: &str) -> Vec<String> {
+    if relative == SETTINGS_FILE {
+        return vec![generated_settings_text()];
+    }
+    let mut contents = Vec::new();
+    for (path, template) in TARGETS {
+        if *path != relative || *path == "CLAUDE.md" {
+            continue;
+        }
+        // The canonical lane renders; the local-only lane writes the raw
+        // template (they differ only for the broker reference). Only
+        // `CLAUDE.md` reads the repository, and it is excluded above.
+        if let Ok(rendered) = render_target(Path::new(""), path, template) {
+            contents.push(rendered);
+        }
+        if !contents.iter().any(|content| content == template) {
+            contents.push(template.to_string());
+        }
+    }
+    contents
+}
+
+/// Whether `relative_dir` (no trailing slash) is an ancestor directory of a
+/// path [`generated_artifact_contents`] knows, so cleanup inspects only
+/// directories Aethyme itself may have created.
+pub fn may_hold_generated_artifacts(relative_dir: &str) -> bool {
+    let relative_dir = relative_dir.trim_end_matches('/');
+    !relative_dir.is_empty()
+        && std::iter::once(SETTINGS_FILE)
+            .chain(
+                TARGETS
+                    .iter()
+                    .map(|(path, _)| *path)
+                    .filter(|path| *path != "CLAUDE.md"),
+            )
+            .any(|path| {
+                path.strip_prefix(relative_dir)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+}
+
 /// Add the SessionStart hook to `.claude/settings.local.json`
 /// (merge-aware, idempotent).
 pub(crate) fn ensure_settings_hook(repo: &Path) -> Result<DeployAction, String> {
@@ -573,38 +669,13 @@ pub(crate) fn ensure_settings_hook(repo: &Path) -> Result<DeployAction, String> 
         }
     }
 
-    // settings.setdefault("hooks", {}) with the non-dict repair.
-    let hooks_ok = settings.get("hooks").map(Value::is_object).unwrap_or(false);
-    if !hooks_ok {
-        settings.set("hooks", Value::object());
-    }
-    let mut hooks = settings.get("hooks").cloned().expect("just ensured");
-    let session_ok = hooks
-        .get("SessionStart")
-        .map(Value::is_array)
-        .unwrap_or(false);
-    if !session_ok {
-        hooks.set("SessionStart", Value::Array(vec![]));
-    }
-    let mut session_start = hooks.get("SessionStart").cloned().expect("just ensured");
-
-    if settings_has_hook_entry(&session_start) {
+    if !add_session_start_hook(&mut settings) {
         return Ok(DeployAction {
             relative_path: SETTINGS_FILE.to_string(),
             action: "unchanged",
         });
     }
-
-    if let Value::Array(entries) = &mut session_start {
-        entries.push(session_start_hook_entry());
-    }
-    hooks.set("SessionStart", session_start);
-    settings.set("hooks", hooks);
-    write_text(
-        repo,
-        &settings_path,
-        &format!("{}\n", pyjson::dumps_indent2(&settings)),
-    )?;
+    write_text(repo, &settings_path, &settings_text(&settings))?;
     Ok(DeployAction {
         relative_path: SETTINGS_FILE.to_string(),
         action: if existed { "updated" } else { "created" },
@@ -885,6 +956,64 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("README.md"), "# Fixture\n").unwrap();
         dir
+    }
+
+    #[test]
+    fn generated_artifact_catalog_matches_what_deploy_writes() {
+        let repo = fixture_repo("generated-catalog");
+        let actions = deploy(&repo, true).unwrap();
+        let mut proven = 0;
+        for action in &actions {
+            let candidates = generated_artifact_contents(&action.relative_path);
+            if candidates.is_empty() {
+                continue;
+            }
+            let written = std::fs::read_to_string(repo.join(&action.relative_path)).unwrap();
+            assert!(
+                candidates.contains(&written),
+                "{} is not catalogued byte for byte",
+                action.relative_path
+            );
+            proven += 1;
+        }
+        // Every target except CLAUDE.md, plus the fresh settings file.
+        assert_eq!(proven, TARGETS.len());
+        for (path, _) in TARGETS {
+            assert_eq!(
+                generated_artifact_contents(path).is_empty(),
+                *path == "CLAUDE.md",
+                "{path}"
+            );
+        }
+        assert!(generated_artifact_contents("CLAUDE.md").is_empty());
+        assert!(generated_artifact_contents(".claude/settings.local.json.bak").is_empty());
+        assert!(may_hold_generated_artifacts(".claude/hooks"));
+        assert!(may_hold_generated_artifacts(".claude"));
+        assert!(may_hold_generated_artifacts(
+            ".codex/skills/aethyme/references/"
+        ));
+        assert!(!may_hold_generated_artifacts(
+            ".claude/hooks/aethyme-load-context.sh"
+        ));
+        assert!(!may_hold_generated_artifacts(".claude/hook"));
+        assert!(!may_hold_generated_artifacts("target"));
+        assert!(!may_hold_generated_artifacts(""));
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn merged_or_edited_settings_are_not_generated_artifacts() {
+        let repo = fixture_repo("generated-settings-merge");
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::fs::write(
+            repo.join(SETTINGS_FILE),
+            "{\"permissions\": {\"allow\": [\"Bash(ls:*)\"]}}\n",
+        )
+        .unwrap();
+        ensure_settings_hook(&repo).unwrap();
+        let merged = std::fs::read_to_string(repo.join(SETTINGS_FILE)).unwrap();
+        assert!(!generated_artifact_contents(SETTINGS_FILE).contains(&merged));
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 
     #[test]

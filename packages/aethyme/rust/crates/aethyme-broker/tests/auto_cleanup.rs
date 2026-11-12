@@ -478,6 +478,84 @@ fn standalone_ignored_root_files_still_keep_the_checkout() {
     assert!(worktree.exists());
 }
 
+/// Ignore the harness directory for every checkout of the fixture, the way
+/// deployed repositories ignore Claude Code's per-project runtime files.
+fn ignore_harness_runtime_files(fx: &Fixture) {
+    let exclude = fx.repo.join(".git/info/exclude");
+    std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    let mut text = std::fs::read_to_string(&exclude).unwrap_or_default();
+    text.push_str(".claude/*\n");
+    std::fs::write(&exclude, text).unwrap();
+}
+
+/// Write the bytes Aethyme's deploy writes at `relative`.
+fn write_generated(worktree: &Path, relative: &str) -> Vec<u8> {
+    let content = aethyme_enhance::deploy::generated_artifact_contents(relative)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("{relative} is not a generated artifact"));
+    let path = worktree.join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &content).unwrap();
+    content.into_bytes()
+}
+
+#[cfg(unix)]
+#[test]
+fn unmodified_generated_harness_files_do_not_keep_a_merged_closed_checkout() {
+    let fx = fixture();
+    ignore_harness_runtime_files(&fx);
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    write_generated(&worktree, ".claude/settings.local.json");
+    write_generated(&worktree, ".claude/hooks/aethyme-load-context.sh");
+    let report = run(&mut broker);
+    assert_eq!(report.removed.len(), 1, "{report:#?}");
+    assert!(!worktree.exists());
+}
+
+#[test]
+fn a_generated_settings_file_changed_by_one_byte_keeps_the_checkout() {
+    let fx = fixture();
+    ignore_harness_runtime_files(&fx);
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let mut edited = write_generated(&worktree, ".claude/settings.local.json");
+    write_generated(&worktree, ".claude/hooks/aethyme-load-context.sh");
+    let last = edited.len() - 2;
+    edited[last] = b' ';
+    let settings = worktree.join(".claude/settings.local.json");
+    std::fs::write(&settings, &edited).unwrap();
+    let report = run(&mut broker);
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(
+        kept_reason(&report, &worktree).contains(
+            "ignored content requires explicit cleanup: ignored path .claude/settings.local.json is not inside a recognised build-output directory"
+        ),
+        "{report:#?}"
+    );
+    assert_eq!(std::fs::read(&settings).unwrap(), edited);
+}
+
+#[test]
+fn an_unknown_file_beside_the_generated_hook_keeps_the_checkout() {
+    let fx = fixture();
+    ignore_harness_runtime_files(&fx);
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    write_generated(&worktree, ".claude/settings.local.json");
+    write_generated(&worktree, ".claude/hooks/aethyme-load-context.sh");
+    std::fs::write(worktree.join(".claude/hooks/mine.sh"), "echo mine\n").unwrap();
+    let report = run(&mut broker);
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(
+        kept_reason(&report, &worktree)
+            .contains("ignored path .claude/hooks/ is not a recognised build-output directory"),
+        "{report:#?}"
+    );
+    assert!(worktree.join(".claude/hooks/mine.sh").is_file());
+}
+
 #[test]
 fn a_stash_made_on_the_branch_keeps_the_checkout() {
     let fx = fixture();

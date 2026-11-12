@@ -10056,6 +10056,14 @@ impl Broker {
     }
 
     fn worktree_checkout_limit(&self) -> Result<Option<(usize, u32)>, BrokerOpError> {
+        Ok(self
+            .worktree_checkout_usage()?
+            .filter(|(count, maximum)| *count >= *maximum as usize))
+    }
+
+    /// Registered linked checkouts and the allocation limit `start` enforces,
+    /// or `None` when the limit is disabled.
+    pub(super) fn worktree_checkout_usage(&self) -> Result<Option<(usize, u32)>, BrokerOpError> {
         // Invalid placement configuration already has a documented host-root
         // fallback and diagnostic. Keep that behavior, with the bounded
         // default rather than letting invalid policy disable admission.
@@ -10071,7 +10079,7 @@ impl Broker {
         // other registration, including prunable ones and other placement
         // roots, without opening or recursively sizing any checkout.
         let count = self.repo.worktree_inventory()?.len().saturating_sub(1);
-        Ok((count >= maximum as usize).then_some((count, maximum)))
+        Ok(Some((count, maximum)))
     }
 
     fn preflight_session_checkout_storage(

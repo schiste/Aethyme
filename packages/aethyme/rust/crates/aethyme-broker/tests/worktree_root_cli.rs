@@ -623,6 +623,71 @@ fn checkout_limit_reclaims_an_eligible_closed_checkout_before_refusing() {
 }
 
 #[test]
+fn checkout_limit_reclaims_a_closed_checkout_holding_only_generated_harness_files() {
+    let tmp = common::canonical_tempdir();
+    let repo = tmp.path().join("project");
+    let state = tmp.path().join("state");
+    let origin = tmp.path().join("origin.git");
+    git(
+        tmp.path(),
+        &["init", "--bare", "-b", "main", origin.to_str().unwrap()],
+    );
+    fixture_at(&repo);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-u", "origin", "main"]);
+    git(&repo, &["remote", "set-head", "origin", "main"]);
+    // Claude Code's per-project runtime files are ignored in every checkout.
+    std::fs::write(repo.join(".git/info/exclude"), ".claude/*\n").unwrap();
+    std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
+    std::fs::write(
+        repo.join(".aethyme/config.toml"),
+        "[worktrees]\nmax_checkouts = 1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".aethyme/broker.toml"),
+        "[retention]\nclosed_worktree_grace_hours = 0\nauto_cleanup_worktrees_on_finish = false\n",
+    )
+    .unwrap();
+
+    let first = json(run_with_host_state(
+        &repo,
+        &state,
+        &["start", "--task", "first", "--json"],
+    ));
+    let first_path = PathBuf::from(first["worktree_path"].as_str().unwrap());
+    let first_id = first["id"].as_i64().unwrap().to_string();
+    json(run(
+        &repo,
+        &state,
+        &["finish", "close", "--session", &first_id, "--json"],
+    ));
+    // `aethyme deploy` run inside the session left Aethyme's own files.
+    for relative in [
+        ".claude/settings.local.json",
+        ".claude/hooks/aethyme-load-context.sh",
+    ] {
+        let content = aethyme_enhance::deploy::generated_artifact_contents(relative)
+            .into_iter()
+            .next()
+            .unwrap();
+        let path = first_path.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    let next = json(run(&repo, &state, &["start", "--task", "next", "--json"]));
+    assert!(
+        !first_path.exists(),
+        "generated harness files do not pin a closed checkout at the limit"
+    );
+    assert!(Path::new(next["worktree_path"].as_str().unwrap()).exists());
+}
+
+#[test]
 fn explicit_zero_checkout_limit_permits_new_allocations() {
     let tmp = common::canonical_tempdir();
     let repo = tmp.path().join("project");

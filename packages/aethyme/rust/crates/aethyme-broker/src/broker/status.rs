@@ -1,5 +1,8 @@
 use super::*;
 
+/// `deferred_checks` name for the linked-checkout capacity check.
+const CHECKOUT_CAPACITY_CHECK: &str = "checkout_capacity";
+
 impl Broker {
     // ── status (Phase 6) ──────────────────────────────────────────────
 
@@ -39,6 +42,7 @@ impl Broker {
         }
         let auto_cleanup = self.last_auto_cleanup_report();
         push_auto_cleanup_advice(&mut view, auto_cleanup);
+        self.push_checkout_capacity_advice(&mut view, deadline);
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
@@ -253,6 +257,19 @@ impl Broker {
             "ownership".into(),
             phase_started.elapsed().as_millis() as u64,
         );
+        let phase_started = std::time::Instant::now();
+        let checkout_capacity = self.checkout_capacity_advice(&agents);
+        phase_timings_ms.insert(
+            "checkout_capacity".into(),
+            phase_started.elapsed().as_millis() as u64,
+        );
+        let checkout_capacity_deferred = match checkout_capacity {
+            Ok(row) => {
+                advice.extend(row);
+                false
+            }
+            Err(_) => true,
+        };
         advice.push(StatusAdvice {
             id: "status.recorded-observations", severity: StatusAdviceSeverity::Notice,
             reason: "summary reads broker records without scanning Git history or retained checkouts",
@@ -278,6 +295,7 @@ impl Broker {
             ]
             .into_iter()
             .map(String::from)
+            .chain(checkout_capacity_deferred.then(|| CHECKOUT_CAPACITY_CHECK.to_string()))
             .collect(),
             leases_refreshed_at_ms: self
                 .store
@@ -292,6 +310,72 @@ impl Broker {
             .phase_timings_ms
             .insert("build".into(), started.elapsed().as_millis() as u64);
         Ok(brief)
+    }
+
+    /// `cleanup.checkout-capacity`: registered linked checkouts have reached
+    /// three quarters of the limit `start` enforces. At the limit `start`
+    /// first runs the unattended removal and refuses only when nothing it can
+    /// prove disposable frees a slot, so this row names the retained count
+    /// and the commands that reclaim slots before that happens. Costs one
+    /// `git worktree list`; an error means the check did not run.
+    fn checkout_capacity_advice(
+        &self,
+        agents: &[AgentView],
+    ) -> Result<Option<StatusAdvice>, BrokerOpError> {
+        let Some((count, maximum)) = self.worktree_checkout_usage()? else {
+            return Ok(None);
+        };
+        if count.saturating_mul(4) < (maximum as usize).saturating_mul(3) {
+            return Ok(None);
+        }
+        let open = agents
+            .iter()
+            .filter(|agent| !agent.session.status.is_closed())
+            .count();
+        let retained = count.saturating_sub(open);
+        Ok(Some(StatusAdvice {
+            id: "cleanup.checkout-capacity",
+            severity: StatusAdviceSeverity::Warning,
+            reason: "broker start refuses a new checkout once the registered linked checkouts reach [worktrees].max_checkouts and unattended removal cannot prove any of them disposable",
+            summary: format!(
+                "{count} of {maximum} linked checkouts are registered; {retained} are not held by an open session"
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: vec![
+                format!("registered linked checkouts: {count}"),
+                format!("limit ([worktrees].max_checkouts): {maximum}"),
+                format!("open sessions: {open}"),
+                format!("retained checkouts: {retained}"),
+            ],
+            commands: vec![
+                "aethyme broker gc sweep --json".into(),
+                "aethyme broker finish cleanup --all-cleaned --json".into(),
+            ],
+        }))
+    }
+
+    /// Add the capacity row to a full status, or name the check in
+    /// `deferred_checks` when the budget is spent or it could not run.
+    fn push_checkout_capacity_advice(&self, view: &mut StatusView, deadline: std::time::Instant) {
+        let advice = if std::time::Instant::now() >= deadline {
+            None
+        } else {
+            self.checkout_capacity_advice(&view.agents).ok()
+        };
+        match advice {
+            Some(Some(row)) => view.advice.push(row),
+            Some(None) => {}
+            None => {
+                if !view
+                    .deferred_checks
+                    .iter()
+                    .any(|check| check == CHECKOUT_CAPACITY_CHECK)
+                {
+                    view.deferred_checks.push(CHECKOUT_CAPACITY_CHECK.into());
+                }
+            }
+        }
     }
 
     /// Render the same status contract from persisted state and derived
@@ -369,6 +453,7 @@ impl Broker {
         let mut view = self.build_status(agents, overlaps, integration, now_ms, false)?;
         let auto_cleanup = self.last_auto_cleanup_report();
         push_auto_cleanup_advice(&mut view, auto_cleanup);
+        self.push_checkout_capacity_advice(&mut view, deadline);
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
