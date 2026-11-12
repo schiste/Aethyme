@@ -62,6 +62,15 @@ pub(crate) fn is_within(candidate: &Path, root: &Path) -> bool {
     canonical(candidate).starts_with(canonical(root))
 }
 
+/// Time one stage of a brokered `git push` as `name`, and nothing otherwise.
+///
+/// The coordinated lane also carries fetches and gh writes; only a push's
+/// stages are named, so `push_git` in a push's telemetry splits into the
+/// remote reads, the lock wait and the push process itself.
+fn push_stage_span(push: bool, name: &'static str) -> Option<crate::phase_telemetry::Span> {
+    push.then(|| crate::phase_telemetry::span(name))
+}
+
 fn plan_exact_push(
     cwd: &Path,
     args: &[String],
@@ -2228,6 +2237,8 @@ impl Broker {
         if request.provider == OperationProvider::Git {
             refuse_code_executing_git_options(&request.args)?;
         }
+        let push_stages = request.provider == OperationProvider::Git && is_push(&request.args);
+        let prepare_span = push_stage_span(push_stages, "push_git_prepare");
         if request.provider == OperationProvider::Git
             && let Some(directory) = git_explicit_directory(&request.args, cwd)?
         {
@@ -2528,7 +2539,11 @@ impl Broker {
         // (issues #138, #146).
         let mut pinned_push_args = None;
         let prechecked_plan = if hooks_ran_outside_lock {
-            let plan = plan_exact_push(cwd, &request.args, resolved_target.as_ref());
+            let _hook_span = push_stage_span(push_stages, "push_git_hook_dry_run");
+            let plan = {
+                let _read_span = push_stage_span(push_stages, "push_git_remote_read_before_lock");
+                plan_exact_push(cwd, &request.args, resolved_target.as_ref())
+            };
             let pinned = match &plan {
                 PushPlanning::Planned(exact) => pin_push_sources(&request.args, exact),
                 _ => None,
@@ -2603,6 +2618,8 @@ impl Broker {
             None
         };
 
+        drop(prepare_span);
+        let lock_wait_span = push_stage_span(push_stages, "push_git_lock_wait");
         let lock_wait_started_at = (effect != OperationEffect::Read).then(unix_now_ms);
         let waiting_started_at = lock_wait_started_at.unwrap_or_else(unix_now_ms);
         let enqueued_at = operation.created_at;
@@ -2787,6 +2804,8 @@ impl Broker {
                 }
             }
         };
+        drop(lock_wait_span);
+        let locked_checks_span = push_stage_span(push_stages, "push_git_locked_checks");
         if request.provider == OperationProvider::Git
             && resource_scope.is_some()
             && let Err(error) =
@@ -2932,7 +2951,9 @@ impl Broker {
             self.resolve_unstarted_operation(queued_operation_id, "revalidation_failed");
             return Err(BrokerOpError::InvalidCoordinatedOperation { reason });
         }
+        drop(locked_checks_span);
         let push_planning = if request.provider == OperationProvider::Git {
+            let _read_span = push_stage_span(push_stages, "push_git_remote_read_under_lock");
             plan_exact_push(cwd, &request.args, resolved_target.as_ref())
         } else {
             PushPlanning::NotApplicable
@@ -3075,6 +3096,7 @@ impl Broker {
         // Split the budget a read spent by phase, so a timeout says whether
         // the broker or the provider used it (#555).
         let preparation_ms = admission.elapsed_ms();
+        let process_span = push_stage_span(push_stages, "push_git_process");
         let provider_output = {
             let records_fetch = fetch_journal.is_some();
             let mut observe_provider = |observation| {
@@ -3102,6 +3124,8 @@ impl Broker {
                 },
             )
         };
+        drop(process_span);
+        let _record_span = push_stage_span(push_stages, "push_git_record");
         let output = match provider_output {
             Ok(output) => output,
             Err(BrokerOpError::AdmissionTimedOut {
