@@ -145,6 +145,84 @@ fn release_json(version: &str, release: ReleaseTotals) -> serde_json::Value {
     })
 }
 
+/// A failure message with the parts that differ between occurrences taken
+/// out, so the same failure in two sessions counts as one reason: paths
+/// become `<path>`, long hexadecimal identifiers `<id>` and numbers `N`.
+/// Only the first line is kept, capped at 160 characters.
+pub fn failure_shape(message: &str) -> String {
+    let line = message.lines().next().unwrap_or("").trim();
+    let mut shape = String::new();
+    for token in line.split_whitespace() {
+        if !shape.is_empty() {
+            shape.push(' ');
+        }
+        let core = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '/');
+        let (lead, rest) = token.split_at(token.find(core).unwrap_or(0));
+        let tail = &rest[core.len()..];
+        shape.push_str(lead);
+        if core.len() > 1 && core.contains('/') {
+            shape.push_str("<path>");
+        } else if core.len() >= 12 && core.chars().all(|c| c.is_ascii_hexdigit()) {
+            shape.push_str("<id>");
+        } else {
+            let mut in_number = false;
+            for c in core.chars() {
+                if c.is_ascii_digit() {
+                    if !in_number {
+                        shape.push('N');
+                    }
+                    in_number = true;
+                } else {
+                    in_number = false;
+                    shape.push(c);
+                }
+            }
+        }
+        shape.push_str(tail);
+    }
+    shape.chars().take(160).collect()
+}
+
+/// Why commands failed: for each command, its failures grouped by
+/// [`failure_shape`], most frequent first, five reasons at most and the rest
+/// counted as `other_failures`. `failures` yields a command surface, its exit
+/// code and the message it printed.
+pub fn failure_reasons<'a>(
+    failures: impl Iterator<Item = (&'a str, u64, &'a str)>,
+) -> serde_json::Value {
+    let mut commands: BTreeMap<&str, BTreeMap<(String, &'static str), u64>> = BTreeMap::new();
+    for (command, exit, message) in failures {
+        *commands
+            .entry(command)
+            .or_default()
+            .entry((failure_shape(message), exit_class(exit)))
+            .or_default() += 1;
+    }
+    let mut commands: Vec<_> = commands
+        .into_iter()
+        .map(|(command, reasons)| {
+            let failures: u64 = reasons.values().sum();
+            let mut reasons: Vec<_> = reasons.into_iter().collect();
+            reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let shown: Vec<_> = reasons.iter().take(5).collect();
+            let other = failures - shown.iter().map(|(_, count)| count).sum::<u64>();
+            (
+                failures,
+                serde_json::json!({
+                    "command": command,
+                    "failures": failures,
+                    "reasons": shown.iter().map(|((reason, class), count)| serde_json::json!({
+                        "reason": reason, "exit_class": class, "count": count,
+                    })).collect::<Vec<_>>(),
+                    "other_failures": other,
+                }),
+            )
+        })
+        .collect();
+    commands.sort_by(|a, b| b.0.cmp(&a.0));
+    serde_json::Value::Array(commands.into_iter().map(|(_, command)| command).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +283,78 @@ mod tests {
         assert_eq!(exit_class(6), "host");
         assert_eq!(exit_class(12), "lease_wait");
         assert_eq!(exit_class(137), "unclassified");
+    }
+
+    #[test]
+    fn the_same_failure_in_two_sessions_is_one_reason() {
+        assert_eq!(
+            failure_shape(
+                "host resource bundle unavailable: preparation_cache: exclusive key is held by lease e4fb2dea09e7e1b5c (holder 4412)\nsecond line"
+            ),
+            "host resource bundle unavailable: preparation_cache: exclusive key is held by lease <id> (holder N)"
+        );
+        assert_eq!(
+            failure_shape("session 6242 is already closed; see /Users/someone/repo/.aethyme/x.md."),
+            "session N is already closed; see <path>."
+        );
+        assert_eq!(
+            failure_shape("step \"js-deps\" failed with exit Some(2)"),
+            "step \"js-deps\" failed with exit Some(N)"
+        );
+        assert_eq!(failure_shape(&"word ".repeat(100)).chars().count(), 160);
+    }
+
+    #[test]
+    fn failure_reasons_rank_commands_and_reasons_and_count_the_remainder() {
+        let mut failures = vec![
+            (
+                "broker.prepare",
+                1,
+                "cache is held by lease aaaaaaaaaaaaaaaa",
+            ),
+            (
+                "broker.prepare",
+                1,
+                "cache is held by lease bbbbbbbbbbbbbbbb",
+            ),
+            ("broker.prepare", 3, "session 7 is already closed"),
+            ("broker.push", 5, "outcome unknown"),
+        ];
+        let distinct: Vec<String> = (0..6)
+            .map(|n| format!("reason {}", "x".repeat(n + 1)))
+            .collect();
+        failures.extend(
+            distinct
+                .iter()
+                .map(|reason| ("broker.sync", 1, reason.as_str())),
+        );
+        let report = failure_reasons(failures.into_iter());
+        let commands: Vec<_> = report
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|command| {
+                (
+                    command["command"].as_str().unwrap(),
+                    command["failures"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                ("broker.sync", 6),
+                ("broker.prepare", 3),
+                ("broker.push", 1)
+            ]
+        );
+        let prepare = &report[1]["reasons"];
+        assert_eq!(prepare[0]["reason"], "cache is held by lease <id>");
+        assert_eq!(prepare[0]["count"], 2);
+        assert_eq!(prepare[0]["exit_class"], "unclassified");
+        assert_eq!(prepare[1]["exit_class"], "refused");
+        assert_eq!(report[0]["reasons"].as_array().unwrap().len(), 5);
+        assert_eq!(report[0]["other_failures"], 1);
+        assert_eq!(report[2]["reasons"][0]["exit_class"], "outcome_unknown");
     }
 }

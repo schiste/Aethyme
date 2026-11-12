@@ -708,8 +708,44 @@ pub(super) fn run_metrics(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
 
+    // Why commands failed over the last week, from the failure events the
+    // command runner records with the message each one printed.
+    const FAILURE_WINDOW_DAYS: i64 = 7;
+    let failed = broker.store().recent_events_of_kind(
+        crate::events::BROKER_COMMAND_FAILED,
+        now_ms() - FAILURE_WINDOW_DAYS * 24 * 60 * 60 * 1000,
+        50_000,
+    )?;
+    let failed: Vec<(String, u64, String)> = failed
+        .iter()
+        .filter_map(|event| {
+            serde_json::from_str::<serde_json::Value>(event.payload_json.as_deref()?).ok()
+        })
+        .filter_map(|payload| {
+            Some((
+                payload.get("command_surface")?.as_str()?.to_string(),
+                payload.get("exit_code")?.as_u64()?,
+                payload
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("(no message recorded)")
+                    .to_string(),
+            ))
+        })
+        .collect();
+    let failure_reasons = crate::scoreboard::failure_reasons(
+        failed
+            .iter()
+            .map(|(command, exit, message)| (command.as_str(), *exit, message.as_str())),
+    );
+
     if parsed.json {
         let out = serde_json::json!({
+            "failure_reasons": {
+                "window_days": FAILURE_WINDOW_DAYS,
+                "failures": failed.len(),
+                "commands": failure_reasons,
+            },
             "gates_executed": executed.iter().map(|(g, n, ms)| serde_json::json!({
                 "gate": g, "runs": n, "total_ms": ms,
             })).collect::<Vec<_>>(),
