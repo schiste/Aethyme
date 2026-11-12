@@ -4,6 +4,12 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.81] - 2026-11-12
+
+### Changed
+
+- `broker push` no longer fetches the default branch when the remote read it already makes under the lock shows the default branch has not moved, saving 1.2-2.3 s on most pushes with no staler advice. The report gains `default_branch_fetch_skipped_unmoved`, and `default_branch_fetch_age_seconds` then counts from that read. `push --pr` still fetches. Set `AETHYME_PUSH_FETCH_SKIP_UNMOVED=off` to always fetch (#1633).
+
 ## [0.8.80] - 2026-11-12
 
 ### Changed
