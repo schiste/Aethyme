@@ -19,11 +19,12 @@ exit 64
 "#;
 
 /// Answers the push's pull request lookup and the review run's reads, keeps
-/// comments as files under `$STATE/comments/<id>` and logs writes to
-/// `$STATE/writes`.
+/// comments as files under `$STATE/comments/<id>`, logs writes to
+/// `$STATE/writes` and every invocation to `$STATE/calls`.
 const FAKE_GH: &str = r#"#!/bin/sh
 STATE="$AETHYME_FAKE_GH_STATE"
 mkdir -p "$STATE/comments"
+echo "$*" >> "$STATE/calls"
 json_string() {
   printf '"'
   sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' "$1" | awk '{ if (NR > 1) printf "\\n"; printf "%s", $0 }'
@@ -252,6 +253,15 @@ impl Fixture {
             .collect()
     }
 
+    /// `gh pr list` invocations that looked one head branch up.
+    fn head_lookups(&self) -> usize {
+        std::fs::read_to_string(self.state.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|call| call.starts_with("pr list") && call.contains("--head"))
+            .count()
+    }
+
     fn comments(&self) -> Vec<String> {
         let mut ids: Vec<u64> = std::fs::read_dir(self.state.join("comments"))
             .map(|entries| {
@@ -401,4 +411,32 @@ fn a_push_does_not_review_a_different_provider_head() {
             .contains("not the expected head")
     );
     assert!(fixture.writes().is_empty());
+}
+
+#[test]
+fn the_overlap_listing_a_push_fetched_replaces_the_pull_request_lookup() {
+    let fixture = Fixture::new(true);
+    let (session, branch, head) = fixture.session();
+
+    // No cached listing yet: the overlap check fetches one, which names the
+    // session's pull request, so no separate `--head` lookup runs.
+    let first = report(&fixture.push(session, &branch, &head, &[]));
+    assert_eq!(first["pr"]["number"], 7, "{first:#}");
+    assert_eq!(first["review_run"]["performed"], true, "{first:#}");
+    assert!(
+        first["pr_lookup_listing_age_seconds"].as_u64().is_some(),
+        "{first:#}"
+    );
+    assert_eq!(fixture.head_lookups(), 0);
+
+    // The second push reuses the cached listing for the overlap check. A
+    // cached listing may predate the PR closing or leaving draft, so the
+    // pull request is looked up again.
+    let second = report(&fixture.push(session, &branch, &head, &[]));
+    assert_eq!(second["pr"]["number"], 7, "{second:#}");
+    assert!(
+        second.get("pr_lookup_listing_age_seconds").is_none(),
+        "{second:#}"
+    );
+    assert_eq!(fixture.head_lookups(), 1);
 }

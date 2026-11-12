@@ -367,6 +367,37 @@ struct GitTransferTrace {
     pre_push_hook: bool,
     pre_push_hook_failed: bool,
     remote_transport: bool,
+    /// When the top-level `git push` started its pre-push hook, in ms since
+    /// that process started. Telemetry only.
+    pre_push_hook_started_ms: Option<u64>,
+    /// How long that hook ran, in ms. Telemetry only.
+    pre_push_hook_ms: Option<u64>,
+}
+
+/// Trace2 seconds (`t_abs`, `t_rel`) as whole milliseconds.
+fn trace2_ms(value: Option<&serde_json::Value>) -> Option<u64> {
+    let seconds = value?.as_f64()?;
+    (seconds.is_finite() && seconds >= 0.0).then(|| (seconds * 1000.0).round() as u64)
+}
+
+/// Split a push process's wall time at its pre-push hook: before it (Git
+/// connecting and reading the remote's refs), the hook itself, and after it
+/// (sending the pack and the remote updating the ref). `None` when no hook
+/// ran in the top-level process, e.g. with hooks run outside the lock.
+fn push_process_split(
+    trace: &GitTransferTrace,
+    process: std::time::Duration,
+) -> Option<[(&'static str, std::time::Duration); 3]> {
+    let before = std::time::Duration::from_millis(trace.pre_push_hook_started_ms?);
+    let hook = std::time::Duration::from_millis(trace.pre_push_hook_ms?);
+    Some([
+        ("push_git_process_before_hook", before),
+        ("push_git_process_hook", hook),
+        (
+            "push_git_process_after_hook",
+            process.saturating_sub(before).saturating_sub(hook),
+        ),
+    ])
 }
 
 impl GitTransferTrace {
@@ -403,6 +434,13 @@ fn inspect_git_transfer_trace(path: &Path) -> GitTransferTrace {
         let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        // A hook's own Git commands inherit GIT_TRACE2_EVENT and append to the
+        // same file with a nested `parent/child` session id; their clocks
+        // start at their own launch, so only top-level events are timed.
+        let top_level = event
+            .get("sid")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|sid| !sid.contains('/'));
         match event.get("event").and_then(serde_json::Value::as_str) {
             Some("child_start") => {
                 let Some(arguments) = event
@@ -427,6 +465,9 @@ fn inspect_git_transfer_trace(path: &Path) -> GitTransferTrace {
                     {
                         pre_push_child_ids.insert(child_id);
                     }
+                    if top_level && trace.pre_push_hook_started_ms.is_none() {
+                        trace.pre_push_hook_started_ms = trace2_ms(event.get("t_abs"));
+                    }
                 }
                 trace.remote_transport |= ["receive-pack", "upload-pack", "git-remote-", "ssh"]
                     .iter()
@@ -436,13 +477,18 @@ fn inspect_git_transfer_trace(path: &Path) -> GitTransferTrace {
                 if event
                     .get("child_id")
                     .and_then(serde_json::Value::as_u64)
-                    .is_some_and(|child_id| pre_push_child_ids.contains(&child_id))
-                    && event
-                        .get("code")
-                        .and_then(serde_json::Value::as_i64)
-                        .is_some_and(|code| code != 0) =>
+                    .is_some_and(|child_id| pre_push_child_ids.contains(&child_id)) =>
             {
-                trace.pre_push_hook_failed = true;
+                if event
+                    .get("code")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some_and(|code| code != 0)
+                {
+                    trace.pre_push_hook_failed = true;
+                }
+                if top_level && trace.pre_push_hook_ms.is_none() {
+                    trace.pre_push_hook_ms = trace2_ms(event.get("t_rel"));
+                }
             }
             _ => {}
         }
@@ -3103,6 +3149,7 @@ impl Broker {
         // the broker or the provider used it (#555).
         let preparation_ms = admission.elapsed_ms();
         let process_span = push_stage_span(push_stages, "push_git_process");
+        let process_started = std::time::Instant::now();
         let provider_output = {
             let records_fetch = fetch_journal.is_some();
             let mut observe_provider = |observation| {
@@ -3131,6 +3178,7 @@ impl Broker {
             )
         };
         drop(process_span);
+        let process_elapsed = process_started.elapsed();
         let _record_span = push_stage_span(push_stages, "push_git_record");
         let output = match provider_output {
             Ok(output) => output,
@@ -3271,10 +3319,19 @@ impl Broker {
         // operation looking `heartbeat_stale` after 30s, so every blocked
         // caller was told the holder may have died: the #138 failure this
         // machinery exists to prevent, restated more confidently.
-        let remote_contact = git_trace
+        let transfer_trace = git_trace
             .as_ref()
-            .map(|trace| inspect_git_transfer_trace(trace.path()))
-            .and_then(GitTransferTrace::remote_contact);
+            .map(|trace| inspect_git_transfer_trace(trace.path()));
+        if push_stages
+            && let Some(split) = transfer_trace
+                .as_ref()
+                .and_then(|trace| push_process_split(trace, process_elapsed))
+        {
+            for (name, elapsed) in split {
+                crate::phase_telemetry::add(name, elapsed);
+            }
+        }
+        let remote_contact = transfer_trace.and_then(GitTransferTrace::remote_contact);
         let exit_code = output.status.code().map(i64::from);
         let (status, mut details) = if output.status.success() {
             match on_success(&output, operation.id) {

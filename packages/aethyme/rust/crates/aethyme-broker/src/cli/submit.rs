@@ -1422,6 +1422,7 @@ mod review_on_push_tests {
             default_branch: None,
             default_branch_note: None,
             default_branch_fetch_age_seconds: None,
+            pr_lookup_listing_age_seconds: None,
             pr_watch_id: None,
             pr_watch_note: None,
             pr_size: None,

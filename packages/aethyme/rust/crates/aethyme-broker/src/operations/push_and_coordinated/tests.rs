@@ -1874,6 +1874,42 @@ fn failed_pre_push_hook_marks_remote_write_as_not_contacted() {
 }
 
 #[test]
+fn push_process_time_splits_at_the_top_level_pre_push_hook() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tmp.path(),
+        r#"{"event":"child_start","sid":"20261112-a","t_abs":0.000500,"child_id":0,"argv":["ssh","git@github.com","git-receive-pack 'o/r.git'"]}
+{"event":"child_start","sid":"20261112-a","t_abs":0.400,"child_id":1,"child_class":"hook","hook_name":"pre-push","argv":[".git/hooks/pre-push","origin"]}
+{"event":"child_start","sid":"20261112-a/20261112-b","t_abs":0.010,"child_id":1,"argv":["git","pre-push-helper"]}
+{"event":"child_exit","sid":"20261112-a/20261112-b","t_abs":0.020,"child_id":1,"code":0,"t_rel":0.010}
+{"event":"child_exit","sid":"20261112-a","t_abs":2.900,"child_id":1,"code":0,"t_rel":2.500}
+"#,
+    )
+    .unwrap();
+    let trace = inspect_git_transfer_trace(tmp.path());
+    assert_eq!(trace.pre_push_hook_started_ms, Some(400));
+    assert_eq!(trace.pre_push_hook_ms, Some(2500));
+    assert!(!trace.pre_push_hook_failed);
+    let split = push_process_split(&trace, std::time::Duration::from_millis(3_200)).unwrap();
+    assert_eq!(
+        split.map(|(name, elapsed)| (name, elapsed.as_millis())),
+        [
+            ("push_git_process_before_hook", 400),
+            ("push_git_process_hook", 2500),
+            ("push_git_process_after_hook", 300),
+        ]
+    );
+    // No hook in the push (hooks ran outside the lock): nothing to split.
+    assert!(
+        push_process_split(
+            &GitTransferTrace::default(),
+            std::time::Duration::from_secs(1)
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn remote_git_detection_ignores_global_checkout_options() {
     assert_eq!(
         git_operation_kind(&args(&["-C", "/tmp/checkout", "push", "origin", "main"])),
