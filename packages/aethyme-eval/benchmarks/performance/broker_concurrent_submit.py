@@ -35,7 +35,7 @@ POLICY_TEXT = (
     '[delivery]\n'
     'push_session_branches = true\n'
     '[promote]\n'
-    'mode = "manual"\n'
+    'mode = "verify-only"\n'
     '[cleanup]\n'
     'auto_remove = false\n'
 )
@@ -553,7 +553,7 @@ def validate_submit_outcome(payload, session_id, baseline, integration_head, ses
         raise RuntimeError('submit plan did not preserve the expected session commit provenance')
     if (payload.get('promoted') is not False or payload.get('no_changes') is not False
             or payload.get('conflicts') != []):
-        raise RuntimeError('submit did not complete as a clean, unpromoted manual submission')
+        raise RuntimeError('submit did not complete as a clean, unpromoted verify-only submission')
     entry = payload.get('entry')
     gate = payload.get('gate_verification')
     if (not isinstance(entry, dict) or entry.get('status') != 'verified'
@@ -637,18 +637,19 @@ def start_session(runner, binary, repo, root, scenario, role, baseline):
 
 
 def validate_shared_history(seed_commits, first_parent_commits, reachable_commits,
-                            integration, seed_tree, integration_tree):
-    # Content promotion may rewrite source commits; preserve the exact seed
-    # tree and record ancestry independently of first-parent patch candidates.
+                            shared_head, seed_tree, shared_tree):
+    # Landing may merge, squash or fast-forward the seed's commits; preserve the
+    # exact seed tree and record ancestry independently of first-parent patch
+    # candidates.
     if (not first_parent_commits or len(first_parent_commits) > 16
-            or first_parent_commits[-1] != integration
+            or first_parent_commits[-1] != shared_head
             or len(reachable_commits) > MAX_HISTORY_COMMITS + 16
             or len(set(seed_commits)) != MAX_HISTORY_COMMITS
             or len(set(first_parent_commits)) != len(first_parent_commits)
             or len(set(reachable_commits)) != len(reachable_commits)
             or not set(first_parent_commits) <= set(reachable_commits)
-            or not seed_tree or integration_tree != seed_tree):
-        raise RuntimeError('promoted shared history did not preserve bounded seed content')
+            or not seed_tree or shared_tree != seed_tree):
+        raise RuntimeError('landed shared history did not preserve bounded seed content')
 
 
 def commit_file(runner, git, worktree, relative_path, data, message, label):
@@ -710,6 +711,10 @@ def setup_scenario(name, binary, git, output, receipts):
         run_git(runner, git, repo, f'{name}:add-origin', 'remote', 'add', 'origin',
                 'git@github.com:playground/concurrent-submit.git')
         run_git(runner, git, repo, f'{name}:push-default', 'push', '-q', 'origin', 'main')
+        # origin/HEAD names the fetched default branch: submit verifies against
+        # it, as it does in any repository that delivers by pull request.
+        run_git(runner, git, repo, f'{name}:set-remote-head', 'remote', 'set-head', 'origin',
+                'main')
 
         sessions = {
             role: start_session(runner, binary, repo, root, name, role, baseline)
@@ -734,27 +739,27 @@ def setup_scenario(name, binary, git, output, receipts):
             expected_owned_commits=seed_commits)
         if len([c for c in seed_plan['commits'] if c.get('ownership') == 'session_owned']) != MAX_HISTORY_COMMITS:
             raise RuntimeError('seed submission plan omitted deterministic history commits')
-        entry_id = seed_outcome['entry']['id']
-        promote_row = runner.run(
-            [str(binary), 'broker', 'submit', 'promote', '--entry', str(entry_id), '--json'],
-            repo, f'{name}:seed-explicit-manual-promotion')
-        promote_payload = json.loads(promote_row['stdout'])
-        if promote_payload.get('promoted') != entry_id:
-            raise RuntimeError('manual seed promotion did not return its entry identity')
-        integration = run_git(runner, git, repo, f'{name}:integration-head', 'rev-parse',
-                              'aethyme/integration').strip()
+        # The seed's pull request merges on the provider: a fast-forward push to
+        # the fixture remote, then the fetch an operator or `broker push` runs.
+        # Nothing is promoted locally; the workers, cut from the baseline, now
+        # verify against a default branch that holds the shared history.
+        run_git(runner, git, repo, f'{name}:land-seed', 'push', '-q', 'origin',
+                f'{seed_commits[-1]}:refs/heads/main')
+        run_git(runner, git, repo, f'{name}:fetch-default', 'fetch', '-q', 'origin')
+        shared_head = run_git(runner, git, repo, f'{name}:shared-head', 'rev-parse',
+                              'refs/remotes/origin/main').strip()
         shared_commits = run_git(
             runner, git, repo, f'{name}:shared-first-parent-candidates', 'rev-list',
-            '--first-parent', '--reverse', integration, '--not', baseline).splitlines()
+            '--first-parent', '--reverse', shared_head, '--not', baseline).splitlines()
         reachable_commits = run_git(
             runner, git, repo, f'{name}:shared-reachable-commits', 'rev-list',
-            '--reverse', integration, '--not', baseline).splitlines()
+            '--reverse', shared_head, '--not', baseline).splitlines()
         seed_tree = run_git(runner, git, repo, f'{name}:seed-tree',
                             'rev-parse', f'{seed_commits[-1]}^{{tree}}').strip()
-        integration_tree = run_git(runner, git, repo, f'{name}:integration-tree',
-                                   'rev-parse', f'{integration}^{{tree}}').strip()
+        shared_tree = run_git(runner, git, repo, f'{name}:shared-tree',
+                              'rev-parse', f'{shared_head}^{{tree}}').strip()
         validate_shared_history(seed_commits, shared_commits, reachable_commits,
-                                integration, seed_tree, integration_tree)
+                                shared_head, seed_tree, shared_tree)
 
         worker_commits = {}
         for role in ('worker-a', 'worker-b'):
@@ -771,7 +776,7 @@ def setup_scenario(name, binary, git, output, receipts):
         policy_path = repo / '.aethyme' / 'config.toml'
         gates_path = repo / '.aethyme' / 'gates.toml'
         if gates_path.exists() or policy_path.read_text() != POLICY_TEXT:
-            raise RuntimeError('fixture policy drifted from the reviewed manual/no-gates contract')
+            raise RuntimeError('fixture policy drifted from the reviewed verify-only/no-gates contract')
         if 'AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS' in env:
             raise RuntimeError('noninteractive test trust escape is forbidden')
 
@@ -781,14 +786,14 @@ def setup_scenario(name, binary, git, output, receipts):
             'repository': str(repo),
             'remote': str(remote),
             'baseline_commit': baseline,
-            'integration_commit': integration,
+            'shared_head_commit': shared_head,
             'seed_session': sessions['seed'],
             'worker_sessions': {role: sessions[role] for role in ('worker-a', 'worker-b')},
             'seed_commits': seed_commits,
             'shared_first_parent_candidate_commits': shared_commits,
             'shared_reachable_commits': reachable_commits,
             'seed_tree': seed_tree,
-            'integration_tree': integration_tree,
+            'shared_tree': shared_tree,
             'seed_content_preserved': True,
             'worker_commits': worker_commits,
             'binary_payload_bytes_each': BINARY_BYTES_PER_COMMIT,
@@ -797,7 +802,7 @@ def setup_scenario(name, binary, git, output, receipts):
                                        for i in range(MAX_HISTORY_COMMITS)],
             'policy': {
                 'sha256': sha256_bytes(POLICY_TEXT.encode()),
-                'promote_mode': 'manual', 'gates_file_present': False,
+                'promote_mode': 'verify-only', 'gates_file_present': False,
                 'gate_trust_escape_present': False,
                 'submit_semantics': 'no gates configured; conflict-only submit; no gate command run',
             },
@@ -808,7 +813,7 @@ def setup_scenario(name, binary, git, output, receipts):
         snapshot_dir = output / 'provenance'
         snapshot_dir.mkdir(mode=0o700, exist_ok=True)
         (snapshot_dir / f'{name}.json').write_bytes(canonical_json_bytes(workload))
-        yield runner, root, repo, sessions, baseline, integration, shared_commits, worker_commits, workload
+        yield runner, root, repo, sessions, baseline, shared_head, shared_commits, worker_commits, workload
 
 
 def audit_patch_stream(runner, git, repo, label, commits):
@@ -859,7 +864,7 @@ def concurrent_pair_claim(overlap_observed):
 
 
 def _measure_submit_scenario(name, binary, git, output, receipts, mode, setup):
-    runner, root, repo, sessions, baseline, integration, shared_commits, worker_commits, workload = setup
+    runner, root, repo, sessions, baseline, shared_head, shared_commits, worker_commits, workload = setup
     if mode == 'single_control':
         workers = ('worker-a',)
     elif mode == 'concurrent_pair':
@@ -879,7 +884,7 @@ def _measure_submit_scenario(name, binary, git, output, receipts, mode, setup):
             barrier=barrier)
         payload = json.loads(row['stdout'])
         plan = validate_submit_outcome(
-            payload, session['id'], baseline, integration, worker_commits[role])
+            payload, session['id'], baseline, shared_head, worker_commits[role])
         plan_path = output / 'provenance' / f'{name}-{role}-submission-plan.json'
         plan_path.write_bytes(canonical_json_bytes(plan))
         plan_paths[role] = {'path': str(plan_path), **hash_file(plan_path)}
@@ -899,12 +904,17 @@ def _measure_submit_scenario(name, binary, git, output, receipts, mode, setup):
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             futures = [executor.submit(submit, role) for role in workers]
             results = [future.result() for future in futures]
+    # Verify-only submits move no ref: the fetched default branch stays where
+    # the seed landed, and the local integration branch where it was created.
+    if run_git(runner, git, repo, f'{name}:default-after-measurement',
+               'rev-parse', 'refs/remotes/origin/main').strip() != shared_head:
+        raise RuntimeError('worker submissions moved the fetched default branch')
     if run_git(runner, git, repo, f'{name}:integration-after-measurement',
-               'rev-parse', 'aethyme/integration').strip() != integration:
-        raise RuntimeError('manual worker submissions moved the shared integration head')
+               'rev-parse', 'aethyme/integration').strip() != baseline:
+        raise RuntimeError('verify-only worker submissions moved the integration branch')
 
     history_audit = audit_patch_stream(
-        runner, git, repo, f'{name}:audit-shared-integration-patch-stream', shared_commits)
+        runner, git, repo, f'{name}:audit-shared-history-patch-stream', shared_commits)
     for result in results:
         owned = [commit['commit'] for commit in result['submission_plan']['commits']
                  if commit['ownership'] == 'session_owned']
@@ -915,8 +925,8 @@ def _measure_submit_scenario(name, binary, git, output, receipts, mode, setup):
     workload.update({
         'measured_submits': results,
         'measured_submit_count': len(results),
-        'manual_mode_kept_integration_fixed': True,
-        'shared_integration_patch_stream': history_audit,
+        'verify_only_kept_refs_fixed': True,
+        'shared_history_patch_stream': history_audit,
         'pair_command_overlap_ms': overlap_ns / 1_000_000 if overlap_ns is not None else None,
         'pair_command_overlap_observed': overlap_observed,
         'pair_command_overlap_basis': (
@@ -969,8 +979,8 @@ def run(binary, output):
         raise RuntimeError('completed diagnostic exceeded its aggregate output limit')
     if scenarios['single_control']['baseline_commit'] != scenarios['concurrent_pair']['baseline_commit']:
         raise RuntimeError('scenario fixtures did not use the same deterministic baseline')
-    if scenarios['single_control']['integration_commit'] != scenarios['concurrent_pair']['integration_commit']:
-        raise RuntimeError('scenario fixtures did not produce identical shared integration history')
+    if scenarios['single_control']['shared_head_commit'] != scenarios['concurrent_pair']['shared_head_commit']:
+        raise RuntimeError('scenario fixtures did not produce identical shared history')
     report = {
         'schema_version': 1,
         'profile': 'synthetic_shared_binary_history_single_control_and_concurrent_pair',
@@ -988,12 +998,12 @@ def run(binary, output):
         'scenarios': scenarios,
         'comparison': {
             'baseline_commit_equal': True,
-            'integration_commit_equal': True,
+            'shared_head_commit_equal': True,
             'shared_candidate_commits_equal': (
                 scenarios['single_control']['shared_first_parent_candidate_commits']
                 == scenarios['concurrent_pair']['shared_first_parent_candidate_commits']),
             'shared_patch_stream_bytes': {
-                key: scenarios[key]['shared_integration_patch_stream']['stream_bytes']
+                key: scenarios[key]['shared_history_patch_stream']['stream_bytes']
                 for key in scenarios
             },
             'single_submit_wall_ms': scenarios['single_control']['measured_submits'][0]['duration_ms'],
@@ -1028,7 +1038,7 @@ def run(binary, output):
             'network_sandbox': 'not provided; this harness does not claim OS-level network isolation',
             'trust_escape_set': False,
             'gate_policy': 'no gates.toml; submit must report no_configuration and execute zero gates',
-            'promotion_policy': 'manual; seed promotion uses explicit broker submit promote; measured submits remain unpromoted',
+            'promotion_policy': 'verify-only (local promotion was removed); the seed lands by a fast-forward push to the fixture remote standing in for a merged pull request; measured submits move no refs',
         },
         'limitations': [
             'synthetic local workload only; not an evaluation or a production latency estimate',

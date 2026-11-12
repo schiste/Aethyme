@@ -3134,13 +3134,16 @@ fn leftover_integration_advice(
     integration_head: &str,
     (baseline_ref, baseline_head): (&str, &str),
     assessment: Option<&crate::IntegrationDriftAssessment>,
+    local_default: Option<&crate::merge::IntegrationAheadOfLocalDefault>,
 ) -> Result<Option<StatusAdvice>, BrokerOpError> {
     // `HEAD` means no `origin/HEAD` names a published branch; measuring
     // against the checkout would call every unpublished commit leftover.
+    // With nothing published at all, the local default branch sessions are
+    // cut from is the branch integration's commits are measured against.
     let tracked;
     let (baseline_ref, baseline_head) = if baseline_ref == "HEAD" {
         let Some(upstream) = repo.tracking_upstream() else {
-            return Ok(None);
+            return Ok(local_default.map(local_default_leftover_advice));
         };
         tracked = upstream;
         (tracked.0.as_str(), tracked.1.as_str())
@@ -3159,8 +3162,9 @@ fn leftover_integration_advice(
         .unwrap_or(baseline_ref);
     let stale_only = assessment.filter(|assessment| assessment.stale_only);
     let mut summary = format!(
-        "integration carries {count} {} {upstream} lacks; this repository is verify-only, so no \
-         session owns {} and the next pull-request merge will defer integration cleanup",
+        "integration carries {count} {} {upstream} lacks; local promotion was removed, so no \
+         session owns {} and nothing (no submit, no pull-request merge) will move integration \
+         again: reconcile to drop what landed and ship the rest through a pull request",
         plural_word(count as usize, "commit", "commits"),
         if count == 1 { "it" } else { "them" }
     );
@@ -3187,6 +3191,40 @@ fn leftover_integration_advice(
             "aethyme broker advanced integration reconcile --upstream {upstream} --dry-run"
         )],
     }))
+}
+
+/// The `integration.leftover-work` row for a repository with no fetched
+/// default branch, measured against the local default branch sessions are cut
+/// from.
+fn local_default_leftover_advice(
+    ahead: &crate::merge::IntegrationAheadOfLocalDefault,
+) -> StatusAdvice {
+    let default = &ahead.default_branch;
+    StatusAdvice {
+        id: "integration.leftover-work",
+        severity: StatusAdviceSeverity::Warning,
+        reason: "an integration branch holds commits the local default branch lacks, and no \
+                 default branch is fetched",
+        summary: format!(
+            "{} carries {} {} {default} lacks and no default branch is fetched; local \
+             promotion was removed, so no session owns {} and nothing will move {} again. \
+             Sessions are cut from {default}, so submit verifies against {default}, not {}: \
+             reconcile to drop what landed and ship the rest through a pull request",
+            ahead.branch,
+            ahead.ahead,
+            plural_word(ahead.ahead as usize, "commit", "commits"),
+            if ahead.ahead == 1 { "it" } else { "them" },
+            ahead.branch,
+            ahead.branch,
+        ),
+        session_id: None,
+        queue_entry_id: None,
+        evidence: vec![
+            format!("integration: {}", short_commit(&ahead.integration)),
+            format!("{default}: {}", short_commit(&ahead.default_commit)),
+        ],
+        commands: vec![ahead.reconcile_command()],
+    }
 }
 
 /// One warning per submit that is gone or has made no progress for

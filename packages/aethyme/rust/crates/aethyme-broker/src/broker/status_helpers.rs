@@ -1164,7 +1164,6 @@ pub(super) fn promotion_removed_advice(setting: &str) -> StatusAdvice {
 pub(super) fn unpushed_work_advice(
     report: &crate::UnpushedWorkReport,
     now_ms: i64,
-    verify_only: bool,
 ) -> Vec<StatusAdvice> {
     let age = |at: Option<i64>| {
         crate::unpushed::describe_age(now_ms.saturating_sub(at.unwrap_or(now_ms)))
@@ -1206,16 +1205,10 @@ pub(super) fn unpushed_work_advice(
         })
         .collect::<Vec<_>>();
     if let Some(integration) = &report.integration {
-        // In a verify-only repository nothing adds to integration any more,
-        // but commits promoted before the switch are still work at risk, so
-        // the row stays -- without recommending the mode already in force.
-        let remedy = if verify_only {
-            "This repository is verify-only and no longer uses integration: ship these \
-             commits through a pull request, or confirm they landed and drop them"
-        } else {
-            "Ship it, or, if this repository delivers through pull requests, set \
-             [promote] mode = \"verify-only\" so submit stops accumulating work here"
-        };
+        // Nothing adds to integration any more, but commits promoted before
+        // local promotion was removed are still work at risk, so the row stays.
+        let remedy = "This repository is verify-only and no longer uses integration: ship these \
+             commits through a pull request, or confirm they landed and drop them";
         advice.push(StatusAdvice {
             id: "integration.unpublished-work",
             severity: integration.severity,

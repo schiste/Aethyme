@@ -2,28 +2,23 @@
 # Reference: docs/aethyme-local-agent-broker.md
 
 [promote]
-# "auto": verified submissions promote to the local integration
-# branch immediately (decision 2026-07-13, after the first dogfood run).
-# "manual" holds verified entries for an explicit `broker submit promote`.
-# "verify-only" verifies and promotes nothing.
+# "verify-only" is the only mode: submit verifies and promotes nothing, and
+# each session's work lands through its own pull request. Local promotion
+# (the old "auto" and "manual" modes, and `broker submit promote`) was
+# removed; an old value still parses, is ignored, and `broker status` warns
+# `promote.mode-removed` so it can be deleted.
 #
-# Set to "verify-only" on 2026-09-22 (decision recorded on #290). This
-# repository ships through pull requests, and the measurement that settled it:
-# `main` advanced only by PR merge that day; at reconcile the broker reported
+# History: this repository moved to "verify-only" on 2026-09-22 (decision
+# recorded on #290), because it ships through pull requests: `main` advanced
+# only by PR merge that day; at reconcile the broker reported
 # `0 promoted entries, 0 commits ahead of main`; and the agent that landed
 # eleven merges never ran `submit` once. Integration was contributing nothing
 # to what shipped while remaining the default base for every new session, so
 # its drift leaked into pull requests that then carried other sessions' work.
 #
-# What is kept by still submitting: cross-session conflict detection before a
-# pull request exists, affected-gate selection instead of a full batch, and the
-# queue entry as an audit record. What is dropped is the second copy of the
-# work and the reconciliation ceremony around it.
-#
-# Revisit this if the repository stops merging through pull requests. Where a
-# single maintainer pushes directly to the default branch,
-# integration-as-destination is a reasonable way to serialize concurrent
-# agents, and "auto" is the right setting.
+# What submitting still gives: cross-session conflict detection before a pull
+# request exists, affected-gate selection instead of a full batch, and the
+# queue entry as an audit record.
 mode = "verify-only"
 # branch = "aethyme/integration"   # the default; local-only, never pushed
 

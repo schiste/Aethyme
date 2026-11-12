@@ -437,7 +437,7 @@ pub use merge::{
     ACTION_REQUIRED_RELPATH, PromoteConfig, SubmissionCommitOwnership, SubmissionCommitProvenance,
     SubmissionConflict, SubmissionGateVerification, SubmissionGateVerificationStatus,
     SubmissionIntegrationState, SubmissionPlan, SubmitOutcome, VERIFIED_AGAINST_INTEGRATION,
-    VERIFIED_AGAINST_UPSTREAM, VerificationBase,
+    VERIFIED_AGAINST_LOCAL_DEFAULT, VERIFIED_AGAINST_UPSTREAM, VerificationBase,
 };
 pub use operation_stats::{
     DEFAULT_OPERATION_STATS_LIMIT, HooksOutsideLockStats, MAX_OPERATION_STATS_LIMIT,

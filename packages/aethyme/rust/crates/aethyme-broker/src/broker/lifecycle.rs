@@ -10277,7 +10277,7 @@ impl Broker {
     /// fetches: `create_session_worktree` refreshes the default branch just
     /// before calling it (see `Broker::refresh_default_branch_before_start`),
     /// so the fetched tip it reads is current unless that refresh failed.
-    fn select_session_start_base_with_promote(
+    pub(crate) fn select_session_start_base_with_promote(
         &self,
         explicit: Option<&str>,
         promote: &crate::merge::PromoteConfig,

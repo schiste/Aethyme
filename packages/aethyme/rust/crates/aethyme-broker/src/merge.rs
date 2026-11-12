@@ -118,8 +118,10 @@ const MERGE_VERIFICATION_SLOTS: usize = 4;
 ///
 /// Local promotion was removed: every repository verifies and reports, and a
 /// session's work lands through its own pull request. `branch` names the local
-/// integration ref, which only a repository with no fetched default branch
-/// still reads, as the base its sessions are cut from. A `mode` that used to
+/// integration ref. Sessions are never cut from it; only a repository with no
+/// fetched default branch still verifies against it, and only while it holds
+/// nothing the local default branch lacks (see `Broker::submission_base`).
+/// A `mode` that used to
 /// promote (`auto`, `manual`) or `promote_on_submit = true` still parses so an
 /// old configuration keeps working; it is ignored and reported once by
 /// `broker status` so the operator can delete it.
@@ -448,20 +450,22 @@ pub struct SubmitOutcome {
 
 /// What a submission is simulated and gated against.
 ///
-/// A promoting repository verifies against its integration branch, because
-/// that is what a verified entry is promoted onto. A verify-only repository
-/// promotes nothing and delivers each session through its own pull request,
-/// so the only base that predicts the merge is the fetched default branch;
-/// integration is not consulted there at all.
+/// Nothing is promoted: each session lands through its own pull request, so
+/// the base that predicts the merge is the fetched default branch. Without
+/// one, the local integration branch (which follows the main checkout) stands
+/// in, unless it holds commits the local default branch lacks; then the local
+/// default branch sessions are cut from is the base.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct VerificationBase {
-    /// `upstream` (the fetched default branch) or `integration`.
+    /// `upstream` (the fetched default branch), `integration`, or
+    /// `local_default` (the local default branch).
     pub source: &'static str,
-    /// The ref verified against, e.g. `origin/main` or `aethyme/integration`.
+    /// The ref verified against, e.g. `origin/main`, `aethyme/integration` or
+    /// `main`.
     pub reference: String,
     pub commit: String,
-    /// Why a verify-only repository fell back to integration: it has no
-    /// fetched default branch to verify against.
+    /// Why the base is not the fetched default branch: there is none to
+    /// verify against.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
 }
@@ -478,6 +482,54 @@ struct ContentEmptySubmission {
 pub const VERIFIED_AGAINST_UPSTREAM: &str = "upstream";
 /// [`VerificationBase::source`] for the integration branch.
 pub const VERIFIED_AGAINST_INTEGRATION: &str = "integration";
+/// [`VerificationBase::source`] for the local default branch: a repository
+/// with no fetched default branch whose integration branch holds commits that
+/// branch lacks verifies against what its sessions are cut from instead.
+pub const VERIFIED_AGAINST_LOCAL_DEFAULT: &str = "local_default";
+
+/// An integration branch holding commits the local default branch lacks, in a
+/// repository with no fetched default branch: what local promotion left behind
+/// before it was removed. Nothing moves either ref; `status` names the
+/// reconciliation and submit verifies against the local default branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IntegrationAheadOfLocalDefault {
+    pub branch: String,
+    pub integration: String,
+    /// Short name of the local default branch, e.g. `main`.
+    pub default_branch: String,
+    pub default_commit: String,
+    /// Commits integration holds that the local default branch lacks.
+    pub ahead: u64,
+}
+
+impl IntegrationAheadOfLocalDefault {
+    /// The command that resolves the leftover commits.
+    pub(crate) fn reconcile_command(&self) -> String {
+        format!(
+            "aethyme broker advanced integration reconcile --upstream {} --dry-run",
+            self.default_branch
+        )
+    }
+
+    fn verification_base(&self) -> VerificationBase {
+        VerificationBase {
+            source: VERIFIED_AGAINST_LOCAL_DEFAULT,
+            reference: self.default_branch.clone(),
+            commit: self.default_commit.clone(),
+            fallback_reason: Some(format!(
+                "no fetched default branch, and {} holds {} {} {} lacks (left by local \
+                 promotion before it was removed); verified against {}, the branch sessions \
+                 are cut from, instead. Resolve the leftover commits with `{}`",
+                self.branch,
+                self.ahead,
+                if self.ahead == 1 { "commit" } else { "commits" },
+                self.default_branch,
+                self.default_branch,
+                self.reconcile_command(),
+            )),
+        }
+    }
+}
 
 /// Whether a commit belongs to the session's recorded work boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -789,9 +841,13 @@ impl Broker {
         let session = self.store().session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
         let session_head = checkout.head_commit()?;
-        let base = match self.upstream_verification_base() {
-            Some(base) => base,
-            None => {
+        let base = match (
+            self.upstream_verification_base(),
+            self.integration_ahead_of_local_default(),
+        ) {
+            (Some(base), _) => base,
+            (None, Some(ahead)) => ahead.verification_base(),
+            (None, None) => {
                 let (reference, commit) = self.integration_head_snapshot()?;
                 VerificationBase {
                     source: VERIFIED_AGAINST_INTEGRATION,
@@ -818,8 +874,10 @@ impl Broker {
     /// A repository with a fetched default branch does not maintain
     /// integration: nothing lands through it, so the ref is neither created
     /// nor moved, and an existing one is reported where it is. Without a
-    /// fetched default branch, integration is still the only local base its
-    /// sessions are cut from, and follows the main checkout's HEAD.
+    /// fetched default branch, integration follows the main checkout's HEAD
+    /// (sessions themselves are cut from the local default branch). A ref that
+    /// holds commits HEAD lacks, left by local promotion before it was
+    /// removed, is never moved.
     pub fn integration_head(&mut self) -> Result<(String, String), BrokerOpError> {
         if self.upstream_verification_head().is_some() {
             return self.integration_head_snapshot();
@@ -866,9 +924,19 @@ impl Broker {
     /// integration behind, so it would verify the change against an old copy
     /// of the default branch. Without a fetched default branch submission falls
     /// back to integration, and the outcome says why. Never fetches.
+    ///
+    /// The one exception: with no fetched default branch, an integration
+    /// branch that holds commits the local default branch lacks (left by
+    /// local promotion before it was removed) is not what sessions are cut
+    /// from, so gates and conflicts judged against it would weigh work the
+    /// session does not hold. Submission verifies against the local default
+    /// branch instead, and the outcome says so.
     pub(crate) fn submission_base(&mut self) -> Result<VerificationBase, BrokerOpError> {
         if let Some(base) = self.upstream_verification_base() {
             return Ok(base);
+        }
+        if let Some(ahead) = self.integration_ahead_of_local_default() {
+            return Ok(ahead.verification_base());
         }
         let (reference, commit) = self.integration_head()?;
         Ok(VerificationBase {
@@ -876,6 +944,45 @@ impl Broker {
             reference,
             commit,
             fallback_reason: Some(VERIFY_ONLY_FALLBACK_REASON.to_string()),
+        })
+    }
+
+    /// [`IntegrationAheadOfLocalDefault`] when this repository has no fetched
+    /// default branch and its integration branch holds commits the local
+    /// default branch (the one sessions are cut from) lacks. `None` with a
+    /// fetched default branch, without an integration ref, when no local
+    /// default branch can be chosen, or when integration holds nothing the
+    /// local default branch lacks. Reads refs only.
+    pub(crate) fn integration_ahead_of_local_default(
+        &self,
+    ) -> Option<IntegrationAheadOfLocalDefault> {
+        if self.upstream_verification_head().is_some() {
+            return None;
+        }
+        let config = PromoteConfig::load(&self.main_root_path());
+        let repo = self.repo_handle();
+        let integration = repo.resolve_ref(&format!("refs/heads/{}", config.branch))?;
+        let start = self
+            .select_session_start_base_with_promote(None, &config)
+            .ok()?;
+        if integration == start.commit || repo.is_ancestor(&integration, &start.commit) {
+            return None;
+        }
+        let ahead = repo
+            .commit_count_between(&start.commit, &integration)
+            .ok()
+            .filter(|ahead| *ahead > 0)?;
+        let default_branch = start
+            .ref_name
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&start.ref_name)
+            .to_string();
+        Some(IntegrationAheadOfLocalDefault {
+            branch: config.branch,
+            integration,
+            default_branch,
+            default_commit: start.commit,
+            ahead,
         })
     }
 
@@ -2277,7 +2384,7 @@ impl Broker {
     }
 }
 
-/// Remove a stale action-required drop once the session's work promotes
+/// Remove a stale action-required drop once the session's work verifies
 /// (#41 follow-on, reported by agent A4: the file survived success with
 /// outdated blocking info). Best-effort — the worktree may be gone.
 fn clear_action_required(worktree: &Path) {
@@ -2295,7 +2402,7 @@ fn write_action_required(
         "No live session currently holds leases on these paths.".to_string()
     } else {
         format!(
-            "Blocking session(s): {} — coordinate or wait for their promotion.",
+            "Blocking session(s): {} — coordinate, or wait for their pull requests to merge.",
             blocking
                 .iter()
                 .map(i64::to_string)
@@ -2305,8 +2412,8 @@ fn write_action_required(
     };
     let body = format!(
         "# Broker: action required — merge conflict\n\n\
-         Your submission (commit `{head}`) conflicts with the integration\n\
-         branch (base `{base}`) and was rejected before any CI ran.\n\n\
+         Your submission (commit `{head}`) conflicts with its verification\n\
+         base (`{base}`) and was rejected before any CI ran.\n\n\
          Conflicting files:\n{files}\n\n{blocking_note}\n\n\
          To resolve, in this worktree:\n\n\
          1. `git fetch . {base}` (the base is a local commit; no network)\n\

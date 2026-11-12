@@ -735,6 +735,7 @@ impl Broker {
                 &integration_head,
                 (&baseline_ref, &baseline_head),
                 integration_reconciliation.as_ref(),
+                self.integration_ahead_of_local_default().as_ref(),
             ) {
                 Ok(Some(row)) => advice.insert(0, row),
                 Ok(None) if !before_deadline() => budget_cut.push("branch_drift"),
@@ -1070,7 +1071,7 @@ impl Broker {
         ) {
             advice.push(row);
         }
-        advice.extend(unpushed_work_advice(&unpushed_work, now_ms, true));
+        advice.extend(unpushed_work_advice(&unpushed_work, now_ms));
         advice.extend(overlap_pair_advice(&overlap_pairs));
         // Cached listing and local refs only: `status` never calls GitHub.
         if refresh && before_deadline() {
@@ -2128,6 +2129,7 @@ impl Broker {
             &integration_head,
             (&baseline_ref, &baseline_head),
             None,
+            self.integration_ahead_of_local_default().as_ref(),
         )
     }
 
