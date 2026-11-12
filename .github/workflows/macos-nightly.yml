@@ -100,8 +100,11 @@ jobs:
 
       - name: Generate workspace coverage reports
         # Bound llvm-profdata report-merge concurrency as a resource diagnostic.
-        # Keep every generated profile and the default merge failure policy; the
-        # cause of the prior SIGILL remains unconfirmed.
+        # The merge has died with SIGILL every night since 2026-11-06 with all
+        # tests passing. Before merging, read each raw profile on its own and
+        # set aside the ones llvm-profdata cannot read, naming them in the job
+        # summary and uploading them, so one bad file costs its own counts and
+        # not the whole report. The merge failure policy stays the default.
         env:
           LLVM_PROFDATA_FLAGS: "--num-threads=1"
         run: |
@@ -113,6 +116,37 @@ jobs:
           eval "$coverage_environment"
           cargo llvm-cov clean --workspace
           ../scripts/test-like-ci.sh --full -- --retries 0
+          profdata="$(find "$(rustc --print sysroot)/lib/rustlib" -name llvm-profdata -type f | head -n 1)"
+          profile_dir="$(dirname "$LLVM_PROFILE_FILE")"
+          mkdir -p coverage/unreadable-profiles
+          profiles=0
+          unreadable=0
+          while IFS= read -r -d '' profile; do
+            profiles=$((profiles + 1))
+            status=0
+            "$profdata" show "$profile" >/dev/null 2>&1 || status=$?
+            if [ "$status" -ne 0 ]; then
+              # A profile written under a restrictive umask reads again once
+              # its owner may read it; anything else is set aside.
+              mode="$(stat -c %a "$profile")"
+              chmod u+rw "$profile"
+              retry=0
+              "$profdata" show "$profile" >/dev/null 2>"coverage/unreadable-profiles/last-error.txt" || retry=$?
+              printf 'profile %s: %s bytes, mode %s, llvm-profdata exit %s, after chmod %s: %s\n' \
+                "$(basename "$profile")" "$(stat -c %s "$profile")" "$mode" "$status" "$retry" \
+                "$(head -c 300 coverage/unreadable-profiles/last-error.txt | tr '\n' ' ')"
+              if [ "$retry" -ne 0 ]; then
+                unreadable=$((unreadable + 1))
+                mv "$profile" coverage/unreadable-profiles/
+              fi
+            fi
+          done < <(find "$profile_dir" -maxdepth 1 -name '*.profraw' -print0)
+          echo "raw profiles: $profiles, unreadable and set aside: $unreadable"
+          {
+            echo "## Raw coverage profiles"
+            echo
+            echo "$profiles written, $unreadable unreadable and left out of the report."
+          } >> "$GITHUB_STEP_SUMMARY"
           cargo llvm-cov report --html --output-dir coverage/html
           cargo llvm-cov report --lcov --output-path coverage/lcov.info
 
@@ -170,3 +204,13 @@ jobs:
             packages/aethyme/rust/coverage/html/
           if-no-files-found: error
           retention-days: 14
+
+      - name: Upload unreadable raw profiles
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rust-unreadable-raw-profiles
+          path: packages/aethyme/rust/coverage/unreadable-profiles/
+          if-no-files-found: ignore
+          retention-days: 7
