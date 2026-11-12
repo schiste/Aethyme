@@ -510,23 +510,32 @@ slow hook in one session no longer stalls every other session's push:
   proves the commit is confined to that session: it runs in the session's own
   linked worktree, `HEAD` is the session's own branch, there are no leading
   global options (`-C`, `-c`, `--git-dir`) and no caller-declared `--scope`.
-  The repository's commit hooks still run, and they run inside this lane.
+  The repository's commit hooks still run, and they run inside this lane. A
+  `reference-transaction` hook keeps the commit repository-wide, as it does
+  for fetches and pushes.
 - `aethyme broker push` of a session branch, which now spells the push as
   `git push --no-follow-tags --porcelain -- <remote> <sha>:refs/heads/<branch>`
   when the repository's configuration proves that footprint (standard fetch
   refmaps, no mirror or push URL, no URL rewrites, extensions, custom ssh
   command or shallow clone). Such a push also locks the one tracking ref it
-  updates, `refs/remotes/<remote>/<branch>`. A repository that fails the check
+  updates, `refs/remotes/<remote>/<branch>`. A repository that fails the check,
+  or sets `push.followTags` (the strict spelling passes `--no-follow-tags`),
   keeps the old spelling and the repository-wide lane. The `pre-push` hook is
   handled exactly as before, inside the push, or before the lock with
-  `hooks_outside_lock`.
+  `hooks_outside_lock`. Any strict fetch or push spelling typed explicitly
+  through `broker advanced git` narrows only when that check passes;
+  otherwise it runs repository-wide and is journaled with scope `repository`.
 
 `gh pr edit <n>` and `gh pr ready <n>` with a plain number as the first operand
 take the lane `pull/<n>`, so edits of two pull requests do not contend. A base
 change (`--base`/`-B`) and any other selector stay repository-wide.
 
 A commit and a push of the same branch still serialise, and so do two pushes of
-the same branch. A repository-wide write still excludes every lane. An
+the same branch. A repository-wide write still excludes every lane, and it is
+not starved by them: before polling for its lanes it holds a wide-intent lock,
+which every new narrow Git writer must pass, so no new narrow writer starts
+while a wide one waits. The wait is recorded as `wide_intent_wait_ms` in the
+operation's `coordination_timing`. An
 operation left `outcome_unknown` blocks the operations it would have serialised
 with: a session-branch commit or push blocks that branch's lane and every
 repository-wide write, but not another session's branch. A repository-wide
@@ -545,8 +554,8 @@ session_hooks_hold_repository_lock = true
 ```
 
 With it set, every coordinated `commit` takes the repository-wide lane again.
-A session push does too whenever a `pre-push` or `reference-transaction` hook
-exists. Leave it off when hooks only check the commit (formatting, lint, tests,
+A session push does too whenever a `pre-push` hook exists (a
+`reference-transaction` hook widens it either way). Leave it off when hooks only check the commit (formatting, lint, tests,
 secret scans). Turn it on when a hook mutates repository state outside the
 branch being committed or pushed.
 

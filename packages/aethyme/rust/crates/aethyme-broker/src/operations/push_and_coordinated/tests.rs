@@ -2676,6 +2676,76 @@ fn strict_named_push_profile_follows_session_hooks_and_push_configuration() {
     git_scopes::validate_repository(root.path(), &fetch, deadline, key, false).unwrap();
 }
 
+/// Only a commit in the session's own linked worktree, on the session's own
+/// branch, without a `reference-transaction` hook, proves a branch lane. The
+/// main checkout (plain cwd, no `-C`) stays repository-wide.
+#[test]
+fn session_commit_profile_refuses_the_main_checkout_and_reference_transaction_hooks() {
+    let root = tempfile::tempdir().unwrap();
+    let main = root.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    let git = |cwd: &Path, args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+    };
+    git(&main, &["init", "-q", "-b", "main"]);
+    git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    let linked = root.path().join("linked");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/a",
+            linked.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let deadline = AdmissionDeadline::start(QueueWait::Seconds(10));
+    let check = |cwd: &Path, worktree: &Path, branch: &str| {
+        git_scopes::validate_session_commit(cwd, &main, worktree, branch, deadline, "local:test")
+    };
+    assert_eq!(
+        check(&linked, &linked, "agent/a").unwrap(),
+        "refs/heads/agent/a"
+    );
+    assert!(check(&main, &main, "main").is_err(), "main checkout");
+    assert!(
+        check(&main, &linked, "agent/a").is_err(),
+        "plain cwd in main"
+    );
+    assert!(
+        check(&linked, &linked, "agent/b").is_err(),
+        "foreign branch"
+    );
+    let hooks = root.path().join("hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    std::fs::write(hooks.join("pre-commit"), "#!/bin/sh\nexit 0\n").unwrap();
+    git(
+        &main,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+    assert!(
+        check(&linked, &linked, "agent/a").is_ok(),
+        "a pre-commit hook alone keeps the branch lane"
+    );
+    std::fs::write(hooks.join("reference-transaction"), "#!/bin/sh\nexit 0\n").unwrap();
+    assert!(
+        check(&linked, &linked, "agent/a").is_err(),
+        "a reference-transaction hook widens a commit like a fetch or push"
+    );
+}
+
 #[test]
 fn common_git_lane_identity_is_invariant_under_symlinked_checkout() {
     let (root, _) = push_fixture();

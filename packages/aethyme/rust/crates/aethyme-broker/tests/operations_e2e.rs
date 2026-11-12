@@ -3845,3 +3845,223 @@ fn commits_not_confined_to_the_session_branch_keep_the_repository_lane() {
         Err(BrokerOpError::InvalidCoordinatedOperation { .. })
     ));
 }
+
+/// Wait until a process records that it is waiting on a coordinated lock on
+/// behalf of `session_id`. The bound only turns a hang into a failure.
+#[cfg(unix)]
+fn wait_for_lock_waiter(repo: &Path, session_id: i64) {
+    let dir = repo.join(".aethyme/run/waits");
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let waiting = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| {
+                std::fs::read(entry.path())
+                    .ok()
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<aethyme_broker::WaitRecord>(&bytes).ok()
+                    })
+                    .is_some_and(|record| {
+                        record.session_id == Some(session_id)
+                            && record.kind == "coordinated_write_lock"
+                    })
+            });
+        if waiting {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session {session_id} never queued"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Writer preference: flock has no queue, so without it a stream of narrow
+/// commits re-taking the shared lanes could starve a repository-wide writer.
+/// While a wide write waits behind one held narrow commit, a second narrow
+/// commit on another branch must not start; it runs after the wide write.
+#[cfg(unix)]
+#[test]
+fn a_waiting_wide_write_is_not_starved_by_new_narrow_commits() {
+    let mut fx = LaneFixture::new(&["gate-first", "wide-writer", "late-narrow"]);
+    let gate = HookGate::install(&fx.hooks(), "pre-commit", "gate-first");
+    fx.stage(0, "first\n");
+    let first = fx.spawn(request(fx.sessions[0], &["commit", "-qm", "first"]));
+    gate.wait_started();
+    let wide = fx.spawn(request(fx.sessions[1], &["branch", "wide-after-first"]));
+    wait_for_lock_waiter(fx.repo(), fx.sessions[1]);
+
+    fx.stage(2, "late\n");
+    let late = fx.try_now(request(fx.sessions[2], &["commit", "-qm", "late"]));
+    let wide_ran_early =
+        !git_output(fx.repo(), &["branch", "--list", "wide-after-first"]).is_empty();
+    gate.release();
+    let first = first.join().unwrap().expect("held commit completes");
+    let wide = wide
+        .join()
+        .unwrap()
+        .expect("the wide write runs once the commit ends");
+    let late_after = fx
+        .try_now(request(fx.sessions[2], &["commit", "-qm", "late"]))
+        .expect("the narrow commit runs after the wide write");
+
+    assert_lock_busy(late, "a narrow commit arriving behind a waiting wide write");
+    assert!(
+        !wide_ran_early,
+        "the wide write cannot run while the commit holds its lane"
+    );
+    assert!(first.ok());
+    assert!(wide.ok());
+    assert_eq!(wide.operation.scope, "repository");
+    assert!(late_after.ok());
+    assert!(late_after.operation.id > wide.operation.id);
+    let timing: serde_json::Value =
+        serde_json::from_str(wide.operation.details_json.as_deref().unwrap()).unwrap();
+    assert!(timing["coordination_timing"]["wide_intent_wait_ms"].is_i64());
+}
+
+/// A repository-lane GitHub write (here a pull request base change) waits for
+/// a held session-branch commit on the same canonical repository. It is
+/// refused before `gh` runs, so nothing reaches GitHub.
+#[cfg(unix)]
+#[test]
+fn a_repository_lane_github_write_waits_for_a_held_session_commit() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    git(tmp.path(), &["config", "user.name", "t"]);
+    git(tmp.path(), &["config", "user.email", "t@t"]);
+    git(
+        tmp.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/Owner/Repo.git",
+        ],
+    );
+    let worktree = add_worktree(tmp.path(), "gh-gate-commit");
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    let session = broker.adopt(&worktree, None).unwrap();
+    let hooks = tmp.path().join(".aethyme/test-hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hooks = hooks.canonicalize().unwrap();
+    git(
+        tmp.path(),
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+    let gate = HookGate::install(&hooks, "pre-commit", "gh-gate-commit");
+    std::fs::write(worktree.join("tracked.txt"), "held\n").unwrap();
+    git(&worktree, &["add", "tracked.txt"]);
+    let repo = tmp.path().to_path_buf();
+    let commit = request(session.id, &["commit", "-qm", "held"]);
+    let committing = std::thread::spawn(move || {
+        common::open_fixture_repository_path_broker(&repo)
+            .unwrap()
+            .into_broker()
+            .run_coordinated_operation(commit)
+    });
+    gate.wait_started();
+
+    let mut edit = github_request(
+        session.id,
+        "Owner/Repo",
+        &["pr", "edit", "7", "--base", "main"],
+    );
+    edit.scope = None;
+    edit.declared_effect = None;
+    edit.authorization_reason = Some("regression".into());
+    let edited = broker.run_coordinated_operation_with_wait(edit, QueueWait::Refuse);
+    gate.release();
+    let committed = committing.join().unwrap().expect("held commit completes");
+
+    assert_lock_busy(edited, "a repository-lane GitHub write");
+    assert!(committed.ok());
+    assert!(committed.operation.scope.starts_with("session-commit:"));
+}
+
+/// A narrow push whose process died while running is marked unknown by the
+/// next operation on its branch and blocks it; another branch proceeds and
+/// leaves the dead record alone.
+#[cfg(unix)]
+#[test]
+fn a_crashed_narrow_push_blocks_its_own_branch_only() {
+    let mut fx = LaneFixture::new(&["crashed-push", "live-push"]);
+    let crashed_branch = fx.branch(0);
+    let live_branch = fx.branch(1);
+    let crashed_sha = fx.commit_plain(0, "crashed\n");
+    let repository = GitRepo::discover(&fx.worktrees[0])
+        .unwrap()
+        .resolve_remote_target("origin", None)
+        .unwrap()
+        .coordination_key;
+    let refspec = format!("{crashed_sha}:refs/heads/{crashed_branch}");
+    let command = [
+        "git",
+        "push",
+        "--no-follow-tags",
+        "--porcelain",
+        "--",
+        "origin",
+        refspec.as_str(),
+    ];
+    let crashed = fx
+        .broker
+        .store()
+        .create_coordinated_operation(&NewCoordinatedOperation {
+            session_id: fx.sessions[0],
+            provider: OperationProvider::Git,
+            repository,
+            scope: format!("session-push:refs/heads/{crashed_branch}"),
+            effect: OperationEffect::Write,
+            authorization_reason: Some("simulated crashed push".into()),
+            command_json: serde_json::to_string(&command).unwrap(),
+            pid: exited_child_pid(),
+            host_operation_id: None,
+            identity_provenance: OperationIdentityProvenance::VerifiedCanonical,
+        })
+        .unwrap()
+        .id;
+    fx.broker
+        .store()
+        .transition_coordinated_operation(crashed, OperationStatus::Running, None, None)
+        .unwrap();
+
+    let live_sha = fx.commit_plain(1, "live\n");
+    let live = fx.strict_push(1, &live_sha, &live_branch);
+    assert!(fx.try_now(live).expect("another branch proceeds").ok());
+    let untouched = fx
+        .broker
+        .store()
+        .coordinated_operation(crashed)
+        .unwrap()
+        .unwrap();
+    assert_eq!(untouched.status, OperationStatus::Running);
+
+    let retry = fx.strict_push(0, &crashed_sha, &crashed_branch);
+    match fx.try_now(retry) {
+        Err(BrokerOpError::CoordinatedOperationBlocked { operation_id, .. }) => {
+            assert_eq!(operation_id, crashed)
+        }
+        other => panic!("a second push of the crashed branch must be blocked: {other:?}"),
+    }
+    let marked = fx
+        .broker
+        .store()
+        .coordinated_operation(crashed)
+        .unwrap()
+        .unwrap();
+    assert_eq!(marked.status, OperationStatus::OutcomeUnknown);
+
+    let live_sha = fx.commit_plain(1, "live again\n");
+    let live = fx.strict_push(1, &live_sha, &live_branch);
+    assert!(
+        fx.try_now(live)
+            .expect("the unknown push does not block another branch")
+            .ok()
+    );
+}

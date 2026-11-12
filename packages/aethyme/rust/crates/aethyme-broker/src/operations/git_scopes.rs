@@ -240,6 +240,15 @@ pub(super) fn validate_session_commit(
     if common_lock_key(cwd)? != common_lock_key(main_root)? {
         return Err(unavailable("the worktree belongs to another repository"));
     }
+    // As for fetches and pushes: a `reference-transaction` hook sees and can
+    // extend every ref update, so it keeps the commit repository-wide.
+    refuse_hooks(
+        cwd,
+        &common_directory(cwd)?,
+        &["reference-transaction"],
+        deadline,
+        repository,
+    )?;
     let head = probe(cwd, &["symbolic-ref", "-q", "HEAD"], deadline, repository)?;
     let branch_ref = format!("refs/heads/{session_branch}");
     if !head.status.success() || head.stdout.trim_ascii() != branch_ref.as_bytes() {
@@ -384,6 +393,74 @@ pub(super) fn observe_ref(
     Ok(found)
 }
 
+/// Refuse the strict profile when any of `hooks` exists in the effective hook
+/// directory (`core.hooksPath`, else `<common>/hooks`).
+fn refuse_hooks(
+    cwd: &Path,
+    common: &Path,
+    hooks: &[&str],
+    deadline: AdmissionDeadline,
+    repository: &str,
+) -> Result<(), BrokerOpError> {
+    let hook_config = probe(
+        cwd,
+        &["config", "--path", "--null", "--get", "core.hooksPath"],
+        deadline,
+        repository,
+    )?;
+    let hook_directory = if hook_config.status.success() {
+        let text = std::str::from_utf8(&hook_config.stdout)
+            .map_err(|_| unavailable("non-UTF-8 hook directory"))?;
+        let Some(value) = text.strip_suffix('\0') else {
+            return Err(unavailable("incomplete hook directory"));
+        };
+        if value.is_empty() || value.contains('\0') || value.chars().any(char::is_control) {
+            return Err(unavailable("ambiguous hook directory"));
+        }
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        }
+    } else if hook_config.status.code() == Some(1) {
+        common.join("hooks")
+    } else {
+        return Err(unavailable("hook directory inventory failed"));
+    };
+    for hook in hooks {
+        if hook_directory
+            .join(hook)
+            .try_exists()
+            .map_err(|_| unavailable("hook state is unreadable"))?
+        {
+            return Err(unavailable("a hook can expand this resource footprint"));
+        }
+    }
+    Ok(())
+}
+
+/// Whether Git would follow tags on a push from `cwd` (`push.followTags`).
+/// The strict session-push spelling passes `--no-follow-tags`, so a repository
+/// that publishes tags this way keeps the historical spelling.
+pub(super) fn push_follows_tags(
+    cwd: &Path,
+    deadline: AdmissionDeadline,
+    repository: &str,
+) -> Result<bool, BrokerOpError> {
+    let output = probe(
+        cwd,
+        &["config", "--type=bool", "--get", "push.followTags"],
+        deadline,
+        repository,
+    )?;
+    match output.status.code() {
+        Some(0) => Ok(output.stdout.trim_ascii() == b"true"),
+        Some(1) => Ok(false),
+        _ => Err(unavailable("push.followTags is unreadable")),
+    }
+}
+
 /// Environment selectors that can change a coordinated Git resource footprint.
 pub(super) const GIT_REPOSITORY_ROUTING_ENV_NAMES: &[&str] = &[
     "GIT_DIR",
@@ -441,49 +518,18 @@ pub(super) fn validate_repository(
             "shallow repository has an additional write footprint",
         ));
     }
-    let hook_config = probe(
-        cwd,
-        &["config", "--path", "--null", "--get", "core.hooksPath"],
-        deadline,
-        repository,
-    )?;
-    let hook_directory = if hook_config.status.success() {
-        let text = std::str::from_utf8(&hook_config.stdout)
-            .map_err(|_| unavailable("non-UTF-8 hook directory"))?;
-        let Some(value) = text.strip_suffix('\0') else {
-            return Err(unavailable("incomplete hook directory"));
-        };
-        if value.is_empty() || value.contains('\0') || value.chars().any(char::is_control) {
-            return Err(unavailable("ambiguous hook directory"));
-        }
-        let path = PathBuf::from(value);
-        if path.is_absolute() {
-            path
-        } else {
-            cwd.join(path)
-        }
-    } else if hook_config.status.code() == Some(1) {
-        common.join("hooks")
-    } else {
-        return Err(unavailable("hook directory inventory failed"));
-    };
     let named_push = strict_push(args).is_some_and(|push| push.named_remote());
-    let hooks: &[&str] = if fetch_footprint(args).is_some() {
+    // A `reference-transaction` hook sees, and can extend, every ref update,
+    // so it always widens. A session branch's own `pre-push` hook does not,
+    // unless the repository opted out.
+    let hooks: &[&str] = if fetch_footprint(args).is_some()
+        || (session_branch_hooks && strict_push(args).is_some())
+    {
         &["reference-transaction"]
-    } else if session_branch_hooks && strict_push(args).is_some() {
-        &[]
     } else {
         &["reference-transaction", "pre-push"]
     };
-    for hook in hooks {
-        if hook_directory
-            .join(hook)
-            .try_exists()
-            .map_err(|_| unavailable("hook state is unreadable"))?
-        {
-            return Err(unavailable("a hook can expand this resource footprint"));
-        }
-    }
+    refuse_hooks(cwd, &common, hooks, deadline, repository)?;
     if resource_scope(args).is_none() {
         return Err(unavailable("unrecognized resource profile"));
     }

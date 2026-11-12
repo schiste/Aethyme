@@ -1582,6 +1582,11 @@ impl RepositoryWriteLock {
     }
 }
 
+/// The writer-preference lock in front of a shareable lane `key`.
+fn wide_intent_key(key: &str) -> String {
+    format!("{key}::wide-intent")
+}
+
 fn repository_write_lock_path(main_root: &Path, repository: &str) -> PathBuf {
     main_root
         .join(".aethyme/locks/operations")
@@ -1734,20 +1739,26 @@ fn session_hooks_hold_repository_lock_enabled(main_root: &Path) -> bool {
 /// Whether `broker push` may publish a session branch with the strict,
 /// branch-scoped push spelling. Checked before the push queues so a
 /// repository whose configuration would refuse that profile under the lock
-/// keeps the historical repository-wide spelling instead of failing.
+/// keeps the historical repository-wide spelling instead of failing. A
+/// repository with `push.followTags` also keeps it: the strict spelling passes
+/// `--no-follow-tags`, and the branch lane does not cover tag refs, so it must
+/// not silently stop publishing the tags Git would have followed.
 pub(crate) fn session_branch_push_lane_available(
     main_root: &Path,
     cwd: &Path,
     args: &[String],
 ) -> bool {
-    git_scopes::validate_repository(
-        cwd,
-        args,
-        AdmissionDeadline::start(QueueWait::Refuse),
-        "session branch push",
-        !session_hooks_hold_repository_lock_enabled(main_root),
-    )
-    .is_ok()
+    let deadline = AdmissionDeadline::start(QueueWait::Refuse);
+    let repository = "session branch push";
+    !git_scopes::push_follows_tags(cwd, deadline, repository).unwrap_or(true)
+        && git_scopes::validate_repository(
+            cwd,
+            args,
+            deadline,
+            repository,
+            !session_hooks_hold_repository_lock_enabled(main_root),
+        )
+        .is_ok()
 }
 
 /// Opt-in measurement of the provider read a future ref-scoped merge would
@@ -2011,6 +2022,7 @@ fn add_coordination_timing(
     lock: Option<&RepositoryWriteLock>,
     hooks_outside_lock: bool,
     ref_determination: Option<RefDeterminationMeasurement>,
+    wide_intent_wait_ms: Option<i64>,
 ) {
     let Some(details) = details.as_object_mut() else {
         return;
@@ -2034,6 +2046,7 @@ fn add_coordination_timing(
             "queue_wait_ms": queue_wait_ms,
             "lock_hold_ms": lock_hold_ms,
             "hooks_outside_lock": hooks_outside_lock,
+            "wide_intent_wait_ms": wide_intent_wait_ms,
             "ref_determination_ms": ref_determination.map(|measurement| measurement.duration_ms),
             "ref_determination_succeeded": ref_determination.map(|measurement| measurement.succeeded),
         }),
@@ -3328,6 +3341,11 @@ fn coordination_lock_key(repository: &str, resource: Option<&str>) -> String {
 /// that column accepts a caller-declared string, and a caller must never be
 /// able to name its way out of the repository lock.
 fn stored_resource_scope(operation: &CoordinatedOperation) -> Option<String> {
+    // A strict spelling whose repository profile was not proven ran on the
+    // repository-wide lane and was journaled `repository`; it stays wide.
+    if operation.provider == OperationProvider::Git && operation.scope == "repository" {
+        return None;
+    }
     session_commit_scope(operation).or_else(|| {
         let command: Vec<String> = serde_json::from_str(&operation.command_json).ok()?;
         resource_lock_scope(operation.provider, command.get(1..)?)

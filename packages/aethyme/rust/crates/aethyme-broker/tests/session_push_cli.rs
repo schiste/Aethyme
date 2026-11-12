@@ -582,6 +582,143 @@ fn a_session_push_holds_only_its_branch_lane_when_the_profile_is_proven() {
     );
 }
 
+/// The strict spelling typed explicitly, in a repository whose configuration
+/// cannot prove its footprint (here `core.sshCommand`), runs on the
+/// repository-wide lane as it did before narrow lanes existed, instead of
+/// being refused.
+#[test]
+fn an_explicit_strict_push_in_an_unproven_repository_runs_wide() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, worktree) = fixture.session_with_commit();
+    let branch = fixture.broker().store().session(session).unwrap().branch;
+    let head = git_output(&worktree, &["rev-parse", "HEAD"]);
+    let refspec = format!("{head}:refs/heads/{branch}");
+    let id = session.to_string();
+    let output = fixture.run(&[
+        "advanced",
+        "git",
+        "--session",
+        &id,
+        "--repo",
+        "acme/project",
+        "--effect",
+        "write",
+        "--reason",
+        "explicit strict spelling",
+        "--",
+        "push",
+        "--no-follow-tags",
+        "--porcelain",
+        "--",
+        "origin",
+        &refspec,
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fixture.remote_branch(&branch).as_deref(),
+        Some(head.as_str())
+    );
+    let operation = fixture
+        .broker()
+        .store()
+        .coordinated_operations()
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|operation| operation.command_json.contains("--porcelain"))
+        .expect("the explicit push is journaled");
+    assert_eq!(operation.scope, "repository");
+    let details: serde_json::Value =
+        serde_json::from_str(operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        details["coordination_timing"]["lock_key"].as_str(),
+        Some(operation.repository.as_str())
+    );
+}
+
+/// The strict spelling passes `--no-follow-tags`. A repository that follows
+/// tags on push keeps the historical spelling, so `broker push` does not
+/// silently stop publishing the tags Git would have followed.
+#[test]
+fn a_repository_that_follows_tags_keeps_the_historical_session_push() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, worktree) = fixture.session_with_commit();
+    git(&fixture.repo, &["config", "--unset", "core.sshCommand"]);
+    git(&fixture.repo, &["config", "push.followTags", "true"]);
+
+    let report = json(&fixture.push(session, &[]));
+    let head = git_output(&worktree, &["rev-parse", "HEAD"]);
+    let branch = report["branch"].as_str().unwrap().to_string();
+    assert_eq!(report["pushed_oid"], head);
+    let operation = fixture
+        .broker()
+        .store()
+        .coordinated_operations()
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|operation| operation.scope.starts_with("session-push:refs/heads/"))
+        .expect("a session push is journaled");
+    let command: Vec<String> = serde_json::from_str(&operation.command_json).unwrap();
+    let refspec = format!("{head}:refs/heads/{branch}");
+    assert_eq!(command, ["git", "push", "origin", refspec.as_str()]);
+}
+
+/// An ambient `GIT_INDEX_FILE` could point the commit at another index, so the
+/// broker cannot prove the commit is confined to the session branch and keeps
+/// the repository-wide lane. The same commit without it narrows.
+#[test]
+fn a_commit_under_an_ambient_index_override_keeps_the_repository_lane() {
+    let fixture = Fixture::new();
+    let (session, worktree) = fixture.session_with_commit();
+    let branch = fixture.broker().store().session(session).unwrap().branch;
+    let id = session.to_string();
+    let index = format!(
+        "{}/index",
+        git_output(&worktree, &["rev-parse", "--absolute-git-dir"])
+    );
+    let commit = |file: &str, env: &[(&str, &str)]| {
+        std::fs::write(worktree.join(file), "x\n").unwrap();
+        git(&worktree, &["add", file]);
+        let output = fixture.run_with_env(
+            &[
+                "advanced",
+                "git",
+                "--session",
+                &id,
+                "--reason",
+                "index override",
+                "--",
+                "commit",
+                "-qm",
+                file,
+            ],
+            env,
+        );
+        assert!(output.status.success(), "{}", stderr(&output));
+    };
+    commit("plain.txt", &[]);
+    commit("override.txt", &[("GIT_INDEX_FILE", index.as_str())]);
+    let scopes: Vec<String> = fixture
+        .broker()
+        .store()
+        .coordinated_operations()
+        .unwrap()
+        .into_iter()
+        .filter(|operation| operation.command_json.contains("\"commit\""))
+        .map(|operation| operation.scope)
+        .collect();
+    assert_eq!(
+        scopes,
+        [
+            format!("session-commit:refs/heads/{branch}"),
+            "repository".to_string()
+        ]
+    );
+}
+
 /// Rebasing or amending rewrites the branch; the next push replaces only
 /// what this session pushed last.
 #[test]
