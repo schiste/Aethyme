@@ -1099,11 +1099,32 @@ fn a_push_fetches_when_the_last_default_branch_fetch_failed() {
     fixture.authorize(true);
     let (session, _) = fixture.session_with_commit();
     json(&fixture.push(session, &[]));
-    // Sync's fetch fails while the remote is away, and says so in the record.
-    let away = fixture.remote.with_extension("away");
-    std::fs::rename(&fixture.remote, &away).unwrap();
+    // Sync's fetch fails while the remote has no default branch, and says so
+    // in the record.
+    let remote_main = git_output(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    git(&fixture.remote, &["update-ref", "-d", "refs/heads/main"]);
     fixture.run(&["sync", "--session", &session.to_string(), "--json"]);
-    std::fs::rename(&away, &fixture.remote).unwrap();
+    git(
+        &fixture.remote,
+        &["update-ref", "refs/heads/main", &remote_main],
+    );
+    // A failed fetch may be journaled with an unknown outcome; settle it as
+    // an operator would, so the push below is not write-blocked by it.
+    let mut broker = fixture.broker();
+    let unknown: Vec<i64> = broker
+        .store()
+        .pending_coordinated_operations()
+        .unwrap()
+        .into_iter()
+        .filter(|operation| operation.status == aethyme_broker::OperationStatus::OutcomeUnknown)
+        .map(|operation| operation.id)
+        .collect();
+    for id in unknown {
+        broker
+            .reconcile_coordinated_operation(id, false, "the remote had no default branch")
+            .unwrap();
+    }
+    drop(broker);
     assert_eq!(
         fixture.default_branch_fetch_record().as_deref(),
         Some("failed")
