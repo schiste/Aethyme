@@ -297,19 +297,63 @@ impl PromoteConfig {
     }
 }
 
+/// The refs a session's own changes are measured from. The same for every
+/// session, so resolve them once per pass and share them.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BaselineRefs {
+    /// The fetched default branch's commit, when there is one.
+    pub(crate) upstream: Option<String>,
+    /// The integration branch's commit. Resolved only where the baseline can
+    /// read it: in a promoting repository, or where there is no fetched
+    /// default branch.
+    pub(crate) integration: Option<String>,
+    /// Whether the repository promotes (`auto` or `manual`).
+    pub(crate) promoting: bool,
+}
+
+impl BaselineRefs {
+    pub(crate) fn resolve(repo: &GitRepo, main_root: &Path) -> Self {
+        let config = PromoteConfig::load(main_root);
+        let promoting = config.mode.promotes_at_all();
+        let upstream = repo.upstream_default().map(|(_, commit)| commit);
+        let integration = if promoting || upstream.is_none() {
+            repo.resolve_ref(&format!("refs/heads/{}", config.branch))
+        } else {
+            None
+        };
+        Self {
+            upstream,
+            integration,
+            promoting,
+        }
+    }
+}
+
 /// The commit a session's own changes start after.
 ///
-/// Its merge-base with integration, unless its merge-base with the fetched
-/// default branch is more recent. That happens exactly when the session was cut
-/// from upstream because integration had fallen behind: measured from
-/// integration alone, everything upstream merged since would count as the
-/// session's own diff and flood the lease and overlap reports.
-pub(crate) fn session_baseline(
-    checkout: &GitRepo,
-    integration: &str,
-    upstream: Option<&str>,
-) -> Option<String> {
-    let from_integration = checkout.merge_base(integration, "HEAD").ok()?;
+/// In a repository that does not promote, nothing lands through integration:
+/// sessions start from the fetched default branch and their pull requests
+/// merge there, so the session's merge-base with that branch is the answer,
+/// one Git call. `None` when it has none locally (a shallow boundary, or
+/// unrelated history); callers then use the session's recorded base.
+///
+/// Integration is read only in a promoting repository, or where there is no
+/// fetched default branch. Then it is the session's merge-base with
+/// integration, unless its merge-base with the fetched default branch is more
+/// recent. That happens exactly when the session was cut from upstream because
+/// integration had fallen behind: measured from integration alone, everything
+/// upstream merged since would count as the session's own diff and flood the
+/// lease and overlap reports.
+pub(crate) fn session_baseline(checkout: &GitRepo, refs: &BaselineRefs) -> Option<String> {
+    let upstream = refs.upstream.as_deref();
+    if !refs.promoting
+        && let Some(upstream) = upstream
+    {
+        return checkout.merge_base(upstream, "HEAD").ok();
+    }
+    let from_integration = checkout
+        .merge_base(refs.integration.as_deref()?, "HEAD")
+        .ok()?;
     if let Some(from_upstream) = upstream.and_then(|tip| checkout.merge_base(tip, "HEAD").ok())
         && from_upstream != from_integration
         && checkout.is_ancestor(&from_integration, &from_upstream)
@@ -2746,19 +2790,21 @@ fn submission_planning_failure_class(error: &BrokerOpError) -> &'static str {
 /// can point agents at this path; no vendor-specific injection.
 impl Broker {
     /// The commit a session's own changes should be measured against:
-    /// `merge-base(session HEAD, integration)`. Unlike the stored
+    /// [`session_baseline`], its merge-base with the fetched default branch
+    /// or, in a promoting repository, with integration. Unlike the stored
     /// adoption-time `diff_base`, this self-heals after a conflict-rebase
     /// (#41): promoted commits brought in by the rebase move into the
     /// common ancestry instead of inflating the session's apparent diff
     /// (the phantom-lease symptom). Read-only — never refreshes the
     /// integration branch.
     pub fn session_change_base(&mut self, session_checkout: &GitRepo) -> Option<String> {
-        let integration = self.integration_tip()?;
-        let upstream = self
-            .repo_handle()
-            .upstream_default()
-            .map(|(_, commit)| commit);
-        session_baseline(session_checkout, &integration, upstream.as_deref())
+        session_baseline(session_checkout, &self.baseline_refs())
+    }
+
+    /// The refs [`session_baseline`] reads, resolved once for a pass over
+    /// many sessions.
+    pub(crate) fn baseline_refs(&self) -> BaselineRefs {
+        BaselineRefs::resolve(self.repo_handle(), &self.main_root_path())
     }
 
     /// The integration branch's current commit, without creating or
@@ -4770,5 +4816,201 @@ mod submission_plan_empty_patch_tests {
             );
             assert_eq!(shape_queries, expected_streams, "shape queries for {mode}");
         }
+    }
+}
+
+#[cfg(test)]
+mod session_baseline_tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.test")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn commit(dir: &Path, name: &str) -> String {
+        std::fs::write(dir.join(name), name).unwrap();
+        git(dir, &["add", name]);
+        git(dir, &["commit", "-q", "-m", name]);
+        git(dir, &["rev-parse", "HEAD"])
+    }
+
+    fn refs(upstream: Option<&str>, integration: Option<&str>, promoting: bool) -> BaselineRefs {
+        BaselineRefs {
+            upstream: upstream.map(str::to_string),
+            integration: integration.map(str::to_string),
+            promoting,
+        }
+    }
+
+    /// History shared by the cases below: `base` is on the default branch,
+    /// `held` is integration's own commit on top of it (promoted work the
+    /// default branch never received), and the checkout's HEAD is a session
+    /// cut from `held` with one change of its own.
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        repo: GitRepo,
+        base: String,
+        held: String,
+    }
+
+    fn session_cut_from_integration_ahead_of_upstream() -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        let base = commit(dir, "base");
+        let held = commit(dir, "held");
+        commit(dir, "mine");
+        let repo = GitRepo::discover(dir).unwrap();
+        Fixture {
+            _tmp: tmp,
+            repo,
+            base,
+            held,
+        }
+    }
+
+    /// A repository that does not promote lands work only through pull
+    /// requests into the default branch, so whatever the session's branch
+    /// carries beyond that branch is what its pull request will carry: one
+    /// merge-base, and integration is not read at all.
+    #[test]
+    fn a_non_promoting_repository_measures_from_the_default_branch_in_one_git_call() {
+        let fixture = session_cut_from_integration_ahead_of_upstream();
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let baseline = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            session_baseline(
+                &fixture.repo,
+                &refs(Some(&fixture.base), Some(&fixture.held), false),
+            )
+        };
+        assert_eq!(baseline.as_deref(), Some(fixture.base.as_str()));
+        assert_eq!(recorder.totals().1.get("subprocess_git"), Some(&1));
+    }
+
+    /// The old rule, unchanged, wherever integration is what work lands on:
+    /// a session cut from integration does not own integration's commits.
+    #[test]
+    fn a_promoting_repository_still_measures_from_integration_when_it_is_ahead() {
+        let fixture = session_cut_from_integration_ahead_of_upstream();
+        let baseline = session_baseline(
+            &fixture.repo,
+            &refs(Some(&fixture.base), Some(&fixture.held), true),
+        );
+        assert_eq!(baseline.as_deref(), Some(fixture.held.as_str()));
+    }
+
+    /// The old rule, unchanged: a session cut from upstream while integration
+    /// lagged is measured from upstream.
+    #[test]
+    fn a_promoting_repository_still_prefers_a_more_recent_upstream() {
+        let fixture = session_cut_from_integration_ahead_of_upstream();
+        let baseline = session_baseline(
+            &fixture.repo,
+            &refs(Some(&fixture.held), Some(&fixture.base), true),
+        );
+        assert_eq!(baseline.as_deref(), Some(fixture.held.as_str()));
+    }
+
+    /// With no fetched default branch there is nothing else to measure from.
+    #[test]
+    fn without_a_default_branch_integration_is_the_baseline() {
+        let fixture = session_cut_from_integration_ahead_of_upstream();
+        let baseline = session_baseline(&fixture.repo, &refs(None, Some(&fixture.held), false));
+        assert_eq!(baseline.as_deref(), Some(fixture.held.as_str()));
+        assert_eq!(
+            session_baseline(&fixture.repo, &refs(None, None, false)),
+            None
+        );
+    }
+
+    /// A session rebased onto a newer default branch owns only what it added
+    /// after the rebase.
+    #[test]
+    fn a_rebased_session_is_measured_from_where_it_now_sits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        let started = commit(dir, "base");
+        git(dir, &["checkout", "-q", "-b", "session"]);
+        commit(dir, "mine");
+        git(dir, &["checkout", "-q", "main"]);
+        let landed = commit(dir, "landed");
+        git(dir, &["checkout", "-q", "session"]);
+        git(dir, &["rebase", "-q", "main"]);
+        let repo = GitRepo::discover(dir).unwrap();
+
+        let baseline = session_baseline(&repo, &refs(Some(&landed), Some(&started), false));
+        assert_eq!(baseline.as_deref(), Some(landed.as_str()));
+    }
+
+    /// Without a common ancestor in local history (past a shallow boundary,
+    /// or unrelated history) there is no measurement, so callers use the
+    /// session's recorded base rather than integration's.
+    #[test]
+    fn no_common_history_with_the_default_branch_leaves_the_recorded_base_to_callers() {
+        let fixture = session_cut_from_integration_ahead_of_upstream();
+        let dir = fixture.repo.root().to_path_buf();
+        let empty_tree = git(&dir, &["hash-object", "-t", "tree", "-w", "/dev/null"]);
+        let unrelated = git(&dir, &["commit-tree", &empty_tree, "-m", "unrelated"]);
+
+        let baseline = session_baseline(
+            &fixture.repo,
+            &refs(Some(&unrelated), Some(&fixture.held), false),
+        );
+        assert_eq!(baseline, None);
+    }
+
+    fn point_origin_at(dir: &Path, commit: &str) {
+        git(dir, &["update-ref", "refs/remotes/origin/main", commit]);
+        git(
+            dir,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+    }
+
+    #[test]
+    fn resolving_reads_integration_only_where_the_baseline_can_use_it() {
+        let fixture = session_cut_from_integration_ahead_of_upstream();
+        let dir = fixture.repo.root().to_path_buf();
+        git(&dir, &["branch", DEFAULT_INTEGRATION_BRANCH, &fixture.held]);
+
+        // Verify-only (no configuration) without a remote: integration.
+        let resolved = BaselineRefs::resolve(&fixture.repo, &dir);
+        assert!(!resolved.promoting);
+        assert_eq!(resolved.upstream, None);
+        assert_eq!(resolved.integration.as_deref(), Some(fixture.held.as_str()));
+
+        // Verify-only with a fetched default branch: integration is not read.
+        point_origin_at(&dir, &fixture.base);
+        let resolved = BaselineRefs::resolve(&fixture.repo, &dir);
+        assert_eq!(resolved.upstream.as_deref(), Some(fixture.base.as_str()));
+        assert_eq!(resolved.integration, None);
+
+        // A promoting repository reads both.
+        std::fs::create_dir_all(dir.join(".aethyme")).unwrap();
+        std::fs::write(
+            dir.join(".aethyme/config.toml"),
+            "[promote]\nmode = \"auto\"\n",
+        )
+        .unwrap();
+        let resolved = BaselineRefs::resolve(&fixture.repo, &dir);
+        assert!(resolved.promoting);
+        assert_eq!(resolved.upstream.as_deref(), Some(fixture.base.as_str()));
+        assert_eq!(resolved.integration.as_deref(), Some(fixture.held.as_str()));
     }
 }

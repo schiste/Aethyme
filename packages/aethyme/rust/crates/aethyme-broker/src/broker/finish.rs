@@ -1151,19 +1151,10 @@ impl Broker {
             if let Some(pending) = pending_from_plan.filter(|pending| *pending > 0) {
                 pending
             } else {
-                let upstream = self.repo.upstream_default().map(|(_, commit)| commit);
                 let base = session
                     .diff_base
                     .clone()
-                    .or_else(|| {
-                        integration_head.as_deref().and_then(|integration| {
-                            crate::merge::session_baseline(
-                                checkout,
-                                integration,
-                                upstream.as_deref(),
-                            )
-                        })
-                    })
+                    .or_else(|| crate::merge::session_baseline(checkout, &self.baseline_refs()))
                     .unwrap_or_else(|| "HEAD".to_string());
                 checkout.commit_count_between(&base, "HEAD")?
             }
