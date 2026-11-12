@@ -183,34 +183,50 @@ pub fn failure_shape(message: &str) -> String {
     shape.chars().take(160).collect()
 }
 
-/// Why commands failed: for each command, its failures grouped by
+/// The `failure_class` recorded when a guarded `exec` ran and the wrapped
+/// command itself exited non-zero while the guard found nothing wrong. That
+/// is the wrapped command's own result (a failing test, a linter finding), not
+/// a broker failure.
+pub const WRAPPED_COMMAND_FAILED: &str = "wrapped_command_failed";
+
+/// Why commands failed: for each command, its broker-side failures grouped by
 /// [`failure_shape`], most frequent first, five reasons at most and the rest
 /// counted as `other_failures`. `failures` yields a command surface, its exit
-/// code and the message it printed.
+/// code, the message it printed and the recorded `failure_class`. Failures of
+/// class [`WRAPPED_COMMAND_FAILED`] are not broker failures: they are counted
+/// per command as `wrapped_command_failures` and kept out of `failures` and
+/// `reasons`.
 pub fn failure_reasons<'a>(
-    failures: impl Iterator<Item = (&'a str, u64, &'a str)>,
+    failures: impl Iterator<Item = (&'a str, u64, &'a str, Option<&'a str>)>,
 ) -> serde_json::Value {
-    let mut commands: BTreeMap<&str, BTreeMap<(String, &'static str), u64>> = BTreeMap::new();
-    for (command, exit, message) in failures {
-        *commands
-            .entry(command)
-            .or_default()
-            .entry((failure_shape(message), exit_class(exit)))
-            .or_default() += 1;
+    /// Per command: how often each (reason, exit class) occurred, and how
+    /// many failures were the wrapped command's own.
+    type Tally = (BTreeMap<(String, &'static str), u64>, u64);
+    let mut commands: BTreeMap<&str, Tally> = BTreeMap::new();
+    for (command, exit, message, class) in failures {
+        let (reasons, wrapped) = commands.entry(command).or_default();
+        if class == Some(WRAPPED_COMMAND_FAILED) {
+            *wrapped += 1;
+        } else {
+            *reasons
+                .entry((failure_shape(message), exit_class(exit)))
+                .or_default() += 1;
+        }
     }
     let mut commands: Vec<_> = commands
         .into_iter()
-        .map(|(command, reasons)| {
+        .map(|(command, (reasons, wrapped))| {
             let failures: u64 = reasons.values().sum();
             let mut reasons: Vec<_> = reasons.into_iter().collect();
             reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             let shown: Vec<_> = reasons.iter().take(5).collect();
             let other = failures - shown.iter().map(|(_, count)| count).sum::<u64>();
             (
-                failures,
+                (failures, wrapped),
                 serde_json::json!({
                     "command": command,
                     "failures": failures,
+                    "wrapped_command_failures": wrapped,
                     "reasons": shown.iter().map(|((reason, class), count)| serde_json::json!({
                         "reason": reason, "exit_class": class, "count": count,
                     })).collect::<Vec<_>>(),
@@ -328,7 +344,11 @@ mod tests {
                 .iter()
                 .map(|reason| ("broker.sync", 1, reason.as_str())),
         );
-        let report = failure_reasons(failures.into_iter());
+        let report = failure_reasons(
+            failures
+                .into_iter()
+                .map(|(command, exit, message)| (command, exit, message, None)),
+        );
         let commands: Vec<_> = report
             .as_array()
             .unwrap()
@@ -356,5 +376,72 @@ mod tests {
         assert_eq!(report[0]["reasons"].as_array().unwrap().len(), 5);
         assert_eq!(report[0]["other_failures"], 1);
         assert_eq!(report[2]["reasons"][0]["exit_class"], "outcome_unknown");
+    }
+
+    #[test]
+    fn wrapped_command_failures_are_counted_apart_from_broker_failures() {
+        let failures = vec![
+            (
+                "broker.exec",
+                1,
+                "the command exited 101",
+                Some(WRAPPED_COMMAND_FAILED),
+            ),
+            (
+                "broker.exec",
+                1,
+                "the command exited 1",
+                Some(WRAPPED_COMMAND_FAILED),
+            ),
+            (
+                "broker.exec",
+                1,
+                "the command exited 2",
+                Some(WRAPPED_COMMAND_FAILED),
+            ),
+            (
+                "broker.exec",
+                3,
+                "session 7 is already closed",
+                Some("command_failed"),
+            ),
+            ("broker.push", 5, "outcome unknown", None),
+        ];
+        let report = failure_reasons(failures.into_iter());
+        let exec = &report[0];
+        assert_eq!(exec["command"], "broker.exec");
+        assert_eq!(exec["failures"], 1);
+        assert_eq!(exec["wrapped_command_failures"], 3);
+        assert_eq!(exec["other_failures"], 0);
+        let reasons = exec["reasons"].as_array().unwrap();
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0]["reason"], "session N is already closed");
+        assert_eq!(reasons[0]["exit_class"], "refused");
+        assert_eq!(report[1]["command"], "broker.push");
+        assert_eq!(report[1]["wrapped_command_failures"], 0);
+    }
+
+    #[test]
+    fn a_command_with_only_wrapped_failures_has_no_broker_failures_or_reasons() {
+        let failures = vec![
+            (
+                "broker.exec",
+                1,
+                "the command exited 1",
+                Some(WRAPPED_COMMAND_FAILED),
+            ),
+            (
+                "broker.exec",
+                1,
+                "the command exited 1",
+                Some(WRAPPED_COMMAND_FAILED),
+            ),
+        ];
+        let report = failure_reasons(failures.into_iter());
+        assert_eq!(report.as_array().unwrap().len(), 1);
+        assert_eq!(report[0]["failures"], 0);
+        assert_eq!(report[0]["wrapped_command_failures"], 2);
+        assert!(report[0]["reasons"].as_array().unwrap().is_empty());
+        assert_eq!(report[0]["other_failures"], 0);
     }
 }

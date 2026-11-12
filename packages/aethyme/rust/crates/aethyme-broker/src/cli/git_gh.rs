@@ -679,6 +679,9 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
         // sends the reader to debug leases when the wrapped command
         // simply exited non-zero for its own reasons.
         let guard_refused = !report.ownership_ok;
+        if !report.command_timed_out && !report.command_success && !guard_refused {
+            super::telemetry::mark_wrapped_command_failure();
+        }
         return Err(UsageError::Message(if report.command_timed_out {
             "guarded exec: the command timed out after verified process-group cleanup; \
                  the ownership audit still ran, and any edits remain listed above"

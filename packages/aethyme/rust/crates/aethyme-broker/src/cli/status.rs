@@ -718,7 +718,7 @@ pub(super) fn run_metrics(parsed: Parsed) -> Result<(), UsageError> {
         now_ms() - FAILURE_WINDOW_DAYS * 24 * 60 * 60 * 1000,
         50_000,
     )?;
-    let failed: Vec<(String, u64, String)> = failed
+    let failed: Vec<(String, u64, String, Option<String>)> = failed
         .iter()
         .filter_map(|event| {
             serde_json::from_str::<serde_json::Value>(event.payload_json.as_deref()?).ok()
@@ -732,20 +732,30 @@ pub(super) fn run_metrics(parsed: Parsed) -> Result<(), UsageError> {
                     .and_then(|m| m.as_str())
                     .unwrap_or("(no message recorded)")
                     .to_string(),
+                payload
+                    .get("failure_class")
+                    .and_then(|class| class.as_str())
+                    .map(str::to_string),
             ))
         })
         .collect();
-    let failure_reasons = crate::scoreboard::failure_reasons(
-        failed
-            .iter()
-            .map(|(command, exit, message)| (command.as_str(), *exit, message.as_str())),
-    );
+    let wrapped_command_failures = failed
+        .iter()
+        .filter(|(_, _, _, class)| {
+            class.as_deref() == Some(crate::scoreboard::WRAPPED_COMMAND_FAILED)
+        })
+        .count();
+    let failure_reasons =
+        crate::scoreboard::failure_reasons(failed.iter().map(|(command, exit, message, class)| {
+            (command.as_str(), *exit, message.as_str(), class.as_deref())
+        }));
 
     if parsed.json {
         let out = serde_json::json!({
             "failure_reasons": {
                 "window_days": FAILURE_WINDOW_DAYS,
-                "failures": failed.len(),
+                "failures": failed.len() - wrapped_command_failures,
+                "wrapped_command_failures": wrapped_command_failures,
                 "commands": failure_reasons,
             },
             "gates_executed": executed.iter().map(|(g, n, ms)| serde_json::json!({
