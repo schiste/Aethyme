@@ -534,8 +534,9 @@ fn an_authorized_push_publishes_the_session_branch_and_records_it() {
 fn a_session_push_holds_only_its_branch_lane_when_the_profile_is_proven() {
     let fixture = Fixture::new();
     fixture.authorize(true);
-    git(&fixture.repo, &["config", "--unset", "core.sshCommand"]);
     let (session, worktree) = fixture.session_with_commit();
+    // Only the CLI run below puts the fake `ssh` on `PATH`.
+    git(&fixture.repo, &["config", "--unset", "core.sshCommand"]);
 
     let report = json(&fixture.push(session, &[]));
     let head = git_output(&worktree, &["rev-parse", "HEAD"]);
