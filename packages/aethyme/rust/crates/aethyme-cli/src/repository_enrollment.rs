@@ -724,11 +724,16 @@ pub fn execute(repo_hint: &Path, confirmation: &str) -> Result<FirstEnrollmentEx
         .map_err(|error| format!("open enrollment broker: {error}"))?;
     if journal.phase < EnrollmentPhase::SessionCreated {
         ensure_remote_head(&repo, &main_root, &journal)?;
+        // Cut from the reviewed remote base itself, never from whatever
+        // `origin/HEAD` names: a stale pointer to another branch would put
+        // unreviewed commits under the enrollment commit.
         let started = broker
-            .start_worktree_with_planned_paths(
+            .start_worktree_with_planned_paths_and_context(
                 "Publish reviewed Aethyme repository enrollment",
                 &journal.planned_paths,
                 None,
+                aethyme_broker::SessionContext::default(),
+                Some(&journal.remote_base.exact_sha),
             )
             .map_err(|error| format!("start isolated enrollment session: {error}"))?;
         journal.enrollment_session_id = Some(started.session.id);
@@ -800,6 +805,22 @@ pub fn execute(repo_hint: &Path, confirmation: &str) -> Result<FirstEnrollmentEx
     }
 
     if journal.phase < EnrollmentPhase::Published {
+        // An older binary may already have pushed its promotion commit.
+        let commit = journal
+            .enrollment_commit
+            .clone()
+            .ok_or("journal lost the enrollment commit")?;
+        if let Some(published) = legacy_promotion_on_remote(&repo, &main_root, &journal, &commit)? {
+            journal.publication_sha = Some(published.clone());
+            journal.verified_remote_sha = Some(published);
+            journal.local_main_synchronized = false;
+            journal.phase = EnrollmentPhase::Published;
+            write_journal(&journal_path, &journal)?;
+            maybe_stop_after(journal.phase)?;
+        }
+    }
+
+    if journal.phase < EnrollmentPhase::Published {
         // The enrollment commit itself is published. A journal left at the
         // old `promoted` phase recorded a promotion SHA; it is ignored, and
         // its queue entry must still vouch for the commit or be replaced by a
@@ -810,7 +831,7 @@ pub fn execute(repo_hint: &Path, confirmation: &str) -> Result<FirstEnrollmentEx
             .ok_or("journal lost the enrollment commit")?;
         let vouched = match journal.queue_entry_id {
             Some(id) => broker
-                .entry_vouching_for_commit(id, &commit)
+                .entry_vouching_for_commit(id, session_id, &commit)
                 .map_err(|error| format!("inspect enrollment queue entry {id}: {error}"))?
                 .map(|entry| entry.id),
             None => None,
@@ -830,6 +851,7 @@ pub fn execute(repo_hint: &Path, confirmation: &str) -> Result<FirstEnrollmentEx
         let published = broker
             .publish_enrollment_commit(&aethyme_broker::EnrollmentPublicationRequest {
                 queue_entry_id: entry_id,
+                session_id,
                 commit: &commit,
                 remote: &journal.remote_base.remote,
                 remote_ref: &journal.remote_base.default_branch_ref,
@@ -997,11 +1019,13 @@ fn create_preservation_refs(
     Ok(())
 }
 
-/// Make the reviewed remote default branch the one sessions are cut from and
-/// verified against. A clone records `refs/remotes/<remote>/HEAD`; a
-/// repository that never had it would otherwise fall back to its local
-/// default branch, which may be stale, or to the integration branch, which
-/// enrollment no longer prepares. An existing value is left alone.
+/// Make sure submit has a fetched default branch to verify against. The
+/// session is cut from the reviewed base explicitly, but a non-promoting
+/// submit finds its base through `refs/remotes/<remote>/HEAD`; without it, it
+/// falls back to the integration branch and would create it. A clone records
+/// the pointer, so this only fills a missing one. An existing value is left
+/// alone: if it names another branch, the gated tree differs from the
+/// enrollment commit's tree and publication refuses rather than pushing.
 fn ensure_remote_head(
     repo: &aethyme_broker::GitRepo,
     main_root: &Path,
@@ -1027,6 +1051,48 @@ fn ensure_remote_head(
     )
 }
 
+/// An older binary at the `promoted` phase recorded its promotion commit as
+/// `publication_sha` and may have pushed it before crashing. When the remote
+/// default branch names that commit, it counts as this enrollment's
+/// publication only if it is exactly the reviewed base plus the verified
+/// enrollment tree. Anything else refuses with the evidence; nothing is
+/// pushed either way.
+fn legacy_promotion_on_remote(
+    repo: &aethyme_broker::GitRepo,
+    main_root: &Path,
+    journal: &EnrollmentJournal,
+    commit: &str,
+) -> Result<Option<String>, String> {
+    let Some(promotion) = journal.publication_sha.as_deref() else {
+        return Ok(None);
+    };
+    if journal.phase != EnrollmentPhase::Promoted || promotion == commit {
+        return Ok(None);
+    }
+    let advertised = repo
+        .remote_default_branch(&journal.remote_base.remote)
+        .map_err(|error| format!("revalidate enrollment upstream: {error}"))?;
+    if advertised.sha != promotion {
+        return Ok(None);
+    }
+    let first_parent = git_output(main_root, &["rev-parse", &format!("{promotion}^1")]).ok();
+    let same_tree = git_output(main_root, &["rev-parse", &format!("{promotion}^{{tree}}")])
+        .ok()
+        .zip(git_output(main_root, &["rev-parse", &format!("{commit}^{{tree}}")]).ok())
+        .is_some_and(|(left, right)| left == right);
+    if first_parent.as_deref() == Some(journal.remote_base.exact_sha.as_str()) && same_tree {
+        return Ok(Some(promotion.to_string()));
+    }
+    Err(format!(
+        "the remote default branch is at {promotion}, which an older Aethyme version recorded as this \
+         enrollment's promotion commit, but it is not exactly the reviewed base {} plus the verified \
+         enrollment tree of {commit}; nothing was pushed. Inspect it with `git log --oneline {}..{promotion}` \
+         and `git diff {commit} {promotion}`, finish the enrollment with the Aethyme version that started it, \
+         or repair the remote and regenerate `aethyme deploy plan --repo .`",
+        journal.remote_base.exact_sha, journal.remote_base.exact_sha
+    ))
+}
+
 /// Run submit's gates on the exact enrollment commit without promoting it,
 /// and return the queue entry that vouches for it.
 fn verify_enrollment_commit(
@@ -1049,7 +1115,7 @@ fn verify_enrollment_commit(
         ));
     }
     let vouched = broker
-        .entry_vouching_for_commit(outcome.entry.id, commit)
+        .entry_vouching_for_commit(outcome.entry.id, session_id, commit)
         .map_err(|error| format!("inspect enrollment queue entry: {error}"))?;
     if vouched.is_none() {
         return Err(format!(

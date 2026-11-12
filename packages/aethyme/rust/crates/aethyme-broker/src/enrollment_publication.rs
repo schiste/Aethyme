@@ -9,8 +9,12 @@
 //! integration branch.
 //!
 //! What the push keeps from that path:
-//! - the queue entry must vouch for the exact commit: same head, a verified
-//!   status, and a gated tree identical to the commit's tree;
+//! - the queue entry must vouch for the exact commit: same session, same
+//!   head, a verified status, and a gated tree identical to the commit's tree;
+//! - the commit must be a single commit on top of the reviewed remote base:
+//!   exactly one parent, and that parent is the base. Otherwise a fast-forward
+//!   push could carry commits the plan never reviewed (the old path refused
+//!   unrecorded commits between the remote tip and the publication);
 //! - the `[publication]` policy committed on the reviewed remote base is
 //!   honoured, and a `review_gated` policy refuses before anything is fetched;
 //! - remote freshness is refreshed through the operation coordinator, and the
@@ -36,6 +40,8 @@ use crate::types::{MergeQueueEntry, MergeStatus, OperationEffect, OperationProvi
 pub struct EnrollmentPublicationRequest<'a> {
     /// Queue entry whose verification vouches for `commit`.
     pub queue_entry_id: i64,
+    /// Session that must own that queue entry.
+    pub session_id: i64,
     /// Exact commit to publish (full SHA).
     pub commit: &'a str,
     /// Remote name, such as `origin`.
@@ -59,12 +65,14 @@ pub struct EnrollmentPublication {
 
 impl Broker {
     /// The queue entry `entry_id` when its verification vouches for exactly
-    /// `commit`: it exists, is verified (or was promoted by an older binary),
-    /// records `commit` as its head, and its gated tree is `commit`'s tree.
-    /// `None` when any of that does not hold; nothing is changed either way.
+    /// `commit`: it exists, belongs to `session_id`, is verified (or was
+    /// promoted by an older binary), records `commit` as its head, and its
+    /// gated tree is `commit`'s tree. `None` when any of that does not hold;
+    /// nothing is changed either way.
     pub fn entry_vouching_for_commit(
         &mut self,
         entry_id: i64,
+        session_id: i64,
         commit: &str,
     ) -> Result<Option<MergeQueueEntry>, BrokerOpError> {
         let Some(entry) = self
@@ -76,6 +84,7 @@ impl Broker {
             return Ok(None);
         };
         if !matches!(entry.status, MergeStatus::Verified | MergeStatus::Promoted)
+            || entry.session_id != session_id
             || entry.head_commit != commit
         {
             return Ok(None);
@@ -100,7 +109,7 @@ impl Broker {
             return Err(BrokerOpError::ShipConfirmationNotFullSha);
         }
         let entry = self
-            .entry_vouching_for_commit(request.queue_entry_id, commit)?
+            .entry_vouching_for_commit(request.queue_entry_id, request.session_id, commit)?
             .ok_or_else(|| BrokerOpError::ShipPlanUnavailable {
                 what: "verified enrollment commit",
                 reason: format!(
@@ -109,15 +118,34 @@ impl Broker {
                 ),
             })?;
 
+        // Exactly the reviewed base plus this one commit may be published.
+        let parents = self.repo_handle().commit_parents(commit)?;
+        if parents.as_slice() != [request.planned_base.to_string()] {
+            return Err(BrokerOpError::ShipPlanUnavailable {
+                what: "reviewed enrollment base",
+                reason: format!(
+                    "enrollment commit {commit} has parent(s) [{}], not exactly the reviewed remote base {}; \
+                     publishing it would carry unreviewed commits. Nothing was fetched or pushed; \
+                     regenerate `aethyme deploy plan --repo .`",
+                    parents.join(", "),
+                    request.planned_base
+                ),
+            });
+        }
+
         // The policy committed on the reviewed remote base decides, never the
         // candidate: an enrollment commit cannot authorize its own push.
         let policy = publication_policy_at(self, request.planned_base)?;
         if policy.mode != ShipPublicationMode::Direct {
             return Err(BrokerOpError::ShipPublicationPolicy {
-                reason: "the enrollment commit is not covered by review evidence".into(),
-                remediation:
-                    "complete and unlock review for every included session, then rebuild the publication plan"
-                        .into(),
+                reason: "first enrollment publishes directly, and the remote default branch's \
+                         [publication] policy is review_gated"
+                    .into(),
+                remediation: "land the enrollment through a reviewed pull request instead: commit \
+                              the changes `aethyme deploy plan --repo . --diff` shows on a branch \
+                              and open a pull request, or commit `[publication] mode = \"direct\"` \
+                              on the default branch and plan again"
+                    .into(),
             });
         }
 
