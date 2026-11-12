@@ -712,14 +712,25 @@ impl Broker {
             .as_deref()
             .is_none_or(|known| known == head || repo.is_ancestor(known, &head));
         let (args, effect) = if fast_forward {
-            (
+            // The strict spelling holds only this branch's lane (and its one
+            // tracking ref), so pushes of different session branches do not
+            // queue behind each other. A repository whose configuration
+            // cannot prove that footprint keeps the repository-wide spelling.
+            let strict = crate::operations::strict_push_args(&default.remote, &head, &branch_ref);
+            let args = if crate::operations::session_branch_push_lane_available(
+                self.main_root(),
+                session_worktree,
+                &strict,
+            ) {
+                strict
+            } else {
                 vec![
                     "push".to_string(),
                     default.remote.clone(),
                     format!("{head}:{branch_ref}"),
-                ],
-                OperationEffect::Write,
-            )
+                ]
+            };
+            (args, OperationEffect::Write)
         } else if let Some(pushed) = recorded.as_deref() {
             (
                 vec![

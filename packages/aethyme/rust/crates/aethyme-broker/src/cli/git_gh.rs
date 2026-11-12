@@ -301,6 +301,13 @@ pub(super) fn render_operation_stats(report: &crate::OperationStats) {
         format_optional_ms(report.unrelated_contention.max_queue_wait_ms),
     );
     out!(
+        "  narrow lanes: {} samples ({} session branch)",
+        report.narrow_lanes.sample_count,
+        report.narrow_lanes.session_branch_sample_count,
+    );
+    render_timing_distribution("    narrow lock hold", &report.narrow_lanes.lock_hold_ms);
+    render_timing_distribution("    narrow queue wait", &report.narrow_lanes.queue_wait_ms);
+    out!(
         "  hooks outside lock: {} samples",
         report.hooks_outside_lock.sample_count
     );

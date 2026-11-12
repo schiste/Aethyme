@@ -675,6 +675,62 @@ fn anything_not_provably_resource_scoped_stays_repository_wide() {
     );
 }
 
+/// `pr edit <n>` and `pr ready <n>` change one pull request and no ref, so two
+/// pull requests take two lanes; a base change, or a selector that is not the
+/// first operand, keeps the repository lane.
+#[test]
+fn pull_request_edits_take_their_own_lane_only_when_the_number_is_certain() {
+    assert_eq!(
+        scope(&["pr", "edit", "7", "--title", "x"]).as_deref(),
+        Some("pull/7")
+    );
+    assert_eq!(scope(&["pr", "ready", "7"]).as_deref(), Some("pull/7"));
+    assert_eq!(
+        scope(&["pr", "ready", "7", "--undo"]).as_deref(),
+        Some("pull/7")
+    );
+    let repo = "github.com/o/r";
+    assert_ne!(
+        coordination_lock_key(repo, scope(&["pr", "edit", "7"]).as_deref()),
+        coordination_lock_key(repo, scope(&["pr", "edit", "8"]).as_deref()),
+        "edits of two pull requests must not share a lock"
+    );
+    assert!(!git_scopes::scopes_conflict(
+        OperationProvider::Github,
+        Some("pull/7"),
+        Some("pull/8")
+    ));
+    for wide in [
+        &["pr", "edit", "7", "--base", "release"][..],
+        &["pr", "edit", "7", "--base=release"],
+        &["pr", "edit", "7", "-Brelease"],
+        &["pr", "edit", "--title", "5", "6"],
+        &["pr", "edit"],
+        &["pr", "edit", "+7"],
+        &["pr", "edit", "07"],
+        &["pr", "edit", "agent/branch"],
+        &["pr", "edit", "https://github.com/o/r/pull/7"],
+        &["pr", "ready"],
+        &["pr", "create", "--head", "agent/a", "--title", "t"],
+    ] {
+        assert_eq!(scope(wide), None, "{wide:?}");
+    }
+    // The journaled spelling recomputes to the same lane after a restart, so a
+    // running edit is never mistaken for a repository-wide write.
+    let stored: Vec<String> = serde_json::from_str(
+        &redacted_command(
+            OperationProvider::Github,
+            &gh(&["pr", "edit", "7", "--body", "private", "--title", "t"]),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        resource_lock_scope(OperationProvider::Github, &stored[1..]).as_deref(),
+        Some("pull/7")
+    );
+}
+
 /// Repository-wide operations keep the bare canonical key, so #166's
 /// "one repository, one lock" is untouched for anything touching a ref.
 #[test]
@@ -2485,8 +2541,14 @@ fn exact_fetch_profile_validates_git_config_and_observes_exact_refs() {
     let (root, target) = push_fixture();
     let args = git_scopes::canonical_fetch_args("origin", "main").unwrap();
     let deadline = AdmissionDeadline::start(QueueWait::Seconds(10));
-    git_scopes::validate_repository(root.path(), &args, deadline, &target.coordination_key)
-        .unwrap();
+    git_scopes::validate_repository(
+        root.path(),
+        &args,
+        deadline,
+        &target.coordination_key,
+        false,
+    )
+    .unwrap();
     let oid = crate::GitRepo::discover(root.path())
         .unwrap()
         .resolve_ref("HEAD")
@@ -2529,8 +2591,14 @@ fn exact_fetch_profile_validates_git_config_and_observes_exact_refs() {
         .unwrap();
     assert!(output.status.success());
     assert!(
-        git_scopes::validate_repository(root.path(), &args, deadline, &target.coordination_key)
-            .is_err(),
+        git_scopes::validate_repository(
+            root.path(),
+            &args,
+            deadline,
+            &target.coordination_key,
+            false
+        )
+        .is_err(),
         "a second expanding refmap must force the wide lane"
     );
 }
@@ -2549,12 +2617,132 @@ fn effective_hooks_path_allows_irrelevant_pre_push_but_refuses_reference_transac
     assert!(config.status.success());
     let args = git_scopes::canonical_fetch_args("origin", "main").unwrap();
     let deadline = AdmissionDeadline::start(QueueWait::Seconds(10));
-    git_scopes::validate_repository(root.path(), &args, deadline, &target.coordination_key)
-        .unwrap();
+    git_scopes::validate_repository(
+        root.path(),
+        &args,
+        deadline,
+        &target.coordination_key,
+        false,
+    )
+    .unwrap();
     std::fs::write(hooks.join("reference-transaction"), "#!/bin/sh\nexit 0\n").unwrap();
     assert!(
-        git_scopes::validate_repository(root.path(), &args, deadline, &target.coordination_key)
-            .is_err()
+        git_scopes::validate_repository(
+            root.path(),
+            &args,
+            deadline,
+            &target.coordination_key,
+            false
+        )
+        .is_err()
+    );
+}
+
+/// A strict push to a configured remote name is widened by a pre-push hook
+/// only when the push is not the caller's own session branch (or the
+/// repository opted out); a mirror or push URL always widens it, while a fetch
+/// ignores both.
+#[test]
+fn strict_named_push_profile_follows_session_hooks_and_push_configuration() {
+    let (root, target) = push_fixture();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(root.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+    };
+    let hooks = root.path().join("custom-hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    std::fs::write(hooks.join("pre-push"), "#!/bin/sh\nexit 0\n").unwrap();
+    git(&["config", "core.hooksPath", "custom-hooks"]);
+    let push = git_scopes::strict_push_args("origin", &"c".repeat(40), "refs/heads/agent/a");
+    let fetch = git_scopes::canonical_fetch_args("origin", "main").unwrap();
+    let deadline = AdmissionDeadline::start(QueueWait::Seconds(10));
+    let key = &target.coordination_key;
+    assert!(git_scopes::validate_repository(root.path(), &push, deadline, key, false).is_err());
+    git_scopes::validate_repository(root.path(), &push, deadline, key, true).unwrap();
+    git(&[
+        "config",
+        "remote.origin.pushurl",
+        "https://example.test/other.git",
+    ]);
+    assert!(git_scopes::validate_repository(root.path(), &push, deadline, key, true).is_err());
+    git_scopes::validate_repository(root.path(), &fetch, deadline, key, false).unwrap();
+    git(&["config", "--unset", "remote.origin.pushurl"]);
+    git(&["config", "remote.origin.mirror", "true"]);
+    assert!(git_scopes::validate_repository(root.path(), &push, deadline, key, true).is_err());
+    git_scopes::validate_repository(root.path(), &fetch, deadline, key, false).unwrap();
+}
+
+/// Only a commit in the session's own linked worktree, on the session's own
+/// branch, without a `reference-transaction` hook, proves a branch lane. The
+/// main checkout (plain cwd, no `-C`) stays repository-wide.
+#[test]
+fn session_commit_profile_refuses_the_main_checkout_and_reference_transaction_hooks() {
+    let root = tempfile::tempdir().unwrap();
+    let main = root.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    let git = |cwd: &Path, args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+    };
+    git(&main, &["init", "-q", "-b", "main"]);
+    git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    let linked = root.path().join("linked");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/a",
+            linked.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let deadline = AdmissionDeadline::start(QueueWait::Seconds(10));
+    let check = |cwd: &Path, worktree: &Path, branch: &str| {
+        git_scopes::validate_session_commit(cwd, &main, worktree, branch, deadline, "local:test")
+    };
+    assert_eq!(
+        check(&linked, &linked, "agent/a").unwrap(),
+        "refs/heads/agent/a"
+    );
+    assert!(check(&main, &main, "main").is_err(), "main checkout");
+    assert!(
+        check(&main, &linked, "agent/a").is_err(),
+        "plain cwd in main"
+    );
+    assert!(
+        check(&linked, &linked, "agent/b").is_err(),
+        "foreign branch"
+    );
+    let hooks = root.path().join("hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    std::fs::write(hooks.join("pre-commit"), "#!/bin/sh\nexit 0\n").unwrap();
+    git(
+        &main,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+    assert!(
+        check(&linked, &linked, "agent/a").is_ok(),
+        "a pre-commit hook alone keeps the branch lane"
+    );
+    std::fs::write(hooks.join("reference-transaction"), "#!/bin/sh\nexit 0\n").unwrap();
+    assert!(
+        check(&linked, &linked, "agent/a").is_err(),
+        "a reference-transaction hook widens a commit like a fetch or push"
     );
 }
 
@@ -2589,7 +2777,8 @@ fn strict_profiles_refuse_effective_url_rewrites() {
             root.path(),
             &args,
             AdmissionDeadline::start(QueueWait::Seconds(10)),
-            &target.coordination_key
+            &target.coordination_key,
+            false,
         )
         .is_err()
     );

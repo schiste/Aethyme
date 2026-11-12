@@ -500,6 +500,65 @@ for secret scanning or signing checks is choosing to run those in the dry run
 alone. Enable it when the hook's cost is the constraint and its checks are
 deterministic over the same commits.
 
+### Session-branch lanes
+
+Most coordinated writes share one repository-wide lane, so they serialise.
+Two kinds of session-local write hold only their branch's lane instead, so a
+slow hook in one session no longer stalls every other session's push:
+
+- `aethyme broker advanced git --session <id> -- commit ...` when the broker
+  proves the commit is confined to that session: it runs in the session's own
+  linked worktree, `HEAD` is the session's own branch, there are no leading
+  global options (`-C`, `-c`, `--git-dir`) and no caller-declared `--scope`.
+  The repository's commit hooks still run, and they run inside this lane. A
+  `reference-transaction` hook keeps the commit repository-wide, as it does
+  for fetches and pushes.
+- `aethyme broker push` of a session branch, which now spells the push as
+  `git push --no-follow-tags --porcelain -- <remote> <sha>:refs/heads/<branch>`
+  when the repository's configuration proves that footprint (standard fetch
+  refmaps, no mirror or push URL, no URL rewrites, extensions, custom ssh
+  command or shallow clone). Such a push also locks the one tracking ref it
+  updates, `refs/remotes/<remote>/<branch>`. A repository that fails the check,
+  or sets `push.followTags` (the strict spelling passes `--no-follow-tags`),
+  keeps the old spelling and the repository-wide lane. The `pre-push` hook is
+  handled exactly as before, inside the push, or before the lock with
+  `hooks_outside_lock`. Any strict fetch or push spelling typed explicitly
+  through `broker advanced git` narrows only when that check passes;
+  otherwise it runs repository-wide and is journaled with scope `repository`.
+
+`gh pr edit <n>` and `gh pr ready <n>` with a plain number as the first operand
+take the lane `pull/<n>`, so edits of two pull requests do not contend. A base
+change (`--base`/`-B`) and any other selector stay repository-wide.
+
+A commit and a push of the same branch still serialise, and so do two pushes of
+the same branch. A repository-wide write still excludes every lane, and it is
+not starved by them: before polling for its lanes it holds a wide-intent lock,
+which every new narrow Git writer must pass, so no new narrow writer starts
+while a wide one waits. The wait is recorded as `wide_intent_wait_ms` in the
+operation's `coordination_timing`. An
+operation left `outcome_unknown` blocks the operations it would have serialised
+with: a session-branch commit or push blocks that branch's lane and every
+repository-wide write, but not another session's branch. A repository-wide
+unknown write blocks everything, as before.
+
+Git's own lock files protect what these writes share: the object database,
+`packed-refs` and `gc --auto`. This lane does not protect anything a hook does
+outside the branch. A repository whose commit or push hooks write other
+branches, tags or `refs/stash`, or change other shared repository state, opts
+out:
+
+```toml
+# .aethyme/config.toml
+[coordination]
+session_hooks_hold_repository_lock = true
+```
+
+With it set, every coordinated `commit` takes the repository-wide lane again.
+A session push does too whenever a `pre-push` hook exists (a
+`reference-transaction` hook widens it either way). Leave it off when hooks only check the commit (formatting, lint, tests,
+secret scans). Turn it on when a hook mutates repository state outside the
+branch being committed or pushed.
+
 ### Measuring whether repository locking is still the bottleneck
 
 Before designing a finer ref lock, inspect the bounded timing window:
@@ -510,7 +569,11 @@ aethyme broker advanced operations stats --repo github.com/org/repo --json
 
 The report includes p50 and p99 lock-hold and queue-wait durations by
 operation kind, queue depth, the subset that ran with `hooks_outside_lock`,
-and waits where both sides named disjoint known scopes. Rows written before
+the subset that held a resource lane (`narrow_lanes`, with the session-branch
+commits and pushes counted separately), and waits where both sides named
+disjoint known scopes. A session commit or push names its branch, so two
+session pushes of different branches that still queued on one key count as
+unrelated contention. Rows written before
 timing instrumentation are counted as unmeasured rather than reconstructed
 from wall-clock timestamps. Repository-wide or provider-unknown targets stay
 out of the unrelated-wait count because the broker cannot safely infer that

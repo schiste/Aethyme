@@ -3371,3 +3371,697 @@ fn ambiguous_remote_identity_refuses_wide_and_scoped_writes_before_journaling() 
         assert_eq!(host_rows(), host_rows_before);
     }
 }
+
+/// Session-branch lanes. A commit confined to its session's own worktree and
+/// branch, and a strict push of a session branch, hold only that branch's lane
+/// (plus the shared compatibility lanes), so a slow hook in one session does
+/// not stall another session's push. Every test here is ordered by files the
+/// test controls and by `QueueWait::Refuse`, never by elapsed time: an
+/// operation that would have to wait fails immediately with
+/// `CoordinatedLockBusy`.
+#[cfg(unix)]
+struct LaneFixture {
+    storage: common::FixtureRepository,
+    remote: std::path::PathBuf,
+    broker: Broker,
+    worktrees: Vec<std::path::PathBuf>,
+    sessions: Vec<i64>,
+    branches: Vec<String>,
+}
+
+#[cfg(unix)]
+impl LaneFixture {
+    fn new(names: &[&str]) -> Self {
+        let storage = common::FixtureRepository::new();
+        let repo = storage.path().to_path_buf();
+        init_repo(&repo);
+        git(&repo, &["config", "user.name", "t"]);
+        git(&repo, &["config", "user.email", "t@t"]);
+        let remote = storage.owner_path().join("remote.git");
+        git(
+            storage.owner_path(),
+            &["init", "--bare", "-q", remote.to_str().unwrap()],
+        );
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-q", "origin", "main"]);
+        let worktrees: Vec<_> = names.iter().map(|name| add_worktree(&repo, name)).collect();
+        let mut broker = common::open_fixture_repository_broker(&storage)
+            .unwrap()
+            .into_broker();
+        let adopted: Vec<_> = worktrees
+            .iter()
+            .map(|worktree| broker.adopt(worktree, None).unwrap())
+            .collect();
+        Self {
+            storage,
+            remote,
+            broker,
+            worktrees,
+            sessions: adopted.iter().map(|session| session.id).collect(),
+            branches: adopted.into_iter().map(|session| session.branch).collect(),
+        }
+    }
+
+    fn repo(&self) -> &Path {
+        self.storage.path()
+    }
+
+    fn hooks(&self) -> std::path::PathBuf {
+        let hooks = self.repo().join(".aethyme/test-hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hooks = hooks.canonicalize().unwrap();
+        git(
+            self.repo(),
+            &["config", "core.hooksPath", hooks.to_str().unwrap()],
+        );
+        hooks
+    }
+
+    fn opt_out(&self) {
+        let config = self.repo().join(".aethyme/config.toml");
+        let existing = std::fs::read_to_string(&config).unwrap_or_default();
+        std::fs::write(
+            &config,
+            format!("{existing}\n[coordination]\nsession_hooks_hold_repository_lock = true\n"),
+        )
+        .unwrap();
+    }
+
+    fn stage(&self, index: usize, contents: &str) {
+        let worktree = &self.worktrees[index];
+        std::fs::write(worktree.join("tracked.txt"), contents).unwrap();
+        git(worktree, &["add", "tracked.txt"]);
+    }
+
+    /// Commit with plain Git, outside the broker, and return the new head.
+    fn commit_plain(&self, index: usize, contents: &str) -> String {
+        self.stage(index, contents);
+        let worktree = &self.worktrees[index];
+        git(worktree, &["commit", "-qm", contents.trim()]);
+        git_output(worktree, &["rev-parse", "HEAD"])
+    }
+
+    fn branch(&self, index: usize) -> String {
+        self.branches[index].clone()
+    }
+
+    fn strict_push(&self, index: usize, sha: &str, branch: &str) -> CoordinatedCommand {
+        let refspec = format!("{sha}:refs/heads/{branch}");
+        let mut command = request(
+            self.sessions[index],
+            &[
+                "push",
+                "--no-follow-tags",
+                "--porcelain",
+                "--",
+                "origin",
+                &refspec,
+            ],
+        );
+        command.resolved_target = Some(
+            GitRepo::discover(&self.worktrees[index])
+                .unwrap()
+                .resolve_remote_target("origin", None)
+                .unwrap(),
+        );
+        command
+    }
+
+    /// Run `command` through a second broker handle on its own thread, the way
+    /// a concurrent session's process would.
+    fn spawn(
+        &self,
+        command: CoordinatedCommand,
+    ) -> std::thread::JoinHandle<Result<aethyme_broker::CoordinatedOperationReport, BrokerOpError>>
+    {
+        let repo = self.repo().to_path_buf();
+        std::thread::spawn(move || {
+            let mut broker = common::open_fixture_repository_path_broker(&repo)
+                .unwrap()
+                .into_broker();
+            broker.run_coordinated_operation(command)
+        })
+    }
+
+    fn try_now(
+        &mut self,
+        command: CoordinatedCommand,
+    ) -> Result<aethyme_broker::CoordinatedOperationReport, BrokerOpError> {
+        self.broker
+            .run_coordinated_operation_with_wait(command, QueueWait::Refuse)
+    }
+
+    fn operation_with_scope(&mut self, scope: &str) -> aethyme_broker::CoordinatedOperation {
+        self.broker
+            .store()
+            .coordinated_operations()
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|operation| operation.scope == scope)
+            .unwrap_or_else(|| panic!("no operation journaled with scope {scope}"))
+    }
+}
+
+/// A hook that blocks only in the worktree whose path contains `marker`, until
+/// the test creates the release file. Dropping the gate releases it, so a
+/// failed assertion cannot leave a hook (and its thread) waiting.
+#[cfg(unix)]
+struct HookGate {
+    started: std::path::PathBuf,
+    release: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl HookGate {
+    fn install(hooks: &Path, hook: &str, marker: &str) -> Self {
+        let started = hooks.join(format!("{hook}.started"));
+        let release = hooks.join(format!("{hook}.release"));
+        write_executable(
+            &hooks.join(hook),
+            &format!(
+                "#!/bin/sh\ncase \"$PWD\" in\n  *{marker}*)\n    : > {started}\n    i=0\n    \
+                 while [ ! -f {release} ] && [ \"$i\" -lt 12000 ]; do sleep 0.05; i=$((i+1)); done\n    \
+                 ;;\nesac\nexit 0\n",
+                started = shell_path(&started),
+                release = shell_path(&release),
+            ),
+        );
+        Self { started, release }
+    }
+
+    /// Wait for the hook to be running. The bound only turns a hang into a
+    /// failure; a passing run never approaches it.
+    fn wait_started(&self) {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        while !self.started.exists() {
+            assert!(Instant::now() < deadline, "the gated hook never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn release(&self) {
+        std::fs::write(&self.release, "").unwrap();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HookGate {
+    fn drop(&mut self) {
+        std::fs::write(&self.release, "").ok();
+    }
+}
+
+#[cfg(unix)]
+fn assert_lock_busy(
+    result: Result<aethyme_broker::CoordinatedOperationReport, BrokerOpError>,
+    what: &str,
+) {
+    match result {
+        Err(BrokerOpError::CoordinatedLockBusy { .. }) => {}
+        other => panic!("{what} must wait for the held lane: {other:?}"),
+    }
+}
+
+/// The measured stall: a commit's pre-commit hook held the repository lane for
+/// up to 161 s, and every other session's push queued behind it.
+#[cfg(unix)]
+#[test]
+fn a_session_commit_hook_does_not_hold_another_sessions_push() {
+    let mut fx = LaneFixture::new(&["commit-held", "push-free"]);
+    let gate = HookGate::install(&fx.hooks(), "pre-commit", "commit-held");
+    let held_branch = fx.branch(0);
+    let free_branch = fx.branch(1);
+    let held_base = git_output(&fx.worktrees[0], &["rev-parse", "HEAD"]);
+    fx.stage(0, "held\n");
+    let committing = fx.spawn(request(fx.sessions[0], &["commit", "-qm", "held"]));
+    gate.wait_started();
+
+    let sha = fx.commit_plain(1, "free\n");
+    let push = fx.strict_push(1, &sha, &free_branch);
+    let pushed = fx.try_now(push);
+    // A wide write still waits for the commit's shared compatibility lane...
+    let wide = fx.try_now(request(fx.sessions[1], &["branch", "wide-probe"]));
+    // ...and so does a push of the committing branch itself.
+    let same_branch = fx.strict_push(0, &held_base, &held_branch);
+    let same_branch = fx.try_now(same_branch);
+    let running = fx.operation_with_scope(&format!("session-commit:refs/heads/{held_branch}"));
+    gate.release();
+    let committed = committing.join().unwrap();
+
+    let pushed = pushed.expect("another session's push must not wait for the commit hook");
+    assert!(pushed.ok());
+    assert!(remote_has_branch(&fx.remote, &free_branch));
+    assert_lock_busy(wide, "a repository-wide write");
+    assert_lock_busy(same_branch, "a push of the committing branch");
+    assert_eq!(
+        running.status,
+        OperationStatus::Running,
+        "nothing that arrived while the commit ran may mark it unknown"
+    );
+    let committed = committed.expect("the held commit completes once released");
+    assert!(committed.ok());
+    let finished = fx
+        .broker
+        .store()
+        .coordinated_operation(running.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(finished.status, OperationStatus::Succeeded);
+}
+
+/// The repository-wide opt-out restores the historical lane for commits: the
+/// same push now has to wait for the commit hook.
+#[cfg(unix)]
+#[test]
+fn the_opt_out_restores_the_repository_lane_for_commits() {
+    let mut fx = LaneFixture::new(&["commit-wide", "push-waits"]);
+    fx.opt_out();
+    let gate = HookGate::install(&fx.hooks(), "pre-commit", "commit-wide");
+    let free_branch = fx.branch(1);
+    fx.stage(0, "wide\n");
+    let committing = fx.spawn(request(fx.sessions[0], &["commit", "-qm", "wide"]));
+    gate.wait_started();
+
+    let sha = fx.commit_plain(1, "waits\n");
+    let push = fx.strict_push(1, &sha, &free_branch);
+    let pushed = fx.try_now(push);
+    gate.release();
+    let committed = committing.join().unwrap().expect("commit completes");
+
+    assert_lock_busy(pushed, "a push behind an opted-out commit");
+    assert!(committed.ok());
+    assert_eq!(committed.operation.scope, "repository");
+}
+
+/// Two sessions pushing different branches do not wait on each other, even
+/// while one push's pre-push hook runs; two pushes of one branch still do.
+#[cfg(unix)]
+#[test]
+fn pushes_of_different_session_branches_do_not_serialise_but_one_branch_does() {
+    let mut fx = LaneFixture::new(&["push-held", "push-other"]);
+    let gate = HookGate::install(&fx.hooks(), "pre-push", "push-held");
+    let held_branch = fx.branch(0);
+    let other_branch = fx.branch(1);
+    let base = git_output(&fx.worktrees[0], &["rev-parse", "HEAD"]);
+    let held_sha = fx.commit_plain(0, "held\n");
+    let held = fx.strict_push(0, &held_sha, &held_branch);
+    let pushing = fx.spawn(held);
+    gate.wait_started();
+
+    let other_sha = fx.commit_plain(1, "other\n");
+    let other = fx.strict_push(1, &other_sha, &other_branch);
+    let other = fx.try_now(other);
+    let same = fx.strict_push(0, &base, &held_branch);
+    let same = fx.try_now(same);
+    gate.release();
+    let held = pushing.join().unwrap().expect("held push completes");
+
+    let other = other.expect("a different branch's push must not wait");
+    assert!(other.ok());
+    assert_lock_busy(same, "a second push of the same branch");
+    assert!(held.ok());
+    assert!(remote_has_branch(&fx.remote, &held_branch));
+    assert!(remote_has_branch(&fx.remote, &other_branch));
+}
+
+/// Unknown outcomes keep blocking exactly where the operations would have
+/// serialised. A session-branch commit left unknown blocks its own branch and
+/// every repository-wide write, but not another session's branch; an unknown
+/// repository-wide write still blocks everything, narrow lanes included.
+#[cfg(unix)]
+#[test]
+fn unknown_outcomes_block_their_own_lane_and_wide_writes_block_everything() {
+    let mut fx = LaneFixture::new(&["wedged", "neighbour"]);
+    let wedged_branch = fx.branch(0);
+    let neighbour_branch = fx.branch(1);
+    let base = git_output(&fx.worktrees[0], &["rev-parse", "HEAD"]);
+    fx.stage(0, "wedged\n");
+    let commit = fx
+        .try_now(request(fx.sessions[0], &["commit", "-qm", "wedged"]))
+        .unwrap();
+    assert_eq!(
+        commit.operation.scope,
+        format!("session-commit:refs/heads/{wedged_branch}")
+    );
+    let wedged = commit.operation.id;
+    fx.broker
+        .store()
+        .transition_coordinated_operation(wedged, OperationStatus::OutcomeUnknown, None, None)
+        .unwrap();
+
+    let blocked_by = |result: Result<_, BrokerOpError>, id: i64, what: &str| match result {
+        Err(BrokerOpError::CoordinatedOperationBlocked { operation_id, .. }) => {
+            assert_eq!(operation_id, id, "{what}")
+        }
+        other => panic!("{what} must be blocked by {id}: {other:?}"),
+    };
+    let same_branch = fx.strict_push(0, &base, &wedged_branch);
+    blocked_by(
+        fx.try_now(same_branch),
+        wedged,
+        "a push of the wedged branch",
+    );
+    blocked_by(
+        fx.try_now(request(fx.sessions[1], &["branch", "wide-after-commit"])),
+        wedged,
+        "a repository-wide write",
+    );
+    let sha = fx.commit_plain(1, "neighbour\n");
+    let neighbour = fx.strict_push(1, &sha, &neighbour_branch);
+    assert!(
+        fx.try_now(neighbour)
+            .expect("another session's branch is not blocked")
+            .ok()
+    );
+    fx.stage(1, "neighbour commit\n");
+    let neighbour_commit = fx
+        .try_now(request(
+            fx.sessions[1],
+            &["commit", "-qm", "neighbour commit"],
+        ))
+        .expect("another session's commit is not blocked");
+    assert!(neighbour_commit.ok());
+    fx.broker
+        .reconcile_coordinated_operation(wedged, false, "test inspected the branch")
+        .unwrap();
+
+    // An unknown repository-wide write blocks narrow lanes exactly as before.
+    let wide = fx
+        .try_now(request(fx.sessions[1], &["branch", "wide-wedge"]))
+        .unwrap();
+    assert_eq!(wide.operation.scope, "repository");
+    fx.broker
+        .store()
+        .transition_coordinated_operation(
+            wide.operation.id,
+            OperationStatus::OutcomeUnknown,
+            None,
+            None,
+        )
+        .unwrap();
+    let head = git_output(&fx.worktrees[1], &["rev-parse", "HEAD"]);
+    let neighbour = fx.strict_push(1, &head, &neighbour_branch);
+    blocked_by(
+        fx.try_now(neighbour),
+        wide.operation.id,
+        "a session-branch push",
+    );
+    fx.stage(1, "after wide\n");
+    blocked_by(
+        fx.try_now(request(fx.sessions[1], &["commit", "-qm", "after wide"])),
+        wide.operation.id,
+        "a session-branch commit",
+    );
+}
+
+/// Only a commit proven to run in the session's own linked worktree on the
+/// session's own branch narrows. The main checkout, a detached HEAD, another
+/// branch, or a declared scope keep the repository-wide lane, and a caller
+/// cannot declare the reserved scope itself.
+#[cfg(unix)]
+#[test]
+fn commits_not_confined_to_the_session_branch_keep_the_repository_lane() {
+    let mut fx = LaneFixture::new(&["confined"]);
+    let main = fx.repo().to_str().unwrap().to_string();
+    let worktree = fx.worktrees[0].clone();
+    let branch = fx.branch(0);
+
+    let main_checkout = fx
+        .try_now(request(
+            fx.sessions[0],
+            &[
+                "-C",
+                &main,
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "main checkout",
+            ],
+        ))
+        .unwrap();
+    assert_eq!(main_checkout.operation.scope, "repository");
+
+    git(&worktree, &["checkout", "-q", "-b", "agent/elsewhere"]);
+    let elsewhere = fx
+        .try_now(request(
+            fx.sessions[0],
+            &["commit", "--allow-empty", "-qm", "other branch"],
+        ))
+        .unwrap();
+    assert_eq!(elsewhere.operation.scope, "repository");
+
+    git(&worktree, &["checkout", "-q", "--detach"]);
+    let detached = fx
+        .try_now(request(
+            fx.sessions[0],
+            &["commit", "--allow-empty", "-qm", "detached"],
+        ))
+        .unwrap();
+    assert_eq!(detached.operation.scope, "repository");
+
+    git(&worktree, &["checkout", "-q", &branch]);
+    let confined = fx
+        .try_now(request(
+            fx.sessions[0],
+            &["commit", "--allow-empty", "-qm", "confined"],
+        ))
+        .unwrap();
+    assert_eq!(
+        confined.operation.scope,
+        format!("session-commit:refs/heads/{branch}")
+    );
+
+    let mut declared = request(
+        fx.sessions[0],
+        &["commit", "--allow-empty", "-qm", "spoofed"],
+    );
+    declared.scope = Some(format!("session-commit:refs/heads/{branch}"));
+    assert!(matches!(
+        fx.try_now(declared),
+        Err(BrokerOpError::InvalidCoordinatedOperation { .. })
+    ));
+}
+
+/// Wait until a process records that it is waiting on a coordinated lock on
+/// behalf of `session_id`. The bound only turns a hang into a failure.
+#[cfg(unix)]
+fn wait_for_lock_waiter(repo: &Path, session_id: i64) {
+    let dir = repo.join(".aethyme/run/waits");
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let waiting = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| {
+                std::fs::read(entry.path())
+                    .ok()
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<aethyme_broker::WaitRecord>(&bytes).ok()
+                    })
+                    .is_some_and(|record| {
+                        record.session_id == Some(session_id)
+                            && record.kind == "coordinated_write_lock"
+                    })
+            });
+        if waiting {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session {session_id} never queued"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Writer preference: flock has no queue, so without it a stream of narrow
+/// commits re-taking the shared lanes could starve a repository-wide writer.
+/// While a wide write waits behind one held narrow commit, a second narrow
+/// commit on another branch must not start; it runs after the wide write.
+#[cfg(unix)]
+#[test]
+fn a_waiting_wide_write_is_not_starved_by_new_narrow_commits() {
+    let mut fx = LaneFixture::new(&["gate-first", "wide-writer", "late-narrow"]);
+    let gate = HookGate::install(&fx.hooks(), "pre-commit", "gate-first");
+    fx.stage(0, "first\n");
+    let first = fx.spawn(request(fx.sessions[0], &["commit", "-qm", "first"]));
+    gate.wait_started();
+    let wide = fx.spawn(request(fx.sessions[1], &["branch", "wide-after-first"]));
+    wait_for_lock_waiter(fx.repo(), fx.sessions[1]);
+
+    fx.stage(2, "late\n");
+    let late = fx.try_now(request(fx.sessions[2], &["commit", "-qm", "late"]));
+    let wide_ran_early =
+        !git_output(fx.repo(), &["branch", "--list", "wide-after-first"]).is_empty();
+    gate.release();
+    let first = first.join().unwrap().expect("held commit completes");
+    let wide = wide
+        .join()
+        .unwrap()
+        .expect("the wide write runs once the commit ends");
+    let late_after = fx
+        .try_now(request(fx.sessions[2], &["commit", "-qm", "late"]))
+        .expect("the narrow commit runs after the wide write");
+
+    assert_lock_busy(late, "a narrow commit arriving behind a waiting wide write");
+    assert!(
+        !wide_ran_early,
+        "the wide write cannot run while the commit holds its lane"
+    );
+    assert!(first.ok());
+    assert!(wide.ok());
+    assert_eq!(wide.operation.scope, "repository");
+    assert!(late_after.ok());
+    assert!(late_after.operation.id > wide.operation.id);
+    let timing: serde_json::Value =
+        serde_json::from_str(wide.operation.details_json.as_deref().unwrap()).unwrap();
+    assert!(timing["coordination_timing"]["wide_intent_wait_ms"].is_i64());
+}
+
+/// A repository-lane GitHub write (here a pull request base change) waits for
+/// a held session-branch commit on the same canonical repository. It is
+/// refused before `gh` runs, so nothing reaches GitHub.
+#[cfg(unix)]
+#[test]
+fn a_repository_lane_github_write_waits_for_a_held_session_commit() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    git(tmp.path(), &["config", "user.name", "t"]);
+    git(tmp.path(), &["config", "user.email", "t@t"]);
+    git(
+        tmp.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/Owner/Repo.git",
+        ],
+    );
+    let worktree = add_worktree(tmp.path(), "gh-gate-commit");
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    let session = broker.adopt(&worktree, None).unwrap();
+    let hooks = tmp.path().join(".aethyme/test-hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hooks = hooks.canonicalize().unwrap();
+    git(
+        tmp.path(),
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+    let gate = HookGate::install(&hooks, "pre-commit", "gh-gate-commit");
+    std::fs::write(worktree.join("tracked.txt"), "held\n").unwrap();
+    git(&worktree, &["add", "tracked.txt"]);
+    let repo = tmp.path().to_path_buf();
+    let commit = request(session.id, &["commit", "-qm", "held"]);
+    let committing = std::thread::spawn(move || {
+        common::open_fixture_repository_path_broker(&repo)
+            .unwrap()
+            .into_broker()
+            .run_coordinated_operation(commit)
+    });
+    gate.wait_started();
+
+    let mut edit = github_request(
+        session.id,
+        "Owner/Repo",
+        &["pr", "edit", "7", "--base", "main"],
+    );
+    edit.scope = None;
+    edit.declared_effect = None;
+    edit.authorization_reason = Some("regression".into());
+    let edited = broker.run_coordinated_operation_with_wait(edit, QueueWait::Refuse);
+    gate.release();
+    let committed = committing.join().unwrap().expect("held commit completes");
+
+    assert_lock_busy(edited, "a repository-lane GitHub write");
+    assert!(committed.ok());
+    assert!(committed.operation.scope.starts_with("session-commit:"));
+}
+
+/// A narrow push whose process died while running is marked unknown by the
+/// next operation on its branch and blocks it; another branch proceeds and
+/// leaves the dead record alone.
+#[cfg(unix)]
+#[test]
+fn a_crashed_narrow_push_blocks_its_own_branch_only() {
+    let mut fx = LaneFixture::new(&["crashed-push", "live-push"]);
+    let crashed_branch = fx.branch(0);
+    let live_branch = fx.branch(1);
+    let crashed_sha = fx.commit_plain(0, "crashed\n");
+    let repository = GitRepo::discover(&fx.worktrees[0])
+        .unwrap()
+        .resolve_remote_target("origin", None)
+        .unwrap()
+        .coordination_key;
+    let refspec = format!("{crashed_sha}:refs/heads/{crashed_branch}");
+    let command = [
+        "git",
+        "push",
+        "--no-follow-tags",
+        "--porcelain",
+        "--",
+        "origin",
+        refspec.as_str(),
+    ];
+    let crashed = fx
+        .broker
+        .store()
+        .create_coordinated_operation(&NewCoordinatedOperation {
+            session_id: fx.sessions[0],
+            provider: OperationProvider::Git,
+            repository,
+            scope: format!("session-push:refs/heads/{crashed_branch}"),
+            effect: OperationEffect::Write,
+            authorization_reason: Some("simulated crashed push".into()),
+            command_json: serde_json::to_string(&command).unwrap(),
+            pid: exited_child_pid(),
+            host_operation_id: None,
+            identity_provenance: OperationIdentityProvenance::VerifiedCanonical,
+        })
+        .unwrap()
+        .id;
+    fx.broker
+        .store()
+        .transition_coordinated_operation(crashed, OperationStatus::Running, None, None)
+        .unwrap();
+
+    let live_sha = fx.commit_plain(1, "live\n");
+    let live = fx.strict_push(1, &live_sha, &live_branch);
+    assert!(fx.try_now(live).expect("another branch proceeds").ok());
+    let untouched = fx
+        .broker
+        .store()
+        .coordinated_operation(crashed)
+        .unwrap()
+        .unwrap();
+    assert_eq!(untouched.status, OperationStatus::Running);
+
+    let retry = fx.strict_push(0, &crashed_sha, &crashed_branch);
+    match fx.try_now(retry) {
+        Err(BrokerOpError::CoordinatedOperationBlocked { operation_id, .. }) => {
+            assert_eq!(operation_id, crashed)
+        }
+        other => panic!("a second push of the crashed branch must be blocked: {other:?}"),
+    }
+    let marked = fx
+        .broker
+        .store()
+        .coordinated_operation(crashed)
+        .unwrap()
+        .unwrap();
+    assert_eq!(marked.status, OperationStatus::OutcomeUnknown);
+
+    let live_sha = fx.commit_plain(1, "live again\n");
+    let live = fx.strict_push(1, &live_sha, &live_branch);
+    assert!(
+        fx.try_now(live)
+            .expect("the unknown push does not block another branch")
+            .ok()
+    );
+}
