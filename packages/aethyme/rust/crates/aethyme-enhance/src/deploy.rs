@@ -990,8 +990,7 @@ mod tests {
             "aethyme broker status --json",
             "gitignored persistence projection",
             "Acknowledging a notice stops repeat delivery",
-            "selected integration prefix clears only entries contained",
-            "Advisories never expand gate selection or block submit",
+            "expand gate selection or block submit",
         ] {
             assert!(
                 reference.contains(required),

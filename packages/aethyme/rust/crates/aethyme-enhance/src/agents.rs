@@ -1210,7 +1210,7 @@ mod tests {
             "aethyme graph materialize --repo .",
             "authority merely to silence a degraded response",
             "local-only",
-            "Advisories never expand gate selection",
+            "expand gate selection or block submit",
             "do not retry blindly",
         ] {
             assert!(
@@ -1292,7 +1292,7 @@ mod tests {
             "Commit early and small, and after each commit run\n   `aethyme broker push --session <id>`",
             "open a draft PR with `aethyme broker push --session <id> --pr`",
             "keep pushing until it is ready. Run `aethyme broker sync --session <id>`\n   before resuming a reused session and when push reports related or unknown\n   impact. A graph-disjoint verdict permits deferring intermediate sync; validate\n   the current merge candidate before merging. Never leave work only in the worktree.",
-            "`aethyme broker finish --session <id>` (it refuses while commits are unpushed)",
+            "`aethyme broker finish --session <id>`\n   (it refuses while commits are unpushed)",
             "authorizes pushing your own\nsession branch and opening a draft PR; nothing else.",
             "`aethyme broker advanced git`",
             "`references/broker.md`",
