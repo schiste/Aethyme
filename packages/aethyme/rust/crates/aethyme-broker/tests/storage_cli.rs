@@ -83,11 +83,7 @@ fn fixture() -> (TestRepo, tempfile::TempDir) {
 }
 
 fn enroll(repo: &Path) {
-    std::fs::write(
-        repo.join(".aethyme/config.toml"),
-        "schema = 1\n",
-    )
-    .unwrap();
+    std::fs::write(repo.join(".aethyme/config.toml"), "schema = 1\n").unwrap();
     std::fs::write(
         repo.join(".gitignore"),
         "/.aethyme/\n/target/\n/build/\n/dist/\n/node_modules/\n/.venv/\n",
