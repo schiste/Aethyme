@@ -7,7 +7,7 @@
 //! such a repository ever produces, and blocked with advice that could not
 //! resolve the state.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod common;
@@ -40,6 +40,8 @@ fn fixture() -> (FixtureRepository, common::FixtureBroker) {
     let fixture = FixtureRepository::new();
     git(fixture.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(fixture.path().join("README.md"), "fixture\n").unwrap();
+    std::fs::write(fixture.path().join("a.txt"), "a base\n").unwrap();
+    std::fs::write(fixture.path().join("b.txt"), "b base\n").unwrap();
     std::fs::write(fixture.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     std::fs::create_dir_all(fixture.path().join(".aethyme")).unwrap();
     std::fs::write(
@@ -205,4 +207,243 @@ fn a_landed_verified_entry_is_pruned_by_retention() {
         "{:#?}",
         plan.rows
     );
+}
+
+/// A live session with one commit made by `edit`. Returns the session id,
+/// its branch and its worktree.
+fn session_with(
+    broker: &mut common::FixtureBroker,
+    edit: impl FnOnce(&Path),
+) -> (i64, String, PathBuf) {
+    let session = broker.start_worktree("pull request work", None).unwrap();
+    let worktree = PathBuf::from(&session.worktree_path);
+    edit(&worktree);
+    git(&worktree, &["add", "-A"]);
+    git(&worktree, &["commit", "-qm", "session work"]);
+    (session.id, session.branch, worktree)
+}
+
+/// Squash-merge `branch` on the remote and delete it there, as a provider's
+/// "delete branch on merge" does.
+fn squash_land(broker: &common::FixtureBroker, branch: &str) {
+    aethyme_testkit::land_as_pull_request(broker.main_root(), branch, MergeStyle::Squash);
+    aethyme_testkit::delete_remote_branch(broker.main_root(), branch);
+}
+
+fn write(worktree: &Path, file: &str, text: &str) {
+    std::fs::write(worktree.join(file), text).unwrap();
+}
+
+/// What must survive a refused finish: the worktree, the branch at the
+/// session's head, and that head commit.
+fn assert_nothing_lost(broker: &common::FixtureBroker, branch: &str, worktree: &Path, head: &str) {
+    assert!(worktree.exists(), "the worktree must survive");
+    assert_eq!(
+        git(
+            broker.main_root(),
+            &["rev-parse", &format!("refs/heads/{branch}")]
+        ),
+        head,
+        "the branch must still point at the session head"
+    );
+    git(
+        broker.main_root(),
+        &["cat-file", "-e", &format!("{head}^{{commit}}")],
+    );
+}
+
+fn abandonments(broker: &mut common::FixtureBroker, session: i64) -> usize {
+    broker
+        .store()
+        .events_after(0, i64::MAX)
+        .unwrap()
+        .into_iter()
+        .filter(|event| {
+            event.kind == events::BROKER_SESSION_ABANDONED_UNPUSHED
+                && event.session_id == Some(session)
+        })
+        .count()
+}
+
+/// A squash landed c1 (A and B); c2 then restored B to its base content. The
+/// net diff covers only A, which the squash holds, but c2 exists only in this
+/// worktree: finish must refuse, and nothing may be cleaned up.
+#[test]
+fn a_follow_up_restoring_a_path_after_a_squash_blocks_and_loses_nothing() {
+    let (_fixture, mut broker) = fixture();
+    let (session, branch, worktree) = session_with(&mut broker, |worktree| {
+        write(worktree, "a.txt", "a changed\n");
+        write(worktree, "b.txt", "b changed\n");
+    });
+    squash_land(&broker, &branch);
+    write(&worktree, "b.txt", "b base\n");
+    git(&worktree, &["commit", "-qam", "restore b"]);
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+
+    let report = broker.finish(session).unwrap();
+    assert_eq!(report.status, FinishStatus::Blocked, "{report:#?}");
+    assert!(!report.cleanup.worktree_removed);
+    assert_nothing_lost(&broker, &branch, &worktree, &head);
+    assert!(
+        broker.cleanup(session, false).is_err(),
+        "cleanup must refuse the open session"
+    );
+    assert_nothing_lost(&broker, &branch, &worktree, &head);
+}
+
+/// The same with a deletion: c2 deletes a file c1 added.
+#[test]
+fn a_follow_up_deleting_an_added_file_after_a_squash_blocks_and_loses_nothing() {
+    let (_fixture, mut broker) = fixture();
+    let (session, branch, worktree) = session_with(&mut broker, |worktree| {
+        write(worktree, "a.txt", "a changed\n");
+        write(worktree, "new.txt", "added\n");
+    });
+    squash_land(&broker, &branch);
+    git(&worktree, &["rm", "-q", "new.txt"]);
+    git(&worktree, &["commit", "-qm", "drop the new file"]);
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+
+    let report = broker.finish(session).unwrap();
+    assert_eq!(report.status, FinishStatus::Blocked, "{report:#?}");
+    assert_nothing_lost(&broker, &branch, &worktree, &head);
+}
+
+/// One commit changes A and B; the default branch gained only A.
+#[test]
+fn a_commit_only_partly_on_the_default_branch_blocks() {
+    let (fixture, mut broker) = fixture();
+    let (session, branch, worktree) = session_with(&mut broker, |worktree| {
+        write(worktree, "a.txt", "a changed\n");
+        write(worktree, "b.txt", "b changed\n");
+    });
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+    write(fixture.path(), "a.txt", "a changed\n");
+    git(fixture.path(), &["commit", "-qam", "only a"]);
+    git(fixture.path(), &["push", "-q", "origin", "main"]);
+    git(fixture.path(), &["fetch", "-q", "origin"]);
+    git(fixture.path(), &["remote", "set-head", "origin", "main"]);
+
+    let report = broker.finish(session).unwrap();
+    assert_eq!(report.status, FinishStatus::Blocked, "{report:#?}");
+    assert_nothing_lost(&broker, &branch, &worktree, &head);
+}
+
+/// Commits that change nothing net are not a landing, even though the
+/// default branch "holds" their empty content: they exist only here.
+#[test]
+fn a_no_net_change_session_is_not_landed() {
+    let (_fixture, mut broker) = fixture();
+    let (session, branch, worktree) = session_with(&mut broker, |worktree| {
+        write(worktree, "a.txt", "a changed\n");
+    });
+    write(&worktree, "a.txt", "a base\n");
+    git(&worktree, &["commit", "-qam", "back to base"]);
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+
+    let report = broker.finish(session).unwrap();
+    assert_eq!(report.status, FinishStatus::Blocked, "{report:#?}");
+    assert_nothing_lost(&broker, &branch, &worktree, &head);
+}
+
+/// A landed session still refuses while its worktree holds uncommitted or
+/// untracked work.
+#[test]
+fn uncommitted_or_untracked_work_on_a_landed_session_still_blocks() {
+    let (_fixture, mut broker) = fixture();
+    let (session, branch, worktree) = session_with(&mut broker, |worktree| {
+        write(worktree, "a.txt", "a changed\n");
+    });
+    squash_land(&broker, &branch);
+
+    write(&worktree, "scratch.txt", "untracked\n");
+    let untracked = broker.finish(session).unwrap();
+    assert_eq!(untracked.status, FinishStatus::Blocked, "{untracked:#?}");
+    assert!(
+        untracked
+            .dirty_paths
+            .iter()
+            .any(|path| path == "scratch.txt")
+    );
+    std::fs::remove_file(worktree.join("scratch.txt")).unwrap();
+
+    write(&worktree, "b.txt", "uncommitted\n");
+    let modified = broker.finish(session).unwrap();
+    assert_eq!(modified.status, FinishStatus::Blocked, "{modified:#?}");
+    assert!(modified.dirty_paths.iter().any(|path| path == "b.txt"));
+    assert!(worktree.exists());
+}
+
+/// Without `keep_worktree`, a squash-landed session closes and its worktree
+/// and branch are removed: the work is on the default branch.
+#[test]
+fn a_squash_landed_session_is_cleaned_up() {
+    let (_fixture, mut broker) = fixture();
+    let (session, branch, worktree) = session_with(&mut broker, |worktree| {
+        write(worktree, "a.txt", "a changed\n");
+    });
+    squash_land(&broker, &branch);
+
+    let report = broker.finish(session).unwrap();
+    assert!(report.closed, "{report:#?}");
+    if worktree.exists() {
+        broker.cleanup(session, false).unwrap();
+    }
+    assert!(!worktree.exists(), "the landed worktree is removed");
+    assert!(
+        git(broker.main_root(), &["branch", "--list", &branch]).is_empty(),
+        "the landed branch is removed"
+    );
+    assert_eq!(
+        git(broker.main_root(), &["show", "origin/main:a.txt"]),
+        "a changed"
+    );
+}
+
+/// A deletion and a pure rename land and finish like any other change.
+#[test]
+fn deletion_and_rename_landings_finish() {
+    let (_fixture, mut broker) = fixture();
+    let (deleted, branch, _) = session_with(&mut broker, |worktree| {
+        std::fs::remove_file(worktree.join("b.txt")).unwrap();
+    });
+    squash_land(&broker, &branch);
+    let report = broker.finish_with_options(deleted, keep()).unwrap();
+    assert_eq!(report.status, FinishStatus::Closed, "{report:#?}");
+
+    let (renamed, branch, _) = session_with(&mut broker, |worktree| {
+        git(worktree, &["mv", "a.txt", "c.txt"]);
+    });
+    squash_land(&broker, &branch);
+    let report = broker.finish_with_options(renamed, keep()).unwrap();
+    assert_eq!(report.status, FinishStatus::Closed, "{report:#?}");
+}
+
+/// `--abandon --reason` records nothing while a refusal (a running gate)
+/// keeps the session open, and records exactly once when it closes.
+#[test]
+fn abandon_records_only_when_the_session_closes() {
+    let (_fixture, mut broker) = fixture();
+    let (session, _branch, worktree) = session_with(&mut broker, |worktree| {
+        write(worktree, "a.txt", "a changed\n");
+    });
+    assert!(worktree.exists());
+    let gates = broker.main_root().join(".aethyme/run/gates");
+    std::fs::create_dir_all(&gates).unwrap();
+    // An unreadable pid record counts as a running gate.
+    let pidfile = gates.join(format!("{session}-tests.pid"));
+    std::fs::write(&pidfile, "unreadable\n").unwrap();
+
+    let refused = broker
+        .finish_abandoning_unpushed(session, keep(), "no longer needed")
+        .unwrap();
+    assert_eq!(refused.status, FinishStatus::Blocked, "{refused:#?}");
+    assert_eq!(abandonments(&mut broker, session), 0);
+
+    std::fs::remove_file(&pidfile).unwrap();
+    let closed = broker
+        .finish_abandoning_unpushed(session, keep(), "no longer needed")
+        .unwrap();
+    assert_eq!(closed.status, FinishStatus::Closed, "{closed:#?}");
+    assert_eq!(abandonments(&mut broker, session), 1);
 }

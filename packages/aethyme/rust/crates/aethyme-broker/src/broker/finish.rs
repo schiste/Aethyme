@@ -856,23 +856,12 @@ impl Broker {
         // `--abandon --reason` closes over undelivered work too, as its help
         // promises: otherwise a session whose work never lands can only be
         // closed by a lower-level command.
-        let mut abandoned = false;
-        if report.unsubmitted_commits > 0
-            && let Some(reason) = abandon_reason
-        {
-            let count = report.unsubmitted_commits;
-            self.record_abandoned_unpushed(
-                &session,
-                &head,
-                u32::try_from(count).unwrap_or(u32::MAX),
-                reason,
-            )?;
-            report.warnings.push(format!(
-                "closed with {count} undelivered committed {} abandoned: {reason}",
-                plural_word(count as usize, "change", "changes")
-            ));
-            abandoned = true;
-        } else if report.unsubmitted_commits > 0 {
+        // Recorded only once every refusal check below has passed, so a
+        // refused retry never records an abandonment that did not happen.
+        let abandon_undelivered = abandon_reason
+            .filter(|_| report.unsubmitted_commits > 0)
+            .map(|reason| (report.unsubmitted_commits, reason));
+        if abandon_undelivered.is_none() && report.unsubmitted_commits > 0 {
             // The guard is right either way -- these commits exist nowhere but
             // this branch, and closing a session holding the only copy is what
             // #222 exists to prevent. What differs is the remedy.
@@ -979,7 +968,7 @@ impl Broker {
                     self.finalize_finish_report(&mut report);
                     return Ok(report);
                 }
-                Some(_) if abandoned => {}
+                Some(_) if abandon_undelivered.is_some() => {}
                 Some(reason) => {
                     self.record_abandoned_unpushed(&session, &unpushed_head, unpushed, reason)?;
                     report.warnings.push(format!(
@@ -990,6 +979,19 @@ impl Broker {
             }
         } else if crate::session_push::session_push_enabled(&self.repo) {
             report.unpushed_commits = Some(0);
+        }
+
+        if let Some((count, reason)) = abandon_undelivered {
+            self.record_abandoned_unpushed(
+                &session,
+                &head,
+                u32::try_from(count).unwrap_or(u32::MAX),
+                reason,
+            )?;
+            report.warnings.push(format!(
+                "closed with {count} undelivered committed {} abandoned: {reason}",
+                plural_word(count as usize, "change", "changes")
+            ));
         }
 
         // The landing is established, so this session's verified rows are
@@ -1282,19 +1284,51 @@ impl Broker {
         // A head that changes nothing has landed nothing: whether its commits
         // may be left behind is the remote-durability question `finish`
         // already asks of a no-net session, not a delivery.
-        let found = found
+        let Some(landed_by) = found
             .filter(|(evidence, _)| *evidence != crate::LandingEvidence::NoNetChange)
-            .map(|(_, landed_by)| landed_by);
-        Ok(found.map(|landed_by| DefaultBranchLanding {
+            .map(|(_, landed_by)| landed_by)
+        else {
+            return Ok(None);
+        };
+        let landing = DefaultBranchLanding {
             reference,
+            tip,
             landed_by,
-        }))
+        };
+        // The search above compares the net diff. That is not enough to
+        // stand in for the unpushed and unsubmitted guards: a later commit
+        // that restored a path, or deleted a file an earlier one added,
+        // leaves the net diff matching while its own change exists only
+        // here. The landing must account for every commit.
+        Ok(self.landing_covers(&landing, head)?.then_some(landing))
+    }
+
+    /// Whether `commit`'s every commit is accounted for by `landing`: it is
+    /// on the default branch, or the landing commit holds `commit`'s content
+    /// on every path any session commit since the default branch touched --
+    /// including a path a later commit restored to its base state.
+    pub(crate) fn landing_covers(
+        &self,
+        landing: &DefaultBranchLanding,
+        commit: &str,
+    ) -> Result<bool, BrokerOpError> {
+        if self.repo.is_ancestor_checked(commit, &landing.tip)? {
+            return Ok(true);
+        }
+        let Some(landed_by) = landing.landed_by.as_deref() else {
+            return Ok(false);
+        };
+        let _span = crate::phase_telemetry::span("default_branch_landing_coverage");
+        let base = self.repo.merge_base(commit, &landing.tip)?;
+        let touched = self.repo.paths_touched_between(&base, commit)?;
+        Ok(self.repo.paths_equal(landed_by, commit, &touched)?)
     }
 
     /// Make this session's `verified` queue rows terminal once its work has
     /// landed on the default branch, so retention can prune them. Only rows
-    /// whose head `head` contains are marked: their work is part of what
-    /// landed. Returns the ids marked.
+    /// whose head `head` contains and whose every commit the landing
+    /// accounts for are marked: a row whose change the session later
+    /// reverted did not land. Returns the ids marked.
     pub(crate) fn mark_landed_queue_entries(
         &mut self,
         session_id: i64,
@@ -1304,7 +1338,10 @@ impl Broker {
         let _span = crate::phase_telemetry::span("mark_landed_queue_entries");
         let mut marked = Vec::new();
         for entry in self.store.verified_merge_queue_for_session(session_id)? {
-            if entry.head_commit != head && !self.repo.is_ancestor(&entry.head_commit, head) {
+            if entry.head_commit != head
+                && (!self.repo.is_ancestor(&entry.head_commit, head)
+                    || !self.landing_covers(landing, &entry.head_commit)?)
+            {
                 continue;
             }
             let mut details = entry
@@ -1538,6 +1575,8 @@ pub(crate) struct HeadDelivery<'q> {
 pub(crate) struct DefaultBranchLanding {
     /// The default branch, e.g. `origin/main`.
     pub(crate) reference: String,
+    /// The default branch's commit the landing was judged against.
+    pub(crate) tip: String,
     /// The commit that carried the work, when the evidence names one.
     pub(crate) landed_by: Option<String>,
 }
