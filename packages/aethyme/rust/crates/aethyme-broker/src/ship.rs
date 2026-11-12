@@ -1,9 +1,12 @@
 //! Direct publication of a verified integration prefix.
 //!
-//! `aethyme deploy` publishes a first enrollment through this path: it plans
-//! the exact promoted prefix, then pushes that confirmed SHA and verifies the
-//! remote. Planning is observational: it resolves the selected promoted entry,
-//! integration tip, local default branch, and the remote's advertised HEAD
+//! The engine plans the exact promoted prefix, then pushes that confirmed SHA
+//! and verifies the remote. A first enrollment no longer comes through here:
+//! `aethyme deploy` publishes its verified commit without promotion (see
+//! `enrollment_publication`), reusing this module's publication-policy, remote
+//! verification and local-main checks. Planning is observational: it
+//! resolves the selected promoted entry, integration tip, local default
+//! branch, and the remote's advertised HEAD
 //! without fetching, updating refs, or publishing anything.
 //!
 //! The same module owns the committed `[delivery]` and `[publication]`
@@ -220,7 +223,7 @@ pub struct ShipLocalMainSyncAssessment {
     pub conflicting_untracked_paths: Vec<String>,
 }
 
-fn ship_operation_failure(
+pub(crate) fn ship_operation_failure(
     phase: &'static str,
     report: &CoordinatedOperationReport,
 ) -> BrokerOpError {
@@ -308,8 +311,7 @@ impl Broker {
     /// silently added to the proposed push.
     pub fn ship_plan(&mut self, entry_id: i64) -> Result<ShipPlan, BrokerOpError> {
         // A repository that never chose a mode can still publish a promoted
-        // entry on an explicit request: `aethyme deploy` publishes a first
-        // enrollment this way, and that commit is what sets the mode.
+        // entry on an explicit request.
         let promote = crate::merge::PromoteConfig::load(self.main_root());
         if promote.mode == crate::merge::PromoteMode::VerifyOnly && promote.mode_chosen {
             return Err(BrokerOpError::ShipPublicationPolicy {
@@ -954,7 +956,7 @@ fn publication_assessment(
     })
 }
 
-fn publication_policy_at(
+pub(crate) fn publication_policy_at(
     broker: &Broker,
     policy_source_commit: &str,
 ) -> Result<ShipPublicationPolicy, BrokerOpError> {
@@ -1144,7 +1146,7 @@ fn assess_local_main_sync(
     )
 }
 
-fn assess_local_main_sync_repo(
+pub(crate) fn assess_local_main_sync_repo(
     repo: &GitRepo,
     default_branch: &str,
     default_branch_ref: &str,
@@ -1283,7 +1285,7 @@ fn tracking_ref(plan: &ShipPlan) -> String {
     format!("refs/remotes/{}/{branch}", plan.target.remote_name)
 }
 
-fn ls_remote_sha(output: &str, ref_name: &str) -> Option<String> {
+pub(crate) fn ls_remote_sha(output: &str, ref_name: &str) -> Option<String> {
     output.lines().find_map(|line| {
         let (sha, name) = line.split_once('\t')?;
         (name == ref_name

@@ -105,9 +105,11 @@ The paths this covers:
 - `reverify_and_promote`, when the base moved after verification;
 - the queue drain inside `promote`, which re-simulates other entries after a
   promotion. Its errors are already swallowed, so an uncaptured entry stays
-  unpromoted rather than failing the promotion that ran;
-- `aethyme-cli`'s repository enrollment, which submits and promotes through the
-  same functions.
+  unpromoted rather than failing the promotion that ran.
+
+`aethyme-cli`'s repository enrollment used to submit and promote through the
+same functions; since 2026-11-12 it verifies without promoting and pushes the
+verified commit directly, so it falls under the next paragraph.
 
 Not gated: verification without promotion (including every `verify-only`
 repository, which never promotes), and publication by pushing a branch or opening
