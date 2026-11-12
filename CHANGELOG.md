@@ -4,6 +4,13 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.82] - 2026-11-12
+
+### Fixed
+
+- Broker commands refused for malformed arguments now refuse before opening the broker for writing, so they no longer run startup GC maintenance or remove a closed checkout. Covers `finish cleanup`, `gc`, `advanced leases`, `advanced representation record` and `start --adopt`; messages and exit codes are unchanged (#1636).
+- Tests that depended on how fast a time-budgeted GC sweep ran are now bounded by an entry count, and the fixtures that keep a closed session's worktree turn unattended removal off through one shared helper (#1631, #1634).
+
 ## [0.8.81] - 2026-11-12
 
 ### Changed
