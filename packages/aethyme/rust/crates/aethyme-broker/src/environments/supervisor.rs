@@ -296,6 +296,21 @@ pub struct TickOutcome {
     pub needs_supervisor: bool,
 }
 
+/// Several units of work hosted by the one supervisor. Each is ticked on
+/// every round, and the supervisor stays up while any of them needs it. A new
+/// background service is added here; it does not get a process of its own.
+pub struct Services(pub Vec<Box<dyn SupervisorWork>>);
+
+impl SupervisorWork for Services {
+    fn tick(&mut self) -> TickOutcome {
+        let mut needs_supervisor = false;
+        for service in &mut self.0 {
+            needs_supervisor |= service.tick().needs_supervisor;
+        }
+        TickOutcome { needs_supervisor }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExitReason {

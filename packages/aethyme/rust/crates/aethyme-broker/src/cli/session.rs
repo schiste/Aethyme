@@ -1767,6 +1767,8 @@ pub(super) fn run_prepare(parsed: Parsed) -> Result<(), UsageError> {
 
 /// `broker agents`.
 pub(super) fn run_agents(parsed: Parsed) -> Result<(), UsageError> {
+    // A report, never a decision: it may reuse changed-path answers.
+    crate::worktree_watch::allow_reuse_for_this_command();
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     let (overlaps, views) = if parsed.read_only_snapshot {
         (
