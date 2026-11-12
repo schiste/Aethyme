@@ -178,9 +178,9 @@ fn a_degraded_status_snapshot_keeps_git_refs_unknown_after_its_deadline() {
     );
 }
 
-/// The status deadline bounds reads. A mutation that starts inside it --
-/// the verify-only integration refresh status runs -- must not have its
-/// Git writes cut off midway, so it runs outside that deadline.
+/// A caller's deadline bounds reads. The automatic integration cleanup is a
+/// mutation and must not have its Git writes cut off midway when it starts
+/// inside one, so it runs outside that deadline.
 #[test]
 fn an_integration_refresh_is_not_cut_off_by_the_status_deadline() {
     let (repo, git) = landing_fixture();

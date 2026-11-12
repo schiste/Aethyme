@@ -7238,10 +7238,23 @@ impl Broker {
         may_create_integration: bool,
     ) -> Result<AdoptIntegrationDrift, BrokerOpError> {
         let session_head = checkout.head_commit()?;
-        let (integration_branch, integration_head) = if may_create_integration {
-            self.integration_head()?
+        // A non-promoting repository compares against its fetched default
+        // branch: integration is not maintained there, and the next step for a
+        // checkout behind that branch is `sync`, not an integration command.
+        let upstream = self.upstream_verification_head();
+        let (inspect_drift, inspect_unowned) = if upstream.is_some() {
+            (
+                format!("aethyme broker sync --session {session_id}"),
+                "aethyme broker status".to_string(),
+            )
         } else {
-            self.integration_head_snapshot()?
+            let command = "aethyme broker advanced integration status".to_string();
+            (command.clone(), command)
+        };
+        let (integration_branch, integration_head) = match upstream {
+            Some(head) => head,
+            None if may_create_integration => self.integration_head()?,
+            None => self.integration_head_snapshot()?,
         };
         if session_head == integration_head {
             return Ok(AdoptIntegrationDrift {
@@ -7313,7 +7326,7 @@ impl Broker {
                 Some(format!(
                     "session HEAD is {behind_commits} commit(s) behind {integration_branch}; inspect drift before editing"
                 )),
-                "aethyme broker advanced integration status".into(),
+                inspect_drift,
             ),
             AdoptIntegrationRelation::Ahead
                 if submission_plan_safe && pending_owned_commits.is_some_and(|count| count > 0) =>
@@ -7330,13 +7343,13 @@ impl Broker {
                 Some(format!(
                     "session HEAD is {ahead_commits} commit(s) ahead of {integration_branch}, but none are session-owned under the recorded baseline, so submit will not replay them; they predate this adoption. To submit them, re-adopt from a base that precedes them"
                 )),
-                "aethyme broker advanced integration status".into(),
+                inspect_unowned,
             ),
             AdoptIntegrationRelation::Diverged => (
                 Some(format!(
                     "session HEAD and {integration_branch} have diverged ({ahead_commits} ahead, {behind_commits} behind); reconcile before editing"
                 )),
-                "aethyme broker advanced integration status".into(),
+                inspect_drift,
             ),
         };
 

@@ -369,6 +369,10 @@ pub struct AutomaticIntegrationCleanupReport {
 }
 
 /// The command that refreshed a verify-only integration branch (#352).
+///
+/// Historical: non-promoting repositories no longer maintain integration, so
+/// nothing emits `broker.integration.refreshed` any more. The type documents
+/// the payload of events already recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntegrationRefreshTrigger {
@@ -794,76 +798,6 @@ impl Broker {
                 .into(),
             next_action: None,
         })
-    }
-
-    /// Keep a verify-only repository's integration branch on the fetched
-    /// default branch (#352).
-    ///
-    /// Integration there is a disposable verification base: nothing lands
-    /// through it, but it falls behind every pull request merged outside the
-    /// broker, and a stale copy of main is what `finish` counted as
-    /// "unsubmitted" work and what reconcile asked an operator to attest.
-    /// When it carries nothing upstream lacks, it is advanced through the same
-    /// reviewed-plan machinery as the post-merge cleanup, and the move is
-    /// recorded as `broker.integration.refreshed`. An integration that holds
-    /// work of its own is left alone for the reviewed path, and promoting
-    /// repositories are never touched.
-    ///
-    /// Never fails the calling command: a refusal or error leaves integration
-    /// where it was, and status advice still describes it. Every trigger only
-    /// takes the strictly-behind case, which needs no drift assessment: on a
-    /// diverged integration that assessment diffs all of history and, with
-    /// work held back for review, moves nothing, so a no-op `sync` in a long
-    /// repository spent minutes reaching that answer again.
-    pub fn refresh_disposable_integration(
-        &mut self,
-        trigger: IntegrationRefreshTrigger,
-    ) -> Option<IntegrationRefresh> {
-        if crate::merge::PromoteConfig::load(self.main_root()).mode
-            != crate::merge::PromoteMode::VerifyOnly
-        {
-            return None;
-        }
-        let (upstream_ref, upstream_head) = self.repo_handle().upstream_default()?;
-        let (branch, integration) = self.integration_head().ok()?;
-        if self.repo_handle().is_ancestor(&upstream_head, &integration) {
-            return None;
-        }
-        if !self.repo_handle().is_ancestor(&integration, &upstream_head) {
-            return None;
-        }
-        let report = match self.auto_cleanup_landed_integration(&upstream_ref) {
-            Ok(report) => report,
-            Err(error) => {
-                crate::warn_unrecorded::<(), _>(
-                    "refresh the verify-only integration branch",
-                    Err(error),
-                );
-                return None;
-            }
-        };
-        if report.state != AutomaticIntegrationCleanupState::Cleaned {
-            return None;
-        }
-        let refresh = IntegrationRefresh {
-            trigger,
-            branch,
-            upstream_ref,
-            from: report.old_integration,
-            to: report.new_integration,
-            cleaned_queue_entry_ids: report.cleaned_queue_entry_ids,
-            explanation: report.explanation,
-        };
-        let payload = serde_json::to_string(&refresh).unwrap_or_default();
-        crate::warn_unrecorded(
-            "record the integration refresh",
-            self.store().append_event(
-                crate::events::BROKER_INTEGRATION_REFRESHED,
-                None,
-                Some(&payload),
-            ),
-        );
-        Some(refresh)
     }
 
     /// Inspect a previously fetched upstream ref and, when `apply` is set,

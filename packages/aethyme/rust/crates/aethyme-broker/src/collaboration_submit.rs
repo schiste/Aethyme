@@ -570,9 +570,7 @@ fn submit_with(
         Err(report) => report.clone(),
         Ok(prepared) => {
             // The base submit will verify against, read the way submit reads
-            // it, so a resubmit after integration refreshes is the same
-            // operation.
-            broker.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Submit);
+            // it.
             let base = broker.submission_base()?.commit;
             let head = prepared.head.clone();
             match open {

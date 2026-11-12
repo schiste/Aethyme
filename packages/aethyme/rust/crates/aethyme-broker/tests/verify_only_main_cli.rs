@@ -258,15 +258,13 @@ fn verify_only_submit_verifies_against_the_default_branch_and_catches_its_confli
         vec!["tracked.txt".to_string()],
         "the change merged on the provider conflicts with this session"
     );
-    // Integration is a disposable verification base here (#352): submit may
-    // advance it onto the fetched default branch it fell behind, but never
-    // promotes the session's own work into it.
+    // Submit used to advance a stale integration onto the default branch
+    // (#352). A repository that does not promote no longer maintains
+    // integration, so submit leaves it exactly where it was.
     let after = git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]);
-    assert_ne!(after, integration, "the stale integration was refreshed");
     assert_eq!(
-        after,
-        git_output(&fixture.repo, &["rev-parse", "origin/main"]),
-        "a verify-only submit only moves integration onto the default branch"
+        after, integration,
+        "a verify-only submit never moves integration"
     );
     let session_head = git_output(
         &fixture.repo,
