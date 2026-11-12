@@ -219,7 +219,7 @@ pub fn failure_reasons<'a>(
             )
         })
         .collect();
-    commands.sort_by(|a, b| b.0.cmp(&a.0));
+    commands.sort_by_key(|command| std::cmp::Reverse(command.0));
     serde_json::Value::Array(commands.into_iter().map(|(_, command)| command).collect())
 }
 
