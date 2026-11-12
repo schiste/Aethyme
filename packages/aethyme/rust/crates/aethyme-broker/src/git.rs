@@ -3008,7 +3008,7 @@ mod repository_identity_cache {
     }
 
     /// Git reads these from the environment, and they change the answers.
-    fn environment_allows_memory() -> bool {
+    pub(super) fn environment_allows_memory() -> bool {
         std::env::var_os("GIT_DIR").is_none()
             && std::env::var_os("GIT_WORK_TREE").is_none()
             && std::env::var_os("GIT_COMMON_DIR").is_none()
@@ -3048,8 +3048,24 @@ mod repository_identity_cache {
         }
     }
 
+    #[cfg(test)]
+    thread_local! {
+        /// Lets one test use the memory without switching it on for the
+        /// other tests that share its process.
+        pub(super) static ENABLED_ON_THIS_THREAD: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    fn enabled() -> bool {
+        #[cfg(test)]
+        if ENABLED_ON_THIS_THREAD.with(std::cell::Cell::get) {
+            return true;
+        }
+        ENABLED.load(Ordering::Relaxed)
+    }
+
     fn with_memory<T>(use_memory: impl FnOnce(&mut Memory) -> T) -> Option<T> {
-        if !ENABLED.load(Ordering::Relaxed) || !environment_allows_memory() {
+        if !enabled() || !environment_allows_memory() {
             return None;
         }
         static MEMORY: OnceLock<Mutex<Memory>> = OnceLock::new();
@@ -3196,7 +3212,25 @@ impl GitRepo {
     /// Resolve a checkout's common directory without a separate root lookup.
     /// The worktree bit is required: a bare repository also has a common
     /// directory, but cannot supply the checkout evidence ownership needs.
+    ///
+    /// A status of 373 sessions asked this 850 times on 2026-11-12, one Git
+    /// process each, which was most of its time. Two answers need no Git: one
+    /// Git already gave in this process for a checkout whose `.git` entry is
+    /// unchanged, and a linked worktree's own registration, which names the
+    /// common directory in files. Anything else, and any registration that is
+    /// not consistent in both directions, is still put to Git. An expired
+    /// deadline reaches Git and fails there.
     pub(crate) fn worktree_common_dir(path: &Path) -> Result<PathBuf, GitError> {
+        let deadline_open = active_git_deadline().is_none_or(|deadline| deadline > Instant::now());
+        if deadline_open && let Some(common) = repository_identity_cache::common_dir_for(path) {
+            crate::phase_telemetry::add("worktree_common_dir_remembered", Duration::ZERO);
+            return Ok(common);
+        }
+        if deadline_open && let Some(common) = Self::registered_worktree_common_dir(path) {
+            crate::phase_telemetry::add("worktree_common_dir_registered", Duration::ZERO);
+            return Ok(common);
+        }
+        let _span = crate::phase_telemetry::span("worktree_common_dir_probe");
         let args = ["rev-parse", "--is-inside-work-tree", "--git-common-dir"];
         let output = run_git(path, &args)?;
         let Some(("true", common)) = output.split_once('\n') else {
@@ -3211,7 +3245,46 @@ impl GitRepo {
                 stderr: "Git returned an empty common directory".into(),
             });
         }
-        Ok(Self::absolute_common_dir(path, common))
+        let common = Self::absolute_common_dir(path, common);
+        repository_identity_cache::remember_common_dir(path, &common);
+        Ok(common)
+    }
+
+    /// The common directory a linked worktree's registration names, when the
+    /// registration is complete: `<path>/.git` points at a Git directory that
+    /// has a `HEAD`, points back at this `.git` file and names a common
+    /// directory that exists. `None` leaves the question to Git; that covers
+    /// main checkouts, paths inside a checkout, a `GIT_DIR`-style environment
+    /// and every registration that is damaged or half removed.
+    fn registered_worktree_common_dir(path: &Path) -> Option<PathBuf> {
+        const POINTER_LIMIT: u64 = 4096;
+        fn pointer(file: &Path) -> Option<String> {
+            let metadata = std::fs::symlink_metadata(file).ok()?;
+            if !metadata.is_file() || metadata.len() > POINTER_LIMIT {
+                return None;
+            }
+            let text = std::fs::read_to_string(file).ok()?;
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        if !repository_identity_cache::environment_allows_memory() {
+            return None;
+        }
+        let git_file = path.join(".git");
+        let git_dir = pointer(&git_file)?;
+        let git_dir = path.join(git_dir.strip_prefix("gitdir:")?.trim());
+        if !git_dir.join("HEAD").is_file() {
+            return None;
+        }
+        let back = PathBuf::from(pointer(&git_dir.join("gitdir"))?);
+        if back.canonicalize().ok()? != git_file.canonicalize().ok()? {
+            return None;
+        }
+        let common = git_dir
+            .join(pointer(&git_dir.join("commondir"))?)
+            .canonicalize()
+            .ok()?;
+        (common.join("HEAD").is_file() && common.join("objects").is_dir()).then_some(common)
     }
 
     fn absolute_common_dir(path: &Path, common: &str) -> PathBuf {
@@ -9903,6 +9976,127 @@ mod worktree_common_dir_tests {
             &queries[0][1..],
             &["rev-parse", "--is-inside-work-tree", "--git-common-dir"]
         );
+    }
+
+    #[test]
+    fn a_repeated_ownership_lookup_is_answered_without_git_until_the_checkout_changes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        run_git(&root, &["init", "-q", "-b", "main"]).unwrap();
+        let root = root.canonicalize().unwrap();
+        let common = root.join(".git");
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        let counts = || {
+            let (_, counts) = recorder.totals();
+            (
+                counts
+                    .get("worktree_common_dir_probe")
+                    .copied()
+                    .unwrap_or(0),
+                counts
+                    .get("worktree_common_dir_remembered")
+                    .copied()
+                    .unwrap_or(0),
+            )
+        };
+
+        assert_eq!(GitRepo::worktree_common_dir(&root).unwrap(), common);
+        assert_eq!(GitRepo::worktree_common_dir(&root).unwrap(), common);
+        assert_eq!(
+            counts(),
+            (2, 0),
+            "the memory is off unless a command enables it"
+        );
+
+        repository_identity_cache::ENABLED_ON_THIS_THREAD.with(|enabled| enabled.set(true));
+        assert_eq!(GitRepo::worktree_common_dir(&root).unwrap(), common);
+        assert_eq!(GitRepo::worktree_common_dir(&root).unwrap(), common);
+        assert_eq!(counts(), (3, 1), "the second lookup needs no Git");
+
+        let expired = with_git_deadline(Duration::ZERO, || GitRepo::worktree_common_dir(&root));
+        assert!(
+            matches!(expired, Err(GitError::TimedOut { .. })),
+            "an expired deadline is not answered from memory: {expired:?}"
+        );
+
+        // A checkout replaced by something else must be asked about again.
+        std::fs::remove_dir_all(&common).unwrap();
+        std::fs::write(&common, "gitdir: /nonexistent\n").unwrap();
+        assert!(GitRepo::worktree_common_dir(&root).is_err());
+        repository_identity_cache::ENABLED_ON_THIS_THREAD.with(|enabled| enabled.set(false));
+    }
+
+    #[test]
+    fn a_linked_worktree_is_answered_from_its_registration_unless_it_is_damaged() {
+        let fixture = tempfile::tempdir().unwrap();
+        let main = fixture.path().join("main");
+        let linked = fixture.path().join("linked");
+        std::fs::create_dir(&main).unwrap();
+        run_git(&main, &["init", "-q", "-b", "main"]).unwrap();
+        run_git(
+            &main,
+            &[
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        )
+        .unwrap();
+        run_git(
+            &main,
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent/linked",
+                linked.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let expected = GitRepo::discover(&main).unwrap().git_common_dir().unwrap();
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        let count = |name: &str| recorder.totals().1.get(name).copied().unwrap_or(0);
+
+        assert_eq!(GitRepo::worktree_common_dir(&linked).unwrap(), expected);
+        assert_eq!(count("worktree_common_dir_registered"), 1);
+        assert_eq!(count("worktree_common_dir_probe"), 0, "no Git was needed");
+
+        // The main checkout and a path inside the worktree have no
+        // registration of their own, so Git answers.
+        assert_eq!(GitRepo::worktree_common_dir(&main).unwrap(), expected);
+        let nested = linked.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        assert_eq!(GitRepo::worktree_common_dir(&nested).unwrap(), expected);
+        assert_eq!(count("worktree_common_dir_probe"), 2);
+
+        // A registration that no longer points back at this checkout is not
+        // believed: the moved copy is put to Git.
+        let moved = fixture.path().join("moved");
+        std::fs::rename(&linked, &moved).unwrap();
+        let registered = count("worktree_common_dir_registered");
+        let _ = GitRepo::worktree_common_dir(&moved);
+        assert_eq!(count("worktree_common_dir_registered"), registered);
+        assert_eq!(count("worktree_common_dir_probe"), 3);
+
+        // Nor is one whose Git directory has been removed.
+        std::fs::rename(&moved, &linked).unwrap();
+        let admin = expected.join("worktrees").join("linked");
+        std::fs::remove_dir_all(&admin).unwrap();
+        assert!(GitRepo::worktree_common_dir(&linked).is_err());
+        assert_eq!(count("worktree_common_dir_registered"), registered);
     }
 
     #[test]
