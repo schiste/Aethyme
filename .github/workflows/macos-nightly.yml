@@ -126,10 +126,19 @@ jobs:
             status=0
             "$profdata" show "$profile" >/dev/null 2>&1 || status=$?
             if [ "$status" -ne 0 ]; then
-              unreadable=$((unreadable + 1))
-              printf 'unreadable profile: %s (%s bytes, llvm-profdata exit %s)\n' \
-                "$(basename "$profile")" "$(stat -c %s "$profile")" "$status"
-              mv "$profile" coverage/unreadable-profiles/
+              # A profile written under a restrictive umask reads again once
+              # its owner may read it; anything else is set aside.
+              mode="$(stat -c %a "$profile")"
+              chmod u+rw "$profile"
+              retry=0
+              "$profdata" show "$profile" >/dev/null 2>"coverage/unreadable-profiles/last-error.txt" || retry=$?
+              printf 'profile %s: %s bytes, mode %s, llvm-profdata exit %s, after chmod %s: %s\n' \
+                "$(basename "$profile")" "$(stat -c %s "$profile")" "$mode" "$status" "$retry" \
+                "$(head -c 300 coverage/unreadable-profiles/last-error.txt | tr '\n' ' ')"
+              if [ "$retry" -ne 0 ]; then
+                unreadable=$((unreadable + 1))
+                mv "$profile" coverage/unreadable-profiles/
+              fi
             fi
           done < <(find "$profile_dir" -maxdepth 1 -name '*.profraw' -print0)
           echo "raw profiles: $profiles, unreadable and set aside: $unreadable"
@@ -198,6 +207,7 @@ jobs:
 
       - name: Upload unreadable raw profiles
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: rust-unreadable-raw-profiles
