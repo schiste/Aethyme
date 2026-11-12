@@ -88,6 +88,10 @@ path.
 
 ### Which promotions required capture gates
 
+> Historical: local promotion and `Broker::promote` were removed on
+> 2026-11-12, and with them `CaptureRequiredForPromotion`. Under `required`,
+> the submit itself is still bound to the captured head; nothing is promoted.
+
 Every promotion in the broker goes through `Broker::promote(entry)`. That
 function refuses, with `CaptureRequiredForPromotion` (exit 3, next action:
 resubmit), an entry whose head has no acknowledged capture recorded with policy

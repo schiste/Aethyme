@@ -1,5 +1,5 @@
-//! Issue #135: a submit whose response is lost must not leave its promotion
-//! unrecorded when the caller retries.
+//! Issue #135: a submit whose response is lost is safe to retry. Nothing is
+//! promoted; a retry verifies the same head again and leaves one live entry.
 
 use std::path::Path;
 use std::process::Command;
@@ -36,7 +36,6 @@ fn repo_with_session(
     let repo = tmp.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     sh(&repo, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(&repo);
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
     sh(&repo, &["add", "-A"]);
@@ -51,77 +50,44 @@ fn repo_with_session(
     (repo, broker, session.id, worktree)
 }
 
-/// The damage this fixes: the promotion commit is on integration, but queue
-/// revalidation superseded the row that would have claimed it. A retry used to
-/// record content-empty supersession, leaving the commit unrecorded and
-/// refusing publication.
+/// A lost response: the caller retries the same head. The retry verifies it
+/// again, moves nothing, and leaves exactly one live verified entry.
 #[test]
-fn a_retry_claims_a_promotion_whose_row_was_lost() {
+fn a_retry_of_the_same_head_verifies_again_and_leaves_one_live_entry() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo, mut broker, session_id, _worktree) = repo_with_session(tmp.path());
+    let main_before = git_output(&repo, &["rev-parse", "main"]);
 
     let first = broker.submit(session_id).unwrap();
-    assert!(first.promoted);
-    let promoted_commit = Command::new("git")
-        .args(["rev-parse", "aethyme/integration"])
-        .current_dir(&repo)
-        .output()
-        .unwrap();
-    let promoted_commit = String::from_utf8_lossy(&promoted_commit.stdout)
-        .trim()
-        .to_string();
+    assert_eq!(first.entry.status, MergeStatus::Verified);
+    assert!(!first.promoted);
 
-    // Simulate the lost response: the ref is correct, but the row that claimed
-    // it is superseded, exactly as queue revalidation would leave it.
-    broker
-        .store()
-        .set_merge_status(first.entry.id, MergeStatus::Superseded, None, None)
-        .unwrap();
-
-    // The retry must claim the existing promotion rather than record nothing.
     let retry = broker.submit(session_id).unwrap();
-    assert!(
-        retry.promoted,
-        "a retry over an unrecorded self-promotion must claim it, got {:?}",
-        retry.entry.status
-    );
-    assert_eq!(retry.entry.status, MergeStatus::Promoted);
+    assert_eq!(retry.entry.status, MergeStatus::Verified);
+    assert!(!retry.promoted);
+    assert_eq!(retry.entry.head_commit, first.entry.head_commit);
 
-    // Integration did not move, and the commit is now claimed.
-    let after = Command::new("git")
-        .args(["rev-parse", "aethyme/integration"])
-        .current_dir(&repo)
-        .output()
-        .unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&after.stdout).trim(),
-        promoted_commit,
-        "claiming must not move integration"
-    );
-    let claimed = broker
+    let live_verified = broker
         .store()
         .merge_queue()
         .unwrap()
         .into_iter()
-        .filter(|entry| entry.status == MergeStatus::Promoted)
-        .filter_map(|entry| {
-            let details: serde_json::Value =
-                serde_json::from_str(entry.details_json.as_deref()?).ok()?;
-            details.get("commit")?.as_str().map(str::to_string)
-        })
-        .any(|commit| commit == promoted_commit);
-    assert!(
-        claimed,
-        "the integration commit must be claimed by a promoted entry"
+        .filter(|entry| entry.session_id == session_id && entry.status == MergeStatus::Verified)
+        .count();
+    assert_eq!(live_verified, 1, "a retry leaves one live verified entry");
+    assert_eq!(
+        git_output(&repo, &["rev-parse", "main"]),
+        main_before,
+        "submit never moves the default branch"
     );
 }
 
-/// A genuinely content-empty submission, where another session legitimately
-/// produced the tip, must still supersede rather than claim that promotion.
+/// Work another session already landed by pull request replays to nothing:
+/// the submission is content-empty and superseded.
 #[test]
-fn an_ordinary_content_empty_submission_still_supersedes() {
+fn work_landed_by_another_session_is_content_empty() {
     let tmp = tempfile::tempdir().unwrap();
-    let (_repo, mut broker, session_id, _worktree) = repo_with_session(tmp.path());
+    let (repo, mut broker, _session_id, worktree) = repo_with_session(tmp.path());
 
     // A second session branches before either lands, and independently produces
     // the identical content.
@@ -131,16 +97,25 @@ fn an_ordinary_content_empty_submission_still_supersedes() {
     sh(&other_worktree, &["add", "-A"]);
     sh(&other_worktree, &["commit", "-qm", "feat: same work"]);
 
-    // The first session lands it.
-    assert!(broker.submit(session_id).unwrap().promoted);
+    // The first session lands it by pull request.
+    let branch = git_output(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    aethyme_testkit::land_as_pull_request(&repo, &branch, aethyme_testkit::MergeStyle::Squash);
 
-    // The second replays to nothing. The tip names the other session, so this
-    // must be content-empty rather than a claim.
     let outcome = broker.submit(other.id).unwrap();
     assert!(
         outcome.no_changes && !outcome.promoted,
-        "content landed by another session is content-empty, not a claim: {:?}",
+        "content landed by another session is content-empty: {:?}",
         outcome.entry.status
     );
     assert_eq!(outcome.entry.status, MergeStatus::Superseded);
+}
+
+fn git_output(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }

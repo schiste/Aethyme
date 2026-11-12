@@ -399,7 +399,7 @@ fn config_schema_key_is_accepted_and_unknown_keys_warn_never_fail() {
     // values still load).
     let promote = aethyme_broker::PromoteConfig::load(tmp.path());
     assert_eq!(promote.branch, "aethyme/integration");
-    assert_eq!(promote.mode, aethyme_broker::PromoteMode::VerifyOnly);
+    assert_eq!(promote.ignored_promotion_setting, None);
 
     // Malformed TOML is still a hard failure (broken, not future, intent).
     std::fs::write(&config, "[promote\n").unwrap();

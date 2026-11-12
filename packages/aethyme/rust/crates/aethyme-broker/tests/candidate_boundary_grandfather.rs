@@ -9,6 +9,8 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
+use aethyme_broker::MergeStatus;
+
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
@@ -48,7 +50,6 @@ fn a_policy_submit_would_grandfather_builds_a_candidate_and_records_nothing() {
     let tmp = common::FixtureRepository::from_tempdir(tempfile::tempdir().unwrap());
     let root = tmp.path();
     git(root, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(root);
     git(root, &["config", "user.name", "Aethyme Test"]);
     git(
         root,
@@ -80,7 +81,7 @@ fn a_policy_submit_would_grandfather_builds_a_candidate_and_records_nothing() {
     git(first_path, &["add", "-A"]);
     git(first_path, &["commit", "-qm", "first"]);
     let outcome = broker.submit(first.id).unwrap();
-    assert!(outcome.promoted, "{outcome:?}");
+    assert_eq!(outcome.entry.status, MergeStatus::Verified, "{outcome:?}");
     assert!(!outcome.gate_outcomes.is_empty(), "the gate ran");
     assert!(files(&host_state.join("gate-trust")).is_empty());
 
@@ -104,9 +105,13 @@ fn a_policy_submit_would_grandfather_builds_a_candidate_and_records_nothing() {
     let trust_files = |dir: &Path| files(&dir.join("gate-trust"));
     assert!(trust_files(&host_state).is_empty());
 
-    // Submit grandfathers, then gates and promotes the same tree.
+    // Submit grandfathers, then gates and verifies the same tree.
     let submitted = broker.submit(session.id).unwrap();
-    assert!(submitted.promoted, "{submitted:?}");
+    assert_eq!(
+        submitted.entry.status,
+        MergeStatus::Verified,
+        "{submitted:?}"
+    );
     assert_eq!(
         submitted.entry.merged_tree.as_deref(),
         Some(candidate.tree.as_str())

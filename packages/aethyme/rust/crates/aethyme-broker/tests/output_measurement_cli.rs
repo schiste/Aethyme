@@ -36,7 +36,6 @@ fn run(repo: &Path, measure: Option<&str>, args: &[&str]) -> Output {
 fn fixture() -> tempfile::TempDir {
     let repo = tempfile::tempdir().unwrap();
     git(repo.path(), &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(repo.path());
     std::fs::write(repo.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
     git(repo.path(), &["add", "-A"]);
@@ -153,6 +152,15 @@ fn active_queue_excludes_terminal_entries() {
             .status
             .success()
     );
+    // A new head supersedes the verified entry: that is the terminal one.
+    std::fs::write(Path::new(&worktree).join("work.txt"), "more work\n").unwrap();
+    git(Path::new(&worktree), &["add", "work.txt"]);
+    git(Path::new(&worktree), &["commit", "-qm", "more work"]);
+    assert!(
+        run(repo.path(), None, &["submit", "--session", &id])
+            .status
+            .success()
+    );
 
     let all =
         String::from_utf8_lossy(&run(repo.path(), None, &["advanced", "queue"]).stdout).to_string();
@@ -160,11 +168,11 @@ fn active_queue_excludes_terminal_entries() {
         String::from_utf8_lossy(&run(repo.path(), None, &["advanced", "queue", "--active"]).stdout)
             .to_string();
     assert!(
-        all.contains("promoted"),
+        all.contains("superseded"),
         "the inventory keeps terminal entries: {all}"
     );
     assert!(
-        !active.contains("promoted"),
+        !active.contains("superseded"),
         "the active view must drop terminal entries: {active}"
     );
     assert!(

@@ -155,20 +155,6 @@ pub fn build_demo_source_repo(root: &Path) -> PathBuf {
 /// Graph queries read from the redb store and will not create it
 /// themselves, so fixture repos must run the same two steps
 /// `scripts/eval/setup-playground.sh` runs.
-/// Opt a fixture repository into promotion, which is off unless a repository
-/// chooses it. Adds to any configuration already written; a `[promote]` table
-/// already there is left alone. Commit it where the fixture commits its files.
-pub fn promote_on_submit(root: impl AsRef<Path>) {
-    let directory = root.as_ref().join(".aethyme");
-    std::fs::create_dir_all(&directory).expect("create .aethyme");
-    let path = directory.join("config.toml");
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    if !existing.contains("[promote]") {
-        std::fs::write(&path, format!("{existing}\n[promote]\nmode = \"auto\"\n"))
-            .expect("write .aethyme/config.toml");
-    }
-}
-
 pub fn bootstrap_repo_fragments(root: &Path) {
     let fragments = std::process::Command::new(crate::bins::graph_index_bin())
         .args([

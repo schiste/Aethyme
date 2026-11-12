@@ -752,7 +752,6 @@
   "aethyme-broker::it reclaim_ordering": 51.7,
   "aethyme-broker::it reconcile_tracked_elsewhere_cli": 3.57,
   "aethyme-broker::it reconcile_usage_cli": 5.14,
-  "aethyme-broker::it reconciliation_external_main": 30.45,
   "aethyme-broker::it recovery_archive_gc_cli": 46.45,
   "aethyme-broker::it remote_target": 0.18,
   "aethyme-broker::it renamed_targets": 5.98,
@@ -777,7 +776,6 @@
   "aethyme-broker::it session_repository_cli": 1.76,
   "aethyme-broker::it session_sync_cli": 19.17,
   "aethyme-broker::it shared_edit_advice_cli": 8.89,
-  "aethyme-broker::it ship_e2e": 132.96,
   "aethyme-broker::it simulated_free_space_cli": 9.91,
   "aethyme-broker::it start_base_cli": 10.27,
   "aethyme-broker::it start_task_overlap_cli": 1.55,
@@ -793,7 +791,6 @@
   "aethyme-broker::it submit_progress_status": 4.6,
   "aethyme-broker::it submit_retry_idempotence": 4.34,
   "aethyme-broker::it unpushed_work_cli": 21.35,
-  "aethyme-broker::it v0_scenario": 6.36,
   "aethyme-broker::it verify_only_main_cli": 25.46,
   "aethyme-broker::it worktree_reconcile": 6.9,
   "aethyme-broker::it worktree_root_cli": 29.93,
@@ -865,12 +862,9 @@
   "aethyme-broker::pr_overlap_cli status_reports_cached_prs_only_when_all_recorded_owners_are_inactive": 4.33,
   "aethyme-broker::pr_overlap_cli the_work_per_push_is_bounded": 1.47,
   "aethyme-broker::promote_mode an_unconfigured_repository_verifies_and_promotes_nothing": 1.61,
-  "aethyme-broker::promote_mode auto_repositories_promote_on_submit": 1.9,
   "aethyme-broker::promote_mode configuration_reads_skip_rediscovery_and_recheck_the_current_default_ref": 0.1,
   "aethyme-broker::promote_mode finish_does_not_demand_promotion_a_repository_opted_out_of": 2.18,
   "aethyme-broker::promote_mode finish_names_a_reachable_remedy_where_promotion_is_off": 2.09,
-  "aethyme-broker::promote_mode finish_still_tells_a_promoting_repository_to_submit": 2.04,
-  "aethyme-broker::promote_mode the_flag_suppresses_promotion_for_one_run_without_changing_policy": 4.18,
   "aethyme-broker::promote_mode the_next_action_does_not_contradict_the_suppression_reason": 3.46,
   "aethyme-broker::promote_mode unknown_mode_warns_in_status_and_submit_and_falls_back_to_verify_only": 2.39,
   "aethyme-broker::promote_mode verify_only_repositories_verify_and_promote_nothing": 1.61,
@@ -1592,26 +1586,6 @@
   },
   {
    "binary": "aethyme-broker::it",
-   "test": "merge_e2e::normalized_replay_handles_rebased_rename_binary_empty_and_stable_order",
-   "seconds": 5.1
-  },
-  {
-   "binary": "aethyme-broker::it",
-   "test": "merge_e2e::promotion_does_not_resurrect_conflicts_from_cleaned_sessions",
-   "seconds": 5.2
-  },
-  {
-   "binary": "aethyme-broker::it",
-   "test": "merge_e2e::reconcile_recognizes_squash_preserves_followups_and_replays_pending_work",
-   "seconds": 6.7
-  },
-  {
-   "binary": "aethyme-broker::it",
-   "test": "merge_e2e::reconcile_uses_upstream_boundary_and_recovers_repromoted_empty_entries",
-   "seconds": 5.8
-  },
-  {
-   "binary": "aethyme-broker::it",
    "test": "queued_operations_cli::an_identical_pending_command_from_one_session_is_refused",
    "seconds": 7.3
   },
@@ -1687,11 +1661,6 @@
   },
   {
    "binary": "aethyme-broker::it",
-   "test": "review_cli::review_gated_ship_requires_every_entry_and_revalidates_live_evidence",
-   "seconds": 6.9
-  },
-  {
-   "binary": "aethyme-broker::it",
    "test": "review_cli::trusted_check_run_can_satisfy_review_without_an_approval_webhook",
    "seconds": 5.3
   },
@@ -1699,31 +1668,6 @@
    "binary": "aethyme-broker::it",
    "test": "session_push_cli::malformed_pr_policy_refuses_before_pushing_the_session_branch",
    "seconds": 5.5
-  },
-  {
-   "binary": "aethyme-broker::it",
-   "test": "ship_e2e::selected_prefix_publication_resolves_only_contained_promoted_entries",
-   "seconds": 5.1
-  },
-  {
-   "binary": "aethyme-broker::it",
-   "test": "ship_e2e::ship_execute_only_publishes_selected_entry_and_reconciles_pending_work",
-   "seconds": 7.6
-  },
-  {
-   "binary": "aethyme-broker::it",
-   "test": "ship_e2e::ship_plan_only_excludes_entries_already_on_the_remote",
-   "seconds": 6.3
-  },
-  {
-   "binary": "aethyme-broker::it",
-   "test": "ship_e2e::ship_plan_only_refuses_to_publish_when_selected_gates_fail",
-   "seconds": 5.3
-  },
-  {
-   "binary": "aethyme-broker::it",
-   "test": "v0_scenario::v0_three_agents_end_to_end",
-   "seconds": 6.4
   },
   {
    "binary": "aethyme-broker::it",
@@ -1779,11 +1723,6 @@
    "binary": "aethyme-cli::it",
    "test": "repository_enrollment_cli::persisted_phase_boundary_after_preserved_resumes_without_duplicate_publication",
    "seconds": 5.2
-  },
-  {
-   "binary": "aethyme-cli::it",
-   "test": "repository_enrollment_cli::persisted_phase_boundary_after_promoted_resumes_without_duplicate_publication",
-   "seconds": 5.3
   },
   {
    "binary": "aethyme-cli::it",

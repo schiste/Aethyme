@@ -79,16 +79,10 @@ struct Fixture {
 /// unpushed commit and an uncommitted file -- both things a cut-short status
 /// must not report as absent.
 fn fixture() -> Fixture {
-    fixture_with(false)
+    fixture_with()
 }
 
-/// [`fixture`] in a repository that promotes to integration, for the one
-/// integration-drift case; it goes with the promotion engine.
-fn promoting_fixture() -> Fixture {
-    fixture_with(true)
-}
-
-fn fixture_with(promote: bool) -> Fixture {
+fn fixture_with() -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -97,9 +91,6 @@ fn fixture_with(promote: bool) -> Fixture {
         &["init", "-q", "--bare", "-b", "main", "origin.git"],
     );
     git(&repo, &["init", "-q", "-b", "main"]);
-    if promote {
-        aethyme_testkit::promote_on_submit(&repo);
-    }
     std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     git(&repo, &["add", "-A"]);
@@ -339,43 +330,4 @@ fn interactive_reads_stay_under_ten_seconds_with_sixty_five_sessions() {
             assert_eq!(rows.len(), fixture.session_count, "{report:#}");
         }
     }
-}
-
-#[test]
-fn an_exhausted_ref_budget_does_not_claim_an_integration_drift_assessment() {
-    let fixture = promoting_fixture();
-    // Upstream moves past integration, so `--refresh` assesses the drift.
-    git(&fixture.repo, &["switch", "-qc", "upstream-side"]);
-    std::fs::write(fixture.repo.join("upstream.txt"), "upstream\n").unwrap();
-    git(&fixture.repo, &["add", "-A"]);
-    git(&fixture.repo, &["commit", "-qm", "upstream"]);
-    let upstream = git(&fixture.repo, &["rev-parse", "HEAD"]);
-    git(&fixture.repo, &["switch", "-q", "main"]);
-    git(
-        &fixture.repo,
-        &["update-ref", "refs/remotes/origin/main", &upstream],
-    );
-    // This test measures the drift budget, not the main-checkout fast-forward
-    // (#232). A local note keeps the primary checkout where the fixture left
-    // it, so `status` inspects exactly the drift set up above.
-    std::fs::write(fixture.repo.join("operator-notes.txt"), "keep\n").unwrap();
-
-    let cut = run(&fixture.repo, &["status", "--refresh", "--json"], Some(0));
-    assert!(
-        strings(&cut["deferred_checks"]).contains(&"git_refs"),
-        "{cut:#}"
-    );
-    // Without a readable upstream ref, status cannot know there is drift or
-    // construct the reviewed dry-run command. Unknown remains unknown.
-    assert!(cut.get("integration_reconciliation").is_none(), "{cut:#}");
-    let rows = advice(&cut, "status.inspection-budget");
-    assert_eq!(rows.len(), 1, "{cut:#}");
-    assert!(strings(&rows[0]["commands"]).is_empty(), "{cut:#}");
-
-    let full = run(&fixture.repo, &["status", "--refresh", "--json"], None);
-    assert!(
-        !strings(&full["deferred_checks"]).contains(&"integration_drift"),
-        "{full:#}"
-    );
-    assert!(full.get("integration_reconciliation").is_some(), "{full:#}");
 }

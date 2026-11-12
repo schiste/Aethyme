@@ -52,16 +52,10 @@ struct Fixture {
 /// tracked, so the broker has an upstream to compare against. A non-empty
 /// `config` is committed as `.aethyme/config.toml` before the push.
 fn fixture(config: &str) -> Fixture {
-    fixture_with(config, false)
+    fixture_with(config)
 }
 
-/// [`fixture`] in a repository that promotes to integration. Only the two
-/// integration-backlog cases need it; they go with the promotion engine.
-fn promoting_fixture() -> Fixture {
-    fixture_with("", true)
-}
-
-fn fixture_with(config: &str, promote: bool) -> Fixture {
+fn fixture_with(config: &str) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let origin = tmp.path().join("origin.git");
     let repo = tmp.path().join("repo");
@@ -71,9 +65,6 @@ fn fixture_with(config: &str, promote: bool) -> Fixture {
         &["init", "-q", "--bare", "-b", "main", "origin.git"],
     );
     git(&repo, &["init", "-q", "-b", "main"]);
-    if promote {
-        aethyme_testkit::promote_on_submit(&repo);
-    }
     std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     git(&repo, &["add", "-A"]);
@@ -186,59 +177,6 @@ fn a_commit_whose_patch_is_already_upstream_is_not_counted() {
         status["unpushed_work"]["sessions"]
             .as_array()
             .is_none_or(Vec::is_empty),
-        "{status:#}"
-    );
-}
-
-#[test]
-fn integration_ahead_of_upstream_is_reported_with_its_age() {
-    let fixture = promoting_fixture();
-    let (session, _, _) = session_with_commit(&fixture.repo, "work.txt");
-    let mut broker = Broker::open(&fixture.repo).unwrap();
-    assert!(broker.submit(session).unwrap().promoted);
-
-    let status = status(&fixture.repo);
-    let integration = &status["unpushed_work"]["integration"];
-    assert_eq!(integration["unpublished_commits"], 1, "{status:#}");
-    assert_eq!(integration["on_no_remote"], 1, "{status:#}");
-    assert_eq!(integration["upstream_ref"], "refs/remotes/origin/main");
-    assert!(integration["oldest_unpublished_at_ms"].is_i64());
-    let rows = advice(&status, "integration.unpublished-work");
-    assert_eq!(rows.len(), 1, "{status:#}");
-    assert!(
-        rows[0]["summary"].as_str().unwrap().contains("verify-only"),
-        "{}",
-        rows[0]["summary"]
-    );
-
-    let doctor = json(&run(&fixture.repo, &["status", "doctor", "--json"]));
-    assert_eq!(
-        doctor["unpushed_work"]["integration"]["unpublished_commits"], 1,
-        "{doctor:#}"
-    );
-}
-
-/// A session built on integration inherits its unpublished promotions. They
-/// are integration's backlog, reported once there -- not a stranded commit in
-/// every worktree that started after them.
-#[test]
-fn a_new_session_does_not_inherit_unpublished_integration_work() {
-    let fixture = promoting_fixture();
-    let (first, _, _) = session_with_commit(&fixture.repo, "work.txt");
-    let mut broker = Broker::open(&fixture.repo).unwrap();
-    assert!(broker.submit(first).unwrap().promoted);
-    let second = broker.start_worktree("built on integration", None).unwrap();
-
-    let status = status(&fixture.repo);
-    let sessions = status["unpushed_work"]["sessions"].as_array().unwrap();
-    assert!(
-        sessions
-            .iter()
-            .all(|session| session["session_id"] != second.id),
-        "{status:#}"
-    );
-    assert_eq!(
-        status["unpushed_work"]["integration"]["unpublished_commits"], 1,
         "{status:#}"
     );
 }
