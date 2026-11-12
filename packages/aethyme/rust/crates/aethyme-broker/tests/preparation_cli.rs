@@ -758,6 +758,8 @@ cache = "repository_shared"
         ],
     );
     assert!(!refused.status.success(), "--wait 0s must still fail fast");
+    // Contention is a host condition to wait out, not an unclassified failure.
+    assert_eq!(refused.status.code(), Some(6), "{refused:?}");
     // `--json` reports the refusal on stdout; the human form uses stderr.
     let refusal = format!(
         "{}{}",

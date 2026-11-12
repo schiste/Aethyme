@@ -416,6 +416,39 @@ fn is_resource_contention(error: &crate::HostResourceError) -> bool {
     )
 }
 
+/// Name the remedy when ordinary contention outlasted the `--wait` budget.
+///
+/// The bare conflict ("exclusive key is held by lease ...") reads like a fault
+/// and left callers guessing whether to retry. The code and conflicts are kept
+/// so the exit class stays "resource contention"; a dead holder or a policy
+/// mismatch already carries its own remedy and passes through unchanged.
+fn shared_cache_wait_exhausted(
+    error: crate::HostResourceError,
+    wait: Duration,
+) -> PreparationError {
+    match error {
+        crate::HostResourceError::Conflict {
+            code,
+            message,
+            conflicts,
+        } if code == "resource_contention" => {
+            crate::phase_telemetry::add("shared_cache_wait_exhausted", wait);
+            crate::HostResourceError::Conflict {
+                code,
+                message: format!(
+                    "{message}; the shared preparation cache stayed busy for the whole {}s \
+                     --wait budget and nothing was prepared: rerun the same prepare command \
+                     to keep waiting, or pass a longer --wait",
+                    wait.as_secs()
+                ),
+                conflicts,
+            }
+            .into()
+        }
+        error => error.into(),
+    }
+}
+
 /// Take the repository's shared cache for one preparation.
 ///
 /// `sharing` is the repository's opt-in. Without it, and whenever the cache
@@ -456,7 +489,9 @@ fn acquire_preparation_cache(
      -> Result<crate::HostResourceGrant, PreparationError> {
         let request = request_for(SharedCacheMode::Exclusive)?;
         let remaining = deadline.saturating_duration_since(Instant::now());
-        Ok(coordinator.acquire_with_wait(&request, remaining, notice)?)
+        coordinator
+            .acquire_with_wait(&request, remaining, notice)
+            .map_err(|error| shared_cache_wait_exhausted(error, wait))
     };
     if !sharing {
         return Ok((
@@ -485,7 +520,9 @@ fn acquire_preparation_cache(
         None => {}
     }
     let request = request_for(SharedCacheMode::Shared)?;
-    let grant = coordinator.acquire_with_wait(&request, wait, &mut notice)?;
+    let grant = coordinator
+        .acquire_with_wait(&request, wait, &mut notice)
+        .map_err(|error| shared_cache_wait_exhausted(error, wait))?;
     let unsettled = {
         let _span = crate::phase_telemetry::span("shared_cache_rotation_probe");
         rotation_unsettled()
@@ -4995,6 +5032,24 @@ mod tests {
             (mode, need),
             (SharedCacheMode::Shared, None),
             "a busy cache leaves the check for a later preparation"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_wait_names_the_remedy_and_stays_contention() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&tmp.path().join("r.db")).unwrap();
+        let (_holder, _, _) = acquire_for_test(&mut coordinator, 1, None, false).unwrap();
+        let alone = acquire_for_test(&mut coordinator, 1, None, false).unwrap_err();
+        assert!(is_contention(&alone), "{alone}");
+        assert!(
+            alone.to_string().contains("pass a longer --wait"),
+            "{alone}"
+        );
+        let error = crate::BrokerOpError::from(alone);
+        assert_eq!(
+            crate::exit_status::for_broker_error(&error),
+            crate::exit_status::ENVIRONMENT
         );
     }
 

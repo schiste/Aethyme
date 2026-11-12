@@ -23,7 +23,8 @@ pub const VERIFICATION_FAILED: u8 = 4;
 /// reconcile; never retry blindly.
 pub const OUTCOME_UNKNOWN: u8 = 5;
 /// The host could not run the command: a missing tool, path or remote base,
-/// or an I/O failure outside the broker's control.
+/// an I/O failure outside the broker's control, or a host-wide resource that
+/// stayed busy for the whole wait budget.
 pub const ENVIRONMENT: u8 = 6;
 /// `leases wait`: the holder was gone past the stale grace and the broker
 /// granted the release (#359). The path is free, as with `SUCCESS`
@@ -141,6 +142,19 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::LeaseRequestRefused { .. }
         | E::SessionSyncRefused { .. }
         | E::GuardedExecTimeoutRequiresSupervision { .. } => REFUSED,
+        // A host-wide resource (the shared preparation cache) stayed busy for
+        // the whole wait budget: nothing ran, and retrying later is the remedy.
+        // Any other refusal (a dead holder to reconcile, a capacity-policy
+        // mismatch) needs its precondition fixed first.
+        E::Preparation(crate::PreparationError::HostResource(
+            crate::HostResourceError::Conflict { code, .. },
+        )) => {
+            if code == "resource_contention" {
+                ENVIRONMENT
+            } else {
+                REFUSED
+            }
+        }
         _ => FAILED,
     }
 }
@@ -217,6 +231,28 @@ mod tests {
         assert_eq!(
             for_broker_error(&BrokerOpError::LeaseClaimPreparationTimedOut { budget_ms: 30_000 }),
             ENVIRONMENT
+        );
+    }
+
+    #[test]
+    fn host_resource_refusals_during_preparation_are_classified() {
+        let conflict = |code: &str| {
+            BrokerOpError::Preparation(crate::PreparationError::HostResource(
+                crate::HostResourceError::Conflict {
+                    code: code.into(),
+                    message: "preparation_cache: exclusive key is held by lease x".into(),
+                    conflicts: Vec::new(),
+                },
+            ))
+        };
+        assert_eq!(
+            for_broker_error(&conflict("resource_contention")),
+            ENVIRONMENT
+        );
+        assert_eq!(for_broker_error(&conflict("orphaned_holder")), REFUSED);
+        assert_eq!(
+            for_broker_error(&conflict("capacity_policy_mismatch")),
+            REFUSED
         );
     }
 
