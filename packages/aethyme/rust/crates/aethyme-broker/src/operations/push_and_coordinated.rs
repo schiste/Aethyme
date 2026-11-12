@@ -1955,6 +1955,7 @@ impl Broker {
                             args,
                             AdmissionDeadline::start(QueueWait::Seconds(5)),
                             repository,
+                            false,
                         )
                         .is_ok()
                     })
@@ -3208,7 +3209,7 @@ impl Broker {
                     &repository,
                 )
                 .and_then(|proven| {
-                    if &proven == branch_ref {
+                    if proven == *branch_ref {
                         Ok(())
                     } else {
                         Err(BrokerOpError::InvalidCoordinatedOperation {

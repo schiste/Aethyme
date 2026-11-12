@@ -2541,8 +2541,14 @@ fn exact_fetch_profile_validates_git_config_and_observes_exact_refs() {
     let (root, target) = push_fixture();
     let args = git_scopes::canonical_fetch_args("origin", "main").unwrap();
     let deadline = AdmissionDeadline::start(QueueWait::Seconds(10));
-    git_scopes::validate_repository(root.path(), &args, deadline, &target.coordination_key)
-        .unwrap();
+    git_scopes::validate_repository(
+        root.path(),
+        &args,
+        deadline,
+        &target.coordination_key,
+        false,
+    )
+    .unwrap();
     let oid = crate::GitRepo::discover(root.path())
         .unwrap()
         .resolve_ref("HEAD")
@@ -2585,8 +2591,14 @@ fn exact_fetch_profile_validates_git_config_and_observes_exact_refs() {
         .unwrap();
     assert!(output.status.success());
     assert!(
-        git_scopes::validate_repository(root.path(), &args, deadline, &target.coordination_key)
-            .is_err(),
+        git_scopes::validate_repository(
+            root.path(),
+            &args,
+            deadline,
+            &target.coordination_key,
+            false
+        )
+        .is_err(),
         "a second expanding refmap must force the wide lane"
     );
 }
@@ -2605,13 +2617,63 @@ fn effective_hooks_path_allows_irrelevant_pre_push_but_refuses_reference_transac
     assert!(config.status.success());
     let args = git_scopes::canonical_fetch_args("origin", "main").unwrap();
     let deadline = AdmissionDeadline::start(QueueWait::Seconds(10));
-    git_scopes::validate_repository(root.path(), &args, deadline, &target.coordination_key)
-        .unwrap();
+    git_scopes::validate_repository(
+        root.path(),
+        &args,
+        deadline,
+        &target.coordination_key,
+        false,
+    )
+    .unwrap();
     std::fs::write(hooks.join("reference-transaction"), "#!/bin/sh\nexit 0\n").unwrap();
     assert!(
-        git_scopes::validate_repository(root.path(), &args, deadline, &target.coordination_key)
-            .is_err()
+        git_scopes::validate_repository(
+            root.path(),
+            &args,
+            deadline,
+            &target.coordination_key,
+            false
+        )
+        .is_err()
     );
+}
+
+/// A strict push to a configured remote name is widened by a pre-push hook
+/// only when the push is not the caller's own session branch (or the
+/// repository opted out); a mirror or push URL always widens it, while a fetch
+/// ignores both.
+#[test]
+fn strict_named_push_profile_follows_session_hooks_and_push_configuration() {
+    let (root, target) = push_fixture();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(root.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+    };
+    let hooks = root.path().join("custom-hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    std::fs::write(hooks.join("pre-push"), "#!/bin/sh\nexit 0\n").unwrap();
+    git(&["config", "core.hooksPath", "custom-hooks"]);
+    let push = git_scopes::strict_push_args("origin", &"c".repeat(40), "refs/heads/agent/a");
+    let fetch = git_scopes::canonical_fetch_args("origin", "main").unwrap();
+    let deadline = AdmissionDeadline::start(QueueWait::Seconds(10));
+    let key = &target.coordination_key;
+    assert!(git_scopes::validate_repository(root.path(), &push, deadline, key, false).is_err());
+    git_scopes::validate_repository(root.path(), &push, deadline, key, true).unwrap();
+    git(&[
+        "config",
+        "remote.origin.pushurl",
+        "https://example.test/other.git",
+    ]);
+    assert!(git_scopes::validate_repository(root.path(), &push, deadline, key, true).is_err());
+    git_scopes::validate_repository(root.path(), &fetch, deadline, key, false).unwrap();
+    git(&["config", "--unset", "remote.origin.pushurl"]);
+    git(&["config", "remote.origin.mirror", "true"]);
+    assert!(git_scopes::validate_repository(root.path(), &push, deadline, key, true).is_err());
+    git_scopes::validate_repository(root.path(), &fetch, deadline, key, false).unwrap();
 }
 
 #[test]
@@ -2645,7 +2707,8 @@ fn strict_profiles_refuse_effective_url_rewrites() {
             root.path(),
             &args,
             AdmissionDeadline::start(QueueWait::Seconds(10)),
-            &target.coordination_key
+            &target.coordination_key,
+            false,
         )
         .is_err()
     );

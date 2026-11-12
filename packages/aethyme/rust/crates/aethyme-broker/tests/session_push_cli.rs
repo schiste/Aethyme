@@ -559,6 +559,7 @@ fn a_session_push_holds_only_its_branch_lane_when_the_profile_is_proven() {
         .find(|operation| operation.scope.starts_with("session-push:refs/heads/"))
         .expect("a session push is journaled");
     let command: Vec<String> = serde_json::from_str(&operation.command_json).unwrap();
+    let refspec = format!("{head}:refs/heads/{branch}");
     assert_eq!(
         command,
         [
@@ -568,7 +569,7 @@ fn a_session_push_holds_only_its_branch_lane_when_the_profile_is_proven() {
             "--porcelain",
             "--",
             "origin",
-            &format!("{head}:refs/heads/{branch}"),
+            refspec.as_str(),
         ]
     );
     let details: serde_json::Value =

@@ -667,7 +667,7 @@ pub(super) fn try_reconcile(
         {
             return Ok(None);
         }
-        validate_repository(cwd, args, deadline, &operation.repository)?;
+        validate_repository(cwd, args, deadline, &operation.repository, false)?;
         let target = crate::GitRepo::discover(cwd)?.resolve_remote_command_target(args, None)?;
         if target.coordination_key != operation.repository {
             return Ok(None);
