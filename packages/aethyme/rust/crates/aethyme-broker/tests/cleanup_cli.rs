@@ -757,14 +757,17 @@ fn malformed_commands_refuse_before_the_writable_open_and_change_nothing() {
         ),
         (&["gc", "apply"], "gc apply requires --confirm"),
         (&["gc", "frobnicate"], "unknown gc action"),
-        (&["leases", "claim"], "claim requires a path"),
-        (&["leases", "frobnicate"], "unknown leases action"),
+        (&["advanced", "leases", "claim"], "claim requires a path"),
         (
-            &["representation", "record", "--session", "9999"],
+            &["advanced", "leases", "frobnicate"],
+            "unknown leases action",
+        ),
+        (
+            &["advanced", "representation", "record", "--session", "9999"],
             "representation record requires --confirm",
         ),
         (
-            &["adopt", "--reuse", "--replace-stale"],
+            &["start", "--adopt", "--reuse", "--replace-stale"],
             "mutually exclusive",
         ),
     ];

@@ -381,11 +381,11 @@ fn validate_leases_arguments(parsed: &Parsed) -> Result<(), UsageError> {
             }
         }
         Some(action @ ("ack" | "decline")) => {
-            if !parsed
+            if parsed
                 .positional
                 .get(1)
                 .and_then(|id| id.parse::<i64>().ok())
-                .is_some_and(|id| id > 0)
+                .is_none_or(|id| id <= 0)
             {
                 return Err(UsageError::Message(format!(
                     "{action} requires a positive request id"
