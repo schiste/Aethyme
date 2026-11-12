@@ -1582,6 +1582,11 @@ impl RepositoryWriteLock {
     }
 }
 
+/// The writer-preference lock in front of a shareable lane `key`.
+fn wide_intent_key(key: &str) -> String {
+    format!("{key}::wide-intent")
+}
+
 fn repository_write_lock_path(main_root: &Path, repository: &str) -> PathBuf {
     main_root
         .join(".aethyme/locks/operations")
@@ -1646,7 +1651,10 @@ pub(crate) fn has_unresolved_repository_wide_mutation(
             matches!(
                 operation.status,
                 OperationStatus::Running | OperationStatus::OutcomeUnknown
-            ) && stored_resource_scope(operation).is_none()
+            ) && (stored_resource_scope(operation).is_none()
+                // A session-branch commit holds only its branch lane, but it
+                // moves a local branch a submission plan may be built from.
+                || session_commit_scope(operation).is_some())
         }))
 }
 
@@ -1698,6 +1706,59 @@ fn hooks_outside_lock_enabled(main_root: &Path) -> bool {
         .and_then(|section| section.get("hooks_outside_lock"))
         .and_then(toml::Value::as_bool)
         .unwrap_or(false)
+}
+
+/// Opt-out: give session-branch commits and pushes the repository-wide lane
+/// again whenever their repository hooks run.
+///
+/// By default a `commit` proven to run in the session's own linked worktree on
+/// the session's own branch, and a strict push of that branch, hold only that
+/// branch's lane, hooks included. Git's own lock files protect the object
+/// database, `packed-refs` and `gc --auto`; what this lane cannot protect is a
+/// hook that itself writes refs outside the branch (other branches, tags,
+/// `refs/stash`) or other shared repository state. A repository whose hooks do
+/// that sets this to `true`: every coordinated commit is then repository-wide,
+/// and a session push is repository-wide whenever a `pre-push` or
+/// `reference-transaction` hook exists.
+fn session_hooks_hold_repository_lock_enabled(main_root: &Path) -> bool {
+    let Ok(Some((_, text))) =
+        aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
+    else {
+        return false;
+    };
+    let Ok(value) = text.parse::<toml::Value>() else {
+        return false;
+    };
+    value
+        .get("coordination")
+        .and_then(|section| section.get("session_hooks_hold_repository_lock"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether `broker push` may publish a session branch with the strict,
+/// branch-scoped push spelling. Checked before the push queues so a
+/// repository whose configuration would refuse that profile under the lock
+/// keeps the historical repository-wide spelling instead of failing. A
+/// repository with `push.followTags` also keeps it: the strict spelling passes
+/// `--no-follow-tags`, and the branch lane does not cover tag refs, so it must
+/// not silently stop publishing the tags Git would have followed.
+pub(crate) fn session_branch_push_lane_available(
+    main_root: &Path,
+    cwd: &Path,
+    args: &[String],
+) -> bool {
+    let deadline = AdmissionDeadline::start(QueueWait::Refuse);
+    let repository = "session branch push";
+    !git_scopes::push_follows_tags(cwd, deadline, repository).unwrap_or(true)
+        && git_scopes::validate_repository(
+            cwd,
+            args,
+            deadline,
+            repository,
+            !session_hooks_hold_repository_lock_enabled(main_root),
+        )
+        .is_ok()
 }
 
 /// Opt-in measurement of the provider read a future ref-scoped merge would
@@ -1961,6 +2022,7 @@ fn add_coordination_timing(
     lock: Option<&RepositoryWriteLock>,
     hooks_outside_lock: bool,
     ref_determination: Option<RefDeterminationMeasurement>,
+    wide_intent_wait_ms: Option<i64>,
 ) {
     let Some(details) = details.as_object_mut() else {
         return;
@@ -1984,6 +2046,7 @@ fn add_coordination_timing(
             "queue_wait_ms": queue_wait_ms,
             "lock_hold_ms": lock_hold_ms,
             "hooks_outside_lock": hooks_outside_lock,
+            "wide_intent_wait_ms": wide_intent_wait_ms,
             "ref_determination_ms": ref_determination.map(|measurement| measurement.duration_ms),
             "ref_determination_succeeded": ref_determination.map(|measurement| measurement.succeeded),
         }),
@@ -3195,6 +3258,21 @@ fn resource_lock_scope(provider: OperationProvider, args: &[String]) -> Option<S
     if crate::gh_ref_guard::is_sub_issue_write(args) {
         return Some("issues/sub-issues".into());
     }
+    // `pr edit <n>` and `pr ready <n>` change one pull request's own fields
+    // and draft state and no Git ref. Only the selector in the first operand
+    // position qualifies: there it cannot be the value of an earlier flag.
+    if let [pr, action, number, ..] = args
+        && pr == "pr"
+        && matches!(action.as_str(), "edit" | "ready")
+        && !number.starts_with('0')
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+        && let Ok(number) = number.parse::<u64>()
+        // A base change moves the pull request to another target branch and
+        // invalidates the open-PR listing; it keeps the repository lane.
+        && !(action == "edit" && push_and_coordinated::gh_pr_edit_changes_base(args))
+    {
+        return Some(format!("pull/{number}"));
+    }
     match args.first()?.as_str() {
         command @ ("pr" | "issue") => {
             let resource = match (command, args.get(1)?.as_str()) {
@@ -3263,8 +3341,25 @@ fn coordination_lock_key(repository: &str, resource: Option<&str>) -> String {
 /// that column accepts a caller-declared string, and a caller must never be
 /// able to name its way out of the repository lock.
 fn stored_resource_scope(operation: &CoordinatedOperation) -> Option<String> {
+    // A strict spelling whose repository profile was not proven ran on the
+    // repository-wide lane and was journaled `repository`; it stays wide.
+    if operation.provider == OperationProvider::Git && operation.scope == "repository" {
+        return None;
+    }
+    session_commit_scope(operation).or_else(|| {
+        let command: Vec<String> = serde_json::from_str(&operation.command_json).ok()?;
+        resource_lock_scope(operation.provider, command.get(1..)?)
+    })
+}
+
+/// The branch lane of a journaled session-branch commit. The recorded scope is
+/// trusted only with its reserved prefix, which no caller can declare.
+fn session_commit_scope(operation: &CoordinatedOperation) -> Option<String> {
+    if operation.provider != OperationProvider::Git {
+        return None;
+    }
     let command: Vec<String> = serde_json::from_str(&operation.command_json).ok()?;
-    resource_lock_scope(operation.provider, command.get(1..)?)
+    git_scopes::recorded_session_commit_scope(command.get(1..)?, &operation.scope)
 }
 
 pub(crate) const DESTRUCTIVE_FLAG_REQUIRED: &str =
@@ -3462,6 +3557,7 @@ fn journal_details(
 mod git_scopes;
 mod push_and_coordinated;
 mod redaction;
+pub(crate) use git_scopes::strict_push_args;
 pub(crate) use push_and_coordinated::{github_command, is_within, worktree_relative_push_sources};
 use push_and_coordinated::{is_github_pull_request_merge, provider_command};
 

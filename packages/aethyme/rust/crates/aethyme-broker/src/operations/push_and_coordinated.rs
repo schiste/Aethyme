@@ -626,7 +626,7 @@ fn gh_pr_topology_write(args: &[String]) -> bool {
 /// Do not inspect body/title values: they are arbitrary content and can contain
 /// flag-looking text. These are the value-taking edit options supported by
 /// `gh`; their values must be skipped while scanning for `--base`.
-fn gh_pr_edit_changes_base(args: &[String]) -> bool {
+pub(super) fn gh_pr_edit_changes_base(args: &[String]) -> bool {
     const VALUE_FLAGS: &[&str] = &[
         "-R",
         "--repo",
@@ -1955,6 +1955,7 @@ impl Broker {
                             args,
                             AdmissionDeadline::start(QueueWait::Seconds(5)),
                             repository,
+                            false,
                         )
                         .is_ok()
                     })
@@ -2753,16 +2754,109 @@ impl Broker {
         } else {
             resource_lock_scope(request.provider, &request.args)
         };
+        if request
+            .scope
+            .as_deref()
+            .is_some_and(|scope| scope.starts_with(git_scopes::SESSION_COMMIT_SCOPE_PREFIX))
+        {
+            return Err(BrokerOpError::InvalidCoordinatedOperation {
+                reason: format!(
+                    "scope prefix {:?} is reserved for commits the broker proves are confined to their session branch",
+                    git_scopes::SESSION_COMMIT_SCOPE_PREFIX
+                ),
+            });
+        }
+        let main_root = self.main_root().to_path_buf();
+        let session_hooks_hold_lock = request.provider == OperationProvider::Git
+            && effect != OperationEffect::Read
+            && session_hooks_hold_repository_lock_enabled(&main_root);
+        // The caller's own live session, the only branch a session lane may
+        // name. A missing or closed session keeps the repository lane.
+        let own_session =
+            if request.provider == OperationProvider::Git && effect != OperationEffect::Read {
+                self.store()
+                    .session(request.session_id)
+                    .ok()
+                    .filter(|session| !session.status.is_closed())
+            } else {
+                None
+            };
+        // A commit proven to run in the session's own linked worktree on the
+        // session's own branch writes only that branch: it takes that branch's
+        // lane, hooks included, unless the repository opted out. Anything
+        // unproven (main checkout, detached or foreign HEAD, a declared scope)
+        // keeps the repository-wide lane.
+        let session_commit_ref = match &own_session {
+            Some(session)
+                if !session_hooks_hold_lock
+                    && request.scope.is_none()
+                    && git_scopes::is_plain_commit(&request.args) =>
+            {
+                git_scopes::validate_session_commit(
+                    cwd,
+                    &main_root,
+                    Path::new(&session.worktree_path),
+                    &session.branch,
+                    admission,
+                    &repository,
+                )
+                .ok()
+            }
+            _ => None,
+        };
+        // A strict push of the caller's own session branch is not widened by
+        // the repository's `pre-push` hook unless the repository opted out.
+        // The hooks still run inside the push exactly as before.
+        let session_branch_hooks = !session_hooks_hold_lock
+            && own_session.as_ref().is_some_and(|session| {
+                git_scopes::strict_push_destination(&request.args).is_some_and(|destination| {
+                    destination == format!("refs/heads/{}", session.branch)
+                })
+            });
+        // A strict fetch or push spelling narrows only when this repository's
+        // configuration proves its footprint. Otherwise it runs on the
+        // repository-wide lane, as every such spelling did before, instead of
+        // being refused; it is journaled `repository` so a recomputed scope
+        // stays wide too. A configuration that changes while the operation
+        // queues is still refused under the lane.
+        let profile_unproven = request.provider == OperationProvider::Git
+            && session_commit_ref.is_none()
+            && resource_scope.is_some()
+            && git_scopes::validate_repository(
+                cwd,
+                &request.args,
+                admission,
+                &repository,
+                session_branch_hooks,
+            )
+            .is_err();
+        let resource_scope = if profile_unproven {
+            None
+        } else {
+            session_commit_ref
+                .as_deref()
+                .map(|branch_ref| format!("git-ref/{branch_ref}"))
+                .or(resource_scope)
+        };
         let lock_key = coordination_lock_key(&repository, resource_scope.as_deref());
 
         let scope_was_declared = request.scope.is_some();
         // The derived scope is also the audit scope, so the journal names the
         // resource the lock actually protects. A caller-declared scope still
         // wins for the record, but never changes which lock is taken.
-        let scope = request
-            .scope
-            .or_else(|| resource_scope.clone())
-            .unwrap_or_else(|| "repository".into());
+        let scope = if profile_unproven {
+            "repository".to_string()
+        } else {
+            request
+                .scope
+                .or_else(|| {
+                    session_commit_ref
+                        .as_deref()
+                        .map(git_scopes::session_commit_record_scope)
+                })
+                .or_else(|| resource_scope.clone())
+                .unwrap_or_else(|| "repository".into())
+        };
         validate_scope(&scope)?;
         if inferred.is_none() && !scope_was_declared {
             return Err(BrokerOpError::InvalidCoordinatedOperation {
@@ -2948,6 +3042,69 @@ impl Broker {
         let lock_wait_started_at = (effect != OperationEffect::Read).then(unix_now_ms);
         let waiting_started_at = lock_wait_started_at.unwrap_or_else(unix_now_ms);
         let enqueued_at = operation.created_at;
+        // Writer preference. flock grants no queue, so a repository-wide
+        // writer polling for an exclusive lane could wait forever while narrow
+        // writers keep re-taking it shared. Every writer that touches a
+        // shareable lane first passes the matching wide-intent lock: a wide
+        // writer holds it exclusively until it holds its lanes, and a narrow
+        // writer takes it shared and releases it at once, so no new narrow
+        // writer starts while a wide one waits. Order: intent (common, then
+        // repository) -> common -> destination -> repository -> lane. A narrow
+        // writer holds no lock while it waits for an intent, and flock releases
+        // with the process, so a crash cannot leak or deadlock it.
+        let wide_writer = resource_scope.is_none();
+        let wide_intent_keys = if effect == OperationEffect::Read {
+            Vec::new()
+        } else {
+            let mut keys = Vec::new();
+            if request.provider == OperationProvider::Git {
+                keys.push(wide_intent_key(&git_scopes::common_lock_key(cwd)?));
+            }
+            // Narrow GitHub writers share no repository lane; only Git narrow
+            // writers and wide writers meet on it.
+            if request.provider == OperationProvider::Git || wide_writer {
+                keys.push(wide_intent_key(&repository));
+            }
+            keys
+        };
+        let wide_intent_started = std::time::Instant::now();
+        let mut wide_intent_guards = Vec::new();
+        for key in &wide_intent_keys {
+            match RepositoryWriteLock::acquire_mode(
+                &main_root,
+                key,
+                (queued_operation_id, Some(request.session_id)),
+                || Ok("a repository-wide write waiting for, or taking, its lanes".to_string()),
+                admission.remaining_queue_wait(queue_wait),
+                OPERATION_LOCK_PROGRESS_INTERVAL,
+                |holder, elapsed| {
+                    eprintln!(
+                        "[coordination] waiting behind {holder} ({})",
+                        humanize_duration(elapsed.as_secs())
+                    )
+                },
+                !wide_writer,
+            ) {
+                // A narrow writer only needed to pass the intent.
+                Ok(guard) if wide_writer => wide_intent_guards.push(guard),
+                Ok(_) => {}
+                Err(error) => {
+                    self.resolve_unstarted_operation(
+                        queued_operation_id,
+                        "wide_intent_unavailable",
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        let wide_intent_wait_ms = (!wide_intent_keys.is_empty())
+            .then(|| wide_intent_started.elapsed().as_millis() as i64);
+        if !wide_intent_keys.is_empty() {
+            crate::phase_telemetry::add(
+                "coordinated_wide_intent_wait",
+                wide_intent_started.elapsed(),
+            );
+        }
         // Keep the historical exclusive lane as the parent of every narrow
         // Git lane. Holding it shared preserves exclusion with old clients and
         // unknown commands instead of silently fragmenting the lock protocol.
@@ -3002,12 +3159,8 @@ impl Broker {
             None
         };
         let _git_destination_guard =
-            if let Some(footprint) = git_scopes::fetch_footprint(&request.args) {
-                let key = format!(
-                    "{}::{}",
-                    git_scopes::common_lock_key(cwd)?,
-                    footprint.destination_ref
-                );
+            if let Some(destination_ref) = git_scopes::local_destination_ref(&request.args) {
+                let key = format!("{}::{}", git_scopes::common_lock_key(cwd)?, destination_ref);
                 let main_root = self.main_root().to_path_buf();
                 match RepositoryWriteLock::acquire(
                     &main_root,
@@ -3129,15 +3282,47 @@ impl Broker {
                 }
             }
         };
+        // Every lane is held: later narrow writers may queue behind them again.
+        drop(wide_intent_guards);
         drop(lock_wait_span);
         let locked_checks_span = push_stage_span(push_stages, "push_git_locked_checks");
-        if request.provider == OperationProvider::Git
-            && resource_scope.is_some()
-            && let Err(error) =
-                git_scopes::validate_repository(cwd, &request.args, admission, &repository)
-        {
-            self.resolve_unstarted_operation(queued_operation_id, "resource_profile_unavailable");
-            return Err(error);
+        if request.provider == OperationProvider::Git && resource_scope.is_some() {
+            // Re-prove the footprint under the lane: a session commit's HEAD
+            // or a push's configuration may have changed while it queued.
+            let checked = match (&session_commit_ref, &own_session) {
+                (Some(branch_ref), Some(session)) => git_scopes::validate_session_commit(
+                    cwd,
+                    &main_root,
+                    Path::new(&session.worktree_path),
+                    &session.branch,
+                    admission,
+                    &repository,
+                )
+                .and_then(|proven| {
+                    if proven == *branch_ref {
+                        Ok(())
+                    } else {
+                        Err(BrokerOpError::InvalidCoordinatedOperation {
+                            reason: "the session worktree changed branch while the commit queued"
+                                .into(),
+                        })
+                    }
+                }),
+                _ => git_scopes::validate_repository(
+                    cwd,
+                    &request.args,
+                    admission,
+                    &repository,
+                    session_branch_hooks,
+                ),
+            };
+            if let Err(error) = checked {
+                self.resolve_unstarted_operation(
+                    queued_operation_id,
+                    "resource_profile_unavailable",
+                );
+                return Err(error);
+            }
         }
         if effect != OperationEffect::Read {
             let unresolved = if request.provider == OperationProvider::Git {
@@ -3170,13 +3355,13 @@ impl Broker {
                 {
                     let recorded: Option<Vec<String>> =
                         serde_json::from_str(&operation.command_json).ok();
-                    let recorded_fetch = recorded
+                    let recorded_destination = recorded
                         .as_ref()
                         .and_then(|args| args.get(1..))
-                        .and_then(git_scopes::fetch_footprint);
-                    let requested_fetch = git_scopes::fetch_footprint(&request.args);
-                    if !matches!((recorded_fetch, requested_fetch), (Some(left), Some(right))
-                        if left.destination_ref == right.destination_ref)
+                        .and_then(git_scopes::local_destination_ref);
+                    let requested_destination = git_scopes::local_destination_ref(&request.args);
+                    if !matches!((recorded_destination, requested_destination), (Some(left), Some(right))
+                        if left == right)
                     {
                         continue;
                     }
@@ -3376,15 +3561,21 @@ impl Broker {
         // it names is the whole point -- see `provider_command`.
         let executable = provider_executable(request.provider);
         let mut command = provider_command(request.provider);
-        command.args(pinned_push_args.as_deref().unwrap_or(&request.args));
-        // Appended after the subcommand, where `git push` accepts it. The
-        // repository opted in, the same hook already ran against these exact
-        // commits in the dry run above, and the plan was re-proven unchanged
-        // under the lock. Re-running it here would double the cost the opt-in
-        // exists to avoid (issues #138, #146).
+        let mut provider_args = pinned_push_args
+            .clone()
+            .unwrap_or_else(|| request.args.clone());
+        // Inserted right after the subcommand, before any `--` that ends the
+        // options, where `git push` accepts it. The repository opted in, the
+        // same hook already ran against these exact commits in the dry run
+        // above, and the plan was re-proven unchanged under the lock.
+        // Re-running it here would double the cost the opt-in exists to avoid
+        // (issues #138, #146).
         if hooks_ran_outside_lock {
-            command.arg("--no-verify");
+            let after_subcommand =
+                git_subcommand_index(&provider_args).map_or(provider_args.len(), |index| index + 1);
+            provider_args.insert(after_subcommand, "--no-verify".into());
         }
+        command.args(&provider_args);
         if request.provider == OperationProvider::Git {
             export_push_shape(&mut command, push_shape.as_ref());
         }
@@ -3508,6 +3699,7 @@ impl Broker {
                     lock.as_ref(),
                     hooks_ran_outside_lock,
                     ref_determination,
+                    wide_intent_wait_ms,
                 );
                 let operation = self.store().transition_coordinated_operation(
                     operation.id,
@@ -3576,6 +3768,7 @@ impl Broker {
                     lock.as_ref(),
                     hooks_ran_outside_lock,
                     ref_determination,
+                    wide_intent_wait_ms,
                 );
                 let operation = self.store().transition_coordinated_operation(
                     operation.id,
@@ -3818,6 +4011,7 @@ impl Broker {
             lock.as_ref(),
             hooks_ran_outside_lock,
             ref_determination,
+            wide_intent_wait_ms,
         );
         let operation = self.store().transition_coordinated_operation(
             operation.id,

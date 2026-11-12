@@ -62,6 +62,17 @@ pub struct UnrelatedContentionStats {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
+pub struct NarrowLaneStats {
+    /// Completed writes whose final lock key was a resource lane
+    /// (`<repository>::<resource>`) rather than the repository-wide key.
+    pub sample_count: usize,
+    /// Of those, commits and pushes that held only their session branch lane.
+    pub session_branch_sample_count: usize,
+    pub lock_hold_ms: OperationTimingDistribution,
+    pub queue_wait_ms: OperationTimingDistribution,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct RefDeterminationStats {
     pub pr_merge_operation_count: usize,
     pub measured_count: usize,
@@ -86,6 +97,7 @@ pub struct OperationStats {
     pub by_kind: Vec<OperationKindStats>,
     pub hooks_outside_lock: HooksOutsideLockStats,
     pub unrelated_contention: UnrelatedContentionStats,
+    pub narrow_lanes: NarrowLaneStats,
     pub pr_merge_ref_determination: RefDeterminationStats,
     pub interpretation: String,
 }
@@ -114,6 +126,7 @@ struct Sample {
     queue_wait_ms: i64,
     lock_hold_ms: i64,
     hooks_outside_lock: bool,
+    session_branch_lane: bool,
 }
 
 pub(crate) fn from_store(
@@ -186,13 +199,14 @@ pub(crate) fn from_store(
         samples.push(Sample {
             operation_id: operation.id,
             kind: operation_kind(operation),
-            lock_key: timing.lock_key,
             wait_started_at,
             acquired_at,
             released_at,
             queue_wait_ms,
             lock_hold_ms,
             hooks_outside_lock: timing.hooks_outside_lock,
+            session_branch_lane: session_branch_scope(&operation.scope).is_some(),
+            lock_key: timing.lock_key,
         });
     }
 
@@ -203,7 +217,17 @@ pub(crate) fn from_store(
     let mut by_kind = BTreeMap::<String, (Vec<i64>, Vec<i64>)>::new();
     let mut hooks_hold = Vec::new();
     let mut hooks_wait = Vec::new();
+    let mut narrow_hold = Vec::new();
+    let mut narrow_wait = Vec::new();
+    let mut session_branch_samples = 0usize;
     for sample in &samples {
+        if sample.lock_key.contains("::") {
+            narrow_hold.push(sample.lock_hold_ms);
+            narrow_wait.push(sample.queue_wait_ms);
+            if sample.session_branch_lane {
+                session_branch_samples += 1;
+            }
+        }
         let entry = by_kind.entry(sample.kind.clone()).or_default();
         entry.0.push(sample.lock_hold_ms);
         entry.1.push(sample.queue_wait_ms);
@@ -243,12 +267,20 @@ pub(crate) fn from_store(
             queue_wait_ms: distribution(hooks_wait),
         },
         unrelated_contention,
+        narrow_lanes: NarrowLaneStats {
+            sample_count: narrow_hold.len(),
+            session_branch_sample_count: session_branch_samples,
+            lock_hold_ms: distribution(narrow_hold),
+            queue_wait_ms: distribution(narrow_wait),
+        },
         pr_merge_ref_determination: ref_stats,
         interpretation: concat!(
             "Samples are completed operations with broker timing data. ",
             "Unrelated contention counts only waits where both operations ",
             "name disjoint, known scopes; repository-wide or unknown targets ",
-            "are excluded. Enable coordination.measure_pr_merge_ref to measure ",
+            "are excluded. Narrow lanes count writes that held a resource lane ",
+            "instead of the repository-wide key. ",
+            "Enable coordination.measure_pr_merge_ref to measure ",
             "the provider read that would determine a pull request's base ref."
         )
         .into(),
@@ -418,9 +450,21 @@ fn disjoint_known_scopes(left: &CoordinatedOperation, right: &CoordinatedOperati
     }
 }
 
+/// The branch a session-branch commit or push names, without its audit prefix,
+/// so a commit and a push of the same branch compare equal.
+fn session_branch_scope(scope: &str) -> Option<&str> {
+    ["session-push:", "session-commit:", "git-ref/"]
+        .iter()
+        .find_map(|prefix| scope.strip_prefix(prefix))
+        .filter(|rest| rest.starts_with("refs/heads/"))
+}
+
 fn known_scope(scope: &str) -> Option<&str> {
     if scope == "repository" || scope.is_empty() {
         return None;
+    }
+    if let Some(branch) = session_branch_scope(scope) {
+        return Some(branch);
     }
     (scope.starts_with("ref:")
         || scope.starts_with("refs/")
@@ -475,6 +519,20 @@ mod tests {
         assert!(!disjoint_known_scopes(
             &operation(1, "repository"),
             &operation(2, "ref:two")
+        ));
+        // Session pushes of different branches that queued on one key are
+        // unrelated contention; a commit and a push of one branch are not.
+        assert!(disjoint_known_scopes(
+            &operation(1, "session-push:refs/heads/agent/a"),
+            &operation(2, "session-push:refs/heads/agent/b")
+        ));
+        assert!(!disjoint_known_scopes(
+            &operation(1, "session-commit:refs/heads/agent/a"),
+            &operation(2, "session-push:refs/heads/agent/a")
+        ));
+        assert!(!disjoint_known_scopes(
+            &operation(1, "session-push:pr-create:agent/a"),
+            &operation(2, "session-push:refs/heads/agent/b")
         ));
     }
 
@@ -577,5 +635,88 @@ mod tests {
             Some(12)
         );
         assert_eq!(report.by_kind.len(), 2);
+        assert_eq!(report.narrow_lanes.sample_count, 0);
+    }
+
+    #[test]
+    fn stats_count_resource_lanes_and_session_branch_lanes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("broker.db");
+        drop(BrokerStore::open(&database).unwrap());
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (
+                     id, worktree_path, branch, origin, status,
+                     created_at, updated_at, last_activity_at
+                 ) VALUES (1, '/repo', 'agent/one', 'adopted', 'active', 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let mut store = BrokerStore::open(&database).unwrap();
+        for (provider, command, scope, lock_key) in [
+            (
+                OperationProvider::Git,
+                "[\"git\",\"commit\",\"-m\",\"x\"]",
+                "session-commit:refs/heads/agent/one",
+                "github.com/o/r::git-ref/refs/heads/agent/one",
+            ),
+            (
+                OperationProvider::Git,
+                "[\"git\",\"push\"]",
+                "session-push:refs/heads/agent/one",
+                "github.com/o/r::git-ref/refs/heads/agent/one",
+            ),
+            (
+                OperationProvider::Github,
+                "[\"gh\",\"pr\",\"edit\",\"7\"]",
+                "pull/7",
+                "github.com/o/r::pull/7",
+            ),
+            (
+                OperationProvider::Git,
+                "[\"git\",\"push\"]",
+                "session-push:refs/heads/agent/one",
+                "github.com/o/r",
+            ),
+        ] {
+            let operation = store
+                .create_coordinated_operation(&crate::NewCoordinatedOperation {
+                    session_id: 1,
+                    provider,
+                    repository: "github.com/o/r".into(),
+                    scope: scope.into(),
+                    effect: OperationEffect::Write,
+                    authorization_reason: Some("test".into()),
+                    command_json: command.into(),
+                    pid: 1,
+                    host_operation_id: None,
+                    identity_provenance: crate::OperationIdentityProvenance::VerifiedCanonical,
+                })
+                .unwrap();
+            let details = serde_json::json!({ "coordination_timing": {
+                "lock_key": lock_key,
+                "lock_wait_started_at": 10,
+                "lock_acquired_at": 10,
+                "lock_released_at": 20,
+                "queue_wait_ms": 0,
+                "lock_hold_ms": 10,
+            }})
+            .to_string();
+            store
+                .transition_coordinated_operation(
+                    operation.id,
+                    crate::OperationStatus::Succeeded,
+                    Some(0),
+                    Some(&details),
+                )
+                .unwrap();
+        }
+        let report = from_store(&store, None, 50).unwrap();
+        assert_eq!(report.measured_operations, 4);
+        assert_eq!(report.narrow_lanes.sample_count, 3);
+        assert_eq!(report.narrow_lanes.session_branch_sample_count, 2);
+        assert_eq!(report.narrow_lanes.lock_hold_ms.sample_count, 3);
     }
 }
