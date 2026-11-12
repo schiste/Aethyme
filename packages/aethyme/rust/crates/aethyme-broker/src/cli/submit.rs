@@ -1074,6 +1074,13 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
     if let Some(note) = &report.default_branch_note {
         out!("  Note: {note}");
     }
+    if let Some(age) = report.default_branch_fetch_age_seconds {
+        out!(
+            "  Note: compared with the default branch as fetched {age}s ago by an earlier \
+             broker command; set {}=off to always fetch",
+            crate::session_push::PUSH_FETCH_REUSE_ENV
+        );
+    }
     for overlap in &report.pr_overlaps {
         out!(
             "  {} open PR #{} {}: {}",
@@ -1698,6 +1705,7 @@ mod review_on_push_tests {
             duplicate_work: Vec::new(),
             default_branch: None,
             default_branch_note: None,
+            default_branch_fetch_age_seconds: None,
             pr_watch_id: None,
             pr_watch_note: None,
             pr_size: None,

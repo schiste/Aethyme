@@ -2663,3 +2663,19 @@ fn hook_push_sources_are_pinned_without_changing_force_or_destination_order() {
     ])));
     assert!(!push_sets_upstream(&args));
 }
+
+#[test]
+fn push_stage_spans_name_only_a_push_stage() {
+    let recorder = crate::phase_telemetry::Recorder::default();
+    {
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        drop(push_stage_span(true, "push_git_process"));
+        drop(push_stage_span(false, "push_git_lock_wait"));
+    }
+    let (_, counts) = recorder.totals();
+    assert_eq!(counts.get("push_git_process"), Some(&1));
+    assert!(
+        !counts.contains_key("push_git_lock_wait"),
+        "a fetch or gh write on the same lane names no push stage"
+    );
+}
