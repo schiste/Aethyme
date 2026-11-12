@@ -4,6 +4,21 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.77] - 2026-11-12
+
+### Removed
+
+- Explicit-lease refusal in promoting repositories. `leases claim`, `start --path`, `adopt --path`, guarded `exec` and `submit` no longer fail because another session holds an overlapping explicit lease; they report the overlap as a warning with a `note send` command, as repositories that do not promote already did. The JSON fields `accepted`, `blockers`, `would_conflict` and `conflicting_leases` remain, with constant values (#1622).
+
+### Fixed
+
+- `broker finish` reclaims a kept worktree's build output again. Its bounded directory walk gave up on the whole worktree at the first directory deeper than six levels, so a cargo `target` directory was often never found and the session ended "incomplete" with gigabytes left behind. An over-deep subtree is now skipped while its siblings are still walked, and ignored directories Git already names are checked directly (#1620).
+- `broker finish cleanup --all-cleaned --apply` reclaims build output from the worktrees it keeps (#1620).
+
+### Added
+
+- `finish --json` reports `cleanup.artifact_bytes_reclaimed`; the bulk cleanup reports `artifact_directories_reclaimed` and `artifact_bytes_reclaimed` (#1620).
+
 ## [0.8.76] - 2026-11-12
 
 ### Removed
