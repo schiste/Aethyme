@@ -17,7 +17,7 @@
   "closed": "bool",
   "delivery": {
     "promoted": "bool",
-    "promotion_commit": "string",
+    "promotion_commit": "null",
     "published": "bool",
     "submitted": "bool"
   },
@@ -43,18 +43,7 @@
     "worktree_missing": "bool"
   },
   "recommended_next_action": "null",
-  "representation": {
-    "created_at": "integer",
-    "discovery": "string",
-    "evidence": "string",
-    "id": "integer",
-    "paths_json": "string",
-    "pr_number": "null",
-    "representing_commit": "string",
-    "representing_ref": "string",
-    "session_head": "string",
-    "session_id": "integer"
-  },
+  "representation": "null",
   "session_id": "integer",
   "status": "string",
   "summary": "string",

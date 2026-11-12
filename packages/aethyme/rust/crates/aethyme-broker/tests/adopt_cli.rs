@@ -1530,7 +1530,7 @@ fn unknown_base_without_integration_does_not_move_a_session_off_the_default_bran
 /// same as nothing having been promoted yet, so it is reported, not stepped over.
 #[test]
 fn unknown_adopted_base_refuses_when_the_integration_it_was_checked_against_is_gone() {
-    let tmp = fixture();
+    let tmp = promoting_fixture();
     set_integration_at_head(tmp.path());
     stdout(&run(
         tmp.path(),

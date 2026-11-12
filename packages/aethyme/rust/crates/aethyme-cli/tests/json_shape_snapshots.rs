@@ -618,11 +618,6 @@ fn other_broker_json_shapes_match_snapshots() {
             .is_some(),
         "submit --json carries an entry id: {submitted}"
     );
-    aethyme_testkit::land_as_pull_request(
-        &repo,
-        &started_branch(&started),
-        aethyme_testkit::MergeStyle::MergeCommit,
-    );
 
     git(&repo, &["branch", "--unset-upstream", "main"]);
     git(&repo, &["update-ref", "-d", "refs/remotes/origin/main"]);
@@ -638,6 +633,12 @@ fn other_broker_json_shapes_match_snapshots() {
     ));
     git(&repo, &["fetch", "-q", "origin"]);
     git(&repo, &["branch", "--set-upstream-to=origin/main", "main"]);
+    // The pull request merges on the provider: the only way work lands.
+    aethyme_testkit::land_as_pull_request(
+        &repo,
+        &started_branch(&started),
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
 
     let finished = json_with_host_state(
         &repo,
