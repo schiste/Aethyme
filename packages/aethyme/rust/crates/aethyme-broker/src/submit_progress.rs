@@ -794,12 +794,22 @@ mod tests {
     fn the_heartbeat_does_not_count_as_progress() {
         let root = tempfile::tempdir().unwrap();
         let progress = SubmitProgress::start(root.path(), 9, Duration::from_millis(20));
-        std::thread::sleep(Duration::from_millis(120));
-        let shared = progress.shared.lock().unwrap();
-        assert!(
-            shared.last_printed_ms > shared.record.started_at_ms,
-            "the heartbeat printed"
-        );
+        // Wait for the heartbeat to print rather than for a fixed time: on a
+        // loaded runner the heartbeat thread may not be scheduled within any
+        // short sleep, and what is under test is what a print leaves behind.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let shared = loop {
+            let shared = progress.shared.lock().unwrap();
+            if shared.last_printed_ms > shared.record.started_at_ms {
+                break shared;
+            }
+            drop(shared);
+            assert!(
+                Instant::now() < deadline,
+                "the heartbeat did not print within 30 s"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
         assert_eq!(
             shared.record.last_progress_at_ms, shared.record.started_at_ms,
             "a heartbeat must not move last progress, or a hung step never looks stalled"
