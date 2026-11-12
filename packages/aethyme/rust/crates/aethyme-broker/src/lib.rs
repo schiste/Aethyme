@@ -78,6 +78,7 @@ mod cli_output;
 mod console;
 pub mod contract_check;
 mod delivery;
+mod enrollment_publication;
 mod error;
 pub mod events;
 mod exposures;
@@ -345,6 +346,7 @@ pub use delivery::{
     DeliveryError, DeliveryOutboxItem, DeliveryPolicy, DeliveryStatus, DeliverySubscription,
 };
 pub use duplicate_work::{DuplicateWork, DuplicateWorkReason, pr_numbers_in_task};
+pub use enrollment_publication::{EnrollmentPublication, EnrollmentPublicationRequest};
 pub use error::{BrokerError, PlannedLeaseConflict};
 pub use exposures::{
     AdvisoryReconciliationItem, EXPOSURE_RECONCILIATION_SCHEMA_VERSION,

@@ -1014,3 +1014,230 @@ fn ship_verify_failure_is_journaled_as_failed() {
         .unwrap();
     assert_eq!(exposure.state, EntryExposureState::Outstanding);
 }
+
+// First-enrollment publication: a verified commit reaches the remote default
+// branch without promotion, so no integration branch is involved.
+
+impl Fixture {
+    /// Make the repository non-promoting, committing `extra` configuration
+    /// alongside it on the remote default branch.
+    fn verify_only_with(&self, extra: &str) -> String {
+        std::fs::create_dir_all(self.repo.join(".aethyme")).unwrap();
+        std::fs::write(
+            self.repo.join(".aethyme/config.toml"),
+            format!("{extra}[promote]\nmode = \"verify-only\"\n"),
+        )
+        .unwrap();
+        git(&self.repo, &["add", "-f", ".aethyme/config.toml"]);
+        git(&self.repo, &["commit", "-qm", "configure verify-only"]);
+        git(&self.repo, &["push", "-q", "origin", "main"]);
+        git(
+            &self.repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        git_output(&self.repo, &["rev-parse", "HEAD"])
+    }
+
+    /// A session head verified by submit without promotion, after
+    /// `unreviewed` extra commits under it. Returns (entry, session, head).
+    fn verified_enrollment_commit(
+        &self,
+        broker: &mut Broker,
+        unreviewed: usize,
+    ) -> (i64, i64, String) {
+        let session = broker.start_worktree("enrollment", None).unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        for index in 0..unreviewed {
+            let name = format!("develop-{index}.txt");
+            std::fs::write(worktree.join(&name), "unreviewed\n").unwrap();
+            git(&worktree, &["add", &name]);
+            git(
+                &worktree,
+                &["commit", "-qm", "feat: unreviewed develop work"],
+            );
+        }
+        std::fs::write(worktree.join("enrolled.txt"), "enrolled\n").unwrap();
+        git(&worktree, &["add", "enrolled.txt"]);
+        git(&worktree, &["commit", "-qm", "chore: enroll"]);
+        let head = git_output(&worktree, &["rev-parse", "HEAD"]);
+        let outcome = broker
+            .submit_expecting_head(
+                session.id,
+                aethyme_broker::CachePolicy::Use,
+                aethyme_broker::PromotionIntent::VerifyOnly,
+                &head,
+            )
+            .unwrap();
+        assert_eq!(outcome.entry.status, aethyme_broker::MergeStatus::Verified);
+        (outcome.entry.id, session.id, head)
+    }
+
+    fn integration_branch(&self) -> String {
+        git_output(
+            &self.repo,
+            &["for-each-ref", "refs/heads/aethyme/integration"],
+        )
+    }
+}
+
+fn enrollment_request<'a>(
+    entry_id: i64,
+    session_id: i64,
+    commit: &'a str,
+    base: &'a str,
+) -> aethyme_broker::EnrollmentPublicationRequest<'a> {
+    aethyme_broker::EnrollmentPublicationRequest {
+        queue_entry_id: entry_id,
+        session_id,
+        commit,
+        remote: "origin",
+        remote_ref: "refs/heads/main",
+        planned_base: base,
+        authorization: "test first enrollment",
+    }
+}
+
+#[test]
+fn enrollment_publication_pushes_the_verified_commit_without_integration() {
+    let fixture = Fixture::new();
+    let base = fixture.verify_only_with("");
+    let mut broker = fixture.broker();
+    let (entry_id, session_id, commit) = fixture.verified_enrollment_commit(&mut broker, 0);
+
+    // Vouching is exact: another session, head or entry does not vouch.
+    assert!(
+        broker
+            .entry_vouching_for_commit(entry_id, session_id, &commit)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        broker
+            .entry_vouching_for_commit(entry_id, session_id + 1, &commit)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        broker
+            .entry_vouching_for_commit(entry_id, session_id, &base)
+            .unwrap()
+            .is_none()
+    );
+    let refused = broker
+        .publish_enrollment_commit(&enrollment_request(
+            entry_id + 1000,
+            session_id,
+            &commit,
+            &base,
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(refused, BrokerOpError::ShipPlanUnavailable { .. }),
+        "{refused}"
+    );
+    assert_eq!(fixture.remote_main(), base);
+
+    let published = broker
+        .publish_enrollment_commit(&enrollment_request(entry_id, session_id, &commit, &base))
+        .unwrap();
+    assert_eq!(published.published_sha, commit);
+    assert_eq!(published.verified_remote_sha, commit);
+    assert_eq!(fixture.remote_main(), commit);
+    assert!(
+        fixture.integration_branch().is_empty(),
+        "publication must not create the integration branch"
+    );
+    let entry = broker
+        .store()
+        .merge_queue()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.id == entry_id)
+        .unwrap();
+    assert_eq!(entry.status, aethyme_broker::MergeStatus::Verified);
+
+    // The remote already showing the commit is an idempotent retry.
+    let retried = broker
+        .publish_enrollment_commit(&enrollment_request(entry_id, session_id, &commit, &base))
+        .unwrap();
+    assert_eq!(retried.verified_remote_sha, commit);
+}
+
+/// A session cut from a branch ahead of the reviewed base (say a stale
+/// `origin/HEAD` naming `develop`) yields a commit that passes the gates and
+/// fast-forwards the remote, yet would publish commits the plan never saw.
+#[test]
+fn enrollment_publication_refuses_a_commit_not_directly_on_the_reviewed_base() {
+    let fixture = Fixture::new();
+    let base = fixture.verify_only_with("");
+    let mut broker = fixture.broker();
+    let (entry_id, session_id, commit) = fixture.verified_enrollment_commit(&mut broker, 2);
+    let operations_before = broker.store().coordinated_operations().unwrap().len();
+
+    let refused = broker
+        .publish_enrollment_commit(&enrollment_request(entry_id, session_id, &commit, &base))
+        .unwrap_err();
+    assert!(
+        matches!(refused, BrokerOpError::ShipPlanUnavailable { .. }),
+        "{refused}"
+    );
+    assert!(
+        refused.to_string().contains("unreviewed commits"),
+        "{refused}"
+    );
+    assert_eq!(fixture.remote_main(), base);
+    assert_eq!(
+        broker.store().coordinated_operations().unwrap().len(),
+        operations_before,
+        "the refusal comes before any remote operation"
+    );
+}
+
+#[test]
+fn enrollment_publication_refuses_when_the_remote_moved() {
+    let fixture = Fixture::new();
+    let base = fixture.verify_only_with("");
+    let mut broker = fixture.broker();
+    let (entry_id, session_id, commit) = fixture.verified_enrollment_commit(&mut broker, 0);
+    let moved = fixture.advance_remote();
+
+    let refused = broker
+        .publish_enrollment_commit(&enrollment_request(entry_id, session_id, &commit, &base))
+        .unwrap_err();
+    assert!(
+        matches!(refused, BrokerOpError::ShipRemoteMoved { .. }),
+        "{refused}"
+    );
+    assert_eq!(fixture.remote_main(), moved);
+}
+
+#[test]
+fn enrollment_publication_refuses_a_review_gated_policy() {
+    let fixture = Fixture::new();
+    let base = fixture
+        .verify_only_with("[publication]\nmode = \"review_gated\"\nallow_break_glass = false\n\n");
+    let mut broker = fixture.broker();
+    let (entry_id, session_id, commit) = fixture.verified_enrollment_commit(&mut broker, 0);
+    let operations_before = broker.store().coordinated_operations().unwrap().len();
+
+    let refused = broker
+        .publish_enrollment_commit(&enrollment_request(entry_id, session_id, &commit, &base))
+        .unwrap_err();
+    assert!(
+        matches!(refused, BrokerOpError::ShipPublicationPolicy { .. }),
+        "{refused}"
+    );
+    let message = refused.to_string();
+    assert!(message.contains("review_gated"), "{message}");
+    assert!(message.contains("pull request"), "{message}");
+    assert_eq!(fixture.remote_main(), base);
+    assert_eq!(
+        broker.store().coordinated_operations().unwrap().len(),
+        operations_before,
+        "the refusal comes before any remote operation"
+    );
+}

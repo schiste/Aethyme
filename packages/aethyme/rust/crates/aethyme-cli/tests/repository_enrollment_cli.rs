@@ -438,9 +438,12 @@ fn persisted_phase_boundary_after_outputs_applied_resumes_without_duplicate_publ
     resume_after_persisted_phase_without_duplicate_publication("outputs_applied");
 }
 
+// Enrollment no longer promotes: the boundary between gating the enrollment
+// commit and publishing it is now persisted as `verified` (formerly
+// `promoted`). An old `promoted` journal is covered separately below.
 #[test]
-fn persisted_phase_boundary_after_promoted_resumes_without_duplicate_publication() {
-    resume_after_persisted_phase_without_duplicate_publication("promoted");
+fn persisted_phase_boundary_after_verified_resumes_without_duplicate_publication() {
+    resume_after_persisted_phase_without_duplicate_publication("verified");
 }
 
 #[test]
@@ -479,4 +482,199 @@ fn resume_after_persisted_phase_without_duplicate_publication(phase: &str) {
         report["publication_sha"], report["verified_remote_sha"],
         "phase {phase}"
     );
+}
+
+fn integration_branch(repo: &Path) -> String {
+    git(repo, &["for-each-ref", "refs/heads/aethyme/integration"])
+}
+
+#[test]
+fn first_enrollment_publishes_without_creating_the_integration_branch() {
+    let fixture = fixture();
+    assert!(integration_branch(&fixture.clone).is_empty());
+    let planned = plan(&fixture.clone);
+    let digest = planned["plan_digest"].as_str().unwrap();
+
+    let executed = run(
+        &fixture.clone,
+        &["deploy", "execute", "--confirm", digest, "--json"],
+    );
+    assert!(
+        executed.status.success(),
+        "{}",
+        failure_context(&fixture.clone, &executed)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&executed.stdout).unwrap();
+    assert_eq!(report["completed"], true);
+    // The enrollment commit itself is what reaches the remote.
+    assert_eq!(report["publication_sha"], report["enrollment_commit"]);
+    assert_eq!(report["verified_remote_sha"], report["enrollment_commit"]);
+    let remote_main = git(&fixture.seed, &["ls-remote", "origin", "refs/heads/main"]);
+    assert!(remote_main.starts_with(report["enrollment_commit"].as_str().unwrap()));
+    assert!(
+        integration_branch(&fixture.clone).is_empty(),
+        "enrollment must neither create nor move the integration branch"
+    );
+}
+
+/// An older binary interrupted after its `promoted` phase left a journal
+/// naming a promotion SHA and a queue entry. Resuming must not trust either:
+/// here both are unusable, so the commit is verified again and the enrollment
+/// commit, not the recorded SHA, is published exactly once.
+#[test]
+fn old_promoted_phase_journal_reverifies_and_publishes_the_enrollment_commit() {
+    let fixture = fixture();
+    let planned = plan(&fixture.clone);
+    let digest = planned["plan_digest"].as_str().unwrap();
+    let interrupted = run_with_env(
+        &fixture.clone,
+        &["deploy", "execute", "--confirm", digest],
+        Some(("AETHYME_TEST_ENROLLMENT_STOP_AFTER_PHASE", "verified")),
+    );
+    assert!(!interrupted.status.success());
+    let journal_path = fixture
+        .clone
+        .join(".git/aethyme-broker/enrollment-publication.json");
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+    let enrollment_commit = journal["enrollment_commit"].as_str().unwrap().to_string();
+    let remote_before = git(&fixture.seed, &["ls-remote", "origin", "refs/heads/main"]);
+    assert!(!remote_before.starts_with(&enrollment_commit));
+    journal["phase"] = "promoted".into();
+    journal["queue_entry_id"] = 999_999.into();
+    journal["publication_sha"] = "f".repeat(40).into();
+    std::fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+
+    let resumed = run(
+        &fixture.clone,
+        &["deploy", "execute", "--confirm", digest, "--json"],
+    );
+    assert!(
+        resumed.status.success(),
+        "{}",
+        failure_context(&fixture.clone, &resumed)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(report["completed"], true);
+    assert_eq!(report["publication_sha"], enrollment_commit.as_str());
+    assert_eq!(report["verified_remote_sha"], enrollment_commit.as_str());
+    assert_ne!(report["queue_entry_id"], 999_999);
+    let remote_after = git(&fixture.seed, &["ls-remote", "origin", "refs/heads/main"]);
+    assert!(remote_after.starts_with(&enrollment_commit));
+    assert!(integration_branch(&fixture.clone).is_empty());
+
+    // Rerunning a completed enrollment reports it again without publishing.
+    let repeated = run(
+        &fixture.clone,
+        &["deploy", "execute", "--confirm", digest, "--json"],
+    );
+    assert!(repeated.status.success());
+    let repeated: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(repeated["publication_sha"], enrollment_commit.as_str());
+}
+
+/// Interrupt a confirmed enrollment after `phase`, rewrite its journal with
+/// `edit` as an older binary would have left it, and resume it.
+fn resume_rewritten_journal(
+    stop_after: &str,
+    edit: impl FnOnce(&Fixture, &mut serde_json::Value),
+) -> (Fixture, serde_json::Value, String) {
+    let fixture = fixture();
+    let planned = plan(&fixture.clone);
+    let digest = planned["plan_digest"].as_str().unwrap().to_string();
+    let interrupted = run_with_env(
+        &fixture.clone,
+        &["deploy", "execute", "--confirm", &digest],
+        Some(("AETHYME_TEST_ENROLLMENT_STOP_AFTER_PHASE", stop_after)),
+    );
+    assert!(!interrupted.status.success());
+    let journal_path = fixture
+        .clone
+        .join(".git/aethyme-broker/enrollment-publication.json");
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+    edit(&fixture, &mut journal);
+    std::fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+    let resumed = run(
+        &fixture.clone,
+        &["deploy", "execute", "--confirm", &digest, "--json"],
+    );
+    assert!(
+        resumed.status.success(),
+        "{}",
+        failure_context(&fixture.clone, &resumed)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(report["completed"], true);
+    let remote = git(&fixture.seed, &["ls-remote", "origin", "refs/heads/main"]);
+    (fixture, report, remote)
+}
+
+#[test]
+fn old_promoted_phase_journal_with_a_vouching_entry_publishes_the_enrollment_commit() {
+    let (fixture, report, remote) = resume_rewritten_journal("verified", |_, journal| {
+        journal["phase"] = "promoted".into();
+    });
+    assert_eq!(report["publication_sha"], report["enrollment_commit"]);
+    assert!(remote.starts_with(report["enrollment_commit"].as_str().unwrap()));
+    assert!(integration_branch(&fixture.clone).is_empty());
+}
+
+#[test]
+fn old_base_prepared_phase_journal_continues_without_integration() {
+    let (fixture, report, remote) =
+        resume_rewritten_journal("remote_materialized", |_, journal| {
+            journal["phase"] = "base_prepared".into();
+        });
+    assert_eq!(report["publication_sha"], report["enrollment_commit"]);
+    assert!(remote.starts_with(report["enrollment_commit"].as_str().unwrap()));
+    assert!(integration_branch(&fixture.clone).is_empty());
+}
+
+/// An older binary pushed its merge promotion of the enrollment commit and
+/// crashed before recording it. The remote then names that promotion, which
+/// is the reviewed base plus exactly the verified tree, so the resume accepts
+/// it instead of refusing forever, and pushes nothing.
+#[test]
+fn old_promoted_journal_whose_promotion_reached_the_remote_completes() {
+    let mut promotion = String::new();
+    let (_fixture, report, remote) = resume_rewritten_journal("verified", |fixture, journal| {
+        let commit = journal["enrollment_commit"].as_str().unwrap().to_string();
+        let base = journal["remote_base"]["exact_sha"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let tree = git(
+            &fixture.clone,
+            &["rev-parse", &format!("{commit}^{{tree}}")],
+        );
+        promotion = git(
+            &fixture.clone,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &base,
+                "-p",
+                &commit,
+                "-m",
+                "promote enrollment",
+            ],
+        );
+        git(
+            &fixture.clone,
+            &[
+                "push",
+                "-q",
+                "--no-verify",
+                "origin",
+                &format!("{promotion}:refs/heads/main"),
+            ],
+        );
+        journal["phase"] = "promoted".into();
+        journal["publication_sha"] = promotion.clone().into();
+    });
+    assert_eq!(report["publication_sha"], promotion.as_str());
+    assert_eq!(report["verified_remote_sha"], promotion.as_str());
+    assert!(remote.starts_with(&promotion));
 }
