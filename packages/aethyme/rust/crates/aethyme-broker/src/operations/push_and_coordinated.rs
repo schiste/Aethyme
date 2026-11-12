@@ -1800,56 +1800,18 @@ impl Broker {
 
         // The default branch just moved: a declared prebuild can start now.
         crate::environments::prebuild::nudge_after_fetch(self.main_root());
-        // Nothing lands through integration in a repository that does not
-        // promote, so there is no layer to clean and the ref is not moved:
-        // the default branch fetched above is what new work starts from.
-        if !crate::merge::PromoteConfig::load(&self.main_root_path())
-            .mode
-            .promotes_at_all()
-        {
-            return PostMergeCleanupReport {
-                state: PostMergeCleanupState::NotNeeded,
-                upstream_ref: Some(upstream_ref),
-                fetch_operation_id: Some(fetch.operation.id),
-                cleanup: None,
-                explanation: "this repository does not promote, so it keeps no integration layer \
-                              to clean; the refreshed default branch is the base"
-                    .into(),
-                next_action: None,
-            };
-        }
-        match self.auto_cleanup_landed_integration(&upstream_ref) {
-            Ok(cleanup) => {
-                let state = match cleanup.state {
-                    crate::AutomaticIntegrationCleanupState::Cleaned => {
-                        PostMergeCleanupState::Cleaned
-                    }
-                    crate::AutomaticIntegrationCleanupState::NotNeeded => {
-                        PostMergeCleanupState::NotNeeded
-                    }
-                    crate::AutomaticIntegrationCleanupState::Deferred => {
-                        PostMergeCleanupState::Deferred
-                    }
-                };
-                PostMergeCleanupReport {
-                    state,
-                    upstream_ref: Some(upstream_ref),
-                    fetch_operation_id: Some(fetch.operation.id),
-                    explanation: cleanup.explanation.clone(),
-                    next_action: cleanup.next_action.clone(),
-                    cleanup: Some(cleanup),
-                }
-            }
-            Err(error) => deferred_post_merge_cleanup(
-                Some(upstream_ref.clone()),
-                Some(fetch.operation.id),
-                &format!(
-                    "the pull request merged and upstream refreshed, but automatic cleanup was refused: {error}"
-                ),
-                Some(format!(
-                    "aethyme broker advanced integration reconcile --upstream {upstream_ref} --dry-run"
-                )),
-            ),
+        // Nothing lands through integration: local promotion was removed, so
+        // there is no layer to clean and the ref is not moved. The default
+        // branch fetched above is what new work starts from.
+        PostMergeCleanupReport {
+            state: PostMergeCleanupState::NotNeeded,
+            upstream_ref: Some(upstream_ref),
+            fetch_operation_id: Some(fetch.operation.id),
+            cleanup: None,
+            explanation: "this repository does not promote, so it keeps no integration layer \
+                          to clean; the refreshed default branch is the base"
+                .into(),
+            next_action: None,
         }
     }
 

@@ -24,7 +24,7 @@ use aethyme_contracts::experimental_v0::SourceSnapshotId;
 
 use crate::collaboration_archive::{self, ArchiveError, CommitOid};
 use crate::merge::{
-    PromoteConfig, PromoteMode, SubmissionCommitOwnership, SubmissionIntegrationState,
+    PromoteConfig, SubmissionCommitOwnership, SubmissionIntegrationState,
     VERIFIED_AGAINST_INTEGRATION, VERIFIED_AGAINST_UPSTREAM,
 };
 use crate::{Broker, BrokerOpError};
@@ -460,13 +460,11 @@ impl Broker {
     /// would create or fast-forward it first, so the base is the main
     /// checkout's HEAD.
     fn candidate_baseline(&self) -> Result<(&'static str, String), BrokerOpError> {
-        let config = PromoteConfig::load(&self.main_root_path());
         let repo = self.repo_handle();
-        if config.mode == PromoteMode::VerifyOnly
-            && let Some((_, commit)) = repo.upstream_default()
-        {
+        if let Some((_, commit)) = repo.upstream_default() {
             return Ok((VERIFIED_AGAINST_UPSTREAM, commit));
         }
+        let config = PromoteConfig::load(&self.main_root_path());
         let head = repo.head_commit()?;
         let commit = match repo.resolve_ref(&config.branch) {
             Some(commit) if commit == head || !repo.is_ancestor(&commit, &head) => commit,

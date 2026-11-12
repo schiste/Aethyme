@@ -21,9 +21,7 @@
 //!   reports `in_progress` instead of waiting for another capture's lock.
 //! - **Required:** the capture runs first, on the base the submit will verify
 //!   against. If it is not acknowledged the submit is refused before any
-//!   queue entry. The submit is bound to the captured commit, and every
-//!   promotion (automatic, `promote --entry`, re-verification, queue drain)
-//!   refuses a head without an acknowledged required capture.
+//!   queue entry. The submit is bound to the captured commit.
 //! - **Anything else** fails closed: an unknown `capture` value, a
 //!   `collaboration` key that is not a table, or an unreadable config that
 //!   visibly mentions `collaboration`. A repository whose config does not
@@ -34,7 +32,6 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
-use rusqlite::OptionalExtension;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -518,9 +515,8 @@ pub(crate) fn submit(
     broker: &mut crate::Broker,
     session: i64,
     cache: crate::CachePolicy,
-    intent: crate::PromotionIntent,
 ) -> Result<CaptureSubmit, crate::BrokerOpError> {
-    submit_with(broker, session, cache, intent, None, &mut || {})
+    submit_with(broker, session, cache, None, &mut || {})
 }
 
 /// [`submit`] with the store opener injected, and `between` run after the
@@ -530,12 +526,11 @@ fn submit_with(
     broker: &mut crate::Broker,
     session: i64,
     cache: crate::CachePolicy,
-    intent: crate::PromotionIntent,
     open: Option<&mut OpenStore<'_>>,
     between: &mut dyn FnMut(),
 ) -> Result<CaptureSubmit, crate::BrokerOpError> {
     let Some(capture) = SubmitCapture::prepare(broker, session) else {
-        let outcome = broker.submit_with_intent(session, cache, intent)?;
+        let outcome = broker.submit_with_policy(session, cache)?;
         return Ok(CaptureSubmit::Submitted {
             outcome: Box::new(outcome),
             capture: None,
@@ -543,7 +538,7 @@ fn submit_with(
     };
     if !capture.required {
         between();
-        let outcome = broker.submit_with_intent(session, cache, intent)?;
+        let outcome = broker.submit_with_policy(session, cache)?;
         let base = outcome
             .verified_against
             .as_ref()
@@ -590,7 +585,7 @@ fn submit_with(
         return Ok(CaptureSubmit::Refused(report));
     };
     between();
-    match broker.submit_expecting_head(session, cache, intent, &head) {
+    match broker.submit_expecting_head(session, cache, &head) {
         Ok(outcome) => Ok(CaptureSubmit::Submitted {
             outcome: Box::new(outcome),
             capture: Some(CaptureStep::Done(report)),
@@ -600,49 +595,6 @@ fn submit_with(
         }
         Err(error) => Err(error),
     }
-}
-
-/// Refuse to promote `head` when the repository requires capture and no
-/// acknowledged required capture of it exists. Off and advisory return
-/// before touching anything but the config.
-pub(crate) fn require_capture_for_promotion(
-    broker: &crate::Broker,
-    entry: i64,
-    head: &str,
-) -> Result<(), crate::BrokerOpError> {
-    let refuse = |reason: String| crate::BrokerOpError::CaptureRequiredForPromotion {
-        entry,
-        head: head.into(),
-        reason,
-    };
-    let project = match setting(broker.main_root()).0 {
-        Setting::Off
-        | Setting::On {
-            policy: CapturePolicy::Advisory,
-            ..
-        } => return Ok(()),
-        Setting::Unsupported { code, .. } => return Err(refuse(code.to_string())),
-        Setting::On { project, .. } => project.map_err(|_| refuse("no_project".into()))?,
-    };
-    let config = crate::merge::repository_config_with_source(broker.main_root());
-    broker.collaboration_fence_state(crate::broker::FenceTrigger::Config(config.as_ref()));
-    let store = broker
-        .collaboration_store(&project)
-        .map_err(|e| refuse(e.code().into()))?;
-    let found = store
-        .read_connection()
-        .query_row(
-            "SELECT 1 FROM capture_operations o
-             JOIN capture_receipts r ON r.operation_id = o.operation_id
-             WHERE o.result_commit = ?1 AND o.policy = 'required'
-               AND o.state IN ('committed', 'acknowledged')
-             LIMIT 1",
-            [head],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|_| refuse("state_unreadable".into()))?;
-    found.ok_or_else(|| refuse("no_receipt".into()))
 }
 
 /// The session's worktree and head, read before the submit.
@@ -943,7 +895,6 @@ mod tests {
             format!("[collaboration]\ncapture = \"{policy}\"\nproject = \"proj-test\"\n"),
         )
         .unwrap();
-        aethyme_testkit::promote_on_submit(repo.path());
         let origin = committed.then(|| {
             let origin = tempfile::tempdir().unwrap();
             git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
@@ -979,7 +930,7 @@ mod tests {
         }
     }
 
-    /// Integration is absent or still at `main`: nothing was promoted. Submit
+    /// Integration is absent or still at `main`: nothing is promoted. Submit
     /// creates it from `main` when it does not exist yet.
     fn assert_integration_unmoved(repo: &Path) {
         let tip = git(
@@ -1024,7 +975,6 @@ mod tests {
             &mut fixture.broker,
             fixture.session,
             crate::CachePolicy::Use,
-            crate::PromotionIntent::Configured,
             Some(&mut open),
             between,
         )?;
@@ -1105,8 +1055,8 @@ mod tests {
         assert_eq!(report.result_commit.as_deref(), Some(moved.as_str()));
     }
 
-    /// Without a move, a required capture submits and promotes the captured
-    /// commit; the promotion gate finds its receipt.
+    /// Without a move, a required capture submits and verifies the captured
+    /// commit.
     #[test]
     fn a_required_capture_submits_the_captured_commit() {
         let mut fixture = fixture("required");
@@ -1119,42 +1069,9 @@ mod tests {
             report.result_commit.as_deref(),
             Some(outcome.entry.head_commit.as_str())
         );
-        assert!(outcome.promoted);
-    }
-
-    /// Under required, a submit that bypasses the capture (the library API,
-    /// or any promotion path) verifies but never promotes an uncaptured head.
-    #[test]
-    fn an_uncaptured_head_is_never_promoted_under_required() {
-        let mut fixture = fixture("required");
-        let config = fixture.repo.path().join(".aethyme/config.toml");
-
-        let error = fixture.broker.submit(fixture.session).unwrap_err();
-        assert!(
-            matches!(
-                error,
-                crate::BrokerOpError::CaptureRequiredForPromotion { .. }
-            ),
-            "{error}"
-        );
-        assert_eq!(
-            crate::exit_status::for_broker_error(&error),
-            crate::exit_status::REFUSED
-        );
+        assert_eq!(outcome.entry.status, crate::MergeStatus::Verified);
+        assert!(!outcome.promoted);
         assert_integration_unmoved(fixture.repo.path());
-        let entry = fixture.broker.store().merge_queue().unwrap().pop().unwrap();
-        assert_eq!(entry.status, crate::MergeStatus::Verified);
-        assert!(matches!(
-            fixture.broker.promote(entry.id),
-            Err(crate::BrokerOpError::CaptureRequiredForPromotion { .. })
-        ));
-        // Advisory never gates promotion.
-        std::fs::write(
-            &config,
-            "[collaboration]\ncapture = \"advisory\"\nproject = \"proj-test\"\n",
-        )
-        .unwrap();
-        fixture.broker.promote(entry.id).unwrap();
     }
 
     /// A panicking capture is reported, not propagated.
@@ -1169,7 +1086,6 @@ mod tests {
             &mut fixture.broker,
             fixture.session,
             crate::CachePolicy::Use,
-            crate::PromotionIntent::Configured,
             Some(&mut open),
             &mut || {},
         )
@@ -1196,7 +1112,6 @@ mod tests {
             &mut fixture.broker,
             fixture.session,
             crate::CachePolicy::Use,
-            crate::PromotionIntent::Configured,
             Some(&mut open),
             &mut || {},
         )

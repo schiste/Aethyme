@@ -1,22 +1,17 @@
-//! Merge simulation & promotion queue (Phase 5).
+//! Merge simulation and verification queue (Phase 5).
 //!
-//! Flow: `submit` snapshots a session's head into the queue, simulates
-//! the merge onto the local integration branch (`git merge-tree`, no
-//! worktree mutation), and — when clean — runs the affected gates on the
-//! materialized merged tree in a throwaway worktree. Conflicts reject
-//! the submission *before any gate runs* and write actionable
-//! instructions into the session's worktree (the broker messages the
-//! agent — decision 2026-07-10). `promote` advances the integration
-//! branch to the verified merge commit; other queued entries whose base
-//! moved are re-simulated.
+//! Flow: `submit` snapshots a session's head into the queue, simulates the
+//! merge onto the fetched default branch (`git merge-tree`, no worktree
+//! mutation), and — when clean — runs the affected gates on the materialized
+//! merged tree in a throwaway worktree. Conflicts reject the submission
+//! *before any gate runs* and write actionable instructions into the
+//! session's worktree (the broker messages the agent — decision 2026-07-10).
 //!
-//! Boundary contract: promotion only advances the **local** integration
-//! branch; publication is a separate, explicit operation.
-//! The broker never opens PRs. The promotion trigger is a config setting
-//! (`[promote] mode = "auto" | "manual"`) — **auto by
-//! default** (decision 2026-07-13, after the first dogfood run: verified
-//! means verified; holding it for a human command makes the human the
-//! bottleneck). `mode = "manual"` restores explicit `broker promote`.
+//! Boundary contract: submit verifies and reports; it never moves a ref.
+//! Work lands through each session's own pull request. Local promotion onto
+//! an integration branch was removed; a repository without a fetched default
+//! branch still verifies against its local integration ref, which follows the
+//! main checkout's HEAD.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -24,10 +19,7 @@ use std::path::Path;
 use crate::broker::{Broker, BrokerOpError};
 use crate::gates::GateRunOutcome;
 use crate::git::GitRepo;
-use crate::types::{
-    AdvisoryEvidence, AdvisorySeverity, MergeQueueEntry, MergeStatus, NewAdvisory,
-    VerificationCandidate,
-};
+use crate::types::{MergeQueueEntry, MergeStatus, VerificationCandidate};
 
 pub const DEFAULT_INTEGRATION_BRANCH: &str = "aethyme/integration";
 pub const ACTION_REQUIRED_RELPATH: &str = ".aethyme/broker-action-required.md";
@@ -58,26 +50,6 @@ fn mint_verification_candidate(
         base: base.to_string(),
         inputs,
         tree: tree.to_string(),
-        commit,
-    })
-}
-
-/// Read the candidate projection written before typed candidate rows existed.
-fn legacy_verification_candidate(entry: &MergeQueueEntry) -> Option<VerificationCandidate> {
-    let details = entry
-        .details_json
-        .as_deref()
-        .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())?;
-    let commit = details.get("merge_commit")?.as_str()?.to_string();
-    let base = details
-        .get("base")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    Some(VerificationCandidate {
-        base,
-        inputs: Vec::new(),
-        tree: entry.merged_tree.clone().unwrap_or_default(),
         commit,
     })
 }
@@ -142,66 +114,22 @@ fn promotion_subject(session_id: i64, task: Option<&str>) -> String {
 /// that many times the throughput.
 const MERGE_VERIFICATION_SLOTS: usize = 4;
 
-/// What a repository does with work that passes verification.
-///
-/// `VerifyOnly` exists because promotion is not universal. Where a repository
-/// ships through pull requests, the integration branch is simultaneously the
-/// default base for every session and a destination nothing reads, so it
-/// accumulates drift that leaks into new sessions while contributing nothing
-/// (#290). Such a repository still wants what `submit` is good at -- cross
-/// session conflict detection before a pull request exists, and affected gates
-/// rather than a full batch -- without a second copy of the work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PromoteMode {
-    /// Verified work moves to the integration branch immediately.
-    Auto,
-    /// Verified work waits for an explicit `broker promote`.
-    Manual,
-    /// Nothing is ever promoted. `submit` verifies and reports; the integration
-    /// branch is never moved.
-    VerifyOnly,
-}
-
-impl PromoteMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Manual => "manual",
-            Self::VerifyOnly => "verify-only",
-        }
-    }
-
-    /// Whether any queue entry in this repository can still be promoted.
-    /// `finish` and the pending-layer accounting use this to avoid demanding a
-    /// promotion the repository has opted out of.
-    pub fn promotes_at_all(self) -> bool {
-        !matches!(self, Self::VerifyOnly)
-    }
-}
-
-/// Whether a single `submit` invocation is allowed to promote.
-///
-/// Separate from [`PromoteMode`] because the repository's policy and one
-/// operator's intent are different facts: `--verify-only` narrows a promoting
-/// repository for one run, and never widens one that has opted out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromotionIntent {
-    /// Follow whatever the repository configured.
-    Configured,
-    /// Verify and report; promote nothing, whatever the repository configured.
-    VerifyOnly,
-}
-
 /// `[promote]` section of `.aethyme/config.toml`.
+///
+/// Local promotion was removed: every repository verifies and reports, and a
+/// session's work lands through its own pull request. `branch` names the local
+/// integration ref, which only a repository with no fetched default branch
+/// still reads, as the base its sessions are cut from. A `mode` that used to
+/// promote (`auto`, `manual`) or `promote_on_submit = true` still parses so an
+/// old configuration keeps working; it is ignored and reported once by
+/// `broker status` so the operator can delete it.
 #[derive(Debug, Clone)]
 pub struct PromoteConfig {
     pub branch: String,
-    pub mode: PromoteMode,
-    /// False when `mode` is only the default: no configuration, or none that
-    /// sets a mode. A repository in that state has made no delivery decision,
-    /// which is how a first enrollment still publishes its own configuration.
-    pub mode_chosen: bool,
+    /// The retired promoting setting this configuration still carries, as
+    /// written (`mode = "auto"`, `mode = "manual"`, `promote_on_submit = true`).
+    /// Ignored; only reported.
+    pub ignored_promotion_setting: Option<String>,
 }
 
 fn invalid_promote_mode_warning(value: Option<&str>) -> String {
@@ -209,8 +137,8 @@ fn invalid_promote_mode_warning(value: Option<&str>) -> String {
         .map(|value| format!("unknown value `{value}`"))
         .unwrap_or_else(|| "expected a string".to_string());
     format!(
-        "invalid [promote].mode ({detail}); using `verify-only` so it cannot enable promotion. \
-         Set it to `auto`, `manual`, `verify-only`, `none`, or `off`."
+        "invalid [promote].mode ({detail}); local promotion was removed and the setting is \
+         ignored. Delete it."
     )
 }
 
@@ -218,12 +146,8 @@ impl PromoteConfig {
     /// Load `[promote]` with the same trust rule as the push policy.
     ///
     /// The configuration committed on the fetched default branch wins when it
-    /// exists; the main checkout's working-tree file is the fallback. Reading
-    /// only the working tree meant a merged `mode = "verify-only"` did nothing
-    /// in any repository whose main checkout had not pulled it, or had a
-    /// feature branch checked out -- the policy on the default branch said one
-    /// thing and the broker did another. As fresh as the last fetch; never
-    /// fetches.
+    /// exists; the main checkout's working-tree file is the fallback. As fresh
+    /// as the last fetch; never fetches.
     pub fn load(main_root: &Path) -> Self {
         Self::load_with_warning(main_root).0
     }
@@ -235,11 +159,10 @@ impl PromoteConfig {
             Err(error) => (
                 Self {
                     branch: DEFAULT_INTEGRATION_BRANCH.to_string(),
-                    mode: PromoteMode::VerifyOnly,
-                    mode_chosen: true,
+                    ignored_promotion_setting: None,
                 },
                 Some(format!(
-                    "repository configuration is unresolved ({}); promotion is disabled until it is corrected",
+                    "repository configuration is unresolved ({})",
                     error.code()
                 )),
             ),
@@ -247,13 +170,9 @@ impl PromoteConfig {
     }
 
     pub(crate) fn from_text(text: Option<&str>) -> (Self, Option<String>) {
-        // Verify-only unless the repository opts in: promoting needs the
-        // integration branch to stay current, and each session branch's own pull
-        // request is otherwise the only delivery path.
         let mut config = Self {
             branch: DEFAULT_INTEGRATION_BRANCH.to_string(),
-            mode: PromoteMode::VerifyOnly,
-            mode_chosen: false,
+            ignored_promotion_setting: None,
         };
         let mut warning = None;
         let Some(text) = text else {
@@ -262,10 +181,7 @@ impl PromoteConfig {
         let value = match text.parse::<toml::Value>() {
             Ok(value) => value,
             Err(error) => {
-                config.mode_chosen = true;
-                warning = Some(format!(
-                    "repository configuration is invalid ({error}); promotion is disabled until it is corrected"
-                ));
+                warning = Some(format!("repository configuration is invalid ({error})"));
                 return (config, warning);
             }
         };
@@ -274,23 +190,22 @@ impl PromoteConfig {
                 config.branch = branch.to_string();
             }
             if let Some(mode) = promote.get("mode") {
-                config.mode_chosen = true;
-                // Decision for #691: preserve broker diagnostics while failing
-                // closed. An unknown critical mode warns and disables promotion
-                // instead of silently restoring the permissive `auto` default.
-                config.mode = match mode.as_str() {
-                    Some("auto") => PromoteMode::Auto,
-                    Some("manual") => PromoteMode::Manual,
-                    Some("verify-only" | "none" | "off") => PromoteMode::VerifyOnly,
-                    Some(value) => {
-                        warning = Some(invalid_promote_mode_warning(Some(value)));
-                        PromoteMode::VerifyOnly
+                match mode.as_str() {
+                    Some(value @ ("auto" | "manual")) => {
+                        config.ignored_promotion_setting = Some(format!("mode = \"{value}\""));
                     }
-                    None => {
-                        warning = Some(invalid_promote_mode_warning(None));
-                        PromoteMode::VerifyOnly
-                    }
-                };
+                    Some("verify-only" | "none" | "off") => {}
+                    Some(value) => warning = Some(invalid_promote_mode_warning(Some(value))),
+                    None => warning = Some(invalid_promote_mode_warning(None)),
+                }
+            }
+            if config.ignored_promotion_setting.is_none()
+                && promote
+                    .get("promote_on_submit")
+                    .and_then(toml::Value::as_bool)
+                    == Some(true)
+            {
+                config.ignored_promotion_setting = Some("promote_on_submit = true".to_string());
             }
         }
         (config, warning)
@@ -303,20 +218,16 @@ impl PromoteConfig {
 pub(crate) struct BaselineRefs {
     /// The fetched default branch's commit, when there is one.
     pub(crate) upstream: Option<String>,
-    /// The integration branch's commit. Resolved only where the baseline can
-    /// read it: in a promoting repository, or where there is no fetched
-    /// default branch.
+    /// The integration branch's commit. Resolved only where there is no
+    /// fetched default branch: it is then the only local base.
     pub(crate) integration: Option<String>,
-    /// Whether the repository promotes (`auto` or `manual`).
-    pub(crate) promoting: bool,
 }
 
 impl BaselineRefs {
     pub(crate) fn resolve(repo: &GitRepo, main_root: &Path) -> Self {
-        let config = PromoteConfig::load(main_root);
-        let promoting = config.mode.promotes_at_all();
         let upstream = repo.upstream_default().map(|(_, commit)| commit);
-        let integration = if promoting || upstream.is_none() {
+        let integration = if upstream.is_none() {
+            let config = PromoteConfig::load(main_root);
             repo.resolve_ref(&format!("refs/heads/{}", config.branch))
         } else {
             None
@@ -324,43 +235,26 @@ impl BaselineRefs {
         Self {
             upstream,
             integration,
-            promoting,
         }
     }
 }
 
 /// The commit a session's own changes start after.
 ///
-/// In a repository that does not promote, nothing lands through integration:
-/// sessions start from the fetched default branch and their pull requests
+/// Sessions start from the fetched default branch and their pull requests
 /// merge there, so the session's merge-base with that branch is the answer,
 /// one Git call. `None` when it has none locally (a shallow boundary, or
 /// unrelated history); callers then use the session's recorded base.
 ///
-/// Integration is read only in a promoting repository, or where there is no
-/// fetched default branch. Then it is the session's merge-base with
-/// integration, unless its merge-base with the fetched default branch is more
-/// recent. That happens exactly when the session was cut from upstream because
-/// integration had fallen behind: measured from integration alone, everything
-/// upstream merged since would count as the session's own diff and flood the
-/// lease and overlap reports.
+/// Without a fetched default branch, the integration branch is the only local
+/// base, and the session's merge-base with it is the answer.
 pub(crate) fn session_baseline(checkout: &GitRepo, refs: &BaselineRefs) -> Option<String> {
-    let upstream = refs.upstream.as_deref();
-    if !refs.promoting
-        && let Some(upstream) = upstream
-    {
+    if let Some(upstream) = refs.upstream.as_deref() {
         return checkout.merge_base(upstream, "HEAD").ok();
     }
-    let from_integration = checkout
+    checkout
         .merge_base(refs.integration.as_deref()?, "HEAD")
-        .ok()?;
-    if let Some(from_upstream) = upstream.and_then(|tip| checkout.merge_base(tip, "HEAD").ok())
-        && from_upstream != from_integration
-        && checkout.is_ancestor(&from_integration, &from_upstream)
-    {
-        return Some(from_upstream);
-    }
-    Some(from_integration)
+        .ok()
 }
 
 /// The repository's `.aethyme/config` (TOML or YAML, #1223) under the
@@ -895,22 +789,16 @@ impl Broker {
         let session = self.store().session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
         let session_head = checkout.head_commit()?;
-        let config = PromoteConfig::load(&self.main_root_path());
-        let (integration_reference, integration_head) = self.integration_head_snapshot()?;
-        let base = if config.mode == PromoteMode::VerifyOnly {
-            self.upstream_verification_base()
-                .unwrap_or(VerificationBase {
+        let base = match self.upstream_verification_base() {
+            Some(base) => base,
+            None => {
+                let (reference, commit) = self.integration_head_snapshot()?;
+                VerificationBase {
                     source: VERIFIED_AGAINST_INTEGRATION,
-                    reference: integration_reference,
-                    commit: integration_head,
+                    reference,
+                    commit,
                     fallback_reason: Some(VERIFY_ONLY_FALLBACK_REASON.to_string()),
-                })
-        } else {
-            VerificationBase {
-                source: VERIFIED_AGAINST_INTEGRATION,
-                reference: integration_reference,
-                commit: integration_head,
-                fallback_reason: None,
+                }
             }
         };
         let mut plan = self.build_submission_plan(&session, &session_head, &base.commit)?;
@@ -927,11 +815,11 @@ impl Broker {
     /// checkout's HEAD with an explanatory event — issue #20) and return
     /// its current commit.
     ///
-    /// A non-promoting repository with a fetched default branch does not
-    /// maintain integration: nothing lands through it, so the ref is neither
-    /// created nor moved, and an existing one is reported where it is.
-    /// Without a fetched default branch, integration is still the only local
-    /// base, and is maintained as before.
+    /// A repository with a fetched default branch does not maintain
+    /// integration: nothing lands through it, so the ref is neither created
+    /// nor moved, and an existing one is reported where it is. Without a
+    /// fetched default branch, integration is still the only local base its
+    /// sessions are cut from, and follows the main checkout's HEAD.
     pub fn integration_head(&mut self) -> Result<(String, String), BrokerOpError> {
         if self.upstream_verification_head().is_some() {
             return self.integration_head_snapshot();
@@ -973,18 +861,13 @@ impl Broker {
 
     /// The base a submission is simulated and gated against.
     ///
-    /// Verify-only repositories verify against the fetched default branch and
-    /// never touch the integration branch: nothing is promoted there, and a
-    /// pull request merged on the provider leaves integration behind, so it
-    /// would verify the change against an old copy of the default branch.
-    /// Without a fetched default branch they fall back to integration, and the
-    /// outcome says why. Promoting repositories keep integration, which is
-    /// what a verified entry is promoted onto. Never fetches.
+    /// The fetched default branch, never the integration branch: nothing is
+    /// promoted there, and a pull request merged on the provider leaves
+    /// integration behind, so it would verify the change against an old copy
+    /// of the default branch. Without a fetched default branch submission falls
+    /// back to integration, and the outcome says why. Never fetches.
     pub(crate) fn submission_base(&mut self) -> Result<VerificationBase, BrokerOpError> {
-        let config = PromoteConfig::load(&self.main_root_path());
-        if config.mode == PromoteMode::VerifyOnly
-            && let Some(base) = self.upstream_verification_base()
-        {
+        if let Some(base) = self.upstream_verification_base() {
             return Ok(base);
         }
         let (reference, commit) = self.integration_head()?;
@@ -992,22 +875,14 @@ impl Broker {
             source: VERIFIED_AGAINST_INTEGRATION,
             reference,
             commit,
-            fallback_reason: (config.mode == PromoteMode::VerifyOnly)
-                .then(|| VERIFY_ONLY_FALLBACK_REASON.to_string()),
+            fallback_reason: Some(VERIFY_ONLY_FALLBACK_REASON.to_string()),
         })
     }
 
-    /// The fetched default branch, in a non-promoting repository: the base
-    /// such a repository compares sessions against in place of integration,
-    /// which nothing there moves. `None` in a promoting repository or when no
-    /// default branch is fetched. Never fetches.
+    /// The fetched default branch: the base sessions are compared against in
+    /// place of integration, which nothing moves. `None` when no default
+    /// branch is fetched. Never fetches.
     pub(crate) fn upstream_verification_head(&self) -> Option<(String, String)> {
-        if PromoteConfig::load(&self.main_root_path())
-            .mode
-            .promotes_at_all()
-        {
-            return None;
-        }
         self.repo_handle().upstream_default()
     }
 
@@ -1039,38 +914,27 @@ impl Broker {
         })
     }
 
-    /// Submit a session's committed head for promotion: queue (idempotent
-    /// per head), simulate, gate on the merged tree, and auto-promote if
-    /// configured. Uncommitted changes are NOT included — the head commit
-    /// is the unit of promotion.
+    /// Submit a session's committed head for verification: queue (idempotent
+    /// per head), simulate, and gate on the merged tree. Nothing is promoted;
+    /// the work lands through the session's pull request. Uncommitted changes
+    /// are NOT included — the head commit is the unit of verification.
     pub fn submit(&mut self, session_id: i64) -> Result<SubmitOutcome, BrokerOpError> {
         self.submit_with_policy(session_id, crate::gates::CachePolicy::Use)
-    }
-
-    /// Submit, declaring whether this invocation may promote at all.
-    pub fn submit_with_intent(
-        &mut self,
-        session_id: i64,
-        cache_policy: crate::gates::CachePolicy,
-        intent: PromotionIntent,
-    ) -> Result<SubmitOutcome, BrokerOpError> {
-        self.submit_inner(session_id, cache_policy, intent, None)
     }
 
     /// Submit only if the session head is still `expected_head` at the point
     /// submit pins it; otherwise refuse with
     /// [`BrokerOpError::CapturedHeadMoved`] before any queue entry exists.
-    /// Everything after that point (simulation, gates, promotion) works from
+    /// Everything after that point (simulation, gates) works from
     /// the pinned queue entry, so the submitted commit is exactly the one the
     /// caller vouched for (#660).
     pub fn submit_expecting_head(
         &mut self,
         session_id: i64,
         cache_policy: crate::gates::CachePolicy,
-        intent: PromotionIntent,
         expected_head: &str,
     ) -> Result<SubmitOutcome, BrokerOpError> {
-        self.submit_inner(session_id, cache_policy, intent, Some(expected_head))
+        self.submit_inner(session_id, cache_policy, Some(expected_head))
     }
 
     /// Submit with an explicit policy for merged-tree gate cache lookup.
@@ -1079,14 +943,13 @@ impl Broker {
         session_id: i64,
         cache_policy: crate::gates::CachePolicy,
     ) -> Result<SubmitOutcome, BrokerOpError> {
-        self.submit_inner(session_id, cache_policy, PromotionIntent::Configured, None)
+        self.submit_inner(session_id, cache_policy, None)
     }
 
     fn submit_inner(
         &mut self,
         session_id: i64,
         cache_policy: crate::gates::CachePolicy,
-        intent: PromotionIntent,
         expected_head: Option<&str>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
         // Refuse legacy and incomplete bindings before submission planning.
@@ -1196,7 +1059,6 @@ impl Broker {
         let mut outcome = self.simulate_and_gate_with_policy(
             entry.id,
             cache_policy,
-            intent,
             Some(&progress),
             prepared_plan,
         )?;
@@ -1326,8 +1188,7 @@ impl Broker {
     }
 
     /// Record that a clean replay left the base's tree unchanged: supersede the
-    /// entry as content-empty, or claim the promotion an earlier attempt of
-    /// this session produced and lost (issue #135).
+    /// entry as content-empty.
     fn record_content_empty(
         &mut self,
         entry: &MergeQueueEntry,
@@ -1341,45 +1202,6 @@ impl Broker {
             "reason": "submission produces no content change",
             "pending_session_owned_commits": submission_plan.pending_owned_commit_ids(),
         });
-        // Ask why it is empty before recording it as nothing. If this very
-        // session already produced the integration tip and no promoted entry
-        // claims it, a previous attempt promoted and lost its response:
-        // superseding here would strand that commit as unrecorded and refuse
-        // publication (issue #135). Claim it instead, which is idempotent.
-        if self.integration_tip_is_unclaimed_promotion_for(session.id, base)? {
-            let recovered = serde_json::json!({
-                "commit": base,
-                "reason": "retry claimed an unrecorded promotion this session produced",
-            });
-            let promotion_parent = self.repo_handle().first_parent(base)?;
-            let promoted_paths = self
-                .repo_handle()
-                .changed_between(&promotion_parent, base)?;
-            let integration_ref = PromoteConfig::load(&self.main_root_path()).branch;
-            self.store().record_recovered_promotion(
-                entry.id,
-                base,
-                tree,
-                &integration_ref,
-                &promoted_paths,
-                &recovered.to_string(),
-            )?;
-            clear_action_required(Path::new(&session.worktree_path));
-            return Ok(SubmitOutcome {
-                entry: self.queue_entry(entry.id)?,
-                submission_plan,
-                conflicts: Vec::new(),
-                conflict_details: Vec::new(),
-                gate_outcomes: Vec::new(),
-                graph_integrity: None,
-                gate_verification: SubmissionGateVerification::not_run(),
-                no_changes: true,
-                lease_warnings: Vec::new(),
-                verified_against: None,
-                promoted: true,
-                promotion_suppressed: None,
-            });
-        }
         self.store().record_content_empty_supersession(
             entry.id,
             base,
@@ -1403,58 +1225,17 @@ impl Broker {
         })
     }
 
-    /// Whether `commit` is a promotion this session produced that no promoted
-    /// queue entry claims.
-    ///
-    /// Both halves matter. The message link proves the commit is this session's
-    /// work rather than someone else's landing first, and the unclaimed check
-    /// keeps a normal already-landed submission -- where another entry legitimately
-    /// owns the tip -- reporting content-empty as it should.
-    fn integration_tip_is_unclaimed_promotion_for(
-        &mut self,
-        session_id: i64,
-        commit: &str,
-    ) -> Result<bool, BrokerOpError> {
-        let Ok(message) = self.repo_handle().commit_message(commit) else {
-            return Ok(false);
-        };
-        if !message.contains(&format!("promote session {session_id} ")) {
-            return Ok(false);
-        }
-        let claimed = self.store().merge_queue()?.into_iter().any(|entry| {
-            entry.status == MergeStatus::Promoted
-                && entry
-                    .details_json
-                    .as_deref()
-                    .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
-                    .and_then(|details| {
-                        details
-                            .get("commit")
-                            .and_then(|value| value.as_str().map(str::to_string))
-                    })
-                    .is_some_and(|claimed| claimed == commit)
-        });
-        Ok(!claimed)
-    }
-
     /// Simulate (and, when clean, gate) one queue entry against the
     /// CURRENT integration head. Rebinds the entry's base if the branch
     /// moved since submission.
     pub fn simulate_and_gate(&mut self, entry_id: i64) -> Result<SubmitOutcome, BrokerOpError> {
-        self.simulate_and_gate_with_policy(
-            entry_id,
-            crate::gates::CachePolicy::Use,
-            PromotionIntent::Configured,
-            None,
-            None,
-        )
+        self.simulate_and_gate_with_policy(entry_id, crate::gates::CachePolicy::Use, None, None)
     }
 
     fn simulate_and_gate_with_policy(
         &mut self,
         entry_id: i64,
         cache_policy: crate::gates::CachePolicy,
-        intent: PromotionIntent,
         progress: Option<&crate::submit_progress::SubmitProgress>,
         prepared_plan: Option<PreparedSubmissionReuse>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
@@ -1481,7 +1262,6 @@ impl Broker {
         let mut outcome = self.simulate_and_gate_against(
             entry_id,
             cache_policy,
-            intent,
             SimulationBase { base, pre_refresh },
             progress,
             prepared_plan,
@@ -1494,7 +1274,6 @@ impl Broker {
         &mut self,
         entry_id: i64,
         cache_policy: crate::gates::CachePolicy,
-        intent: PromotionIntent,
         simulation_base: SimulationBase,
         progress: Option<&crate::submit_progress::SubmitProgress>,
         prepared_plan: Option<PreparedSubmissionReuse>,
@@ -1869,49 +1648,18 @@ impl Broker {
             )?;
         }
 
-        let (promote_config, promotion_config_warning) =
-            PromoteConfig::load_with_warning(&self.main_root_path());
-        let configured = promote_config.mode;
-        let effective = match intent {
-            PromotionIntent::Configured => configured,
-            PromotionIntent::VerifyOnly => PromoteMode::VerifyOnly,
-        };
-        let mut promoted = false;
-        let mut promotion_suppressed = promotion_config_warning.clone();
-        if all_pass {
-            match effective {
-                PromoteMode::Auto => {
-                    self.promote(entry.id)?;
-                    promoted = true;
-                }
-                PromoteMode::Manual => {
-                    promotion_suppressed = Some(format!(
-                        "verified; promotion is manual for this repository — \
-                         run `aethyme broker submit promote --entry {}`",
-                        entry.id
-                    ));
-                }
-                PromoteMode::VerifyOnly => {
-                    let reason = match intent {
-                        PromotionIntent::VerifyOnly => {
-                            "verified; --verify-only, so nothing was promoted".to_string()
-                        }
-                        PromotionIntent::Configured => {
-                            "verified; promotion is off for this repository, so the work was \
-                             checked and nothing was moved"
-                                .to_string()
-                        }
-                    };
-                    promotion_suppressed = Some(match promotion_config_warning.as_deref() {
-                        Some(warning) => format!("{reason}; {warning}"),
-                        None => reason,
-                    });
-                }
+        // Nothing is promoted: the work lands through the session's pull
+        // request. Say so on a verified entry, so a verified-but-unmoved result
+        // never reads as a silent failure.
+        let promotion_config_warning = PromoteConfig::load_with_warning(&self.main_root_path()).1;
+        let promotion_suppressed = all_pass.then(|| {
+            let reason = "verified; the work lands through the session's pull request, so \
+                          nothing was moved locally";
+            match promotion_config_warning.as_deref() {
+                Some(warning) => format!("{reason}; {warning}"),
+                None => reason.to_string(),
             }
-        }
-        if promoted {
-            clear_action_required(Path::new(&session.worktree_path));
-        }
+        });
         let entry = self.queue_entry(entry.id)?;
         Ok(SubmitOutcome {
             entry,
@@ -1924,7 +1672,7 @@ impl Broker {
             no_changes: false,
             lease_warnings: Vec::new(),
             verified_against: None,
-            promoted,
+            promoted: false,
             promotion_suppressed,
         })
     }
@@ -2416,343 +2164,6 @@ impl Broker {
         })
     }
 
-    /// Prefer the typed candidate when it agrees with the stable legacy
-    /// projection. Older writers can update queue details without knowing
-    /// about the additive table, so a disagreement falls back to that copy.
-    fn verification_candidate_for_entry(
-        &mut self,
-        entry: &MergeQueueEntry,
-    ) -> Result<Option<VerificationCandidate>, BrokerOpError> {
-        let typed = self.store().verification_candidate(entry.id)?;
-        let legacy = legacy_verification_candidate(entry);
-        let Some(typed) = typed else {
-            return Ok(legacy);
-        };
-        let tree_matches = entry
-            .merged_tree
-            .as_deref()
-            .is_none_or(|tree| tree == typed.tree.as_str());
-        let legacy_matches = legacy.as_ref().is_none_or(|legacy| {
-            legacy.base.as_str() == typed.base.as_str()
-                && legacy.commit.as_str() == typed.commit.as_str()
-        });
-        if tree_matches && legacy_matches {
-            Ok(Some(typed))
-        } else {
-            Ok(legacy)
-        }
-    }
-
-    /// Complete the durable half of a promotion when the integration ref
-    /// already names a verified entry's exact merge commit. This is the
-    /// only ref/database ordering gap in normal promotion: the ref moves
-    /// first, so reopening the broker must checkpoint the accepted session
-    /// HEAD before any follow-up submission is planned.
-    pub(crate) fn recover_interrupted_promotion(&mut self) -> Result<(), BrokerOpError> {
-        let verified = self
-            .store()
-            .promotion_recovery_entries(MergeStatus::Verified)?;
-        if verified.is_empty() {
-            return Ok(());
-        }
-        let config = PromoteConfig::load(&self.main_root_path());
-        let Some(integration_head) = self.repo_handle().resolve_ref(&config.branch) else {
-            return Ok(());
-        };
-        let mut candidate = None;
-        for entry in verified {
-            let Some(verification_candidate) = self.verification_candidate_for_entry(&entry)?
-            else {
-                continue;
-            };
-            if verification_candidate.commit.as_str() == integration_head.as_str() {
-                candidate = Some((entry, verification_candidate));
-                break;
-            }
-        }
-        if let Some((entry, verification_candidate)) = candidate {
-            let promoted_base = if verification_candidate.base.is_empty() {
-                self.repo_handle().first_parent(&integration_head)?
-            } else {
-                verification_candidate.base
-            };
-            let promoted_paths = self
-                .repo_handle()
-                .changed_between(&promoted_base, &integration_head)?;
-            self.store().record_merge_promotion(
-                entry.id,
-                &integration_head,
-                &config.branch,
-                &promoted_paths,
-                &crate::events::merge_promoted_payload(&config.branch, &integration_head),
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Schema v17 compatibility: reconstruct exact outstanding exposure for
-    /// promotions recorded before exposure storage existed. Only currently
-    /// promoted entries qualify; externally landed and superseded history is
-    /// already terminal and must not be resurrected.
-    pub(crate) fn backfill_promoted_path_exposures(&mut self) -> Result<(), BrokerOpError> {
-        let promoted_entries = self
-            .store()
-            .promotion_recovery_entries(MergeStatus::Promoted)?;
-        for entry in promoted_entries {
-            if self.store().entry_path_exposure(entry.id)?.is_some() {
-                continue;
-            }
-            let promotion_sha = entry
-                .details_json
-                .as_deref()
-                .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
-                .and_then(|details| details.get("commit")?.as_str().map(str::to_string))
-                .ok_or_else(|| BrokerOpError::ShipPlanUnavailable {
-                    what: "promotion commit",
-                    reason: format!(
-                        "promoted queue entry {} has no commit detail for exposure backfill",
-                        entry.id
-                    ),
-                })?;
-            let parent = self.repo_handle().first_parent(&promotion_sha)?;
-            let promoted_paths = self
-                .repo_handle()
-                .changed_between(&parent, &promotion_sha)?;
-            self.store()
-                .backfill_entry_path_exposure(entry.id, &promotion_sha, &promoted_paths)?;
-        }
-        Ok(())
-    }
-
-    /// Advance the integration branch to a verified entry's merge commit,
-    /// then re-simulate every other non-terminal entry whose base moved.
-    /// Publication is a separate, explicit operation.
-    /// Re-simulate an entry whose verified base is no longer the integration
-    /// tip, and promote it if it still verifies.
-    fn reverify_and_promote(&mut self, entry_id: i64) -> Result<(), BrokerOpError> {
-        let outcome = self.simulate_and_gate(entry_id)?;
-        if outcome.entry.status != MergeStatus::Verified {
-            return Err(BrokerOpError::NotVerified {
-                entry: entry_id,
-                status: outcome.entry.status.as_str(),
-            });
-        }
-        self.promote(entry_id)
-    }
-
-    pub fn promote(&mut self, entry_id: i64) -> Result<(), BrokerOpError> {
-        let entry = self.queue_entry(entry_id)?;
-        if entry.status != MergeStatus::Verified {
-            return Err(BrokerOpError::NotVerified {
-                entry: entry_id,
-                status: entry.status.as_str(),
-            });
-        }
-        // Every promotion, automatic or explicit, passes here. Under
-        // `[collaboration] capture = "required"` only a head with an
-        // acknowledged required capture may move integration (#660); with
-        // capture off or advisory this reads the config and nothing else.
-        crate::collaboration_submit::require_capture_for_promotion(
-            self,
-            entry_id,
-            &entry.head_commit,
-        )?;
-        let candidate = self
-            .verification_candidate_for_entry(&entry)?
-            .ok_or(crate::BrokerError::SessionNotFound(entry_id))?;
-        let base_at_verify = candidate.base;
-        let merge_commit = candidate.commit;
-
-        let (branch, current_base) = self.integration_head()?;
-        if current_base != base_at_verify {
-            // Base moved since verification: verification is stale —
-            // re-simulate instead of promoting a stale merge.
-            return self.reverify_and_promote(entry_id);
-        }
-
-        // Capture the exact promoted path set before moving the ref. This is
-        // durable publication state, so unlike notification projection it is
-        // part of the promotion transaction and cannot be best-effort.
-        let promoted_paths = self
-            .repo_handle()
-            .changed_between(&current_base, &merge_commit)?;
-        // The check above and this update are not atomic, and merge
-        // verifications run concurrently: two entries verified against the
-        // same base can both pass the check. An unconditional update would let
-        // the second silently overwrite the first while the first stays
-        // recorded as promoted. Moving the ref only from the verified base
-        // turns that race into one more stale verification.
-        if !advance_branch_from(self.repo_handle(), &branch, &current_base, &merge_commit)? {
-            return self.reverify_and_promote(entry_id);
-        }
-        self.store().record_merge_promotion(
-            entry_id,
-            &merge_commit,
-            &branch,
-            &promoted_paths,
-            &crate::events::merge_promoted_payload(&branch, &merge_commit),
-        )?;
-        self.persist_promotion_lease_advisories(&entry, &merge_commit, &promoted_paths);
-
-        // Requeue: everything still in flight was verified/conflicted
-        // against a base that just moved (#23).
-        let stale: Vec<i64> = self
-            .store()
-            .merge_queue()?
-            .into_iter()
-            .filter(|e| {
-                e.id != entry_id
-                    && matches!(
-                        e.status,
-                        MergeStatus::Submitted
-                            | MergeStatus::Simulating
-                            | MergeStatus::Verified
-                            | MergeStatus::Conflict
-                    )
-            })
-            .map(|e| e.id)
-            .collect();
-        for stale_id in stale {
-            // Promoting an entry can recursively re-simulate and promote
-            // another queued entry. Re-read both queue and session state so
-            // the outer stale snapshot cannot promote that entry twice, and
-            // never resurrect abandoned work owned by a cleaned session.
-            let Ok(stale_entry) = self.queue_entry(stale_id) else {
-                continue;
-            };
-            if !matches!(
-                stale_entry.status,
-                MergeStatus::Submitted
-                    | MergeStatus::Simulating
-                    | MergeStatus::Verified
-                    | MergeStatus::Conflict
-            ) {
-                continue;
-            }
-            let Ok(stale_session) = self.store().session(stale_entry.session_id) else {
-                continue;
-            };
-            if stale_session.status.is_closed() {
-                crate::warn_unrecorded(
-                    "mark a closed session's queue entry superseded",
-                    self.store().set_merge_status(
-                        stale_id,
-                        MergeStatus::Superseded,
-                        None,
-                        Some("{\"reason\":\"session cleaned before queue revalidation\"}"),
-                    ),
-                );
-                continue;
-            }
-            // Best effort: a failure re-simulating one entry must not
-            // abort the promotion that already happened.
-            let _ = self.simulate_and_gate(stale_id);
-        }
-        Ok(())
-    }
-
-    /// Persist one idempotent advisory for every *other* live session whose
-    /// explicit or implicit lease intersects the newly promoted paths.
-    ///
-    /// The integration ref and promotion row are already authoritative when
-    /// this runs. Every failure is therefore reported as a warning, never
-    /// returned: notifications may be
-    /// repaired or acknowledged, but they can never roll back or block a
-    /// verified promotion and they never mutate another worktree.
-    fn persist_promotion_lease_advisories(
-        &mut self,
-        entry: &MergeQueueEntry,
-        integration_sha: &str,
-        promoted_paths: &[String],
-    ) {
-        if promoted_paths.is_empty() {
-            return;
-        }
-        let Ok(live_sessions) = self.store().live_sessions() else {
-            return;
-        };
-        let live_session_ids: BTreeSet<i64> = live_sessions
-            .into_iter()
-            .filter(|session| session.id != entry.session_id)
-            .map(|session| session.id)
-            .collect();
-        let Ok(leases) = self.store().active_leases() else {
-            return;
-        };
-        let mut paths_by_session: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
-        let mut lease_evidence_by_session: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
-        for lease in leases {
-            if !live_session_ids.contains(&lease.session_id) {
-                continue;
-            }
-            for promoted_path in promoted_paths {
-                if crate::leases::paths_overlap(&lease.path, promoted_path) {
-                    paths_by_session
-                        .entry(lease.session_id)
-                        .or_default()
-                        .insert(promoted_path.clone());
-                    lease_evidence_by_session
-                        .entry(lease.session_id)
-                        .or_default()
-                        .insert(format!(
-                            "{} lease {:?} overlaps promoted path {:?}",
-                            lease.kind.as_str(),
-                            lease.path,
-                            promoted_path
-                        ));
-                }
-            }
-        }
-
-        for (session_id, paths) in paths_by_session {
-            let path_count = paths.len();
-            let paths = paths.into_iter().take(100).collect::<Vec<_>>();
-            let lease_evidence = lease_evidence_by_session
-                .remove(&session_id)
-                .unwrap_or_default();
-            let lease_evidence_count = lease_evidence.len();
-            let mut evidence = vec![AdvisoryEvidence {
-                kind: "promotion_intersects_lease".into(),
-                summary: format!(
-                    "integration {integration_sha} changed paths leased by session {session_id}; the broker did not rebase or modify that worktree"
-                ),
-            }];
-            evidence.extend(
-                lease_evidence
-                    .into_iter()
-                    .take(97)
-                    .map(|summary| AdvisoryEvidence {
-                        kind: "lease_overlap".into(),
-                        summary,
-                    }),
-            );
-            evidence.push(AdvisoryEvidence {
-                kind: "bounded_result".into(),
-                summary: format!(
-                    "recorded {} of {path_count} intersecting promoted paths and {} of {lease_evidence_count} lease overlaps",
-                    paths.len(),
-                    lease_evidence_count.min(97),
-                ),
-            });
-            evidence.push(AdvisoryEvidence {
-                kind: "safe_next_action".into(),
-                summary: "aethyme broker status --json".into(),
-            });
-            let persisted = self.persist_advisory(NewAdvisory {
-                identity: format!("promotion_lease_intersection:{integration_sha}:{session_id}"),
-                audience: crate::AdvisoryAudience::Session,
-                producer: crate::AdvisoryProducer::Coordination,
-                session_id: Some(session_id),
-                severity: AdvisorySeverity::Warning,
-                queue_entry_id: Some(entry.id),
-                integration_sha: Some(integration_sha.to_string()),
-                paths,
-                evidence,
-            });
-            crate::warn_unrecorded("persist a lease-intersection advisory", persisted);
-        }
-    }
-
     pub(crate) fn queue_entry(&mut self, entry_id: i64) -> Result<MergeQueueEntry, BrokerOpError> {
         self.store()
             .merge_queue()?
@@ -2858,28 +2269,6 @@ impl Broker {
     }
 }
 
-/// Move `branch` from `expected` to `commit`, and only from `expected`.
-///
-/// `Ok(false)` means the branch had already moved away from `expected`, so the
-/// caller's verification is stale. Any other failure is an error.
-fn advance_branch_from(
-    repo: &GitRepo,
-    branch: &str,
-    expected: &str,
-    commit: &str,
-) -> Result<bool, BrokerOpError> {
-    match repo.update_branch_ref_checked(branch, commit, expected) {
-        Ok(()) => Ok(true),
-        Err(error) => {
-            if repo.resolve_ref(&format!("refs/heads/{branch}")).as_deref() == Some(expected) {
-                Err(error.into())
-            } else {
-                Ok(false)
-            }
-        }
-    }
-}
-
 /// Remove a stale action-required drop once the session's work promotes
 /// (#41 follow-on, reported by agent A4: the file survived success with
 /// outdated blocking info). Best-effort — the worktree may be gone.
@@ -2954,33 +2343,42 @@ fn write_action_required(
 
 #[cfg(test)]
 mod verdict_tests {
-    /// Promotion is opt-in: no file, and a file that does not choose, both
-    /// verify only. Choosing still works.
+    /// Local promotion was removed. A promoting setting still parses, is
+    /// ignored, and is remembered only so status can say to delete it;
+    /// `verify-only` and no setting at all carry nothing.
     #[test]
-    fn a_repository_promotes_only_when_it_chooses_to() {
-        use super::{PromoteConfig, PromoteMode};
+    fn a_retired_promoting_setting_parses_and_is_only_remembered() {
+        use super::PromoteConfig;
 
-        let mode = |text: Option<&str>| PromoteConfig::from_text(text).0.mode;
-        let chosen = |text: Option<&str>| PromoteConfig::from_text(text).0.mode_chosen;
-        assert_eq!(mode(None), PromoteMode::VerifyOnly);
-        assert!(!chosen(None) && !chosen(Some("[promote]\nbranch = \"x\"\n")));
-        assert!(chosen(Some("[promote]\nmode = \"verify-only\"\n")));
+        let ignored =
+            |text: Option<&str>| PromoteConfig::from_text(text).0.ignored_promotion_setting;
+        let warning = |text: Option<&str>| PromoteConfig::from_text(text).1;
+        assert_eq!(ignored(None), None);
+        assert_eq!(ignored(Some("[promote]\nbranch = \"x\"\n")), None);
+        assert_eq!(ignored(Some("[promote]\nmode = \"verify-only\"\n")), None);
+        assert_eq!(warning(Some("[promote]\nmode = \"verify-only\"\n")), None);
+        assert_eq!(
+            ignored(Some("[promote]\nmode = \"auto\"\n")).as_deref(),
+            Some("mode = \"auto\"")
+        );
+        assert_eq!(warning(Some("[promote]\nmode = \"auto\"\n")), None);
+        assert_eq!(
+            ignored(Some("[promote]\nmode = \"manual\"\n")).as_deref(),
+            Some("mode = \"manual\"")
+        );
+        assert_eq!(
+            ignored(Some("[promote]\npromote_on_submit = true\n")).as_deref(),
+            Some("promote_on_submit = true")
+        );
+        assert_eq!(
+            PromoteConfig::from_text(Some("[promote]\nmode = \"auto\"\nbranch = \"x\"\n"))
+                .0
+                .branch,
+            "x"
+        );
         assert!(
-            chosen(Some("[promote\n")),
-            "a broken file refuses, as before"
-        );
-        assert_eq!(mode(Some("schema = 1\n")), PromoteMode::VerifyOnly);
-        assert_eq!(
-            mode(Some("[promote]\nbranch = \"x\"\n")),
-            PromoteMode::VerifyOnly
-        );
-        assert_eq!(
-            mode(Some("[promote]\nmode = \"auto\"\n")),
-            PromoteMode::Auto
-        );
-        assert_eq!(
-            mode(Some("[promote]\nmode = \"manual\"\n")),
-            PromoteMode::Manual
+            warning(Some("[promote\n")).is_some(),
+            "a broken file still warns"
         );
     }
 
@@ -3118,7 +2516,7 @@ mod promotion_ref_tests {
         std::fs::remove_file(dir.join(".aethyme/config.yaml")).unwrap();
 
         let (config, warning) = PromoteConfig::load_with_warning(dir);
-        assert_eq!(config.mode, PromoteMode::VerifyOnly);
+        assert_eq!(config.ignored_promotion_setting, None);
         assert!(
             warning
                 .as_deref()
@@ -3269,35 +2667,8 @@ mode = "auto"
     #[test]
     fn invalid_promotion_config_does_not_restore_automatic_mode() {
         let (config, warning) = PromoteConfig::from_text(Some("[promote]\nmode = ["));
-        assert_eq!(config.mode, PromoteMode::VerifyOnly);
+        assert_eq!(config.ignored_promotion_setting, None);
         assert!(warning.is_some());
-    }
-
-    /// Two promotions verified against the same base: the first advances
-    /// integration, and the second must see that its base moved instead of
-    /// overwriting the first promotion.
-    #[test]
-    fn a_second_promotion_from_the_same_base_does_not_overwrite_the_first() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path();
-        git(dir, &["init", "-q", "-b", "main"]);
-        let base = commit(dir, "base");
-        git(dir, &["branch", "integration", &base]);
-        let first = commit(dir, "first");
-        git(dir, &["reset", "-q", "--hard", &base]);
-        let second = commit(dir, "second");
-        let repo = GitRepo::discover(dir).unwrap();
-
-        assert!(advance_branch_from(&repo, "integration", &base, &first).unwrap());
-        assert!(
-            !advance_branch_from(&repo, "integration", &base, &second).unwrap(),
-            "the second promotion did not notice its base had moved"
-        );
-        assert_eq!(
-            git(dir, &["rev-parse", "integration"]),
-            first,
-            "the first promotion was overwritten"
-        );
     }
 }
 
@@ -3660,11 +3031,7 @@ mod owned_merge_history_tests {
         }));
 
         let outcome = broker
-            .submit_with_intent(
-                session_id,
-                crate::gates::CachePolicy::Bypass,
-                crate::PromotionIntent::VerifyOnly,
-            )
+            .submit_with_policy(session_id, crate::gates::CachePolicy::Bypass)
             .unwrap();
 
         assert!(
@@ -3711,11 +3078,7 @@ mod owned_merge_history_tests {
             }
         }));
 
-        let result = broker.submit_with_intent(
-            plan.session_id,
-            crate::gates::CachePolicy::Bypass,
-            crate::PromotionIntent::VerifyOnly,
-        );
+        let result = broker.submit_with_policy(plan.session_id, crate::gates::CachePolicy::Bypass);
 
         assert!(matches!(
             result,
@@ -3741,7 +3104,6 @@ mod owned_merge_history_tests {
             .submit_expecting_head(
                 plan.session_id,
                 crate::gates::CachePolicy::Bypass,
-                crate::PromotionIntent::VerifyOnly,
                 &wrong_head,
             )
             .unwrap_err();
@@ -4090,11 +3452,7 @@ mod owned_merge_history_tests {
             .name("submit-with-reuse-lock-test".into())
             .spawn(move || {
                 let _owner = submit_owner;
-                submit_broker.submit_with_intent(
-                    session_id,
-                    crate::gates::CachePolicy::Bypass,
-                    crate::PromotionIntent::VerifyOnly,
-                )
+                submit_broker.submit_with_policy(session_id, crate::gates::CachePolicy::Bypass)
             })
             .unwrap();
 
@@ -4870,11 +4228,10 @@ mod session_baseline_tests {
         git(dir, &["rev-parse", "HEAD"])
     }
 
-    fn refs(upstream: Option<&str>, integration: Option<&str>, promoting: bool) -> BaselineRefs {
+    fn refs(upstream: Option<&str>, integration: Option<&str>) -> BaselineRefs {
         BaselineRefs {
             upstream: upstream.map(str::to_string),
             integration: integration.map(str::to_string),
-            promoting,
         }
     }
 
@@ -4905,59 +4262,32 @@ mod session_baseline_tests {
         }
     }
 
-    /// A repository that does not promote lands work only through pull
+    /// A repository lands work only through pull
     /// requests into the default branch, so whatever the session's branch
     /// carries beyond that branch is what its pull request will carry: one
     /// merge-base, and integration is not read at all.
     #[test]
-    fn a_non_promoting_repository_measures_from_the_default_branch_in_one_git_call() {
+    fn a_repository_measures_from_the_default_branch_in_one_git_call() {
         let fixture = session_cut_from_integration_ahead_of_upstream();
         let recorder = crate::phase_telemetry::Recorder::default();
         let baseline = {
             let _installed = crate::phase_telemetry::install(recorder.clone());
             session_baseline(
                 &fixture.repo,
-                &refs(Some(&fixture.base), Some(&fixture.held), false),
+                &refs(Some(&fixture.base), Some(&fixture.held)),
             )
         };
         assert_eq!(baseline.as_deref(), Some(fixture.base.as_str()));
         assert_eq!(recorder.totals().1.get("subprocess_git"), Some(&1));
     }
 
-    /// The old rule, unchanged, wherever integration is what work lands on:
-    /// a session cut from integration does not own integration's commits.
-    #[test]
-    fn a_promoting_repository_still_measures_from_integration_when_it_is_ahead() {
-        let fixture = session_cut_from_integration_ahead_of_upstream();
-        let baseline = session_baseline(
-            &fixture.repo,
-            &refs(Some(&fixture.base), Some(&fixture.held), true),
-        );
-        assert_eq!(baseline.as_deref(), Some(fixture.held.as_str()));
-    }
-
-    /// The old rule, unchanged: a session cut from upstream while integration
-    /// lagged is measured from upstream.
-    #[test]
-    fn a_promoting_repository_still_prefers_a_more_recent_upstream() {
-        let fixture = session_cut_from_integration_ahead_of_upstream();
-        let baseline = session_baseline(
-            &fixture.repo,
-            &refs(Some(&fixture.held), Some(&fixture.base), true),
-        );
-        assert_eq!(baseline.as_deref(), Some(fixture.held.as_str()));
-    }
-
     /// With no fetched default branch there is nothing else to measure from.
     #[test]
     fn without_a_default_branch_integration_is_the_baseline() {
         let fixture = session_cut_from_integration_ahead_of_upstream();
-        let baseline = session_baseline(&fixture.repo, &refs(None, Some(&fixture.held), false));
+        let baseline = session_baseline(&fixture.repo, &refs(None, Some(&fixture.held)));
         assert_eq!(baseline.as_deref(), Some(fixture.held.as_str()));
-        assert_eq!(
-            session_baseline(&fixture.repo, &refs(None, None, false)),
-            None
-        );
+        assert_eq!(session_baseline(&fixture.repo, &refs(None, None)), None);
     }
 
     /// A session rebased onto a newer default branch owns only what it added
@@ -4976,7 +4306,7 @@ mod session_baseline_tests {
         git(dir, &["rebase", "-q", "main"]);
         let repo = GitRepo::discover(dir).unwrap();
 
-        let baseline = session_baseline(&repo, &refs(Some(&landed), Some(&started), false));
+        let baseline = session_baseline(&repo, &refs(Some(&landed), Some(&started)));
         assert_eq!(baseline.as_deref(), Some(landed.as_str()));
     }
 
@@ -4990,10 +4320,8 @@ mod session_baseline_tests {
         let empty_tree = git(&dir, &["hash-object", "-t", "tree", "-w", "/dev/null"]);
         let unrelated = git(&dir, &["commit-tree", &empty_tree, "-m", "unrelated"]);
 
-        let baseline = session_baseline(
-            &fixture.repo,
-            &refs(Some(&unrelated), Some(&fixture.held), false),
-        );
+        let baseline =
+            session_baseline(&fixture.repo, &refs(Some(&unrelated), Some(&fixture.held)));
         assert_eq!(baseline, None);
     }
 
@@ -5017,7 +4345,6 @@ mod session_baseline_tests {
 
         // Verify-only (no configuration) without a remote: integration.
         let resolved = BaselineRefs::resolve(&fixture.repo, &dir);
-        assert!(!resolved.promoting);
         assert_eq!(resolved.upstream, None);
         assert_eq!(resolved.integration.as_deref(), Some(fixture.held.as_str()));
 
@@ -5026,17 +4353,5 @@ mod session_baseline_tests {
         let resolved = BaselineRefs::resolve(&fixture.repo, &dir);
         assert_eq!(resolved.upstream.as_deref(), Some(fixture.base.as_str()));
         assert_eq!(resolved.integration, None);
-
-        // A promoting repository reads both.
-        std::fs::create_dir_all(dir.join(".aethyme")).unwrap();
-        std::fs::write(
-            dir.join(".aethyme/config.toml"),
-            "[promote]\nmode = \"auto\"\n",
-        )
-        .unwrap();
-        let resolved = BaselineRefs::resolve(&fixture.repo, &dir);
-        assert!(resolved.promoting);
-        assert_eq!(resolved.upstream.as_deref(), Some(fixture.base.as_str()));
-        assert_eq!(resolved.integration.as_deref(), Some(fixture.held.as_str()));
     }
 }

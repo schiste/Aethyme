@@ -183,26 +183,16 @@ fn removed_public_spellings_and_advanced_duplicates_refuse_before_preflight() {
     )
     .unwrap();
 
-    for (args, old, new) in [
-        (
-            &["broker", "doctor", "--json"][..],
-            "aethyme broker doctor",
-            "aethyme broker status doctor",
-        ),
-        (
-            &["broker", "promote", "--entry", "1", "--json"][..],
-            "aethyme broker promote",
-            "aethyme broker submit promote",
-        ),
-    ] {
+    for (args, old, new) in [(
+        &["broker", "doctor", "--json"][..],
+        "aethyme broker doctor",
+        "aethyme broker status doctor",
+    )] {
         let output = aethyme(&repo, args);
         assert_removed(&output, old, new, true);
     }
 
-    for line in [
-        "broker status doctor --json",
-        "broker submit promote --entry 1 --json",
-    ] {
+    for line in ["broker status doctor --json"] {
         let args: Vec<&str> = line.split(' ').collect();
         let output = aethyme(&repo, &args);
         assert_eq!(
@@ -221,10 +211,6 @@ fn removed_public_spellings_and_advanced_duplicates_refuse_before_preflight() {
         (
             "broker advanced status readiness recover --plan x",
             "status readiness recover --plan x",
-        ),
-        (
-            "broker advanced submit promote --entry 1 --json",
-            "submit promote --entry 1 --json",
         ),
         (
             "broker advanced submit prepare --session 1",

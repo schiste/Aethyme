@@ -82,7 +82,6 @@ pub(super) const KNOWN_COMMAND_WORDS: &[&str] = &[
     "record",
     "apply",
     "queue",
-    "promote",
     "plan",
     "sync-integration",
     "no-cache",

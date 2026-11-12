@@ -19,7 +19,7 @@ Agent broker:
                               create an isolated worktree + session
   broker status               sessions, overlaps, queue, integration, readiness
   broker submit --session <id>
-                              simulate, gate, and promote a session
+                              simulate and gate a session
   broker finish --session <id>
                               safely close a completed session
   broker unblock [<id>]       list blockers, or clear one

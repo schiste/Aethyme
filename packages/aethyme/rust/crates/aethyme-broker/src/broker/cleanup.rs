@@ -5713,7 +5713,6 @@ mod registered_removal_failure_tests {
         let repository = root.join("repository");
         std::fs::create_dir_all(&repository).unwrap();
         git(&repository, &["init", "-q", "-b", "main"]);
-        aethyme_testkit::promote_on_submit(&repository);
         git(&repository, &["config", "user.name", "Cleanup test"]);
         git(
             &repository,
@@ -5979,15 +5978,17 @@ mod registered_removal_failure_tests {
         broker: &mut crate::Broker,
         label: &str,
     ) -> (crate::Session, std::path::PathBuf) {
-        aethyme_testkit::promote_on_submit(broker.main_root());
         let session = broker.start_worktree(label, None).unwrap();
         let worktree = Path::new(&session.worktree_path).to_path_buf();
         std::fs::write(worktree.join("session-change.txt"), "represented\n").unwrap();
         git(&worktree, &["add", "session-change.txt"]);
         git(&worktree, &["commit", "-qm", "represented cleanup head"]);
-        assert!(
-            broker.submit(session.id).unwrap().promoted,
-            "recovery fixture must represent the session head before cleanup starts"
+        // The recovery fixture must represent the session head before
+        // cleanup starts: land it the way work lands, by pull request.
+        aethyme_testkit::land_as_pull_request(
+            broker.main_root(),
+            &session.branch,
+            aethyme_testkit::MergeStyle::MergeCommit,
         );
         (session, worktree)
     }

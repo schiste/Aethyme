@@ -5090,9 +5090,7 @@ impl Broker {
         broker.collaboration_fence_state(FenceTrigger::Open);
         broker.backfill_live_repository_contracts()?;
         broker.reap_abandoned_prepared_operations()?;
-        broker.recover_interrupted_promotion()?;
         broker.recover_prepared_reconciliation()?;
-        broker.backfill_promoted_path_exposures()?;
         // Best effort: only an already-confirmed journal may be resumed here.
         // If current eligibility or an older journal's missing fingerprint
         // prevents continuation, leave the journal for explicit review and
@@ -6528,14 +6526,13 @@ impl Broker {
                 Some(evidence) => {
                     self.resolve_observed_reuse_target(previous, evidence, prefetched, &promote)?
                 }
-                None => self.resolve_unknown_reuse_target(Some(previous), &promote)?,
+                None => self.resolve_unknown_reuse_target(&promote)?,
             }
         } else {
             // Older rows have no trusted source provenance. Compare against
-            // the configured integration ref, or the base a new session would
-            // get when there is none, and allow the relation check below to
-            // accept only a checkout that already contains it.
-            self.resolve_unknown_reuse_target(None, &promote)?
+            // the base a new session would get, and allow the relation check
+            // below to accept only a checkout that already contains it.
+            self.resolve_unknown_reuse_target(&promote)?
         };
 
         self.require_base_contains_default(&target.commit, confirmed_default.as_deref())?;
@@ -6790,66 +6787,13 @@ impl Broker {
                 }
             }
             crate::SessionStartBaseEvidence::IntegrationTip => {
-                let expected_ref = format!("refs/heads/{}", observation.promote_branch);
-                if promote.mode == crate::PromoteMode::VerifyOnly
-                    || observation.target_ref != expected_ref
-                {
-                    return Err(reuse_freshness_refusal(format!(
-                        "the stored integration base {} is no longer selected by the current promote policy; choose a new base explicitly",
-                        observation.target_ref
-                    )));
-                }
-                let commit = self.repo.resolve_ref(&expected_ref).ok_or_else(|| {
-                    reuse_freshness_refusal(format!(
-                        "the recorded integration ref {expected_ref} is missing; no fallback base was selected"
-                    ))
-                })?;
-                if let Some(default_ref) = observation.default_ref.as_deref() {
-                    // The task boundary already required a fresh default.
-                    // Also ensure integration contains that confirmed tip.
-                    if prefetched
-                        .refresh
-                        .as_ref()
-                        .is_some_and(|refresh| refresh.fetched)
-                    {
-                        let current_default =
-                            self.require_fresh_default(prefetched, default_ref)?;
-                        let history_is_complete = self
-                            .repo
-                            .has_complete_unmodified_history()
-                            .map_err(|error| {
-                                reuse_freshness_refusal(format!(
-                                    "could not verify integration ancestry: {error}"
-                                ))
-                            })?;
-                        if !history_is_complete
-                            || !self
-                                .repo
-                                .is_ancestor_checked(&current_default, &commit)
-                                .map_err(|error| {
-                                    reuse_freshness_refusal(format!(
-                                        "could not verify that integration contains the fetched default branch: {error}"
-                                    ))
-                                })?
-                        {
-                            return Err(reuse_freshness_refusal(format!(
-                                "integration {expected_ref} no longer contains the fetched default branch; no fallback base was selected"
-                            )));
-                        }
-                    }
-                } else if crate::session_push::tracked_default(&self.repo).is_some() {
-                    return Err(reuse_freshness_refusal(
-                        "a fetched default branch is now available but the session was started without one; create a new session to select its base",
-                    ));
-                }
-                ReuseTarget {
-                    reference: expected_ref,
-                    commit,
-                    evidence: Some(evidence),
-                    default_ref: observation.default_ref.clone(),
-                    promote_branch: promote.branch.clone(),
-                    verify_ref: true,
-                }
+                // Local promotion was removed, so integration is never a
+                // session's selected base any more.
+                return Err(reuse_freshness_refusal(format!(
+                    "the stored integration base {} is no longer selected now that local \
+                     promotion was removed; choose a new base explicitly",
+                    observation.target_ref
+                )));
             }
             crate::SessionStartBaseEvidence::FetchedDefaultBranch => {
                 let default_ref = observation.default_ref.as_deref().ok_or_else(|| {
@@ -6962,49 +6906,24 @@ impl Broker {
 
     fn resolve_unknown_reuse_target(
         &self,
-        previous: Option<&crate::broker::SessionBaseObservation>,
         promote: &crate::PromoteConfig,
     ) -> Result<ReuseTarget, BrokerOpError> {
-        let reference = format!("refs/heads/{}", promote.branch);
-        let integration = self.repo.resolve_ref(&reference);
-        // A reference this session was last checked against has gone away, which
-        // says something happened to it. One it never saw says only that nothing
-        // has been promoted here yet.
-        let integration_vanished = integration.is_none()
-            && previous.is_some_and(|observation| observation.target_ref == reference);
-        if promote.mode == crate::PromoteMode::VerifyOnly
-            || (integration.is_none() && !integration_vanished)
-        {
-            // An adopted session records no base source. When integration is not
-            // what a new session would start from, check it against the base one
-            // would get. `evidence: None` keeps this a containment check: the
-            // relation below refuses to move a checkout that is behind it.
-            let base = self
-                .select_session_start_base_with_promote(None, promote)
-                .map_err(|error| {
-                    reuse_freshness_refusal(format!(
-                        "the session base source is unknown and no base could be selected: {error}; start a new session with an explicit base"
-                    ))
-                })?;
-            return Ok(ReuseTarget {
-                reference: base.ref_name,
-                commit: base.commit,
-                evidence: None,
-                default_ref: base.default_ref,
-                promote_branch: promote.branch.clone(),
-                verify_ref: true,
-            });
-        }
-        let commit = integration.ok_or_else(|| {
-            reuse_freshness_refusal(format!(
-                "the session base source is unknown and configured integration ref {reference}, which this session was last checked against, is missing; no fallback base was selected. Restore it or start a new session"
-            ))
-        })?;
+        // An adopted session records no base source. Check it against the
+        // base a new session would get. `evidence: None` keeps this a
+        // containment check: the relation below refuses to move a checkout
+        // that is behind it.
+        let base = self
+            .select_session_start_base_with_promote(None, promote)
+            .map_err(|error| {
+                reuse_freshness_refusal(format!(
+                    "the session base source is unknown and no base could be selected: {error}; start a new session with an explicit base"
+                ))
+            })?;
         Ok(ReuseTarget {
-            reference,
-            commit,
+            reference: base.ref_name,
+            commit: base.commit,
             evidence: None,
-            default_ref: previous.and_then(|observation| observation.default_ref.clone()),
+            default_ref: base.default_ref,
             promote_branch: promote.branch.clone(),
             verify_ref: true,
         })
@@ -10332,47 +10251,6 @@ impl Broker {
         Ok(())
     }
 
-    /// A `status` row when a promoting integration branch no longer contains
-    /// the fetched default branch's tip. New sessions start from upstream in
-    /// that state (see [`Self::select_session_start_base_with_promote`]), but promotion and
-    /// submit still target integration, so it needs reconciling. Silent in
-    /// verify-only repositories, where integration is not used as a base.
-    pub(super) fn integration_behind_upstream_advice(&self) -> Option<StatusAdvice> {
-        let promote = PromoteConfig::load(&self.main_root);
-        if promote.mode == crate::merge::PromoteMode::VerifyOnly {
-            return None;
-        }
-        let integration_ref = format!("refs/heads/{}", promote.branch);
-        let integration = self.repo.resolve_ref(&integration_ref)?;
-        let (upstream_ref, upstream) = self.repo.upstream_default()?;
-        if self.repo.is_ancestor(&upstream, &integration) {
-            return None;
-        }
-        let (behind, ahead, _) = self.start_base_drift(&integration);
-        let behind = behind.unwrap_or(0);
-        let ahead = ahead.unwrap_or(0);
-        Some(StatusAdvice {
-            id: "integration.behind-upstream",
-            severity: StatusAdviceSeverity::Warning,
-            reason: "integration no longer contains the default branch",
-            summary: format!(
-                "{} is {behind} commit(s) behind {upstream_ref} and {ahead} ahead. New \
-                 sessions start from {upstream_ref} instead; reconcile integration so \
-                 submit and promotion stop targeting an old tree",
-                promote.branch
-            ),
-            session_id: None,
-            queue_entry_id: None,
-            evidence: vec![
-                format!("{} {}", promote.branch, short_commit(&integration)),
-                format!("{upstream_ref} {}", short_commit(&upstream)),
-            ],
-            commands: vec![format!(
-                "aethyme broker advanced integration reconcile --upstream {upstream_ref}"
-            )],
-        })
-    }
-
     /// Compare a chosen start base against the fetched default branch.
     pub(super) fn start_base_drift(
         &self,
@@ -10393,12 +10271,9 @@ impl Broker {
     /// still measured against the default branch, because naming a base does
     /// not make its inherited commits stop landing in a pull request (#290).
     ///
-    /// Without `--base`, integration is the base only when it is current: the
-    /// promote mode promotes, and integration contains the fetched default
-    /// branch's tip. Otherwise the session is cut from the fetched default
-    /// branch, and the bypassed integration is reported. Choosing integration
-    /// whenever it existed cut sessions 2,101 commits behind upstream in one
-    /// repository, where it had stopped moving three days earlier. Nothing here
+    /// Without `--base`, the session is cut from the fetched default branch,
+    /// and an integration branch that exists is reported as bypassed: local
+    /// promotion was removed, so integration is never a session base. Nothing here
     /// fetches: `create_session_worktree` refreshes the default branch just
     /// before calling it (see `Broker::refresh_default_branch_before_start`),
     /// so the fetched tip it reads is current unless that refresh failed.
@@ -10430,52 +10305,21 @@ impl Broker {
                 cached_ref_age_seconds: None,
             });
         }
-        let verify_only = promote.mode == crate::merge::PromoteMode::VerifyOnly;
         let integration_ref = format!("refs/heads/{}", promote.branch);
         let integration = self.repo.resolve_ref(&integration_ref);
         let upstream = self.repo.upstream_default();
-        if let Some(commit) = &integration
-            && !verify_only
-            && upstream
-                .as_ref()
-                .is_none_or(|(_, tip)| self.repo.is_ancestor(tip, commit))
-        {
-            let (behind_default_commits, ahead_default_commits, default_ref) =
-                self.start_base_drift(commit);
-            return Ok(SessionStartBase {
-                ref_name: integration_ref,
-                commit: commit.clone(),
-                evidence: SessionStartBaseEvidence::IntegrationTip,
-                behind_default_commits,
-                ahead_default_commits,
-                default_ref,
-                bypassed_integration: None,
-                fetched: None,
-                fetch_error: None,
-                cached_ref_age_seconds: None,
-            });
-        }
 
         if let Some((upstream_ref, upstream_commit)) = upstream {
             let bypassed_integration = integration.map(|commit| {
                 let (behind_default_commits, ahead_default_commits, _) =
                     self.start_base_drift(&commit);
-                let behind = !verify_only;
                 BypassedIntegration {
                     ref_name: integration_ref,
                     commit,
-                    reason: if behind {
-                        IntegrationBypassReason::BehindUpstream
-                    } else {
-                        IntegrationBypassReason::VerifyOnly
-                    },
+                    reason: IntegrationBypassReason::VerifyOnly,
                     behind_default_commits,
                     ahead_default_commits,
-                    recovery_command: behind.then(|| {
-                        format!(
-                            "aethyme broker advanced integration reconcile --upstream {upstream_ref}"
-                        )
-                    }),
+                    recovery_command: None,
                 }
             });
             return Ok(SessionStartBase {
@@ -10491,9 +10335,7 @@ impl Broker {
                 cached_ref_age_seconds: None,
             });
         }
-        // No fetched default branch: a promoting integration was taken above
-        // (there is nothing to be behind), so only a verify-only repository or
-        // one without integration reaches its local default branch here.
+        // No fetched default branch: the local default branch is the base.
         if let Some(remote_head) = self.repo.symbolic_ref("refs/remotes/origin/HEAD")
             && let Some(branch_name) = remote_head.strip_prefix("refs/remotes/origin/")
         {

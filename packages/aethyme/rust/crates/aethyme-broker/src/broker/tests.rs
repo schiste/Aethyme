@@ -785,22 +785,25 @@ fn active_version_verification_rejects_a_shadowing_path_binary() {
 }
 
 #[test]
-fn integration_movement_advice_points_to_live_sessions() {
-    let agent = super::AgentView {
-        session: session(56),
-        activity_at: 0,
-        derived_status: SessionStatus::Active,
-        pid_alive: None,
-    };
+fn a_retired_promoting_setting_is_one_warning_saying_to_delete_it() {
+    let advice = super::promotion_removed_advice("mode = \"auto\"");
 
-    let advice =
-        super::integration_movement_advice("aethyme/integration", "abcdef1234567890", &[agent]);
-
-    assert_eq!(advice.id, "integration.may-move");
-    assert_eq!(advice.severity, super::StatusAdviceSeverity::Notice);
-    assert_eq!(
-        advice.commands,
-        vec!["aethyme broker advanced agents".to_string()]
+    assert_eq!(advice.id, "promote.mode-removed");
+    assert_eq!(advice.severity, super::StatusAdviceSeverity::Warning);
+    assert!(
+        advice.summary.contains("mode = \"auto\" is ignored"),
+        "{}",
+        advice.summary
+    );
+    assert!(
+        advice.summary.contains("local promotion was removed"),
+        "{}",
+        advice.summary
+    );
+    assert!(
+        advice.summary.contains("Delete the setting"),
+        "{}",
+        advice.summary
     );
 }
 
@@ -837,7 +840,6 @@ fn current_summary_integration() -> super::SummaryIntegration {
         main_head: "a".repeat(40),
         main_is_ancestor: true,
         ahead_main_commits: 0,
-        promotes: true,
     }
 }
 
@@ -944,34 +946,6 @@ fn a_head_fallback_baseline_is_named_checkout() {
     );
 }
 
-#[test]
-fn status_summary_explains_single_active_session_risk() {
-    let agent = super::AgentView {
-        session: session(70),
-        activity_at: 0,
-        derived_status: SessionStatus::Active,
-        pid_alive: None,
-    };
-
-    let summary = super::status_summary(
-        &[agent],
-        0,
-        super::OverlapPairCounts::default(),
-        0,
-        0,
-        &current_summary_integration(),
-    );
-
-    assert_eq!(summary.live_sessions, 1);
-    assert_eq!(summary.active_sessions, 1);
-    assert!(summary.may_move_integration);
-    assert_eq!(
-        summary.message,
-        "1 active session; no overlaps; aethyme/integration current with main; active session may promote new integration work"
-    );
-    assert!(summary.commands.is_empty(), "{:?}", summary.commands);
-}
-
 /// Verify-only: live sessions submit, but nothing they do moves
 /// integration, so neither the flag nor the commands may say it can.
 #[test]
@@ -985,7 +959,6 @@ fn verify_only_summary_does_not_say_sessions_move_integration() {
     let integration = super::SummaryIntegration {
         relation: super::StatusIntegrationRelation::AheadOfMain,
         ahead_baseline_commits: 3,
-        promotes: false,
         ..current_summary_integration()
     };
 
@@ -1025,7 +998,7 @@ fn status_summary_explains_no_active_submitters() {
     assert!(!summary.may_move_integration);
     assert_eq!(
         summary.message,
-        "no live sessions; no overlaps; aethyme/integration current with main; no active submitters"
+        "no live sessions; no overlaps; aethyme/integration current with main; verify-only: submit does not move integration"
     );
     assert!(summary.commands.is_empty());
 }

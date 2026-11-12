@@ -1373,35 +1373,6 @@ impl BrokerStore {
             .transpose()
     }
 
-    /// Idempotent compatibility backfill for an entry promoted before path
-    /// exposure storage existed. Normal promotion uses the atomic write in
-    /// [`Self::record_merge_promotion`] instead.
-    pub(crate) fn backfill_entry_path_exposure(
-        &mut self,
-        queue_entry_id: i64,
-        promotion_sha: &str,
-        promoted_paths: &[String],
-    ) -> Result<EntryPathExposure, BrokerError> {
-        let mut paths = promoted_paths.to_vec();
-        paths.sort();
-        paths.dedup();
-        let paths_json =
-            serde_json::to_string(&paths).expect("serializing exposure paths cannot fail");
-        self.conn.execute(
-            "INSERT OR IGNORE INTO entry_path_exposures (
-                 queue_entry_id, promotion_sha, paths_json, created_at, state
-             ) VALUES (?1, ?2, ?3, ?4, 'outstanding')",
-            params![queue_entry_id, promotion_sha, paths_json, now_ms()],
-        )?;
-        let stored = self
-            .entry_path_exposure(queue_entry_id)?
-            .expect("insert or existing exposure must resolve");
-        if stored.promotion_sha != promotion_sha || stored.paths != paths {
-            return Err(BrokerError::EntryExposureIdentityConflict(queue_entry_id));
-        }
-        Ok(stored)
-    }
-
     /// Oldest-first outstanding exposures, suitable for deterministic
     /// containment checks against one verified remote tip.
     pub fn outstanding_entry_path_exposures(&self) -> Result<Vec<EntryPathExposure>, BrokerError> {

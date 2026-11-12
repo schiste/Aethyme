@@ -1,18 +1,16 @@
-//! Promotion is opt-in (#290 phase 2.2).
+//! Local promotion was removed: submit verifies and the work lands through the
+//! session's pull request (#290).
 //!
-//! A repository that ships through pull requests gets nothing from a second
-//! copy of its work on an integration branch, while paying for it in drift
-//! that leaks into every new session's base. Such a repository still wants
-//! what `submit` is good at -- cross-session conflict detection before a pull
-//! request exists, and affected gates rather than a full batch -- so the
-//! verification and the promotion had to become separable.
+//! A configuration written before the removal still parses. A promoting
+//! `[promote] mode` is ignored, the repository verifies only, and `status`
+//! says once to delete the setting; `verify-only` stays valid and silent.
 
 use std::path::Path;
 use std::process::Command;
 
 mod common;
 
-use aethyme_broker::{Broker, CachePolicy, MergeStatus, PromotionIntent};
+use aethyme_broker::{Broker, MergeStatus};
 use common::{FixtureRepository, open_fixture_repository_broker};
 
 fn git(repo: &Path, args: &[&str]) -> String {
@@ -72,15 +70,67 @@ fn an_unconfigured_repository_verifies_and_promotes_nothing() {
     assert_eq!(outcome.entry.status, MergeStatus::Verified);
 }
 
-/// Promotion stays available to a repository that chooses it.
+fn promotion_removed_rows(broker: &mut Broker) -> Vec<aethyme_broker::StatusAdvice> {
+    broker
+        .status_brief(0)
+        .unwrap()
+        .advice
+        .into_iter()
+        .filter(|advice| advice.id == "promote.mode-removed")
+        .collect()
+}
+
+/// A retired promoting mode still parses, is ignored on submit, and status
+/// carries exactly one warning saying to delete it.
 #[test]
-fn auto_repositories_promote_on_submit() {
-    let (_fixture, mut broker) = fixture(Some("auto"));
-    let session = commit_work(&mut broker, "chosen");
-    let outcome = broker.submit(session).unwrap();
-    assert!(outcome.promoted, "{outcome:?}");
-    assert!(outcome.promotion_suppressed.is_none());
-    assert_eq!(outcome.entry.status, MergeStatus::Promoted);
+fn a_retired_promoting_mode_parses_verifies_only_and_warns_once() {
+    for mode in ["auto", "manual"] {
+        let (fixture, mut broker) = fixture(Some(mode));
+        let before = git(fixture.path(), &["rev-parse", "HEAD"]);
+        let session = commit_work(&mut broker, &format!("retired-{mode}"));
+
+        let outcome = broker.submit(session).unwrap();
+        assert!(!outcome.promoted, "{outcome:?}");
+        assert_eq!(outcome.entry.status, MergeStatus::Verified);
+        assert!(outcome.promotion_suppressed.is_some());
+        let integration = git(
+            fixture.path(),
+            &["rev-parse", "--verify", "-q", "aethyme/integration"],
+        );
+        assert!(
+            integration.is_empty() || integration == before,
+            "`{mode}` moved integration to {integration}"
+        );
+
+        let rows = promotion_removed_rows(&mut broker);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.severity.as_str(), "warning");
+        assert!(
+            row.summary.contains(&format!("mode = \"{mode}\"")),
+            "{}",
+            row.summary
+        );
+        assert!(
+            row.summary.contains("local promotion was removed"),
+            "{}",
+            row.summary
+        );
+        assert!(
+            row.summary.contains("Delete the setting"),
+            "{}",
+            row.summary
+        );
+    }
+}
+
+/// `verify-only`, and no setting at all, carry no removal warning.
+#[test]
+fn verify_only_and_unconfigured_repositories_carry_no_removal_warning() {
+    for mode in [None, Some("verify-only")] {
+        let (_fixture, mut broker) = fixture(mode);
+        assert!(promotion_removed_rows(&mut broker).is_empty(), "{mode:?}");
+    }
 }
 
 /// `verify-only` verifies and moves nothing. The entry records the
@@ -97,7 +147,7 @@ fn verify_only_repositories_verify_and_promote_nothing() {
     let reason = outcome
         .promotion_suppressed
         .expect("a verified entry that did not move must say why");
-    assert!(reason.contains("promotion is off"), "{reason}");
+    assert!(reason.contains("nothing was moved locally"), "{reason}");
 
     // The integration branch must not exist or must not have moved.
     let integration = git(
@@ -129,11 +179,7 @@ fn unknown_mode_warns_in_status_and_submit_and_falls_back_to_verify_only() {
         "{}",
         warning.summary
     );
-    assert!(
-        warning.summary.contains("verify-only"),
-        "{}",
-        warning.summary
-    );
+    assert!(warning.summary.contains("ignored"), "{}", warning.summary);
 
     let session_id = session.to_string();
     let mut command = common::broker_cli(
@@ -180,7 +226,7 @@ fn the_next_action_does_not_contradict_the_suppression_reason() {
         outcome
             .promotion_suppressed
             .as_deref()
-            .is_some_and(|r| r.contains("promotion is off"))
+            .is_some_and(|r| r.contains("nothing was moved locally"))
     );
 
     let mut command = common::broker_cli(
@@ -261,39 +307,33 @@ fn finish_names_a_reachable_remedy_where_promotion_is_off() {
     );
 }
 
-/// A promoting repository is unchanged: submit is the right next step there.
+/// `--verify-only` is still accepted, and changes nothing: every submit
+/// verifies only.
 #[test]
-fn finish_still_tells_a_promoting_repository_to_submit() {
-    let (_tmp, mut broker) = fixture(Some("manual"));
-    let session = commit_work(&mut broker, "held");
-    assert!(!broker.submit(session).unwrap().promoted);
-
-    let report = broker.finish(session).unwrap();
-    let commands = report.next_commands.join("\n");
-    assert!(
-        commands.contains("broker promote") || commands.contains("broker submit"),
-        "a promoting repository keeps its promotion remedy: {commands} / {:?}",
-        report.warnings
-    );
-}
-
-/// `--verify-only` narrows one run of a promoting repository, and the reason
-/// distinguishes the flag from the repository policy.
-#[test]
-fn the_flag_suppresses_promotion_for_one_run_without_changing_policy() {
-    let (_tmp, mut broker) = fixture(Some("auto"));
+fn the_retired_verify_only_flag_is_accepted() {
+    let (fixture, mut broker) = fixture(Some("auto"));
     let session = commit_work(&mut broker, "one-run");
-
-    let outcome = broker
-        .submit_with_intent(session, CachePolicy::Use, PromotionIntent::VerifyOnly)
+    let mut command = common::broker_cli(
+        env!("CARGO_BIN_EXE_broker-cli-shim"),
+        &[
+            "submit",
+            "--session",
+            &session.to_string(),
+            "--verify-only",
+            "--json",
+        ],
+    );
+    broker
+        .configure_storage_context_for_child(&mut command)
         .unwrap();
-    assert!(!outcome.promoted, "{outcome:?}");
-    let reason = outcome.promotion_suppressed.unwrap();
-    assert!(reason.contains("--verify-only"), "{reason}");
-
-    // Policy is untouched: the next session promotes as before.
-    let next = commit_work(&mut broker, "next-run");
-    assert!(broker.submit(next).unwrap().promoted);
+    let output = command.current_dir(fixture.path()).output().unwrap();
+    assert!(
+        output.status.success(),
+        "submit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(outcome["promoted"], false);
 }
 
 #[test]
@@ -333,20 +373,22 @@ fn configuration_reads_skip_rediscovery_and_recheck_the_current_default_ref() {
     if let Some(root) = std::env::var_os(PROBE_ROOT) {
         let root = std::path::PathBuf::from(root);
         let home = root.parent().unwrap().join("home");
-        assert!(matches!(
-            aethyme_broker::PromoteConfig::load(&root).mode,
-            aethyme_broker::PromoteMode::Manual
-        ));
+        assert_eq!(
+            aethyme_broker::PromoteConfig::load(&root)
+                .ignored_promotion_setting
+                .as_deref(),
+            Some("mode = \"manual\"")
+        );
         let next = std::env::var(NEXT_COMMIT).unwrap();
         isolated_git(
             &root,
             &home,
             &["update-ref", "refs/remotes/origin/main", &next],
         );
-        assert!(matches!(
-            aethyme_broker::PromoteConfig::load(&root).mode,
-            aethyme_broker::PromoteMode::VerifyOnly
-        ));
+        assert_eq!(
+            aethyme_broker::PromoteConfig::load(&root).ignored_promotion_setting,
+            None
+        );
         // Dirty local configuration cannot override the newly selected
         // committed default policy. No cached text or ref is authority.
         std::fs::write(
@@ -354,10 +396,10 @@ fn configuration_reads_skip_rediscovery_and_recheck_the_current_default_ref() {
             "[promote]\nmode = \"auto\"\n",
         )
         .unwrap();
-        assert!(matches!(
-            aethyme_broker::PromoteConfig::load(&root).mode,
-            aethyme_broker::PromoteMode::VerifyOnly
-        ));
+        assert_eq!(
+            aethyme_broker::PromoteConfig::load(&root).ignored_promotion_setting,
+            None
+        );
         return;
     }
     let fixture = tempfile::tempdir().unwrap();

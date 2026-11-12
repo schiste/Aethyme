@@ -1065,12 +1065,7 @@ impl Fixture {
         git(&worktree, &["commit", "-qm", "chore: enroll"]);
         let head = git_output(&worktree, &["rev-parse", "HEAD"]);
         let outcome = broker
-            .submit_expecting_head(
-                session.id,
-                aethyme_broker::CachePolicy::Use,
-                aethyme_broker::PromotionIntent::VerifyOnly,
-                &head,
-            )
+            .submit_expecting_head(session.id, aethyme_broker::CachePolicy::Use, &head)
             .unwrap();
         assert_eq!(outcome.entry.status, aethyme_broker::MergeStatus::Verified);
         (outcome.entry.id, session.id, head)

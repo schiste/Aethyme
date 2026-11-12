@@ -713,10 +713,11 @@ Usage:
   aethyme broker advanced review-thread resolve <thread-id> --session <id> --repo <owner/name> --pr <number> --reason <text> [--no-wait|--queue-timeout <seconds>] [--json]
       Verify and resolve one inline review thread through the same coordinated lane.
   aethyme broker submit --session <id> [--no-cache] [--verify-only] [--json]
-      Submit the session's head commit: simulate the merge onto the local
-      integration branch, run affected gates on the merged tree, and
-      promote when verified (default; set [promote] mode = 'manual' to
-      hold verified entries for explicit promote). Conflicts reject
+      Submit the session's head commit: simulate the merge onto the
+      fetched default branch (the local integration branch when there is
+      none) and run affected gates on the merged tree. Nothing is promoted:
+      the work lands through the session's pull request, and --verify-only
+      is accepted for compatibility. Conflicts reject
       before any gate runs and write instructions to
       <worktree>/.aethyme/broker-action-required.md. V1 submits the
       whole session head only; --path/--commit scoping is intentionally
@@ -751,11 +752,11 @@ Usage:
       deferring intermediate sync; validate the current merge candidate before merge.
   aethyme broker repair --session <id> [--json]
       Conflict-scoped recovery: apply the documented local rebase path for
-      the latest submit conflict, or rebase onto promoted integration work
-      when status reports that conflict surface. Checkpoint divergence is
+      the latest submit conflict, or rebase onto integration work when
+      status reports that conflict surface. Checkpoint divergence is
       handled by `broker checkpoint plan`, never by an implicit broad rebase.
-      Then refresh leases and show affected gates. Never submits or
-      promotes; run submit when the report is clean.
+      Then refresh leases and show affected gates. Never submits; run
+      submit when the report is clean.
   aethyme broker checkpoint plan --session <id> [--json]
       Read-only recovery plan for a session whose accepted checkpoint is no
       longer an ancestor of its rewritten branch. Reports the old and proposed
@@ -773,9 +774,6 @@ Usage:
       The bare command remains the compatibility inventory. `history` is a
       bounded newest-first terminal page with a stable next_before_id cursor.
       Show the merge queue.
-  aethyme broker promote --entry <id> [--json]
-      Manual-mode only: advance the local integration branch to a verified
-      entry's merge commit; other in-flight entries are re-simulated.
   aethyme broker integration reconcile --upstream <ref> [--resolution-file <path>] [--write-resolution-template <path>] [--dry-run|--apply --confirm <sha256>] [--json]
       Compare already-fetched upstream with local main and promoted queue
       state. Dry-run is the default. --apply marks externally landed work,
@@ -829,11 +827,11 @@ Usage:
       worktrees are never removed here; their own commands are listed.
   aethyme broker quick-test [--chau7] [--with-gate] [--json]
       Disposable first-run smoke: creates a temporary git repo, runs init,
-      adopt, commit, submit, verifies promotion, and removes the repo.
+      adopt, commit, submit, checks it verifies, and removes the repo.
       --chau7 requires a Chau7 runtime marker; outside Chau7 it reports
       that this test is designed to run in Chau7 and skips the smoke.
       --with-gate installs a passing fixture gate and then proves a
-      failing variant is rejected without promotion.
+      failing variant is rejected.
   aethyme broker verify-loop [--json]   (alias: e2e)
       End-to-end broker verification for operators: snapshot integration,
       run quick-test, run doctor, run broker source tests when this is an
@@ -1576,8 +1574,6 @@ struct Parsed {
     read_only_snapshot: bool,
     /// Why `read_only_snapshot` is set; refusals quote it.
     read_only_compatibility: Option<ReadOnlyCompatibility>,
-    /// `submit --verify-only`: run verification and promote nothing.
-    verify_only: bool,
     /// `status --summary`: skip the per-session lease refresh (#182).
     summary: bool,
     /// `status --compact`: emit a compact routine response.
@@ -1764,7 +1760,6 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
     let mut parsed = Parsed {
         read_only_snapshot: false,
         read_only_compatibility: None,
-        verify_only: false,
         summary: false,
         compact: false,
         status_revision: None,
@@ -2056,7 +2051,8 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--sync-integration" => parsed.sync_integration = true,
             "--allow-main-checkout" => parsed.allow_main_checkout = true,
             "--no-cache" => parsed.no_cache = true,
-            "--verify-only" => parsed.verify_only = true,
+            // Accepted for compatibility: every submit verifies only.
+            "--verify-only" => {}
             "--probe" => parsed.probe = true,
             "--only" => {
                 parsed.only = Some(
@@ -2883,7 +2879,6 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         "representation" => run_representation(parsed)?,
         "checkpoint" => run_checkpoint(parsed)?,
         "queue" => run_queue(parsed)?,
-        "promote" => run_promote(parsed)?,
         "integration" => run_integration(parsed)?,
         "status" => run_status(parsed)?,
         "events" => run_events(parsed)?,
@@ -3157,7 +3152,7 @@ fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseComma
         | "console" | "resources" | "agents" | "ownership" | "merge-chain" | "advisories"
         | "exposures" | "note" | "operations" | "gates" | "watch" | "pr" | "hooks" | "finish"
         | "close" | "gc" | "storage" | "unblock" | "doctor" | "quick-test" | "trust"
-        | "verify-loop" | "e2e" | "init" | "certify" | "scaffold" | "checkpoint" | "promote"
+        | "verify-loop" | "e2e" | "init" | "certify" | "scaffold" | "checkpoint"
         | "integration" | "events" => TaskLeaseCommandClass::OtherWork,
         _ => TaskLeaseCommandClass::NoSessionWork,
     }

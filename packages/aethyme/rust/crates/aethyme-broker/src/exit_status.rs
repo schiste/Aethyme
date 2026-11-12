@@ -50,7 +50,6 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         // a lock is wedged, so the next step is to look at the environment.
         E::Git(crate::GitError::TimedOut { .. }) => ENVIRONMENT,
         E::GraphIntegrityRejected { .. }
-        | E::NotVerified { .. }
         | E::ExposureVerificationFailed { .. }
         | E::ShipVerificationMismatch { .. } => VERIFICATION_FAILED,
         E::Spawn { .. }
@@ -99,7 +98,6 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::InvalidLeasePath { .. }
         | E::OwnershipViolation { .. }
         | E::CapturedHeadMoved { .. }
-        | E::CaptureRequiredForPromotion { .. }
         | E::InvalidCoordinatedOperation { .. }
         | E::ClosedSessionOperation { .. }
         | E::SessionRepositoryMismatch { .. }

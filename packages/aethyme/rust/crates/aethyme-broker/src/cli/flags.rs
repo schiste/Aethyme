@@ -572,7 +572,6 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     // Bare `queue` reads `--limit` and `--before` only to refuse them by name.
     ("queue", &["--active", "--limit", "--before"]),
     ("queue history", &["--limit", "--before"]),
-    ("promote", &["--entry"]),
     (
         "integration reconcile",
         &[

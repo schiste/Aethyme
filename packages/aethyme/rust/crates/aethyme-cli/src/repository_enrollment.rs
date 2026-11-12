@@ -1101,12 +1101,7 @@ fn verify_enrollment_commit(
     commit: &str,
 ) -> Result<i64, String> {
     let outcome = broker
-        .submit_expecting_head(
-            session_id,
-            aethyme_broker::CachePolicy::Use,
-            aethyme_broker::PromotionIntent::VerifyOnly,
-            commit,
-        )
+        .submit_expecting_head(session_id, aethyme_broker::CachePolicy::Use, commit)
         .map_err(|error| format!("submit reviewed enrollment: {error}"))?;
     if !outcome.conflicts.is_empty() {
         return Err(format!(
