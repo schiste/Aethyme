@@ -42,6 +42,9 @@ use crate::git::{GitError, GitRepo};
 const DIRECTORY: &str = "worktree-watch-v1";
 #[cfg_attr(not(unix), allow(dead_code))]
 const LOCK: &str = "watch.lock";
+/// Held by the watcher only once its epoch is published; see `run`.
+#[cfg_attr(not(unix), allow(dead_code))]
+const READY: &str = "ready.lock";
 #[cfg_attr(not(unix), allow(dead_code))]
 const EPOCH: &str = "epoch";
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -166,7 +169,7 @@ mod imp {
     use sha2::{Digest, Sha256};
 
     use super::{
-        ANSWER_MAX_AGE, ANSWERS, EPOCH, FLUSH_EVERY, LOCK, SEEN, WANTED, WANTED_ACTIVE,
+        ANSWER_MAX_AGE, ANSWERS, EPOCH, FLUSH_EVERY, LOCK, READY, SEEN, WANTED, WANTED_ACTIVE,
         WANTED_KEEP, WANTED_REFRESH,
     };
     use crate::environments::supervisor::{SupervisorWork, TickOutcome};
@@ -259,11 +262,12 @@ mod imp {
         })
     }
 
-    /// True while a watcher holds `watch.lock`. The probe takes the lock
-    /// shared, so two probes never mistake each other for a watcher, and a
-    /// watcher that died released it with its last descriptor.
+    /// True while a watcher holds `ready.lock`, which it takes only after it
+    /// has replaced the previous watcher's epoch and counters. The probe takes
+    /// the lock shared, so two probes never mistake each other for a watcher,
+    /// and a watcher that died released it with its last descriptor.
     fn watcher_is_alive(directory: &Path) -> bool {
-        let Ok(file) = fs::File::open(directory.join(LOCK)) else {
+        let Ok(file) = fs::File::open(directory.join(READY)) else {
             return false;
         };
         matches!(SharedFileLock::try_acquire(file), Ok(None))
@@ -509,6 +513,21 @@ mod imp {
         }
         let epoch = format!("{}-{}", std::process::id(), now_ms());
         write_atomically(&directory.join(EPOCH), epoch.as_bytes())?;
+        // Only now may a command trust what it reads here. Between taking
+        // `watch.lock` and this point the directory still held the previous
+        // watcher's epoch and counters, and a command that believed a watcher
+        // was alive would have reused an answer from before that watcher died.
+        let mut ready = None;
+        for _ in 0..250 {
+            ready = ExclusiveFileLock::try_acquire(open_lock_file(&directory.join(READY))?)?;
+            if ready.is_some() || stop.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let Some(_ready) = ready else {
+            return Ok(());
+        };
 
         let (sender, events) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(move |event| {
@@ -621,7 +640,8 @@ mod imp {
 #[cfg(unix)]
 pub use imp::WorktreeWatchService;
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use std::process::Command;
