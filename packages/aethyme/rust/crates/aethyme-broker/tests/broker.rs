@@ -637,7 +637,8 @@ fn cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees() {
             .unwrap()
             .accepted_session_head
     );
-    assert!(safe_provenance.accepted_queue_entry_id.is_some());
+    // Nothing is accepted locally: the merged pull request is the proof.
+    assert!(safe_provenance.accepted_queue_entry_id.is_none());
     assert!(safe_provenance.represented_on.is_some());
     assert_eq!(
         dry_run
@@ -1664,17 +1665,14 @@ fn finish_blocks_dirty_then_unsubmitted_commits() {
     assert!(unsubmitted.pending_work.present);
     assert_eq!(unsubmitted.pending_work.dirty_path_count, 0);
     assert_eq!(unsubmitted.pending_work.unsubmitted_commits, 1);
-    // Both cures are offered because the warning alone cannot tell unsubmitted
-    // work apart from work that already landed through a pull request (#152).
+    // Submitting again cannot land work in a repository that lands by pull
+    // request; proving it landed is the only cure offered (#152).
     assert_eq!(
         unsubmitted.next_commands,
-        vec![
-            format!("aethyme broker submit --session {}", session.id),
-            format!(
-                "aethyme broker advanced representation scan --session {}",
-                session.id
-            ),
-        ]
+        vec![format!(
+            "aethyme broker advanced representation scan --session {}",
+            session.id
+        )]
     );
     assert_ne!(
         broker.store().session(session.id).unwrap().status,
@@ -2693,7 +2691,7 @@ fn a_finished_session_stops_colliding_on_its_declared_targets() {
 #[test]
 fn refreshed_summary_names_its_baseline_after_an_unpushed_fast_forward() {
     let tmp = common::FixtureRepository::new();
-    init_repo(tmp.path());
+    init_promoting_repo(tmp.path());
     sh(
         tmp.path(),
         &["update-ref", "refs/remotes/origin/main", "HEAD"],

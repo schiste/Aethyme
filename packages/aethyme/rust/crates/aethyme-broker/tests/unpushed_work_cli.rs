@@ -269,10 +269,15 @@ fn finish_refuses_unpushed_work_under_the_push_lane() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // The local default branch is ahead of its upstream, which the broker
+    // warns about on stderr; the refusal itself is JSON on stdout only.
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.stderr.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .all(|line| line.starts_with("warning: ")),
+        "{stderr}"
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout)
         .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stdout)));

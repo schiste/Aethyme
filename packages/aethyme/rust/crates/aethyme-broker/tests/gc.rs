@@ -54,14 +54,32 @@ impl Fixture {
     }
 }
 
+/// A closed session whose work landed by pull request, worktree kept.
 fn fixture() -> (Fixture, Broker, i64, PathBuf) {
+    fixture_with(false)
+}
+
+/// [`fixture`] with the work promoted to integration instead. Accepted
+/// checkpoints, their pins, publication exposures and terminal queue rows
+/// exist only where a repository promotes; those cases go with the
+/// promotion engine.
+fn promoting_fixture() -> (Fixture, Broker, i64, PathBuf) {
+    fixture_with(true)
+}
+
+fn fixture_with(promote: bool) -> (Fixture, Broker, i64, PathBuf) {
     let tmp = Fixture::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
+    if promote {
+        aethyme_testkit::promote_on_submit(tmp.path());
+    }
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
-    aethyme_testkit::ensure_origin(tmp.path());
+    if !promote {
+        aethyme_testkit::ensure_origin(tmp.path());
+    }
     std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
     std::fs::write(
         tmp.path().join(".aethyme/broker.toml"),
@@ -75,12 +93,15 @@ fn fixture() -> (Fixture, Broker, i64, PathBuf) {
     std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
     git(&worktree, &["add", "done.txt"]);
     git(&worktree, &["commit", "-qm", "done"]);
-    broker.submit(delivered.id).unwrap();
-    aethyme_testkit::land_as_pull_request(
-        broker.main_root(),
-        &delivered.branch,
-        aethyme_testkit::MergeStyle::MergeCommit,
-    );
+    let submitted = broker.submit(delivered.id).unwrap();
+    assert_eq!(submitted.promoted, promote);
+    if !promote {
+        aethyme_testkit::land_as_pull_request(
+            broker.main_root(),
+            &delivered.branch,
+            aethyme_testkit::MergeStyle::MergeCommit,
+        );
+    }
     assert!(
         broker
             .finish_with_options(
@@ -156,7 +177,7 @@ fn gc_fixture_worktree_stays_under_owned_root_and_is_removed_with_fixture() {
 
 #[test]
 fn closing_session_releases_checkpoint_pin_without_erasing_provenance() {
-    let (tmp, mut broker, delivered_id, _worktree) = fixture();
+    let (tmp, mut broker, delivered_id, _worktree) = promoting_fixture();
     let session = broker.store().session(delivered_id).unwrap();
     let queue_entry_id = session.accepted_queue_entry_id.unwrap();
 
@@ -200,7 +221,7 @@ fn closing_session_releases_checkpoint_pin_without_erasing_provenance() {
 
 #[test]
 fn reviewed_gc_plan_releases_legacy_pin_and_keeps_provenance_and_files() {
-    let (tmp, mut broker, delivered_id, worktree) = fixture();
+    let (tmp, mut broker, delivered_id, worktree) = promoting_fixture();
     let session = broker.store().session(delivered_id).unwrap();
     let queue_entry_id = session.accepted_queue_entry_id.unwrap();
     drop(broker);
@@ -269,7 +290,7 @@ fn reviewed_gc_plan_releases_legacy_pin_and_keeps_provenance_and_files() {
 
 #[test]
 fn reviewed_gc_plan_expires_old_publication_exposure_to_terminal_state() {
-    let (tmp, mut broker, _delivered_id, _worktree) = fixture();
+    let (tmp, mut broker, _delivered_id, _worktree) = promoting_fixture();
     let exposure = broker
         .store()
         .outstanding_entry_path_exposures()
@@ -457,7 +478,7 @@ fn plan_is_exact_deterministic_and_protects_live_or_unresolved_state() {
 
 #[test]
 fn digest_confirmed_apply_resumes_a_deadline_and_preserves_monotonic_ids() {
-    let (tmp, mut broker, delivered_id, worktree) = fixture();
+    let (tmp, mut broker, delivered_id, worktree) = promoting_fixture();
     let main_root = broker.main_root().to_path_buf();
     let gate_dir = main_root.join(".aethyme/logs/gates");
     std::fs::create_dir_all(&gate_dir).unwrap();

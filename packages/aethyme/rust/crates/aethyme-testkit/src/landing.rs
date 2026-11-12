@@ -172,18 +172,7 @@ pub fn merge_on_remote(remote: &Path, branch: &str, style: MergeStyle) -> String
             clone.to_str().expect("UTF-8 path"),
         ],
     );
-    // The bare repository's HEAD names its default branch; a remote created
-    // without `-b` can name one that was never pushed, in which case the
-    // fixture's branch is `main`.
-    let default = try_git(remote, &["symbolic-ref", "--short", "HEAD"])
-        .filter(|name| {
-            try_git(
-                remote,
-                &["rev-parse", "--verify", "-q", &format!("refs/heads/{name}")],
-            )
-            .is_some()
-        })
-        .unwrap_or_else(|| "main".to_string());
+    let default = remote_default_branch(remote);
     git(
         &clone,
         &[
@@ -226,6 +215,21 @@ pub fn delete_remote_branch(repo: &Path, branch: &str) {
     git(repo, &["fetch", "-q", "--prune", "origin"]);
 }
 
+/// The default branch of the bare repository `remote`: the branch its HEAD
+/// names, or `main` when HEAD names one that was never pushed (a remote
+/// created without `-b`).
+fn remote_default_branch(remote: &Path) -> String {
+    try_git(remote, &["symbolic-ref", "--short", "HEAD"])
+        .filter(|name| {
+            try_git(
+                remote,
+                &["rev-parse", "--verify", "-q", &format!("refs/heads/{name}")],
+            )
+            .is_some()
+        })
+        .unwrap_or_else(|| "main".to_string())
+}
+
 /// Fetch `origin`, so the remote-tracking refs show what merged there.
 pub fn fetch_origin(repo: &Path) {
     git(repo, &["fetch", "-q", "origin"]);
@@ -235,8 +239,9 @@ pub fn fetch_origin(repo: &Path) {
 /// default branch on the remote with `style`, and fetch. Returns the commit
 /// that landed it (the merge commit, or the squash commit).
 ///
-/// Afterwards `refs/remotes/origin/<default>` carries the session's work and
-/// `refs/remotes/origin/<branch>` its head, while the local default branch and
+/// Afterwards `refs/remotes/origin/<default>` carries the session's work,
+/// `refs/remotes/origin/HEAD` names that branch and
+/// `refs/remotes/origin/<branch>` holds the session head, while the local default branch and
 /// the primary checkout are unchanged: the state the broker sees after a pull
 /// request merged on the provider. It records no broker state; a broker-run
 /// `gh pr merge` additionally records the landing, which a test of that path
@@ -246,5 +251,17 @@ pub fn land_as_pull_request(repo: &Path, branch: &str, style: MergeStyle) -> Str
     push_branch(repo, branch);
     let landed = merge_on_remote(&remote, branch, style);
     fetch_origin(repo);
+    // A clone records the remote's default branch as `origin/HEAD`, and
+    // publication is judged against it. Whether `fetch` creates it depends on
+    // the Git version, so it is set explicitly.
+    git(
+        repo,
+        &[
+            "remote",
+            "set-head",
+            "origin",
+            &remote_default_branch(&remote),
+        ],
+    );
     landed
 }

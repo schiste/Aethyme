@@ -207,7 +207,7 @@ fn handoff_by_worktree_returns_the_latest_completed_session() {
         "{text}"
     );
     assert!(
-        text.contains("delivery: submitted=no, promoted=no, published=no"),
+        text.contains("delivery: submitted=no, promoted=no, published=yes"),
         "{text}"
     );
     assert!(text.contains("leases: 0 recorded"), "{text}");
