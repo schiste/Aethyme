@@ -1,5 +1,7 @@
 {
   "applied": "bool",
+  "artifact_bytes_reclaimed": "integer",
+  "artifact_directories_reclaimed": "integer",
   "failures": [],
   "plan": {
     "digest": "string",

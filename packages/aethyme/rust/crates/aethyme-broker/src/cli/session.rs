@@ -594,6 +594,18 @@ pub(super) fn render_cleanup_sweep_report(report: &crate::CleanupSweepReport, de
                 failure.reason
             );
         }
+        if report.artifact_directories_reclaimed > 0 {
+            out!(
+                "  build output reclaimed from kept worktrees: {} ({} director{})",
+                human_bytes(report.artifact_bytes_reclaimed),
+                report.artifact_directories_reclaimed,
+                if report.artifact_directories_reclaimed == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            );
+        }
     } else if report.plan.eligible_worktree_count > 0 || report.plan.eligible_branch_count > 0 {
         let scope = match (report.plan.closed_before_ms, report.plan.batch_limit) {
             (Some(before), Some(limit)) => format!(

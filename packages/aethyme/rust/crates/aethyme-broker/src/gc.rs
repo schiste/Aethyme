@@ -1154,6 +1154,10 @@ struct BoundedArtifactDiscovery {
     classified: Vec<PathBuf>,
     complete: bool,
     entries_examined: usize,
+    /// A subtree was skipped at the depth cap. The lap stays incomplete, but
+    /// siblings are still walked: a deep tracked tree must not hide a
+    /// shallow build directory beside it.
+    depth_limited: bool,
 }
 
 struct IgnoredDirectoryDiscovery {
@@ -1239,6 +1243,7 @@ impl BoundedArtifactDiscovery {
             classified: Vec::new(),
             complete: true,
             entries_examined: 0,
+            depth_limited: false,
         }
     }
 }
@@ -1280,8 +1285,10 @@ fn collect_artifact_dirs_bounded_with_opaque_ignored_roots(
         if depth > ARTIFACT_SCAN_DEPTH {
             // A depth cap is a discovery limit just like the entry budget: a
             // hidden cache may exist below this point, so the caller must not
-            // advance the completed generation.
-            discovery.complete = false;
+            // advance the completed generation. Unlike the budget it does not
+            // stop the walk: abandoning every sibling here left the shallow
+            // Cargo target of a checkout with deep tracked fixtures unfound.
+            discovery.depth_limited = true;
             return;
         }
         if Instant::now() >= deadline || discovery.entries_examined >= entry_budget {
@@ -1315,14 +1322,14 @@ fn collect_artifact_dirs_bounded_with_opaque_ignored_roots(
             if path.file_name().is_some_and(|name| name == ".git") {
                 continue;
             }
-            if artifact_witness_for_with_extras(&path, extras).is_some() {
-                discovery.classified.push(path);
+            if opaque_ignored_roots.contains(&path) {
+                // A complete Git listing already classified this ignored root:
+                // seeded above when witnessed, otherwise the opt-in lane
+                // handles it as one unit. Never descend into its contents.
                 continue;
             }
-            if opaque_ignored_roots.contains(&path) {
-                // A complete Git listing already classified this ignored root.
-                // Do not descend into its opaque contents looking for nested
-                // cache names; the opt-in lane handles the root as one unit.
+            if artifact_witness_for_with_extras(&path, extras).is_some() {
+                discovery.classified.push(path);
                 continue;
             }
             visit(
@@ -1341,6 +1348,16 @@ fn collect_artifact_dirs_bounded_with_opaque_ignored_roots(
     }
 
     let mut discovery = BoundedArtifactDiscovery::new();
+    // A complete Git listing already names witnessed ignored build roots, so
+    // they need no walk to be found; the walk skips them below.
+    discovery.classified.extend(
+        opaque_ignored_roots
+            .iter()
+            .filter(|path| {
+                is_real_directory(path) && artifact_witness_for_with_extras(path, extras).is_some()
+            })
+            .cloned(),
+    );
     visit(
         root,
         0,
@@ -1350,6 +1367,9 @@ fn collect_artifact_dirs_bounded_with_opaque_ignored_roots(
         entry_budget,
         &mut discovery,
     );
+    if discovery.depth_limited {
+        discovery.complete = false;
+    }
     discovery
 }
 
@@ -8968,6 +8988,7 @@ impl Broker {
                     classified: Vec::new(),
                     complete: false,
                     entries_examined: 0,
+                    depth_limited: false,
                 },
                 None => collect_artifact_dirs_bounded(
                     &root,
@@ -17885,6 +17906,59 @@ mod tests {
         assert!(
             !bounded.complete,
             "a depth cap must not be reported as a complete cache lap"
+        );
+    }
+
+    #[test]
+    fn a_too_deep_subtree_does_not_hide_a_shallow_build_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Deep siblings at both levels above the cache: read-directory order
+        // decides which is visited first, so the old abort-on-depth walk
+        // found the cache only when it happened to precede every chain.
+        for parent in ["", "workspace/"] {
+            for index in 0..8 {
+                dir(root, &format!("{parent}deep-{index}/a/b/c/d/e/f/g"));
+            }
+        }
+        let target = dir(root, "workspace/target");
+        std::fs::write(target.join("CACHEDIR.TAG"), "Signature\n").unwrap();
+
+        let discovery = collect_artifact_dirs_bounded(
+            root,
+            &[],
+            Instant::now() + Duration::from_secs(5),
+            ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+        );
+
+        assert_eq!(discovery.classified, vec![target]);
+        assert!(
+            !discovery.complete,
+            "the skipped deep subtrees still keep the lap open"
+        );
+    }
+
+    #[test]
+    fn witnessed_ignored_roots_are_found_without_walking_to_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let target = dir(root, "a/b/c/d/e/f/g/target");
+        std::fs::write(target.join("CACHEDIR.TAG"), "Signature\n").unwrap();
+        let unmarked = dir(root, "scratch/target");
+        let opaque = BTreeSet::from([target.clone(), unmarked]);
+
+        let discovery = collect_artifact_dirs_bounded_with_opaque_ignored_roots(
+            root,
+            &[],
+            &opaque,
+            Instant::now() + Duration::from_secs(5),
+            ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+        );
+
+        assert_eq!(
+            discovery.classified,
+            vec![target],
+            "only the witnessed ignored root is a candidate"
         );
     }
 

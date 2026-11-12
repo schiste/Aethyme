@@ -131,6 +131,19 @@ are preserved. It submits no work and enables no default routing. Startup
 budgets, log behavior and lifecycle limits are specified in
 [broker-service.md](broker-service.md).
 
+## Build output of kept worktrees
+
+`broker finish --json` adds `cleanup.artifact_bytes_reclaimed`: bytes of
+recognised build output (for example a Cargo `target` holding `CACHEDIR.TAG`)
+removed from a closed session's worktree that finish kept. It is `0` when the
+worktree was removed (that size stays in `cleanup.reclaimed_bytes`) or nothing
+was reclaimed; readers of saved reports must default it to `0`.
+`broker finish cleanup --all-cleaned --json` adds
+`artifact_directories_reclaimed` and `artifact_bytes_reclaimed`; `--apply`
+runs the same guarded closed-session reclaim on every retained checkout it
+did not remove. Both are `0` for a read-only plan. `retention.artifact_sweep_budget_ms = 0`
+or `[cleanup] strict = true` still disables the reclaim.
+
 ## Automatic checkout maintenance (v0.8.44)
 
 `AutoCleanupReport` adds optional `sessions_retired` and

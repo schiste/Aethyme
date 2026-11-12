@@ -1754,6 +1754,9 @@ pub struct CleanupSweepReport {
     pub plan: CleanupPlan,
     pub removed_session_ids: Vec<i64>,
     pub failures: Vec<CleanupSweepFailure>,
+    /// Recognised build output removed from closed checkouts that apply kept.
+    pub artifact_directories_reclaimed: usize,
+    pub artifact_bytes_reclaimed: u64,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -2738,6 +2741,10 @@ pub struct FinishCleanupReport {
     pub attempted: bool,
     pub completed: bool,
     pub reclaimed_bytes: u64,
+    /// Bytes of recognised build output removed from a worktree that finish
+    /// kept. Separate from `reclaimed_bytes`, which counts worktree removal.
+    #[serde(default)]
+    pub artifact_bytes_reclaimed: u64,
     pub worktree_removed: bool,
     pub branch_removed: bool,
     pub branch_ref: Option<String>,
