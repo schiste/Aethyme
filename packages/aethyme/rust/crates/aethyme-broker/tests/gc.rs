@@ -67,11 +67,7 @@ fn fixture() -> (Fixture, Broker, i64, PathBuf) {
     // window. With unattended checkout removal on, the bounded inline sweep
     // of the next writable broker open may remove it before `gc plan` can
     // propose it. These tests exercise reviewed GC, so turn that lane off.
-    std::fs::write(
-        tmp.path().join(".aethyme/config.toml"),
-        "[cleanup]\nauto_remove = false\n",
-    )
-    .unwrap();
+    aethyme_testkit::disable_unattended_checkout_removal(tmp.path());
     std::fs::write(
         tmp.path().join(".aethyme/broker.toml"),
         "[retention]\nterminal_events_days = 1\ngate_results_days = 1\nterminal_merge_queue_days = 1\ncommand_metrics_days = 1\nclosed_worktrees_days = 1\nstartup_budget_ms = 5\n",

@@ -378,7 +378,7 @@ pub use gc::{
     ArtifactSweepBlockerExample, ArtifactSweepBlockerSummary, ArtifactSweepLastReport,
     ArtifactSweepLegacyUnscopedState, ArtifactSweepOutcome, ArtifactSweepReport,
     GC_PLAN_SCHEMA_VERSION, INLINE_ARTIFACT_SWEEP_BUDGET_MS,
-    UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES,
+    TEST_ARTIFACT_SWEEP_DISCOVERY_ENTRIES_ENV, UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES,
 };
 pub use git::enable_repository_identity_memory;
 pub use git::{

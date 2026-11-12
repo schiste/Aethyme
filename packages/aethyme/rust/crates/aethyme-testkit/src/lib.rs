@@ -50,8 +50,8 @@ pub mod repos;
 pub use bins::{aethyme_bin, engine_bin, graph_index_bin};
 pub use invoke::{Invoke, InvokeResult, invoke_aethyme};
 pub use landing::{
-    MergeStyle, delete_remote_branch, ensure_origin, fetch_origin, land_as_pull_request,
-    merge_on_remote, push_branch,
+    MergeStyle, delete_remote_branch, disable_unattended_checkout_removal, ensure_origin,
+    fetch_origin, land_as_pull_request, merge_on_remote, push_branch,
 };
 pub use paths::{package_root, repo_root, rust_workspace_root};
 

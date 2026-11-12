@@ -61,12 +61,7 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
     // unconfirmed apply) may remove it before the assertions that the plan
     // and refused applies left it alone. This test is about explicit bulk
     // cleanup, so turn unattended checkout removal off explicitly.
-    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
-    std::fs::write(
-        tmp.path().join(".aethyme/config.toml"),
-        "[cleanup]\nauto_remove = false\n",
-    )
-    .unwrap();
+    aethyme_testkit::disable_unattended_checkout_removal(tmp.path());
 
     let mut broker = Broker::open(tmp.path()).unwrap();
     let session = broker.start_worktree("cleanup CLI fixture", None).unwrap();

@@ -1120,12 +1120,7 @@ mod json_error;
 #[test]
 fn invalid_finish_cleanup_proof_keeps_checkout_after_transient_git_errors() {
     let (tmp, session_id, worktree, branch) = landed_fixture();
-    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
-    std::fs::write(
-        tmp.path().join(".aethyme/config.toml"),
-        "[cleanup]\nauto_remove = false\n",
-    )
-    .unwrap();
+    aethyme_testkit::disable_unattended_checkout_removal(tmp.path());
 
     let session = session_id.to_string();
     let finish = run(
