@@ -448,9 +448,9 @@ blocked.
    notice and current branch state before retrying; follow the printed recovery
    step rather than retrying blindly.
    `broker start` and `start --reuse` refresh the default branch first, so a
-   new worktree starts from the latest fetched tip. In a repository
-   with `[promote] mode = "verify-only"`, `broker submit` is a pre-flight
-   against the current default branch; the integration branch is not used.
+   new worktree starts from the latest fetched tip. `broker submit` verifies
+   your work against the current default branch and lands nothing: the pull
+   request is merged on GitHub.
    When `broker status` shows `coordination.land-shared-edit-first`, another
    session changes the same lines or symbol as yours: follow it -- the named
    session lands only the shared edit as its own small PR, then both rebase
@@ -523,68 +523,23 @@ blocked.
    this worktree with `aethyme graph materialize --repo .`. Do not enable graph
    authority merely to silence a degraded response.
 
-6. **When your task is complete**, use verified broker integration by
-   default instead of manually combining concurrent session branches:
+6. **When your task is complete**, verify the work with the broker gates:
 
    ```bash
    aethyme broker submit --session <your-session-id>
    ```
 
-   Before submitting, put `Contract decision: <none|introduce|soft-retire|hard-delete>`
-   in a session commit message: submit preflight reads pending commit messages,
-   not the PR body. For `none` on a tracked-symbol removal, also include a
-   `Contract justification:` of at least 24 characters explaining the match.
-
-   This simulates the merge and runs only the checks your diff affects.
-   Submit replays session-owned commits as an ordered, single-parent patch
-   series. If your session contains an owned merge commit, submission refuses
-   safely and prints the accepted checkpoint plus an exact recovery sequence.
+   This simulates the merge and runs only the checks your diff affects. With
+   the default `[promote] mode = "verify-only"` it promotes nothing; it does not
+   publish a remote branch, merge a pull request, or push a release tag. Work
+   lands through GitHub: push the session branch with `aethyme broker push
+   --session <id> --pr` (step 4) and merge the pull request there.
+   If your session contains an owned merge commit, submission refuses safely
+   and prints the accepted checkpoint plus an exact recovery sequence.
    Follow it in order: preserve the current HEAD on the named recovery branch
    before flattening the reviewed tree change. Never reset first.
-   `broker submit` promotes to the local integration branch; it does not
-   publish a remote branch, create a pull request, or push a release tag.
-   Publication is a separate, explicitly authorized operator action. When
-   publication is authorized, review the exact promoted prefix first, then
-   confirm the plan's full publication SHA:
-
-   ```bash
-   aethyme broker advanced ship plan --entry <promoted-entry-id>
-   aethyme broker advanced ship execute --entry <promoted-entry-id> --confirm <full-publication-sha>
-   ```
-
-   By default, the selected entry is a prefix boundary: every earlier
-   promoted-but-unpublished entry ships with it. In promote-mode repositories,
-   `--only` can publish one independent entry without changing that default:
-
-   ```bash
-   aethyme broker advanced ship plan --entry <promoted-entry-id> --only
-   aethyme broker advanced ship execute --entry <promoted-entry-id> --only --confirm <full-publication-sha> --plan <sha256>
-   ```
-
-   The plan refuses when an earlier unshipped entry is required by ancestry,
-   changed-path overlap, or a declared `Depends-On` trailer. Otherwise it gates
-   the exact tree made from the remote default branch plus only the selected
-   entry. Planning does not move refs, though it may record gate results in the
-   local cache; execution requires the reviewed plan digest. After publication,
-   the broker rebases the remaining pending entries onto the published commit
-   in integration and re-runs gates only for replayed trees that changed.
-   Review that reconciliation report. If it refuses or cannot apply safely,
-   use `aethyme broker advanced integration reconcile --upstream <published-sha> --dry-run`
-   and follow its reviewed apply plan. Advancing the local default checkout
-   from integration is a separate reviewed operation: run
-   `aethyme broker advanced main reconcile plan`, then apply its reviewed
-   digest with `aethyme broker advanced main reconcile apply --session <id> --confirm <sha256>`.
-   Independent publication does not mark the other queue entries shipped or
-   change their promotion order.
-
-   Prefer this reviewed broker ship workflow over a raw push. Never infer
-   publication authority from permission to edit, submit, or promote.
-   Without publication authority, stop after submit and report the promoted
-   entry. Under `push_session_branches` (step 4), your pushed session branch
-   and its draft PR are the delivery: report the PR rather than a promoted
-   entry. Repositories that deliver through pull requests usually also set
-   `[promote] mode = "verify-only"`, so verified work does not pile up
-   unpublished on the local integration branch.
+   Never infer merge or publication authority from permission to edit or
+   submit. Report the pull request in your summary.
    Report the outcome (verified / rejected / conflict) in your summary.
    In PR delivery workflows, keep the session live until its PR has merged and
    required follow-up is complete. Ending an agent turn does not close a broker
@@ -657,10 +612,8 @@ blocked.
    deterministically ordered. Acknowledging a notice stops repeat delivery
    but does not clear the queue entry's unpublished path exposure. Session
    close and rebase do not clear it either. Only verified publication or
-   confirmed external reconciliation resolves an exposure; publishing a
-   selected integration prefix clears only entries contained in the verified
-   remote tip. Advisories never expand gate selection or block submit,
-   promotion, or shipping.
+   confirmed external reconciliation resolves an exposure. Advisories never
+   expand gate selection or block submit.
 
 9. **Git operations remain available to agents.** The broker coordinates
    concurrent work; it does not remove Git capabilities. When the user's
@@ -672,7 +625,7 @@ blocked.
 
    Operations that require coordination **must go through the broker**. Use a
    dedicated broker workflow when one exists (for example `broker submit` for
-   verified integration). Run other coordinated Git operations through the
+   verification). Run other coordinated Git operations through the
    durable Git operation coordinator:
 
    ```bash

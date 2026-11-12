@@ -25,8 +25,8 @@ graph, task, facts, intents, analyze, enhance, and Explore.
 
 ## Lease Overlaps
 
-Check `[promote] mode` in `.aethyme/config.toml`: `verify-only` makes overlaps
-advisory; other modes can refuse claims against active explicit leases. An
+Overlaps with another session's explicit lease are advisory unless the
+repository's `[promote]` config in `.aethyme/config.toml` makes them refusals. An
 accepted claim with warnings permits work in your own session. Inspect overlaps,
 reconcile before merging, and resolve refusals; never edit another session's tree.
 

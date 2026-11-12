@@ -113,9 +113,9 @@ fn agents_document_includes_broker_protocol_only_when_configured() {
         "AETHYME_TEST_DB_SUFFIX",
         "aethyme broker finish cleanup --all-cleaned --apply",
         "aethyme broker advanced operations reconcile",
-        "aethyme broker advanced ship execute",
+        "lands through GitHub: push the session branch",
         "--effect write|destructive --scope <resource>",
-        "Never infer\n   publication authority",
+        "Never infer merge or publication authority",
     ] {
         assert!(
             broker_reference.contains(moved),
