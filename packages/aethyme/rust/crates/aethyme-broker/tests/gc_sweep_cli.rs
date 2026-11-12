@@ -2302,9 +2302,12 @@ fn build_caches_are_reclaimable_even_when_the_worktree_itself_is_blocked() {
             .all(|worktree| worktree["session_id"].as_i64().unwrap().to_string() != id),
         "a session with unaccepted commits must not be scheduled for removal"
     );
-    // This failed every night and once in a sharded main run (43008303335)
-    // with no trace of what the plan decided instead. Name it, so the next
-    // failure says which blocker or deferral replaced the age blocker.
+    // This failed on commit 41ea2e006 (gates 43008303335, nightly
+    // 43009370379): the bulk remote pass of #1576 read an unpushed head as
+    // durable, so the worktree became eligible and was held as
+    // `closed_worktree_grace` instead. #1577 fixed it. Name the replacement,
+    // so a future failure says which blocker or deferral took the age
+    // blocker's place.
     let retained_summary = plan["blocker_summary"]
         .as_array()
         .unwrap()
