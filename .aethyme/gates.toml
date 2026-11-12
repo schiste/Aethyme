@@ -133,6 +133,20 @@ triggers = [
 key = "rust-workspace-v3"
 max_bytes = 12884901888
 
+# 2026-11-12: every Rust gate draws its cost from the host build pool, the
+# same pool `packages/aethyme/scripts/with-host-capacity.sh` reserves for a
+# local cargo run (limit 6). Before this a gate and any number of local
+# builds compiled at once: `cost` only orders gates and bounds this
+# repository's own gate scheduler. Units equal the gate's cost, and
+# `gate_policy.rs` (`every_rust_gate_draws_its_cost_from_the_host_build_pool`)
+# keeps the pool, units and limit in step with the script.
+[[gate.resources]]
+key = "host_build"
+kind = "capacity"
+pool = "aethyme-host-build"
+units = 2
+limit = 6
+
 [[gate]]
 name = "cargo-test"
 # 2026-11-05: Aethyme Gates no longer runs this command on main. It takes 20
@@ -210,6 +224,13 @@ triggers = [".aethyme/gates.toml"]
 key = "rust-workspace-v3"
 max_bytes = 12884901888
 
+[[gate.resources]]
+key = "host_build"
+kind = "capacity"
+pool = "aethyme-host-build"
+units = 3
+limit = 6
+
 [[gate]]
 # Shell/jq-only changes must exercise the trust/privacy contracts they change,
 # without selecting the full workspace suite. This does not remove any gate.
@@ -223,6 +244,13 @@ triggers = ["install.sh", "scripts/pilot-*.jq", "packages/aethyme/rust/crates/ae
 [gate.managed_cache]
 key = "rust-workspace-v3"
 max_bytes = 12884901888
+
+[[gate.resources]]
+key = "host_build"
+kind = "capacity"
+pool = "aethyme-host-build"
+units = 1
+limit = 6
 
 [[gate]]
 # 2026-09-13: `.github/workflows/**` matched no trigger, so an entry that
@@ -254,6 +282,13 @@ triggers = [".github/workflows/**"]
 key = "rust-workspace-v3"
 max_bytes = 12884901888
 
+[[gate.resources]]
+key = "host_build"
+kind = "capacity"
+pool = "aethyme-host-build"
+units = 1
+limit = 6
+
 [[gate]]
 # 2026-09-13: this file matched no trigger, so an entry that rewrote gate
 # policy selected only the always-on gates — the gate being weakened never
@@ -284,6 +319,13 @@ triggers = [".aethyme/gates.toml"]
 [gate.managed_cache]
 key = "rust-workspace-v3"
 max_bytes = 12884901888
+
+[[gate.resources]]
+key = "host_build"
+kind = "capacity"
+pool = "aethyme-host-build"
+units = 1
+limit = 6
 
 [[gate]]
 # 2026-07-27: the registry's enforcement previously ran ONLY in the
@@ -336,3 +378,10 @@ max_load_per_cpu = 3.0
 [gate.managed_cache]
 key = "rust-contract-v1"
 max_bytes = 12884901888
+
+[[gate.resources]]
+key = "host_build"
+kind = "capacity"
+pool = "aethyme-host-build"
+units = 1
+limit = 6
