@@ -180,6 +180,7 @@ mod text_redaction;
 mod unpushed;
 pub mod worktree_location;
 mod worktree_report;
+mod worktree_watch;
 pub use pr_monitoring::{
     activate as activate_pr_monitoring, active_sessions as pr_monitoring_sessions,
     deactivate as deactivate_pr_monitoring, is_active as pr_monitoring_is_active,

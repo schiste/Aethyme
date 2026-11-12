@@ -4041,7 +4041,7 @@ fn implicit_lease_paths(
             .unwrap_or_else(|| "HEAD".to_string())
     };
     let _span = crate::phase_telemetry::span("implicit_lease_changed_files");
-    let changed = checkout.changed_files(&base).ok()?;
+    let changed = crate::worktree_watch::changed_files(&checkout, &base).ok()?;
     Some(
         changed
             .into_iter()

@@ -70,6 +70,8 @@ pub(super) fn run_readiness(parsed: Parsed) -> Result<(), UsageError> {
 
 /// `broker status`.
 pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
+    // Status reports and never decides, so it may reuse changed-path answers.
+    crate::worktree_watch::allow_reuse_for_this_command();
     if parsed.status_revision.is_some() && (!parsed.json || parsed.summary || parsed.refresh) {
         return Err(UsageError::Message(
             "--since-revision requires JSON compact status and cannot be combined with --summary or --refresh".into(),

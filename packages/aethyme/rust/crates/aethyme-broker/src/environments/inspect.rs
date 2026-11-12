@@ -388,7 +388,7 @@ pub(super) fn run_supervise(options: &Options) -> Result<Output, Failure> {
     supervisor::install_signal_handlers()
         .map_err(|error| environment_failure(format!("supervisor signals: {error}")))?;
     let config = SupervisorConfig::new(root);
-    let mut work = super::operate::LifecycleWork {
+    let lifecycle = super::operate::LifecycleWork {
         watch: StoreWatch { store_path },
         proxy_started: false,
         last_sample: None,
@@ -398,6 +398,16 @@ pub(super) fn run_supervise(options: &Options) -> Result<Output, Failure> {
         last_prebuild: None,
         prebuild: None,
     };
+    // The supervisor is the host's one background process: every service
+    // that must outlive a command is hosted here.
+    let mut services: Vec<Box<dyn supervisor::SupervisorWork>> = vec![Box::new(lifecycle)];
+    #[cfg(unix)]
+    if let Some(directory) = crate::worktree_watch::directory() {
+        services.push(Box::new(crate::worktree_watch::WorktreeWatchService::new(
+            directory,
+        )));
+    }
+    let mut work = supervisor::Services(services);
     let reason = supervisor::run(&config, &mut work, &|| false)
         .map_err(|error| environment_failure(format!("supervisor: {error}")))?;
     let value = json!({ "schema": SUPERVISE_SCHEMA, "exit_reason": reason });
