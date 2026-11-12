@@ -265,3 +265,24 @@ pub fn land_as_pull_request(repo: &Path, branch: &str, style: MergeStyle) -> Str
     );
     landed
 }
+
+/// Turn off unattended checkout removal for `repo`: write
+/// `[cleanup] auto_remove = false` as its `.aethyme/config.toml`.
+///
+/// A landed, closed checkout past its grace window is exactly what the
+/// unattended lane removes, and every writable broker open runs that lane
+/// inside its wall-clock-bounded inline sweep. Whether one particular open
+/// reaches the checkout depends on how fast the runner is, so a test that
+/// keeps such a checkout and asserts on it after another writable open must
+/// turn the lane off instead of racing it. Tests of unattended removal itself
+/// call the cleanup directly, with no deadline.
+///
+/// It replaces the whole file, so call it before adding other keys.
+pub fn disable_unattended_checkout_removal(repo: &Path) {
+    let directory = repo.join(".aethyme");
+    std::fs::create_dir_all(&directory)
+        .unwrap_or_else(|error| panic!("mkdir {}: {error}", directory.display()));
+    let config = directory.join("config.toml");
+    std::fs::write(&config, "[cleanup]\nauto_remove = false\n")
+        .unwrap_or_else(|error| panic!("write {}: {error}", config.display()));
+}

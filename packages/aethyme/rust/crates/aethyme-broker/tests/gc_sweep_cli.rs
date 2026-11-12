@@ -162,11 +162,7 @@ fn fixture(retention: &str) -> (tempfile::TempDir, tempfile::TempDir) {
     // This suite tests artifact cleanup and reclaim, not whole-checkout removal.
     // Set that policy explicitly instead of relying on an absent remote ref to
     // keep otherwise eligible fixture worktrees around.
-    std::fs::write(
-        repo.path().join(".aethyme/config.toml"),
-        "[cleanup]\nauto_remove = false\n",
-    )
-    .unwrap();
+    aethyme_testkit::disable_unattended_checkout_removal(repo.path());
     std::fs::write(repo.path().join(".aethyme/broker.toml"), retention).unwrap();
     discover_artifact_sweep_namespace(repo.path(), container.path());
     (repo, container)
