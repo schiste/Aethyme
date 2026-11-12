@@ -1,6 +1,5 @@
 //! Lease overlaps grouped by session pair, ranked by Git's merge condition,
-//! announced once per pair, and blocking submit only on a real conflict with
-//! a session that is actively working.
+//! announced once per pair, and reported on submit, which they never block.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -39,7 +38,6 @@ fn numbered(edit: Option<(usize, &str)>) -> String {
 
 fn init_repo(root: &Path) {
     sh(root, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     for name in ["auth.py", "other.py", "third.py"] {
         std::fs::write(root.join("src").join(name), numbered(None)).unwrap();
@@ -194,7 +192,7 @@ fn disjoint_hunks_in_one_file_are_low_and_do_not_block_submit() {
 
 /// The owner's edit is uncommitted: classification must see it anyway.
 #[test]
-fn overlapping_hunks_with_an_active_holder_block_submit() {
+fn overlapping_hunks_with_an_active_holder_are_high_and_only_warn() {
     let tmp = FixtureRepository::new();
     init_repo(tmp.path());
     let mut broker = open_fixture_repository_broker(&tmp).unwrap();
@@ -209,18 +207,17 @@ fn overlapping_hunks_with_an_active_holder_block_submit() {
     commit(&wt_other, "other");
 
     let audit = broker.audit_submit_ownership(other.id).unwrap();
-    assert!(!audit.ok, "{audit:?}");
-    assert_eq!(audit.conflicting_leases.len(), 1, "{audit:?}");
-    assert_eq!(audit.conflicting_leases[0].session_id, owner.id);
-    assert_eq!(
-        audit.conflicting_leases[0].severity.as_deref(),
-        Some("high")
-    );
+    assert!(audit.ok, "{audit:?}");
+    assert!(audit.conflicting_leases.is_empty(), "{audit:?}");
+    assert_eq!(audit.warned_leases.len(), 1, "{audit:?}");
+    assert_eq!(audit.warned_leases[0].session_id, owner.id);
+    assert_eq!(audit.warned_leases[0].severity.as_deref(), Some("high"));
     assert!(
-        audit.conflicting_leases[0]
+        audit.warned_leases[0]
             .reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("actively working")),
+            .is_some_and(|reason| reason.contains("actively working")
+                && reason.contains("resolved when one of them merges")),
         "{audit:?}"
     );
 }

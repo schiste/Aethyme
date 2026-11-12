@@ -282,10 +282,9 @@ impl Broker {
                 .unavailable
                 .push(source_error("host-resources.db", error)),
         }
-        // Path leases are claim-specific: only the shared LeaseRefusalPolicy
-        // can say whether a particular requested path is refused. Listing a
-        // stale claim as a repository-wide blocker is wrong; the full lease
-        // and liveness views already expose it for information.
+        // Path leases never refuse a claim, so none is a repository-wide
+        // blocker; the full lease and liveness views expose them for
+        // information.
         if inspect_recovery {
             match self.gate_cache_blockers() {
                 Ok(found) => report.blockers.extend(found),

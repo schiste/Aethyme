@@ -79,7 +79,6 @@ fn session_context_round_trips_and_can_be_enriched_from_chau7() {
     let (_tmp, mut store) = open_temp();
     let session = store
         .register_session_with_context_and_leases(
-            false,
             &NewSession {
                 worktree_path: "/repo/.aethyme/worktrees/chau7-auth".into(),
                 branch: "agent/chau7-auth".into(),
@@ -134,7 +133,6 @@ fn session_context_round_trips_and_can_be_enriched_from_chau7() {
 
     let reused = store
         .reuse_session_with_context_and_leases(
-            false,
             session.id,
             None,
             None,
@@ -261,7 +259,7 @@ fn session_round_trip_attach_first() {
 }
 
 #[test]
-fn session_registration_and_planned_leases_rollback_as_one_transaction() {
+fn session_registration_records_planned_leases_and_never_refuses_an_overlap() {
     let (_tmp, mut store) = open_temp();
     let contract = RepositoryContract {
         repository_schema: Some(1),
@@ -288,31 +286,28 @@ fn session_registration_and_planned_leases_rollback_as_one_transaction() {
     let first = store
         .register_session_with_leases(&session("first"), &["generated/".into()])
         .unwrap();
-    let error = store
+    let second = store
         .register_session_with_leases(
             &session("second"),
             &["docs/new.md".into(), "generated/policy.md".into()],
         )
-        .unwrap_err();
-    assert!(matches!(error, BrokerError::PlannedLeaseConflict(_)));
-    assert!(
-        store
-            .session_for_worktree("/repo/.aethyme/worktrees/second")
-            .unwrap()
-            .is_none(),
-        "the session row must roll back with its first non-conflicting claim"
-    );
+        .expect("another session's lease never refuses a planned lease");
     let live = store.live_sessions().unwrap();
-    assert_eq!(live.len(), 1);
-    assert_eq!(live[0].id, first.id);
+    assert_eq!(live.len(), 2);
+    let mut leases = store
+        .active_leases()
+        .unwrap()
+        .iter()
+        .map(|lease| (lease.session_id, lease.path.clone()))
+        .collect::<Vec<_>>();
+    leases.sort();
     assert_eq!(
-        store
-            .active_leases()
-            .unwrap()
-            .iter()
-            .map(|lease| lease.path.as_str())
-            .collect::<Vec<_>>(),
-        vec!["generated/"]
+        leases,
+        vec![
+            (first.id, "generated/".to_string()),
+            (second.id, "docs/new.md".to_string()),
+            (second.id, "generated/policy.md".to_string()),
+        ]
     );
 }
 

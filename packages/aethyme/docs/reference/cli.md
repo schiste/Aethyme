@@ -1230,7 +1230,7 @@ environment fallbacks are `AETHYME_SESSION_REPO_NAME`,
 `AETHYME_CHAU7_*` aliases). When host context includes a tab or provider but
 omits the repository name, the broker infers the repository basename. Chau7
 delivery commands enrich an existing session from the live tab snapshot, so
-`broker status`, lease refusals, and lease plans can identify a blocker as well
+`broker status`, lease warnings, and lease plans can identify a holder as well
 as report its liveness. These fields are descriptive only: they never grant
 ownership or change lease routing.
 

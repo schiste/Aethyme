@@ -1125,21 +1125,10 @@ impl Broker {
             return self.submit_content_empty(&session, &checkout, &head, empty);
         }
         progress.phase("auditing lease ownership");
-        let mut ownership = self.audit_submit_ownership(session_id)?;
+        let ownership = self.audit_submit_ownership(session_id)?;
         if !ownership.ok {
-            let changed = ownership.changed_paths.clone();
-            self.attach_overlap_changes(session_id, &changed, &mut ownership.conflicting_leases);
-            let mut summary = ownership.failure_summary();
-            for changes in ownership
-                .conflicting_leases
-                .iter()
-                .filter_map(|lease| lease.other_changes.as_ref())
-            {
-                summary.push('\n');
-                summary.push_str(&crate::overlap_diff::render(changes, "  "));
-            }
             return Err(BrokerOpError::OwnershipViolation {
-                summary,
+                summary: ownership.failure_summary(),
                 report: Box::new(ownership),
             });
         }

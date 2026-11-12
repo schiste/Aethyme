@@ -6160,11 +6160,6 @@ impl Broker {
             });
         }
         let planned_paths = normalize_planned_paths(&options.planned_paths)?;
-        let plan_owner = existing.as_ref().and_then(|session| match options.mode {
-            AdoptMode::Reuse | AdoptMode::ReplaceStale => Some(session.id),
-            AdoptMode::New => None,
-        });
-        self.ensure_planned_paths_available(&planned_paths, plan_owner)?;
         let mut integration_sync = None;
         let mut outcome = AdoptOutcome::Created;
         let mut replaced_session_id = None;
@@ -6211,7 +6206,6 @@ impl Broker {
                         .store
                         .reuse_session_with_context_and_leases_and_base_observation(
                             crate::store::SessionReuseOptions {
-                                verify_only: LeaseRefusalPolicy::verify_only_at(&self.main_root),
                                 id: existing.id,
                                 task,
                                 diff_base: refreshed_base,
@@ -6341,7 +6335,6 @@ impl Broker {
                 .store
                 .replace_session_with_context_and_leases_and_base_observation(
                     crate::store::SessionReplacementOptions {
-                        verify_only: LeaseRefusalPolicy::verify_only_at(&self.main_root),
                         replaced_id: replaced_session_id,
                         new: &new_session,
                         context: &context,
@@ -6351,7 +6344,6 @@ impl Broker {
                 )?,
             (Some(replaced_session_id), None) => {
                 self.store.replace_session_with_context_and_leases(
-                    LeaseRefusalPolicy::verify_only_at(&self.main_root),
                     replaced_session_id,
                     &new_session,
                     &context,
@@ -6361,14 +6353,12 @@ impl Broker {
             (None, Some(observation)) => self
                 .store
                 .register_session_with_context_and_leases_and_base_observation(
-                    LeaseRefusalPolicy::verify_only_at(&self.main_root),
                     &new_session,
                     &context,
                     &planned_paths,
                     observation,
                 )?,
             (None, None) => self.store.register_session_with_context_and_leases(
-                LeaseRefusalPolicy::verify_only_at(&self.main_root),
                 &new_session,
                 &context,
                 &planned_paths,
@@ -7599,7 +7589,6 @@ impl Broker {
         let session = match self
             .store
             .register_spawned_session_with_context_and_leases_and_base_observation(
-                LeaseRefusalPolicy::verify_only_at(&self.main_root),
                 &new_session,
                 &context,
                 &planned_paths,
@@ -7813,7 +7802,6 @@ impl Broker {
         let registration = self
             .store
             .register_spawned_session_with_context_and_leases_and_base_observation(
-                LeaseRefusalPolicy::verify_only_at(&self.main_root),
                 &NewSession {
                     worktree_path: worktree_path_string.clone(),
                     branch: branch.clone(),
@@ -8072,7 +8060,6 @@ impl Broker {
         // Choose the unique branch and recheck the destination immediately
         // before the checkout is allocated. The returned guard stays held
         // until the caller registers the session or rolls the checkout back.
-        self.ensure_planned_paths_available(planned_paths, None)?;
         let slug = self.next_worktree_slug(task, &placement.root);
         let worktree_path = placement.root.join(&slug);
         self.refuse_nested_worktree_path(&worktree_path)?;

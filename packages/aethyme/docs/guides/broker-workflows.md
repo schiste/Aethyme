@@ -917,20 +917,18 @@ aethyme broker advanced leases plan src/broker.rs packages/aethyme/docs/ \
 Use repository-relative file paths for exact claims and a trailing slash for a
 directory claim. Paths containing `.` or `..` components are rejected as
 ambiguous. The plan reports exact and directory overlaps, the owning session,
-implicit or explicit lease kind, expiry, and whether a claim would currently
-conflict. With `--session`, leases already owned by that session are separated
-from foreign blockers; without it, every overlap is a potential conflict.
+implicit or explicit lease kind and expiry. With `--session`, leases already
+owned by that session are separated from other sessions' leases.
 
-A claim is refused by one kind of lease only: another session's explicit
-lease whose holder is actively working, and never in a `verify-only`
-repository. Implicit leases (derived from another session's edits) and leases
-held by idle, stale or exited sessions do not refuse; the claim succeeds and
-returns them as `warnings`, each with its holder, the reason and the
-`aethyme broker advanced note send` command to coordinate. Leases implied by a
-stale session's old edits are left out. `would_conflict` in a plan follows the
-same rule, and so do planned leases at `start --path` and the guarded-exec
-check. The rule is shared with `submit`, which additionally requires the two
-sessions' edits to conflict.
+Another session's lease never refuses a claim. Every overlapping lease of a
+live session, and every explicit lease, is returned in `warnings`, each with
+its holder, the reason and the `aethyme broker advanced note send` command to
+coordinate. Leases implied by a stale session's old edits are left out. The
+same holds for planned leases at `start --path`, the guarded-exec check and
+`submit`, which also reports whether the two sessions' edits conflict. A plan's
+`would_conflict`, a claim's `accepted` and `blockers`, and the
+`conflicting_leases` of an ownership audit or guarded exec are kept for JSON
+compatibility and are always `false`, `true` and empty.
 
 Implicit warnings use the last recorded diagnostic snapshot. Claims do not
 scan other worktrees for new edits; changes made since the last lease refresh

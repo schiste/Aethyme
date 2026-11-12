@@ -90,9 +90,8 @@ pub enum LeaseLiveness {
     /// The holder process is running and used the broker recently.
     Active,
     /// The holder process is running but quiet past `idle_minutes`. The lease
-    /// still counts as an overlap, like an active one. Whether it refuses is a
-    /// separate question: `LeaseRefusalPolicy` refuses only for a session whose
-    /// derived status is active, so an idle holder warns.
+    /// still counts as an overlap, like an active one. No lease refuses; an
+    /// overlap is reported as a warning.
     Idle,
     /// The holder process is gone. Within the grace period the lease still
     /// holds; past it, it is no longer a conflict.

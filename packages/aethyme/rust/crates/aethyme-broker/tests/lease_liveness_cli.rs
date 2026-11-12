@@ -64,7 +64,6 @@ fn fixture(config: &str) -> Fixture {
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(repo.join("src")).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(&repo);
     std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
     std::fs::write(repo.join(PATH), "fn main() {}\n").unwrap();
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
@@ -72,7 +71,6 @@ fn fixture(config: &str) -> Fixture {
     git(&repo, &["commit", "-qm", "init"]);
     std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
     std::fs::write(repo.join(".aethyme/config.toml"), config).unwrap();
-    aethyme_testkit::promote_on_submit(&repo);
     let host = tmp.path().join("host");
     std::fs::create_dir_all(&host).unwrap();
     Fixture {
@@ -134,6 +132,8 @@ impl Fixture {
         leases[0].clone()
     }
 
+    /// Whether the holder's lease still holds in the planner's lease plan. A
+    /// lease never refuses a claim, so this is liveness, not a refusal.
     fn plan_conflicts(&self, planner: &str, session: i64) -> bool {
         let plan = self.json_as(
             planner,
@@ -147,7 +147,12 @@ impl Fixture {
                 "--json",
             ],
         );
-        plan["would_conflict"].as_bool().unwrap()
+        assert_eq!(plan["would_conflict"], false, "{plan}");
+        plan["paths"][0]["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|conflict| conflict["liveness_evidence"]["holds"] == true)
     }
 }
 

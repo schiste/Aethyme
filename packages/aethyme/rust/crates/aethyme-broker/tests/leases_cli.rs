@@ -33,7 +33,6 @@ fn run(repo: &Path, args: &[&str]) -> Output {
 fn fixture() -> common::FixtureRepository {
     let tmp = common::FixtureRepository::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::create_dir_all(tmp.path().join("src")).unwrap();
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join("src/owned.rs"), "owned\n").unwrap();
@@ -154,7 +153,6 @@ fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
         "schema = 1\n[leases.routing]\ndirty-secret = [\"private/\"]\n",
     )
     .unwrap();
-    aethyme_testkit::promote_on_submit(tmp.path());
     let planner_id = planner.id.to_string();
 
     let json_output = run(
@@ -178,7 +176,10 @@ fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
     );
     let report: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
     assert_eq!(report["session_id"], planner.id);
-    assert_eq!(report["would_conflict"], true);
+    assert_eq!(
+        report["would_conflict"], false,
+        "a lease never refuses a claim"
+    );
     assert_eq!(report["paths"][0]["path"], "README.md");
     assert_eq!(report["paths"][0]["conflicts"][0]["relation"], "exact");
     assert_eq!(report["paths"][0]["conflicts"][0]["session_id"], owner.id);
@@ -226,7 +227,7 @@ fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
     );
     assert!(text_output.status.success());
     let text = String::from_utf8_lossy(&text_output.stdout);
-    assert!(text.contains("src/owned.rs — would conflict"), "{text}");
+    assert!(text.contains("src/owned.rs — clear"), "{text}");
     assert!(text.contains("owned"), "{text}");
     assert!(text.contains("conflict"), "{text}");
     assert!(text.contains("exact"), "{text}");
@@ -429,7 +430,6 @@ fn lease_export_is_bounded_redacted_routed_and_read_only() {
         "schema = 1\n[leases.routing]\nbackend = [\"src/\"]\ndocumentation = [\"docs/\"]\n",
     )
     .unwrap();
-    aethyme_testkit::promote_on_submit(tmp.path());
     git(tmp.path(), &["add", "-f", ".aethyme/config.toml"]);
     git(tmp.path(), &["commit", "-qm", "routing config"]);
 
@@ -640,12 +640,11 @@ fn lease_export_requires_a_selector_and_valid_bounds() {
     assert!(String::from_utf8_lossy(&excessive.stderr).contains("between 1 and 1000"));
 }
 
-/// A lease refusal must name who holds the lease and what state they are in
-/// (#137 B4). The blockers were always attached to the error; printing only the
-/// count forced a JSON query to learn whether the holder was even working, and
-/// at eight concurrent sessions that made leases impractical.
+/// An overlapping lease never refuses a claim, but the claim must name who
+/// holds it and what state they are in (#137 B4): at eight concurrent sessions
+/// that is what makes coordinating possible.
 #[test]
-fn a_lease_refusal_names_the_holder_and_its_status() {
+fn a_lease_overlap_names_the_holder_and_its_status() {
     let repo = fixture();
     let first = run(
         repo.path(),
@@ -671,7 +670,7 @@ fn a_lease_refusal_names_the_holder_and_its_status() {
     let claimant: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
     let claimant_id = claimant["id"].as_i64().unwrap().to_string();
 
-    let refused = run(
+    let claimed = run(
         repo.path(),
         &[
             "advanced",
@@ -682,11 +681,15 @@ fn a_lease_refusal_names_the_holder_and_its_status() {
             &claimant_id,
         ],
     );
-    assert!(!refused.status.success(), "the claim must be refused");
-    let text = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        text.contains(&format!("session {holder_id}")),
-        "the refusal must name the holding session: {text}"
+        claimed.status.success(),
+        "another session's lease never refuses a claim: {}",
+        String::from_utf8_lossy(&claimed.stderr)
+    );
+    let text = String::from_utf8_lossy(&claimed.stdout);
+    assert!(
+        text.contains(&format!("note: session {holder_id}")),
+        "the claim must name the holding session: {text}"
     );
     assert!(text.contains("shared.txt"), "and the path it holds: {text}");
     assert!(
