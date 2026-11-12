@@ -16,6 +16,12 @@
 //!   moment believe another one runs, and exit.
 //! - **Lingers, then exits.** After `linger` with no environment that needs
 //!   supervision, it exits on its own.
+//! - **Replaced with its executable.** An update swaps the binary under a
+//!   running supervisor, which would otherwise keep the old code (and none
+//!   of the new services) for as long as anything needs it. It watches its
+//!   own executable and, once the file has changed and settled, exits with
+//!   [`ExitReason::Replaced`]; `aethyme env supervise` then starts the
+//!   successor from the new file.
 //! - **Degraded mode.** Without a supervisor, foreground commands still work;
 //!   only background behaviour (idle parking, wake on request) stops, and
 //!   `env status` says `supervisor: absent`.
@@ -52,6 +58,9 @@ pub struct SupervisorConfig {
     pub root: PathBuf,
     pub linger: Duration,
     pub tick: Duration,
+    /// The file this supervisor runs, watched for replacement. `None`
+    /// (tests, or an unreadable path) never ends the supervisor.
+    pub executable: Option<PathBuf>,
 }
 
 impl SupervisorConfig {
@@ -70,7 +79,63 @@ impl SupervisorConfig {
                 .map(Duration::from_millis)
                 .unwrap_or(DEFAULT_TICK)
                 .max(Duration::from_millis(10)),
+            executable: std::env::current_exe().ok(),
         }
+    }
+}
+
+/// What the filesystem says about an executable: enough to tell one
+/// installed build from the next without reading it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecutableStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    file: (u64, u64),
+}
+
+impl ExecutableStamp {
+    fn read(path: &Path) -> Option<Self> {
+        let metadata = fs::metadata(path).ok()?;
+        Some(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            file: {
+                use std::os::unix::fs::MetadataExt;
+                (metadata.dev(), metadata.ino())
+            },
+        })
+    }
+}
+
+/// Notices that the running executable was replaced on disk.
+///
+/// An installer removes and rewrites the file, so one differing reading may
+/// be a half-written binary. The replacement counts only once two
+/// consecutive readings agree with each other and differ from the start.
+#[derive(Debug)]
+pub struct ExecutableWatch {
+    path: PathBuf,
+    started: ExecutableStamp,
+    candidate: Option<ExecutableStamp>,
+}
+
+impl ExecutableWatch {
+    pub fn new(path: &Path) -> Option<Self> {
+        Some(Self {
+            path: path.to_path_buf(),
+            started: ExecutableStamp::read(path)?,
+            candidate: None,
+        })
+    }
+
+    /// True once the file differs from the one started and has settled.
+    pub fn replaced(&mut self) -> bool {
+        let now = ExecutableStamp::read(&self.path).filter(|stamp| *stamp != self.started);
+        let settled = now.is_some() && now == self.candidate;
+        self.candidate = now;
+        settled
     }
 }
 
@@ -322,6 +387,8 @@ pub enum ExitReason {
     Stopped,
     /// SIGTERM, SIGINT or SIGHUP, once [`install_signal_handlers`] ran.
     Signal,
+    /// The executable was replaced on disk; a successor should be started.
+    Replaced,
 }
 
 /// The last terminating signal received, 0 for none.
@@ -383,6 +450,7 @@ fn describe_exit(reason: ExitReason, config: &SupervisorConfig) -> String {
         ),
         ExitReason::Stopped => "stopped".into(),
         ExitReason::Signal => signal_name(SIGNALLED.load(std::sync::atomic::Ordering::Relaxed)),
+        ExitReason::Replaced => "the executable was replaced; a successor takes over".into(),
     }
 }
 
@@ -444,12 +512,16 @@ fn supervise(
 ) -> ExitReason {
     let signalled = || SIGNALLED.load(std::sync::atomic::Ordering::Relaxed) != 0;
     let mut idle_since: Option<Instant> = None;
+    let mut executable = config.executable.as_deref().and_then(ExecutableWatch::new);
     loop {
         if stop() {
             return ExitReason::Stopped;
         }
         if signalled() {
             return ExitReason::Signal;
+        }
+        if executable.as_mut().is_some_and(ExecutableWatch::replaced) {
+            return ExitReason::Replaced;
         }
         let outcome = work.tick();
         if outcome.needs_supervisor {

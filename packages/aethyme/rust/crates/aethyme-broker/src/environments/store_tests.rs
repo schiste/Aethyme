@@ -431,7 +431,46 @@ fn quick(root: PathBuf, linger_ms: u64) -> SupervisorConfig {
         root,
         linger: Duration::from_millis(linger_ms),
         tick: Duration::from_millis(10),
+        executable: None,
     }
+}
+
+/// An update swaps the binary under a running supervisor. Left alone it kept
+/// the old build for as long as anything needed it (seen on 2026-11-12: a
+/// 0.8.72 supervisor outlived the 0.8.73 install and never ran its watcher).
+#[test]
+fn a_supervisor_whose_executable_is_replaced_exits_for_its_successor() {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("aethyme");
+    std::fs::write(&executable, b"old build").unwrap();
+    let mut config = quick(directory.path().join("state"), 60_000);
+    config.executable = Some(executable.clone());
+    let swap = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::remove_file(&executable).unwrap();
+        std::fs::write(&executable, b"a newer, longer build").unwrap();
+    });
+    // Always needed, so only the replacement can end it.
+    let reason = supervisor::run(&config, &mut Script(vec![true; 100_000]), &|| false).unwrap();
+    swap.join().unwrap();
+    assert_eq!(reason, ExitReason::Replaced);
+    assert_eq!(supervisor::status(&config.root).state, "absent");
+}
+
+#[test]
+fn an_executable_counts_as_replaced_only_once_it_has_settled() {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("aethyme");
+    std::fs::write(&executable, b"old").unwrap();
+    let mut watch = supervisor::ExecutableWatch::new(&executable).unwrap();
+    assert!(!watch.replaced(), "unchanged");
+    std::fs::remove_file(&executable).unwrap();
+    assert!(!watch.replaced(), "removed mid-install is not a new build");
+    std::fs::write(&executable, b"half").unwrap();
+    assert!(!watch.replaced(), "first sight of a changed file");
+    std::fs::write(&executable, b"the whole new build").unwrap();
+    assert!(!watch.replaced(), "still being written");
+    assert!(watch.replaced(), "same reading twice");
 }
 
 #[test]
