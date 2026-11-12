@@ -5,10 +5,9 @@ use std::process::Command;
 use std::os::unix::fs::PermissionsExt;
 
 use aethyme_broker::{
-    AdoptMode, AdoptOptions, AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity, Broker,
-    BrokerOpError, BrokerOpenOptions, DeliveryExecutionReport, EntryExposureResolutionKind,
-    EntryExposureState, IntegrationDeliveryState, NewAdvisory, OperationIdentityProvenance,
-    OperationStatus, RepositoryDeliveryMode, RepositoryDeliveryModeSource, ShipFreshnessResult,
+    AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity, Broker, BrokerOpError,
+    BrokerOpenOptions, EntryExposureResolutionKind, EntryExposureState, IntegrationDeliveryState,
+    NewAdvisory, OperationIdentityProvenance, OperationStatus, ShipFreshnessResult,
     ShipPublicationMode,
 };
 
@@ -93,95 +92,6 @@ impl Fixture {
         (outcome.entry.id, session.id, integration)
     }
 
-    fn commit_fixture_file(&self, path: &str, contents: &str, message: &str) {
-        let target = self.repo.join(path);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(target, contents).unwrap();
-        git(&self.repo, &["add", path]);
-        git(&self.repo, &["commit", "-qm", message]);
-        git(&self.repo, &["push", "-q", "origin", "main"]);
-        git(
-            &self.repo,
-            &[
-                "fetch",
-                "-q",
-                "origin",
-                "refs/heads/main:refs/remotes/origin/main",
-            ],
-        );
-    }
-
-    fn configure_ship_gate(&self, command: &str, trigger: &str) {
-        let config = self.repo.join(".aethyme/gates.toml");
-        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
-        std::fs::write(
-            &config,
-            format!(
-                "[[gate]]\nname = \"ship-only-selected\"\ncommand = {command:?}\ntriggers = [{trigger:?}]\n"
-            ),
-        )
-        .unwrap();
-        git(&self.repo, &["add", "-f", ".aethyme/gates.toml"]);
-        git(
-            &self.repo,
-            &["commit", "-qm", "test: configure ship-only gate"],
-        );
-        git(&self.repo, &["push", "-q", "origin", "main"]);
-        git(
-            &self.repo,
-            &[
-                "fetch",
-                "-q",
-                "origin",
-                "refs/heads/main:refs/remotes/origin/main",
-            ],
-        );
-    }
-
-    fn promoted_siblings(
-        &self,
-        first_path: &str,
-        first_contents: &str,
-        second_path: &str,
-        second_contents: &str,
-        second_message: &str,
-    ) -> (i64, i64, String) {
-        let mut broker = self.broker();
-        let first_session = broker.start_worktree("ship-only-first", None).unwrap();
-        let second_session = broker.start_worktree("ship-only-second", None).unwrap();
-        for (session, path, contents, message) in [
-            (
-                &first_session,
-                first_path,
-                first_contents,
-                "feat: first independent entry",
-            ),
-            (
-                &second_session,
-                second_path,
-                second_contents,
-                second_message,
-            ),
-        ] {
-            let worktree = PathBuf::from(&session.worktree_path);
-            let target = worktree.join(path);
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).unwrap();
-            }
-            std::fs::write(target, contents).unwrap();
-            git(&worktree, &["add", path]);
-            git(&worktree, &["commit", "-qm", message]);
-        }
-        let first = broker.submit(first_session.id).unwrap();
-        assert!(first.promoted, "first sibling must be promoted");
-        let second = broker.submit(second_session.id).unwrap();
-        assert!(second.promoted, "second sibling must be promoted");
-        let integration = git_output(&self.repo, &["rev-parse", "aethyme/integration"]);
-        (first.entry.id, second.entry.id, integration)
-    }
-
     fn refs(&self) -> String {
         git_output(
             &self.repo,
@@ -196,49 +106,6 @@ impl Fixture {
 
     fn remote_main(&self) -> String {
         git_output(&self.remote, &["rev-parse", "refs/heads/main"])
-    }
-
-    #[cfg(unix)]
-    fn refresh_remote_main(&self) {
-        git(
-            &self.repo,
-            &[
-                "fetch",
-                "-q",
-                self.remote.to_str().unwrap(),
-                "refs/heads/main:refs/remotes/origin/main",
-            ],
-        );
-    }
-
-    #[cfg(unix)]
-    fn mark_fake_pr_merged(&self, state: &Path, branch: &str) {
-        std::fs::write(state, format!("{branch}\nMERGED\n")).unwrap();
-    }
-
-    #[cfg(unix)]
-    fn merge_delivery_branch_into_remote_main(&self, branch: &str) {
-        let merged = self._tmp.path().join("merge-delivery");
-        git(
-            self._tmp.path(),
-            &[
-                "clone",
-                "-q",
-                self.remote.to_str().unwrap(),
-                merged.to_str().unwrap(),
-            ],
-        );
-        git(
-            &merged,
-            &[
-                "merge",
-                "--no-ff",
-                "-qm",
-                "merge delivery",
-                &format!("origin/{branch}"),
-            ],
-        );
-        git(&merged, &["push", "-q", "origin", "main"]);
     }
 
     fn advance_remote(&self) -> String {
@@ -285,123 +152,6 @@ impl Fixture {
         git(&self.repo, &["commit", "-qm", "configure publication"]);
         git(&self.repo, &["push", "-q", "origin", "main"]);
         git_output(&self.repo, &["rev-parse", "HEAD"])
-    }
-
-    #[cfg(unix)]
-    fn configure_github_delivery_provider(&self) -> (PathBuf, PathBuf) {
-        git(
-            &self.repo,
-            &[
-                "remote",
-                "set-url",
-                "origin",
-                "git@github.com:acme/project.git",
-            ],
-        );
-        let fake_bin = self._tmp.path().join("fake-bin");
-        std::fs::create_dir_all(&fake_bin).unwrap();
-        let ssh = fake_bin.join("ssh");
-        std::fs::write(
-            &ssh,
-            r#"#!/bin/sh
-case "$*" in
-  *git-upload-pack*) exec git-upload-pack "$AETHYME_TEST_GIT_REMOTE" ;;
-  *git-receive-pack*) exec git-receive-pack "$AETHYME_TEST_GIT_REMOTE" ;;
-esac
-exit 64
-"#,
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&ssh).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&ssh, permissions).unwrap();
-        let quoted_ssh = ssh.to_str().unwrap().replace('\'', "'\\''");
-        let ssh_command = format!("sh '{quoted_ssh}'");
-        git(&self.repo, &["config", "core.sshCommand", &ssh_command]);
-
-        let state = self._tmp.path().join("fake-pr-state");
-        let gh = fake_bin.join("gh");
-        std::fs::write(
-            &gh,
-            r#"#!/bin/sh
-state="$AETHYME_FAKE_PR_STATE"
-render_pr() {
-  branch=$(sed -n '1p' "$state")
-  pr_state=$(sed -n '2p' "$state")
-  if [ -z "$pr_state" ]; then pr_state=OPEN; fi
-  merged_at=null
-  if [ "$pr_state" = "MERGED" ]; then
-    merged_at='"2026-09-17T00:00:00Z"'
-  fi
-  head=$(git -C "$AETHYME_TEST_REPO" rev-parse "refs/heads/$branch") || exit 1
-  base=$(git -C "$AETHYME_TEST_REPO" rev-parse refs/remotes/origin/main) || exit 1
-  printf '{"number":7,"url":"https://github.com/acme/project/pull/7","state":"%s","isDraft":false,"mergedAt":%s,"headRefName":"%s","headRefOid":"%s","headRepository":{"nameWithOwner":"acme/project"},"baseRefName":"main","baseRefOid":"%s","statusCheckRollup":[]}' "$pr_state" "$merged_at" "$branch" "$head" "$base"
-}
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  if [ ! -f "$state" ]; then
-    printf '[]\n'
-  else
-    printf '['
-    render_pr
-    printf ']\n'
-  fi
-  exit 0
-fi
-if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
-  shift 2
-  branch=""
-  while [ "$#" -gt 0 ]; do
-    if [ "$1" = "--head" ]; then
-      branch="$2"
-      shift 2
-    else
-      shift
-    fi
-  done
-  printf '%s\n' "$branch" > "$state"
-  printf 'https://github.com/acme/project/pull/7\n'
-  exit 0
-fi
-if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
-  render_pr
-  printf '\n'
-  exit 0
-fi
-exit 64
-"#,
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&gh).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&gh, permissions).unwrap();
-        (fake_bin, state)
-    }
-
-    #[cfg(unix)]
-    fn run_delivery_cli(
-        &self,
-        args: &[&str],
-        fake_bin: &Path,
-        state: &Path,
-    ) -> std::process::Output {
-        let path = format!(
-            "{}:{}",
-            fake_bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        Command::new(CLI)
-            .args(args)
-            .current_dir(&self.repo)
-            .env("PATH", path)
-            .env(
-                "AETHYME_HOST_STATE_DIR",
-                self.host_operations.parent().unwrap(),
-            )
-            .env("AETHYME_TEST_GIT_REMOTE", &self.remote)
-            .env("AETHYME_TEST_REPO", &self.repo)
-            .env("AETHYME_FAKE_PR_STATE", state)
-            .output()
-            .unwrap()
     }
 
     #[cfg(unix)]
@@ -458,13 +208,6 @@ fn ship_plan_reports_exact_tip_and_does_not_mutate_refs() {
     );
     assert_eq!(plan.target.remote_name, "origin");
     assert!(plan.target.caller_assertion.is_none());
-    assert_eq!(plan.delivery.mode, RepositoryDeliveryMode::LocalMainMerge);
-    assert_eq!(
-        plan.delivery.source,
-        RepositoryDeliveryModeSource::LegacyDefault
-    );
-    assert!(plan.delivery.divergence_reasons.is_empty());
-    assert_eq!(plan.plan_digest.len(), 64);
     assert_eq!(
         plan.proposed_push.refspec,
         format!("{}:refs/heads/main", plan.publication_sha)
@@ -489,40 +232,6 @@ fn ship_plan_reports_exact_tip_and_does_not_mutate_refs() {
 }
 
 #[test]
-fn ship_plan_accepts_an_explicit_delivery_override_and_binds_its_digest() {
-    let fixture = Fixture::new();
-    let (entry_id, _, _) = fixture.promoted_entry();
-    let refs_before = fixture.refs();
-    let mut broker = fixture.broker();
-
-    let plan = broker
-        .ship_plan_with_delivery(entry_id, Some(RepositoryDeliveryMode::PullRequest))
-        .unwrap();
-
-    assert_eq!(plan.delivery.mode, RepositoryDeliveryMode::PullRequest);
-    assert_eq!(
-        plan.delivery.source,
-        RepositoryDeliveryModeSource::CliOverride
-    );
-    assert!(!plan.delivery.requires_explicit_selection);
-    assert_eq!(plan.plan_digest.len(), 64);
-    assert_eq!(
-        plan.proposed_push.destination_ref,
-        format!(
-            "refs/heads/aethyme/delivery/q{}-{}",
-            entry_id,
-            &plan.publication_sha[..12]
-        )
-    );
-    assert_eq!(
-        fixture.refs(),
-        refs_before,
-        "an explicit delivery plan must remain read-only"
-    );
-}
-
-#[cfg(unix)]
-#[test]
 fn ship_refuses_verify_only_repositories_and_points_to_pull_request_delivery() {
     let fixture = Fixture::new();
     let config_dir = fixture.repo.join(".aethyme");
@@ -533,10 +242,7 @@ fn ship_refuses_verify_only_repositories_and_points_to_pull_request_delivery() {
     )
     .unwrap();
 
-    let error = fixture
-        .broker()
-        .ship_plan_with_delivery(1, None)
-        .unwrap_err();
+    let error = fixture.broker().ship_plan(1).unwrap_err();
     assert!(matches!(
         &error,
         BrokerOpError::ShipPublicationPolicy { .. }
@@ -550,7 +256,7 @@ fn ship_refuses_verify_only_repositories_and_points_to_pull_request_delivery() {
 
     let execution_error = fixture
         .broker()
-        .ship_execute_with_policy(1, &"0".repeat(40), false, false, None)
+        .ship_execute_with_sync(1, &"0".repeat(40), false)
         .unwrap_err();
     assert!(matches!(
         &execution_error,
@@ -561,347 +267,6 @@ fn ship_refuses_verify_only_repositories_and_points_to_pull_request_delivery() {
             .to_string()
             .contains("aethyme broker push --session <id> --pr")
     );
-
-    let (fake_bin, state) = fixture.configure_github_delivery_provider();
-    let output = fixture.run_delivery_cli(
-        &["advanced", "ship", "plan", "--entry", "1"],
-        &fake_bin,
-        &state,
-    );
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("verify-only"), "{stderr}");
-    assert!(
-        stderr.contains("aethyme broker push --session <id> --pr"),
-        "{stderr}"
-    );
-
-    let output = fixture.run_delivery_cli(
-        &[
-            "advanced",
-            "ship",
-            "execute",
-            "--entry",
-            "1",
-            "--confirm",
-            &"0".repeat(40),
-        ],
-        &fake_bin,
-        &state,
-    );
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("verify-only"), "{stderr}");
-    assert!(
-        stderr.contains("aethyme broker push --session <id> --pr"),
-        "{stderr}"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn pull_request_delivery_pushes_and_reuses_one_exact_provider_pr() {
-    let fixture = Fixture::new();
-    let (entry_id, _, integration) = fixture.promoted_entry();
-    let (fake_bin, state) = fixture.configure_github_delivery_provider();
-    let entry = entry_id.to_string();
-    let planned = fixture.run_delivery_cli(
-        &[
-            "advanced",
-            "ship",
-            "plan",
-            "--entry",
-            &entry,
-            "--delivery",
-            "pull_request",
-            "--json",
-        ],
-        &fake_bin,
-        &state,
-    );
-    assert!(
-        planned.status.success(),
-        "{}",
-        String::from_utf8_lossy(&planned.stderr)
-    );
-    let plan: serde_json::Value = serde_json::from_slice(&planned.stdout).unwrap();
-    assert_eq!(plan["target"]["normalized_host"], "github.com");
-    assert_eq!(plan["delivery"]["mode"], "pull_request");
-    assert_eq!(plan["delivery"]["source"], "cli_override");
-    let plan_digest = plan["plan_digest"].as_str().unwrap().to_string();
-    let remote_before = fixture.remote_main();
-    let execute = fixture.run_delivery_cli(
-        &[
-            "advanced",
-            "ship",
-            "execute",
-            "--entry",
-            &entry,
-            "--confirm",
-            &integration,
-            "--delivery",
-            "pull_request",
-            "--plan",
-            &plan_digest,
-            "--json",
-        ],
-        &fake_bin,
-        &state,
-    );
-    assert!(
-        execute.status.success(),
-        "stderr: {}\nstdout: {}",
-        String::from_utf8_lossy(&execute.stderr),
-        String::from_utf8_lossy(&execute.stdout)
-    );
-    let report: serde_json::Value = serde_json::from_slice(&execute.stdout).unwrap();
-    let report = &report["PullRequest"];
-    assert_eq!(report["delivery_state"], "pull_request_open");
-    assert_eq!(report["pull_request"]["number"], 7);
-    assert_eq!(report["pull_request"]["head_sha"], integration);
-    assert!(report["resolved_exposures"].as_array().unwrap().is_empty());
-    assert_eq!(fixture.remote_main(), remote_before);
-    let branch = report["branch"].as_str().unwrap().to_string();
-    let remote_branch_ref = format!("refs/heads/{branch}");
-    assert_eq!(
-        git_output(&fixture.remote, &["rev-parse", &remote_branch_ref]),
-        integration
-    );
-
-    let retry = fixture.run_delivery_cli(
-        &[
-            "advanced",
-            "ship",
-            "execute",
-            "--entry",
-            &entry,
-            "--confirm",
-            &integration,
-            "--delivery",
-            "pull_request",
-            "--plan",
-            &plan_digest,
-            "--json",
-        ],
-        &fake_bin,
-        &state,
-    );
-    assert!(
-        retry.status.success(),
-        "{}",
-        String::from_utf8_lossy(&retry.stderr)
-    );
-    let operations = fixture.run_delivery_cli(
-        &["advanced", "operations", "list", "--json"],
-        &fake_bin,
-        &state,
-    );
-    assert!(operations.status.success());
-    let operations = String::from_utf8(operations.stdout).unwrap();
-    assert_eq!(
-        operations.matches("delivery:pr-create:").count(),
-        1,
-        "retry must reuse the existing provider PR"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn pull_request_delivery_distinguishes_merged_from_target_verified_publication() {
-    let fixture = Fixture::new();
-    let (entry_id, _, integration) = fixture.promoted_entry();
-    let (fake_bin, state) = fixture.configure_github_delivery_provider();
-    let entry = entry_id.to_string();
-    let planned = fixture.run_delivery_cli(
-        &[
-            "advanced",
-            "ship",
-            "plan",
-            "--entry",
-            &entry,
-            "--delivery",
-            "pull_request",
-            "--json",
-        ],
-        &fake_bin,
-        &state,
-    );
-    assert!(planned.status.success());
-    let plan: serde_json::Value = serde_json::from_slice(&planned.stdout).unwrap();
-    let plan_digest = plan["plan_digest"].as_str().unwrap().to_string();
-
-    let execute = fixture.run_delivery_cli(
-        &[
-            "advanced",
-            "ship",
-            "execute",
-            "--entry",
-            &entry,
-            "--confirm",
-            &integration,
-            "--delivery",
-            "pull_request",
-            "--plan",
-            &plan_digest,
-            "--json",
-        ],
-        &fake_bin,
-        &state,
-    );
-    assert!(execute.status.success());
-    let open: serde_json::Value = serde_json::from_slice(&execute.stdout).unwrap();
-    let open = &open["PullRequest"];
-    let branch = open["branch"].as_str().unwrap().to_string();
-
-    // The provider can confirm a merge before the target ref is visible to a
-    // fresh Git fetch. The broker must report that intermediate state and keep
-    // publication exposures outstanding.
-    fixture.mark_fake_pr_merged(&state, &branch);
-    let merged = fixture.run_delivery_cli(
-        &[
-            "advanced",
-            "ship",
-            "execute",
-            "--entry",
-            &entry,
-            "--confirm",
-            &integration,
-            "--delivery",
-            "pull_request",
-            "--plan",
-            &plan_digest,
-            "--json",
-        ],
-        &fake_bin,
-        &state,
-    );
-    assert!(merged.status.success());
-    let merged: serde_json::Value = serde_json::from_slice(&merged.stdout).unwrap();
-    let merged = &merged["PullRequest"];
-    assert_eq!(merged["delivery_state"], "pull_request_merged");
-    assert!(merged["target_verification_operation"].is_object());
-    assert!(merged["target_remote_sha"].is_string());
-    assert!(merged["resolved_exposures"].as_array().unwrap().is_empty());
-
-    fixture.merge_delivery_branch_into_remote_main(&branch);
-    // Planning intentionally remains read-only and fails closed when the
-    // newly observed remote policy commit is not present locally. Refresh the
-    // local object database before asking it to build the next plan.
-    fixture.refresh_remote_main();
-    let replanned = fixture.run_delivery_cli(
-        &[
-            "advanced",
-            "ship",
-            "plan",
-            "--entry",
-            &entry,
-            "--delivery",
-            "pull_request",
-            "--json",
-        ],
-        &fake_bin,
-        &state,
-    );
-    assert!(replanned.status.success());
-    let replanned: serde_json::Value = serde_json::from_slice(&replanned.stdout).unwrap();
-    let replanned_digest = replanned["plan_digest"].as_str().unwrap();
-    let published = fixture.run_delivery_cli(
-        &[
-            "advanced",
-            "ship",
-            "execute",
-            "--entry",
-            &entry,
-            "--confirm",
-            &integration,
-            "--delivery",
-            "pull_request",
-            "--plan",
-            replanned_digest,
-            "--json",
-        ],
-        &fake_bin,
-        &state,
-    );
-    assert!(published.status.success());
-    let published: serde_json::Value = serde_json::from_slice(&published.stdout).unwrap();
-    let published = &published["PullRequest"];
-    assert_eq!(published["delivery_state"], "published");
-    assert!(
-        !published["resolved_exposures"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(
-        published["target_remote_sha"],
-        fixture.remote_main(),
-        "publication must record the verified target tip"
-    );
-}
-
-#[test]
-fn ship_plan_reads_the_delivery_policy_from_the_remote_default_commit() {
-    let fixture = Fixture::new();
-    let policy_commit = fixture.set_delivery_policy("pull_request");
-    let (entry_id, _, _) = fixture.promoted_entry();
-    let mut broker = fixture.broker();
-
-    let plan = broker.ship_plan(entry_id).unwrap();
-
-    assert_eq!(plan.delivery.mode, RepositoryDeliveryMode::PullRequest);
-    assert_eq!(
-        plan.delivery.source,
-        RepositoryDeliveryModeSource::TrustedConfig
-    );
-    assert_eq!(
-        plan.delivery.trusted_config_commit, policy_commit,
-        "the policy must be bound to the observed remote default commit"
-    );
-    assert_eq!(
-        plan.delivery
-            .trusted_config_digest
-            .as_ref()
-            .map(String::len),
-        Some(64)
-    );
-    assert_eq!(plan.plan_digest.len(), 64);
-    assert!(matches!(
-        broker.ship_plan_with_delivery(entry_id, Some(RepositoryDeliveryMode::LocalMainMerge)),
-        Err(BrokerOpError::ShipDeliveryOverrideUnsafe { .. })
-    ));
-}
-
-/// `[delivery]` may only authorize `broker push`. That must neither break a
-/// ship plan nor select a route: the plan behaves as if no route were set.
-#[test]
-fn a_push_only_delivery_table_keeps_the_unconfigured_ship_route() {
-    let fixture = Fixture::new();
-    std::fs::create_dir_all(fixture.repo.join(".aethyme")).unwrap();
-    std::fs::write(
-        fixture.repo.join(".aethyme/config.toml"),
-        "[delivery]\npush_session_branches = true\n",
-    )
-    .unwrap();
-    aethyme_testkit::promote_on_submit(&fixture.repo);
-    git(&fixture.repo, &["add", "-f", ".aethyme/config.toml"]);
-    git(
-        &fixture.repo,
-        &["commit", "-qm", "authorize session pushes"],
-    );
-    git(&fixture.repo, &["push", "-q", "origin", "main"]);
-    let (entry_id, _, _) = fixture.promoted_entry();
-    let mut broker = fixture.broker();
-
-    let plan = broker.ship_plan(entry_id).unwrap();
-
-    assert_ne!(
-        plan.delivery.source,
-        RepositoryDeliveryModeSource::TrustedConfig,
-        "a push-only table must not count as a configured route"
-    );
-    assert_eq!(plan.delivery.configured_mode, None);
-    assert_eq!(plan.plan_digest.len(), 64);
 }
 
 #[test]
@@ -942,160 +307,25 @@ fn ship_plan_reads_publication_policy_from_the_remote_default_commit() {
     assert!(!plan.publication_policy.satisfied);
 }
 
+/// The `[delivery] default` route selector belonged to the removed
+/// `broker ship` command. A committed value, valid or not, must neither fail
+/// planning nor redirect the publication away from the remote default branch.
 #[test]
-fn local_main_delivery_preserves_then_merges_and_publishes_the_reviewed_sha() {
+fn ship_plan_ignores_the_retired_delivery_route_selector() {
     let fixture = Fixture::new();
-    let _ = fixture.set_delivery_policy("local_main_merge");
+    for route in ["pull_request", "not-a-route"] {
+        let _ = fixture.set_delivery_policy(route);
+    }
     let (entry_id, _, integration) = fixture.promoted_entry();
-    let mut broker = fixture.broker();
-    let plan = broker.ship_plan(entry_id).unwrap();
-
-    let report = broker
-        .ship_execute_delivery(
-            entry_id,
-            &integration,
-            None,
-            Some(&plan.plan_digest),
-            false,
-            false,
-            None,
-        )
-        .unwrap();
-    let aethyme_broker::DeliveryExecutionReport::LocalMainMerge {
-        ship,
-        preservation_operation,
-        merge_operation,
-        plan_digest,
-    } = report
-    else {
-        panic!("configured local delivery should use the local-main route");
-    };
-    assert_eq!(plan_digest, plan.plan_digest);
-    assert!(preservation_operation.is_some());
-    assert!(merge_operation.is_some());
-    assert_eq!(ship.published_sha, integration);
-    assert_eq!(fixture.remote_main(), integration);
-    assert_eq!(
-        git_output(&fixture.repo, &["rev-parse", "refs/heads/main"]),
-        integration
-    );
-    assert!(!ship.resolved_exposures.is_empty());
-
-    let retry_plan = broker.ship_plan(entry_id).unwrap();
-    let retry = broker
-        .ship_execute_delivery(
-            entry_id,
-            &integration,
-            None,
-            Some(&retry_plan.plan_digest),
-            false,
-            false,
-            None,
-        )
-        .unwrap();
-    let aethyme_broker::DeliveryExecutionReport::LocalMainMerge {
-        preservation_operation,
-        merge_operation,
-        ..
-    } = retry
-    else {
-        panic!("configured local retry should remain on the local-main route");
-    };
-    assert!(preservation_operation.is_none());
-    assert!(merge_operation.is_none());
-}
-
-#[test]
-fn configured_local_main_delivery_refuses_unrepresented_main_commits_before_writes() {
-    let fixture = Fixture::new();
-    let _ = fixture.set_delivery_policy("local_main_merge");
-    let (entry_id, _, integration) = fixture.promoted_entry();
-    std::fs::write(fixture.repo.join("local-only.txt"), "do not discard\n").unwrap();
-    git(&fixture.repo, &["add", "local-only.txt"]);
-    git(&fixture.repo, &["commit", "-qm", "local-only work"]);
-    let local_only = git_output(&fixture.repo, &["rev-parse", "HEAD"]);
-    let remote_before = fixture.remote_main();
-    let mut broker = fixture.broker();
-    let plan = broker.ship_plan(entry_id).unwrap();
-
-    assert!(!plan.local_main_sync_safe);
-    assert_eq!(
-        plan.local_main_sync_assessment
-            .local_commits_not_in_integration,
-        vec![local_only.clone()]
-    );
-    let error = broker
-        .ship_execute_delivery(
-            entry_id,
-            &integration,
-            None,
-            Some(&plan.plan_digest),
-            false,
-            false,
-            None,
-        )
-        .unwrap_err();
-    assert!(matches!(error, BrokerOpError::ShipLocalMainUnsafe { .. }));
-    assert!(error.to_string().contains("not represented by integration"));
-    assert!(broker.store().coordinated_operations().unwrap().is_empty());
-    assert_eq!(fixture.remote_main(), remote_before);
-    assert_eq!(
-        git_output(&fixture.repo, &["rev-parse", "refs/heads/main"]),
-        local_only
-    );
-}
-
-#[test]
-fn ship_plan_recommends_explicit_pull_request_delivery_for_a_dirty_main_checkout() {
-    let fixture = Fixture::new();
-    let (entry_id, _, integration) = fixture.promoted_entry();
-    std::fs::write(fixture.repo.join("operator-note.txt"), "keep me\n").unwrap();
     let mut broker = fixture.broker();
 
     let plan = broker.ship_plan(entry_id).unwrap();
+    assert_eq!(plan.publication_sha, integration);
+    assert_eq!(plan.freshness.result, ShipFreshnessResult::Ready);
     assert_eq!(
-        plan.delivery.source,
-        RepositoryDeliveryModeSource::DivergenceRecommendation
+        plan.proposed_push.refspec,
+        format!("{integration}:refs/heads/main")
     );
-    assert_eq!(plan.delivery.mode, RepositoryDeliveryMode::PullRequest);
-    assert_eq!(
-        plan.delivery.recommended_mode,
-        Some(RepositoryDeliveryMode::PullRequest)
-    );
-    assert!(plan.delivery.requires_explicit_selection);
-    assert!(
-        plan.delivery
-            .divergence_reasons
-            .iter()
-            .any(|reason| reason.starts_with("working_tree_not_clean"))
-    );
-
-    let error = broker
-        .ship_execute_delivery(entry_id, &integration, None, None, false, false, None)
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        BrokerOpError::ShipDeliveryRequiresExplicitSelection { .. }
-    ));
-    assert!(broker.store().coordinated_operations().unwrap().is_empty());
-}
-
-#[test]
-fn ship_plan_rejects_an_invalid_trusted_delivery_policy() {
-    let fixture = Fixture::new();
-    let _ = fixture.set_delivery_policy("not-a-route");
-    let (entry_id, _, _) = fixture.promoted_entry();
-    let mut broker = fixture.broker();
-
-    let error = broker.ship_plan(entry_id).unwrap_err();
-    assert!(matches!(
-        error,
-        BrokerOpError::ShipPlanUnavailable {
-            what: "trusted delivery policy",
-            ..
-        }
-    ));
-    assert!(error.to_string().contains("not-a-route"));
 }
 
 #[test]
@@ -1117,782 +347,6 @@ fn ship_plan_rejects_an_entry_that_is_not_promoted() {
             .to_string()
             .contains("requires a promoted queue entry")
     );
-}
-
-#[test]
-fn ship_plan_only_builds_and_gates_exactly_one_independent_entry() {
-    let fixture = Fixture::new();
-    fixture.configure_ship_gate("test -f second.txt", "second.txt");
-    let (first, selected, integration) = fixture.promoted_siblings(
-        "first.txt",
-        "first\n",
-        "second.txt",
-        "second\n",
-        "feat: second independent entry",
-    );
-    let refs_before = fixture.refs();
-    let mut broker = fixture.broker();
-    let selected_entry = broker
-        .store()
-        .merge_queue_entry(selected)
-        .expect("selected promoted entry");
-    let submitted_base_is_not_head_ancestor = Command::new("git")
-        .args([
-            "merge-base",
-            "--is-ancestor",
-            selected_entry.base_commit.as_str(),
-            selected_entry.head_commit.as_str(),
-        ])
-        .current_dir(&fixture.repo)
-        .status()
-        .unwrap();
-    assert!(
-        !submitted_base_is_not_head_ancestor.success(),
-        "the later sibling's submitted integration base should not be its source head's ancestor"
-    );
-    // A later reuse can advance this session field after the queue entry was
-    // promoted. The queued promotion remains the immutable source of the
-    // selected patch.
-    broker
-        .store()
-        .set_session_diff_base(selected_entry.session_id, &integration)
-        .unwrap();
-
-    let plan = broker.ship_plan_only_with_delivery(selected, None).unwrap();
-
-    assert!(plan.only);
-    assert_eq!(plan.integration_sha, integration);
-    assert_eq!(
-        plan.included_entries
-            .iter()
-            .map(|entry| entry.queue_entry_id)
-            .collect::<Vec<_>>(),
-        vec![selected]
-    );
-    assert!(
-        plan.excluded_entries
-            .iter()
-            .any(|entry| entry.queue_entry_id == first)
-    );
-    let verification = plan.only_verification.as_ref().unwrap();
-    assert_eq!(verification.base_sha, fixture.remote_main());
-    let selected_promotion = plan.included_entries[0].promotion_sha.as_str();
-    let promotion_parent = format!("{selected_promotion}^1");
-    let promotion_parent = git_output(&fixture.repo, &["rev-parse", &promotion_parent]);
-    assert_eq!(verification.source_base_sha, promotion_parent);
-    assert_eq!(verification.changed_files, vec!["second.txt"]);
-    assert_eq!(verification.selected_gates.len(), 1);
-    assert_eq!(verification.selected_gates[0].gate, "ship-only-selected");
-    assert_eq!(verification.selected_gates[0].status, "pass");
-
-    let first_in_tree = Command::new("git")
-        .args([
-            "cat-file",
-            "-e",
-            &format!("{}:first.txt", plan.publication_sha),
-        ])
-        .current_dir(&fixture.repo)
-        .output()
-        .unwrap();
-    assert!(!first_in_tree.status.success());
-    assert_eq!(
-        git_output(
-            &fixture.repo,
-            &["show", &format!("{}:second.txt", plan.publication_sha)]
-        ),
-        "second"
-    );
-    assert_eq!(fixture.refs(), refs_before, "planning must not move refs");
-}
-
-#[test]
-fn ship_plan_only_uses_submitted_entry_base_after_reuse_sync() {
-    let fixture = Fixture::new();
-    let mut broker = fixture.broker();
-    let resumed = broker.start_worktree("ship-only-resumed", None).unwrap();
-    let resumed_worktree = PathBuf::from(&resumed.worktree_path);
-    let adopted_head = resumed.adopted_head.clone().unwrap();
-
-    let earlier = broker.start_worktree("ship-only-earlier", None).unwrap();
-    let earlier_worktree = PathBuf::from(&earlier.worktree_path);
-    std::fs::write(earlier_worktree.join("earlier.txt"), "earlier\n").unwrap();
-    git(&earlier_worktree, &["add", "earlier.txt"]);
-    git(
-        &earlier_worktree,
-        &["commit", "-qm", "feat: earlier promotion"],
-    );
-    let first = broker.submit(earlier.id).unwrap();
-    assert!(first.promoted);
-
-    let integration = git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]);
-    assert_ne!(integration, adopted_head);
-    git(&resumed_worktree, &["reset", "--hard", &integration]);
-    let reuse = broker
-        .adopt_with_options(
-            &resumed_worktree,
-            Some("replay after integration sync"),
-            AdoptOptions {
-                mode: AdoptMode::Reuse,
-                sync_integration: true,
-                planned_paths: Vec::new(),
-            },
-            None,
-        )
-        .unwrap();
-    assert_eq!(
-        reuse.session.adopted_head.as_deref(),
-        Some(adopted_head.as_str())
-    );
-    assert_eq!(
-        reuse.session.diff_base.as_deref(),
-        Some(integration.as_str())
-    );
-
-    std::fs::write(resumed_worktree.join("selected.txt"), "selected\n").unwrap();
-    git(&resumed_worktree, &["add", "selected.txt"]);
-    git(
-        &resumed_worktree,
-        &["commit", "-qm", "feat: selected entry"],
-    );
-    let selected = broker.submit(resumed.id).unwrap();
-    assert!(selected.promoted);
-    assert_eq!(selected.entry.base_commit, integration);
-
-    let plan = broker
-        .ship_plan_only_with_delivery(selected.entry.id, None)
-        .unwrap();
-    let verification = plan.only_verification.unwrap();
-    assert_eq!(verification.source_base_sha, integration);
-    assert_eq!(verification.changed_files, vec!["selected.txt"]);
-    assert_eq!(plan.included_entries.len(), 1);
-    assert_eq!(plan.included_entries[0].queue_entry_id, selected.entry.id);
-    assert!(
-        plan.excluded_entries
-            .iter()
-            .any(|entry| entry.queue_entry_id == first.entry.id)
-    );
-    assert_eq!(
-        git_output(
-            &fixture.repo,
-            &["show", &format!("{}:selected.txt", plan.publication_sha)]
-        ),
-        "selected"
-    );
-    let earlier_in_tree = Command::new("git")
-        .args([
-            "cat-file",
-            "-e",
-            &format!("{}:earlier.txt", plan.publication_sha),
-        ])
-        .current_dir(&fixture.repo)
-        .output()
-        .unwrap();
-    assert!(!earlier_in_tree.status.success());
-}
-
-#[cfg(unix)]
-#[test]
-fn ship_plan_only_cli_reports_the_exact_selected_entry_and_gate() {
-    let fixture = Fixture::new();
-    fixture.configure_ship_gate("test -f second.txt", "second.txt");
-    let (first, selected, _) = fixture.promoted_siblings(
-        "first.txt",
-        "first\n",
-        "second.txt",
-        "second\n",
-        "feat: second independent entry",
-    );
-    let fake_bin = fixture._tmp.path().join("empty-bin");
-    std::fs::create_dir_all(&fake_bin).unwrap();
-    let state = fixture._tmp.path().join("unused-pr-state");
-    let entry = selected.to_string();
-
-    let output = fixture.run_delivery_cli(
-        &[
-            "advanced", "ship", "plan", "--entry", &entry, "--only", "--json",
-        ],
-        &fake_bin,
-        &state,
-    );
-
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(plan["only"], true);
-    assert_eq!(plan["included_entries"].as_array().unwrap().len(), 1);
-    assert_eq!(plan["included_entries"][0]["queue_entry_id"], selected);
-    assert!(
-        plan["excluded_entries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|entry| entry["queue_entry_id"] == first)
-    );
-    assert_eq!(
-        plan["only_verification"]["selected_gates"][0]["gate"],
-        "ship-only-selected"
-    );
-}
-
-#[test]
-fn ship_plan_only_refuses_an_earlier_unshipped_path_overlap() {
-    let fixture = Fixture::new();
-    fixture.commit_fixture_file(
-        "shared.txt",
-        "first\nmiddle\nlast\n",
-        "test: seed overlap file",
-    );
-    let (first, selected, _) = fixture.promoted_siblings(
-        "shared.txt",
-        "FIRST\nmiddle\nlast\n",
-        "shared.txt",
-        "first\nmiddle\nLAST\n",
-        "feat: second overlapping entry",
-    );
-    let mut broker = fixture.broker();
-
-    let error = broker
-        .ship_plan_only_with_delivery(selected, None)
-        .unwrap_err();
-
-    assert!(error.to_string().contains(&format!("entry {first}")));
-    assert!(error.to_string().contains("overlapping paths"));
-}
-
-#[test]
-fn ship_plan_only_refuses_an_overlap_promoted_ahead_with_a_higher_queue_id() {
-    // Manual promotion lets a later-submitted (higher id) entry land in
-    // integration ahead of an earlier-submitted one. "Earlier unshipped" must
-    // follow integration order, or the overlap goes unchecked.
-    let fixture = Fixture::new();
-    fixture.commit_fixture_file(
-        "shared.txt",
-        "first\nmiddle\nlast\n",
-        "test: seed overlap file",
-    );
-    std::fs::create_dir_all(fixture.repo.join(".aethyme")).unwrap();
-    std::fs::write(
-        fixture.repo.join(".aethyme/config.toml"),
-        "[promote]\nmode = \"manual\"\n",
-    )
-    .unwrap();
-    let mut broker = fixture.broker();
-    let low = broker.start_worktree("ship-only-low", None).unwrap();
-    let high = broker.start_worktree("ship-only-high", None).unwrap();
-    for (session, contents) in [
-        (&low, "FIRST\nmiddle\nlast\n"),
-        (&high, "first\nmiddle\nLAST\n"),
-    ] {
-        let worktree = PathBuf::from(&session.worktree_path);
-        std::fs::write(worktree.join("shared.txt"), contents).unwrap();
-        git(&worktree, &["add", "shared.txt"]);
-        git(&worktree, &["commit", "-qm", "feat: edit shared file"]);
-    }
-    let low_entry = broker.submit(low.id).unwrap().entry.id;
-    let high_entry = broker.submit(high.id).unwrap().entry.id;
-    assert!(low_entry < high_entry);
-    broker.promote(high_entry).unwrap();
-    broker.promote(low_entry).unwrap();
-
-    let error = broker
-        .ship_plan_only_with_delivery(low_entry, None)
-        .unwrap_err();
-
-    assert!(
-        error.to_string().contains(&format!("entry {high_entry}"))
-            && error.to_string().contains("overlapping paths"),
-        "{error}"
-    );
-}
-
-#[test]
-fn ship_plan_only_excludes_entries_already_on_the_remote() {
-    let fixture = Fixture::new();
-    let (shipped, _, integration) = fixture.promoted_entry();
-    fixture
-        .broker()
-        .ship_execute(shipped, &integration)
-        .unwrap();
-    let (first, selected, _) = fixture.promoted_siblings(
-        "first.txt",
-        "first\n",
-        "second.txt",
-        "second\n",
-        "feat: second independent entry",
-    );
-    let mut broker = fixture.broker();
-
-    let plan = broker.ship_plan_only_with_delivery(selected, None).unwrap();
-
-    assert_eq!(
-        plan.excluded_entries
-            .iter()
-            .map(|entry| entry.queue_entry_id)
-            .collect::<Vec<_>>(),
-        vec![first],
-        "an entry already on the remote is not left behind by this ship"
-    );
-}
-
-#[test]
-fn ship_plan_only_publishes_the_promotion_message_and_identities() {
-    let fixture = Fixture::new();
-    let (_, selected, _) = fixture.promoted_siblings(
-        "first.txt",
-        "first\n",
-        "second.txt",
-        "second\n",
-        "feat: second independent entry\n\nContract decision: none",
-    );
-    let mut broker = fixture.broker();
-
-    let plan = broker.ship_plan_only_with_delivery(selected, None).unwrap();
-
-    let promotion = &plan.included_entries[0].promotion_sha;
-    let format = "--format=%an <%ae>%n%cn <%ce>";
-    assert_eq!(
-        git_output(
-            &fixture.repo,
-            &["show", "-s", format, &plan.publication_sha]
-        ),
-        git_output(&fixture.repo, &["show", "-s", format, promotion]),
-    );
-    let promotion_message = git_output(&fixture.repo, &["show", "-s", "--format=%B", promotion]);
-    let published_message = git_output(
-        &fixture.repo,
-        &["show", "-s", "--format=%B", &plan.publication_sha],
-    );
-    assert!(
-        promotion_message.contains("Contract decision: none"),
-        "{promotion_message}"
-    );
-    assert!(
-        published_message.starts_with(promotion_message.trim_end()),
-        "{published_message}"
-    );
-    let (_, trailers) = published_message.rsplit_once("\n\n").unwrap();
-    assert!(
-        trailers.contains("Contract decision: none")
-            && trailers.ends_with(&format!("Aethyme-Queue-Entry: q{selected}")),
-        "{published_message}"
-    );
-}
-
-#[test]
-fn ship_plan_only_refuses_an_unshipped_ancestor_only_dependency() {
-    let fixture = Fixture::new();
-    std::fs::create_dir_all(fixture.repo.join(".aethyme")).unwrap();
-    std::fs::write(
-        fixture.repo.join(".aethyme/config.toml"),
-        "[promote]\nmode = \"manual\"\n",
-    )
-    .unwrap();
-    let mut broker = fixture.broker();
-    let initial_integration = broker.integration_head().unwrap().1;
-    let first_session = broker.start_worktree("ancestry-first", None).unwrap();
-    let selected_session = broker.start_worktree("ancestry-selected", None).unwrap();
-    let first_worktree = PathBuf::from(&first_session.worktree_path);
-    let selected_worktree = PathBuf::from(&selected_session.worktree_path);
-
-    std::fs::write(first_worktree.join("first.txt"), "first\n").unwrap();
-    git(&first_worktree, &["add", "first.txt"]);
-    git(
-        &first_worktree,
-        &["commit", "-qm", "feat: earlier independent entry"],
-    );
-    let first = broker.submit(first_session.id).unwrap();
-    assert!(!first.promoted, "manual mode keeps the candidate unshipped");
-    assert_eq!(first.entry.base_commit, initial_integration);
-    let first_details: serde_json::Value = serde_json::from_str(
-        first
-            .entry
-            .details_json
-            .as_deref()
-            .expect("verified first entry has candidate details"),
-    )
-    .unwrap();
-    let earlier_candidate = first_details["merge_commit"]
-        .as_str()
-        .expect("verified first entry records its candidate commit")
-        .to_owned();
-
-    std::fs::write(selected_worktree.join("second.txt"), "second\n").unwrap();
-    git(&selected_worktree, &["add", "second.txt"]);
-    git(
-        &selected_worktree,
-        &["commit", "-qm", "feat: selected without Depends-On"],
-    );
-    git(
-        &selected_worktree,
-        &[
-            "merge",
-            "--no-ff",
-            "-m",
-            "include verified earlier promotion candidate",
-            earlier_candidate.as_str(),
-        ],
-    );
-    let selected = broker.submit(selected_session.id).unwrap();
-    assert!(!selected.promoted, "manual mode leaves both entries queued");
-    assert_eq!(selected.entry.base_commit, initial_integration);
-    let selected_queued_entry = broker
-        .store()
-        .merge_queue_entry(selected.entry.id)
-        .expect("selected queued entry");
-    assert_eq!(selected_queued_entry.base_commit, initial_integration);
-    assert_eq!(
-        selected_queued_entry.head_commit,
-        selected.entry.head_commit
-    );
-
-    broker.promote(first.entry.id).unwrap();
-    let earlier_promotion = git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]);
-    assert_eq!(earlier_promotion, earlier_candidate);
-    broker.promote(selected.entry.id).unwrap();
-    let selected_promotion = git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]);
-
-    let earlier_parent = format!("{earlier_promotion}^1");
-    let earlier_paths = git_output(
-        &fixture.repo,
-        &["diff", "--name-only", &earlier_parent, &earlier_promotion],
-    );
-    let selected_parent = git_output(
-        &fixture.repo,
-        &["rev-parse", &format!("{selected_promotion}^1")],
-    );
-    let selected_paths = git_output(
-        &fixture.repo,
-        &["diff", "--name-only", &selected_parent, &selected_promotion],
-    );
-    assert_eq!(earlier_paths, "first.txt");
-    assert_eq!(selected_paths, "second.txt");
-
-    let selected_entry = broker
-        .store()
-        .merge_queue_entry(selected.entry.id)
-        .expect("selected promoted entry");
-    let base_contains_earlier = Command::new("git")
-        .args([
-            "merge-base",
-            "--is-ancestor",
-            earlier_promotion.as_str(),
-            selected_entry.base_commit.as_str(),
-        ])
-        .current_dir(&fixture.repo)
-        .status()
-        .unwrap()
-        .success();
-    let head_contains_earlier = Command::new("git")
-        .args([
-            "merge-base",
-            "--is-ancestor",
-            earlier_promotion.as_str(),
-            selected_entry.head_commit.as_str(),
-        ])
-        .current_dir(&fixture.repo)
-        .status()
-        .unwrap()
-        .success();
-    assert_eq!(selected_entry.base_commit, initial_integration);
-    assert!(
-        !base_contains_earlier,
-        "the selected entry base predates the earlier promotion"
-    );
-    assert!(
-        head_contains_earlier,
-        "the selected source head carries the earlier promotion"
-    );
-    assert!(
-        !git_output(
-            &fixture.repo,
-            &["show", "-s", "--format=%B", &selected_entry.head_commit]
-        )
-        .contains("Depends-On:")
-    );
-
-    let refs_before = fixture.refs();
-    let error = broker
-        .ship_plan_only_with_delivery(selected.entry.id, None)
-        .unwrap_err();
-
-    assert!(
-        error.to_string().contains("ancestry dependency"),
-        "unexpected refusal: {error}"
-    );
-    assert_eq!(fixture.refs(), refs_before, "a refusal must not move refs");
-}
-
-#[test]
-fn ship_plan_only_allows_an_entry_based_on_an_earlier_independent_promotion() {
-    let fixture = Fixture::new();
-    let mut broker = fixture.broker();
-    let first_session = broker.start_worktree("inherited-first", None).unwrap();
-    let first_worktree = PathBuf::from(&first_session.worktree_path);
-    std::fs::write(first_worktree.join("first.txt"), "first\n").unwrap();
-    git(&first_worktree, &["add", "first.txt"]);
-    git(
-        &first_worktree,
-        &["commit", "-qm", "feat: earlier independent entry"],
-    );
-    let first = broker.submit(first_session.id).unwrap();
-    assert!(first.promoted);
-    let earlier_promotion = git_output(&fixture.repo, &["rev-parse", "aethyme/integration"]);
-
-    let selected_session = broker.start_worktree("inherited-selected", None).unwrap();
-    let selected_worktree = PathBuf::from(&selected_session.worktree_path);
-    std::fs::write(selected_worktree.join("second.txt"), "second\n").unwrap();
-    git(&selected_worktree, &["add", "second.txt"]);
-    git(
-        &selected_worktree,
-        &["commit", "-qm", "feat: second based on integration"],
-    );
-    let selected = broker.submit(selected_session.id).unwrap();
-    assert!(selected.promoted);
-    let selected_entry = broker
-        .store()
-        .merge_queue_entry(selected.entry.id)
-        .expect("selected promoted entry");
-
-    for descendant in [
-        selected_entry.base_commit.as_str(),
-        selected_entry.head_commit.as_str(),
-    ] {
-        assert!(
-            Command::new("git")
-                .args([
-                    "merge-base",
-                    "--is-ancestor",
-                    earlier_promotion.as_str(),
-                    descendant,
-                ])
-                .current_dir(&fixture.repo)
-                .status()
-                .unwrap()
-                .success(),
-            "the earlier promotion should be inherited by {descendant}"
-        );
-    }
-    assert!(
-        !git_output(
-            &fixture.repo,
-            &["show", "-s", "--format=%B", &selected_entry.head_commit]
-        )
-        .contains("Depends-On:")
-    );
-
-    let plan = broker
-        .ship_plan_only_with_delivery(selected.entry.id, None)
-        .unwrap();
-
-    assert_eq!(
-        plan.included_entries
-            .iter()
-            .map(|entry| entry.queue_entry_id)
-            .collect::<Vec<_>>(),
-        vec![selected.entry.id]
-    );
-    assert!(
-        plan.excluded_entries
-            .iter()
-            .any(|entry| entry.queue_entry_id == first.entry.id)
-    );
-    assert_eq!(
-        plan.only_verification.as_ref().unwrap().changed_files,
-        vec!["second.txt"]
-    );
-}
-
-#[test]
-fn ship_plan_only_refuses_an_earlier_declared_unshipped_dependency() {
-    let fixture = Fixture::new();
-    let first_session = fixture
-        .broker()
-        .start_worktree("dependency-first", None)
-        .unwrap();
-    let first_worktree = PathBuf::from(&first_session.worktree_path);
-    std::fs::write(first_worktree.join("first.txt"), "first\n").unwrap();
-    git(&first_worktree, &["add", "first.txt"]);
-    git(
-        &first_worktree,
-        &["commit", "-qm", "feat: first dependency entry"],
-    );
-
-    let second_session = fixture
-        .broker()
-        .start_worktree("dependency-second", None)
-        .unwrap();
-    let second_worktree = PathBuf::from(&second_session.worktree_path);
-    std::fs::write(second_worktree.join("second.txt"), "second\n").unwrap();
-    git(&second_worktree, &["add", "second.txt"]);
-    git(
-        &second_worktree,
-        &[
-            "commit",
-            "-qm",
-            &format!(
-                "feat: declared dependency\n\nDepends-On: q{}",
-                first_session.id
-            ),
-        ],
-    );
-
-    let mut broker = fixture.broker();
-    let first = broker.submit(first_session.id).unwrap();
-    assert!(first.promoted);
-    // The trailer names a queue id, not a broker session id. Rewrite the
-    // selected commit's message to use the actual queue id before submission.
-    git(
-        &second_worktree,
-        &[
-            "commit",
-            "--amend",
-            "-qm",
-            &format!(
-                "feat: declared dependency\n\nDepends-On: q{}",
-                first.entry.id
-            ),
-        ],
-    );
-    let second = broker.submit(second_session.id).unwrap();
-    assert!(second.promoted);
-
-    let error = broker
-        .ship_plan_only_with_delivery(second.entry.id, None)
-        .unwrap_err();
-
-    assert!(
-        error
-            .to_string()
-            .contains(&format!("entry {}", first.entry.id))
-    );
-    assert!(
-        error.to_string().contains("declared Depends-On trailer"),
-        "unexpected refusal: {error}"
-    );
-}
-
-#[test]
-fn ship_plan_only_refuses_to_publish_when_selected_gates_fail() {
-    let fixture = Fixture::new();
-    let (_, selected, _) = fixture.promoted_siblings(
-        "first.txt",
-        "first\n",
-        "second.txt",
-        "second\n",
-        "feat: failing-gate entry",
-    );
-    // Install the trusted gate after promotion so it specifically exercises
-    // the independently assembled remote-base-plus-entry tree.
-    fixture.configure_ship_gate("exit 1", "second.txt");
-    let refs_before = fixture.refs();
-    let mut broker = fixture.broker();
-
-    let error = broker
-        .ship_plan_only_with_delivery(selected, None)
-        .unwrap_err();
-
-    assert!(
-        error.to_string().contains("ship-only-selected"),
-        "unexpected refusal: {error}"
-    );
-    assert!(error.to_string().contains("did not pass"), "{error}");
-    assert_eq!(
-        fixture.refs(),
-        refs_before,
-        "a failed plan must not move refs"
-    );
-}
-
-#[test]
-fn ship_execute_only_publishes_selected_entry_and_reconciles_pending_work() {
-    let fixture = Fixture::new();
-    fixture.configure_ship_gate("true", "*.txt");
-    let (first, selected, integration_before) = fixture.promoted_siblings(
-        "first.txt",
-        "first\n",
-        "second.txt",
-        "second\n",
-        "feat: selected independent entry",
-    );
-    let mut broker = fixture.broker();
-    let plan = broker.ship_plan_only_with_delivery(selected, None).unwrap();
-    let report = broker
-        .ship_execute_only_delivery(
-            selected,
-            &plan.publication_sha,
-            None,
-            Some(&plan.plan_digest),
-            false,
-            false,
-            None,
-        )
-        .unwrap();
-    let DeliveryExecutionReport::LocalMainMerge { ship, .. } = report else {
-        panic!("the fixture's legacy delivery route should publish directly");
-    };
-
-    let remote_sha = fixture.remote_main();
-    assert_eq!(remote_sha, plan.publication_sha);
-    assert_eq!(ship.verified_remote_sha, remote_sha);
-    assert_eq!(ship.plan.included_entries.len(), 1);
-    assert_eq!(ship.plan.included_entries[0].queue_entry_id, selected);
-    let remote_first = Command::new("git")
-        .args(["cat-file", "-e", &format!("{remote_sha}:first.txt")])
-        .current_dir(&fixture.repo)
-        .output()
-        .unwrap();
-    assert!(!remote_first.status.success());
-    assert_eq!(
-        git_output(
-            &fixture.repo,
-            &["show", &format!("{remote_sha}:second.txt")]
-        ),
-        "second"
-    );
-
-    let reconciliation = ship.integration_reconciliation.as_ref().unwrap();
-    assert!(reconciliation.safe, "{}", reconciliation.next_action);
-    assert!(reconciliation.applied, "{}", reconciliation.next_action);
-    assert_eq!(reconciliation.upstream_sha, remote_sha);
-    assert_eq!(reconciliation.old_integration, integration_before);
-    assert_eq!(reconciliation.preserved_queue_entry_ids, vec![first]);
-    assert_eq!(
-        reconciliation.reverified_gates,
-        vec![format!("q{first}:ship-only-selected")]
-    );
-    let new_integration = git_output(
-        &fixture.repo,
-        &["rev-parse", "refs/heads/aethyme/integration"],
-    );
-    assert_eq!(new_integration, reconciliation.new_integration);
-    assert_eq!(
-        git_output(
-            &fixture.repo,
-            &["show", &format!("{new_integration}:first.txt"),],
-        ),
-        "first"
-    );
-    assert_eq!(
-        git_output(
-            &fixture.repo,
-            &["show", &format!("{new_integration}:second.txt")],
-        ),
-        "second"
-    );
-    let selected_publication_commits = git_output(
-        &fixture.repo,
-        &[
-            "log",
-            "--format=%H",
-            "--grep",
-            &format!("Aethyme-Queue-Entry: q{selected}"),
-            "refs/heads/aethyme/integration",
-        ],
-    );
-    assert_eq!(selected_publication_commits.lines().count(), 1);
 }
 
 #[test]
@@ -1918,7 +372,9 @@ fn ship_execute_publishes_and_verifies_the_exact_confirmed_sha() {
             }],
         })
         .unwrap();
-    let report = broker.ship_execute(entry_id, &integration).unwrap();
+    let report = broker
+        .ship_execute_with_sync(entry_id, &integration, false)
+        .unwrap();
 
     assert_eq!(report.published_sha, integration);
     assert_eq!(report.verified_remote_sha, integration);
@@ -1978,13 +434,6 @@ fn ship_execute_publishes_and_verifies_the_exact_confirmed_sha() {
     assert!(!report.local_main_sync.synchronized);
     assert_eq!(report.local_main_sync.before_sha, main_before);
     assert_eq!(report.local_main_sync.after_sha, main_before);
-    let follow_up = format!(
-        "aethyme broker advanced ship execute --entry {entry_id} --confirm {integration} --sync-main"
-    );
-    assert_eq!(
-        report.local_main_sync.follow_up_command.as_deref(),
-        Some(follow_up.as_str())
-    );
 }
 
 #[test]
@@ -2013,7 +462,9 @@ fn ship_retains_advisory_while_its_overlapping_lease_is_live() {
         })
         .unwrap();
 
-    let report = broker.ship_execute(entry_id, &integration).unwrap();
+    let report = broker
+        .ship_execute_with_sync(entry_id, &integration, false)
+        .unwrap();
     assert_eq!(report.resolved_exposures.len(), 1);
     assert!(report.resolved_advisories.is_empty());
     let retained = broker.advisory(advisory.id).unwrap();
@@ -2154,7 +605,7 @@ fn selected_prefix_publication_resolves_only_contained_promoted_entries() {
     assert_eq!(plan.proposed_push.source_sha, selected_integration);
 
     let report = broker
-        .ship_execute(second.entry.id, &selected_integration)
+        .ship_execute_with_sync(second.entry.id, &selected_integration, false)
         .unwrap();
     assert_eq!(report.published_sha, selected_integration);
     assert_eq!(fixture.remote_main(), report.published_sha);
@@ -2258,7 +709,6 @@ fn ship_execute_sync_main_fast_forwards_a_clean_primary_checkout() {
     assert!(report.local_main_sync.synchronized);
     assert_eq!(report.local_main_sync.before_sha, main_before);
     assert_eq!(report.local_main_sync.after_sha, integration);
-    assert!(report.local_main_sync.follow_up_command.is_none());
     assert_eq!(
         report.sync_operation.as_ref().unwrap().status,
         OperationStatus::Succeeded
@@ -2266,7 +716,7 @@ fn ship_execute_sync_main_fast_forwards_a_clean_primary_checkout() {
 }
 
 #[test]
-fn integration_status_routes_promoted_published_and_synchronized_states_through_ship() {
+fn integration_status_reports_promoted_published_and_synchronized_states() {
     let fixture = Fixture::new();
     let (entry_id, _, integration) = fixture.promoted_entry();
     let mut broker = fixture.broker();
@@ -2276,25 +726,20 @@ fn integration_status_routes_promoted_published_and_synchronized_states_through_
         promoted.next_action.state,
         IntegrationDeliveryState::Promoted
     );
-    assert_eq!(
-        promoted.next_action.commands,
-        vec![format!(
-            "aethyme broker advanced ship plan --entry {entry_id}"
-        )]
+    assert!(
+        promoted.next_action.commands.is_empty(),
+        "no local publication command remains to recommend"
     );
 
-    broker.ship_execute(entry_id, &integration).unwrap();
+    broker
+        .ship_execute_with_sync(entry_id, &integration, false)
+        .unwrap();
     let published = broker.integration_status(0).unwrap();
     assert_eq!(
         published.next_action.state,
         IntegrationDeliveryState::Published
     );
-    assert_eq!(
-        published.next_action.commands,
-        vec![format!(
-            "aethyme broker advanced ship execute --entry {entry_id} --confirm {integration} --sync-main"
-        )]
-    );
+    assert!(published.next_action.commands.is_empty());
 
     broker
         .ship_execute_with_sync(entry_id, &integration, true)
@@ -2464,10 +909,12 @@ fn ship_execute_rejects_abbreviated_and_mismatched_confirmations_before_operatio
     let mut broker = fixture.broker();
 
     assert!(matches!(
-        broker.ship_execute(entry_id, &integration[..12]),
+        broker.ship_execute_with_sync(entry_id, &integration[..12], false),
         Err(BrokerOpError::ShipConfirmationNotFullSha)
     ));
-    let mismatch = broker.ship_execute(entry_id, &"0".repeat(40)).unwrap_err();
+    let mismatch = broker
+        .ship_execute_with_sync(entry_id, &"0".repeat(40), false)
+        .unwrap_err();
     assert!(matches!(
         mismatch,
         BrokerOpError::ShipConfirmationMismatch { .. }
@@ -2494,7 +941,9 @@ fn ship_execute_rejects_a_remote_that_moved_since_the_planned_base() {
     let advanced = fixture.advance_remote();
     let mut broker = fixture.broker();
 
-    let error = broker.ship_execute(entry_id, &integration).unwrap_err();
+    let error = broker
+        .ship_execute_with_sync(entry_id, &integration, false)
+        .unwrap_err();
     assert!(matches!(
         &error,
         BrokerOpError::ShipPlanUnavailable {
@@ -2528,7 +977,9 @@ fn ship_execute_rejects_a_non_fast_forward_remote() {
     git(&fixture.repo, &["fetch", "-q", "origin", "main"]);
     let mut broker = fixture.broker();
 
-    let error = broker.ship_execute(entry_id, &integration).unwrap_err();
+    let error = broker
+        .ship_execute_with_sync(entry_id, &integration, false)
+        .unwrap_err();
     assert!(matches!(
         error,
         BrokerOpError::ShipNonFastForward { remote_sha, .. } if remote_sha == advanced
@@ -2544,7 +995,9 @@ fn ship_push_failure_with_unchanged_remote_is_failed_and_retryable() {
     let hook = fixture.install_hook("pre-receive", "#!/bin/sh\nexit 1\n");
     let mut broker = fixture.broker();
 
-    let error = broker.ship_execute(entry_id, &integration).unwrap_err();
+    let error = broker
+        .ship_execute_with_sync(entry_id, &integration, false)
+        .unwrap_err();
     let operation_id = match error {
         BrokerOpError::ShipOperationFailed {
             phase: "push",
@@ -2563,7 +1016,9 @@ fn ship_push_failure_with_unchanged_remote_is_failed_and_retryable() {
         OperationStatus::Failed
     );
     std::fs::remove_file(hook).unwrap();
-    let report = broker.ship_execute(entry_id, &integration).unwrap();
+    let report = broker
+        .ship_execute_with_sync(entry_id, &integration, false)
+        .unwrap();
     assert_eq!(report.verified_remote_sha, integration);
 }
 
@@ -2578,7 +1033,9 @@ fn ship_verify_failure_is_journaled_as_failed() {
     );
     let mut broker = fixture.broker();
 
-    let error = broker.ship_execute(entry_id, &integration).unwrap_err();
+    let error = broker
+        .ship_execute_with_sync(entry_id, &integration, false)
+        .unwrap_err();
     assert!(matches!(
         error,
         BrokerOpError::ShipVerificationMismatch { actual, .. } if actual == "<missing>"

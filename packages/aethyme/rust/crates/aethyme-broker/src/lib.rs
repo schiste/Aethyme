@@ -671,13 +671,11 @@ pub use session_push::{
 };
 pub use session_sync::{SessionSyncReport, SyncOutcome, SyncStrategy};
 pub use ship::{
-    DeliveryCheck, DeliveryChecksSummary, DeliveryExecutionReport, DeliveryExecutionState,
-    DeliveryPullRequest, PUBLICATION_POLICY_SCHEMA_VERSION, PullRequestDeliveryReport,
-    REPOSITORY_DELIVERY_POLICY_SCHEMA_VERSION, RepositoryDeliveryConfig, RepositoryDeliveryMode,
-    RepositoryDeliveryModeSource, RepositoryDeliverySelection, ShipExecutionReport, ShipFreshness,
-    ShipFreshnessResult, ShipLocalMainSync, ShipPlan, ShipPublicationAssessment,
-    ShipPublicationAuthorization, ShipPublicationAuthorizationKind, ShipPublicationMode,
-    ShipPublicationPolicy, ShipPush, ShipReviewEvidence,
+    PUBLICATION_POLICY_SCHEMA_VERSION, REPOSITORY_DELIVERY_POLICY_SCHEMA_VERSION,
+    RepositoryDeliveryConfig, ShipExecutionReport, ShipFreshness, ShipFreshnessResult,
+    ShipLocalMainSync, ShipPlan, ShipPublicationAssessment, ShipPublicationAuthorization,
+    ShipPublicationAuthorizationKind, ShipPublicationMode, ShipPublicationPolicy, ShipPush,
+    ShipReviewEvidence,
 };
 pub use storage::{
     STORAGE_ATTRIBUTION_SCHEMA_VERSION, STORAGE_PLAN_SCHEMA_VERSION,

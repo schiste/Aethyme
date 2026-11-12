@@ -117,13 +117,6 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::ShipEntryNotPromoted { .. }
         | E::ShipEntryNotOnIntegration { .. }
         | E::ShipPublicationPolicy { .. }
-        | E::ShipDeliveryOverrideUnsafe { .. }
-        | E::ShipDeliveryRequiresExplicitSelection { .. }
-        | E::ShipDeliveryPlanDigestRequired
-        | E::ShipDeliveryPlanDigestNotSha256
-        | E::ShipDeliveryPlanDigestMismatch { .. }
-        | E::ShipDeliveryBranchConflict { .. }
-        | E::ShipDeliveryPullRequestMismatch { .. }
         | E::ShipConfirmationNotFullSha
         | E::ShipConfirmationMismatch { .. }
         | E::ReconciliationConfirmationRequired { .. }

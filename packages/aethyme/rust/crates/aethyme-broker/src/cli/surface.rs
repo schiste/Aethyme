@@ -112,7 +112,6 @@ pub const ADVANCED_VERBS: &[(&str, &str)] = &[
         "exec-status",
         "inspect a guarded-exec receipt without signaling or reconciling processes",
     ),
-    ("ship", "plan or execute a reviewed full-SHA publication"),
     ("review", "plan, run, record and route pull request reviews"),
     (
         "review-thread",
@@ -435,7 +434,7 @@ pub(super) fn public_help() -> String {
         text.push_str(&format!("  {verb:<9} {summary}\n"));
     }
     text.push_str(
-        "\nEverything else (leases, git, gh, ship, review, operations, exec, ...):\n\
+        "\nEverything else (leases, git, gh, review, operations, exec, ...):\n\
          \x20 aethyme broker advanced --help\n\n\
          Run `aethyme broker <verb> --help` for a verb's forms and flags.\n\
          In verify-only mode overlaps warn; other modes can refuse claims against active explicit leases.\n",

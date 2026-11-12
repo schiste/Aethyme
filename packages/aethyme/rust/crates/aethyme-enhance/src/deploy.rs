@@ -913,15 +913,15 @@ mod tests {
                 .unwrap();
         assert_eq!(codex_broker_reference, claude_broker_reference);
         for required in [
-            "aethyme broker advanced main reconcile plan",
-            "aethyme broker advanced main reconcile apply --session <id> --confirm <sha256>",
+            "lands through GitHub: push the session branch",
+            "aethyme broker push --session <your-session-id> --pr",
         ] {
             assert!(
                 codex_broker_reference.contains(required),
                 "generated broker reference is missing {required:?}"
             );
         }
-        assert!(!codex_broker_reference.contains("broker main reconcile"));
+        assert!(!codex_broker_reference.contains("main reconcile"));
 
         let settings = std::fs::read_to_string(repo.join(SETTINGS_FILE)).unwrap();
         assert_eq!(
@@ -990,8 +990,7 @@ mod tests {
             "aethyme broker status --json",
             "gitignored persistence projection",
             "Acknowledging a notice stops repeat delivery",
-            "selected integration prefix clears only entries contained",
-            "Advisories never expand gate selection or block submit",
+            "expand gate selection or block submit",
         ] {
             assert!(
                 reference.contains(required),

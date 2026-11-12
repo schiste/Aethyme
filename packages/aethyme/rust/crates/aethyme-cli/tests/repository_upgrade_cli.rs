@@ -1126,7 +1126,7 @@ fn homebrew_upgrade_mid_session_preserves_commit_and_recovery_lanes() {
             "--short-name",
             "Blocked",
         ][..],
-        &["broker", "advanced", "ship", "execute"][..],
+        &["broker", "advanced", "issues", "upsert"][..],
     ] {
         let blocked = run(&repo, args);
         assert!(
@@ -1417,7 +1417,7 @@ fn older_repository_allows_diagnostics_recovery_and_only_pinned_continuation() {
             "--short-name",
             "Work",
         ][..],
-        &["broker", "advanced", "ship", "execute"][..],
+        &["broker", "advanced", "issues", "upsert"][..],
     ] {
         let output = run(&repo, args);
         assert!(!output.status.success(), "broker command ran: {args:?}");

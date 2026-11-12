@@ -296,11 +296,13 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
     assert_eq!(report["cleanup"]["branch_removed"], true);
     assert!(!worktree.exists());
     assert!(!branch_exists(tmp.path(), &branch));
+    // Pull requests are the only landing path: a promoted entry no longer
+    // earns a local publication command.
     assert!(
         report["recommended_next_action"]
             .as_str()
-            .unwrap()
-            .starts_with("aethyme broker advanced ship plan --entry ")
+            .is_none_or(|action| !action.contains("advanced ship")),
+        "{report}"
     );
 
     let mut broker = isolation::open(tmp.path());
@@ -617,10 +619,8 @@ fn finish_cli_text_summarizes_the_structured_handoff() {
     assert!(text.contains("attempted=true, completed=true"), "{text}");
     assert!(text.contains("(removed)"), "{text}");
     assert!(!worktree.exists());
-    assert!(
-        text.contains("recommended next: aethyme broker advanced ship plan --entry"),
-        "{text}"
-    );
+    assert!(text.contains("recommended next: "), "{text}");
+    assert!(!text.contains("advanced ship"), "{text}");
 }
 
 fn finish_guidance_text(report: &serde_json::Value) -> String {

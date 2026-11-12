@@ -343,11 +343,9 @@ fn automation_issues_allowed(repo: &Path) -> bool {
 
 fn render_push_aware_protocol(repo: &Path) -> String {
     if pushes_session_branches(repo) {
-        // Work that lives only in a worktree is lost with it, and a local
-        // integration branch nobody publishes grows unnoticed: one repository
-        // held 74 unpublished commits over five weeks. Where the repository
-        // authorizes it, the session branch is the unit of delivery, so the
-        // agent pushes it as it goes rather than at the end.
+        // Work that lives only in a worktree is lost with it. Where the
+        // repository authorizes it, the session branch is the unit of
+        // delivery, so the agent pushes it as it goes rather than at the end.
         let protocol = PUSHING_PROTOCOL.to_string();
         return match pr_size_thresholds(repo) {
             Some((files, lines)) => format!(
@@ -368,10 +366,10 @@ Other agents may be working in sibling worktrees.
 For routine coordination, use `aethyme broker status --compact --json`.
 It groups advice and reports deferred checks as unknown. Use full
 `aethyme broker status --json` when exact session or lease-path evidence is
-needed. Check overlapping work before duplicating it. In `.aethyme/config.toml`,
-`[promote] mode = "verify-only"` makes overlaps advisory; other modes can refuse
-claims against an active session's explicit lease. Accepted warnings permit work
-in your session; reconcile before merging. Resolve blockers and refusals.
+needed. Check overlapping work before duplicating it. Overlaps with an active
+session's explicit lease are advisory unless the repository's `[promote]` config
+makes them refusals. Accepted warnings permit work in your session; reconcile
+before merging. Resolve blockers and refusals.
 
 1. `aethyme broker start --task "<task>"`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
@@ -387,8 +385,9 @@ in your session; reconcile before merging. Resolve blockers and refusals.
    before resuming a reused session and when push reports related or unknown
    impact. A graph-disjoint verdict permits deferring intermediate sync; validate
    the current merge candidate before merging. Never leave work only in the worktree.
-3. When done: `aethyme broker submit --session <id>`, then
-   `aethyme broker finish --session <id>` (it refuses while commits are unpushed).
+3. When done: `aethyme broker submit --session <id>` runs the gates and lands
+   nothing. Merge the PR on GitHub, then `aethyme broker finish --session <id>`
+   (it refuses while commits are unpushed).
 
 This repository's `push_session_branches` policy authorizes pushing your own
 session branch and opening a draft PR; nothing else. Other remote or shared Git
@@ -403,10 +402,10 @@ Other agents may be working in sibling worktrees.
 For routine coordination, use `aethyme broker status --compact --json`.
 It groups advice and reports deferred checks as unknown. Use full
 `aethyme broker status --json` when exact session or lease-path evidence is
-needed. Check overlapping work before duplicating it. In `.aethyme/config.toml`,
-`[promote] mode = "verify-only"` makes overlaps advisory; other modes can refuse
-claims against an active session's explicit lease. Accepted warnings permit work
-in your session; reconcile before merging. Resolve blockers and refusals.
+needed. Check overlapping work before duplicating it. Overlaps with an active
+session's explicit lease are advisory unless the repository's `[promote]` config
+makes them refusals. Accepted warnings permit work in your session; reconcile
+before merging. Resolve blockers and refusals.
 
 1. `aethyme broker start --task "<task>" [--short-name "<label>"]`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
@@ -415,8 +414,8 @@ in your session; reconcile before merging. Resolve blockers and refusals.
    status and follow its `next_action` when dependencies are required:
    `aethyme broker submit prepare status --session <id> --json`. Preparation
    is explicit; do not assume a fresh worktree has installed dependencies.
-2. When done: `aethyme broker submit --session <id>`, then
-   `aethyme broker finish --session <id>`.
+2. When done: `aethyme broker submit --session <id>` runs the gates and lands
+   nothing. Then `aethyme broker finish --session <id>`.
 
 For a local commit in your own active session, use
 `aethyme broker commit --session <id> -- <git-commit-args>`. It checks the
@@ -665,9 +664,9 @@ blocked.
    Sync is local only: it never pushes, so run `aethyme broker push --session
    <id>` afterwards to publish the caught-up branch.
    `broker start` and `start --reuse` refresh the default branch first, so a
-   new worktree starts from the latest fetched tip. In a repository
-   with `[promote] mode = "verify-only"`, `broker submit` is a pre-flight
-   against the current default branch; the integration branch is not used.
+   new worktree starts from the latest fetched tip. `broker submit` verifies
+   your work against the current default branch and lands nothing: the pull
+   request is merged on GitHub.
    When `broker status` shows `coordination.land-shared-edit-first`, another
    session changes the same lines or symbol as yours: follow it -- the named
    session lands only the shared edit as its own small PR, then both rebase
@@ -699,63 +698,23 @@ blocked.
    this worktree with `aethyme graph materialize --repo .`. Do not enable graph
    authority merely to silence a degraded response.
 
-6. **When your task is complete**, use verified broker integration by
-   default instead of manually combining concurrent session branches:
+6. **When your task is complete**, verify the work with the broker gates:
 
    ```bash
    aethyme broker submit --session <your-session-id>
    ```
 
-   This simulates the merge and runs only the checks your diff affects.
-   Submit replays session-owned commits as an ordered, single-parent patch
-   series. If your session contains an owned merge commit, submission refuses
-   safely and prints the accepted checkpoint plus an exact recovery sequence.
+   This simulates the merge and runs only the checks your diff affects. With
+   the default `[promote] mode = "verify-only"` it promotes nothing; it does not
+   publish a remote branch, merge a pull request, or push a release tag. Work
+   lands through GitHub: push the session branch with `aethyme broker push
+   --session <id> --pr` (step 4) and merge the pull request there.
+   If your session contains an owned merge commit, submission refuses safely
+   and prints the accepted checkpoint plus an exact recovery sequence.
    Follow it in order: preserve the current HEAD on the named recovery branch
    before flattening the reviewed tree change. Never reset first.
-   `broker submit` promotes to the local integration branch; it does not
-   publish a remote branch, create a pull request, or push a release tag.
-   Publication is a separate, explicitly authorized operator action. When
-   publication is authorized, review the exact promoted prefix first, then
-   confirm the plan's full publication SHA:
-
-   ```bash
-   aethyme broker advanced ship plan --entry <promoted-entry-id>
-   aethyme broker advanced ship execute --entry <promoted-entry-id> --confirm <full-publication-sha>
-   ```
-
-   By default, the selected entry is a prefix boundary: every earlier
-   promoted-but-unpublished entry ships with it. In promote-mode repositories,
-   `--only` can publish one independent entry without changing that default:
-
-   ```bash
-   aethyme broker advanced ship plan --entry <promoted-entry-id> --only
-   aethyme broker advanced ship execute --entry <promoted-entry-id> --only --confirm <full-publication-sha> --plan <sha256>
-   ```
-
-   The plan refuses when an earlier unshipped entry is required by ancestry,
-   changed-path overlap, or a declared `Depends-On` trailer. Otherwise it gates
-   the exact tree made from the remote default branch plus only the selected
-   entry. Planning does not move refs, though it may record gate results in the
-   local cache; execution requires the reviewed plan digest. After publication,
-   the broker rebases the remaining pending entries onto the published commit
-   in integration and re-runs gates only for replayed trees that changed.
-   Review that reconciliation report. If it refuses or cannot apply safely,
-   use `aethyme broker advanced integration reconcile --upstream <published-sha> --dry-run`
-   and follow its reviewed apply plan. Advancing the local default checkout
-   from integration is a separate reviewed operation: run
-   `aethyme broker advanced main reconcile plan`, then apply its reviewed
-   digest with `aethyme broker advanced main reconcile apply --session <id> --confirm <sha256>`.
-   Independent publication does not mark the other queue entries shipped or
-   change their promotion order.
-
-   Prefer this reviewed broker ship workflow over a raw push. Never infer
-   publication authority from permission to edit, submit, or promote.
-   Without publication authority, stop after submit and report the promoted
-   entry. Under `push_session_branches` (step 4), your pushed session branch
-   and its draft PR are the delivery: report the PR rather than a promoted
-   entry. Repositories that deliver through pull requests usually also set
-   `[promote] mode = "verify-only"`, so verified work does not pile up
-   unpublished on the local integration branch.
+   Never infer merge or publication authority from permission to edit or
+   submit. Report the pull request in your summary.
    Report the outcome (verified / rejected / conflict) in your summary.
    Afterwards, finish the session with
    `aethyme broker finish --session <id>`, or point it at a follow-up task
@@ -798,10 +757,8 @@ blocked.
    deterministically ordered. Acknowledging a notice stops repeat delivery
    but does not clear the queue entry's unpublished path exposure. Session
    close and rebase do not clear it either. Only verified publication or
-   confirmed external reconciliation resolves an exposure; publishing a
-   selected integration prefix clears only entries contained in the verified
-   remote tip. Advisories never expand gate selection or block submit,
-   promotion, or shipping.
+   confirmed external reconciliation resolves an exposure. Advisories never
+   expand gate selection or block submit.
 
 9. **Git operations remain available to agents.** The broker coordinates
    concurrent work; it does not remove Git capabilities. When the user's
@@ -813,7 +770,7 @@ blocked.
 
    Operations that require coordination **must go through the broker**. Use a
    dedicated broker workflow when one exists (for example `broker submit` for
-   verified integration). Run other coordinated Git operations through the
+   verification). Run other coordinated Git operations through the
    durable Git operation coordinator:
 
    ```bash
@@ -1248,17 +1205,12 @@ mod tests {
             "AETHYME_TEST_DB_SUFFIX",
             "aethyme broker finish cleanup --all-cleaned --apply",
             "aethyme broker advanced operations reconcile",
-            "aethyme broker advanced ship execute",
-            "ship plan --entry <promoted-entry-id> --only",
-            "changed-path overlap",
-            "broker advanced integration reconcile --upstream <published-sha> --dry-run",
-            "aethyme broker advanced main reconcile plan",
-            "aethyme broker advanced main reconcile apply --session <id> --confirm <sha256>",
+            "lands through GitHub: push the session branch",
             "aethyme broker start --reuse --task",
             "aethyme graph materialize --repo .",
             "authority merely to silence a degraded response",
             "local-only",
-            "Advisories never expand gate selection",
+            "expand gate selection or block submit",
             "do not retry blindly",
         ] {
             assert!(
@@ -1340,7 +1292,7 @@ mod tests {
             "Commit early and small, and after each commit run\n   `aethyme broker push --session <id>`",
             "open a draft PR with `aethyme broker push --session <id> --pr`",
             "keep pushing until it is ready. Run `aethyme broker sync --session <id>`\n   before resuming a reused session and when push reports related or unknown\n   impact. A graph-disjoint verdict permits deferring intermediate sync; validate\n   the current merge candidate before merging. Never leave work only in the worktree.",
-            "`aethyme broker finish --session <id>` (it refuses while commits are unpushed)",
+            "`aethyme broker finish --session <id>`\n   (it refuses while commits are unpushed)",
             "authorizes pushing your own\nsession branch and opening a draft PR; nothing else.",
             "`aethyme broker advanced git`",
             "`references/broker.md`",
@@ -1377,8 +1329,8 @@ mod tests {
             for required in [
                 "For routine coordination, use `aethyme broker status --compact --json`.",
                 "`aethyme broker status --json` when exact session or lease-path evidence is",
-                "`[promote] mode = \"verify-only\"` makes overlaps advisory",
-                "claims against an active session's explicit lease.",
+                "session's explicit lease are advisory unless the repository's `[promote]` config",
+                "makes them refusals.",
                 "Resolve blockers and refusals.",
             ] {
                 assert!(
@@ -1438,15 +1390,18 @@ mod tests {
             "--abandon --reason",
             "`[promote] mode = \"verify-only\"`",
             "`coordination.land-shared-edit-first`",
-            "ship plan --entry <promoted-entry-id> --only",
-            "changed-path overlap",
-            "broker advanced integration reconcile --upstream <published-sha> --dry-run",
-            "aethyme broker advanced main reconcile plan",
-            "aethyme broker advanced main reconcile apply --session <id> --confirm <sha256>",
+            "lands through GitHub: push the session branch",
         ] {
             assert!(reference.contains(needle), "missing {needle:?}");
         }
-        assert!(!reference.contains("broker main reconcile"));
+        for retired in [
+            "advanced ship",
+            "integration reconcile",
+            "main reconcile",
+            "promotes to the local integration branch",
+        ] {
+            assert!(!reference.contains(retired), "still mentions {retired:?}");
+        }
     }
 
     #[test]

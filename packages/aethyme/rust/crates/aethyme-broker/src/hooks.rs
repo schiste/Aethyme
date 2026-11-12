@@ -131,7 +131,7 @@ pub enum HooksError {
     #[error(
         "git push refused by Aethyme pre-push:\n\
          enrolled repository is publishing protected ref(s): {refs}.\n\
-         Publish verified integration with: aethyme broker advanced ship plan --entry <id>\n\
+         Publish your session branch and open a pull request with: aethyme broker push --session <id> --pr\n\
          Or run an explicitly authorized push through: aethyme broker advanced git --session <id> --reason \"<authorization>\" -- push ...\n\
          Emergency break glass (journaled): AETHYME_BROKER_BREAK_GLASS_REASON=\"<reason>\" git push ..."
     )]

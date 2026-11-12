@@ -1679,13 +1679,6 @@ fn finish_closes_promoted_session_and_suggests_cleanup_when_integration_contains
     sh(&wt, &["add", "-A"]);
     sh(&wt, &["commit", "-qm", "done"]);
     assert!(broker.submit(session.id).unwrap().promoted);
-    let queue_entry = broker
-        .store()
-        .merge_queue()
-        .unwrap()
-        .into_iter()
-        .last()
-        .unwrap();
     broker
         .store()
         .claim_lease(session.id, "src/", None)
@@ -1760,10 +1753,7 @@ fn finish_closes_promoted_session_and_suggests_cleanup_when_integration_contains
     assert_eq!(closed.pending_work.unsubmitted_commits, 0);
     assert_eq!(
         closed.recommended_next_action,
-        Some(format!(
-            "aethyme broker advanced ship plan --entry {}",
-            queue_entry.id
-        ))
+        Some(format!("aethyme broker finish cleanup {}", session.id))
     );
     // A verified close releases the session's leases in the transaction
     // that closes it, before any physical cleanup (#358): the store holds
