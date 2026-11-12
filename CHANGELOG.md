@@ -4,6 +4,22 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.75] - 2026-11-12
+
+### Added
+
+- `broker push` records where its Git push step spends time, as `push_git_*` phases (lock wait, remote reads, the push process, the hook dry run), and reports `default_branch_fetch_age_seconds` when it reused a fetch (#1614).
+
+### Changed
+
+- A plain `broker push` reuses a default-branch fetch made successfully by any broker command in the last 60 seconds instead of fetching again; `push --pr` and `sync` always fetch. Set `AETHYME_PUSH_FETCH_REUSE=off` to always fetch (#1614).
+- In a repository that does not promote, a session's own changes are measured from its merge-base with the fetched default branch, one Git call, and the integration branch is not read (#1612).
+- In a repository that does not promote and has a fetched default branch, the broker no longer creates or moves the integration branch. `status` and the adopt/reuse drift check compare against the default branch, and the drift check's next step is `broker sync --session <id>` (#1615).
+
+### Deprecated
+
+- The `integration.refreshed` advice row and the `broker.integration.refreshed` event are no longer emitted in repositories that do not promote (#1615).
+
 ## [0.8.74] - 2026-11-12
 
 ### Removed
