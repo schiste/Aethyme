@@ -15339,11 +15339,9 @@ mod tests {
         std::fs::write(worktree.join("landed.txt"), "landed\n").unwrap();
         git(&worktree, &["add", "landed.txt"]);
         git(&worktree, &["commit", "-qm", "landed"]);
-        aethyme_testkit::land_as_pull_request(
-            broker.main_root(),
-            &session.branch,
-            aethyme_testkit::MergeStyle::Squash,
-        );
+        // Land it on the local default branch: this fixture has no remote,
+        // and the sweep below must see the same repository it always has.
+        git(root, &["merge", "-q", "--ff-only", &session.branch]);
         assert!(
             broker
                 .finish_with_options(

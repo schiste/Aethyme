@@ -183,25 +183,23 @@ fn removed_public_spellings_and_advanced_duplicates_refuse_before_preflight() {
     )
     .unwrap();
 
-    for (args, old, new) in [(
-        &["broker", "doctor", "--json"][..],
+    let output = aethyme(&repo, &["broker", "doctor", "--json"]);
+    assert_removed(
+        &output,
         "aethyme broker doctor",
         "aethyme broker status doctor",
-    )] {
-        let output = aethyme(&repo, args);
-        assert_removed(&output, old, new, true);
-    }
+        true,
+    );
 
-    for line in ["broker status doctor --json"] {
-        let args: Vec<&str> = line.split(' ').collect();
-        let output = aethyme(&repo, &args);
-        assert_eq!(
-            output.status.code(),
-            Some(1),
-            "`{line}` must be refused by compatibility policy: {}",
-            json_error::message(&output)
-        );
-    }
+    let line = "broker status doctor --json";
+    let args: Vec<&str> = line.split(' ').collect();
+    let output = aethyme(&repo, &args);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "`{line}` must be refused by compatibility policy: {}",
+        json_error::message(&output)
+    );
 
     for (line, public) in [
         (
