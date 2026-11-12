@@ -1252,8 +1252,8 @@ impl Broker {
 
     /// Where `head`'s work landed on the fetched default branch, in a
     /// repository that does not promote. `None` in a promoting repository,
-    /// without a fetched default branch, or when the branch does not hold
-    /// every path the session changed.
+    /// without a fetched default branch, when the branch does not hold every
+    /// path the session changed, or when the session changed nothing.
     ///
     /// `known` is the landing already found on `searched` targets, which are
     /// asked in turn and the first holding the work answers: a default branch
@@ -1269,14 +1269,22 @@ impl Broker {
             return Ok(None);
         };
         let found = match known {
-            Some((target, _, landed_by)) if *target == tip => Some(landed_by.clone()),
+            Some((target, evidence, landed_by)) if *target == tip => {
+                Some((*evidence, landed_by.clone()))
+            }
             None if searched.contains(&tip) => None,
             _ => {
                 let _span = crate::phase_telemetry::span("default_branch_landing");
                 self.landing_on_delivery_targets(head, std::slice::from_ref(&tip))?
-                    .map(|(_, _, landed_by)| landed_by)
+                    .map(|(_, evidence, landed_by)| (evidence, landed_by))
             }
         };
+        // A head that changes nothing has landed nothing: whether its commits
+        // may be left behind is the remote-durability question `finish`
+        // already asks of a no-net session, not a delivery.
+        let found = found
+            .filter(|(evidence, _)| *evidence != crate::LandingEvidence::NoNetChange)
+            .map(|(_, landed_by)| landed_by);
         Ok(found.map(|landed_by| DefaultBranchLanding {
             reference,
             landed_by,

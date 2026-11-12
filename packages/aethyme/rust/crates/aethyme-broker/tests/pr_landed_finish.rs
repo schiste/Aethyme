@@ -48,6 +48,8 @@ fn fixture() -> (FixtureRepository, common::FixtureBroker) {
     )
     .unwrap();
     git(fixture.path(), &["add", "-A"]);
+    // `/.aethyme/` is ignored; the policy file is tracked on purpose.
+    git(fixture.path(), &["add", "-f", ".aethyme/config.toml"]);
     git(fixture.path(), &["commit", "-qm", "init"]);
     aethyme_testkit::ensure_origin(fixture.path());
     let broker = open_fixture_repository_broker(&fixture).unwrap();
