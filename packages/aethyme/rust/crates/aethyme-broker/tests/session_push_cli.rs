@@ -262,8 +262,13 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.run_with_env(args, &[])
+    }
+
+    fn run_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         let broker = self.broker();
         let mut command = common::broker_cli(CLI, args);
+        command.envs(env.iter().copied());
         command
             .current_dir(&self.repo)
             .env(
@@ -321,6 +326,56 @@ impl Fixture {
     fn gh_log(&self) -> String {
         std::fs::read_to_string(self.storage.owner_path().join("gh-log")).unwrap_or_default()
     }
+
+    /// Another clone lands a commit on the remote's default branch. This
+    /// repository's `origin/main` moves only when something fetches it, so it
+    /// shows whether a push fetched.
+    fn land_on_remote_only(&self, name: &str) -> String {
+        let other = self.storage.owner_path().join(format!("other-{name}"));
+        git(
+            self.storage.owner_path(),
+            &[
+                "clone",
+                "-q",
+                self.remote.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(other.join(format!("{name}.txt")), "landed\n").unwrap();
+        git(&other, &["add", "."]);
+        git(&other, &["commit", "-qm", "merged elsewhere"]);
+        git(&other, &["push", "-q", "origin", "main"]);
+        git_output(&other, &["rev-parse", "HEAD"])
+    }
+
+    fn tracking_main(&self) -> String {
+        git_output(&self.repo, &["rev-parse", "refs/remotes/origin/main"])
+    }
+
+    fn default_branch_fetch_record(&self) -> Option<String> {
+        self.broker()
+            .store()
+            .meta_get(DEFAULT_BRANCH_FETCH_KEY)
+            .unwrap()
+    }
+
+    fn record_default_branch_fetch(&self, value: &str) {
+        self.broker()
+            .store()
+            .meta_set(DEFAULT_BRANCH_FETCH_KEY, value)
+            .unwrap();
+    }
+}
+
+/// Where the broker records its last default-branch fetch for `origin/main`.
+const DEFAULT_BRANCH_FETCH_KEY: &str =
+    "default_branch_fetch.refs/remotes/origin/main.started_at_ms";
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 /// The first real pushes reported 3,687-5,171 "uncommitted files": every
@@ -976,4 +1031,150 @@ fn automatic_pr_watch_observation_has_a_finite_deadline() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// The busiest repository spent ~2.9 s of every push fetching the default
+/// branch it had fetched moments before. A push within a minute of a
+/// successful fetch compares against the tracking ref that fetch left.
+#[test]
+fn a_push_reuses_a_default_branch_fetch_from_moments_before() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, _) = fixture.session_with_commit();
+    json(&fixture.push(session, &[]));
+    let recorded: i64 = fixture
+        .default_branch_fetch_record()
+        .expect("the push's fetch is recorded")
+        .parse()
+        .expect("a successful fetch records its time");
+    assert!(recorded <= now_ms());
+    let cached = fixture.tracking_main();
+    fixture.land_on_remote_only("moved");
+
+    let report = json(&fixture.push(session, &[]));
+
+    assert_eq!(fixture.tracking_main(), cached, "no fetch ran: {report}");
+    let age = report["default_branch_fetch_age_seconds"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the report says the fetch was reused: {report}"));
+    assert!(age <= 60, "{report}");
+    assert_eq!(report["default_branch"]["behind"], 0, "{report}");
+}
+
+#[test]
+fn a_push_fetches_when_the_recorded_fetch_is_old_unreadable_or_in_the_future() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, _) = fixture.session_with_commit();
+    json(&fixture.push(session, &[]));
+
+    for (name, record) in [
+        ("old", Some((now_ms() - 120_000).to_string())),
+        ("future", Some((now_ms() + 120_000).to_string())),
+        ("unreadable", None),
+    ] {
+        match record {
+            Some(record) => fixture.record_default_branch_fetch(&record),
+            None => fixture.record_default_branch_fetch("not a time"),
+        }
+        let landed = fixture.land_on_remote_only(name);
+
+        let report = json(&fixture.push(session, &[]));
+
+        assert_eq!(fixture.tracking_main(), landed, "{name}: push fetched");
+        assert!(
+            report.get("default_branch_fetch_age_seconds").is_none(),
+            "{name}: {report}"
+        );
+        assert!(
+            report["default_branch"]["behind"].as_u64() > Some(0),
+            "{name}: {report}"
+        );
+    }
+}
+
+#[test]
+fn a_push_fetches_when_the_last_default_branch_fetch_failed() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, _) = fixture.session_with_commit();
+    json(&fixture.push(session, &[]));
+    // Sync's fetch fails while the remote is away, and says so in the record.
+    let away = fixture.remote.with_extension("away");
+    std::fs::rename(&fixture.remote, &away).unwrap();
+    fixture.run(&["sync", "--session", &session.to_string(), "--json"]);
+    std::fs::rename(&away, &fixture.remote).unwrap();
+    assert_eq!(
+        fixture.default_branch_fetch_record().as_deref(),
+        Some("failed")
+    );
+    let landed = fixture.land_on_remote_only("after-failure");
+
+    let report = json(&fixture.push(session, &[]));
+
+    assert_eq!(fixture.tracking_main(), landed, "push fetched: {report}");
+    assert!(
+        report.get("default_branch_fetch_age_seconds").is_none(),
+        "{report}"
+    );
+}
+
+/// `--pr` measures the change against the default branch, so it must not
+/// measure against a copy another command fetched.
+#[test]
+fn a_push_that_opens_a_pull_request_always_fetches() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, _) = fixture.session_with_commit();
+    json(&fixture.push(session, &[]));
+    let landed = fixture.land_on_remote_only("before-pr");
+
+    let report = json(&fixture.push(session, &["--pr"]));
+
+    assert_eq!(report["pr"]["number"], 7, "{report}");
+    assert_eq!(
+        fixture.tracking_main(),
+        landed,
+        "push --pr fetched: {report}"
+    );
+    assert!(
+        report.get("default_branch_fetch_age_seconds").is_none(),
+        "{report}"
+    );
+}
+
+#[test]
+fn reuse_of_a_recent_default_branch_fetch_can_be_turned_off() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, _) = fixture.session_with_commit();
+    json(&fixture.push(session, &[]));
+    let landed = fixture.land_on_remote_only("reuse-off");
+
+    let id = session.to_string();
+    let report = json(&fixture.run_with_env(
+        &["push", "--session", &id, "--json"],
+        &[("AETHYME_PUSH_FETCH_REUSE", "off")],
+    ));
+
+    assert_eq!(fixture.tracking_main(), landed, "push fetched: {report}");
+    assert!(
+        report.get("default_branch_fetch_age_seconds").is_none(),
+        "{report}"
+    );
+}
+
+/// Only `push` reuses a recent fetch: `sync` exists to catch up with the
+/// default branch as it is now.
+#[test]
+fn sync_fetches_even_right_after_a_push_fetched() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, _) = fixture.session_with_commit();
+    json(&fixture.push(session, &[]));
+    let landed = fixture.land_on_remote_only("before-sync");
+
+    fixture.run(&["sync", "--session", &session.to_string(), "--json"]);
+
+    assert_eq!(fixture.tracking_main(), landed, "sync fetched");
 }
