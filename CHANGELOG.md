@@ -4,6 +4,16 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.72] - 2026-11-12
+
+### Added
+
+- Report why commands failed in `broker advanced metrics --json` as `failure_reasons`: for the last seven days, each command's failures grouped by the message it printed (with paths, identifiers and numbers taken out), its exit class, and the five most frequent reasons (#1598).
+
+### Changed
+
+- `broker submit prepare` now exits 6 when the shared preparation cache stayed busy for the whole `--wait` budget, and 3 when the cache is held by a dead holder or a mismatched capacity policy; both were exit 1. The contention message says to rerun or pass a longer `--wait` (#1599).
+
 ## [0.8.71] - 2026-11-12
 
 ### Fixed
