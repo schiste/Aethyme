@@ -793,6 +793,33 @@ pub fn fetch_reconciled_payload(
     status: crate::types::OperationStatus,
     exit_code: Option<i64>,
 ) -> String {
+    fetch_reconciled_payload_from(
+        FETCH_RECONCILED_OBSERVED_COMPLETION,
+        operation_id,
+        repository,
+        scope,
+        effect,
+        status,
+        exit_code,
+    )
+}
+
+/// `reconciliation_source` of a fetch settled by observed child completion.
+pub const FETCH_RECONCILED_OBSERVED_COMPLETION: &str = "observed_fetch_completion";
+/// `reconciliation_source` of a repeatable fetch closed without an operator
+/// because fetching again is its whole recovery (added 2026-11-12).
+pub const FETCH_RECONCILED_REPEATABLE_AUTO_RESOLVED: &str = "repeatable_fetch_auto_resolved";
+
+/// [`fetch_reconciled_payload`] naming which automatic rule settled it.
+pub fn fetch_reconciled_payload_from(
+    source: &str,
+    operation_id: i64,
+    repository: &str,
+    scope: &str,
+    effect: crate::types::OperationEffect,
+    status: crate::types::OperationStatus,
+    exit_code: Option<i64>,
+) -> String {
     let mut payload: serde_json::Value = serde_json::from_str(&operation_payload(
         operation_id,
         crate::types::OperationProvider::Git,
@@ -803,7 +830,7 @@ pub fn fetch_reconciled_payload(
         exit_code,
     ))
     .expect("operation payload is JSON");
-    payload["reconciliation_source"] = json!("observed_fetch_completion");
+    payload["reconciliation_source"] = json!(source);
     payload.to_string()
 }
 

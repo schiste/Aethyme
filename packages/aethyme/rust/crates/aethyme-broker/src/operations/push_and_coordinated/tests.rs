@@ -2715,3 +2715,73 @@ fn push_stage_spans_name_only_a_push_stage() {
         "a fetch or gh write on the same lane names no push stage"
     );
 }
+
+#[test]
+fn gh_file_arguments_name_only_files_gh_itself_will_read() {
+    let files = |argv: &[&str]| gh_file_arguments(&gh(argv));
+    let pair = |flag: &str, path: &str| (flag.to_owned(), path.to_owned());
+    assert_eq!(
+        files(&["pr", "create", "--title", "t", "--body-file", "body.md"]),
+        vec![pair("--body-file", "body.md")]
+    );
+    assert_eq!(
+        files(&["-R", "o/r", "pr", "comment", "1", "-F", "c.md"]),
+        vec![pair("-F", "c.md")]
+    );
+    assert_eq!(
+        files(&["release", "create", "v1", "--notes-file=notes.md"]),
+        vec![pair("--notes-file", "notes.md")]
+    );
+    assert_eq!(
+        files(&[
+            "api",
+            "--method",
+            "POST",
+            "repos/o/r/issues",
+            "-F",
+            "title=plain",
+            "-F",
+            "body=@body.md",
+            "--input",
+            "payload.json",
+        ]),
+        vec![pair("-F", "body.md"), pair("--input", "payload.json")]
+    );
+    assert_eq!(
+        files(&["workflow", "run", "ci.yml", "--field", "config=@c.json"]),
+        vec![pair("--field", "c.json")]
+    );
+    // Standard input, inline values and flags these commands do not read
+    // files through are never treated as paths.
+    assert!(files(&["pr", "create", "--body-file", "-"]).is_empty());
+    assert!(files(&["api", "graphql", "-F", "query=@-"]).is_empty());
+    assert!(files(&["api", "graphql", "-f", "query=@q.graphql"]).is_empty());
+    assert!(files(&["workflow", "run", "ci.yml", "-F", "ref=main"]).is_empty());
+    assert!(files(&["run", "view", "1", "-F", "x"]).is_empty());
+    assert!(files(&["pr", "create", "--input", "x"]).is_empty());
+}
+
+#[test]
+fn gh_file_validation_refuses_missing_empty_and_directory_paths_only() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("body.md"), "text").unwrap();
+    std::fs::write(dir.path().join("empty.md"), "").unwrap();
+    std::fs::create_dir(dir.path().join("folder")).unwrap();
+    let check = |argv: &[&str]| validate_gh_file_arguments(&gh(argv), dir.path());
+    assert!(check(&["pr", "create", "--body-file", "body.md"]).is_ok());
+    let absolute = dir.path().join("body.md");
+    assert!(check(&["pr", "create", "--body-file", absolute.to_str().unwrap()]).is_ok());
+    assert!(check(&["pr", "create", "--body-file", "/dev/null"]).is_ok());
+    for (argv, problem) in [
+        (
+            &["pr", "create", "--body-file", "missing.md"][..],
+            "cannot be read",
+        ),
+        (&["pr", "create", "-F", "empty.md"], "is empty"),
+        (&["pr", "create", "--body-file", "folder"], "is a directory"),
+    ] {
+        let error = check(argv).unwrap_err().to_string();
+        assert!(error.contains(problem), "{argv:?}: {error}");
+        assert!(error.contains("nothing was journaled"), "{error}");
+    }
+}

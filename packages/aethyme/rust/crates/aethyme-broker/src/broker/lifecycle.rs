@@ -5090,6 +5090,12 @@ impl Broker {
         broker.collaboration_fence_state(FenceTrigger::Open);
         broker.backfill_live_repository_contracts()?;
         broker.reap_abandoned_prepared_operations()?;
+        // Best effort: an unresolved repeatable fetch keeps blocking only
+        // until the next write reaches its lock, which retries the same step.
+        crate::warn_unrecorded(
+            "auto-resolve interrupted repeatable fetches",
+            broker.auto_resolve_abandoned_repeatable_fetches(),
+        );
         broker.recover_prepared_reconciliation()?;
         // Best effort: only an already-confirmed journal may be resumed here.
         // If current eligibility or an older journal's missing fingerprint

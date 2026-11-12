@@ -2624,6 +2624,16 @@ pub struct FinishCleanupReport {
     /// kept. Separate from `reclaimed_bytes`, which counts worktree removal.
     #[serde(default)]
     pub artifact_bytes_reclaimed: u64,
+    /// Post-close checkout reclaim could not be queued because another
+    /// process (normally the background reclaim worker) holds the GC lock.
+    /// The durable cleanup request is kept, so reclaim is deferred to that
+    /// process or the next wake, not skipped. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reclaim_deferred: bool,
+    /// Process holding the GC lock when `reclaim_deferred` is set, when its
+    /// lock file names one. Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reclaim_worker_pid: Option<i64>,
     pub worktree_removed: bool,
     pub branch_removed: bool,
     pub branch_ref: Option<String>,

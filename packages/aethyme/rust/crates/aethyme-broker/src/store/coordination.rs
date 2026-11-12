@@ -484,7 +484,25 @@ impl BrokerStore {
             ],
         )?;
         let payload = if resolution.is_some() {
-            crate::events::fetch_reconciled_payload(
+            // Only two automatic rules resolve here; anything else in the
+            // new details is reported as the original observed-completion rule.
+            let auto_resolved = serde_json::from_str::<serde_json::Value>(details_json)
+                .ok()
+                .and_then(|details| {
+                    details
+                        .pointer("/reconciliation/source")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .is_some_and(|source| {
+                    source == crate::events::FETCH_RECONCILED_REPEATABLE_AUTO_RESOLVED
+                });
+            crate::events::fetch_reconciled_payload_from(
+                if auto_resolved {
+                    crate::events::FETCH_RECONCILED_REPEATABLE_AUTO_RESOLVED
+                } else {
+                    crate::events::FETCH_RECONCILED_OBSERVED_COMPLETION
+                },
                 expected.id,
                 &expected.repository,
                 &expected.scope,
