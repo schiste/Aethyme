@@ -1494,6 +1494,77 @@ pub(super) fn remove_inherited_git_config_overrides(command: &mut Command) {
         .env_remove("GIT_CONFIG_COUNT");
 }
 
+/// The files a `gh` command will read itself, as `(flag, path)` pairs.
+///
+/// `--body-file` and `--notes-file` read a file in every command that has
+/// them; `-F` is that same flag only under `pr`, `issue` and `release`. Under
+/// `api`, `--input` names a file; under `api` and `workflow`, `-F key=@path`
+/// reads one while `-F key=value` does not. `-` means standard input.
+fn gh_file_arguments(args: &[String]) -> Vec<(String, String)> {
+    let command = gh_subcommand(args).map(|(command, _)| command);
+    let api = args.first().is_some_and(|first| first == "api") || command == Some("api");
+    let typed_fields = api || command == Some("workflow");
+    let short_body_file = !typed_fields && matches!(command, Some("pr" | "issue" | "release"));
+    let mut files = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => (flag, Some(value.to_owned())),
+            _ => (arg.as_str(), None),
+        };
+        let field = match flag {
+            "--body-file" | "--notes-file" => false,
+            "--input" if api => false,
+            "-F" | "--field" if typed_fields => true,
+            "-F" if short_body_file => false,
+            _ => continue,
+        };
+        let Some(value) = inline.or_else(|| iter.next().cloned()) else {
+            break;
+        };
+        let path = if field {
+            match value.split_once("=@") {
+                Some((_, path)) => path.to_owned(),
+                None => continue,
+            }
+        } else {
+            value
+        };
+        if path != "-" {
+            files.push((flag.to_owned(), path));
+        }
+    }
+    files
+}
+
+/// Refuse a GitHub write whose file argument is missing, a directory or an
+/// empty regular file, before anything is journaled. `gh` reads these files
+/// itself and exits 1 when one is missing -- the same status it uses after an
+/// API error that may follow a partial write -- so the broker cannot tell
+/// the two apart afterwards, and such a typo used to be journaled
+/// `outcome_unknown` and write-block the repository. Pipes and other special
+/// files (process substitution, `/dev/stdin`) are accepted unread.
+fn validate_gh_file_arguments(args: &[String], cwd: &Path) -> Result<(), BrokerOpError> {
+    for (flag, path) in gh_file_arguments(args) {
+        let problem = match std::fs::metadata(cwd.join(&path)) {
+            Err(error) => Some(format!("cannot be read ({error})")),
+            Ok(metadata) if metadata.is_dir() => Some("is a directory".to_owned()),
+            Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {
+                Some("is empty".to_owned())
+            }
+            Ok(_) => None,
+        };
+        if let Some(problem) = problem {
+            return Err(BrokerOpError::InvalidCoordinatedOperation {
+                reason: format!(
+                    "{flag} {path:?} {problem}; nothing was journaled or sent to GitHub. Write the file, then run the same command again"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn redacted_command(provider: OperationProvider, args: &[String]) -> Result<String, BrokerOpError> {
     let sensitive_flags = [
         "-m",
@@ -1943,6 +2014,61 @@ impl Broker {
             reaped += 1;
         }
         Ok(reaped)
+    }
+
+    /// [`git_scopes::auto_resolve_repeatable_fetch`] for a caller that is
+    /// about to report the row as blocking: a failure to resolve it is a
+    /// warning and leaves today's block in place, never a new error.
+    fn auto_resolve_repeatable_fetch(
+        &mut self,
+        operation: &CoordinatedOperation,
+        deadline: Option<std::time::Instant>,
+    ) -> bool {
+        match git_scopes::auto_resolve_repeatable_fetch(self, operation, deadline) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                crate::warn_unrecorded(
+                    "auto-resolve an interrupted repeatable fetch",
+                    Err::<(), _>(error),
+                );
+                false
+            }
+        }
+    }
+
+    /// Resolve repeatable fetches left `outcome_unknown`, or `running` by a
+    /// process that is gone, from broker open. Without this the row would
+    /// still be reported as write-blocking until another write reached the
+    /// same lock. Bounded: the host ledger is waited on for at most two
+    /// seconds per row, and a row that cannot be resolved stays for the
+    /// write path to retry.
+    pub(crate) fn auto_resolve_abandoned_repeatable_fetches(
+        &mut self,
+    ) -> Result<usize, BrokerOpError> {
+        let pending = self.store().pending_coordinated_operations()?;
+        let mut resolved = 0;
+        for operation in pending {
+            if !git_scopes::records_repeatable_tracking_fetch(&operation) {
+                continue;
+            }
+            let operation = match operation.status {
+                OperationStatus::OutcomeUnknown => operation,
+                OperationStatus::Running if process_is_gone(operation.pid) => {
+                    self.store().transition_coordinated_operation(
+                        operation.id,
+                        OperationStatus::OutcomeUnknown,
+                        operation.exit_code,
+                        Some(r#"{"reason":"process_ended_without_outcome"}"#),
+                    )?
+                }
+                _ => continue,
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            if self.auto_resolve_repeatable_fetch(&operation, Some(deadline)) {
+                resolved += 1;
+            }
+        }
+        Ok(resolved)
     }
 
     pub(crate) fn run_coordinated_operation_at(
@@ -2416,6 +2542,9 @@ impl Broker {
                     .into(),
             });
         }
+        if request.provider == OperationProvider::Github && effect != OperationEffect::Read {
+            validate_gh_file_arguments(&request.args, cwd)?;
+        }
         // A session id is all a caller needs to name a session, so it proves
         // nothing about whose branch is being deleted or rewritten. Before
         // anything is journaled: the refusal leaves no operation behind (#393).
@@ -2586,6 +2715,12 @@ impl Broker {
 
         let is_remote_write = effect != OperationEffect::Read
             && (resolved_target.is_some() || github_target.is_some());
+        // A fetch of one branch into its own tracking ref touches nothing but
+        // that local ref and is safe to repeat, so no ending of it -- error,
+        // timeout or crash -- leaves anything for an operator to inspect.
+        let repeatable_fetch = request.provider == OperationProvider::Git
+            && git_scopes::is_repeatable_tracking_fetch(&request.args);
+        let remote_outcome_uncertain = is_remote_write && !repeatable_fetch;
 
         // Register before queueing, not after acquiring. An operation that only
         // existed once it held the lock was invisible for the whole wait, so a
@@ -3016,7 +3151,9 @@ impl Broker {
                             operation.exit_code,
                             Some(r#"{"reason":"process_ended_without_outcome"}"#),
                         )?;
-                        if git_scopes::try_reconcile(self, &blocking, cwd, admission)? {
+                        if git_scopes::try_reconcile(self, &blocking, cwd, admission)?
+                            || self.auto_resolve_repeatable_fetch(&blocking, admission.at)
+                        {
                             continue;
                         }
                         self.resolve_unstarted_operation(queued_operation_id, "repository_blocked");
@@ -3027,7 +3164,9 @@ impl Broker {
                         });
                     }
                     OperationStatus::OutcomeUnknown => {
-                        if git_scopes::try_reconcile(self, &operation, cwd, admission)? {
+                        if git_scopes::try_reconcile(self, &operation, cwd, admission)?
+                            || self.auto_resolve_repeatable_fetch(&operation, admission.at)
+                        {
                             continue;
                         }
                         let recovery = UnknownOutcomeRecovery::from_operation(&operation);
@@ -3276,7 +3415,7 @@ impl Broker {
             }) => {
                 let operation_liveness =
                     operation_heartbeat.as_mut().map(OperationHeartbeat::finish);
-                let status = if is_remote_write {
+                let status = if remote_outcome_uncertain {
                     OperationStatus::OutcomeUnknown
                 } else {
                     OperationStatus::Failed
@@ -3290,7 +3429,7 @@ impl Broker {
                             "failure_class": "coordinated_operation_timeout",
                             "stage": stage,
                             "budget": budget,
-                            "remote_outcome": if is_remote_write {
+                            "remote_outcome": if remote_outcome_uncertain {
                                 "unknown"
                             } else {
                                 "not_applicable"
@@ -3484,6 +3623,23 @@ impl Broker {
                         "failure_class": "local_git_command_failed",
                         "remote_contact": "not_applicable",
                         "recovery": "inspect_or_abort_local_worktree_state",
+                    }),
+                ),
+            )
+        } else if repeatable_fetch {
+            // A failed fetch moved at most its own tracking ref to a value the
+            // remote really held. Fetching again is the whole recovery, so
+            // `outcome_unknown` would write-block every session for nothing.
+            (
+                OperationStatus::Failed,
+                journal_details(
+                    classification,
+                    resolved_target.as_ref(),
+                    github_target.as_ref(),
+                    json!({
+                        "failure_class": "repeatable_fetch_failed",
+                        "remote_outcome": "not_applicable",
+                        "recovery": "fetch_again",
                     }),
                 ),
             )

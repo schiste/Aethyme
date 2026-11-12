@@ -144,6 +144,38 @@ runs the same guarded closed-session reclaim on every retained checkout it
 did not remove. Both are `0` for a read-only plan. `retention.artifact_sweep_budget_ms = 0`
 or `[cleanup] strict = true` still disables the reclaim.
 
+## Deferred post-close reclaim
+
+`broker finish --json` adds `cleanup.reclaim_deferred` (bool) and
+`cleanup.reclaim_worker_pid` (integer). Both are omitted unless finish could
+not queue post-close checkout cleanup because another process held the GC
+lock (`.aethyme/gc.lock`), normally the background reclaim worker; the pid is
+that lock's owner when the lock file names one. `reclaim_deferred: true` means
+reclaim was handed off, not skipped: the session's durable cleanup request is
+kept, the running worker re-reads that request after its cache lane, and any
+later broker open re-queues it. Nothing is removed before the request's
+closed-worktree grace period ends either way. `cleanup.attempted` and
+`cleanup.artifact_bytes_reclaimed` keep their meaning. Readers of saved reports
+must treat a missing field as `false` / absent.
+
+## Coordinated fetches never write-block (2026-11-12)
+
+A coordinated fetch of exactly one branch into its own remote-tracking ref
+(`fetch <remote> refs/heads/<b>:refs/remotes/<remote>/<b>`, or the strict
+`--atomic` profile) is journaled `failed` when it exits non-zero or times out,
+with `details.failure_class` `repeatable_fetch_failed` or
+`coordinated_operation_timeout` and `remote_outcome: not_applicable`. A crash
+mid-fetch is closed as `reconciled_failed` with
+`details.reconciliation.source: repeatable_fetch_auto_resolved` and an
+`operation.fetch_reconciled` event, at broker open or the next overlapping
+write. None of these write-blocks the repository. Every other write, including
+any other fetch spelling, keeps `outcome_unknown` and its barrier.
+
+A coordinated `gh` write whose `--body-file`, `--notes-file`, `-F <file>`
+(under `pr`, `issue` and `release`), `--input` (under `api`) or
+`-F key=@file` (under `api` and `workflow`) names a missing file, a directory
+or an empty regular file is refused before anything is journaled.
+
 ## Automatic checkout maintenance (v0.8.44)
 
 `AutoCleanupReport` adds optional `sessions_retired` and

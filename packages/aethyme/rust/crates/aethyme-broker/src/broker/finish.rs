@@ -298,10 +298,7 @@ impl Broker {
             let handoff_result = self.record_finished_handoff(report);
             drop(_lifecycle_claim);
             if checkout_cleanup_request.is_some() {
-                crate::warn_unrecorded(
-                    "wake post-close checkout cleanup",
-                    self.request_checkout_cleanup_after_close(report.session_id),
-                );
+                self.wake_checkout_cleanup_after_close(report.session_id, &mut report.cleanup);
             }
             handoff_result?;
             return Ok(());
@@ -433,13 +430,27 @@ impl Broker {
         let handoff_result = self.record_finished_handoff(report);
         drop(_lifecycle_claim);
         if checkout_cleanup_request.is_some() {
-            crate::warn_unrecorded(
-                "wake post-close checkout cleanup",
-                self.request_checkout_cleanup_after_close(report.session_id),
-            );
+            self.wake_checkout_cleanup_after_close(report.session_id, &mut report.cleanup);
         }
         handoff_result?;
         Ok(())
+    }
+
+    /// Queue post-close checkout cleanup. When another process already holds
+    /// the GC lock, say so in `cleanup` so a JSON reader can tell reclaim was
+    /// deferred to it rather than skipped; the stderr warning is kept.
+    pub(super) fn wake_checkout_cleanup_after_close(
+        &mut self,
+        session_id: i64,
+        cleanup: &mut FinishCleanupReport,
+    ) {
+        if let Err(error) = self.request_checkout_cleanup_after_close(session_id) {
+            if let BrokerOpError::GcLocked { pid } = &error {
+                cleanup.reclaim_deferred = true;
+                cleanup.reclaim_worker_pid = pid.trim().parse().ok();
+            }
+            crate::warn_unrecorded("wake post-close checkout cleanup", Err::<(), _>(error));
+        }
     }
 
     /// Finish a session at the operator level: close it when there is no
@@ -1022,10 +1033,7 @@ impl Broker {
         self.finalize_finish_report(&mut report);
         self.persist_finish_report(&report, checkout_cleanup_request)?;
         if checkout_cleanup_request.is_some() {
-            crate::warn_unrecorded(
-                "wake post-close checkout cleanup",
-                self.request_checkout_cleanup_after_close(session_id),
-            );
+            self.wake_checkout_cleanup_after_close(session_id, &mut report.cleanup);
         }
         Ok(report)
     }
@@ -1548,6 +1556,63 @@ pub(crate) struct DefaultBranchLanding {
 #[cfg(test)]
 mod checkout_cleanup_grace_tests {
     use super::*;
+
+    #[test]
+    fn a_held_gc_lock_reports_reclaim_as_deferred_not_skipped() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["commit", "-q", "--allow-empty", "-m", "fixture"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+
+        let mut free = FinishCleanupReport::default();
+        broker.wake_checkout_cleanup_after_close(1, &mut free);
+        assert!(!free.reclaim_deferred);
+        assert_eq!(free.reclaim_worker_pid, None);
+        let json = serde_json::to_value(&free).unwrap();
+        assert!(
+            json.get("reclaim_deferred").is_none() && json.get("reclaim_worker_pid").is_none(),
+            "absent unless deferred, so existing finish shapes are unchanged: {json}"
+        );
+
+        // A live process (this one) holds the GC lock, as the background
+        // reclaim worker does while it runs.
+        std::fs::write(
+            root.join(".aethyme/gc.lock"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        let mut held = FinishCleanupReport::default();
+        broker.wake_checkout_cleanup_after_close(1, &mut held);
+        assert!(held.reclaim_deferred);
+        assert_eq!(held.reclaim_worker_pid, Some(i64::from(std::process::id())));
+        let json = serde_json::to_value(&held).unwrap();
+        assert_eq!(json["reclaim_deferred"], true);
+        assert_eq!(json["reclaim_worker_pid"], i64::from(std::process::id()));
+        assert_eq!(json["attempted"], false);
+        let saved: FinishCleanupReport =
+            serde_json::from_str(r#"{"requested":true,"kept":false,"attempted":false,"completed":false,"reclaimed_bytes":0,"worktree_removed":false,"branch_removed":false,"branch_ref":null,"branch_tip":null,"failure":null,"recovery_action":null}"#)
+                .unwrap();
+        assert!(
+            !saved.reclaim_deferred,
+            "saved reports without the field still load"
+        );
+    }
 
     #[test]
     fn close_scheduling_uses_compact_opt_in_without_lowering_archive_retention() {

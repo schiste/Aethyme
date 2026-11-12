@@ -1908,6 +1908,297 @@ fn crashed_write_blocks_until_operator_reconciliation() {
     assert!(retry.ok());
 }
 
+/// A pid that certainly belonged to a process which has exited.
+fn exited_child_pid() -> i64 {
+    let mut child = Command::new("git")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = i64::from(child.id());
+    assert!(child.wait().unwrap().success());
+    pid
+}
+
+/// Bind the worktree root, without which broker open skips its recovery.
+fn bind_worktree_root(broker: &mut Broker) {
+    let root_setup = broker
+        .start_worktree("bind root before operation recovery", None)
+        .unwrap();
+    broker.close(root_setup.id).unwrap();
+    broker.cleanup(root_setup.id, false).unwrap();
+}
+
+/// Journal a write that was `running` when its broker process died.
+fn record_interrupted_write(broker: &mut Broker, session_id: i64, command: &[&str]) -> i64 {
+    let repository = format!("local:{}", broker.main_root().display());
+    let command_json = serde_json::to_string(command).unwrap();
+    let operation = broker
+        .store()
+        .create_coordinated_operation(&NewCoordinatedOperation {
+            session_id,
+            provider: OperationProvider::Git,
+            repository,
+            scope: "repository".into(),
+            effect: OperationEffect::Write,
+            authorization_reason: Some("simulated interrupted operation".into()),
+            command_json,
+            pid: exited_child_pid(),
+            host_operation_id: None,
+            identity_provenance: OperationIdentityProvenance::LocalRepository,
+        })
+        .unwrap();
+    broker
+        .store()
+        .transition_coordinated_operation(operation.id, OperationStatus::Running, None, None)
+        .unwrap();
+    operation.id
+}
+
+fn assert_auto_resolved_fetch(broker: &mut Broker, operation_id: i64) {
+    let shown = broker.show_coordinated_operation(operation_id).unwrap();
+    assert_eq!(
+        shown.reconciliation.state,
+        OperationReconciliationState::ReconciledFailed,
+        "the journal row is kept and closed, not deleted"
+    );
+    assert!(!shown.reconciliation.write_blocked);
+    assert_eq!(
+        shown.reconciliation.source.as_deref(),
+        Some("repeatable_fetch_auto_resolved")
+    );
+    let events = broker.store().events_after(0, i64::MAX).unwrap();
+    let event = events
+        .iter()
+        .rev()
+        .find(|event| event.kind == "operation.fetch_reconciled")
+        .expect("auto-resolution is visible in the event log");
+    let payload: serde_json::Value =
+        serde_json::from_str(event.payload_json.as_deref().unwrap()).unwrap();
+    assert_eq!(payload["operation_id"], operation_id);
+    assert_eq!(payload["status"], "reconciled_failed");
+    assert_eq!(
+        payload["reconciliation_source"],
+        "repeatable_fetch_auto_resolved"
+    );
+}
+
+#[test]
+fn interrupted_default_branch_fetch_does_not_block_another_sessions_write() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    let fetching = add_worktree(tmp.path(), "fetching");
+    let writing = add_worktree(tmp.path(), "writing");
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    let fetch_session = broker.adopt(&fetching, None).unwrap();
+    let write_session = broker.adopt(&writing, None).unwrap();
+    let fetch = record_interrupted_write(
+        &mut broker,
+        fetch_session.id,
+        &[
+            "git",
+            "fetch",
+            "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+        ],
+    );
+
+    let report = broker
+        .run_coordinated_operation(request(write_session.id, &["branch", "after-fetch"]))
+        .expect("an interrupted fetch must not write-block another session");
+    assert!(report.ok());
+    assert_auto_resolved_fetch(&mut broker, fetch);
+}
+
+#[test]
+fn interrupted_push_still_blocks_while_an_interrupted_fetch_does_not() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    let worktree = add_worktree(tmp.path(), "pin-push");
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    bind_worktree_root(&mut broker);
+    let session = broker.adopt(&worktree, None).unwrap();
+    // Each of these may have changed the remote, so each must stay a barrier.
+    for command in [
+        &["git", "push", "origin", "refs/heads/main:refs/heads/main"][..],
+        &["git", "push", "--force", "origin", "main"],
+        &["git", "push", "origin", "refs/tags/v1:refs/tags/v1"],
+        &["git", "push", "origin", ":refs/heads/gone"],
+        // A fetch outside the repeatable profile keeps today's handling.
+        &["git", "fetch", "--prune", "origin"],
+    ] {
+        let stale = record_interrupted_write(&mut broker, session.id, command);
+        let blocked = broker
+            .run_coordinated_operation(request(session.id, &["branch", "after-push"]))
+            .unwrap_err();
+        assert!(
+            matches!(
+                blocked,
+                BrokerOpError::CoordinatedOperationBlocked { operation_id, .. }
+                    if operation_id == stale
+            ),
+            "{command:?}: {blocked}"
+        );
+        let shown = broker.show_coordinated_operation(stale).unwrap();
+        assert_eq!(
+            shown.reconciliation.state,
+            OperationReconciliationState::Required,
+            "{command:?}"
+        );
+        assert!(shown.reconciliation.write_blocked);
+        broker
+            .reconcile_coordinated_operation(stale, false, "test inspected the remote")
+            .unwrap();
+    }
+    // Reopening never auto-resolves a real write either.
+    let stale = record_interrupted_write(
+        &mut broker,
+        session.id,
+        &["git", "push", "origin", "refs/heads/main:refs/heads/main"],
+    );
+    drop(broker);
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    let operation = broker
+        .store()
+        .coordinated_operation(stale)
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            operation.status,
+            OperationStatus::Running | OperationStatus::OutcomeUnknown
+        ),
+        "{:?}",
+        operation.status
+    );
+    assert!(matches!(
+        broker
+            .run_coordinated_operation(request(session.id, &["branch", "after-reopen"]))
+            .unwrap_err(),
+        BrokerOpError::CoordinatedOperationBlocked { operation_id, .. } if operation_id == stale
+    ));
+}
+
+#[test]
+fn opening_the_broker_resolves_an_interrupted_fetch_without_another_write() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    let worktree = add_worktree(tmp.path(), "fetch-open");
+    let operation_id;
+    {
+        let mut broker = common::open_fixture_repository_broker(&tmp)
+            .unwrap()
+            .into_broker();
+        bind_worktree_root(&mut broker);
+        let session = broker.adopt(&worktree, None).unwrap();
+        operation_id = record_interrupted_write(
+            &mut broker,
+            session.id,
+            &[
+                "git",
+                "fetch",
+                "origin",
+                "refs/heads/main:refs/remotes/origin/main",
+            ],
+        );
+    }
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    assert!(
+        broker
+            .store()
+            .pending_coordinated_operations()
+            .unwrap()
+            .is_empty(),
+        "no unresolved row is left to be reported as blocking"
+    );
+    assert_auto_resolved_fetch(&mut broker, operation_id);
+}
+
+#[test]
+fn failed_fetch_is_failed_and_does_not_block_the_next_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = push_fixture(tmp.path(), "failed-fetch");
+    let mut broker = fixture.broker;
+    let mut fetch = exact_push_request(fixture.session_id, &fixture.worktree, &[]);
+    fetch.args = [
+        "fetch",
+        "origin",
+        "refs/heads/absent:refs/remotes/origin/absent",
+    ]
+    .iter()
+    .map(|arg| (*arg).into())
+    .collect();
+    let report = broker.run_coordinated_operation(fetch).unwrap();
+    assert!(!report.command_success, "the remote has no such branch");
+    assert_eq!(report.operation.status, OperationStatus::Failed);
+    let details: serde_json::Value =
+        serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(details["failure_class"], "repeatable_fetch_failed");
+    assert!(report.unknown_outcome_recovery().is_none());
+    let retry = broker
+        .run_coordinated_operation(request(
+            fixture.session_id,
+            &["branch", "after-failed-fetch"],
+        ))
+        .unwrap();
+    assert!(retry.ok());
+}
+
+#[test]
+fn github_write_with_an_unreadable_file_argument_is_refused_before_journaling() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    let worktree = add_worktree(tmp.path(), "gh-files");
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    let session = broker.adopt(&worktree, None).unwrap();
+    std::fs::write(worktree.join("empty.md"), "").unwrap();
+    std::fs::create_dir(worktree.join("notes")).unwrap();
+    for (args, flag) in [
+        (
+            &["issue", "comment", "1", "--body-file", "missing.md"][..],
+            "--body-file",
+        ),
+        (&["pr", "create", "-F", "empty.md"], "-F"),
+        (
+            &["release", "create", "v1", "--notes-file=notes"],
+            "--notes-file",
+        ),
+        (
+            &["api", "repos/owner/repo/issues", "-F", "body=@missing.md"],
+            "-F",
+        ),
+        (
+            &["api", "--method", "POST", "graphql", "--input", "empty.md"],
+            "--input",
+        ),
+    ] {
+        let mut write = github_request(session.id, "owner/repo", args);
+        write.declared_effect = None;
+        write.scope = None;
+        write.authorization_reason = Some("test file pre-validation".into());
+        let error = broker.run_coordinated_operation(write).unwrap_err();
+        assert!(
+            matches!(error, BrokerOpError::InvalidCoordinatedOperation { .. }),
+            "{args:?}: {error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains(flag), "{args:?}: {message}");
+        assert!(message.contains("nothing was journaled"), "{message}");
+    }
+    assert!(broker.store().coordinated_operations().unwrap().is_empty());
+}
+
 #[test]
 fn opening_the_broker_reaps_a_dead_prepared_operation_without_another_write() {
     let tmp = common::FixtureRepository::new();

@@ -616,9 +616,166 @@ pub(super) fn try_reconcile(
         .is_some())
 }
 
+/// `reconciliation.source` of a repeatable fetch closed without an operator.
+pub(crate) const REPEATABLE_FETCH_AUTO_RESOLVED: &str =
+    crate::events::FETCH_RECONCILED_REPEATABLE_AUTO_RESOLVED;
+
+/// Whether `args` fetch exactly one branch into its own remote-tracking ref.
+///
+/// Such a fetch reads the remote and moves one local remote-tracking ref,
+/// atomically under Git's own ref lock. It cannot leave the remote in an
+/// unknown state, and repeating it converges on whatever the remote holds, so
+/// an interrupted or failed attempt never needs anyone to inspect external
+/// state. Both spellings the broker issues qualify: the strict profile above
+/// and `fetch <remote> refs/heads/<b>:refs/remotes/<remote>/<b>`. Any other
+/// fetch (extra flags, globs, forced or several refspecs, leading global
+/// options, a URL remote) keeps the conservative unknown-outcome handling.
+pub(crate) fn is_repeatable_tracking_fetch(args: &[String]) -> bool {
+    if fetch_footprint(args).is_some() {
+        return true;
+    }
+    let [command, remote, refspec] = args else {
+        return false;
+    };
+    if command != "fetch" || !ref_component(remote) || remote.contains('/') {
+        return false;
+    }
+    let Some((source, destination)) = refspec.split_once(':') else {
+        return false;
+    };
+    source.strip_prefix("refs/heads/").is_some_and(|branch| {
+        ref_component(branch) && destination == format!("refs/remotes/{remote}/{branch}")
+    })
+}
+
+/// [`is_repeatable_tracking_fetch`] for a journaled operation.
+pub(crate) fn records_repeatable_tracking_fetch(operation: &CoordinatedOperation) -> bool {
+    operation.provider == OperationProvider::Git
+        && serde_json::from_str::<Vec<String>>(&operation.command_json)
+            .ok()
+            .is_some_and(|command| command.get(1..).is_some_and(is_repeatable_tracking_fetch))
+}
+
+/// Close an `outcome_unknown` repeatable fetch without operator inspection.
+///
+/// The row is kept and becomes `reconciled_failed`: nothing is trusted to
+/// have been refreshed, so the next caller simply fetches again. The
+/// `operation.fetch_reconciled` event and `reconciliation.source` say it was
+/// resolved automatically and why. Returns whether this call resolved it.
+pub(crate) fn auto_resolve_repeatable_fetch(
+    broker: &mut Broker,
+    operation: &CoordinatedOperation,
+    deadline: Option<std::time::Instant>,
+) -> Result<bool, BrokerOpError> {
+    if operation.status != OperationStatus::OutcomeUnknown
+        || !records_repeatable_tracking_fetch(operation)
+    {
+        return Ok(false);
+    }
+    let started = Instant::now();
+    if let Some(host_id) = &operation.host_operation_id {
+        crate::host_operations::reconcile_host_operation_with_deadline(
+            &broker.host_operation_database_path()?,
+            host_id,
+            false,
+            deadline,
+        )?;
+    }
+    let mut details = serde_json::from_str::<serde_json::Value>(
+        operation.details_json.as_deref().unwrap_or("{}"),
+    )
+    .ok()
+    .filter(serde_json::Value::is_object)
+    .unwrap_or_else(|| json!({}));
+    details["reconciliation"] = json!({
+        "source": REPEATABLE_FETCH_AUTO_RESOLVED,
+        "outcome": OperationStatus::ReconciledFailed.as_str(),
+        "reason": "a fetch only moves one local remote-tracking ref and is safe to repeat; it cannot leave the remote in an unknown state",
+        "recovery": "fetch again",
+        "resolved_at": unix_now_ms(),
+    });
+    let resolved = broker
+        .store()
+        .reconcile_observed_operation(
+            operation,
+            &details.to_string(),
+            OperationStatus::ReconciledFailed,
+            operation.exit_code,
+        )?
+        .is_some();
+    if resolved {
+        crate::phase_telemetry::add("coordinated_operation_auto_resolved", started.elapsed());
+    }
+    Ok(resolved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_single_branch_tracking_fetches_are_repeatable() {
+        let args = |parts: &[&str]| {
+            parts
+                .iter()
+                .map(|part| (*part).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(is_repeatable_tracking_fetch(
+            &canonical_fetch_args("origin", "main").unwrap()
+        ));
+        assert!(is_repeatable_tracking_fetch(&args(&[
+            "fetch",
+            "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+        ])));
+        assert!(is_repeatable_tracking_fetch(&args(&[
+            "fetch",
+            "upstream",
+            "refs/heads/release/1.0:refs/remotes/upstream/release/1.0",
+        ])));
+        for unsafe_spelling in [
+            &["fetch", "origin"][..],
+            &["fetch", "--all"],
+            &[
+                "fetch",
+                "origin",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ],
+            &["fetch", "origin", "refs/heads/main:refs/heads/main"],
+            &["fetch", "origin", "refs/heads/main:refs/remotes/other/main"],
+            &["fetch", "origin", "refs/heads/*:refs/remotes/origin/*"],
+            &[
+                "fetch",
+                "--upload-pack=x",
+                "refs/heads/main:refs/remotes/--upload-pack=x/main",
+            ],
+            &[
+                "fetch",
+                "/tmp/remote.git",
+                "refs/heads/main:refs/remotes/origin/main",
+            ],
+            &[
+                "-c",
+                "core.sshCommand=x",
+                "fetch",
+                "origin",
+                "refs/heads/main:refs/remotes/origin/main",
+            ],
+            &[
+                "fetch",
+                "--prune",
+                "origin",
+                "refs/heads/main:refs/remotes/origin/main",
+            ],
+            &["push", "origin", "refs/heads/main:refs/remotes/origin/main"],
+        ] {
+            assert!(
+                !is_repeatable_tracking_fetch(&args(unsafe_spelling)),
+                "{unsafe_spelling:?}"
+            );
+        }
+    }
 
     #[test]
     fn canonical_fetch_footprint_has_one_destination_and_no_auxiliary_ref_writes() {
