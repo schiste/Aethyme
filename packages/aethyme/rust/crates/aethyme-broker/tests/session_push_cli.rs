@@ -673,6 +673,9 @@ fn a_repository_that_follows_tags_keeps_the_historical_session_push() {
 fn a_commit_under_an_ambient_index_override_keeps_the_repository_lane() {
     let fixture = Fixture::new();
     let (session, worktree) = fixture.session_with_commit();
+    // The broker's own `git commit` needs an identity of its own.
+    git(&fixture.repo, &["config", "user.name", "t"]);
+    git(&fixture.repo, &["config", "user.email", "t@t"]);
     let branch = fixture.broker().store().session(session).unwrap().branch;
     let id = session.to_string();
     let index = format!(
