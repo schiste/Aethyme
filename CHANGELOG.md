@@ -4,6 +4,15 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.78] - 2026-11-12
+
+### Fixed
+
+- `broker finish` recognises work landed by a pull request in repositories that do not promote, including a squash merge. When the fetched default branch holds the session's content on every path any of its commits touched, finish closes the session as published without a manual `representation record`. A follow-up commit that is not on the default branch, including one that only restores a path, still blocks (#1625).
+- When finish cannot prove the work landed, its next step is now one that can resolve the state (`broker push --session <id> --pr`, or `finish --abandon --reason`), and `finish --abandon --reason` is honoured there. The abandonment event is recorded once, only when the session closes (#1625).
+- A rename landed by a pull request is reported to sessions still editing the old path; the check compared only against the integration branch (#1625).
+- Verified queue entries become `externally_landed` once their work is established on the default branch, so queue retention prunes them (#1625).
+
 ## [0.8.77] - 2026-11-12
 
 ### Removed
