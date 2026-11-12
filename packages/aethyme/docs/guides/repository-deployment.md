@@ -168,8 +168,8 @@ edited directly.
 
 The managed `.gitignore` block excludes machine-local broker state. It is
 generated from the broker's single runtime-path catalog, the same list
-`aethyme broker advanced ship` uses to tell broker output from operator
-changes, so the two cannot drift:
+the broker uses to tell its own output from operator changes, so the two
+cannot drift:
 
 - `.aethyme/broker.db*`;
 - `.aethyme/logs/`, `.aethyme/locks/`, `.aethyme/reports/`, `.aethyme/run/`,
