@@ -302,12 +302,21 @@ fn fixture() -> tempfile::TempDir {
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(&repo);
     std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-qm", "init"]);
+    aethyme_testkit::ensure_origin(&repo);
     tmp
+}
+
+/// The branch a `start --json` report names.
+fn started_branch(started: &serde_json::Value) -> String {
+    started["branch"]
+        .as_str()
+        .or_else(|| started["session"]["branch"].as_str())
+        .unwrap_or_else(|| panic!("start --json carries a branch: {started}"))
+        .to_string()
 }
 
 fn fixture_with_local_origin() -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -382,6 +391,13 @@ fn session_lifecycle_json_shapes_match_snapshots() {
 
     let status = json(&repo, &["broker", "status", "--json"]);
     entries.push(("status".to_string(), status_shape(&status)));
+
+    // The pull request merges on the provider: the only way work lands.
+    aethyme_testkit::land_as_pull_request(
+        &repo,
+        &started_branch(&started),
+        aethyme_testkit::MergeStyle::MergeCommit,
+    );
 
     let finished = json(
         &repo,
@@ -469,7 +485,6 @@ fn other_broker_json_shapes_match_snapshots() {
         "[graph]\nauthority = 'disabled'\n",
     )
     .unwrap();
-    aethyme_testkit::promote_on_submit(&repo);
     std::fs::write(
         repo.join(".aethyme/gates.toml"),
         "[[gate]]\nname = 'shape-gate'\ncommand = 'true'\ntriggers = ['src/**']\n",
@@ -602,6 +617,11 @@ fn other_broker_json_shapes_match_snapshots() {
             .or_else(|| submitted["entry_id"].as_i64())
             .is_some(),
         "submit --json carries an entry id: {submitted}"
+    );
+    aethyme_testkit::land_as_pull_request(
+        &repo,
+        &started_branch(&started),
+        aethyme_testkit::MergeStyle::MergeCommit,
     );
 
     git(&repo, &["branch", "--unset-upstream", "main"]);

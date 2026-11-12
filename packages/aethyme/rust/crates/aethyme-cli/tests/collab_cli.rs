@@ -228,7 +228,7 @@ const WRITE_COMMANDS: &[&[&str]] = &[
 fn without_a_policy_status_is_disabled_and_everything_else_refuses() {
     for config in [
         None,
-        Some("[promote]\nmode = \"auto\"\n"),
+        Some("[promote]\nmode = \"verify-only\"\n"),
         Some("[collaboration]\ncapture = \"off\"\n"),
     ] {
         let fixture = Fixture::new(config);
