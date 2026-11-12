@@ -29,7 +29,7 @@ pub const PUBLIC_VERBS: &[(&str, &str)] = &[
     ),
     (
         "submit",
-        "simulate, gate and promote a session; preparation and promotion recovery",
+        "simulate, gate and promote a session; preparation",
     ),
     (
         "push",
@@ -61,7 +61,6 @@ const MERGED_FORMS: &[(&str, &str, &[&str])] = &[
     ("status", "doctor", &["doctor"]),
     ("submit", "prepare", &["prepare"]),
     ("submit", "promote", &["promote"]),
-    ("submit", "promotion-record", &["promotion-record"]),
     ("finish", "close", &["close"]),
     ("finish", "cleanup", &["cleanup"]),
     ("gc", "reclaim", &["reclaim"]),
@@ -135,11 +134,7 @@ pub const ADVANCED_VERBS: &[(&str, &str)] = &[
     ("queue", "show the merge queue"),
     (
         "integration",
-        "inspect, wait on or reconcile the integration branch",
-    ),
-    (
-        "main",
-        "reconcile the local default branch onto integration",
+        "reconcile the integration branch with a fetched upstream",
     ),
     (
         "representation",
@@ -577,7 +572,6 @@ mod tests {
             ("status doctor", "doctor"),
             ("submit prepare --session 3", "prepare --session 3"),
             ("submit promote --entry 4", "promote --entry 4"),
-            ("submit promotion-record plan", "promotion-record plan"),
             ("finish close --session 3", "close --session 3"),
             ("finish cleanup 3 --force", "cleanup 3 --force"),
             ("gc reclaim plan", "reclaim plan"),

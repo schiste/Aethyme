@@ -773,14 +773,6 @@ Usage:
   aethyme broker promote --entry <id> [--json]
       Manual-mode only: advance the local integration branch to a verified
       entry's merge commit; other in-flight entries are re-simulated.
-  aethyme broker integration status [--json]
-      Focused promoted-but-unmerged view: the local integration branch as
-      a pending layer above main, with promoted entries, files changed,
-      live sessions conflicting with that layer, and the next action.
-  aethyme broker integration wait-stable [--seconds <n>] [--json]
-      Sample integration, wait for a quiet window (default: 30s), then
-      sample again. Fails if integration moved, printing the old and new
-      tips so long checks are not mistaken for current-tip proof.
   aethyme broker integration reconcile --upstream <ref> [--resolution-file <path>] [--write-resolution-template <path>] [--dry-run|--apply --confirm <sha256>] [--json]
       Compare already-fetched upstream with local main and promoted queue
       state. Dry-run is the default. --apply marks externally landed work,
@@ -871,20 +863,6 @@ Usage:
       bytes, blocker and next action per item, and the cleanup apply digest,
       which binds the same target snapshot. --repo audits the repository at
       <path> instead of the current directory.
-  aethyme broker main reconcile plan [--detail] [--resolution-file <path>] [--write-resolution-template <path>] [--json]
-      Read-only classification of everything the local default branch carries
-      that the integration branch does not. A commit counts as already
-      represented when integration holds its content for every path it touched,
-      which recognizes work that landed through a squashed promotion and whose
-      SHA therefore differs. A clean default branch that is a strict ancestor
-      of integration gets a `fast_forward` plan instead. Uncommitted tracked
-      changes, a checkout on another branch, or any commit that cannot be
-      proven represented refuse the apply.
-  aethyme broker main reconcile apply --session <id> --confirm <sha256> [--resolution-file <path>] [--json]
-      Move the local default branch onto integration after re-proving the
-      reviewed plan. A reset creates a preservation ref at the pre-move tip
-      first; a fast-forward runs `merge --ff-only` to the exact reviewed SHA
-      and needs none. Never runs when anything would be lost.
   aethyme broker representation scan --session <id> [--json]
   aethyme broker representation status --session <id> [--json]
       Read-only: decide whether this session's work is already present on the
@@ -894,15 +872,6 @@ Usage:
   aethyme broker representation record --session <id> --confirm <sha256> [--json]
       Record the reviewed landing so the session can finish. Re-proves the scan
       and refuses if anything moved since it was reviewed.
-  aethyme broker promotion-record plan [--json]
-      Read-only plan for integration commits that no promoted queue entry
-      claims. A commit is recoverable when exactly one non-promoted entry
-      recorded a merge tree equal to the commit's tree; ambiguous or
-      unmatched commits are reported, never repaired.
-  aethyme broker promotion-record apply --confirm <sha256> [--json]
-      Restore the promoted record for every recoverable candidate in the
-      reviewed plan. Re-proves each precondition, writes only status and
-      commit details, and rebuilds the missing path exposures.
   aethyme broker reclaim plan [--session <id>] [--json]
   aethyme broker reclaim apply --confirm <sha256> [--session <id>] [--json]
       Report regenerable build output (target, node_modules, .venv, build,
@@ -2909,8 +2878,6 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         "sync" => run_sync(parsed)?,
         "repair" => run_repair(parsed)?,
         "representation" => run_representation(parsed)?,
-        "main" => run_main_reconcile(parsed)?,
-        "promotion-record" => run_promotion_record(parsed)?,
         "checkpoint" => run_checkpoint(parsed)?,
         "queue" => run_queue(parsed)?,
         "promote" => run_promote(parsed)?,
@@ -3187,8 +3154,8 @@ fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseComma
         | "console" | "resources" | "agents" | "ownership" | "merge-chain" | "advisories"
         | "exposures" | "note" | "operations" | "gates" | "watch" | "pr" | "hooks" | "finish"
         | "close" | "gc" | "storage" | "unblock" | "doctor" | "quick-test" | "trust"
-        | "verify-loop" | "e2e" | "init" | "certify" | "scaffold" | "promotion-record"
-        | "checkpoint" | "promote" | "integration" | "events" => TaskLeaseCommandClass::OtherWork,
+        | "verify-loop" | "e2e" | "init" | "certify" | "scaffold" | "checkpoint" | "promote"
+        | "integration" | "events" => TaskLeaseCommandClass::OtherWork,
         _ => TaskLeaseCommandClass::NoSessionWork,
     }
 }

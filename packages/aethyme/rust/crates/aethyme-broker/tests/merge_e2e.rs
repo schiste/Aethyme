@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use aethyme_broker::{
     AdoptMode, AuditDisposition, Broker, CheckpointRefusalCode, CleanupDisposition,
     EntryExposureState, FinishOptions, FinishStatus, GitRepo, GraphIntegrityStatus,
-    IntegrationDeliveryState, IntegrationReconcileClassification, IntegrationReconcileOptions,
-    MergeStatus, NewSession, RepairAction, RepairSource, SessionOrigin, StatusAdviceSeverity,
-    SubmissionCommitOwnership, SubmissionGateVerificationStatus, SubmissionIntegrationState,
+    IntegrationReconcileClassification, IntegrationReconcileOptions, MergeStatus, NewSession,
+    RepairAction, RepairSource, SessionOrigin, StatusAdviceSeverity, SubmissionCommitOwnership,
+    SubmissionGateVerificationStatus, SubmissionIntegrationState,
 };
 use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, link_repo};
 use aethyme_graph_storage::bootstrap_repo;
@@ -2787,79 +2787,6 @@ fn status_reports_promoted_unmerged_work_as_separate_conflict_surface() {
 }
 
 #[test]
-fn integration_status_reports_pending_layer_entries_files_and_conflicts() {
-    let tmp = common::FixtureRepository::new();
-    init_repo(tmp.path());
-    let mut broker = common::open_fixture_repository_broker(&tmp)
-        .unwrap()
-        .into_broker();
-
-    let wt_promoted = agent_worktree(tmp.path(), "pending-promoted");
-    let promoted = broker.adopt(&wt_promoted, Some("promoted layer")).unwrap();
-    commit_edit(&wt_promoted, "src/a.py", "a = 20\n");
-    let promoted_out = broker.submit(promoted.id).unwrap();
-    assert!(promoted_out.promoted);
-    broker.close(promoted.id).unwrap();
-
-    let wt_live = agent_worktree(tmp.path(), "pending-live");
-    let live = broker.adopt(&wt_live, Some("live overlap")).unwrap();
-    commit_edit(&wt_live, "src/a.py", "a = 30\n");
-
-    let report = broker.integration_status(0).unwrap();
-    assert_eq!(report.branch, "aethyme/integration");
-    assert_eq!(report.head, resolve(tmp.path(), "aethyme/integration"));
-    assert_eq!(report.main_head, resolve(tmp.path(), "main"));
-    assert!(report.main_is_ancestor);
-    assert!(report.commits_ahead_main > 0);
-    assert_eq!(report.changed_files, vec!["src/a.py".to_string()]);
-
-    assert_eq!(report.promoted_entries.len(), 1);
-    let entry = &report.promoted_entries[0];
-    assert_eq!(entry.queue_entry_id, promoted_out.entry.id);
-    assert_eq!(entry.session_id, promoted.id);
-    assert_eq!(entry.task.as_deref(), Some("promoted layer"));
-    assert_eq!(entry.files, vec!["src/a.py".to_string()]);
-
-    assert_eq!(report.conflicts.len(), 1);
-    assert_eq!(report.conflicts[0].session_id, live.id);
-    assert_eq!(report.conflicts[0].path, "src/a.py");
-    assert!(
-        report
-            .next_action
-            .summary
-            .contains("pending integration layer")
-    );
-    assert!(
-        report
-            .next_action
-            .commands
-            .iter()
-            .any(|command| command
-                == &format!("aethyme broker advanced repair --session {}", live.id)),
-        "{report:?}"
-    );
-    assert_eq!(report.next_action.state, IntegrationDeliveryState::Blocked);
-
-    sh(tmp.path(), &["merge", "--ff-only", "aethyme/integration"]);
-    let report = broker.integration_status(0).unwrap();
-    assert!(report.changed_files.is_empty());
-    assert!(report.promoted_entries.is_empty());
-    assert!(
-        report.conflicts.is_empty(),
-        "once integration is merged to main, this focused command should not \
-         label old-main drift as promoted-but-unmerged work"
-    );
-    assert_eq!(
-        report.next_action.summary,
-        "local main is synchronized with aethyme/integration"
-    );
-    assert_eq!(
-        report.next_action.state,
-        IntegrationDeliveryState::LocallySynchronized
-    );
-}
-
-#[test]
 fn repair_rebases_promoted_conflict_and_reports_affected_gates() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
@@ -4349,13 +4276,6 @@ fn reconcile_uses_upstream_boundary_and_recovers_repromoted_empty_entries() {
         .unwrap();
     assert_eq!(upstream_advice.severity, StatusAdviceSeverity::Notice);
     assert!(upstream_advice.commands.is_empty());
-    let integration_status = broker.integration_status(0).unwrap();
-    assert!(
-        !integration_status
-            .next_action
-            .summary
-            .contains("reconcile before")
-    );
 }
 
 #[test]
@@ -4518,22 +4438,6 @@ fn status_warns_on_the_first_external_main_movement() {
             && advice.commands
                 == vec!["aethyme broker advanced integration reconcile --upstream origin/main --dry-run"]
     }));
-
-    let integration = broker.integration_status(0).unwrap();
-    assert_eq!(integration.main_behind_upstream_commits, 1);
-    assert!(
-        integration
-            .next_action
-            .summary
-            .contains("external main movement detected")
-    );
-    assert!(
-        integration
-            .next_action
-            .commands
-            .iter()
-            .any(|command| command.contains("--upstream origin/main --dry-run"))
-    );
 }
 
 #[test]
@@ -4589,13 +4493,6 @@ fn status_distinguishes_stale_landed_promotions_from_unresolved_drift() {
         advice.id == "integration.upstream-main-ahead"
             && advice.severity == StatusAdviceSeverity::Blocked
     }));
-
-    let integration = broker.integration_status(0).unwrap();
-    assert_eq!(
-        integration.next_action.state,
-        IntegrationDeliveryState::ReconciliationReady
-    );
-    assert!(integration.reconciliation.unwrap().stale_only);
 }
 
 #[test]
@@ -4647,14 +4544,6 @@ fn status_reports_both_local_and_upstream_only_counts_after_divergence() {
         advice.id == "integration.upstream-main-ahead"
             && advice.severity == StatusAdviceSeverity::Blocked
     }));
-
-    let integration = broker.integration_status(0).unwrap();
-    assert_eq!(integration.main_ahead_upstream_commits, 1);
-    assert_eq!(integration.main_behind_upstream_commits, 2);
-    assert_eq!(
-        integration.next_action.state,
-        IntegrationDeliveryState::Blocked
-    );
 }
 
 #[test]
@@ -4718,19 +4607,6 @@ fn status_warns_when_local_and_upstream_main_move_together_beyond_integration() 
         }),
         "{:?}",
         status.advice
-    );
-
-    let integration = broker.integration_status(0).unwrap();
-    assert_eq!(integration.main_behind_upstream_commits, 0);
-    assert_eq!(
-        integration.next_action.state,
-        IntegrationDeliveryState::Blocked
-    );
-    assert!(
-        integration
-            .next_action
-            .summary
-            .contains("integration does not contain origin/main")
     );
 }
 

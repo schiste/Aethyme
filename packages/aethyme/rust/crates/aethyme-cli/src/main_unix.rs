@@ -168,7 +168,7 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
             CommandCapability::RecoveryWrite
         }
         (Some("checkpoint"), Some("plan"))
-        | (Some("integration"), Some("status" | "reconcile"))
+        | (Some("integration"), Some("reconcile"))
         | (Some("leases" | "ownership"), _)
         | (Some("resources"), Some("plan" | "list"))
         | (Some("gates"), Some("validate"))
@@ -1372,10 +1372,6 @@ mod compatibility_command_tests {
             (
                 &["broker", "advanced", "hooks", "pre-commit"][..],
                 CommandCapability::ManagedPreCommit,
-            ),
-            (
-                &["broker", "advanced", "integration", "status"][..],
-                CommandCapability::DiagnosticRead,
             ),
             (
                 &["broker", "advanced", "advisories", "list"][..],

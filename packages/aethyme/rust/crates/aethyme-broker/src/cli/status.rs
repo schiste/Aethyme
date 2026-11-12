@@ -2,6 +2,25 @@
 
 use super::*;
 
+pub(super) fn upstream_relation(local_only: u64, upstream_only: u64) -> String {
+    match (local_only, upstream_only) {
+        (0, 0) => "fetched upstream matches local main".into(),
+        (local, 0) => format!(
+            "local main ahead by {local} {}",
+            plural(local as usize, "commit", "commits")
+        ),
+        (0, upstream) => format!(
+            "local main behind by {upstream} {}",
+            plural(upstream as usize, "commit", "commits")
+        ),
+        (local, upstream) => format!(
+            "diverged: {local} local-only {}, {upstream} upstream-only {}",
+            plural(local as usize, "commit", "commits"),
+            plural(upstream as usize, "commit", "commits")
+        ),
+    }
+}
+
 pub(super) fn render_readiness_report(
     report: &crate::ReadinessReport,
     json: bool,

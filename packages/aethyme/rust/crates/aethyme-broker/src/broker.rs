@@ -132,19 +132,9 @@ pub enum BrokerOpError {
     MainReconcileUnavailable { reason: String },
     /// Representation asks a different question from reconciliation -- whether
     /// a session's work is already on the default branch -- so its refusals
-    /// must not read as a `main reconcile` failure.
+    /// must not read as a default-branch failure.
     #[error("representation cannot be decided: {reason}")]
     RepresentationUnavailable { reason: String },
-    #[error("main reconciliation is unsafe: {reason}")]
-    MainReconcileUnsafe { reason: String },
-    /// See [`BrokerOpError::CleanupConfirmationMismatch`] for why no digest is
-    /// offered here (issue #142).
-    #[error(
-        "the reviewed main reconciliation plan no longer matches current state, so nothing was \
-         moved; review a new plan with `aethyme broker advanced main reconcile plan` and confirm the \
-         digest it prints (the digest passed, {actual}, is stale)"
-    )]
-    MainReconcileConfirmationMismatch { actual: String },
 
     /// An identical command from the same session is still pending. Queueing a
     /// second one would fire it against state the first already changed.
@@ -338,14 +328,6 @@ pub enum BrokerOpError {
     GcAbandonConfirmationMismatch { expected: String, actual: String },
     #[error("GC journal cannot be abandoned: {reason}")]
     GcJournalAbandonRefused { reason: String },
-    /// See [`BrokerOpError::CleanupConfirmationMismatch`] for why no digest is
-    /// offered here (issue #142).
-    #[error(
-        "the reviewed promotion record plan no longer matches current state, so nothing was \
-         restored; review a new plan with `aethyme broker submit promotion-record plan` and confirm \
-         the digest it prints (the digest passed, {actual}, is stale)"
-    )]
-    PromotionRecordConfirmationMismatch { actual: String },
     #[error("GC is already running under process {pid}; wait or inspect .aethyme/gc.lock")]
     GcLocked { pid: String },
     #[error("automatic cleanup cursor changed concurrently; this candidate plan was not returned")]
@@ -2088,16 +2070,13 @@ pub struct StatusSummary {
     pub overlap_count: usize,
     pub promoted_conflict_count: usize,
     /// Relation to `baseline_ref`, the published branch -- not to the local
-    /// checkout, which `integration status` counts against.
+    /// checkout.
     pub integration_relation: StatusIntegrationRelation,
     pub integration_ahead_main_commits: u64,
     pub integration_head: String,
     pub baseline_ref: String,
     pub baseline_head: String,
-    /// The main checkout's HEAD and integration's lead over it: the same
-    /// pair `integration status` reports as `main_head` and
-    /// `commits_ahead_main`, so the two views can be compared like for like
-    /// (#374). After a local fast-forward that has not been pushed, this is 0
+    /// The main checkout's HEAD and integration's lead over it (#374). After a local fast-forward that has not been pushed, this is 0
     /// while `integration_ahead_main_commits` still counts the unpublished
     /// commits.
     pub main_head: String,
@@ -2579,92 +2558,6 @@ fn working_path_identity(root: &Path, relative: &str) -> Result<String, BrokerOp
         }
     }
     Ok(format!("{:x}", digest.finalize()))
-}
-
-/// Result of `broker integration wait-stable`.
-#[derive(Debug, serde::Serialize)]
-pub struct IntegrationStabilityReport {
-    pub branch: String,
-    pub start_head: String,
-    pub end_head: String,
-    pub stable: bool,
-    pub requested_seconds: u64,
-    pub observed_ms: i64,
-    pub live_sessions: Vec<IntegrationLiveSession>,
-    pub message: String,
-    pub commands: Vec<String>,
-}
-
-/// Focused view of the local integration branch as a pending layer above
-/// the main checkout.
-#[derive(Debug, serde::Serialize)]
-pub struct IntegrationStatusView {
-    pub branch: String,
-    pub head: String,
-    pub main_head: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub upstream_ref: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub upstream_head: Option<String>,
-    /// Commits reachable from local main but not the fetched upstream.
-    pub main_ahead_upstream_commits: u64,
-    /// Commits reachable from the fetched upstream but not local main.
-    pub main_behind_upstream_commits: u64,
-    pub main_is_ancestor: bool,
-    pub commits_ahead_main: u64,
-    pub changed_files: Vec<String>,
-    pub promoted_entries: Vec<PromotedIntegrationEntry>,
-    pub conflicts: Vec<PromotedConflict>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reconciliation: Option<crate::IntegrationDriftAssessment>,
-    pub next_action: IntegrationNextAction,
-}
-
-/// A promoted queue entry whose merge commit is still reachable from
-/// integration and not yet reachable from main.
-#[derive(Debug, serde::Serialize)]
-pub struct PromotedIntegrationEntry {
-    pub queue_entry_id: i64,
-    pub session_id: i64,
-    pub branch: Option<String>,
-    pub task: Option<String>,
-    pub base_commit: String,
-    pub head_commit: String,
-    pub merge_commit: String,
-    pub files: Vec<String>,
-}
-
-/// Deterministic operator guidance for the focused integration view.
-#[derive(Debug, serde::Serialize)]
-pub struct IntegrationNextAction {
-    pub state: IntegrationDeliveryState,
-    pub summary: String,
-    pub commands: Vec<String>,
-}
-
-/// Delivery stage of the current integration tip.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IntegrationDeliveryState {
-    Promoted,
-    Published,
-    LocallySynchronized,
-    Blocked,
-    ReconciliationReady,
-    Untracked,
-}
-
-impl IntegrationDeliveryState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Promoted => "promoted",
-            Self::Published => "published",
-            Self::LocallySynchronized => "locally_synchronized",
-            Self::Blocked => "blocked",
-            Self::ReconciliationReady => "reconciliation_ready",
-            Self::Untracked => "untracked",
-        }
-    }
 }
 
 /// Result of `broker repair --session`: a conservative recovery action

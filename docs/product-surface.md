@@ -49,7 +49,6 @@ aethyme broker submit --session <id>
 aethyme broker advanced repair --session <id>
 aethyme broker finish --session <id>
 aethyme broker advanced handoff --session <id>
-aethyme broker advanced integration status
 ```
 
 What this provides:
@@ -107,7 +106,6 @@ These commands are the public product path and should stay easy to explain:
 - `aethyme broker advanced repair`
 - `aethyme broker finish`
 - `aethyme broker advanced handoff`
-- `aethyme broker advanced integration status`
 - `aethyme broker quick-test`
 - `aethyme broker advanced verify-loop`
 - `aethyme update check`
@@ -164,7 +162,6 @@ Only the frozen broker JSON contracts in
 [`json-contracts.md`](json-contracts.md) are stable for long-lived scripts:
 
 - `aethyme broker status --json`
-- `aethyme broker advanced integration status --json`
 - `aethyme broker advanced events --json`
 - `aethyme broker advanced metrics --json`
 - `aethyme broker submit --json`

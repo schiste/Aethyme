@@ -67,7 +67,6 @@ The local integration landing path is being retired in favour of pull requests; 
 
 ```sh
 aethyme broker status --json
-aethyme broker advanced integration status --json
 aethyme broker advanced integration reconcile --upstream origin/main --dry-run
 ```
 

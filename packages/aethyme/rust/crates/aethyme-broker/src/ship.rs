@@ -1236,7 +1236,8 @@ fn local_main_sync_refusal(
     if !assessment.local_commits_not_in_integration.is_empty() {
         return format!(
             "local {} contains commits not represented by integration: {}. Review them with \
-             `aethyme broker advanced main reconcile plan` before retrying delivery",
+             `git log --oneline` and land anything still needed through a pull request before \
+             retrying delivery",
             plan.local_default_branch_ref,
             assessment.local_commits_not_in_integration.join(", "),
         );

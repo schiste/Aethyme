@@ -1052,10 +1052,7 @@ fn adopt_reuse_reports_behind_drift_and_dirty_path_overlap() {
     assert_eq!(drift.behind_commits, 1);
     assert_eq!(drift.overlapping_changed_paths, vec!["shared.txt"]);
     assert!(drift.warning.as_deref().unwrap().contains("behind"));
-    assert_eq!(
-        drift.safe_next_action,
-        "aethyme broker advanced integration status"
-    );
+    assert_eq!(drift.safe_next_action, "aethyme broker status");
 }
 
 #[test]
@@ -2569,13 +2566,13 @@ fn a_finished_session_stops_colliding_on_its_declared_targets() {
 }
 
 /// The #374 field report, end to end: integration is ahead of `origin/main`,
-/// local main is fast-forwarded to integration and not pushed. `integration
-/// status` then reports 0 ahead of local main, and the summary used to report
-/// "ahead of main by N" with no refs, which read as a stale contradiction. Both
-/// views must now carry the same SHAs and the same local-main count, and the
-/// summary must name the baseline its own count is against.
+/// local main is fast-forwarded to integration and not pushed. The local
+/// checkout is then 0 commits behind integration, and the summary used to
+/// report "ahead of main by N" with no refs, which read as a stale
+/// contradiction. The summary must carry the local-main count and name the
+/// baseline its own count is against.
 #[test]
-fn refreshed_summary_and_integration_status_agree_after_an_unpushed_fast_forward() {
+fn refreshed_summary_names_its_baseline_after_an_unpushed_fast_forward() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());
     sh(
@@ -2591,8 +2588,8 @@ fn refreshed_summary_and_integration_status_agree_after_an_unpushed_fast_forward
         ],
     );
     let published = rev(tmp.path(), "HEAD");
+    set_integration_at_head(tmp.path());
     let mut broker = open_fixture_broker(tmp.path()).unwrap();
-    broker.integration_status(now_ms()).unwrap();
 
     // Two commits land on integration without touching main.
     sh(tmp.path(), &["switch", "-q", "aethyme/integration"]);
@@ -2610,17 +2607,11 @@ fn refreshed_summary_and_integration_status_agree_after_an_unpushed_fast_forward
     assert_eq!(rev(tmp.path(), "HEAD"), integration);
     assert_eq!(rev(tmp.path(), "refs/remotes/origin/main"), published);
 
-    let detailed = broker.integration_status(now_ms()).unwrap();
     let summary = broker.status(now_ms()).unwrap().summary;
 
-    assert_eq!(detailed.head, integration);
-    assert_eq!(summary.integration_head, detailed.head);
-    assert_eq!(summary.main_head, detailed.main_head);
-    assert_eq!(detailed.commits_ahead_main, 0);
-    assert_eq!(
-        summary.integration_ahead_local_main_commits,
-        detailed.commits_ahead_main
-    );
+    assert_eq!(summary.integration_head, integration);
+    assert_eq!(summary.main_head, integration);
+    assert_eq!(summary.integration_ahead_local_main_commits, 0);
     // Publishing would still add both commits: that count is correct, and
     // now says what it is counted against.
     assert_eq!(summary.baseline_ref, "refs/remotes/origin/main");

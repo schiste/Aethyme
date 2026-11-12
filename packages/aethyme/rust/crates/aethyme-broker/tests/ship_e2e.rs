@@ -6,9 +6,8 @@ use std::os::unix::fs::PermissionsExt;
 
 use aethyme_broker::{
     AdvisoryEvidence, AdvisoryResolutionState, AdvisorySeverity, Broker, BrokerOpError,
-    BrokerOpenOptions, EntryExposureResolutionKind, EntryExposureState, IntegrationDeliveryState,
-    NewAdvisory, OperationIdentityProvenance, OperationStatus, ShipFreshnessResult,
-    ShipPublicationMode,
+    BrokerOpenOptions, EntryExposureResolutionKind, EntryExposureState, NewAdvisory,
+    OperationIdentityProvenance, OperationStatus, ShipFreshnessResult, ShipPublicationMode,
 };
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
@@ -713,43 +712,6 @@ fn ship_execute_sync_main_fast_forwards_a_clean_primary_checkout() {
         report.sync_operation.as_ref().unwrap().status,
         OperationStatus::Succeeded
     );
-}
-
-#[test]
-fn integration_status_reports_promoted_published_and_synchronized_states() {
-    let fixture = Fixture::new();
-    let (entry_id, _, integration) = fixture.promoted_entry();
-    let mut broker = fixture.broker();
-
-    let promoted = broker.integration_status(0).unwrap();
-    assert_eq!(
-        promoted.next_action.state,
-        IntegrationDeliveryState::Promoted
-    );
-    assert!(
-        promoted.next_action.commands.is_empty(),
-        "no local publication command remains to recommend"
-    );
-
-    broker
-        .ship_execute_with_sync(entry_id, &integration, false)
-        .unwrap();
-    let published = broker.integration_status(0).unwrap();
-    assert_eq!(
-        published.next_action.state,
-        IntegrationDeliveryState::Published
-    );
-    assert!(published.next_action.commands.is_empty());
-
-    broker
-        .ship_execute_with_sync(entry_id, &integration, true)
-        .unwrap();
-    let synchronized = broker.integration_status(0).unwrap();
-    assert_eq!(
-        synchronized.next_action.state,
-        IntegrationDeliveryState::LocallySynchronized
-    );
-    assert!(synchronized.next_action.commands.is_empty());
 }
 
 #[test]

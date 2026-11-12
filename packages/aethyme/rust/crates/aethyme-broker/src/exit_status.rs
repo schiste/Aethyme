@@ -67,9 +67,7 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::ShipPlanUnavailable { .. }
         | E::ShipDeliveryUnavailable { .. }
         | E::ShipRemoteBaseUnavailable { .. } => ENVIRONMENT,
-        E::MainReconcileUnsafe { .. }
-        | E::MainReconcileConfirmationMismatch { .. }
-        | E::DuplicatePendingOperation { .. }
+        E::DuplicatePendingOperation { .. }
         | E::CoordinatedLockBusy { .. }
         | E::AdmissionTimedOut { .. }
         | E::DirtyWorktree { .. }
@@ -84,7 +82,6 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::GcResumeConfirmationMismatch { .. }
         | E::GcAbandonConfirmationMismatch { .. }
         | E::GcJournalAbandonRefused { .. }
-        | E::PromotionRecordConfirmationMismatch { .. }
         | E::GcLocked { .. }
         | E::UnsafeRepairPlan { .. }
         | E::RepairNotApplicable { .. }

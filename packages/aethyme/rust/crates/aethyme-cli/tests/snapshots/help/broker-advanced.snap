@@ -24,8 +24,7 @@ Verbs:
   owners           name the sessions behind landed commits, with liveness
   handoff          read a finished session's persisted handoff
   queue            show the merge queue
-  integration      inspect, wait on or reconcile the integration branch
-  main             reconcile the local default branch onto integration
+  integration      reconcile the integration branch with a fetched upstream
   representation   prove a session's work already landed on main
   checkpoint       recover a session whose checkpoint was rewritten
   repair           apply the documented recovery for a submit conflict

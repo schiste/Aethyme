@@ -1744,7 +1744,7 @@ fn reuse_cli_exposes_structured_integration_drift_and_safe_guidance() {
     assert!(report["integration_drift"]["warning"].is_string());
     assert_eq!(
         report["integration_drift"]["safe_next_action"],
-        "aethyme broker advanced integration status"
+        "aethyme broker status"
     );
 
     let rendered = stdout(&run(
@@ -1755,7 +1755,7 @@ fn reuse_cli_exposes_structured_integration_drift_and_safe_guidance() {
     assert!(rendered.contains("Overlapping changed paths:\n  shared.txt"));
     assert!(rendered.contains("Warning:"), "{rendered}");
     assert!(
-        rendered.contains("Safe next action: aethyme broker advanced integration status"),
+        rendered.contains("Safe next action: aethyme broker status"),
         "{rendered}"
     );
 }
@@ -1813,7 +1813,7 @@ fn reuse_behind_or_diverged_observes_drift_without_submission_patch_scans() {
         assert!(report["integration_drift"]["warning"].is_string());
         assert_eq!(
             report["integration_drift"]["safe_next_action"],
-            "aethyme broker advanced integration status"
+            "aethyme broker status"
         );
         assert_eq!(git_output(worktree, &["rev-parse", "HEAD"]), session_head);
 

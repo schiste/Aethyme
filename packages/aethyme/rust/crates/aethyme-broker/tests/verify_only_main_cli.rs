@@ -508,7 +508,6 @@ fn a_promoting_repository_still_reports_integration_movement() {
     }
     let summary = &status["summary"];
     assert_eq!(summary["may_move_integration"], true, "{summary:#}");
-    assert!(names_wait_stable(&summary["commands"]), "{summary:#}");
 
     let doctor = json(&fixture.run(&["status", "doctor", "--json"], &fixture.remote));
     assert!(doctor["integration_movement"].is_object(), "{doctor:#}");

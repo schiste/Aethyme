@@ -7248,7 +7248,7 @@ impl Broker {
                 "aethyme broker status".to_string(),
             )
         } else {
-            let command = "aethyme broker advanced integration status".to_string();
+            let command = "aethyme broker status".to_string();
             (command.clone(), command)
         };
         let (integration_branch, integration_head) = match upstream {

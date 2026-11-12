@@ -111,11 +111,6 @@ fn removed_merged_and_advanced_spellings_fail_with_replacements() {
             "aethyme broker gc reclaim",
         ),
         (
-            &["broker", "promotion-record", "plan", "--json"][..],
-            "aethyme broker promotion-record",
-            "aethyme broker submit promotion-record",
-        ),
-        (
             &["broker", "leases", "--json"][..],
             "aethyme broker leases",
             "aethyme broker advanced leases",

@@ -20,7 +20,7 @@ Each workflow separates observation from mutation:
 | Need | Inspect first | Explicit mutation | Refusal boundary |
 | --- | --- | --- | --- |
 | Prepare worktree dependencies | `prepare status --session <id>` | `prepare --session <id>`, optionally `--offline` | no implicit execution; symlink outputs, undeclared offline commands, lease loss, and writes outside session leases fail closed |
-| Continue in an existing worktree | `broker advanced integration status` | `start --reuse`, optionally with `--sync-integration` | synchronization requires a clean, fast-forwardable worktree |
+| Continue in an existing worktree | `broker status` | `start --reuse`, optionally with `--sync-integration` | synchronization requires a clean, fast-forwardable worktree |
 | Prove the current tree | default gate run and its tree provenance | rerun with `--no-cache` | a bypass never substitutes an older cached result |
 | Share gate scope with CI | `gates manifest` and `gates scope` | none | unsupported schema, digest drift, missing refs, or invalid committed policy fail closed |
 | Inspect graph-derived gate hints | `gates semantic` | none; suggestions remain advisory | only changed-path triggers reach `gates run` and `submit` |
@@ -303,7 +303,7 @@ task. Start by checking whether integration advanced while the session was
 working:
 
 ```bash
-aethyme broker advanced integration status
+aethyme broker status
 cd /path/to/the/session-worktree
 aethyme broker start --reuse --task "Address review feedback" --short-name "Review fixes" --json
 ```
@@ -526,56 +526,6 @@ measure_pr_merge_ref = true
 
 This runs a read-only `gh pr view <selector> --json baseRefName` probe, records
 its duration, and leaves the current repository-wide lock policy unchanged.
-
-### Reconciling a local default branch
-
-When the local default branch carries commits integration does not, `broker advanced main reconcile` decides whether moving it is safe:
-
-```bash
-aethyme broker advanced main reconcile plan
-aethyme broker advanced main reconcile apply --session <id> --confirm <plan-sha256>
-```
-
-Representation is decided by content, not ancestry. The broker promotes by
-replaying into a squashed commit, so a commit whose work already landed is
-usually not an ancestor of anything on integration, and `git cherry` misses the
-same cases because patch ids do not survive squashing. A commit counts as
-already represented when integration holds its content for every path the
-commit touched; a deletion counts when the path is absent there.
-
-The apply refuses unless every local-only commit is represented and no tracked
-path is dirty. Untracked files are ignored: they survive the move. Before moving anything it creates
-`aethyme/preserve/<branch>-<sha>` at the pre-move tip, so the commits left
-behind remain recoverable even though their content is already on integration.
-
-Work that is genuinely unrepresented is not moved over by default. Replay it
-through a broker session and submit it, then reconcile.
-
-Where that is not the right answer -- work superseded elsewhere, or an
-experiment that should simply leave the branch -- record a reviewed decision
-instead:
-
-```bash
-aethyme broker advanced main reconcile plan --write-resolution-template resolutions.json
-# edit each entry's resolution and reason
-aethyme broker advanced main reconcile plan --resolution-file resolutions.json
-aethyme broker advanced main reconcile apply --session <id> --confirm <digest> \
-    --resolution-file resolutions.json
-```
-
-Three dispositions are available, and only one unblocks the move:
-
-- `replay_through_broker` -- the default; keeps refusing, because the work
-  belongs in integration;
-- `archive_local` -- accept that it leaves the default branch, remaining
-  reachable from the preservation ref;
-- `keep_local_and_block_publication` -- keep it and refuse to move at all.
-
-A commit with no entry stays undecided and keeps refusing: the file records a
-decision rather than waiving the check. `already_represented` cannot be chosen,
-because asserting it would defeat the content check that makes the move safe.
-Each entry requires a reason, and the decisions are bound into the plan digest,
-so an edited file no longer matches a reviewed plan.
 
 ## Choose Gate Cache Policy Deliberately
 
@@ -870,7 +820,7 @@ An inherited commit that already exists under a stable patch identity is
 reported but not replayed. A pending owned commit is replayed using its parent
 tree as the three-way base. Promotion records a normalized integration commit;
 the original session SHA does not need to become an ancestor of integration.
-Finish, cleanup, and integration status use the verified queue record to track
+Finish and cleanup use the verified queue record to track
 that delivered content safely.
 
 The broker refuses instead of guessing when the recorded baseline is missing,

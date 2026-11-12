@@ -140,7 +140,6 @@ pub mod local_source_transport;
 pub mod local_target;
 pub mod local_wave;
 mod main_drift;
-pub mod main_reconcile;
 pub mod managed_services;
 mod measurement;
 mod merge;
@@ -196,7 +195,6 @@ mod pr_watch_service;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 mod pr_watch_service_install;
 mod preparation;
-mod promotion_record;
 mod quality_report;
 mod quick_test;
 mod readiness;
@@ -297,19 +295,18 @@ pub use broker::{
     FinishCleanupReport, FinishDelivery, FinishGateCacheSource, FinishGateRun,
     FinishGraphIntegrity, FinishHandoff, FinishLease, FinishLeaseState, FinishOptions,
     FinishPendingWork, FinishReport, FinishStatus, GuardedExecReport,
-    HEALTH_CHECK_ELIGIBILITY_BUDGET, IntegrationBypassReason, IntegrationDeliveryState,
-    IntegrationLiveSession, IntegrationMovementNotice, IntegrationNextAction,
-    IntegrationStabilityReport, IntegrationStatusView, LeaseBlocker, LeaseClaimReport,
-    LeaseOverlapRelation, LeasePathPlan, LeasePlan, LeasePlanOverlap, MAX_OWNER_COMMITS,
-    OwnedCommit, OwnersReport, OwnershipAuditReport, PromotedConflict, PromotedIntegrationEntry,
-    RecentCommandFailure, RepairAction, RepairGateSelection, RepairReport, RepairSource,
-    RepresentationScan, RetentionConfigStatus, SESSION_NOTE_MAX_BYTES, SemanticGateAdvice,
-    SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus,
-    SemanticGateSuggestionChain, SessionCheckpointApplyReport, SessionCheckpointRecoveryPlan,
-    SessionHandoffReport, SessionStartBase, SessionStartBaseEvidence, StartAgentReport,
-    StartReport, StatusAdvice, StatusAdviceSeverity, StatusBrief, StatusIntegrationRelation,
-    StatusSummary, StatusView, VersionRepairReport, VersionRepairStep,
-    WORKTREE_ROOT_SCHEMA_VERSION, WorktreePlacement, WorktreeRootPlan, WorktreeRootSource,
+    HEALTH_CHECK_ELIGIBILITY_BUDGET, IntegrationBypassReason, IntegrationLiveSession,
+    IntegrationMovementNotice, LeaseBlocker, LeaseClaimReport, LeaseOverlapRelation, LeasePathPlan,
+    LeasePlan, LeasePlanOverlap, MAX_OWNER_COMMITS, OwnedCommit, OwnersReport,
+    OwnershipAuditReport, PromotedConflict, RecentCommandFailure, RepairAction,
+    RepairGateSelection, RepairReport, RepairSource, RepresentationScan, RetentionConfigStatus,
+    SESSION_NOTE_MAX_BYTES, SemanticGateAdvice, SemanticGateSelection, SemanticGateSource,
+    SemanticGateSourceStatus, SemanticGateSuggestionChain, SessionCheckpointApplyReport,
+    SessionCheckpointRecoveryPlan, SessionHandoffReport, SessionStartBase,
+    SessionStartBaseEvidence, StartAgentReport, StartReport, StatusAdvice, StatusAdviceSeverity,
+    StatusBrief, StatusIntegrationRelation, StatusSummary, StatusView, VersionRepairReport,
+    VersionRepairStep, WORKTREE_ROOT_SCHEMA_VERSION, WorktreePlacement, WorktreeRootPlan,
+    WorktreeRootSource,
 };
 pub use change_classification::{
     CHANGE_CLASSIFICATION_SCHEMA_VERSION, ChangeClassification, ChangeClassificationError,
@@ -431,11 +428,6 @@ pub use lease_export::{
 };
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
 pub use main_drift::DefaultBranchDrift;
-pub use main_reconcile::{
-    MAIN_RECONCILE_SCHEMA_VERSION, MainReconcileApplyReport, MainReconcileCommit,
-    MainReconcileDisposition, MainReconcilePlan, MainReconcileResolution,
-    MainReconcileResolutionDocument, MainReconcileResolutionTemplate, MainReconcileStrategy,
-};
 pub use measurement::{
     BudgetVerdict, MeasuredTotal, SizeRecord, SizeRecords, SizeScan, budget_verdict,
 };
@@ -508,10 +500,6 @@ pub use preparation::{
     PreparationCachePolicy, PreparationConfig, PreparationError, PreparationReport,
     PreparationState, PreparationStatus, PreparationStep, PreparationStepResult, RuntimeProbe,
     SharedCacheRotation, SharedCacheRotationReason,
-};
-pub use promotion_record::{
-    PROMOTION_RECORD_PLAN_SCHEMA_VERSION, PromotionRecordApplyReport, PromotionRecordPlan,
-    UnrecordedPromotion,
 };
 pub use quick_test::{
     Chau7Probe, QuickTestError, QuickTestGateOutcome, QuickTestGateReport, QuickTestMode,

@@ -573,8 +573,6 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("queue", &["--active", "--limit", "--before"]),
     ("queue history", &["--limit", "--before"]),
     ("promote", &["--entry"]),
-    ("integration status", &[]),
-    ("integration wait-stable", &["--seconds"]),
     (
         "integration reconcile",
         &[
@@ -654,23 +652,9 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
             "--retire",
         ],
     ),
-    (
-        "main reconcile plan",
-        &[
-            "--detail",
-            "--resolution-file",
-            "--write-resolution-template",
-        ],
-    ),
-    (
-        "main reconcile apply",
-        &["--session", "--confirm", "--resolution-file"],
-    ),
     ("representation scan", &["--session"]),
     ("representation status", &["--session"]),
     ("representation record", &["--session", "--confirm"]),
-    ("promotion-record plan", &[]),
-    ("promotion-record apply", &["--confirm"]),
     // `plan` reads `--confirm` only to refuse it by name.
     (
         "gc plan",

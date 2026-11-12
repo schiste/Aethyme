@@ -1316,7 +1316,6 @@ fn older_repository_allows_diagnostics_recovery_and_only_pinned_continuation() {
 
     for args in [
         &["broker", "status", "--json"][..],
-        &["broker", "advanced", "integration", "status", "--json"][..],
         &["broker", "advanced", "agents", "--json"][..],
         &["broker", "advanced", "leases", "--json"][..],
         &["broker", "advanced", "operations", "--json"][..],

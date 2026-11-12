@@ -10,7 +10,6 @@ may depend on their field names:
 | Surface | Command | Shape (source of truth) |
 |---|---|---|
 | Status | `aethyme broker status --json` | `StatusView` (`src/broker.rs`) |
-| Integration status | `aethyme broker advanced integration status --json` | `IntegrationStatusView` (`src/broker.rs`) |
 | Events | `aethyme broker advanced events --json` | `Event` rows (`src/types.rs`), NDJSON |
 | Metrics | `aethyme broker advanced metrics --json` | inline object (`src/cli.rs`) |
 | Insights | `aethyme broker advanced insights --json` | `InsightsReport` (`src/insights.rs`) — see [insights-contract.md](insights-contract.md) |
@@ -179,39 +178,15 @@ they do not participate in ownership or liveness. Display `derived_status`
 `base_commit`, `status`, `merged_tree`, `details_json`, `created_at`,
 `updated_at`.
 
-### `integration status --json`
+### ~~`integration status --json`~~ (removed 2026-11-12)
 
-```
-{
-  "branch": "aethyme/integration",
-  "head": "<commit>",
-  "main_head": "<commit>",
-  "main_is_ancestor": true|false,
-  "commits_ahead_main": n,
-  "changed_files": [ "path", ... ],
-  "promoted_entries": [
-    {
-      "queue_entry_id": n,
-      "session_id": n,
-      "branch": "...",
-      "task": "...",
-      "base_commit": "<commit>",
-      "head_commit": "<commit>",
-      "merge_commit": "<commit>",
-      "files": [ "path", ... ]
-    }
-  ],
-  "conflicts": [
-    { "session_id", "path", "session_path", "promoted_path" }
-  ],
-  "next_action": { "summary": "...", "commands": [ "..." ] }
-}
-```
-
-This is the focused promoted-but-unmerged view: only work present on the
-local integration branch and absent from the main checkout is considered
-pending. `conflicts` are scoped to that pending layer, not every change
-between an old live session and current main.
+Versioned break: `aethyme broker advanced integration status` was
+hard-deleted on 2026-11-12, together with its `IntegrationStatusView` shape.
+The owner decided on 2026-11-11 that pull requests are the only landing path,
+and the command only described the local integration landing path. Read the
+integration head, its relation to the default branch and the related advice
+from `status --json` (`summary.integration_head`,
+`summary.integration_relation`, `advice[]`) instead.
 
 ### `events --json`
 
