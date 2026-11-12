@@ -163,6 +163,21 @@ pub(super) fn idle_delivery_poll(exit: u8) -> bool {
     exit == 0 && IDLE_DELIVERY_POLL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+thread_local! {
+    static WRAPPED_COMMAND_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark the current invocation's failure as the wrapped command's own exit,
+/// not a broker failure. `exec` calls this only when the command ran, was not
+/// timed out, and the ownership audit passed.
+pub(super) fn mark_wrapped_command_failure() {
+    WRAPPED_COMMAND_FAILURE.with(|flag| flag.set(true));
+}
+
+fn take_wrapped_command_failure() -> bool {
+    WRAPPED_COMMAND_FAILURE.with(|flag| flag.replace(false))
+}
+
 /// Longest failure message kept with a `broker.command.failed` event. Enough
 /// for an error and its first cause; the full text went to stderr.
 pub(super) const FAILURE_MESSAGE_MAX_CHARS: usize = 500;
@@ -171,6 +186,7 @@ pub(super) const FAILURE_MESSAGE_MAX_CHARS: usize = 500;
 /// one. It is stored redacted and capped so a failure can be explained after
 /// the terminal that showed it is gone.
 pub(super) fn record_command_outcome(args: &[String], exit: u8, error: Option<&str>) {
+    let wrapped_command_failure = take_wrapped_command_failure();
     if !command_records_outcome(args) {
         return;
     }
@@ -210,6 +226,7 @@ pub(super) fn record_command_outcome(args: &[String], exit: u8, error: Option<&s
         Some("submit") => "submission_failed",
         Some("repair") => "recovery_failed",
         Some("git" | "gh") => "coordinated_operation_failed",
+        Some("exec") if wrapped_command_failure => crate::scoreboard::WRAPPED_COMMAND_FAILED,
         _ => "command_failed",
     });
     let message = (exit != 0)
