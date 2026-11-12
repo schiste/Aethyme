@@ -200,6 +200,13 @@ mod imp {
         files: Vec<String>,
     }
 
+    /// Drop the result of writing or removing one of this module's files.
+    ///
+    /// Every file here is a hint, never broker state: a missing or stale
+    /// request, counter or answer makes the next command ask Git, and a
+    /// counter that could not be published stays marked and is retried.
+    fn hint<T, E>(_result: Result<T, E>) {}
+
     fn now_ms() -> u64 {
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -282,8 +289,8 @@ mod imp {
         let Some(text) = canonical.to_str() else {
             return;
         };
-        let _ = fs::create_dir_all(directory.join(WANTED));
-        let _ = write_atomically(&path, text.as_bytes());
+        hint(fs::create_dir_all(directory.join(WANTED)));
+        hint(write_atomically(&path, text.as_bytes()));
     }
 
     pub(super) fn observe(directory: &Path, worktree: &Path, base: &str) -> Option<Observed> {
@@ -339,8 +346,11 @@ mod imp {
         let Ok(bytes) = serde_json::to_vec(&answer) else {
             return;
         };
-        let _ = fs::create_dir_all(directory.join(ANSWERS));
-        let _ = write_atomically(&directory.join(ANSWERS).join(&observed.key), &bytes);
+        hint(fs::create_dir_all(directory.join(ANSWERS)));
+        hint(write_atomically(
+            &directory.join(ANSWERS).join(&observed.key),
+            &bytes,
+        ));
     }
 
     fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -356,7 +366,7 @@ mod imp {
         ));
         fs::write(&temporary, bytes)?;
         fs::rename(&temporary, path).inspect_err(|_| {
-            let _ = fs::remove_file(&temporary);
+            hint(fs::remove_file(&temporary));
         })
     }
 
@@ -373,7 +383,10 @@ mod imp {
                 return;
             };
             std::thread::spawn(move || {
-                let _ = crate::environments::supervisor::ensure_running(&root, &executable);
+                hint(crate::environments::supervisor::ensure_running(
+                    &root,
+                    &executable,
+                ));
             });
         });
     }
@@ -426,7 +439,7 @@ mod imp {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
             if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
+                hint(thread.join());
             }
         }
     }
@@ -492,14 +505,14 @@ mod imp {
         };
         // A new epoch outdates every counter and answer of earlier watchers.
         for entry in fs::read_dir(directory.join(SEEN))?.flatten() {
-            let _ = fs::remove_file(entry.path());
+            hint(fs::remove_file(entry.path()));
         }
         let epoch = format!("{}-{}", std::process::id(), now_ms());
         write_atomically(&directory.join(EPOCH), epoch.as_bytes())?;
 
         let (sender, events) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(move |event| {
-            let _ = sender.send(event);
+            hint(sender.send(event));
         })
         .map_err(io::Error::other)?;
         let mut watching: HashMap<String, Watched> = HashMap::new();
@@ -558,12 +571,12 @@ mod imp {
                 }
             } else if !keep {
                 if let Some(watched) = watching.remove(key) {
-                    let _ = watcher.unwatch(&watched.path);
+                    hint(watcher.unwatch(&watched.path));
                     changed_watch_set = true;
                 }
-                let _ = fs::remove_file(directory.join(SEEN).join(key));
-                let _ = fs::remove_file(directory.join(ANSWERS).join(key));
-                let _ = fs::remove_file(directory.join(WANTED).join(key));
+                hint(fs::remove_file(directory.join(SEEN).join(key)));
+                hint(fs::remove_file(directory.join(ANSWERS).join(key)));
+                hint(fs::remove_file(directory.join(WANTED).join(key)));
             }
         }
         // Changing the watch set can restart the underlying event stream, and
@@ -589,6 +602,11 @@ mod imp {
                 return;
             }
         };
+        // Reads are reported on Linux (inotify opens and closes), and a lease
+        // scan itself reads the worktree: only changes move a counter.
+        if matches!(event.kind, notify::EventKind::Access(_)) {
+            return;
+        }
         for path in &event.paths {
             for watched in watching.values_mut() {
                 if path.starts_with(&watched.path) {
@@ -677,6 +695,29 @@ mod tests {
             changed_files_in(&self.directory, &self.checkout, &self.base).unwrap()
         }
 
+        /// What the watcher has published, for a failure message.
+        fn published(&self) -> Vec<String> {
+            let mut lines = vec![format!(
+                "epoch={:?}",
+                std::fs::read_to_string(self.directory.join(EPOCH)).ok()
+            )];
+            for name in [WANTED, SEEN, ANSWERS] {
+                let entries = std::fs::read_dir(self.directory.join(name))
+                    .map(|entries| entries.flatten().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                for entry in entries {
+                    lines.push(format!(
+                        "{name}/{}={:?}",
+                        entry.file_name().to_string_lossy(),
+                        std::fs::read_to_string(entry.path())
+                            .ok()
+                            .map(|text| text.chars().take(120).collect::<String>())
+                    ));
+                }
+            }
+            lines
+        }
+
         /// Ask until the answer comes from `source`, for at most ten seconds.
         fn ask_until(&self, source: Source) -> Vec<String> {
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -687,7 +728,8 @@ mod tests {
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "no answer from {source:?} within ten seconds"
+                    "no answer from {source:?} within ten seconds; published counters: {:?}",
+                    self.published()
                 );
                 std::thread::sleep(Duration::from_millis(50));
             }
