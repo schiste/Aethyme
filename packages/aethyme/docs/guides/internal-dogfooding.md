@@ -42,8 +42,8 @@ For sampled work, record locally:
 | Friction | Refused commands, onboarding confusion, and prompt/policy burden |
 
 Report time-to-first-session and time-to-first-accepted-submit separately.
-Record the repository's promotion mode: in `verify-only` mode, a successful
-submit verifies but does not promote. Gate execution times overlap with task
+A successful submit verifies but does not promote: local promotion was
+removed, and work lands through the session's pull request. Gate execution times overlap with task
 time; do not add them together. Estimated cache savings are not net savings,
 and overlap warnings are not proven prevented incidents.
 

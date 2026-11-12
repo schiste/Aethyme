@@ -77,7 +77,7 @@ product surface.
 - `aethyme certify`
 - `aethyme broker start` (its adopt, reuse and spawn forms are in the verb table under Broker Commands)
 - `aethyme broker status` (also `status readiness`, `status doctor`)
-- `aethyme broker submit` (also `submit prepare`, `submit promote`)
+- `aethyme broker submit` (also `submit prepare`)
 - `aethyme broker finish` (also `finish close`, `finish cleanup`)
 - `aethyme broker unblock`
 - `aethyme broker gc` (also `gc reclaim`, `gc storage`, `gc reap`)
@@ -250,7 +250,7 @@ print the replacement command. The migration table names old forms explicitly:
 | `aethyme broker start-agent --cmd <command>` | `aethyme broker start --cmd <command>` |
 | `aethyme broker readiness`, `aethyme readiness` | `aethyme broker status readiness` |
 | `aethyme broker doctor` | `aethyme broker status doctor` |
-| `aethyme broker prepare` / `promote` | `aethyme broker submit prepare` / `submit promote` |
+| `aethyme broker prepare` | `aethyme broker submit prepare` |
 | `aethyme broker close` / `cleanup` | `aethyme broker finish close` / `finish cleanup` |
 | `aethyme broker blockers` | `aethyme broker unblock` (no id lists blockers) |
 | `aethyme broker reclaim` / `storage` / `resources reap` | `aethyme broker gc reclaim` / `gc storage` / `gc reap` |
@@ -883,7 +883,7 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker advanced leases plan <paths...> [--session <id>] [--json]`
 - `aethyme broker advanced leases export (--session <id> | --entry <id>) [--limit <n>] [--json]`
 - `aethyme broker submit --session <id> [--no-cache] [--json]`
-- `aethyme broker push --session <id> [--pr] [--json]` — publish the session's own `agent/*` branch to the default branch's remote (and nothing else); `--pr` opens a draft pull request when none is open. Authorized by `[delivery] push_session_branches = true` in `.aethyme/config.toml` on the default branch; a fast-forward is pushed plainly, a rewritten branch only under a lease on the oid this broker last pushed for the session. It reports what it left behind the way `git status` shows it: changed tracked paths, and each untracked directory as one entry (JSON `uncommitted.modified`, `uncommitted.untracked_entries`, `uncommitted.sample`). After pushing it compares the session's change with the repository's open pull requests and reports `pr_overlaps` (see [Overlap with open pull requests](#overlap-with-open-pull-requests)), then fetches exactly the default branch and reports `default_branch` (`reference`, `commit`, `head`, `behind`, `ahead`, `would_conflict`, `conflicting_paths` (up to five), `suggested_command`) from a `git merge-tree` simulation; a failed fetch compares the last fetched copy and sets `default_branch_note`. Neither ever fails the push. In a `[promote] mode = "verify-only"` repository, `broker submit` simulates and gates against the fetched default branch instead of the integration branch and reports the base as `verified_against` (`source`, `reference`, `commit`, `fallback_reason`); see [broker workflows](../guides/broker-workflows.md).
+- `aethyme broker push --session <id> [--pr] [--json]` — publish the session's own `agent/*` branch to the default branch's remote (and nothing else); `--pr` opens a draft pull request when none is open. Authorized by `[delivery] push_session_branches = true` in `.aethyme/config.toml` on the default branch; a fast-forward is pushed plainly, a rewritten branch only under a lease on the oid this broker last pushed for the session. It reports what it left behind the way `git status` shows it: changed tracked paths, and each untracked directory as one entry (JSON `uncommitted.modified`, `uncommitted.untracked_entries`, `uncommitted.sample`). After pushing it compares the session's change with the repository's open pull requests and reports `pr_overlaps` (see [Overlap with open pull requests](#overlap-with-open-pull-requests)), then fetches exactly the default branch and reports `default_branch` (`reference`, `commit`, `head`, `behind`, `ahead`, `would_conflict`, `conflicting_paths` (up to five), `suggested_command`) from a `git merge-tree` simulation; a failed fetch compares the last fetched copy and sets `default_branch_note`. Neither ever fails the push. `broker submit` simulates and gates against the fetched default branch instead of the integration branch and reports the base as `verified_against` (`source`, `reference`, `commit`, `fallback_reason`); see [broker workflows](../guides/broker-workflows.md).
 - `aethyme broker sync --session <id> [--json]` — bring a live session up to the default branch, fetched first, when that is safe. It refuses (exit code for refusals, nothing changed) a dirty tree (each untracked directory counts as one entry, ignored files never count), a rebase, merge, cherry-pick or revert already in progress, a closed session, or a repository without a fetched default branch. It simulates the catch-up with `git merge-tree`: when that would conflict it changes nothing, lists up to five conflicting paths and the manual commands, and exits with the refusal code; otherwise it rebases an unpublished branch onto the default branch, or merges the default branch into a published one (a branch already on the remote), so a pull request's history is never rewritten. JSON: `session_id`, `branch`, `outcome` (`already_current`, `synced`, `conflict`), `strategy` (`rebase`, `merge`, `none`), `before`, `after`, `default_ref`, `default_commit`, `behind_before`, `ahead`, `conflicts`, `fetched`, optional `fetch_note`, `manual_commands` and `next_action` (the `broker push` command, present after `synced`: sync is local only and never pushes). Emits `broker.session.synced` when it changes the branch.
 - `broker start` fetches exactly the default branch from its remote (one ref, at most ten seconds) before choosing the base, so a new worktree starts from the remote's tip. `start_base` gains `fetched`, `fetch_error` and, for an intentional explicit base after a failed fetch, `cached_ref_age_seconds` (how long ago that copy last moved). `start --reuse` and `start --adopt` refresh it too and report `default_branch` / `default_branch_note`, the comparison `push` makes. Successful reuse of an existing registered broker session with a selected base via `start --reuse --json` also includes the `base_freshness` report described below.
 - `aethyme broker advanced repair --session <id> [--json]`
@@ -1065,12 +1065,9 @@ stores only a digest of the operator reason. Every resulting advisory is
 ordinary and non-blocking: it cannot select gates, stop promotion, or authorize
 publication.
 
-When a verified promotion changes a path covered by another live session's
-explicit or implicit lease, the broker records one deterministic warning for
-that affected session. It binds the originating queue entry, exact 40-character
-integration SHA, intersecting promoted paths, lease evidence, and the safe next
-command. Promotion remains non-blocking and the broker never rebases or edits
-the affected worktree. Outstanding notices appear on stderr for every broker
+Promotion-intersection warnings recorded by older releases (local promotion
+was removed) stay readable until acknowledged; the broker never rebases or
+edits the affected worktree. Outstanding notices appear on stderr for every broker
 command associated with that session, after managed post-commit output, and
 immediately before an uncached gate with cost greater than 1 starts. JSON stdout
 remains parseable. `broker status --json` includes both
@@ -1505,10 +1502,9 @@ this machine, read from local refs without fetching:
   `aethyme broker push --session <id>`, and in `unpushed_work.sessions[]`.
 - **For the integration branch:** commits upstream lacks, less patch
   equivalents, with how many exist on no remote at all
-  (`integration.unpublished-work`, `unpushed_work.integration`). The advice
-  names shipping, or `[promote] mode = "verify-only"` for a repository that
-  delivers through pull requests, where integration would otherwise
-  accumulate work nobody publishes.
+  (`integration.unpublished-work`, `unpushed_work.integration`). Nothing adds
+  to it any more: local promotion was removed, so this reports work left
+  there by an older release.
 
 Severity follows the age of the oldest unpushed commit. Without the push lane
 the session count is context only: `info`, then `notice` after a day. With
@@ -1605,12 +1601,10 @@ construction. The broker names that, from local facts only, and never blocks:
   status` adds a `session.mid-merge` warning with `git status`,
   `--continue` and `--abort` commands. The check reads the worktree's Git
   directory and runs no Git command.
-- **Verify-only submit:** in a `[promote] mode = "verify-only"` repository, a
-  conflicting explicit lease held by an active session no longer fails the
-  submit ownership audit. It is reported in `lease_warnings` with the
-  coordination command, and submit continues to the gates. `auto` and
-  `manual` repositories still refuse, because they promote onto a shared
-  integration branch. `broker advanced exec`'s guard is unchanged.
+- **Verify-only submit:** a conflicting explicit lease held by an active
+  session does not fail the submit ownership audit. It is reported in
+  `lease_warnings` with the coordination command, and submit continues to the
+  gates. `broker advanced exec`'s guard is unchanged.
 - **`[leases] ignore`:** an entry ending in `/` is a directory prefix, an entry
   containing `/` is an exact repository-relative path, and any other entry is
   a file name matched in every directory. The rules are read from

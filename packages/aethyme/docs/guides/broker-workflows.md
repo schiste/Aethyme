@@ -32,8 +32,8 @@ Each workflow separates observation from mutation:
 | End or recover a session | `finish` report | successful `finish` closes and records the handoff | dirty or unsubmitted work refuses the finish |
 
 These commands coordinate local repository state. Work lands through GitHub
-pull requests (`broker push --pr`); `broker submit` verifies and, with the
-default `[promote] mode = "verify-only"`, promotes nothing.
+pull requests (`broker push --pr`); `broker submit` verifies and promotes
+nothing.
 
 ## Inspect a Running Coordinated Operation
 
@@ -1010,9 +1010,6 @@ should make the session branch the unit of delivery and push it continuously:
 
 ```toml
 # .aethyme/config.toml
-[promote]
-mode = "verify-only"   # verify on submit, keep nothing unpublished locally
-
 [delivery]
 default = "pull_request"
 push_session_branches = true
@@ -1045,10 +1042,13 @@ Without the policy, the generated instructions keep the conservative default:
 submitting never authorizes publishing; opt in to `push_session_branches` so
 sessions deliver through pull requests.
 
-### Verify-only repositories do not use integration
+### Repositories do not use integration
 
-Under `mode = "verify-only"` each session branch and its pull request are the
-delivery path, and the integration branch plays no part:
+Each session branch and its pull request are the delivery path, and the
+integration branch plays no part. Local promotion was removed: `verify-only`
+is the only `[promote] mode`, and an old `mode = "auto"` or `"manual"` (or
+`promote_on_submit = true`) still parses, is ignored, and `broker status`
+reports one `promote.mode-removed` warning saying to delete it.
 
 - **`broker submit` is a pre-flight against the current default branch.** It
   simulates the merge onto the fetched default branch and gates that tree,
@@ -1065,7 +1065,7 @@ delivery path, and the integration branch plays no part:
   origin/main`), because rebasing a published branch rewrites what its pull
   request shows; an unpublished one by rebasing. A failed fetch never fails
   the push: the last fetched copy is compared and `default_branch_note` says
-  so. This applies in every promote mode.
+  so.
 - **`broker start` starts from the latest default branch.** It fetches
   exactly the default branch (one ref, at most ten seconds) before choosing
   the base. If the fetch fails, the session starts from the cached copy and
@@ -1129,34 +1129,17 @@ them, and resolve the merge-time conflict by regenerating.
 
 ## Where A New Session Starts
 
-The integration-branch base below belongs to the local landing path that is being retired in favour of pull requests.
-
 Without `--base`, `broker start` cuts the session branch from the first of:
 
-1. The integration branch, when `[promote]` promotes (`auto` or `manual`) and
-   integration contains the fetched default branch's tip.
-2. The fetched default branch (`origin/HEAD`'s target, else the main
-   checkout's upstream). This is always the base under
-   `mode = "verify-only"`, and the base whenever integration has fallen
-   behind upstream.
-3. The local default branch, then `main` or `master`, when nothing has been
+1. The fetched default branch (`origin/HEAD`'s target, else the main
+   checkout's upstream).
+2. The local default branch, then `main` or `master`, when nothing has been
    fetched.
 
-A session never starts from an integration branch that is behind upstream:
-one repository's integration stopped moving while upstream merged 2,101
-commits, and every session cut from it started three days stale. `start`
-names what it skipped in `start_base.bypassed_integration` (`reason`,
-`behind_default_commits`, `ahead_default_commits`, and a `recovery_command`
-when integration is behind), prints a warning, and `broker status` keeps an
-`integration.behind-upstream` row until integration is reconciled with
-`aethyme broker advanced integration reconcile --upstream <ref>`. `start` never
+Integration is never a session base: local promotion was removed. When an
+integration branch exists, `start` names it in
+`start_base.bypassed_integration` with `reason: "verify_only"`. `start` never
 fetches, so "upstream" is as fresh as the last fetch.
-
-`[promote]` is read with the same trust rule as the push policy: the
-`.aethyme/config.toml` committed on the fetched default branch wins, and the
-main checkout's working-tree file is used only when the default branch commits
-none. A merged `mode = "verify-only"` therefore takes effect without anyone
-pulling it into the main checkout.
 
 ## Finish With A Durable Handoff
 
@@ -1418,8 +1401,7 @@ project = "proj-7k2m"
 ```
 
 - `advisory` reports the capture beside the submit result and never changes it.
-- `required` refuses a submit, and every promotion, whose exact head was not
-  captured.
+- `required` refuses a submit whose exact head was not captured.
 
 > **`required` is one-way for older binaries.** Once `capture = "required"` is
 > committed on the default branch and fetched, the first writable open, status,

@@ -367,9 +367,8 @@ For routine coordination, use `aethyme broker status --compact --json`.
 It groups advice and reports deferred checks as unknown. Use full
 `aethyme broker status --json` when exact session or lease-path evidence is
 needed. Check overlapping work before duplicating it. Overlaps with an active
-session's explicit lease are advisory unless the repository's `[promote]` config
-makes them refusals. Accepted warnings permit work in your session; reconcile
-before merging. Resolve blockers and refusals.
+session's explicit lease are advisory. Accepted warnings permit work in your
+session; reconcile before merging. Resolve blockers and refusals.
 
 1. `aethyme broker start --task "<task>"`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
@@ -403,9 +402,8 @@ For routine coordination, use `aethyme broker status --compact --json`.
 It groups advice and reports deferred checks as unknown. Use full
 `aethyme broker status --json` when exact session or lease-path evidence is
 needed. Check overlapping work before duplicating it. Overlaps with an active
-session's explicit lease are advisory unless the repository's `[promote]` config
-makes them refusals. Accepted warnings permit work in your session; reconcile
-before merging. Resolve blockers and refusals.
+session's explicit lease are advisory. Accepted warnings permit work in your
+session; reconcile before merging. Resolve blockers and refusals.
 
 1. `aethyme broker start --task "<task>" [--short-name "<label>"]`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
@@ -704,9 +702,9 @@ blocked.
    aethyme broker submit --session <your-session-id>
    ```
 
-   This simulates the merge and runs only the checks your diff affects. With
-   the default `[promote] mode = "verify-only"` it promotes nothing; it does not
-   publish a remote branch, merge a pull request, or push a release tag. Work
+   This simulates the merge and runs only the checks your diff affects. It
+   promotes nothing; it does not publish a remote branch, merge a pull request,
+   or push a release tag. Work
    lands through GitHub: push the session branch with `aethyme broker push
    --session <id> --pr` (step 4) and merge the pull request there.
    If your session contains an owned merge commit, submission refuses safely
@@ -1329,8 +1327,7 @@ mod tests {
             for required in [
                 "For routine coordination, use `aethyme broker status --compact --json`.",
                 "`aethyme broker status --json` when exact session or lease-path evidence is",
-                "session's explicit lease are advisory unless the repository's `[promote]` config",
-                "makes them refusals.",
+                "session's explicit lease are advisory. Accepted warnings permit work in your",
                 "Resolve blockers and refusals.",
             ] {
                 assert!(
@@ -1388,7 +1385,7 @@ mod tests {
             "aethyme broker push --session <your-session-id> --pr",
             "it does not authorize\n   merging, marking a PR ready, or pushing any other ref",
             "--abandon --reason",
-            "`[promote] mode = \"verify-only\"`",
+            "It\n   promotes nothing; it does not publish a remote branch",
             "`coordination.land-shared-edit-first`",
             "lands through GitHub: push the session branch",
         ] {

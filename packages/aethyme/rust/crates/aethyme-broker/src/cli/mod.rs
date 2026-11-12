@@ -974,7 +974,7 @@ Usage:
       the `cross-process-contract` gate. Exit 1 = undeclared contract
       change; the refusal lists every source it read.
 
-In verify-only mode overlaps warn; other modes can refuse claims against active explicit leases.
+Overlaps with another session's explicit lease warn.
 ";
 
 pub fn run(args: &[String]) -> u8 {
