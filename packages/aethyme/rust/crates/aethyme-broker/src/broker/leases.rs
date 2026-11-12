@@ -1588,13 +1588,9 @@ impl Broker {
         use crate::leases::{LeaseIgnoreRules, detect_overlaps};
 
         let rules = LeaseIgnoreRules::load(&self.main_root);
-        // The integration tip is the same for every session; resolving it
-        // inside the loop cost one git subprocess per live session.
-        let integration = self.integration_tip();
-        if let Some(preparation) = preparation {
-            preparation.check()?;
-        }
-        let upstream = self.repo.upstream_default().map(|(_, commit)| commit);
+        // The baseline refs are the same for every session; resolving them
+        // inside the loop cost git subprocesses per live session.
+        let refs = self.baseline_refs();
         if let Some(preparation) = preparation {
             preparation.check()?;
         }
@@ -1619,7 +1615,7 @@ impl Broker {
                 .collect::<Vec<_>>();
             let _span = crate::phase_telemetry::span("implicit_lease_scan_all");
             let scanned = crate::worktree_report::inspect_in_parallel(&sessions, |session| {
-                implicit_lease_paths(session, &rules, integration.as_deref(), upstream.as_deref())
+                implicit_lease_paths(session, &rules, &refs)
             });
             pending_implicit_leases.extend(
                 sessions
@@ -1636,13 +1632,8 @@ impl Broker {
             if !coordinating.contains(&session.id) {
                 continue;
             }
-            let Some(paths) = implicit_lease_paths(
-                &session,
-                &rules,
-                integration.as_deref(),
-                upstream.as_deref(),
-            ) else {
-                // `integration_tip`, `upstream_default`, baseline and
+            let Some(paths) = implicit_lease_paths(&session, &rules, &refs) else {
+                // `baseline_refs`, baseline and
                 // changed-file helpers deliberately hide ordinary Git
                 // failures behind `Option`. A timeout is different: a
                 // lease claim must stop rather than treating that
@@ -2472,11 +2463,7 @@ impl Broker {
         let session = self.store.session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
         let head = checkout.head_commit()?;
-        let integration = self.integration_tip();
-        let upstream = self.repo.upstream_default().map(|(_, commit)| commit);
-        let base = integration
-            .as_deref()
-            .and_then(|tip| crate::merge::session_baseline(&checkout, tip, upstream.as_deref()))
+        let base = crate::merge::session_baseline(&checkout, &self.baseline_refs())
             .or(session.diff_base.clone())
             .unwrap_or_else(|| "HEAD".to_string());
         let leases = self.leases_as_refreshed(session_id)?;
@@ -2523,8 +2510,7 @@ impl Broker {
         use crate::leases::LeaseIgnoreRules;
 
         let rules = LeaseIgnoreRules::load(&self.main_root);
-        let integration = self.integration_tip();
-        let upstream = self.repo.upstream_default().map(|(_, commit)| commit);
+        let refs = self.baseline_refs();
         let mut coordinating = self.coordinating_session_ids()?;
         coordinating.insert(acting);
         let mut refreshed = std::collections::BTreeMap::new();
@@ -2532,12 +2518,7 @@ impl Broker {
             if !coordinating.contains(&session.id) {
                 continue;
             }
-            if let Some(paths) = implicit_lease_paths(
-                &session,
-                &rules,
-                integration.as_deref(),
-                upstream.as_deref(),
-            ) {
+            if let Some(paths) = implicit_lease_paths(&session, &rules, &refs) {
                 refreshed.insert(session.id, paths);
             }
         }
@@ -4022,8 +4003,7 @@ struct GuardedCommandResult {
 fn implicit_lease_paths(
     session: &crate::types::Session,
     rules: &crate::leases::LeaseIgnoreRules,
-    integration: Option<&str>,
-    upstream: Option<&str>,
+    refs: &crate::merge::BaselineRefs,
 ) -> Option<Vec<String>> {
     let _span = crate::phase_telemetry::span("implicit_lease_scan");
     let checkout = {
@@ -4035,8 +4015,7 @@ fn implicit_lease_paths(
     // value inflates the diff with everyone else's promoted work.
     let base = {
         let _span = crate::phase_telemetry::span("implicit_lease_baseline");
-        integration
-            .and_then(|tip| crate::merge::session_baseline(&checkout, tip, upstream))
+        crate::merge::session_baseline(&checkout, refs)
             .or_else(|| session.diff_base.clone())
             .unwrap_or_else(|| "HEAD".to_string())
     };

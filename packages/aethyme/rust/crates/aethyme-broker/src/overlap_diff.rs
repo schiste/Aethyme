@@ -161,10 +161,8 @@ pub(crate) fn read_all(
                 crate::git::drop_inherited_git_environment_on_this_thread();
                 let _deadline = limit_git_until(deadline);
                 let main = GitRepo::at_known_root(&main_root);
-                let branch = crate::merge::PromoteConfig::load(&main_root).branch;
-                let integration = main.resolve_ref(&format!("refs/heads/{branch}"));
-                let upstream = main.upstream_default().map(|(_, commit)| commit);
-                let (integration, upstream) = (integration.as_deref(), upstream.as_deref());
+                let refs = crate::merge::BaselineRefs::resolve(&main, &main_root);
+                let refs = &refs;
                 std::thread::scope(|inner| {
                     let handles: Vec<_> = requests
                         .iter()
@@ -172,7 +170,7 @@ pub(crate) fn read_all(
                             inner.spawn(move || {
                                 crate::git::drop_inherited_git_environment_on_this_thread();
                                 let _deadline = limit_git_until(deadline);
-                                read_one(request, integration, upstream)
+                                read_one(request, refs)
                             })
                         })
                         .collect();
@@ -197,20 +195,15 @@ pub(crate) fn read_all(
     })
 }
 
-fn read_one(
-    request: &HolderRequest,
-    integration: Option<&str>,
-    upstream: Option<&str>,
-) -> OverlapChanges {
+fn read_one(request: &HolderRequest, refs: &crate::merge::BaselineRefs) -> OverlapChanges {
     if !Path::new(&request.worktree).is_dir() {
         return unavailable(request, "its worktree no longer exists".into());
     }
     let checkout = GitRepo::at_known_root(Path::new(&request.worktree));
     // As implicit leases do: a stored base would count everything the session
     // has merged from upstream since as its own change.
-    let base = integration
-        .and_then(|tip| crate::merge::session_baseline(&checkout, tip, upstream))
-        .or_else(|| request.recorded_base.clone());
+    let base =
+        crate::merge::session_baseline(&checkout, refs).or_else(|| request.recorded_base.clone());
     let Some(base) = base else {
         return unavailable(request, "the session has no recorded base".into());
     };
