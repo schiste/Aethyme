@@ -110,6 +110,9 @@ ID   STATUS   ORIGIN   BRANCH                   TASK
 
 ## Scene 3 — alpha lands first
 
+This scene shows the local promotion path, which is being retired in favour of
+pull requests (`broker push --pr`); it needs the opt-in `[promote] mode = "auto"`.
+
 Both agents are about to change the same `GREETING` line. Alpha commits
 and submits first: merge simulation is clean, the gate runs on the merged
 tree, and with `[promote] mode = "auto"` set for this demo (the default is

@@ -63,6 +63,8 @@ discarding working-tree changes.
 
 ## 3. Diagnose integration before moving refs
 
+The local integration landing path is being retired in favour of pull requests; this section covers recovery for repositories that still have integration state.
+
 ```sh
 aethyme broker status --json
 aethyme broker advanced integration status --json

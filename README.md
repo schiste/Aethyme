@@ -4,8 +4,8 @@
 
 Aethyme is a Rust-native CLI for running concurrent agent work safely in one
 repository. It gives each task an isolated worktree, tracks ownership and
-leases, runs repository-owned gates against the merged tree, and promotes
-verified work to a local integration branch. Its engine adds bounded,
+leases, runs repository-owned gates against the merged tree, and delivers
+verified work through GitHub pull requests. Its engine adds bounded,
 observable repository navigation when an agent needs context.
 
 There is no hosted control plane to operate. Repository policy and broker state
@@ -32,9 +32,9 @@ adds that part:
 | Concern | `git worktree` + PRs | Claude Code native worktrees | Aethyme broker |
 | --- | --- | --- | --- |
 | Isolated checkout per task | yes | yes | yes (`broker start`) |
-| Gates run on the *merged* tree before integration | only if CI does it, after push | no | yes: `broker submit` simulates the merge onto `aethyme/integration` and runs the repository's affected gates on that result |
+| Gates run on the *merged* tree before merging | only if CI does it, after push | no | yes: `broker submit` simulates the merge onto the current default branch and runs the repository's affected gates on that result |
 | Path ownership between concurrent agents | no | no | leases: a conflicting `leases claim` is refused, and `broker advanced exec` fails a command that dirties paths outside its leases |
-| A local integration branch that only verified work reaches | no | no | `aethyme/integration`; nothing is pushed until someone publishes |
+| Session branches and draft PRs pushed for you | no | no | `broker push --pr` pushes your own session branch and opens a draft PR; the PR is merged on GitHub |
 | Serialized, journaled Git/GitHub writes | no | no | `broker advanced git` / `broker advanced gh` queue per repository and journal each write; an unknown remote outcome fails closed until `broker advanced operations reconcile` |
 | Recovery after conflicts or crashes | manual | manual | conflict notices with exact rebase steps (`.aethyme/broker-action-required.md`), `broker unblock`, `broker finish cleanup` with provenance checks |
 
@@ -199,7 +199,9 @@ aethyme broker start --task "Describe the task" --short-name "Short label"
 # Change into the worktree printed by `broker start`.
 aethyme broker advanced leases claim path/to/area --session <id>
 # Edit, test, and commit in that worktree.
+aethyme broker push --session <id> --pr
 aethyme broker submit --session <id>
+# Merge the pull request on GitHub, then:
 aethyme broker finish --session <id>
 ```
 
@@ -209,10 +211,9 @@ Run broad commands through `aethyme broker advanced exec --session <id> -- ...`;
 mutations. Only committed work can be submitted.
 
 `broker submit` simulates the merge, selects the affected repository gates,
-and promotes a verified result to the local `aethyme/integration` branch. It
-does not publish a remote branch. Use the reviewed `broker advanced ship plan` /
-`broker advanced ship execute` lane, or your normal review flow, when publication is
-authorized.
+and reports whether the work verifies. With the default `[promote] mode =
+"verify-only"` it promotes nothing and publishes nothing; work lands when the
+pull request opened by `broker push --pr` is merged on GitHub.
 
 ## Explore a repository
 

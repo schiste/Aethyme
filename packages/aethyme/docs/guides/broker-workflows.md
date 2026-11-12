@@ -31,9 +31,10 @@ Each workflow separates observation from mutation:
 | Recover a rewritten checkpoint | `checkpoint plan --json` | `checkpoint apply --confirm <digest>` when the plan is safe | unsafe plans preserve the exact tip before directing a clean replay; they never recommend a blanket integration rebase |
 | End or recover a session | `finish` report | successful `finish` closes and records the handoff | dirty or unsubmitted work refuses the finish |
 
-These commands coordinate local repository state. Submission promotes only to
-the local `aethyme/integration` branch. Use the separate
-`broker advanced ship plan`/`broker advanced ship execute` lane when publication is authorized.
+These commands coordinate local repository state. Work lands through GitHub
+pull requests (`broker push --pr`); `broker submit` verifies and, with the
+default `[promote] mode = "verify-only"`, promotes nothing. The local
+promotion and `broker advanced ship` lane is being retired.
 
 ## Inspect a Running Coordinated Operation
 
@@ -112,6 +113,8 @@ for the selected manager. The broker does not override package-manager
 settings such as `PNPM_HOME` or `UV_CACHE_DIR`.
 
 ## Recover External Main Movement
+
+The local landing path this section recovers is being retired in favour of pull requests.
 
 Status warns as soon as the configured upstream contains the first commit that
 broker-managed integration does not contain. This commonly happens when a
@@ -451,6 +454,8 @@ is not persisted; the broker records only its digest in a redacted event.
 
 ## Require Review Evidence at Publication
 
+The local `ship` publication lane described here is being retired in favour of pull requests.
+
 Review coordination and publication authorization are separate controls. The
 default ship lane remains direct and requires the exact planned SHA. To make
 unlocked review evidence mandatory, commit the policy in the promoted series:
@@ -554,6 +559,8 @@ its duration, and leaves the current repository-wide lock policy unchanged.
 
 ### Reconciling a local default branch
 
+This local landing path is being retired in favour of pull requests.
+
 `ship` publishes an exact promoted prefix and refuses to discard local work the
 prefix omits. When the local default branch carries commits integration does
 not, `broker advanced main reconcile` decides whether moving it is safe:
@@ -606,6 +613,8 @@ Each entry requires a reason, and the decisions are bound into the plan digest,
 so an edited file no longer matches a reviewed plan.
 
 ### Synchronizing local main from another worktree
+
+This local landing path is being retired in favour of pull requests.
 
 `ship execute --sync-main` is safe to run from any session worktree, which is
 the normal case: the primary checkout almost always has the default branch
@@ -894,6 +903,8 @@ submit or external CI must run.
 
 ## Understand Normalized Submission Planning
 
+Replaying onto the local integration branch is part of the local landing path that is being retired in favour of pull requests; with `verify-only` submit only verifies.
+
 Submit plans commit provenance before it simulates a merge. This matters when
 main and integration contain patch-equivalent commits under different SHAs,
 as can happen after a rebase or cherry-pick. The broker does not merge the
@@ -1137,8 +1148,8 @@ unpushed unless the agent records why the work should not be kept with
 `--abandon --reason "<why>"`.
 
 Without the policy, the generated instructions keep the conservative default:
-submitting never authorizes publishing, and delivery goes through the
-reviewed `broker advanced ship` workflow.
+submitting never authorizes publishing; opt in to `push_session_branches` so
+sessions deliver through pull requests.
 
 ### Verify-only repositories do not use integration
 
@@ -1223,6 +1234,8 @@ directory prefixes ending in `/`, or bare file names), or stop committing
 them, and resolve the merge-time conflict by regenerating.
 
 ## Where A New Session Starts
+
+The integration-branch base below belongs to the local landing path that is being retired in favour of pull requests.
 
 Without `--base`, `broker start` cuts the session branch from the first of:
 
@@ -1431,6 +1444,7 @@ what is safe next,” not as an audit replay of the work itself.
 One safe follow-up sequence is:
 
 ```bash
+aethyme broker push --session 110 --pr
 aethyme broker submit --session 110
 aethyme broker finish --session 110
 aethyme broker advanced handoff --session 110 --json
@@ -1441,6 +1455,7 @@ aethyme broker advanced leases plan src/broker.rs --session 111
 aethyme broker advanced leases claim src/broker.rs --session 111
 # edit and commit
 aethyme broker advanced gates run --session 111 --no-cache
+aethyme broker push --session 111 --pr
 aethyme broker submit --session 111
 aethyme broker finish --session 111
 aethyme broker finish cleanup 111

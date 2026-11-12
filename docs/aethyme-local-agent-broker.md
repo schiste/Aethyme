@@ -70,8 +70,9 @@ contracts, so any future delivery surface is a client, not a rewrite.
   while the repository is private.
 - **Kill criterion for the dogfood:** stop if costs increase too much AND
   no time is saved; the friction log includes cost/time accounting.
-- **Promotion lands on a local integration branch only.** `broker submit`
-  never pushes and never opens PRs. Explicitly authorized Git and GitHub
+- **Pull requests are the landing path; local promotion is being retired.**
+  `broker submit` verifies, never pushes and never opens PRs (`broker push --pr`
+  does that for your own session branch). Explicitly authorized Git and GitHub
   mutations use `broker advanced git` / `broker advanced gh`: fixed executables, repository-wide
   write serialization, a durable redacted journal, and fail-closed recovery
   when a crashed operation has an unknown external outcome.
@@ -86,7 +87,7 @@ contracts, so any future delivery surface is a client, not a rewrite.
   repository delivers through pull requests, so a second copy on an integration
   branch only adds drift). `[promote] mode = "auto"` promotes as soon as gates
   pass; `"manual"` adds an explicit `broker submit promote` step.
-- **Delivery is explicit and target-aware.** `broker advanced ship plan` reads an
+- **Delivery is explicit and target-aware** (the local `ship` lane is being retired in favour of pull requests). `broker advanced ship plan` reads an
   optional `[delivery] default = "pull_request" | "local_main_merge"` from
   the exact remote default-branch commit, never from the pending integration
   tip. A plan reports the selected route, policy source, compared SHAs,

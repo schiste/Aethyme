@@ -44,6 +44,7 @@ aethyme broker advanced git --session <id> [--repo <owner/name>] [--reason <text
 aethyme broker advanced gh --session <id> --repo <owner/name> [--reason <text>] -- <gh-args>
 aethyme broker advanced operations
 # edit and commit in the session worktree
+aethyme broker push --session <id> --pr
 aethyme broker submit --session <id>
 aethyme broker advanced repair --session <id>
 aethyme broker finish --session <id>
@@ -57,7 +58,7 @@ What this provides:
 - dirty-worktree visibility, explicit leases, and overlap warnings
 - guarded command execution for broad rewrites
 - durable, repository-serialized Git and GitHub mutations with crash recovery
-- merge simulation before promotion
+- merge simulation against the default branch before merging
 - repo-owned gates on the merged tree
 - promoted-but-unmerged integration visibility
 - written recovery steps for rejected submits
@@ -150,7 +151,7 @@ These should not lead product docs unless they are being actively promoted:
 
 `aethyme broker quick-test` is the install smoke. It creates a disposable repo,
 runs init, adopts a session, commits a broker-owned change, submits it, verifies
-promotion, and removes the temporary repo.
+the result, and removes the temporary repo.
 
 `aethyme broker advanced verify-loop` is the fuller broker E2E. It reports the
 integration commit tested and fails if integration moved before the result could
