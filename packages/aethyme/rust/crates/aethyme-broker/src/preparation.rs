@@ -470,6 +470,112 @@ fn acquire_preparation_cache(
     ),
     PreparationError,
 > {
+    let deadline = Instant::now() + wait;
+    let mut reclaims = 0;
+    loop {
+        // The first attempt gets the caller's budget unchanged, so the wait
+        // it announces is the one that was asked for; a retry after a reclaim
+        // gets what is left of it.
+        let remaining = if reclaims == 0 {
+            wait
+        } else {
+            deadline.saturating_duration_since(Instant::now())
+        };
+        let attempt = acquire_preparation_cache_once(
+            coordinator,
+            request_for,
+            sharing,
+            budget_check,
+            remaining,
+            &mut *rotation_unsettled,
+        );
+        match attempt {
+            Err(PreparationError::HostResource(error))
+                if reclaims < DEAD_HOLDER_RECLAIMS_PER_PREPARATION
+                    && reclaim_dead_cache_holders(coordinator, &error) =>
+            {
+                reclaims += 1;
+            }
+            attempt => return attempt,
+        }
+    }
+}
+
+/// A preparation reclaims at most this many dead holders before it reports
+/// the conflict. One is the expected case; the bound only stops a loop.
+const DEAD_HOLDER_RECLAIMS_PER_PREPARATION: u32 = 3;
+
+/// Release the preparation-cache leases this conflict names whose holder
+/// process is gone, and say whether any was released.
+///
+/// A preparation that was killed (a closed agent tab, a timeout, a crash)
+/// never releases its lease, and waiting cannot. Until 2026-11-12 every later
+/// preparation in the repository then refused and asked for `resources
+/// reconcile`, which adds no information: the broker had already proven the
+/// holder gone. Only a lease that holds nothing but this cache is released
+/// here; gate build caches and every other resource keep the reviewed path.
+fn reclaim_dead_cache_holders(
+    coordinator: &mut HostResourceCoordinator,
+    error: &crate::HostResourceError,
+) -> bool {
+    let crate::HostResourceError::Conflict { conflicts, .. } = error else {
+        return false;
+    };
+    let named = conflicts
+        .iter()
+        .filter(|conflict| conflict.code == "orphaned_holder" && conflict.kind == "exclusive_key")
+        .filter_map(|conflict| conflict.owning_lease.as_deref());
+    let Ok(leases) = coordinator.list(false) else {
+        return false;
+    };
+    let mut reclaimed = false;
+    for lease_id in named {
+        let Some(lease) = leases.iter().find(|lease| lease.lease_id == lease_id) else {
+            continue;
+        };
+        let only_this_cache = !lease.allocations.is_empty()
+            && lease.allocations.iter().all(|allocation| {
+                matches!(
+                    allocation.key.as_str(),
+                    "preparation_cache" | "preparation_cache_users"
+                )
+            });
+        if !only_this_cache {
+            continue;
+        }
+        if let Ok(Some(released)) = coordinator.reconcile_dead_holder(lease_id, lease.generation) {
+            crate::phase_telemetry::add("shared_cache_dead_holder_reclaimed", Duration::ZERO);
+            eprintln!(
+                "reclaimed the shared preparation cache from lease {} (generation {}): its \
+                 holder process {} is gone",
+                released.lease_id,
+                released.generation,
+                released
+                    .holder_pid
+                    .map_or_else(|| "unknown".to_string(), |pid| pid.to_string()),
+            );
+            reclaimed = true;
+        }
+    }
+    reclaimed
+}
+
+/// One attempt of [`acquire_preparation_cache`].
+fn acquire_preparation_cache_once(
+    coordinator: &mut HostResourceCoordinator,
+    request_for: &dyn Fn(SharedCacheMode) -> Result<HostResourceRequest, PreparationError>,
+    sharing: bool,
+    budget_check: Option<ExclusiveNeed>,
+    wait: Duration,
+    rotation_unsettled: &mut dyn FnMut() -> bool,
+) -> Result<
+    (
+        crate::HostResourceGrant,
+        SharedCacheMode,
+        Option<ExclusiveNeed>,
+    ),
+    PreparationError,
+> {
     let _span = crate::phase_telemetry::span("shared_cache_acquire");
     let deadline = Instant::now() + wait;
     let mut next_notice = Instant::now();
@@ -4956,6 +5062,79 @@ mod tests {
             Duration::ZERO,
             &mut || rotation_unsettled,
         )
+    }
+
+    /// A preparation-cache request whose holder has already exited.
+    fn request_from_a_dead_holder(mode: SharedCacheMode) -> HostResourceRequest {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let mut request = cache_test_request(mode, 2);
+        request.holder_pid = Some(pid);
+        request
+    }
+
+    #[test]
+    fn a_cache_held_by_a_dead_preparation_is_reclaimed_without_a_reviewer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&tmp.path().join("r.db")).unwrap();
+        let dead = coordinator
+            .acquire(&request_from_a_dead_holder(SharedCacheMode::Exclusive))
+            .unwrap();
+        // Without sharing, the next preparation needs the cache alone.
+        let (grant, mode, _) = acquire_for_test(&mut coordinator, 1, None, false).unwrap();
+        assert_eq!(mode, SharedCacheMode::Exclusive);
+        assert_ne!(grant.lease.lease_id, dead.lease.lease_id);
+        let released = coordinator
+            .list(true)
+            .unwrap()
+            .into_iter()
+            .find(|lease| lease.lease_id == dead.lease.lease_id)
+            .unwrap();
+        assert_eq!(released.state, crate::HostLeaseState::Released);
+    }
+
+    #[test]
+    fn a_cache_held_by_a_living_preparation_is_never_reclaimed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&tmp.path().join("r.db")).unwrap();
+        let living = coordinator
+            .acquire(&cache_test_request(SharedCacheMode::Exclusive, 2))
+            .unwrap();
+        let error = acquire_for_test(&mut coordinator, 1, None, false).unwrap_err();
+        assert!(is_contention(&error), "{error}");
+        let held = coordinator
+            .list(false)
+            .unwrap()
+            .into_iter()
+            .find(|lease| lease.lease_id == living.lease.lease_id)
+            .unwrap();
+        assert_eq!(held.state, crate::HostLeaseState::Active);
+    }
+
+    #[test]
+    fn a_dead_holder_of_another_resource_keeps_the_reviewed_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&tmp.path().join("r.db")).unwrap();
+        // The dead holder took the cache together with something else, so
+        // releasing its lease would release more than the cache.
+        let mut request = request_from_a_dead_holder(SharedCacheMode::Exclusive);
+        request.resources.push(HostResourceRequirement {
+            key: "something_else".into(),
+            resource: HostResourceKind::ExclusiveKey {
+                name: "fixture-something-else".into(),
+            },
+        });
+        let dead = coordinator.acquire(&request).unwrap();
+        let error = acquire_for_test(&mut coordinator, 1, None, false).unwrap_err();
+        assert!(!is_contention(&error), "{error}");
+        let kept = coordinator
+            .list(false)
+            .unwrap()
+            .into_iter()
+            .find(|lease| lease.lease_id == dead.lease.lease_id)
+            .unwrap();
+        assert_ne!(kept.state, crate::HostLeaseState::Released);
     }
 
     fn is_contention(error: &PreparationError) -> bool {
