@@ -3574,6 +3574,8 @@ impl Broker {
         };
         let mut removed_session_ids = Vec::new();
         let mut failures = Vec::new();
+        let mut artifact_directories_reclaimed = 0usize;
+        let mut artifact_bytes_reclaimed = 0u64;
         if apply {
             let confirm = confirm.ok_or(BrokerOpError::CleanupConfirmationNotSha256)?;
             if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -3593,12 +3595,31 @@ impl Broker {
                     }),
                 }
             }
+            // A checkout that must stay still loses its rebuildable build
+            // output, through the same guarded lane `finish` uses.
+            let _span = crate::phase_telemetry::span("cleanup_kept_worktree_artifact_reclaim");
+            for item in plan.worktrees.iter().filter(|item| {
+                item.worktree_present && !removed_session_ids.contains(&item.session_id)
+            }) {
+                match self.reclaim_closed_session_artifacts(item.session_id) {
+                    Ok(outcome) => {
+                        artifact_directories_reclaimed += outcome.directories_reclaimed;
+                        artifact_bytes_reclaimed += outcome.observed_logical_file_bytes;
+                    }
+                    Err(error) => failures.push(CleanupSweepFailure {
+                        session_id: item.session_id,
+                        reason: format!("build output was not reclaimed: {error}"),
+                    }),
+                }
+            }
         }
         Ok(CleanupSweepReport {
             applied: apply,
             plan,
             removed_session_ids,
             failures,
+            artifact_directories_reclaimed,
+            artifact_bytes_reclaimed,
         })
     }
 

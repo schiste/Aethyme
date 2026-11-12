@@ -3440,3 +3440,106 @@ fn a_remembered_path_through_a_symlink_is_never_removed() {
         );
     }
 }
+
+/// Commit, on `main` and its fetched remote, a harness-local ignore rule, an
+/// ignored scratch root and tracked trees deeper than the artifact walk's
+/// depth cap at the two levels above `rust/target`. Before the walk learned to
+/// skip a too-deep subtree instead of abandoning the checkout, visiting any of
+/// these chains first left the shallow build directory unfound.
+fn commit_kept_worktree_fixture(repo: &Path) {
+    std::fs::write(
+        repo.join(".gitignore"),
+        "/.aethyme/\n/rust/target/\n/rust/build/\n/.claude/settings.local.json\n/scratch/\n",
+    )
+    .unwrap();
+    for parent in ["", "rust/"] {
+        for index in 0..8 {
+            let chain = repo.join(format!("{parent}deep-{index}/a/b/c/d/e/f"));
+            std::fs::create_dir_all(&chain).unwrap();
+            std::fs::write(chain.join("fixture.txt"), "tracked\n").unwrap();
+        }
+    }
+    std::fs::write(repo.join("rust/Cargo.toml"), "# fixture\n").unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-qm", "kept worktree fixture"]);
+    let head = git_output(repo, &["rev-parse", "HEAD"]);
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+    git(repo, &["update-ref", "refs/remotes/origin/main", &head]);
+}
+
+/// Give a session checkout an ignored harness file, a recognised Cargo target
+/// and an unmarked `target` directory, returning the recognised target.
+fn populate_kept_worktree(worktree: &Path) -> PathBuf {
+    std::fs::create_dir_all(worktree.join(".claude")).unwrap();
+    std::fs::write(worktree.join(".claude/settings.local.json"), "{}\n").unwrap();
+    let unmarked = worktree.join("scratch/target");
+    std::fs::create_dir_all(&unmarked).unwrap();
+    std::fs::write(unmarked.join("notes.bin"), vec![1_u8; 512]).unwrap();
+    let target = worktree.join("rust/target");
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(target.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
+    std::fs::write(target.join("debug/artifact.bin"), vec![0_u8; 4096]).unwrap();
+    target
+}
+
+fn start_session(repo: &Path, container: &Path, task: &str) -> (String, PathBuf) {
+    let output = run(repo, container, &["start", "--task", task, "--json"]);
+    assert!(
+        output.status.success(),
+        "start: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let session: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    (
+        session["id"].as_i64().unwrap().to_string(),
+        PathBuf::from(session["worktree_path"].as_str().unwrap()),
+    )
+}
+
+#[test]
+fn finish_reclaims_build_output_from_a_worktree_an_ignored_file_keeps() {
+    let (repo, container) =
+        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
+    commit_kept_worktree_fixture(repo.path());
+    let (id, worktree) = start_session(repo.path(), container.path(), "kept worktree finish");
+    let target = populate_kept_worktree(&worktree);
+    std::fs::write(
+        repo.path().join(".aethyme/broker.toml"),
+        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\n",
+    )
+    .unwrap();
+
+    let output = run(
+        repo.path(),
+        container.path(),
+        &["finish", "--session", &id, "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "finish: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["closed"], true, "{report}");
+    assert_eq!(report["cleanup"]["worktree_removed"], false, "{report}");
+    assert!(
+        !target.exists(),
+        "a kept worktree must lose its recognised build output: {report}"
+    );
+    assert!(
+        report["cleanup"]["artifact_bytes_reclaimed"]
+            .as_u64()
+            .is_some_and(|bytes| bytes >= 4096),
+        "finish must report the reclaimed bytes: {report}"
+    );
+    assert!(worktree.join(".claude/settings.local.json").is_file());
+    assert!(
+        worktree.join("scratch/target/notes.bin").is_file(),
+        "a directory without the recognition marker must stay"
+    );
+    assert!(
+        worktree
+            .join("rust/deep-0/a/b/c/d/e/f/fixture.txt")
+            .is_file()
+    );
+}

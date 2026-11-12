@@ -1,5 +1,6 @@
 {
   "cleanup": {
+    "artifact_bytes_reclaimed": "integer",
     "attempted": "bool",
     "branch_ref": "string",
     "branch_removed": "bool",

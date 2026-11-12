@@ -506,8 +506,13 @@ impl Broker {
             }
         }
         if report.closed && !report.cleanup.worktree_removed {
-            match self.reclaim_closed_session_artifacts(session_id) {
+            let reclaim = {
+                let _span = crate::phase_telemetry::span("finish_kept_worktree_artifact_reclaim");
+                self.reclaim_closed_session_artifacts(session_id)
+            };
+            match reclaim {
                 Ok(outcome) => {
+                    report.cleanup.artifact_bytes_reclaimed = outcome.observed_logical_file_bytes;
                     if outcome.directories_reclaimed > 0 {
                         let count = outcome.directories_reclaimed;
                         let noun = if count == 1 {
