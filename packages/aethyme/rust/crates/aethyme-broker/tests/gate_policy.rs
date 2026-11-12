@@ -15,7 +15,9 @@
 //! single-glob matcher built below is byte-identical to one member of the
 //! set the broker compiles.
 
-use aethyme_broker::{GATES_CONFIG_RELPATH, load_gates, parse_gates, select_gates};
+use aethyme_broker::{
+    GATES_CONFIG_RELPATH, HostResourceKind, load_gates, parse_gates, select_gates,
+};
 use aethyme_testkit::repo_root;
 use globset::Glob;
 use std::fs;
@@ -721,4 +723,59 @@ fn contract_check_has_a_separate_managed_cache_from_workspace_tests() {
         find("cargo-test").key,
         "workspace test gates must still reuse the same cache"
     );
+}
+
+/// A Rust gate compiles, so it must queue with every other build on the host.
+///
+/// `cost` orders gates and bounds this repository's own scheduler; it reserves
+/// nothing on the machine. Until 2026-11-12 a gate therefore compiled beside
+/// any number of local cargo runs, which reserve the same pool through
+/// `with-host-capacity.sh`. A pool refuses callers that disagree on its limit,
+/// so the limit here is read from that script rather than repeated.
+#[test]
+fn every_rust_gate_draws_its_cost_from_the_host_build_pool() {
+    let root = repo_root();
+    let script = fs::read_to_string(root.join("packages/aethyme/scripts/with-host-capacity.sh"))
+        .expect("the host capacity script is readable");
+    let setting = |name: &str| {
+        script
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("with-host-capacity.sh no longer sets {name}="))
+            .to_owned()
+    };
+    let script_pool = setting("pool");
+    let script_limit: u32 = setting("limit").parse().expect("limit is a count");
+
+    let gates = load_gates(&root).expect("the shipped gates.toml parses");
+    let rust_gates: Vec<_> = gates
+        .iter()
+        .filter(|gate| gate.managed_cache.is_some())
+        .collect();
+    assert!(!rust_gates.is_empty(), "no gate uses a managed Rust cache");
+    for gate in rust_gates {
+        let draws: Vec<_> = gate
+            .resources
+            .iter()
+            .filter_map(|requirement| match &requirement.resource {
+                HostResourceKind::Capacity { pool, units, limit } => Some((pool, *units, *limit)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            draws.len(),
+            1,
+            "{} must draw from exactly one capacity pool",
+            gate.name
+        );
+        let (pool, units, limit) = draws[0];
+        assert_eq!(pool, &script_pool, "{} draws from another pool", gate.name);
+        assert_eq!(limit, script_limit, "{} declares another limit", gate.name);
+        assert_eq!(
+            i64::from(units),
+            gate.cost,
+            "{} must draw its cost in units",
+            gate.name
+        );
+    }
 }
