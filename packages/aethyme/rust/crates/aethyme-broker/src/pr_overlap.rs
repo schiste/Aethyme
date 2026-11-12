@@ -172,6 +172,50 @@ struct OpenPr {
     url: String,
     head: String,
     head_oid: Option<String>,
+    /// `isDraft` as GitHub reported it; absent in listings cached before it
+    /// was requested, which therefore never stand in for a PR lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    draft: Option<bool>,
+}
+
+/// The session's own open pull request, read from an open-PR listing that
+/// this push fetched itself (see [`listed_session_pr`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ListedSessionPr {
+    pub(crate) number: i64,
+    pub(crate) url: String,
+    pub(crate) draft: bool,
+    /// When the listing it came from was fetched, Unix epoch milliseconds.
+    pub(crate) listed_at_ms: i64,
+}
+
+/// The session's open pull request from `listing`, so `push` can skip its
+/// separate `gh pr list --head` lookup.
+///
+/// Only a listing fetched by this same push qualifies: a cached one may
+/// predate the PR closing or leaving draft, and the draft flag decides whether
+/// a review runs. Only positive evidence counts -- an absent PR may still be
+/// open against another base or beyond the listing's cap, so absence falls
+/// back to the lookup -- and only with a reported draft flag.
+fn listed_session_pr(
+    listing: &OpenPrListing,
+    branch: &str,
+    fetched_by_this_push: bool,
+) -> Option<ListedSessionPr> {
+    if !fetched_by_this_push {
+        return None;
+    }
+    let mut matches = listing.prs.iter().filter(|pr| pr.head == branch);
+    let pr = matches.next()?;
+    if matches.next().is_some() || pr.url.is_empty() {
+        return None;
+    }
+    Some(ListedSessionPr {
+        number: pr.number,
+        url: pr.url.clone(),
+        draft: pr.draft?,
+        listed_at_ms: listing.fetched_at_ms,
+    })
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -216,7 +260,7 @@ fn checked_key(session: i64) -> String {
     format!("pr_overlap.checked.{session}")
 }
 
-/// Parse `gh pr list --json number,url,state,headRefName,headRefOid`.
+/// Parse `gh pr list --json number,url,state,headRefName,headRefOid,isDraft`.
 /// Anything that is not an open PR is dropped; unparseable output is empty.
 fn parse_open_prs(stdout: &str) -> Vec<OpenPr> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
@@ -240,6 +284,7 @@ fn parse_open_prs(stdout: &str) -> Vec<OpenPr> {
                     .as_str()
                     .filter(|oid| !oid.is_empty())
                     .map(str::to_string),
+                draft: pr["isDraft"].as_bool(),
             })
         })
         .take(MAX_OPEN_PRS)
@@ -632,6 +677,9 @@ impl Broker {
     /// Refresh the open-PR listing and the PR ranges a push needs, then
     /// compare. Called by `broker push` after it published; every failure
     /// degrades to "unknown" and never fails the push.
+    ///
+    /// Also returns the session's own open PR when this call fetched the
+    /// listing and it names one ([`listed_session_pr`]).
     pub(crate) fn check_pr_overlaps_for_push(
         &mut self,
         session_id: i64,
@@ -640,10 +688,11 @@ impl Broker {
         repository: &str,
         cwd: &Path,
         now_ms: i64,
-    ) -> PrOverlapCheck {
+    ) -> (PrOverlapCheck, Option<ListedSessionPr>) {
         let Some(default) = tracked_default(self.repo_handle()) else {
-            return PrOverlapCheck::default();
+            return (PrOverlapCheck::default(), None);
         };
+        let mut fetched_listing = false;
         let listing = match self.cached_listing() {
             Some(listing)
                 if listing.repository.as_deref() == Some(repository)
@@ -653,8 +702,10 @@ impl Broker {
             {
                 Some(listing)
             }
-            _ => self
-                .run_github_read(
+            _ => {
+                let _span = crate::phase_telemetry::span("push_overlap_listing");
+                fetched_listing = true;
+                self.run_github_read(
                     session_id,
                     repository,
                     format!("pr-overlap:pr-list:{}", default.branch),
@@ -668,7 +719,7 @@ impl Broker {
                         "--limit".into(),
                         MAX_OPEN_PRS.to_string(),
                         "--json".into(),
-                        "number,url,state,headRefName,headRefOid".into(),
+                        "number,url,state,headRefName,headRefOid,isDraft".into(),
                     ],
                     cwd,
                 )
@@ -677,14 +728,19 @@ impl Broker {
                     fetched_at_ms: now_ms,
                     base: default.branch.clone(),
                     prs: parse_open_prs(&stdout),
-                }),
+                })
+            }
         };
         let Some(listing) = listing else {
-            return PrOverlapCheck {
-                listing_unavailable: true,
-                ..Default::default()
-            };
+            return (
+                PrOverlapCheck {
+                    listing_unavailable: true,
+                    ..Default::default()
+                },
+                None,
+            );
         };
+        let session_pr = listed_session_pr(&listing, branch, fetched_listing);
         if let Ok(text) = serde_json::to_string(&listing) {
             // The cache only saves the next command a `gh` call; the check
             // this push reports is already computed.
@@ -694,11 +750,14 @@ impl Broker {
             );
         }
         let Some(session_ranges) = self.ranges_for_head(&default, head) else {
-            return PrOverlapCheck {
-                unknown_prs: listing.prs.iter().map(|pr| pr.number).collect(),
-                listed_at_ms: Some(listing.fetched_at_ms),
-                ..Default::default()
-            };
+            return (
+                PrOverlapCheck {
+                    unknown_prs: listing.prs.iter().map(|pr| pr.number).collect(),
+                    listed_at_ms: Some(listing.fetched_at_ms),
+                    ..Default::default()
+                },
+                session_pr,
+            );
         };
         let mut gh_budget = MAX_GH_DIFFS_PER_PUSH;
         let mut check = PrOverlapCheck {
@@ -716,6 +775,7 @@ impl Broker {
                     let local_base_verified = fresh.is_some();
                     if fresh.is_none() && gh_budget > 0 {
                         gh_budget -= 1;
+                        let _span = crate::phase_telemetry::span("push_overlap_provider_diff");
                         fresh = self
                             .run_github_read(
                                 session_id,
@@ -781,7 +841,7 @@ impl Broker {
                 );
             }
         }
-        check
+        (check, session_pr)
     }
 
     /// Compare a session with the open PRs using only cached listings, cached
@@ -1322,6 +1382,60 @@ diff --git a/f b/f
         assert_eq!(prs[0].number, 1);
         assert_eq!(prs[0].head_oid.as_deref(), Some("aaa"));
         assert!(parse_open_prs("not json").is_empty());
+    }
+
+    #[test]
+    fn only_a_listing_this_push_fetched_stands_in_for_the_session_pr_lookup() {
+        let listing = |prs: &str| OpenPrListing {
+            repository: Some("o/r".into()),
+            fetched_at_ms: 42_000,
+            base: "main".into(),
+            prs: parse_open_prs(prs),
+        };
+        let mine = listing(
+            r#"[
+            {"number":3,"url":"u3","state":"OPEN","headRefName":"agent/other","isDraft":false},
+            {"number":7,"url":"u7","state":"OPEN","headRefName":"agent/mine","isDraft":true}
+        ]"#,
+        );
+        assert_eq!(
+            listed_session_pr(&mine, "agent/mine", true),
+            Some(ListedSessionPr {
+                number: 7,
+                url: "u7".into(),
+                draft: true,
+                listed_at_ms: 42_000,
+            })
+        );
+        assert_eq!(
+            listed_session_pr(&mine, "agent/mine", false),
+            None,
+            "a cached listing may predate the PR closing or leaving draft"
+        );
+        assert_eq!(
+            listed_session_pr(&mine, "agent/absent", true),
+            None,
+            "absence is not evidence: the PR may target another base"
+        );
+        let no_draft_flag =
+            listing(r#"[{"number":7,"url":"u7","state":"OPEN","headRefName":"agent/mine"}]"#);
+        assert_eq!(
+            listed_session_pr(&no_draft_flag, "agent/mine", true),
+            None,
+            "without isDraft the review decision cannot be made from the listing"
+        );
+        let twice = listing(
+            r#"[
+            {"number":7,"url":"u7","state":"OPEN","headRefName":"agent/mine","isDraft":false},
+            {"number":8,"url":"u8","state":"OPEN","headRefName":"agent/mine","isDraft":false}
+        ]"#,
+        );
+        assert_eq!(listed_session_pr(&twice, "agent/mine", true), None);
+        let old_cache: OpenPrListing = serde_json::from_str(
+            r#"{"fetched_at_ms":1,"base":"main","prs":[{"number":7,"url":"u7","head":"agent/mine","head_oid":null}]}"#,
+        )
+        .unwrap();
+        assert_eq!(old_cache.prs[0].draft, None);
     }
 
     #[test]

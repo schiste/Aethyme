@@ -147,6 +147,12 @@ fn reusable_fetch_age_ms(recorded: Option<&str>, now_ms: i64, window_ms: i64) ->
     (0..=window_ms).contains(&age_ms).then_some(age_ms)
 }
 
+/// Whole seconds between `listed_at_ms` and `now_ms`; zero for a clock that
+/// stepped back.
+fn listing_age_seconds(listed_at_ms: i64, now_ms: i64) -> u64 {
+    u64::try_from(now_ms.saturating_sub(listed_at_ms) / 1000).unwrap_or(0)
+}
+
 /// How long one push or GitHub call may queue for the repository write lock.
 fn push_operation_wait() -> QueueWait {
     QueueWait::Seconds(60)
@@ -247,6 +253,12 @@ pub struct SessionPushReport {
     /// fetched itself. `AETHYME_PUSH_FETCH_REUSE=off` always fetches.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_branch_fetch_age_seconds: Option<u64>,
+    /// Seconds since the open-PR listing `pr` was read from, when this push
+    /// took its pull request from the listing its overlap check had just
+    /// fetched instead of looking the branch up separately. Omitted when `pr`
+    /// came from a lookup, from `--pr`, or is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_lookup_listing_age_seconds: Option<u64>,
     /// With `--pr`: the change measured against `[review] pr_size` (#239).
     /// Advisory only -- a push is never refused for its size. Omitted without
     /// `--pr`, or when the change could not be measured.
@@ -665,7 +677,7 @@ impl Broker {
         );
         let phase_started = std::time::Instant::now();
 
-        let pr = if let Some(policy) = pr_open_as {
+        let mut pr = if let Some(policy) = pr_open_as {
             Some(self.open_session_pull_request(
                 &session,
                 &default,
@@ -674,21 +686,14 @@ impl Broker {
                 policy.open_as,
                 &main_root,
             )?)
-        } else if crate::ReviewPolicy::load(&main_root).is_ok_and(|policy| policy.run_on_push) {
-            // The review run on push needs the open pull request even when
-            // this push did not ask to open one. A failed lookup only means
-            // no review runs; the push already happened.
-            self.find_session_pull_request(
-                session_id,
-                &target.display_slug,
-                &session.branch,
-                &main_root,
-            )
-            .ok()
-            .flatten()
         } else {
             None
         };
+        // The review run on push needs the open pull request even when this
+        // push did not ask to open one. Looked up after the overlap check,
+        // whose fresh open-PR listing usually names it already.
+        let pr_lookup_for_review = pr_open_as.is_none()
+            && crate::ReviewPolicy::load(&main_root).is_ok_and(|policy| policy.run_on_push);
 
         // Association happens only after --pr confirms this session's PR.
         // A push that already succeeded must not become an error if watching fails.
@@ -752,7 +757,7 @@ impl Broker {
 
         // Advisory and best-effort: a listing or diff that cannot be read
         // degrades to "unknown" and never fails a push that already happened.
-        let overlap = self.check_pr_overlaps_for_push(
+        let (overlap, listed_pr) = self.check_pr_overlaps_for_push(
             session_id,
             &session.branch,
             &head,
@@ -765,6 +770,38 @@ impl Broker {
             "push_overlap".into(),
             phase_started.elapsed().as_millis() as u64,
         );
+        let mut pr_lookup_listing_age_seconds = None;
+        if pr_lookup_for_review {
+            let _span = crate::phase_telemetry::span("push_pr_lookup");
+            pr = match listed_pr {
+                Some(listed) => {
+                    crate::phase_telemetry::add("push_pr_lookup_reused", std::time::Duration::ZERO);
+                    pr_lookup_listing_age_seconds = Some(listing_age_seconds(
+                        listed.listed_at_ms,
+                        crate::clock::epoch_ms(),
+                    ));
+                    Some(SessionPullRequest {
+                        url: listed.url,
+                        number: listed.number,
+                        state: "OPEN".into(),
+                        created: false,
+                        ci_skips_drafts: false,
+                        draft: listed.draft,
+                    })
+                }
+                // A failed lookup only means no review runs; the push
+                // already happened.
+                None => self
+                    .find_session_pull_request(
+                        session_id,
+                        &target.display_slug,
+                        &session.branch,
+                        &main_root,
+                    )
+                    .ok()
+                    .flatten(),
+            };
+        }
         let phase_started = std::time::Instant::now();
         let payload = serde_json::json!({
             "session_id": session_id,
@@ -773,18 +810,24 @@ impl Broker {
             "pr_url": pr.as_ref().map(|pr| pr.url.clone()),
         })
         .to_string();
-        self.store().append_event(
-            crate::events::BROKER_SESSION_PUSHED,
-            Some(session_id),
-            Some(&payload),
-        )?;
+        {
+            let _span = crate::phase_telemetry::span("push_finalization_event");
+            self.store().append_event(
+                crate::events::BROKER_SESSION_PUSHED,
+                Some(session_id),
+                Some(&payload),
+            )?;
+        }
 
         let pr_size = if open_pr {
             measure_pr_size(&main_root, &default.tracking_ref, &head)
         } else {
             None
         };
-        let duplicate_work = self.duplicate_work_for(&session);
+        let duplicate_work = {
+            let _span = crate::phase_telemetry::span("push_finalization_duplicate_work");
+            self.duplicate_work_for(&session)
+        };
         phase_timings_ms.insert(
             "push_finalization".into(),
             phase_started.elapsed().as_millis() as u64,
@@ -809,6 +852,7 @@ impl Broker {
             default_branch_note,
             default_branch_fetch_age_seconds: reused_fetch_age_ms
                 .map(|age_ms| u64::try_from(age_ms / 1000).unwrap_or(0)),
+            pr_lookup_listing_age_seconds,
             pr_size,
             review_run: None,
             phase_timings_ms,
@@ -1307,6 +1351,13 @@ mod tests {
             "a record in the future proves nothing"
         );
         assert_eq!(reusable_fetch_age_ms(Some("garbage"), now, window), None);
+    }
+
+    #[test]
+    fn listing_age_is_whole_seconds_and_never_negative() {
+        assert_eq!(listing_age_seconds(10_000, 12_999), 2);
+        assert_eq!(listing_age_seconds(10_000, 10_000), 0);
+        assert_eq!(listing_age_seconds(10_000, 9_000), 0);
     }
 
     #[test]
