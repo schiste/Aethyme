@@ -81,6 +81,44 @@ const ARTIFACT_SCAN_DEPTH: usize = 6;
 /// bounds broad trees when metadata calls are unusually cheap.
 const ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET: usize = 16_384;
 
+/// Test-only: lower `ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET` for every
+/// autonomous sweep pass a throwaway repository runs.
+///
+/// A suite that needs a pass to stop part-way cannot get one from a short
+/// wall-clock budget: a fast runner finishes the whole fixture inside it, and
+/// the test then fails on every retry of that shard. An entry count stops the
+/// pass at the same point on every machine. `0` stops discovery before it
+/// examines anything, so the pass is incomplete without removing a cache.
+///
+/// It can only lower the cap, never raise it, and it is honoured only for a
+/// repository under the system temporary directory, the same narrowing as
+/// `AETHYME_TEST_AVAILABLE_BYTES`.
+pub const TEST_ARTIFACT_SWEEP_DISCOVERY_ENTRIES_ENV: &str =
+    "AETHYME_TEST_ARTIFACT_SWEEP_DISCOVERY_ENTRIES";
+
+fn artifact_sweep_discovery_entry_budget(repository: &Path) -> usize {
+    artifact_sweep_discovery_entry_budget_from(
+        std::env::var_os(TEST_ARTIFACT_SWEEP_DISCOVERY_ENTRIES_ENV).as_deref(),
+        repository,
+    )
+}
+
+/// [`artifact_sweep_discovery_entry_budget`] with the environment value
+/// supplied, so the narrowing is tested without mutating the process
+/// environment.
+fn artifact_sweep_discovery_entry_budget_from(
+    value: Option<&std::ffi::OsStr>,
+    repository: &Path,
+) -> usize {
+    value
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|_| crate::host_state::path_is_ephemeral(repository))
+        .map_or(ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET, |entries| {
+            entries.min(ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET)
+        })
+}
+
 /// How long a recorded-size plan spends looking for build directories in
 /// retained worktrees before it stops and reports how many it did not scan.
 /// `doctor`, `certify` and the verify loop take that path, and on a
@@ -2359,6 +2397,7 @@ fn artifact_worker_process_is_suppressed() -> bool {
             "AETHYME_TEST_DB_SUFFIX",
             crate::disk_headroom::TEST_AVAILABLE_BYTES_ENV,
             crate::disk_headroom::TEST_AVAILABLE_INODES_ENV,
+            TEST_ARTIFACT_SWEEP_DISCOVERY_ENTRIES_ENV,
             "CARGO_MANIFEST_DIR",
             "CARGO_TARGET_DIR",
             "CARGO_BIN_EXE_aethyme",
@@ -8306,13 +8345,14 @@ impl Broker {
         scope: ArtifactSweepScope,
         deadline_override: Option<Instant>,
     ) -> Result<(ArtifactSweepOutcome, usize), BrokerOpError> {
+        let discovery_entry_budget = artifact_sweep_discovery_entry_budget(self.main_root());
         self.sweep_artifacts_autonomously_with_deadlines(
             policy,
             scope,
             deadline_override,
             deadline_override,
             deadline_override,
-            ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+            discovery_entry_budget,
         )
     }
 
@@ -13469,6 +13509,40 @@ mod tests {
         assert!(!complete, "exceeding the entry budget is incomplete");
         assert!(scan.classified.is_empty());
         assert!(scan.declined.is_empty());
+    }
+
+    #[test]
+    fn the_test_discovery_entry_limit_only_lowers_the_cap_of_a_throwaway_repository() {
+        let throwaway = tempfile::tempdir().unwrap();
+        let entries = |value: &str| {
+            artifact_sweep_discovery_entry_budget_from(
+                Some(std::ffi::OsStr::new(value)),
+                throwaway.path(),
+            )
+        };
+        assert_eq!(entries("0"), 0);
+        assert_eq!(entries(" 7 "), 7);
+        assert_eq!(
+            entries(&(ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET + 1).to_string()),
+            ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+            "the test limit never raises the production cap"
+        );
+        assert_eq!(entries("many"), ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET);
+        assert_eq!(
+            artifact_sweep_discovery_entry_budget_from(None, throwaway.path()),
+            ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET
+        );
+
+        let checkout = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            !crate::host_state::path_is_ephemeral(checkout),
+            "this test needs a checkout outside the temporary directory"
+        );
+        assert_eq!(
+            artifact_sweep_discovery_entry_budget_from(Some(std::ffi::OsStr::new("0")), checkout),
+            ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+            "a real checkout keeps the production cap"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

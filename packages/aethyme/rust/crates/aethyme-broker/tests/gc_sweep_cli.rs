@@ -2972,19 +2972,11 @@ fn gc_sweep_drains_the_backlog_and_stamps_the_cadence() {
     populate_large_cache(&target);
     std::fs::write(
         repo.path().join(".aethyme/broker.toml"),
-        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 50\n",
-    )
-    .unwrap();
-    assert!(
-        run(repo.path(), container.path(), &["status", "--refresh"])
-            .status
-            .success()
-    );
-    std::fs::write(
-        repo.path().join(".aethyme/broker.toml"),
         "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\n",
     )
     .unwrap();
+    open_with_a_paused_sweep(repo.path(), container.path());
+    assert!(target.exists(), "the paused open leaves the backlog");
 
     // The paused marker would keep a broker open away; the explicit sweep
     // ignores it.
@@ -3074,15 +3066,11 @@ fn finish_continues_an_unfinished_sweep() {
     populate_large_cache(&target);
     std::fs::write(
         repo.path().join(".aethyme/broker.toml"),
-        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 50\n",
+        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\n",
     )
     .unwrap();
-    assert!(
-        run(repo.path(), container.path(), &["status", "--refresh"])
-            .status
-            .success()
-    );
-    assert!(target.exists(), "the 50 ms open must leave a backlog");
+    open_with_a_paused_sweep(repo.path(), container.path());
+    assert!(target.exists(), "the paused open must leave a backlog");
     assert_ne!(meta(repo.path(), SWEEP_PARTIAL).as_deref(), Some("0"));
 
     std::fs::write(
@@ -3112,6 +3100,28 @@ fn finish_continues_an_unfinished_sweep() {
         !target.exists(),
         "finish should drain the other session's backlog: {}",
         String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// Open the broker once with an inline sweep that stops part-way.
+///
+/// The pass is cut by an entry count, not by its wall-clock budget: a short
+/// budget left a backlog on a slow runner, but a fast one finished the whole
+/// fixture inside it and the assertion failed on every retry. An entry limit
+/// of zero stops discovery before it reaches any cache, so the open records a
+/// paused lap and removes nothing on every machine.
+fn open_with_a_paused_sweep(repo: &Path, container: &Path) {
+    let output = command_from_fixture(repo, repo, container, &["status", "--refresh"])
+        .env(
+            aethyme_broker::TEST_ARTIFACT_SWEEP_DISCOVERY_ENTRIES_ENV,
+            "0",
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
