@@ -122,7 +122,10 @@ the directory goes:
    protected ignored content. Only recognized or configured output directories
    are disposable; `.DS_Store` and recognized
    artifact files or links and catalogued broker runtime output are disposable
-   too. With `strict = true`, every
+   too, as are Aethyme's own generated files (`.claude/settings.local.json`
+   as deploy creates it, `.claude/hooks/aethyme-load-context.sh`, deployed
+   skill files) when their bytes are exactly what Aethyme writes; an edited
+   copy keeps the checkout. With `strict = true`, every
    ignored leftover keeps the checkout.
 4. **Contained** -- every commit is in the fetched remote default branch, by
    ancestry or by the verbatim content/patch proof. Local `main` and the
@@ -130,7 +133,10 @@ the directory goes:
 
 Anything the sweep cannot decide keeps the checkout, with the reason in
 `aethyme broker gc plan --json` (`auto_cleanup.kept[]`) and a
-`cleanup.auto-removal` row in `broker status`. Each removal emits
+`cleanup.auto-removal` row in `broker status`. Once registered linked
+checkouts reach three quarters of `[worktrees].max_checkouts`, a
+`cleanup.checkout-capacity` row names the retained count and the commands that
+reclaim slots before `broker start` refuses. Each removal emits
 `broker.cleanup.auto_removed` with its proof. Configure it in
 `.aethyme/config.toml`:
 

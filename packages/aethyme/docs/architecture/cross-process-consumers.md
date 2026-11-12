@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-11-08
+Last Updated: 2026-11-13
 
 When code outside the `packages/aethyme/` Rust source tree invokes an
 Aethyme command, it crosses a process boundary. Static
@@ -211,6 +211,35 @@ support this protocol; unsupported targets retain the existing explicit cleanup
 contract while protocol-dependent unattended removal stays blocked. See
 [automatic checkout maintenance](../guides/automatic-checkout-maintenance.md)
 for rollout holds, policy restoration and the report field contract.
+
+## Generated files and checkout capacity (2026-11-13)
+
+Cleanup (finish, `finish cleanup --all-cleaned`, unattended removal, `gc`
+and recovery archives) no longer keeps a closed checkout for an ignored file
+that is byte for byte what an Aethyme writer (`deploy`, `upgrade`, the
+local-only lane) produces at that path without reading the checkout:
+`.claude/settings.local.json` exactly as created fresh (only the SessionStart
+hook), `.claude/hooks/aethyme-load-context.sh`, and the deployed
+`.claude/skills/aethyme*/` and `.codex/skills/aethyme*/` files. A directory is
+disposable only when every entry is such a file, a nested directory of the
+same kind or `.DS_Store`; symlinks are never followed or proven. A settings
+file that deploy merged into, that a harness added permissions to or that a
+person edited, a file written by a different Aethyme version, and
+repository-rendered content (root policy, onboarding skills, local policy and
+marker) keep the existing protection and message. Strict mode still keeps
+every ignored leftover. The catalog is
+`aethyme_enhance::deploy::generated_artifact_contents`, derived from the
+writer itself.
+
+`broker status` (default and `--refresh`) adds the advice row
+`cleanup.checkout-capacity` (severity `warning`) once registered linked
+checkouts reach three quarters of `[worktrees].max_checkouts`. Its evidence
+names the registered count, the limit, open sessions and retained checkouts;
+its commands are `aethyme broker gc sweep --json` and
+`aethyme broker finish cleanup --all-cleaned --json`. When the status budget is
+spent the check is skipped and `checkout_capacity` is added to
+`deferred_checks`. `broker start` at the limit already runs the unattended
+removal before refusing; that behaviour is unchanged.
 
 ## Managed daemon runtime identity and bundle pins (#1313)
 
