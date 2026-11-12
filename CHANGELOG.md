@@ -4,6 +4,22 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.74] - 2026-11-12
+
+### Removed
+
+- `aethyme broker advanced ship plan|execute`, with `--sync-main`, `--only`, `--entry` and `--break-glass`. Pull requests are the only landing path: `aethyme broker push --session <id> --pr`, then merge on GitHub. An existing `[delivery] default` key is parsed and ignored; `[delivery] push_session_branches` is unchanged. The publication engine stays for `aethyme deploy`'s first enrollment (#1609).
+
+### Changed
+
+- Generated agent instructions, the Aethyme skill and the guides no longer present local promotion or shipping as a way to land work (#1609, #1611).
+- Failure telemetry separates a wrapped command's own failure under `broker advanced exec` from a broker failure: it is counted per command as `wrapped_command_failures` and kept out of the failure reasons (#1604).
+
+### Fixed
+
+- The host supervisor notices that its executable was replaced by an update and hands over to the new build within two ticks, instead of running the old build for as long as anything needs it. After 0.8.73 an old supervisor kept the new worktree watcher from starting until it was stopped by hand (#1610).
+- A worktree's registration answer is remembered until its `.git` file changes, removing a repeated Git call per session in listing commands (#1605).
+
 ## [0.8.73] - 2026-11-12
 
 ### Added
