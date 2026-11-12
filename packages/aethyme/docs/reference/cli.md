@@ -101,8 +101,6 @@ use most:
 - `aethyme broker advanced exec`
 - `aethyme broker advanced leases ...`
 - `aethyme broker advanced ownership ...`
-- `aethyme broker advanced ship plan`
-- `aethyme broker advanced ship execute`
 - `aethyme broker advanced advisories`
 - `aethyme broker advanced queue history`
 - `aethyme broker advanced repair`
@@ -259,7 +257,7 @@ print the replacement command. The migration table names old forms explicitly:
 | `aethyme broker reclaim` / `storage` / `resources reap` | `aethyme broker gc reclaim` / `gc storage` / `gc reap` |
 | `aethyme broker init` / `certify` | `aethyme init` / `aethyme certify` |
 | `aethyme broker e2e` | `aethyme broker advanced verify-loop` |
-| `aethyme broker <verb>` for any advanced verb (`leases`, `git`, `gh`, `ship`, `operations`, `exec`, `review`, `gates`, ...) | `aethyme broker advanced <verb>` |
+| `aethyme broker <verb>` for any advanced verb (`leases`, `git`, `gh`, `operations`, `exec`, `review`, `gates`, ...) | `aethyme broker advanced <verb>` |
 | `aethyme enhance deploy` / `aethyme enhance verify` | `aethyme deploy --generated-only` / `aethyme deploy verify --generated-only` |
 
 <!-- deprecated-spellings: end -->
@@ -917,8 +915,6 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker advanced issues upsert --repo <owner/name> --fingerprint <key> (--title <title> --body-file <path> [--label <label>]... | --resolve [--body-file <path>]) [--session <id>] [--json]`
 - `aethyme broker advanced outcomes report --source <kind:name> (--failed --title <title> [--commits <from>..<to>] | --recovered) [--body-file <path>] [--key <key>] [--session <id>] [--json]`
 - `aethyme broker advanced owners --commits <from>..<to> [--path <glob>]... [--json]`
-- `aethyme broker advanced ship plan --entry <id> [--json]`
-- `aethyme broker advanced ship execute --entry <id> --confirm <full-integration-sha> [--sync-main] [--break-glass --reason <authorization>] [--json]`
 - `aethyme broker advanced integration status [--json]`
 - `aethyme broker advanced integration reconcile --upstream <ref> [--resolution-file <path>] [--write-resolution-template <path>] [--dry-run|--apply --confirm <sha256>] [--json]`
 - `aethyme broker advanced quick-test [--with-gate] [--json]`
@@ -1117,7 +1113,7 @@ Every promotion also creates one authoritative path exposure owned by its
 queue entry. It contains the exact promoted SHA and repository-relative path
 set, survives closure of either the promoting or affected session, and is not
 cleared by a worktree rebase. The broker resolves it—and any still-outstanding
-advisory linked to that entry—only after `broker advanced ship execute` observes a
+advisory linked to that entry—only after a verified publication observes a
 remote-main SHA containing the promotion, or a confirmed `integration
 reconcile --apply` proves an exact, patch-equivalent, or reviewed superseding
 landing. Read-only plans, stale remote state, failed verification, ambiguous
@@ -1432,8 +1428,8 @@ The managed pre-push shim is a publication guard, not the full-gate adapter.
 From an enrolled Git common directory it rejects updates to `main`, `master`,
 the advertised origin default branch, and `aethyme/integration` unless Git is
 running inside a broker-coordinated operation. Normal publication therefore
-uses `broker advanced ship plan` followed by digest/SHA-confirmed `broker advanced ship execute`;
-an explicitly authorized exceptional push uses `broker advanced git`.
+goes through a pull request (`broker push --pr`); an explicitly authorized
+exceptional push uses `broker advanced git`.
 
 For emergency recovery only, set
 `AETHYME_BROKER_BREAK_GLASS_REASON="<reviewed reason>"` on the one Git push.
@@ -2402,63 +2398,9 @@ unknown repository operation remains unresolved. Reconciliation as `succeeded`
 continues to block duplicate filing for that source report; reconciliation as
 `failed` permits a later, separately confirmed filing command.
 
-Promotion only advances the local integration ref. Use `broker advanced ship plan` to
-inspect the selected promoted-prefix SHA, the entries included through it,
-later entries explicitly excluded from it, the current integration tip, remote
-freshness, proposed non-force push, and local-main safety without mutating refs
-or remote state. Publish only with the plan's full publication SHA:
-
-```bash
-aethyme broker advanced ship plan --entry 42
-aethyme broker advanced ship execute --entry 42 \
-  --confirm 0123456789abcdef0123456789abcdef01234567
-```
-
-Execution fetches and revalidates the planned remote base, requires a
-fast-forward, pushes that exact selected-prefix SHA, and verifies the remote
-default ref. A later integration promotion does not broaden the confirmed
-publication. The planner refuses a prefix containing an integration commit
-without promoted queue provenance. It
-then resolves every outstanding entry exposure whose promotion is an ancestor
-of that verified remote SHA; selecting a later promoted entry therefore closes
-the verified published prefix without guessing about unrelated entries. It
-leaves the primary checkout unchanged unless `--sync-main` is present; that
-option additionally requires a clean, unchanged, fast-forwardable local
-default branch. `broker advanced integration status` reports whether the integration tip
-is promoted, published, or locally synchronized and routes its next action
-through this ship lane.
-
-Publication authorization is independently opt-in. The default remains the
-direct, full-SHA-confirmed lane above. A repository that requires reviewed
-publication commits this policy before the promoted prefix is created:
-
-```toml
-[publication]
-schema_version = 1
-mode = "review_gated"
-allow_break_glass = false
-```
-
-For `review_gated`, plan JSON contains a `publication_policy` assessment for
-every included queue entry. Each entry must be covered by a
-`validation_unlocked` lifecycle for the same canonical repository, default
-branch, promoted session commit, and selected prefix. Execute re-fetches the
-live PR and refuses an older head, changed base, closed or draft PR, dismissed
-approval, provider outage, lifecycle drift, or partial prefix coverage. Review
-evidence never broadens the confirmed SHA and does not bypass freshness,
-fast-forward, unknown-outcome, or exact-push checks.
-
-Emergency publication is unavailable unless the committed policy sets
-`allow_break_glass = true`. It is then a separate explicit action:
-
-```bash
-aethyme broker advanced ship execute --entry 42 \
-  --confirm 0123456789abcdef0123456789abcdef01234567 \
-  --break-glass --reason "incident authorization reference"
-```
-
-The reason must be supplied at execution time. Only its SHA-256 is retained in
-the report and coordinated-operation journal; the text is not persisted.
+Promotion only advances the local integration ref; pull requests are the only
+landing path. `broker advanced integration status` reports whether the
+integration tip is promoted, published, or locally synchronized.
 
 Frozen broker JSON contracts are limited to the commands listed in
 [`../../../../docs/json-contracts.md`](../../../../docs/json-contracts.md).
@@ -2885,8 +2827,8 @@ write is coordinated and journaled. Only proven success records
 `validation_unlocked`; an unknown outcome activates the existing host-wide
 write barrier and blind retry remains forbidden. Repeated proven transitions
 are idempotent. This lifecycle authorizes publication only when the exact
-promoted prefix commits the opt-in `[publication]` policy described in the
-ship section; the default direct profile is unchanged.
+promoted prefix commits the opt-in `[publication] mode = "review_gated"`
+policy; the default direct profile is unchanged.
 
 Provisional JSON shape:
 

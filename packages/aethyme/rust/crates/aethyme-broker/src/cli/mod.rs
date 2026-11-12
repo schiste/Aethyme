@@ -18,6 +18,7 @@ mod gates;
 mod gc_storage;
 mod git_gh;
 pub(crate) mod insights;
+mod integration;
 mod leases;
 mod merge_chain;
 mod render;
@@ -26,7 +27,6 @@ mod resources;
 mod review;
 mod service;
 mod session;
-mod ship;
 mod status;
 mod status_compact;
 mod status_revision;
@@ -42,6 +42,7 @@ use gates::*;
 use gc_storage::*;
 use git_gh::*;
 use insights::*;
+use integration::*;
 use leases::*;
 use merge_chain::*;
 use render::*;
@@ -49,7 +50,6 @@ use report::*;
 use resources::*;
 use review::*;
 use session::*;
-use ship::*;
 use status::*;
 use submit::*;
 use telemetry::*;
@@ -773,26 +773,6 @@ Usage:
   aethyme broker promote --entry <id> [--json]
       Manual-mode only: advance the local integration branch to a verified
       entry's merge commit; other in-flight entries are re-simulated.
-      Promotion stays local; publish through `broker ship plan --entry <id>`.
-  aethyme broker ship plan --entry <id> [--only] [--delivery <local_main_merge|pull_request>] [--json]
-      Build a delivery plan through an exact promoted entry: resolve the
-      trusted delivery policy, divergence recommendation, publication prefix,
-      remote freshness, proposed route, and local-main safety. --only selects
-      one independent entry and gates origin/main plus its changes in an
-      exact-tree checkout. Planning never moves refs; --only may record gate
-      results and cache entries. After publication it reconciles the remaining
-      promoted entries and re-verifies every replay whose tree changed.
-  aethyme broker ship execute --entry <id> --confirm <full-publication-sha> [--only] [--delivery <local_main_merge|pull_request>] [--plan <sha256>] [--sync-main] [--break-glass --reason <authorization>] [--json]
-      Revalidate and execute the reviewed delivery route. Local-main delivery
-      uses a clean fast-forward merge; pull-request delivery pushes a
-      deterministic branch and opens or verifies one exact GitHub PR.
-      --only requires the plan SHA-256 produced by `ship plan --only`.
-      --sync-main additionally fast-forwards an unchanged primary checkout.
-      A committed review-gated policy requires live exact-review evidence.
-      Break-glass is available only when that committed policy opts in; the
-      journal retains the reason digest, never the reason text.
-      Tracked changes and incoming-path collisions block; unrelated untracked
-      files are preserved and reported.
   aethyme broker integration status [--json]
       Focused promoted-but-unmerged view: the local integration branch as
       a pending layer above main, with promoted entries, files changed,
@@ -1667,8 +1647,6 @@ struct Parsed {
     entry: Option<i64>,
     confirm: Option<String>,
     broker_bin: Option<PathBuf>,
-    delivery_mode: Option<String>,
-    delivery_plan: Option<String>,
     operation: Option<String>,
     before: Option<i64>,
     limit: Option<u32>,
@@ -1789,14 +1767,11 @@ struct Parsed {
     no_wait: bool,
     allow_parallel: bool,
     queue_timeout_seconds: Option<u64>,
-    break_glass: bool,
-    sync_main: bool,
     sync_integration: bool,
     allow_main_checkout: bool,
     no_cache: bool,
     probe: bool,
     only: Option<String>,
-    ship_only: bool,
     stdout: bool,
     include_task: bool,
     offline: bool,
@@ -1814,10 +1789,6 @@ struct Parsed {
 }
 
 fn parse(args: &[String]) -> Result<Parsed, UsageError> {
-    parse_with_context(args, false)
-}
-
-fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, UsageError> {
     let mut parsed = Parsed {
         read_only_snapshot: false,
         read_only_compatibility: None,
@@ -1856,8 +1827,6 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         entry: None,
         confirm: None,
         broker_bin: None,
-        delivery_mode: None,
-        delivery_plan: None,
         operation: None,
         before: None,
         limit: None,
@@ -1953,14 +1922,11 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         allow_parallel: false,
         queue_timeout_seconds: None,
 
-        break_glass: false,
-        sync_main: false,
         sync_integration: false,
         allow_main_checkout: false,
         no_cache: false,
         probe: false,
         only: None,
-        ship_only: false,
         stdout: false,
         include_task: false,
         offline: false,
@@ -2115,14 +2081,11 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
                 parsed.merge_chain.set(flag, value)?;
             }
             "--allow-parallel" => parsed.allow_parallel = true,
-            "--break-glass" => parsed.break_glass = true,
-            "--sync-main" => parsed.sync_main = true,
             "--sync-integration" => parsed.sync_integration = true,
             "--allow-main-checkout" => parsed.allow_main_checkout = true,
             "--no-cache" => parsed.no_cache = true,
             "--verify-only" => parsed.verify_only = true,
             "--probe" => parsed.probe = true,
-            "--only" if ship_command => parsed.ship_only = true,
             "--only" => {
                 parsed.only = Some(
                     iter.next()
@@ -2693,22 +2656,6 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
                         .clone(),
                 )
             }
-            "--delivery" => {
-                parsed.delivery_mode = Some(
-                    iter.next()
-                        .ok_or(UsageError::Message("--delivery requires a value".into()))?
-                        .clone(),
-                )
-            }
-            "--plan" | "--plan-digest" => {
-                parsed.delivery_plan = Some(
-                    iter.next()
-                        .ok_or(UsageError::Message(
-                            "--plan requires a SHA-256 digest".into(),
-                        ))?
-                        .clone(),
-                )
-            }
             "--operation" => {
                 let value = iter
                     .next()
@@ -2772,8 +2719,7 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         return Err(UsageError::Help);
     };
     // Everywhere else `--pr` takes a pull-request number; for `push` it is a
-    // switch. Translate it before parsing, and only give the parser ship
-    // context because `--only` normally takes a value for other commands.
+    // switch. Translate it before parsing.
     let rest: Vec<String> = if subcommand == "push" {
         let separator = args
             .iter()
@@ -2793,12 +2739,7 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
     } else {
         args[1..].to_vec()
     };
-    let parse_result = if subcommand == "ship" {
-        parse_with_context(&rest, true)
-    } else {
-        parse(&rest)
-    };
-    let mut parsed = parse_result.map_err(|error| {
+    let mut parsed = parse(&rest).map_err(|error| {
         if subcommand == "operations" && args.get(1).map(String::as_str) == Some("reconcile") {
             match error {
                 UsageError::Message(message) if !message.contains(OPERATIONS_RECONCILE_USAGE) => {
@@ -2973,7 +2914,6 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         "checkpoint" => run_checkpoint(parsed)?,
         "queue" => run_queue(parsed)?,
         "promote" => run_promote(parsed)?,
-        "ship" => run_ship(parsed)?,
         "integration" => run_integration(parsed)?,
         "status" => run_status(parsed)?,
         "events" => run_events(parsed)?,
@@ -3248,9 +3188,7 @@ fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseComma
         | "exposures" | "note" | "operations" | "gates" | "watch" | "pr" | "hooks" | "finish"
         | "close" | "gc" | "storage" | "unblock" | "doctor" | "quick-test" | "trust"
         | "verify-loop" | "e2e" | "init" | "certify" | "scaffold" | "promotion-record"
-        | "checkpoint" | "promote" | "ship" | "integration" | "events" => {
-            TaskLeaseCommandClass::OtherWork
-        }
+        | "checkpoint" | "promote" | "integration" | "events" => TaskLeaseCommandClass::OtherWork,
         _ => TaskLeaseCommandClass::NoSessionWork,
     }
 }

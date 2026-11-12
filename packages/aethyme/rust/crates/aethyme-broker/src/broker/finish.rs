@@ -214,10 +214,6 @@ impl Broker {
         };
         report.recommended_next_action = if report.cleanup.attempted && !report.cleanup.completed {
             report.cleanup.recovery_action.clone()
-        } else if report.delivery.promoted && !report.delivery.published {
-            report
-                .latest_queue_entry_id
-                .map(|entry| format!("aethyme broker advanced ship plan --entry {entry}"))
         } else {
             report.next_commands.first().cloned().or_else(|| {
                 (report.delivery.published && !report.cleanup_safe)

@@ -717,7 +717,7 @@ fn check_enrollment_visibility(repo: &crate::GitRepo, checkout_root: &Path) -> V
                 id: "certify.upstream-enrollment",
                 status: CheckStatus::Warn,
                 detail: format!(
-                    "enrollment is absent from {reference}; sibling worktrees based on upstream remain unenrolled — submit and publish the enrollment through broker ship"
+                    "enrollment is absent from {reference}; sibling worktrees based on upstream remain unenrolled — submit the enrollment and publish it to {reference}"
                 ),
             },
             Err(error) => Check {
@@ -1287,7 +1287,6 @@ const CONFIG_TEMPLATE: &str = "\
 #   schema            optional; the config schema version (currently 1)
 #   [promote] mode    \"auto\" | \"manual\" | \"verify-only\"
 #   [promote] branch  integration branch name
-#   [delivery] default \"pull_request\" | \"local_main_merge\"
 #   [delivery] push_session_branches  true | false (default false; authorizes `broker push`)
 #   [issue_workflows] issue_sets  \"allow\" | \"deny\" (default deny)
 #   [broker.pr] open_as  \"draft\" | \"ready\" (default draft for new PRs)
@@ -1315,13 +1314,7 @@ schema = 1
 mode = \"verify-only\"
 # branch = \"aethyme/integration\"
 
-# Delivery route for a promoted prefix. The policy is read from the target
-# default branch before a ship plan is made; an explicit pull request is the
-# safer choice when refs diverge. Leave this section absent to preserve the
-# legacy direct-ship behavior in existing repositories.
 # [delivery]
-# default = \"pull_request\"
-#
 # `push_session_branches = true` authorizes agents to push their own session
 # branch (`aethyme broker push`) and open a pull request
 # (`aethyme broker push --pr`) while they work, so no work exists only in a
@@ -1969,10 +1962,6 @@ mod config_template_tests {
 
         let opted_in = CONFIG_TEMPLATE
             .replace("# [delivery]\n", "[delivery]\n")
-            .replace(
-                "# default = \"pull_request\"\n",
-                "default = \"pull_request\"\n",
-            )
             .replace(
                 "# push_session_branches = true\n",
                 "push_session_branches = true\n",

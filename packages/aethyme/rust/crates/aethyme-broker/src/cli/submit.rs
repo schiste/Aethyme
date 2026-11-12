@@ -1665,7 +1665,6 @@ pub(super) fn run_promote(parsed: Parsed) -> Result<(), UsageError> {
         out!("{{\"promoted\":{entry}}}");
     } else {
         out!("Promoted entry {entry} to the local integration branch.");
-        out!("Next: aethyme broker advanced ship plan --entry {entry}");
     }
     Ok(())
 }

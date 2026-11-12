@@ -26,7 +26,7 @@ Agent broker:
   broker gc plan|apply        reviewed cleanup of retained state and disk
   broker gc abandon|forget-abandoned
                               archive or retire a pending cleanup journal safely
-  broker advanced <verb>      leases, git, gh, ship, review, operations, exec, ...
+  broker advanced <verb>      leases, git, gh, review, operations, exec, ...
   hook <event>                agent-surface hook entry point (the plugin's only
                               entry point; reads event JSON on stdin)
   plugin install|status|remove

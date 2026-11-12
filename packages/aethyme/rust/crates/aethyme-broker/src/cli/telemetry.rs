@@ -85,10 +85,7 @@ pub(super) const KNOWN_COMMAND_WORDS: &[&str] = &[
     "apply",
     "queue",
     "promote",
-    "ship",
     "plan",
-    "execute",
-    "sync-main",
     "sync-integration",
     "no-cache",
     "integration",
@@ -389,7 +386,6 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
             Some("ingest" | "reconcile")
         ),
         Some("review") => !matches!(args.get(1).map(String::as_str), Some("show")),
-        Some("ship") => args.get(1).map(String::as_str) != Some("plan"),
         Some("checkpoint") => args.get(1).map(String::as_str) == Some("apply"),
         Some("gc") => matches!(args.get(1).map(String::as_str), Some("apply" | "sweep")),
         Some("storage") => match args.get(1).map(String::as_str) {

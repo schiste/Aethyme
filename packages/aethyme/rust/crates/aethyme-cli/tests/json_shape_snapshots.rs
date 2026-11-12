@@ -596,19 +596,13 @@ fn other_broker_json_shapes_match_snapshots() {
         &["broker", "submit", "--session", &session_arg, "--json"],
         &host_state,
     );
-    let entry = submitted["entry"]["id"]
-        .as_i64()
-        .or_else(|| submitted["entry_id"].as_i64())
-        .unwrap_or_else(|| panic!("submit --json carries an entry id: {submitted}"));
-    let entry_arg = entry.to_string();
-    let ship_plan = json_with_host_state(
-        &repo,
-        &[
-            "broker", "advanced", "ship", "plan", "--entry", &entry_arg, "--json",
-        ],
-        &host_state,
+    assert!(
+        submitted["entry"]["id"]
+            .as_i64()
+            .or_else(|| submitted["entry_id"].as_i64())
+            .is_some(),
+        "submit --json carries an entry id: {submitted}"
     );
-    entries.push(("ship-plan".to_string(), shape(&ship_plan)));
 
     git(&repo, &["branch", "--unset-upstream", "main"]);
     git(&repo, &["update-ref", "-d", "refs/remotes/origin/main"]);

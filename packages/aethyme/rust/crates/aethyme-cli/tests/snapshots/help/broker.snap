@@ -15,7 +15,7 @@ Verbs:
   unblock   list current blockers, or clear one by id
   gc        reviewed plan/apply cleanup: retention, build output, storage, resources
 
-Everything else (leases, git, gh, ship, review, operations, exec, ...):
+Everything else (leases, git, gh, review, operations, exec, ...):
   aethyme broker advanced --help
 
 Run `aethyme broker <verb> --help` for a verb's forms and flags.

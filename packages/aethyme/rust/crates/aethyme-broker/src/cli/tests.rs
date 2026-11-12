@@ -1,4 +1,4 @@
-use super::{UsageError, owned_comment_from_view, repository_wide_publication_lines};
+use super::{UsageError, owned_comment_from_view};
 
 #[test]
 fn task_lease_classification_uses_normalized_actions_and_preserves_polling() {
@@ -749,69 +749,6 @@ fn a_pull_request_aethyme_has_never_commented_on_owns_nothing() {
     ));
 }
 
-fn assessment(fast_forward: bool, dirty: &[&str]) -> crate::ship::ShipLocalMainSyncAssessment {
-    crate::ship::ShipLocalMainSyncAssessment {
-        safe: fast_forward && dirty.is_empty(),
-        current_branch_matches: true,
-        local_head_unchanged: true,
-        fast_forward,
-        local_commits_not_in_integration: Vec::new(),
-        tracked_dirty_paths: dirty.iter().map(|p| (*p).into()).collect(),
-        untracked_paths: Vec::new(),
-        conflicting_untracked_paths: Vec::new(),
-    }
-}
-
-/// Issue #141: "Freshness: Ready" describes the prefix, not the repository.
-/// An operator asking to publish everything must be told what is omitted.
-#[test]
-fn ship_plan_states_whether_the_prefix_represents_all_local_work() {
-    let complete = repository_wide_publication_lines(
-        &assessment(true, &[]),
-        "refs/heads/main",
-        "aaaa",
-        "aaaa",
-    );
-    assert_eq!(complete.len(), 1);
-    assert!(complete[0].contains("complete"), "{complete:?}");
-
-    let diverged = repository_wide_publication_lines(
-        &assessment(false, &[]),
-        "refs/heads/main",
-        "aaaa",
-        "bbbb",
-    )
-    .join("\n");
-    assert!(diverged.contains("INCOMPLETE"), "{diverged}");
-    assert!(
-        diverged.contains("git log --oneline aaaa..bbbb"),
-        "the operator must be able to list what is excluded: {diverged}"
-    );
-
-    let dirty = repository_wide_publication_lines(
-        &assessment(true, &["src/a.rs", "src/b.rs"]),
-        "refs/heads/main",
-        "aaaa",
-        "aaaa",
-    )
-    .join("\n");
-    assert!(dirty.contains("INCOMPLETE"), "{dirty}");
-    assert!(
-        dirty.contains("2 uncommitted tracked path(s): src/a.rs, src/b.rs"),
-        "uncommitted tracked work must never be silently omitted: {dirty}"
-    );
-}
-
-/// On another branch, local main says nothing about completeness.
-#[test]
-fn a_different_checked_out_branch_makes_no_completeness_claim() {
-    let mut other = assessment(true, &[]);
-    other.current_branch_matches = false;
-    assert!(
-        repository_wide_publication_lines(&other, "refs/heads/main", "aaaa", "bbbb").is_empty()
-    );
-}
-
 fn args(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| (*part).to_string()).collect()
 }
@@ -1296,42 +1233,6 @@ fn parse_accepts_repeated_planned_session_paths() {
 }
 
 #[test]
-fn parse_accepts_read_only_ship_plan() {
-    let parsed = match super::parse(&args(&["ship", "plan", "--entry", "42", "--json"])) {
-        Ok(parsed) => parsed,
-        Err(_) => panic!("ship plan should parse"),
-    };
-    assert_eq!(parsed.positional, vec!["ship", "plan"]);
-    assert_eq!(parsed.entry, Some(42));
-    assert!(parsed.json);
-    assert!(!super::command_records_metric(&args(&[
-        "ship", "plan", "--entry", "42"
-    ])));
-}
-
-#[test]
-fn parse_accepts_delivery_route_and_plan_digest() {
-    let digest = "a".repeat(64);
-    let parsed = match super::parse(&args(&[
-        "ship",
-        "execute",
-        "--entry",
-        "42",
-        "--confirm",
-        &"b".repeat(40),
-        "--delivery",
-        "pull_request",
-        "--plan",
-        &digest,
-    ])) {
-        Ok(parsed) => parsed,
-        Err(_) => panic!("delivery route should parse"),
-    };
-    assert_eq!(parsed.delivery_mode.as_deref(), Some("pull_request"));
-    assert_eq!(parsed.delivery_plan.as_deref(), Some(digest.as_str()));
-}
-
-#[test]
 fn parse_accepts_read_only_handoff_selectors() {
     let by_session = match super::parse(&args(&["handoff", "--session", "7", "--json"])) {
         Ok(parsed) => parsed,
@@ -1391,43 +1292,6 @@ fn parse_accepts_offline_report_capture_outputs() {
         "bug",
         "--title",
         "Gate failed",
-    ])));
-}
-
-#[test]
-fn parse_accepts_confirmed_ship_execution() {
-    let sha = "a".repeat(40);
-    let parsed = match super::parse(&args(&[
-        "ship",
-        "execute",
-        "--entry",
-        "42",
-        "--confirm",
-        &sha,
-        "--sync-main",
-        "--break-glass",
-        "--reason",
-        "approved emergency publication",
-    ])) {
-        Ok(parsed) => parsed,
-        Err(_) => panic!("ship execute should parse"),
-    };
-    assert_eq!(parsed.positional, vec!["ship", "execute"]);
-    assert_eq!(parsed.entry, Some(42));
-    assert_eq!(parsed.confirm.as_deref(), Some(sha.as_str()));
-    assert!(parsed.sync_main);
-    assert!(parsed.break_glass);
-    assert_eq!(
-        parsed.reason.as_deref(),
-        Some("approved emergency publication")
-    );
-    assert!(super::command_records_metric(&args(&[
-        "ship",
-        "execute",
-        "--entry",
-        "42",
-        "--confirm",
-        &sha,
     ])));
 }
 
