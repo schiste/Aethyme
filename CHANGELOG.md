@@ -4,6 +4,21 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.79] - 2026-11-12
+
+### Removed
+
+- Local promotion. `aethyme broker submit` verifies and moves nothing; work lands through the session's pull request. `broker submit promote` is gone, with the promote engine, its recovery at broker open, the ship plan and execute code, and the status rows only promoting repositories emitted (`integration.may-move`, `integration.upstream-main-ahead`, `integration.fast-forward-available`, `integration.stale-promotions`, `main.external-writes`, `integration.behind-upstream`) (#1627).
+
+### Changed
+
+- `[promote] mode = "auto"` or `"manual"` and `promote_on_submit = true` still parse but are ignored; `broker status` shows a `promote.mode-removed` warning asking to delete them. `mode = "verify-only"` stays valid and silent. `submit --verify-only` is accepted and does nothing; `submit --json` always reports `promoted: false` (#1627).
+- New sessions always start from the default branch, never from the integration branch (#1627).
+
+### Fixed
+
+- A main-checkout session in a repository with no remote selects its gates from the base before the refresh; promotion had hidden the wrong base (#1627).
+
 ## [0.8.78] - 2026-11-12
 
 ### Fixed
