@@ -4,6 +4,21 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.85] - 2026-11-13
+
+### Changed
+
+- A commit run through the broker in a session's own worktree and branch, and a `broker push` of a session branch, no longer hold the repository-wide write lock while hooks run; each holds only its branch's lane. `gh pr edit <n>` (without `--base`) and `gh pr ready <n>` lock one pull request. A waiting repository-wide write takes an intent lock first, so overlapping narrow commits cannot starve it (`coordination_timing.wide_intent_wait_ms`). `operations stats` gains `narrow_lanes` (#1641).
+- A repository with a `reference-transaction` hook, `push.followTags`, or Git configuration whose push footprint cannot be proven keeps the repository-wide lane. `[coordination] session_hooks_hold_repository_lock = true` restores it for repositories whose hooks write other branches or shared state (#1641).
+
+### Fixed
+
+- Closed session checkouts are no longer kept forever because of Aethyme's own generated files (`.claude/settings.local.json` as deploy creates it, `.claude/hooks/aethyme-load-context.sh`, deployed skill files) when their bytes are unchanged; an edited copy still keeps the checkout. This also lets `broker start` recover by itself at the linked checkout limit (#1643).
+
+### Added
+
+- `broker status` warns with `cleanup.checkout-capacity` from three quarters of the linked checkout limit (#1643).
+
 ## [0.8.84] - 2026-11-13
 
 ### Fixed
