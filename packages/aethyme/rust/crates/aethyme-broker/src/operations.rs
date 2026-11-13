@@ -4087,7 +4087,7 @@ fn journal_details(
 mod git_scopes;
 mod push_and_coordinated;
 mod redaction;
-pub(crate) use git_scopes::strict_push_args;
+pub(crate) use git_scopes::{canonical_fetch_args, strict_push_args};
 pub(crate) use push_and_coordinated::{github_command, is_within, worktree_relative_push_sources};
 use push_and_coordinated::{is_github_pull_request_merge, provider_command};
 

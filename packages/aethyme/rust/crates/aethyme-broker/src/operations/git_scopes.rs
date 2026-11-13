@@ -46,7 +46,11 @@ fn ref_component(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.'))
 }
 
-pub(super) fn canonical_fetch_args(remote: &str, branch: &str) -> Option<Vec<String>> {
+/// The one fetch spelling with a closed ref footprint: exactly
+/// `refs/heads/<branch>` into `refs/remotes/<remote>/<branch>`, no tags, no
+/// FETCH_HEAD, no maintenance. It takes that tracking ref's lane instead of
+/// the repository-wide one when the repository's configuration proves it.
+pub(crate) fn canonical_fetch_args(remote: &str, branch: &str) -> Option<Vec<String>> {
     if !ref_component(remote) || remote.contains('/') || !ref_component(branch) {
         return None;
     }
@@ -1686,6 +1690,49 @@ mod tests {
         );
         drop(held);
         assert!(recorded_lock_holder(&root, &common_key).is_none());
+    }
+
+    /// The broker's own default-branch fetch (push, sync) uses the strict
+    /// spelling, so it takes its tracking ref's lane instead of the
+    /// repository-wide one (`not_strict_spelling` on every push before). A
+    /// name the strict profile cannot express keeps the plain spelling.
+    #[test]
+    fn the_default_branch_fetch_takes_its_tracking_ref_lane() {
+        let tracked = |remote: &str, branch: &str| crate::session_push::TrackedDefault {
+            remote: remote.into(),
+            branch: branch.into(),
+            tracking_ref: format!("refs/remotes/{remote}/{branch}"),
+            commit: "0".repeat(40),
+        };
+        let args = crate::session_push::default_branch_fetch_args(&tracked("origin", "main"));
+        assert_eq!(args, canonical_fetch_args("origin", "main").unwrap());
+        assert_eq!(
+            resource_scope(&args).as_deref(),
+            Some("git-ref/refs/heads/main")
+        );
+        assert_eq!(
+            local_destination_ref(&args).as_deref(),
+            Some("refs/remotes/origin/main")
+        );
+        assert!(is_repeatable_tracking_fetch(&args));
+
+        let nested =
+            crate::session_push::default_branch_fetch_args(&tracked("origin", "release/2"));
+        assert_eq!(
+            resource_scope(&nested).as_deref(),
+            Some("git-ref/refs/heads/release/2")
+        );
+
+        let unusual = crate::session_push::default_branch_fetch_args(&tracked("origin", "a@{b"));
+        assert_eq!(
+            unusual,
+            vec![
+                "fetch",
+                "origin",
+                "refs/heads/a@{b:refs/remotes/origin/a@{b"
+            ]
+        );
+        assert_eq!(resource_scope(&unusual), None);
     }
 
     /// The shared read lanes `submit` holds for its short history-view checks

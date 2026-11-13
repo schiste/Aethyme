@@ -416,6 +416,23 @@ pub(crate) struct DefaultBranchRefreshEvidence {
     pub(crate) fetched: bool,
 }
 
+/// How the broker fetches the default branch into its tracking ref (`push`,
+/// `sync`, `start`).
+///
+/// The strict spelling holds only that tracking ref's lane, so this fetch
+/// neither waits behind nor blocks other sessions' pushes and commits. It used
+/// to be the plain `fetch <remote> refs/heads/<b>:<tracking ref>`, journaled
+/// `not_strict_spelling` and run on the repository-wide lane on every push and
+/// sync. A repository whose configuration cannot prove the footprint still
+/// runs it wide, and the operation journals why. The plain spelling remains
+/// only for a remote or branch name the strict profile cannot express.
+pub(crate) fn default_branch_fetch_args(default: &TrackedDefault) -> Vec<String> {
+    let refspec = format!("refs/heads/{}:{}", default.branch, default.tracking_ref);
+    crate::operations::canonical_fetch_args(&default.remote, &default.branch)
+        .filter(|args| args.last() == Some(&refspec))
+        .unwrap_or_else(|| vec!["fetch".into(), default.remote.clone(), refspec])
+}
+
 pub(crate) fn tracked_default(repo: &GitRepo) -> Option<TrackedDefault> {
     let (upstream, commit) = repo.upstream_default()?;
     let (remote, branch) = upstream
@@ -1415,7 +1432,7 @@ impl Broker {
                     )
                 })?,
         };
-        let source = format!("refs/heads/{}", default.branch);
+        let args = default_branch_fetch_args(default);
         let fetch = self.run_coordinated_operation_at_with_wait(
             CoordinatedCommand {
                 session_id,
@@ -1430,11 +1447,7 @@ impl Broker {
                 authorization_reason: Some(
                     "refresh the default branch to compare a session with it".into(),
                 ),
-                args: vec![
-                    "fetch".into(),
-                    default.remote.clone(),
-                    format!("{source}:{}", default.tracking_ref),
-                ],
+                args,
             },
             main_root,
             fetch_operation_wait(),
