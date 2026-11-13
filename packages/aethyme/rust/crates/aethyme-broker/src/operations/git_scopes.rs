@@ -153,6 +153,20 @@ pub(crate) fn strict_push_args(remote: &str, source: &str, branch_ref: &str) -> 
     ]
 }
 
+/// The strict spelling of `push <remote> <sha>:refs/heads/<branch>`, the
+/// spelling `broker push` falls back to when the strict profile is refused.
+pub(super) fn strict_equivalent_of_plain_push(args: &[String]) -> Option<Vec<String>> {
+    let [command, remote, refspec] = args else {
+        return None;
+    };
+    if command != "push" {
+        return None;
+    }
+    let (source, destination) = refspec.split_once(':')?;
+    let strict = strict_push_args(remote, source, destination);
+    strict_push(&strict).is_some().then_some(strict)
+}
+
 /// The branch a strict push writes, as `refs/heads/<branch>`.
 pub(super) fn strict_push_destination(args: &[String]) -> Option<String> {
     strict_push(args).map(|push| format!("refs/heads/{}", push.branch))
@@ -297,11 +311,129 @@ pub(super) struct FetchCompletion {
     pub observed_at: i64,
 }
 
+const UNAVAILABLE_PREFIX: &str = "strict Git resource profile unavailable: ";
+
 fn unavailable(reason: &str) -> BrokerOpError {
     BrokerOpError::InvalidCoordinatedOperation {
-        reason: format!(
-            "strict Git resource profile unavailable: {reason}; use the repository-wide spelling"
-        ),
+        reason: format!("{UNAVAILABLE_PREFIX}{reason}; use the repository-wide spelling"),
+    }
+}
+
+/// `push.followTags` is set: the strict spelling would stop following tags.
+pub(crate) const LANE_PUSH_FOLLOWS_TAGS: &str = "push_follow_tags";
+/// `coordination.session_hooks_hold_repository_lock = true`, and a hook the
+/// opt-out names exists (or the operation is a commit).
+pub(crate) const LANE_SESSION_HOOKS_HOLD_LOCK: &str = "session_hooks_hold_repository_lock";
+/// The caller declared `--scope`; a session commit lane is derived, never declared.
+pub(crate) const LANE_DECLARED_SCOPE: &str = "declared_scope";
+/// The operation's session is missing or closed.
+pub(crate) const LANE_NO_LIVE_SESSION: &str = "no_live_session";
+/// The argv is not one of the closed profiles (`unrecognized resource profile`).
+pub(crate) const LANE_NOT_STRICT_SPELLING: &str = "not_strict_spelling";
+/// A `--force-with-lease` replacement: never a closed profile.
+pub(crate) const LANE_FORCE_WITH_LEASE: &str = "force_with_lease_push";
+/// A push that writes a branch other than the caller's own session branch.
+pub(crate) const LANE_NOT_SESSION_BRANCH: &str = "not_session_branch";
+/// The admission budget ran out while proving the footprint.
+pub(crate) const LANE_ADMISSION_TIMED_OUT: &str = "admission_timed_out";
+/// A probe failed for a reason that is not one of the coded refusals.
+pub(crate) const LANE_PROBE_FAILED: &str = "probe_failed";
+/// A refusal whose text is not in [`LANE_REASONS`]; a test keeps this empty.
+pub(crate) const LANE_UNCLASSIFIED: &str = "unclassified";
+
+/// Stable reason codes for every refusal [`unavailable`] can produce, keyed by
+/// the start of its human detail. Codes are recorded in operation journals and
+/// aggregated by `operations stats`, so they are never renamed.
+const LANE_REASONS: &[(&str, &str)] = &[
+    ("ambient Git routing", "ambient_git_override"),
+    (
+        "session branch is not a plain branch name",
+        "session_branch_not_plain",
+    ),
+    (
+        "the commit does not run in the session's worktree",
+        "commit_outside_session_worktree",
+    ),
+    ("a main-checkout commit", "main_checkout_commit"),
+    (
+        "the worktree belongs to another repository",
+        "foreign_repository_worktree",
+    ),
+    (
+        "HEAD is not the session's own branch",
+        "head_not_session_branch",
+    ),
+    ("resource evidence was truncated", "evidence_truncated"),
+    (
+        "common Git directory identity",
+        "common_directory_identity_unavailable",
+    ),
+    (
+        "exact local ref inventory failed",
+        "ref_evidence_unreadable",
+    ),
+    ("non-UTF-8 ref inventory", "ref_evidence_unreadable"),
+    ("malformed ref inventory", "ref_evidence_unreadable"),
+    ("unrecognized object format", "ref_evidence_unreadable"),
+    ("duplicate exact ref evidence", "ref_evidence_unreadable"),
+    ("non-UTF-8 remote ref evidence", "ref_evidence_unreadable"),
+    ("non-UTF-8 hook directory", "hook_directory_unreadable"),
+    ("incomplete hook directory", "hook_directory_unreadable"),
+    ("ambiguous hook directory", "hook_directory_unreadable"),
+    (
+        "hook directory inventory failed",
+        "hook_directory_unreadable",
+    ),
+    ("hook state is unreadable", "hook_directory_unreadable"),
+    ("a reference-transaction hook", "reference_transaction_hook"),
+    ("a pre-push hook", "pre_push_hook"),
+    (
+        "push.followTags is unreadable",
+        "push_follow_tags_unreadable",
+    ),
+    ("shallow", "shallow_repository"),
+    ("unrecognized resource profile", LANE_NOT_STRICT_SPELLING),
+    (
+        "Git configuration inventory failed",
+        "config_inventory_unreadable",
+    ),
+    (
+        "non-UTF-8 configuration inventory",
+        "config_inventory_unreadable",
+    ),
+    ("malformed Git configuration", "config_inventory_unreadable"),
+    ("a mirror or push URL", "push_url_or_mirror"),
+    ("a custom SSH command", "custom_ssh_command"),
+    ("repository extension", "repository_extension"),
+    ("a URL rewrite", "url_rewrite"),
+    ("the ext transport", "ext_transport"),
+    (
+        "a custom remote helper or pack program",
+        "custom_remote_program",
+    ),
+    (
+        "nonstandard remote fetch mapping",
+        "nonstandard_remote_fetch",
+    ),
+    (
+        "unrecognized Git configuration evidence",
+        "unrecognized_config",
+    ),
+];
+
+/// The stable reason code for an error a footprint proof returned.
+pub(crate) fn lane_unavailable_code(error: &BrokerOpError) -> &'static str {
+    match error {
+        BrokerOpError::InvalidCoordinatedOperation { reason } => reason
+            .strip_prefix(UNAVAILABLE_PREFIX)
+            .and_then(|detail| {
+                LANE_REASONS
+                    .iter()
+                    .find(|(prefix, _)| detail.starts_with(*prefix))
+            })
+            .map_or(LANE_UNCLASSIFIED, |(_, code)| *code),
+        BrokerOpError::AdmissionTimedOut { .. } => LANE_ADMISSION_TIMED_OUT,
+        _ => LANE_PROBE_FAILED,
     }
 }
 
@@ -434,7 +566,9 @@ fn refuse_hooks(
             .try_exists()
             .map_err(|_| unavailable("hook state is unreadable"))?
         {
-            return Err(unavailable("a hook can expand this resource footprint"));
+            return Err(unavailable(&format!(
+                "a {hook} hook can expand this resource footprint"
+            )));
         }
     }
     Ok(())
@@ -567,16 +701,32 @@ pub(super) fn validate_repository(
             }
             continue;
         }
-        if key == "core.sshcommand"
-            || key.starts_with("extensions.")
-            || key.starts_with("url.")
-            || key == "protocol.ext.allow"
-            || key.ends_with(".vcs")
-            || key.ends_with(".uploadpack")
-            || key.ends_with(".receivepack")
-        {
+        // `extensions.worktreeConfig` only makes Git also read the current
+        // worktree's `config.worktree`. This inventory runs in that worktree,
+        // so every key that file sets is already in front of us and judged
+        // like any other: the extension itself writes no ref and moves no
+        // transport. Linked-worktree tooling (`git sparse-checkout`, editors)
+        // sets it, which kept every session push in such repositories wide.
+        if key == "extensions.worktreeconfig" {
+            continue;
+        }
+        if key == "core.sshcommand" {
+            return Err(unavailable("a custom SSH command needs the wide lane"));
+        }
+        if key.starts_with("extensions.") {
+            return Err(unavailable(&format!(
+                "repository extension {key} needs the wide lane"
+            )));
+        }
+        if key.starts_with("url.") {
+            return Err(unavailable("a URL rewrite needs the wide lane"));
+        }
+        if key == "protocol.ext.allow" {
+            return Err(unavailable("the ext transport needs the wide lane"));
+        }
+        if key.ends_with(".vcs") || key.ends_with(".uploadpack") || key.ends_with(".receivepack") {
             return Err(unavailable(
-                "custom hooks or repository extensions need the wide lane",
+                "a custom remote helper or pack program needs the wide lane",
             ));
         }
         if let Some(remote) = key
@@ -1220,6 +1370,369 @@ mod tests {
         assert!(
             !journal.proves_provider_completion(),
             "signal death cannot settle descendants"
+        );
+    }
+
+    /// Every refusal text `unavailable` is called with maps to a stable code,
+    /// so a new refusal cannot silently journal as `unclassified`.
+    #[test]
+    fn every_unavailable_refusal_has_a_stable_reason_code() {
+        let source = include_str!("git_scopes.rs");
+        let needle = concat!("unavail", "able(");
+        let mut literals = Vec::new();
+        for (index, _) in source.match_indices(needle) {
+            let rest = source[index + needle.len()..].trim_start();
+            if let Some(rest) = rest.strip_prefix('"') {
+                literals.push(&rest[..rest.find('"').unwrap()]);
+            }
+        }
+        assert!(literals.len() > 25, "{literals:?}");
+        for detail in literals {
+            assert_ne!(
+                lane_unavailable_code(&unavailable(detail)),
+                LANE_UNCLASSIFIED,
+                "{detail}"
+            );
+        }
+        for (detail, code) in [
+            (
+                "a pre-push hook can expand this resource footprint",
+                "pre_push_hook",
+            ),
+            (
+                "a reference-transaction hook can expand this resource footprint",
+                "reference_transaction_hook",
+            ),
+            (
+                "repository extension extensions.partialclone needs the wide lane",
+                "repository_extension",
+            ),
+        ] {
+            assert_eq!(lane_unavailable_code(&unavailable(detail)), code);
+        }
+        assert_eq!(
+            lane_unavailable_code(&BrokerOpError::InvalidCoordinatedOperation {
+                reason: "something else".into()
+            }),
+            LANE_UNCLASSIFIED
+        );
+    }
+
+    fn git_in(root: &Path, arguments: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn repository_with_origin(origin: &str) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        git_in(root.path(), &["init", "-q", "-b", "main"]);
+        git_in(root.path(), &["remote", "add", "origin", origin]);
+        root
+    }
+
+    /// The busiest repository kept every session push wide on 0.8.85 and
+    /// 0.8.86 because its only unexplained configuration key was
+    /// `extensions.worktreeConfig = true`. That extension only makes Git read
+    /// the worktree's own `config.worktree`, which the inventory already
+    /// reads, so it no longer widens; every other refusal names its reason.
+    #[test]
+    fn a_worktree_config_extension_keeps_the_lane_and_each_refusal_names_its_reason() {
+        let push = strict_push_args("origin", &"a".repeat(40), "refs/heads/agent/a");
+        let deadline = || AdmissionDeadline::start(QueueWait::Refuse);
+        let check = |root: &Path, session_branch_hooks: bool| {
+            validate_repository(root, &push, deadline(), "test", session_branch_hooks)
+                .map_err(|error| lane_unavailable_code(&error))
+        };
+
+        let root = repository_with_origin("https://example.invalid/acme/project.git");
+        assert_eq!(check(root.path(), true), Ok(()));
+        git_in(
+            root.path(),
+            &["config", "extensions.worktreeConfig", "true"],
+        );
+        assert_eq!(check(root.path(), true), Ok(()));
+        // The per-worktree file is still inventoried.
+        git_in(
+            root.path(),
+            &["config", "--worktree", "core.sshCommand", "ssh -v"],
+        );
+        assert_eq!(check(root.path(), true), Err("custom_ssh_command"));
+
+        for (setting, code) in [
+            (&["core.sshCommand", "ssh -v"][..], "custom_ssh_command"),
+            (
+                &[
+                    "url.https://mirror.invalid/.insteadOf",
+                    "https://example.invalid/",
+                ],
+                "url_rewrite",
+            ),
+            (
+                &["extensions.partialClone", "origin"],
+                "repository_extension",
+            ),
+            (
+                &["remote.origin.pushurl", "https://example.invalid/other.git"],
+                "push_url_or_mirror",
+            ),
+            (&["protocol.ext.allow", "always"], "ext_transport"),
+            (
+                &["remote.origin.receivepack", "git-receive-pack"],
+                "custom_remote_program",
+            ),
+            (
+                &["--add", "remote.origin.fetch", "+refs/tags/*:refs/tags/*"],
+                "nonstandard_remote_fetch",
+            ),
+        ] {
+            let root = repository_with_origin("https://example.invalid/acme/project.git");
+            let mut arguments = vec!["config"];
+            arguments.extend_from_slice(setting);
+            git_in(root.path(), &arguments);
+            assert_eq!(check(root.path(), true), Err(code), "{setting:?}");
+        }
+
+        // A session branch's own pre-push hook does not widen its push; any
+        // other strict push, and a reference-transaction hook, do.
+        let root = repository_with_origin("https://example.invalid/acme/project.git");
+        let hooks = root.path().join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("pre-push"), "#!/bin/sh\n").unwrap();
+        assert_eq!(check(root.path(), true), Ok(()));
+        assert_eq!(check(root.path(), false), Err("pre_push_hook"));
+        std::fs::write(hooks.join("reference-transaction"), "#!/bin/sh\n").unwrap();
+        assert_eq!(check(root.path(), true), Err("reference_transaction_hook"));
+
+        // A relative `core.hooksPath` (husky's `.husky`) resolves against the
+        // worktree and widens only for the hook it actually holds.
+        let root = repository_with_origin("https://example.invalid/acme/project.git");
+        std::fs::create_dir(root.path().join(".husky")).unwrap();
+        std::fs::write(root.path().join(".husky/pre-push"), "#!/bin/sh\n").unwrap();
+        git_in(root.path(), &["config", "core.hooksPath", ".husky"]);
+        assert_eq!(check(root.path(), true), Ok(()));
+        std::fs::write(
+            root.path().join(".husky/reference-transaction"),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
+        assert_eq!(check(root.path(), true), Err("reference_transaction_hook"));
+
+        // `broker push`'s own check names `push.followTags` and the opt-out.
+        let root = repository_with_origin("https://example.invalid/acme/project.git");
+        assert_eq!(
+            crate::operations::session_branch_push_lane(root.path(), root.path(), &push),
+            Ok(())
+        );
+        git_in(root.path(), &["config", "push.followTags", "true"]);
+        assert_eq!(
+            crate::operations::session_branch_push_lane(root.path(), root.path(), &push),
+            Err(LANE_PUSH_FOLLOWS_TAGS)
+        );
+        let root = repository_with_origin("https://example.invalid/acme/project.git");
+        std::fs::create_dir_all(root.path().join(".git/hooks")).unwrap();
+        std::fs::write(root.path().join(".git/hooks/pre-push"), "#!/bin/sh\n").unwrap();
+        std::fs::create_dir(root.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            root.path().join(".aethyme/config.toml"),
+            "[coordination]\nsession_hooks_hold_repository_lock = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            crate::operations::session_branch_push_lane(root.path(), root.path(), &push),
+            Err(LANE_SESSION_HOOKS_HOLD_LOCK)
+        );
+
+        // The fallback spelling `broker push` uses re-derives its strict twin.
+        let plain = vec![
+            "push".to_owned(),
+            "origin".to_owned(),
+            format!("{}:refs/heads/agent/a", "a".repeat(40)),
+        ];
+        assert_eq!(strict_equivalent_of_plain_push(&plain), Some(push.clone()));
+        let mut moving = plain.clone();
+        moving[2] = "HEAD:refs/heads/agent/a".into();
+        assert_eq!(strict_equivalent_of_plain_push(&moving), None);
+    }
+
+    /// An exclusive holder writes who it is next to the lock, so a waiter
+    /// can name a holder the journal does not know, and the record goes
+    /// away with the lock. Shared holders write none.
+    #[test]
+    fn an_exclusive_holder_is_recorded_next_to_its_lock_until_it_releases() {
+        let root = tempfile::tempdir().unwrap();
+        let held = RepositoryWriteLock::acquire(
+            root.path(),
+            "example/repo",
+            7,
+            Some(3),
+            || Ok("test".into()),
+            QueueWait::Refuse,
+            |_, _| {},
+        )
+        .unwrap();
+        let record = recorded_lock_holder(root.path(), "example/repo").expect("a holder record");
+        assert_eq!(record.kind, "coordinated_operation");
+        assert_eq!(record.pid, std::process::id());
+        assert_eq!(record.session_id, Some(3));
+        assert_eq!(record.operation_id, Some(7));
+        assert!(
+            RepositoryWriteLock::acquire(
+                root.path(),
+                "example/repo",
+                8,
+                None,
+                || Ok("test".into()),
+                QueueWait::Refuse,
+                |_, _| {},
+            )
+            .is_err()
+        );
+        drop(held);
+        assert!(recorded_lock_holder(root.path(), "example/repo").is_none());
+
+        let shared = RepositoryWriteLock::acquire_shared(
+            root.path(),
+            "example/repo",
+            (9, Some(4)),
+            || Ok("test".into()),
+            QueueWait::Refuse,
+            |_, _| {},
+        )
+        .unwrap();
+        assert!(recorded_lock_holder(root.path(), "example/repo").is_none());
+        drop(shared);
+    }
+
+    /// `submit`'s plan-reuse hold has no journal row. A coordinated write
+    /// refused behind it now names it: kind, pid, session and hold time.
+    #[test]
+    fn a_refusal_behind_an_unjournaled_submit_hold_names_the_holder() {
+        let root = repository_with_origin("https://github.com/example/repo.git");
+        let root = root.path().canonicalize().unwrap();
+        let checkout = crate::GitRepo::discover(&root).unwrap();
+        let (_repository, held) = crate::operations::try_acquire_local_repository_write_lock_as(
+            &root,
+            &checkout,
+            "submit_plan_reuse",
+            Some(5),
+        )
+        .unwrap()
+        .expect("an uncontended hold");
+        let common_key = common_lock_key(&root).unwrap();
+        let record = recorded_lock_holder(&root, &common_key).expect("a holder record");
+        assert_eq!(record.kind, "submit_plan_reuse");
+        assert_eq!(record.session_id, Some(5));
+
+        let refused = RepositoryWriteLock::acquire_mode(
+            &root,
+            &common_key,
+            (11, Some(6)),
+            || Ok(unidentified_lock_holder().description),
+            QueueWait::Refuse,
+            Duration::from_secs(2),
+            |_, _| {},
+            false,
+        );
+        assert!(refused.is_err());
+        let holder = with_recorded_holder(unidentified_lock_holder(), &root, &common_key);
+        let details = lane_refusal_details(
+            "local_git_lane_unavailable",
+            &common_key,
+            Some(unix_now_ms() - 59_000),
+            &LaneTelemetry::default(),
+            &holder,
+        );
+        assert_eq!(details["reason"], "local_git_lane_unavailable");
+        assert_eq!(details["holder"]["scope"], "submit_plan_reuse");
+        assert_eq!(details["holder"]["session_id"], 5);
+        assert_eq!(details["holder"]["pid"], i64::from(std::process::id()));
+        assert!(details["holder"]["held_ms"].as_i64().is_some());
+        assert!(
+            details["holder"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("submit_plan_reuse"),
+            "{details}"
+        );
+        assert!(
+            details["coordination_timing"]["queue_wait_ms"]
+                .as_i64()
+                .unwrap()
+                >= 59_000
+        );
+        drop(held);
+        assert!(recorded_lock_holder(&root, &common_key).is_none());
+    }
+
+    /// `queue_wait_ms` is the whole wait, not only the last lock's: a 15 s
+    /// common-directory wait used to journal `queue_wait_ms: 0`.
+    #[test]
+    fn queue_wait_includes_every_lane_and_the_lane_decision_is_recorded() {
+        let root = tempfile::tempdir().unwrap();
+        let lock = RepositoryWriteLock::try_acquire_nonblocking(root.path(), "example/repo")
+            .unwrap()
+            .unwrap();
+        let lanes = LaneTelemetry {
+            narrow_lane: Some(NarrowLaneDecision {
+                kind: "push",
+                unavailable: Some("repository_extension"),
+            }),
+            git_common_lane_wait_ms: Some(15_000),
+            ..LaneTelemetry::default()
+        };
+        let timing = coordination_timing_value(
+            "example/repo",
+            Some(lock.acquired_at_ms - 15_000),
+            Some(&lock),
+            false,
+            None,
+            &lanes,
+        );
+        assert!(
+            timing["queue_wait_ms"].as_i64().unwrap() >= 15_000,
+            "{timing}"
+        );
+        assert_eq!(timing["lock_queue_wait_ms"], 0);
+        assert_eq!(timing["git_common_lane_wait_ms"], 15_000);
+        assert_eq!(timing["narrow_lane"], "unavailable");
+        assert_eq!(timing["narrow_lane_kind"], "push");
+        assert_eq!(
+            timing["narrow_lane_unavailable_reason"],
+            "repository_extension"
+        );
+
+        let taken = NarrowLaneDecision {
+            kind: "commit",
+            unavailable: None,
+        };
+        assert_eq!(taken.phase(), "commit_narrow_lane_taken");
+        assert_eq!(
+            lanes.narrow_lane.unwrap().phase(),
+            "push_narrow_lane_unavailable"
+        );
+        assert_eq!(
+            narrow_lane_kind(
+                OperationProvider::Git,
+                OperationEffect::Write,
+                &["commit".to_owned(), "-m".to_owned(), "x".to_owned()]
+            ),
+            Some("commit")
+        );
+        assert_eq!(
+            narrow_lane_kind(
+                OperationProvider::Git,
+                OperationEffect::Write,
+                &["add".to_owned(), "x".to_owned()]
+            ),
+            None
         );
     }
 }
