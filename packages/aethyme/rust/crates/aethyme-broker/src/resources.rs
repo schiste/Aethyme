@@ -15,6 +15,12 @@ use sha2::{Digest, Sha256};
 pub(crate) mod cache_gc_fs;
 pub(crate) mod managed_storage_inventory;
 pub(crate) use managed_storage_inventory::{ManagedStorageOwner, ManagedStorageRootSetBinding};
+mod wait_queue;
+pub(crate) use wait_queue::describe_queue;
+pub use wait_queue::{
+    HostResourceQueueHolder, HostResourceQueueReport, HostResourceQueueStanding,
+    HostResourceWaitStats, HostResourceWaiter, HostResourceWaiterDemand,
+};
 
 pub const HOST_RESOURCE_SCHEMA_VERSION: u32 = 1;
 /// Additive ledger version, independent of the host-resource store version.
@@ -29,6 +35,11 @@ const MAX_TTL_SECONDS: u64 = 86_400;
 /// the host resource database.
 const MAX_MANAGED_STORAGE_ROWS_PER_REPOSITORY: i64 = 16_384;
 const ORPHANED_HOLDER_CONFLICT_CODE: &str = "orphaned_holder";
+/// Bounded queue wait for short in-product acquisitions that never waited
+/// before the queue existed. A live waiter can now reserve a free pool or key
+/// for its turn; this lets such a caller take its own turn when the earlier
+/// waiter is granted and done shortly, instead of failing outright.
+pub(crate) const BRIEF_ACQUIRE_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
@@ -1280,6 +1291,10 @@ pub struct HostResourceExplanation {
     pub proposed: Vec<HostResourceAllocation>,
     pub blockers: Vec<HostResourceBlocker>,
     pub wait: HostResourceWaitAdvice,
+    /// Arrival-order standing of this request among live waiters. Additive;
+    /// readers built before it must tolerate its presence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<HostResourceQueueReport>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1513,6 +1528,37 @@ pub struct HostResourceCoordinator {
     conn: Connection,
     path: PathBuf,
     database_identity: Option<HostResourceDatabaseIdentity>,
+    /// Evidence from the most recent `acquire_with_wait` or `run`
+    /// acquisition on this coordinator, for command metrics and contention
+    /// output.
+    last_wait: Option<HostResourceWaitStats>,
+}
+
+/// One acquisition transaction's outcome. Contention is a value here, not an
+/// error, so the waiting loop can read the queue standing it computed.
+struct AcquireAttempt {
+    result: Result<HostResourceGrant, AttemptConflict>,
+    /// This request's waiter ticket after the attempt, when it has a row.
+    ticket: Option<i64>,
+    reaped: u64,
+    times_skipped: u64,
+    queue: HostResourceQueueReport,
+}
+
+struct AttemptConflict {
+    code: String,
+    message: String,
+    conflicts: Vec<HostResourceConflict>,
+}
+
+impl From<AttemptConflict> for HostResourceError {
+    fn from(conflict: AttemptConflict) -> Self {
+        HostResourceError::Conflict {
+            code: conflict.code,
+            message: conflict.message,
+            conflicts: conflict.conflicts,
+        }
+    }
 }
 
 /// A typed acknowledgement for the host-wide managed-storage floor change.
@@ -1611,6 +1657,7 @@ impl HostResourceCoordinator {
             conn,
             path: path.into(),
             database_identity: Some(database_identity),
+            last_wait: None,
         })
     }
 
@@ -1629,6 +1676,7 @@ impl HostResourceCoordinator {
                 conn,
                 path: path.into(),
                 database_identity: None,
+                last_wait: None,
             });
         }
         let identity_before_open = HostResourceDatabaseIdentity::capture_if_present(&open_path)?
@@ -1650,6 +1698,7 @@ impl HostResourceCoordinator {
             conn,
             path: path.into(),
             database_identity: Some(database_identity),
+            last_wait: None,
         })
     }
 
@@ -2754,17 +2803,58 @@ impl HostResourceCoordinator {
         &self,
         request: &HostResourceRequest,
     ) -> Result<HostResourcePlan, HostResourceError> {
+        self.plan_with_queue(request).map(|(plan, _)| plan)
+    }
+
+    /// Plan including arrival order: earlier live waiters reserve what they
+    /// demand. Read-only; dead waiter rows are ignored, not deleted.
+    fn plan_with_queue(
+        &self,
+        request: &HostResourceRequest,
+    ) -> Result<(HostResourcePlan, HostResourceQueueReport), HostResourceError> {
         validate_request(request)?;
+        let now = now_ms();
         let occupied = load_occupied(&self.conn)?;
-        let (proposed, conflicts) = plan_allocations(request, &occupied)?;
-        Ok(HostResourcePlan {
-            schema_version: HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
-            request_id: request.request_id.clone(),
-            available: conflicts.is_empty(),
-            proposed,
-            conflicts,
-            advisory: true,
-        })
+        let (mut proposed, mut conflicts) = plan_allocations(request, &occupied)?;
+        let live = wait_queue::live_waiters(&self.conn, now)?;
+        let (own, ahead) = wait_queue::split_queue(&live, &request.request_id);
+        append_queue_conflicts(request, &occupied, &ahead, &mut conflicts);
+        proposed.retain(|allocation| {
+            !conflicts.iter().any(|conflict| {
+                conflict.resource_key == allocation.key
+                    || (conflict.kind == "capacity"
+                        && allocation.kind == "capacity"
+                        && conflict
+                            .requested
+                            .split_once(':')
+                            .is_some_and(|(pool, _)| pool == allocation.value))
+            })
+        });
+        let demands = wait_queue::request_demands(request);
+        let queue = wait_queue::queue_report(&demands, &occupied, &live, own, &ahead, now);
+        Ok((
+            HostResourcePlan {
+                schema_version: HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+                request_id: request.request_id.clone(),
+                available: conflicts.is_empty(),
+                proposed,
+                conflicts,
+                advisory: true,
+            },
+            queue,
+        ))
+    }
+
+    /// Live waiters in arrival order, without credentials. Read-only.
+    pub fn waiting(&self) -> Result<Vec<HostResourceWaiter>, HostResourceError> {
+        let now = now_ms();
+        let live = wait_queue::live_waiters(&self.conn, now)?;
+        Ok(wait_queue::waiter_inventory(&live, now))
+    }
+
+    /// Evidence from the most recent waiting acquisition on this coordinator.
+    pub fn last_wait_stats(&self) -> Option<&HostResourceWaitStats> {
+        self.last_wait.as_ref()
     }
 
     /// Explain a plan using only read queries. The returned blocker records
@@ -2774,7 +2864,7 @@ impl HostResourceCoordinator {
         &self,
         request: &HostResourceRequest,
     ) -> Result<HostResourceExplanation, HostResourceError> {
-        let plan = self.plan(request)?;
+        let (plan, queue) = self.plan_with_queue(request)?;
         let leases = self.list(false)?;
         let blockers = plan
             .conflicts
@@ -2804,6 +2894,7 @@ impl HostResourceCoordinator {
             proposed: plan.proposed,
             blockers,
             wait,
+            queue: Some(queue),
         })
     }
 
@@ -2815,22 +2906,42 @@ impl HostResourceCoordinator {
         self.acquire_inner(request, false)
     }
 
+    /// A request without a waiter registration is admitted as if it arrived
+    /// after every live waiter, so it cannot take what they demand.
     fn acquire_inner(
         &mut self,
         request: &HostResourceRequest,
         supervised: bool,
     ) -> Result<HostResourceGrant, HostResourceError> {
+        self.acquire_attempt(request, supervised, None, now_ms())?
+            .result
+            .map_err(HostResourceError::from)
+    }
+
+    /// One immediate transaction: reap dead waiters, then grant the bundle if
+    /// it fits both current holders and the reservations of earlier live
+    /// waiters. On ordinary contention with a registration, record or refresh
+    /// this request's waiter row; otherwise an unchanged attempt rolls back
+    /// without writing, so it does not wake other waiters.
+    fn acquire_attempt(
+        &mut self,
+        request: &HostResourceRequest,
+        supervised: bool,
+        registration: Option<&wait_queue::WaitRegistration>,
+        now: i64,
+    ) -> Result<AcquireAttempt, HostResourceError> {
         validate_request(request)?;
         let digest = if supervised {
             supervised_request_digest(request)?
         } else {
             request_digest(request)?
         };
-        let now = now_ms();
+        let demands = wait_queue::request_demands(request);
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         quarantine_reclaimable(&tx, now)?;
+        let (live, reaped) = wait_queue::reap_dead_waiters(&tx, now)?;
         if let Some((existing_digest, state, token)) = tx.query_row(
             "SELECT request_digest,state,ownership_token FROM resource_leases WHERE request_id=?1",
             [&request.request_id],
@@ -2845,30 +2956,88 @@ impl HostResourceCoordinator {
             }
             if state != "active" { return Err(HostResourceError::RequestNotActive { request_id: request.request_id.clone(), state }); }
             let lease = load_lease(&tx, "request_id", &request.request_id)?.ok_or_else(|| HostResourceError::LeaseNotFound(request.request_id.clone()))?;
+            wait_queue::delete_waiter(&tx, &request.request_id, None)?;
             tx.commit()?;
-            return Ok(HostResourceGrant { lease, ownership_token: token });
+            return Ok(AcquireAttempt {
+                result: Ok(HostResourceGrant { lease, ownership_token: token }),
+                ticket: None,
+                reaped,
+                times_skipped: 0,
+                queue: wait_queue::queue_report(&demands, &[], &[], None, &[], now),
+            });
+        }
+        let (own, ahead) = wait_queue::split_queue(&live, &request.request_id);
+        if own.is_some_and(|own| own.request_digest != digest) {
+            return Err(HostResourceError::IdempotencyMismatch(
+                request.request_id.clone(),
+            ));
         }
         let occupied = load_occupied(&tx)?;
-        let (allocations, conflicts) = plan_allocations(request, &occupied)?;
+        let (allocations, mut conflicts) = plan_allocations(request, &occupied)?;
+        append_queue_conflicts(request, &occupied, &ahead, &mut conflicts);
         if !conflicts.is_empty() {
             let code = aggregate_conflict_code(&conflicts).to_string();
-            if code == ORPHANED_HOLDER_CONFLICT_CODE {
+            let contention = code == "resource_contention";
+            let (queue, ticket) = if code == ORPHANED_HOLDER_CONFLICT_CODE {
                 quarantine_conflicting_orphaned_holders(&tx, now, &conflicts, &occupied)?;
+                if own.is_some() {
+                    // Waiting cannot resolve this refusal; stop reserving.
+                    wait_queue::delete_waiter(&tx, &request.request_id, None)?;
+                }
+                let queue = wait_queue::queue_report(&demands, &occupied, &live, own, &ahead, now);
                 // This commits the existing safe cleanup sweep plus quarantine
                 // for the exact dead owners behind the non-waitable result.
                 // Named allocations remain, and rejected-bundle allocations
                 // are not inserted before this branch.
                 tx.commit()?;
-            }
+                (queue, None)
+            } else {
+                let registration = registration.filter(|_| contention);
+                let contended = wait_queue::contended_demands(request, &demands, &conflicts);
+                let reserved = wait_queue::next_reservation(&demands, contended.as_deref(), own);
+                let settle = reaped > 0
+                    || (!contention && own.is_some())
+                    || registration.is_some_and(|registration| {
+                        wait_queue::registration_needs_write(own, &reserved, registration, now)
+                    });
+                let queue = wait_queue::queue_report(&demands, &occupied, &live, own, &ahead, now);
+                // A retryable refusal rolls back the opportunistic quarantine
+                // sweep; only waiter bookkeeping is written, separately.
+                drop(tx);
+                if settle {
+                    let refreshed = self.settle_waiter(
+                        request,
+                        &digest,
+                        &demands,
+                        contended.as_deref(),
+                        registration,
+                        !contention,
+                        now,
+                    )?;
+                    let (own, ahead) = wait_queue::split_queue(&refreshed, &request.request_id);
+                    (
+                        wait_queue::queue_report(&demands, &occupied, &refreshed, own, &ahead, now),
+                        own.map(|own| own.ticket),
+                    )
+                } else {
+                    (queue, own.map(|own| own.ticket))
+                }
+            };
             let message = conflicts
                 .iter()
                 .map(|c| format!("{}: {}", c.resource_key, c.reason))
                 .collect::<Vec<_>>()
                 .join("; ");
-            return Err(HostResourceError::Conflict {
-                code,
-                message,
-                conflicts,
+            return Ok(AcquireAttempt {
+                result: Err(AttemptConflict {
+                    code,
+                    message,
+                    conflicts,
+                }),
+                ticket,
+                reaped,
+                times_skipped: 0,
+                queue,
             });
         }
         let generation: i64 = tx.query_row(
@@ -2904,10 +3073,21 @@ impl HostResourceCoordinator {
         }
         let lease = load_lease(&tx, "lease_id", &lease_id)?
             .ok_or_else(|| HostResourceError::LeaseNotFound(lease_id.clone()))?;
+        wait_queue::record_skips(&tx, &ahead, &demands)?;
+        if own.is_some() {
+            wait_queue::delete_waiter(&tx, &request.request_id, None)?;
+        }
+        let queue = wait_queue::queue_report(&demands, &occupied, &live, own, &ahead, now);
         tx.commit()?;
-        Ok(HostResourceGrant {
-            lease,
-            ownership_token,
+        Ok(AcquireAttempt {
+            result: Ok(HostResourceGrant {
+                lease,
+                ownership_token,
+            }),
+            ticket: None,
+            reaped,
+            times_skipped: own.map_or(0, |own| own.times_skipped),
+            queue,
         })
     }
 
@@ -2978,51 +3158,213 @@ impl HostResourceCoordinator {
         &mut self,
         request: &HostResourceRequest,
         wait: std::time::Duration,
-        on_conflict: F,
-    ) -> Result<HostResourceGrant, HostResourceError>
-    where
-        F: FnMut(&str),
-    {
-        self.acquire_with_wait_inner(request, wait, false, on_conflict)
-    }
-
-    fn acquire_with_wait_inner<F>(
-        &mut self,
-        request: &HostResourceRequest,
-        wait: std::time::Duration,
-        supervised: bool,
         mut on_conflict: F,
     ) -> Result<HostResourceGrant, HostResourceError>
     where
         F: FnMut(&str),
     {
-        let deadline = std::time::Instant::now() + wait;
-        loop {
-            match self.acquire_inner(request, supervised) {
-                Ok(grant) => return Ok(grant),
-                Err(HostResourceError::Conflict {
-                    code,
-                    message,
-                    conflicts: _,
-                }) if code == "resource_contention" && std::time::Instant::now() < deadline => {
-                    on_conflict(&message);
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    std::thread::sleep(remaining.min(std::time::Duration::from_millis(250)));
+        self.acquire_with_wait_inner(request, wait, false, |message, _queue| on_conflict(message))
+    }
+
+    /// Wait in arrival order. The first contended attempt records a durable
+    /// waiter row; the row is removed on grant, on a refusal waiting cannot
+    /// resolve, on timeout, and (by any other acquirer) once this process is
+    /// gone or its deadline or heartbeat has lapsed.
+    ///
+    /// Between attempts this sleeps in short ticks and reads only
+    /// `PRAGMA data_version`, which changes when another connection commits.
+    /// The head of a queue retries on the first change and at least every
+    /// second; waiters behind it retry at most once a second on a change and
+    /// back off to five seconds without one.
+    fn acquire_with_wait_inner<F>(
+        &mut self,
+        request: &HostResourceRequest,
+        wait: std::time::Duration,
+        supervised: bool,
+        on_conflict: F,
+    ) -> Result<HostResourceGrant, HostResourceError>
+    where
+        F: FnMut(&str, &HostResourceQueueReport),
+    {
+        self.acquire_with_wait_clocked(request, wait, supervised, on_conflict, &mut now_ms)
+    }
+
+    /// The waiting loop with an injectable wall clock. The wait deadline and
+    /// the waiter row's `deadline_at` come from the same clock, so a process
+    /// that was suspended past its deadline (a sleeping laptop stops the
+    /// monotonic clock, not the wall clock) ends its wait instead of writing
+    /// a row that is already dead.
+    fn acquire_with_wait_clocked<F>(
+        &mut self,
+        request: &HostResourceRequest,
+        wait: std::time::Duration,
+        supervised: bool,
+        mut on_conflict: F,
+        clock: &mut dyn FnMut() -> i64,
+    ) -> Result<HostResourceGrant, HostResourceError>
+    where
+        F: FnMut(&str, &HostResourceQueueReport),
+    {
+        let started_at = clock();
+        let deadline_at =
+            started_at.saturating_add(i64::try_from(wait.as_millis()).unwrap_or(i64::MAX));
+        let pid = i64::from(std::process::id());
+        let mut stats = HostResourceWaitStats::default();
+        let mut ticket = None;
+        let mut enqueued_at = None;
+        let mut tail_gap = wait_queue::TAIL_POLL_MIN;
+        let mut last_position = None;
+        let result = loop {
+            let now = clock();
+            let registration = (now < deadline_at).then_some(wait_queue::WaitRegistration {
+                pid,
+                deadline_at,
+                ticket,
+                enqueued_at,
+            });
+            stats.attempts = stats.attempts.saturating_add(1);
+            let attempt =
+                match self.acquire_attempt(request, supervised, registration.as_ref(), now) {
+                    Ok(attempt) => attempt,
+                    Err(error) => break Err(error),
+                };
+            stats.reaped_dead_waiters = stats.reaped_dead_waiters.saturating_add(attempt.reaped);
+            let queue = attempt.queue;
+            if queue.queued {
+                stats.queued = true;
+                stats.times_skipped = queue.times_skipped;
+                if ticket.is_none() {
+                    ticket = attempt.ticket;
+                    enqueued_at = queue.enqueued_at;
+                    stats.position_at_enqueue = Some(queue.position);
                 }
-                Err(HostResourceError::Conflict {
-                    code,
-                    message,
-                    conflicts,
-                }) => {
-                    return Err(HostResourceError::Conflict {
-                        code,
-                        message,
-                        conflicts,
-                    });
-                }
-                Err(error) => return Err(error),
             }
+            let conflict = match attempt.result {
+                Ok(grant) => {
+                    stats.times_skipped = stats.times_skipped.max(attempt.times_skipped);
+                    stats.final_queue = Some(queue);
+                    break Ok(grant);
+                }
+                Err(conflict) => conflict,
+            };
+            if conflict.code != "resource_contention" || clock() >= deadline_at {
+                stats.final_queue = Some(queue);
+                break Err(conflict.into());
+            }
+            on_conflict(&conflict.message, &queue);
+            let head = queue.position == 0;
+            if last_position.is_some_and(|last| queue.position < last) {
+                tail_gap = wait_queue::TAIL_POLL_MIN;
+            }
+            last_position = Some(queue.position);
+            let (min_gap, max_gap) = if head {
+                (wait_queue::POLL_TICK, wait_queue::HEAD_POLL_MAX)
+            } else {
+                let gap = tail_gap;
+                tail_gap = (tail_gap * 2).min(wait_queue::TAIL_POLL_MAX);
+                (wait_queue::TAIL_POLL_MIN, gap)
+            };
+            let attempted = std::time::Instant::now();
+            // A failed read only loses the early wake-up; the bounded retry
+            // interval still applies.
+            let version = self.data_version().ok();
+            loop {
+                let remaining_ms = deadline_at.saturating_sub(clock());
+                if remaining_ms <= 0 {
+                    break;
+                }
+                let remaining = std::time::Duration::from_millis(remaining_ms as u64);
+                std::thread::sleep(remaining.min(wait_queue::POLL_TICK));
+                stats.poll_ticks = stats.poll_ticks.saturating_add(1);
+                let elapsed = attempted.elapsed();
+                if elapsed >= max_gap {
+                    break;
+                }
+                if elapsed >= min_gap && version.is_some() && self.data_version().ok() != version {
+                    break;
+                }
+            }
+        };
+        if result.is_err() && stats.queued {
+            // Leave no record behind. Should this fail, the row stops gating
+            // anyone at its deadline and is reaped by the next acquirer.
+            crate::warn_unrecorded(
+                "withdraw the host resource waiter record",
+                self.withdraw_waiter(&request.request_id, pid),
+            );
         }
+        stats.waited_ms = u64::try_from(clock().saturating_sub(started_at)).unwrap_or(0);
+        self.last_wait = Some(stats);
+        result
+    }
+
+    fn data_version(&self) -> Result<i64, HostResourceError> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?)
+    }
+
+    /// Waiter bookkeeping after a refused attempt, in its own transaction so
+    /// the refused attempt's opportunistic sweep stays rolled back: reap dead
+    /// waiters, then register (or refresh) this waiter when it may wait, or
+    /// remove its row when it may not. Returns the live waiters afterwards.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "bookkeeping binds the refused attempt's identity and findings explicitly"
+    )]
+    fn settle_waiter(
+        &mut self,
+        request: &HostResourceRequest,
+        digest: &str,
+        demands: &[wait_queue::WaiterDemand],
+        contended: Option<&[wait_queue::WaiterDemand]>,
+        registration: Option<&wait_queue::WaitRegistration>,
+        withdraw: bool,
+        now: i64,
+    ) -> Result<Vec<wait_queue::QueuedWaiter>, HostResourceError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (live, _) = wait_queue::reap_dead_waiters(&tx, now)?;
+        let own = live
+            .iter()
+            .find(|waiter| waiter.request_id == request.request_id);
+        match registration {
+            Some(registration) => {
+                if own.is_some_and(|own| own.request_digest != digest) {
+                    return Err(HostResourceError::IdempotencyMismatch(
+                        request.request_id.clone(),
+                    ));
+                }
+                let reserved = wait_queue::next_reservation(demands, contended, own);
+                wait_queue::register_waiter(
+                    &tx,
+                    request,
+                    digest,
+                    demands,
+                    &reserved,
+                    registration,
+                    own,
+                    now,
+                )?;
+            }
+            None if withdraw => {
+                wait_queue::delete_waiter(&tx, &request.request_id, None)?;
+            }
+            None => {}
+        }
+        let refreshed = wait_queue::live_waiters(&tx, now)?;
+        tx.commit()?;
+        Ok(refreshed)
+    }
+
+    fn withdraw_waiter(&mut self, request_id: &str, pid: i64) -> Result<(), HostResourceError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        wait_queue::delete_waiter(&tx, request_id, Some(pid))?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn renew(
@@ -3318,13 +3660,16 @@ impl HostResourceCoordinator {
         }
         let acquire_started = std::time::Instant::now();
         let mut last_wait_notice = None;
-        let grant_result = self.acquire_with_wait_inner(request, wait, true, |message| {
-            let emit = last_wait_notice.is_none_or(|last: std::time::Instant| {
-                last.elapsed() >= std::time::Duration::from_secs(10)
-            });
+        let mut last_position = None;
+        let grant_result = self.acquire_with_wait_inner(request, wait, true, |message, queue| {
+            let emit = last_position != Some(queue.position)
+                || last_wait_notice.is_none_or(|last: std::time::Instant| {
+                    last.elapsed() >= std::time::Duration::from_secs(10)
+                });
             if emit {
-                event(&format!("waiting: {message}"));
+                event(&format!("waiting: {message}; {}", describe_queue(queue)));
                 last_wait_notice = Some(std::time::Instant::now());
+                last_position = Some(queue.position);
             }
         });
         let waited_ms = acquire_started.elapsed().as_millis();
@@ -4591,6 +4936,10 @@ fn migrate_writable_schema(conn: &mut Connection) -> Result<(), HostResourceErro
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     preflight_existing_store_versions(&tx)?;
     tx.execute_batch(SCHEMA)?;
+    // Additive and versionless: older binaries never read or write waiter
+    // rows, and their schema validation ignores unknown tables, so this keeps
+    // the shared store at its current version.
+    tx.execute_batch(wait_queue::RESOURCE_WAITER_SCHEMA)?;
     let version = store_schema_version(&tx)?;
     match version {
         1 => {
@@ -5085,6 +5434,25 @@ fn plan_allocations(
     }
     mark_orphaned_holder_conflicts(&mut conflicts, occupied);
     Ok((proposed, conflicts))
+}
+
+/// Add arrival-order conflicts when every existing conflict is ordinary
+/// contention. A refusal waiting cannot resolve is reported unchanged.
+fn append_queue_conflicts(
+    request: &HostResourceRequest,
+    occupied: &[Occupied],
+    ahead: &[&wait_queue::QueuedWaiter],
+    conflicts: &mut Vec<HostResourceConflict>,
+) {
+    if conflicts
+        .iter()
+        .any(|conflict| conflict.code != "resource_contention")
+    {
+        return;
+    }
+    let demands = wait_queue::request_demands(request);
+    let queued = wait_queue::queue_conflicts(request, &demands, occupied, ahead, conflicts);
+    conflicts.extend(queued);
 }
 
 fn quarantine_conflicting_orphaned_holders(
@@ -6045,6 +6413,10 @@ mod tests {
         conn.execute_batch(SCHEMA).unwrap();
         conn.execute_batch(SUPERVISED_HOLD_MIGRATION).unwrap();
         conn.execute("UPDATE meta SET value=2 WHERE key='schema_version'", [])
+            .unwrap();
+        // The additive waiter queue is part of the current host store; its
+        // one-time creation on an older store is covered in wait_queue tests.
+        conn.execute_batch(wait_queue::RESOURCE_WAITER_SCHEMA)
             .unwrap();
         seed_migration_legacy_rows(&conn);
 

@@ -406,7 +406,14 @@ impl Run {
         claim_file.sync_all()?;
         File::open(&root)?.sync_all()?;
         drop(claim_lock);
-        let grant = coordinator.acquire(&journal.request)?;
+        // The same exact request on every attempt, so the journal's recovery
+        // contract holds; a short queued wait lets an earlier waiter that
+        // reserved free capacity take its turn first instead of failing this.
+        let grant = coordinator.acquire_with_wait(
+            &journal.request,
+            crate::resources::BRIEF_ACQUIRE_QUEUE_WAIT,
+            |_| {},
+        )?;
         journal.grant = Some(grant);
         save(&root, &journal)?;
         Ok(Self {

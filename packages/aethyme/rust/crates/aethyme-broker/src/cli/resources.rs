@@ -242,6 +242,78 @@ pub(super) struct ResourceAcquireFailure<'a> {
     retryable: bool,
     waited_ms: u128,
     conflicts: &'a [crate::HostResourceConflict],
+    /// Arrival-order standing at refusal; absent when no queue was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queue: Option<&'a crate::HostResourceQueueReport>,
+}
+
+/// Attach the acquisition's queue evidence to the command metric, alongside
+/// any phase timings already recorded.
+fn record_resource_wait_metric(
+    stats: Option<&crate::HostResourceWaitStats>,
+    phase_timings_ms: Option<&std::collections::BTreeMap<String, u128>>,
+) {
+    let mut details = serde_json::Map::new();
+    if let Some(phase_timings_ms) = phase_timings_ms {
+        details.insert(
+            "phase_timings_ms".into(),
+            serde_json::json!(phase_timings_ms),
+        );
+    }
+    if let Some(stats) = stats {
+        details.insert(
+            "resource_queue".into(),
+            serde_json::json!({
+                "waited_ms": stats.waited_ms,
+                "attempts": stats.attempts,
+                "poll_ticks": stats.poll_ticks,
+                "queued": stats.queued,
+                "position_at_enqueue": stats.position_at_enqueue,
+                "times_skipped": stats.times_skipped,
+                "reaped_dead_waiters": stats.reaped_dead_waiters,
+            }),
+        );
+    }
+    if !details.is_empty() {
+        super::telemetry::set_command_metric_details(serde_json::Value::Object(details));
+    }
+}
+
+fn render_queue_report(queue: &crate::HostResourceQueueReport) {
+    if queue.resources.is_empty() {
+        return;
+    }
+    out!(
+        "  queue: position {}{}, waited {}ms, skipped {} time(s)",
+        queue.position,
+        if queue.queued { "" } else { " (not queued)" },
+        queue.waited_ms,
+        queue.times_skipped
+    );
+    for standing in &queue.resources {
+        out!(
+            "    {} {} — {} waiter(s) ahead ({} unit(s)), {} behind; {} allocated{}; holders: {}",
+            standing.kind,
+            standing.resource,
+            standing.waiters_ahead,
+            standing.units_ahead,
+            standing.waiters_behind,
+            standing.units_allocated,
+            standing
+                .limit
+                .map_or_else(String::new, |limit| format!("/{limit}")),
+            if standing.holders.is_empty() {
+                "none".to_string()
+            } else {
+                standing
+                    .holders
+                    .iter()
+                    .map(|holder| holder.lease_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        );
+    }
 }
 
 // Keep this off successful acquisition and retry paths. It is observational
@@ -343,6 +415,9 @@ pub(super) fn render_host_resource_explanation(explanation: &crate::HostResource
             }
         }
         out!("    recovery: {}", blocker.recovery);
+    }
+    if let Some(queue) = &explanation.queue {
+        render_queue_report(queue);
     }
 }
 
@@ -1113,11 +1188,11 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                     .transpose()?
                     .unwrap_or_default();
                 let started = std::time::Instant::now();
-                let acquired = if wait.is_zero() {
-                    coordinator.acquire(&request)
-                } else {
-                    coordinator.acquire_with_wait(&request, wait, |_| {})
-                };
+                // A zero wait makes one non-waiting attempt, which is queued
+                // behind every live waiter like any other non-waiting request.
+                let acquired = coordinator.acquire_with_wait(&request, wait, |_| {});
+                let wait_stats = coordinator.last_wait_stats();
+                record_resource_wait_metric(wait_stats, None);
                 let grant = match acquired {
                     Ok(grant) => grant,
                     Err(crate::HostResourceError::Conflict {
@@ -1132,6 +1207,7 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                                 request_id: &request.request_id,
                                 waited_ms: started.elapsed().as_millis(),
                                 conflicts: &conflicts,
+                                queue: wait_stats.and_then(|stats| stats.final_queue.as_ref()),
                             })?
                         );
                         return Err(UsageError::SilentExit(75));
@@ -1280,6 +1356,8 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                     record_resource_run_phase(&mut phase_timings_ms, phase, duration_ms)
                 },
             );
+            let wait_stats = coordinator.last_wait_stats();
+            record_resource_wait_metric(wait_stats, Some(&phase_timings_ms));
             let report = match report {
                 Ok(report) => report,
                 Err(crate::HostResourceRunError::Resource(
@@ -1294,8 +1372,10 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                             retryable: code == "resource_contention",
                             code: &code,
                             request_id: &request.request_id,
-                            waited_ms: wait.as_millis(),
+                            waited_ms: wait_stats
+                                .map_or(wait.as_millis(), |stats| { u128::from(stats.waited_ms) }),
                             conflicts: &conflicts,
+                            queue: wait_stats.and_then(|stats| stats.final_queue.as_ref()),
                         })?
                     );
                     return Err(UsageError::SilentExit(75));
@@ -1344,12 +1424,53 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
             let coordinator = crate::HostResourceCoordinator::open_read_only_default()?;
             let leases = coordinator.list(parsed.all)?;
             if parsed.json {
+                // The documented JSON shape is a lease array; the queue is
+                // reported per request by `explain --json`.
                 out!("{}", serde_json::to_string_pretty(&leases)?);
-            } else if leases.is_empty() {
-                out!("No active or quarantined host resource leases.");
             } else {
-                for lease in &leases {
-                    render_host_lease(lease);
+                if leases.is_empty() {
+                    out!("No active or quarantined host resource leases.");
+                } else {
+                    for lease in &leases {
+                        render_host_lease(lease);
+                    }
+                }
+                let waiting = coordinator.waiting()?;
+                if !waiting.is_empty() {
+                    out!("Waiting requests (arrival order):");
+                    for waiter in &waiting {
+                        let demands = waiter
+                            .demands
+                            .iter()
+                            .map(|demand| {
+                                let reserved = if demand.reserved { " (reserved)" } else { "" };
+                                match demand.units {
+                                    Some(units) => format!(
+                                        "{} {}:{}/{}{reserved}",
+                                        demand.kind,
+                                        demand.resource,
+                                        units,
+                                        demand.limit.unwrap_or(0)
+                                    ),
+                                    None => {
+                                        format!("{} {}{reserved}", demand.kind, demand.resource)
+                                    }
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        out!(
+                            "  {} position {} — waited {}ms, skipped {} time(s), pid {}: {}",
+                            waiter.request_id,
+                            waiter.position,
+                            waiter.waited_ms,
+                            waiter.times_skipped,
+                            waiter
+                                .waiter_pid
+                                .map_or_else(|| "-".into(), |pid| pid.to_string()),
+                            demands
+                        );
+                    }
                 }
             }
         }

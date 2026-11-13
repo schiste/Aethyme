@@ -483,6 +483,65 @@ publishes atomically with mode 0600 on Unix, and omits the ownership token from
 stdout. Inventory and gate reports never contain that token, file contents,
 diffs, or absolute worktree paths.
 
+### Waiting order
+
+A request that meets ordinary contention while it waits (`--wait` above zero,
+`resources run --wait`, or a gate's `resource_wait_seconds`) records a waiter
+row in the host-resource store and is served in arrival order per resource:
+
+- A waiter reserves a pool or key only once that resource has been contended
+  for it (the pool did not fit, the key was held, or an earlier reservation
+  was in the way); resources of its bundle that were free stay usable by
+  others. A reservation lasts for the rest of the wait. While any conflict is
+  on a TCP port, the waiter keeps its place in line but reserves nothing.
+- A capacity request is granted only if its pool has room for what is
+  allocated plus the units reserved by every earlier live waiter, plus its
+  own, measured against the smallest limit any of them declared. A later,
+  smaller request can pass an earlier one only when it cannot take a unit the
+  earlier one reserved, so a full-pool request is never starved by smaller
+  ones.
+- An exclusive key is not granted to a request while an earlier live waiter
+  has reserved it.
+- A request that does not wait (`--wait` absent or zero) is admitted as if it
+  arrived after every live waiter: it fails with retryable
+  `resource_contention` instead of taking what a waiter needs.
+- TCP ports and namespaces are not queued; the operating system, not the
+  store, decides whether a port is free.
+
+The waiter row is removed on grant, on a refusal waiting cannot resolve, and on
+timeout. A row whose process is gone, whose own deadline has passed, or whose
+heartbeat is older than two minutes stops gating anyone at once and is deleted
+by the next acquisition; no reconcile is needed. Order is the row's
+`AUTOINCREMENT` ticket, so a clock step cannot reorder the queue, and a waiter
+whose row was reaped while it still polled re-enters with its original ticket.
+The wait deadline and the row's deadline use the same wall clock, so a process
+suspended past its deadline ends its wait instead of re-entering. Short
+in-product acquisitions that used to make one non-waiting attempt (preparation
+cache root initialization, local execution admission) now wait up to five
+seconds in the queue. Between attempts a waiter
+reads only SQLite's `data_version`: the head of a queue retries as soon as the
+store changes and at least every second, and waiters behind it retry at most
+once a second on a change and back off to five seconds without one.
+
+`explain --json` adds a `queue` object (schema
+`aethyme.host-resource-queue/v1`): `queued`, `position` (live waiters ahead on
+any queued resource it demands; 0 is the head), `enqueued_at`, `waited_ms`,
+`times_skipped`, and per-resource `resources[]` with `kind`, `resource`,
+`waiters_ahead`, `waiters_behind`, `units_ahead`, `units_requested`,
+`units_allocated`, `limit`, and `holders[]` (`lease_id`, `generation`, `units`,
+`holder_pid`). Contention JSON from `acquire --json` and `run --json` carries
+the same `queue` object at refusal. Human `list` prints the waiting requests in
+arrival order, marking which demands each one currently reserves;
+`list --json` keeps its lease-array shape. Command metrics gain
+`resource_queue` with `waited_ms`, `attempts`, `poll_ticks`, `queued`,
+`position_at_enqueue`, `times_skipped`, and `reaped_dead_waiters`.
+
+Older binaries keep working on a store that has the waiter table: it is
+created additively and the store version is unchanged. They do not read it, so
+their polling acquire can still take units an earlier waiter has reserved;
+the queue bounds only current binaries and becomes complete once every running
+process has been upgraded.
+
 `reap` is an independent dead-holder sweep. It quarantines active leases whose
 holder PID is provably gone, releases ordinary leases' capacity allocations,
 and reports the reclaimed units. A supervised capacity hold is retained even
