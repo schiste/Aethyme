@@ -24,6 +24,7 @@
       "removal_inventory_unavailable": "bool",
       "removal_memo_skips": "integer",
       "removal_priority_examined": "integer",
+      "removal_probe_ms": "integer",
       "removal_scan_ms": "integer",
       "removal_selected": "integer",
       "retirement_budget_ms": "integer",

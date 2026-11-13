@@ -8166,7 +8166,56 @@ impl GitRepo {
     }
 
     /// The lock reason of the worktree registered at `worktree`, if locked.
+    /// Reads that one registration's `locked` file (what `git worktree list`
+    /// reports) when the checkout's `.git` names a registration of this
+    /// repository; only otherwise lists every worktree, which on a large
+    /// repository costs seconds per removal.
     fn worktree_lock_reason(&self, worktree: &Path) -> Option<String> {
+        match self.registration_lock_reason(worktree) {
+            Ok(reason) => reason,
+            Err(()) => self.listed_worktree_lock_reason(worktree),
+        }
+    }
+
+    /// `Ok(lock reason)` from the registration the checkout's `.git` file
+    /// names, when that registration is this repository's and names the
+    /// checkout back; `Err(())` when that cannot be established.
+    pub(crate) fn registration_lock_reason(&self, worktree: &Path) -> Result<Option<String>, ()> {
+        let worktree = worktree.canonicalize().map_err(|_| ())?;
+        let pointer = worktree.join(".git");
+        let text = fs::read_to_string(&pointer).map_err(|_| ())?;
+        let admin = text
+            .lines()
+            .find_map(|line| line.strip_prefix("gitdir:"))
+            .map(|value| PathBuf::from(value.trim()))
+            .ok_or(())?;
+        let admin = if admin.is_absolute() {
+            admin
+        } else {
+            worktree.join(admin)
+        };
+        let admin = admin.canonicalize().map_err(|_| ())?;
+        let registrations = self
+            .git_common_dir()
+            .map_err(|_| ())?
+            .join("worktrees")
+            .canonicalize()
+            .map_err(|_| ())?;
+        if admin.parent() != Some(registrations.as_path()) {
+            return Err(());
+        }
+        let named = fs::read_to_string(admin.join("gitdir")).map_err(|_| ())?;
+        if Path::new(named.trim()).canonicalize().map_err(|_| ())? != pointer {
+            return Err(());
+        }
+        match fs::read_to_string(admin.join("locked")) {
+            Ok(reason) => Ok(Some(reason.trim_end_matches(['\n', '\r']).to_string())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(()),
+        }
+    }
+
+    fn listed_worktree_lock_reason(&self, worktree: &Path) -> Option<String> {
         let listing = run_git(&self.root, &["worktree", "list", "--porcelain"]).ok()?;
         let wanted = worktree
             .canonicalize()

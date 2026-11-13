@@ -340,16 +340,12 @@ impl AutoCleanupPolicy {
                         })
                         .ok_or_else(|| format!("[cleanup] {key} must be a list of strings"))?;
                     for glob in &list {
-                        let matcher = globset::Glob::new(glob)
-                            .map_err(|error| format!("[cleanup] {key} glob {glob:?}: {error}"))?
-                            .compile_matcher();
-                        if key == "regenerable"
-                            && let Some(probe) =
-                                GLOB_PROBES.iter().find(|probe| matcher.is_match(probe))
-                        {
-                            return Err(format!(
-                                "[cleanup] regenerable glob {glob:?} matches {probe:?}; it may only name build-output directories"
-                            ));
+                        if key == "regenerable" {
+                            validate_regenerable_glob(glob)?;
+                        } else {
+                            globset::Glob::new(glob).map_err(|error| {
+                                format!("[cleanup] {key} glob {glob:?}: {error}")
+                            })?;
                         }
                     }
                     if key == "regenerable" {
@@ -395,12 +391,95 @@ impl AutoCleanupPolicy {
                 .is_some_and(|name| set.is_match(Path::new(name)))
     }
 
-    /// Whether a configured `regenerable` glob names this directory,
-    /// relative to the worktree root. Configured globs only ever apply to
-    /// directories, never to files.
+    /// Whether a configured `regenerable` glob names this directory (or
+    /// link), relative to the worktree root. `*` may cross `/` here, as it
+    /// always has for directory roots.
     fn configured_regenerable_dir(&self, relative_dir: &str) -> bool {
         !self.regenerable.is_empty() && Self::glob_set(&self.regenerable).is_match(relative_dir)
     }
+
+    /// Whether a configured `regenerable` glob names this standalone regular
+    /// file by its whole path relative to the worktree root. Stricter than
+    /// the directory match so a pattern written for directories does not
+    /// reach files in unrelated places: `*`, `?` and `[...]` stay within one
+    /// path component, and a pattern containing `**` never names a file.
+    fn configured_regenerable_file(&self, relative_file: &str) -> bool {
+        !self.regenerable.is_empty() && file_glob_set(&self.regenerable).is_match(relative_file)
+    }
+}
+
+/// The matcher [`AutoCleanupPolicy::configured_regenerable_file`] uses.
+fn file_glob_set(globs: &[String]) -> globset::GlobSet {
+    let mut builder = globset::GlobSetBuilder::new();
+    for glob in globs.iter().filter(|glob| !glob.contains("**")) {
+        if let Ok(glob) = globset::GlobBuilder::new(glob)
+            .literal_separator(true)
+            .build()
+        {
+            builder.add(glob);
+        }
+    }
+    builder
+        .build()
+        .unwrap_or_else(|_| globset::GlobSet::empty())
+}
+
+/// A `[cleanup] regenerable` glob is valid when it compiles and matches none
+/// of [`GLOB_PROBES`], under either the directory or the file rule.
+fn validate_regenerable_glob(glob: &str) -> Result<(), String> {
+    let matcher = globset::Glob::new(glob)
+        .map_err(|error| format!("[cleanup] regenerable glob {glob:?}: {error}"))?
+        .compile_matcher();
+    if let Some(probe) = GLOB_PROBES.iter().find(|probe| matcher.is_match(probe)) {
+        return Err(format!(
+            "[cleanup] regenerable glob {glob:?} matches {probe:?}; it may only name regenerable output"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether any component of `relative` is a protected name
+/// ([`protected_cache_entry`]). Judged by name only; nothing is opened.
+fn protected_ignored_path(relative: &str) -> bool {
+    relative
+        .trim_end_matches('/')
+        .split('/')
+        .any(protected_cache_entry)
+}
+
+/// Why a protected standalone ignored entry stays even though a configured
+/// `regenerable` glob names it.
+const PROTECTED_NAME_REASON: &str =
+    "has a protected name, which [cleanup] regenerable never releases";
+
+/// The `.aethyme/config.toml` line that would release exactly this
+/// standalone ignored file, or why no line can.
+pub(crate) fn regenerable_file_config_line(relative_file: &str) -> Result<String, String> {
+    if protected_ignored_path(relative_file) {
+        return Err(
+            "protected name: [cleanup] regenerable never releases it; review and delete it, or keep the checkout"
+                .into(),
+        );
+    }
+    const UNNAMEABLE: &str = "this path cannot be named by a [cleanup] regenerable pattern (it contains a backslash or a control character); review and delete it, or keep the checkout";
+    // `globset::escape` leaves `\` as an escape and control characters make
+    // the line unreadable, so neither can be named exactly.
+    if relative_file
+        .chars()
+        .any(|character| character == '\\' || character.is_control())
+    {
+        return Err(UNNAMEABLE.into());
+    }
+    let glob = globset::escape(relative_file);
+    if globset::Glob::new(&glob).is_err()
+        || !file_glob_set(std::slice::from_ref(&glob)).is_match(relative_file)
+    {
+        return Err(UNNAMEABLE.into());
+    }
+    validate_regenerable_glob(&glob).map_err(|_| {
+        "[cleanup] regenerable refuses a pattern naming it, since that pattern matches a secret or ordinary root-file name; review and delete it, or keep the checkout".to_string()
+    })?;
+    Ok(format!("[cleanup] regenerable = [{}]", toml_string(&glob)))
 }
 
 /// Whether `relative_dir` (no trailing slash) is a recognised build-output
@@ -492,16 +571,40 @@ fn has_cache_directory_tag(directory: &Path) -> bool {
 /// witness sits above them: the secrets, keys, credentials, databases and
 /// broker state a configured `regenerable` glob may never match
 /// ([`GLOB_PROBES`]), plus SSH private keys (`id_*` without `.pub`) and
-/// package-manager and password-store credential files.
+/// package-manager and password-store credential files. Case-insensitive:
+/// `.env*`, anything containing `.sqlite` (its `-wal`, `-shm` and
+/// `-journal` siblings included), `*.db` and its `-wal`, `-shm` and
+/// `-journal` siblings, `*.tfstate` and `*.tfstate.*`, key stores and
+/// credential files.
 fn protected_cache_entry(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower == ".env"
-        || lower.starts_with(".env.")
+    lower.starts_with(".env")
         || lower == ".aethyme"
         || (lower.starts_with("id_") && !lower.ends_with(".pub"))
-        || [".netrc", ".npmrc", ".pypirc", "credentials.json"].contains(&lower.as_str())
+        || lower.contains(".sqlite")
+        || lower.contains(".tfstate.")
         || [
-            ".key", ".pem", ".p12", ".pfx", ".sqlite", ".sqlite3", ".db", ".kdbx",
+            ".netrc",
+            ".npmrc",
+            ".pypirc",
+            "credentials.json",
+            ".git-credentials",
+            ".pgpass",
+        ]
+        .contains(&lower.as_str())
+        || [
+            ".key",
+            ".pem",
+            ".p12",
+            ".pfx",
+            ".db",
+            ".db-wal",
+            ".db-shm",
+            ".db-journal",
+            ".kdbx",
+            ".tfstate",
+            ".jks",
+            ".keystore",
         ]
         .iter()
         .any(|suffix| lower.ends_with(suffix))
@@ -753,8 +856,30 @@ pub(crate) fn classify_ignored_for_recovery(
     relative: &str,
     policy: &AutoCleanupPolicy,
 ) -> Result<RecoveryIgnoredClassification, String> {
+    classify_ignored_entry(worktree, relative, policy).map(|(classification, _)| classification)
+}
+
+/// Which rule decided a standalone ignored entry, for phase counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IgnoredEntryRule {
+    /// Any rule other than the two below.
+    Other,
+    /// A configured `regenerable` glob released a standalone regular file.
+    FilePattern,
+    /// A configured `regenerable` glob named a protected standalone entry,
+    /// which therefore stays.
+    ProtectedRefusal,
+}
+
+/// [`classify_ignored_for_recovery`], with the rule that decided it.
+fn classify_ignored_entry(
+    worktree: &Path,
+    relative: &str,
+    policy: &AutoCleanupPolicy,
+) -> Result<(RecoveryIgnoredClassification, IgnoredEntryRule), String> {
+    let other = |classification| (classification, IgnoredEntryRule::Other);
     if policy.strict {
-        return Ok(RecoveryIgnoredClassification::StrictRefusal);
+        return Ok(other(RecoveryIgnoredClassification::StrictRefusal));
     }
     let trimmed = relative.trim_end_matches('/');
     if trimmed.is_empty()
@@ -768,44 +893,74 @@ pub(crate) fn classify_ignored_for_recovery(
     if (!relative.ends_with('/') && name == ".DS_Store")
         || crate::runtime_paths::is_broker_runtime_path(relative)
     {
-        return Ok(RecoveryIgnoredClassification::DisposableOutput);
+        return Ok(other(RecoveryIgnoredClassification::DisposableOutput));
     }
+    // Never follow a link: the entry is judged as the link itself.
     let metadata = std::fs::symlink_metadata(worktree.join(trimmed))
         .map_err(|error| format!("cannot stat ignored path {relative}: {error}"))?;
     // Aethyme's own deploy output, byte for byte, holds no user data. Anything
     // else at the same path (a merged or edited settings file) falls through
     // to the protection below with its existing reason.
     if unmodified_generated_artifact(worktree, trimmed, &metadata) {
-        return Ok(if metadata.is_dir() {
+        return Ok(other(if metadata.is_dir() {
             RecoveryIgnoredClassification::DisposableDirectory
         } else {
             RecoveryIgnoredClassification::DisposableOutput
-        });
+        }));
     }
     // Git ignore rules do not prove a directory is regenerable. Do not walk
     // arbitrary ignored trees or follow symlinks: preserve unknown roots.
     if metadata.is_dir() {
-        return Ok(if regenerable_dir(worktree, trimmed, policy).is_some() {
-            RecoveryIgnoredClassification::DisposableDirectory
+        return Ok(other(
+            if regenerable_dir(worktree, trimmed, policy).is_some() {
+                RecoveryIgnoredClassification::DisposableDirectory
+            } else {
+                RecoveryIgnoredClassification::Preserve(
+                    "is not a recognised build-output directory",
+                )
+            },
+        ));
+    }
+    if let Some((enclosing, cargo_target)) = enclosing_regenerable(worktree, trimmed, policy) {
+        // The entry itself matched: a link with a recognised dependency
+        // name or one a configured glob names. Removal only unlinks it, but
+        // a configured glob still never releases a protected name.
+        if enclosing == trimmed && protected_ignored_path(trimmed) {
+            return Ok((
+                RecoveryIgnoredClassification::Preserve(PROTECTED_NAME_REASON),
+                IgnoredEntryRule::ProtectedRefusal,
+            ));
+        }
+        if trimmed.split('/').any(|component| component == ".aethyme") && !cargo_target {
+            return Ok(other(RecoveryIgnoredClassification::Preserve(
+                "holds Aethyme state",
+            )));
+        }
+        // The policy declares this output disposable. Package fixtures routinely
+        // contain keys, databases, dangling links and hundreds of thousands of files;
+        // inspecting those contents both invents blockers and scales with the output.
+        // Worktree removal unlinks symlinks; it never follows their targets.
+        return Ok(other(RecoveryIgnoredClassification::DisposableOutput));
+    }
+    // A standalone regular file the repository names by its whole path. A
+    // protected name stays whatever the configuration says.
+    if !relative.ends_with('/') && metadata.is_file() && policy.configured_regenerable_file(trimmed)
+    {
+        return Ok(if protected_ignored_path(trimmed) {
+            (
+                RecoveryIgnoredClassification::Preserve(PROTECTED_NAME_REASON),
+                IgnoredEntryRule::ProtectedRefusal,
+            )
         } else {
-            RecoveryIgnoredClassification::Preserve("is not a recognised build-output directory")
+            (
+                RecoveryIgnoredClassification::DisposableOutput,
+                IgnoredEntryRule::FilePattern,
+            )
         });
     }
-    let Some((_enclosing, cargo_target)) = enclosing_regenerable(worktree, trimmed, policy) else {
-        return Ok(RecoveryIgnoredClassification::Preserve(
-            "is not inside a recognised build-output directory",
-        ));
-    };
-    if trimmed.split('/').any(|component| component == ".aethyme") && !cargo_target {
-        return Ok(RecoveryIgnoredClassification::Preserve(
-            "holds Aethyme state",
-        ));
-    }
-    // The policy declares this output disposable. Package fixtures routinely
-    // contain keys, databases, dangling links and hundreds of thousands of files;
-    // inspecting those contents both invents blockers and scales with the output.
-    // Worktree removal unlinks symlinks; it never follows their targets.
-    Ok(RecoveryIgnoredClassification::DisposableOutput)
+    Ok(other(RecoveryIgnoredClassification::Preserve(
+        "is not inside a recognised build-output directory",
+    )))
 }
 
 /// Cleanup's removal verdict remains conservative: only paths with an
@@ -815,7 +970,18 @@ pub(crate) fn classify_ignored(
     relative: &str,
     policy: &AutoCleanupPolicy,
 ) -> Result<(), String> {
-    match classify_ignored_for_recovery(worktree, relative, policy)? {
+    ignored_verdict(
+        relative,
+        classify_ignored_for_recovery(worktree, relative, policy)?,
+    )
+}
+
+/// The removal verdict for one classified ignored entry.
+fn ignored_verdict(
+    relative: &str,
+    classification: RecoveryIgnoredClassification,
+) -> Result<(), String> {
+    match classification {
         RecoveryIgnoredClassification::DisposableDirectory
         | RecoveryIgnoredClassification::DisposableOutput => Ok(()),
         RecoveryIgnoredClassification::Preserve(reason) => {
@@ -1050,6 +1216,43 @@ pub struct AutoCleanupLanes {
     /// cleanup request is due. Included in `removal_examined`.
     #[serde(default)]
     pub removal_priority_examined: usize,
+    /// Time the capacity-pressure probe took before selection's inventory.
+    #[serde(default)]
+    pub removal_probe_ms: u64,
+    /// With `removal_inventory_unavailable`: what the inventory was waiting
+    /// on when the deadline passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal_inventory_wait: Option<InventoryWait>,
+}
+
+/// What selection's checkout inventory was waiting on when it ran out of time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryWait {
+    /// The capacity-pressure probe used the deadline before the scan began.
+    CapacityProbe,
+    /// The checkout path index was mid-lap (its progress is kept and resumed).
+    CohortIndex,
+    /// Reading the page of closed-checkout groups.
+    GroupPage,
+    /// Resolving open sessions' checkout paths.
+    LivePaths,
+}
+
+impl InventoryWait {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CapacityProbe => "capacity_probe",
+            Self::CohortIndex => "cohort_index",
+            Self::GroupPage => "group_page",
+            Self::LivePaths => "live_paths",
+        }
+    }
+}
+
+/// Whether `deadline` had already passed at `instant`.
+fn deadline_expired_at(deadline: Option<Instant>, instant: Instant) -> bool {
+    deadline.is_some_and(|end| instant >= end)
 }
 
 /// What one auto-cleanup pass did.
@@ -1172,6 +1375,19 @@ pub struct CapacityRemovalSlice {
     /// `checkout_count` or `pre_selection`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_consumed_by: Option<String>,
+    /// Time the removal passes' capacity-pressure probes took, summed.
+    #[serde(default)]
+    pub probe_ms: u64,
+    /// With outcome `inventory_unavailable`: what the inventory was waiting
+    /// on (`capacity_probe`, `cohort_index`, `group_page`, `live_paths`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<String>,
+    /// The checkout path index lap's position when the slice ended: the last
+    /// session id indexed and the session id the lap runs to (done of total).
+    #[serde(default)]
+    pub index_after_session_id: i64,
+    #[serde(default)]
+    pub index_high_water_session_id: i64,
 }
 
 impl CapacityRemovalSlice {
@@ -1210,6 +1426,10 @@ pub(crate) struct CapacityRemovalLapPosition {
     pub lap_remaining: usize,
     pub after_session_id: i64,
     pub high_water_session_id: i64,
+    /// How far the checkout path index lap has got, as the last session id
+    /// it indexed and the session id it runs to.
+    pub index_after_session_id: i64,
+    pub index_high_water_session_id: i64,
 }
 
 /// The retirement cursor as reported: the last session judged in the current
@@ -2403,6 +2623,7 @@ pub(crate) fn ignored_content_blockers(
         // Keep every listed entry in the existing whole-checkout classifier:
         // typed protection here is only for future in-place artifact discovery.
         let mut blockers = Vec::new();
+        let mut released_by_file_pattern = false;
         for entry in ignored {
             ensure_ignored_content_before(deadline)?;
             let relative = if entry.directory_marker {
@@ -2410,9 +2631,23 @@ pub(crate) fn ignored_content_blockers(
             } else {
                 entry.relative
             };
-            let classification = classify_ignored(worktree, &relative, policy);
+            // A classification error keeps the checkout as a blocker, exactly
+            // as `classify_ignored` reports it.
+            let verdict = classify_ignored_entry(worktree, &relative, policy).and_then(
+                |(classification, rule)| {
+                    match rule {
+                        IgnoredEntryRule::FilePattern => released_by_file_pattern = true,
+                        IgnoredEntryRule::ProtectedRefusal => crate::phase_telemetry::add(
+                            "cleanup_regenerable_protected_refused",
+                            Duration::ZERO,
+                        ),
+                        IgnoredEntryRule::Other => {}
+                    }
+                    ignored_verdict(&relative, classification)
+                },
+            );
             ensure_ignored_content_before(deadline)?;
-            if let Err(reason) = classification {
+            if let Err(reason) = verdict {
                 blockers.push((relative, reason));
                 if blockers.len() >= limit.max(1) {
                     break;
@@ -2420,6 +2655,12 @@ pub(crate) fn ignored_content_blockers(
             }
         }
         ensure_ignored_content_before(deadline)?;
+        if blockers.is_empty() && released_by_file_pattern {
+            crate::phase_telemetry::add(
+                "cleanup_checkout_released_by_file_pattern",
+                Duration::ZERO,
+            );
+        }
         Ok(blockers)
     })
 }
@@ -2669,12 +2910,17 @@ pub struct BlockedByIgnored {
     pub name: String,
     /// Closed checkouts it keeps.
     pub checkouts: usize,
-    /// The `.aethyme/config.toml` line that would declare it regenerable, for
-    /// a directory. Absent for a standalone file, which no glob may release.
-    /// The repository decides: configure it only when the directory holds
+    /// The `.aethyme/config.toml` line that would declare it regenerable:
+    /// the directory itself, or for a standalone file its exact path as a
+    /// glob. The repository decides: configure it only when the path holds
     /// nothing but output its tools regenerate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_line: Option<String>,
+    /// Why no configuration line can release this standalone file (a
+    /// protected name, or a path a pattern cannot name on its own). Absent
+    /// whenever `config_line` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_refusal: Option<String>,
 }
 
 /// Aggregate remembered keep verdicts whose checkout still exists.
@@ -2690,12 +2936,26 @@ fn blocked_by_ignored_from_memo(memo: &KeepMemo) -> Vec<BlockedByIgnored> {
     }
     let mut rows = counts
         .into_iter()
-        .map(|(name, checkouts)| BlockedByIgnored {
-            name: name.to_string(),
-            checkouts,
-            config_line: name
-                .strip_suffix('/')
-                .map(|directory| format!("[cleanup] regenerable = [{}]", toml_string(directory))),
+        .map(|(name, checkouts)| {
+            let (config_line, config_refusal) = match name.strip_suffix('/') {
+                Some(directory) => (
+                    Some(format!(
+                        "[cleanup] regenerable = [{}]",
+                        toml_string(directory)
+                    )),
+                    None,
+                ),
+                None => match regenerable_file_config_line(name) {
+                    Ok(line) => (Some(line), None),
+                    Err(refusal) => (None, Some(refusal)),
+                },
+            };
+            BlockedByIgnored {
+                name: name.to_string(),
+                checkouts,
+                config_line,
+                config_refusal,
+            }
         })
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| {
@@ -2747,14 +3007,16 @@ pub(crate) fn checkout_capacity_refusal_detail(report: Option<&AutoCleanupReport
         report.deferred
     );
     if let Some(blocked) = report.blocked_by_ignored.first() {
-        match &blocked.config_line {
-            Some(line) => detail.push_str(&format!(
+        match (&blocked.config_line, &blocked.config_refusal) {
+            (Some(line), _) => detail.push_str(&format!(
                 "; ignored {} keeps {} closed checkout(s): if it holds only regenerable output, adding `{line}` to .aethyme/config.toml releases them",
                 blocked.name, blocked.checkouts
             )),
-            None => detail.push_str(&format!(
-                "; ignored file {} keeps {} closed checkout(s): review and delete it",
-                blocked.name, blocked.checkouts
+            (None, refusal) => detail.push_str(&format!(
+                "; ignored file {} keeps {} closed checkout(s): {}",
+                blocked.name,
+                blocked.checkouts,
+                refusal.as_deref().unwrap_or("review and delete it")
             )),
         }
     } else if report.deferred > 0 {
@@ -2887,6 +3149,9 @@ const CAPACITY_PROBE_MIN_BUDGET: Duration = Duration::from_secs(1);
 pub(crate) const CHECKOUT_USAGE_KEY: &str = "auto_cleanup.checkout_usage";
 /// How long a recorded count stands in for a fresh one.
 const CHECKOUT_USAGE_MAX_AGE_MS: i64 = 15 * 60 * 1_000;
+/// A recorded count this recent stands in for a fresh one in a long pass's
+/// pressure probe (the worker records one at the start of every slice).
+const CHECKOUT_USAGE_REUSE_MS: i64 = 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct RecordedCheckoutUsage {
@@ -4034,6 +4299,7 @@ impl Broker {
         &mut self,
         cursor: &mut AutoCleanupCursor,
         deadline: Option<Instant>,
+        waiting_on: &mut Option<InventoryWait>,
     ) -> Result<Option<AutoCleanupGroupScan>, BrokerOpError> {
         let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
         // A completed, revision-current path index remains useful for planning.
@@ -4055,6 +4321,7 @@ impl Broker {
                 let mut last_progress = None;
                 loop {
                     let Some(state) = self.refresh_cleanup_cohort_aliases(deadline)? else {
+                        *waiting_on = Some(InventoryWait::CohortIndex);
                         return Ok(None);
                     };
                     crate::phase_telemetry::add(
@@ -4073,6 +4340,7 @@ impl Broker {
             }
         };
         if !index_state.complete {
+            *waiting_on = Some(InventoryWait::CohortIndex);
             return Ok(None);
         }
         if index_state.unresolved_rows > 0 {
@@ -4111,6 +4379,7 @@ impl Broker {
             }
         }
         if deadline_expired(deadline) {
+            *waiting_on = Some(InventoryWait::GroupPage);
             return Ok(None);
         }
         let indexed_groups = self.store().cleanup_cohort_group_page(
@@ -4122,6 +4391,7 @@ impl Broker {
         let mut groups = Vec::with_capacity(indexed_groups.len());
         for (canonical_path, first_session_id) in indexed_groups {
             if deadline_expired(deadline) {
+                *waiting_on = Some(InventoryWait::GroupPage);
                 return Ok(None);
             }
             let (sessions, truncated) = self
@@ -4136,9 +4406,11 @@ impl Broker {
         }
         let live = self.store().live_sessions()?;
         if deadline_expired(deadline) {
+            *waiting_on = Some(InventoryWait::LivePaths);
             return Ok(None);
         }
         let Some(live_worktrees) = resolve_live_worktree_paths(&live, deadline) else {
+            *waiting_on = Some(InventoryWait::LivePaths);
             return Ok(None);
         };
         Ok(Some(AutoCleanupGroupScan {
@@ -5399,6 +5671,8 @@ impl Broker {
         lanes.removal_priority_examined = planned.removal_priority_examined;
         lanes.removal_scan_ms = planned.removal_scan_ms;
         lanes.removal_inventory_unavailable = planned.removal_inventory_unavailable;
+        lanes.removal_probe_ms = planned.removal_probe_ms;
+        lanes.removal_inventory_wait = planned.removal_inventory_wait;
         lanes.removal_elapsed_ms = duration_ms(Some(removal_started.elapsed()));
         plan.report.lanes = Some(lanes);
         let report = self.auto_cleanup_apply(plan)?;
@@ -5428,22 +5702,31 @@ impl Broker {
             );
             return recorded.is_some_and(|(count, maximum)| usage_under_pressure(count, maximum));
         }
+        // A count the worker or `start` recorded moments ago, against the
+        // same configured limit, answers without touching the filesystem.
+        if let Some((count, maximum)) = self.fresh_recorded_checkout_usage(now_ms()) {
+            crate::phase_telemetry::add("auto_cleanup_capacity_recorded", Duration::ZERO);
+            return usage_under_pressure(count, maximum);
+        }
         // Recording is left to `start` and the background worker: a pass
         // here may run while another writer holds the database and must not
-        // wait on it.
+        // wait on it. The count is one directory read, never a full listing.
         matches!(
             self.worktree_checkout_usage(),
             Ok(Some((count, maximum))) if usage_under_pressure(count, maximum)
         )
     }
 
-    /// The linked-checkout count from this repository's registrations
-    /// (`<common>/worktrees/*`, the records `git worktree list` reads), with
-    /// one directory read instead of a listing that inspects every checkout.
-    /// Falls back to the listing when the registrations cannot be read.
-    pub(crate) fn worktree_checkout_usage_from_registrations(
-        &self,
-    ) -> Result<Option<(usize, u32)>, BrokerOpError> {
+    /// The recorded checkout count when it is at most
+    /// [`CHECKOUT_USAGE_REUSE_MS`] old and was taken against the limit the
+    /// configuration sets now.
+    fn fresh_recorded_checkout_usage(&self, now: i64) -> Option<(usize, u32)> {
+        let raw = self
+            .store_ref()
+            .meta_get(CHECKOUT_USAGE_KEY)
+            .ok()
+            .flatten()?;
+        let usage = serde_json::from_str::<RecordedCheckoutUsage>(&raw).ok()?;
         let maximum = match crate::worktree_location::WorktreeLocationConfig::load(self.main_root())
         {
             Ok(Some(config)) => config.max_checkouts(),
@@ -5451,29 +5734,18 @@ impl Broker {
                 crate::worktree_location::WorktreeLocationConfig::default().max_checkouts()
             }
         };
-        if maximum == 0 {
-            return Ok(None);
-        }
-        let Ok(common) = self.repo_handle().git_common_dir() else {
-            return self.worktree_checkout_usage();
-        };
-        let count = match std::fs::read_dir(common.join("worktrees")) {
-            Ok(entries) => {
-                let mut count = 0usize;
-                for entry in entries {
-                    let Ok(entry) = entry else {
-                        return self.worktree_checkout_usage();
-                    };
-                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                        count += 1;
-                    }
-                }
-                count
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(_) => return self.worktree_checkout_usage(),
-        };
-        Ok(Some((count, maximum)))
+        (usage.maximum == maximum
+            && (0..=CHECKOUT_USAGE_REUSE_MS).contains(&now.saturating_sub(usage.at_ms)))
+        .then_some((usage.count, usage.maximum))
+    }
+
+    /// The linked-checkout count from this repository's registrations: the
+    /// same cheap count `start` admission uses
+    /// ([`Self::worktree_checkout_usage`]).
+    pub(crate) fn worktree_checkout_usage_from_registrations(
+        &self,
+    ) -> Result<Option<(usize, u32)>, BrokerOpError> {
+        self.worktree_checkout_usage()
     }
 
     /// Remember a linked-checkout count for passes too short to list them.
@@ -5621,13 +5893,17 @@ impl Broker {
         // Under capacity pressure a bounded pass keeps going page by page
         // while time remains; otherwise each pass keeps its one-page tranche
         // and the background worker paces the lap.
+        let probe_started = Instant::now();
         let multi_page = deadline.is_some() && self.checkout_capacity_pressure(deadline);
+        let probe_elapsed = probe_started.elapsed();
+        crate::phase_telemetry::add("auto_cleanup_capacity_probe", probe_elapsed);
         let mut first_page = true;
         let mut scan_elapsed = Duration::ZERO;
         loop {
             let cursor_before_scan = cursor;
             let scan_started = Instant::now();
-            let scan = self.auto_cleanup_checkout_groups(&mut cursor, deadline)?;
+            let mut waiting_on = None;
+            let scan = self.auto_cleanup_checkout_groups(&mut cursor, deadline, &mut waiting_on)?;
             scan_elapsed += scan_started.elapsed();
             let Some(scan) = scan else {
                 if first_page {
@@ -5640,6 +5916,16 @@ impl Broker {
                     report.lanes = Some(AutoCleanupLanes {
                         removal_scan_ms: duration_ms(Some(scan_elapsed)),
                         removal_inventory_unavailable: true,
+                        removal_probe_ms: duration_ms(Some(probe_elapsed)),
+                        // Time the probe used up before the scan could start
+                        // is what the scan was really waiting on.
+                        removal_inventory_wait: Some(
+                            if deadline_expired_at(deadline, scan_started) {
+                                InventoryWait::CapacityProbe
+                            } else {
+                                waiting_on.unwrap_or(InventoryWait::CohortIndex)
+                            },
+                        ),
                         ..AutoCleanupLanes::default()
                     });
                     return Ok(AutoCleanupPlan::nothing(report));
@@ -5964,6 +6250,7 @@ impl Broker {
             removal_memo_skips: memo_skips,
             removal_scan_ms: duration_ms(Some(scan_elapsed)),
             removal_priority_examined: priority_examined,
+            removal_probe_ms: duration_ms(Some(probe_elapsed)),
             ..AutoCleanupLanes::default()
         });
         // The current deferred group, if any, was counted above and the cursor
@@ -6395,10 +6682,12 @@ impl Broker {
         &mut self,
     ) -> Result<CapacityRemovalLapPosition, BrokerOpError> {
         let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
-        let index_complete = self
-            .store()
-            .cleanup_cohort_scan_state(namespace)?
-            .is_some_and(|state| state.complete);
+        let index_state = self.store().cleanup_cohort_scan_state(namespace)?;
+        let index_complete = index_state.as_ref().is_some_and(|state| state.complete);
+        let (index_after_session_id, index_high_water_session_id) =
+            index_state.as_ref().map_or((0, 0), |state| {
+                (state.after_session_id, state.high_water_session_id)
+            });
         let (cursor, _) = self.auto_cleanup_cursor()?;
         let maximum_group_id = self
             .store()
@@ -6413,6 +6702,8 @@ impl Broker {
             lap_remaining,
             after_session_id: cursor.after_session_id,
             high_water_session_id: cursor.high_water_session_id,
+            index_after_session_id,
+            index_high_water_session_id,
         })
     }
 
@@ -6710,6 +7001,53 @@ mod tests {
             "{reason}"
         );
         assert!(root.join("opaque/nested/user-data.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_pattern_releases_and_protected_refusals_are_counted() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "user.name", "Auto cleanup test"]);
+        git(
+            root,
+            &["config", "user.email", "auto-cleanup@example.invalid"],
+        );
+        std::fs::write(root.join(".gitignore"), "reports/*\n!reports/README.md\n").unwrap();
+        touch(root, "reports/README.md");
+        git(root, &["add", ".gitignore", "reports/README.md"]);
+        git(root, &["commit", "-qm", "ignore generated reports"]);
+        touch(root, "reports/quality-1.json");
+        let policy = AutoCleanupPolicy {
+            regenerable: vec!["reports/*.json".into(), "reports/*.pem".into()],
+            ..Default::default()
+        };
+
+        let recorder = crate::phase_telemetry::Recorder::default();
+        {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            assert_eq!(
+                super::ignored_content_blockers(root, &policy, 16).unwrap(),
+                Vec::<(String, String)>::new()
+            );
+            touch(root, "reports/signing.pem");
+            let blockers = super::ignored_content_blockers(root, &policy, 16).unwrap();
+            assert_eq!(blockers.len(), 1, "{blockers:?}");
+            assert_eq!(blockers[0].0, "reports/signing.pem");
+            assert!(blockers[0].1.contains("protected name"), "{blockers:?}");
+        }
+        let (_, counts) = recorder.totals();
+        assert_eq!(
+            counts.get("cleanup_checkout_released_by_file_pattern"),
+            Some(&1),
+            "{counts:?}"
+        );
+        assert_eq!(
+            counts.get("cleanup_regenerable_protected_refused"),
+            Some(&1),
+            "{counts:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -10609,6 +10947,167 @@ mod tests {
         );
     }
 
+    /// A long pass's pressure probe answers from a count recorded moments
+    /// ago against the same limit, instead of counting again; a count taken
+    /// against another limit, or a stale one, is recounted.
+    #[cfg(unix)]
+    #[test]
+    fn a_long_pass_pressure_probe_reuses_a_fresh_recorded_count_for_the_same_limit() {
+        let (_owner, _storage, broker, _session) = retirement_fixture();
+        std::fs::write(
+            broker.main_root().join(".aethyme/config.toml"),
+            "[worktrees]\nmax_checkouts = 100\n",
+        )
+        .unwrap();
+        let long = || Some(Instant::now() + Duration::from_secs(30));
+        assert!(
+            !broker.checkout_capacity_pressure(long()),
+            "one checkout of 100"
+        );
+        broker.record_checkout_usage(99, 100);
+        assert!(
+            broker.checkout_capacity_pressure(long()),
+            "a fresh count for the same limit is reused"
+        );
+        broker.record_checkout_usage(99, 200);
+        assert!(
+            !broker.checkout_capacity_pressure(long()),
+            "a count against another limit is not"
+        );
+        let stale = serde_json::json!({
+            "count": 99,
+            "maximum": 100,
+            "at_ms": super::now_ms() - super::CHECKOUT_USAGE_REUSE_MS - 1,
+        })
+        .to_string();
+        broker
+            .store_ref()
+            .meta_set(super::CHECKOUT_USAGE_KEY, &stale)
+            .unwrap();
+        assert!(
+            !broker.checkout_capacity_pressure(long()),
+            "a stale count is recounted"
+        );
+    }
+
+    /// The checkout count is one read of this repository's registrations, the
+    /// records `git worktree list` enumerates, not the listing itself.
+    #[cfg(unix)]
+    #[test]
+    fn the_checkout_count_reads_this_repositorys_registrations() {
+        let (_owner, _storage, broker, _session) = retirement_fixture();
+        let listed = broker.repo_handle().worktree_inventory().unwrap().len() - 1;
+        assert_eq!(broker.registered_linked_checkout_count(), Some(listed));
+        let common = broker.repo_handle().git_common_dir().unwrap();
+        std::fs::create_dir_all(common.join("worktrees/registration-only")).unwrap();
+        assert_eq!(broker.registered_linked_checkout_count(), Some(listed + 1));
+        assert_eq!(
+            broker
+                .worktree_checkout_usage()
+                .unwrap()
+                .map(|(count, _)| count),
+            Some(listed + 1)
+        );
+    }
+
+    /// An inventory that is not ready says what it waited on, and the path
+    /// index work one pass did is resumed by the next instead of restarting,
+    /// so it converges over passes.
+    #[cfg(unix)]
+    #[test]
+    fn an_unavailable_inventory_says_what_it_waited_on_and_resumes_its_progress() {
+        let (_owner, _storage, mut broker, _first) = retirement_fixture();
+        for index in 0..3 {
+            broker
+                .start_worktree(&format!("index lap {index}"), None)
+                .unwrap();
+        }
+        let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
+        while !broker
+            .refresh_cleanup_cohort_aliases(None)
+            .unwrap()
+            .unwrap()
+            .complete
+        {}
+        broker
+            .store()
+            .begin_cleanup_cohort_alias_refresh(namespace, super::now_ms())
+            .unwrap();
+        super::COHORT_SCAN_LIMITS.with(|limits| limits.set(Some((1, 1))));
+        let first = broker.auto_cleanup_plan(None);
+        let after_first = broker
+            .store()
+            .cleanup_cohort_scan_state(namespace)
+            .unwrap()
+            .unwrap();
+        let expired = broker.auto_cleanup_plan(Some(Instant::now() - Duration::from_millis(1)));
+        let second = broker.auto_cleanup_plan(None);
+        let after_second = broker
+            .store()
+            .cleanup_cohort_scan_state(namespace)
+            .unwrap()
+            .unwrap();
+        super::COHORT_SCAN_LIMITS.with(|limits| limits.set(None));
+        let lanes = first.unwrap().report.lanes.unwrap();
+        assert!(lanes.removal_inventory_unavailable, "{lanes:?}");
+        assert_eq!(
+            lanes.removal_inventory_wait,
+            Some(super::InventoryWait::CohortIndex)
+        );
+        assert_eq!(
+            expired
+                .unwrap()
+                .report
+                .lanes
+                .unwrap()
+                .removal_inventory_wait,
+            Some(super::InventoryWait::CapacityProbe),
+            "a deadline gone before the scan began names the probe"
+        );
+        second.unwrap();
+        assert!(
+            after_second.complete || after_second.after_session_id > after_first.after_session_id,
+            "the next pass resumes the lap: {after_first:?} then {after_second:?}"
+        );
+    }
+
+    /// Removal reads the lock reason from the checkout's own registration
+    /// instead of listing every worktree; a checkout whose `.git` names no
+    /// registration of this repository is not read that way.
+    #[cfg(unix)]
+    #[test]
+    fn the_lock_reason_comes_from_the_checkouts_own_registration() {
+        let (_owner, _storage, broker, session) = retirement_fixture();
+        let path = PathBuf::from(&session.worktree_path);
+        let root = broker.main_root().to_path_buf();
+        assert_eq!(
+            broker.repo_handle().registration_lock_reason(&path),
+            Ok(None)
+        );
+        git(
+            &root,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "fixture lock reason",
+                path.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            broker.repo_handle().registration_lock_reason(&path),
+            Ok(Some("fixture lock reason".into()))
+        );
+        git(&root, &["worktree", "unlock", path.to_str().unwrap()]);
+        let stray = root.parent().unwrap().join("stray-checkout");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join(".git"), "gitdir: /nowhere\n").unwrap();
+        assert_eq!(
+            broker.repo_handle().registration_lock_reason(&stray),
+            Err(())
+        );
+    }
+
     /// A pass too short to list checkouts reads the count `start` recorded:
     /// at 861 of 900 it is under pressure, which it used to report as none.
     #[cfg(unix)]
@@ -10838,6 +11337,7 @@ mod tests {
                 name: "project-cache/".into(),
                 checkouts: 1,
                 config_line: Some("[cleanup] regenerable = [\"project-cache\"]".into()),
+                config_refusal: None,
             }]
         );
         assert!(slice.index_complete, "{slice:#?}");
@@ -10948,6 +11448,7 @@ mod tests {
                 name: "project-cache/".into(),
                 checkouts: 1,
                 config_line: Some("[cleanup] regenerable = [\"project-cache\"]".into()),
+                config_refusal: None,
             }]
         );
         assert_eq!(first.lanes.unwrap().removal_memo_skips, 0);
@@ -10987,6 +11488,74 @@ mod tests {
             !worktree.exists(),
             "the configured cache no longer keeps it"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_standalone_ignored_file_is_named_with_its_line_and_released_by_a_file_pattern() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let root = broker.main_root().to_path_buf();
+        std::fs::write(root.join(".git/info/exclude"), "quality-*.json\n").unwrap();
+        let (_session, worktree) = closed_landed_checkout(&mut broker, "generated report file");
+        touch(&worktree, "quality-report.json");
+        // A link the same pattern names is unlinked; its target is not touched.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("kept.json"), "outside\n").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("kept.json"),
+            worktree.join("quality-link.json"),
+        )
+        .unwrap();
+        let text = std::fs::canonicalize(&worktree)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let first = broker.auto_cleanup_now(None).unwrap().unwrap();
+        let kept = first
+            .kept
+            .iter()
+            .find(|kept| kept.worktree == text)
+            .cloned()
+            .unwrap_or_else(|| panic!("{first:#?}"));
+        assert_eq!(kept.code, "ignored_content", "{kept:?}");
+        assert!(
+            kept.ignored_blockers
+                .contains(&"quality-report.json".to_string()),
+            "{kept:?}"
+        );
+        let report_row = first
+            .blocked_by_ignored
+            .iter()
+            .find(|row| row.name == "quality-report.json")
+            .cloned()
+            .unwrap_or_else(|| panic!("{first:#?}"));
+        assert_eq!(
+            report_row,
+            super::BlockedByIgnored {
+                name: "quality-report.json".into(),
+                checkouts: 1,
+                config_line: Some("[cleanup] regenerable = [\"quality-report.json\"]".into()),
+                config_refusal: None,
+            }
+        );
+
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[cleanup]\nregenerable = [\"quality-*.json\"]\n",
+        )
+        .unwrap();
+        for _ in 0..2 {
+            if !worktree.exists() {
+                break;
+            }
+            broker.auto_cleanup_now(None).unwrap().unwrap();
+        }
+        assert!(
+            !worktree.exists(),
+            "the file pattern no longer keeps the checkout"
+        );
+        assert!(outside.path().join("kept.json").is_file());
     }
 
     #[test]
@@ -11811,6 +12380,15 @@ mod tests {
             ".pypirc",
             "credentials.json",
             "vault.kdbx",
+            ".envrc",
+            "app.db-wal",
+            "cache.sqlite-shm",
+            "infra.tfstate",
+            "infra.tfstate.backup",
+            ".git-credentials",
+            ".pgpass",
+            "release.jks",
+            "debug.keystore",
         ]
         .into_iter()
         .enumerate()
@@ -11891,6 +12469,299 @@ mod tests {
             let reason = classify(root, path, &policy).unwrap_err();
             assert!(reason.contains("strict cleanup"), "{path}: {reason}");
         }
+    }
+
+    fn regenerable_policy(globs: &[&str]) -> AutoCleanupPolicy {
+        AutoCleanupPolicy {
+            regenerable: globs.iter().map(|glob| (*glob).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_file_pattern_releases_only_the_standalone_files_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = regenerable_policy(&["reports/quality-*.json", "apps/*/public/_routes.json"]);
+        for released in ["reports/quality-1.json", "apps/web/public/_routes.json"] {
+            touch(root, released);
+            assert_eq!(classify(root, released, &policy), Ok(()), "{released}");
+            assert!(
+                classify(root, released, &AutoCleanupPolicy::default()).is_err(),
+                "{released} is kept without the pattern"
+            );
+        }
+        // `*` stays within one component, so neither a deeper file nor a
+        // sibling the pattern does not name is released.
+        for kept in [
+            "reports/quality-1.txt",
+            "reports/summary.json",
+            "reports/nested/quality-2.json",
+            "apps/web/nested/public/_routes.json",
+        ] {
+            touch(root, kept);
+            let reason = classify(root, kept, &policy).unwrap_err();
+            assert!(
+                reason.contains("is not inside a recognised build-output directory"),
+                "{kept}: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_pattern_does_not_release_a_standalone_file_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = regenerable_policy(&["*-cache", "**/generated"]);
+        // Directory roots keep their existing match, where `*` crosses `/`.
+        touch(root, "src/tool-cache/index.bin");
+        assert_eq!(classify(root, "src/tool-cache/", &policy), Ok(()));
+        touch(root, "lib/generated/out.json");
+        assert_eq!(classify(root, "lib/generated/", &policy), Ok(()));
+        // Files those patterns would reach under the directory match stay.
+        for kept in ["src/app-cache", "docs/generated"] {
+            touch(root, kept);
+            let reason = classify(root, kept, &policy).unwrap_err();
+            assert!(
+                reason.contains("is not inside a recognised build-output directory"),
+                "{kept}: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_pattern_never_releases_a_protected_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = regenerable_policy(&["reports/*"]);
+        touch(root, "reports/report.json");
+        assert_eq!(classify(root, "reports/report.json", &policy), Ok(()));
+        for protected in [
+            "reports/signing.pem",
+            "reports/.env.ci",
+            "reports/.envrc",
+            "reports/.env-prod",
+            "reports/.ENV",
+            "reports/Signing.PEM",
+            "reports/id_ed25519",
+            "reports/cache.sqlite3",
+            "reports/cache.sqlite-wal",
+            "reports/app.db-wal",
+            "reports/app.db-shm",
+            "reports/app.db-journal",
+            "reports/credentials.json",
+            "reports/.npmrc",
+            "reports/.git-credentials",
+            "reports/.pgpass",
+            "reports/infra.tfstate",
+            "reports/infra.tfstate.backup",
+            "reports/release.jks",
+            "reports/debug.keystore",
+        ] {
+            touch(root, protected);
+            let reason = classify(root, protected, &policy).unwrap_err();
+            assert!(reason.contains("protected name"), "{protected}: {reason}");
+        }
+
+        // A protected directory component keeps a file the pattern names,
+        // not only a protected basename. (A glob naming the directory itself
+        // would release it through the directory rule, which is unchanged.)
+        let nested = regenerable_policy(&["runs/*/out.json"]);
+        touch(root, "runs/run-1/out.json");
+        assert_eq!(classify(root, "runs/run-1/out.json", &nested), Ok(()));
+        for protected in [
+            "runs/.env.d/out.json",
+            "runs/state.tfstate.d/out.json",
+            "runs/VAULT.KDBX/out.json",
+        ] {
+            touch(root, protected);
+            let reason = classify(root, protected, &nested).unwrap_err();
+            assert!(reason.contains("protected name"), "{protected}: {reason}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_pattern_releases_only_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("reports")).unwrap();
+        let policy = regenerable_policy(&["reports/q-*"]);
+        assert!(
+            Command::new("mkfifo")
+                .arg(root.join("reports/q-pipe"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _listener =
+            std::os::unix::net::UnixListener::bind(root.join("reports/q-sock")).unwrap();
+        for special in ["reports/q-pipe", "reports/q-sock"] {
+            let reason = classify(root, special, &policy).unwrap_err();
+            assert!(
+                reason.contains("is not inside a recognised build-output directory"),
+                "{special}: {reason}"
+            );
+        }
+        touch(root, "reports/q-file");
+        assert_eq!(classify(root, "reports/q-file", &policy), Ok(()));
+    }
+
+    #[test]
+    fn strict_mode_keeps_a_file_a_pattern_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = AutoCleanupPolicy {
+            strict: true,
+            ..regenerable_policy(&["reports/quality-*.json"])
+        };
+        touch(root, "reports/quality-1.json");
+        let reason = classify(root, "reports/quality-1.json", &policy).unwrap_err();
+        assert!(reason.contains("strict cleanup"), "{reason}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_pattern_judges_a_link_by_itself_and_never_follows_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("checkout");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(root.join("reports")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("id_ed25519"), "private\n").unwrap();
+        let policy = regenerable_policy(&["reports/quality-*.json", "reports/*.pem"]);
+
+        // Judged by the link's own name; removing it only unlinks it.
+        symlink(
+            outside.join("id_ed25519"),
+            root.join("reports/quality-link.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            classify(&root, "reports/quality-link.json", &policy),
+            Ok(())
+        );
+        // Following a dangling link would fail to stat it.
+        symlink(
+            outside.join("missing"),
+            root.join("reports/quality-dangling.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            classify(&root, "reports/quality-dangling.json", &policy),
+            Ok(())
+        );
+        // A link whose own name is protected stays even when configured.
+        symlink(outside.join("id_ed25519"), root.join("reports/signing.pem")).unwrap();
+        let reason = classify(&root, "reports/signing.pem", &policy).unwrap_err();
+        assert!(reason.contains("protected name"), "{reason}");
+        assert!(outside.join("id_ed25519").is_file());
+    }
+
+    #[test]
+    fn a_standalone_file_blocker_names_the_line_that_releases_exactly_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let entry = |blockers: &[&str]| super::KeepMemoEntry {
+            head: "head".into(),
+            policy: String::new(),
+            fingerprint: Vec::new(),
+            blockers: blockers
+                .iter()
+                .map(|blocker| (*blocker).to_string())
+                .collect(),
+            sessions: vec![1],
+            reason: String::new(),
+            recorded_at_ms: 0,
+        };
+        let mut memo = super::decode_keep_memo(None);
+        memo.entries.insert(
+            first.to_string_lossy().into_owned(),
+            entry(&[
+                "reports/quality-1.json",
+                "reports/[draft] v1.json",
+                "keys/server.pem",
+                "notes.txt",
+                "project-cache/",
+            ]),
+        );
+        memo.entries.insert(
+            second.to_string_lossy().into_owned(),
+            entry(&["reports/quality-1.json"]),
+        );
+        let rows = super::blocked_by_ignored_from_memo(&memo);
+        let row = |name: &str| {
+            rows.iter()
+                .find(|row| row.name == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("{name}: {rows:#?}"))
+        };
+
+        let quality = row("reports/quality-1.json");
+        assert_eq!(quality.checkouts, 2, "one row per path across checkouts");
+        assert_eq!(
+            quality.config_line.as_deref(),
+            Some("[cleanup] regenerable = [\"reports/quality-1.json\"]")
+        );
+        assert_eq!(quality.config_refusal, None);
+        // Each line is valid configuration that releases exactly its file.
+        std::fs::create_dir_all(dir.path().join(".aethyme")).unwrap();
+        touch(&first, "reports/other.json");
+        for name in ["reports/quality-1.json", "reports/[draft] v1.json"] {
+            let line = row(name).config_line.expect(name);
+            let body = line.strip_prefix("[cleanup] ").expect(&line);
+            std::fs::write(
+                dir.path().join(".aethyme/config.toml"),
+                format!("[cleanup]\n{body}\n"),
+            )
+            .unwrap();
+            let policy = AutoCleanupPolicy::load(dir.path()).unwrap();
+            touch(&first, name);
+            assert_eq!(classify(&first, name, &policy), Ok(()), "{line}");
+            assert!(
+                classify(&first, "reports/other.json", &policy).is_err(),
+                "{line} names only {name}"
+            );
+        }
+
+        let key = row("keys/server.pem");
+        assert_eq!(key.config_line, None);
+        assert!(
+            key.config_refusal
+                .as_deref()
+                .is_some_and(|refusal| refusal.contains("protected name")),
+            "{key:?}"
+        );
+        // A root file a pattern cannot name without also naming ordinary
+        // root files gets no line either.
+        let notes = row("notes.txt");
+        assert_eq!(notes.config_line, None);
+        assert!(
+            notes
+                .config_refusal
+                .as_deref()
+                .is_some_and(|refusal| refusal.contains("secret or ordinary root-file")),
+            "{notes:?}"
+        );
+        // A name the escaper cannot express says so, not that it is a secret.
+        for unnameable in ["reports/trailing\\", "reports/two\nlines.json"] {
+            let refusal = super::regenerable_file_config_line(unnameable).unwrap_err();
+            assert!(
+                refusal.contains("cannot be named by a [cleanup] regenerable pattern"),
+                "{unnameable:?}: {refusal}"
+            );
+        }
+        let directory = row("project-cache/");
+        assert_eq!(
+            directory.config_line.as_deref(),
+            Some("[cleanup] regenerable = [\"project-cache\"]")
+        );
+        assert_eq!(directory.config_refusal, None);
     }
 
     /// Write Aethyme's generated bytes for `relative` under `root`.
