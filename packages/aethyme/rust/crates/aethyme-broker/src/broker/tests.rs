@@ -757,6 +757,30 @@ fn a_retired_promoting_setting_is_one_warning_saying_to_delete_it() {
 }
 
 #[test]
+fn a_retired_break_glass_setting_is_one_warning_saying_to_delete_it() {
+    let advice = super::break_glass_removed_advice("allow_break_glass = true");
+
+    assert_eq!(advice.id, "config.allow-break-glass-removed");
+    assert_eq!(advice.severity, super::StatusAdviceSeverity::Warning);
+    assert!(
+        advice
+            .summary
+            .contains("[publication] allow_break_glass = true is ignored"),
+        "{}",
+        advice.summary
+    );
+    assert!(
+        advice.summary.contains("Delete the setting"),
+        "{}",
+        advice.summary
+    );
+    assert_eq!(
+        advice.evidence,
+        vec![".aethyme/config.toml [publication] allow_break_glass = true".to_string()]
+    );
+}
+
+#[test]
 fn promoted_clean_finish_advice_points_to_finish() {
     let agent = super::AgentView {
         session: session(69),
