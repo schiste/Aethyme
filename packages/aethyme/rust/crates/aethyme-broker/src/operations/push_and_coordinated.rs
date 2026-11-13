@@ -2665,6 +2665,7 @@ impl Broker {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_coordinated_operation_observing<P, F>(
         &mut self,
         mut request: CoordinatedCommand,
