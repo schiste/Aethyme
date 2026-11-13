@@ -2156,6 +2156,26 @@ impl Broker {
         self.resolve_unstarted_operation_with_details(id, json!({ "reason": reason }));
     }
 
+    /// Resolve a write refused while waiting for `key`'s lock, naming the
+    /// holder (from the journal, else from the record next to the lock) and
+    /// how long this write waited.
+    fn resolve_lane_refusal(
+        &mut self,
+        id: i64,
+        reason: &str,
+        key: &str,
+        holder: LockHolderInfo,
+        lock_wait_started_at: Option<i64>,
+        lanes: &LaneTelemetry,
+    ) {
+        let main_root = self.main_root().to_path_buf();
+        let holder = with_recorded_holder(holder, &main_root, key);
+        self.resolve_unstarted_operation_with_details(
+            id,
+            lane_refusal_details(reason, key, lock_wait_started_at, lanes, &holder),
+        );
+    }
+
     fn resolve_unstarted_operation_with_details(&mut self, id: i64, details: serde_json::Value) {
         let details = details.to_string();
         crate::warn_unrecorded(
@@ -2909,24 +2929,27 @@ impl Broker {
         // lane, hooks included, unless the repository opted out. Anything
         // unproven (main checkout, detached or foreign HEAD, a declared scope)
         // keeps the repository-wide lane.
-        let session_commit_ref = match &own_session {
-            Some(session)
-                if !session_hooks_hold_lock
-                    && request.scope.is_none()
-                    && git_scopes::is_plain_commit(&request.args) =>
-            {
-                git_scopes::validate_session_commit(
-                    cwd,
-                    &main_root,
-                    Path::new(&session.worktree_path),
-                    &session.branch,
-                    admission,
-                    &repository,
-                )
-                .ok()
-            }
-            _ => None,
-        };
+        let commit_lane = (request.provider == OperationProvider::Git
+            && effect != OperationEffect::Read
+            && git_scopes::is_plain_commit(&request.args))
+        .then(|| match &own_session {
+            None => Err(git_scopes::LANE_NO_LIVE_SESSION),
+            Some(_) if session_hooks_hold_lock => Err(git_scopes::LANE_SESSION_HOOKS_HOLD_LOCK),
+            Some(_) if request.scope.is_some() => Err(git_scopes::LANE_DECLARED_SCOPE),
+            Some(session) => git_scopes::validate_session_commit(
+                cwd,
+                &main_root,
+                Path::new(&session.worktree_path),
+                &session.branch,
+                admission,
+                &repository,
+            )
+            .map_err(|error| git_scopes::lane_unavailable_code(&error)),
+        });
+        let session_commit_ref = commit_lane
+            .as_ref()
+            .and_then(|lane| lane.as_ref().ok())
+            .cloned();
         // A strict push of the caller's own session branch is not widened by
         // the repository's `pre-push` hook unless the repository opted out.
         // The hooks still run inside the push exactly as before.
@@ -2942,17 +2965,22 @@ impl Broker {
         // being refused; it is journaled `repository` so a recomputed scope
         // stays wide too. A configuration that changes while the operation
         // queues is still refused under the lane.
-        let profile_unproven = request.provider == OperationProvider::Git
+        let profile_unavailable = (request.provider == OperationProvider::Git
             && session_commit_ref.is_none()
-            && resource_scope.is_some()
-            && git_scopes::validate_repository(
+            && resource_scope.is_some())
+        .then(|| {
+            git_scopes::validate_repository(
                 cwd,
                 &request.args,
                 admission,
                 &repository,
                 session_branch_hooks,
             )
-            .is_err();
+            .err()
+            .map(|error| session_lane_reason(&error, session_hooks_hold_lock))
+        })
+        .flatten();
+        let profile_unproven = profile_unavailable.is_some();
         let resource_scope = if profile_unproven {
             None
         } else {
@@ -2962,6 +2990,46 @@ impl Broker {
                 .or(resource_scope)
         };
         let lock_key = coordination_lock_key(&repository, resource_scope.as_deref());
+        // Which lane this write asked for and, when it stays wide, why: a
+        // lane that is never taken must say so instead of collapsing into
+        // "wide" (the busiest repository ran on 0.8.85 with no session lane
+        // ever taken and nothing recording the reason).
+        let narrow_lane = narrow_lane_kind(request.provider, effect, &request.args).map(|kind| {
+            NarrowLaneDecision {
+                kind,
+                unavailable: if resource_scope.is_some() {
+                    None
+                } else {
+                    Some(
+                        profile_unavailable
+                            .or_else(|| {
+                                commit_lane
+                                    .as_ref()
+                                    .and_then(|lane| lane.as_ref().err().copied())
+                            })
+                            .unwrap_or_else(|| {
+                                if kind == "push" {
+                                    wide_push_lane_reason(
+                                        &main_root,
+                                        cwd,
+                                        &request.args,
+                                        own_session.as_ref(),
+                                    )
+                                } else {
+                                    git_scopes::LANE_NOT_STRICT_SPELLING
+                                }
+                            }),
+                    )
+                },
+            }
+        });
+        if let Some(lane) = narrow_lane {
+            crate::phase_telemetry::add(lane.phase(), Duration::ZERO);
+        }
+        let mut lanes = LaneTelemetry {
+            narrow_lane,
+            ..LaneTelemetry::default()
+        };
 
         let scope_was_declared = request.scope.is_some();
         // The derived scope is also the audit scope, so the journal names the
@@ -3212,9 +3280,15 @@ impl Broker {
                 Ok(guard) if wide_writer => wide_intent_guards.push(guard),
                 Ok(_) => {}
                 Err(error) => {
-                    self.resolve_unstarted_operation(
+                    lanes.wide_intent_wait_ms =
+                        Some(wide_intent_started.elapsed().as_millis() as i64);
+                    self.resolve_lane_refusal(
                         queued_operation_id,
                         "wide_intent_unavailable",
+                        key,
+                        unidentified_lock_holder(),
+                        lock_wait_started_at,
+                        &lanes,
                     );
                     return Err(error);
                 }
@@ -3222,6 +3296,7 @@ impl Broker {
         }
         let wide_intent_wait_ms = (!wide_intent_keys.is_empty())
             .then(|| wide_intent_started.elapsed().as_millis() as i64);
+        lanes.wide_intent_wait_ms = wide_intent_wait_ms;
         if !wide_intent_keys.is_empty() {
             crate::phase_telemetry::add(
                 "coordinated_wide_intent_wait",
@@ -3269,11 +3344,25 @@ impl Broker {
                 },
                 resource_scope.is_some(),
             ) {
-                Ok(guard) => Some(guard),
+                Ok(guard) => {
+                    lanes.git_common_lane_wait_ms = Some(guard.queue_wait_ms);
+                    Some(guard)
+                }
                 Err(error) => {
-                    self.resolve_unstarted_operation(
+                    let holder = lock_holder_info_for_domain(
+                        self.store(),
+                        &repository,
+                        None,
+                        resource_scope.is_some(),
+                        Some(OperationProvider::Git),
+                    );
+                    self.resolve_lane_refusal(
                         queued_operation_id,
                         "local_git_lane_unavailable",
+                        &common_key,
+                        holder,
+                        lock_wait_started_at,
+                        &lanes,
                     );
                     return Err(error);
                 }
@@ -3310,11 +3399,18 @@ impl Broker {
                         )
                     },
                 ) {
-                    Ok(guard) => Some(guard),
+                    Ok(guard) => {
+                        lanes.local_ref_lane_wait_ms = Some(guard.queue_wait_ms);
+                        Some(guard)
+                    }
                     Err(error) => {
-                        self.resolve_unstarted_operation(
+                        self.resolve_lane_refusal(
                             queued_operation_id,
                             "local_ref_lane_unavailable",
+                            &key,
+                            unidentified_lock_holder(),
+                            lock_wait_started_at,
+                            &lanes,
                         );
                         return Err(error);
                     }
@@ -3349,11 +3445,19 @@ impl Broker {
                     )
                 },
             ) {
-                Ok(guard) => Some(guard),
+                Ok(guard) => {
+                    lanes.repository_lane_wait_ms = Some(guard.queue_wait_ms);
+                    Some(guard)
+                }
                 Err(error) => {
-                    self.resolve_unstarted_operation(
+                    let holder = lock_holder_info_for_scope(self.store(), &repository, None, true);
+                    self.resolve_lane_refusal(
                         queued_operation_id,
                         "repository_lane_unavailable",
+                        &repository,
+                        holder,
+                        lock_wait_started_at,
+                        &lanes,
                     );
                     return Err(error);
                 }
@@ -3400,7 +3504,20 @@ impl Broker {
                 Ok(lock) => Some(lock),
                 Err(error) => {
                     // Nothing ran, so the record must not linger as queued.
-                    self.resolve_unstarted_operation(queued_operation_id, "lock_unavailable");
+                    let holder = lock_holder_info_for_scope(
+                        self.store(),
+                        &repository,
+                        resource_scope.as_deref(),
+                        false,
+                    );
+                    self.resolve_lane_refusal(
+                        queued_operation_id,
+                        "lock_unavailable",
+                        &lock_key,
+                        holder,
+                        lock_wait_started_at,
+                        &lanes,
+                    );
                     return Err(error);
                 }
             }
@@ -3822,7 +3939,7 @@ impl Broker {
                     lock.as_ref(),
                     hooks_ran_outside_lock,
                     ref_determination,
-                    wide_intent_wait_ms,
+                    &lanes,
                 );
                 let operation = self.store().transition_coordinated_operation(
                     operation.id,
@@ -3891,7 +4008,7 @@ impl Broker {
                     lock.as_ref(),
                     hooks_ran_outside_lock,
                     ref_determination,
-                    wide_intent_wait_ms,
+                    &lanes,
                 );
                 let operation = self.store().transition_coordinated_operation(
                     operation.id,
@@ -4134,7 +4251,7 @@ impl Broker {
             lock.as_ref(),
             hooks_ran_outside_lock,
             ref_determination,
-            wide_intent_wait_ms,
+            &lanes,
         );
         let operation = self.store().transition_coordinated_operation(
             operation.id,
