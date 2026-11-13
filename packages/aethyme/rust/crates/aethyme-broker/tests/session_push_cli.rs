@@ -255,6 +255,86 @@ impl Fixture {
         ])
     }
 
+    /// Replace the session branch on the remote with the worktree's HEAD
+    /// through `broker advanced git`, as an agent publishing a rewrite does.
+    fn advanced_force_push(&self, session: i64, worktree: &Path) -> Output {
+        let session_id = session.to_string();
+        let branch = self.broker().store().session(session).unwrap().branch;
+        let head = git_output(worktree, &["rev-parse", "HEAD"]);
+        let refspec = format!("+{head}:refs/heads/{branch}");
+        self.run(&[
+            "advanced",
+            "git",
+            "--session",
+            &session_id,
+            "--repo",
+            "acme/project",
+            "--effect",
+            "destructive",
+            "--destructive",
+            "--reason",
+            "publish a rewritten session branch",
+            "--",
+            "push",
+            "origin",
+            &refspec,
+        ])
+    }
+
+    /// The oid `broker push` leases a rewrite against for `session`.
+    fn recorded_push(&self, session: i64) -> Option<String> {
+        self.broker()
+            .store()
+            .meta_get(&format!("session_push.{session}.oid"))
+            .unwrap()
+    }
+
+    /// Overwrite that oid, as a binary that predates recording
+    /// `broker advanced git` pushes would have left it.
+    fn set_recorded_push(&self, session: i64, oid: &str) {
+        self.broker()
+            .store()
+            .meta_set(&format!("session_push.{session}.oid"), oid)
+            .unwrap();
+    }
+
+    /// Journaled `broker push` operations, oldest first.
+    fn session_push_operations(&self) -> Vec<aethyme_broker::CoordinatedOperation> {
+        self.broker()
+            .store()
+            .coordinated_operations()
+            .unwrap()
+            .into_iter()
+            .filter(|operation| operation.scope.starts_with("session-push:"))
+            .collect()
+    }
+
+    /// Another clone replaces the remote session branch with its own commit
+    /// on top of `main`, which the session branch does not contain.
+    fn replace_remote_branch_from_main(&self, branch: &str) -> String {
+        let outsider = self.storage.owner_path().join("replacer");
+        git(
+            self.storage.owner_path(),
+            &[
+                "clone",
+                "-q",
+                self.remote.to_str().unwrap(),
+                outsider.to_str().unwrap(),
+            ],
+        );
+        self.commit(&outsider, "replaced.txt", "theirs\n", "replacement work");
+        git(
+            &outsider,
+            &[
+                "push",
+                "-qf",
+                "origin",
+                &format!("HEAD:refs/heads/{branch}"),
+            ],
+        );
+        git_output(&outsider, &["rev-parse", "HEAD"])
+    }
+
     fn commit(&self, worktree: &Path, file: &str, body: &str, message: &str) {
         std::fs::write(worktree.join(file), body).unwrap();
         git(worktree, &["add", file]);
@@ -876,10 +956,262 @@ fn the_lease_refuses_when_the_remote_branch_moved_underneath() {
 
     git(&worktree, &["commit", "--amend", "-qm", "feat: rewritten"]);
     let refused = fixture.push(session, &[]);
-    assert!(!refused.status.success(), "{}", stderr(&refused));
+    assert_eq!(refused.status.code(), Some(3), "{}", stderr(&refused));
+    let message = json_error::message(&refused);
+    assert!(
+        message.contains(&theirs) && message.contains("this session did not push"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!(
+            "`git fetch origin {branch} && git log HEAD..{theirs}`"
+        )) && message.contains(&format!(
+            "`git fetch origin {branch} && git merge {theirs}`, then \
+             `aethyme broker push --session {session}`"
+        )) && !message.contains("broker sync"),
+        "{message}"
+    );
     assert_eq!(
         fixture.remote_branch(&branch).as_deref(),
         Some(theirs.as_str())
+    );
+    // The lease was decided against the oid recorded last, and the push
+    // lock's read showed the remote elsewhere: Git never ran the push.
+    let operations = fixture.session_push_operations();
+    let (first_push, refusals) = operations.split_first().unwrap();
+    assert_eq!(first_push.status.as_str(), "succeeded");
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    let refusal = &refusals[0];
+    assert_eq!(refusal.status.as_str(), "failed");
+    assert_eq!(refusal.exit_code, None);
+    let details: serde_json::Value =
+        serde_json::from_str(refusal.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        details["reason"], "remote_tip_revalidation_failed",
+        "{details}"
+    );
+    assert_eq!(details["observed_sha"], theirs.as_str(), "{details}");
+}
+
+/// The remote moved past the session's last `broker push` through this
+/// session's own `broker advanced git` push, and HEAD builds on it: a plain
+/// push, whatever oid was recorded. Before, the push leased against the
+/// stale recorded oid and Git refused it with "stale info" on every retry.
+#[test]
+fn a_remote_ahead_by_this_sessions_own_advanced_push_gets_a_plain_push() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, worktree) = fixture.session_with_commit();
+    let first = json(&fixture.push(session, &[]));
+    let branch = first["branch"].as_str().unwrap().to_string();
+    let first_oid = first["pushed_oid"].as_str().unwrap().to_string();
+
+    git(
+        &worktree,
+        &["commit", "--amend", "-qm", "feat: first step, reworded"],
+    );
+    let advanced = fixture.advanced_force_push(session, &worktree);
+    assert!(advanced.status.success(), "{}", stderr(&advanced));
+    let rewritten = git_output(&worktree, &["rev-parse", "HEAD"]);
+    // The advanced push keeps the recorded oid current at the source ...
+    assert_eq!(
+        fixture.recorded_push(session).as_deref(),
+        Some(rewritten.as_str())
+    );
+    // ... and the reader does not depend on it: an older binary left it
+    // at the first push.
+    fixture.set_recorded_push(session, &first_oid);
+    fixture.commit(&worktree, "second.txt", "two\n", "feat: second step");
+
+    let report = json(&fixture.push(session, &[]));
+    let head = git_output(&worktree, &["rev-parse", "HEAD"]);
+    assert_eq!(report["pushed_oid"], head);
+    assert_eq!(report["previous_remote_oid"], rewritten.as_str());
+    assert_eq!(
+        fixture.remote_branch(&branch).as_deref(),
+        Some(head.as_str())
+    );
+    assert_eq!(
+        fixture.recorded_push(session).as_deref(),
+        Some(head.as_str())
+    );
+}
+
+/// A rebase after such an advanced push: the remote holds a tip this
+/// session's journaled push sent, so the lease may expect it even though the
+/// recorded oid is older.
+#[test]
+fn a_rebase_after_an_advanced_push_leases_against_the_journal_proven_tip() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, worktree) = fixture.session_with_commit();
+    let first = json(&fixture.push(session, &[]));
+    let branch = first["branch"].as_str().unwrap().to_string();
+    let first_oid = first["pushed_oid"].as_str().unwrap().to_string();
+
+    git(
+        &worktree,
+        &["commit", "--amend", "-qm", "feat: reworded once"],
+    );
+    let advanced = fixture.advanced_force_push(session, &worktree);
+    assert!(advanced.status.success(), "{}", stderr(&advanced));
+    let rewritten = git_output(&worktree, &["rev-parse", "HEAD"]);
+    fixture.set_recorded_push(session, &first_oid);
+    git(
+        &worktree,
+        &["commit", "--amend", "-qm", "feat: reworded twice"],
+    );
+
+    let report = json(&fixture.push(session, &[]));
+    let head = git_output(&worktree, &["rev-parse", "HEAD"]);
+    assert_eq!(report["pushed_oid"], head);
+    assert_eq!(report["previous_remote_oid"], rewritten.as_str());
+    assert_eq!(
+        fixture.remote_branch(&branch).as_deref(),
+        Some(head.as_str())
+    );
+    let operations = fixture.session_push_operations();
+    let last = operations.last().unwrap();
+    assert!(
+        last.command_json.contains(&format!(
+            "--force-with-lease=refs/heads/{branch}:{rewritten}"
+        )),
+        "{}",
+        last.command_json
+    );
+}
+
+/// Someone else replaced the remote branch and this session rebuilt on what
+/// they pushed, without the remote-tracking ref learning of it. The push
+/// lock's read shows the remote at an ancestor of HEAD, so the push is
+/// decided again and sent plain instead of leasing against the stale oid.
+#[test]
+fn a_remote_tip_head_contains_gets_a_plain_push_even_if_this_session_never_pushed_it() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, worktree) = fixture.session_with_commit();
+    let first = json(&fixture.push(session, &[]));
+    let branch = first["branch"].as_str().unwrap().to_string();
+
+    let theirs = fixture.replace_remote_branch_from_main(&branch);
+    // Fetched by path, so `origin/<branch>` still names the first push.
+    git(
+        &worktree,
+        &[
+            "fetch",
+            "-q",
+            fixture.remote.to_str().unwrap(),
+            &format!("refs/heads/{branch}"),
+        ],
+    );
+    git(&worktree, &["reset", "-q", "--hard", "FETCH_HEAD"]);
+    assert_eq!(git_output(&worktree, &["rev-parse", "HEAD"]), theirs);
+    fixture.commit(&worktree, "mine.txt", "mine\n", "feat: build on theirs");
+
+    let report = json(&fixture.push(session, &[]));
+    let head = git_output(&worktree, &["rev-parse", "HEAD"]);
+    assert_eq!(report["pushed_oid"], head);
+    assert_eq!(report["previous_remote_oid"], theirs.as_str());
+    assert_eq!(
+        fixture.remote_branch(&branch).as_deref(),
+        Some(head.as_str())
+    );
+    let operations = fixture.session_push_operations();
+    let statuses = operations
+        .iter()
+        .map(|operation| operation.status.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        statuses,
+        ["succeeded", "failed", "succeeded"],
+        "{operations:?}"
+    );
+    assert_eq!(operations[1].exit_code, None, "{operations:?}");
+    assert!(
+        !operations[2].command_json.contains("--force-with-lease"),
+        "{}",
+        operations[2].command_json
+    );
+}
+
+/// A remote tip the session branch does not contain and this session never
+/// pushed, already known from a fetch, is refused before anything is
+/// journaled or sent, with the commands that resolve it.
+#[test]
+fn a_foreign_remote_tip_is_refused_before_git_runs() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, worktree) = fixture.session_with_commit();
+    let first = json(&fixture.push(session, &[]));
+    let branch = first["branch"].as_str().unwrap().to_string();
+
+    let outsider = fixture.storage.owner_path().join("outsider");
+    git(
+        fixture.storage.owner_path(),
+        &[
+            "clone",
+            "-q",
+            fixture.remote.to_str().unwrap(),
+            outsider.to_str().unwrap(),
+        ],
+    );
+    git(&outsider, &["checkout", "-q", &branch]);
+    fixture.commit(&outsider, "theirs.txt", "theirs\n", "someone else's work");
+    git(&outsider, &["push", "-q", "origin", &branch]);
+    let theirs = git_output(&outsider, &["rev-parse", "HEAD"]);
+    fixture.git_env(&["fetch", "-q", "origin"]);
+    fixture.commit(&worktree, "second.txt", "two\n", "feat: second step");
+    let journaled_before = fixture.session_push_operations().len();
+
+    let refused = fixture.push(session, &[]);
+    assert_eq!(refused.status.code(), Some(3), "{}", stderr(&refused));
+    let message = json_error::message(&refused);
+    assert!(
+        message.contains(&format!("origin/{branch} is at {theirs}"))
+            && message.contains("this session did not push"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!(
+            "`git fetch origin {branch} && git log HEAD..{theirs}`"
+        )) && message.contains(&format!(
+            "`git fetch origin {branch} && git merge {theirs}`, then \
+             `aethyme broker push --session {session}`"
+        )) && !message.contains("broker sync"),
+        "{message}"
+    );
+    assert_eq!(
+        fixture.remote_branch(&branch).as_deref(),
+        Some(theirs.as_str())
+    );
+    assert_eq!(fixture.session_push_operations().len(), journaled_before);
+
+    // Following the message: fetch and merge the tip in the session
+    // worktree, after which it is an ancestor of HEAD and the push is plain.
+    let fetch = Command::new("git")
+        .args(["fetch", "-q", "origin", &branch])
+        .current_dir(&worktree)
+        .env("AETHYME_TEST_GIT_REMOTE", &fixture.remote)
+        .output()
+        .unwrap();
+    assert!(fetch.status.success(), "{}", stderr(&fetch));
+    git(&worktree, &["merge", "-q", "--no-edit", &theirs]);
+    let report = json(&fixture.push(session, &[]));
+    let head = git_output(&worktree, &["rev-parse", "HEAD"]);
+    assert_eq!(report["pushed_oid"], head);
+    assert_eq!(report["previous_remote_oid"], theirs.as_str());
+    assert_eq!(
+        fixture.remote_branch(&branch).as_deref(),
+        Some(head.as_str())
+    );
+    let operations = fixture.session_push_operations();
+    assert_eq!(operations.len(), journaled_before + 1);
+    let last = operations.last().unwrap();
+    assert_eq!(last.status.as_str(), "succeeded");
+    assert!(
+        !last.command_json.contains("--force-with-lease"),
+        "{}",
+        last.command_json
     );
 }
 

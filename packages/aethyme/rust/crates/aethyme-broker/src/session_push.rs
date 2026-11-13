@@ -437,6 +437,142 @@ fn refused(reason: impl Into<String>) -> BrokerOpError {
     }
 }
 
+/// One attempt of [`Broker::push_session`].
+enum PushAttempt {
+    Pushed(Box<SessionPushReport>),
+    /// The remote branch was not where the attempt decided to push against;
+    /// nothing was pushed. `tip` is what was read there (`None`: no branch).
+    RemoteTipMoved {
+        remote: String,
+        tip: Option<String>,
+    },
+}
+
+/// How `broker push` sends the session branch, decided by
+/// [`Broker::push_path`] against the tip the remote branch holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PushPath {
+    /// The remote branch is absent or an ancestor of HEAD: a plain push,
+    /// which Git refuses rather than letting it replace anything.
+    FastForward,
+    /// A rewritten branch, leased against the oid the last `broker push`
+    /// recorded for this session.
+    LeaseRecorded(String),
+    /// A rewritten branch, leased against an oid a succeeded journaled push
+    /// of this session sent to this branch on this remote.
+    LeaseJournalProven(String),
+}
+
+impl PushPath {
+    /// The oid a lease expects the remote branch to hold.
+    fn lease(&self) -> Option<&str> {
+        match self {
+            Self::FastForward => None,
+            Self::LeaseRecorded(oid) | Self::LeaseJournalProven(oid) => Some(oid),
+        }
+    }
+
+    /// The `phase_counts` counter recording that this path was chosen.
+    fn counter(&self) -> &'static str {
+        match self {
+            Self::FastForward => "push_plain_fast_forward",
+            Self::LeaseRecorded(_) => "push_lease_recorded",
+            Self::LeaseJournalProven(_) => "push_lease_journal_proven",
+        }
+    }
+
+    /// Whether `observed`, the tip the push lock's remote read saw, still
+    /// allows this path: a plain push needs the remote at an ancestor of
+    /// `head` (or absent), a lease needs it at exactly the leased oid.
+    fn holds(&self, repo: &GitRepo, head: &str, observed: Option<&str>) -> bool {
+        match self.lease() {
+            None => observed.is_none_or(|tip| tip == head || repo.is_ancestor(tip, head)),
+            Some(oid) => observed == Some(oid),
+        }
+    }
+}
+
+/// Where the remote branch is believed to be before the push reads it: the
+/// newer of the oid the last `broker push` recorded and the remote-tracking
+/// ref (which Git moves on every fetch and push of the branch, including
+/// `broker advanced git` pushes). When they diverge the tracking ref wins;
+/// the push lock's read corrects any wrong belief before Git runs.
+fn believed_remote_tip(
+    repo: &GitRepo,
+    recorded: Option<&str>,
+    tracking: Option<&str>,
+) -> Option<String> {
+    match (recorded, tracking) {
+        (Some(recorded), Some(tracking))
+            if recorded != tracking && repo.is_ancestor(tracking, recorded) =>
+        {
+            Some(recorded.to_string())
+        }
+        (_, Some(tracking)) => Some(tracking.to_string()),
+        (recorded, None) => recorded.map(str::to_string),
+    }
+}
+
+/// Whether a journaled operation's exact push plan sent `oid` to
+/// `branch_ref`. Only the plan the broker resolved before the push counts,
+/// never the command line, which may name a symbolic source.
+fn journal_records_push(details: &str, branch_ref: &str, oid: &str) -> bool {
+    let Ok(details) = serde_json::from_str::<serde_json::Value>(details) else {
+        return false;
+    };
+    let push = &details["push_reconciliation"];
+    push["planning"].as_str() == Some("planned")
+        && push["plan"]["destinations"]
+            .as_array()
+            .is_some_and(|destinations| {
+                destinations.iter().any(|destination| {
+                    destination["destination_ref"].as_str() == Some(branch_ref)
+                        && destination["proposed_sha"].as_str() == Some(oid)
+                })
+            })
+}
+
+/// The refusal for a remote tip this session neither contains nor pushed.
+fn foreign_remote_tip_refusal(
+    session_id: i64,
+    branch: &str,
+    remote: &str,
+    tip: &str,
+) -> BrokerOpError {
+    crate::phase_telemetry::add("push_refused_foreign_remote_tip", std::time::Duration::ZERO);
+    refused(format!(
+        "remote branch {remote}/{branch} is at {tip}, which this session's branch does not \
+         contain and this session did not push (it is neither the oid broker push last \
+         recorded nor one a succeeded push of this session sent), so broker push will not \
+         replace it; nothing was pushed. {}",
+        remote_tip_next_steps(session_id, branch, remote, tip)
+    ))
+}
+
+/// What to run, in the session worktree, when the remote branch holds `tip`
+/// (an oid, or `FETCH_HEAD` when it could not be read): inspect it, or merge
+/// it so HEAD contains it and the next `broker push` is a plain push.
+/// `broker sync` is not offered: it merges only the default branch.
+fn remote_tip_next_steps(session_id: i64, branch: &str, remote: &str, tip: &str) -> String {
+    format!(
+        "In the session worktree, inspect it with `git fetch {remote} {branch} && git log \
+         HEAD..{tip}`; to keep it, run `git fetch {remote} {branch} && git merge {tip}`, then \
+         `aethyme broker push --session {session_id}` (HEAD then contains it, so the push is a \
+         plain fast-forward)"
+    )
+}
+
+/// Whether Git refused the push because the remote ref was not where the
+/// push expected it: a lease that no longer holds (`stale info`), or a plain
+/// push the remote moved past (`fetch first`, `non-fast-forward`). Git prints
+/// these on stderr, or on stdout with `--porcelain`.
+fn remote_tip_rejection(output: &str) -> bool {
+    output.contains("[rejected]")
+        && ["(stale info)", "(fetch first)", "(non-fast-forward)"]
+            .iter()
+            .any(|reason| output.contains(reason))
+}
+
 fn operation_failure(phase: &'static str, report: &CoordinatedOperationReport) -> BrokerOpError {
     if report.operation.status == crate::OperationStatus::OutcomeUnknown {
         BrokerOpError::CoordinatedOperationBlocked {
@@ -620,13 +756,124 @@ impl Broker {
         })
     }
 
+    /// Decide how to push `head` to the session branch when the remote
+    /// branch is at `tip` (`None`: absent). A tip `head` contains is a plain
+    /// push. Otherwise the branch was rewritten, and the lease may expect
+    /// `tip` only when it is this session's own: the oid the last
+    /// `broker push` recorded, or the proposed oid of a succeeded journaled
+    /// push of this session to this branch on this remote. Anything else
+    /// refuses before Git runs.
+    #[allow(clippy::too_many_arguments)]
+    fn push_path(
+        &mut self,
+        session_id: i64,
+        branch: &str,
+        remote: &str,
+        coordination_key: &str,
+        head: &str,
+        recorded: Option<&str>,
+        tip: Option<&str>,
+    ) -> Result<PushPath, BrokerOpError> {
+        let Some(tip) = tip else {
+            return Ok(PushPath::FastForward);
+        };
+        if tip == head || self.repo_handle().is_ancestor(tip, head) {
+            return Ok(PushPath::FastForward);
+        }
+        if recorded == Some(tip) {
+            return Ok(PushPath::LeaseRecorded(tip.to_string()));
+        }
+        let branch_ref = format!("refs/heads/{branch}");
+        let journaled = self
+            .store()
+            .session_git_write_details_mentioning(session_id, coordination_key, tip)?
+            .iter()
+            .any(|details| journal_records_push(details, &branch_ref, tip));
+        if journaled {
+            return Ok(PushPath::LeaseJournalProven(tip.to_string()));
+        }
+        Err(foreign_remote_tip_refusal(session_id, branch, remote, tip))
+    }
+
+    /// Keep the oid `broker push` leases against current when a session
+    /// pushes its own branch through `broker advanced git`: record what that
+    /// succeeded push sent, when it went to the remote `broker push` uses.
+    /// Best-effort; `broker push` also proves such a push from the journal.
+    pub(crate) fn note_session_branch_push(
+        &mut self,
+        session: &crate::Session,
+        report: &CoordinatedOperationReport,
+    ) {
+        let branch_ref = format!("refs/heads/{}", session.branch);
+        let Some(pushed) = report
+            .pushed_refs
+            .iter()
+            .find(|pushed| pushed.destination_ref == branch_ref)
+        else {
+            return;
+        };
+        let Some(target) = report.resolved_target.as_ref() else {
+            return;
+        };
+        let repo = self.repo_handle();
+        let same_remote = tracked_default(repo).is_some_and(|default| {
+            repo.resolve_remote_target(&default.remote, None)
+                .is_ok_and(|resolved| resolved.coordination_key == target.coordination_key)
+        });
+        if same_remote {
+            crate::warn_unrecorded(
+                "record the session branch push for broker push",
+                self.store()
+                    .meta_set(&pushed_oid_key(session.id), &pushed.proposed_sha),
+            );
+        }
+    }
+
     /// Publish a live session's own branch, and optionally open a pull request
     /// in the trusted repository-configured mode. See module docs for authorization.
+    ///
+    /// The push is decided against the tip the remote branch is believed to
+    /// hold and re-checked against the tip read under the push lock. When the
+    /// two differ, nothing is pushed and the push is decided once more against
+    /// the tip actually read; a second difference refuses.
     pub fn push_session(
         &mut self,
         session_id: i64,
         open_pr: bool,
     ) -> Result<SessionPushReport, BrokerOpError> {
+        let tip = match self.push_session_attempt(session_id, open_pr, None)? {
+            PushAttempt::Pushed(report) => return Ok(*report),
+            PushAttempt::RemoteTipMoved { tip, .. } => tip,
+        };
+        crate::phase_telemetry::add("push_remote_tip_redecided", std::time::Duration::ZERO);
+        match self.push_session_attempt(session_id, open_pr, Some(tip))? {
+            PushAttempt::Pushed(report) => Ok(*report),
+            PushAttempt::RemoteTipMoved { remote, tip } => {
+                let branch = self.store().session(session_id)?.branch;
+                let next = match tip.as_deref() {
+                    Some(tip) => remote_tip_next_steps(session_id, &branch, &remote, tip),
+                    None => format!(
+                        "It was deleted; re-run `aethyme broker push --session {session_id}`"
+                    ),
+                };
+                Err(refused(format!(
+                    "remote branch {remote}/{branch} moved again while broker push waited for \
+                     the push lock (it is now at {}); nothing was pushed. {next}",
+                    tip.as_deref().unwrap_or("nothing"),
+                )))
+            }
+        }
+    }
+
+    /// One decision and push for [`Self::push_session`]. `known_tip`, when
+    /// given, is the tip a previous attempt read on the remote under the lock
+    /// (`Some(None)`: the branch does not exist there).
+    fn push_session_attempt(
+        &mut self,
+        session_id: i64,
+        open_pr: bool,
+        known_tip: Option<Option<String>>,
+    ) -> Result<PushAttempt, BrokerOpError> {
         let mut phase_timings_ms = std::collections::BTreeMap::new();
         let phase_started = std::time::Instant::now();
         let session = self.store().session(session_id)?;
@@ -706,11 +953,26 @@ impl Broker {
         // anything else. A rewritten branch (rebase, amend) needs a lease, and
         // the lease is only ever against an oid this broker recorded pushing
         // for this session -- never one merely seen in a fetch, which could be
-        // someone else's work under the same name.
-        let known = recorded.clone().or_else(|| tracking.clone());
-        let fast_forward = known
-            .as_deref()
-            .is_none_or(|known| known == head || repo.is_ancestor(known, &head));
+        // someone else's work under the same name. "Recorded" is the oid the
+        // last `broker push` stored, or one a succeeded journaled push of this
+        // session sent to this branch on this remote (`broker advanced git`).
+        // Which applies is decided against the tip the remote is believed to
+        // hold, and re-checked under the push lock against the tip it holds.
+        let believed_tip = match known_tip {
+            Some(tip) => tip,
+            None => believed_remote_tip(repo, recorded.as_deref(), tracking.as_deref()),
+        };
+        let path = self.push_path(
+            session_id,
+            &session.branch,
+            &default.remote,
+            &target.coordination_key,
+            &head,
+            recorded.as_deref(),
+            believed_tip.as_deref(),
+        )?;
+        crate::phase_telemetry::add(path.counter(), std::time::Duration::ZERO);
+        let fast_forward = path == PushPath::FastForward;
         let (args, effect) = if fast_forward {
             // The strict spelling holds only this branch's lane (and its one
             // tracking ref), so pushes of different session branches do not
@@ -734,7 +996,7 @@ impl Broker {
                 ]
             };
             (args, OperationEffect::Write)
-        } else if let Some(pushed) = recorded.as_deref() {
+        } else if let Some(pushed) = path.lease() {
             (
                 vec![
                     "push".to_string(),
@@ -745,12 +1007,14 @@ impl Broker {
                 OperationEffect::Destructive,
             )
         } else {
-            return Err(refused(format!(
-                "remote branch {} is at {}, which this session's branch does not contain and \
-                 this broker never pushed; inspect it before replacing it",
-                session.branch,
-                known.unwrap_or_default()
-            )));
+            // `push_path` refuses every tip it can neither fast-forward nor
+            // lease, so this is unreachable; refusing keeps it harmless.
+            return Err(foreign_remote_tip_refusal(
+                session_id,
+                &session.branch,
+                &default.remote,
+                believed_tip.as_deref().unwrap_or_default(),
+            ));
         };
         phase_timings_ms.insert(
             "push_preflight".into(),
@@ -772,20 +1036,72 @@ impl Broker {
             authorization_reason: Some(format!("repository policy {SESSION_PUSH_POLICY_KEY}")),
             args,
         };
-        let push = if observe_default {
-            self.run_coordinated_push_observing_default(
-                push_command,
-                session_worktree,
-                push_operation_wait(),
-                &remote_default_ref,
-            )?
-        } else {
-            self.run_coordinated_operation_at_with_wait(
-                push_command,
-                session_worktree,
-                push_operation_wait(),
-            )?
+        // What the push lock's remote read saw, when it no longer allows the
+        // path chosen above. Git did not run; the caller decides again.
+        let moved_tip = std::cell::RefCell::new(None::<Option<String>>);
+        let check_repo = GitRepo::discover(&main_root)?;
+        let tip_check: &dyn Fn(Option<&str>) -> Result<(), String> = &|observed| {
+            if path.holds(&check_repo, &head, observed) {
+                return Ok(());
+            }
+            *moved_tip.borrow_mut() = Some(observed.map(str::to_owned));
+            Err(format!(
+                "remote branch {} is at {}, not where broker push decided to push against; \
+                 nothing was pushed",
+                session.branch,
+                observed.unwrap_or("nothing")
+            ))
         };
+        let push = self.run_coordinated_session_push(
+            push_command,
+            session_worktree,
+            push_operation_wait(),
+            observe_default.then_some(remote_default_ref.as_str()),
+            (branch_ref.as_str(), tip_check),
+        );
+        if let Some(tip) = moved_tip.borrow_mut().take() {
+            return Ok(PushAttempt::RemoteTipMoved {
+                remote: default.remote,
+                tip,
+            });
+        }
+        // Git's own check is the last line: the remote moved after the lock's
+        // read (or before an outside-the-lock hook dry run), outside the
+        // broker. Read what it holds instead of relaying the raw rejection,
+        // and decide again against it.
+        let rejected = match &push {
+            Ok(push) => {
+                !push.ok()
+                    && (remote_tip_rejection(&push.stderr) || remote_tip_rejection(&push.stdout))
+            }
+            Err(error) => remote_tip_rejection(&error.to_string()),
+        };
+        if rejected {
+            crate::phase_telemetry::add("push_remote_tip_rejected", std::time::Duration::ZERO);
+            return match self
+                .repo_handle()
+                .remote_ref_oids(&default.remote, std::slice::from_ref(&branch_ref))
+            {
+                Ok(tips) => Ok(PushAttempt::RemoteTipMoved {
+                    tip: tips.get(&branch_ref).cloned().flatten(),
+                    remote: default.remote,
+                }),
+                Err(error) => Err(refused(format!(
+                    "Git refused the push because remote branch {}/{} is no longer where \
+                     broker push expected it, and reading where it is failed ({error}); \
+                     nothing was pushed. {}",
+                    default.remote,
+                    session.branch,
+                    remote_tip_next_steps(
+                        session_id,
+                        &session.branch,
+                        &default.remote,
+                        "FETCH_HEAD"
+                    ),
+                ))),
+            };
+        }
+        let push = push?;
         if !push.ok() {
             return Err(operation_failure("push", &push));
         }
@@ -986,12 +1302,12 @@ impl Broker {
             "push_finalization".into(),
             phase_started.elapsed().as_millis() as u64,
         );
-        Ok(SessionPushReport {
+        Ok(PushAttempt::Pushed(Box::new(SessionPushReport {
             session_id,
             branch: session.branch,
             remote: default.remote,
             pushed_oid: head,
-            previous_remote_oid: recorded.or(tracking),
+            previous_remote_oid: believed_tip,
             commits_pushed: u32::try_from(new_commits).unwrap_or(u32::MAX),
             uncommitted_files: u32::try_from(uncommitted.len()).unwrap_or(u32::MAX),
             uncommitted: UncommittedCounts::from(&uncommitted),
@@ -1012,7 +1328,7 @@ impl Broker {
             review_run: None,
             phase_timings_ms,
             repository: target.display_slug.clone(),
-        })
+        })))
     }
 
     /// Fetch exactly the default branch into its remote-tracking ref through
