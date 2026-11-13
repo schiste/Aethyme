@@ -1,5 +1,6 @@
 use super::*;
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use std::time::Duration;
 
 const BROKER_OPEN_HOST_OPERATION_DB_ENV: &str = "AETHYME_BROKER_OPEN_HOST_OPERATION_DB";
