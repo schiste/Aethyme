@@ -2662,7 +2662,7 @@ pub(crate) fn wait_for_host_deleter_slot(
         if waited >= wait {
             return (HostDeleterSlot::Busy, waited);
         }
-        let step = HOST_DELETER_POLL.min(wait - waited);
+        let step = HOST_DELETER_POLL.min(wait.saturating_sub(waited));
         sleep(step);
         waited += step;
     }

@@ -440,11 +440,12 @@ impl UnattendedPacer {
             .now()
             .saturating_duration_since(self.installed_at);
         let elapsed_ms = duration_ms(elapsed);
-        let removal_rate_per_second = if elapsed_ms == 0 {
-            0
-        } else {
-            self.summary.entries_removed.saturating_mul(1_000) / elapsed_ms
-        };
+        let removal_rate_per_second = self
+            .summary
+            .entries_removed
+            .saturating_mul(1_000)
+            .checked_div(elapsed_ms)
+            .unwrap_or(0);
         UnattendedPacingSummary {
             at_ms,
             elapsed_ms,
