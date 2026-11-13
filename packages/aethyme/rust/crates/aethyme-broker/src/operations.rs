@@ -1764,6 +1764,16 @@ pub(crate) fn try_acquire_local_repository_read_lanes(
     )
 }
 
+/// Whether `checkout` has the canonical coordination key the lanes are keyed
+/// by. Without one, coordinated writers cannot be ordered against at all, so a
+/// `None` from [`try_acquire_local_repository_read_lanes`] means "not
+/// applicable" rather than "busy".
+pub(crate) fn local_repository_has_coordination_key(
+    checkout: &crate::GitRepo,
+) -> Result<bool, BrokerOpError> {
+    Ok(local_repository_coordination_key(checkout, None)?.is_some())
+}
+
 /// Whether a coordinated repository-wide Git write may have run on
 /// `repository` since `generation` was read: one queued after it, or one that
 /// was queued but not started then (`pending_at_generation`) and has started

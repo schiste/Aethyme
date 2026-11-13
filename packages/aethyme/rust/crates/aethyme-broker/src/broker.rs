@@ -572,6 +572,18 @@ pub enum BrokerOpError {
     },
     #[error("session {session_id}'s branch {branch} does not exist in this repository")]
     SessionBranchMissing { session_id: i64, branch: String },
+    /// Submit could not prove that its replay and base tree ran under the Git
+    /// history view it read before them (a repository-wide write such as
+    /// `git replace` may have changed it), even after one rebuild. Nothing was
+    /// verified; rerunning submit plans and replays afresh.
+    #[error(
+        "refusing to verify session {session_id}: the Git history view may have changed while submit replayed it ({first_cause}; after one rebuild: {cause}), so the candidate tree may not be what the commits produce; nothing was verified -- rerun `aethyme broker submit --session {session_id}`"
+    )]
+    SubmissionHistoryViewMoved {
+        session_id: i64,
+        first_cause: &'static str,
+        cause: &'static str,
+    },
     /// `broker sync` declined before changing anything: the worktree is
     /// dirty or mid-operation, or there is no default branch to sync with.
     #[error("broker sync refused: {reason}")]
@@ -3351,7 +3363,13 @@ pub(crate) enum ArtifactSweepNamespaceRegistration {
 pub(crate) enum SubmissionPlanTestPhase {
     PreflightPlanReady,
     ConsumerStarting,
+    /// The consumer has validated (or read) the history view, before it
+    /// plans and replays.
+    ConsumerViewChecked,
     BaseTreeCaptured,
+    /// The one rebuild has replayed and captured the base tree, before its
+    /// view is validated.
+    RebuildBaseTreeCaptured,
 }
 
 #[cfg(test)]

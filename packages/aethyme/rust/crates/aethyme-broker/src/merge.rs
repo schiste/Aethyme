@@ -636,7 +636,7 @@ struct PreparedSubmissionPlan {
 }
 
 /// A plan that can be reused only if its history view is proven unchanged
-/// when it is consumed (`validate_submission_plan_reuse`).
+/// when it is consumed (`validate_submission_history_view`).
 struct PreparedSubmissionReuse {
     prepared: PreparedSubmissionPlan,
     history_view: HistoryViewSnapshot,
@@ -712,16 +712,45 @@ fn build_or_reuse_submission_plan(
     build()
 }
 
-/// Read the history view a submission plan is about to be built under, holding
-/// the shared lanes only for this check. `None` gives the reuse up: the plan is
-/// then built again where it is consumed, as on any submit without reuse.
-fn capture_submission_plan_history_view(
+/// One reading of the history view: what a plan or replay is about to run
+/// under, or why it cannot be read.
+enum HistoryViewRead<T> {
+    Read(T),
+    /// Nothing to coordinate against: no canonical coordination key, or the
+    /// view is already overridden (replace refs, grafts, shallow), as on every
+    /// submit before this check existed in such a repository.
+    NotApplicable(&'static str),
+    /// A repository-wide writer holds or waits for the lanes, one is running
+    /// or unresolved, or the journal could not be read.
+    Unavailable(&'static str),
+}
+
+const VIEW_NO_COORDINATION_KEY: &str = "the repository has no canonical coordination key";
+const VIEW_OVERRIDDEN: &str =
+    "the Git history view is overridden (replace refs, grafts or a shallow boundary)";
+const VIEW_LANES_BUSY: &str = "a repository-wide Git write holds or is waiting for the Git lanes";
+const VIEW_WIDE_WRITE_UNRESOLVED: &str = "a repository-wide Git write is running or unresolved";
+const VIEW_UNREADABLE: &str = "the operation journal or the coordination key could not be read";
+const VIEW_LANES_UNOPENABLE: &str = "the Git lane lock files could not be opened";
+const VIEW_WIDE_WRITE_RAN: &str =
+    "a repository-wide Git write ran while submit planned and replayed";
+
+/// How long a consumer-side reading waits, polling, for a repository-wide
+/// writer to release the lanes before it counts as unavailable. Such writes
+/// (a non-strict push, `git replace`) take seconds; submit waits on them,
+/// briefly, rather than refuse. Preflight never waits: reuse is optional there.
+const CONSUMER_VIEW_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Read the history view a submission plan or replay is about to run under,
+/// holding the shared lanes only for this check.
+fn read_submission_history_view(
     main_root: &Path,
     repo: &GitRepo,
     store: &crate::BrokerStore,
-) -> Option<HistoryViewSnapshot> {
+    wait: std::time::Duration,
+) -> HistoryViewRead<HistoryViewSnapshot> {
     let started = std::time::Instant::now();
-    let snapshot = read_plain_history_view(main_root, repo, store, |store, repository| {
+    let snapshot = read_plain_history_view(main_root, repo, store, wait, |store, repository| {
         Ok(HistoryViewSnapshot {
             repository: repository.to_owned(),
             generation: store.latest_coordinated_operation_id(repository)?,
@@ -729,49 +758,70 @@ fn capture_submission_plan_history_view(
         })
     });
     crate::phase_telemetry::add(PLAN_REUSE_SNAPSHOT_HOLD, started.elapsed());
-    if snapshot.is_none() {
-        crate::phase_telemetry::add(PLAN_REUSE_UNAVAILABLE, std::time::Duration::ZERO);
-    }
     snapshot
 }
 
-/// Whether the history view `snapshot` read is provably the view now, so the
-/// plan built under it may be reused. Holds the shared lanes only for this
-/// check; a busy lane, a doubt or an error answers `false` (build afresh).
-fn validate_submission_plan_reuse(
+/// Read the history view before preflight planning. `None` gives the reuse
+/// up: the consumer reads the view itself and builds the plan afresh.
+fn capture_submission_plan_history_view(
+    main_root: &Path,
+    repo: &GitRepo,
+    store: &crate::BrokerStore,
+) -> Option<HistoryViewSnapshot> {
+    match read_submission_history_view(main_root, repo, store, std::time::Duration::ZERO) {
+        HistoryViewRead::Read(snapshot) => Some(snapshot),
+        HistoryViewRead::NotApplicable(_) | HistoryViewRead::Unavailable(_) => {
+            crate::phase_telemetry::add(PLAN_REUSE_UNAVAILABLE, std::time::Duration::ZERO);
+            None
+        }
+    }
+}
+
+/// Whether the history view `snapshot` read is provably the view now: still
+/// plain, and no repository-wide Git write queued after it or started since
+/// one it saw queued. Holds the shared lanes only for this check. `Err` names
+/// why it could not be proven; the caller builds afresh or refuses.
+fn validate_submission_history_view(
     main_root: &Path,
     repo: &GitRepo,
     store: &crate::BrokerStore,
     snapshot: &HistoryViewSnapshot,
-) -> bool {
+) -> Result<(), &'static str> {
     let started = std::time::Instant::now();
-    let unchanged = read_plain_history_view(main_root, repo, store, |store, repository| {
-        Ok(repository == snapshot.repository
-            && !crate::operations::repository_wide_write_since(
-                store,
-                repository,
-                snapshot.generation,
-                &snapshot.pending,
-            )?)
-    })
-    .unwrap_or(false);
+    let unchanged = read_plain_history_view(
+        main_root,
+        repo,
+        store,
+        CONSUMER_VIEW_WAIT,
+        |store, repository| {
+            Ok(repository == snapshot.repository
+                && !crate::operations::repository_wide_write_since(
+                    store,
+                    repository,
+                    snapshot.generation,
+                    &snapshot.pending,
+                )?)
+        },
+    );
     crate::phase_telemetry::add(PLAN_REUSE_VALIDATE_HOLD, started.elapsed());
-    if !unchanged {
-        crate::phase_telemetry::add(PLAN_REUSE_INVALIDATED, std::time::Duration::ZERO);
+    match unchanged {
+        HistoryViewRead::Read(true) => Ok(()),
+        HistoryViewRead::Read(false) => Err(VIEW_WIDE_WRITE_RAN),
+        HistoryViewRead::NotApplicable(cause) | HistoryViewRead::Unavailable(cause) => Err(cause),
     }
-    unchanged
 }
 
-/// Time submit holds the shared Git lanes to read the history view before
-/// planning (`submit_plan_reuse_snapshot_hold` in phase timings).
+/// Time submit holds the shared Git lanes to read the history view
+/// (`submit_plan_reuse_snapshot_hold` in phase timings), before preflight
+/// planning and before a consumer-side build.
 const PLAN_REUSE_SNAPSHOT_HOLD: &str = "submit_plan_reuse_snapshot_hold";
-/// Time submit holds the shared Git lanes to prove that view unchanged before
-/// reusing the plan.
+/// Time submit holds the shared Git lanes to prove that view unchanged: before
+/// reusing the plan, and again after the replay and base-tree capture.
 const PLAN_REUSE_VALIDATE_HOLD: &str = "submit_plan_reuse_validate_hold";
 /// Counted when the preflight plan was reused.
 const PLAN_REUSE_REUSED: &str = "submit_plan_reuse_reused";
-/// Counted when the history view could not be proven unchanged and the plan
-/// was built again (the one bounded retry).
+/// Counted when the history view could not be proven unchanged before reuse
+/// and the plan was built again instead.
 const PLAN_REUSE_INVALIDATED: &str = "submit_plan_reuse_invalidated";
 /// Counted when the view was unchanged but the base or a session input moved
 /// while submit planned, so the plan was built again against the new inputs.
@@ -779,62 +829,107 @@ const PLAN_REUSE_INPUTS_MOVED: &str = "submit_plan_reuse_inputs_moved";
 /// Counted when the view could not be read before planning (lane busy, wide
 /// writer running or waiting, overridden history, no canonical key).
 const PLAN_REUSE_UNAVAILABLE: &str = "submit_plan_reuse_unavailable";
+/// Counted when the replay and base tree were proven to have run under the
+/// view read before them, the first time.
+const REPLAY_VIEW_VALIDATED: &str = "submit_plan_reuse_replay_validated";
+/// Counted when they could not be, and the one rebuild and replay was proven.
+const REPLAY_VIEW_REBUILT: &str = "submit_plan_reuse_replay_rebuilt";
+/// Counted when the rebuild could not be proven either, and submit refused.
+const REPLAY_VIEW_REFUSED: &str = "submit_plan_reuse_replay_refused";
+/// Counted when the repository has nothing to coordinate the view against (no
+/// canonical key, or an already overridden view) and the replay ran as before.
+const REPLAY_VIEW_UNCOORDINATED: &str = "submit_plan_reuse_replay_uncoordinated";
 
 /// Run `read` with the shared lanes held, if the history view is the plain one
-/// and no repository-wide write is running or unresolved.
+/// and no repository-wide write is running or unresolved. A busy lane or an
+/// unresolved writer is retried, polling, for up to `wait`.
 ///
-/// Invariant (why no lane is held across planning and replay): narrow writers
-/// -- other sessions' pushes, commits and fetches -- hold these lanes shared
-/// and never change the history view, so submit need not exclude them. A
+/// Why no lane is held across planning and replay: narrow writers -- other
+/// sessions' pushes, commits and fetches -- hold these lanes shared and never
+/// change the history view, so submit need not exclude them. A
 /// repository-wide writer, the only kind that can, needs the lanes
 /// exclusively; it cannot hold them while this shared hold lasts, and the
 /// operation journal read under it (`HistoryViewSnapshot`) tells a later
-/// reading whether one ran in between. Plans and replays work on pinned object
-/// IDs and write only objects (`merge-tree --write-tree`, `commit-tree`), never
-/// a ref, which Git allows concurrently with any writer.
+/// reading whether one ran in between. Pinned object IDs alone do NOT make a
+/// plan or replay immune: their Git calls honour replace refs and grafts, so
+/// the same IDs can yield another graph and another tree. That is why the
+/// view is read before planning and proven unchanged both before the plan is
+/// reused and after the replay and base-tree capture, and why a replay that
+/// cannot be proven is rebuilt once or refused, never verified. Replays write
+/// only objects (`merge-tree --write-tree`, `commit-tree`), never a ref.
 fn read_plain_history_view<T>(
     main_root: &Path,
     repo: &GitRepo,
     store: &crate::BrokerStore,
-    read: impl FnOnce(&crate::BrokerStore, &str) -> Result<T, crate::BrokerError>,
-) -> Option<T> {
-    let (repository, lanes) =
-        match crate::operations::try_acquire_local_repository_read_lanes(main_root, repo) {
-            Ok(Some(locked)) => locked,
-            Ok(None) => return None,
-            Err(error) => {
-                crate::warn_unrecorded(
-                    "acquire the shared Git lanes for submission-plan reuse",
-                    Err::<(), _>(error),
-                );
-                return None;
-            }
-        };
-    // Do not plan under a history view the lanes do not make complete. A
-    // shallow boundary, replace ref, or graft keeps the fresh-plan behavior.
-    let result = if repo.has_complete_unmodified_history().unwrap_or(false) {
-        match crate::operations::has_unresolved_repository_wide_mutation(store, &repository)
-            .and_then(|unresolved| {
-                if unresolved {
-                    Ok(None)
-                } else {
-                    read(store, &repository).map(Some)
+    wait: std::time::Duration,
+    mut read: impl FnMut(&crate::BrokerStore, &str) -> Result<T, crate::BrokerError>,
+) -> HistoryViewRead<T> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let unavailable =
+            match crate::operations::try_acquire_local_repository_read_lanes(main_root, repo) {
+                Ok(Some((repository, lanes))) => {
+                    // Do not plan under a history view the lanes do not make
+                    // complete: a shallow boundary, replace ref, or graft keeps the
+                    // fresh-plan behavior.
+                    if !repo.has_complete_unmodified_history().unwrap_or(false) {
+                        return HistoryViewRead::NotApplicable(VIEW_OVERRIDDEN);
+                    }
+                    match crate::operations::has_unresolved_repository_wide_mutation(
+                        store,
+                        &repository,
+                    ) {
+                        Ok(false) => {
+                            let result = match read(store, &repository) {
+                                Ok(value) => HistoryViewRead::Read(value),
+                                Err(error) => {
+                                    crate::warn_unrecorded(
+                                        "read coordinated operations for submission-plan reuse",
+                                        Err::<(), _>(error),
+                                    );
+                                    HistoryViewRead::Unavailable(VIEW_UNREADABLE)
+                                }
+                            };
+                            drop(lanes);
+                            return result;
+                        }
+                        Ok(true) => VIEW_WIDE_WRITE_UNRESOLVED,
+                        Err(error) => {
+                            crate::warn_unrecorded(
+                                "inspect coordinated operations for submission-plan reuse",
+                                Err::<(), _>(error),
+                            );
+                            return HistoryViewRead::Unavailable(VIEW_UNREADABLE);
+                        }
+                    }
                 }
-            }) {
-            Ok(value) => value,
-            Err(error) => {
-                crate::warn_unrecorded(
-                    "inspect coordinated operations for submission-plan reuse",
-                    Err::<(), _>(error),
-                );
-                None
-            }
+                Ok(None) => match crate::operations::local_repository_has_coordination_key(repo) {
+                    Ok(false) => return HistoryViewRead::NotApplicable(VIEW_NO_COORDINATION_KEY),
+                    Ok(true) => VIEW_LANES_BUSY,
+                    Err(error) => {
+                        crate::warn_unrecorded(
+                            "resolve the coordination key for submission-plan reuse",
+                            Err::<(), _>(error),
+                        );
+                        return HistoryViewRead::Unavailable(VIEW_UNREADABLE);
+                    }
+                },
+                // Lock files that cannot be opened cannot be held by a
+                // coordinated repository-wide writer either: it refuses on the
+                // same error. Nothing to coordinate against, as before.
+                Err(error) => {
+                    crate::warn_unrecorded(
+                        "acquire the shared Git lanes for submission-plan reuse",
+                        Err::<(), _>(error),
+                    );
+                    return HistoryViewRead::NotApplicable(VIEW_LANES_UNOPENABLE);
+                }
+            };
+        if std::time::Instant::now() >= deadline {
+            return HistoryViewRead::Unavailable(unavailable);
         }
-    } else {
-        None
-    };
-    drop(lanes);
-    result
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 impl SubmissionPlan {
@@ -1501,6 +1596,103 @@ impl Broker {
         Ok(outcome)
     }
 
+    /// The consumer's own reading of the history view, waiting briefly for a
+    /// repository-wide writer to release the lanes.
+    fn read_consumer_history_view(&self, main_root: &Path) -> HistoryViewRead<HistoryViewSnapshot> {
+        read_submission_history_view(
+            main_root,
+            self.repo_handle(),
+            self.store_ref(),
+            CONSUMER_VIEW_WAIT,
+        )
+    }
+
+    /// Build or reuse the plan, replay it onto `base`, and capture the paths
+    /// it changes and the base tree: everything the gates will judge.
+    fn plan_and_replay(
+        &self,
+        prepared_plan: Option<PreparedSubmissionPlan>,
+        entry: &MergeQueueEntry,
+        session: &crate::types::Session,
+        base: &str,
+    ) -> Result<(SubmissionPlan, SubmissionReplay, String), BrokerOpError> {
+        let offered = prepared_plan.is_some();
+        let rebuilt = std::cell::Cell::new(false);
+        let mut submission_plan = build_or_reuse_submission_plan(
+            self.repo_handle(),
+            prepared_plan,
+            entry,
+            session,
+            &entry.head_commit,
+            base,
+            || {
+                rebuilt.set(true);
+                self.build_submission_plan(session, &entry.head_commit, base)
+            },
+        )?;
+        if offered {
+            crate::phase_telemetry::add(
+                if rebuilt.get() {
+                    PLAN_REUSE_INPUTS_MOVED
+                } else {
+                    PLAN_REUSE_REUSED
+                },
+                std::time::Duration::ZERO,
+            );
+        }
+        let simulation = self.replay_submission_plan(&submission_plan)?;
+        if simulation.conflicts.is_empty() {
+            submission_plan.merged_tree_paths =
+                self.repo_handle().changed_between(base, &simulation.tree)?;
+        }
+        let base_tree = self.repo_handle().commit_tree_id(base)?;
+        Ok((submission_plan, simulation, base_tree))
+    }
+
+    /// The one rebuild: read the view afresh, build and replay under it, and
+    /// prove it unchanged afterwards. Anything short of that refuses, naming
+    /// both causes; there is no further retry.
+    fn replay_once_more(
+        &self,
+        main_root: &Path,
+        entry: &MergeQueueEntry,
+        session: &crate::types::Session,
+        base: &str,
+        first_cause: &'static str,
+    ) -> Result<(SubmissionPlan, SubmissionReplay, String), BrokerOpError> {
+        let refuse = |cause: &'static str| {
+            crate::phase_telemetry::add(REPLAY_VIEW_REFUSED, std::time::Duration::ZERO);
+            BrokerOpError::SubmissionHistoryViewMoved {
+                session_id: entry.session_id,
+                first_cause,
+                cause,
+            }
+        };
+        let snapshot = match self.read_consumer_history_view(main_root) {
+            HistoryViewRead::Read(snapshot) => snapshot,
+            HistoryViewRead::NotApplicable(cause) | HistoryViewRead::Unavailable(cause) => {
+                return Err(refuse(cause));
+            }
+        };
+        let replayed = self.plan_and_replay(None, entry, session, base)?;
+        #[cfg(test)]
+        self.observe_submission_plan_test_phase(
+            crate::broker::SubmissionPlanTestPhase::RebuildBaseTreeCaptured,
+        );
+        match validate_submission_history_view(
+            main_root,
+            self.repo_handle(),
+            self.store_ref(),
+            &snapshot,
+        ) {
+            Ok(()) => {
+                crate::phase_telemetry::add(REPLAY_VIEW_REBUILT, std::time::Duration::ZERO);
+                Ok(replayed)
+            }
+            Err(cause) => Err(refuse(cause)),
+        }
+    }
+
     fn simulate_and_gate_against(
         &mut self,
         entry_id: i64,
@@ -1525,58 +1717,79 @@ impl Broker {
         self.observe_submission_plan_test_phase(
             crate::broker::SubmissionPlanTestPhase::ConsumerStarting,
         );
-        // The bounded retry: a plan whose history view cannot be proven
-        // unchanged since it was built is built once more, here, against the
-        // freshly read base; a moved base or session input rebuilds it too
-        // (`PreparedSubmissionPlan::matches`). Nothing stale is reused.
-        let prepared_plan = prepared_plan.and_then(|reuse| {
-            validate_submission_plan_reuse(
-                &self.main_root_path(),
+        // A plan whose history view cannot be proven unchanged since it was
+        // built is built again, here, against the freshly read base; a moved
+        // base or session input rebuilds it too (`PreparedSubmissionPlan::
+        // matches`). Nothing stale is reused.
+        let main_root = self.main_root_path();
+        let (prepared_plan, view) = match prepared_plan {
+            Some(reuse) => match validate_submission_history_view(
+                &main_root,
                 self.repo_handle(),
                 self.store_ref(),
                 &reuse.history_view,
-            )
-            .then_some(reuse.prepared)
-        });
-        let offered = prepared_plan.is_some();
-        let rebuilt = std::cell::Cell::new(false);
-        let mut submission_plan = build_or_reuse_submission_plan(
-            self.repo_handle(),
-            prepared_plan,
-            &entry,
-            &session,
-            &entry.head_commit,
-            &base,
-            || {
-                rebuilt.set(true);
-                self.build_submission_plan(&session, &entry.head_commit, &base)
+            ) {
+                Ok(()) => (
+                    Some(reuse.prepared),
+                    HistoryViewRead::Read(reuse.history_view),
+                ),
+                Err(_) => {
+                    crate::phase_telemetry::add(PLAN_REUSE_INVALIDATED, std::time::Duration::ZERO);
+                    (None, self.read_consumer_history_view(&main_root))
+                }
             },
-        )?;
-        if offered {
-            crate::phase_telemetry::add(
-                if rebuilt.get() {
-                    PLAN_REUSE_INPUTS_MOVED
-                } else {
-                    PLAN_REUSE_REUSED
-                },
-                std::time::Duration::ZERO,
-            );
-        }
+            None => (None, self.read_consumer_history_view(&main_root)),
+        };
+        #[cfg(test)]
+        self.observe_submission_plan_test_phase(
+            crate::broker::SubmissionPlanTestPhase::ConsumerViewChecked,
+        );
 
         if let Some(progress) = progress {
             progress.phase("simulating the merge");
         }
-        let simulation = self.replay_submission_plan(&submission_plan)?;
-        if simulation.conflicts.is_empty() {
-            submission_plan.merged_tree_paths = self
-                .repo_handle()
-                .changed_between(&base, &simulation.tree)?;
-        }
-        let base_tree = self.repo_handle().commit_tree_id(&base)?;
-        #[cfg(test)]
-        self.observe_submission_plan_test_phase(
-            crate::broker::SubmissionPlanTestPhase::BaseTreeCaptured,
-        );
+        // The replay and base tree are what gates verify, and their Git calls
+        // honour replace refs and grafts: prove they ran under the view read
+        // before them, or build and replay once more under a fresh reading
+        // and prove that, or refuse. Never verify an unproven replay.
+        let (submission_plan, simulation, base_tree) = match view {
+            HistoryViewRead::NotApplicable(_) => {
+                let replayed = self.plan_and_replay(prepared_plan, &entry, &session, &base)?;
+                #[cfg(test)]
+                self.observe_submission_plan_test_phase(
+                    crate::broker::SubmissionPlanTestPhase::BaseTreeCaptured,
+                );
+                crate::phase_telemetry::add(REPLAY_VIEW_UNCOORDINATED, std::time::Duration::ZERO);
+                replayed
+            }
+            HistoryViewRead::Read(snapshot) => {
+                let replayed = self.plan_and_replay(prepared_plan, &entry, &session, &base)?;
+                #[cfg(test)]
+                self.observe_submission_plan_test_phase(
+                    crate::broker::SubmissionPlanTestPhase::BaseTreeCaptured,
+                );
+                match validate_submission_history_view(
+                    &main_root,
+                    self.repo_handle(),
+                    self.store_ref(),
+                    &snapshot,
+                ) {
+                    Ok(()) => {
+                        crate::phase_telemetry::add(
+                            REPLAY_VIEW_VALIDATED,
+                            std::time::Duration::ZERO,
+                        );
+                        replayed
+                    }
+                    Err(cause) => {
+                        self.replay_once_more(&main_root, &entry, &session, &base, cause)?
+                    }
+                }
+            }
+            HistoryViewRead::Unavailable(cause) => {
+                self.replay_once_more(&main_root, &entry, &session, &base, cause)?
+            }
+        };
         let main_checkout_session = Path::new(&session.worktree_path) == self.main_root_path();
         self.store()
             .set_merge_status(entry.id, MergeStatus::Simulating, None, None)?;
@@ -3674,8 +3887,21 @@ mod owned_merge_history_tests {
     /// thread recorded, and every failure the test observed.
     struct PausedSubmit {
         outcome: Option<SubmitOutcome>,
+        error: Option<BrokerOpError>,
+        phases: Vec<crate::broker::SubmissionPlanTestPhase>,
         counts: std::collections::BTreeMap<String, u64>,
         failures: Vec<String>,
+    }
+
+    impl PausedSubmit {
+        /// The failures, plus one if submit did not succeed.
+        fn failures_requiring_success(&self) -> Vec<String> {
+            let mut failures = self.failures.clone();
+            if let Some(error) = &self.error {
+                failures.push(format!("submit failed: {error}"));
+            }
+            failures
+        }
     }
 
     /// Run `submit` on its own thread, pausing at each submission-plan phase
@@ -3713,24 +3939,25 @@ mod owned_merge_history_tests {
             .unwrap();
 
         let mut failures = Vec::new();
-        for expected in [
-            crate::broker::SubmissionPlanTestPhase::PreflightPlanReady,
-            crate::broker::SubmissionPlanTestPhase::ConsumerStarting,
-            crate::broker::SubmissionPlanTestPhase::BaseTreeCaptured,
-        ] {
-            match phase_receiver.recv_timeout(Duration::from_secs(10)) {
-                Ok(actual) => {
-                    if actual != expected {
-                        failures.push(format!(
-                            "submit phase order changed: expected {expected:?}, observed {actual:?}"
-                        ));
-                    }
-                    at_phase(actual, &mut failures);
+        let mut phases = Vec::new();
+        let started = std::time::Instant::now();
+        loop {
+            match phase_receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(phase) => {
+                    phases.push(phase);
+                    at_phase(phase, &mut failures);
                     let _ = resume_sender.send(());
                 }
-                Err(error) => failures.push(format!(
-                    "submit did not reach expected phase {expected:?}: {error}"
-                )),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if submit.is_finished() {
+                        break;
+                    }
+                    if started.elapsed() > Duration::from_secs(60) {
+                        failures.push(format!("submit did not finish; phases seen: {phases:?}"));
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         // Release any phase callback the test failed to observe before
@@ -3738,19 +3965,19 @@ mod owned_merge_history_tests {
         for _ in 0..3 {
             let _ = resume_sender.send(());
         }
-        let (outcome, counts) = match join_before(submit, Duration::from_secs(30), "submit") {
-            Ok((Ok(outcome), counts)) => (Some(outcome), counts),
-            Ok((Err(error), counts)) => {
-                failures.push(format!("submit failed: {error}"));
-                (None, counts)
-            }
+        let (outcome, error, counts) = match join_before(submit, Duration::from_secs(30), "submit")
+        {
+            Ok((Ok(outcome), counts)) => (Some(outcome), None, counts),
+            Ok((Err(error), counts)) => (None, Some(error), counts),
             Err(error) => {
                 failures.push(error);
-                (None, Default::default())
+                (None, None, Default::default())
             }
         };
         PausedSubmit {
             outcome,
+            error,
+            phases,
             counts,
             failures,
         }
@@ -3797,17 +4024,37 @@ mod owned_merge_history_tests {
                 }
             },
         );
-        let mut failures = paused.failures;
+        let mut failures = paused.failures_requiring_success();
         if paused.counts.get(PLAN_REUSE_REUSED) != Some(&1) {
             failures.push(format!(
                 "an undisturbed submit should reuse its plan once: {:?}",
                 paused.counts
             ));
         }
-        for key in [PLAN_REUSE_SNAPSHOT_HOLD, PLAN_REUSE_VALIDATE_HOLD] {
-            if paused.counts.get(key) != Some(&1) {
-                failures.push(format!("{key} was not recorded once: {:?}", paused.counts));
+        // One reading before planning; one proof before reuse and one after
+        // the replay and base-tree capture.
+        for (key, expected) in [
+            (PLAN_REUSE_SNAPSHOT_HOLD, 1),
+            (PLAN_REUSE_VALIDATE_HOLD, 2),
+            (REPLAY_VIEW_VALIDATED, 1),
+        ] {
+            if paused.counts.get(key) != Some(&expected) {
+                failures.push(format!(
+                    "{key} was not recorded {expected} time(s): {:?}",
+                    paused.counts
+                ));
             }
+        }
+        use crate::broker::SubmissionPlanTestPhase as Phase;
+        if paused.phases
+            != [
+                Phase::PreflightPlanReady,
+                Phase::ConsumerStarting,
+                Phase::ConsumerViewChecked,
+                Phase::BaseTreeCaptured,
+            ]
+        {
+            failures.push(format!("unexpected phases: {:?}", paused.phases));
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
@@ -3884,7 +4131,7 @@ mod owned_merge_history_tests {
                 }
             },
         );
-        let mut failures = paused.failures;
+        let mut failures = paused.failures_requiring_success();
         if paused.counts.get(PLAN_REUSE_INVALIDATED) != Some(&1)
             || paused.counts.contains_key(PLAN_REUSE_REUSED)
         {
@@ -3945,7 +4192,7 @@ mod owned_merge_history_tests {
                 moved_base = Some(git(&root, &["rev-parse", "HEAD"]));
             },
         );
-        let mut failures = paused.failures;
+        let mut failures = paused.failures_requiring_success();
         let moved_base = moved_base.expect("the base moved during planning");
         match paused.outcome.as_ref() {
             Some(outcome) => {
@@ -3969,6 +4216,351 @@ mod owned_merge_history_tests {
         {
             failures.push(format!(
                 "a moved base must rebuild the plan: {:?}",
+                paused.counts
+            ));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Journal a repository-wide Git write (`git replace`) on `repository`,
+    /// moved through `statuses` after it is queued; returns its id.
+    fn journal_wide_write(
+        broker: &mut Broker,
+        session_id: i64,
+        repository: &str,
+        statuses: &[(crate::OperationStatus, Option<i64>)],
+    ) -> Result<i64, crate::BrokerError> {
+        let operation =
+            broker
+                .store()
+                .create_coordinated_operation(&crate::NewCoordinatedOperation {
+                    session_id,
+                    provider: crate::OperationProvider::Git,
+                    repository: repository.to_owned(),
+                    scope: "repository".into(),
+                    effect: crate::OperationEffect::Write,
+                    authorization_reason: Some("a wide writer during submit".into()),
+                    command_json: r#"["replace","old","new"]"#.into(),
+                    pid: i64::from(std::process::id()),
+                    host_operation_id: None,
+                    identity_provenance: crate::OperationIdentityProvenance::VerifiedCanonical,
+                })?;
+        for (status, exit_code) in statuses {
+            broker.store().transition_coordinated_operation(
+                operation.id,
+                *status,
+                *exit_code,
+                None,
+            )?;
+        }
+        Ok(operation.id)
+    }
+
+    /// A Running-then-Succeeded wide write, as one that ran to completion.
+    const RAN_TO_COMPLETION: &[(crate::OperationStatus, Option<i64>)] = &[
+        (crate::OperationStatus::Running, None),
+        (crate::OperationStatus::Succeeded, Some(0)),
+    ];
+
+    /// A repository with a canonical origin and one session beside it whose
+    /// branch adds `work.txt` to the base: (owner, root, broker, session id,
+    /// session head, base commit, coordination key).
+    fn linear_session_fixture() -> (
+        std::sync::Arc<tempfile::TempDir>,
+        PathBuf,
+        Broker,
+        i64,
+        String,
+        String,
+        String,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repository");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        edit(&root, "base.txt", "base\n");
+        let base = git(&root, &["rev-parse", "HEAD"]);
+        git(
+            &root,
+            &["remote", "add", "origin", "git@github.com:example/repo.git"],
+        );
+        let mut broker = Broker::open(&root).unwrap();
+        let worktree = tmp.path().join("session");
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent/session",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let session = broker.adopt(&worktree, None).unwrap();
+        edit(&worktree, "work.txt", "work\n");
+        let head = git(&worktree, &["rev-parse", "HEAD"]);
+        let repository = GitRepo::discover(&root)
+            .unwrap()
+            .resolve_remote_target("origin", None)
+            .unwrap()
+            .coordination_key;
+        (
+            std::sync::Arc::new(tmp),
+            root,
+            broker,
+            session.id,
+            head,
+            base,
+            repository,
+        )
+    }
+
+    /// A same-parent replacement for `commit` that changes nothing: replayed
+    /// under it, the session would look content-empty.
+    fn empty_replacement(root: &Path, commit: &str, base: &str) -> String {
+        let checkout = GitRepo::discover(root).unwrap();
+        checkout
+            .commit_tree(
+                &checkout.commit_tree_id(base).unwrap(),
+                &[base],
+                "same-parent replacement that drops the session's change",
+                &crate::attribution::Attribution::broker_only(),
+            )
+            .unwrap_or_else(|error| panic!("replacement for {commit}: {error}"))
+    }
+
+    /// Run a coordinated, journaled `git replace <commit> <replacement>`.
+    fn coordinated_replace(
+        broker: &mut Broker,
+        session_id: i64,
+        commit: &str,
+        replacement: &str,
+    ) -> Result<(), String> {
+        let request = crate::CoordinatedCommand {
+            session_id,
+            provider: crate::OperationProvider::Git,
+            repository: None,
+            resolved_target: None,
+            scope: None,
+            declared_effect: Some(crate::OperationEffect::Write),
+            destructive_confirmed: false,
+            cross_session: None,
+            ref_write_acknowledged: false,
+            authorization_reason: Some("change the history view during submit".into()),
+            args: vec!["replace".into(), commit.into(), replacement.into()],
+        };
+        match broker.run_coordinated_operation_with_wait(request, crate::QueueWait::Seconds(8)) {
+            Ok(report) if report.ok() => Ok(()),
+            Ok(report) => Err(format!(
+                "replace did not succeed: {:?}",
+                report.operation.status
+            )),
+            Err(error) => Err(format!("replace failed: {error}")),
+        }
+    }
+
+    /// The gap a single check before reuse left: a coordinated `git replace`
+    /// that lands after that check but before the replay makes the replay
+    /// read the replacement, so the candidate tree is not what the real
+    /// commits produce (here the session would look content-empty). The check
+    /// after the base-tree capture sees the write in the journal, and submit
+    /// rebuilds and replays once more under a fresh, proven view: the
+    /// candidate is the real commits' tree.
+    #[test]
+    fn a_replace_landing_before_the_replay_rebuilds_and_verifies_the_real_tree() {
+        use crate::broker::SubmissionPlanTestPhase as Phase;
+
+        let (owner, root, submit_broker, session_id, head, base, _repository) =
+            linear_session_fixture();
+        let replacement = empty_replacement(&root, &head, &base);
+        let mut writer_broker = Broker::open(&root).unwrap();
+        let replace_ref = format!("refs/replace/{head}");
+
+        let paused = submit_pausing_at_plan_phases(
+            submit_broker,
+            session_id,
+            std::sync::Arc::clone(&owner),
+            |phase, failures| match phase {
+                Phase::ConsumerViewChecked => {
+                    if let Err(error) =
+                        coordinated_replace(&mut writer_broker, session_id, &head, &replacement)
+                    {
+                        failures.push(error);
+                    }
+                }
+                // The replay has run under the replacement; restore the plain
+                // view so the one rebuild can be proven.
+                Phase::BaseTreeCaptured => {
+                    if GitRepo::discover(&root)
+                        .unwrap()
+                        .resolve_ref(&replace_ref)
+                        .is_none()
+                    {
+                        failures.push("the replacement was not in place for the replay".into());
+                    }
+                    git(&root, &["replace", "-d", &head]);
+                }
+                _ => {}
+            },
+        );
+        let mut failures = paused.failures_requiring_success();
+        match paused.outcome.as_ref() {
+            Some(outcome) => {
+                if outcome.no_changes
+                    || outcome.submission_plan.merged_tree_paths != ["work.txt".to_string()]
+                {
+                    failures.push(format!(
+                        "verified a replay made under the replacement: no_changes {}, paths {:?}",
+                        outcome.no_changes, outcome.submission_plan.merged_tree_paths
+                    ));
+                }
+            }
+            None => failures.push("submit produced no outcome".into()),
+        }
+        if paused.counts.get(REPLAY_VIEW_REBUILT) != Some(&1)
+            || paused.counts.contains_key(REPLAY_VIEW_VALIDATED)
+        {
+            failures.push(format!(
+                "the replay under a changed view must be rebuilt once: {:?}",
+                paused.counts
+            ));
+        }
+        if !paused.phases.contains(&Phase::RebuildBaseTreeCaptured) {
+            failures.push(format!("no rebuild ran: {:?}", paused.phases));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// When the history view changes again while the one rebuild runs,
+    /// submit refuses with a retryable refusal that names the cause and
+    /// verifies nothing; it never loops and never verifies an unproven replay.
+    #[test]
+    fn a_second_history_change_during_the_rebuild_refuses() {
+        use crate::broker::SubmissionPlanTestPhase as Phase;
+
+        let (owner, root, submit_broker, session_id, head, base, repository) =
+            linear_session_fixture();
+        let replacement = empty_replacement(&root, &head, &base);
+        let mut writer_broker = Broker::open(&root).unwrap();
+
+        let paused = submit_pausing_at_plan_phases(
+            submit_broker,
+            session_id,
+            std::sync::Arc::clone(&owner),
+            |phase, failures| {
+                let result = match phase {
+                    Phase::ConsumerViewChecked => {
+                        coordinated_replace(&mut writer_broker, session_id, &head, &replacement)
+                    }
+                    Phase::BaseTreeCaptured => {
+                        git(&root, &["replace", "-d", &head]);
+                        Ok(())
+                    }
+                    Phase::RebuildBaseTreeCaptured => journal_wide_write(
+                        &mut writer_broker,
+                        session_id,
+                        &repository,
+                        RAN_TO_COMPLETION,
+                    )
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                    _ => Ok(()),
+                };
+                if let Err(error) = result {
+                    failures.push(error);
+                }
+            },
+        );
+        let mut failures = paused.failures.clone();
+        match paused.error.as_ref() {
+            Some(error @ BrokerOpError::SubmissionHistoryViewMoved { cause, .. }) => {
+                if *cause != VIEW_WIDE_WRITE_RAN {
+                    failures.push(format!("the refusal names the wrong cause: {error}"));
+                }
+                if crate::exit_status::for_broker_error(error) != crate::exit_status::REFUSED {
+                    failures.push("the refusal is not the retryable exit".into());
+                }
+                if !error.to_string().contains("rerun `aethyme broker submit") {
+                    failures.push(format!("the refusal does not say to rerun: {error}"));
+                }
+            }
+            other => failures.push(format!(
+                "a second change must refuse, not {other:?} / outcome {:?}",
+                paused.outcome.as_ref().map(|outcome| outcome.entry.status)
+            )),
+        }
+        if paused.counts.get(REPLAY_VIEW_REFUSED) != Some(&1)
+            || paused.counts.contains_key(REPLAY_VIEW_REBUILT)
+        {
+            failures.push(format!("expected one refusal: {:?}", paused.counts));
+        }
+        if paused
+            .phases
+            .iter()
+            .filter(|phase| **phase == Phase::RebuildBaseTreeCaptured)
+            .count()
+            != 1
+        {
+            failures.push(format!("expected exactly one rebuild: {:?}", paused.phases));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A repository-wide write already queued when the view is read, which
+    /// starts and finishes while submit plans, adds no journal row after the
+    /// read's generation: only the queued-at-read check sees it. Submit must
+    /// not reuse a plan built while it may have run.
+    #[test]
+    fn a_wide_write_queued_before_planning_that_runs_during_it_rebuilds_the_plan() {
+        let managed_root_owner = tempfile::tempdir().unwrap();
+        let managed_root = managed_root_owner.path().join("worktrees");
+        let (tmp, submit_broker, plan) = fixture_with_worktree_root(Some(managed_root));
+        let owner = std::sync::Arc::new(tmp);
+        let root = owner.path().canonicalize().unwrap();
+        git(
+            &root,
+            &["remote", "add", "origin", "git@github.com:example/repo.git"],
+        );
+        let repository = GitRepo::discover(&root)
+            .unwrap()
+            .resolve_remote_target("origin", None)
+            .unwrap()
+            .coordination_key;
+        let session_id = plan.session_id;
+        let mut writer_broker = Broker::open(&root).unwrap();
+        let queued = journal_wide_write(&mut writer_broker, session_id, &repository, &[]).unwrap();
+
+        let paused = submit_pausing_at_plan_phases(
+            submit_broker,
+            session_id,
+            std::sync::Arc::clone(&owner),
+            |phase, failures| {
+                if phase != crate::broker::SubmissionPlanTestPhase::PreflightPlanReady {
+                    return;
+                }
+                for (status, exit_code) in RAN_TO_COMPLETION {
+                    if let Err(error) = writer_broker
+                        .store()
+                        .transition_coordinated_operation(queued, *status, *exit_code, None)
+                    {
+                        failures.push(format!("could not run the queued writer: {error}"));
+                    }
+                }
+            },
+        );
+        let mut failures = paused.failures_requiring_success();
+        if paused.counts.get(PLAN_REUSE_INVALIDATED) != Some(&1)
+            || paused.counts.contains_key(PLAN_REUSE_REUSED)
+        {
+            failures.push(format!(
+                "a queued wide write that ran during planning must rebuild the plan: {:?}",
+                paused.counts
+            ));
+        }
+        if paused.counts.get(REPLAY_VIEW_VALIDATED) != Some(&1) {
+            failures.push(format!(
+                "the rebuilt replay was not proven: {:?}",
                 paused.counts
             ));
         }
