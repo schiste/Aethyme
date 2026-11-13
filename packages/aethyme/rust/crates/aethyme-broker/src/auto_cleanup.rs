@@ -8350,8 +8350,12 @@ mod tests {
         );
 
         let next_lap = broker.auto_cleanup_now(None).unwrap().unwrap();
+        // The new lap starts again from the oldest session. The two
+        // `no_landing_evidence` declines the last pass proved are remembered
+        // (same head, tip and evidence), so only the first session is
+        // proved; all three are still counted under their decline.
         assert_eq!(
-            next_lap.landed_sessions_examined, 3,
+            next_lap.landed_sessions_examined, 1,
             "a finished lap starts the next one from the oldest session: {next_lap:#?}"
         );
         assert_eq!(
