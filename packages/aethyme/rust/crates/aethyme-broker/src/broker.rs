@@ -1991,6 +1991,12 @@ pub struct StatusView {
     /// cursor. Omitted until that lane has judged a session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub landed_session_retirement: Option<crate::LandedSessionRetirementView>,
+    /// The background worker's last capacity removal slice (meta key
+    /// `auto_cleanup.capacity_removal`): outcome, counts per keep code, top
+    /// ignored blockers with their config line, lap position and timings.
+    /// Omitted until a slice has run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity_removal: Option<crate::CapacityRemovalSlice>,
 }
 
 /// How many refused reviews `broker status` carries.

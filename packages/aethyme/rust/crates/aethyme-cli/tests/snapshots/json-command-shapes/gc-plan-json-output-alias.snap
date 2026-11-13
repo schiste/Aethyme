@@ -21,7 +21,9 @@
       "removal_budget_ms": "integer",
       "removal_elapsed_ms": "integer",
       "removal_examined": "integer",
+      "removal_inventory_unavailable": "bool",
       "removal_memo_skips": "integer",
+      "removal_scan_ms": "integer",
       "removal_selected": "integer",
       "retirement_budget_ms": "integer",
       "retirement_elapsed_ms": "integer"

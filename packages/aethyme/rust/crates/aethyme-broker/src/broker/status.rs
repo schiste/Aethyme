@@ -44,6 +44,9 @@ impl Broker {
         view.landed_session_retirement = auto_cleanup
             .as_ref()
             .and_then(crate::AutoCleanupReport::landed_session_retirement_view);
+        view.capacity_removal = auto_cleanup
+            .as_ref()
+            .and_then(|report| report.capacity_removal.clone());
         push_auto_cleanup_advice(&mut view, auto_cleanup);
         self.push_checkout_capacity_advice(&mut view, deadline);
         push_environment_minimum_advice(&mut view, deadline);
@@ -488,6 +491,9 @@ impl Broker {
         view.landed_session_retirement = auto_cleanup
             .as_ref()
             .and_then(crate::AutoCleanupReport::landed_session_retirement_view);
+        view.capacity_removal = auto_cleanup
+            .as_ref()
+            .and_then(|report| report.capacity_removal.clone());
         push_auto_cleanup_advice(&mut view, auto_cleanup);
         self.push_checkout_capacity_advice(&mut view, deadline);
         push_environment_minimum_advice(&mut view, deadline);
@@ -1409,6 +1415,7 @@ impl Broker {
             in_flight_submits,
             waiters: crate::waiters::current_waiters(&self.main_root, now_ms),
             landed_session_retirement: None,
+            capacity_removal: None,
         })
     }
 

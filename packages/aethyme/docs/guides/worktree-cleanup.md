@@ -174,7 +174,21 @@ its cache passes, each of which now holds the GC lock for at most 30 seconds.
 A slice removes one checkout at a time, at most four, and after each waits out
 what Git deleted at `[cleanup] unattended_unlinks_per_second` with no lock
 held. A slice that removes nothing waits 10 minutes before pressure alone
-starts another; one that finds the GC lock held waits 1 minute. Broker opens too short to count checkouts read the count
+starts another once its lap of closed checkouts has ended; one that finds the
+GC lock held, or that moved the lap forward but ran out of time before its
+end, waits 1 minute. A slice first finishes the checkout path index if another
+lane left it mid-lap, so a long index lap no longer leaves selection without
+an inventory. Each slice records its own result under the meta key
+`auto_cleanup.capacity_removal`, shown as `auto_cleanup.capacity_removal` in
+`aethyme broker gc plan --json` and as `capacity_removal` in
+`aethyme broker status --json`; the worker's later lanes do not overwrite it.
+Its `outcome` is `removed`, `lock_busy`, `inventory_unavailable`,
+`lap_unfinished` or `nothing_removable`; `kept_by_code` counts the kept
+checkouts per keep code, `blocked_by_ignored` names the ignored directories
+holding the most checkouts with the line that would release each,
+`lap_remaining` and the cursor say how far the lap got, and `scan_ms`,
+`selection_ms`, `apply_ms`, `paced_ms` and `elapsed_ms` say where the time
+went. Broker opens too short to count checkouts read the count
 `broker start` last recorded. Within the removal lane, selection uses at most
 three quarters of the budget, so revalidation and the first removal always
 have time (`auto_cleanup.lanes.removal_selected` and
