@@ -73,6 +73,10 @@ pub struct AuditTarget {
 struct AuditLandingContext<'a> {
     target: &'a AuditTarget,
     cache: &'a mut LandingVerdictCache,
+    /// One `for-each-ref` listing of local branch tips, read once per audit
+    /// instead of one `rev-parse` per session ever recorded. `None` when the
+    /// listing failed; each session then resolves its own branch.
+    branch_tips: Option<&'a BTreeMap<String, String>>,
 }
 
 /// Who, if anyone, accounts for an item.
@@ -549,10 +553,18 @@ impl Broker {
                 Vec::new()
             }
         };
-        let registration = |path: &Path| {
-            let key = path_key(path);
-            registered.iter().find(|entry| path_key(&entry.path) == key)
-        };
+        // Canonicalize each registration once. Looking each session up by a
+        // linear scan canonicalized every registration again per session:
+        // thousands of sessions times hundreds of checkouts.
+        let mut registered_by_key: std::collections::HashMap<PathBuf, &GitWorktreeInfo> =
+            std::collections::HashMap::with_capacity(registered.len());
+        for entry in &registered {
+            registered_by_key
+                .entry(path_key(&entry.path))
+                .or_insert(entry);
+        }
+        let registration = |path: &Path| registered_by_key.get(&path_key(path)).copied();
+        let branch_tips = repo.local_branch_tips();
 
         let plan_items: BTreeMap<i64, &CleanupWorktreePlan> = plan
             .worktrees
@@ -591,6 +603,7 @@ impl Broker {
             let mut landing_context = AuditLandingContext {
                 target: &target,
                 cache: &mut *landing_cache,
+                branch_tips: branch_tips.as_ref(),
             };
             if let Some(mut item) = self.audit_session(
                 &session,
@@ -725,7 +738,11 @@ impl Broker {
     ) -> Option<AuditItem> {
         let repo = self.repo_handle();
         let present = path.exists();
-        let branch_tip = repo.resolve_ref(&format!("refs/heads/{}", session.branch));
+        let branch_ref = format!("refs/heads/{}", session.branch);
+        let branch_tip = match landing.branch_tips {
+            Some(tips) => tips.get(&branch_ref).cloned(),
+            None => repo.resolve_ref(&branch_ref),
+        };
         let live = !session.status.is_closed();
         if !present && branch_tip.is_none() && !live && registration.is_none() {
             // Nothing on disk, no branch, no registration: the row is history.
