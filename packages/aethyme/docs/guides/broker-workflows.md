@@ -545,11 +545,15 @@ A write that provably sent nothing to the remote is recorded `failed`, never
 `outcome_unknown`, so it blocks nothing and can simply be retried. For a
 `git push` the proof is Git's own Trace2 events: the push entered the remote
 ref listing, never finished it, never reached a hook or the ref-update phase,
-and exited non-zero. That is how an unresolvable host, a refused or
-unreachable connection, a TLS or SSH handshake failure, or a rejected login
-ends, and it does not depend on Git's (localisable) messages. For `gh`, the
+and exited non-zero, and every push URL uses a transport built into Git
+(ssh, http, https, git, file or a local path). That is how an unresolvable
+host, a refused or unreachable connection, a TLS or SSH handshake failure, or
+a rejected login ends, and it does not depend on Git's (localisable)
+messages. A push through a remote helper (`<helper>::…`, `ext::`, another URL
+scheme, `remote.<name>.vcs`) runs the helper's code during the listing and
+keeps the previous classification. For `gh`, the
 proof is a command line gh's flag parser rejected, or a single-request
-`gh api` call (no `--paginate`) whose connection was never established (DNS,
+`gh api` call (no `--paginate` or `--slurp`) whose connection was never established (DNS,
 `dial tcp`, certificate or TLS handshake timeout). A timeout, a reset after
 the ref listing, or any multi-request `gh` command still ends
 `outcome_unknown`. Such pushes first get the immediate re-read that already

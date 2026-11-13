@@ -2133,6 +2133,135 @@ fn an_incomplete_or_foreign_trace_proves_nothing_about_the_push() {
 }
 
 #[test]
+fn only_transports_built_into_git_count_as_built_in() {
+    for url in [
+        "https://github.com/o/r.git",
+        "HTTP://github.com/o/r.git",
+        "ssh://git@github.com/o/r.git",
+        "git+ssh://git@github.com/o/r.git",
+        "git://example.com/o/r.git",
+        "file:///srv/repos/r.git",
+        "git@github.com:o/r.git",
+        "/srv/repos/r.git",
+        "../r.git",
+    ] {
+        assert!(is_builtin_transport_url(url), "{url}");
+    }
+    for url in [
+        "ext::sh -c touch% /tmp/x",
+        "gcrypt::rsync://example.com/r",
+        "custom::anything",
+        "svn://example.com/r",
+        "ftp://example.com/r.git",
+        "persistent-https://example.com/r.git",
+        "",
+    ] {
+        assert!(!is_builtin_transport_url(url), "{url:?}");
+    }
+}
+
+#[test]
+fn a_push_through_a_remote_helper_stays_unproven_whatever_its_trace_shows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["remote", "add", "origin", "https://example.com/o/r.git"]);
+    let trace = parse_git_transfer_trace(PUSH_TRACE_DNS_FAILURE);
+    let push = gh_args(&["push", "origin", "HEAD:refs/heads/x"]);
+    let decide = |remote: Option<&str>| {
+        push_provably_sent_no_update(&push, Some(&trace), tmp.path(), remote)
+    };
+    assert!(decide(Some("origin")), "a built-in transport qualifies");
+    assert!(!decide(None), "no resolved remote proves nothing");
+    assert!(!push_provably_sent_no_update(
+        &push,
+        None,
+        tmp.path(),
+        Some("origin")
+    ));
+
+    // A helper-style push URL runs the helper's code during the listing.
+    git(&[
+        "remote",
+        "set-url",
+        "--push",
+        "origin",
+        "custom::example.com/o/r",
+    ]);
+    assert!(!decide(Some("origin")), "helper push URL");
+    git(&["remote", "set-url", "--push", "origin", "ext::sh -c true"]);
+    assert!(!decide(Some("origin")), "ext:: push URL");
+    // One helper among several push URLs is enough.
+    git(&[
+        "remote",
+        "set-url",
+        "--push",
+        "origin",
+        "https://example.com/o/r.git",
+    ]);
+    git(&[
+        "remote",
+        "set-url",
+        "--add",
+        "--push",
+        "origin",
+        "custom::example.com/o/r",
+    ]);
+    assert!(!decide(Some("origin")), "one helper among push URLs");
+    git(&["config", "--unset-all", "remote.origin.pushurl"]);
+    assert!(decide(Some("origin")));
+    // `remote.<name>.vcs` routes every URL through a helper.
+    git(&["config", "remote.origin.vcs", "custom"]);
+    assert!(!decide(Some("origin")), "remote.<name>.vcs");
+    // A remote that cannot be read proves nothing.
+    assert!(!decide(Some("missing")));
+}
+
+#[test]
+fn a_failed_write_is_counted_as_a_remote_read_only_when_one_decided_it() {
+    let read = serde_json::json!({
+        "push_reconciliation": { "evidence": { "classification": "failed", "destinations": [] } }
+    });
+    assert_eq!(
+        failed_remote_write_outcome(OperationStatus::Failed, &read),
+        "remote_write_failed_by_remote_read"
+    );
+    assert_eq!(
+        failed_remote_write_outcome(OperationStatus::Succeeded, &read),
+        "remote_write_succeeded_by_remote_read"
+    );
+    let observed = serde_json::json!({
+        "create_reconciliation": { "evidence": { "source": "post_create_observation" } }
+    });
+    assert_eq!(
+        failed_remote_write_outcome(OperationStatus::Failed, &observed),
+        "remote_write_failed_by_remote_read"
+    );
+    // A URL gh printed is not a remote read, and neither is nothing at all.
+    let printed = serde_json::json!({
+        "create_reconciliation": { "evidence": { "source": "command_output" } }
+    });
+    assert_eq!(
+        failed_remote_write_outcome(OperationStatus::Succeeded, &printed),
+        "remote_write_succeeded_other"
+    );
+    let unexplained = serde_json::json!({
+        "push_reconciliation": { "evidence": { "reason": "exact_push_plan_unavailable" } }
+    });
+    assert_eq!(
+        failed_remote_write_outcome(OperationStatus::Failed, &unexplained),
+        "remote_write_failed_other"
+    );
+}
+
+#[test]
 fn a_push_failed_before_remote_refs_keeps_its_plan_and_says_why() {
     let planning = PushPlanning::Unsupported {
         reason: "push_uses_implicit_or_set_expanding_options",
@@ -2284,6 +2413,17 @@ fn gh_failures_that_may_follow_a_sent_request_stay_unknown() {
             "{args:?}"
         );
     }
+    // Every spelling that may paginate is more than one request; only an
+    // explicit `--paginate=false` is not.
+    for flag in ["--paginate=true", "--paginate=1", "--slurp", "--slurp=true"] {
+        let args = gh_args(&["api", flag, "-X", "POST", "repos/o/r/issues"]);
+        assert!(
+            classify_github_unsent_request(&args, true, Some(1), dns).is_none(),
+            "{flag} may paginate"
+        );
+    }
+    let explicit_single = gh_args(&["api", "--paginate=false", "-X", "POST", "repos/o/r/issues"]);
+    assert!(classify_github_unsent_request(&explicit_single, true, Some(1), dns).is_some());
     // A truncated stderr is a prefix and proves nothing.
     assert!(classify_github_unsent_request_if_complete(&api, true, Some(1), dns, true).is_none());
     // A process that did not exit with gh's generic error status.

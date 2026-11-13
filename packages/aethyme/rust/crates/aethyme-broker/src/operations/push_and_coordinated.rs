@@ -1344,7 +1344,7 @@ fn classify_github_unsent_request(
         }));
     }
     let single_request =
-        args.first().map(String::as_str) == Some("api") && !has_any(args, &["--paginate"]);
+        args.first().map(String::as_str) == Some("api") && !gh_api_may_paginate(args);
     if !single_request || !github_http_statuses(&stderr).is_empty() {
         return None;
     }
@@ -1377,6 +1377,23 @@ fn classify_github_unsent_request(
     }))
 }
 
+/// Whether a `gh api` command line may send more than one request.
+///
+/// `--paginate` in any spelling other than an explicit `--paginate=false`,
+/// and `--slurp` (which only works with pagination), count. A boolean value
+/// pflag would also read as false (`0`, `f`, ...) still counts: erring
+/// towards "may paginate" only keeps a write unknown.
+fn gh_api_may_paginate(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        arg == "--paginate"
+            || arg == "--slurp"
+            || arg.starts_with("--slurp=")
+            || arg
+                .strip_prefix("--paginate=")
+                .is_some_and(|value| value != "false")
+    })
+}
+
 fn classify_github_unsent_request_if_complete(
     args: &[String],
     builtin: bool,
@@ -1391,22 +1408,100 @@ fn classify_github_unsent_request_if_complete(
 }
 
 /// The phase-telemetry counter for how a failed remote write was settled.
+///
+/// `*_by_remote_read` only when the journal shows a post-failure remote
+/// observation decided it: the push re-read recorded what each destination
+/// held, or the create observation listed the collection. Anything else
+/// (a URL `gh` printed, a future path that sets no `failure_class`) is
+/// counted as `*_other` rather than claimed as a remote read.
 fn failed_remote_write_outcome(
     status: OperationStatus,
     details: &serde_json::Value,
 ) -> &'static str {
+    let settled_by_remote_read = details["push_reconciliation"]["evidence"]["destinations"]
+        .is_array()
+        || details["create_reconciliation"]["evidence"]["source"] == "post_create_observation";
     match details["failure_class"].as_str() {
         Some(PUSH_FAILED_BEFORE_REMOTE_REFS) => "remote_write_failed_before_remote_refs",
         Some(GITHUB_REQUEST_NOT_SENT) => "remote_write_failed_request_not_sent",
         Some("github_refused") => "remote_write_failed_refused",
         Some("repeatable_fetch_failed") => "remote_write_failed_repeatable_fetch",
         _ => match status {
-            OperationStatus::Failed => "remote_write_failed_by_remote_read",
-            OperationStatus::Succeeded => "remote_write_succeeded_by_remote_read",
+            OperationStatus::Failed if settled_by_remote_read => {
+                "remote_write_failed_by_remote_read"
+            }
+            OperationStatus::Failed => "remote_write_failed_other",
+            OperationStatus::Succeeded if settled_by_remote_read => {
+                "remote_write_succeeded_by_remote_read"
+            }
+            OperationStatus::Succeeded => "remote_write_succeeded_other",
             OperationStatus::OutcomeUnknown => "remote_write_outcome_unknown",
             _ => "remote_write_outcome_other",
         },
     }
+}
+
+/// Whether every URL `remote` pushes to is reached through a transport built
+/// into Git (ssh, http(s), git, file or a local path), so that the push's
+/// ref listing runs only Git's own code.
+///
+/// A remote helper -- `<helper>::<address>`, a URL scheme Git hands to
+/// `git-remote-<scheme>`, `ext::`, or `remote.<name>.vcs` -- runs arbitrary
+/// code while listing refs, so a push through one proves nothing by where it
+/// died. The URLs are Git's effective push URLs (`remote get-url --push
+/// --all`, rewrites applied), read raw: the resolved target keeps only a
+/// sanitized spelling that drops a helper prefix. Any read that fails counts
+/// as not built-in.
+fn push_remote_uses_builtin_transports(cwd: &Path, remote: &str) -> bool {
+    let Ok(repo) = crate::GitRepo::discover(cwd) else {
+        return false;
+    };
+    if repo.config_get(&format!("remote.{remote}.vcs")).is_some() {
+        return false;
+    }
+    let Ok(urls) = repo.remote_push_urls(remote) else {
+        return false;
+    };
+    !urls.is_empty() && urls.iter().all(|url| is_builtin_transport_url(url))
+}
+
+/// Git's own transport selection (`transport_get`), restricted to transports
+/// that need no helper beyond the ones Git ships for HTTP.
+fn is_builtin_transport_url(url: &str) -> bool {
+    // A leading run of URL-scheme characters followed by `::` names a remote
+    // helper, whatever follows (`ext::`, `gcrypt::rsync://...`).
+    let scheme_len = url
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'-' | b'.'))
+        .count();
+    if url.is_empty() || url[scheme_len..].starts_with("::") {
+        return false;
+    }
+    match url.split_once("://") {
+        Some((scheme, _)) => {
+            scheme.len() == scheme_len
+                && ["http", "https", "ssh", "git+ssh", "ssh+git", "git", "file"]
+                    .iter()
+                    .any(|builtin| scheme.eq_ignore_ascii_case(builtin))
+        }
+        // `host:path` is SSH; anything else is a local path.
+        None => true,
+    }
+}
+
+/// Whether a failed push provably sent no ref update: its trace ended inside
+/// the ref listing ([`GitTransferTrace::ended_before_remote_refs_listed`])
+/// and every push URL uses a built-in transport.
+fn push_provably_sent_no_update(
+    args: &[String],
+    trace: Option<&GitTransferTrace>,
+    cwd: &Path,
+    remote: Option<&str>,
+) -> bool {
+    is_push(args)
+        && trace.is_some_and(GitTransferTrace::ended_before_remote_refs_listed)
+        // Read only on this rare path, after the trace already qualified.
+        && remote.is_some_and(|remote| push_remote_uses_builtin_transports(cwd, remote))
 }
 
 fn classify_github_refusal_if_complete(
@@ -4309,10 +4404,14 @@ impl Broker {
                 ),
             }
         }
-        let push_never_listed_remote_refs = is_push(&request.args)
-            && transfer_trace
+        let push_never_listed_remote_refs = push_provably_sent_no_update(
+            &request.args,
+            transfer_trace.as_ref(),
+            cwd,
+            resolved_target
                 .as_ref()
-                .is_some_and(GitTransferTrace::ended_before_remote_refs_listed);
+                .map(|target| target.remote_name.as_str()),
+        );
         let remote_contact = transfer_trace.and_then(GitTransferTrace::remote_contact);
         let exit_code = output.status.code().map(i64::from);
         let (status, mut details) = if output.status.success() {

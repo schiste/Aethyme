@@ -248,7 +248,12 @@ A coordinated write that provably sent nothing to the remote is journaled
 - A `git push` (any spelling, through `broker push` or `broker advanced git`)
   whose Trace2 events show the top-level process entered
   `transport_push/get_refs_list`, never left it, never entered `push_refs` or
-  ran `pre-push`, and exited non-zero. `details.failure_class` is
+  ran `pre-push`, and exited non-zero, and whose remote's effective push
+  URLs (`git remote get-url --push --all`) all use a transport built into
+  Git: `http`, `https`, `ssh`, `git+ssh`, `ssh+git`, `git`, `file`, an
+  `host:path` SSH address or a local path. A `<helper>::` URL (including
+  `ext::`), any other scheme, a set `remote.<name>.vcs`, or a URL list that
+  cannot be read keeps the previous classification. `details.failure_class` is
   `push_failed_before_remote_refs_listed`, with `remote_outcome: not_sent`,
   `remote_write_contact: not_contacted` and `recovery: retry`;
   `details.push_reconciliation` keeps the plan and adds `evidence`
@@ -259,7 +264,8 @@ A coordinated write that provably sent nothing to the remote is journaled
   flag-parser rejection (`unknown flag:`, `unknown shorthand flag:`,
   `flag needs an argument:`, `bad flag syntax:`, `invalid argument "`,
   `required flag(s)`, `accepts`, `requires at least`) for a built-in command,
-  or a `gh api` call without `--paginate` whose stderr shows the connection
+  or a `gh api` call without `--paginate` (any value but an explicit
+  `--paginate=false`) or `--slurp` whose stderr shows the connection
   was never established (gh's `error connecting to` DNS message, `dial tcp`,
   `net/http: TLS handshake timeout`, a certificate failure) and no HTTP status.
   `details.failure_class` is `github_request_not_sent`, with
@@ -274,8 +280,11 @@ adds one count to the command's `phase_counts` naming how it was settled:
 `remote_write_failed_before_remote_refs`, `remote_write_failed_request_not_sent`,
 `remote_write_failed_refused` (`github_refused`),
 `remote_write_failed_repeatable_fetch`, `remote_write_failed_by_remote_read`
-and `remote_write_succeeded_by_remote_read` (the existing post-failure push
-or create observation settled it), `remote_write_outcome_unknown`, and for a
+and `remote_write_succeeded_by_remote_read` (only when the journal records
+that the post-failure push re-read observed the destinations, or the create
+observation listed the collection), `remote_write_failed_other` and
+`remote_write_succeeded_other` (settled any other way, such as a URL `gh`
+printed), `remote_write_outcome_unknown`, and for a
 provider killed at its budget `remote_write_outcome_unknown_timeout` or
 `remote_write_failed_timeout`. Consumers must ignore names they do not know.
 
