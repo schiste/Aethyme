@@ -4,6 +4,23 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.87] - 2026-11-13
+
+### Removed
+
+- The legacy `aethyme repo clear-cache` and `aethyme root show|set` commands; neither had a remaining use (#1648).
+- The code path in `aethyme explore` that started the engine daemon. It could no longer run: Explore reads the graph store directly. `aethyme-engine-cli daemon` is unchanged (#1648).
+
+### Changed
+
+- `[publication] allow_break_glass` is ignored. It gated only the removed `ship execute --break-glass`. The key still parses, and `broker status` warns with `config.allow-break-glass-removed` saying to delete it (#1647).
+- `deploy plan` no longer reads or preserves `aethyme/integration` when a default branch is fetched, and leftover integration commits no longer block first enrollment. Without a fetched default branch it behaves as before (#1647).
+
+### Fixed
+
+- Fourteen more broker commands (`operations`, `advisories`, `exposures`, `note`, `ownership`, `quality-report`, `review state`, `review waive`, `handoff`, `checkpoint`, `queue`, `watch pr`, `watch repo`, `deliveries`) refuse malformed arguments before opening the broker, so a refused call no longer runs startup maintenance (#1647).
+- `broker advanced gh` no longer refuses a flag value such as `--title -F` as a missing body file; `-F` is a body file only for the `pr`, `issue` and `release` commands that define it, and stays a field for `gh api` (#1647).
+
 ## [0.8.86] - 2026-11-13
 
 ### Changed
