@@ -159,8 +159,9 @@ A witness saved before volume UUIDs were recorded (schema 2) stores mount
 device numbers, which macOS renumbers after a restart or remount. Such a
 checkout is re-proved when its paths, inodes and spawn root generation are
 unchanged, its session was spawned and is closed, it sits under the broker
-worktree root, `git worktree list` registers it on the session branch and HEAD
-is that branch's tip; the removal then records
+worktree root, this repository's registration of it (the record
+`git worktree list` reads) names its `.git` and has the session branch checked
+out at a commit; the removal then records
 `removed[].ownership_reproof: "device_renumber"`. If any condition fails it
 stays kept with code `ownership_reproof_refused` and the failed condition in
 the reason. Checkouts that cannot be proven at all stay kept with their own
@@ -202,7 +203,8 @@ an inventory. Each slice records its own result under the meta key
 Its `outcome` is `removed`, `lock_busy`, `inventory_unavailable`,
 `lap_unfinished`, `out_of_time_before_selection` (the budget ran out before
 any checkout was judged; `budget_consumed_by` says whether counting checkouts
-or the other checks used it, and the slice retries after one minute) or
+or the other checks used it; it retries after one minute, backing off to ten
+minutes while slices keep running out) or
 `nothing_removable`; `kept_by_code` counts the kept
 checkouts per keep code, `blocked_by_ignored` names the ignored directories
 holding the most checkouts with the line that would release each,

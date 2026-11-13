@@ -1532,18 +1532,20 @@ pub(crate) struct RenumberReproofEvidence {
     /// The live `.git` pointer resolves into this repository's common
     /// directory.
     pub common_dir_is_this_repository: bool,
-    /// The branch ref this repository's `git worktree list` records for the
-    /// path; `None` when the path is not registered or Git marks it prunable.
-    pub registered_branch: Option<String>,
-    /// The branch the checkout has checked out.
+    /// This repository registers the checkout: its Git admin directory is
+    /// `<common>/worktrees/<name>` and that registration's `gitdir` names the
+    /// checkout's own `.git` file, the record `git worktree list` reads. A
+    /// registration whose `gitdir` target is gone (prunable) is not one.
+    pub registered: bool,
+    /// The branch the registration's `HEAD` has checked out.
     pub checkout_branch: Option<String>,
-    /// The checkout's HEAD commit.
+    /// The commit that `HEAD` resolves to through this repository's refs.
     pub checkout_head: Option<String>,
     /// The tip of `refs/heads/<session branch>` in this repository.
     pub branch_tip: Option<String>,
 }
 
-const REGISTRATION_REFUSAL: &str = "git worktree list does not register it on the session branch";
+const REGISTRATION_REFUSAL: &str = "this repository does not register the checkout";
 
 /// Decide the device-renumber re-proof. `None` means every condition holds;
 /// otherwise the first failed condition, which keeps the checkout.
@@ -1571,16 +1573,107 @@ pub(crate) fn renumber_reproof_refusal(
     if !evidence.common_dir_is_this_repository {
         return Some("the checkout's .git does not point into this repository");
     }
-    let expected_ref = format!("refs/heads/{session_branch}");
-    if session_branch.is_empty() || evidence.registered_branch.as_deref() != Some(&expected_ref) {
+    if !evidence.registered {
         return Some(REGISTRATION_REFUSAL);
     }
-    if evidence.checkout_branch.as_deref() != Some(session_branch) {
+    if session_branch.is_empty() || evidence.checkout_branch.as_deref() != Some(session_branch) {
         return Some("the checkout is not on the session branch");
     }
     match (&evidence.checkout_head, &evidence.branch_tip) {
         (Some(head), Some(tip)) if !head.is_empty() && head == tip => None,
         _ => Some("the checkout HEAD is not the session branch tip"),
+    }
+}
+
+/// Why a device-renumber re-proof did not authorize a reclaim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReproofFailure {
+    /// A condition failed: keep the checkout, with this reason.
+    Refused(String),
+    /// Evidence could not be gathered in time (a bounded Git call ran out
+    /// or failed): judge it again later, never as a refusal.
+    Unavailable(String),
+}
+
+/// Whether the admin directory `admin` is this repository's registration of
+/// `worktree`: it lives in `<common>/worktrees/` and its `gitdir` file names
+/// the checkout's existing `.git` file. Reads two paths; runs no Git process.
+fn registration_names_checkout(common: &Path, admin: &Path, worktree: &Path) -> bool {
+    let canonical = |path: &Path| std::fs::canonicalize(path).ok();
+    let Some(admin) = canonical(admin) else {
+        return false;
+    };
+    let Some(registrations) = canonical(&common.join("worktrees")) else {
+        return false;
+    };
+    if admin.parent() != Some(registrations.as_path()) {
+        return false;
+    }
+    let Ok(gitdir) = std::fs::read_to_string(admin.join("gitdir")) else {
+        return false;
+    };
+    let pointer = worktree.join(".git");
+    if !std::fs::symlink_metadata(&pointer).is_ok_and(|metadata| metadata.is_file()) {
+        return false;
+    }
+    match (canonical(Path::new(gitdir.trim())), canonical(&pointer)) {
+        (Some(named), Some(pointer)) => named == pointer,
+        _ => false,
+    }
+}
+
+/// Resolve `refname` (`refs/heads/...`) to a commit from the loose ref or
+/// `packed-refs` in `common`. Anything else (a symbolic or malformed ref,
+/// another ref backend) is `None`, which refuses the re-proof.
+fn resolve_branch_ref_in_common(common: &Path, refname: &str) -> Option<String> {
+    let valid_id = |value: &str| {
+        matches!(value.len(), 40 | 64)
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    let branch = refname.strip_prefix("refs/heads/")?;
+    if branch.is_empty()
+        || Path::new(branch)
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    if let Ok(loose) = std::fs::read_to_string(common.join(refname)) {
+        let loose = loose.trim();
+        return valid_id(loose).then(|| loose.to_string());
+    }
+    let packed = std::fs::read_to_string(common.join("packed-refs")).ok()?;
+    packed.lines().find_map(|line| {
+        if line.starts_with('#') || line.starts_with('^') {
+            return None;
+        }
+        let (id, name) = line.split_once(' ')?;
+        (name == refname && valid_id(id)).then(|| id.to_string())
+    })
+}
+
+/// What one registration's `HEAD` file says: the branch it has checked out
+/// (`None` when detached) and the commit it resolves to.
+fn registration_head(common: &Path, admin: &Path) -> (Option<String>, Option<String>) {
+    let Ok(head) = std::fs::read_to_string(admin.join("HEAD")) else {
+        return (None, None);
+    };
+    let head = head.trim();
+    match head.strip_prefix("ref: ") {
+        Some(refname) => (
+            refname.strip_prefix("refs/heads/").map(str::to_string),
+            resolve_branch_ref_in_common(common, refname),
+        ),
+        None => (
+            None,
+            (matches!(head.len(), 40 | 64)
+                && head
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+            .then(|| head.to_string()),
+        ),
     }
 }
 
@@ -2341,6 +2434,10 @@ fn ensure_ignored_content_before(deadline: Instant) -> Result<(), String> {
     }
 }
 
+/// Test seam callback for [`AFTER_REMOVAL_COHORT_HOOK`].
+#[cfg(test)]
+type RemovalCohortHook = Box<dyn FnMut(&Path)>;
+
 #[cfg(test)]
 thread_local! {
     /// Test seam: the retirement lane consumes its whole deadline.
@@ -2354,6 +2451,11 @@ thread_local! {
     /// in for a lap longer than one call covers.
     static COHORT_SCAN_LIMITS: std::cell::Cell<Option<(usize, usize)>> =
         const { std::cell::Cell::new(None) };
+    /// Test seam: runs in the removal verdict right after the cohort (and
+    /// its ownership re-proof) was built, so a test can change the checkout
+    /// before the verdict's own fresh re-check.
+    static AFTER_REMOVAL_COHORT_HOOK: std::cell::RefCell<Option<RemovalCohortHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Sessions per cohort-index discovery page.
@@ -2393,9 +2495,12 @@ pub(crate) const PRIORITY_MEMO_KEY: &str = "auto_cleanup.priority_memo";
 const PRIORITY_GROUPS_PER_PASS: usize = 8;
 /// Priority candidates read per pass before the memo filters them.
 const PRIORITY_CANDIDATE_LIMIT: usize = 256;
-/// A kept priority group is judged again after this long, or at once when its
-/// merged state changes.
+/// A kept or selected priority group is judged again after this long, or at
+/// once when its merged state changes.
 const PRIORITY_REJUDGE_MS: i64 = 30 * 60_000;
+/// A deferred priority group (its proofs ran out of time) is judged ahead of
+/// the lap again after this long, so it cannot hold every pass.
+const PRIORITY_DEFER_MS: i64 = 5 * 60_000;
 /// Remembered priority verdicts kept at most; the oldest go first.
 const PRIORITY_MEMO_MAX_ENTRIES: usize = 4096;
 
@@ -2403,6 +2508,23 @@ const PRIORITY_MEMO_MAX_ENTRIES: usize = 4096;
 struct PriorityMemoEntry {
     judged_at_ms: i64,
     merged: bool,
+    /// Not judged ahead of the lap again before this time.
+    #[serde(default)]
+    retry_at_ms: i64,
+    /// `selected`, `kept` or `deferred` at selection.
+    #[serde(default)]
+    outcome: String,
+    /// The keep code apply recorded when it kept a selected group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    apply_code: Option<String>,
+}
+
+/// How selection left a priority group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriorityOutcome {
+    Selected,
+    Kept,
+    Deferred,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2419,15 +2541,34 @@ impl PriorityMemo {
 
     /// Whether `path` was judged recently with the same merged state.
     fn recently_judged(&self, path: &str, merged: bool, now_ms: i64) -> bool {
-        self.entries.get(path).is_some_and(|entry| {
-            entry.merged == merged
-                && now_ms.saturating_sub(entry.judged_at_ms) < PRIORITY_REJUDGE_MS
-        })
+        self.entries
+            .get(path)
+            .is_some_and(|entry| entry.merged == merged && now_ms < entry.retry_at_ms)
+    }
+
+    /// Remember a judged priority group, whatever selection made of it: a
+    /// selected one that apply then keeps, or a deferred one, must not be
+    /// picked first on every pass and hold the lane.
+    fn remember(&mut self, path: String, merged: bool, outcome: PriorityOutcome, now_ms: i64) {
+        let (wait, outcome) = match outcome {
+            PriorityOutcome::Selected => (PRIORITY_REJUDGE_MS, "selected"),
+            PriorityOutcome::Kept => (PRIORITY_REJUDGE_MS, "kept"),
+            PriorityOutcome::Deferred => (PRIORITY_DEFER_MS, "deferred"),
+        };
+        self.entries.insert(
+            path,
+            PriorityMemoEntry {
+                judged_at_ms: now_ms,
+                merged,
+                retry_at_ms: now_ms.saturating_add(wait),
+                outcome: outcome.into(),
+                apply_code: None,
+            },
+        );
     }
 
     fn prune(&mut self, now_ms: i64) {
-        self.entries
-            .retain(|_, entry| now_ms.saturating_sub(entry.judged_at_ms) < PRIORITY_REJUDGE_MS);
+        self.entries.retain(|_, entry| now_ms < entry.retry_at_ms);
         if self.entries.len() > PRIORITY_MEMO_MAX_ENTRIES {
             let mut ages = self
                 .entries
@@ -3519,17 +3660,20 @@ impl Broker {
                     let reproved = purpose == ClosedCohortPurpose::CheckoutRemoval
                         && match (saved, current_witness.as_ref()) {
                             (Some(saved), Some(current)) => {
-                                if deadline_expired(deadline) {
-                                    return Ok(unavailable(Reason::DeadlineExceeded));
-                                }
-                                let _git_deadline = deadline.map(crate::git::limit_git_until);
-                                self.renumbered_witness_reproof(
+                                match self.renumbered_witness_reproof(
                                     session,
                                     Path::new(&canonical_path),
                                     saved,
                                     current,
-                                )
-                                .is_ok()
+                                    deadline,
+                                ) {
+                                    Ok(()) => true,
+                                    Err(ReproofFailure::Refused(_)) => false,
+                                    // Unproven for now, not refused: retry.
+                                    Err(ReproofFailure::Unavailable(_)) => {
+                                        return Ok(unavailable(Reason::DeadlineExceeded));
+                                    }
+                                }
                             }
                             _ => false,
                         };
@@ -3717,89 +3861,82 @@ impl Broker {
     /// Gathers every condition of [`RenumberReproofEvidence`] and refuses on
     /// the first that fails. Callers must already have required that the
     /// exact comparison failed; this never widens a schema-3 or legacy check.
+    ///
+    /// Registration and branch evidence are read from this checkout's own
+    /// registration files under the common directory, fresh on every call
+    /// and without listing every worktree; the one Git call (the broker-root
+    /// ownership check) is bounded by `deadline`. Evidence that cannot be
+    /// gathered in time is [`ReproofFailure::Unavailable`], never a refusal.
     pub(crate) fn renumbered_witness_reproof(
         &self,
         session: &Session,
         worktree: &Path,
         saved: &crate::events::SpawnedWorktreeInstanceWitness,
         current: &crate::events::SpawnedWorktreeInstanceWitness,
-    ) -> Result<(), String> {
-        let refuse = |condition: &str| -> Result<(), String> {
+        deadline: Option<Instant>,
+    ) -> Result<(), ReproofFailure> {
+        let refuse = |condition: &str| -> Result<(), ReproofFailure> {
             crate::phase_telemetry::add("auto_cleanup_ownership_reproof_refused", Duration::ZERO);
-            Err(format!(
+            Err(ReproofFailure::Refused(format!(
                 "spawn-time worktree identity device renumber re-proof refused: {condition}"
-            ))
+            )))
+        };
+        let unavailable = |detail: String| -> Result<(), ReproofFailure> {
+            crate::phase_telemetry::add(
+                "auto_cleanup_ownership_reproof_unavailable",
+                Duration::ZERO,
+            );
+            Err(ReproofFailure::Unavailable(detail))
         };
         // The filesystem half first: it needs no Git process.
-        if let Some(condition) = renumber_reproof_refusal(
-            saved,
-            current,
-            &session.branch,
-            &RenumberReproofEvidence {
-                origin_spawned: true,
-                closed: true,
-                session_path_matches: true,
-                under_broker_root: true,
-                common_dir_is_this_repository: true,
-                registered_branch: Some(format!("refs/heads/{}", session.branch)),
-                checkout_branch: Some(session.branch.clone()),
-                checkout_head: Some("filesystem-only".into()),
-                branch_tip: Some("filesystem-only".into()),
-            },
-        ) {
-            return refuse(condition);
+        if !saved.matches_after_device_renumber(current) {
+            return refuse("filesystem identity differs beyond a device renumber");
+        }
+        if deadline_expired(deadline) {
+            return unavailable("the pass deadline passed before the re-proof".into());
         }
         let canonical =
             |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let worktree = canonical(worktree);
-        let under_broker_root = self
-            .is_broker_owned_worktree_checked(session, &worktree)
-            .unwrap_or(false);
-        let common_dir_is_this_repository = self
-            .repo_handle()
-            .git_common_dir()
-            .ok()
-            .is_some_and(|common| Path::new(&current.git_common_path) == canonical(&common));
-        // What `git worktree list` says about this path, kept for the
-        // refusal so an operator can see why registration did not match.
-        let (registered_branch, registration) = match self.repo_handle().worktree_inventory() {
-            Err(error) => (None, format!("worktree listing failed: {error}")),
-            Ok(entries) => match entries
-                .into_iter()
-                .find(|entry| !entry.bare && canonical(&entry.path) == worktree)
-            {
-                None => (None, "not registered".to_string()),
-                Some(entry) if entry.prunable => (None, "registered but prunable".to_string()),
-                Some(entry) => {
-                    let found = entry
-                        .branch
-                        .clone()
-                        .unwrap_or_else(|| "a detached HEAD".to_string());
-                    (entry.branch, format!("registered on {found}"))
+        let under_broker_root = {
+            let _git_deadline = deadline.map(crate::git::limit_git_until);
+            match self.is_broker_owned_worktree_checked(session, &worktree) {
+                Ok(owned) => owned,
+                Err(error) => {
+                    return unavailable(format!("the broker root could not be checked: {error}"));
                 }
-            },
+            }
         };
-        let checkout = GitRepo::discover(&worktree).ok();
-        let checkout_branch = checkout
-            .as_ref()
-            .and_then(|checkout| checkout.current_branch().ok())
-            .map(|branch| branch.trim().to_string());
-        let checkout_head = checkout
-            .as_ref()
-            .and_then(|checkout| checkout.head_commit().ok())
-            .map(|head| head.trim().to_string());
-        let branch_tip = self
-            .repo_handle()
-            .resolve_ref(&format!("refs/heads/{}", session.branch))
-            .map(|tip| tip.trim().to_string());
+        if deadline_expired(deadline) {
+            return unavailable("the pass deadline passed during the re-proof".into());
+        }
+        let this_common = match self.repo_handle().git_common_dir() {
+            Ok(common) => canonical(&common),
+            Err(error) => {
+                return unavailable(format!(
+                    "this repository's common directory is unreadable: {error}"
+                ));
+            }
+        };
+        let registration_started = Instant::now();
+        let common = Path::new(&current.git_common_path);
+        let admin = Path::new(&current.git_admin_path);
+        let registered = registration_names_checkout(common, admin, &worktree);
+        let (checkout_branch, checkout_head) = registration_head(common, admin);
+        let branch_tip =
+            resolve_branch_ref_in_common(common, &format!("refs/heads/{}", session.branch));
+        crate::phase_telemetry::add(
+            "auto_cleanup_ownership_reproof_registration",
+            registration_started.elapsed(),
+        );
         let evidence = RenumberReproofEvidence {
             origin_spawned: session.origin == SessionOrigin::Spawned,
             closed: session.status.is_closed()
                 && session.cleanup_state == SessionCleanupState::Closed,
             session_path_matches: canonical(Path::new(&session.worktree_path)) == worktree,
             under_broker_root,
-            common_dir_is_this_repository,
-            registered_branch,
+            common_dir_is_this_repository: common == this_common.as_path(),
+            registered,
             checkout_branch,
             checkout_head,
             branch_tip,
@@ -3809,10 +3946,6 @@ impl Broker {
                 crate::phase_telemetry::add("auto_cleanup_ownership_reproved", Duration::ZERO);
                 Ok(())
             }
-            Some(condition) if condition == REGISTRATION_REFUSAL => refuse(&format!(
-                "{condition} ({registration}; session branch refs/heads/{})",
-                session.branch
-            )),
             Some(condition) => refuse(condition),
         }
     }
@@ -4342,12 +4475,18 @@ impl Broker {
         {
             ClosedArtifactCheckoutCohortResolution::Available(cohort) => cohort,
             ClosedArtifactCheckoutCohortResolution::Unavailable(reason) => {
-                return Err(keep(
-                    self.closed_cohort_unavailable_keep_reason(reason, candidate, &owner),
-                ));
+                return Err(
+                    self.closed_cohort_unavailable_verdict(reason, candidate, &owner, deadline)
+                );
             }
         };
         let ownership_reproof = current_cohort.ownership_reproof();
+        #[cfg(test)]
+        AFTER_REMOVAL_COHORT_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(&candidate.worktree);
+            }
+        });
         let mut current_session_ids = current_cohort.session_ids();
         current_session_ids.sort_unstable();
         if current_session_ids != expected_session_ids {
@@ -4375,16 +4514,23 @@ impl Broker {
                 // Only the re-proof the cohort itself accepted, re-made now
                 // against this fresh observation, may stand in for the exact
                 // comparison.
-                let reproved = ownership_reproof == Some(OWNERSHIP_REPROOF_DEVICE_RENUMBER)
-                    && current_witness.as_ref().is_some_and(|current| {
-                        self.renumbered_witness_reproof(
-                            &owner,
-                            &candidate.worktree,
-                            expected,
-                            current,
-                        )
-                        .is_ok()
-                    });
+                let reproved = if ownership_reproof == Some(OWNERSHIP_REPROOF_DEVICE_RENUMBER)
+                    && let Some(current) = current_witness.as_ref()
+                {
+                    match self.renumbered_witness_reproof(
+                        &owner,
+                        &candidate.worktree,
+                        expected,
+                        current,
+                        deadline,
+                    ) {
+                        Ok(()) => true,
+                        Err(ReproofFailure::Refused(_)) => false,
+                        Err(ReproofFailure::Unavailable(_)) => return Err(NotRemoved::Defer),
+                    }
+                } else {
+                    false
+                };
                 if !reproved {
                     return Err(keep(
                         "worktree instance no longer matches its spawn record".into(),
@@ -4507,45 +4653,60 @@ impl Broker {
         Ok(proof)
     }
 
-    /// A specific, countable keep reason for a cohort automatic removal could
-    /// not build. Every reason keeps the leading phrase older readers match.
-    fn closed_cohort_unavailable_keep_reason(
+    /// The verdict for a cohort automatic removal could not build: a
+    /// specific, countable keep reason, or a deferral when the cohort or its
+    /// re-proof only ran out of time. Every reason keeps the leading phrase
+    /// older readers match.
+    fn closed_cohort_unavailable_verdict(
         &self,
         reason: ClosedArtifactCheckoutCohortUnavailableReason,
         candidate: &AutoCleanupCandidate,
         owner: &Session,
-    ) -> String {
+        deadline: Option<Instant>,
+    ) -> NotRemoved {
         const PREFIX: &str = "closed checkout cohort or ownership witness changed";
+        if reason == ClosedArtifactCheckoutCohortUnavailableReason::DeadlineExceeded {
+            return NotRemoved::Defer;
+        }
         if reason != ClosedArtifactCheckoutCohortUnavailableReason::SpawnedWitnessMismatch {
-            return format!("{PREFIX}: cohort unavailable ({})", reason.code());
+            return NotRemoved::Keep(format!("{PREFIX}: cohort unavailable ({})", reason.code()));
         }
         let manual = format!(
             "inspect it, then remove it with `aethyme broker finish cleanup {}`",
             owner.id
         );
         let Some(saved) = candidate.spawned_instance_witness.as_ref() else {
-            return format!(
+            return NotRemoved::Keep(format!(
                 "{PREFIX}: {OWNERSHIP_WITNESS_NEVER_RECORDED} for session {}; {manual}",
                 owner.id
-            );
+            ));
         };
         if !saved.is_supported() {
-            return format!(
+            return NotRemoved::Keep(format!(
                 "{PREFIX}: {OWNERSHIP_WITNESS_LEGACY} (schema {}); {manual}",
                 saved.schema_version
-            );
+            ));
         }
-        let current = GitRepo::discover(&candidate.worktree)
-            .ok()
-            .and_then(|checkout| checkout.spawned_worktree_instance_witness());
-        match current {
-            None => format!("{PREFIX}: spawn-time worktree instance identity is unavailable"),
-            Some(current) => {
-                match self.renumbered_witness_reproof(owner, &candidate.worktree, saved, &current) {
-                    Err(refusal) => format!("{PREFIX}: {refusal}"),
-                    Ok(()) => format!("{PREFIX}: cohort membership changed during re-proof"),
-                }
+        let current = {
+            let _git_deadline = deadline.map(crate::git::limit_git_until);
+            GitRepo::discover(&candidate.worktree)
+                .ok()
+                .and_then(|checkout| checkout.spawned_worktree_instance_witness())
+        };
+        let Some(current) = current else {
+            return NotRemoved::Keep(format!(
+                "{PREFIX}: spawn-time worktree instance identity is unavailable"
+            ));
+        };
+        match self.renumbered_witness_reproof(owner, &candidate.worktree, saved, &current, deadline)
+        {
+            Err(ReproofFailure::Refused(refusal)) => {
+                NotRemoved::Keep(format!("{PREFIX}: {refusal}"))
             }
+            Err(ReproofFailure::Unavailable(_)) => NotRemoved::Defer,
+            Ok(()) => NotRemoved::Keep(format!(
+                "{PREFIX}: cohort membership changed during re-proof"
+            )),
         }
     }
 
@@ -5276,6 +5437,45 @@ impl Broker {
         )
     }
 
+    /// The linked-checkout count from this repository's registrations
+    /// (`<common>/worktrees/*`, the records `git worktree list` reads), with
+    /// one directory read instead of a listing that inspects every checkout.
+    /// Falls back to the listing when the registrations cannot be read.
+    pub(crate) fn worktree_checkout_usage_from_registrations(
+        &self,
+    ) -> Result<Option<(usize, u32)>, BrokerOpError> {
+        let maximum = match crate::worktree_location::WorktreeLocationConfig::load(self.main_root())
+        {
+            Ok(Some(config)) => config.max_checkouts(),
+            Ok(None) | Err(_) => {
+                crate::worktree_location::WorktreeLocationConfig::default().max_checkouts()
+            }
+        };
+        if maximum == 0 {
+            return Ok(None);
+        }
+        let Ok(common) = self.repo_handle().git_common_dir() else {
+            return self.worktree_checkout_usage();
+        };
+        let count = match std::fs::read_dir(common.join("worktrees")) {
+            Ok(entries) => {
+                let mut count = 0usize;
+                for entry in entries {
+                    let Ok(entry) = entry else {
+                        return self.worktree_checkout_usage();
+                    };
+                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        count += 1;
+                    }
+                }
+                count
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(_) => return self.worktree_checkout_usage(),
+        };
+        Ok(Some((count, maximum)))
+    }
+
     /// Remember a linked-checkout count for passes too short to list them.
     pub(crate) fn record_checkout_usage(&self, count: usize, maximum: u32) {
         let usage = RecordedCheckoutUsage {
@@ -5415,6 +5615,9 @@ impl Broker {
         let mut priority_memo =
             PriorityMemo::decode(self.store().meta_get(PRIORITY_MEMO_KEY)?.as_deref());
         let mut priority_memo_changed = false;
+        // Groups judged ahead of the lap in this pass, skipped by every lap
+        // page of the same pass.
+        let mut priority_paths = std::collections::BTreeSet::<PathBuf>::new();
         // Under capacity pressure a bounded pass keeps going page by page
         // while time remains; otherwise each pass keeps its one-page tranche
         // and the background worker paces the lap.
@@ -5498,10 +5701,11 @@ impl Broker {
             } else {
                 Vec::new()
             };
-            let priority_paths = priority_groups
-                .iter()
-                .map(|(group, _)| group.worktree.clone())
-                .collect::<std::collections::BTreeSet<_>>();
+            priority_paths.extend(
+                priority_groups
+                    .iter()
+                    .map(|(group, _)| group.worktree.clone()),
+            );
             let ordered = priority_groups
                 .into_iter()
                 .map(|(group, merged)| (Some(merged), group))
@@ -5683,23 +5887,25 @@ impl Broker {
                     }
                 }
                 if let Some(merged) = priority {
-                    // A priority group never moves the lap cursor. Remember a
-                    // judged, unselected one so the next pass judges others.
+                    // A priority group never moves the lap cursor. Remember
+                    // every judged one, selected and deferred included, so the
+                    // next pass judges others and the lap moves on.
                     priority_examined += 1;
                     crate::phase_telemetry::add("auto_cleanup_priority_examined", Duration::ZERO);
-                    let key = group.worktree.to_string_lossy().into_owned();
-                    if selected.len() > selected_before || report.deferred > deferred_before {
-                        priority_memo_changed |= priority_memo.entries.remove(&key).is_some();
+                    let outcome = if selected.len() > selected_before {
+                        PriorityOutcome::Selected
+                    } else if stop_for_deadline || report.deferred > deferred_before {
+                        PriorityOutcome::Deferred
                     } else {
-                        priority_memo.entries.insert(
-                            key,
-                            PriorityMemoEntry {
-                                judged_at_ms: now_ms(),
-                                merged,
-                            },
-                        );
-                        priority_memo_changed = true;
-                    }
+                        PriorityOutcome::Kept
+                    };
+                    priority_memo.remember(
+                        group.worktree.to_string_lossy().into_owned(),
+                        merged,
+                        outcome,
+                        now_ms(),
+                    );
+                    priority_memo_changed = true;
                 } else {
                     cursor.after_session_id = cursor_session_id;
                     self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
@@ -6009,8 +6215,39 @@ impl Broker {
             }
         }
         report.assign_kept_codes();
+        self.note_priority_apply_keeps(&report)?;
         self.record_auto_cleanup_report(&report)?;
         Ok(report)
+    }
+
+    /// Record, on the priority memo entry of each checkout apply kept, the
+    /// keep code it gave, so the record says why a selected priority group was
+    /// not removed. The entry already keeps it from being picked first again.
+    fn note_priority_apply_keeps(
+        &mut self,
+        report: &AutoCleanupReport,
+    ) -> Result<(), BrokerOpError> {
+        if report.kept.is_empty() {
+            return Ok(());
+        }
+        let raw = self.store().meta_get(PRIORITY_MEMO_KEY)?;
+        let mut memo = PriorityMemo::decode(raw.as_deref());
+        let mut changed = false;
+        for kept in &report.kept {
+            if let Some(entry) = memo.entries.get_mut(&kept.worktree)
+                && entry.outcome == "selected"
+                && entry.apply_code.as_deref() != Some(kept.code.as_str())
+            {
+                entry.apply_code = Some(kept.code.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            let text =
+                serde_json::to_string(&memo).expect("serializing the priority memo is infallible");
+            self.store().meta_set(PRIORITY_MEMO_KEY, &text)?;
+        }
+        Ok(())
     }
 
     fn remove_auto_cleanup_candidate(
@@ -8043,7 +8280,7 @@ mod tests {
             session_path_matches: true,
             under_broker_root: true,
             common_dir_is_this_repository: true,
-            registered_branch: Some("refs/heads/agent/task".into()),
+            registered: true,
             checkout_branch: Some("agent/task".into()),
             checkout_head: Some("1".repeat(40)),
             branch_tip: Some("1".repeat(40)),
@@ -8132,21 +8369,21 @@ mod tests {
     }
 
     #[test]
-    fn renumber_reproof_requires_registration_on_the_session_branch() {
+    fn renumber_reproof_requires_this_repository_to_register_the_checkout() {
         assert_renumber_refused(
-            |evidence| evidence.registered_branch = None,
-            "git worktree list does not register it on the session branch",
-        );
-        assert_renumber_refused(
-            |evidence| evidence.registered_branch = Some("refs/heads/agent/other".into()),
-            "git worktree list does not register it on the session branch",
+            |evidence| evidence.registered = false,
+            "this repository does not register the checkout",
         );
     }
 
     #[test]
     fn renumber_reproof_requires_the_checkout_on_the_session_branch() {
         assert_renumber_refused(
-            |evidence| evidence.checkout_branch = Some("HEAD".into()),
+            |evidence| evidence.checkout_branch = None,
+            "the checkout is not on the session branch",
+        );
+        assert_renumber_refused(
+            |evidence| evidence.checkout_branch = Some("agent/other".into()),
             "the checkout is not on the session branch",
         );
     }
@@ -8317,8 +8554,7 @@ mod tests {
             "the verdict records the re-proof it used"
         );
 
-        // A detached HEAD fails the registration condition: kept, and
-        // countable, with what Git registered in the reason.
+        // A detached HEAD fails the branch condition: kept, and countable.
         git(&path, &["checkout", "-q", "--detach"]);
         match verdict_for(&mut broker) {
             Err(NotRemoved::Keep(reason)) => {
@@ -8327,7 +8563,10 @@ mod tests {
                     "ownership_reproof_refused",
                     "{reason}"
                 );
-                assert!(reason.contains("registered on a detached HEAD"), "{reason}");
+                assert!(
+                    reason.contains("the checkout is not on the session branch"),
+                    "{reason}"
+                );
             }
             other => panic!("a detached checkout must be kept: {other:?}"),
         }
@@ -8365,6 +8604,424 @@ mod tests {
                 super::ClosedArtifactCheckoutCohortUnavailableReason::SpawnedWitnessMismatch
             )
         ));
+    }
+
+    /// A closed spawned checkout whose saved witness is a schema-2 record of
+    /// the same objects under renumbered devices, with today's observation.
+    #[cfg(unix)]
+    struct RenumberFixture {
+        _owner: tempfile::TempDir,
+        _storage: crate::test_storage::TestStorage,
+        broker: crate::Broker,
+        session: crate::Session,
+        path: PathBuf,
+        saved: crate::events::SpawnedWorktreeInstanceWitness,
+        current: crate::events::SpawnedWorktreeInstanceWitness,
+    }
+
+    #[cfg(unix)]
+    impl RenumberFixture {
+        fn new() -> Self {
+            let (owner, storage, mut broker, session) = retirement_fixture();
+            broker
+                .close_abandoning_unpushed(session.id, "renumber evidence fixture")
+                .unwrap();
+            let path = PathBuf::from(&session.worktree_path);
+            let current = GitRepo::discover(&path)
+                .unwrap()
+                .spawned_worktree_instance_witness()
+                .expect("the live checkout has a witness");
+            let mut saved = current.clone();
+            saved.schema_version = 2;
+            saved.volume_uuids = None;
+            saved.worktree_device += 1000;
+            saved.git_pointer_device += 1000;
+            saved.git_admin_device += 1000;
+            saved.git_common_device += 1000;
+            let session = broker.store().session(session.id).unwrap();
+            Self {
+                _owner: owner,
+                _storage: storage,
+                broker,
+                session,
+                path,
+                saved,
+                current,
+            }
+        }
+
+        fn reproof(&self, session: &crate::Session) -> Result<(), super::ReproofFailure> {
+            self.broker.renumbered_witness_reproof(
+                session,
+                &self.path,
+                &self.saved,
+                &self.current,
+                None,
+            )
+        }
+
+        /// The re-proof holds as built, and refuses naming `expected` after
+        /// `change` (undone by `restore`) breaks one gathered condition.
+        fn assert_refused_by(
+            &self,
+            session: &crate::Session,
+            change: impl FnOnce(),
+            restore: impl FnOnce(),
+            expected: &str,
+        ) {
+            assert_eq!(self.reproof(&self.session), Ok(()));
+            change();
+            let result = self.reproof(session);
+            restore();
+            match result {
+                Err(super::ReproofFailure::Refused(reason)) => {
+                    assert!(reason.contains(expected), "{reason}");
+                    assert_eq!(
+                        super::kept_reason_code(&reason),
+                        "ownership_reproof_refused"
+                    );
+                }
+                other => panic!("expected a refusal naming {expected:?}: {other:?}"),
+            }
+            assert_eq!(self.reproof(&self.session), Ok(()), "restored");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renumber_evidence_requires_a_closed_session_row() {
+        let fixture = RenumberFixture::new();
+        let mut open = fixture.session.clone();
+        open.cleanup_state = SessionCleanupState::Open;
+        fixture.assert_refused_by(&open, || {}, || {}, "the session is not closed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renumber_evidence_requires_the_session_row_to_name_the_checkout() {
+        let fixture = RenumberFixture::new();
+        let mut elsewhere = fixture.session.clone();
+        elsewhere.worktree_path = fixture.broker.main_root().to_string_lossy().into_owned();
+        fixture.assert_refused_by(
+            &elsewhere,
+            || {},
+            || {},
+            "the session row names another path",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renumber_evidence_requires_the_broker_worktree_root() {
+        let fixture = RenumberFixture::new();
+        let marker = fixture
+            .path
+            .parent()
+            .unwrap()
+            .join(crate::broker::WORKTREE_ROOT_MARKER);
+        let original = std::fs::read(&marker).expect("the fixture root carries its marker");
+        fixture.assert_refused_by(
+            &fixture.session,
+            || std::fs::write(&marker, b"{}").unwrap(),
+            || std::fs::write(&marker, &original).unwrap(),
+            "the checkout is not under the broker worktree root",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renumber_evidence_requires_this_repositorys_common_directory() {
+        let mut fixture = RenumberFixture::new();
+        let other = fixture.broker.main_root().join(".aethyme");
+        let other = std::fs::canonicalize(other).unwrap();
+        fixture.saved.git_common_path = other.to_string_lossy().into_owned();
+        fixture.current.git_common_path = fixture.saved.git_common_path.clone();
+        match fixture.reproof(&fixture.session) {
+            Err(super::ReproofFailure::Refused(reason)) => assert!(
+                reason.contains("does not point into this repository"),
+                "{reason}"
+            ),
+            other => panic!("another common directory must be refused: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renumber_evidence_requires_a_registration_naming_the_checkout() {
+        let fixture = RenumberFixture::new();
+        let gitdir = Path::new(&fixture.current.git_admin_path).join("gitdir");
+        let original = std::fs::read(&gitdir).unwrap();
+        // Prunable: the registration names a `.git` that no longer exists.
+        fixture.assert_refused_by(
+            &fixture.session,
+            || std::fs::write(&gitdir, "/nonexistent/checkout/.git\n").unwrap(),
+            || std::fs::write(&gitdir, &original).unwrap(),
+            "this repository does not register the checkout",
+        );
+        // Registered to another checkout's `.git` file.
+        let other = fixture
+            .broker
+            .main_root()
+            .parent()
+            .unwrap()
+            .join("other-checkout");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join(".git"), "gitdir: /nowhere\n").unwrap();
+        let other_pointer = other.join(".git");
+        fixture.assert_refused_by(
+            &fixture.session,
+            || {
+                std::fs::write(&gitdir, format!("{}\n", other_pointer.display())).unwrap();
+            },
+            || std::fs::write(&gitdir, &original).unwrap(),
+            "this repository does not register the checkout",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renumber_evidence_requires_the_checkout_on_the_session_branch() {
+        let fixture = RenumberFixture::new();
+        let mut renamed = fixture.session.clone();
+        renamed.branch = "agent/some-other-branch".into();
+        fixture.assert_refused_by(
+            &renamed,
+            || {},
+            || {},
+            "the checkout is not on the session branch",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renumber_evidence_requires_head_at_the_session_branch_tip() {
+        let fixture = RenumberFixture::new();
+        // On the branch, but the branch ref no longer resolves.
+        let loose = Path::new(&fixture.current.git_common_path)
+            .join("refs/heads")
+            .join(&fixture.session.branch);
+        let aside = loose.with_extension("aside");
+        assert!(loose.is_file(), "the fixture branch is a loose ref");
+        fixture.assert_refused_by(
+            &fixture.session,
+            || std::fs::rename(&loose, &aside).unwrap(),
+            || std::fs::rename(&aside, &loose).unwrap(),
+            "the checkout HEAD is not the session branch tip",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renumber_evidence_out_of_time_is_unavailable_not_refused() {
+        let fixture = RenumberFixture::new();
+        let expired = Some(Instant::now() - Duration::from_millis(1));
+        assert!(matches!(
+            fixture.broker.renumbered_witness_reproof(
+                &fixture.session,
+                &fixture.path,
+                &fixture.saved,
+                &fixture.current,
+                expired,
+            ),
+            Err(super::ReproofFailure::Unavailable(_))
+        ));
+    }
+
+    /// The verdict re-makes the re-proof against a fresh observation after
+    /// building the cohort: a registration broken in between keeps the
+    /// checkout even though the cohort accepted it.
+    #[cfg(unix)]
+    #[test]
+    fn the_verdict_recheck_refuses_a_checkout_changed_after_the_cohort() {
+        use super::{
+            AutoCleanupCheckoutGroup, AutoCleanupVerdictOptions, LeaseProcessTableSnapshot,
+            NotRemoved,
+        };
+
+        let mut fixture = RenumberFixture::new();
+        let session_id = fixture.session.id;
+        let saved = fixture.saved.clone();
+        rewrite_spawn_witness(&mut fixture.broker, session_id, &saved);
+        std::fs::write(
+            fixture.broker.main_root().join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktree_grace_hours = 0\n",
+        )
+        .unwrap();
+        let closed = fixture.broker.store().session(session_id).unwrap();
+        let group = AutoCleanupCheckoutGroup {
+            worktree: fixture.path.clone(),
+            sessions: vec![closed],
+            complete: true,
+            cursor_session_id: session_id,
+        };
+        let candidate = match fixture
+            .broker
+            .auto_cleanup_candidate_for_group(&group, &[], &[], None)
+            .unwrap()
+        {
+            AutoCleanupGroupInspection::Candidate(candidate) => candidate,
+            _ => panic!("the renumbered checkout must be a cleanup candidate"),
+        };
+        let head = GitRepo::discover(&fixture.path)
+            .unwrap()
+            .head_commit()
+            .unwrap();
+        let upstream = ("main".into(), head.clone());
+        let selected = ContainmentProof {
+            head: head.clone(),
+            containing_commit: head,
+            proof: "fixture unchanged HEAD".into(),
+            interrupted_removal_deletions: 0,
+            ownership_reproof: None,
+        };
+        let gitdir = Path::new(&fixture.current.git_admin_path).join("gitdir");
+        let original = std::fs::read(&gitdir).unwrap();
+        let broken = gitdir.clone();
+        super::AFTER_REMOVAL_COHORT_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_: &Path| {
+                std::fs::write(&broken, "/nonexistent/checkout/.git\n").unwrap();
+            }));
+        });
+        let mut lease_process_table = LeaseProcessTableSnapshot::default();
+        let verdict = fixture.broker.auto_cleanup_verdict(
+            &candidate,
+            &AutoCleanupPolicy::default(),
+            &upstream,
+            AutoCleanupVerdictOptions {
+                deep: false,
+                deadline: None,
+                selected: Some(&selected),
+                lease_process_table: &mut lease_process_table,
+            },
+        );
+        super::AFTER_REMOVAL_COHORT_HOOK.with(|hook| *hook.borrow_mut() = None);
+        std::fs::write(&gitdir, &original).unwrap();
+        match verdict {
+            Err(NotRemoved::Keep(reason)) => assert!(
+                reason.contains("worktree instance no longer matches its spawn record"),
+                "{reason}"
+            ),
+            other => panic!("the fresh re-check must keep it: {other:?}"),
+        }
+    }
+
+    /// A closed checkout whose directory is gone is judged by one stat,
+    /// under its own code, before any Git process.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_checkout_directory_is_kept_as_checkout_missing() {
+        let (_owner, _storage, mut broker, session) = retirement_fixture();
+        broker
+            .close_abandoning_unpushed(session.id, "missing directory fixture")
+            .unwrap();
+        let closed = broker.store().session(session.id).unwrap();
+        let gone = broker.main_root().parent().unwrap().join("gone-checkout");
+        let group = super::AutoCleanupCheckoutGroup {
+            worktree: gone,
+            sessions: vec![closed],
+            complete: true,
+            cursor_session_id: session.id,
+        };
+        match broker
+            .auto_cleanup_candidate_for_group(&group, &[], &[], None)
+            .unwrap()
+        {
+            AutoCleanupGroupInspection::Kept(kept) => {
+                assert_eq!(
+                    super::kept_reason_code(&kept.reason),
+                    "checkout_missing",
+                    "{}",
+                    kept.reason
+                );
+            }
+            _ => panic!("a missing directory must be kept"),
+        }
+    }
+
+    /// Every judged priority group is remembered, selected and deferred ones
+    /// included, so it is not picked first on the next pass; a deferred one
+    /// comes back sooner, and a changed merged state at once.
+    #[test]
+    fn the_priority_memo_remembers_selected_kept_and_deferred_groups() {
+        use super::{PRIORITY_DEFER_MS, PRIORITY_REJUDGE_MS, PriorityMemo, PriorityOutcome};
+
+        let now = 1_000_000;
+        let mut memo = PriorityMemo::default();
+        memo.remember("/selected".into(), true, PriorityOutcome::Selected, now);
+        memo.remember("/kept".into(), true, PriorityOutcome::Kept, now);
+        memo.remember("/deferred".into(), false, PriorityOutcome::Deferred, now);
+        for path in ["/selected", "/kept"] {
+            assert!(
+                memo.recently_judged(path, true, now + PRIORITY_REJUDGE_MS - 1),
+                "{path}"
+            );
+            assert!(
+                !memo.recently_judged(path, true, now + PRIORITY_REJUDGE_MS),
+                "{path}"
+            );
+        }
+        assert!(memo.recently_judged("/deferred", false, now + PRIORITY_DEFER_MS - 1));
+        assert!(!memo.recently_judged("/deferred", false, now + PRIORITY_DEFER_MS));
+        assert!(
+            !memo.recently_judged("/deferred", true, now),
+            "a pull request merging since is judged at once"
+        );
+        memo.prune(now + PRIORITY_DEFER_MS);
+        assert!(!memo.entries.contains_key("/deferred"));
+        assert!(memo.entries.contains_key("/selected"));
+    }
+
+    /// A merged closed checkout that selection picks but apply keeps (an
+    /// artifact-use marker only apply checks) must not hold the removal lane:
+    /// the next landed checkout is still removed by the following passes.
+    #[cfg(unix)]
+    #[test]
+    fn a_merged_checkout_kept_at_apply_does_not_block_the_next_removal() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let (blocked_session, blocked) = closed_landed_checkout(&mut broker, "kept at apply");
+        let (_session, landed) = closed_landed_checkout(&mut broker, "removable next");
+        record_merged_pull_request(&mut broker, blocked_session.id, 77);
+        let admission = crate::file_lock::artifact_use::begin_artifact_use(
+            broker.main_root(),
+            &blocked,
+            blocked_session.id,
+            "apply-only blocker",
+        )
+        .unwrap();
+        let crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer) = admission
+        else {
+            panic!("artifact-use protocol should be available for this test");
+        };
+        // The marker stays after the producer handle is dropped.
+        drop(producer);
+        let root = broker.main_root().to_path_buf();
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[worktrees]\nmax_checkouts = 1\n",
+        )
+        .unwrap();
+        for _ in 0..3 {
+            if !landed.exists() {
+                break;
+            }
+            let _ = broker.run_capacity_removal_slice(Instant::now()).unwrap();
+        }
+        assert!(!landed.exists(), "the next landed checkout must be removed");
+        assert!(blocked.exists(), "the marked checkout stays");
+        let memo = super::PriorityMemo::decode(
+            broker
+                .store()
+                .meta_get(super::PRIORITY_MEMO_KEY)
+                .unwrap()
+                .as_deref(),
+        );
+        let key = std::fs::canonicalize(&blocked).unwrap();
+        let entry = memo
+            .entries
+            .get(key.to_string_lossy().as_ref())
+            .expect("the selected priority group is remembered");
+        assert_eq!(entry.outcome, "selected");
+        assert_eq!(entry.apply_code.as_deref(), Some("artifact_use"));
     }
 
     /// `count` closed spawned checkouts with no checkout cleanup request, and
