@@ -4,6 +4,22 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.89] - 2026-11-13
+
+### Changed
+
+- Unattended maintenance closes a session whose work is on the fetched default branch (merge commit, squash or rebase, by the rule `finish` uses) once it has been idle 24 hours, its worktree is clean, it has no unmerged linked pull request, and no process uses it. This now applies even when the agent process that held it is still running with an expired task lease, provided no gate, operation, preparation, open file or working directory of that process is in the worktree. The checkout is then removed by the existing cleanup lane with its own containment proof. `[cleanup] auto_remove = false` turns this off (#1652).
+- Every proof is checked again under the session and lifecycle claims, and HEAD and worktree activity are read once more immediately before the close; a commit made in between keeps the session open (#1652).
+
+### Added
+
+- `broker status --json` reports `landed_session_retirement`, and the auto-cleanup report gains `landed_sessions_examined`, `landed_sessions_closed`, `landed_sessions_declined` (a count per reason code), `retirement_cursor` and `landed_retirement_elapsed_ms`, so every session that stays open has a recorded reason (#1652).
+- Phase telemetry `landed_session_retirement`, `landed_landing_search`, `landed_landing_search_memo_skipped` and `landed_sessions_*` counts (#1652).
+
+### Fixed
+
+- Checking a session's worktree for cleanliness no longer refreshes the index timestamp that the idle windows read (#1652).
+
 ## [0.8.88] - 2026-11-13
 
 ### Fixed
