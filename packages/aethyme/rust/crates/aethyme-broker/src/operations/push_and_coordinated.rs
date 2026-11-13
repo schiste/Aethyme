@@ -71,6 +71,10 @@ fn push_stage_span(push: bool, name: &'static str) -> Option<crate::phase_teleme
     push.then(|| crate::phase_telemetry::span(name))
 }
 
+/// A pushed destination ref, and a check of the tip a push's under-lock
+/// remote read saw there (`None`: the ref does not exist on the remote).
+pub(crate) type RemoteTipCheck<'a> = (&'a str, &'a dyn Fn(Option<&str>) -> Result<(), String>);
+
 fn plan_exact_push(
     cwd: &Path,
     args: &[String],
@@ -1995,6 +1999,9 @@ impl Broker {
             || Ok(()),
             |_, _| Ok(None),
         )?;
+        if report.ok() {
+            self.note_session_branch_push(&session, &report);
+        }
         if report.ok() && should_cleanup_after_merge {
             report.post_merge_cleanup = Some(
                 self.cleanup_after_github_pull_request_merge(session_id, repository.as_deref()),
@@ -2624,20 +2631,28 @@ impl Broker {
             pre_execute,
             on_success,
             None,
+            None,
         )
     }
 
-    /// As [`Self::run_coordinated_operation_at_with_wait`] for a `git push`,
-    /// and also read `default_ref` on the remote in the push's own under-lock
-    /// `ls-remote`, reported as
+    /// As [`Self::run_coordinated_operation_at_with_wait`] for `broker push`
+    /// of a session branch.
+    ///
+    /// `tip_check` names the pushed destination ref and a check of the tip
+    /// the push's own under-lock `ls-remote` saw there. The check runs under
+    /// the push lock, after that read and before Git runs; an `Err` resolves
+    /// the operation unstarted and is returned as the refusal reason, so a
+    /// push decided against a remote tip never runs against another one.
+    /// When `default_ref` is given, the same read also reads it, reported as
     /// [`CoordinatedOperationReport::remote_default_observation`]. No extra
     /// network call: the read the push makes anyway carries one more pattern.
-    pub(crate) fn run_coordinated_push_observing_default(
+    pub(crate) fn run_coordinated_session_push(
         &mut self,
         request: CoordinatedCommand,
         cwd: &Path,
         queue_wait: QueueWait,
-        default_ref: &str,
+        default_ref: Option<&str>,
+        tip_check: RemoteTipCheck<'_>,
     ) -> Result<CoordinatedOperationReport, BrokerOpError> {
         self.run_coordinated_operation_observing(
             request,
@@ -2645,7 +2660,8 @@ impl Broker {
             queue_wait,
             || Ok(()),
             |_, _| Ok(None),
-            Some(default_ref),
+            default_ref,
+            Some(tip_check),
         )
     }
 
@@ -2657,6 +2673,7 @@ impl Broker {
         pre_execute: P,
         on_success: F,
         observe_default: Option<&str>,
+        tip_check: Option<RemoteTipCheck<'_>>,
     ) -> Result<CoordinatedOperationReport, BrokerOpError>
     where
         P: FnOnce() -> Result<(), String>,
@@ -3633,6 +3650,28 @@ impl Broker {
                          the hook no longer describes what would be pushed; re-run the command"
                     .into(),
             });
+        }
+
+        // A caller that chose how to push against a remote tip re-checks that
+        // choice against the tip this read saw, under the lock the push holds,
+        // so no brokered write can move the branch between check and push.
+        if let Some((destination_ref, check)) = tip_check
+            && let PushPlanning::Planned(plan) = &push_planning
+            && let Some(destination) = plan
+                .destinations
+                .iter()
+                .find(|destination| destination.destination_ref == destination_ref)
+            && let Err(reason) = check(destination.pre_push_sha.as_deref())
+        {
+            self.resolve_unstarted_operation_with_details(
+                queued_operation_id,
+                json!({
+                    "reason": "remote_tip_revalidation_failed",
+                    "destination_ref": destination_ref,
+                    "observed_sha": destination.pre_push_sha,
+                }),
+            );
+            return Err(BrokerOpError::InvalidCoordinatedOperation { reason });
         }
 
         // A bounded request may spend its entire budget in revalidation or

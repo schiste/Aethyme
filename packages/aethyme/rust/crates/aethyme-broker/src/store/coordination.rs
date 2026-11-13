@@ -233,6 +233,38 @@ impl BrokerStore {
         Ok(operations)
     }
 
+    /// `details_json` of this session's succeeded Git writes to `repository`
+    /// whose journal mentions `oid`, newest first. `broker push` reads the
+    /// exact push plan out of them to prove a remote tip is this session's
+    /// own push. The unary pluses keep the planner on the per-session index,
+    /// so the read stays proportional to one session's operations.
+    pub(crate) fn session_git_write_details_mentioning(
+        &self,
+        session_id: i64,
+        repository: &str,
+        oid: &str,
+    ) -> Result<Vec<String>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT details_json FROM coordinated_operations
+             WHERE session_id = ?1
+               AND +repository = ?2
+               AND provider = 'git'
+               AND +status = 'succeeded'
+               AND effect <> 'read'
+               AND details_json IS NOT NULL
+               AND instr(details_json, ?3) > 0
+             ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map(params![session_id, repository, oid], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut details = Vec::new();
+        for row in rows {
+            details.push(row?);
+        }
+        Ok(details)
+    }
+
     /// The host operation is only known once the lock is held, but the record is
     /// created before queueing, so the link is attached rather than inserted.
     pub fn attach_host_operation(

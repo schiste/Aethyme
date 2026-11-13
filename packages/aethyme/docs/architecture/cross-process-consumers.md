@@ -1406,7 +1406,29 @@ also carry the span `default_branch_unmoved_check` (comparing the remote
 default branch the push read with the local tracking ref) and the counters
 `default_branch_fetch_skipped_unmoved` (the fetch was skipped because the
 default branch had not moved) and `default_branch_fetch_reused` (a recent
-fetch was reused) in `phase_counts`. The coordinated `git push` process span
+fetch was reused) in `phase_counts`. Since 2026-11-13 each push attempt also
+counts, in `phase_counts`, how it chose to send the session branch, before
+Git runs: `push_plain_fast_forward` (the remote branch is absent or an
+ancestor of HEAD, so a plain push), `push_lease_recorded` (a rewritten branch
+leased against the oid the last `broker push` recorded for the session),
+`push_lease_journal_proven` (a rewritten branch leased against the oid a
+succeeded journaled push of the same session sent to the same branch on the
+same remote, such as a `broker advanced git` push) or
+`push_refused_foreign_remote_tip` (the remote branch holds a commit HEAD does
+not contain and the session did not push; refused with exit code 3 before
+anything is sent). The choice is made against the tip the remote is believed
+to hold (the newer of the recorded oid and the remote-tracking ref) and
+re-checked under the push lock against the tip the push's own remote read
+saw; `push_remote_tip_redecided` counts a push decided a second time because
+that read showed the remote elsewhere (the first attempt is journaled
+`failed` with `reason` `remote_tip_revalidation_failed` and `observed_sha`,
+and Git never ran it), and `push_remote_tip_rejected` counts a push Git
+rejected because the remote moved after that read (`stale info`,
+`fetch first`, `non-fast-forward`), which is then also decided again against
+a fresh read instead of relaying Git's output. A second miss refuses with
+exit code 3. A successful `broker advanced git` push of the session's own
+branch to the remote `broker push` uses now records the pushed oid the same
+way `broker push` does. The coordinated `git push` process span
 `push_git_process` is split, from Git's own Trace2 events, into
 `push_git_process_before_hook` (connecting and reading the remote's refs),
 `push_git_process_hook` (the `pre-push` hook run by that push; `0` when the
