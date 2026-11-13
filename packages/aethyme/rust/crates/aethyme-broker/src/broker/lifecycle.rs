@@ -7973,6 +7973,7 @@ impl Broker {
                     self.auto_cleanup_for_checkout_capacity(
                         CHECKOUT_CAPACITY_LOCK_WAIT,
                         CHECKOUT_CAPACITY_CLEANUP_BUDGET,
+                        None,
                     )
                 });
             let cleanup_report = match cleanup {
@@ -10075,9 +10076,12 @@ impl Broker {
     }
 
     fn worktree_checkout_limit(&self) -> Result<Option<(usize, u32)>, BrokerOpError> {
-        Ok(self
-            .worktree_checkout_usage()?
-            .filter(|(count, maximum)| *count >= *maximum as usize))
+        let usage = self.worktree_checkout_usage()?;
+        if let Some((count, maximum)) = usage {
+            // Passes too short to list checkouts read this to see pressure.
+            self.record_checkout_usage(count, maximum);
+        }
+        Ok(usage.filter(|(count, maximum)| *count >= *maximum as usize))
     }
 
     /// Registered linked checkouts and the allocation limit `start` enforces,

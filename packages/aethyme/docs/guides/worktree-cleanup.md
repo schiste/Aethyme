@@ -168,6 +168,29 @@ blockers with the line that would release a directory, for example:
 
 and the `cleanup.checkout-capacity` row repeats the top five in its evidence.
 
+From three quarters of the limit the background worker also removes closed
+checkouts itself: a 20-second removal slice before its other work and between
+its cache passes, each of which now holds the GC lock for at most 30 seconds.
+A slice removes one checkout at a time, at most four, and after each waits out
+what Git deleted at `[cleanup] unattended_unlinks_per_second` with no lock
+held. A slice that removes nothing waits 10 minutes before pressure alone
+starts another; one that finds the GC lock held waits 1 minute. Broker opens too short to count checkouts read the count
+`broker start` last recorded. Within the removal lane, selection uses at most
+three quarters of the budget, so revalidation and the first removal always
+have time (`auto_cleanup.lanes.removal_selected` and
+`removal_apply_reserve_ms`).
+
+Automatic removal records that it started on a checkout before Git deletes
+anything. A closed checkout that such a recorded removal left part-deleted
+(tracked files missing, nothing modified, staged or untracked, at least a
+quarter of the tracked paths gone, same owner and HEAD) is finished once HEAD
+is proved contained; `removed[].resumed_interrupted_removal` counts the missing
+paths. Without that record a pure deletion is somebody's change and is kept,
+code `unmarked_tracked_deletions`; checkouts half-deleted before the record
+existed stay kept this way and need a manual look. Any other change still
+keeps a checkout, and `[cleanup] strict = true` keeps a recorded one too
+(`strict_tracked_deletions`).
+
 At the limit, `broker start` first runs the removal lane alone with a 20-second
 budget, waiting up to 5 seconds for a maintenance pass that holds the GC lock.
 If the limit still refuses, the error says how many closed checkouts that pass
