@@ -153,6 +153,23 @@ checkouts reach three quarters of `[worktrees].max_checkouts`, a
 `cleanup.checkout-capacity` row names the retained count and the commands that
 reclaim slots before `broker start` refuses.
 
+Ownership is proved from the spawn-time witness: the broker removes a
+checkout automatically only when it can show it created that exact directory.
+A witness saved before volume UUIDs were recorded (schema 2) stores mount
+device numbers, which macOS renumbers after a restart or remount. Such a
+checkout is re-proved when its paths, inodes and spawn root generation are
+unchanged, its session was spawned and is closed, it sits under the broker
+worktree root, `git worktree list` registers it on the session branch and HEAD
+is that branch's tip; the removal then records
+`removed[].ownership_reproof: "device_renumber"`. If any condition fails it
+stays kept with code `ownership_reproof_refused` and the failed condition in
+the reason. Checkouts that cannot be proven at all stay kept with their own
+code and the manual command in the reason: `ownership_witness_missing` (a
+spawned session that never recorded a witness), `ownership_witness_legacy`
+(a schema-1 witness) and `ownership_adopted_only` (only adopted sessions use
+it). Inspect one, then run `aethyme broker finish cleanup <session-id>`. A
+closed checkout whose directory is already gone is `checkout_missing`.
+
 When a closed checkout is kept only for ignored leftovers, the removal lane
 lists every ignored root that blocks it (`kept[].ignored_blockers`) and
 remembers the verdict. It skips that checkout on later passes until its HEAD,
