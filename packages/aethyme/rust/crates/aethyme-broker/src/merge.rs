@@ -1197,12 +1197,15 @@ impl Broker {
         // repository write lanes for optional plan reuse: every coordinated
         // Git write in the repository would wait behind it with no journal
         // row to name. Give the reuse up and plan again later instead.
-        let (lifecycle_claim, prepared_plan) = match self.try_claim_worktree_lifecycle()? {
-            Some(claim) => (claim, prepared_plan),
-            None => {
-                drop(prepared_plan);
-                (self.claim_worktree_lifecycle()?, None)
-            }
+        let (lifecycle_claim, prepared_plan) = match prepared_plan {
+            None => (self.claim_worktree_lifecycle()?, None),
+            Some(reuse) => match self.try_claim_worktree_lifecycle()? {
+                Some(claim) => (claim, Some(reuse)),
+                None => {
+                    drop(reuse);
+                    (self.claim_worktree_lifecycle()?, None)
+                }
+            },
         };
         self.prepare_worktree_root_for_submission()?;
         let entry = self.store().submit(session_id, &head, &base)?;
