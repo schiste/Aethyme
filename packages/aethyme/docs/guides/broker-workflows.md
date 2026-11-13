@@ -541,6 +541,26 @@ with: a session-branch commit or push blocks that branch's lane and every
 repository-wide write, but not another session's branch. A repository-wide
 unknown write blocks everything, as before.
 
+A write that provably sent nothing to the remote is recorded `failed`, never
+`outcome_unknown`, so it blocks nothing and can simply be retried. For a
+`git push` the proof is Git's own Trace2 events: the push entered the remote
+ref listing, never finished it, never reached a hook or the ref-update phase,
+and exited non-zero. That is how an unresolvable host, a refused or
+unreachable connection, a TLS or SSH handshake failure, or a rejected login
+ends, and it does not depend on Git's (localisable) messages. For `gh`, the
+proof is a command line gh's flag parser rejected, or a single-request
+`gh api` call (no `--paginate`) whose connection was never established (DNS,
+`dial tcp`, certificate or TLS handshake timeout). A timeout, a reset after
+the ref listing, or any multi-request `gh` command still ends
+`outcome_unknown`. Such pushes first get the immediate re-read that already
+existed: the broker reads the pushed refs again under the same lock and
+settles the write itself when every destination is still at its old commit
+(`failed`) or already at the pushed one (`succeeded`). Only when that read is
+impossible -- typically because the network is still down -- does the write
+stay unknown and need `aethyme broker advanced operations reconcile`. See
+[cross-process consumers](../architecture/cross-process-consumers.md) for the
+journal fields and counters.
+
 Git's own lock files protect what these writes share: the object database,
 `packed-refs` and `gc --auto`. This lane does not protect anything a hook does
 outside the branch. A repository whose commit or push hooks write other

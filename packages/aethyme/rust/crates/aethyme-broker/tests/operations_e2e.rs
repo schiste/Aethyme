@@ -1167,10 +1167,17 @@ fn missing_post_push_evidence_keeps_an_exact_push_unknown() {
     let tmp = shell_fixture_tempdir();
     let mut fixture = push_fixture(tmp.path(), "push-missing");
     commit_push_fixture(&fixture, "missing evidence\n");
+    // The remote answers with its refs and takes the update first, so the
+    // push did reach it; only the evidence afterwards is missing. A transport
+    // that fails before advertising refs is classified from Git's trace
+    // instead (see the next test).
+    let git_exec_path = git_output(&fixture.worktree, &["--exec-path"]);
     let receive_pack = tmp.path().join("remove-remote-then-fail");
     write_executable(
         &receive_pack,
-        "#!/bin/sh\nmv \"$1\" \"$1.unavailable\"\nprintf 'remote disappeared\\n' >&2\nexit 1\n",
+        &format!(
+            "#!/bin/sh\n\"{git_exec_path}/git-receive-pack\" \"$@\"\nmv \"$1\" \"$1.unavailable\"\nprintf 'remote disappeared\\n' >&2\nexit 1\n"
+        ),
     );
     git(
         &fixture.worktree,
@@ -1209,6 +1216,95 @@ fn missing_post_push_evidence_keeps_an_exact_push_unknown() {
         shown.reconciliation.evidence.as_ref().unwrap()["evidence"]["reason"],
         "post_push_remote_evidence_unavailable"
     );
+}
+
+/// 2026-11-13: a push that died on "Could not resolve host" was journaled
+/// `outcome_unknown` and write-blocked every session until an operator read
+/// the remote and reconciled it by hand. A transport that fails before the
+/// remote advertises a single ref has sent no ref update, and Git's trace
+/// shows exactly that.
+#[cfg(unix)]
+#[test]
+fn push_that_fails_before_the_remote_lists_its_refs_is_failed_without_blocking() {
+    let tmp = shell_fixture_tempdir();
+    let mut fixture = push_fixture(tmp.path(), "push-before-refs");
+    let base = git_output(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    commit_push_fixture(&fixture, "never sent\n");
+    // Fails the way an unresolvable host or a refused connection does: no
+    // ref advertisement at all. It also hides the remote, so the
+    // post-failure remote read fails too -- as it does while the network is
+    // down -- and only the trace can classify this push.
+    let mut unreachable = fixture.remote.clone().into_os_string();
+    unreachable.push(".unreachable");
+    let unreachable = std::path::PathBuf::from(unreachable);
+    let receive_pack = tmp.path().join("hide-remote-before-advertising");
+    write_executable(
+        &receive_pack,
+        &format!(
+            "#!/bin/sh\nmv {} {}\nprintf 'ssh: Could not resolve hostname example.invalid\\n' >&2\nexit 255\n",
+            shell_path(&fixture.remote),
+            shell_path(&unreachable),
+        ),
+    );
+    git(
+        &fixture.worktree,
+        &[
+            "config",
+            "remote.origin.receivepack",
+            &shell_path(&receive_pack),
+        ],
+    );
+
+    let report = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &["HEAD:refs/heads/main"],
+        ))
+        .unwrap();
+    assert!(!report.command_success);
+    assert_eq!(report.operation.status, OperationStatus::Failed);
+    let details: serde_json::Value =
+        serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        details["failure_class"],
+        "push_failed_before_remote_refs_listed"
+    );
+    assert_eq!(details["remote_write_contact"], "not_contacted");
+    assert_eq!(details["recovery"], "retry");
+    let evidence = &details["push_reconciliation"]["evidence"];
+    assert_eq!(evidence["classification"], "failed");
+    assert_eq!(evidence["source"], "git_trace2");
+    let shown = fixture
+        .broker
+        .show_coordinated_operation(report.operation.id)
+        .unwrap();
+    assert_eq!(
+        shown.reconciliation.state,
+        OperationReconciliationState::NotRequired
+    );
+    assert!(!shown.reconciliation.write_blocked);
+
+    std::fs::rename(&unreachable, &fixture.remote).unwrap();
+    assert_eq!(
+        git_output(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        base
+    );
+    // Nothing blocks the repository: the next push runs.
+    git(
+        &fixture.worktree,
+        &["config", "--unset", "remote.origin.receivepack"],
+    );
+    let retried = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &["HEAD:refs/heads/main"],
+        ))
+        .unwrap();
+    assert!(retried.ok(), "{}", retried.stderr);
 }
 
 #[cfg(unix)]
