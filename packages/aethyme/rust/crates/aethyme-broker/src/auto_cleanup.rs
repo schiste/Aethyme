@@ -905,6 +905,11 @@ pub struct AutoRemovedCheckout {
     /// ordinary removal.
     #[serde(default, skip_serializing_if = "is_zero_count")]
     pub resumed_interrupted_removal: usize,
+    /// The ownership re-proof this removal used because the saved spawn
+    /// witness no longer matched exactly: `device_renumber` for a schema-2
+    /// witness whose mounts macOS renumbered. Absent for an exact match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership_reproof: Option<String>,
 }
 
 /// One candidate auto-cleanup kept, and why.
@@ -922,6 +927,11 @@ pub struct AutoKeptCheckout {
     /// built-in witness or `[cleanup] regenerable` glob recognises.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignored_blockers: Vec<String>,
+    /// Set to `device_renumber` when the device-renumber ownership re-proof
+    /// was tried for this checkout and refused (code
+    /// `ownership_reproof_refused`); the reason names the failed condition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership_reproof: Option<String>,
 }
 
 /// Classify a keep reason into a stable code. The reasons are written by the
@@ -931,6 +941,23 @@ pub fn kept_reason_code(reason: &str) -> &'static str {
         .strip_prefix("changed before removal: ")
         .unwrap_or(reason);
     const CODES: &[(&str, &str)] = &[
+        // Ownership causes first: their reasons quote failed conditions such
+        // as "the session is not closed" that later needles would misfile.
+        (
+            "device renumber re-proof refused",
+            "ownership_reproof_refused",
+        ),
+        (
+            OWNERSHIP_WITNESS_NEVER_RECORDED,
+            "ownership_witness_missing",
+        ),
+        (OWNERSHIP_WITNESS_LEGACY, "ownership_witness_legacy"),
+        (OWNERSHIP_ADOPTED_ONLY, "ownership_adopted_only"),
+        (CHECKOUT_DIRECTORY_MISSING, "checkout_missing"),
+        (
+            "closed checkout cohort or ownership witness changed: cohort unavailable",
+            "cohort_unavailable",
+        ),
         (
             "ignored content requires explicit cleanup",
             "ignored_content",
@@ -1018,6 +1045,11 @@ pub struct AutoCleanupLanes {
     /// the deadline passed while reading it).
     #[serde(default)]
     pub removal_inventory_unavailable: bool,
+    /// Closed-checkout groups selection judged ahead of its oldest-first lap
+    /// because a session's pull request is recorded merged or its checkout
+    /// cleanup request is due. Included in `removal_examined`.
+    #[serde(default)]
+    pub removal_priority_examined: usize,
 }
 
 /// What one auto-cleanup pass did.
@@ -1092,7 +1124,9 @@ pub struct CapacityRemovalSlice {
     /// `removed`; `lock_busy` (another maintenance pass held the GC lock);
     /// `inventory_unavailable` (no complete checkout inventory before the
     /// deadline); `lap_unfinished` (time ran out before the closed-checkout
-    /// lap reached its end); `nothing_removable` (the lap ended and every
+    /// lap reached its end); `out_of_time_before_selection` (the budget ran
+    /// out before one removal pass started, see `budget_consumed_by`; retried
+    /// after one minute); `nothing_removable` (the lap ended and every
     /// examined checkout was kept or deferred).
     pub outcome: String,
     pub removed: usize,
@@ -1128,6 +1162,16 @@ pub struct CapacityRemovalSlice {
     /// removed something and the next one may run at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<i64>,
+    /// Time the slice spent counting registered checkouts.
+    #[serde(default)]
+    pub count_ms: u64,
+    /// Time from the slice start to its first removal pass (or to giving up).
+    #[serde(default)]
+    pub pre_selection_ms: u64,
+    /// With outcome `out_of_time_before_selection`: what used the budget,
+    /// `checkout_count` or `pre_selection`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_consumed_by: Option<String>,
 }
 
 impl CapacityRemovalSlice {
@@ -1196,6 +1240,9 @@ impl AutoCleanupReport {
         for kept in &mut self.kept {
             if kept.code.is_empty() {
                 kept.code = kept_reason_code(&kept.reason).to_string();
+            }
+            if kept.code == "ownership_reproof_refused" && kept.ownership_reproof.is_none() {
+                kept.ownership_reproof = Some(OWNERSHIP_REPROOF_DEVICE_RENUMBER.to_string());
             }
         }
     }
@@ -1376,6 +1423,10 @@ pub(crate) struct ClosedArtifactCheckoutCohort {
     /// live checkout. They grant no cleanup authority of their own.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     handed_over_predecessors: Vec<i64>,
+    /// Set when a spawned row's saved witness matched only through
+    /// [`OWNERSHIP_REPROOF_DEVICE_RENUMBER`]. `CheckoutRemoval` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ownership_reproof: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1429,10 +1480,201 @@ impl ClosedArtifactCheckoutCohortUnavailableReason {
 /// artifact-use markers, so it tolerates a renumbered mount on a witness saved
 /// without volume UUIDs and never advances the index. Reclaim can delete
 /// checkout contents and keeps the exact witness comparison.
+///
+/// `CheckoutRemoval` is reclaim for automatic whole-checkout removal: the same
+/// exact comparison, plus the device-renumber re-proof for a schema-2 witness
+/// (see [`renumber_reproof_refusal`]). Artifact reclamation keeps `Reclaim`,
+/// whose final unlink guard compares the live instance exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClosedCohortPurpose {
     Reclaim,
+    CheckoutRemoval,
     MarkerReview,
+}
+
+impl ClosedCohortPurpose {
+    fn reclaims(self) -> bool {
+        matches!(self, Self::Reclaim | Self::CheckoutRemoval)
+    }
+}
+
+/// The re-proof that authorized a reclaim whose saved spawn witness no longer
+/// matched exactly: macOS renumbered the mounts of a schema-2 witness.
+pub(crate) const OWNERSHIP_REPROOF_DEVICE_RENUMBER: &str = "device_renumber";
+
+/// Keep-reason phrase for a spawned row that never persisted a witness.
+const OWNERSHIP_WITNESS_NEVER_RECORDED: &str =
+    "spawn-time worktree instance witness was never recorded";
+/// Keep-reason phrase for a schema-1 witness, which has no spawn generation.
+const OWNERSHIP_WITNESS_LEGACY: &str =
+    "spawn-time worktree instance witness is a legacy record without a spawn generation";
+/// Keep-reason phrase for a checkout only adopted sessions use.
+const OWNERSHIP_ADOPTED_ONLY: &str = "only adopted sessions use this checkout";
+/// Keep-reason phrase for a closed checkout whose directory is gone.
+const CHECKOUT_DIRECTORY_MISSING: &str = "the checkout directory no longer exists";
+
+/// What the device-renumber re-proof observes beyond the two witnesses. Each
+/// field is one condition, gathered by
+/// [`Broker::renumbered_witness_reproof`]; [`renumber_reproof_refusal`]
+/// decides.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RenumberReproofEvidence {
+    /// The session row was created by `start` (origin `spawned`).
+    pub origin_spawned: bool,
+    /// The session row is closed and its checkout not yet cleaned.
+    pub closed: bool,
+    /// The session row names this exact checkout path.
+    pub session_path_matches: bool,
+    /// The checkout sits directly under the broker-owned worktree root and
+    /// its Git common directory is this repository's
+    /// ([`Broker::is_broker_owned_worktree_checked`]).
+    pub under_broker_root: bool,
+    /// The live `.git` pointer resolves into this repository's common
+    /// directory.
+    pub common_dir_is_this_repository: bool,
+    /// This repository registers the checkout: its Git admin directory is
+    /// `<common>/worktrees/<name>` and that registration's `gitdir` names the
+    /// checkout's own `.git` file, the record `git worktree list` reads. A
+    /// registration whose `gitdir` target is gone (prunable) is not one.
+    pub registered: bool,
+    /// The branch the registration's `HEAD` has checked out.
+    pub checkout_branch: Option<String>,
+    /// The commit that `HEAD` resolves to through this repository's refs.
+    pub checkout_head: Option<String>,
+    /// The tip of `refs/heads/<session branch>` in this repository.
+    pub branch_tip: Option<String>,
+}
+
+const REGISTRATION_REFUSAL: &str = "this repository does not register the checkout";
+
+/// Decide the device-renumber re-proof. `None` means every condition holds;
+/// otherwise the first failed condition, which keeps the checkout.
+pub(crate) fn renumber_reproof_refusal(
+    saved: &crate::events::SpawnedWorktreeInstanceWitness,
+    current: &crate::events::SpawnedWorktreeInstanceWitness,
+    session_branch: &str,
+    evidence: &RenumberReproofEvidence,
+) -> Option<&'static str> {
+    if !saved.matches_after_device_renumber(current) {
+        return Some("filesystem identity differs beyond a device renumber");
+    }
+    if !evidence.origin_spawned {
+        return Some("the session was not spawned by the broker");
+    }
+    if !evidence.closed {
+        return Some("the session is not closed");
+    }
+    if !evidence.session_path_matches {
+        return Some("the session row names another path");
+    }
+    if !evidence.under_broker_root {
+        return Some("the checkout is not under the broker worktree root");
+    }
+    if !evidence.common_dir_is_this_repository {
+        return Some("the checkout's .git does not point into this repository");
+    }
+    if !evidence.registered {
+        return Some(REGISTRATION_REFUSAL);
+    }
+    if session_branch.is_empty() || evidence.checkout_branch.as_deref() != Some(session_branch) {
+        return Some("the checkout is not on the session branch");
+    }
+    match (&evidence.checkout_head, &evidence.branch_tip) {
+        (Some(head), Some(tip)) if !head.is_empty() && head == tip => None,
+        _ => Some("the checkout HEAD is not the session branch tip"),
+    }
+}
+
+/// Why a device-renumber re-proof did not authorize a reclaim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReproofFailure {
+    /// A condition failed: keep the checkout, with this reason.
+    Refused(String),
+    /// Evidence could not be gathered in time (a bounded Git call ran out
+    /// or failed): judge it again later, never as a refusal.
+    Unavailable(String),
+}
+
+/// Whether the admin directory `admin` is this repository's registration of
+/// `worktree`: it lives in `<common>/worktrees/` and its `gitdir` file names
+/// the checkout's existing `.git` file. Reads two paths; runs no Git process.
+fn registration_names_checkout(common: &Path, admin: &Path, worktree: &Path) -> bool {
+    let canonical = |path: &Path| std::fs::canonicalize(path).ok();
+    let Some(admin) = canonical(admin) else {
+        return false;
+    };
+    let Some(registrations) = canonical(&common.join("worktrees")) else {
+        return false;
+    };
+    if admin.parent() != Some(registrations.as_path()) {
+        return false;
+    }
+    let Ok(gitdir) = std::fs::read_to_string(admin.join("gitdir")) else {
+        return false;
+    };
+    let pointer = worktree.join(".git");
+    if !std::fs::symlink_metadata(&pointer).is_ok_and(|metadata| metadata.is_file()) {
+        return false;
+    }
+    match (canonical(Path::new(gitdir.trim())), canonical(&pointer)) {
+        (Some(named), Some(pointer)) => named == pointer,
+        _ => false,
+    }
+}
+
+/// Resolve `refname` (`refs/heads/...`) to a commit from the loose ref or
+/// `packed-refs` in `common`. Anything else (a symbolic or malformed ref,
+/// another ref backend) is `None`, which refuses the re-proof.
+fn resolve_branch_ref_in_common(common: &Path, refname: &str) -> Option<String> {
+    let valid_id = |value: &str| {
+        matches!(value.len(), 40 | 64)
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    let branch = refname.strip_prefix("refs/heads/")?;
+    if branch.is_empty()
+        || Path::new(branch)
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    if let Ok(loose) = std::fs::read_to_string(common.join(refname)) {
+        let loose = loose.trim();
+        return valid_id(loose).then(|| loose.to_string());
+    }
+    let packed = std::fs::read_to_string(common.join("packed-refs")).ok()?;
+    packed.lines().find_map(|line| {
+        if line.starts_with('#') || line.starts_with('^') {
+            return None;
+        }
+        let (id, name) = line.split_once(' ')?;
+        (name == refname && valid_id(id)).then(|| id.to_string())
+    })
+}
+
+/// What one registration's `HEAD` file says: the branch it has checked out
+/// (`None` when detached) and the commit it resolves to.
+fn registration_head(common: &Path, admin: &Path) -> (Option<String>, Option<String>) {
+    let Ok(head) = std::fs::read_to_string(admin.join("HEAD")) else {
+        return (None, None);
+    };
+    let head = head.trim();
+    match head.strip_prefix("ref: ") {
+        Some(refname) => (
+            refname.strip_prefix("refs/heads/").map(str::to_string),
+            resolve_branch_ref_in_common(common, refname),
+        ),
+        None => (
+            None,
+            (matches!(head.len(), 40 | 64)
+                && head
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+            .then(|| head.to_string()),
+        ),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1475,6 +1717,12 @@ impl ClosedArtifactCheckoutCohort {
             .iter()
             .find(|session| session.id == session_id)
             .and_then(|session| session.spawned_instance_witness.as_ref())
+    }
+
+    /// The re-proof this cohort's ownership needed, if the saved witness did
+    /// not match exactly.
+    pub(crate) fn ownership_reproof(&self) -> Option<&'static str> {
+        self.ownership_reproof
     }
 
     pub(crate) fn owner_witness(&self) -> Option<&crate::events::SpawnedWorktreeInstanceWitness> {
@@ -1708,6 +1956,9 @@ pub(crate) struct ContainmentProof {
     /// Tracked paths proof 3 found already deleted by an interrupted
     /// removal; 0 for an intact checkout.
     pub interrupted_removal_deletions: usize,
+    /// The ownership re-proof the verdict needed, if the saved spawn witness
+    /// did not match exactly ([`OWNERSHIP_REPROOF_DEVICE_RENUMBER`]).
+    pub ownership_reproof: Option<&'static str>,
 }
 
 /// Why a candidate is not removed in this pass.
@@ -2183,6 +2434,10 @@ fn ensure_ignored_content_before(deadline: Instant) -> Result<(), String> {
     }
 }
 
+/// Test seam callback for [`AFTER_REMOVAL_COHORT_HOOK`].
+#[cfg(test)]
+type RemovalCohortHook = Box<dyn FnMut(&Path)>;
+
 #[cfg(test)]
 thread_local! {
     /// Test seam: the retirement lane consumes its whole deadline.
@@ -2196,6 +2451,11 @@ thread_local! {
     /// in for a lap longer than one call covers.
     static COHORT_SCAN_LIMITS: std::cell::Cell<Option<(usize, usize)>> =
         const { std::cell::Cell::new(None) };
+    /// Test seam: runs in the removal verdict right after the cohort (and
+    /// its ownership re-proof) was built, so a test can change the checkout
+    /// before the verdict's own fresh re-check.
+    static AFTER_REMOVAL_COHORT_HOOK: std::cell::RefCell<Option<RemovalCohortHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Sessions per cohort-index discovery page.
@@ -2227,6 +2487,102 @@ const KEEP_MEMO_MAX_ENTRIES: usize = 4096;
 const KEEP_MEMO_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 /// Ignored roots recorded per kept checkout.
 const IGNORED_BLOCKER_LIMIT: usize = 16;
+
+/// Meta key of the closed-checkout groups the removal lane last judged ahead
+/// of its lap, so a kept one yields to the others before it is judged again.
+pub(crate) const PRIORITY_MEMO_KEY: &str = "auto_cleanup.priority_memo";
+/// Priority groups judged per pass, before the lap page.
+const PRIORITY_GROUPS_PER_PASS: usize = 8;
+/// Priority candidates read per pass before the memo filters them.
+const PRIORITY_CANDIDATE_LIMIT: usize = 256;
+/// A kept or selected priority group is judged again after this long, or at
+/// once when its merged state changes.
+const PRIORITY_REJUDGE_MS: i64 = 30 * 60_000;
+/// A deferred priority group (its proofs ran out of time) is judged ahead of
+/// the lap again after this long, so it cannot hold every pass.
+const PRIORITY_DEFER_MS: i64 = 5 * 60_000;
+/// Remembered priority verdicts kept at most; the oldest go first.
+const PRIORITY_MEMO_MAX_ENTRIES: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PriorityMemoEntry {
+    judged_at_ms: i64,
+    merged: bool,
+    /// Not judged ahead of the lap again before this time.
+    #[serde(default)]
+    retry_at_ms: i64,
+    /// `selected`, `kept` or `deferred` at selection.
+    #[serde(default)]
+    outcome: String,
+    /// The keep code apply recorded when it kept a selected group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    apply_code: Option<String>,
+}
+
+/// How selection left a priority group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriorityOutcome {
+    Selected,
+    Kept,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PriorityMemo {
+    #[serde(default)]
+    entries: std::collections::BTreeMap<String, PriorityMemoEntry>,
+}
+
+impl PriorityMemo {
+    fn decode(raw: Option<&str>) -> Self {
+        raw.and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default()
+    }
+
+    /// Whether `path` was judged recently with the same merged state.
+    fn recently_judged(&self, path: &str, merged: bool, now_ms: i64) -> bool {
+        self.entries
+            .get(path)
+            .is_some_and(|entry| entry.merged == merged && now_ms < entry.retry_at_ms)
+    }
+
+    /// Remember a judged priority group, whatever selection made of it: a
+    /// selected one that apply then keeps, or a deferred one, must not be
+    /// picked first on every pass and hold the lane.
+    fn remember(&mut self, path: String, merged: bool, outcome: PriorityOutcome, now_ms: i64) {
+        let (wait, outcome) = match outcome {
+            PriorityOutcome::Selected => (PRIORITY_REJUDGE_MS, "selected"),
+            PriorityOutcome::Kept => (PRIORITY_REJUDGE_MS, "kept"),
+            PriorityOutcome::Deferred => (PRIORITY_DEFER_MS, "deferred"),
+        };
+        self.entries.insert(
+            path,
+            PriorityMemoEntry {
+                judged_at_ms: now_ms,
+                merged,
+                retry_at_ms: now_ms.saturating_add(wait),
+                outcome: outcome.into(),
+                apply_code: None,
+            },
+        );
+    }
+
+    fn prune(&mut self, now_ms: i64) {
+        self.entries.retain(|_, entry| now_ms < entry.retry_at_ms);
+        if self.entries.len() > PRIORITY_MEMO_MAX_ENTRIES {
+            let mut ages = self
+                .entries
+                .iter()
+                .map(|(path, entry)| (entry.judged_at_ms, path.clone()))
+                .collect::<Vec<_>>();
+            ages.sort();
+            let excess = self.entries.len() - PRIORITY_MEMO_MAX_ENTRIES;
+            for (_, path) in ages.into_iter().take(excess) {
+                self.entries.remove(&path);
+            }
+        }
+    }
+}
 /// Names `blocked_by_ignored` lists, most common first.
 const BLOCKED_BY_IGNORED_LIMIT: usize = 10;
 
@@ -2662,6 +3018,7 @@ pub(crate) fn containment(
             containing_commit: upstream_tip.to_string(),
             proof: crate::LandingEvidence::Ancestry.as_str().to_string(),
             interrupted_removal_deletions: 0,
+            ownership_reproof: None,
         });
     }
     if !deep {
@@ -2676,6 +3033,7 @@ pub(crate) fn containment(
             containing_commit: landed_by.unwrap_or_else(|| upstream_tip.to_string()),
             proof: evidence.as_str().to_string(),
             interrupted_removal_deletions: 0,
+            ownership_reproof: None,
         }),
         Ok(crate::LandingVerdict::NotLanded { truncated, .. }) => {
             Err(NotRemoved::Keep(if truncated {
@@ -3131,7 +3489,7 @@ impl Broker {
         // Successful removals and concurrent authority changes enqueue only
         // their affected rows. Drain those deltas in place; do not restart the
         // full filesystem lap between candidates in one pass.
-        while purpose == ClosedCohortPurpose::Reclaim
+        while purpose.reclaims()
             && !index_state.complete
             && index_state.after_session_id >= index_state.high_water_session_id
             && index_state.pending_dirty_rows > 0
@@ -3155,7 +3513,7 @@ impl Broker {
         // this checkout, so a busy repository's unrelated session churn is
         // checked below against the pending delta instead of refusing here.
         let scoped_index_check = !index_state.complete || index_state.unresolved_rows != 0;
-        if scoped_index_check && purpose == ClosedCohortPurpose::Reclaim {
+        if scoped_index_check && purpose.reclaims() {
             return Ok(unavailable(Reason::IndexIncomplete));
         }
         let witness_revision = self.store().cleanup_witness_revision()?;
@@ -3272,6 +3630,7 @@ impl Broker {
 
         let mut snapshots = Vec::with_capacity(sessions.len());
         let mut owner_session_id = None;
+        let mut ownership_reproof = None;
         for session in &sessions {
             if deadline_expired(deadline) {
                 return Ok(unavailable(Reason::DeadlineExceeded));
@@ -3281,22 +3640,48 @@ impl Broker {
             } else {
                 None
             };
-            if session.origin == SessionOrigin::Spawned
-                && !spawned_instance_witness.as_ref().is_some_and(|witness| {
-                    witness.worktree_path == canonical_path
-                        && current_witness
-                            .as_ref()
-                            .is_some_and(|current| match purpose {
-                                ClosedCohortPurpose::Reclaim => {
-                                    witness.matches_current_instance(current)
+            if session.origin == SessionOrigin::Spawned {
+                let saved = spawned_instance_witness
+                    .as_ref()
+                    .filter(|witness| witness.worktree_path == canonical_path);
+                let exact = saved.is_some_and(|witness| {
+                    current_witness
+                        .as_ref()
+                        .is_some_and(|current| match purpose {
+                            ClosedCohortPurpose::Reclaim | ClosedCohortPurpose::CheckoutRemoval => {
+                                witness.matches_current_instance(current)
+                            }
+                            ClosedCohortPurpose::MarkerReview => {
+                                witness.matches_instance_for_marker_review(current)
+                            }
+                        })
+                });
+                if !exact {
+                    let reproved = purpose == ClosedCohortPurpose::CheckoutRemoval
+                        && match (saved, current_witness.as_ref()) {
+                            (Some(saved), Some(current)) => {
+                                match self.renumbered_witness_reproof(
+                                    session,
+                                    Path::new(&canonical_path),
+                                    saved,
+                                    current,
+                                    deadline,
+                                ) {
+                                    Ok(()) => true,
+                                    Err(ReproofFailure::Refused(_)) => false,
+                                    // Unproven for now, not refused: retry.
+                                    Err(ReproofFailure::Unavailable(_)) => {
+                                        return Ok(unavailable(Reason::DeadlineExceeded));
+                                    }
                                 }
-                                ClosedCohortPurpose::MarkerReview => {
-                                    witness.matches_instance_for_marker_review(current)
-                                }
-                            })
-                })
-            {
-                return Ok(unavailable(Reason::SpawnedWitnessMismatch));
+                            }
+                            _ => false,
+                        };
+                    if !reproved {
+                        return Ok(unavailable(Reason::SpawnedWitnessMismatch));
+                    }
+                    ownership_reproof = Some(OWNERSHIP_REPROOF_DEVICE_RENUMBER);
+                }
             }
             if owner_session_id.is_none()
                 && session.origin == SessionOrigin::Spawned
@@ -3322,7 +3707,7 @@ impl Broker {
         // unlike a fresh observation it shares the predecessor's mount epoch,
         // so a later remount's renumbering does not break the comparison.
         let saved_owner_witness = match purpose {
-            ClosedCohortPurpose::Reclaim => None,
+            ClosedCohortPurpose::Reclaim | ClosedCohortPurpose::CheckoutRemoval => None,
             ClosedCohortPurpose::MarkerReview => snapshots
                 .iter()
                 .find(|snapshot| snapshot.id == owner_session_id)
@@ -3426,6 +3811,7 @@ impl Broker {
             alias_refresh_generation: index_state.alias_refresh_generation,
             retired_predecessors,
             handed_over_predecessors,
+            ownership_reproof,
         }))
     }
 
@@ -3468,6 +3854,117 @@ impl Broker {
             current = successor;
         }
         Ok(false)
+    }
+
+    /// Re-prove broker ownership of a closed checkout whose schema-2 spawn
+    /// witness differs from today's observation only by renumbered devices.
+    /// Gathers every condition of [`RenumberReproofEvidence`] and refuses on
+    /// the first that fails. Callers must already have required that the
+    /// exact comparison failed; this never widens a schema-3 or legacy check.
+    ///
+    /// Registration and branch evidence are read from this checkout's own
+    /// registration files under the common directory, fresh on every call
+    /// and without listing every worktree; the one Git call (the broker-root
+    /// ownership check) is bounded by `deadline`. Evidence that cannot be
+    /// gathered in time is [`ReproofFailure::Unavailable`], never a refusal.
+    pub(crate) fn renumbered_witness_reproof(
+        &self,
+        session: &Session,
+        worktree: &Path,
+        saved: &crate::events::SpawnedWorktreeInstanceWitness,
+        current: &crate::events::SpawnedWorktreeInstanceWitness,
+        deadline: Option<Instant>,
+    ) -> Result<(), ReproofFailure> {
+        let refuse = |condition: &str| -> Result<(), ReproofFailure> {
+            crate::phase_telemetry::add("auto_cleanup_ownership_reproof_refused", Duration::ZERO);
+            Err(ReproofFailure::Refused(format!(
+                "spawn-time worktree identity device renumber re-proof refused: {condition}"
+            )))
+        };
+        let unavailable = |detail: String| -> Result<(), ReproofFailure> {
+            crate::phase_telemetry::add(
+                "auto_cleanup_ownership_reproof_unavailable",
+                Duration::ZERO,
+            );
+            Err(ReproofFailure::Unavailable(detail))
+        };
+        // The filesystem half first: it needs no Git process.
+        if !saved.matches_after_device_renumber(current) {
+            return refuse("filesystem identity differs beyond a device renumber");
+        }
+        if deadline_expired(deadline) {
+            return unavailable("the pass deadline passed before the re-proof".into());
+        }
+        let canonical =
+            |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let worktree = canonical(worktree);
+        let under_broker_root = {
+            let _git_deadline = deadline.map(crate::git::limit_git_until);
+            match self.is_broker_owned_worktree_checked(session, &worktree) {
+                Ok(owned) => owned,
+                Err(error) => {
+                    return unavailable(format!("the broker root could not be checked: {error}"));
+                }
+            }
+        };
+        if deadline_expired(deadline) {
+            return unavailable("the pass deadline passed during the re-proof".into());
+        }
+        let this_common = match self.repo_handle().git_common_dir() {
+            Ok(common) => canonical(&common),
+            Err(error) => {
+                return unavailable(format!(
+                    "this repository's common directory is unreadable: {error}"
+                ));
+            }
+        };
+        let registration_started = Instant::now();
+        let common = Path::new(&current.git_common_path);
+        let admin = Path::new(&current.git_admin_path);
+        let registered = registration_names_checkout(common, admin, &worktree);
+        let (checkout_branch, checkout_head) = registration_head(common, admin);
+        let branch_tip =
+            resolve_branch_ref_in_common(common, &format!("refs/heads/{}", session.branch));
+        crate::phase_telemetry::add(
+            "auto_cleanup_ownership_reproof_registration",
+            registration_started.elapsed(),
+        );
+        let evidence = RenumberReproofEvidence {
+            origin_spawned: session.origin == SessionOrigin::Spawned,
+            closed: session.status.is_closed()
+                && session.cleanup_state == SessionCleanupState::Closed,
+            session_path_matches: canonical(Path::new(&session.worktree_path)) == worktree,
+            under_broker_root,
+            common_dir_is_this_repository: common == this_common.as_path(),
+            registered,
+            checkout_branch,
+            checkout_head,
+            branch_tip,
+        };
+        match renumber_reproof_refusal(saved, current, &session.branch, &evidence) {
+            None => {
+                crate::phase_telemetry::add("auto_cleanup_ownership_reproved", Duration::ZERO);
+                Ok(())
+            }
+            Some(condition) => refuse(condition),
+        }
+    }
+
+    /// [`Self::closed_artifact_checkout_cohort_for_session_detailed`] for
+    /// automatic whole-checkout removal, which alone also accepts the
+    /// device-renumber re-proof ([`ClosedCohortPurpose::CheckoutRemoval`]).
+    fn closed_checkout_cohort_for_removal(
+        &mut self,
+        session_id: i64,
+        worktree: &Path,
+        deadline: Option<Instant>,
+    ) -> Result<ClosedArtifactCheckoutCohortResolution, BrokerOpError> {
+        self.closed_artifact_checkout_cohort_for_session_detailed_mode(
+            session_id,
+            worktree,
+            deadline,
+            ClosedCohortPurpose::CheckoutRemoval,
+        )
     }
 
     /// Exclude a removed spawn's historical alias only after proving that its
@@ -3653,6 +4150,48 @@ impl Broker {
         }))
     }
 
+    /// Up to [`PRIORITY_GROUPS_PER_PASS`] complete closed-checkout groups
+    /// most likely removable now (see `cleanup_cohort_priority_groups` in the
+    /// store), skipping one
+    /// judged within [`PRIORITY_REJUDGE_MS`] with the same merged state. Each
+    /// is built exactly like a lap group and judged by the same proofs; only
+    /// the order changes. Returns each group with its merged state.
+    fn auto_cleanup_priority_groups(
+        &mut self,
+        memo: &PriorityMemo,
+        now_ms: i64,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<(AutoCleanupCheckoutGroup, bool)>, BrokerOpError> {
+        let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
+        let candidates = self.store().cleanup_cohort_priority_groups(
+            namespace,
+            now_ms,
+            PRIORITY_CANDIDATE_LIMIT,
+        )?;
+        let mut groups = Vec::new();
+        for (canonical_path, first_session_id, merged) in candidates {
+            if groups.len() >= PRIORITY_GROUPS_PER_PASS || deadline_expired(deadline) {
+                break;
+            }
+            if memo.recently_judged(&canonical_path, merged, now_ms) {
+                continue;
+            }
+            let (sessions, truncated) = self
+                .store()
+                .cleanup_cohort_sessions_for_path(namespace, &canonical_path)?;
+            groups.push((
+                AutoCleanupCheckoutGroup {
+                    worktree: PathBuf::from(canonical_path),
+                    sessions,
+                    complete: !truncated,
+                    cursor_session_id: first_session_id,
+                },
+                merged,
+            ));
+        }
+        Ok(groups)
+    }
+
     /// Make the existing ownership and live-session proofs for one complete
     /// cohort. A raw group returned by auto_cleanup_checkout_groups never
     /// authorizes deletion by itself.
@@ -3703,9 +4242,31 @@ impl Broker {
             })
             .collect::<Vec<_>>();
         if spawned_sessions.is_empty() {
+            if sessions
+                .iter()
+                .all(|session| session.origin == SessionOrigin::Adopted)
+            {
+                return Ok(keep(format!(
+                    "no matching spawn-time worktree instance witness: {OWNERSHIP_ADOPTED_ONLY}, \
+                     so the broker cannot prove it created it; inspect it, then remove it with \
+                     `aethyme broker finish cleanup {}`",
+                    ids.last().copied().unwrap_or_default()
+                )));
+            }
             return Ok(keep(
                 "no matching spawn-time worktree instance witness".into(),
             ));
+        }
+        // A directory that is gone holds no checkout slot. Judge it with one
+        // stat instead of a Git process, under its own countable code.
+        if matches!(
+            std::fs::symlink_metadata(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ) {
+            crate::phase_telemetry::add("auto_cleanup_checkout_missing", Duration::ZERO);
+            return Ok(keep(format!(
+                "not a readable broker-owned worktree: {CHECKOUT_DIRECTORY_MISSING}"
+            )));
         }
         // Only a still-retained spawned row with a persisted witness for this
         // exact Git worktree instance proves broker creation. Adopted rows and
@@ -3908,14 +4469,24 @@ impl Broker {
         let mut expected_session_ids = candidate.session_ids();
         expected_session_ids.sort_unstable();
         let owner = current_spawned_owner.ok_or_else(|| keep("no recorded owner".into()))?;
-        let current_cohort = self
-            .closed_artifact_checkout_cohort_for_session(
-                owner.id,
-                &candidate.worktree,
-                options.deadline,
-            )
+        let current_cohort = match self
+            .closed_checkout_cohort_for_removal(owner.id, &candidate.worktree, options.deadline)
             .map_err(|error| keep(format!("closed checkout cohort unreadable: {error}")))?
-            .ok_or_else(|| keep("closed checkout cohort or ownership witness changed".into()))?;
+        {
+            ClosedArtifactCheckoutCohortResolution::Available(cohort) => cohort,
+            ClosedArtifactCheckoutCohortResolution::Unavailable(reason) => {
+                return Err(
+                    self.closed_cohort_unavailable_verdict(reason, candidate, &owner, deadline)
+                );
+            }
+        };
+        let ownership_reproof = current_cohort.ownership_reproof();
+        #[cfg(test)]
+        AFTER_REMOVAL_COHORT_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(&candidate.worktree);
+            }
+        });
         let mut current_session_ids = current_cohort.session_ids();
         current_session_ids.sort_unstable();
         if current_session_ids != expected_session_ids {
@@ -3940,9 +4511,31 @@ impl Broker {
                     .as_ref()
                     .is_some_and(|current| expected.matches_current_instance(current)) =>
             {
-                return Err(keep(
-                    "worktree instance no longer matches its spawn record".into(),
-                ));
+                // Only the re-proof the cohort itself accepted, re-made now
+                // against this fresh observation, may stand in for the exact
+                // comparison.
+                let reproved = if ownership_reproof == Some(OWNERSHIP_REPROOF_DEVICE_RENUMBER)
+                    && let Some(current) = current_witness.as_ref()
+                {
+                    match self.renumbered_witness_reproof(
+                        &owner,
+                        &candidate.worktree,
+                        expected,
+                        current,
+                        deadline,
+                    ) {
+                        Ok(()) => true,
+                        Err(ReproofFailure::Refused(_)) => false,
+                        Err(ReproofFailure::Unavailable(_)) => return Err(NotRemoved::Defer),
+                    }
+                } else {
+                    false
+                };
+                if !reproved {
+                    return Err(keep(
+                        "worktree instance no longer matches its spawn record".into(),
+                    ));
+                }
             }
             None => {}
             Some(_) => {}
@@ -4056,7 +4649,65 @@ impl Broker {
             None => containment(self.repo_handle(), &head, &upstream.1, deep, deadline)?,
         };
         proof.interrupted_removal_deletions = interrupted_removal_deletions;
+        proof.ownership_reproof = ownership_reproof;
         Ok(proof)
+    }
+
+    /// The verdict for a cohort automatic removal could not build: a
+    /// specific, countable keep reason, or a deferral when the cohort or its
+    /// re-proof only ran out of time. Every reason keeps the leading phrase
+    /// older readers match.
+    fn closed_cohort_unavailable_verdict(
+        &self,
+        reason: ClosedArtifactCheckoutCohortUnavailableReason,
+        candidate: &AutoCleanupCandidate,
+        owner: &Session,
+        deadline: Option<Instant>,
+    ) -> NotRemoved {
+        const PREFIX: &str = "closed checkout cohort or ownership witness changed";
+        if reason == ClosedArtifactCheckoutCohortUnavailableReason::DeadlineExceeded {
+            return NotRemoved::Defer;
+        }
+        if reason != ClosedArtifactCheckoutCohortUnavailableReason::SpawnedWitnessMismatch {
+            return NotRemoved::Keep(format!("{PREFIX}: cohort unavailable ({})", reason.code()));
+        }
+        let manual = format!(
+            "inspect it, then remove it with `aethyme broker finish cleanup {}`",
+            owner.id
+        );
+        let Some(saved) = candidate.spawned_instance_witness.as_ref() else {
+            return NotRemoved::Keep(format!(
+                "{PREFIX}: {OWNERSHIP_WITNESS_NEVER_RECORDED} for session {}; {manual}",
+                owner.id
+            ));
+        };
+        if !saved.is_supported() {
+            return NotRemoved::Keep(format!(
+                "{PREFIX}: {OWNERSHIP_WITNESS_LEGACY} (schema {}); {manual}",
+                saved.schema_version
+            ));
+        }
+        let current = {
+            let _git_deadline = deadline.map(crate::git::limit_git_until);
+            GitRepo::discover(&candidate.worktree)
+                .ok()
+                .and_then(|checkout| checkout.spawned_worktree_instance_witness())
+        };
+        let Some(current) = current else {
+            return NotRemoved::Keep(format!(
+                "{PREFIX}: spawn-time worktree instance identity is unavailable"
+            ));
+        };
+        match self.renumbered_witness_reproof(owner, &candidate.worktree, saved, &current, deadline)
+        {
+            Err(ReproofFailure::Refused(refusal)) => {
+                NotRemoved::Keep(format!("{PREFIX}: {refusal}"))
+            }
+            Err(ReproofFailure::Unavailable(_)) => NotRemoved::Defer,
+            Ok(()) => NotRemoved::Keep(format!(
+                "{PREFIX}: cohort membership changed during re-proof"
+            )),
+        }
     }
 
     fn session_retirement_cursor(
@@ -4745,6 +5396,7 @@ impl Broker {
         let planned = plan.report.lanes.unwrap_or_default();
         lanes.removal_examined = planned.removal_examined;
         lanes.removal_memo_skips = planned.removal_memo_skips;
+        lanes.removal_priority_examined = planned.removal_priority_examined;
         lanes.removal_scan_ms = planned.removal_scan_ms;
         lanes.removal_inventory_unavailable = planned.removal_inventory_unavailable;
         lanes.removal_elapsed_ms = duration_ms(Some(removal_started.elapsed()));
@@ -4783,6 +5435,45 @@ impl Broker {
             self.worktree_checkout_usage(),
             Ok(Some((count, maximum))) if usage_under_pressure(count, maximum)
         )
+    }
+
+    /// The linked-checkout count from this repository's registrations
+    /// (`<common>/worktrees/*`, the records `git worktree list` reads), with
+    /// one directory read instead of a listing that inspects every checkout.
+    /// Falls back to the listing when the registrations cannot be read.
+    pub(crate) fn worktree_checkout_usage_from_registrations(
+        &self,
+    ) -> Result<Option<(usize, u32)>, BrokerOpError> {
+        let maximum = match crate::worktree_location::WorktreeLocationConfig::load(self.main_root())
+        {
+            Ok(Some(config)) => config.max_checkouts(),
+            Ok(None) | Err(_) => {
+                crate::worktree_location::WorktreeLocationConfig::default().max_checkouts()
+            }
+        };
+        if maximum == 0 {
+            return Ok(None);
+        }
+        let Ok(common) = self.repo_handle().git_common_dir() else {
+            return self.worktree_checkout_usage();
+        };
+        let count = match std::fs::read_dir(common.join("worktrees")) {
+            Ok(entries) => {
+                let mut count = 0usize;
+                for entry in entries {
+                    let Ok(entry) = entry else {
+                        return self.worktree_checkout_usage();
+                    };
+                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        count += 1;
+                    }
+                }
+                count
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(_) => return self.worktree_checkout_usage(),
+        };
+        Ok(Some((count, maximum)))
     }
 
     /// Remember a linked-checkout count for passes too short to list them.
@@ -4920,6 +5611,13 @@ impl Broker {
         let mut alias_refresh_generation = None;
         let mut examined = 0_usize;
         let mut memo_skips = 0_usize;
+        let mut priority_examined = 0_usize;
+        let mut priority_memo =
+            PriorityMemo::decode(self.store().meta_get(PRIORITY_MEMO_KEY)?.as_deref());
+        let mut priority_memo_changed = false;
+        // Groups judged ahead of the lap in this pass, skipped by every lap
+        // page of the same pass.
+        let mut priority_paths = std::collections::BTreeSet::<PathBuf>::new();
         // Under capacity pressure a bounded pass keeps going page by page
         // while time remains; otherwise each pass keeps its one-page tranche
         // and the background worker paces the lap.
@@ -4993,14 +5691,41 @@ impl Broker {
             }
             alias_refresh_generation = Some(scan.alias_refresh_generation);
 
+            // Under capacity pressure, judge what most likely became
+            // removable first: a merged pull request, then a due cleanup
+            // request. The lap below still visits every group in session
+            // order, so nothing is starved.
+            let priority_groups = if first_page && multi_page {
+                let _span = crate::phase_telemetry::span("auto_cleanup_priority_selection");
+                self.auto_cleanup_priority_groups(&priority_memo, now_ms(), deadline)?
+            } else {
+                Vec::new()
+            };
+            priority_paths.extend(
+                priority_groups
+                    .iter()
+                    .map(|(group, _)| group.worktree.clone()),
+            );
+            let ordered = priority_groups
+                .into_iter()
+                .map(|(group, merged)| (Some(merged), group))
+                .chain(scan.groups.into_iter().map(|group| (None, group)));
             let mut stop_pass = false;
-            for group in scan.groups {
+            for (priority, group) in ordered {
                 if deadline_expired(deadline) {
                     stop_pass = true;
                     break;
                 }
-                examined += 1;
                 let cursor_session_id = checkout_group_cursor_session_id(&group);
+                if priority.is_none() && priority_paths.contains(&group.worktree) {
+                    // Already judged ahead of the lap in this pass.
+                    cursor.after_session_id = cursor_session_id;
+                    self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
+                    continue;
+                }
+                examined += 1;
+                let deferred_before = report.deferred;
+                let selected_before = selected.len();
                 let inspection =
                     inspect_group(self, &group, &scan.live, &scan.live_worktrees, deadline)?;
                 let mut stop_for_deadline = false;
@@ -5044,6 +5769,7 @@ impl Broker {
                                 reason: entry.reason,
                                 code: "ignored_content".into(),
                                 ignored_blockers: entry.blockers,
+                                ownership_reproof: None,
                             });
                         } else if deadline_expired(deadline) {
                             report.deferred += 1;
@@ -5128,12 +5854,16 @@ impl Broker {
                                             memo_changed |=
                                                 memo.entries.remove(&worktree_key).is_some();
                                         }
+                                        let ownership_reproof = (code
+                                            == "ownership_reproof_refused")
+                                            .then(|| OWNERSHIP_REPROOF_DEVICE_RENUMBER.to_string());
                                         report.kept.push(AutoKeptCheckout {
                                             worktree: worktree_key,
                                             sessions: candidate.session_ids(),
                                             reason,
                                             code: code.to_string(),
                                             ignored_blockers,
+                                            ownership_reproof,
                                         })
                                     }
                                 }
@@ -5156,8 +5886,30 @@ impl Broker {
                         stop_for_deadline = true;
                     }
                 }
-                cursor.after_session_id = cursor_session_id;
-                self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
+                if let Some(merged) = priority {
+                    // A priority group never moves the lap cursor. Remember
+                    // every judged one, selected and deferred included, so the
+                    // next pass judges others and the lap moves on.
+                    priority_examined += 1;
+                    crate::phase_telemetry::add("auto_cleanup_priority_examined", Duration::ZERO);
+                    let outcome = if selected.len() > selected_before {
+                        PriorityOutcome::Selected
+                    } else if stop_for_deadline || report.deferred > deferred_before {
+                        PriorityOutcome::Deferred
+                    } else {
+                        PriorityOutcome::Kept
+                    };
+                    priority_memo.remember(
+                        group.worktree.to_string_lossy().into_owned(),
+                        merged,
+                        outcome,
+                        now_ms(),
+                    );
+                    priority_memo_changed = true;
+                } else {
+                    cursor.after_session_id = cursor_session_id;
+                    self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
+                }
                 if stop_for_deadline || selected.len() >= max_selected.max(1) {
                     stop_pass = true;
                     break;
@@ -5199,12 +5951,19 @@ impl Broker {
                 serde_json::to_string(&memo).expect("serializing the keep memo is infallible");
             self.store().meta_set(KEEP_MEMO_KEY, &text)?;
         }
+        if priority_memo_changed {
+            priority_memo.prune(now_ms());
+            let text = serde_json::to_string(&priority_memo)
+                .expect("serializing the priority memo is infallible");
+            self.store().meta_set(PRIORITY_MEMO_KEY, &text)?;
+        }
         report.blocked_by_ignored = blocked_by_ignored_from_memo(&memo);
         crate::phase_telemetry::add("auto_cleanup_removal_scan", scan_elapsed);
         report.lanes = Some(AutoCleanupLanes {
             removal_examined: examined,
             removal_memo_skips: memo_skips,
             removal_scan_ms: duration_ms(Some(scan_elapsed)),
+            removal_priority_examined: priority_examined,
             ..AutoCleanupLanes::default()
         });
         // The current deferred group, if any, was counted above and the cursor
@@ -5442,6 +6201,7 @@ impl Broker {
                                 })
                             }),
                         resumed_interrupted_removal: proof.interrupted_removal_deletions,
+                        ownership_reproof: proof.ownership_reproof.map(str::to_string),
                     };
                     let payload = serde_json::to_string(&removed).unwrap_or_default();
                     self.store().append_event(
@@ -5455,8 +6215,39 @@ impl Broker {
             }
         }
         report.assign_kept_codes();
+        self.note_priority_apply_keeps(&report)?;
         self.record_auto_cleanup_report(&report)?;
         Ok(report)
+    }
+
+    /// Record, on the priority memo entry of each checkout apply kept, the
+    /// keep code it gave, so the record says why a selected priority group was
+    /// not removed. The entry already keeps it from being picked first again.
+    fn note_priority_apply_keeps(
+        &mut self,
+        report: &AutoCleanupReport,
+    ) -> Result<(), BrokerOpError> {
+        if report.kept.is_empty() {
+            return Ok(());
+        }
+        let raw = self.store().meta_get(PRIORITY_MEMO_KEY)?;
+        let mut memo = PriorityMemo::decode(raw.as_deref());
+        let mut changed = false;
+        for kept in &report.kept {
+            if let Some(entry) = memo.entries.get_mut(&kept.worktree)
+                && entry.outcome == "selected"
+                && entry.apply_code.as_deref() != Some(kept.code.as_str())
+            {
+                entry.apply_code = Some(kept.code.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            let text =
+                serde_json::to_string(&memo).expect("serializing the priority memo is infallible");
+            self.store().meta_set(PRIORITY_MEMO_KEY, &text)?;
+        }
+        Ok(())
     }
 
     fn remove_auto_cleanup_candidate(
@@ -7454,6 +8245,909 @@ mod tests {
         assert!(still_retained.owner_witness().is_some());
     }
 
+    fn renumber_witnesses() -> (
+        crate::events::SpawnedWorktreeInstanceWitness,
+        crate::events::SpawnedWorktreeInstanceWitness,
+    ) {
+        let saved = crate::events::SpawnedWorktreeInstanceWitness {
+            schema_version: 2,
+            worktree_path: "/worktrees/task".into(),
+            worktree_device: 5,
+            worktree_inode: 101,
+            git_pointer_device: 5,
+            git_pointer_inode: 102,
+            git_admin_path: "/repository/.git/worktrees/task".into(),
+            git_admin_device: 6,
+            git_admin_inode: 201,
+            git_common_path: "/repository/.git".into(),
+            git_common_device: 6,
+            git_common_inode: 202,
+            root_generation_sha256: Some("c".repeat(64)),
+            volume_uuids: None,
+        };
+        let mut current = saved.clone();
+        current.worktree_device += 10;
+        current.git_pointer_device += 10;
+        current.git_admin_device += 10;
+        current.git_common_device += 10;
+        (saved, current)
+    }
+
+    fn proven_renumber_evidence() -> super::RenumberReproofEvidence {
+        super::RenumberReproofEvidence {
+            origin_spawned: true,
+            closed: true,
+            session_path_matches: true,
+            under_broker_root: true,
+            common_dir_is_this_repository: true,
+            registered: true,
+            checkout_branch: Some("agent/task".into()),
+            checkout_head: Some("1".repeat(40)),
+            branch_tip: Some("1".repeat(40)),
+        }
+    }
+
+    /// The re-proof refuses with `expected` after `mutate` breaks exactly one
+    /// condition of an otherwise proven renumber.
+    fn assert_renumber_refused(
+        mutate: impl FnOnce(&mut super::RenumberReproofEvidence),
+        expected: &str,
+    ) {
+        let (saved, current) = renumber_witnesses();
+        let mut evidence = proven_renumber_evidence();
+        assert_eq!(
+            super::renumber_reproof_refusal(&saved, &current, "agent/task", &evidence),
+            None,
+            "the unbroken evidence must prove the renumber"
+        );
+        mutate(&mut evidence);
+        let refusal = super::renumber_reproof_refusal(&saved, &current, "agent/task", &evidence);
+        assert_eq!(refusal, Some(expected));
+        let reason = format!(
+            "closed checkout cohort or ownership witness changed: spawn-time worktree identity \
+             device renumber re-proof refused: {expected}"
+        );
+        assert_eq!(
+            super::kept_reason_code(&reason),
+            "ownership_reproof_refused"
+        );
+    }
+
+    #[test]
+    fn renumber_reproof_accepts_only_unchanged_objects() {
+        let (saved, mut current) = renumber_witnesses();
+        let evidence = proven_renumber_evidence();
+        assert_eq!(
+            super::renumber_reproof_refusal(&saved, &current, "agent/task", &evidence),
+            None
+        );
+        current.worktree_inode += 1;
+        assert_eq!(
+            super::renumber_reproof_refusal(&saved, &current, "agent/task", &evidence),
+            Some("filesystem identity differs beyond a device renumber")
+        );
+    }
+
+    #[test]
+    fn renumber_reproof_requires_a_spawned_session() {
+        assert_renumber_refused(
+            |evidence| evidence.origin_spawned = false,
+            "the session was not spawned by the broker",
+        );
+    }
+
+    #[test]
+    fn renumber_reproof_requires_a_closed_session() {
+        assert_renumber_refused(
+            |evidence| evidence.closed = false,
+            "the session is not closed",
+        );
+    }
+
+    #[test]
+    fn renumber_reproof_requires_the_session_row_to_name_the_checkout() {
+        assert_renumber_refused(
+            |evidence| evidence.session_path_matches = false,
+            "the session row names another path",
+        );
+    }
+
+    #[test]
+    fn renumber_reproof_requires_the_broker_worktree_root() {
+        assert_renumber_refused(
+            |evidence| evidence.under_broker_root = false,
+            "the checkout is not under the broker worktree root",
+        );
+    }
+
+    #[test]
+    fn renumber_reproof_requires_the_git_pointer_into_this_repository() {
+        assert_renumber_refused(
+            |evidence| evidence.common_dir_is_this_repository = false,
+            "the checkout's .git does not point into this repository",
+        );
+    }
+
+    #[test]
+    fn renumber_reproof_requires_this_repository_to_register_the_checkout() {
+        assert_renumber_refused(
+            |evidence| evidence.registered = false,
+            "this repository does not register the checkout",
+        );
+    }
+
+    #[test]
+    fn renumber_reproof_requires_the_checkout_on_the_session_branch() {
+        assert_renumber_refused(
+            |evidence| evidence.checkout_branch = None,
+            "the checkout is not on the session branch",
+        );
+        assert_renumber_refused(
+            |evidence| evidence.checkout_branch = Some("agent/other".into()),
+            "the checkout is not on the session branch",
+        );
+    }
+
+    #[test]
+    fn renumber_reproof_requires_head_at_the_session_branch_tip() {
+        assert_renumber_refused(
+            |evidence| evidence.checkout_head = Some("2".repeat(40)),
+            "the checkout HEAD is not the session branch tip",
+        );
+        assert_renumber_refused(
+            |evidence| evidence.branch_tip = None,
+            "the checkout HEAD is not the session branch tip",
+        );
+    }
+
+    #[test]
+    fn ownership_keep_reasons_have_their_own_codes() {
+        for (reason, code) in [
+            (
+                "closed checkout cohort or ownership witness changed: spawn-time worktree \
+                 instance witness was never recorded for session 7; inspect it",
+                "ownership_witness_missing",
+            ),
+            (
+                "closed checkout cohort or ownership witness changed: spawn-time worktree \
+                 instance witness is a legacy record without a spawn generation (schema 1)",
+                "ownership_witness_legacy",
+            ),
+            (
+                "no matching spawn-time worktree instance witness: only adopted sessions use \
+                 this checkout, so the broker cannot prove it created it",
+                "ownership_adopted_only",
+            ),
+            (
+                "not a readable broker-owned worktree: the checkout directory no longer exists",
+                "checkout_missing",
+            ),
+            (
+                "closed checkout cohort or ownership witness changed: cohort unavailable \
+                 (index_changed)",
+                "cohort_unavailable",
+            ),
+            (
+                "no matching spawn-time worktree instance witness",
+                "ownership_unproven",
+            ),
+        ] {
+            assert_eq!(super::kept_reason_code(reason), code, "{reason}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn rewrite_spawn_witness(
+        broker: &mut crate::Broker,
+        session_id: i64,
+        witness: &crate::events::SpawnedWorktreeInstanceWitness,
+    ) {
+        let connection = rusqlite::Connection::open(broker.store().db_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE spawned_worktree_instances SET witness_json = ?2 WHERE session_id = ?1",
+                rusqlite::params![session_id, serde_json::to_string(witness).unwrap()],
+            )
+            .unwrap();
+        while !broker
+            .refresh_cleanup_cohort_aliases(None)
+            .unwrap()
+            .unwrap()
+            .complete
+        {}
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_removal_reproves_a_schema_two_witness_after_a_device_renumber() {
+        use super::{
+            AutoCleanupCheckoutGroup, AutoCleanupVerdictOptions,
+            ClosedArtifactCheckoutCohortResolution, LeaseProcessTableSnapshot, NotRemoved,
+            OWNERSHIP_REPROOF_DEVICE_RENUMBER,
+        };
+
+        let (_owner, _storage, mut broker, session) = retirement_fixture();
+        broker
+            .close_abandoning_unpushed(session.id, "device renumber fixture")
+            .unwrap();
+        let path = PathBuf::from(&session.worktree_path);
+        let mut saved = broker
+            .store()
+            .spawned_worktree_instance_witness(session.id)
+            .unwrap()
+            .expect("spawn captures a witness");
+        // What a pre-UUID spawn saved, seen after a restart renumbered every
+        // mount: same objects and generation, new device numbers.
+        saved.schema_version = 2;
+        saved.volume_uuids = None;
+        saved.worktree_device += 1000;
+        saved.git_pointer_device += 1000;
+        saved.git_admin_device += 1000;
+        saved.git_common_device += 1000;
+        rewrite_spawn_witness(&mut broker, session.id, &saved);
+
+        assert!(
+            broker
+                .closed_artifact_checkout_cohort_for_session(session.id, &path, None)
+                .unwrap()
+                .is_none(),
+            "artifact reclamation keeps the exact comparison"
+        );
+        let cohort = match broker
+            .closed_checkout_cohort_for_removal(session.id, &path, None)
+            .unwrap()
+        {
+            ClosedArtifactCheckoutCohortResolution::Available(cohort) => cohort,
+            other => panic!("the renumbered checkout must be re-proven: {other:?}"),
+        };
+        assert_eq!(
+            cohort.ownership_reproof(),
+            Some(OWNERSHIP_REPROOF_DEVICE_RENUMBER)
+        );
+
+        std::fs::write(
+            broker.main_root().join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktree_grace_hours = 0\n",
+        )
+        .unwrap();
+        let closed = broker.store().session(session.id).unwrap();
+        let group = AutoCleanupCheckoutGroup {
+            worktree: path.clone(),
+            sessions: vec![closed],
+            complete: true,
+            cursor_session_id: session.id,
+        };
+        let candidate = match broker
+            .auto_cleanup_candidate_for_group(&group, &[], &[], None)
+            .unwrap()
+        {
+            AutoCleanupGroupInspection::Candidate(candidate) => candidate,
+            _ => panic!("the renumbered checkout must remain a cleanup candidate"),
+        };
+        let head = GitRepo::discover(&path).unwrap().head_commit().unwrap();
+        let upstream = ("main".into(), head.clone());
+        let selected = ContainmentProof {
+            head: head.clone(),
+            containing_commit: head,
+            proof: "fixture unchanged HEAD".into(),
+            interrupted_removal_deletions: 0,
+            ownership_reproof: None,
+        };
+        let verdict_for = |broker: &mut crate::Broker| {
+            let mut lease_process_table = LeaseProcessTableSnapshot::default();
+            broker.auto_cleanup_verdict(
+                &candidate,
+                &AutoCleanupPolicy::default(),
+                &upstream,
+                AutoCleanupVerdictOptions {
+                    deep: false,
+                    deadline: None,
+                    selected: Some(&selected),
+                    lease_process_table: &mut lease_process_table,
+                },
+            )
+        };
+        let proof = verdict_for(&mut broker).expect("the re-proof authorizes the verdict");
+        assert_eq!(
+            proof.ownership_reproof,
+            Some(OWNERSHIP_REPROOF_DEVICE_RENUMBER),
+            "the verdict records the re-proof it used"
+        );
+
+        // A detached HEAD fails the branch condition: kept, and countable.
+        git(&path, &["checkout", "-q", "--detach"]);
+        match verdict_for(&mut broker) {
+            Err(NotRemoved::Keep(reason)) => {
+                assert_eq!(
+                    super::kept_reason_code(&reason),
+                    "ownership_reproof_refused",
+                    "{reason}"
+                );
+                assert!(
+                    reason.contains("the checkout is not on the session branch"),
+                    "{reason}"
+                );
+            }
+            other => panic!("a detached checkout must be kept: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_removal_refuses_a_renumbered_witness_whose_root_was_replaced() {
+        use super::ClosedArtifactCheckoutCohortResolution;
+
+        let (_owner, _storage, mut broker, session) = retirement_fixture();
+        broker
+            .close_abandoning_unpushed(session.id, "replaced root fixture")
+            .unwrap();
+        let path = PathBuf::from(&session.worktree_path);
+        let mut saved = broker
+            .store()
+            .spawned_worktree_instance_witness(session.id)
+            .unwrap()
+            .expect("spawn captures a witness");
+        saved.schema_version = 2;
+        saved.volume_uuids = None;
+        saved.worktree_device += 1000;
+        saved.git_pointer_device += 1000;
+        saved.git_admin_device += 1000;
+        saved.git_common_device += 1000;
+        // Another root generation: not the directory the broker spawned.
+        saved.root_generation_sha256 = Some("d".repeat(64));
+        rewrite_spawn_witness(&mut broker, session.id, &saved);
+        assert!(matches!(
+            broker
+                .closed_checkout_cohort_for_removal(session.id, &path, None)
+                .unwrap(),
+            ClosedArtifactCheckoutCohortResolution::Unavailable(
+                super::ClosedArtifactCheckoutCohortUnavailableReason::SpawnedWitnessMismatch
+            )
+        ));
+    }
+
+    /// A closed spawned checkout whose saved witness is a schema-2 record of
+    /// the same objects under renumbered devices, with today's observation.
+    #[cfg(unix)]
+    struct RenumberFixture {
+        _owner: tempfile::TempDir,
+        _storage: crate::test_storage::TestStorage,
+        broker: crate::Broker,
+        session: crate::Session,
+        path: PathBuf,
+        saved: crate::events::SpawnedWorktreeInstanceWitness,
+        current: crate::events::SpawnedWorktreeInstanceWitness,
+    }
+
+    #[cfg(unix)]
+    impl RenumberFixture {
+        fn new() -> Self {
+            let (owner, storage, mut broker, session) = retirement_fixture();
+            broker
+                .close_abandoning_unpushed(session.id, "renumber evidence fixture")
+                .unwrap();
+            let path = PathBuf::from(&session.worktree_path);
+            let current = GitRepo::discover(&path)
+                .unwrap()
+                .spawned_worktree_instance_witness()
+                .expect("the live checkout has a witness");
+            let mut saved = current.clone();
+            saved.schema_version = 2;
+            saved.volume_uuids = None;
+            saved.worktree_device += 1000;
+            saved.git_pointer_device += 1000;
+            saved.git_admin_device += 1000;
+            saved.git_common_device += 1000;
+            let session = broker.store().session(session.id).unwrap();
+            Self {
+                _owner: owner,
+                _storage: storage,
+                broker,
+                session,
+                path,
+                saved,
+                current,
+            }
+        }
+
+        fn reproof(&self, session: &crate::Session) -> Result<(), super::ReproofFailure> {
+            self.broker.renumbered_witness_reproof(
+                session,
+                &self.path,
+                &self.saved,
+                &self.current,
+                None,
+            )
+        }
+
+        /// The re-proof holds as built, and refuses naming `expected` after
+        /// `change` (undone by `restore`) breaks one gathered condition.
+        fn assert_refused_by(
+            &self,
+            session: &crate::Session,
+            change: impl FnOnce(),
+            restore: impl FnOnce(),
+            expected: &str,
+        ) {
+            assert_eq!(self.reproof(&self.session), Ok(()));
+            change();
+            let result = self.reproof(session);
+            restore();
+            match result {
+                Err(super::ReproofFailure::Refused(reason)) => {
+                    assert!(reason.contains(expected), "{reason}");
+                    assert_eq!(
+                        super::kept_reason_code(&reason),
+                        "ownership_reproof_refused"
+                    );
+                }
+                other => panic!("expected a refusal naming {expected:?}: {other:?}"),
+            }
+            assert_eq!(self.reproof(&self.session), Ok(()), "restored");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renumber_evidence_requires_a_closed_session_row() {
+        let fixture = RenumberFixture::new();
+        let mut open = fixture.session.clone();
+        open.cleanup_state = SessionCleanupState::Open;
+        fixture.assert_refused_by(&open, || {}, || {}, "the session is not closed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renumber_evidence_requires_the_session_row_to_name_the_checkout() {
+        let fixture = RenumberFixture::new();
+        let mut elsewhere = fixture.session.clone();
+        elsewhere.worktree_path = fixture.broker.main_root().to_string_lossy().into_owned();
+        fixture.assert_refused_by(
+            &elsewhere,
+            || {},
+            || {},
+            "the session row names another path",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renumber_evidence_requires_the_broker_worktree_root() {
+        let fixture = RenumberFixture::new();
+        let marker = fixture
+            .path
+            .parent()
+            .unwrap()
+            .join(crate::broker::WORKTREE_ROOT_MARKER);
+        let original = std::fs::read(&marker).expect("the fixture root carries its marker");
+        fixture.assert_refused_by(
+            &fixture.session,
+            || std::fs::write(&marker, b"{}").unwrap(),
+            || std::fs::write(&marker, &original).unwrap(),
+            "the checkout is not under the broker worktree root",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renumber_evidence_requires_this_repositorys_common_directory() {
+        let mut fixture = RenumberFixture::new();
+        let other = fixture.broker.main_root().join(".aethyme");
+        let other = std::fs::canonicalize(other).unwrap();
+        fixture.saved.git_common_path = other.to_string_lossy().into_owned();
+        fixture.current.git_common_path = fixture.saved.git_common_path.clone();
+        match fixture.reproof(&fixture.session) {
+            Err(super::ReproofFailure::Refused(reason)) => assert!(
+                reason.contains("does not point into this repository"),
+                "{reason}"
+            ),
+            other => panic!("another common directory must be refused: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renumber_evidence_requires_a_registration_naming_the_checkout() {
+        let fixture = RenumberFixture::new();
+        let gitdir = Path::new(&fixture.current.git_admin_path).join("gitdir");
+        let original = std::fs::read(&gitdir).unwrap();
+        // Prunable: the registration names a `.git` that no longer exists.
+        fixture.assert_refused_by(
+            &fixture.session,
+            || std::fs::write(&gitdir, "/nonexistent/checkout/.git\n").unwrap(),
+            || std::fs::write(&gitdir, &original).unwrap(),
+            "this repository does not register the checkout",
+        );
+        // Registered to another checkout's `.git` file.
+        let other = fixture
+            .broker
+            .main_root()
+            .parent()
+            .unwrap()
+            .join("other-checkout");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join(".git"), "gitdir: /nowhere\n").unwrap();
+        let other_pointer = other.join(".git");
+        fixture.assert_refused_by(
+            &fixture.session,
+            || {
+                std::fs::write(&gitdir, format!("{}\n", other_pointer.display())).unwrap();
+            },
+            || std::fs::write(&gitdir, &original).unwrap(),
+            "this repository does not register the checkout",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renumber_evidence_requires_the_checkout_on_the_session_branch() {
+        let fixture = RenumberFixture::new();
+        let mut renamed = fixture.session.clone();
+        renamed.branch = "agent/some-other-branch".into();
+        fixture.assert_refused_by(
+            &renamed,
+            || {},
+            || {},
+            "the checkout is not on the session branch",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renumber_evidence_requires_head_at_the_session_branch_tip() {
+        let fixture = RenumberFixture::new();
+        // On the branch, but the branch ref no longer resolves.
+        let loose = Path::new(&fixture.current.git_common_path)
+            .join("refs/heads")
+            .join(&fixture.session.branch);
+        let aside = loose.with_extension("aside");
+        assert!(loose.is_file(), "the fixture branch is a loose ref");
+        fixture.assert_refused_by(
+            &fixture.session,
+            || std::fs::rename(&loose, &aside).unwrap(),
+            || std::fs::rename(&aside, &loose).unwrap(),
+            "the checkout HEAD is not the session branch tip",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renumber_evidence_out_of_time_is_unavailable_not_refused() {
+        let fixture = RenumberFixture::new();
+        let expired = Some(Instant::now() - Duration::from_millis(1));
+        assert!(matches!(
+            fixture.broker.renumbered_witness_reproof(
+                &fixture.session,
+                &fixture.path,
+                &fixture.saved,
+                &fixture.current,
+                expired,
+            ),
+            Err(super::ReproofFailure::Unavailable(_))
+        ));
+    }
+
+    /// The verdict re-makes the re-proof against a fresh observation after
+    /// building the cohort: a registration broken in between keeps the
+    /// checkout even though the cohort accepted it.
+    #[cfg(unix)]
+    #[test]
+    fn the_verdict_recheck_refuses_a_checkout_changed_after_the_cohort() {
+        use super::{
+            AutoCleanupCheckoutGroup, AutoCleanupVerdictOptions, LeaseProcessTableSnapshot,
+            NotRemoved,
+        };
+
+        let mut fixture = RenumberFixture::new();
+        let session_id = fixture.session.id;
+        let saved = fixture.saved.clone();
+        rewrite_spawn_witness(&mut fixture.broker, session_id, &saved);
+        std::fs::write(
+            fixture.broker.main_root().join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktree_grace_hours = 0\n",
+        )
+        .unwrap();
+        let closed = fixture.broker.store().session(session_id).unwrap();
+        let group = AutoCleanupCheckoutGroup {
+            worktree: fixture.path.clone(),
+            sessions: vec![closed],
+            complete: true,
+            cursor_session_id: session_id,
+        };
+        let candidate = match fixture
+            .broker
+            .auto_cleanup_candidate_for_group(&group, &[], &[], None)
+            .unwrap()
+        {
+            AutoCleanupGroupInspection::Candidate(candidate) => candidate,
+            _ => panic!("the renumbered checkout must be a cleanup candidate"),
+        };
+        let head = GitRepo::discover(&fixture.path)
+            .unwrap()
+            .head_commit()
+            .unwrap();
+        let upstream = ("main".into(), head.clone());
+        let selected = ContainmentProof {
+            head: head.clone(),
+            containing_commit: head,
+            proof: "fixture unchanged HEAD".into(),
+            interrupted_removal_deletions: 0,
+            ownership_reproof: None,
+        };
+        let gitdir = Path::new(&fixture.current.git_admin_path).join("gitdir");
+        let original = std::fs::read(&gitdir).unwrap();
+        let broken = gitdir.clone();
+        super::AFTER_REMOVAL_COHORT_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_: &Path| {
+                std::fs::write(&broken, "/nonexistent/checkout/.git\n").unwrap();
+            }));
+        });
+        let mut lease_process_table = LeaseProcessTableSnapshot::default();
+        let verdict = fixture.broker.auto_cleanup_verdict(
+            &candidate,
+            &AutoCleanupPolicy::default(),
+            &upstream,
+            AutoCleanupVerdictOptions {
+                deep: false,
+                deadline: None,
+                selected: Some(&selected),
+                lease_process_table: &mut lease_process_table,
+            },
+        );
+        super::AFTER_REMOVAL_COHORT_HOOK.with(|hook| *hook.borrow_mut() = None);
+        std::fs::write(&gitdir, &original).unwrap();
+        match verdict {
+            Err(NotRemoved::Keep(reason)) => assert!(
+                reason.contains("worktree instance no longer matches its spawn record"),
+                "{reason}"
+            ),
+            other => panic!("the fresh re-check must keep it: {other:?}"),
+        }
+    }
+
+    /// A closed checkout whose directory is gone is judged by one stat,
+    /// under its own code, before any Git process.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_checkout_directory_is_kept_as_checkout_missing() {
+        let (_owner, _storage, mut broker, session) = retirement_fixture();
+        broker
+            .close_abandoning_unpushed(session.id, "missing directory fixture")
+            .unwrap();
+        let closed = broker.store().session(session.id).unwrap();
+        let gone = broker.main_root().parent().unwrap().join("gone-checkout");
+        let group = super::AutoCleanupCheckoutGroup {
+            worktree: gone,
+            sessions: vec![closed],
+            complete: true,
+            cursor_session_id: session.id,
+        };
+        match broker
+            .auto_cleanup_candidate_for_group(&group, &[], &[], None)
+            .unwrap()
+        {
+            AutoCleanupGroupInspection::Kept(kept) => {
+                assert_eq!(
+                    super::kept_reason_code(&kept.reason),
+                    "checkout_missing",
+                    "{}",
+                    kept.reason
+                );
+            }
+            _ => panic!("a missing directory must be kept"),
+        }
+    }
+
+    /// Every judged priority group is remembered, selected and deferred ones
+    /// included, so it is not picked first on the next pass; a deferred one
+    /// comes back sooner, and a changed merged state at once.
+    #[test]
+    fn the_priority_memo_remembers_selected_kept_and_deferred_groups() {
+        use super::{PRIORITY_DEFER_MS, PRIORITY_REJUDGE_MS, PriorityMemo, PriorityOutcome};
+
+        let now = 1_000_000;
+        let mut memo = PriorityMemo::default();
+        memo.remember("/selected".into(), true, PriorityOutcome::Selected, now);
+        memo.remember("/kept".into(), true, PriorityOutcome::Kept, now);
+        memo.remember("/deferred".into(), false, PriorityOutcome::Deferred, now);
+        for path in ["/selected", "/kept"] {
+            assert!(
+                memo.recently_judged(path, true, now + PRIORITY_REJUDGE_MS - 1),
+                "{path}"
+            );
+            assert!(
+                !memo.recently_judged(path, true, now + PRIORITY_REJUDGE_MS),
+                "{path}"
+            );
+        }
+        assert!(memo.recently_judged("/deferred", false, now + PRIORITY_DEFER_MS - 1));
+        assert!(!memo.recently_judged("/deferred", false, now + PRIORITY_DEFER_MS));
+        assert!(
+            !memo.recently_judged("/deferred", true, now),
+            "a pull request merging since is judged at once"
+        );
+        memo.prune(now + PRIORITY_DEFER_MS);
+        assert!(!memo.entries.contains_key("/deferred"));
+        assert!(memo.entries.contains_key("/selected"));
+    }
+
+    /// A merged closed checkout that selection picks but apply keeps (an
+    /// artifact-use marker only apply checks) must not hold the removal lane:
+    /// the next landed checkout is still removed by the following passes.
+    #[cfg(unix)]
+    #[test]
+    fn a_merged_checkout_kept_at_apply_does_not_block_the_next_removal() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let (blocked_session, blocked) = closed_landed_checkout(&mut broker, "kept at apply");
+        let (_session, landed) = closed_landed_checkout(&mut broker, "removable next");
+        record_merged_pull_request(&mut broker, blocked_session.id, 77);
+        let admission = crate::file_lock::artifact_use::begin_artifact_use(
+            broker.main_root(),
+            &blocked,
+            blocked_session.id,
+            "apply-only blocker",
+        )
+        .unwrap();
+        let crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer) = admission
+        else {
+            panic!("artifact-use protocol should be available for this test");
+        };
+        // The marker stays after the producer handle is dropped.
+        drop(producer);
+        let root = broker.main_root().to_path_buf();
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[worktrees]\nmax_checkouts = 1\n",
+        )
+        .unwrap();
+        for _ in 0..3 {
+            if !landed.exists() {
+                break;
+            }
+            let _ = broker.run_capacity_removal_slice(Instant::now()).unwrap();
+        }
+        assert!(!landed.exists(), "the next landed checkout must be removed");
+        assert!(blocked.exists(), "the marked checkout stays");
+        let memo = super::PriorityMemo::decode(
+            broker
+                .store()
+                .meta_get(super::PRIORITY_MEMO_KEY)
+                .unwrap()
+                .as_deref(),
+        );
+        let key = std::fs::canonicalize(&blocked).unwrap();
+        let entry = memo
+            .entries
+            .get(key.to_string_lossy().as_ref())
+            .expect("the selected priority group is remembered");
+        assert_eq!(entry.outcome, "selected");
+        assert_eq!(entry.apply_code.as_deref(), Some("artifact_use"));
+    }
+
+    /// `count` closed spawned checkouts with no checkout cleanup request, and
+    /// a complete path index.
+    #[cfg(unix)]
+    fn closed_priority_fixture(
+        count: usize,
+    ) -> (
+        tempfile::TempDir,
+        crate::test_storage::TestStorage,
+        crate::Broker,
+        Vec<crate::Session>,
+    ) {
+        let (owner, storage, mut broker, first) = retirement_fixture();
+        let mut sessions = vec![first];
+        for index in 1..count {
+            sessions.push(
+                broker
+                    .start_worktree(&format!("priority fixture {index}"), None)
+                    .unwrap(),
+            );
+        }
+        for session in &sessions {
+            broker
+                .close_abandoning_unpushed(session.id, "priority fixture")
+                .unwrap();
+        }
+        broker
+            .store()
+            .connection()
+            .execute("DELETE FROM closed_checkout_cleanup_requests", [])
+            .unwrap();
+        while !broker
+            .refresh_cleanup_cohort_aliases(None)
+            .unwrap()
+            .unwrap()
+            .complete
+        {}
+        (owner, storage, broker, sessions)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn priority_groups_order_merged_pull_requests_then_due_requests() {
+        let (_owner, _storage, mut broker, sessions) = closed_priority_fixture(3);
+        let (plain, due, merged) = (&sessions[0], &sessions[1], &sessions[2]);
+        record_merged_pull_request(&mut broker, merged.id, 41);
+        let insert_request = |session_id: i64, not_before_ms: i64| {
+            broker
+                .store_ref()
+                .connection()
+                .execute(
+                    "INSERT INTO closed_checkout_cleanup_requests (
+                         session_id, requested_at_ms, not_before_ms, last_progress_at_ms
+                     ) VALUES (?1, 1, ?2, 1)",
+                    rusqlite::params![session_id, not_before_ms],
+                )
+                .unwrap();
+        };
+        insert_request(due.id, 1);
+        insert_request(plain.id, i64::MAX);
+        let order = broker
+            .store()
+            .cleanup_cohort_priority_groups(
+                crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+                now_ms(),
+                16,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|(_, first_session_id, merged)| (first_session_id, merged))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            vec![(merged.id, true), (due.id, false)],
+            "a merged pull request first, then a due request; a request still in grace is not a priority"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn under_capacity_pressure_a_merged_checkout_is_judged_before_the_lap() {
+        let (_owner, _storage, mut broker, sessions) = closed_priority_fixture(3);
+        let merged = sessions[2].id;
+        record_merged_pull_request(&mut broker, merged, 42);
+        broker.record_checkout_usage(900, 900);
+        let judge = |broker: &mut crate::Broker| {
+            let mut order = Vec::new();
+            broker
+                .auto_cleanup_plan_with_group_inspector(
+                    Some(Instant::now() + Duration::from_millis(900)),
+                    |_, group, _, _, _| {
+                        order.push(group.cursor_session_id);
+                        Ok(AutoCleanupGroupInspection::Kept(super::AutoKeptCheckout {
+                            worktree: group.worktree.to_string_lossy().into_owned(),
+                            sessions: group.sessions.iter().map(|session| session.id).collect(),
+                            reason: "injected planner inspection".into(),
+                            ..Default::default()
+                        }))
+                    },
+                )
+                .unwrap();
+            order
+        };
+        let first = judge(&mut broker);
+        assert_eq!(first.first(), Some(&merged), "{first:?}");
+        assert_eq!(
+            first.iter().filter(|id| **id == merged).count(),
+            1,
+            "the lap does not judge it again in the same pass: {first:?}"
+        );
+        let memo = super::PriorityMemo::decode(
+            broker
+                .store()
+                .meta_get(super::PRIORITY_MEMO_KEY)
+                .unwrap()
+                .as_deref(),
+        );
+        let merged_path = std::fs::canonicalize(&sessions[2].worktree_path).unwrap();
+        assert!(memo.recently_judged(&merged_path.to_string_lossy(), true, now_ms()));
+        // Kept, it yields to the rest of the lap instead of being judged
+        // first on every pass.
+        let second = judge(&mut broker);
+        assert_ne!(second.first(), Some(&merged), "{second:?}");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn closed_cohort_accepts_remounted_git_volume_with_spawn_time_uuid() {
@@ -7531,6 +9225,7 @@ mod tests {
             containing_commit: head,
             proof: "fixture unchanged HEAD".into(),
             interrupted_removal_deletions: 0,
+            ownership_reproof: None,
         };
         let mut lease_process_table = LeaseProcessTableSnapshot::default();
         let verdict = broker.auto_cleanup_verdict(
@@ -7655,6 +9350,7 @@ mod tests {
                     containing_commit: "fixture-head".into(),
                     proof: "test proof, never reached".into(),
                     interrupted_removal_deletions: 0,
+                    ownership_reproof: None,
                 },
             )],
             deadline: None,
@@ -10462,6 +12158,7 @@ mod fail_closed_removal_tests {
             containing_commit: "fixture-containing-commit".into(),
             proof: "ancestry".into(),
             interrupted_removal_deletions: 0,
+            ownership_reproof: None,
         };
 
         let result = with_git_deadline(Duration::ZERO, || {

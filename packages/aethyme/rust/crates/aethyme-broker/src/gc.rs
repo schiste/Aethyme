@@ -308,17 +308,41 @@ fn capacity_removal_retry_ms(
     lock_busy: bool,
     lap_unfinished: bool,
     progressed: bool,
+    selection_ran: bool,
 ) -> Option<i64> {
     if removed > 0 {
         None
     } else if lock_busy {
         Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS)
+    } else if !selection_ran {
+        // The budget ran out before one removal pass could start (counting
+        // checkouts, for example): nothing was judged, so nothing is known to
+        // be unremovable.
+        Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_RETRY_MS)
     } else if lap_unfinished && progressed {
         Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_RETRY_MS)
     } else {
         Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS)
     }
 }
+/// Whether a capacity slice reached selection: it ran a removal pass, or it
+/// found the GC lock held (another pass was selecting).
+fn capacity_slice_selection_ran(passes: usize, lock_busy: bool) -> bool {
+    passes > 0 || lock_busy
+}
+
+/// Consecutive slices that ran out of time before selection.
+const ARTIFACT_WORKER_CAPACITY_REMOVAL_OUT_OF_TIME_STREAK_KEY: &str =
+    "gc.artifact_sweep.capacity_removal_out_of_time_streak";
+
+/// The wait after the `streak`-th consecutive slice that never reached
+/// selection: 1, 2, 4, 8 minutes, then the ten-minute back-off.
+fn out_of_time_retry_ms(streak: u32) -> i64 {
+    let doublings = streak.saturating_sub(1).min(4);
+    (ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_RETRY_MS << doublings)
+        .min(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS)
+}
+
 /// Removals one slice makes at most, each followed by its pacer charge.
 const ARTIFACT_WORKER_CAPACITY_REMOVALS_PER_SLICE: usize = 4;
 const ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_AFTER_KEY: &str =
@@ -7660,7 +7684,14 @@ impl Broker {
         }
         // The worker can afford a fresh count; it also refreshes the
         // recorded one that broker opens read.
-        match self.worktree_checkout_usage() {
+        let count_started = Instant::now();
+        let usage = self.worktree_checkout_usage_from_registrations();
+        let count_ms = u64::try_from(count_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        crate::phase_telemetry::add(
+            "artifact_worker_capacity_removal_count",
+            count_started.elapsed(),
+        );
+        match usage {
             Ok(Some((count, maximum))) => self.record_checkout_usage(count, maximum),
             Ok(None) | Err(_) => return Ok(None),
         }
@@ -7678,6 +7709,7 @@ impl Broker {
         let mut selection_ms = 0u64;
         let mut apply_ms = 0u64;
         let mut inventory_unavailable = false;
+        let pre_selection_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         while combined
             .as_ref()
             .is_none_or(|report| report.removed.len() < ARTIFACT_WORKER_CAPACITY_REMOVALS_PER_SLICE)
@@ -7735,7 +7767,11 @@ impl Broker {
                     so_far
                 }
             });
-            if removed_now == 0 {
+            // A pass that selected a checkout apply then kept (an open file,
+            // an artifact-use marker, a failed removal) did not judge the
+            // rest: the selected group is remembered or behind the cursor, so
+            // the next pass moves on instead of ending the slice on it.
+            if removed_now == 0 && pass_lanes.removal_selected == 0 {
                 break;
             }
         }
@@ -7748,14 +7784,42 @@ impl Broker {
         }
         let removed = combined.as_ref().map_or(0, |report| report.removed.len());
         let position = self.capacity_removal_lap_position()?;
-        let progressed = self.auto_cleanup_progress_marker()? != progress_before;
+        // A selection is progress too: its group is now remembered or behind
+        // the cursor, so the next slice judges others.
+        let progressed = self.auto_cleanup_progress_marker()? != progress_before || selected > 0;
         let lap_unfinished =
             inventory_unavailable || !position.index_complete || position.lap_remaining > 0;
         // Nothing removable: wait before pressure alone runs another slice.
         // The lock busy, or a lap that moved but did not end: a short wait,
         // so the rest of the lap is judged soon without broker opens
         // respawning the worker into the same held lock.
-        let retry_ms = capacity_removal_retry_ms(removed, lock_busy, lap_unfinished, progressed);
+        let selection_ran = capacity_slice_selection_ran(passes, lock_busy);
+        let mut retry_ms = capacity_removal_retry_ms(
+            removed,
+            lock_busy,
+            lap_unfinished,
+            progressed,
+            selection_ran,
+        );
+        // Consecutive slices that never reached selection back off (1, 2, 4,
+        // 8, then 10 minutes); any slice that reaches selection resets it.
+        let streak = self
+            .artifact_sweep_meta_get(ARTIFACT_WORKER_CAPACITY_REMOVAL_OUT_OF_TIME_STREAK_KEY)?
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        if removed == 0 && !selection_ran {
+            let streak = streak.saturating_add(1);
+            retry_ms = Some(out_of_time_retry_ms(streak));
+            self.artifact_sweep_meta_set(
+                ARTIFACT_WORKER_CAPACITY_REMOVAL_OUT_OF_TIME_STREAK_KEY,
+                &streak.to_string(),
+            )?;
+        } else if streak != 0 {
+            self.artifact_sweep_meta_set(
+                ARTIFACT_WORKER_CAPACITY_REMOVAL_OUT_OF_TIME_STREAK_KEY,
+                "",
+            )?;
+        }
         let retry_after_ms = retry_ms.map(|wait| now_ms().saturating_add(wait));
         self.artifact_sweep_meta_set(
             ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_AFTER_KEY,
@@ -7768,6 +7832,8 @@ impl Broker {
             "removed"
         } else if lock_busy {
             "lock_busy"
+        } else if !selection_ran {
+            "out_of_time_before_selection"
         } else if inventory_unavailable {
             "inventory_unavailable"
         } else if lap_unfinished {
@@ -7782,6 +7848,9 @@ impl Broker {
                 "artifact_worker_capacity_removal_outcome_inventory_unavailable"
             }
             "lap_unfinished" => "artifact_worker_capacity_removal_outcome_lap_unfinished",
+            "out_of_time_before_selection" => {
+                "artifact_worker_capacity_removal_outcome_out_of_time_before_selection"
+            }
             _ => "artifact_worker_capacity_removal_outcome_nothing_removable",
         };
         crate::phase_telemetry::add(telemetry_outcome, Duration::ZERO);
@@ -7814,6 +7883,20 @@ impl Broker {
         slice.paced_ms = u64::try_from(paced_wait.as_millis()).unwrap_or(u64::MAX);
         slice.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         slice.retry_after_ms = retry_after_ms;
+        slice.count_ms = count_ms;
+        slice.pre_selection_ms = pre_selection_ms;
+        if !selection_ran {
+            // Name what used the budget: the checkout count, or the other
+            // checks before selection (retry gate, policy, progress marker).
+            slice.budget_consumed_by = Some(
+                if count_ms.saturating_mul(2) >= pre_selection_ms {
+                    "checkout_count"
+                } else {
+                    "pre_selection"
+                }
+                .to_string(),
+            );
+        }
         self.record_capacity_removal_slice(&slice)?;
         self.write_artifact_sweep_worker_status(&format!(
             "capacity_removal removed={removed} kept={} deferred={} examined={examined} lock_busy={lock_busy} paced_ms={} elapsed_ms={} outcome={outcome}",
@@ -11208,23 +11291,64 @@ mod tests {
     /// or could not move, earns the ten-minute back-off.
     #[test]
     fn an_unfinished_capacity_lap_retries_soon_and_a_finished_one_backs_off() {
-        assert_eq!(capacity_removal_retry_ms(1, false, true, true), None);
+        assert_eq!(capacity_removal_retry_ms(1, false, true, true, true), None);
         assert_eq!(
-            capacity_removal_retry_ms(0, true, true, true),
+            capacity_removal_retry_ms(0, true, true, true, true),
             Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS)
         );
         assert_eq!(
-            capacity_removal_retry_ms(0, false, true, true),
+            capacity_removal_retry_ms(0, false, true, true, true),
             Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_RETRY_MS)
         );
         assert_eq!(
-            capacity_removal_retry_ms(0, false, true, false),
+            capacity_removal_retry_ms(0, false, true, false, true),
             Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS),
             "a lap that could not move must not spin every minute"
         );
         assert_eq!(
-            capacity_removal_retry_ms(0, false, false, true),
+            capacity_removal_retry_ms(0, false, false, true, true),
             Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS)
+        );
+    }
+
+    #[test]
+    fn a_slice_reaches_selection_only_by_a_pass_or_a_held_lock() {
+        assert!(!capacity_slice_selection_ran(0, false));
+        assert!(capacity_slice_selection_ran(1, false));
+        assert!(capacity_slice_selection_ran(0, true));
+    }
+
+    /// Slices that keep running out of time before selection back off
+    /// instead of counting checkouts every minute forever.
+    #[test]
+    fn repeated_out_of_time_slices_back_off_to_ten_minutes() {
+        assert_eq!(out_of_time_retry_ms(1), 60_000);
+        assert_eq!(out_of_time_retry_ms(2), 120_000);
+        assert_eq!(out_of_time_retry_ms(3), 240_000);
+        assert_eq!(out_of_time_retry_ms(4), 480_000);
+        assert_eq!(
+            out_of_time_retry_ms(5),
+            ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS
+        );
+        assert_eq!(
+            out_of_time_retry_ms(40),
+            ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS
+        );
+    }
+
+    /// A slice whose budget ran out before one removal pass started judged
+    /// nothing, so it must come back within a minute, never after the
+    /// ten-minute "nothing removable" back-off, even with an incomplete index
+    /// and no progress.
+    #[test]
+    fn a_slice_that_ran_out_of_time_before_selection_retries_soon() {
+        assert_eq!(
+            capacity_removal_retry_ms(0, false, true, false, false),
+            Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_RETRY_MS)
+        );
+        assert_eq!(
+            capacity_removal_retry_ms(0, false, false, false, false),
+            Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_RETRY_MS)
         );
     }
 

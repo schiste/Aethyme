@@ -420,6 +420,48 @@ impl SpawnedWorktreeInstanceWitness {
                 observed.map(|v| v.git_common),
             )
     }
+
+    /// The filesystem half of re-proving a schema-2 witness after macOS
+    /// renumbered its mounts. Schema 2 saved device numbers without volume
+    /// UUIDs, and a restart or remount assigns new ones, so the exact
+    /// comparison fails for the same objects forever. This accepts only when
+    /// every path, all four inodes and the random root generation written at
+    /// spawn are unchanged, and the renumbering kept which of the four objects
+    /// shared a device. It is never authority on its own: reclaim also needs
+    /// the Git registration proof in `auto_cleanup`.
+    pub(crate) fn matches_after_device_renumber(&self, current: &Self) -> bool {
+        let saved_devices = [
+            self.worktree_device,
+            self.git_pointer_device,
+            self.git_admin_device,
+            self.git_common_device,
+        ];
+        let current_devices = [
+            current.worktree_device,
+            current.git_pointer_device,
+            current.git_admin_device,
+            current.git_common_device,
+        ];
+        let same_sharing = (0..4).all(|left| {
+            (0..4).all(|right| {
+                (saved_devices[left] == saved_devices[right])
+                    == (current_devices[left] == current_devices[right])
+            })
+        });
+        self.schema_version == 2
+            && self.volume_uuids.is_none()
+            && self.is_supported()
+            && current.is_supported()
+            && self.worktree_path == current.worktree_path
+            && self.git_admin_path == current.git_admin_path
+            && self.git_common_path == current.git_common_path
+            && self.root_generation_sha256 == current.root_generation_sha256
+            && self.worktree_inode == current.worktree_inode
+            && self.git_pointer_inode == current.git_pointer_inode
+            && self.git_admin_inode == current.git_admin_inode
+            && self.git_common_inode == current.git_common_inode
+            && same_sharing
+    }
 }
 
 /// Immutable identity captured before `finish` begins physical cleanup. A
@@ -978,6 +1020,68 @@ mod spawned_instance_volume_tests {
         saved.schema_version = 1;
         saved.root_generation_sha256 = None;
         assert!(!saved.matches_instance_for_marker_review(&renumbered(&saved)));
+    }
+
+    #[test]
+    fn device_renumber_accepts_a_schema_two_witness_whose_objects_are_unchanged() {
+        let saved = uuid_less_witness();
+        let current = renumbered(&saved);
+        assert!(!saved.matches_current_instance(&current));
+        assert!(saved.matches_after_device_renumber(&current));
+    }
+
+    #[test]
+    fn device_renumber_refuses_each_changed_object_path_and_generation() {
+        let saved = uuid_less_witness();
+        type Mutation = fn(&mut SpawnedWorktreeInstanceWitness);
+        let mutations: &[(&str, Mutation)] = &[
+            ("worktree inode", |v| v.worktree_inode += 1),
+            ("pointer inode", |v| v.git_pointer_inode += 1),
+            ("admin inode", |v| v.git_admin_inode += 1),
+            ("common inode", |v| v.git_common_inode += 1),
+            ("worktree path", |v| v.worktree_path.push('x')),
+            ("admin path", |v| v.git_admin_path.push('x')),
+            ("common path", |v| v.git_common_path.push('x')),
+            ("generation", |v| {
+                v.root_generation_sha256 = Some("b".repeat(64))
+            }),
+            ("generation missing", |v| v.root_generation_sha256 = None),
+        ];
+        for (name, mutate) in mutations {
+            let mut current = renumbered(&saved);
+            mutate(&mut current);
+            assert!(!saved.matches_after_device_renumber(&current), "{name}");
+        }
+    }
+
+    #[test]
+    fn device_renumber_refuses_a_changed_device_sharing_pattern() {
+        let saved = uuid_less_witness();
+        // At spawn the checkout and the repository were on different devices;
+        // a checkout now on the repository's own device is a different layout.
+        let mut current = renumbered(&saved);
+        current.worktree_device = current.git_common_device;
+        current.git_pointer_device = current.git_common_device;
+        assert!(!saved.matches_after_device_renumber(&current));
+        // The admin directory leaving the common directory's device too.
+        let mut current = renumbered(&saved);
+        current.git_admin_device += 1;
+        assert!(!saved.matches_after_device_renumber(&current));
+    }
+
+    #[test]
+    fn device_renumber_applies_only_to_uuid_less_schema_two_witnesses() {
+        // Schema 3 already compares stable volume UUIDs; a mismatch there is a
+        // different volume, never a renumbered one.
+        let with_uuids = witness();
+        let mut other_volume = renumbered(&with_uuids);
+        other_volume.volume_uuids.as_mut().unwrap().git_common = [3; 16];
+        assert!(!with_uuids.matches_after_device_renumber(&other_volume));
+        // Schema 1 has no spawn generation and cannot be re-proven.
+        let mut legacy = uuid_less_witness();
+        legacy.schema_version = 1;
+        legacy.root_generation_sha256 = None;
+        assert!(!legacy.matches_after_device_renumber(&renumbered(&legacy)));
     }
 
     #[test]

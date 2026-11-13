@@ -153,6 +153,24 @@ checkouts reach three quarters of `[worktrees].max_checkouts`, a
 `cleanup.checkout-capacity` row names the retained count and the commands that
 reclaim slots before `broker start` refuses.
 
+Ownership is proved from the spawn-time witness: the broker removes a
+checkout automatically only when it can show it created that exact directory.
+A witness saved before volume UUIDs were recorded (schema 2) stores mount
+device numbers, which macOS renumbers after a restart or remount. Such a
+checkout is re-proved when its paths, inodes and spawn root generation are
+unchanged, its session was spawned and is closed, it sits under the broker
+worktree root, this repository's registration of it (the record
+`git worktree list` reads) names its `.git` and has the session branch checked
+out at a commit; the removal then records
+`removed[].ownership_reproof: "device_renumber"`. If any condition fails it
+stays kept with code `ownership_reproof_refused` and the failed condition in
+the reason. Checkouts that cannot be proven at all stay kept with their own
+code and the manual command in the reason: `ownership_witness_missing` (a
+spawned session that never recorded a witness), `ownership_witness_legacy`
+(a schema-1 witness) and `ownership_adopted_only` (only adopted sessions use
+it). Inspect one, then run `aethyme broker finish cleanup <session-id>`. A
+closed checkout whose directory is already gone is `checkout_missing`.
+
 When a closed checkout is kept only for ignored leftovers, the removal lane
 lists every ignored root that blocks it (`kept[].ignored_blockers`) and
 remembers the verdict. It skips that checkout on later passes until its HEAD,
@@ -183,7 +201,11 @@ an inventory. Each slice records its own result under the meta key
 `aethyme broker gc plan --json` and as `capacity_removal` in
 `aethyme broker status --json`; the worker's later lanes do not overwrite it.
 Its `outcome` is `removed`, `lock_busy`, `inventory_unavailable`,
-`lap_unfinished` or `nothing_removable`; `kept_by_code` counts the kept
+`lap_unfinished`, `out_of_time_before_selection` (the budget ran out before
+any checkout was judged; `budget_consumed_by` says whether counting checkouts
+or the other checks used it; it retries after one minute, backing off to ten
+minutes while slices keep running out) or
+`nothing_removable`; `kept_by_code` counts the kept
 checkouts per keep code, `blocked_by_ignored` names the ignored directories
 holding the most checkouts with the line that would release each,
 `lap_remaining` and the cursor say how far the lap got, and `scan_ms`,
@@ -193,6 +215,15 @@ went. Broker opens too short to count checkouts read the count
 three quarters of the budget, so revalidation and the first removal always
 have time (`auto_cleanup.lanes.removal_selected` and
 `removal_apply_reserve_ms`).
+
+Under capacity pressure each removal pass first judges up to eight closed
+checkouts most likely removable now: those whose pull request is recorded
+merged, most recently merged first, then those whose cleanup request is past
+its grace, most recently closed first. Every proof still applies; one kept this
+way is not judged ahead of the lap again for 30 minutes or until its pull
+request merges (`auto_cleanup.priority_memo`), and
+`auto_cleanup.lanes.removal_priority_examined` counts them. The session-order
+lap continues behind them, so every closed checkout is still judged.
 
 Automatic removal records that it started on a checkout before Git deletes
 anything. A closed checkout that such a recorded removal left part-deleted
