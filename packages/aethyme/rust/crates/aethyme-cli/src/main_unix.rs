@@ -25,7 +25,6 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
 mod branches_audit;
 mod graph_refresh;
@@ -35,11 +34,6 @@ mod repository_deploy;
 mod repository_enrollment;
 mod repository_upgrade;
 mod terminal_preview;
-
-/// Upper bound for waiting on a freshly-spawned engine daemon. The socket
-/// binds only after the initial map build (~70s on a 12K-file repo), so
-/// this is generous rather than snappy on purpose.
-const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(240);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ParsedCommand<'a> {
@@ -405,7 +399,6 @@ fn main_with_args(args: &[String]) -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => report_cli_error(error),
         },
-        "root" => run_root_subcommand(&args[1..]),
         // The agent-surface hook entry point the Aethyme plugin shims
         // to. One stable spelling so an installed plugin never has to
         // match an installed CLI version.
@@ -673,7 +666,7 @@ Usage: aethyme <command> [args...]
 
 Hot path:
   explore --repo <path> --request \"<task>\"
-                              in-process engine; auto-starts the engine daemon
+                              in-process engine over the local graph store
   explore-summary --from explore.json
                               compact decision surface from a saved answer-json
   verify-targets --repo <path> --from explore.json [--max-targets 2 --max-lines 80]
@@ -734,7 +727,6 @@ Setup:
   certify                     read-only certification checks for this repo
   deploy [verify|bridge] [--repo <path>]
                               enroll repository policy and agent guidance
-  root show|set <path>        developer checkout pointer (legacy compatibility)
 
 Graph and analysis:
   graph status|units|materialize|refresh|impact|node|callers|...
@@ -855,10 +847,8 @@ fn resolve_spelling(args: Vec<String>) -> Result<Vec<String>, ExitCode> {
 
 // ── explore ─────────────────────────────────────────────────────────────────
 //
-// In-process engine call via the shared front end. No Python involvement:
-// the Python explore orchestrator was deleted 2026-05-08, so the old
-// "fall back to Python" tail was already a dead path. The only recoverable
-// condition is "daemon not running", which the router now fixes itself.
+// In-process engine call via the shared front end. Explore reads the redb
+// graph store directly, so it neither needs nor starts the engine daemon.
 
 fn run_explore(args: &[String]) -> ExitCode {
     use aethyme_engine::explore_cli::{ExploreCliOutcome, run};
@@ -871,36 +861,6 @@ fn run_explore(args: &[String]) -> ExitCode {
         ExploreCliOutcome::Failed(msg) => {
             eprintln!("{msg}");
             ExitCode::from(1)
-        }
-        ExploreCliOutcome::DaemonNotRunning { repo } => {
-            eprintln!(
-                "explore: engine daemon not running for {} — starting it \
-                 (first map build can take a minute on large repos)…",
-                repo.display()
-            );
-            if let Err(msg) = start_engine_daemon_and_wait(&repo) {
-                eprintln!("explore: {msg}");
-                return ExitCode::from(1);
-            }
-            match run(args) {
-                ExploreCliOutcome::Done => ExitCode::SUCCESS,
-                ExploreCliOutcome::DaemonNotRunning { .. } => {
-                    eprintln!(
-                        "explore: engine daemon still not reachable after start; \
-                         check {}",
-                        aethyme_engine::daemon::logfile_path_for(&repo).display()
-                    );
-                    ExitCode::from(1)
-                }
-                ExploreCliOutcome::BadUsage(msg) => {
-                    eprintln!("{msg}");
-                    ExitCode::from(2)
-                }
-                ExploreCliOutcome::Failed(msg) => {
-                    eprintln!("{msg}");
-                    ExitCode::from(1)
-                }
-            }
         }
     }
 }
@@ -933,200 +893,6 @@ fn run_explore_summary(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
-}
-
-fn start_engine_daemon_and_wait(repo: &Path) -> Result<(), String> {
-    use aethyme_engine::daemon::{self, ReadyOutcome, StartOutcome};
-    let expected_identity = daemon::runtime_build_identity();
-    let router_exe = env::current_exe().map_err(|error| format!("current_exe: {error}"))?;
-    let managed_launch =
-        aethyme_broker::pin_runtime_pair_for_build(&router_exe, &expected_identity)?;
-    let serve_exe = managed_launch
-        .as_ref()
-        .map(|launch| launch.paths().engine_path().to_path_buf())
-        .unwrap_or_else(engine_cli_binary_path);
-    let runtime_pin = managed_launch.as_ref().map(|launch| launch.pin());
-    let opts = daemon::StartOptions::default();
-    let mut spawned =
-        match daemon::start_detached_with_runtime_pin(repo, &serve_exe, &opts, runtime_pin)? {
-            StartOutcome::Spawned(child) => Some(child),
-            // Already running but the socket refused just now — likely mid
-            // map-build. Don't watch a process we didn't spawn.
-            StartOutcome::AlreadyRunning(_) => None,
-        };
-    match daemon::wait_until_ready_for_identity(
-        repo,
-        spawned.as_mut(),
-        DAEMON_READY_TIMEOUT,
-        &expected_identity,
-    ) {
-        ReadyOutcome::Ready => Ok(()),
-        ReadyOutcome::IdentityMismatch => Err(format!(
-            "engine daemon answered with a different protocol or build identity; log: {}",
-            daemon::logfile_path_for(repo).display()
-        )),
-        ReadyOutcome::ProcessExited => Err(format!(
-            "engine daemon exited during startup (is the repo indexed? \
-             run `aethyme graph status --repo .`, then review and execute \
-             `aethyme graph refresh plan --repo .`). Log tail:\n{}",
-            daemon::log_tail(repo, 5)
-        )),
-        ReadyOutcome::TimedOut => Err(format!(
-            "engine daemon did not become ready within {}s; log: {}",
-            DAEMON_READY_TIMEOUT.as_secs(),
-            daemon::logfile_path_for(repo).display()
-        )),
-    }
-}
-
-/// Locate the engine for unmanaged development/archive layouts. Installer
-/// managed launches resolve an immutable full-identity pair instead.
-fn engine_cli_binary_path() -> PathBuf {
-    if let Ok(mut exe) = env::current_exe() {
-        exe.pop();
-        let candidate = exe.join("aethyme-engine-cli");
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    PathBuf::from("aethyme-engine-cli")
-}
-
-// ── aethyme root — legacy developer checkout pointer ────────────────────────
-//
-// Repository deployment is self-contained and does not consult this pointer.
-// The command remains for developer compatibility and explicit inspection of
-// source checkouts configured by older installations.
-//
-// Resolution order:
-//   1. $AETHYME_ROOT (explicit override, highest priority)
-//   2. pointer file: $XDG_CONFIG_HOME/aethyme/root (default ~/.config/aethyme/root)
-//   3. upward walk from the current directory (covers working inside the
-//      Aethyme repo or any of its worktrees with zero configuration)
-//
-// Existing pointer files remain readable so upgrades do not destroy operator
-// configuration.
-
-fn config_pointer_path() -> Option<PathBuf> {
-    let base = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("aethyme").join("root"))
-}
-
-/// A directory qualifies as an Aethyme developer checkout when it holds the
-/// Rust workspace and canonical skill sources.
-fn is_aethyme_root(dir: &Path) -> bool {
-    dir.join("rust").join("Cargo.toml").is_file() && dir.join("skills").join("aethyme").is_dir()
-}
-
-fn resolve_aethyme_root() -> Option<(PathBuf, &'static str)> {
-    if let Ok(v) = env::var("AETHYME_ROOT")
-        && !v.is_empty()
-    {
-        return Some((PathBuf::from(v), "AETHYME_ROOT env"));
-    }
-    if let Some(pointer) = config_pointer_path()
-        && let Ok(text) = std::fs::read_to_string(&pointer)
-    {
-        let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            let path = PathBuf::from(trimmed);
-            if is_aethyme_root(&path) {
-                return Some((path, "pointer file"));
-            }
-        }
-    }
-    // Upward walk: <dir>/packages/aethyme (monorepo root or any worktree)
-    // or <dir> itself (running from inside the package).
-    let mut dir = env::current_dir().ok()?;
-    loop {
-        if is_aethyme_root(&dir) {
-            return Some((dir, "upward walk"));
-        }
-        let candidate = dir.join("packages").join("aethyme");
-        if is_aethyme_root(&candidate) {
-            return Some((candidate, "upward walk"));
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
-}
-
-fn run_root_subcommand(args: &[String]) -> ExitCode {
-    match args.first().map(String::as_str) {
-        Some("show") | None => match resolve_aethyme_root() {
-            Some((path, source)) => {
-                println!("{} (via {source})", path.display());
-                ExitCode::SUCCESS
-            }
-            None => {
-                eprintln!("aethyme root: not resolved. Fix one of:");
-                print_root_guidance();
-                ExitCode::from(1)
-            }
-        },
-        Some("set") => {
-            let Some(raw) = args.get(1) else {
-                eprintln!("usage: aethyme root set <path-to-aethyme-package>");
-                return ExitCode::from(2);
-            };
-            let path = match std::fs::canonicalize(raw) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("aethyme root set: {raw}: {e}");
-                    return ExitCode::from(1);
-                }
-            };
-            // Accept either the package dir or the monorepo root.
-            let target = if is_aethyme_root(&path) {
-                path
-            } else {
-                let nested = path.join("packages").join("aethyme");
-                if is_aethyme_root(&nested) {
-                    nested
-                } else {
-                    eprintln!(
-                        "aethyme root set: {} does not contain rust/Cargo.toml + skills/aethyme \
-                         (nor packages/aethyme/)",
-                        path.display()
-                    );
-                    return ExitCode::from(1);
-                }
-            };
-            let Some(pointer) = config_pointer_path() else {
-                eprintln!("aethyme root set: cannot resolve a config directory (no HOME)");
-                return ExitCode::from(1);
-            };
-            if let Some(parent) = pointer.parent()
-                && let Err(e) = std::fs::create_dir_all(parent)
-            {
-                eprintln!("aethyme root set: create {}: {e}", parent.display());
-                return ExitCode::from(1);
-            }
-            if let Err(e) = std::fs::write(&pointer, format!("{}\n", target.display())) {
-                eprintln!("aethyme root set: write {}: {e}", pointer.display());
-                return ExitCode::from(1);
-            }
-            println!(
-                "aethyme root -> {} ({})",
-                target.display(),
-                pointer.display()
-            );
-            ExitCode::SUCCESS
-        }
-        Some(other) => {
-            eprintln!("aethyme root: unknown action '{other}' (use show|set)");
-            ExitCode::from(2)
-        }
-    }
-}
-
-fn print_root_guidance() {
-    eprintln!("  - run from inside an Aethyme checkout (auto-discovered), or");
-    eprintln!("  - `aethyme root set /path/to/Aethyme` (writes ~/.config/aethyme/root), or");
-    eprintln!("  - export AETHYME_ROOT=/path/to/Aethyme/packages/aethyme");
 }
 
 /// Unknown subcommand. Until python-retirement Phase 6 this fell through

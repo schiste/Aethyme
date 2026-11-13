@@ -9,8 +9,6 @@ Usage:
       Show the repository map (default mode: full).
   aethyme repo warm <repo_path>
       Build the repository map once.
-  aethyme repo clear-cache <repo_path>
-      Delete the legacy output cache root ($AETHYME_CACHE_DIR, default /tmp/aethyme-cache).
   aethyme repo engine-info [--repo <path>] [--check] [--json-output]
       Binary, version, graph store, and daemon status; --check exits 1 when not ready.
   aethyme repo deploy-skills <repo_path> [--force | --remove]

@@ -33,5 +33,4 @@ Usage:
       --no-methods            Exclude methods from the symbol set.
       --budget-ms <n>         Time budget in ms (default 10000).
       --max-evidence-per-symbol <n>  Evidence items per symbol (default 5).
-    Starts the engine daemon automatically when it is not running.
 --- stderr

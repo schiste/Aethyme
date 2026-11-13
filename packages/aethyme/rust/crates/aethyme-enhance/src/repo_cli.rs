@@ -7,7 +7,7 @@
 //! `record-wrapper-invocation` (hidden), `experience-telemetry`,
 //! `experience-status`, `commit-message-template`,
 //! `lint-commit-message`. The engine-facing basics (`ingest`, `inspect`,
-//! `clear-cache`, `warm`, `engine-info`) stay in
+//! `warm`, `engine-info`) stay in
 //! `aethyme_engine::repo_cli`; anything else returns
 //! [`Outcome::Delegate`] so the router can produce its unified
 //! unknown-subcommand error.

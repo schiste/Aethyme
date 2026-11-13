@@ -1,7 +1,7 @@
 //! Native `aethyme repo` basics (python-retirement Phase 1 closeout).
 //!
 //! Only the engine-facing basics live here: `ingest`, `inspect`,
-//! `clear-cache`, `warm`, and `engine-info`. The rest of the repo group
+//! `warm`, and `engine-info`. The rest of the repo group
 //! (skills deploy/compile, onboarding/agents overrides, commit hygiene,
 //! telemetry, record-wrapper-invocation) is native too since the
 //! Phase 3 flip — [`run`] returns [`Outcome::Delegate`] for those and
@@ -10,9 +10,8 @@
 //! Sanctioned reinterpretations (recorded in cli-surface-v1.md): the
 //! transport/cache era ended, so `engine-info` now reports binary/
 //! store/daemon status instead of transports; `ingest` reports engine
-//! snapshot + store state instead of the Python cache key; `clear-cache`
-//! clears the whole legacy output-cache root. `inspect` and `warm` are
-//! byte-parity ports.
+//! snapshot + store state instead of the Python cache key. `inspect` and
+//! `warm` are byte-parity ports.
 
 use std::path::{Path, PathBuf};
 
@@ -34,7 +33,7 @@ pub fn run(args: &[String]) -> Outcome {
         return Outcome::Delegate;
     };
     match subcommand.as_str() {
-        "ingest" | "inspect" | "clear-cache" | "warm" | "engine-info" => {
+        "ingest" | "inspect" | "warm" | "engine-info" => {
             Outcome::Handled(dispatch(subcommand.clone().as_str(), &args[1..]))
         }
         _ => Outcome::Delegate,
@@ -59,7 +58,6 @@ fn dispatch(subcommand: &str, rest: &[String]) -> Result<(), String> {
     match subcommand {
         "ingest" => ingest(&repo),
         "inspect" => inspect(&repo, rest),
-        "clear-cache" => clear_cache(&repo),
         "warm" => warm(&repo),
         _ => unreachable!("gated by run()"),
     }
@@ -184,20 +182,6 @@ fn inspect(repo: &Path, rest: &[String]) -> Result<(), String> {
             );
         }
     }
-    Ok(())
-}
-
-fn clear_cache(repo: &Path) -> Result<(), String> {
-    // Legacy Python output cache (snapshot-keyed). The cache retires
-    // with the transports; clearing the root is the coarse, correct
-    // interpretation until Phase 6 deletes the concept entirely.
-    let cache_root = std::env::var("AETHYME_CACHE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp/aethyme-cache"));
-    if cache_root.is_dir() {
-        std::fs::remove_dir_all(&cache_root).map_err(|e| e.to_string())?;
-    }
-    println!("Cleared cache for {}", repo.display());
     Ok(())
 }
 

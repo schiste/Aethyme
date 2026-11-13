@@ -829,31 +829,12 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 
 // explore subcommand — thin adapter over the shared front end in
 // aethyme_engine::explore_cli (also used by the top-level `aethyme`
-// router). This binary keeps the documented exit-code contract:
-// exit 2 with a recognizable message when the engine daemon isn't
-// running, so out-of-repo callers can detect the condition.
+// router). Bad usage exits 2; execution failures return an error.
 
 fn run_explore_via_shared_cli(args: &[String]) -> Result<(), String> {
     use aethyme_engine::explore_cli::{ExploreCliOutcome, run};
     match run(args) {
         ExploreCliOutcome::Done => Ok(()),
-        ExploreCliOutcome::DaemonNotRunning { repo } => {
-            #[cfg(unix)]
-            {
-                eprintln!(
-                    "explore: engine daemon not running; \
-                     start one with `aethyme-engine-cli daemon start --repo {}`",
-                    repo.display()
-                );
-                std::process::exit(2);
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = repo;
-                eprintln!("explore: engine daemon is not yet supported on this platform");
-                std::process::exit(1);
-            }
-        }
         ExploreCliOutcome::BadUsage(msg) => {
             eprintln!("{msg}");
             std::process::exit(2);

@@ -5,9 +5,8 @@
 //! parse the same flags and produce the same answer-json. This module owns
 //! that parsing and dispatch so the two front ends cannot drift; the
 //! binaries translate [`ExploreCliOutcome`] into their own exit-code
-//! contracts. The non-usage-boundary native explore path reads redb directly;
-//! the daemon outcome remains only for older callers that still surface that
-//! process-management distinction.
+//! contracts. Explore reads the redb graph store directly; it never needs
+//! the engine daemon.
 
 use std::path::PathBuf;
 
@@ -18,9 +17,6 @@ use crate::explore;
 pub enum ExploreCliOutcome {
     /// Answer printed to stdout.
     Done,
-    /// Legacy process-management outcome for callers that still distinguish
-    /// daemon startup from ordinary query failures.
-    DaemonNotRunning { repo: PathBuf },
     /// Caller error (bad flags / bad params) — exit-2 semantics.
     BadUsage(String),
     /// Execution failure — exit-1 semantics.
@@ -152,9 +148,6 @@ pub fn run(args: &[String]) -> ExploreCliOutcome {
 
     match explore::explore_with_intent(&repo, &request, intent, intent_source, &params) {
         Ok(response) => emit(&repo, format, &response),
-        Err(explore::ExploreError::DaemonNotRunning) => {
-            ExploreCliOutcome::DaemonNotRunning { repo }
-        }
         Err(explore::ExploreError::GraphUnavailable { status, reason }) => print_graph_unavailable(
             &repo,
             &request,
