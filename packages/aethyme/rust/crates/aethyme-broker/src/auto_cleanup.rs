@@ -98,6 +98,9 @@ pub(crate) const AUTO_COMPACTION_MIN_BUDGET: Duration = Duration::from_secs(60);
 const SESSION_RETIREMENT_CURSOR_KEY: &str = "auto_cleanup.session_retirement_cursor";
 const SESSION_RETIREMENT_CURSOR_VERSION: u32 = 1;
 const SESSION_RETIREMENT_PAGE_SIZE: usize = 128;
+/// A landed proof that alone exhausts a pass this long is passed over for the
+/// rest of the lap instead of holding the retirement cursor.
+const LANDED_SEARCH_HOLD_LIMIT: Duration = Duration::from_secs(10);
 /// Bound discovery of ignored roots before whole-checkout cleanup considers
 /// their existing policy classifications.
 const IGNORED_PATH_LISTING_BUDGET: Duration = Duration::from_secs(15);
@@ -1482,6 +1485,21 @@ pub(crate) fn unclean_reason(
     main_root: &Path,
     policy: &AutoCleanupPolicy,
 ) -> Result<Option<String>, String> {
+    if let Some(reason) = uncommitted_reason(worktree, branch, main_root, policy)? {
+        return Ok(Some(reason));
+    }
+    ignored_content_reason(worktree, policy)
+}
+
+/// Proof 3 without the ignored-path listing: no uncommitted or untracked
+/// path, no merge, rebase or similar in progress, and no stash made on
+/// `branch`.
+pub(crate) fn uncommitted_reason(
+    worktree: &Path,
+    branch: Option<&str>,
+    main_root: &Path,
+    policy: &AutoCleanupPolicy,
+) -> Result<Option<String>, String> {
     // `--no-optional-locks`: asking must not refresh the index, whose
     // modification time is the worktree activity the idle windows read.
     let status = git(
@@ -1541,7 +1559,7 @@ pub(crate) fn unclean_reason(
         }
     }
 
-    ignored_content_reason(worktree, policy)
+    Ok(None)
 }
 
 /// Shared ignored-content verdict for automatic and finish-time cleanup.
@@ -3138,6 +3156,8 @@ impl Broker {
             .collect::<Vec<_>>();
         let mut holder_process_table = crate::session_holder::RecordedHolderProcessTable::default();
         holder_process_table.prime(self.store_ref(), &retirement_candidates, deadline);
+        let pass_started = Instant::now();
+        let mut landed_judged_in_pass = 0_usize;
         for session in sessions {
             if deadline_expired(deadline) {
                 summary.deferred += 1;
@@ -3190,6 +3210,7 @@ impl Broker {
             let mut landed_decline = None;
             let mut outcome = crate::broker::AbandonedSessionCloseOutcome::NotDue;
             if idle_enough_for_landed {
+                landed_judged_in_pass += 1;
                 summary.landed_examined += 1;
                 crate::phase_telemetry::add("landed_sessions_examined", Duration::ZERO);
                 let started = Instant::now();
@@ -3210,6 +3231,26 @@ impl Broker {
                 if landed_decline.is_none() {
                     summary.landed_closed += 1;
                     crate::phase_telemetry::add("landed_sessions_closed", elapsed);
+                }
+                // Leave the cursor on this session so the next pass, usually
+                // the background worker with its larger budget, resumes here;
+                // unless this one session alone used a long pass, which must
+                // not hold every later session back.
+                let held_alone_too_long = landed_judged_in_pass == 1
+                    && pass_started.elapsed() >= LANDED_SEARCH_HOLD_LIMIT;
+                if landed_decline == Some(crate::broker::LandedSessionDecline::BudgetExhausted)
+                    && !held_alone_too_long
+                {
+                    let reason = crate::broker::LandedSessionDecline::BudgetExhausted;
+                    *summary.landed_declined.entry(reason.code()).or_default() += 1;
+                    crate::phase_telemetry::add(reason.telemetry_name(), Duration::ZERO);
+                    summary.deferred += 1;
+                    summary
+                        .reasons
+                        .push(SessionRetirementDeferredReason::DeadlineExceeded {
+                            after_session_id: cursor.after_session_id,
+                        });
+                    return Ok(summary);
                 }
             }
             let fall_through = landed_decline
@@ -6819,6 +6860,46 @@ mod tests {
                 "{reason}"
             );
             assert!(worktree.exists(), "{reason}: the checkout is kept");
+        }
+    }
+
+    /// A tool cache Git ignores is the repository's data until `[cleanup]
+    /// regenerable` names it: unlisted it keeps the landed session, listed
+    /// it is disposable output and the session closes.
+    #[cfg(unix)]
+    #[test]
+    fn a_configured_regenerable_directory_does_not_keep_a_landed_session() {
+        for (cleanup, closes) in [
+            (None, false),
+            (Some("[cleanup]\nregenerable = [\"tool-cache\"]\n"), true),
+        ] {
+            let (_owner, _storage, mut broker) = landed_lane_fixture(cleanup);
+            let root = broker.main_root().to_path_buf();
+            std::fs::write(root.join(".git/info/exclude"), "tool-cache/\n").unwrap();
+            let (session, worktree) = landed_lane_session(
+                &mut broker,
+                "landed with a tool cache",
+                Some(aethyme_testkit::MergeStyle::MergeCommit),
+            );
+            std::fs::create_dir_all(worktree.join("tool-cache")).unwrap();
+            std::fs::write(worktree.join("tool-cache/entry.bin"), "cached\n").unwrap();
+            quiet_with_gone_holder(&mut broker, &session, 30);
+
+            let report = broker.auto_cleanup_now(None).unwrap().unwrap();
+
+            assert_eq!(
+                report.landed_sessions_closed,
+                usize::from(closes),
+                "{report:#?}"
+            );
+            if !closes {
+                assert_eq!(
+                    report.landed_sessions_declined.get("worktree_unclean"),
+                    Some(&1),
+                    "{report:#?}"
+                );
+                assert!(worktree.join("tool-cache/entry.bin").exists());
+            }
         }
     }
 

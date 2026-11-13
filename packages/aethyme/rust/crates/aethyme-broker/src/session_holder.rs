@@ -372,6 +372,10 @@ pub(crate) struct RecordedHolderProcessTable {
     process_use_snapshot: Option<(Instant, crate::reclaim::OpenFileSnapshot)>,
     #[cfg(test)]
     snapshots_taken: usize,
+    /// Runs immediately before the landed lane's last HEAD and activity
+    /// re-read, so a test can interleave an agent's commit there.
+    #[cfg(test)]
+    before_landed_close: Option<Box<dyn FnMut()>>,
 }
 
 impl RecordedHolderProcessTable {
@@ -501,6 +505,18 @@ impl RecordedHolderProcessTable {
         snapshot: crate::reclaim::OpenFileSnapshot,
     ) {
         self.process_use_snapshot = Some((Instant::now(), snapshot));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_before_landed_close_for_test(&mut self, hook: Box<dyn FnMut()>) {
+        self.before_landed_close = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_before_landed_close_for_test(&mut self) {
+        if let Some(hook) = self.before_landed_close.as_mut() {
+            hook();
+        }
     }
 
     #[cfg(test)]
@@ -1584,6 +1600,7 @@ mod tests {
             snapshot: Some(Some(table)),
             process_use_snapshot: None,
             snapshots_taken: 0,
+            before_landed_close: None,
         };
         assert_eq!(
             recorded_holder_liveness(broker.store(), session.id, &mut matching, true).liveness,
@@ -1595,6 +1612,7 @@ mod tests {
             snapshot: Some(Some(ProcessTable::parse(""))),
             process_use_snapshot: None,
             snapshots_taken: 0,
+            before_landed_close: None,
         };
         assert_eq!(
             recorded_holder_liveness(broker.store(), session.id, &mut missing, true).liveness,

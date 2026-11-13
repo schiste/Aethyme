@@ -241,7 +241,21 @@ guard and the lifecycle claim:
   is gone or, when it still runs (one agent process routinely holds many
   sessions in turn), its task lease on this session has expired and no gate,
   unresolved operation, preparation or open file uses the worktree. The
+  holder's own working directory inside the worktree counts as use here
+  (the opt-in abandonment lane still tolerates it). The
   `expire_abandoned_task_leases` opt-in is not needed for a landed session.
+
+The proof is computed once, before the claims, within the pass deadline (out
+of budget: `budget_exhausted`, and the cursor stays on that session for the
+next pass unless that one proof alone spent 10 s of a pass). Under the claims
+it is only verified: HEAD is the proved head, the fetched default-branch tip
+is unchanged (`upstream_moved` otherwise), and `git status` plus in-progress
+markers are clean. Immediately before the close HEAD and the worktree's
+index/HEAD modification times are read again; any change is
+`moved_before_close`. A head the search found unlanded is remembered in broker
+meta (`landed_lane.not_landed.<session id>` = `<head> <tip>`), so it is not
+searched again until either moves; `landed_landing_search` times searches and
+`landed_landing_search_memo_skipped` counts the ones skipped.
 
 Closing releases the session's leases in the same transaction and requests the
 existing whole-checkout cleanup, which removes the checkout after
@@ -259,8 +273,10 @@ fixed high-water lap), so successive passes resume instead of restarting.
 background worker sums them across its passes. `broker status --json` (routine
 and `--refresh`; not `--summary`) adds an optional top-level `landed_session_retirement` object
 (`evaluated_at_ms`, `examined`, `closed`, `declined`, `cursor`) taken from the
-last report, omitted until the landed lane has judged a session; the
-`cleanup.auto-removal` advice gains one evidence line with the same counts.
+last report, omitted until the landed lane has judged a session. Routine
+declines do not raise the `cleanup.auto-removal` advice; `policy_unavailable`,
+`landing_unknown`, `holder_unknown` or `operation_unknown` do, and whenever the
+advice is shown it carries one evidence line with the same counts.
 Each pass adds `landed_sessions_examined`, `landed_sessions_closed`,
 `landed_session_retirement` (time) and one `landed_sessions_declined_<reason>`
 per kept session to the command's `phase_counts`. `status` output size is the
@@ -271,7 +287,11 @@ Reason codes: `recent_activity`, `changed`, `process_alive`, `holder_alive`,
 `worktree_unavailable`, `busy`, `operation_active`, `operation_unknown`,
 `policy_unavailable`, `auto_remove_disabled`, `pinned`,
 `pull_request_unmerged`, `no_session_commits`, `no_landing_evidence`,
-`not_landed`, `landing_unknown`, `worktree_unclean`. Fixtures that keep a
+`not_landed`, `landing_unknown`, `worktree_unclean`, `moved_before_close`,
+`upstream_moved`, `budget_exhausted`. An ignored tool cache keeps a session as
+`worktree_unclean` until the repository names it in `[cleanup] regenerable`
+(a list of globs, relative to the worktree root, in `.aethyme/config.toml`).
+Fixtures that keep a
 checkout across broker opens with `[cleanup] auto_remove = false` keep their
 sessions open too (`auto_remove_disabled`).
 

@@ -2970,21 +2970,32 @@ fn push_auto_cleanup_advice(view: &mut StatusView, report: Option<crate::AutoCle
     let Some(report) = report else {
         return;
     };
-    let actionable_retirement_issue = report.retirement_deferred_reasons.iter().any(|reason| {
-        matches!(
-            reason,
-            crate::SessionRetirementDeferredReason::RetentionPolicyUnavailable { .. }
-                | crate::SessionRetirementDeferredReason::HolderLivenessUnavailable { .. }
-                | crate::SessionRetirementDeferredReason::WorktreeActivityUnavailable { .. }
-                | crate::SessionRetirementDeferredReason::LeaseLivenessUnavailable { .. }
-                | crate::SessionRetirementDeferredReason::OperationEvidenceUnavailable { .. }
-        )
-    });
+    // Routine landed-lane declines (not landed yet, holder still working,
+    // dirty worktree) are reported in `landed_session_retirement` only. Evidence
+    // the broker could not read is a reason to look.
+    let actionable_landed_issue = [
+        "policy_unavailable",
+        "landing_unknown",
+        "holder_unknown",
+        "operation_unknown",
+    ]
+    .iter()
+    .any(|reason| report.landed_sessions_declined.contains_key(*reason));
+    let actionable_retirement_issue = actionable_landed_issue
+        || report.retirement_deferred_reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                crate::SessionRetirementDeferredReason::RetentionPolicyUnavailable { .. }
+                    | crate::SessionRetirementDeferredReason::HolderLivenessUnavailable { .. }
+                    | crate::SessionRetirementDeferredReason::WorktreeActivityUnavailable { .. }
+                    | crate::SessionRetirementDeferredReason::LeaseLivenessUnavailable { .. }
+                    | crate::SessionRetirementDeferredReason::OperationEvidenceUnavailable { .. }
+            )
+        });
     if report.removed.is_empty()
         && report.kept.is_empty()
         && report.config_error.is_none()
         && report.sessions_retired == 0
-        && report.landed_sessions_examined == 0
         && !actionable_retirement_issue
     {
         return;

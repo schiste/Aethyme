@@ -212,7 +212,7 @@ policy separately.
 | `retirement_deferred_reasons` | Typed reasons why retirement could not finish; omitted when empty. |
 | `landed_sessions_examined` | Open sessions idle past `session_landed_after_hours` that the landed lane judged; omitted when zero. |
 | `landed_sessions_closed` | Of those, the sessions it closed; omitted when zero. |
-| `landed_sessions_declined` | Sessions it kept, counted per reason code (`recent_activity`, `changed`, `process_alive`, `holder_alive`, `holder_unbound`, `holder_unknown`, `lease_held`, `lease_unknown`, `worktree_unavailable`, `busy`, `operation_active`, `operation_unknown`, `policy_unavailable`, `auto_remove_disabled`, `pinned`, `pull_request_unmerged`, `no_session_commits`, `no_landing_evidence`, `not_landed`, `landing_unknown`, `worktree_unclean`); omitted when empty. A session the abandonment window then closed is not counted. |
+| `landed_sessions_declined` | Sessions it kept, counted per reason code (`recent_activity`, `changed`, `process_alive`, `holder_alive`, `holder_unbound`, `holder_unknown`, `lease_held`, `lease_unknown`, `worktree_unavailable`, `busy`, `operation_active`, `operation_unknown`, `policy_unavailable`, `auto_remove_disabled`, `pinned`, `pull_request_unmerged`, `no_session_commits`, `no_landing_evidence`, `not_landed`, `landing_unknown`, `worktree_unclean`, `moved_before_close`, `upstream_moved`, `budget_exhausted`); omitted when empty. A session the abandonment window then closed is not counted. |
 | `retirement_cursor` | `{after_session_id, high_water_session_id}`: where the open-session retirement lap stood when the report was written; omitted before the first lap. |
 | `landed_retirement_elapsed_ms` | Milliseconds the landed lane spent; omitted when zero. |
 
