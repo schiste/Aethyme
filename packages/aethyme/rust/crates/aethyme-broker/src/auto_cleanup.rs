@@ -6895,6 +6895,7 @@ mod tests {
         let view = broker.status(now_ms()).unwrap();
         let landed = view
             .landed_session_retirement
+            .as_ref()
             .expect("status reports the landed lane");
         assert_eq!(landed.examined, 1);
         assert_eq!(landed.closed, 0);

@@ -840,7 +840,7 @@ impl Broker {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     fn landed_session_is_safe_to_retire(&self, session: &crate::Session) -> bool {
         self.landed_session_decline(session).is_none()
     }
