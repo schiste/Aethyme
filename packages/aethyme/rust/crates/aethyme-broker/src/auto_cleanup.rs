@@ -47,6 +47,10 @@ use crate::{Broker, BrokerOpError, GitRepo};
 /// | `.venv` | `pyvenv.cfg` inside |
 /// | `build`, `dist` | a sibling `package.json`, `setup.py`, `pyproject.toml` or `CMakeLists.txt` |
 /// | `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache` | always (tool caches) |
+/// | `.hypothesis` | only Hypothesis's own entries (`examples`, `unicode_data`, ...) |
+/// | `playwright-report` | only `index.html`, `data/` and `trace/` |
+/// | `test-results` | Playwright's `.last-run.json` status file inside |
+/// | any other name | a `CACHEDIR.TAG` with the standard signature inside, and no protected name (`.env*`, keys, databases, `.aethyme`) anywhere beneath it |
 ///
 /// Names are compared as whole path components: `target-notes/`,
 /// `my_build/` and `targets.json` are not build output.
@@ -61,6 +65,9 @@ pub const BUILT_IN_REGENERABLE: &[&str] = &[
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
+    ".hypothesis",
+    "playwright-report",
+    "test-results",
 ];
 
 /// Manifests whose presence beside `build/` or `dist/` proves it is output.
@@ -420,6 +427,9 @@ fn regenerable_dir(
         "node_modules" | "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache" => {
             Some(false)
         }
+        ".hypothesis" if hypothesis_database(&path) => Some(false),
+        "playwright-report" if playwright_html_report(&path) => Some(false),
+        "test-results" if playwright_output_directory(&path) => Some(false),
         "target" if parent.join("Cargo.toml").is_file() || path.join("CACHEDIR.TAG").is_file() => {
             Some(true)
         }
@@ -438,11 +448,163 @@ fn regenerable_dir(
             .filter(|witness| witness.confirms(&path))
             .map(|_| false),
     };
-    recognised.or_else(|| {
-        policy
-            .configured_regenerable_dir(relative_dir)
-            .then_some(false)
-    })
+    recognised
+        .or_else(|| tagged_cache_without_protected_entries(&path).then_some(false))
+        .or_else(|| {
+            policy
+                .configured_regenerable_dir(relative_dir)
+                .then_some(false)
+        })
+}
+
+/// The first bytes of a `CACHEDIR.TAG` under the Cache Directory Tagging
+/// specification (<https://bford.info/cachedir/>).
+const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+/// Entries a tagged cache may hold before cleanup stops checking it for
+/// protected names and keeps it.
+const TAGGED_CACHE_ENTRY_LIMIT: usize = 20_000;
+
+/// Whether `directory` holds a regular `CACHEDIR.TAG` that begins with the
+/// standard signature: the tool that wrote the cache declared it regenerable.
+fn has_cache_directory_tag(directory: &Path) -> bool {
+    use std::io::Read;
+    let tag = directory.join("CACHEDIR.TAG");
+    let Ok(metadata) = std::fs::symlink_metadata(&tag) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    let mut prefix = [0_u8; CACHEDIR_TAG_SIGNATURE.len()];
+    std::fs::File::open(&tag)
+        .and_then(|mut file| file.read_exact(&mut prefix))
+        .is_ok_and(|()| prefix.as_slice() == CACHEDIR_TAG_SIGNATURE)
+}
+
+/// Names that never become disposable because a cache tag sits above them:
+/// the same secrets, keys, databases and broker state a configured
+/// `regenerable` glob may never match ([`GLOB_PROBES`]).
+fn protected_cache_entry(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == ".env"
+        || lower.starts_with(".env.")
+        || lower == ".aethyme"
+        || [".key", ".pem", ".p12", ".pfx", ".sqlite", ".sqlite3", ".db"]
+            .iter()
+            .any(|suffix| lower.ends_with(suffix))
+}
+
+/// A tagged cache directory whose bounded walk finds no protected name.
+/// Symlinks are judged by name and never followed; an unreadable entry, a
+/// non-Unicode name or a walk past [`TAGGED_CACHE_ENTRY_LIMIT`] keeps it.
+fn tagged_cache_without_protected_entries(directory: &Path) -> bool {
+    if !has_cache_directory_tag(directory) {
+        return false;
+    }
+    let mut pending = vec![directory.to_path_buf()];
+    let mut examined = 0_usize;
+    while let Some(current) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            return false;
+        };
+        for entry in entries {
+            examined += 1;
+            if examined > TAGGED_CACHE_ENTRY_LIMIT {
+                return false;
+            }
+            let Ok(entry) = entry else {
+                return false;
+            };
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                return false;
+            };
+            if protected_cache_entry(&name) {
+                return false;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                return false;
+            };
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    true
+}
+
+/// Hypothesis's example database (`.hypothesis/`): only the subdirectories
+/// and ignore file Hypothesis writes, and at least one of its stores. Any
+/// other entry keeps it.
+fn hypothesis_database(directory: &Path) -> bool {
+    only_known_entries(
+        directory,
+        &[
+            "examples",
+            "unicode_data",
+            "constants",
+            "patches",
+            "observed",
+            ".gitignore",
+            ".DS_Store",
+        ],
+        &["examples", "unicode_data"],
+    )
+}
+
+/// Playwright's HTML report: `index.html` plus its `data/` and `trace/`
+/// folders, and nothing else.
+fn playwright_html_report(directory: &Path) -> bool {
+    only_known_entries(
+        directory,
+        &["index.html", "data", "trace", ".DS_Store"],
+        &["index.html"],
+    )
+}
+
+/// Playwright's test output folder, proved by the `.last-run.json` status
+/// file Playwright writes there. Playwright empties this folder at the start
+/// of every run, so nothing a person puts in it survives the next run.
+fn playwright_output_directory(directory: &Path) -> bool {
+    let last_run = directory.join(".last-run.json");
+    let Ok(metadata) = std::fs::symlink_metadata(&last_run) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        return false;
+    }
+    std::fs::read(&last_run)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|value| {
+            value
+                .get("status")
+                .is_some_and(serde_json::Value::is_string)
+        })
+}
+
+/// Every top-level entry of `directory` is in `allowed`, and each name in
+/// `required` is present. Unreadable entries keep the directory.
+fn only_known_entries(directory: &Path, allowed: &[&str], required: &[&str]) -> bool {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return false;
+    };
+    let mut seen = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            return false;
+        };
+        if !allowed.contains(&name.as_str()) {
+            return false;
+        }
+        seen.push(name);
+    }
+    required
+        .iter()
+        .any(|name| seen.iter().any(|seen| seen == name))
 }
 
 /// The nearest enclosing build-output directory of an ignored path, as
@@ -7239,6 +7401,50 @@ mod tests {
         assert!(!worktree.exists(), "the closed landed checkout is removed");
     }
 
+    /// A closed landed checkout whose only leftover is a cache its tool
+    /// tagged is removed; the same cache holding a `.env` keeps its checkout,
+    /// reported as `ignored_content`.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_landed_checkout_holding_only_a_tagged_cache_is_removed() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let root = broker.main_root().to_path_buf();
+        std::fs::write(root.join(".git/info/exclude"), "tool-cache/\n").unwrap();
+        let (_tagged_session, tagged) = closed_landed_checkout(&mut broker, "tagged cache only");
+        touch(&tagged, "tool-cache/objects/ab/cdef");
+        std::fs::write(tagged.join("tool-cache/CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        let (_guarded_session, guarded) =
+            closed_landed_checkout(&mut broker, "tagged cache with a secret");
+        touch(&guarded, "tool-cache/objects/ab/cdef");
+        touch(&guarded, "tool-cache/.env");
+        std::fs::write(guarded.join("tool-cache/CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        let guarded_text = std::fs::canonicalize(&guarded)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let mut guarded_codes = Vec::new();
+        for _ in 0..3 {
+            let report = broker.auto_cleanup_now(None).unwrap().unwrap();
+            guarded_codes.extend(
+                report
+                    .kept
+                    .iter()
+                    .filter(|kept| kept.worktree == guarded_text)
+                    .map(|kept| kept.code.clone()),
+            );
+            if !tagged.exists() && !guarded_codes.is_empty() {
+                break;
+            }
+        }
+        assert!(!tagged.exists(), "the tagged cache alone does not keep it");
+        assert!(guarded.join("tool-cache/.env").is_file());
+        assert!(
+            guarded_codes.iter().any(|code| code == "ignored_content"),
+            "{guarded_codes:?}"
+        );
+    }
+
     #[test]
     fn lane_shares_give_removal_the_larger_part_under_capacity_pressure() {
         use std::time::{Duration, Instant};
@@ -7851,6 +8057,95 @@ mod tests {
         )
         .unwrap();
         assert_eq!(classify(root, "node_modules/", &policy), Ok(()));
+    }
+
+    const CACHEDIR_TAG: &str =
+        "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag.\n";
+
+    #[test]
+    fn a_cache_directory_tag_declares_an_ignored_directory_regenerable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = AutoCleanupPolicy::default();
+        touch(root, "tool-cache/objects/ab/cdef");
+        std::fs::write(root.join("tool-cache/CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        assert_eq!(classify(root, "tool-cache/", &policy), Ok(()));
+
+        // A wrong signature, a tag in a subdirectory only, or a tag that is
+        // a symlink proves nothing.
+        touch(root, "near-miss/data.bin");
+        std::fs::write(
+            root.join("near-miss/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc56\n",
+        )
+        .unwrap();
+        assert!(classify(root, "near-miss/", &policy).is_err());
+        touch(root, "mixed/reports/summary.json");
+        std::fs::create_dir_all(root.join("mixed/tagged")).unwrap();
+        std::fs::write(root.join("mixed/tagged/CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        assert!(classify(root, "mixed/", &policy).is_err());
+        #[cfg(unix)]
+        {
+            touch(root, "linked-tag/data.bin");
+            std::os::unix::fs::symlink(
+                root.join("tool-cache/CACHEDIR.TAG"),
+                root.join("linked-tag/CACHEDIR.TAG"),
+            )
+            .unwrap();
+            assert!(classify(root, "linked-tag/", &policy).is_err());
+        }
+
+        // Secrets, keys, databases and broker state beneath the tag keep it.
+        for protected in [
+            "nested/.env",
+            "nested/.env.local",
+            "deploy.pem",
+            "state/app.sqlite",
+            "x/.aethyme/state.json",
+        ] {
+            let name = format!("guarded-{}", protected.len());
+            touch(root, &format!("{name}/{protected}"));
+            std::fs::write(root.join(&name).join("CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+            assert!(
+                classify(root, &format!("{name}/"), &policy).is_err(),
+                "{protected}"
+            );
+        }
+    }
+
+    #[test]
+    fn witnessed_test_tool_outputs_are_regenerable_and_lookalikes_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = AutoCleanupPolicy::default();
+        touch(root, ".hypothesis/examples/0a1b/2c3d");
+        touch(root, ".hypothesis/.gitignore");
+        assert_eq!(classify(root, ".hypothesis/", &policy), Ok(()));
+        touch(root, "playwright-report/index.html");
+        touch(root, "playwright-report/data/0123.png");
+        assert_eq!(classify(root, "playwright-report/", &policy), Ok(()));
+        std::fs::create_dir_all(root.join("test-results/spec-chromium")).unwrap();
+        std::fs::write(
+            root.join("test-results/.last-run.json"),
+            r#"{"status":"passed","failedTests":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(classify(root, "test-results/", &policy), Ok(()));
+
+        let other = tempfile::tempdir().unwrap();
+        let root = other.path();
+        // A person's notes beside the tool's entries, a report folder with
+        // extra files, or a results folder no Playwright run wrote.
+        touch(root, ".hypothesis/examples/0a1b/2c3d");
+        touch(root, ".hypothesis/notes.md");
+        assert!(classify(root, ".hypothesis/", &policy).is_err());
+        touch(root, "playwright-report/index.html");
+        touch(root, "playwright-report/summary.xlsx");
+        assert!(classify(root, "playwright-report/", &policy).is_err());
+        touch(root, "test-results/junit.xml");
+        assert!(classify(root, "test-results/", &policy).is_err());
+        std::fs::write(root.join("test-results/.last-run.json"), "not json").unwrap();
+        assert!(classify(root, "test-results/", &policy).is_err());
     }
 
     #[test]
