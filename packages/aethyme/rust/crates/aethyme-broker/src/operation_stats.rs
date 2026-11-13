@@ -70,6 +70,36 @@ pub struct NarrowLaneStats {
     pub session_branch_sample_count: usize,
     pub lock_hold_ms: OperationTimingDistribution,
     pub queue_wait_ms: OperationTimingDistribution,
+    /// Git pushes, commits and fetches whose journal row records a lane
+    /// decision (`coordination_timing.narrow_lane`), refused ones included.
+    pub taken_count: usize,
+    pub unavailable_count: usize,
+    /// Unavailable decisions by stable reason code.
+    pub unavailable_by_reason: BTreeMap<String, usize>,
+    /// The same decisions per kind (`push`, `commit`, `fetch`).
+    pub by_kind: BTreeMap<String, NarrowLaneDecisionCounts>,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct NarrowLaneDecisionCounts {
+    pub taken_count: usize,
+    pub unavailable_count: usize,
+    pub unavailable_by_reason: BTreeMap<String, usize>,
+}
+
+impl NarrowLaneDecisionCounts {
+    fn count(&mut self, unavailable_reason: Option<&str>) {
+        match unavailable_reason {
+            None => self.taken_count += 1,
+            Some(reason) => {
+                self.unavailable_count += 1;
+                *self
+                    .unavailable_by_reason
+                    .entry(reason.to_owned())
+                    .or_default() += 1;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -113,6 +143,8 @@ struct Timing {
     hooks_outside_lock: bool,
     ref_determination_ms: Option<i64>,
     ref_determination_succeeded: Option<bool>,
+    /// `(kind, unavailable reason)`; `None` reason when the lane was taken.
+    narrow_lane: Option<(String, Option<String>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +182,8 @@ pub(crate) fn from_store(
     let mut ref_stats = RefDeterminationStats::default();
     let mut ref_determination_values = Vec::new();
     let mut observed_timing = 0usize;
+    let mut lane_decisions = NarrowLaneDecisionCounts::default();
+    let mut lane_decisions_by_kind = BTreeMap::<String, NarrowLaneDecisionCounts>::new();
     for operation in &page.operations {
         let timing = operation_timing(operation);
         if operation_kind(operation) == "gh.pr.merge" {
@@ -178,6 +212,13 @@ pub(crate) fn from_store(
         let Some(timing) = timing else {
             continue;
         };
+        if let Some((kind, reason)) = &timing.narrow_lane {
+            lane_decisions.count(reason.as_deref());
+            lane_decisions_by_kind
+                .entry(kind.clone())
+                .or_default()
+                .count(reason.as_deref());
+        }
         let (Some(wait_started_at), Some(acquired_at), Some(released_at)) = (
             timing.wait_started_at,
             timing.acquired_at,
@@ -272,6 +313,10 @@ pub(crate) fn from_store(
             session_branch_sample_count: session_branch_samples,
             lock_hold_ms: distribution(narrow_hold),
             queue_wait_ms: distribution(narrow_wait),
+            taken_count: lane_decisions.taken_count,
+            unavailable_count: lane_decisions.unavailable_count,
+            unavailable_by_reason: lane_decisions.unavailable_by_reason,
+            by_kind: lane_decisions_by_kind,
         },
         pr_merge_ref_determination: ref_stats,
         interpretation: concat!(
@@ -279,7 +324,9 @@ pub(crate) fn from_store(
             "Unrelated contention counts only waits where both operations ",
             "name disjoint, known scopes; repository-wide or unknown targets ",
             "are excluded. Narrow lanes count writes that held a resource lane ",
-            "instead of the repository-wide key. ",
+            "instead of the repository-wide key; their taken and unavailable ",
+            "counts, by reason code, come from each row's recorded lane decision. ",
+            "queue_wait_ms is the whole wait for every lock a write passed. ",
             "Enable coordination.measure_pr_merge_ref to measure ",
             "the provider read that would determine a pull request's base ref."
         )
@@ -306,7 +353,26 @@ fn operation_timing(operation: &CoordinatedOperation) -> Option<Timing> {
         ref_determination_succeeded: timing
             .get("ref_determination_succeeded")
             .and_then(serde_json::Value::as_bool),
+        narrow_lane: narrow_lane_decision(timing),
     })
+}
+
+fn narrow_lane_decision(timing: &serde_json::Value) -> Option<(String, Option<String>)> {
+    let kind = timing.get("narrow_lane_kind")?.as_str()?.to_owned();
+    match timing.get("narrow_lane")?.as_str()? {
+        "taken" => Some((kind, None)),
+        "unavailable" => Some((
+            kind,
+            Some(
+                timing
+                    .get("narrow_lane_unavailable_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+            ),
+        )),
+        _ => None,
+    }
 }
 
 fn as_i64(value: &serde_json::Value) -> Option<i64> {
@@ -718,5 +784,114 @@ mod tests {
         assert_eq!(report.narrow_lanes.sample_count, 3);
         assert_eq!(report.narrow_lanes.session_branch_sample_count, 2);
         assert_eq!(report.narrow_lanes.lock_hold_ms.sample_count, 3);
+    }
+
+    #[test]
+    fn stats_aggregate_lane_decisions_by_reason_including_refused_writes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("broker.db");
+        drop(BrokerStore::open(&database).unwrap());
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (
+                     id, worktree_path, branch, origin, status,
+                     created_at, updated_at, last_activity_at
+                 ) VALUES (1, '/repo', 'agent/one', 'adopted', 'active', 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let mut store = BrokerStore::open(&database).unwrap();
+        let completed = |lane: &str, kind: &str, reason: Option<&str>| {
+            serde_json::json!({ "coordination_timing": {
+                "lock_key": "github.com/o/r",
+                "lock_wait_started_at": 10,
+                "lock_acquired_at": 10,
+                "lock_released_at": 20,
+                "queue_wait_ms": 0,
+                "lock_hold_ms": 10,
+                "narrow_lane": lane,
+                "narrow_lane_kind": kind,
+                "narrow_lane_unavailable_reason": reason,
+            }})
+        };
+        // A write refused while waiting has no acquired lock but still
+        // recorded its decision.
+        let refused = serde_json::json!({
+            "reason": "local_git_lane_unavailable",
+            "coordination_timing": {
+                "lock_key": "git-common:1:2",
+                "lock_wait_started_at": 10,
+                "lock_acquired_at": null,
+                "lock_released_at": null,
+                "queue_wait_ms": 59_000,
+                "narrow_lane": "unavailable",
+                "narrow_lane_kind": "push",
+                "narrow_lane_unavailable_reason": "repository_extension",
+            }
+        });
+        for (command, details, status) in [
+            (
+                "[\"git\",\"push\"]",
+                completed("unavailable", "push", Some("repository_extension")),
+                crate::OperationStatus::Succeeded,
+            ),
+            (
+                "[\"git\",\"push\"]",
+                refused,
+                crate::OperationStatus::Failed,
+            ),
+            (
+                "[\"git\",\"push\"]",
+                completed("taken", "push", None),
+                crate::OperationStatus::Succeeded,
+            ),
+            (
+                "[\"git\",\"commit\"]",
+                completed("unavailable", "commit", Some("ambient_git_override")),
+                crate::OperationStatus::Succeeded,
+            ),
+        ] {
+            let operation = store
+                .create_coordinated_operation(&crate::NewCoordinatedOperation {
+                    session_id: 1,
+                    provider: OperationProvider::Git,
+                    repository: "github.com/o/r".into(),
+                    scope: "repository".into(),
+                    effect: OperationEffect::Write,
+                    authorization_reason: Some("test".into()),
+                    command_json: command.into(),
+                    pid: 1,
+                    host_operation_id: None,
+                    identity_provenance: crate::OperationIdentityProvenance::VerifiedCanonical,
+                })
+                .unwrap();
+            store
+                .transition_coordinated_operation(
+                    operation.id,
+                    status,
+                    None,
+                    Some(&details.to_string()),
+                )
+                .unwrap();
+        }
+        let report = from_store(&store, None, 50).unwrap();
+        let lanes = &report.narrow_lanes;
+        assert_eq!(lanes.taken_count, 1);
+        assert_eq!(lanes.unavailable_count, 3);
+        assert_eq!(
+            lanes.unavailable_by_reason.get("repository_extension"),
+            Some(&2)
+        );
+        assert_eq!(
+            lanes.unavailable_by_reason.get("ambient_git_override"),
+            Some(&1)
+        );
+        let push = &lanes.by_kind["push"];
+        assert_eq!((push.taken_count, push.unavailable_count), (1, 2));
+        assert_eq!(lanes.by_kind["commit"].unavailable_count, 1);
+        // The refused row is not a timing sample.
+        assert_eq!(report.measured_operations, 3);
     }
 }

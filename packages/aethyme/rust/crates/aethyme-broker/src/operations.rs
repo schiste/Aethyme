@@ -1350,6 +1350,8 @@ pub(crate) struct RepositoryWriteLock {
     acquired_at: Instant,
     acquired_at_ms: i64,
     queue_wait_ms: i64,
+    /// The holder record this exclusive holder wrote; removed on drop.
+    holder_record: Option<PathBuf>,
     _compatibility_guard: Option<Box<RepositoryWriteLock>>,
 }
 
@@ -1375,6 +1377,7 @@ impl RepositoryWriteLock {
                 acquired_at: Instant::now(),
                 acquired_at_ms: unix_now_ms(),
                 queue_wait_ms: 0,
+                holder_record: None,
                 _compatibility_guard: None,
             }));
         }
@@ -1475,13 +1478,23 @@ impl RepositoryWriteLock {
         // and cannot invalidate the borrow.
         let rc = unsafe { libc::flock(file.as_raw_fd(), lock_mode | libc::LOCK_NB) };
         if rc == 0 {
-            return Ok(Self {
+            let mut lock = Self {
                 file,
                 acquired_at: Instant::now(),
                 acquired_at_ms: unix_now_ms(),
                 queue_wait_ms: 0,
+                holder_record: None,
                 _compatibility_guard: None,
-            });
+            };
+            if !shared {
+                lock.record_holder(
+                    path,
+                    "coordinated_operation",
+                    session_id,
+                    Some(operation_id),
+                );
+            }
+            return Ok(lock);
         }
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
@@ -1568,17 +1581,42 @@ impl RepositoryWriteLock {
             "[coordination] acquired the {repository} write lock after {}",
             humanize_duration(waited.elapsed().as_secs())
         );
-        Ok(Self {
+        let mut lock = Self {
             file,
             acquired_at: Instant::now(),
             acquired_at_ms: unix_now_ms(),
             queue_wait_ms: waited.elapsed().as_millis() as i64,
+            holder_record: None,
             _compatibility_guard: None,
-        })
+        };
+        if !shared {
+            lock.record_holder(
+                path,
+                "coordinated_operation",
+                session_id,
+                Some(operation_id),
+            );
+        }
+        Ok(lock)
     }
 
     fn hold_duration_ms(&self) -> i64 {
         self.acquired_at.elapsed().as_millis() as i64
+    }
+
+    /// Write who holds this exclusive lock next to its lock file, so a waiter
+    /// can name a holder the operation journal does not know. Diagnostic
+    /// only: a holder whose record cannot be written still holds the lock.
+    fn record_holder(
+        &mut self,
+        lock_path: PathBuf,
+        kind: &str,
+        session_id: Option<i64>,
+        operation_id: Option<i64>,
+    ) {
+        let path = lock_holder_record_path(&lock_path);
+        let record = LockHolderRecord::current(kind, session_id, operation_id, self.acquired_at_ms);
+        self.holder_record = write_lock_holder_record(&path, &record).ok().map(|()| path);
     }
 }
 
@@ -1617,19 +1655,44 @@ pub(crate) fn local_git_coordination_lock_key(cwd: &Path) -> Result<String, Brok
 
 /// Acquire both the common-directory lane and canonical remote compatibility
 /// lane used by coordinated writers before reusing a submission plan.
+#[cfg(test)]
 pub(crate) fn try_acquire_local_repository_write_lock(
     main_root: &Path,
     checkout: &crate::GitRepo,
+) -> Result<Option<(String, RepositoryWriteLock)>, BrokerOpError> {
+    try_acquire_local_repository_write_lock_as(main_root, checkout, "internal", None)
+}
+
+/// Acquire both lanes like `try_acquire_local_repository_write_lock`, naming the holder. These
+/// holds have no journal row, so the record written next to each lock is the
+/// only way a coordinated writer waiting behind them can say who it waits for.
+pub(crate) fn try_acquire_local_repository_write_lock_as(
+    main_root: &Path,
+    checkout: &crate::GitRepo,
+    kind: &str,
+    session_id: Option<i64>,
 ) -> Result<Option<(String, RepositoryWriteLock)>, BrokerOpError> {
     let Some(repository) = local_repository_coordination_key(checkout, None)? else {
         return Ok(None);
     };
     let key = git_scopes::common_lock_key(checkout.root())?;
-    let Some(common) = RepositoryWriteLock::try_acquire_nonblocking(main_root, &key)? else {
+    let Some(mut common) = RepositoryWriteLock::try_acquire_nonblocking(main_root, &key)? else {
         return Ok(None);
     };
+    common.record_holder(
+        repository_write_lock_path(main_root, &key),
+        kind,
+        session_id,
+        None,
+    );
     Ok(
         RepositoryWriteLock::try_acquire_nonblocking(main_root, &repository)?.map(|mut lock| {
+            lock.record_holder(
+                repository_write_lock_path(main_root, &repository),
+                kind,
+                session_id,
+                None,
+            );
             lock._compatibility_guard = Some(Box::new(common));
             (repository, lock)
         }),
@@ -1743,22 +1806,85 @@ fn session_hooks_hold_repository_lock_enabled(main_root: &Path) -> bool {
 /// repository with `push.followTags` also keeps it: the strict spelling passes
 /// `--no-follow-tags`, and the branch lane does not cover tag refs, so it must
 /// not silently stop publishing the tags Git would have followed.
-pub(crate) fn session_branch_push_lane_available(
+///
+/// `Err` carries the stable reason code (see `git_scopes::LANE_REASONS`) that
+/// the coordinated operation journals as `narrow_lane_unavailable_reason`.
+pub(crate) fn session_branch_push_lane(
     main_root: &Path,
     cwd: &Path,
     args: &[String],
-) -> bool {
+) -> Result<(), &'static str> {
     let deadline = AdmissionDeadline::start(QueueWait::Refuse);
     let repository = "session branch push";
-    !git_scopes::push_follows_tags(cwd, deadline, repository).unwrap_or(true)
-        && git_scopes::validate_repository(
-            cwd,
-            args,
-            deadline,
-            repository,
-            !session_hooks_hold_repository_lock_enabled(main_root),
-        )
-        .is_ok()
+    match git_scopes::push_follows_tags(cwd, deadline, repository) {
+        Ok(false) => {}
+        Ok(true) => return Err(git_scopes::LANE_PUSH_FOLLOWS_TAGS),
+        Err(error) => return Err(git_scopes::lane_unavailable_code(&error)),
+    }
+    let hooks_hold_lock = session_hooks_hold_repository_lock_enabled(main_root);
+    git_scopes::validate_repository(cwd, args, deadline, repository, !hooks_hold_lock)
+        .map_err(|error| session_lane_reason(&error, hooks_hold_lock))
+}
+
+/// The narrow lane a Git write could ask for: `push`, `commit` or `fetch`.
+/// Other writes have no lane to report.
+fn narrow_lane_kind(
+    provider: OperationProvider,
+    effect: OperationEffect,
+    args: &[String],
+) -> Option<&'static str> {
+    if provider != OperationProvider::Git || effect == OperationEffect::Read {
+        return None;
+    }
+    if is_push(args) {
+        Some("push")
+    } else if git_scopes::is_plain_commit(args) {
+        Some("commit")
+    } else if args.first().is_some_and(|command| command == "fetch") {
+        Some("fetch")
+    } else {
+        None
+    }
+}
+
+/// Why a push that did not arrive in the strict spelling holds the wide
+/// lane. `broker push` falls back to `push <remote> <sha>:refs/heads/<own
+/// branch>` when its own check refuses the lane; re-asking that check names
+/// the reason here, where it is journaled.
+fn wide_push_lane_reason(
+    main_root: &Path,
+    cwd: &Path,
+    args: &[String],
+    own_session: Option<&crate::types::Session>,
+) -> &'static str {
+    if args
+        .iter()
+        .any(|argument| argument.starts_with("--force-with-lease"))
+    {
+        return git_scopes::LANE_FORCE_WITH_LEASE;
+    }
+    let Some(strict) = git_scopes::strict_equivalent_of_plain_push(args) else {
+        return git_scopes::LANE_NOT_STRICT_SPELLING;
+    };
+    let Some(session) = own_session else {
+        return git_scopes::LANE_NO_LIVE_SESSION;
+    };
+    let own_branch = format!("refs/heads/{}", session.branch);
+    if git_scopes::strict_push_destination(&strict).as_deref() != Some(own_branch.as_str()) {
+        return git_scopes::LANE_NOT_SESSION_BRANCH;
+    }
+    session_branch_push_lane(main_root, cwd, &strict)
+        .err()
+        .unwrap_or(git_scopes::LANE_NOT_STRICT_SPELLING)
+}
+
+/// A `pre-push` hook widens a session push only because the repository opted
+/// out; name the opt-out rather than the hook.
+fn session_lane_reason(error: &BrokerOpError, hooks_hold_lock: bool) -> &'static str {
+    match git_scopes::lane_unavailable_code(error) {
+        "pre_push_hook" if hooks_hold_lock => git_scopes::LANE_SESSION_HOOKS_HOLD_LOCK,
+        code => code,
+    }
 }
 
 /// Opt-in measurement of the provider read a future ref-scoped merge would
@@ -2015,6 +2141,119 @@ fn unix_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Which narrow lane a Git write asked for, and why it did not get it.
+///
+/// Journaled in `coordination_timing` (`narrow_lane`, `narrow_lane_kind`,
+/// `narrow_lane_unavailable_reason`) and counted as a phase
+/// (`<kind>_narrow_lane_taken` / `<kind>_narrow_lane_unavailable`), so a lane
+/// that is never taken says why instead of collapsing into "wide".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NarrowLaneDecision {
+    /// `push`, `commit` or `fetch`.
+    kind: &'static str,
+    /// `None` when the lane was taken; otherwise a stable reason code.
+    unavailable: Option<&'static str>,
+}
+
+impl NarrowLaneDecision {
+    fn phase(&self) -> &'static str {
+        match (self.kind, self.unavailable.is_none()) {
+            ("push", true) => "push_narrow_lane_taken",
+            ("push", false) => "push_narrow_lane_unavailable",
+            ("commit", true) => "commit_narrow_lane_taken",
+            ("commit", false) => "commit_narrow_lane_unavailable",
+            (_, true) => "fetch_narrow_lane_taken",
+            (_, false) => "fetch_narrow_lane_unavailable",
+        }
+    }
+
+    fn record(&self, timing: &mut serde_json::Map<String, serde_json::Value>) {
+        timing.insert("narrow_lane_kind".into(), json!(self.kind));
+        timing.insert(
+            "narrow_lane".into(),
+            json!(if self.unavailable.is_none() {
+                "taken"
+            } else {
+                "unavailable"
+            }),
+        );
+        timing.insert(
+            "narrow_lane_unavailable_reason".into(),
+            json!(self.unavailable),
+        );
+    }
+}
+
+/// The lane decision and every lock wait of one coordinated write. Each lock
+/// a writer passes is measured separately; `queue_wait_ms` is their total.
+#[derive(Debug, Clone, Copy, Default)]
+struct LaneTelemetry {
+    narrow_lane: Option<NarrowLaneDecision>,
+    wide_intent_wait_ms: Option<i64>,
+    git_common_lane_wait_ms: Option<i64>,
+    local_ref_lane_wait_ms: Option<i64>,
+    repository_lane_wait_ms: Option<i64>,
+}
+
+/// Time from the start of the lock wait to the moment the last lock was
+/// held. The final lock's own wait alone hid every earlier lane (a 15 s
+/// common-directory wait was journaled as `queue_wait_ms: 0`).
+fn total_queue_wait_ms(lock: &RepositoryWriteLock, lock_wait_started_at: Option<i64>) -> i64 {
+    lock_wait_started_at
+        .map_or(lock.queue_wait_ms, |started| {
+            lock.acquired_at_ms
+                .saturating_sub(started)
+                .max(lock.queue_wait_ms)
+        })
+        .max(0)
+}
+
+fn coordination_timing_value(
+    lock_key: &str,
+    lock_wait_started_at: Option<i64>,
+    lock: Option<&RepositoryWriteLock>,
+    hooks_outside_lock: bool,
+    ref_determination: Option<RefDeterminationMeasurement>,
+    lanes: &LaneTelemetry,
+) -> serde_json::Value {
+    let (lock_acquired_at, queue_wait_ms, lock_queue_wait_ms, lock_hold_ms) = match lock {
+        Some(lock) => (
+            Some(lock.acquired_at_ms),
+            Some(total_queue_wait_ms(lock, lock_wait_started_at)),
+            Some(lock.queue_wait_ms),
+            Some(lock.hold_duration_ms()),
+        ),
+        // Refused before the last lock: the wait so far.
+        None => (
+            None,
+            lock_wait_started_at.map(|started| unix_now_ms().saturating_sub(started).max(0)),
+            None,
+            None,
+        ),
+    };
+    let mut timing = json!({
+        "schema_version": 1,
+        "lock_key": lock_key,
+        "lock_wait_started_at": lock_wait_started_at,
+        "lock_acquired_at": lock_acquired_at,
+        "lock_released_at": lock.map(|_| unix_now_ms()),
+        "queue_wait_ms": queue_wait_ms,
+        "lock_queue_wait_ms": lock_queue_wait_ms,
+        "lock_hold_ms": lock_hold_ms,
+        "hooks_outside_lock": hooks_outside_lock,
+        "wide_intent_wait_ms": lanes.wide_intent_wait_ms,
+        "git_common_lane_wait_ms": lanes.git_common_lane_wait_ms,
+        "local_ref_lane_wait_ms": lanes.local_ref_lane_wait_ms,
+        "repository_lane_wait_ms": lanes.repository_lane_wait_ms,
+        "ref_determination_ms": ref_determination.map(|measurement| measurement.duration_ms),
+        "ref_determination_succeeded": ref_determination.map(|measurement| measurement.succeeded),
+    });
+    if let (Some(lane), Some(map)) = (lanes.narrow_lane, timing.as_object_mut()) {
+        lane.record(map);
+    }
+    timing
+}
+
 fn add_coordination_timing(
     details: &mut serde_json::Value,
     lock_key: &str,
@@ -2022,35 +2261,168 @@ fn add_coordination_timing(
     lock: Option<&RepositoryWriteLock>,
     hooks_outside_lock: bool,
     ref_determination: Option<RefDeterminationMeasurement>,
-    wide_intent_wait_ms: Option<i64>,
+    lanes: &LaneTelemetry,
 ) {
     let Some(details) = details.as_object_mut() else {
         return;
     };
-    let (lock_acquired_at, queue_wait_ms, lock_hold_ms) = match lock {
-        Some(lock) => (
-            Some(lock.acquired_at_ms),
-            Some(lock.queue_wait_ms),
-            Some(lock.hold_duration_ms()),
-        ),
-        None => (None, None, None),
-    };
     details.insert(
         "coordination_timing".into(),
-        json!({
-            "schema_version": 1,
-            "lock_key": lock_key,
-            "lock_wait_started_at": lock_wait_started_at,
-            "lock_acquired_at": lock_acquired_at,
-            "lock_released_at": lock.map(|_| unix_now_ms()),
-            "queue_wait_ms": queue_wait_ms,
-            "lock_hold_ms": lock_hold_ms,
-            "hooks_outside_lock": hooks_outside_lock,
-            "wide_intent_wait_ms": wide_intent_wait_ms,
-            "ref_determination_ms": ref_determination.map(|measurement| measurement.duration_ms),
-            "ref_determination_succeeded": ref_determination.map(|measurement| measurement.succeeded),
-        }),
+        coordination_timing_value(
+            lock_key,
+            lock_wait_started_at,
+            lock,
+            hooks_outside_lock,
+            ref_determination,
+            lanes,
+        ),
     );
+}
+
+/// Journal details for a write refused while waiting for one of its locks:
+/// the reason, the wait so far, the lane decision and the named holder.
+fn lane_refusal_details(
+    reason: &str,
+    lock_key: &str,
+    lock_wait_started_at: Option<i64>,
+    lanes: &LaneTelemetry,
+    holder: &LockHolderInfo,
+) -> serde_json::Value {
+    let now = unix_now_ms();
+    json!({
+        "reason": reason,
+        "holder": {
+            "description": holder.description.as_str(),
+            "operation_id": holder.operation_id,
+            "session_id": holder.session_id,
+            "pid": holder.pid,
+            "scope": holder.scope.as_deref(),
+            "started_at": holder.started_at,
+            "held_ms": holder.started_at.map(|started| now.saturating_sub(started).max(0)),
+        },
+        "coordination_timing": coordination_timing_value(
+            lock_key,
+            lock_wait_started_at,
+            None,
+            false,
+            None,
+            lanes,
+        ),
+    })
+}
+
+/// Who holds a write lock, written next to the lock file by every exclusive
+/// holder, journaled or not. The journal names coordinated operations; this
+/// also names `submit`'s plan-reuse hold and maintenance, which have no row.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LockHolderRecord {
+    pub schema_version: u32,
+    /// `coordinated_operation`, `submit_plan_reuse`, `git_maintenance_lock_apply`.
+    pub kind: String,
+    /// The holder's command words, without options or operands that follow one.
+    pub command: String,
+    pub pid: u32,
+    pub session_id: Option<i64>,
+    pub operation_id: Option<i64>,
+    pub acquired_at_ms: i64,
+}
+
+impl LockHolderRecord {
+    fn current(
+        kind: &str,
+        session_id: Option<i64>,
+        operation_id: Option<i64>,
+        acquired_at_ms: i64,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            kind: kind.to_owned(),
+            command: current_command_words(),
+            pid: std::process::id(),
+            session_id,
+            operation_id,
+            acquired_at_ms,
+        }
+    }
+
+    fn describe(&self, now_ms: i64) -> String {
+        let mut owner = format!("pid {}", self.pid);
+        if let Some(session) = self.session_id {
+            owner.push_str(&format!(", session {session}"));
+        }
+        if let Some(operation) = self.operation_id {
+            owner.push_str(&format!(", operation {operation}"));
+        }
+        format!(
+            "{} `{}` ({owner}) has held it for {}",
+            self.kind,
+            self.command,
+            humanize_duration(now_ms.saturating_sub(self.acquired_at_ms).max(0) as u64 / 1_000),
+        )
+    }
+}
+
+/// The program name and the subcommand words before the first option.
+fn current_command_words() -> String {
+    let mut words = Vec::new();
+    for (index, argument) in std::env::args_os().enumerate() {
+        let argument = if index == 0 {
+            Path::new(&argument)
+                .file_name()
+                .unwrap_or(argument.as_os_str())
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            argument.to_string_lossy().into_owned()
+        };
+        if index == 0 {
+            words.push(argument);
+            continue;
+        }
+        if argument.starts_with('-') || words.len() >= 5 {
+            break;
+        }
+        words.push(argument);
+    }
+    words.join(" ")
+}
+
+fn lock_holder_record_path(lock_path: &Path) -> PathBuf {
+    lock_path.with_extension("holder.json")
+}
+
+fn write_lock_holder_record(path: &Path, record: &LockHolderRecord) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(record).map_err(std::io::Error::other)?;
+    let temporary = path.with_extension(format!("holder.{}.tmp", std::process::id()));
+    std::fs::write(&temporary, bytes)?;
+    std::fs::rename(&temporary, path)
+}
+
+/// The recorded holder of `key`'s lock, if its process is still alive.
+pub(crate) fn recorded_lock_holder(main_root: &Path, key: &str) -> Option<LockHolderRecord> {
+    let path = lock_holder_record_path(&repository_write_lock_path(main_root, key));
+    let bytes = std::fs::read(path).ok()?;
+    let record: LockHolderRecord = serde_json::from_slice(&bytes).ok()?;
+    (!process_is_gone(i64::from(record.pid))).then_some(record)
+}
+
+/// Name a holder the journal could not identify from the record its process
+/// wrote next to the lock.
+fn with_recorded_holder(holder: LockHolderInfo, main_root: &Path, key: &str) -> LockHolderInfo {
+    if holder.operation_id.is_some() {
+        return holder;
+    }
+    match recorded_lock_holder(main_root, key) {
+        Some(record) => LockHolderInfo {
+            description: record.describe(unix_now_ms()),
+            operation_id: record.operation_id,
+            session_id: record.session_id,
+            pid: Some(i64::from(record.pid)),
+            scope: Some(record.kind),
+            started_at: Some(record.acquired_at_ms),
+        },
+        None => holder,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2166,6 +2538,19 @@ fn coordination_wait_details(
 
 impl Drop for RepositoryWriteLock {
     fn drop(&mut self) {
+        // Still holding the lock, so no later holder's record is removed.
+        if let Some(path) = self.holder_record.take() {
+            crate::warn_unrecorded(
+                "remove a write-lock holder record",
+                std::fs::remove_file(&path).or_else(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                }),
+            );
+        }
         // SAFETY: `self.file` is still owned by `self` for the duration of
         // `drop`, so the descriptor is valid. `flock` takes it by value and
         // dereferences nothing. Discarding the result is deliberate: an

@@ -696,23 +696,39 @@ fn build_or_reuse_submission_plan(
     build()
 }
 
+#[cfg(test)]
 fn try_submission_plan_reuse_lock(
     main_root: &Path,
     repo: &GitRepo,
     store: &crate::BrokerStore,
 ) -> Option<crate::operations::RepositoryWriteLock> {
-    let (repository, lock) =
-        match crate::operations::try_acquire_local_repository_write_lock(main_root, repo) {
-            Ok(Some(locked)) => locked,
-            Ok(None) => return None,
-            Err(error) => {
-                crate::warn_unrecorded(
-                    "acquire optional submission-plan history lock",
-                    Err::<(), _>(error),
-                );
-                return None;
-            }
-        };
+    try_submission_plan_reuse_lock_for(main_root, repo, store, None)
+}
+
+/// The submission-plan reuse lock, naming the submitting session in the
+/// holder record, since this hold has no operation-journal row.
+fn try_submission_plan_reuse_lock_for(
+    main_root: &Path,
+    repo: &GitRepo,
+    store: &crate::BrokerStore,
+    session_id: Option<i64>,
+) -> Option<crate::operations::RepositoryWriteLock> {
+    let (repository, lock) = match crate::operations::try_acquire_local_repository_write_lock_as(
+        main_root,
+        repo,
+        "submit_plan_reuse",
+        session_id,
+    ) {
+        Ok(Some(locked)) => locked,
+        Ok(None) => return None,
+        Err(error) => {
+            crate::warn_unrecorded(
+                "acquire optional submission-plan history lock",
+                Err::<(), _>(error),
+            );
+            return None;
+        }
+    };
 
     // Do not plan under a history view that the coordinated writer lock does
     // not make complete. A shallow boundary, replace ref, or graft keeps the
@@ -1134,10 +1150,11 @@ impl Broker {
         // repository lock is busy or unavailable, keep the ordinary fresh
         // planning path instead.
         progress.phase("planning the submission");
-        let reuse_lock = try_submission_plan_reuse_lock(
+        let reuse_lock = try_submission_plan_reuse_lock_for(
             &self.main_root_path(),
             self.repo_handle(),
             self.store_ref(),
+            Some(session_id),
         );
         let plan = self
             .build_submission_plan(&session, &head, &base)
@@ -1174,7 +1191,19 @@ impl Broker {
         // Root creation is an explicit submit side effect. Keep it after the
         // ownership, policy, provenance, replay, and checkout checks, and
         // before the queue row records this submission.
-        let lifecycle_claim = self.claim_worktree_lifecycle()?;
+        //
+        // Never wait for another checkout's creation or removal (a `start`,
+        // `finish` or `cleanup` deleting a large worktree) while holding the
+        // repository write lanes for optional plan reuse: every coordinated
+        // Git write in the repository would wait behind it with no journal
+        // row to name. Give the reuse up and plan again later instead.
+        let (lifecycle_claim, prepared_plan) = match self.try_claim_worktree_lifecycle()? {
+            Some(claim) => (claim, prepared_plan),
+            None => {
+                drop(prepared_plan);
+                (self.claim_worktree_lifecycle()?, None)
+            }
+        };
         self.prepare_worktree_root_for_submission()?;
         let entry = self.store().submit(session_id, &head, &base)?;
         drop(lifecycle_claim);

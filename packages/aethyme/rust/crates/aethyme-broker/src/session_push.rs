@@ -715,13 +715,16 @@ impl Broker {
             // The strict spelling holds only this branch's lane (and its one
             // tracking ref), so pushes of different session branches do not
             // queue behind each other. A repository whose configuration
-            // cannot prove that footprint keeps the repository-wide spelling.
+            // cannot prove that footprint keeps the repository-wide spelling;
+            // the coordinated operation journals why (`narrow_lane_unavailable_reason`).
             let strict = crate::operations::strict_push_args(&default.remote, &head, &branch_ref);
-            let args = if crate::operations::session_branch_push_lane_available(
+            let args = if crate::operations::session_branch_push_lane(
                 self.main_root(),
                 session_worktree,
                 &strict,
-            ) {
+            )
+            .is_ok()
+            {
                 strict
             } else {
                 vec![

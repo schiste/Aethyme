@@ -580,6 +580,76 @@ fn a_session_push_holds_only_its_branch_lane_when_the_profile_is_proven() {
         lock_key.ends_with(&format!("::git-ref/refs/heads/{branch}")),
         "{lock_key}"
     );
+    assert_eq!(details["coordination_timing"]["narrow_lane"], "taken");
+    assert_eq!(details["coordination_timing"]["narrow_lane_kind"], "push");
+    assert!(details["coordination_timing"]["narrow_lane_unavailable_reason"].is_null());
+}
+
+/// The journaled lane decision of the newest session push.
+fn last_session_push(fixture: &Fixture) -> (Vec<String>, serde_json::Value) {
+    let operation = fixture
+        .broker()
+        .store()
+        .coordinated_operations()
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|operation| operation.scope.starts_with("session-push:refs/heads/"))
+        .expect("a session push is journaled");
+    let command = serde_json::from_str(&operation.command_json).unwrap();
+    let details: serde_json::Value =
+        serde_json::from_str(operation.details_json.as_deref().unwrap()).unwrap();
+    (command, details["coordination_timing"].clone())
+}
+
+/// `extensions.worktreeConfig` (set by `git sparse-checkout` and editors on
+/// repositories with linked worktrees) kept every session push in the busiest
+/// repository on the repository-wide lane. It no longer does.
+#[test]
+fn a_worktree_config_extension_does_not_widen_a_session_push() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, worktree) = fixture.session_with_commit();
+    git(&fixture.repo, &["config", "--unset", "core.sshCommand"]);
+    git(
+        &fixture.repo,
+        &["config", "extensions.worktreeConfig", "true"],
+    );
+
+    let report = json(&fixture.push(session, &[]));
+    let head = git_output(&worktree, &["rev-parse", "HEAD"]);
+    let branch = report["branch"].as_str().unwrap().to_string();
+    assert_eq!(report["pushed_oid"], head);
+    let (command, timing) = last_session_push(&fixture);
+    assert_eq!(command[2], "--no-follow-tags", "{command:?}");
+    let lock_key = timing["lock_key"].as_str().unwrap();
+    assert!(
+        lock_key.ends_with(&format!("::git-ref/refs/heads/{branch}")),
+        "{lock_key}"
+    );
+    assert_eq!(timing["narrow_lane"], "taken");
+}
+
+/// A session push kept on the repository-wide lane journals why, with a
+/// stable reason code, instead of silently using the old spelling.
+#[test]
+fn a_session_push_kept_wide_journals_its_reason() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, _worktree) = fixture.session_with_commit();
+    // The fixture's `core.sshCommand` reroutes the transport.
+    let report = json(&fixture.push(session, &[]));
+    assert!(report["pushed_oid"].is_string(), "{report}");
+    let (command, timing) = last_session_push(&fixture);
+    assert_eq!(command.len(), 4, "the old spelling: {command:?}");
+    assert_eq!(timing["narrow_lane"], "unavailable");
+    assert_eq!(timing["narrow_lane_kind"], "push");
+    assert_eq!(
+        timing["narrow_lane_unavailable_reason"],
+        "custom_ssh_command"
+    );
+    assert!(timing["queue_wait_ms"].is_i64(), "{timing}");
+    assert!(timing["git_common_lane_wait_ms"].is_i64(), "{timing}");
 }
 
 /// The strict spelling typed explicitly, in a repository whose configuration
@@ -664,6 +734,12 @@ fn a_repository_that_follows_tags_keeps_the_historical_session_push() {
     let command: Vec<String> = serde_json::from_str(&operation.command_json).unwrap();
     let refspec = format!("{head}:refs/heads/{branch}");
     assert_eq!(command, ["git", "push", "origin", refspec.as_str()]);
+    let details: serde_json::Value =
+        serde_json::from_str(operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        details["coordination_timing"]["narrow_lane_unavailable_reason"],
+        "push_follow_tags"
+    );
 }
 
 /// An ambient `GIT_INDEX_FILE` could point the commit at another index, so the
@@ -704,6 +780,33 @@ fn a_commit_under_an_ambient_index_override_keeps_the_repository_lane() {
     };
     commit("plain.txt", &[]);
     commit("override.txt", &[("GIT_INDEX_FILE", index.as_str())]);
+    let decisions: Vec<(serde_json::Value, serde_json::Value)> = fixture
+        .broker()
+        .store()
+        .coordinated_operations()
+        .unwrap()
+        .into_iter()
+        .filter(|operation| operation.command_json.contains("\"commit\""))
+        .map(|operation| {
+            let details: serde_json::Value =
+                serde_json::from_str(operation.details_json.as_deref().unwrap()).unwrap();
+            let timing = &details["coordination_timing"];
+            (
+                timing["narrow_lane"].clone(),
+                timing["narrow_lane_unavailable_reason"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        decisions,
+        [
+            (serde_json::json!("taken"), serde_json::Value::Null),
+            (
+                serde_json::json!("unavailable"),
+                serde_json::json!("ambient_git_override")
+            ),
+        ]
+    );
     let scopes: Vec<String> = fixture
         .broker()
         .store()
