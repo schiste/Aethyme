@@ -138,6 +138,13 @@ closed checkouts gets the rest. Removal frees capacity; retirement only prepares
 it, so retirement can no longer use a whole pass. `auto_cleanup.lanes` reports
 each lane's budget, time and the checkouts the removal lane judged.
 
+Within the retirement share, sessions that already show landing evidence (a
+merged pull request in the cached provider data, or a branch tip with its own
+commits already on the fetched default branch) are judged first, before the
+oldest-first cursor; a `no_session_commits` or `no_landing_evidence` decline is
+remembered until the session head, the default-branch tip or that evidence
+changes. The proofs are unchanged; only the order and repetition are.
+
 Anything the sweep cannot decide keeps the checkout, with the reason and a
 stable `code` in
 `aethyme broker gc plan --json` (`auto_cleanup.kept[]`) and a

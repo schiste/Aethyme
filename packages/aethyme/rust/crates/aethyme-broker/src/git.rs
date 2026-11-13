@@ -4538,6 +4538,34 @@ impl GitRepo {
         )
     }
 
+    /// Local branches (`refs/heads/...`) whose tip is an ancestor of
+    /// `commit`, in one `for-each-ref --merged` listing. `None` when Git
+    /// fails.
+    pub(crate) fn local_branches_merged_into(
+        &self,
+        commit: &str,
+    ) -> Option<std::collections::BTreeSet<String>> {
+        let merged = format!("--merged={commit}");
+        let output = run_git(
+            &self.root,
+            &[
+                "for-each-ref",
+                &merged,
+                "--format=%(refname)",
+                "refs/heads/",
+            ],
+        )
+        .ok()?;
+        Some(
+            output
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+
     /// Remote-tracking refs from which `commit` is reachable.
     ///
     /// Reachability from a pushed ref is what makes a worktree disposable: the

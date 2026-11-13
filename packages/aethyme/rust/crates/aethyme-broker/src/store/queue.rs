@@ -537,6 +537,23 @@ impl BrokerStore {
             .map_err(Into::into)
     }
 
+    /// Open sessions linked to a pull request the cached provider data
+    /// records as merged, oldest first. Ordering evidence only: the landed
+    /// lane still proves each one.
+    pub(crate) fn open_sessions_with_merged_pull_request(&self) -> Result<Vec<i64>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT l.session_id FROM pull_request_session_links l
+             JOIN pull_request_milestones m
+               ON m.repository = l.repository AND m.pr_number = l.pr_number
+             JOIN sessions s ON s.id = l.session_id
+             WHERE m.merged_at IS NOT NULL AND s.cleanup_state = 'open'
+             ORDER BY l.session_id",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(BrokerError::from)
+    }
+
     /// Sessions linked to one pull request.
     pub fn pull_request_sessions(
         &self,

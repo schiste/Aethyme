@@ -98,6 +98,11 @@ pub(crate) const AUTO_CLEANUP_LAST_REPORT_KEY: &str = "auto_cleanup.last_report"
 const AUTO_CLEANUP_CURSOR_KEY: &str = "auto_cleanup.cursor";
 const AUTO_CLEANUP_CURSOR_VERSION: u32 = 3;
 const CLEANUP_COHORT_SCAN_PAGE_SIZE: usize = 16;
+/// Paging under capacity pressure never selects more checkouts for removal
+/// in one pass than a single page could before (32 groups), so removal is
+/// no faster per pass than it was; it only stops spending passes on pages
+/// of checkouts it keeps.
+const AUTO_CLEANUP_MAX_SELECTED_PER_PASS: usize = 32;
 const CLEANUP_COHORT_UNBOUNDED_PAGE_CAP: usize = 128;
 /// The background compact lane admits an archive attempt only when it can
 /// reserve this much time after the alias snapshot and ownership proof.
@@ -2096,6 +2101,113 @@ pub(crate) fn blocked_by_ignored_from_meta(raw: Option<&str>) -> Vec<BlockedByIg
     blocked_by_ignored_from_memo(&decode_keep_memo(raw))
 }
 
+/// Meta key of remembered landed-lane declines that cannot change while the
+/// session head, the fetched default-branch tip and the session's pull
+/// request and representation evidence stay the same.
+const LANDED_DECLINE_MEMO_KEY: &str = "auto_cleanup.landed_decline_memo";
+const LANDED_DECLINE_MEMO_MAX_ENTRIES: usize = 4096;
+/// Where the likely-landed queue resumes, so one session whose proof keeps
+/// running out of budget cannot hold the front of the queue.
+const LIKELY_LANDED_CURSOR_KEY: &str = "auto_cleanup.likely_landed_after";
+/// Likely-landed sessions one pass may take, before the oldest-first cursor.
+const LIKELY_LANDED_PASS_LIMIT: usize = 64;
+
+/// Landed-lane declines (`no_session_commits`, `no_landing_evidence`) keyed
+/// by everything their proof read. A remembered decline only skips the
+/// landed lane; it never closes anything, and the abandonment window still
+/// applies.
+#[derive(Debug, Default)]
+struct LandedDeclineMemo {
+    entries: std::collections::BTreeMap<i64, (String, String)>,
+}
+
+impl LandedDeclineMemo {
+    fn load(broker: &Broker) -> Self {
+        let entries = broker
+            .store_ref()
+            .meta_get(LANDED_DECLINE_MEMO_KEY)
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        Self { entries }
+    }
+
+    /// What the decline depended on, or `None` when it cannot be read (then
+    /// nothing is remembered or skipped).
+    fn key(
+        &self,
+        broker: &Broker,
+        session: &Session,
+        upstream_tip: Option<&str>,
+    ) -> Option<String> {
+        let tip = upstream_tip?;
+        let head = checkout_head(Path::new(&session.worktree_path))?;
+        let store = broker.store_ref();
+        let merged = store
+            .session_has_merged_pull_request_link(session.id)
+            .ok()?;
+        let represented = store
+            .session_representation(session.id, &head)
+            .ok()?
+            .is_some();
+        Some(format!(
+            "{head} {tip} merged={merged} represented={represented}"
+        ))
+    }
+
+    fn remembered(
+        &self,
+        session_id: i64,
+        key: &str,
+    ) -> Option<crate::broker::LandedSessionDecline> {
+        let (recorded, code) = self.entries.get(&session_id)?;
+        if recorded != key {
+            return None;
+        }
+        match code.as_str() {
+            "no_session_commits" => Some(crate::broker::LandedSessionDecline::NoSessionCommits),
+            "no_landing_evidence" => Some(crate::broker::LandedSessionDecline::NoLandingEvidence),
+            _ => None,
+        }
+    }
+
+    /// Remember a cacheable decline under the key read before the proof ran;
+    /// forget the session on any other outcome.
+    fn record(
+        &mut self,
+        broker: &Broker,
+        session_id: i64,
+        key: Option<&str>,
+        decline: Option<crate::broker::LandedSessionDecline>,
+    ) {
+        use crate::broker::LandedSessionDecline as Decline;
+        let entry = match (key, decline) {
+            (
+                Some(key),
+                Some(reason @ (Decline::NoSessionCommits | Decline::NoLandingEvidence)),
+            ) => Some((key.to_string(), reason.code().to_string())),
+            _ => None,
+        };
+        let changed = match entry {
+            Some(entry) => self.entries.insert(session_id, entry.clone()) != Some(entry),
+            None => self.entries.remove(&session_id).is_some(),
+        };
+        if !changed {
+            return;
+        }
+        while self.entries.len() > LANDED_DECLINE_MEMO_MAX_ENTRIES {
+            self.entries.pop_first();
+        }
+        if let Ok(text) = serde_json::to_string(&self.entries) {
+            crate::warn_unrecorded(
+                "remember a landed-lane decline",
+                broker.store_ref().meta_set(LANDED_DECLINE_MEMO_KEY, &text),
+            );
+        }
+    }
+}
+
 /// Passes shorter than this (a broker open's inline sweep) do not spend part
 /// of their budget counting registered checkouts.
 const CAPACITY_PROBE_MIN_BUDGET: Duration = Duration::from_secs(1);
@@ -3647,6 +3759,25 @@ impl Broker {
             return Ok(summary);
         }
 
+        let landed_window_ms =
+            i64::from(policy.session_landed_after_hours).saturating_mul(3_600_000);
+        let mut decline_memo = LandedDeclineMemo::load(self);
+        let upstream_tip = self.repo_handle().upstream_default().map(|(_, tip)| tip);
+        // Sessions that already show landing evidence go first, ahead of
+        // the oldest-first cursor whose head is full of sessions that will
+        // never close. Same proof, same re-checks: only the order changes.
+        let prioritized = if landed_window_ms > 0 {
+            self.retire_likely_landed_sessions(
+                landed_window_ms,
+                lane_deadline(Instant::now(), deadline, (1, 2)),
+                upstream_tip.as_deref(),
+                &mut decline_memo,
+                &mut summary,
+            )?
+        } else {
+            std::collections::BTreeSet::new()
+        };
+
         let sessions = self.store().open_session_page(
             cursor.after_session_id,
             cursor.high_water_session_id,
@@ -3673,8 +3804,6 @@ impl Broker {
         }
 
         let retirement_now = now_ms();
-        let landed_window_ms =
-            i64::from(policy.session_landed_after_hours).saturating_mul(3_600_000);
         let candidate_window_ms = if landed_window_ms > 0 {
             window_ms.min(landed_window_ms)
         } else {
@@ -3734,6 +3863,7 @@ impl Broker {
             )
             .is_abandoned();
             let idle_enough_for_landed = landed_window_ms > 0
+                && !prioritized.contains(&session.id)
                 && crate::decide_abandonment(
                     &crate::SessionActivity {
                         session_id: session.id,
@@ -3753,7 +3883,22 @@ impl Broker {
             // question open falls through to the abandonment window.
             let mut landed_decline = None;
             let mut outcome = crate::broker::AbandonedSessionCloseOutcome::NotDue;
-            if idle_enough_for_landed {
+            let memo_key = if idle_enough_for_landed {
+                decline_memo.key(self, &session, upstream_tip.as_deref())
+            } else {
+                None
+            };
+            let remembered = memo_key
+                .as_deref()
+                .and_then(|key| decline_memo.remembered(session.id, key));
+            if let Some(reason) = remembered {
+                // Same head, same default-branch tip, same pull-request and
+                // representation evidence: the landed lane would decline
+                // again for the same reason. The abandonment window below
+                // still applies.
+                crate::phase_telemetry::add("landed_decline_memo_skips", Duration::ZERO);
+                landed_decline = Some(reason);
+            } else if idle_enough_for_landed {
                 landed_judged_in_pass += 1;
                 summary.landed_examined += 1;
                 crate::phase_telemetry::add("landed_sessions_examined", Duration::ZERO);
@@ -3776,6 +3921,7 @@ impl Broker {
                     summary.landed_closed += 1;
                     crate::phase_telemetry::add("landed_sessions_closed", elapsed);
                 }
+                decline_memo.record(self, session.id, memo_key.as_deref(), landed_decline);
                 // Leave the cursor on this session so the next pass, usually
                 // the background worker with its larger budget, resumes here;
                 // unless this one session alone used a long pass, which must
@@ -3936,6 +4082,147 @@ impl Broker {
                 });
         }
         Ok(summary)
+    }
+
+    /// Offer the landed lane, first, the open sessions idle past the landed
+    /// window that already show landing evidence: a merged pull request in
+    /// the cached provider data, or a branch tip (with commits of its own)
+    /// that is an ancestor of the fetched default branch, read with one
+    /// `for-each-ref --merged` listing. Every proof and re-check is
+    /// `try_close_landed_session`'s, unchanged; only the order differs from
+    /// the oldest-first cursor. Returns the sessions it judged, which the
+    /// cursor lane does not judge again in this pass.
+    fn retire_likely_landed_sessions(
+        &mut self,
+        landed_window_ms: i64,
+        deadline: Option<Instant>,
+        upstream_tip: Option<&str>,
+        decline_memo: &mut LandedDeclineMemo,
+        summary: &mut SessionRetirementSummary,
+    ) -> Result<std::collections::BTreeSet<i64>, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("landed_likely_queue");
+        let mut judged = std::collections::BTreeSet::new();
+        if deadline_expired(deadline) {
+            return Ok(judged);
+        }
+        let now = now_ms();
+        let merged_pull_requests = self
+            .store_ref()
+            .open_sessions_with_merged_pull_request()?
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let merged_branches = upstream_tip
+            .and_then(|tip| self.repo_handle().local_branches_merged_into(tip))
+            .unwrap_or_default();
+        let tips = self.repo_handle().local_branch_tips().unwrap_or_default();
+        let after = self
+            .store_ref()
+            .meta_get(LIKELY_LANDED_CURSOR_KEY)
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let mut likely = self
+            .store_ref()
+            .live_sessions()?
+            .into_iter()
+            .filter(|session| {
+                if session.cleanup_state != SessionCleanupState::Open {
+                    return false;
+                }
+                let branch_ref = format!("refs/heads/{}", session.branch);
+                let on_default = merged_branches.contains(&branch_ref)
+                    && tips
+                        .get(&branch_ref)
+                        .is_some_and(|tip| session.diff_base.as_deref() != Some(tip.as_str()));
+                (merged_pull_requests.contains(&session.id) || on_default)
+                    && crate::decide_abandonment(
+                        &crate::SessionActivity {
+                            session_id: session.id,
+                            last_activity_at: session.last_activity_at,
+                            created_at: session.created_at,
+                            agent_alive: None,
+                            closed: false,
+                        },
+                        now,
+                        landed_window_ms,
+                    )
+                    .is_abandoned()
+            })
+            .collect::<Vec<_>>();
+        likely.sort_by_key(|session| (session.id <= after, session.id));
+        likely.truncate(LIKELY_LANDED_PASS_LIMIT);
+        if likely.is_empty() {
+            return Ok(judged);
+        }
+        let ids = likely.iter().map(|session| session.id).collect::<Vec<_>>();
+        let mut process_table = crate::session_holder::RecordedHolderProcessTable::default();
+        process_table.prime(self.store_ref(), &ids, deadline);
+        for session in likely {
+            if deadline_expired(deadline) {
+                break;
+            }
+            let key = decline_memo.key(self, &session, upstream_tip);
+            if key
+                .as_deref()
+                .and_then(|key| decline_memo.remembered(session.id, key))
+                .is_some()
+            {
+                continue;
+            }
+            judged.insert(session.id);
+            let allow_snapshot = match deadline {
+                Some(deadline) => {
+                    deadline.saturating_duration_since(Instant::now())
+                        > crate::session_holder::PROCESS_TABLE_TIMEOUT + Duration::from_millis(100)
+                }
+                None => true,
+            };
+            summary.landed_examined += 1;
+            crate::phase_telemetry::add("landed_sessions_examined", Duration::ZERO);
+            crate::phase_telemetry::add("landed_likely_examined", Duration::ZERO);
+            let started = Instant::now();
+            let outcome = self.try_close_landed_session(
+                session.id,
+                now_ms(),
+                landed_window_ms,
+                &mut process_table,
+                allow_snapshot,
+                deadline,
+            )?;
+            let elapsed = started.elapsed();
+            crate::phase_telemetry::add("landed_session_retirement", elapsed);
+            summary.landed_elapsed_ms = summary
+                .landed_elapsed_ms
+                .saturating_add(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+            crate::warn_unrecorded(
+                "advance the likely-landed queue",
+                self.store_ref()
+                    .meta_set(LIKELY_LANDED_CURSOR_KEY, &session.id.to_string()),
+            );
+            let decline = crate::broker::LandedSessionDecline::from_outcome(outcome);
+            decline_memo.record(self, session.id, key.as_deref(), decline);
+            match decline {
+                None => {
+                    summary.landed_closed += 1;
+                    summary.retired += 1;
+                    crate::phase_telemetry::add("landed_sessions_closed", elapsed);
+                    crate::phase_telemetry::add("landed_likely_closed", elapsed);
+                }
+                Some(reason) => {
+                    *summary.landed_declined.entry(reason.code()).or_default() += 1;
+                    crate::phase_telemetry::add(reason.telemetry_name(), Duration::ZERO);
+                    if matches!(
+                        reason,
+                        crate::broker::LandedSessionDecline::BudgetExhausted
+                            | crate::broker::LandedSessionDecline::Busy
+                    ) {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(judged)
     }
 
     /// Run one bounded session-retirement page without planning or applying
@@ -4354,6 +4641,7 @@ impl Broker {
             // current lap.
             if stop_pass
                 || !multi_page
+                || selected.len() >= AUTO_CLEANUP_MAX_SELECTED_PER_PASS
                 || deadline_expired(deadline)
                 || self.store().cleanup_cohort_group_count(
                     crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
@@ -7943,6 +8231,78 @@ mod tests {
         };
         report.assign_kept_codes();
         assert_eq!(report.kept[0].code, "pinned");
+    }
+
+    /// The busiest repository's landed lane: the oldest-first cursor sat on
+    /// sessions that will never land while younger sessions with a merged
+    /// pull request were never reached. A likely-landed session now closes
+    /// in the first pass even while a lap over older sessions is in
+    /// progress, and the older sessions' unchangeable declines are
+    /// remembered instead of re-proved every lap.
+    #[cfg(unix)]
+    #[test]
+    fn a_likely_landed_session_behind_never_landing_older_ones_closes_first() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let root = broker.main_root().to_path_buf();
+        git(&root, &["remote", "set-head", "origin", "main"]);
+        let mut older = Vec::new();
+        for index in 0..5 {
+            let (session, _) =
+                landed_lane_session(&mut broker, &format!("never lands {index}"), None);
+            quiet_with_gone_holder(&mut broker, &session, 30);
+            older.push(session);
+        }
+        let (landed, _) = landed_lane_session(
+            &mut broker,
+            "landed behind older sessions",
+            Some(aethyme_testkit::MergeStyle::MergeCommit),
+        );
+        record_merged_pull_request(&mut broker, landed.id, 21);
+        quiet_with_gone_holder(&mut broker, &landed, 30);
+        // A fixed-high-water lap over the older sessions is in progress: the
+        // cursor alone would not reach the landed session in this pass.
+        let lap = SessionRetirementCursor {
+            version: SESSION_RETIREMENT_CURSOR_VERSION,
+            after_session_id: 0,
+            high_water_session_id: older.last().unwrap().id,
+        };
+        broker
+            .store()
+            .meta_set(
+                SESSION_RETIREMENT_CURSOR_KEY,
+                &serde_json::to_string(&lap).unwrap(),
+            )
+            .unwrap();
+
+        let report = broker.auto_cleanup_now(None).unwrap().unwrap();
+        assert_ne!(
+            broker.store().session(landed.id).unwrap().cleanup_state,
+            SessionCleanupState::Open,
+            "{report:#?}"
+        );
+        assert!(report.landed_sessions_closed >= 1, "{report:#?}");
+        for session in &older {
+            assert_eq!(
+                broker.store().session(session.id).unwrap().cleanup_state,
+                SessionCleanupState::Open,
+                "an unlanded session stays open"
+            );
+        }
+        let memo: std::collections::BTreeMap<i64, (String, String)> = serde_json::from_str(
+            &broker
+                .store()
+                .meta_get(super::LANDED_DECLINE_MEMO_KEY)
+                .unwrap()
+                .expect("unchangeable declines are remembered"),
+        )
+        .unwrap();
+        for session in &older {
+            assert_eq!(
+                memo.get(&session.id).map(|(_, code)| code.as_str()),
+                Some("no_landing_evidence"),
+                "{memo:?}"
+            );
+        }
     }
 
     /// The retirement cursor resumes where the last pass stopped instead of
