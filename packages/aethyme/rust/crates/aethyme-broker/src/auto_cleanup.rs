@@ -936,6 +936,14 @@ pub fn kept_reason_code(reason: &str) -> &'static str {
             "ignored_content",
         ),
         ("ignored-path classification", "ignored_content_unverified"),
+        (
+            "deleted with no recorded removal attempt",
+            "unmarked_tracked_deletions",
+        ),
+        (
+            "strict cleanup removes only pristine checkouts",
+            "strict_tracked_deletions",
+        ),
         ("uncommitted or untracked path", "uncommitted_changes"),
         ("is in progress", "operation_in_progress"),
         ("a stash was made", "stash"),
@@ -1792,22 +1800,44 @@ pub(crate) fn uncommitted_reason(
     main_root: &Path,
     policy: &AutoCleanupPolicy,
 ) -> Result<Option<String>, String> {
-    uncommitted_verdict(worktree, branch, main_root, policy, false).map(|(reason, _)| reason)
+    uncommitted_verdict(worktree, branch, main_root, policy, TrackedDeletions::Keep)
+        .map(|(reason, _)| reason)
+}
+
+/// How proof 3 treats a checkout whose only changes are tracked deletions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackedDeletions {
+    /// Like any other uncommitted change (`finish`, the landed lane).
+    Keep,
+    /// Automatic removal: resumable only when the broker recorded that it
+    /// had started removing this checkout at this HEAD (`marked`); kept
+    /// under a distinct reason otherwise, so such checkouts are countable.
+    Automatic { marked: bool },
 }
 
 /// Proof 3 for automatic removal of a closed checkout: [`unclean_reason`],
-/// except that a checkout an earlier removal left part-deleted (see
+/// except that a checkout the broker itself had started removing (a
+/// recorded removal attempt for this path, owner and HEAD: `marked`) and
+/// that the stopped removal left part-deleted (see
 /// [`interrupted_removal_deletions`]) is not kept for its missing tracked
-/// files. Returns the keep reason, or `None` and how many tracked paths were
-/// already gone. The caller must still prove HEAD contained: that is what
-/// makes every missing file recoverable.
+/// files. Without the record a pure deletion is somebody's change and keeps
+/// the checkout, as before. Returns the keep reason, or `None` and how many
+/// tracked paths were already gone. The caller must still prove HEAD
+/// contained: that is what makes every missing file recoverable.
 pub(crate) fn unclean_reason_resuming_interrupted_removal(
     worktree: &Path,
     branch: Option<&str>,
     main_root: &Path,
     policy: &AutoCleanupPolicy,
+    marked: bool,
 ) -> Result<(Option<String>, usize), String> {
-    let (reason, deleted) = uncommitted_verdict(worktree, branch, main_root, policy, true)?;
+    let (reason, deleted) = uncommitted_verdict(
+        worktree,
+        branch,
+        main_root,
+        policy,
+        TrackedDeletions::Automatic { marked },
+    )?;
     if reason.is_some() {
         return Ok((reason, 0));
     }
@@ -1821,9 +1851,9 @@ pub(crate) fn unclean_reason_resuming_interrupted_removal(
 /// still matches HEAD for that path, so the missing content is exactly
 /// HEAD's. Any staged change, modification, rename, type change or
 /// untracked path (Finder's `.DS_Store` aside unless `strict`) returns
-/// `None`, as does a deletion of less than a quarter of the `tracked` paths:
-/// a hand-made uncommitted deletion is somebody's change, while a recursive
-/// removal that stopped has taken whole directories.
+/// `None`, as does a deletion of less than a quarter of the `tracked` paths.
+/// This shape alone proves nothing about who deleted the files: the caller
+/// also requires the broker's recorded removal attempt.
 pub(crate) fn interrupted_removal_deletions(
     status_z: &str,
     tracked: usize,
@@ -1853,7 +1883,17 @@ fn interrupted_removal_in(worktree: &Path, status_z: &str, strict: bool) -> Opti
         &["--no-optional-locks", "ls-files", "-z", "--stage"],
     )
     .ok()?;
-    let entries = staged
+    interrupted_removal_against_index(status_z, &staged, strict)
+}
+
+/// [`interrupted_removal_deletions`] given the `ls-files -z --stage`
+/// listing: `None` whenever the index tracks a submodule (mode `160000`).
+pub(crate) fn interrupted_removal_against_index(
+    status_z: &str,
+    staged_z: &str,
+    strict: bool,
+) -> Option<usize> {
+    let entries = staged_z
         .split('\0')
         .filter(|entry| !entry.is_empty())
         .collect::<Vec<_>>();
@@ -1868,7 +1908,7 @@ fn uncommitted_verdict(
     branch: Option<&str>,
     main_root: &Path,
     policy: &AutoCleanupPolicy,
-    resume_interrupted_removal: bool,
+    tracked_deletions: TrackedDeletions,
 ) -> Result<(Option<String>, usize), String> {
     // `--no-optional-locks`: asking must not refresh the index, whose
     // modification time is the worktree activity the idle windows read.
@@ -1895,15 +1935,33 @@ fn uncommitted_verdict(
         .collect::<Vec<_>>();
     let mut interrupted_removal = 0;
     if let Some(first) = changed.first() {
-        // Strict cleanup removes only pristine checkouts.
-        let resumable = if resume_interrupted_removal && !policy.strict {
-            interrupted_removal_in(worktree, &status, policy.strict)
-        } else {
-            None
+        let deleted = match tracked_deletions {
+            TrackedDeletions::Keep => None,
+            TrackedDeletions::Automatic { .. } => {
+                interrupted_removal_in(worktree, &status, policy.strict)
+            }
         };
-        match resumable {
-            Some(deleted) => interrupted_removal = deleted,
-            None => {
+        match (tracked_deletions, deleted) {
+            (TrackedDeletions::Automatic { marked: true }, Some(deleted)) if !policy.strict => {
+                interrupted_removal = deleted;
+            }
+            (TrackedDeletions::Automatic { marked: true }, Some(deleted)) => {
+                return Ok((
+                    Some(format!(
+                        "{deleted} tracked path(s) deleted by an interrupted removal; strict cleanup removes only pristine checkouts"
+                    )),
+                    0,
+                ));
+            }
+            (TrackedDeletions::Automatic { marked: false }, Some(deleted)) => {
+                return Ok((
+                    Some(format!(
+                        "{deleted} tracked path(s) deleted with no recorded removal attempt, first: {first}"
+                    )),
+                    0,
+                ));
+            }
+            _ => {
                 return Ok((
                     Some(format!(
                         "{} uncommitted or untracked path(s), first: {first}",
@@ -2350,6 +2408,22 @@ struct RecordedCheckoutUsage {
     count: usize,
     maximum: u32,
     at_ms: i64,
+}
+
+/// Meta key prefix of the record automatic removal writes, before Git
+/// deletes anything, for the checkout path that follows the prefix. Cleared
+/// once the removal finished; a record left behind means it stopped part-way.
+const REMOVAL_ATTEMPT_KEY_PREFIX: &str = "auto_cleanup.removal_attempt:";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct RemovalAttempt {
+    owner_session_id: i64,
+    head: String,
+    at_ms: i64,
+}
+
+fn removal_attempt_key(worktree: &Path) -> String {
+    format!("{REMOVAL_ATTEMPT_KEY_PREFIX}{}", worktree.to_string_lossy())
 }
 
 /// Registered linked checkouts at or above three quarters of the limit.
@@ -3796,11 +3870,15 @@ impl Broker {
         // Proof 3. Tracked files an interrupted removal already deleted do
         // not keep the checkout: their content is HEAD's, and proof 4 below
         // must still show HEAD contained before anything is removed.
+        let marked = checkout.head_commit().ok().is_some_and(|head| {
+            self.removal_attempt_recorded(&candidate.worktree, owner.id, &head)
+        });
         let interrupted_removal_deletions = match unclean_reason_resuming_interrupted_removal(
             &candidate.worktree,
             Some(candidate.branch()),
             self.main_root(),
             policy,
+            marked,
         ) {
             Ok((None, deleted)) => deleted,
             Ok((Some(reason), _)) => return Err(keep(reason)),
@@ -4597,9 +4675,20 @@ impl Broker {
         &mut self,
         deadline: Option<Instant>,
     ) -> Result<AutoCleanupPlan, BrokerOpError> {
+        self.auto_cleanup_plan_limited(deadline, AUTO_CLEANUP_MAX_SELECTED_PER_PASS)
+    }
+
+    /// [`Self::auto_cleanup_plan`] that stops once `max_selected` checkouts
+    /// are selected, leaving the cursor on the last one judged.
+    pub(crate) fn auto_cleanup_plan_limited(
+        &mut self,
+        deadline: Option<Instant>,
+        max_selected: usize,
+    ) -> Result<AutoCleanupPlan, BrokerOpError> {
         let _span = crate::phase_telemetry::span("auto_cleanup_plan");
-        self.auto_cleanup_plan_with_group_inspector(
+        self.auto_cleanup_plan_with_group_inspector_limited(
             deadline,
+            max_selected,
             |broker, group, live, live_worktrees, deadline| {
                 broker.auto_cleanup_candidate_for_group(group, live, live_worktrees, deadline)
             },
@@ -4608,9 +4697,32 @@ impl Broker {
 
     /// Planner seam used to verify that cursor rotation happens before
     /// per-group Git and ownership work.
+    #[cfg(test)]
     fn auto_cleanup_plan_with_group_inspector<F>(
         &mut self,
         deadline: Option<Instant>,
+        inspect_group: F,
+    ) -> Result<AutoCleanupPlan, BrokerOpError>
+    where
+        F: FnMut(
+            &mut Self,
+            &AutoCleanupCheckoutGroup,
+            &[Session],
+            &[ResolvedWorktreePath],
+            Option<Instant>,
+        ) -> Result<AutoCleanupGroupInspection, BrokerOpError>,
+    {
+        self.auto_cleanup_plan_with_group_inspector_limited(
+            deadline,
+            AUTO_CLEANUP_MAX_SELECTED_PER_PASS,
+            inspect_group,
+        )
+    }
+
+    fn auto_cleanup_plan_with_group_inspector_limited<F>(
+        &mut self,
+        deadline: Option<Instant>,
+        max_selected: usize,
         mut inspect_group: F,
     ) -> Result<AutoCleanupPlan, BrokerOpError>
     where
@@ -4880,7 +4992,7 @@ impl Broker {
                 }
                 cursor.after_session_id = cursor_session_id;
                 self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
-                if stop_for_deadline {
+                if stop_for_deadline || selected.len() >= max_selected.max(1) {
                     stop_pass = true;
                     break;
                 }
@@ -4891,7 +5003,7 @@ impl Broker {
             // current lap.
             if stop_pass
                 || !multi_page
-                || selected.len() >= AUTO_CLEANUP_MAX_SELECTED_PER_PASS
+                || selected.len() >= max_selected.max(1)
                 || deadline_expired(deadline)
                 || self.store().cleanup_cohort_group_count(
                     crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
@@ -5190,6 +5302,9 @@ impl Broker {
             .map(|session| session.id)
             .unwrap_or_default();
         self.refuse_live_checkout(first, &candidate.worktree)?;
+        // Durable before Git deletes anything: only this record lets a later
+        // pass finish a removal that stopped part-way.
+        self.record_removal_attempt(&candidate.worktree, candidate.spawned_owner.id, &proof.head)?;
         // Forced: the proofs above are stricter than Git's own check, and the
         // only untracked file they let through is Finder's `.DS_Store`, which
         // a plain `worktree remove` refuses.
@@ -5212,7 +5327,49 @@ impl Broker {
             self.store()
                 .set_session_status(session.id, crate::SessionStatus::Cleaned, None)?;
         }
+        self.clear_removal_attempt(&candidate.worktree);
         Ok(())
+    }
+
+    /// Record, before Git starts deleting, that automatic removal began on
+    /// `worktree` for `owner_session_id` at `head`.
+    pub(crate) fn record_removal_attempt(
+        &self,
+        worktree: &Path,
+        owner_session_id: i64,
+        head: &str,
+    ) -> Result<(), BrokerOpError> {
+        let attempt = RemovalAttempt {
+            owner_session_id,
+            head: head.to_string(),
+            at_ms: now_ms(),
+        };
+        let text = serde_json::to_string(&attempt).expect("serializing the attempt is infallible");
+        self.store_ref()
+            .meta_set(&removal_attempt_key(worktree), &text)?;
+        Ok(())
+    }
+
+    fn clear_removal_attempt(&self, worktree: &Path) {
+        crate::warn_unrecorded(
+            "clear a finished checkout removal record",
+            self.store_ref()
+                .meta_set(&removal_attempt_key(worktree), ""),
+        );
+    }
+
+    /// Whether automatic removal recorded starting on `worktree` for this
+    /// owner at this HEAD. A checkout someone later re-created at the same
+    /// path has another owner session.
+    fn removal_attempt_recorded(&self, worktree: &Path, owner_session_id: i64, head: &str) -> bool {
+        self.store_ref()
+            .meta_get(&removal_attempt_key(worktree))
+            .ok()
+            .flatten()
+            .and_then(|text| serde_json::from_str::<RemovalAttempt>(&text).ok())
+            .is_some_and(|attempt| {
+                attempt.owner_session_id == owner_session_id && attempt.head == head
+            })
     }
 
     pub(crate) fn record_auto_cleanup_report(
@@ -5276,10 +5433,12 @@ impl Broker {
     /// selecting and removing closed checkouts. Waits up to `lock_wait` for
     /// a GC lock another maintenance pass holds instead of giving up at
     /// once; `None` when it stays held.
+    /// `max_removals` caps the selection (`None`: the usual per-pass cap).
     pub(crate) fn auto_cleanup_for_checkout_capacity(
         &mut self,
         lock_wait: Duration,
         budget: Duration,
+        max_removals: Option<usize>,
     ) -> Result<Option<AutoCleanupReport>, BrokerOpError> {
         let waiting_since = Instant::now();
         let _lock = loop {
@@ -5302,7 +5461,10 @@ impl Broker {
         let selection_deadline = lane_deadline(started, Some(deadline), REMOVAL_SELECTION_SHARE);
         let mut plan = {
             let _span = crate::phase_telemetry::span("auto_cleanup_removal_lane");
-            self.auto_cleanup_plan(selection_deadline)?
+            self.auto_cleanup_plan_limited(
+                selection_deadline,
+                max_removals.unwrap_or(AUTO_CLEANUP_MAX_SELECTED_PER_PASS),
+            )?
         };
         // Revalidation and removal may use the whole budget.
         plan.deadline = Some(deadline);
@@ -8354,48 +8516,136 @@ mod tests {
         assert!(!worktree.exists(), "the selected checkout is removed");
     }
 
-    /// A closed landed checkout an earlier removal left part-deleted (tracked
-    /// files missing, nothing else changed) is removed, and the report says
-    /// so; the same checkout holding an untracked file is still kept.
+    /// The HEAD of a checkout, for a removal-attempt record.
+    #[cfg(unix)]
+    fn checkout_head_of(worktree: &Path) -> String {
+        GitRepo::discover(worktree).unwrap().head_commit().unwrap()
+    }
+
+    /// Kept codes the removal lane reports for `worktree` over up to three
+    /// passes, and whether it is gone afterwards.
+    #[cfg(unix)]
+    fn kept_codes_over_passes(
+        broker: &mut crate::Broker,
+        worktree: &Path,
+    ) -> (Vec<String>, Vec<super::AutoRemovedCheckout>) {
+        let text = std::fs::canonicalize(worktree)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut codes = Vec::new();
+        let mut removed = Vec::new();
+        for _ in 0..3 {
+            let report = broker.auto_cleanup_now(None).unwrap().unwrap();
+            removed.extend(
+                report
+                    .removed
+                    .iter()
+                    .filter(|r| r.worktree == text)
+                    .cloned(),
+            );
+            codes.extend(
+                report
+                    .kept
+                    .iter()
+                    .filter(|kept| kept.worktree == text)
+                    .map(|kept| kept.code.clone()),
+            );
+            if !worktree.exists() || !codes.is_empty() {
+                break;
+            }
+        }
+        (codes, removed)
+    }
+
+    /// A pure tracked deletion is somebody's change unless the broker had
+    /// recorded starting to remove that checkout: without the record it is
+    /// kept under its own code, as an agent's uncommitted `rm -rf` must be;
+    /// with the record for this owner and HEAD the removal is finished. An
+    /// untracked file still keeps a recorded one.
     #[cfg(unix)]
     #[test]
     fn an_interrupted_removal_of_a_closed_landed_checkout_is_resumed() {
         let (_owner, _storage, mut broker) = landed_lane_fixture(None);
-        let (_session, interrupted) = closed_landed_checkout(&mut broker, "interrupted removal");
-        std::fs::remove_file(interrupted.join("base.txt")).unwrap();
-        let (_kept_session, with_notes) =
+        let (session, deleted) = closed_landed_checkout(&mut broker, "hand-deleted file");
+        std::fs::remove_file(deleted.join("base.txt")).unwrap();
+
+        let (codes, removed) = kept_codes_over_passes(&mut broker, &deleted);
+        assert!(removed.is_empty(), "{removed:#?}");
+        assert!(deleted.exists(), "no removal record: the deletion is kept");
+        assert!(
+            codes
+                .iter()
+                .any(|code| code == "unmarked_tracked_deletions"),
+            "{codes:?}"
+        );
+
+        let canonical = std::fs::canonicalize(&deleted).unwrap();
+        broker
+            .record_removal_attempt(&canonical, session.id, &checkout_head_of(&deleted))
+            .unwrap();
+        let (codes, removed) = kept_codes_over_passes(&mut broker, &deleted);
+        assert!(!deleted.exists(), "{codes:?}");
+        assert_eq!(removed.len(), 1, "{removed:#?}");
+        assert_eq!(removed[0].resumed_interrupted_removal, 1, "{removed:#?}");
+
+        let (notes_session, with_notes) =
             closed_landed_checkout(&mut broker, "interrupted removal with notes");
         std::fs::remove_file(with_notes.join("base.txt")).unwrap();
         std::fs::write(with_notes.join("notes.txt"), "somebody's notes\n").unwrap();
-        let notes_text = std::fs::canonicalize(&with_notes)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-
-        let mut removed = Vec::new();
-        let mut kept_codes = Vec::new();
-        for _ in 0..3 {
-            let report = broker.auto_cleanup_now(None).unwrap().unwrap();
-            removed.extend(report.removed.iter().cloned());
-            kept_codes.extend(
-                report
-                    .kept
-                    .iter()
-                    .filter(|kept| kept.worktree == notes_text)
-                    .map(|kept| kept.code.clone()),
-            );
-            if !interrupted.exists() && !kept_codes.is_empty() {
-                break;
-            }
-        }
-        assert!(!interrupted.exists(), "{removed:#?}");
-        assert_eq!(removed.len(), 1, "{removed:#?}");
-        assert_eq!(removed[0].resumed_interrupted_removal, 1, "{removed:#?}");
+        broker
+            .record_removal_attempt(
+                &std::fs::canonicalize(&with_notes).unwrap(),
+                notes_session.id,
+                &checkout_head_of(&with_notes),
+            )
+            .unwrap();
+        let (codes, removed) = kept_codes_over_passes(&mut broker, &with_notes);
+        assert!(removed.is_empty(), "{removed:#?}");
         assert!(with_notes.join("notes.txt").is_file());
         assert!(
-            kept_codes.iter().any(|code| code == "uncommitted_changes"),
-            "{kept_codes:?}"
+            codes.iter().any(|code| code == "uncommitted_changes"),
+            "{codes:?}"
         );
+    }
+
+    /// Strict cleanup removes only pristine checkouts, even one the broker
+    /// recorded starting to remove.
+    #[cfg(unix)]
+    #[test]
+    fn strict_cleanup_keeps_a_recorded_interrupted_removal() {
+        let (_owner, _storage, mut broker) =
+            landed_lane_fixture(Some("[cleanup]\nstrict = true\n"));
+        let (session, deleted) = closed_landed_checkout(&mut broker, "strict interrupted");
+        std::fs::remove_file(deleted.join("base.txt")).unwrap();
+        broker
+            .record_removal_attempt(
+                &std::fs::canonicalize(&deleted).unwrap(),
+                session.id,
+                &checkout_head_of(&deleted),
+            )
+            .unwrap();
+        let (codes, removed) = kept_codes_over_passes(&mut broker, &deleted);
+        assert!(removed.is_empty(), "{removed:#?}");
+        assert!(deleted.exists());
+        assert!(
+            codes.iter().any(|code| code == "strict_tracked_deletions"),
+            "{codes:?}"
+        );
+    }
+
+    /// A record for another owner or another HEAD does not count.
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_record_counts_only_for_its_owner_and_head() {
+        let (_owner, _storage, broker) = landed_lane_fixture(None);
+        let path = Path::new("/nonexistent/checkout");
+        broker.record_removal_attempt(path, 7, "abc").unwrap();
+        assert!(broker.removal_attempt_recorded(path, 7, "abc"));
+        assert!(!broker.removal_attempt_recorded(path, 8, "abc"));
+        assert!(!broker.removal_attempt_recorded(path, 7, "abd"));
+        broker.clear_removal_attempt(path);
+        assert!(!broker.removal_attempt_recorded(path, 7, "abc"));
     }
 
     #[test]
@@ -8428,6 +8678,20 @@ mod tests {
             );
         }
         assert_eq!(deletions("", 3, false), None, "a clean listing is not one");
+    }
+
+    /// A checkout tracking a submodule is never an interrupted removal: the
+    /// submodule's own history could go with it.
+    #[test]
+    fn a_tracked_submodule_is_never_an_interrupted_removal() {
+        use super::interrupted_removal_against_index as against;
+        let blob = "100644 e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 0\ta";
+        let gitlink = "160000 e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 0\tsub";
+        assert_eq!(against(" D a\0", &format!("{blob}\0"), false), Some(1));
+        assert_eq!(
+            against(" D a\0", &format!("{blob}\0{gitlink}\0"), false),
+            None
+        );
     }
 
     /// A pass too short to list checkouts reads the count `start` recorded:
@@ -8500,6 +8764,54 @@ mod tests {
             "a slice that removed nothing backs off"
         );
         assert!(!broker.capacity_removal_due(super::now_ms()).unwrap());
+    }
+
+    /// One slice removes at most four checkouts, one at a time, so a long
+    /// backlog cannot turn into a burst of forced removals.
+    #[cfg(unix)]
+    #[test]
+    fn a_worker_capacity_slice_caps_its_removals() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let worktrees = (0..5)
+            .map(|index| closed_landed_checkout(&mut broker, &format!("backlog {index}")).1)
+            .collect::<Vec<_>>();
+        let root = broker.main_root().to_path_buf();
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[worktrees]\nmax_checkouts = 1\n",
+        )
+        .unwrap();
+        let report = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("five checkouts against a limit of one is pressure");
+        assert_eq!(report.removed.len(), 4, "{report:#?}");
+        assert_eq!(worktrees.iter().filter(|path| path.exists()).count(), 1);
+    }
+
+    /// A slice that finds the GC lock held backs off briefly instead of
+    /// letting every broker open respawn the worker into the same lock.
+    #[cfg(unix)]
+    #[test]
+    fn a_worker_capacity_slice_backs_off_when_the_gc_lock_is_held() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let (_session, landed) = closed_landed_checkout(&mut broker, "lock held");
+        let root = broker.main_root().to_path_buf();
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[worktrees]\nmax_checkouts = 1\n",
+        )
+        .unwrap();
+        let held = crate::gc::GcLock::acquire(&root).unwrap();
+        assert!(
+            broker
+                .run_capacity_removal_slice(Instant::now())
+                .unwrap()
+                .is_none()
+        );
+        assert!(!broker.capacity_removal_due(super::now_ms()).unwrap());
+        drop(held);
+        assert!(landed.exists());
     }
 
     /// A closed landed checkout whose only leftover is a cache its tool

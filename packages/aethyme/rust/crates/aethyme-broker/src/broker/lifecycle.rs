@@ -7973,6 +7973,7 @@ impl Broker {
                     self.auto_cleanup_for_checkout_capacity(
                         CHECKOUT_CAPACITY_LOCK_WAIT,
                         CHECKOUT_CAPACITY_CLEANUP_BUDGET,
+                        None,
                     )
                 });
             let cleanup_report = match cleanup {

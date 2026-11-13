@@ -292,6 +292,10 @@ const ARTIFACT_WORKER_CAPACITY_REMOVAL_MIN_SLICE: Duration = Duration::from_secs
 /// After a removal slice that removed nothing, capacity pressure alone does
 /// not wake or occupy the worker again for this long.
 const ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS: i64 = 10 * 60_000;
+/// After a slice that found the GC lock held before removing anything.
+const ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS: i64 = 60_000;
+/// Removals one slice makes at most, each followed by its pacer charge.
+const ARTIFACT_WORKER_CAPACITY_REMOVALS_PER_SLICE: usize = 4;
 const ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_AFTER_KEY: &str =
     "gc.artifact_sweep.capacity_removal_retry_after_ms";
 
@@ -7603,17 +7607,22 @@ impl Broker {
     /// One bounded closed-checkout removal slice of the detached worker,
     /// when registered checkouts are at three quarters of the limit. The
     /// worker already runs at background priority and holds the host's
-    /// single-deleter slot; the burst Git removes is charged to its pacer
-    /// afterwards, with no lock held. Takes the GC lock only for the slice.
-    /// Returns the slice's report, `None` when no slice ran.
+    /// single-deleter slot. It removes one checkout at a time, at most
+    /// `ARTIFACT_WORKER_CAPACITY_REMOVALS_PER_SLICE`, and after each one
+    /// waits out what Git deleted on the unattended pacer with no GC lock or
+    /// lifecycle claim held, so removals never run back to back. Returns the
+    /// slice's combined report, `None` when no removal pass ran.
     pub(crate) fn run_capacity_removal_slice(
         &mut self,
         worker_started: Instant,
     ) -> Result<Option<crate::AutoCleanupReport>, BrokerOpError> {
-        let remaining = ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
-        let budget = remaining
-            .saturating_sub(SESSION_RETIREMENT_WORKER_RESERVE)
-            .min(ARTIFACT_WORKER_CAPACITY_REMOVAL_SLICE);
+        let slice_end = |worker_started: Instant| {
+            ARTIFACT_SWEEP_WORKER_MAX_DURATION
+                .saturating_sub(worker_started.elapsed())
+                .saturating_sub(SESSION_RETIREMENT_WORKER_RESERVE)
+        };
+        let started = Instant::now();
+        let budget = slice_end(worker_started).min(ARTIFACT_WORKER_CAPACITY_REMOVAL_SLICE);
         if budget < ARTIFACT_WORKER_CAPACITY_REMOVAL_MIN_SLICE
             || !crate::AutoCleanupPolicy::load(self.main_root())
                 .is_ok_and(|policy| policy.auto_remove)
@@ -7633,65 +7642,101 @@ impl Broker {
         if !self.recorded_checkout_capacity_pressure() {
             return Ok(None);
         }
-        let started = Instant::now();
-        let report = {
-            let _span = crate::phase_telemetry::span("artifact_worker_capacity_removal");
-            self.auto_cleanup_for_checkout_capacity(Duration::ZERO, budget)?
-        };
-        let Some(report) = report else {
+        let mut combined: Option<crate::AutoCleanupReport> = None;
+        let mut paced_wait = Duration::ZERO;
+        let mut lock_busy = false;
+        while combined
+            .as_ref()
+            .is_none_or(|report| report.removed.len() < ARTIFACT_WORKER_CAPACITY_REMOVALS_PER_SLICE)
+        {
+            let remaining = budget.saturating_sub(started.elapsed());
+            if remaining < ARTIFACT_WORKER_CAPACITY_REMOVAL_MIN_SLICE {
+                break;
+            }
+            let pass = {
+                let _span = crate::phase_telemetry::span("artifact_worker_capacity_removal");
+                self.auto_cleanup_for_checkout_capacity(Duration::ZERO, remaining, Some(1))?
+            };
+            let Some(pass) = pass else {
+                lock_busy = true;
+                break;
+            };
+            let removed_now = pass.removed.len();
+            let removed_ids = pass
+                .removed
+                .iter()
+                .flat_map(|checkout| checkout.sessions.iter().copied())
+                .collect::<Vec<_>>();
+            if !removed_ids.is_empty() {
+                self.store()
+                    .complete_checkout_cleanup_requests_after_removal(&removed_ids, now_ms())?;
+            }
+            // Throttle: no lock is held here. Wait out what Git just deleted,
+            // at the unattended rate and under the same pressure back-off,
+            // before the next removal.
+            let entries = crate::auto_cleanup::estimated_removed_entries(self.main_root(), &pass);
+            let paced_started = Instant::now();
+            unattended_pacing::charge_bulk_unattended_removal(
+                entries,
+                Some(Instant::now() + slice_end(worker_started)),
+            );
+            paced_wait += paced_started.elapsed();
+            combined = Some(match combined.take() {
+                None => pass,
+                Some(mut so_far) => {
+                    so_far.removed.extend(pass.removed);
+                    so_far.kept.extend(pass.kept);
+                    so_far.deferred = pass.deferred;
+                    so_far.lanes = pass.lanes;
+                    so_far
+                }
+            });
+            if removed_now == 0 {
+                break;
+            }
+        }
+        crate::phase_telemetry::add("artifact_worker_capacity_removal_paced", paced_wait);
+        if lock_busy {
             crate::phase_telemetry::add(
                 "artifact_worker_capacity_removal_lock_busy",
                 Duration::ZERO,
             );
-            return Ok(None);
-        };
-        let removed_ids = report
-            .removed
-            .iter()
-            .flat_map(|checkout| checkout.sessions.iter().copied())
-            .collect::<Vec<_>>();
-        if !removed_ids.is_empty() {
-            self.store()
-                .complete_checkout_cleanup_requests_after_removal(&removed_ids, now_ms())?;
         }
+        let removed = combined.as_ref().map_or(0, |report| report.removed.len());
+        // Nothing removable: wait before pressure alone runs another slice.
+        // The lock busy with nothing removed yet: a short wait, so broker
+        // opens do not respawn the worker into the same held lock.
+        let retry_after = if removed > 0 {
+            String::new()
+        } else if lock_busy {
+            now_ms()
+                .saturating_add(ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS)
+                .to_string()
+        } else {
+            now_ms()
+                .saturating_add(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS)
+                .to_string()
+        };
         self.artifact_sweep_meta_set(
             ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_AFTER_KEY,
-            &if report.removed.is_empty() {
-                now_ms()
-                    .saturating_add(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS)
-                    .to_string()
-            } else {
-                String::new()
-            },
+            &retry_after,
         )?;
-        for _ in 0..report.removed.len().min(4096) {
+        for _ in 0..removed.min(4096) {
             crate::phase_telemetry::add("artifact_worker_capacity_removed", Duration::ZERO);
         }
-        // Throttle: pay for what Git just deleted before more removal, at
-        // the unattended rate and under the same pressure back-off.
-        let entries = crate::auto_cleanup::estimated_removed_entries(self.main_root(), &report);
-        // Never into the retirement tranche the worker keeps for its end.
-        let pacing_deadline = Instant::now()
-            + ARTIFACT_SWEEP_WORKER_MAX_DURATION
-                .saturating_sub(worker_started.elapsed())
-                .saturating_sub(SESSION_RETIREMENT_WORKER_RESERVE);
-        let paced_started = Instant::now();
-        unattended_pacing::charge_bulk_unattended_removal(entries, Some(pacing_deadline));
-        crate::phase_telemetry::add(
-            "artifact_worker_capacity_removal_paced",
-            paced_started.elapsed(),
-        );
-        let lanes = report.lanes.unwrap_or_default();
+        let lanes = combined
+            .as_ref()
+            .and_then(|report| report.lanes)
+            .unwrap_or_default();
         self.write_artifact_sweep_worker_status(&format!(
-            "capacity_removal removed={} kept={} deferred={} examined={} selected={} elapsed_ms={}",
-            report.removed.len(),
-            report.kept.len(),
-            report.deferred,
+            "capacity_removal removed={removed} kept={} deferred={} examined={} lock_busy={lock_busy} paced_ms={} elapsed_ms={}",
+            combined.as_ref().map_or(0, |report| report.kept.len()),
+            combined.as_ref().map_or(0, |report| report.deferred),
             lanes.removal_examined,
-            lanes.removal_selected,
+            paced_wait.as_millis(),
             started.elapsed().as_millis()
         ))?;
-        Ok(Some(report))
+        Ok(combined)
     }
 
     fn run_cleanup_after_cache_lane(
