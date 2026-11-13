@@ -3034,6 +3034,9 @@ fn gh_file_arguments_name_only_files_gh_itself_will_read() {
     assert!(files(&["pr", "create", "--input", "x"]).is_empty());
 }
 
+/// A `gh` argument vector and the `(flag, path)` pairs it must yield.
+type FileArgumentCase = (&'static [&'static str], Vec<(String, String)>);
+
 /// `-F` is the body file only under the `pr`, `issue` and `release` actions
 /// that take one; under `api` and `workflow` it is a field, and elsewhere it
 /// may not exist. The value of another flag is never read as a flag, nothing
@@ -3042,7 +3045,7 @@ fn gh_file_arguments_name_only_files_gh_itself_will_read() {
 fn gh_file_arguments_are_subcommand_and_position_aware() {
     let files = |argv: &[&str]| gh_file_arguments(&gh(argv));
     let pair = |flag: &str, path: &str| vec![(flag.to_owned(), path.to_owned())];
-    let cases: &[(&[&str], Vec<(String, String)>)] = &[
+    let cases: &[FileArgumentCase] = &[
         // Body files.
         (
             &["pr", "create", "--title", "t", "-F", "b.md"][..],
