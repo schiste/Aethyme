@@ -331,7 +331,21 @@ fn capacity_slice_selection_ran(passes: usize, lock_busy: bool) -> bool {
     passes > 0 || lock_busy
 }
 
-/// Consecutive slices that ran out of time before selection.
+/// Whether a slice that removed nothing also moved nothing: it never reached
+/// selection, or its inventory stayed unavailable without the path index or
+/// cursor advancing. Only such slices back off past one minute; one whose
+/// inventory work progressed retries in a minute.
+fn slice_made_no_progress(
+    removed: usize,
+    selection_ran: bool,
+    inventory_unavailable: bool,
+    progressed: bool,
+) -> bool {
+    removed == 0 && (!selection_ran || (inventory_unavailable && !progressed))
+}
+
+/// Consecutive slices that ran out of time before selection, or whose
+/// inventory stayed unavailable without progress.
 const ARTIFACT_WORKER_CAPACITY_REMOVAL_OUT_OF_TIME_STREAK_KEY: &str =
     "gc.artifact_sweep.capacity_removal_out_of_time_streak";
 
@@ -7709,6 +7723,8 @@ impl Broker {
         let mut selection_ms = 0u64;
         let mut apply_ms = 0u64;
         let mut inventory_unavailable = false;
+        let mut probe_ms = 0u64;
+        let mut inventory_wait = None;
         let pre_selection_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         while combined
             .as_ref()
@@ -7737,6 +7753,10 @@ impl Broker {
             apply_ms =
                 apply_ms.saturating_add(pass_ms.saturating_sub(pass_lanes.removal_elapsed_ms));
             inventory_unavailable |= pass_lanes.removal_inventory_unavailable;
+            probe_ms = probe_ms.saturating_add(pass_lanes.removal_probe_ms);
+            if pass_lanes.removal_inventory_wait.is_some() {
+                inventory_wait = pass_lanes.removal_inventory_wait;
+            }
             let removed_now = pass.removed.len();
             let removed_ids = pass
                 .removed
@@ -7807,7 +7827,7 @@ impl Broker {
             .artifact_sweep_meta_get(ARTIFACT_WORKER_CAPACITY_REMOVAL_OUT_OF_TIME_STREAK_KEY)?
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(0);
-        if removed == 0 && !selection_ran {
+        if slice_made_no_progress(removed, selection_ran, inventory_unavailable, progressed) {
             let streak = streak.saturating_add(1);
             retry_ms = Some(out_of_time_retry_ms(streak));
             self.artifact_sweep_meta_set(
@@ -7885,6 +7905,10 @@ impl Broker {
         slice.retry_after_ms = retry_after_ms;
         slice.count_ms = count_ms;
         slice.pre_selection_ms = pre_selection_ms;
+        slice.probe_ms = probe_ms;
+        slice.waiting_on = inventory_wait.map(|wait| wait.as_str().to_string());
+        slice.index_after_session_id = position.index_after_session_id;
+        slice.index_high_water_session_id = position.index_high_water_session_id;
         if !selection_ran {
             // Name what used the budget: the checkout count, or the other
             // checks before selection (retry gate, policy, progress marker).
@@ -11309,6 +11333,23 @@ mod tests {
             capacity_removal_retry_ms(0, false, false, true, true),
             Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS)
         );
+    }
+
+    /// An inventory that stays unavailable without progress backs off like a
+    /// slice that never reached selection; one that progressed does not, and
+    /// retries within a minute.
+    #[test]
+    fn an_unavailable_inventory_backs_off_only_without_progress() {
+        assert!(slice_made_no_progress(0, true, true, false));
+        assert!(!slice_made_no_progress(0, true, true, true));
+        assert_eq!(
+            capacity_removal_retry_ms(0, false, true, true, true),
+            Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_RETRY_MS),
+            "progress toward the inventory retries in a minute"
+        );
+        assert!(slice_made_no_progress(0, false, false, false));
+        assert!(!slice_made_no_progress(1, true, true, false));
+        assert!(!slice_made_no_progress(0, true, false, false));
     }
 
     #[test]

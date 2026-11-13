@@ -1050,6 +1050,43 @@ pub struct AutoCleanupLanes {
     /// cleanup request is due. Included in `removal_examined`.
     #[serde(default)]
     pub removal_priority_examined: usize,
+    /// Time the capacity-pressure probe took before selection's inventory.
+    #[serde(default)]
+    pub removal_probe_ms: u64,
+    /// With `removal_inventory_unavailable`: what the inventory was waiting
+    /// on when the deadline passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal_inventory_wait: Option<InventoryWait>,
+}
+
+/// What selection's checkout inventory was waiting on when it ran out of time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryWait {
+    /// The capacity-pressure probe used the deadline before the scan began.
+    CapacityProbe,
+    /// The checkout path index was mid-lap (its progress is kept and resumed).
+    CohortIndex,
+    /// Reading the page of closed-checkout groups.
+    GroupPage,
+    /// Resolving open sessions' checkout paths.
+    LivePaths,
+}
+
+impl InventoryWait {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CapacityProbe => "capacity_probe",
+            Self::CohortIndex => "cohort_index",
+            Self::GroupPage => "group_page",
+            Self::LivePaths => "live_paths",
+        }
+    }
+}
+
+/// Whether `deadline` had already passed at `instant`.
+fn deadline_expired_at(deadline: Option<Instant>, instant: Instant) -> bool {
+    deadline.is_some_and(|end| instant >= end)
 }
 
 /// What one auto-cleanup pass did.
@@ -1172,6 +1209,19 @@ pub struct CapacityRemovalSlice {
     /// `checkout_count` or `pre_selection`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_consumed_by: Option<String>,
+    /// Time the removal passes' capacity-pressure probes took, summed.
+    #[serde(default)]
+    pub probe_ms: u64,
+    /// With outcome `inventory_unavailable`: what the inventory was waiting
+    /// on (`capacity_probe`, `cohort_index`, `group_page`, `live_paths`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<String>,
+    /// The checkout path index lap's position when the slice ended: the last
+    /// session id indexed and the session id the lap runs to (done of total).
+    #[serde(default)]
+    pub index_after_session_id: i64,
+    #[serde(default)]
+    pub index_high_water_session_id: i64,
 }
 
 impl CapacityRemovalSlice {
@@ -1210,6 +1260,10 @@ pub(crate) struct CapacityRemovalLapPosition {
     pub lap_remaining: usize,
     pub after_session_id: i64,
     pub high_water_session_id: i64,
+    /// How far the checkout path index lap has got, as the last session id
+    /// it indexed and the session id it runs to.
+    pub index_after_session_id: i64,
+    pub index_high_water_session_id: i64,
 }
 
 /// The retirement cursor as reported: the last session judged in the current
@@ -2887,6 +2941,9 @@ const CAPACITY_PROBE_MIN_BUDGET: Duration = Duration::from_secs(1);
 pub(crate) const CHECKOUT_USAGE_KEY: &str = "auto_cleanup.checkout_usage";
 /// How long a recorded count stands in for a fresh one.
 const CHECKOUT_USAGE_MAX_AGE_MS: i64 = 15 * 60 * 1_000;
+/// A recorded count this recent stands in for a fresh one in a long pass's
+/// pressure probe (the worker records one at the start of every slice).
+const CHECKOUT_USAGE_REUSE_MS: i64 = 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct RecordedCheckoutUsage {
@@ -4034,6 +4091,7 @@ impl Broker {
         &mut self,
         cursor: &mut AutoCleanupCursor,
         deadline: Option<Instant>,
+        waiting_on: &mut Option<InventoryWait>,
     ) -> Result<Option<AutoCleanupGroupScan>, BrokerOpError> {
         let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
         // A completed, revision-current path index remains useful for planning.
@@ -4055,6 +4113,7 @@ impl Broker {
                 let mut last_progress = None;
                 loop {
                     let Some(state) = self.refresh_cleanup_cohort_aliases(deadline)? else {
+                        *waiting_on = Some(InventoryWait::CohortIndex);
                         return Ok(None);
                     };
                     crate::phase_telemetry::add(
@@ -4073,6 +4132,7 @@ impl Broker {
             }
         };
         if !index_state.complete {
+            *waiting_on = Some(InventoryWait::CohortIndex);
             return Ok(None);
         }
         if index_state.unresolved_rows > 0 {
@@ -4111,6 +4171,7 @@ impl Broker {
             }
         }
         if deadline_expired(deadline) {
+            *waiting_on = Some(InventoryWait::GroupPage);
             return Ok(None);
         }
         let indexed_groups = self.store().cleanup_cohort_group_page(
@@ -4122,6 +4183,7 @@ impl Broker {
         let mut groups = Vec::with_capacity(indexed_groups.len());
         for (canonical_path, first_session_id) in indexed_groups {
             if deadline_expired(deadline) {
+                *waiting_on = Some(InventoryWait::GroupPage);
                 return Ok(None);
             }
             let (sessions, truncated) = self
@@ -4136,9 +4198,11 @@ impl Broker {
         }
         let live = self.store().live_sessions()?;
         if deadline_expired(deadline) {
+            *waiting_on = Some(InventoryWait::LivePaths);
             return Ok(None);
         }
         let Some(live_worktrees) = resolve_live_worktree_paths(&live, deadline) else {
+            *waiting_on = Some(InventoryWait::LivePaths);
             return Ok(None);
         };
         Ok(Some(AutoCleanupGroupScan {
@@ -5399,6 +5463,8 @@ impl Broker {
         lanes.removal_priority_examined = planned.removal_priority_examined;
         lanes.removal_scan_ms = planned.removal_scan_ms;
         lanes.removal_inventory_unavailable = planned.removal_inventory_unavailable;
+        lanes.removal_probe_ms = planned.removal_probe_ms;
+        lanes.removal_inventory_wait = planned.removal_inventory_wait;
         lanes.removal_elapsed_ms = duration_ms(Some(removal_started.elapsed()));
         plan.report.lanes = Some(lanes);
         let report = self.auto_cleanup_apply(plan)?;
@@ -5428,22 +5494,31 @@ impl Broker {
             );
             return recorded.is_some_and(|(count, maximum)| usage_under_pressure(count, maximum));
         }
+        // A count the worker or `start` recorded moments ago, against the
+        // same configured limit, answers without touching the filesystem.
+        if let Some((count, maximum)) = self.fresh_recorded_checkout_usage(now_ms()) {
+            crate::phase_telemetry::add("auto_cleanup_capacity_recorded", Duration::ZERO);
+            return usage_under_pressure(count, maximum);
+        }
         // Recording is left to `start` and the background worker: a pass
         // here may run while another writer holds the database and must not
-        // wait on it.
+        // wait on it. The count is one directory read, never a full listing.
         matches!(
             self.worktree_checkout_usage(),
             Ok(Some((count, maximum))) if usage_under_pressure(count, maximum)
         )
     }
 
-    /// The linked-checkout count from this repository's registrations
-    /// (`<common>/worktrees/*`, the records `git worktree list` reads), with
-    /// one directory read instead of a listing that inspects every checkout.
-    /// Falls back to the listing when the registrations cannot be read.
-    pub(crate) fn worktree_checkout_usage_from_registrations(
-        &self,
-    ) -> Result<Option<(usize, u32)>, BrokerOpError> {
+    /// The recorded checkout count when it is at most
+    /// [`CHECKOUT_USAGE_REUSE_MS`] old and was taken against the limit the
+    /// configuration sets now.
+    fn fresh_recorded_checkout_usage(&self, now: i64) -> Option<(usize, u32)> {
+        let raw = self
+            .store_ref()
+            .meta_get(CHECKOUT_USAGE_KEY)
+            .ok()
+            .flatten()?;
+        let usage = serde_json::from_str::<RecordedCheckoutUsage>(&raw).ok()?;
         let maximum = match crate::worktree_location::WorktreeLocationConfig::load(self.main_root())
         {
             Ok(Some(config)) => config.max_checkouts(),
@@ -5451,29 +5526,18 @@ impl Broker {
                 crate::worktree_location::WorktreeLocationConfig::default().max_checkouts()
             }
         };
-        if maximum == 0 {
-            return Ok(None);
-        }
-        let Ok(common) = self.repo_handle().git_common_dir() else {
-            return self.worktree_checkout_usage();
-        };
-        let count = match std::fs::read_dir(common.join("worktrees")) {
-            Ok(entries) => {
-                let mut count = 0usize;
-                for entry in entries {
-                    let Ok(entry) = entry else {
-                        return self.worktree_checkout_usage();
-                    };
-                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                        count += 1;
-                    }
-                }
-                count
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(_) => return self.worktree_checkout_usage(),
-        };
-        Ok(Some((count, maximum)))
+        (usage.maximum == maximum
+            && (0..=CHECKOUT_USAGE_REUSE_MS).contains(&now.saturating_sub(usage.at_ms)))
+        .then_some((usage.count, usage.maximum))
+    }
+
+    /// The linked-checkout count from this repository's registrations: the
+    /// same cheap count `start` admission uses
+    /// ([`Self::worktree_checkout_usage`]).
+    pub(crate) fn worktree_checkout_usage_from_registrations(
+        &self,
+    ) -> Result<Option<(usize, u32)>, BrokerOpError> {
+        self.worktree_checkout_usage()
     }
 
     /// Remember a linked-checkout count for passes too short to list them.
@@ -5621,13 +5685,17 @@ impl Broker {
         // Under capacity pressure a bounded pass keeps going page by page
         // while time remains; otherwise each pass keeps its one-page tranche
         // and the background worker paces the lap.
+        let probe_started = Instant::now();
         let multi_page = deadline.is_some() && self.checkout_capacity_pressure(deadline);
+        let probe_elapsed = probe_started.elapsed();
+        crate::phase_telemetry::add("auto_cleanup_capacity_probe", probe_elapsed);
         let mut first_page = true;
         let mut scan_elapsed = Duration::ZERO;
         loop {
             let cursor_before_scan = cursor;
             let scan_started = Instant::now();
-            let scan = self.auto_cleanup_checkout_groups(&mut cursor, deadline)?;
+            let mut waiting_on = None;
+            let scan = self.auto_cleanup_checkout_groups(&mut cursor, deadline, &mut waiting_on)?;
             scan_elapsed += scan_started.elapsed();
             let Some(scan) = scan else {
                 if first_page {
@@ -5640,6 +5708,16 @@ impl Broker {
                     report.lanes = Some(AutoCleanupLanes {
                         removal_scan_ms: duration_ms(Some(scan_elapsed)),
                         removal_inventory_unavailable: true,
+                        removal_probe_ms: duration_ms(Some(probe_elapsed)),
+                        // Time the probe used up before the scan could start
+                        // is what the scan was really waiting on.
+                        removal_inventory_wait: Some(
+                            if deadline_expired_at(deadline, scan_started) {
+                                InventoryWait::CapacityProbe
+                            } else {
+                                waiting_on.unwrap_or(InventoryWait::CohortIndex)
+                            },
+                        ),
                         ..AutoCleanupLanes::default()
                     });
                     return Ok(AutoCleanupPlan::nothing(report));
@@ -5964,6 +6042,7 @@ impl Broker {
             removal_memo_skips: memo_skips,
             removal_scan_ms: duration_ms(Some(scan_elapsed)),
             removal_priority_examined: priority_examined,
+            removal_probe_ms: duration_ms(Some(probe_elapsed)),
             ..AutoCleanupLanes::default()
         });
         // The current deferred group, if any, was counted above and the cursor
@@ -6395,10 +6474,12 @@ impl Broker {
         &mut self,
     ) -> Result<CapacityRemovalLapPosition, BrokerOpError> {
         let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
-        let index_complete = self
-            .store()
-            .cleanup_cohort_scan_state(namespace)?
-            .is_some_and(|state| state.complete);
+        let index_state = self.store().cleanup_cohort_scan_state(namespace)?;
+        let index_complete = index_state.as_ref().is_some_and(|state| state.complete);
+        let (index_after_session_id, index_high_water_session_id) =
+            index_state.as_ref().map_or((0, 0), |state| {
+                (state.after_session_id, state.high_water_session_id)
+            });
         let (cursor, _) = self.auto_cleanup_cursor()?;
         let maximum_group_id = self
             .store()
@@ -6413,6 +6494,8 @@ impl Broker {
             lap_remaining,
             after_session_id: cursor.after_session_id,
             high_water_session_id: cursor.high_water_session_id,
+            index_after_session_id,
+            index_high_water_session_id,
         })
     }
 
@@ -10606,6 +10689,167 @@ mod tests {
         assert_eq!(
             against(" D a\0", &format!("{blob}\0{gitlink}\0"), false),
             None
+        );
+    }
+
+    /// A long pass's pressure probe answers from a count recorded moments
+    /// ago against the same limit, instead of counting again; a count taken
+    /// against another limit, or a stale one, is recounted.
+    #[cfg(unix)]
+    #[test]
+    fn a_long_pass_pressure_probe_reuses_a_fresh_recorded_count_for_the_same_limit() {
+        let (_owner, _storage, broker, _session) = retirement_fixture();
+        std::fs::write(
+            broker.main_root().join(".aethyme/config.toml"),
+            "[worktrees]\nmax_checkouts = 100\n",
+        )
+        .unwrap();
+        let long = || Some(Instant::now() + Duration::from_secs(30));
+        assert!(
+            !broker.checkout_capacity_pressure(long()),
+            "one checkout of 100"
+        );
+        broker.record_checkout_usage(99, 100);
+        assert!(
+            broker.checkout_capacity_pressure(long()),
+            "a fresh count for the same limit is reused"
+        );
+        broker.record_checkout_usage(99, 200);
+        assert!(
+            !broker.checkout_capacity_pressure(long()),
+            "a count against another limit is not"
+        );
+        let stale = serde_json::json!({
+            "count": 99,
+            "maximum": 100,
+            "at_ms": super::now_ms() - super::CHECKOUT_USAGE_REUSE_MS - 1,
+        })
+        .to_string();
+        broker
+            .store_ref()
+            .meta_set(super::CHECKOUT_USAGE_KEY, &stale)
+            .unwrap();
+        assert!(
+            !broker.checkout_capacity_pressure(long()),
+            "a stale count is recounted"
+        );
+    }
+
+    /// The checkout count is one read of this repository's registrations, the
+    /// records `git worktree list` enumerates, not the listing itself.
+    #[cfg(unix)]
+    #[test]
+    fn the_checkout_count_reads_this_repositorys_registrations() {
+        let (_owner, _storage, broker, _session) = retirement_fixture();
+        let listed = broker.repo_handle().worktree_inventory().unwrap().len() - 1;
+        assert_eq!(broker.registered_linked_checkout_count(), Some(listed));
+        let common = broker.repo_handle().git_common_dir().unwrap();
+        std::fs::create_dir_all(common.join("worktrees/registration-only")).unwrap();
+        assert_eq!(broker.registered_linked_checkout_count(), Some(listed + 1));
+        assert_eq!(
+            broker
+                .worktree_checkout_usage()
+                .unwrap()
+                .map(|(count, _)| count),
+            Some(listed + 1)
+        );
+    }
+
+    /// An inventory that is not ready says what it waited on, and the path
+    /// index work one pass did is resumed by the next instead of restarting,
+    /// so it converges over passes.
+    #[cfg(unix)]
+    #[test]
+    fn an_unavailable_inventory_says_what_it_waited_on_and_resumes_its_progress() {
+        let (_owner, _storage, mut broker, _first) = retirement_fixture();
+        for index in 0..3 {
+            broker
+                .start_worktree(&format!("index lap {index}"), None)
+                .unwrap();
+        }
+        let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
+        while !broker
+            .refresh_cleanup_cohort_aliases(None)
+            .unwrap()
+            .unwrap()
+            .complete
+        {}
+        broker
+            .store()
+            .begin_cleanup_cohort_alias_refresh(namespace, super::now_ms())
+            .unwrap();
+        super::COHORT_SCAN_LIMITS.with(|limits| limits.set(Some((1, 1))));
+        let first = broker.auto_cleanup_plan(None);
+        let after_first = broker
+            .store()
+            .cleanup_cohort_scan_state(namespace)
+            .unwrap()
+            .unwrap();
+        let expired = broker.auto_cleanup_plan(Some(Instant::now() - Duration::from_millis(1)));
+        let second = broker.auto_cleanup_plan(None);
+        let after_second = broker
+            .store()
+            .cleanup_cohort_scan_state(namespace)
+            .unwrap()
+            .unwrap();
+        super::COHORT_SCAN_LIMITS.with(|limits| limits.set(None));
+        let lanes = first.unwrap().report.lanes.unwrap();
+        assert!(lanes.removal_inventory_unavailable, "{lanes:?}");
+        assert_eq!(
+            lanes.removal_inventory_wait,
+            Some(super::InventoryWait::CohortIndex)
+        );
+        assert_eq!(
+            expired
+                .unwrap()
+                .report
+                .lanes
+                .unwrap()
+                .removal_inventory_wait,
+            Some(super::InventoryWait::CapacityProbe),
+            "a deadline gone before the scan began names the probe"
+        );
+        second.unwrap();
+        assert!(
+            after_second.complete || after_second.after_session_id > after_first.after_session_id,
+            "the next pass resumes the lap: {after_first:?} then {after_second:?}"
+        );
+    }
+
+    /// Removal reads the lock reason from the checkout's own registration
+    /// instead of listing every worktree; a checkout whose `.git` names no
+    /// registration of this repository is not read that way.
+    #[cfg(unix)]
+    #[test]
+    fn the_lock_reason_comes_from_the_checkouts_own_registration() {
+        let (_owner, _storage, broker, session) = retirement_fixture();
+        let path = PathBuf::from(&session.worktree_path);
+        let root = broker.main_root().to_path_buf();
+        assert_eq!(
+            broker.repo_handle().registration_lock_reason(&path),
+            Ok(None)
+        );
+        git(
+            &root,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "fixture lock reason",
+                path.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            broker.repo_handle().registration_lock_reason(&path),
+            Ok(Some("fixture lock reason".into()))
+        );
+        git(&root, &["worktree", "unlock", path.to_str().unwrap()]);
+        let stray = root.parent().unwrap().join("stray-checkout");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join(".git"), "gitdir: /nowhere\n").unwrap();
+        assert_eq!(
+            broker.repo_handle().registration_lock_reason(&stray),
+            Err(())
         );
     }
 

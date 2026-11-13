@@ -200,8 +200,12 @@ an inventory. Each slice records its own result under the meta key
 `auto_cleanup.capacity_removal`, shown as `auto_cleanup.capacity_removal` in
 `aethyme broker gc plan --json` and as `capacity_removal` in
 `aethyme broker status --json`; the worker's later lanes do not overwrite it.
-Its `outcome` is `removed`, `lock_busy`, `inventory_unavailable`,
-`lap_unfinished`, `out_of_time_before_selection` (the budget ran out before
+Its `outcome` is `removed`, `lock_busy`, `inventory_unavailable`
+(`waiting_on` names what the checkout inventory was waiting on and
+`index_after_session_id` / `index_high_water_session_id` how far its index lap
+got; that progress is kept for the next slice, which retries in a minute when
+it moved and backs off when it did not), `lap_unfinished`,
+`out_of_time_before_selection` (the budget ran out before
 any checkout was judged; `budget_consumed_by` says whether counting checkouts
 or the other checks used it; it retries after one minute, backing off to ten
 minutes while slices keep running out) or
