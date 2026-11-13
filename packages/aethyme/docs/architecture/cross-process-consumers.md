@@ -168,6 +168,60 @@ Before this change the build output waited for the next periodic lap
 `cleanup.attempted` and `cleanup.artifact_bytes_reclaimed` keep their meaning.
 Readers of saved reports must treat a missing field as `false` / absent.
 
+## Unattended deletion is paced (2026-11-13)
+
+The detached worker (`aethyme broker gc __continue-artifacts <repo>`) is now a
+polite background job. Foreground commands an agent waits on (`finish`,
+`finish cleanup <id>`, `gc apply`, `gc sweep`, the bounded inline sweep at
+broker open) are unchanged and run at full speed.
+
+- **Priority.** First thing in the worker process: `setpriority(PRIO_DARWIN_PROCESS,
+  0, PRIO_DARWIN_BG)` and `setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS,
+  IOPOL_THROTTLE)` on macOS; `nice 19`, `SCHED_IDLE` and the idle `ioprio`
+  class on Linux; nothing elsewhere (Windows included). Children (Git)
+  inherit it. Not configurable.
+- **Rate limit.** Every unlink of descriptor-relative tree removal in the
+  worker passes a token bucket checked every 256 entries.
+  `[cleanup] unattended_unlinks_per_second` in `.aethyme/config.toml`
+  (default `1000`; `0` or `"unlimited"` restores full speed). An invalid
+  value keeps the default and is reported as `config_error`. When the sweep
+  is below gate headroom (disk-pressure mode) the limit is lifted for that
+  pass; priority and pressure back-off stay.
+- **Pressure back-off.** Once per batch the worker reads
+  `kern.memorystatus_vm_pressure_level` and the one-minute load average
+  (macOS) or `/proc/pressure/memory`, `/proc/pressure/io` and `/proc/loadavg`
+  (Linux). While memory pressure is above normal, PSI memory `some avg10 >= 10`,
+  PSI I/O `some avg10 >= 40`, or load exceeds twice the core count, it sleeps
+  in one-second steps, never past the pass deadline and at most 120 s per run;
+  then removal stops resumably exactly as at a deadline. An unreadable signal
+  means proceed at the rate limit.
+- **One deleter per machine.** After its due checks the worker takes
+  `<host state dir>/run/gc-unattended-deleter.lock` (an advisory `flock`),
+  polling every 2 s for up to 15 minutes while it keeps its repository
+  singleton. A worker that never gets it writes worker status
+  `host_deleter_busy waited_ms=<n>; request retained` and exits; every
+  request stays durable and the next broker open admits a worker again.
+  Without a resolvable host state directory the worker proceeds unserialised.
+- **Coalescing.** The worker holds its repository singleton for 2 s before
+  reading the backlog. A broker open or `finish` that finds the singleton held
+  never starts a second worker; it increments the scoped meta counter
+  `gc.artifact_sweep.coalesced_requests`, which the next run reads and resets.
+
+Telemetry: `broker status --json` gains the optional object
+`cleanup_retention.last_artifact_sweep.unattended_pacing` (absent until a
+paced worker has run on a binary with this change; readers must accept its
+absence). It is stored under its own scoped meta key
+(`gc.artifact_sweep.last_unattended_pacing`) and attached on read, so the
+persisted sweep report keeps the shape older binaries parse. Fields:
+`at_ms`, `unlinks_per_second_limit` (null when unlimited), `config_error`
+(omitted when none), `priority.cpu_lowered`, `priority.io_lowered`,
+`entries_removed`, `logical_bytes_removed`, `elapsed_ms`,
+`removal_rate_per_second`, `limiter_sleep_ms`, `memory_pause_ms`,
+`load_pause_ms`, `pressure_yields`, `host_lock_wait_ms`, `requests_coalesced`,
+`rate_lifted_for_disk_pressure`. Tree-removal progress itself is not
+journalled per file: the ignored-directory queue is written once per removed
+directory, and the sweep cursor once per pass.
+
 ## Coordinated fetches never write-block (2026-11-12)
 
 A coordinated fetch of exactly one branch into its own remote-tracking ref

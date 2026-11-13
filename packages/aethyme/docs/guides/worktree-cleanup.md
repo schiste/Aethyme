@@ -188,7 +188,13 @@ strict = false                 # the default; recognized output directories disp
 ignored_directory_sweep = false # opt in to reclaim ignored folders in retained checkouts
 regenerable = [".gradle/**"]    # extra explicitly disposable output directories
 keep = ["*-investigation"]     # worktrees never removed automatically
+unattended_unlinks_per_second = 1000 # background worker pace; 0 or "unlimited" = full speed
 ```
+
+The background worker's pace, priority, host-wide single deleter and pressure
+pause are described in
+[automatic checkout maintenance](automatic-checkout-maintenance.md), under
+"Background deletion pace". `finish cleanup <id>` and `gc apply` are never throttled.
 
 State-only closed checkouts also respect `[retention]
 closed_worktree_grace_hours` in `.aethyme/broker.toml` (24 hours / 1 day by default;

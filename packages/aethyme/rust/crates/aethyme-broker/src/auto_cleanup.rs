@@ -358,6 +358,7 @@ impl AutoCleanupPolicy {
                         policy.keep = list;
                     }
                 }
+                "unattended_unlinks_per_second" => {} // Parsed by gc::unattended_pacing.
                 other => return Err(format!("[cleanup] has no key {other:?}")),
             }
         }

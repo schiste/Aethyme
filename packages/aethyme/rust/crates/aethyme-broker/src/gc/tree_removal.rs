@@ -815,12 +815,19 @@ mod unix {
                     .last()
                     .expect("the root frame remains below each nested frame")
                     .directory_fd;
+                // Unattended removal is paced here; foreground callers have
+                // no pacer installed and pass straight through. A refusal
+                // stops resumably, exactly like an expired deadline.
+                if !super::super::unattended_pacing::before_unattended_unlink(deadline) {
+                    return Ok(TreeRemoval::Interrupted);
+                }
                 before_mutation()?;
                 ensure_bindings(pinned, &bindings)?;
                 ensure_named_directory(binding.parent_fd, &binding.name, binding.identity)?;
                 match unlink_at(parent_fd, &binding.name, true) {
                     Ok(()) => {
                         *entries_reclaimed = entries_reclaimed.saturating_add(1);
+                        super::super::unattended_pacing::after_unattended_unlink(0);
                     }
                     Err(error)
                         if error.kind() == io::ErrorKind::NotFound
@@ -897,16 +904,23 @@ mod unix {
                         "refusing to remove a special cache entry",
                     ));
                 }
+                if !super::super::unattended_pacing::before_unattended_unlink(deadline) {
+                    return Ok(TreeRemoval::Interrupted);
+                }
                 before_mutation()?;
                 ensure_bindings(pinned, &bindings)?;
                 ensure_named_entry(directory_fd, &c_name, observed.identity)?;
                 match unlink_at(directory_fd, &c_name, false) {
                     Ok(()) => {
                         *entries_reclaimed = entries_reclaimed.saturating_add(1);
-                        if observed.is_regular {
-                            *observed_regular_bytes =
-                                observed_regular_bytes.saturating_add(observed.logical_bytes);
-                        }
+                        let logical_bytes = if observed.is_regular {
+                            observed.logical_bytes
+                        } else {
+                            0
+                        };
+                        *observed_regular_bytes =
+                            observed_regular_bytes.saturating_add(logical_bytes);
+                        super::super::unattended_pacing::after_unattended_unlink(logical_bytes);
                     }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error),
@@ -1759,6 +1773,95 @@ mod unix {
             assert_eq!(entries_reclaimed, 1);
             assert!(root.is_dir());
             assert!(!payload.exists());
+        }
+
+        fn wide_tree(root: &Path, files: usize) {
+            fs::create_dir(root).unwrap();
+            fs::create_dir(root.join("nested")).unwrap();
+            for index in 0..files {
+                let parent = if index % 2 == 0 {
+                    root.to_path_buf()
+                } else {
+                    root.join("nested")
+                };
+                fs::write(parent.join(format!("file-{index}")), b"0123456789").unwrap();
+            }
+        }
+
+        #[test]
+        fn installed_pacer_rate_limits_every_unlink_of_a_removal() {
+            use crate::gc::unattended_pacing::{
+                self, FakeClock, PACING_BATCH_ENTRIES, PressureSample, Scripted, UnattendedPacer,
+                UnlinkRate,
+            };
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("root");
+            let files = PACING_BATCH_ENTRIES as usize * 3;
+            wide_tree(&root, files);
+            let clock = FakeClock::new();
+            let scope = unattended_pacing::install(UnattendedPacer::new(
+                UnlinkRate::Limited(PACING_BATCH_ENTRIES),
+                Box::new(clock.clone()),
+                Box::new(Scripted {
+                    samples: vec![PressureSample::default()],
+                    reads: Default::default(),
+                }),
+            ));
+
+            let (outcome, entries) =
+                remove_condemned_tree_with_progress(&root, None, None).unwrap();
+            let summary = unattended_pacing::current_summary(0).unwrap();
+            drop(scope);
+
+            assert_eq!(outcome, TreeRemoval::Complete);
+            assert!(!root.exists());
+            // `files` payload entries plus `nested`, then the root itself.
+            assert_eq!(entries, files + 2);
+            // Every drained unlink went through the pacer (the root's final
+            // rmdir is outside the drain); the rate is one batch per fake
+            // second, so three full batches cost three seconds.
+            assert_eq!(summary.entries_removed, files as u64 + 1);
+            assert_eq!(summary.logical_bytes_removed, files as u64 * 10);
+            assert_eq!(clock.slept.get(), std::time::Duration::from_secs(3));
+        }
+
+        #[test]
+        fn persistent_pressure_stops_unattended_removal_resumably() {
+            use crate::gc::unattended_pacing::{
+                self, FakeClock, PressureSample, Scripted, UnattendedPacer, UnlinkRate,
+            };
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("root");
+            wide_tree(&root, 8);
+            let clock = FakeClock::new();
+            let scope = unattended_pacing::install(UnattendedPacer::new(
+                UnlinkRate::Unlimited,
+                Box::new(clock.clone()),
+                Box::new(Scripted {
+                    samples: vec![PressureSample {
+                        memory_elevated: Some(true),
+                        load_elevated: None,
+                    }],
+                    reads: Default::default(),
+                }),
+            ));
+
+            let (outcome, entries) =
+                remove_condemned_tree_with_progress(&root, None, None).unwrap();
+            drop(scope);
+
+            assert_eq!(outcome, TreeRemoval::Interrupted);
+            assert_eq!(entries, 0);
+            assert!(root.join("nested").is_dir());
+            // Without the pacer the same call is the foreground path and
+            // finishes at full speed.
+            assert_eq!(
+                remove_condemned_tree_with_progress(&root, None, None)
+                    .unwrap()
+                    .0,
+                TreeRemoval::Complete
+            );
+            assert!(!root.exists());
         }
 
         #[test]
