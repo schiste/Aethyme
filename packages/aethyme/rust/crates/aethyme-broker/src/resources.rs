@@ -2813,9 +2813,15 @@ impl HostResourceCoordinator {
         let (own, ahead) = wait_queue::split_queue(&live, &request.request_id);
         append_queue_conflicts(request, &occupied, &ahead, &mut conflicts);
         proposed.retain(|allocation| {
-            !conflicts
-                .iter()
-                .any(|conflict| conflict.resource_key == allocation.key)
+            !conflicts.iter().any(|conflict| {
+                conflict.resource_key == allocation.key
+                    || (conflict.kind == "capacity"
+                        && allocation.kind == "capacity"
+                        && conflict
+                            .requested
+                            .split_once(':')
+                            .is_some_and(|(pool, _)| pool == allocation.value))
+            })
         });
         let demands = wait_queue::request_demands(request);
         let queue = wait_queue::queue_report(&demands, &occupied, &live, own, &ahead, now);
@@ -2963,46 +2969,46 @@ impl HostResourceCoordinator {
         append_queue_conflicts(request, &occupied, &ahead, &mut conflicts);
         if !conflicts.is_empty() {
             let code = aggregate_conflict_code(&conflicts).to_string();
-            // Reaping dead waiters is housekeeping worth keeping even when
-            // this attempt is refused.
-            let mut wrote = reaped > 0;
-            if code == ORPHANED_HOLDER_CONFLICT_CODE {
+            let contention = code == "resource_contention";
+            let queue = if code == ORPHANED_HOLDER_CONFLICT_CODE {
                 quarantine_conflicting_orphaned_holders(&tx, now, &conflicts, &occupied)?;
+                if own.is_some() {
+                    // Waiting cannot resolve this refusal; stop reserving.
+                    wait_queue::delete_waiter(&tx, &request.request_id, None)?;
+                }
+                let queue = wait_queue::queue_report(&demands, &occupied, &live, own, &ahead, now);
                 // This commits the existing safe cleanup sweep plus quarantine
                 // for the exact dead owners behind the non-waitable result.
                 // Named allocations remain, and rejected-bundle allocations
                 // are not inserted before this branch.
-                wrote = true;
-            }
-            let mut registered = false;
-            if code == "resource_contention" {
-                if let Some(registration) = registration {
-                    registered = wait_queue::register_waiter(
-                        &tx,
+                tx.commit()?;
+                queue
+            } else {
+                let registration = registration.filter(|_| contention);
+                let settle = reaped > 0
+                    || (!contention && own.is_some())
+                    || registration.is_some_and(|registration| {
+                        wait_queue::registration_needs_write(own, registration, now)
+                    });
+                let queue = wait_queue::queue_report(&demands, &occupied, &live, own, &ahead, now);
+                // A retryable refusal rolls back the opportunistic quarantine
+                // sweep; only waiter bookkeeping is written, separately.
+                drop(tx);
+                if settle {
+                    let refreshed = self.settle_waiter(
                         request,
                         &digest,
                         &demands,
                         registration,
-                        own,
+                        !contention,
                         now,
                     )?;
-                    wrote |= registered;
+                    let (own, ahead) = wait_queue::split_queue(&refreshed, &request.request_id);
+                    wait_queue::queue_report(&demands, &occupied, &refreshed, own, &ahead, now)
+                } else {
+                    queue
                 }
-            } else if own.is_some() {
-                // Waiting cannot resolve this refusal; stop reserving.
-                wait_queue::delete_waiter(&tx, &request.request_id, None)?;
-                wrote = true;
-            }
-            let queue = if registered {
-                let refreshed = wait_queue::live_waiters(&tx, now)?;
-                let (own, ahead) = wait_queue::split_queue(&refreshed, &request.request_id);
-                wait_queue::queue_report(&demands, &occupied, &refreshed, own, &ahead, now)
-            } else {
-                wait_queue::queue_report(&demands, &occupied, &live, own, &ahead, now)
             };
-            if wrote {
-                tx.commit()?;
-            }
             let message = conflicts
                 .iter()
                 .map(|c| format!("{}: {}", c.resource_key, c.reason))
@@ -3257,6 +3263,45 @@ impl HostResourceCoordinator {
         Ok(self
             .conn
             .query_row("PRAGMA data_version", [], |row| row.get(0))?)
+    }
+
+    /// Waiter bookkeeping after a refused attempt, in its own transaction so
+    /// the refused attempt's opportunistic sweep stays rolled back: reap dead
+    /// waiters, then register (or refresh) this waiter when it may wait, or
+    /// remove its row when it may not. Returns the live waiters afterwards.
+    fn settle_waiter(
+        &mut self,
+        request: &HostResourceRequest,
+        digest: &str,
+        demands: &[wait_queue::WaiterDemand],
+        registration: Option<&wait_queue::WaitRegistration>,
+        withdraw: bool,
+        now: i64,
+    ) -> Result<Vec<wait_queue::QueuedWaiter>, HostResourceError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (live, _) = wait_queue::reap_dead_waiters(&tx, now)?;
+        let own = live
+            .iter()
+            .find(|waiter| waiter.request_id == request.request_id);
+        match registration {
+            Some(registration) => {
+                if own.is_some_and(|own| own.request_digest != digest) {
+                    return Err(HostResourceError::IdempotencyMismatch(
+                        request.request_id.clone(),
+                    ));
+                }
+                wait_queue::register_waiter(&tx, request, digest, demands, registration, own, now)?;
+            }
+            None if withdraw => {
+                wait_queue::delete_waiter(&tx, &request.request_id, None)?;
+            }
+            None => {}
+        }
+        let refreshed = wait_queue::live_waiters(&tx, now)?;
+        tx.commit()?;
+        Ok(refreshed)
     }
 
     fn withdraw_waiter(&mut self, request_id: &str, pid: i64) -> Result<(), HostResourceError> {
@@ -6314,6 +6359,10 @@ mod tests {
         conn.execute_batch(SCHEMA).unwrap();
         conn.execute_batch(SUPERVISED_HOLD_MIGRATION).unwrap();
         conn.execute("UPDATE meta SET value=2 WHERE key='schema_version'", [])
+            .unwrap();
+        // The additive waiter queue is part of the current host store; its
+        // one-time creation on an older store is covered in wait_queue tests.
+        conn.execute_batch(wait_queue::RESOURCE_WAITER_SCHEMA)
             .unwrap();
         seed_migration_legacy_rows(&conn);
 

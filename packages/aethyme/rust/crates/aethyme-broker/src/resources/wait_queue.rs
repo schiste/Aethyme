@@ -54,6 +54,8 @@ const WAITER_HEARTBEAT_REFRESH_MS: i64 = 30_000;
 /// A waiter whose heartbeat is this old is treated as gone even when its PID
 /// still answers (PID reuse) and its own deadline has not passed.
 pub(super) const WAITER_STALE_MS: i64 = 120_000;
+/// A row past its own deadline by more than this is dead.
+const WAITER_DEADLINE_GRACE_MS: i64 = 2_000;
 
 /// Sleep granularity between cheap change checks (`PRAGMA data_version`).
 pub(super) const POLL_TICK: std::time::Duration = std::time::Duration::from_millis(250);
@@ -99,9 +101,11 @@ impl QueuedWaiter {
     }
 
     /// Gone process, passed deadline, stale heartbeat or unreadable demands.
+    /// The short deadline grace lets a waiter's own final attempt, made at
+    /// its deadline, still see its row instead of reaping it.
     pub fn is_dead(&self, now: i64) -> bool {
         self.demands.is_none()
-            || self.deadline_at <= now
+            || self.deadline_at.saturating_add(WAITER_DEADLINE_GRACE_MS) <= now
             || self.heartbeat_at.saturating_add(WAITER_STALE_MS) <= now
             || self.waiter_pid.is_some_and(holder_process_is_gone)
     }
@@ -116,12 +120,6 @@ impl QueuedWaiter {
             .filter(|demand| demand.kind == "capacity" && demand.value == pool)
             .filter_map(|demand| demand.units)
             .fold(0, u64::saturating_add)
-    }
-
-    fn wants_key(&self, name: &str) -> bool {
-        self.demands()
-            .iter()
-            .any(|demand| demand.kind == "exclusive_key" && demand.value == name)
     }
 
     fn shares_any(&self, demands: &[WaiterDemand]) -> bool {
@@ -522,9 +520,23 @@ pub(super) fn queue_report(
     }
 }
 
+/// Whether registering would write: no row yet, a heartbeat due, or a changed
+/// process or deadline. An attempt that would not write commits nothing, so
+/// it does not wake every other waiter.
+pub(super) fn registration_needs_write(
+    own: Option<&QueuedWaiter>,
+    registration: &WaitRegistration,
+    now: i64,
+) -> bool {
+    own.is_none_or(|own| {
+        now.saturating_sub(own.heartbeat_at) >= WAITER_HEARTBEAT_REFRESH_MS
+            || own.waiter_pid != Some(registration.pid)
+            || own.deadline_at != registration.deadline_at
+    })
+}
+
 /// Insert this request's waiter row, or refresh its heartbeat. Returns
-/// whether it wrote, so an otherwise unchanged attempt can roll back and not
-/// wake every other waiter.
+/// whether it wrote.
 pub(super) fn register_waiter(
     conn: &Connection,
     request: &HostResourceRequest,
@@ -536,11 +548,7 @@ pub(super) fn register_waiter(
 ) -> Result<bool, HostResourceError> {
     match own {
         Some(own) => {
-            let stale = now.saturating_sub(own.heartbeat_at) >= WAITER_HEARTBEAT_REFRESH_MS;
-            if !stale
-                && own.waiter_pid == Some(registration.pid)
-                && own.deadline_at == registration.deadline_at
-            {
+            if !registration_needs_write(Some(own), registration, now) {
                 return Ok(false);
             }
             conn.execute(
