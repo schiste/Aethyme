@@ -161,6 +161,9 @@ blockers with the line that would release a directory, for example:
 
 and the `cleanup.checkout-capacity` row repeats the top five in its evidence.
 
+From three quarters of the limit, the background checkout-cleanup worker also
+retries after one minute instead of ten when a run ends without finishing.
+
 At the limit, `broker start` first runs the removal lane alone with a 20-second
 budget, waiting up to 5 seconds for a maintenance pass that holds the GC lock.
 If the limit still refuses, the error says how many closed checkouts that pass

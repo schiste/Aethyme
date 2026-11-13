@@ -256,6 +256,17 @@ const AUTO_CHECKOUT_CLEANUP_WORKER_MAX_PASSES: usize = 4096;
 /// a later normal open when this deadline expires.
 const ARTIFACT_SWEEP_WORKER_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
 const ARTIFACT_SWEEP_WORKER_RETRY_MS: i64 = 10 * 60_000;
+/// The whole-checkout cleanup worker's backoff once registered checkouts
+/// reach three quarters of `[worktrees] max_checkouts`.
+const AUTO_CHECKOUT_CLEANUP_PRESSURE_RETRY_MS: i64 = 60_000;
+
+fn checkout_cleanup_retry_ms(capacity_pressure: bool) -> i64 {
+    if capacity_pressure {
+        AUTO_CHECKOUT_CLEANUP_PRESSURE_RETRY_MS
+    } else {
+        ARTIFACT_SWEEP_WORKER_RETRY_MS
+    }
+}
 /// Cache work yields this part of the singleton worker's total budget to an
 /// independently requested whole-checkout cleanup pass.
 const AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE: Duration = Duration::from_secs(60);
@@ -7654,7 +7665,15 @@ impl Broker {
     }
 
     fn defer_auto_checkout_cleanup_worker(&mut self, reason: &str) -> Result<(), BrokerOpError> {
-        let retry_after = now_ms().saturating_add(ARTIFACT_SWEEP_WORKER_RETRY_MS);
+        // Near the linked-checkout limit the removal backlog is what blocks
+        // `broker start`: keep draining at a short interval instead of the
+        // ordinary ten-minute backoff.
+        let capacity_pressure = matches!(
+            self.worktree_checkout_usage(),
+            Ok(Some((count, maximum)))
+                if count.saturating_mul(4) >= (maximum as usize).saturating_mul(3)
+        );
+        let retry_after = now_ms().saturating_add(checkout_cleanup_retry_ms(capacity_pressure));
         self.artifact_sweep_meta_set(
             AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY,
             &retry_after.to_string(),
@@ -10659,6 +10678,15 @@ impl Broker {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn checkout_cleanup_worker_retries_sooner_under_capacity_pressure() {
+        assert_eq!(super::checkout_cleanup_retry_ms(true), 60_000);
+        assert_eq!(
+            super::checkout_cleanup_retry_ms(false),
+            super::ARTIFACT_SWEEP_WORKER_RETRY_MS
+        );
+    }
+
     use super::*;
     use crate::disk_headroom::SweepUrgency;
     use std::cell::RefCell;
