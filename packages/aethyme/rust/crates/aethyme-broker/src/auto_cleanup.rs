@@ -8315,10 +8315,7 @@ mod tests {
                     "ownership_reproof_refused",
                     "{reason}"
                 );
-                assert!(
-                    reason.contains("registered on a detached HEAD"),
-                    "{reason}"
-                );
+                assert!(reason.contains("registered on a detached HEAD"), "{reason}");
             }
             other => panic!("a detached checkout must be kept: {other:?}"),
         }
