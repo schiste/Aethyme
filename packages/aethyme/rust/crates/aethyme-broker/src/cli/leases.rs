@@ -947,8 +947,39 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+/// The refusals of `broker advisories` that read only the parsed arguments,
+/// with the messages each action gives. They run before the broker opens, whose
+/// startup maintenance a refused command must not trigger.
+fn validate_advisories_arguments(parsed: &Parsed) -> Result<(), UsageError> {
+    let id = |usage: &str| {
+        if parsed.positional.len() != 2 {
+            return Err(UsageError::Message(usage.into()));
+        }
+        parse_advisory_id(parsed.positional.get(1), usage).map(|_| ())
+    };
+    match parsed.positional.first().map(String::as_str) {
+        Some("list") if parsed.positional.len() != 1 => Err(UsageError::Message(
+            "usage: aethyme broker advanced advisories list [--all] [--json]".into(),
+        )),
+        Some("metrics") if parsed.positional.len() != 1 => Err(UsageError::Message(
+            "usage: aethyme broker advanced advisories metrics [--json]".into(),
+        )),
+        Some("list" | "metrics") => Ok(()),
+        Some("show") => id(ADVISORIES_SHOW_USAGE),
+        Some("ack") => id(ADVISORIES_ACK_USAGE),
+        Some("suppress") => id(ADVISORIES_SUPPRESS_USAGE),
+        Some(other) => Err(UsageError::Message(format!(
+            "unknown advisories action {other:?} — expected list, show, ack, suppress, or metrics"
+        ))),
+        None => Err(UsageError::Message(
+            "advisories requires an action: list, show, ack, suppress, or metrics".into(),
+        )),
+    }
+}
+
 /// `broker advisories`.
 pub(super) fn run_advisories(parsed: Parsed) -> Result<(), UsageError> {
+    validate_advisories_arguments(&parsed)?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     match parsed.positional.first().map(String::as_str) {
         Some("list") => {
@@ -1104,6 +1135,24 @@ pub(super) fn run_exposures(parsed: Parsed) -> Result<(), UsageError> {
         .first()
         .map(String::as_str)
         .ok_or_else(|| UsageError::Message("exposures requires an action: plan or apply".into()))?;
+    // Refuse a malformed command before the writable open below, whose
+    // startup maintenance a refused command must not trigger.
+    match action {
+        "plan" => {}
+        "apply" => {
+            parsed.session.ok_or_else(|| {
+                UsageError::Message("exposures apply requires --session <id>".into())
+            })?;
+            parsed.confirm.as_deref().ok_or_else(|| {
+                UsageError::Message("exposures apply requires --confirm <sha256>".into())
+            })?;
+        }
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown exposures action {other:?} — expected plan or apply"
+            )));
+        }
+    }
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     match action {
         "plan" => {
@@ -1189,8 +1238,88 @@ pub(super) fn run_exposures(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+/// The refusals of `broker note` that read only the parsed arguments, in the
+/// order and with the messages its handler gives. They run before the broker
+/// opens, whose startup maintenance a refused command must not trigger.
+fn validate_note_arguments(parsed: &Parsed) -> Result<(), UsageError> {
+    let require = |present: bool, message: &str| {
+        if present {
+            Ok(())
+        } else {
+            Err(UsageError::Message(message.into()))
+        }
+    };
+    let single = parsed.positional.len() == 1;
+    match parsed.positional.first().map(String::as_str) {
+        Some("send") if single && parsed.note_from.is_some() => {
+            if parsed.session.is_some() {
+                return Err(UsageError::Message(
+                    "note send takes --session <sender> or --from automation:<name>, not both"
+                        .into(),
+                ));
+            }
+            require(
+                parsed.to_session.is_some(),
+                "note send requires --to-session <recipient>",
+            )?;
+            require(
+                parsed.message.is_some(),
+                "note send requires --message <text>",
+            )
+        }
+        Some("send") if single => {
+            if parsed.fingerprint.is_some() {
+                return Err(UsageError::Message(
+                    "--fingerprint applies only to note send --from automation:<name>".into(),
+                ));
+            }
+            require(
+                parsed.session.is_some(),
+                "note send requires --session <sender>",
+            )?;
+            require(
+                parsed.to_session.is_some(),
+                "note send requires --to-session <recipient>",
+            )?;
+            require(
+                parsed.message.is_some(),
+                "note send requires --message <text>",
+            )
+        }
+        Some("list") if single => require(
+            parsed.session.is_some(),
+            "note list requires --session <recipient>",
+        ),
+        Some("ack") if single => {
+            require(
+                parsed.session.is_some(),
+                "note ack requires --session <recipient>",
+            )?;
+            if parsed.automation_note_id.is_some() {
+                if parsed.note_id.is_some() {
+                    return Err(UsageError::Message(
+                        "note ack takes --id or --automation-id, not both".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            require(
+                parsed.note_id.is_some(),
+                "note ack requires --id <note-id> or --automation-id <note-id>",
+            )
+        }
+        Some(other) => Err(UsageError::Message(format!(
+            "unknown note action {other:?} — expected send, list, or ack"
+        ))),
+        None => Err(UsageError::Message(
+            "note requires an action: send, list, or ack".into(),
+        )),
+    }
+}
+
 /// `broker note`.
 pub(super) fn run_note(parsed: Parsed) -> Result<(), UsageError> {
+    validate_note_arguments(&parsed)?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     match parsed.positional.first().map(String::as_str) {
         Some("send") if parsed.positional.len() == 1 && parsed.note_from.is_some() => {
@@ -1348,6 +1477,33 @@ pub(super) fn run_note(parsed: Parsed) -> Result<(), UsageError> {
 
 /// `broker ownership`: named operations a session declared it is driving.
 pub(super) fn run_ownership(parsed: Parsed) -> Result<(), UsageError> {
+    // Refuse a malformed command before the writable open below, whose
+    // startup maintenance a refused command must not trigger.
+    match parsed.positional.first().map(String::as_str) {
+        None | Some("list") => {}
+        Some(verb @ ("claim" | "release")) => {
+            if parsed.positional.get(1).is_none() {
+                return Err(UsageError::Message(
+                    "ownership claim/release requires a name".into(),
+                ));
+            }
+            if parsed.session.is_none() {
+                return Err(UsageError::Message(format!(
+                    "ownership {verb} requires --session <id>"
+                )));
+            }
+            if verb == "claim" && parsed.reason.is_none() {
+                return Err(UsageError::Message(
+                    "ownership claim requires --reason <what it is for>".into(),
+                ));
+            }
+        }
+        Some(other) => {
+            return Err(UsageError::Message(format!(
+                "unknown ownership action {other:?} — expected list, claim, or release"
+            )));
+        }
+    }
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     let name = || {
         parsed

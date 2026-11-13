@@ -689,15 +689,10 @@ fn sweep_witnesses(repo: &Path) -> (Vec<String>, i64) {
     (keys, gc_events)
 }
 
-/// Every writable broker open resumes GC maintenance and runs a bounded
-/// inline sweep that may remove an eligible closed checkout. A command refused
-/// for a malformed argument must refuse before that open, so it changes
-/// nothing. Removal itself depends on how much of the 250 ms budget the
-/// runner gets, so the test asserts on what every unspaced inline pass writes
-/// however fast it runs: its last report. The closing control shows that a
-/// writable open in this very fixture writes it.
-#[test]
-fn malformed_commands_refuse_before_the_writable_open_and_change_nothing() {
+/// A repository whose one landed, closed session checkout is eligible for
+/// unattended removal on the next writable broker open (grace 0, auto removal
+/// on). Returns the temporary root and that checkout.
+fn eligible_closed_checkout_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
@@ -737,6 +732,19 @@ fn malformed_commands_refuse_before_the_writable_open_and_change_nothing() {
         "[retention]\nclosed_worktree_grace_hours = 0\n",
     )
     .unwrap();
+    (tmp, worktree)
+}
+
+/// Every writable broker open resumes GC maintenance and runs a bounded
+/// inline sweep that may remove an eligible closed checkout. A command refused
+/// for a malformed argument must refuse before that open, so it changes
+/// nothing. Removal itself depends on how much of the 250 ms budget the
+/// runner gets, so the test asserts on what every unspaced inline pass writes
+/// however fast it runs: its last report. The closing control shows that a
+/// writable open in this very fixture writes it.
+#[test]
+fn malformed_commands_refuse_before_the_writable_open_and_change_nothing() {
+    let (tmp, worktree) = eligible_closed_checkout_fixture();
 
     let digest_shaped = "0".repeat(64);
     let refusals: [(&[&str], &str); 8] = [
@@ -818,4 +826,121 @@ fn malformed_commands_refuse_before_the_writable_open_and_change_nothing() {
         !witnesses.is_empty(),
         "a writable open in this fixture must leave a sweep witness"
     );
+}
+
+/// Every command that refuses a malformed argument which needs no broker
+/// state must refuse before the writable open, as above: one row per command
+/// whose argument checks moved ahead of `Broker::open`, each in its public
+/// `advanced` spelling.
+#[test]
+fn more_malformed_commands_refuse_before_the_writable_open_and_change_nothing() {
+    let (tmp, worktree) = eligible_closed_checkout_fixture();
+    let refusals: [(&[&str], &str); 14] = [
+        (
+            &["advanced", "operations", "frobnicate"],
+            "unknown operations action",
+        ),
+        (&["advanced", "advisories"], "advisories requires an action"),
+        (
+            &["advanced", "exposures", "apply"],
+            "exposures apply requires --session",
+        ),
+        (&["advanced", "note", "frobnicate"], "unknown note action"),
+        (
+            &["advanced", "ownership", "claim"],
+            "ownership claim/release requires a name",
+        ),
+        (
+            &[
+                "advanced",
+                "quality-report",
+                "frobnicate",
+                "report.json",
+                "--repo",
+                "owner/name",
+                "--pr",
+                "1",
+            ],
+            "unknown quality-report action",
+        ),
+        (
+            &[
+                "advanced",
+                "review",
+                "state",
+                "--repo",
+                "owner/name",
+                "--pr",
+                "1",
+                "--type",
+                "code",
+                "--state",
+                "requested",
+                "--head",
+                "not-hex",
+            ],
+            "is not a commit",
+        ),
+        (
+            &[
+                "advanced",
+                "review",
+                "waive",
+                "--repo",
+                "owner/name",
+                "--pr",
+                "1",
+                "--type",
+                "code",
+                "--head",
+                "not-hex",
+                "--reason",
+                "fixture",
+            ],
+            "is not a commit",
+        ),
+        (
+            &["advanced", "handoff"],
+            "handoff requires --session <id> or --worktree <path>",
+        ),
+        (
+            &["advanced", "checkpoint", "apply", "--session", "9999"],
+            "checkpoint apply requires --confirm",
+        ),
+        (
+            &["advanced", "queue", "frobnicate"],
+            "queue accepts no selectors",
+        ),
+        (
+            &["advanced", "watch", "pr", "frobnicate"],
+            "unknown watch pr action",
+        ),
+        (
+            &["advanced", "watch", "repo", "frobnicate"],
+            "unknown watch repo action",
+        ),
+        (
+            &["advanced", "deliveries", "frobnicate"],
+            "unknown deliveries action",
+        ),
+    ];
+    for (args, refusal) in refusals {
+        reset_sweep_witnesses(tmp.path());
+        let (_, gc_events_before) = sweep_witnesses(tmp.path());
+        let output = run(tmp.path(), args);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "{args:?} succeeded: {text}");
+        assert!(text.contains(refusal), "{args:?}: {text}");
+        let (witnesses, gc_events) = sweep_witnesses(tmp.path());
+        assert!(
+            witnesses.is_empty(),
+            "{args:?} was refused after a writable broker open ran its sweep: {witnesses:?}"
+        );
+        assert_eq!(gc_events, gc_events_before, "{args:?} wrote a GC event");
+        assert!(worktree.exists(), "{args:?} removed the eligible checkout");
+    }
 }

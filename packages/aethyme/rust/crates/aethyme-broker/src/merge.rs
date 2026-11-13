@@ -132,6 +132,11 @@ pub struct PromoteConfig {
     /// written (`mode = "auto"`, `mode = "manual"`, `promote_on_submit = true`).
     /// Ignored; only reported.
     pub ignored_promotion_setting: Option<String>,
+    /// The retired `[publication] allow_break_glass` setting, as written
+    /// (`allow_break_glass = true`), read from the same configuration so
+    /// `broker status` can say to delete it. It authorized the deleted
+    /// `ship execute --break-glass`; ignored, only reported.
+    pub ignored_break_glass_setting: Option<String>,
 }
 
 fn invalid_promote_mode_warning(value: Option<&str>) -> String {
@@ -162,6 +167,7 @@ impl PromoteConfig {
                 Self {
                     branch: DEFAULT_INTEGRATION_BRANCH.to_string(),
                     ignored_promotion_setting: None,
+                    ignored_break_glass_setting: None,
                 },
                 Some(format!(
                     "repository configuration is unresolved ({})",
@@ -175,6 +181,7 @@ impl PromoteConfig {
         let mut config = Self {
             branch: DEFAULT_INTEGRATION_BRANCH.to_string(),
             ignored_promotion_setting: None,
+            ignored_break_glass_setting: None,
         };
         let mut warning = None;
         let Some(text) = text else {
@@ -209,6 +216,12 @@ impl PromoteConfig {
             {
                 config.ignored_promotion_setting = Some("promote_on_submit = true".to_string());
             }
+        }
+        if let Some(value) = value
+            .get("publication")
+            .and_then(|publication| publication.get("allow_break_glass"))
+        {
+            config.ignored_break_glass_setting = Some(format!("allow_break_glass = {value}"));
         }
         (config, warning)
     }
@@ -2494,6 +2507,31 @@ mod verdict_tests {
         assert!(
             warning(Some("[promote\n")).is_some(),
             "a broken file still warns"
+        );
+    }
+
+    /// `[publication] allow_break_glass` gated the deleted break-glass ship.
+    /// It still parses and is remembered only so status can say to delete it.
+    #[test]
+    fn a_retired_break_glass_setting_is_only_remembered() {
+        use super::PromoteConfig;
+
+        let ignored =
+            |text: Option<&str>| PromoteConfig::from_text(text).0.ignored_break_glass_setting;
+        assert_eq!(ignored(None), None);
+        assert_eq!(ignored(Some("[publication]\nmode = \"direct\"\n")), None);
+        assert_eq!(
+            ignored(Some("[publication]\nallow_break_glass = true\n")).as_deref(),
+            Some("allow_break_glass = true")
+        );
+        assert_eq!(
+            ignored(Some("[publication]\nallow_break_glass = false\n")).as_deref(),
+            Some("allow_break_glass = false")
+        );
+        assert_eq!(
+            PromoteConfig::from_text(Some("[publication]\nallow_break_glass = true\n")).1,
+            None,
+            "a retired key is not an invalid configuration"
         );
     }
 

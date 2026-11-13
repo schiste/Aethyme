@@ -133,6 +133,56 @@ fn verify_only_and_unconfigured_repositories_carry_no_removal_warning() {
     }
 }
 
+/// `[publication] allow_break_glass` authorized the deleted break-glass
+/// ship. An old configuration still opens and submits; status carries exactly
+/// one warning saying to delete the key, and a configuration without it none.
+#[test]
+fn a_retired_break_glass_setting_loads_and_warns_once() {
+    let repo = FixtureRepository::new();
+    git(repo.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.path().join("README.md"), "fixture\n").unwrap();
+    std::fs::write(repo.path().join(".gitignore"), "/.aethyme/\n").unwrap();
+    std::fs::create_dir_all(repo.path().join(".aethyme")).unwrap();
+    std::fs::write(
+        repo.path().join(".aethyme/config.toml"),
+        "[publication]\nmode = \"direct\"\nallow_break_glass = true\n",
+    )
+    .unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-qm", "init"]);
+    let mut broker = open_fixture_repository_broker(&repo).unwrap();
+    let session = commit_work(&mut broker, "retired-break-glass");
+    let outcome = broker.submit(session).unwrap();
+    assert_eq!(outcome.entry.status, MergeStatus::Verified);
+
+    let rows: Vec<_> = broker
+        .status_brief(0)
+        .unwrap()
+        .advice
+        .into_iter()
+        .filter(|advice| advice.id == "config.allow-break-glass-removed")
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].severity.as_str(), "warning");
+    assert!(
+        rows[0]
+            .summary
+            .contains("allow_break_glass = true is ignored"),
+        "{}",
+        rows[0].summary
+    );
+
+    let (_clean, mut clean_broker) = fixture(None);
+    assert!(
+        clean_broker
+            .status_brief(0)
+            .unwrap()
+            .advice
+            .iter()
+            .all(|advice| advice.id != "config.allow-break-glass-removed")
+    );
+}
+
 /// `verify-only` verifies and moves nothing. The entry records the
 /// verification, because the audit trail is the point of submitting at all.
 #[test]

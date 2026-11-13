@@ -83,7 +83,12 @@ pub enum ShipPublicationMode {
 pub struct ShipPublicationPolicy {
     pub schema_version: u32,
     pub mode: ShipPublicationMode,
-    pub allow_break_glass: bool,
+    /// Retired: it authorized `broker advanced ship execute --break-glass`,
+    /// which was deleted with the ship commands. Existing configurations still
+    /// parse; the value is ignored and `broker status` reports
+    /// `config.allow-break-glass-removed` so the operator can delete it.
+    #[serde(rename = "allow_break_glass", skip_serializing)]
+    pub retired_allow_break_glass: Option<bool>,
 }
 
 impl Default for ShipPublicationPolicy {
@@ -91,7 +96,7 @@ impl Default for ShipPublicationPolicy {
         Self {
             schema_version: PUBLICATION_POLICY_SCHEMA_VERSION,
             mode: ShipPublicationMode::Direct,
-            allow_break_glass: false,
+            retired_allow_break_glass: None,
         }
     }
 }
@@ -255,7 +260,8 @@ pub(crate) fn ls_remote_sha(output: &str, ref_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        REPOSITORY_DELIVERY_POLICY_SCHEMA_VERSION, RepositoryDeliveryConfig, checkout_paths_collide,
+        REPOSITORY_DELIVERY_POLICY_SCHEMA_VERSION, RepositoryDeliveryConfig, ShipPublicationMode,
+        ShipPublicationPolicy, checkout_paths_collide,
     };
 
     #[test]
@@ -329,5 +335,30 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// `allow_break_glass` gated the deleted `ship execute --break-glass`.
+    /// An old configuration still loads, the value changes nothing, and it
+    /// never reappears in serialized policy.
+    #[test]
+    fn publication_policy_parses_and_ignores_the_retired_break_glass_key() {
+        for value in ["true", "false"] {
+            let policy = ShipPublicationPolicy::from_config_text(&format!(
+                "[publication]\nmode = \"review_gated\"\nallow_break_glass = {value}\n"
+            ))
+            .unwrap();
+            assert_eq!(policy.mode, ShipPublicationMode::ReviewGated);
+            assert_eq!(
+                policy.retired_allow_break_glass,
+                Some(value == "true"),
+                "allow_break_glass = {value}"
+            );
+            let json = serde_json::to_value(&policy).unwrap();
+            assert!(json.get("allow_break_glass").is_none(), "{json}");
+            assert!(json.get("retired_allow_break_glass").is_none(), "{json}");
+        }
+        let policy =
+            ShipPublicationPolicy::from_config_text("[publication]\nmode = \"direct\"\n").unwrap();
+        assert_eq!(policy.retired_allow_break_glass, None);
     }
 }

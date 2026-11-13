@@ -1552,22 +1552,140 @@ pub(super) fn remove_inherited_git_config_overrides(command: &mut Command) {
         .env_remove("GIT_CONFIG_COUNT");
 }
 
+/// `gh` flags that take a value, in any of the commands whose file
+/// arguments [`gh_file_arguments`] reads. Their value is skipped, so text such
+/// as `--title -F` is never mistaken for a flag. A value flag missing here
+/// lets its value be read as a flag again; a switch listed here would hide the
+/// argument after it, which is why per-command switches are carved out in
+/// [`gh_command_switches`].
+const GH_VALUE_FLAGS: &[&str] = &[
+    "-R",
+    "--repo",
+    "--hostname",
+    "-t",
+    "--title",
+    "-b",
+    "--body",
+    "-B",
+    "--base",
+    "-H",
+    "--head",
+    "--header",
+    "-l",
+    "--label",
+    "--add-label",
+    "--remove-label",
+    "-a",
+    "--assignee",
+    "--add-assignee",
+    "--remove-assignee",
+    "-r",
+    "--reviewer",
+    "--add-reviewer",
+    "--remove-reviewer",
+    "-m",
+    "--milestone",
+    "-p",
+    "--project",
+    "--add-project",
+    "--remove-project",
+    "-T",
+    "--template",
+    "-q",
+    "--jq",
+    "-X",
+    "--method",
+    "--raw-field",
+    "--cache",
+    "--preview",
+    "-n",
+    "--notes",
+    "--notes-start-tag",
+    "--target",
+    "--discussion-category",
+    "--attach",
+    "-c",
+    "--comment",
+    "-s",
+    "--state",
+    "-S",
+    "--search",
+    "-L",
+    "--limit",
+    "-A",
+    "--author",
+    "--json",
+    "--ref",
+    "--subject",
+    "--match-head-commit",
+    "--author-email",
+];
+
+/// Flags in [`GH_VALUE_FLAGS`] that are switches under one command:
+/// `gh pr merge` (`--merge`, `--rebase`, `--squash`) and `gh pr review`
+/// (`--approve`, `--comment`, `--request-changes`).
+fn gh_command_switches(subcommand: Option<(&str, &str)>) -> &'static [&'static str] {
+    match subcommand {
+        Some(("pr", "merge")) => &["-m", "-r", "-s"],
+        Some(("pr", "review")) => &["-a", "-c", "--comment", "-r"],
+        _ => &[],
+    }
+}
+
+/// Whether `flag` takes the next argument as its value here. `-f` is
+/// `--raw-field` under `api` and `workflow` but `--fill`, a switch, under
+/// `pr create`.
+fn gh_flag_takes_value(flag: &str, typed_fields: bool, subcommand: Option<(&str, &str)>) -> bool {
+    if flag == "-f" {
+        return typed_fields;
+    }
+    !gh_command_switches(subcommand).contains(&flag) && GH_VALUE_FLAGS.contains(&flag)
+}
+
+/// Whether `-F` is the body (or release-notes) file flag for this command.
+/// Under `api` and `workflow` it is a typed field; elsewhere it may not exist.
+fn gh_short_flag_is_body_file(command: Option<(&str, &str)>) -> bool {
+    matches!(
+        command,
+        Some(("pr", "create" | "edit" | "comment" | "review" | "merge"))
+            | Some(("issue", "create" | "edit" | "comment"))
+            | Some(("release", "create" | "edit"))
+    )
+}
+
 /// The files a `gh` command will read itself, as `(flag, path)` pairs.
 ///
 /// `--body-file` and `--notes-file` read a file in every command that has
-/// them; `-F` is that same flag only under `pr`, `issue` and `release`. Under
+/// them; `-F` is that same flag only under the `pr`, `issue` and `release`
+/// actions that take a body (see [`gh_short_flag_is_body_file`]). Under
 /// `api`, `--input` names a file; under `api` and `workflow`, `-F key=@path`
 /// reads one while `-F key=value` does not. `-` means standard input.
+///
+/// The scan is position-aware: the value of a value-taking flag
+/// ([`GH_VALUE_FLAGS`]) is skipped, so `--title -F` names no file, and nothing
+/// after `--` is a flag.
 fn gh_file_arguments(args: &[String]) -> Vec<(String, String)> {
-    let command = gh_subcommand(args).map(|(command, _)| command);
+    let subcommand = gh_subcommand(args);
+    let command = subcommand.map(|(command, _)| command);
     let api = args.first().is_some_and(|first| first == "api") || command == Some("api");
     let typed_fields = api || command == Some("workflow");
-    let short_body_file = !typed_fields && matches!(command, Some("pr" | "issue" | "release"));
+    let short_body_file = !typed_fields && gh_short_flag_is_body_file(subcommand);
     let mut files = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
+        if arg == "--" {
+            break;
+        }
         let (flag, inline) = match arg.split_once('=') {
             Some((flag, value)) if flag.starts_with("--") => (flag, Some(value.to_owned())),
+            // pflag's attached shorthand, `-Fbody.md` or `-F=body.md`.
+            _ if arg.len() > 2 && arg.starts_with("-F") => {
+                let value = &arg[2..];
+                (
+                    "-F",
+                    Some(value.strip_prefix('=').unwrap_or(value).to_owned()),
+                )
+            }
             _ => (arg.as_str(), None),
         };
         let field = match flag {
@@ -1575,7 +1693,12 @@ fn gh_file_arguments(args: &[String]) -> Vec<(String, String)> {
             "--input" if api => false,
             "-F" | "--field" if typed_fields => true,
             "-F" if short_body_file => false,
-            _ => continue,
+            _ => {
+                if inline.is_none() && gh_flag_takes_value(flag, typed_fields, subcommand) {
+                    iter.next();
+                }
+                continue;
+            }
         };
         let Some(value) = inline.or_else(|| iter.next().cloned()) else {
             break;

@@ -1804,6 +1804,17 @@ pub(super) fn run_review_ledger(parsed: Parsed) -> Result<(), UsageError> {
 /// result is recorded as unsolicited. Naming a head is therefore required for
 /// a late result whose completion commit differs from the request it belongs
 /// to.
+/// Refuse a `--head` abbreviation that is not hex of a usable length, with the
+/// message head resolution gives. Reads no broker state.
+fn refuse_malformed_review_head(prefix: &str) -> Result<(), UsageError> {
+    match crate::review::resolve_review_head_prefix(std::iter::empty::<&str>(), prefix) {
+        Err(crate::review::HeadPrefixError::Malformed(message)) => {
+            Err(UsageError::Message(message))
+        }
+        _ => Ok(()),
+    }
+}
+
 pub(super) fn run_review_state(parsed: Parsed) -> Result<(), UsageError> {
     let repository = parsed.repository.clone().ok_or_else(|| {
         UsageError::Message(
@@ -1896,6 +1907,12 @@ pub(super) fn run_review_state(parsed: Parsed) -> Result<(), UsageError> {
         }
         None
     };
+    // A head that is not a commit at all is a usage error; refuse it before
+    // the writable open below, whose startup maintenance a refused command
+    // must not trigger. Matching it against recorded heads needs the broker.
+    if let Some(prefix) = parsed.head.as_deref().filter(|prefix| prefix.len() < 40) {
+        refuse_malformed_review_head(prefix)?;
+    }
 
     let mut broker = open_broker(parsed.read_only_snapshot)?;
 
@@ -2077,6 +2094,11 @@ pub(super) fn run_review_waive(parsed: Parsed) -> Result<(), UsageError> {
                     .into(),
             )
         })?;
+    // As in `review state`: a head that is not a commit at all is refused
+    // before the writable open, whose startup maintenance it must not trigger.
+    if head_argument.len() < 40 {
+        refuse_malformed_review_head(&head_argument)?;
+    }
 
     let mut broker = open_broker(parsed.read_only_snapshot)?;
 

@@ -206,6 +206,7 @@ impl Broker {
             (
                 promote_config.ignored_promotion_setting.clone(),
                 promote_config_warning,
+                promote_config.ignored_break_glass_setting.clone(),
             ),
             None,
         );
@@ -743,6 +744,7 @@ impl Broker {
             (
                 promote_config.ignored_promotion_setting.clone(),
                 promote_config_warning,
+                promote_config.ignored_break_glass_setting.clone(),
             ),
             checkouts.as_ref(),
         );
@@ -1811,11 +1813,12 @@ impl Broker {
         promoted_conflicts: &[PromotedConflict],
         queue: &[MergeQueueEntry],
         integration: (&str, &str),
-        promotion: (Option<String>, Option<String>),
+        promotion: (Option<String>, Option<String>, Option<String>),
         checkouts: Option<&std::collections::BTreeMap<i64, CheckoutInspection>>,
     ) -> Vec<StatusAdvice> {
         use std::collections::BTreeMap;
-        let (ignored_promotion_setting, promote_config_warning) = promotion;
+        let (ignored_promotion_setting, promote_config_warning, ignored_break_glass_setting) =
+            promotion;
         let (integration_branch, _) = integration;
 
         let mut advice = self.base_failure_incident_status_advice(Some(agents));
@@ -1834,6 +1837,9 @@ impl Broker {
         }
         if let Some(setting) = ignored_promotion_setting {
             advice.push(promotion_removed_advice(&setting));
+        }
+        if let Some(setting) = ignored_break_glass_setting {
+            advice.push(break_glass_removed_advice(&setting));
         }
         let mut latest_queue_by_session = BTreeMap::new();
         for entry in queue {

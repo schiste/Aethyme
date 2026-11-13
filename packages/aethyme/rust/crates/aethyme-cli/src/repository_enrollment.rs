@@ -319,6 +319,26 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The integration ref's commit, when it still plays a part in this
+/// repository; `None` otherwise.
+///
+/// Sessions are cut from, and `submit` verifies against, the fetched default
+/// branch whenever there is one, and enrollment neither creates nor moves
+/// integration. With a fetched default branch the plan therefore does not
+/// read integration at all: leftover commits there cannot be lost, need no
+/// preservation ref, and do not block enrollment. Without one, `submit` still
+/// falls back to integration, so the plan reads, preserves and checks it as
+/// before. The same resolution as `Broker::submission_base`.
+fn integration_ref_in_play(
+    repo: &aethyme_broker::GitRepo,
+    integration_ref: &str,
+) -> Option<String> {
+    if repo.upstream_default().is_some() {
+        return None;
+    }
+    repo.resolve_ref(integration_ref)
+}
+
 pub fn build_plan(repo_hint: &Path) -> Result<FirstEnrollmentPlan, String> {
     build_plan_with_diff(repo_hint).map(|(plan, _)| plan)
 }
@@ -338,7 +358,7 @@ fn build_plan_with_diff(repo_hint: &Path) -> Result<(FirstEnrollmentPlan, String
     let integration_branch = aethyme_broker::PromoteConfig::load(&main_root).branch;
     let integration_ref = format!("refs/heads/{integration_branch}");
     let local_default_sha = repo.resolve_ref(&local_default_ref);
-    let integration_sha = repo.resolve_ref(&integration_ref);
+    let integration_sha = integration_ref_in_play(&repo, &integration_ref);
 
     let disposable = DisposableRemoteTree::new(&main_root, remote, &remote_default)?;
     let (generated_tree, generated_diff) =

@@ -187,6 +187,74 @@ fn plan_is_read_only_digest_bound_and_based_on_current_upstream() {
     assert!(!fixture.clone.join(".aethyme").exists());
 }
 
+/// Leave a local `aethyme/integration` holding a commit neither the local nor
+/// the upstream default branch has, as local promotion used to.
+fn leave_distinct_integration_work(repo: &Path) -> String {
+    git(repo, &["checkout", "-qb", "leftover"]);
+    std::fs::write(repo.join("leftover.txt"), "promoted once\n").unwrap();
+    git(repo, &["add", "leftover.txt"]);
+    git(repo, &["commit", "-qm", "leftover promotion"]);
+    let leftover = git(repo, &["rev-parse", "HEAD"]);
+    git(repo, &["checkout", "-q", "main"]);
+    git(repo, &["branch", "-qD", "leftover"]);
+    git(repo, &["branch", "aethyme/integration", &leftover]);
+    leftover
+}
+
+/// With a fetched default branch, sessions are cut from and verified against
+/// it and enrollment never touches integration, so leftover integration work
+/// is not read: it neither blocks the plan nor gets a preservation ref.
+#[test]
+fn plan_ignores_integration_when_a_default_branch_is_fetched() {
+    let fixture = fixture();
+    leave_distinct_integration_work(&fixture.clone);
+
+    let report = plan(&fixture.clone);
+    assert_eq!(report["safe"], true, "{report:#}");
+    assert_eq!(report["integration_can_rebase_to_upstream"], true);
+    assert!(report["integration"]["exact_sha"].is_null(), "{report:#}");
+    let encoded = serde_json::to_string(&report["preservation_refs"]).unwrap();
+    assert!(!encoded.contains("/integration"), "{encoded}");
+    assert!(
+        report["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|blocker| !blocker.as_str().unwrap().contains("integration")),
+        "{report:#}"
+    );
+}
+
+/// Without a fetched default branch `submit` still falls back to
+/// integration, so the plan keeps reading, preserving and checking it.
+#[test]
+fn plan_still_checks_integration_without_a_fetched_default_branch() {
+    let fixture = fixture();
+    let leftover = leave_distinct_integration_work(&fixture.clone);
+    git(
+        &fixture.clone,
+        &["remote", "set-head", "origin", "--delete"],
+    );
+    git(&fixture.clone, &["branch", "--unset-upstream", "main"]);
+    git(
+        &fixture.clone,
+        &["update-ref", "-d", "refs/remotes/origin/main"],
+    );
+
+    let report = plan(&fixture.clone);
+    assert_eq!(report["safe"], false, "{report:#}");
+    assert_eq!(report["integration_can_rebase_to_upstream"], false);
+    assert_eq!(report["integration"]["exact_sha"], leftover);
+    assert!(
+        report["preservation_refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|preserved| preserved["target_sha"] == leftover.as_str()),
+        "{report:#}"
+    );
+}
+
 #[test]
 fn plan_distinguishes_disjoint_overlap_and_foreign_hook_ownership() {
     let fixture = fixture();

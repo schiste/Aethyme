@@ -1159,6 +1159,27 @@ pub(super) fn promotion_removed_advice(setting: &str) -> StatusAdvice {
     }
 }
 
+/// The `status` row for a configuration that still carries
+/// `[publication] allow_break_glass`. It authorized the deleted
+/// `ship execute --break-glass`; the key is ignored, so the operator should
+/// delete it.
+pub(super) fn break_glass_removed_advice(setting: &str) -> StatusAdvice {
+    StatusAdvice {
+        id: "config.allow-break-glass-removed",
+        severity: StatusAdviceSeverity::Warning,
+        reason: "break-glass publication was removed; the setting is ignored",
+        summary: format!(
+            "[publication] {setting} is ignored: break-glass publication was removed with the \
+             ship commands, so work lands only through the session's pull request. Delete the \
+             setting from .aethyme/config.toml"
+        ),
+        session_id: None,
+        queue_entry_id: None,
+        evidence: vec![format!(".aethyme/config.toml [publication] {setting}")],
+        commands: Vec::new(),
+    }
+}
+
 /// One advice row per session holding unpushed commits, plus one for an
 /// integration branch running ahead of upstream.
 pub(super) fn unpushed_work_advice(

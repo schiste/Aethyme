@@ -1111,7 +1111,10 @@ Each session branch and its pull request are the delivery path, and the
 integration branch plays no part. Local promotion was removed: `verify-only`
 is the only `[promote] mode`, and an old `mode = "auto"` or `"manual"` (or
 `promote_on_submit = true`) still parses, is ignored, and `broker status`
-reports one `promote.mode-removed` warning saying to delete it.
+reports one `promote.mode-removed` warning saying to delete it. Likewise
+`[publication] allow_break_glass`, which authorized the deleted break-glass
+ship, still parses, is ignored, and `broker status` reports one
+`config.allow-break-glass-removed` warning saying to delete it.
 
 - **`broker submit` is a pre-flight against the current default branch.** It
   simulates the merge onto the fetched default branch and gates that tree,
