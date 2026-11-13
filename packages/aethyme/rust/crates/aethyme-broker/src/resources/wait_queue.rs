@@ -4,24 +4,38 @@
 //! records one row in `resource_waiters`. Every later admission decision made
 //! by a current binary respects those rows:
 //!
-//! - **Capacity pools:** a request may be granted only if the pool still has
-//!   room for the units demanded by *every* live waiter that arrived before it,
-//!   plus its own. A later, smaller request may therefore pass an earlier one
-//!   only when that cannot take a unit the earlier one could use.
-//! - **Exclusive keys:** a request may not take a key that an earlier live
-//!   waiter demands.
-//! - **Requests that do not wait** are treated as arriving after every live
-//!   waiter, so they cannot take capacity or keys a waiter would need.
+//! **What a waiter reserves.** A waiter reserves a pool or key only once that
+//! resource has itself been contended for it (the pool did not fit, the key
+//! was held, or an earlier waiter's reservation was in the way). Resources in
+//! its bundle that were free stay usable by others. A reservation is sticky
+//! for the rest of the wait, so a resource cannot slip back and forth between
+//! reserved and taken. If any current conflict is on something the queue does
+//! not manage (a TCP port), the waiter reserves nothing for that attempt: it
+//! keeps its place in line but holds no pool or key against anyone while it
+//! could not run anyway.
 //!
-//! Starvation freedom: the oldest live waiter has nobody ahead of it, so the
-//! queue never gates it. No later grant may take a unit or key it demands
-//! (every later request counts its demand as reserved), so the set of holders
-//! it waits for only shrinks; holders are bounded by their lease lifecycle, so
-//! it is granted in finite time, and the next waiter becomes the oldest.
+//! **Admission.** A request may be granted only if, for every pool it demands,
+//! the pool has room for what is allocated plus the units reserved by every
+//! earlier live waiter, plus its own (against the smallest limit any of them
+//! declared), and it takes no key an earlier live waiter has reserved.
+//! Requests that do not wait are ordered after every live waiter.
 //!
-//! TCP ports and namespaces are not queued: a namespace never conflicts, and a
-//! port's availability is decided by the operating system, which the store
-//! cannot reserve for a waiter.
+//! **Starvation freedom** (for bundles of pools and keys). The oldest live
+//! waiter W has nobody ahead, so the queue never gates it. While W is not
+//! granted, some resource of its bundle is contended and becomes reserved;
+//! reservations only accumulate, so after at most one event per resource in
+//! its bundle every resource that blocks W is reserved. From then on no later
+//! grant can take a reserved unit or key: a reserved pool's allocation only
+//! falls until W fits and then keeps room for W, and a reserved key is not
+//! granted to anyone else. Holders end in finite time (release, TTL expiry, or
+//! reclaim of a dead holder), so W is granted; the next waiter becomes the
+//! oldest, and by induction every waiter is served. A bundle that also needs a
+//! TCP port is outside this guarantee while the port is short, because the
+//! operating system, not the store, decides when a port frees.
+//!
+//! **Order** is the row's `AUTOINCREMENT` ticket alone, so a wall-clock step
+//! cannot reorder the queue; a waiter whose row was reaped while it still
+//! polled re-enters with its original ticket.
 //!
 //! Waiter rows are advisory to older binaries, which neither read nor write
 //! them. The table is created additively with `CREATE TABLE IF NOT EXISTS` and
@@ -31,20 +45,19 @@ use super::*;
 
 pub(super) const RESOURCE_WAITER_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS resource_waiters (
- ticket INTEGER PRIMARY KEY,
+ ticket INTEGER PRIMARY KEY AUTOINCREMENT,
  request_id TEXT NOT NULL UNIQUE,
  request_digest TEXT NOT NULL,
  repository TEXT NOT NULL,
  run_id TEXT NOT NULL,
  waiter_pid INTEGER,
  demands TEXT NOT NULL,
+ reserved TEXT NOT NULL DEFAULT '[]',
  enqueued_at INTEGER NOT NULL,
  deadline_at INTEGER NOT NULL,
  heartbeat_at INTEGER NOT NULL,
  times_skipped INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS resource_waiters_by_arrival
- ON resource_waiters(enqueued_at, ticket);
 "#;
 
 pub(super) const QUEUE_REPORT_SCHEMA: &str = "aethyme.host-resource-queue/v1";
@@ -87,8 +100,12 @@ pub(super) struct QueuedWaiter {
     pub repository: String,
     pub run_id: String,
     pub waiter_pid: Option<i64>,
-    /// `None` when the stored JSON could not be read; such a row is reaped.
+    /// Everything the request needs from the queue. `None` when the stored
+    /// JSON could not be read; such a row is reaped.
     pub demands: Option<Vec<WaiterDemand>>,
+    /// The subset it currently holds against later requests. `None` when
+    /// unreadable; such a row is reaped.
+    pub reserved: Option<Vec<WaiterDemand>>,
     pub enqueued_at: i64,
     pub deadline_at: i64,
     pub heartbeat_at: i64,
@@ -96,8 +113,8 @@ pub(super) struct QueuedWaiter {
 }
 
 impl QueuedWaiter {
-    fn arrival(&self) -> (i64, i64) {
-        (self.enqueued_at, self.ticket)
+    fn arrival(&self) -> i64 {
+        self.ticket
     }
 
     /// Gone process, passed deadline, stale heartbeat or unreadable demands.
@@ -105,6 +122,7 @@ impl QueuedWaiter {
     /// its deadline, still see its row instead of reaping it.
     pub fn is_dead(&self, now: i64) -> bool {
         self.demands.is_none()
+            || self.reserved.is_none()
             || self.deadline_at.saturating_add(WAITER_DEADLINE_GRACE_MS) <= now
             || self.heartbeat_at.saturating_add(WAITER_STALE_MS) <= now
             || self.waiter_pid.is_some_and(holder_process_is_gone)
@@ -114,8 +132,12 @@ impl QueuedWaiter {
         self.demands.as_deref().unwrap_or(&[])
     }
 
+    pub fn reserved(&self) -> &[WaiterDemand] {
+        self.reserved.as_deref().unwrap_or(&[])
+    }
+
     fn units_on(&self, pool: &str) -> u64 {
-        self.demands()
+        self.reserved()
             .iter()
             .filter(|demand| demand.kind == "capacity" && demand.value == pool)
             .filter_map(|demand| demand.units)
@@ -126,10 +148,20 @@ impl QueuedWaiter {
         demands.iter().any(|demand| self.shares(demand))
     }
 
+    /// Whether this waiter currently reserves the same pool or key.
     fn shares(&self, demand: &WaiterDemand) -> bool {
-        self.demands()
+        self.reserved()
             .iter()
             .any(|own| own.kind == demand.kind && own.value == demand.value)
+    }
+
+    /// Smallest limit this waiter reserved the pool under.
+    fn limit_on(&self, pool: &str) -> Option<u32> {
+        self.reserved()
+            .iter()
+            .filter(|demand| demand.kind == "capacity" && demand.value == pool)
+            .filter_map(|demand| demand.limit)
+            .min()
     }
 }
 
@@ -137,9 +169,10 @@ impl QueuedWaiter {
 pub(super) struct WaitRegistration {
     pub pid: i64,
     pub deadline_at: i64,
-    /// Original arrival time, kept if this waiter's row was reaped while it
-    /// still polled (for example after the machine slept), so it re-enters at
-    /// its original place instead of the back.
+    /// Original ticket and arrival time, kept if this waiter's row was reaped
+    /// while it still polled (for example after a long stall), so it re-enters
+    /// at its original place instead of the back.
+    pub ticket: Option<i64>,
     pub enqueued_at: Option<i64>,
 }
 
@@ -210,6 +243,9 @@ pub struct HostResourceWaiter {
 pub struct HostResourceWaiterDemand {
     pub kind: String,
     pub resource: String,
+    /// Whether the waiter currently holds this resource against later
+    /// requests (it has been contended for it).
+    pub reserved: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub units: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -249,12 +285,13 @@ pub(super) fn load_waiters(conn: &Connection) -> Result<Vec<QueuedWaiter>, HostR
     }
     let mut stmt = conn.prepare(
         "SELECT ticket,request_id,request_digest,repository,run_id,waiter_pid,demands,\
-         enqueued_at,deadline_at,heartbeat_at,times_skipped \
-         FROM resource_waiters ORDER BY enqueued_at,ticket",
+         enqueued_at,deadline_at,heartbeat_at,times_skipped,reserved \
+         FROM resource_waiters ORDER BY ticket",
     )?;
     let rows = stmt
         .query_map([], |row| {
             let demands: String = row.get(6)?;
+            let reserved: String = row.get(11)?;
             Ok(QueuedWaiter {
                 ticket: row.get(0)?,
                 request_id: row.get(1)?,
@@ -267,6 +304,7 @@ pub(super) fn load_waiters(conn: &Connection) -> Result<Vec<QueuedWaiter>, HostR
                 deadline_at: row.get(8)?,
                 heartbeat_at: row.get(9)?,
                 times_skipped: u64::try_from(row.get::<_, i64>(10)?).unwrap_or(0),
+                reserved: serde_json::from_str(&reserved).ok(),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -406,7 +444,16 @@ pub(super) fn queue_conflicts(
         }
         if demand.kind == "capacity" {
             let pool = demand.value.as_str();
-            let limit = u64::from(demand.limit.unwrap_or(0));
+            // Against the smallest declared limit: a request with a larger
+            // limit must not overbook a pool earlier waiters reserved.
+            let limit = u64::from(
+                earlier
+                    .iter()
+                    .filter_map(|waiter| waiter.limit_on(pool))
+                    .chain(demand.limit)
+                    .min()
+                    .unwrap_or(0),
+            );
             let requested = demand.units.unwrap_or(0);
             let used = allocated_units(occupied, pool);
             let reserved = earlier
@@ -525,6 +572,7 @@ pub(super) fn queue_report(
 /// it does not wake every other waiter.
 pub(super) fn registration_needs_write(
     own: Option<&QueuedWaiter>,
+    reserved: &[WaiterDemand],
     registration: &WaitRegistration,
     now: i64,
 ) -> bool {
@@ -532,47 +580,117 @@ pub(super) fn registration_needs_write(
         now.saturating_sub(own.heartbeat_at) >= WAITER_HEARTBEAT_REFRESH_MS
             || own.waiter_pid != Some(registration.pid)
             || own.deadline_at != registration.deadline_at
+            || own.reserved() != reserved
     })
+}
+
+/// Contended resources of this request: the pools and keys named by an
+/// ordinary-contention conflict (holders or earlier reservations in the way).
+/// `None` when a conflict is on something the queue does not manage, such as
+/// a TCP port: then the waiter reserves nothing for this attempt.
+pub(super) fn contended_demands(
+    request: &HostResourceRequest,
+    demands: &[WaiterDemand],
+    conflicts: &[HostResourceConflict],
+) -> Option<Vec<WaiterDemand>> {
+    if conflicts
+        .iter()
+        .any(|conflict| conflict.kind != "capacity" && conflict.kind != "exclusive_key")
+    {
+        return None;
+    }
+    Some(
+        demands
+            .iter()
+            .filter(|demand| {
+                requirement_key_for(request, demand).is_some_and(|key| {
+                    conflicts.iter().any(|conflict| {
+                        conflict.code == "resource_contention" && conflict.resource_key == key
+                    })
+                })
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
+/// What this waiter reserves after an attempt: its earlier reservations plus
+/// the resources contended now (sticky), or nothing while an unqueued
+/// resource blocks it. Kept in the order of `demands`.
+pub(super) fn next_reservation(
+    demands: &[WaiterDemand],
+    contended: Option<&[WaiterDemand]>,
+    own: Option<&QueuedWaiter>,
+) -> Vec<WaiterDemand> {
+    let Some(contended) = contended else {
+        return Vec::new();
+    };
+    let same = |a: &WaiterDemand, b: &WaiterDemand| a.kind == b.kind && a.value == b.value;
+    demands
+        .iter()
+        .filter(|demand| {
+            contended.iter().any(|other| same(demand, other))
+                || own.is_some_and(|own| own.reserved().iter().any(|other| same(demand, other)))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Insert this request's waiter row, or refresh its heartbeat. Returns
 /// whether it wrote.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the row binds request identity, demand sets and registration explicitly"
+)]
 pub(super) fn register_waiter(
     conn: &Connection,
     request: &HostResourceRequest,
     digest: &str,
     demands: &[WaiterDemand],
+    reserved: &[WaiterDemand],
     registration: &WaitRegistration,
     own: Option<&QueuedWaiter>,
     now: i64,
 ) -> Result<bool, HostResourceError> {
+    let to_json = |value: &[WaiterDemand]| {
+        serde_json::to_string(value)
+            .map_err(|error| HostResourceError::InvalidRequest(error.to_string()))
+    };
     match own {
         Some(own) => {
-            if !registration_needs_write(Some(own), registration, now) {
+            if !registration_needs_write(Some(own), reserved, registration, now) {
                 return Ok(false);
             }
             conn.execute(
-                "UPDATE resource_waiters SET heartbeat_at=?2,waiter_pid=?3,deadline_at=?4 \
-                 WHERE ticket=?1",
-                params![own.ticket, now, registration.pid, registration.deadline_at],
+                "UPDATE resource_waiters SET heartbeat_at=?2,waiter_pid=?3,deadline_at=?4,\
+                 reserved=?5 WHERE ticket=?1",
+                params![
+                    own.ticket,
+                    now,
+                    registration.pid,
+                    registration.deadline_at,
+                    to_json(reserved)?
+                ],
             )?;
             Ok(true)
         }
         None => {
-            let demands = serde_json::to_string(demands)
-                .map_err(|error| HostResourceError::InvalidRequest(error.to_string()))?;
+            // A re-entering waiter keeps its original ticket. AUTOINCREMENT
+            // never hands a deleted ticket to anyone else, so it is free.
             conn.execute(
                 "INSERT INTO resource_waiters \
-                 (request_id,request_digest,repository,run_id,waiter_pid,demands,\
-                  enqueued_at,deadline_at,heartbeat_at,times_skipped) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,0)",
+                 (ticket,request_id,request_digest,repository,run_id,waiter_pid,demands,\
+                  reserved,enqueued_at,deadline_at,heartbeat_at,times_skipped) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0)",
                 params![
+                    registration.ticket,
                     request.request_id,
                     digest,
                     request.repository,
                     request.run_id,
                     registration.pid,
-                    demands,
+                    to_json(demands)?,
+                    to_json(reserved)?,
                     registration.enqueued_at.unwrap_or(now).min(now),
                     registration.deadline_at,
                     now
@@ -645,6 +763,7 @@ pub(super) fn waiter_inventory(live: &[QueuedWaiter], now: i64) -> Vec<HostResou
                     .map(|demand| HostResourceWaiterDemand {
                         kind: demand.kind.clone(),
                         resource: demand.value.clone(),
+                        reserved: waiter.shares(demand),
                         units: demand.units,
                         limit: demand.limit,
                     })
@@ -706,6 +825,7 @@ mod tests {
         WaitRegistration {
             pid: i64::from(std::process::id()),
             deadline_at: now_ms() + 600_000,
+            ticket: None,
             enqueued_at: None,
         }
     }
@@ -716,7 +836,7 @@ mod tests {
         request: &HostResourceRequest,
     ) -> HostResourceQueueReport {
         let attempt = coordinator
-            .acquire_attempt(request, false, Some(&registration()))
+            .acquire_attempt(request, false, Some(&registration()), now_ms())
             .unwrap();
         let Err(conflict) = attempt.result else {
             panic!("{} must wait", request.request_id);
@@ -730,7 +850,7 @@ mod tests {
         request: &HostResourceRequest,
     ) -> HostResourceGrant {
         match coordinator
-            .acquire_attempt(request, false, Some(&registration()))
+            .acquire_attempt(request, false, Some(&registration()), now_ms())
             .unwrap()
             .result
         {
@@ -807,7 +927,7 @@ mod tests {
         release(&mut c, &holder);
         // The empty pool belongs to the earlier full-pool request.
         assert!(
-            c.acquire_attempt(&small, false, Some(&registration()))
+            c.acquire_attempt(&small, false, Some(&registration()), now_ms())
                 .unwrap()
                 .result
                 .is_err()
@@ -843,8 +963,8 @@ mod tests {
             c.conn
                 .execute(
                     "INSERT INTO resource_waiters (request_id,request_digest,repository,run_id,\
-                     waiter_pid,demands,enqueued_at,deadline_at,heartbeat_at) \
-                     VALUES (?1,'digest','owner/repo','run',?2,?3,?4,?5,?6)",
+                     waiter_pid,demands,reserved,enqueued_at,deadline_at,heartbeat_at) \
+                     VALUES (?1,'digest','owner/repo','run',?2,?3,?3,?4,?5,?6)",
                     params![
                         request_id,
                         pid,
@@ -862,7 +982,7 @@ mod tests {
         assert_eq!(explained.queue.unwrap().position, 0);
         assert_eq!(waiter_rows(&c).len(), 2, "explain is read-only");
 
-        let attempt = c.acquire_attempt(&next, false, None).unwrap();
+        let attempt = c.acquire_attempt(&next, false, None, now_ms()).unwrap();
         assert!(attempt.result.is_ok());
         assert_eq!(attempt.reaped, 2);
         assert!(waiter_rows(&c).is_empty());
@@ -1027,5 +1147,270 @@ mod tests {
         assert_eq!(queue.resources[0].units_allocated, 2);
         granted(&mut c, &capacity("waiter", 2));
         assert!(waiter_rows(&c).is_empty());
+    }
+
+    fn pool(key: &str, units: u32, limit: u32) -> HostResourceRequirement {
+        HostResourceRequirement {
+            key: key.into(),
+            resource: HostResourceKind::Capacity {
+                pool: "pool".into(),
+                units,
+                limit,
+            },
+        }
+    }
+
+    fn bundle(id: &str, resources: Vec<HostResourceRequirement>) -> HostResourceRequest {
+        let mut request = capacity(id, 1);
+        request.resources = resources;
+        request
+    }
+
+    fn reserved_of(coordinator: &HostResourceCoordinator, request_id: &str) -> Vec<String> {
+        load_waiters(&coordinator.conn)
+            .unwrap()
+            .into_iter()
+            .find(|waiter| waiter.request_id == request_id)
+            .unwrap()
+            .reserved()
+            .iter()
+            .map(|demand| format!("{}:{}", demand.kind, demand.value))
+            .collect()
+    }
+
+    #[test]
+    fn a_waiter_blocked_on_a_port_reserves_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&temp.path().join("h.db")).unwrap();
+        let listener =
+            std::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        c.acquire(&capacity("holder", 2)).unwrap();
+        let waiter = bundle(
+            "port-waiter",
+            vec![
+                pool("slot", 4, 4),
+                HostResourceRequirement {
+                    key: "port".into(),
+                    resource: HostResourceKind::TcpPort {
+                        start: port,
+                        end: port,
+                    },
+                },
+            ],
+        );
+        let queue = contended(&mut c, &waiter);
+        assert!(queue.queued, "it keeps its place in line");
+        assert!(reserved_of(&c, "port-waiter").is_empty());
+        // The two free units are not held for a request that cannot run.
+        c.acquire(&capacity("later", 2)).unwrap();
+        drop(listener);
+    }
+
+    #[test]
+    fn a_waiter_reserves_only_what_was_contended_for_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&temp.path().join("h.db")).unwrap();
+        let key_holder = c.acquire(&key("key-holder", "shared")).unwrap();
+        let waiter = bundle(
+            "bundle",
+            vec![
+                pool("slot", 2, 4),
+                HostResourceRequirement {
+                    key: "lock".into(),
+                    resource: HostResourceKind::ExclusiveKey {
+                        name: "shared".into(),
+                    },
+                },
+            ],
+        );
+        contended(&mut c, &waiter);
+        assert_eq!(reserved_of(&c, "bundle"), vec!["exclusive_key:shared"]);
+        // The pool was free for the waiter, so it is not held against others.
+        let whole = c.acquire(&capacity("whole", 4)).unwrap();
+
+        release(&mut c, &key_holder);
+        // The key it waited for is free but still its turn.
+        let reason = conflict_reason(c.acquire(&key("jumper", "shared")).unwrap_err());
+        assert!(reason.contains("earlier waiting request"), "{reason}");
+        // Now the pool blocks it: the pool joins its (sticky) reservation.
+        contended(&mut c, &waiter);
+        assert_eq!(
+            reserved_of(&c, "bundle"),
+            vec!["capacity:pool", "exclusive_key:shared"]
+        );
+        release(&mut c, &whole);
+        let reason = conflict_reason(c.acquire(&capacity("three", 3)).unwrap_err());
+        assert!(reason.contains("reserved for 1 earlier"), "{reason}");
+        c.acquire(&capacity("one", 1)).unwrap();
+        granted(&mut c, &waiter);
+        assert!(waiter_rows(&c).is_empty());
+    }
+
+    #[test]
+    fn a_larger_declared_limit_cannot_overbook_an_earlier_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&temp.path().join("h.db")).unwrap();
+        let holder = c.acquire(&capacity("holder", 4)).unwrap();
+        let first = capacity("first", 4);
+        contended(&mut c, &first);
+        release(&mut c, &holder);
+
+        let larger = bundle("larger", vec![pool("slot", 2, 8)]);
+        let reason = conflict_reason(c.acquire(&larger).unwrap_err());
+        assert!(reason.contains("reserved for 1 earlier"), "{reason}");
+        granted(&mut c, &first);
+        // Against the live holder the different limit is a policy refusal,
+        // which waiting cannot resolve, so it leaves no waiter row.
+        let attempt = c
+            .acquire_attempt(&larger, false, Some(&registration()), now_ms())
+            .unwrap();
+        let Err(conflict) = attempt.result else {
+            panic!("a mismatched limit must be refused");
+        };
+        assert_eq!(conflict.code, "capacity_policy_mismatch");
+        assert!(waiter_rows(&c).is_empty());
+    }
+
+    #[test]
+    fn a_wait_longer_than_the_stale_threshold_keeps_its_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&temp.path().join("h.db")).unwrap();
+        let mut holder = capacity("holder", 4);
+        holder.ttl_seconds = 3_600;
+        c.acquire(&holder).unwrap();
+        let base = now_ms();
+        let registration = WaitRegistration {
+            pid: i64::from(std::process::id()),
+            deadline_at: base + 36_000_000,
+            ticket: None,
+            enqueued_at: None,
+        };
+        let first = capacity("first", 2);
+        let attempt = c
+            .acquire_attempt(&first, false, Some(&registration), base)
+            .unwrap();
+        let ticket = attempt.ticket.unwrap();
+        // Keep polling for well over the stale threshold.
+        for step in 1..=5 {
+            let now = base + step * (WAITER_STALE_MS / 2);
+            let attempt = c
+                .acquire_attempt(&first, false, Some(&registration), now)
+                .unwrap();
+            assert!(attempt.result.is_err());
+            assert_eq!(attempt.reaped, 0, "the waiter's own row must stay live");
+            assert_eq!(attempt.ticket, Some(ticket), "it must keep its place");
+        }
+        let later = capacity("later", 2);
+        let attempt = c
+            .acquire_attempt(
+                &later,
+                false,
+                Some(&registration),
+                base + 3 * WAITER_STALE_MS,
+            )
+            .unwrap();
+        assert_eq!(attempt.queue.position, 1);
+    }
+
+    #[test]
+    fn a_wait_whose_wall_clock_deadline_passed_ends_without_a_dead_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&temp.path().join("h.db")).unwrap();
+        c.acquire(&key("holder", "shared")).unwrap();
+        let base = now_ms();
+        let calls = std::cell::Cell::new(0_u32);
+        // The process "sleeps" for an hour right after its first attempt.
+        let mut clock = || {
+            let call = calls.get();
+            calls.set(call + 1);
+            if call < 2 { base } else { base + 3_600_000 }
+        };
+        let started = std::time::Instant::now();
+        let error = c
+            .acquire_with_wait_clocked(
+                &key("sleeper", "shared"),
+                std::time::Duration::from_secs(60),
+                false,
+                |_, _| {},
+                &mut clock,
+            )
+            .unwrap_err();
+        assert!(matches!(error, HostResourceError::Conflict { .. }));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(c.last_wait_stats().unwrap().attempts, 1);
+        assert!(waiter_rows(&c).is_empty());
+    }
+
+    #[test]
+    fn re_entry_keeps_the_original_ticket() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&temp.path().join("h.db")).unwrap();
+        c.acquire(&capacity("holder", 4)).unwrap();
+        let first = capacity("first", 2);
+        let ticket = c
+            .acquire_attempt(&first, false, Some(&registration()), now_ms())
+            .unwrap()
+            .ticket
+            .unwrap();
+        contended(&mut c, &capacity("second", 2));
+        // The first waiter's row is lost (as if reaped while it stalled).
+        delete_waiter(&c.conn, "first", None).unwrap();
+        let mut again = registration();
+        again.ticket = Some(ticket);
+        let attempt = c
+            .acquire_attempt(&first, false, Some(&again), now_ms())
+            .unwrap();
+        assert_eq!(attempt.ticket, Some(ticket));
+        assert_eq!(attempt.queue.position, 0);
+        assert_eq!(
+            waiter_rows(&c),
+            vec!["first".to_string(), "second".to_string()]
+        );
+    }
+
+    fn wait_for_waiters(coordinator: &HostResourceCoordinator, count: usize) {
+        for _ in 0..400 {
+            if coordinator.waiting().unwrap().len() >= count {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!("{count} waiter(s) never queued");
+    }
+
+    #[test]
+    fn two_connections_are_served_in_arrival_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("h.db");
+        let mut main = HostResourceCoordinator::open(&db).unwrap();
+        let holder = main.acquire(&capacity("holder", 4)).unwrap();
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spawn = |id: &'static str, units: u32| {
+            let db = db.clone();
+            let order = order.clone();
+            std::thread::spawn(move || {
+                let mut c = HostResourceCoordinator::open(&db).unwrap();
+                let grant = c
+                    .acquire_with_wait(
+                        &capacity(id, units),
+                        std::time::Duration::from_secs(60),
+                        |_| {},
+                    )
+                    .unwrap();
+                order.lock().unwrap().push(id);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                release(&mut c, &grant);
+            })
+        };
+        let big = spawn("big", 4);
+        wait_for_waiters(&main, 1);
+        let small = spawn("small", 2);
+        wait_for_waiters(&main, 2);
+        release(&mut main, &holder);
+        big.join().unwrap();
+        small.join().unwrap();
+        assert_eq!(*order.lock().unwrap(), vec!["big", "small"]);
+        assert!(waiter_rows(&main).is_empty());
     }
 }

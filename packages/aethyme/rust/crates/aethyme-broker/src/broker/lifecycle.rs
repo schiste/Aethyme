@@ -915,7 +915,9 @@ impl BrokerStorageContext {
                 }
             })?;
         let grant = coordinator
-            .acquire_with_wait(&request, Duration::ZERO, |_| {})
+            // A short queued wait, not zero: an earlier waiter may hold this
+            // key for its turn while it is free, which used to succeed here.
+            .acquire_with_wait(&request, crate::resources::BRIEF_ACQUIRE_QUEUE_WAIT, |_| {})
             .map_err(|error| BrokerOpError::InvalidStorageContext {
                 reason: format!(
                     "cannot acquire the repository preparation-cache lease for root initialization: {error}"

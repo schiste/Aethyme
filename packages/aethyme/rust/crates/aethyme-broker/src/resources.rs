@@ -35,6 +35,11 @@ const MAX_TTL_SECONDS: u64 = 86_400;
 /// the host resource database.
 const MAX_MANAGED_STORAGE_ROWS_PER_REPOSITORY: i64 = 16_384;
 const ORPHANED_HOLDER_CONFLICT_CODE: &str = "orphaned_holder";
+/// Bounded queue wait for short in-product acquisitions that never waited
+/// before the queue existed. A live waiter can now reserve a free pool or key
+/// for its turn; this lets such a caller take its own turn when the earlier
+/// waiter is granted and done shortly, instead of failing outright.
+pub(crate) const BRIEF_ACQUIRE_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
@@ -1533,6 +1538,8 @@ pub struct HostResourceCoordinator {
 /// error, so the waiting loop can read the queue standing it computed.
 struct AcquireAttempt {
     result: Result<HostResourceGrant, AttemptConflict>,
+    /// This request's waiter ticket after the attempt, when it has a row.
+    ticket: Option<i64>,
     reaped: u64,
     times_skipped: u64,
     queue: HostResourceQueueReport,
@@ -2906,7 +2913,7 @@ impl HostResourceCoordinator {
         request: &HostResourceRequest,
         supervised: bool,
     ) -> Result<HostResourceGrant, HostResourceError> {
-        self.acquire_attempt(request, supervised, None)?
+        self.acquire_attempt(request, supervised, None, now_ms())?
             .result
             .map_err(HostResourceError::from)
     }
@@ -2921,6 +2928,7 @@ impl HostResourceCoordinator {
         request: &HostResourceRequest,
         supervised: bool,
         registration: Option<&wait_queue::WaitRegistration>,
+        now: i64,
     ) -> Result<AcquireAttempt, HostResourceError> {
         validate_request(request)?;
         let digest = if supervised {
@@ -2928,7 +2936,6 @@ impl HostResourceCoordinator {
         } else {
             request_digest(request)?
         };
-        let now = now_ms();
         let demands = wait_queue::request_demands(request);
         let tx = self
             .conn
@@ -2953,6 +2960,7 @@ impl HostResourceCoordinator {
             tx.commit()?;
             return Ok(AcquireAttempt {
                 result: Ok(HostResourceGrant { lease, ownership_token: token }),
+                ticket: None,
                 reaped,
                 times_skipped: 0,
                 queue: wait_queue::queue_report(&demands, &[], &[], None, &[], now),
@@ -2970,7 +2978,7 @@ impl HostResourceCoordinator {
         if !conflicts.is_empty() {
             let code = aggregate_conflict_code(&conflicts).to_string();
             let contention = code == "resource_contention";
-            let queue = if code == ORPHANED_HOLDER_CONFLICT_CODE {
+            let (queue, ticket) = if code == ORPHANED_HOLDER_CONFLICT_CODE {
                 quarantine_conflicting_orphaned_holders(&tx, now, &conflicts, &occupied)?;
                 if own.is_some() {
                     // Waiting cannot resolve this refusal; stop reserving.
@@ -2982,13 +2990,15 @@ impl HostResourceCoordinator {
                 // Named allocations remain, and rejected-bundle allocations
                 // are not inserted before this branch.
                 tx.commit()?;
-                queue
+                (queue, None)
             } else {
                 let registration = registration.filter(|_| contention);
+                let contended = wait_queue::contended_demands(request, &demands, &conflicts);
+                let reserved = wait_queue::next_reservation(&demands, contended.as_deref(), own);
                 let settle = reaped > 0
                     || (!contention && own.is_some())
                     || registration.is_some_and(|registration| {
-                        wait_queue::registration_needs_write(own, registration, now)
+                        wait_queue::registration_needs_write(own, &reserved, registration, now)
                     });
                 let queue = wait_queue::queue_report(&demands, &occupied, &live, own, &ahead, now);
                 // A retryable refusal rolls back the opportunistic quarantine
@@ -2999,14 +3009,18 @@ impl HostResourceCoordinator {
                         request,
                         &digest,
                         &demands,
+                        contended.as_deref(),
                         registration,
                         !contention,
                         now,
                     )?;
                     let (own, ahead) = wait_queue::split_queue(&refreshed, &request.request_id);
-                    wait_queue::queue_report(&demands, &occupied, &refreshed, own, &ahead, now)
+                    (
+                        wait_queue::queue_report(&demands, &occupied, &refreshed, own, &ahead, now),
+                        own.map(|own| own.ticket),
+                    )
                 } else {
-                    queue
+                    (queue, own.map(|own| own.ticket))
                 }
             };
             let message = conflicts
@@ -3020,6 +3034,7 @@ impl HostResourceCoordinator {
                     message,
                     conflicts,
                 }),
+                ticket,
                 reaped,
                 times_skipped: 0,
                 queue,
@@ -3069,6 +3084,7 @@ impl HostResourceCoordinator {
                 lease,
                 ownership_token,
             }),
+            ticket: None,
             reaped,
             times_skipped: own.map_or(0, |own| own.times_skipped),
             queue,
@@ -3165,38 +3181,60 @@ impl HostResourceCoordinator {
         request: &HostResourceRequest,
         wait: std::time::Duration,
         supervised: bool,
-        mut on_conflict: F,
+        on_conflict: F,
     ) -> Result<HostResourceGrant, HostResourceError>
     where
         F: FnMut(&str, &HostResourceQueueReport),
     {
-        let started = std::time::Instant::now();
-        let deadline = started + wait;
+        self.acquire_with_wait_clocked(request, wait, supervised, on_conflict, &mut now_ms)
+    }
+
+    /// The waiting loop with an injectable wall clock. The wait deadline and
+    /// the waiter row's `deadline_at` come from the same clock, so a process
+    /// that was suspended past its deadline (a sleeping laptop stops the
+    /// monotonic clock, not the wall clock) ends its wait instead of writing
+    /// a row that is already dead.
+    fn acquire_with_wait_clocked<F>(
+        &mut self,
+        request: &HostResourceRequest,
+        wait: std::time::Duration,
+        supervised: bool,
+        mut on_conflict: F,
+        clock: &mut dyn FnMut() -> i64,
+    ) -> Result<HostResourceGrant, HostResourceError>
+    where
+        F: FnMut(&str, &HostResourceQueueReport),
+    {
+        let started_at = clock();
         let deadline_at =
-            now_ms().saturating_add(i64::try_from(wait.as_millis()).unwrap_or(i64::MAX));
+            started_at.saturating_add(i64::try_from(wait.as_millis()).unwrap_or(i64::MAX));
         let pid = i64::from(std::process::id());
         let mut stats = HostResourceWaitStats::default();
+        let mut ticket = None;
         let mut enqueued_at = None;
         let mut tail_gap = wait_queue::TAIL_POLL_MIN;
         let mut last_position = None;
         let result = loop {
-            let registration =
-                (std::time::Instant::now() < deadline).then_some(wait_queue::WaitRegistration {
-                    pid,
-                    deadline_at,
-                    enqueued_at,
-                });
+            let now = clock();
+            let registration = (now < deadline_at).then_some(wait_queue::WaitRegistration {
+                pid,
+                deadline_at,
+                ticket,
+                enqueued_at,
+            });
             stats.attempts = stats.attempts.saturating_add(1);
-            let attempt = match self.acquire_attempt(request, supervised, registration.as_ref()) {
-                Ok(attempt) => attempt,
-                Err(error) => break Err(error),
-            };
+            let attempt =
+                match self.acquire_attempt(request, supervised, registration.as_ref(), now) {
+                    Ok(attempt) => attempt,
+                    Err(error) => break Err(error),
+                };
             stats.reaped_dead_waiters = stats.reaped_dead_waiters.saturating_add(attempt.reaped);
             let queue = attempt.queue;
             if queue.queued {
                 stats.queued = true;
                 stats.times_skipped = queue.times_skipped;
-                if enqueued_at.is_none() {
+                if ticket.is_none() {
+                    ticket = attempt.ticket;
                     enqueued_at = queue.enqueued_at;
                     stats.position_at_enqueue = Some(queue.position);
                 }
@@ -3209,7 +3247,7 @@ impl HostResourceCoordinator {
                 }
                 Err(conflict) => conflict,
             };
-            if conflict.code != "resource_contention" || std::time::Instant::now() >= deadline {
+            if conflict.code != "resource_contention" || clock() >= deadline_at {
                 stats.final_queue = Some(queue);
                 break Err(conflict.into());
             }
@@ -3231,10 +3269,11 @@ impl HostResourceCoordinator {
             // interval still applies.
             let version = self.data_version().ok();
             loop {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
+                let remaining_ms = deadline_at.saturating_sub(clock());
+                if remaining_ms <= 0 {
                     break;
                 }
+                let remaining = std::time::Duration::from_millis(remaining_ms as u64);
                 std::thread::sleep(remaining.min(wait_queue::POLL_TICK));
                 stats.poll_ticks = stats.poll_ticks.saturating_add(1);
                 let elapsed = attempted.elapsed();
@@ -3254,7 +3293,7 @@ impl HostResourceCoordinator {
                 self.withdraw_waiter(&request.request_id, pid),
             );
         }
-        stats.waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        stats.waited_ms = u64::try_from(clock().saturating_sub(started_at)).unwrap_or(0);
         self.last_wait = Some(stats);
         result
     }
@@ -3269,11 +3308,16 @@ impl HostResourceCoordinator {
     /// the refused attempt's opportunistic sweep stays rolled back: reap dead
     /// waiters, then register (or refresh) this waiter when it may wait, or
     /// remove its row when it may not. Returns the live waiters afterwards.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "bookkeeping binds the refused attempt's identity and findings explicitly"
+    )]
     fn settle_waiter(
         &mut self,
         request: &HostResourceRequest,
         digest: &str,
         demands: &[wait_queue::WaiterDemand],
+        contended: Option<&[wait_queue::WaiterDemand]>,
         registration: Option<&wait_queue::WaitRegistration>,
         withdraw: bool,
         now: i64,
@@ -3292,7 +3336,17 @@ impl HostResourceCoordinator {
                         request.request_id.clone(),
                     ));
                 }
-                wait_queue::register_waiter(&tx, request, digest, demands, registration, own, now)?;
+                let reserved = wait_queue::next_reservation(demands, contended, own);
+                wait_queue::register_waiter(
+                    &tx,
+                    request,
+                    digest,
+                    demands,
+                    &reserved,
+                    registration,
+                    own,
+                    now,
+                )?;
             }
             None if withdraw => {
                 wait_queue::delete_waiter(&tx, &request.request_id, None)?;

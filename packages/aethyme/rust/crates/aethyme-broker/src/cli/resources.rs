@@ -1442,15 +1442,20 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                         let demands = waiter
                             .demands
                             .iter()
-                            .map(|demand| match demand.units {
-                                Some(units) => format!(
-                                    "{} {}:{}/{}",
-                                    demand.kind,
-                                    demand.resource,
-                                    units,
-                                    demand.limit.unwrap_or(0)
-                                ),
-                                None => format!("{} {}", demand.kind, demand.resource),
+                            .map(|demand| {
+                                let reserved = if demand.reserved { " (reserved)" } else { "" };
+                                match demand.units {
+                                    Some(units) => format!(
+                                        "{} {}:{}/{}{reserved}",
+                                        demand.kind,
+                                        demand.resource,
+                                        units,
+                                        demand.limit.unwrap_or(0)
+                                    ),
+                                    None => {
+                                        format!("{} {}{reserved}", demand.kind, demand.resource)
+                                    }
+                                }
                             })
                             .collect::<Vec<_>>()
                             .join(", ");
