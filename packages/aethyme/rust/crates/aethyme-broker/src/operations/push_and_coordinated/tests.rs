@@ -3034,6 +3034,110 @@ fn gh_file_arguments_name_only_files_gh_itself_will_read() {
     assert!(files(&["pr", "create", "--input", "x"]).is_empty());
 }
 
+/// `-F` is the body file only under the `pr`, `issue` and `release` actions
+/// that take one; under `api` and `workflow` it is a field, and elsewhere it
+/// may not exist. The value of another flag is never read as a flag, nothing
+/// after `--` is a flag, and `-` is standard input.
+#[test]
+fn gh_file_arguments_are_subcommand_and_position_aware() {
+    let files = |argv: &[&str]| gh_file_arguments(&gh(argv));
+    let pair = |flag: &str, path: &str| vec![(flag.to_owned(), path.to_owned())];
+    let cases: &[(&[&str], Vec<(String, String)>)] = &[
+        // Body files.
+        (
+            &["pr", "create", "--title", "t", "-F", "b.md"][..],
+            pair("-F", "b.md"),
+        ),
+        (&["pr", "edit", "7", "-F", "b.md"], pair("-F", "b.md")),
+        (&["pr", "comment", "7", "-F", "b.md"], pair("-F", "b.md")),
+        (&["issue", "create", "-F", "b.md"], pair("-F", "b.md")),
+        (&["issue", "edit", "3", "-F", "b.md"], pair("-F", "b.md")),
+        (&["issue", "comment", "3", "-F", "b.md"], pair("-F", "b.md")),
+        (&["pr", "create", "-Fb.md"], pair("-F", "b.md")),
+        (&["pr", "create", "-F=b.md"], pair("-F", "b.md")),
+        // A switch that shares a value flag's shorthand does not swallow -F.
+        (&["pr", "create", "-f", "-F", "b.md"], pair("-F", "b.md")),
+        (
+            &["pr", "merge", "7", "-s", "-F", "b.md"],
+            pair("-F", "b.md"),
+        ),
+        (
+            &["pr", "review", "7", "-r", "-F", "b.md"],
+            pair("-F", "b.md"),
+        ),
+        // Typed fields.
+        (&["api", "graphql", "-F", "body=@b.md"], pair("-F", "b.md")),
+        // A literal value of another flag is never a flag.
+        (
+            &["pr", "create", "--title", "-F", "--body", "x"],
+            Vec::new(),
+        ),
+        (&["pr", "create", "-t", "-F", "-b", "-F"], Vec::new()),
+        (&["pr", "create", "--title=-F", "--body", "-F"], Vec::new()),
+        (
+            &["issue", "comment", "3", "--body", "--body-file"],
+            Vec::new(),
+        ),
+        (&["pr", "close", "7", "-c", "-F"], Vec::new()),
+        (&["-R", "-F", "pr", "list"], Vec::new()),
+        (&["api", "repos/o/r/issues", "-F", "title=-F"], Vec::new()),
+        (
+            &["api", "graphql", "-f", "query=-F", "-H", "-F"],
+            Vec::new(),
+        ),
+        // `-F` that is not a body file here.
+        (&["pr", "list", "-F", "b.md"], Vec::new()),
+        (&["pr", "view", "7", "-F", "b.md"], Vec::new()),
+        (&["issue", "close", "3", "-F", "b.md"], Vec::new()),
+        (&["repo", "edit", "-F", "b.md"], Vec::new()),
+        (&["workflow", "run", "ci.yml", "-F", "ref=main"], Vec::new()),
+        // Standard input and everything after `--`.
+        (&["pr", "create", "-F", "-"], Vec::new()),
+        (&["issue", "create", "--body-file", "-"], Vec::new()),
+        (
+            &["release", "create", "v1", "--notes-file", "-"],
+            Vec::new(),
+        ),
+        (
+            &["pr", "create", "--title", "t", "--", "-F", "b.md"],
+            Vec::new(),
+        ),
+    ];
+    for (argv, expected) in cases {
+        assert_eq!(&files(argv), expected, "{argv:?}");
+    }
+}
+
+/// The cases a position-blind or subcommand-blind check refused although
+/// `gh` would read no file, next to the ones that must still be refused.
+#[test]
+fn gh_file_validation_refuses_only_real_missing_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let check = |argv: &[&str]| validate_gh_file_arguments(&gh(argv), dir.path());
+    for argv in [
+        &["pr", "create", "--title", "-F", "--body", "missing.md"][..],
+        &["pr", "create", "-t", "-F", "-b", "text"],
+        &["pr", "list", "-F", "missing.md"],
+        &["issue", "close", "3", "-F", "missing.md"],
+        &["api", "repos/o/r/issues", "-F", "title=missing.md"],
+        &["workflow", "run", "ci.yml", "-F", "ref=missing.md"],
+        &["pr", "create", "-F", "-"],
+        &["pr", "create", "--", "-F", "missing.md"],
+    ] {
+        assert!(check(argv).is_ok(), "{argv:?} must not be refused");
+    }
+    for argv in [
+        &["issue", "create", "-F", "missing.md"][..],
+        &["pr", "comment", "7", "-F", "missing.md"],
+        &["pr", "create", "-Fmissing.md"],
+        &["pr", "create", "--title", "-F", "--body-file", "missing.md"],
+        &["api", "graphql", "-F", "query=@missing.graphql"],
+    ] {
+        let error = check(argv).unwrap_err().to_string();
+        assert!(error.contains("cannot be read"), "{argv:?}: {error}");
+    }
+}
+
 #[test]
 fn gh_file_validation_refuses_missing_empty_and_directory_paths_only() {
     let dir = tempfile::tempdir().unwrap();
