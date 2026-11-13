@@ -201,12 +201,15 @@ remains available without waiting for the window.
 Besides the named build outputs, three test-tool outputs count when their own
 layout proves them: `.hypothesis/` holding only Hypothesis's entries,
 `playwright-report/` holding only `index.html`, `data/` and `trace/`, and
-`test-results/` holding Playwright's `.last-run.json`. Any ignored directory
+`test-results/` holding Playwright's `.last-run.json`, each only when the
+same protected-name walk described below finds nothing beneath it. Any ignored directory
 that carries a `CACHEDIR.TAG` beginning with the standard signature
 (`Signature: 8a477f597d28d172789f06886806bc55`, see bford.info/cachedir) is
 regenerable by its tool's own declaration, unless a bounded walk beneath it
 finds a protected name (`.env*`, `*.key`, `*.pem`, `*.p12`, `*.pfx`,
-`*.sqlite*`, `*.db`, `.aethyme`) or more than 20,000 entries; then it keeps
+`*.sqlite*`, `*.db`, `*.kdbx`, `id_*` private keys without `.pub`, `.netrc`,
+`.npmrc`, `.pypirc`, `credentials.json`, `.aethyme`), an unreadable entry or
+more than 20,000 entries; then it keeps
 the checkout. A tag only in a subdirectory does not cover its parent. Generic
 names (`logs`, `dist` without a manifest, `build`, `out`, `tmp`) are never
 recognised by name: configure them.

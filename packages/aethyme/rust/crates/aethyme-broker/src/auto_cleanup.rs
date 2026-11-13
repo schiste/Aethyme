@@ -47,10 +47,10 @@ use crate::{Broker, BrokerOpError, GitRepo};
 /// | `.venv` | `pyvenv.cfg` inside |
 /// | `build`, `dist` | a sibling `package.json`, `setup.py`, `pyproject.toml` or `CMakeLists.txt` |
 /// | `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache` | always (tool caches) |
-/// | `.hypothesis` | only Hypothesis's own entries (`examples`, `unicode_data`, ...) |
-/// | `playwright-report` | only `index.html`, `data/` and `trace/` |
-/// | `test-results` | Playwright's `.last-run.json` status file inside |
-/// | any other name | a `CACHEDIR.TAG` with the standard signature inside, and no protected name (`.env*`, keys, databases, `.aethyme`) anywhere beneath it |
+/// | `.hypothesis` | only Hypothesis's own entries (`examples`, `unicode_data`, ...), and no protected name beneath |
+/// | `playwright-report` | only `index.html`, `data/` and `trace/`, and no protected name beneath |
+/// | `test-results` | Playwright's `.last-run.json` status file inside, and no protected name beneath |
+/// | any other name | a `CACHEDIR.TAG` with the standard signature inside, and no protected name (`.env*`, keys, credentials, databases, `.aethyme`) anywhere beneath it |
 ///
 /// Names are compared as whole path components: `target-notes/`,
 /// `my_build/` and `targets.json` are not build output.
@@ -487,26 +487,34 @@ fn has_cache_directory_tag(directory: &Path) -> bool {
         .is_ok_and(|()| prefix.as_slice() == CACHEDIR_TAG_SIGNATURE)
 }
 
-/// Names that never become disposable because a cache tag sits above them:
-/// the same secrets, keys, databases and broker state a configured
-/// `regenerable` glob may never match ([`GLOB_PROBES`]).
+/// Names that never become disposable because a cache tag or a test-tool
+/// witness sits above them: the secrets, keys, credentials, databases and
+/// broker state a configured `regenerable` glob may never match
+/// ([`GLOB_PROBES`]), plus SSH private keys (`id_*` without `.pub`) and
+/// package-manager and password-store credential files.
 fn protected_cache_entry(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower == ".env"
         || lower.starts_with(".env.")
         || lower == ".aethyme"
-        || [".key", ".pem", ".p12", ".pfx", ".sqlite", ".sqlite3", ".db"]
-            .iter()
-            .any(|suffix| lower.ends_with(suffix))
+        || (lower.starts_with("id_") && !lower.ends_with(".pub"))
+        || [".netrc", ".npmrc", ".pypirc", "credentials.json"].contains(&lower.as_str())
+        || [
+            ".key", ".pem", ".p12", ".pfx", ".sqlite", ".sqlite3", ".db", ".kdbx",
+        ]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
 }
 
 /// A tagged cache directory whose bounded walk finds no protected name.
-/// Symlinks are judged by name and never followed; an unreadable entry, a
-/// non-Unicode name or a walk past [`TAGGED_CACHE_ENTRY_LIMIT`] keeps it.
 fn tagged_cache_without_protected_entries(directory: &Path) -> bool {
-    if !has_cache_directory_tag(directory) {
-        return false;
-    }
+    has_cache_directory_tag(directory) && subtree_free_of_protected_entries(directory)
+}
+
+/// A bounded walk of the whole subtree finds no protected name. Symlinks are
+/// judged by name and never followed; an unreadable entry, a non-Unicode
+/// name or a walk past [`TAGGED_CACHE_ENTRY_LIMIT`] keeps the directory.
+fn subtree_free_of_protected_entries(directory: &Path) -> bool {
     let mut pending = vec![directory.to_path_buf()];
     let mut examined = 0_usize;
     while let Some(current) = pending.pop() {
@@ -539,8 +547,8 @@ fn tagged_cache_without_protected_entries(directory: &Path) -> bool {
 }
 
 /// Hypothesis's example database (`.hypothesis/`): only the subdirectories
-/// and ignore file Hypothesis writes, and at least one of its stores. Any
-/// other entry keeps it.
+/// and ignore file Hypothesis writes, at least one of its stores, and no
+/// protected name anywhere beneath. Any other entry keeps it.
 fn hypothesis_database(directory: &Path) -> bool {
     only_known_entries(
         directory,
@@ -554,22 +562,23 @@ fn hypothesis_database(directory: &Path) -> bool {
             ".DS_Store",
         ],
         &["examples", "unicode_data"],
-    )
+    ) && subtree_free_of_protected_entries(directory)
 }
 
 /// Playwright's HTML report: `index.html` plus its `data/` and `trace/`
-/// folders, and nothing else.
+/// folders, nothing else, and no protected name anywhere beneath.
 fn playwright_html_report(directory: &Path) -> bool {
     only_known_entries(
         directory,
         &["index.html", "data", "trace", ".DS_Store"],
         &["index.html"],
-    )
+    ) && subtree_free_of_protected_entries(directory)
 }
 
 /// Playwright's test output folder, proved by the `.last-run.json` status
 /// file Playwright writes there. Playwright empties this folder at the start
-/// of every run, so nothing a person puts in it survives the next run.
+/// of every run, so nothing a person puts in it survives the next run; a
+/// protected name anywhere beneath still keeps it.
 fn playwright_output_directory(directory: &Path) -> bool {
     let last_run = directory.join(".last-run.json");
     let Ok(metadata) = std::fs::symlink_metadata(&last_run) else {
@@ -586,10 +595,11 @@ fn playwright_output_directory(directory: &Path) -> bool {
                 .get("status")
                 .is_some_and(serde_json::Value::is_string)
         })
+        && subtree_free_of_protected_entries(directory)
 }
 
-/// Every top-level entry of `directory` is in `allowed`, and each name in
-/// `required` is present. Unreadable entries keep the directory.
+/// Every top-level entry of `directory` is in `allowed`, and at least one
+/// name in `required` is present. Unreadable entries keep the directory.
 fn only_known_entries(directory: &Path, allowed: &[&str], required: &[&str]) -> bool {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return false;
@@ -8948,6 +8958,85 @@ mod tests {
         touch(root, "test-results/junit.xml");
         assert!(classify(root, "test-results/", &policy).is_err());
         std::fs::write(root.join("test-results/.last-run.json"), "not json").unwrap();
+        assert!(classify(root, "test-results/", &policy).is_err());
+    }
+
+    /// A protected file nested two levels deep keeps each witnessed test-tool
+    /// directory, however well its top level matches the tool's layout.
+    #[test]
+    fn witnessed_test_tool_outputs_keep_a_nested_protected_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = AutoCleanupPolicy::default();
+        touch(root, ".hypothesis/examples/0a1b/.env");
+        assert!(classify(root, ".hypothesis/", &policy).is_err());
+        touch(root, "playwright-report/index.html");
+        touch(root, "playwright-report/data/attachments/deploy.pem");
+        assert!(classify(root, "playwright-report/", &policy).is_err());
+        std::fs::create_dir_all(root.join("test-results")).unwrap();
+        std::fs::write(
+            root.join("test-results/.last-run.json"),
+            r#"{"status":"passed"}"#,
+        )
+        .unwrap();
+        touch(root, "test-results/spec-chromium/state/app.sqlite");
+        assert!(classify(root, "test-results/", &policy).is_err());
+    }
+
+    /// Every protected name keeps a tagged cache when it sits two levels
+    /// below the tag; a public key alone does not.
+    #[test]
+    fn every_protected_name_keeps_a_tagged_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = AutoCleanupPolicy::default();
+        for (index, name) in [
+            "server.key",
+            "bundle.p12",
+            "bundle.pfx",
+            "app.db",
+            "app.sqlite3",
+            "id_rsa",
+            "id_ed25519",
+            "id_ecdsa",
+            ".netrc",
+            ".npmrc",
+            ".pypirc",
+            "credentials.json",
+            "vault.kdbx",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let cache = format!("guarded-cache-{index}");
+            touch(root, &format!("{cache}/nested/deeper/{name}"));
+            std::fs::write(root.join(&cache).join("CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+            assert!(
+                classify(root, &format!("{cache}/"), &policy).is_err(),
+                "{name}"
+            );
+        }
+        touch(root, "public-cache/nested/deeper/id_ed25519.pub");
+        std::fs::write(root.join("public-cache/CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        assert_eq!(classify(root, "public-cache/", &policy), Ok(()));
+    }
+
+    /// `.hypothesis` needs one of its stores, not only its ignore file, and
+    /// an oversized `.last-run.json` proves nothing.
+    #[test]
+    fn test_tool_witnesses_require_their_store_and_a_bounded_status_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = AutoCleanupPolicy::default();
+        touch(root, ".hypothesis/.gitignore");
+        assert!(classify(root, ".hypothesis/", &policy).is_err());
+        std::fs::create_dir_all(root.join("test-results")).unwrap();
+        let padding = " ".repeat(1024 * 1024);
+        std::fs::write(
+            root.join("test-results/.last-run.json"),
+            format!(r#"{{"status":"passed"}}{padding}"#),
+        )
+        .unwrap();
         assert!(classify(root, "test-results/", &policy).is_err());
     }
 
