@@ -340,16 +340,12 @@ impl AutoCleanupPolicy {
                         })
                         .ok_or_else(|| format!("[cleanup] {key} must be a list of strings"))?;
                     for glob in &list {
-                        let matcher = globset::Glob::new(glob)
-                            .map_err(|error| format!("[cleanup] {key} glob {glob:?}: {error}"))?
-                            .compile_matcher();
-                        if key == "regenerable"
-                            && let Some(probe) =
-                                GLOB_PROBES.iter().find(|probe| matcher.is_match(probe))
-                        {
-                            return Err(format!(
-                                "[cleanup] regenerable glob {glob:?} matches {probe:?}; it may only name build-output directories"
-                            ));
+                        if key == "regenerable" {
+                            validate_regenerable_glob(glob)?;
+                        } else {
+                            globset::Glob::new(glob).map_err(|error| {
+                                format!("[cleanup] {key} glob {glob:?}: {error}")
+                            })?;
                         }
                     }
                     if key == "regenerable" {
@@ -395,12 +391,84 @@ impl AutoCleanupPolicy {
                 .is_some_and(|name| set.is_match(Path::new(name)))
     }
 
-    /// Whether a configured `regenerable` glob names this directory,
-    /// relative to the worktree root. Configured globs only ever apply to
-    /// directories, never to files.
+    /// Whether a configured `regenerable` glob names this directory (or
+    /// link), relative to the worktree root. `*` may cross `/` here, as it
+    /// always has for directory roots.
     fn configured_regenerable_dir(&self, relative_dir: &str) -> bool {
         !self.regenerable.is_empty() && Self::glob_set(&self.regenerable).is_match(relative_dir)
     }
+
+    /// Whether a configured `regenerable` glob names this standalone regular
+    /// file by its whole path relative to the worktree root. Stricter than
+    /// the directory match so a pattern written for directories does not
+    /// reach files in unrelated places: `*`, `?` and `[...]` stay within one
+    /// path component, and a pattern containing `**` never names a file.
+    fn configured_regenerable_file(&self, relative_file: &str) -> bool {
+        !self.regenerable.is_empty() && file_glob_set(&self.regenerable).is_match(relative_file)
+    }
+}
+
+/// The matcher [`AutoCleanupPolicy::configured_regenerable_file`] uses.
+fn file_glob_set(globs: &[String]) -> globset::GlobSet {
+    let mut builder = globset::GlobSetBuilder::new();
+    for glob in globs.iter().filter(|glob| !glob.contains("**")) {
+        if let Ok(glob) = globset::GlobBuilder::new(glob)
+            .literal_separator(true)
+            .build()
+        {
+            builder.add(glob);
+        }
+    }
+    builder
+        .build()
+        .unwrap_or_else(|_| globset::GlobSet::empty())
+}
+
+/// A `[cleanup] regenerable` glob is valid when it compiles and matches none
+/// of [`GLOB_PROBES`], under either the directory or the file rule.
+fn validate_regenerable_glob(glob: &str) -> Result<(), String> {
+    let matcher = globset::Glob::new(glob)
+        .map_err(|error| format!("[cleanup] regenerable glob {glob:?}: {error}"))?
+        .compile_matcher();
+    if let Some(probe) = GLOB_PROBES.iter().find(|probe| matcher.is_match(probe)) {
+        return Err(format!(
+            "[cleanup] regenerable glob {glob:?} matches {probe:?}; it may only name regenerable output"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether any component of `relative` is a protected name
+/// ([`protected_cache_entry`]). Judged by name only; nothing is opened.
+fn protected_ignored_path(relative: &str) -> bool {
+    relative
+        .trim_end_matches('/')
+        .split('/')
+        .any(protected_cache_entry)
+}
+
+/// Why a protected standalone ignored entry stays even though a configured
+/// `regenerable` glob names it.
+const PROTECTED_NAME_REASON: &str =
+    "has a protected name, which [cleanup] regenerable never releases";
+
+/// The `.aethyme/config.toml` line that would release exactly this
+/// standalone ignored file, or why no line can.
+pub(crate) fn regenerable_file_config_line(relative_file: &str) -> Result<String, String> {
+    if protected_ignored_path(relative_file) {
+        return Err(
+            "protected name: [cleanup] regenerable never releases it; review and delete it, or keep the checkout"
+                .into(),
+        );
+    }
+    let glob = globset::escape(relative_file);
+    validate_regenerable_glob(&glob).map_err(|_| {
+        "[cleanup] regenerable refuses a pattern naming it, since that pattern matches a secret or ordinary root-file name; review and delete it, or keep the checkout".to_string()
+    })?;
+    if !file_glob_set(std::slice::from_ref(&glob)).is_match(relative_file) {
+        return Err("no [cleanup] regenerable pattern can name this path; review and delete it, or keep the checkout".into());
+    }
+    Ok(format!("[cleanup] regenerable = [{}]", toml_string(&glob)))
 }
 
 /// Whether `relative_dir` (no trailing slash) is a recognised build-output
@@ -753,8 +821,30 @@ pub(crate) fn classify_ignored_for_recovery(
     relative: &str,
     policy: &AutoCleanupPolicy,
 ) -> Result<RecoveryIgnoredClassification, String> {
+    classify_ignored_entry(worktree, relative, policy).map(|(classification, _)| classification)
+}
+
+/// Which rule decided a standalone ignored entry, for phase counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IgnoredEntryRule {
+    /// Any rule other than the two below.
+    Other,
+    /// A configured `regenerable` glob released a standalone regular file.
+    FilePattern,
+    /// A configured `regenerable` glob named a protected standalone entry,
+    /// which therefore stays.
+    ProtectedRefusal,
+}
+
+/// [`classify_ignored_for_recovery`], with the rule that decided it.
+fn classify_ignored_entry(
+    worktree: &Path,
+    relative: &str,
+    policy: &AutoCleanupPolicy,
+) -> Result<(RecoveryIgnoredClassification, IgnoredEntryRule), String> {
+    let other = |classification| (classification, IgnoredEntryRule::Other);
     if policy.strict {
-        return Ok(RecoveryIgnoredClassification::StrictRefusal);
+        return Ok(other(RecoveryIgnoredClassification::StrictRefusal));
     }
     let trimmed = relative.trim_end_matches('/');
     if trimmed.is_empty()
@@ -768,44 +858,74 @@ pub(crate) fn classify_ignored_for_recovery(
     if (!relative.ends_with('/') && name == ".DS_Store")
         || crate::runtime_paths::is_broker_runtime_path(relative)
     {
-        return Ok(RecoveryIgnoredClassification::DisposableOutput);
+        return Ok(other(RecoveryIgnoredClassification::DisposableOutput));
     }
+    // Never follow a link: the entry is judged as the link itself.
     let metadata = std::fs::symlink_metadata(worktree.join(trimmed))
         .map_err(|error| format!("cannot stat ignored path {relative}: {error}"))?;
     // Aethyme's own deploy output, byte for byte, holds no user data. Anything
     // else at the same path (a merged or edited settings file) falls through
     // to the protection below with its existing reason.
     if unmodified_generated_artifact(worktree, trimmed, &metadata) {
-        return Ok(if metadata.is_dir() {
+        return Ok(other(if metadata.is_dir() {
             RecoveryIgnoredClassification::DisposableDirectory
         } else {
             RecoveryIgnoredClassification::DisposableOutput
-        });
+        }));
     }
     // Git ignore rules do not prove a directory is regenerable. Do not walk
     // arbitrary ignored trees or follow symlinks: preserve unknown roots.
     if metadata.is_dir() {
-        return Ok(if regenerable_dir(worktree, trimmed, policy).is_some() {
-            RecoveryIgnoredClassification::DisposableDirectory
+        return Ok(other(
+            if regenerable_dir(worktree, trimmed, policy).is_some() {
+                RecoveryIgnoredClassification::DisposableDirectory
+            } else {
+                RecoveryIgnoredClassification::Preserve(
+                    "is not a recognised build-output directory",
+                )
+            },
+        ));
+    }
+    if let Some((enclosing, cargo_target)) = enclosing_regenerable(worktree, trimmed, policy) {
+        // The entry itself matched: a link with a recognised dependency
+        // name or one a configured glob names. Removal only unlinks it, but
+        // a configured glob still never releases a protected name.
+        if enclosing == trimmed && protected_ignored_path(trimmed) {
+            return Ok((
+                RecoveryIgnoredClassification::Preserve(PROTECTED_NAME_REASON),
+                IgnoredEntryRule::ProtectedRefusal,
+            ));
+        }
+        if trimmed.split('/').any(|component| component == ".aethyme") && !cargo_target {
+            return Ok(other(RecoveryIgnoredClassification::Preserve(
+                "holds Aethyme state",
+            )));
+        }
+        // The policy declares this output disposable. Package fixtures routinely
+        // contain keys, databases, dangling links and hundreds of thousands of files;
+        // inspecting those contents both invents blockers and scales with the output.
+        // Worktree removal unlinks symlinks; it never follows their targets.
+        return Ok(other(RecoveryIgnoredClassification::DisposableOutput));
+    }
+    // A standalone regular file the repository names by its whole path. A
+    // protected name stays whatever the configuration says.
+    if !relative.ends_with('/') && metadata.is_file() && policy.configured_regenerable_file(trimmed)
+    {
+        return Ok(if protected_ignored_path(trimmed) {
+            (
+                RecoveryIgnoredClassification::Preserve(PROTECTED_NAME_REASON),
+                IgnoredEntryRule::ProtectedRefusal,
+            )
         } else {
-            RecoveryIgnoredClassification::Preserve("is not a recognised build-output directory")
+            (
+                RecoveryIgnoredClassification::DisposableOutput,
+                IgnoredEntryRule::FilePattern,
+            )
         });
     }
-    let Some((_enclosing, cargo_target)) = enclosing_regenerable(worktree, trimmed, policy) else {
-        return Ok(RecoveryIgnoredClassification::Preserve(
-            "is not inside a recognised build-output directory",
-        ));
-    };
-    if trimmed.split('/').any(|component| component == ".aethyme") && !cargo_target {
-        return Ok(RecoveryIgnoredClassification::Preserve(
-            "holds Aethyme state",
-        ));
-    }
-    // The policy declares this output disposable. Package fixtures routinely
-    // contain keys, databases, dangling links and hundreds of thousands of files;
-    // inspecting those contents both invents blockers and scales with the output.
-    // Worktree removal unlinks symlinks; it never follows their targets.
-    Ok(RecoveryIgnoredClassification::DisposableOutput)
+    Ok(other(RecoveryIgnoredClassification::Preserve(
+        "is not inside a recognised build-output directory",
+    )))
 }
 
 /// Cleanup's removal verdict remains conservative: only paths with an
@@ -815,7 +935,18 @@ pub(crate) fn classify_ignored(
     relative: &str,
     policy: &AutoCleanupPolicy,
 ) -> Result<(), String> {
-    match classify_ignored_for_recovery(worktree, relative, policy)? {
+    ignored_verdict(
+        relative,
+        classify_ignored_for_recovery(worktree, relative, policy)?,
+    )
+}
+
+/// The removal verdict for one classified ignored entry.
+fn ignored_verdict(
+    relative: &str,
+    classification: RecoveryIgnoredClassification,
+) -> Result<(), String> {
+    match classification {
         RecoveryIgnoredClassification::DisposableDirectory
         | RecoveryIgnoredClassification::DisposableOutput => Ok(()),
         RecoveryIgnoredClassification::Preserve(reason) => {
@@ -2403,6 +2534,7 @@ pub(crate) fn ignored_content_blockers(
         // Keep every listed entry in the existing whole-checkout classifier:
         // typed protection here is only for future in-place artifact discovery.
         let mut blockers = Vec::new();
+        let mut released_by_file_pattern = false;
         for entry in ignored {
             ensure_ignored_content_before(deadline)?;
             let relative = if entry.directory_marker {
@@ -2410,9 +2542,23 @@ pub(crate) fn ignored_content_blockers(
             } else {
                 entry.relative
             };
-            let classification = classify_ignored(worktree, &relative, policy);
+            // A classification error keeps the checkout as a blocker, exactly
+            // as `classify_ignored` reports it.
+            let verdict = classify_ignored_entry(worktree, &relative, policy).and_then(
+                |(classification, rule)| {
+                    match rule {
+                        IgnoredEntryRule::FilePattern => released_by_file_pattern = true,
+                        IgnoredEntryRule::ProtectedRefusal => crate::phase_telemetry::add(
+                            "cleanup_regenerable_protected_refused",
+                            Duration::ZERO,
+                        ),
+                        IgnoredEntryRule::Other => {}
+                    }
+                    ignored_verdict(&relative, classification)
+                },
+            );
             ensure_ignored_content_before(deadline)?;
-            if let Err(reason) = classification {
+            if let Err(reason) = verdict {
                 blockers.push((relative, reason));
                 if blockers.len() >= limit.max(1) {
                     break;
@@ -2420,6 +2566,12 @@ pub(crate) fn ignored_content_blockers(
             }
         }
         ensure_ignored_content_before(deadline)?;
+        if blockers.is_empty() && released_by_file_pattern {
+            crate::phase_telemetry::add(
+                "cleanup_checkout_released_by_file_pattern",
+                Duration::ZERO,
+            );
+        }
         Ok(blockers)
     })
 }
@@ -2669,12 +2821,17 @@ pub struct BlockedByIgnored {
     pub name: String,
     /// Closed checkouts it keeps.
     pub checkouts: usize,
-    /// The `.aethyme/config.toml` line that would declare it regenerable, for
-    /// a directory. Absent for a standalone file, which no glob may release.
-    /// The repository decides: configure it only when the directory holds
+    /// The `.aethyme/config.toml` line that would declare it regenerable:
+    /// the directory itself, or for a standalone file its exact path as a
+    /// glob. The repository decides: configure it only when the path holds
     /// nothing but output its tools regenerate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_line: Option<String>,
+    /// Why no configuration line can release this standalone file (a
+    /// protected name, or a path a pattern cannot name on its own). Absent
+    /// whenever `config_line` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_refusal: Option<String>,
 }
 
 /// Aggregate remembered keep verdicts whose checkout still exists.
@@ -2690,12 +2847,26 @@ fn blocked_by_ignored_from_memo(memo: &KeepMemo) -> Vec<BlockedByIgnored> {
     }
     let mut rows = counts
         .into_iter()
-        .map(|(name, checkouts)| BlockedByIgnored {
-            name: name.to_string(),
-            checkouts,
-            config_line: name
-                .strip_suffix('/')
-                .map(|directory| format!("[cleanup] regenerable = [{}]", toml_string(directory))),
+        .map(|(name, checkouts)| {
+            let (config_line, config_refusal) = match name.strip_suffix('/') {
+                Some(directory) => (
+                    Some(format!(
+                        "[cleanup] regenerable = [{}]",
+                        toml_string(directory)
+                    )),
+                    None,
+                ),
+                None => match regenerable_file_config_line(name) {
+                    Ok(line) => (Some(line), None),
+                    Err(refusal) => (None, Some(refusal)),
+                },
+            };
+            BlockedByIgnored {
+                name: name.to_string(),
+                checkouts,
+                config_line,
+                config_refusal,
+            }
         })
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| {
@@ -2747,14 +2918,16 @@ pub(crate) fn checkout_capacity_refusal_detail(report: Option<&AutoCleanupReport
         report.deferred
     );
     if let Some(blocked) = report.blocked_by_ignored.first() {
-        match &blocked.config_line {
-            Some(line) => detail.push_str(&format!(
+        match (&blocked.config_line, &blocked.config_refusal) {
+            (Some(line), _) => detail.push_str(&format!(
                 "; ignored {} keeps {} closed checkout(s): if it holds only regenerable output, adding `{line}` to .aethyme/config.toml releases them",
                 blocked.name, blocked.checkouts
             )),
-            None => detail.push_str(&format!(
-                "; ignored file {} keeps {} closed checkout(s): review and delete it",
-                blocked.name, blocked.checkouts
+            (None, refusal) => detail.push_str(&format!(
+                "; ignored file {} keeps {} closed checkout(s): {}",
+                blocked.name,
+                blocked.checkouts,
+                refusal.as_deref().unwrap_or("review and delete it")
             )),
         }
     } else if report.deferred > 0 {
@@ -6710,6 +6883,53 @@ mod tests {
             "{reason}"
         );
         assert!(root.join("opaque/nested/user-data.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_pattern_releases_and_protected_refusals_are_counted() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "user.name", "Auto cleanup test"]);
+        git(
+            root,
+            &["config", "user.email", "auto-cleanup@example.invalid"],
+        );
+        std::fs::write(root.join(".gitignore"), "reports/*\n!reports/README.md\n").unwrap();
+        touch(root, "reports/README.md");
+        git(root, &["add", ".gitignore", "reports/README.md"]);
+        git(root, &["commit", "-qm", "ignore generated reports"]);
+        touch(root, "reports/quality-1.json");
+        let policy = AutoCleanupPolicy {
+            regenerable: vec!["reports/*.json".into(), "reports/*.pem".into()],
+            ..Default::default()
+        };
+
+        let recorder = crate::phase_telemetry::Recorder::default();
+        {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            assert_eq!(
+                super::ignored_content_blockers(root, &policy, 16).unwrap(),
+                Vec::<(String, String)>::new()
+            );
+            touch(root, "reports/signing.pem");
+            let blockers = super::ignored_content_blockers(root, &policy, 16).unwrap();
+            assert_eq!(blockers.len(), 1, "{blockers:?}");
+            assert_eq!(blockers[0].0, "reports/signing.pem");
+            assert!(blockers[0].1.contains("protected name"), "{blockers:?}");
+        }
+        let (_, counts) = recorder.totals();
+        assert_eq!(
+            counts.get("cleanup_checkout_released_by_file_pattern"),
+            Some(&1),
+            "{counts:?}"
+        );
+        assert_eq!(
+            counts.get("cleanup_regenerable_protected_refused"),
+            Some(&1),
+            "{counts:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -10838,6 +11058,7 @@ mod tests {
                 name: "project-cache/".into(),
                 checkouts: 1,
                 config_line: Some("[cleanup] regenerable = [\"project-cache\"]".into()),
+                config_refusal: None,
             }]
         );
         assert!(slice.index_complete, "{slice:#?}");
@@ -10948,6 +11169,7 @@ mod tests {
                 name: "project-cache/".into(),
                 checkouts: 1,
                 config_line: Some("[cleanup] regenerable = [\"project-cache\"]".into()),
+                config_refusal: None,
             }]
         );
         assert_eq!(first.lanes.unwrap().removal_memo_skips, 0);
@@ -10987,6 +11209,74 @@ mod tests {
             !worktree.exists(),
             "the configured cache no longer keeps it"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_standalone_ignored_file_is_named_with_its_line_and_released_by_a_file_pattern() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let root = broker.main_root().to_path_buf();
+        std::fs::write(root.join(".git/info/exclude"), "quality-*.json\n").unwrap();
+        let (_session, worktree) = closed_landed_checkout(&mut broker, "generated report file");
+        touch(&worktree, "quality-report.json");
+        // A link the same pattern names is unlinked; its target is not touched.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("kept.json"), "outside\n").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("kept.json"),
+            worktree.join("quality-link.json"),
+        )
+        .unwrap();
+        let text = std::fs::canonicalize(&worktree)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let first = broker.auto_cleanup_now(None).unwrap().unwrap();
+        let kept = first
+            .kept
+            .iter()
+            .find(|kept| kept.worktree == text)
+            .cloned()
+            .unwrap_or_else(|| panic!("{first:#?}"));
+        assert_eq!(kept.code, "ignored_content", "{kept:?}");
+        assert!(
+            kept.ignored_blockers
+                .contains(&"quality-report.json".to_string()),
+            "{kept:?}"
+        );
+        let report_row = first
+            .blocked_by_ignored
+            .iter()
+            .find(|row| row.name == "quality-report.json")
+            .cloned()
+            .unwrap_or_else(|| panic!("{first:#?}"));
+        assert_eq!(
+            report_row,
+            super::BlockedByIgnored {
+                name: "quality-report.json".into(),
+                checkouts: 1,
+                config_line: Some("[cleanup] regenerable = [\"quality-report.json\"]".into()),
+                config_refusal: None,
+            }
+        );
+
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[cleanup]\nregenerable = [\"quality-*.json\"]\n",
+        )
+        .unwrap();
+        for _ in 0..2 {
+            if !worktree.exists() {
+                break;
+            }
+            broker.auto_cleanup_now(None).unwrap().unwrap();
+        }
+        assert!(
+            !worktree.exists(),
+            "the file pattern no longer keeps the checkout"
+        );
+        assert!(outside.path().join("kept.json").is_file());
     }
 
     #[test]
@@ -11891,6 +12181,228 @@ mod tests {
             let reason = classify(root, path, &policy).unwrap_err();
             assert!(reason.contains("strict cleanup"), "{path}: {reason}");
         }
+    }
+
+    fn regenerable_policy(globs: &[&str]) -> AutoCleanupPolicy {
+        AutoCleanupPolicy {
+            regenerable: globs.iter().map(|glob| (*glob).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_file_pattern_releases_only_the_standalone_files_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = regenerable_policy(&["reports/quality-*.json", "apps/*/public/_routes.json"]);
+        for released in ["reports/quality-1.json", "apps/web/public/_routes.json"] {
+            touch(root, released);
+            assert_eq!(classify(root, released, &policy), Ok(()), "{released}");
+            assert!(
+                classify(root, released, &AutoCleanupPolicy::default()).is_err(),
+                "{released} is kept without the pattern"
+            );
+        }
+        // `*` stays within one component, so neither a deeper file nor a
+        // sibling the pattern does not name is released.
+        for kept in [
+            "reports/quality-1.txt",
+            "reports/summary.json",
+            "reports/nested/quality-2.json",
+            "apps/web/nested/public/_routes.json",
+        ] {
+            touch(root, kept);
+            let reason = classify(root, kept, &policy).unwrap_err();
+            assert!(
+                reason.contains("is not inside a recognised build-output directory"),
+                "{kept}: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_pattern_does_not_release_a_standalone_file_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = regenerable_policy(&["*-cache", "**/generated"]);
+        // Directory roots keep their existing match, where `*` crosses `/`.
+        touch(root, "src/tool-cache/index.bin");
+        assert_eq!(classify(root, "src/tool-cache/", &policy), Ok(()));
+        touch(root, "lib/generated/out.json");
+        assert_eq!(classify(root, "lib/generated/", &policy), Ok(()));
+        // Files those patterns would reach under the directory match stay.
+        for kept in ["src/app-cache", "docs/generated"] {
+            touch(root, kept);
+            let reason = classify(root, kept, &policy).unwrap_err();
+            assert!(
+                reason.contains("is not inside a recognised build-output directory"),
+                "{kept}: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_pattern_never_releases_a_protected_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = regenerable_policy(&["reports/*"]);
+        touch(root, "reports/report.json");
+        assert_eq!(classify(root, "reports/report.json", &policy), Ok(()));
+        for protected in [
+            "reports/signing.pem",
+            "reports/.env.ci",
+            "reports/id_ed25519",
+            "reports/cache.sqlite3",
+            "reports/credentials.json",
+            "reports/.npmrc",
+        ] {
+            touch(root, protected);
+            let reason = classify(root, protected, &policy).unwrap_err();
+            assert!(reason.contains("protected name"), "{protected}: {reason}");
+        }
+    }
+
+    #[test]
+    fn strict_mode_keeps_a_file_a_pattern_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = AutoCleanupPolicy {
+            strict: true,
+            ..regenerable_policy(&["reports/quality-*.json"])
+        };
+        touch(root, "reports/quality-1.json");
+        let reason = classify(root, "reports/quality-1.json", &policy).unwrap_err();
+        assert!(reason.contains("strict cleanup"), "{reason}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_pattern_judges_a_link_by_itself_and_never_follows_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("checkout");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(root.join("reports")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("id_ed25519"), "private\n").unwrap();
+        let policy = regenerable_policy(&["reports/quality-*.json", "reports/*.pem"]);
+
+        // Judged by the link's own name; removing it only unlinks it.
+        symlink(
+            outside.join("id_ed25519"),
+            root.join("reports/quality-link.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            classify(&root, "reports/quality-link.json", &policy),
+            Ok(())
+        );
+        // Following a dangling link would fail to stat it.
+        symlink(
+            outside.join("missing"),
+            root.join("reports/quality-dangling.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            classify(&root, "reports/quality-dangling.json", &policy),
+            Ok(())
+        );
+        // A link whose own name is protected stays even when configured.
+        symlink(outside.join("id_ed25519"), root.join("reports/signing.pem")).unwrap();
+        let reason = classify(&root, "reports/signing.pem", &policy).unwrap_err();
+        assert!(reason.contains("protected name"), "{reason}");
+        assert!(outside.join("id_ed25519").is_file());
+    }
+
+    #[test]
+    fn a_standalone_file_blocker_names_the_line_that_releases_exactly_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let entry = |blockers: &[&str]| super::KeepMemoEntry {
+            head: "head".into(),
+            policy: String::new(),
+            fingerprint: Vec::new(),
+            blockers: blockers
+                .iter()
+                .map(|blocker| (*blocker).to_string())
+                .collect(),
+            sessions: vec![1],
+            reason: String::new(),
+            recorded_at_ms: 0,
+        };
+        let mut memo = super::decode_keep_memo(None);
+        memo.entries.insert(
+            first.to_string_lossy().into_owned(),
+            entry(&[
+                "reports/quality-1.json",
+                "reports/[draft] v1.json",
+                "keys/server.pem",
+                "notes.txt",
+                "project-cache/",
+            ]),
+        );
+        memo.entries.insert(
+            second.to_string_lossy().into_owned(),
+            entry(&["reports/quality-1.json"]),
+        );
+        let rows = super::blocked_by_ignored_from_memo(&memo);
+        let row = |name: &str| {
+            rows.iter()
+                .find(|row| row.name == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("{name}: {rows:#?}"))
+        };
+
+        let quality = row("reports/quality-1.json");
+        assert_eq!(quality.checkouts, 2, "one row per path across checkouts");
+        assert_eq!(
+            quality.config_line.as_deref(),
+            Some("[cleanup] regenerable = [\"reports/quality-1.json\"]")
+        );
+        assert_eq!(quality.config_refusal, None);
+        // Each line is valid configuration that releases exactly its file.
+        std::fs::create_dir_all(dir.path().join(".aethyme")).unwrap();
+        touch(&first, "reports/other.json");
+        for name in ["reports/quality-1.json", "reports/[draft] v1.json"] {
+            let line = row(name).config_line.expect(name);
+            let body = line.strip_prefix("[cleanup] ").expect(&line);
+            std::fs::write(
+                dir.path().join(".aethyme/config.toml"),
+                format!("[cleanup]\n{body}\n"),
+            )
+            .unwrap();
+            let policy = AutoCleanupPolicy::load(dir.path()).unwrap();
+            touch(&first, name);
+            assert_eq!(classify(&first, name, &policy), Ok(()), "{line}");
+            assert!(
+                classify(&first, "reports/other.json", &policy).is_err(),
+                "{line} names only {name}"
+            );
+        }
+
+        let key = row("keys/server.pem");
+        assert_eq!(key.config_line, None);
+        assert!(
+            key.config_refusal
+                .as_deref()
+                .is_some_and(|refusal| refusal.contains("protected name")),
+            "{key:?}"
+        );
+        // A root file a pattern cannot name without also naming ordinary
+        // root files gets no line either.
+        let notes = row("notes.txt");
+        assert_eq!(notes.config_line, None);
+        assert!(notes.config_refusal.is_some(), "{notes:?}");
+        let directory = row("project-cache/");
+        assert_eq!(
+            directory.config_line.as_deref(),
+            Some("[cleanup] regenerable = [\"project-cache\"]")
+        );
+        assert_eq!(directory.config_refusal, None);
     }
 
     /// Write Aethyme's generated bytes for `relative` under `root`.
