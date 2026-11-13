@@ -3090,10 +3090,15 @@ binds generated hashes and modes, local/integration state, dirty overlap, live
 broker state, hook ownership, activation state, and preservation refs into a
 SHA-256. `--diff` renders the content inventory locally; `--json` is the stable
 automation form.
+The local integration ref is read only when the repository has no fetched
+default branch, the one case where `submit` still verifies against it. With a
+fetched default branch the plan reports `integration.exact_sha` as `null`,
+creates no integration preservation ref, and leftover integration commits do
+not block enrollment, which never creates or moves that ref.
 
 `deploy execute` requires that full digest. It creates preservation refs before
 mutation, applies only the reviewed outputs in an isolated leased session,
-submits and publishes the promoted SHA, verifies the remote, and synchronizes
+verifies and publishes the enrollment commit, verifies the remote, and synchronizes
 local main only by a verified clean fast-forward. Its Git-common-dir journal
 makes the same command resumable across interruption. Remote movement,
 ambiguous history, foreign hook ownership, overlapping dirty policy, or live
