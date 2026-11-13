@@ -4,6 +4,17 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.86] - 2026-11-13
+
+### Changed
+
+- `broker push` no longer builds the full agents view to report duplicate work. Candidates come from branch, task and the cached pull-request listing, and liveness is worked out only for sessions that match (count `agents_view_sessions_skipped`). `push`, `start`, `adopt` and `reuse` therefore no longer reconcile or close unrelated sessions as a side effect; the next `status` or `agents` does (#1645).
+- `review run`, including review on push, makes its read-only GitHub calls in parallel instead of one after another. Reports and error order are unchanged (#1645).
+
+### Added
+
+- Phase telemetry for review on push (`review_on_push_policy`, `review_on_push_child_start`, `review_on_push_child_wait`) and for the review run's reads, classification and GitHub writes (`review_run_*`) (#1645).
+
 ## [0.8.85] - 2026-11-13
 
 ### Changed
