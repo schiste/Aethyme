@@ -1045,6 +1045,11 @@ pub struct AutoCleanupLanes {
     /// the deadline passed while reading it).
     #[serde(default)]
     pub removal_inventory_unavailable: bool,
+    /// Closed-checkout groups selection judged ahead of its oldest-first lap
+    /// because a session's pull request is recorded merged or its checkout
+    /// cleanup request is due. Included in `removal_examined`.
+    #[serde(default)]
+    pub removal_priority_examined: usize,
 }
 
 /// What one auto-cleanup pass did.
@@ -1526,6 +1531,8 @@ pub(crate) struct RenumberReproofEvidence {
     pub branch_tip: Option<String>,
 }
 
+const REGISTRATION_REFUSAL: &str = "git worktree list does not register it on the session branch";
+
 /// Decide the device-renumber re-proof. `None` means every condition holds;
 /// otherwise the first failed condition, which keeps the checkout.
 pub(crate) fn renumber_reproof_refusal(
@@ -1554,7 +1561,7 @@ pub(crate) fn renumber_reproof_refusal(
     }
     let expected_ref = format!("refs/heads/{session_branch}");
     if session_branch.is_empty() || evidence.registered_branch.as_deref() != Some(&expected_ref) {
-        return Some("git worktree list does not register it on the session branch");
+        return Some(REGISTRATION_REFUSAL);
     }
     if evidence.checkout_branch.as_deref() != Some(session_branch) {
         return Some("the checkout is not on the session branch");
@@ -2366,6 +2373,63 @@ const KEEP_MEMO_MAX_ENTRIES: usize = 4096;
 const KEEP_MEMO_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 /// Ignored roots recorded per kept checkout.
 const IGNORED_BLOCKER_LIMIT: usize = 16;
+
+/// Meta key of the closed-checkout groups the removal lane last judged ahead
+/// of its lap, so a kept one yields to the others before it is judged again.
+pub(crate) const PRIORITY_MEMO_KEY: &str = "auto_cleanup.priority_memo";
+/// Priority groups judged per pass, before the lap page.
+const PRIORITY_GROUPS_PER_PASS: usize = 8;
+/// Priority candidates read per pass before the memo filters them.
+const PRIORITY_CANDIDATE_LIMIT: usize = 256;
+/// A kept priority group is judged again after this long, or at once when its
+/// merged state changes.
+const PRIORITY_REJUDGE_MS: i64 = 30 * 60_000;
+/// Remembered priority verdicts kept at most; the oldest go first.
+const PRIORITY_MEMO_MAX_ENTRIES: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PriorityMemoEntry {
+    judged_at_ms: i64,
+    merged: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PriorityMemo {
+    #[serde(default)]
+    entries: std::collections::BTreeMap<String, PriorityMemoEntry>,
+}
+
+impl PriorityMemo {
+    fn decode(raw: Option<&str>) -> Self {
+        raw.and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default()
+    }
+
+    /// Whether `path` was judged recently with the same merged state.
+    fn recently_judged(&self, path: &str, merged: bool, now_ms: i64) -> bool {
+        self.entries.get(path).is_some_and(|entry| {
+            entry.merged == merged
+                && now_ms.saturating_sub(entry.judged_at_ms) < PRIORITY_REJUDGE_MS
+        })
+    }
+
+    fn prune(&mut self, now_ms: i64) {
+        self.entries
+            .retain(|_, entry| now_ms.saturating_sub(entry.judged_at_ms) < PRIORITY_REJUDGE_MS);
+        if self.entries.len() > PRIORITY_MEMO_MAX_ENTRIES {
+            let mut ages = self
+                .entries
+                .iter()
+                .map(|(path, entry)| (entry.judged_at_ms, path.clone()))
+                .collect::<Vec<_>>();
+            ages.sort();
+            let excess = self.entries.len() - PRIORITY_MEMO_MAX_ENTRIES;
+            for (_, path) in ages.into_iter().take(excess) {
+                self.entries.remove(&path);
+            }
+        }
+    }
+}
 /// Names `blocked_by_ignored` lists, most common first.
 const BLOCKED_BY_IGNORED_LIMIT: usize = 10;
 
@@ -3684,17 +3748,25 @@ impl Broker {
             .git_common_dir()
             .ok()
             .is_some_and(|common| Path::new(&current.git_common_path) == canonical(&common));
-        let registered_branch = self
-            .repo_handle()
-            .worktree_inventory()
-            .ok()
-            .and_then(|entries| {
-                entries
-                    .into_iter()
-                    .find(|entry| !entry.bare && canonical(&entry.path) == worktree)
-            })
-            .filter(|entry| !entry.prunable)
-            .and_then(|entry| entry.branch);
+        // What `git worktree list` says about this path, kept for the
+        // refusal so an operator can see why registration did not match.
+        let (registered_branch, registration) = match self.repo_handle().worktree_inventory() {
+            Err(error) => (None, format!("worktree listing failed: {error}")),
+            Ok(entries) => match entries
+                .into_iter()
+                .find(|entry| !entry.bare && canonical(&entry.path) == worktree)
+            {
+                None => (None, "not registered".to_string()),
+                Some(entry) if entry.prunable => (None, "registered but prunable".to_string()),
+                Some(entry) => {
+                    let found = entry
+                        .branch
+                        .clone()
+                        .unwrap_or_else(|| "a detached HEAD".to_string());
+                    (entry.branch, format!("registered on {found}"))
+                }
+            },
+        };
         let checkout = GitRepo::discover(&worktree).ok();
         let checkout_branch = checkout
             .as_ref()
@@ -3725,6 +3797,10 @@ impl Broker {
                 crate::phase_telemetry::add("auto_cleanup_ownership_reproved", Duration::ZERO);
                 Ok(())
             }
+            Some(condition) if condition == REGISTRATION_REFUSAL => refuse(&format!(
+                "{condition} ({registration}; session branch refs/heads/{})",
+                session.branch
+            )),
             Some(condition) => refuse(condition),
         }
     }
@@ -3927,6 +4003,48 @@ impl Broker {
             unresolved_rows: 0,
             alias_refresh_generation: index_state.alias_refresh_generation,
         }))
+    }
+
+    /// Up to [`PRIORITY_GROUPS_PER_PASS`] complete closed-checkout groups
+    /// most likely removable now (see `cleanup_cohort_priority_groups` in the
+    /// store), skipping one
+    /// judged within [`PRIORITY_REJUDGE_MS`] with the same merged state. Each
+    /// is built exactly like a lap group and judged by the same proofs; only
+    /// the order changes. Returns each group with its merged state.
+    fn auto_cleanup_priority_groups(
+        &mut self,
+        memo: &PriorityMemo,
+        now_ms: i64,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<(AutoCleanupCheckoutGroup, bool)>, BrokerOpError> {
+        let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
+        let candidates = self.store().cleanup_cohort_priority_groups(
+            namespace,
+            now_ms,
+            PRIORITY_CANDIDATE_LIMIT,
+        )?;
+        let mut groups = Vec::new();
+        for (canonical_path, first_session_id, merged) in candidates {
+            if groups.len() >= PRIORITY_GROUPS_PER_PASS || deadline_expired(deadline) {
+                break;
+            }
+            if memo.recently_judged(&canonical_path, merged, now_ms) {
+                continue;
+            }
+            let (sessions, truncated) = self
+                .store()
+                .cleanup_cohort_sessions_for_path(namespace, &canonical_path)?;
+            groups.push((
+                AutoCleanupCheckoutGroup {
+                    worktree: PathBuf::from(canonical_path),
+                    sessions,
+                    complete: !truncated,
+                    cursor_session_id: first_session_id,
+                },
+                merged,
+            ));
+        }
+        Ok(groups)
     }
 
     /// Make the existing ownership and live-session proofs for one complete
@@ -5105,6 +5223,7 @@ impl Broker {
         let planned = plan.report.lanes.unwrap_or_default();
         lanes.removal_examined = planned.removal_examined;
         lanes.removal_memo_skips = planned.removal_memo_skips;
+        lanes.removal_priority_examined = planned.removal_priority_examined;
         lanes.removal_scan_ms = planned.removal_scan_ms;
         lanes.removal_inventory_unavailable = planned.removal_inventory_unavailable;
         lanes.removal_elapsed_ms = duration_ms(Some(removal_started.elapsed()));
@@ -5280,6 +5399,10 @@ impl Broker {
         let mut alias_refresh_generation = None;
         let mut examined = 0_usize;
         let mut memo_skips = 0_usize;
+        let mut priority_examined = 0_usize;
+        let mut priority_memo =
+            PriorityMemo::decode(self.store().meta_get(PRIORITY_MEMO_KEY)?.as_deref());
+        let mut priority_memo_changed = false;
         // Under capacity pressure a bounded pass keeps going page by page
         // while time remains; otherwise each pass keeps its one-page tranche
         // and the background worker paces the lap.
@@ -5353,14 +5476,40 @@ impl Broker {
             }
             alias_refresh_generation = Some(scan.alias_refresh_generation);
 
+            // Under capacity pressure, judge what most likely became
+            // removable first: a merged pull request, then a due cleanup
+            // request. The lap below still visits every group in session
+            // order, so nothing is starved.
+            let priority_groups = if first_page && multi_page {
+                let _span = crate::phase_telemetry::span("auto_cleanup_priority_selection");
+                self.auto_cleanup_priority_groups(&priority_memo, now_ms(), deadline)?
+            } else {
+                Vec::new()
+            };
+            let priority_paths = priority_groups
+                .iter()
+                .map(|(group, _)| group.worktree.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            let ordered = priority_groups
+                .into_iter()
+                .map(|(group, merged)| (Some(merged), group))
+                .chain(scan.groups.into_iter().map(|group| (None, group)));
             let mut stop_pass = false;
-            for group in scan.groups {
+            for (priority, group) in ordered {
                 if deadline_expired(deadline) {
                     stop_pass = true;
                     break;
                 }
-                examined += 1;
                 let cursor_session_id = checkout_group_cursor_session_id(&group);
+                if priority.is_none() && priority_paths.contains(&group.worktree) {
+                    // Already judged ahead of the lap in this pass.
+                    cursor.after_session_id = cursor_session_id;
+                    self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
+                    continue;
+                }
+                examined += 1;
+                let deferred_before = report.deferred;
+                let selected_before = selected.len();
                 let inspection =
                     inspect_group(self, &group, &scan.live, &scan.live_worktrees, deadline)?;
                 let mut stop_for_deadline = false;
@@ -5521,8 +5670,28 @@ impl Broker {
                         stop_for_deadline = true;
                     }
                 }
-                cursor.after_session_id = cursor_session_id;
-                self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
+                if let Some(merged) = priority {
+                    // A priority group never moves the lap cursor. Remember a
+                    // judged, unselected one so the next pass judges others.
+                    priority_examined += 1;
+                    crate::phase_telemetry::add("auto_cleanup_priority_examined", Duration::ZERO);
+                    let key = group.worktree.to_string_lossy().into_owned();
+                    if selected.len() > selected_before || report.deferred > deferred_before {
+                        priority_memo_changed |= priority_memo.entries.remove(&key).is_some();
+                    } else {
+                        priority_memo.entries.insert(
+                            key,
+                            PriorityMemoEntry {
+                                judged_at_ms: now_ms(),
+                                merged,
+                            },
+                        );
+                        priority_memo_changed = true;
+                    }
+                } else {
+                    cursor.after_session_id = cursor_session_id;
+                    self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
+                }
                 if stop_for_deadline || selected.len() >= max_selected.max(1) {
                     stop_pass = true;
                     break;
@@ -5564,12 +5733,19 @@ impl Broker {
                 serde_json::to_string(&memo).expect("serializing the keep memo is infallible");
             self.store().meta_set(KEEP_MEMO_KEY, &text)?;
         }
+        if priority_memo_changed {
+            priority_memo.prune(now_ms());
+            let text = serde_json::to_string(&priority_memo)
+                .expect("serializing the priority memo is infallible");
+            self.store().meta_set(PRIORITY_MEMO_KEY, &text)?;
+        }
         report.blocked_by_ignored = blocked_by_ignored_from_memo(&memo);
         crate::phase_telemetry::add("auto_cleanup_removal_scan", scan_elapsed);
         report.lanes = Some(AutoCleanupLanes {
             removal_examined: examined,
             removal_memo_skips: memo_skips,
             removal_scan_ms: duration_ms(Some(scan_elapsed)),
+            removal_priority_examined: priority_examined,
             ..AutoCleanupLanes::default()
         });
         // The current deferred group, if any, was counted above and the cursor
@@ -8129,7 +8305,8 @@ mod tests {
             "the verdict records the re-proof it used"
         );
 
-        // A detached HEAD fails the branch condition: kept, and countable.
+        // A detached HEAD fails the registration condition: kept, and
+        // countable, with what Git registered in the reason.
         git(&path, &["checkout", "-q", "--detach"]);
         match verdict_for(&mut broker) {
             Err(NotRemoved::Keep(reason)) => {
@@ -8139,7 +8316,7 @@ mod tests {
                     "{reason}"
                 );
                 assert!(
-                    reason.contains("the checkout is not on the session branch"),
+                    reason.contains("registered on a detached HEAD"),
                     "{reason}"
                 );
             }
@@ -8179,6 +8356,130 @@ mod tests {
                 super::ClosedArtifactCheckoutCohortUnavailableReason::SpawnedWitnessMismatch
             )
         ));
+    }
+
+    /// `count` closed spawned checkouts with no checkout cleanup request, and
+    /// a complete path index.
+    #[cfg(unix)]
+    fn closed_priority_fixture(
+        count: usize,
+    ) -> (
+        tempfile::TempDir,
+        crate::test_storage::TestStorage,
+        crate::Broker,
+        Vec<crate::Session>,
+    ) {
+        let (owner, storage, mut broker, first) = retirement_fixture();
+        let mut sessions = vec![first];
+        for index in 1..count {
+            sessions.push(
+                broker
+                    .start_worktree(&format!("priority fixture {index}"), None)
+                    .unwrap(),
+            );
+        }
+        for session in &sessions {
+            broker
+                .close_abandoning_unpushed(session.id, "priority fixture")
+                .unwrap();
+        }
+        broker
+            .store()
+            .connection()
+            .execute("DELETE FROM closed_checkout_cleanup_requests", [])
+            .unwrap();
+        while !broker
+            .refresh_cleanup_cohort_aliases(None)
+            .unwrap()
+            .unwrap()
+            .complete
+        {}
+        (owner, storage, broker, sessions)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn priority_groups_order_merged_pull_requests_then_due_requests() {
+        let (_owner, _storage, mut broker, sessions) = closed_priority_fixture(3);
+        let (plain, due, merged) = (&sessions[0], &sessions[1], &sessions[2]);
+        record_merged_pull_request(&mut broker, merged.id, 41);
+        let insert_request = |session_id: i64, not_before_ms: i64| {
+            broker
+                .store_ref()
+                .connection()
+                .execute(
+                    "INSERT INTO closed_checkout_cleanup_requests (
+                         session_id, requested_at_ms, not_before_ms, last_progress_at_ms
+                     ) VALUES (?1, 1, ?2, 1)",
+                    rusqlite::params![session_id, not_before_ms],
+                )
+                .unwrap();
+        };
+        insert_request(due.id, 1);
+        insert_request(plain.id, i64::MAX);
+        let order = broker
+            .store()
+            .cleanup_cohort_priority_groups(
+                crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+                now_ms(),
+                16,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|(_, first_session_id, merged)| (first_session_id, merged))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            vec![(merged.id, true), (due.id, false)],
+            "a merged pull request first, then a due request; a request still in grace is not a priority"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn under_capacity_pressure_a_merged_checkout_is_judged_before_the_lap() {
+        let (_owner, _storage, mut broker, sessions) = closed_priority_fixture(3);
+        let merged = sessions[2].id;
+        record_merged_pull_request(&mut broker, merged, 42);
+        broker.record_checkout_usage(900, 900);
+        let judge = |broker: &mut crate::Broker| {
+            let mut order = Vec::new();
+            broker
+                .auto_cleanup_plan_with_group_inspector(
+                    Some(Instant::now() + Duration::from_millis(900)),
+                    |_, group, _, _, _| {
+                        order.push(group.cursor_session_id);
+                        Ok(AutoCleanupGroupInspection::Kept(super::AutoKeptCheckout {
+                            worktree: group.worktree.to_string_lossy().into_owned(),
+                            sessions: group.sessions.iter().map(|session| session.id).collect(),
+                            reason: "injected planner inspection".into(),
+                            ..Default::default()
+                        }))
+                    },
+                )
+                .unwrap();
+            order
+        };
+        let first = judge(&mut broker);
+        assert_eq!(first.first(), Some(&merged), "{first:?}");
+        assert_eq!(
+            first.iter().filter(|id| **id == merged).count(),
+            1,
+            "the lap does not judge it again in the same pass: {first:?}"
+        );
+        let memo = super::PriorityMemo::decode(
+            broker
+                .store()
+                .meta_get(super::PRIORITY_MEMO_KEY)
+                .unwrap()
+                .as_deref(),
+        );
+        let merged_path = std::fs::canonicalize(&sessions[2].worktree_path).unwrap();
+        assert!(memo.recently_judged(&merged_path.to_string_lossy(), true, now_ms()));
+        // Kept, it yields to the rest of the lap instead of being judged
+        // first on every pass.
+        let second = judge(&mut broker);
+        assert_ne!(second.first(), Some(&merged), "{second:?}");
     }
 
     #[cfg(target_os = "macos")]

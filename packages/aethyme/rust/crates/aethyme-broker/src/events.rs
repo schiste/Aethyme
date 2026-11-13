@@ -1033,7 +1033,8 @@ mod spawned_instance_volume_tests {
     #[test]
     fn device_renumber_refuses_each_changed_object_path_and_generation() {
         let saved = uuid_less_witness();
-        let mutations: &[(&str, fn(&mut SpawnedWorktreeInstanceWitness))] = &[
+        type Mutation = fn(&mut SpawnedWorktreeInstanceWitness);
+        let mutations: &[(&str, Mutation)] = &[
             ("worktree inode", |v| v.worktree_inode += 1),
             ("pointer inode", |v| v.git_pointer_inode += 1),
             ("admin inode", |v| v.git_admin_inode += 1),

@@ -211,6 +211,15 @@ three quarters of the budget, so revalidation and the first removal always
 have time (`auto_cleanup.lanes.removal_selected` and
 `removal_apply_reserve_ms`).
 
+Under capacity pressure each removal pass first judges up to eight closed
+checkouts most likely removable now: those whose pull request is recorded
+merged, most recently merged first, then those whose cleanup request is past
+its grace, most recently closed first. Every proof still applies; one kept this
+way is not judged ahead of the lap again for 30 minutes or until its pull
+request merges (`auto_cleanup.priority_memo`), and
+`auto_cleanup.lanes.removal_priority_examined` counts them. The session-order
+lap continues behind them, so every closed checkout is still judged.
+
 Automatic removal records that it started on a checkout before Git deletes
 anything. A closed checkout that such a recorded removal left part-deleted
 (tracked files missing, nothing modified, staged or untracked, at least a

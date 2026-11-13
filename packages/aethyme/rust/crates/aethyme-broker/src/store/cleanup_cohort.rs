@@ -1431,6 +1431,53 @@ impl BrokerStore {
             .map_err(BrokerError::from)
     }
 
+    /// Indexed closed-checkout groups most likely removable now, for the
+    /// removal lane to judge before its oldest-first lap: a group with a
+    /// session whose pull request is recorded merged, then a group with a due
+    /// (past grace, uncompleted) checkout cleanup request. Merged groups come
+    /// first, most recently merged first; the rest most recently closed first.
+    /// Returns `(canonical_path, first_session_id, merged)`. Candidate order
+    /// only: every returned group still goes through every removal proof.
+    pub(crate) fn cleanup_cohort_priority_groups(
+        &self,
+        namespace: &str,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<(String, i64, bool)>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.canonical_path, g.first_session_id,
+                    MAX(COALESCE(linked.merged_at, direct.merged_at) IS NOT NULL) AS merged,
+                    MAX(COALESCE(linked.merged_at, direct.merged_at, 0)) AS merged_at,
+                    MAX(COALESCE(s.closed_at, 0)) AS closed_at
+             FROM cleanup_cohort_scan_groups g
+             JOIN cleanup_cohort_scan_rows r
+               ON r.namespace = g.namespace AND r.canonical_path = g.canonical_path
+              AND r.cleanup_state = 'closed'
+             JOIN sessions s ON s.id = r.session_id AND s.cleanup_state = 'closed'
+             LEFT JOIN closed_checkout_cleanup_requests q
+               ON q.session_id = s.id AND q.completed_at_ms IS NULL
+              AND q.not_before_ms <= ?2
+             LEFT JOIN pull_request_session_links l ON l.session_id = s.id
+             LEFT JOIN pull_request_milestones linked
+               ON linked.repository = l.repository AND linked.pr_number = l.pr_number
+              AND linked.merged_at IS NOT NULL
+             LEFT JOIN pull_request_milestones direct
+               ON direct.session_id = s.id AND direct.merged_at IS NOT NULL
+             WHERE g.namespace = ?1
+               AND (q.session_id IS NOT NULL OR linked.merged_at IS NOT NULL
+                    OR direct.merged_at IS NOT NULL)
+             GROUP BY g.canonical_path, g.first_session_id
+             ORDER BY merged DESC, merged_at DESC, closed_at DESC, g.first_session_id DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![namespace, now_ms, limit.clamp(1, 256) as i64],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(BrokerError::from)
+    }
+
     pub(crate) fn cleanup_cohort_indexed_rows_page(
         &self,
         namespace: &str,

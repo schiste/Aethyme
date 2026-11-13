@@ -1889,3 +1889,13 @@ Introduced 2026-11-13. A schema-2 spawn witness (saved before volume UUIDs) reco
 - Phase telemetry adds the counters `auto_cleanup_ownership_reproved`, `auto_cleanup_ownership_reproof_refused` (each evaluation) and `auto_cleanup_checkout_missing`.
 
 Consumers must tolerate the new fields and codes. Covered by `events.rs` `device_renumber_accepts_a_schema_two_witness_whose_objects_are_unchanged`, `device_renumber_refuses_each_changed_object_path_and_generation`, `device_renumber_refuses_a_changed_device_sharing_pattern` and `device_renumber_applies_only_to_uuid_less_schema_two_witnesses`, and `auto_cleanup.rs` `renumber_reproof_requires_*`, `renumber_reproof_accepts_only_unchanged_objects`, `ownership_keep_reasons_have_their_own_codes`, `checkout_removal_reproves_a_schema_two_witness_after_a_device_renumber` and `checkout_removal_refuses_a_renumbered_witness_whose_root_was_replaced`.
+
+### Removal judges likely-removable checkouts before its lap
+
+Introduced 2026-11-13. The removal lane walked closed checkouts only in session-id order, so on the busiest repository a checkout whose pull request had merged waited behind a lap over hundreds of long-kept or long-gone groups. Under checkout capacity pressure (bounded passes: the worker's removal slice and `broker start` at the limit), each pass now first judges up to eight indexed closed-checkout groups with a session whose pull request is recorded merged (`pull_request_milestones.merged_at`, through `pull_request_session_links` or the milestone's own `session_id`), most recently merged first, then groups with a due, uncompleted `closed_checkout_cleanup_requests` row (`not_before_ms` passed), most recently closed first. They go through every removal proof unchanged; only the order changes. They do not move the lap cursor, and the lap skips them within the same pass.
+
+- Meta key `auto_cleanup.priority_memo` (JSON `{"entries": {"<canonical checkout path>": {"judged_at_ms", "merged"}}}`, at most 4,096 entries, pruned after 30 minutes) remembers a judged priority group that was neither selected nor deferred; it is not judged ahead of the lap again for 30 minutes, or until its merged state changes.
+- `auto_cleanup.lanes` gains `removal_priority_examined` (integer, groups judged ahead of the lap, included in `removal_examined`).
+- Phase telemetry adds the span `auto_cleanup_priority_selection` and the counter `auto_cleanup_priority_examined`.
+
+Consumers must tolerate the new field and key. Covered by `auto_cleanup.rs` `priority_groups_order_merged_pull_requests_then_due_requests` and `under_capacity_pressure_a_merged_checkout_is_judged_before_the_lap`.
