@@ -1909,6 +1909,21 @@ pub(super) fn run_owners(parsed: Parsed) -> Result<(), UsageError> {
 
 /// `broker handoff`.
 pub(super) fn run_handoff(parsed: Parsed) -> Result<(), UsageError> {
+    // Refuse a malformed selector before the writable open below, whose
+    // startup maintenance a refused command must not trigger.
+    match (parsed.session, parsed.worktree.as_deref()) {
+        (Some(_), Some(_)) => {
+            return Err(UsageError::Message(
+                "handoff takes either --session <id> or --worktree <path>, not both".into(),
+            ));
+        }
+        (None, None) => {
+            return Err(UsageError::Message(
+                "handoff requires --session <id> or --worktree <path>".into(),
+            ));
+        }
+        _ => {}
+    }
     let broker = open_broker(parsed.read_only_snapshot)?;
     let report = match (parsed.session, parsed.worktree.as_deref()) {
         (Some(session), None) => broker.latest_handoff_for_session(session)?,

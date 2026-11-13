@@ -222,6 +222,14 @@ pub(super) fn run_quality_report(parsed: Parsed) -> Result<(), UsageError> {
     let pull_request = parsed
         .pr_number
         .ok_or_else(|| UsageError::Message("quality-report requires --pr <number>".into()))?;
+    // Refuse an unknown action before the writable open below, whose startup
+    // maintenance a refused command must not trigger, and before the report
+    // and the pull request are read.
+    if !matches!(action, "plan" | "publish") {
+        return Err(UsageError::Message(format!(
+            "unknown quality-report action {action:?}; expected plan or publish"
+        )));
+    }
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     let projection_policy =
         crate::PrProjectionPolicy::load(broker.main_root()).map_err(to_usage)?;

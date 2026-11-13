@@ -66,6 +66,215 @@ pub(super) fn render_pr_check_report(
     Ok(())
 }
 
+/// Turn a missing flag into the refusal its handler gives.
+fn require_flag(present: bool, message: impl Into<String>) -> Result<(), UsageError> {
+    if present {
+        Ok(())
+    } else {
+        Err(UsageError::Message(message.into()))
+    }
+}
+
+/// The refusals of `broker watch pr <action>` that read only the parsed
+/// arguments, in the order and with the messages its handler gives. They run
+/// before the broker opens: a writable open runs startup maintenance, which a
+/// refused command must not trigger.
+fn validate_pull_request_watch_arguments(parsed: &Parsed, action: &str) -> Result<(), UsageError> {
+    match action {
+        "monitoring" => {
+            let mode = parsed.positional.get(2).map(String::as_str);
+            require_flag(
+                mode.is_some(),
+                "watch pr monitoring requires activate, deactivate, or status",
+            )?;
+            require_flag(
+                parsed.session.is_some(),
+                "watch pr monitoring requires --session <id>",
+            )?;
+            if let Some(other) =
+                mode.filter(|mode| !matches!(*mode, "activate" | "deactivate" | "status"))
+            {
+                return Err(UsageError::Message(format!(
+                    "unknown watch pr monitoring mode {other:?}; expected activate, deactivate, or status"
+                )));
+            }
+        }
+        "start" => {
+            require_flag(
+                parsed.session.is_some(),
+                "watch pr start requires --session <id>",
+            )?;
+            require_flag(
+                parsed.repository.is_some(),
+                "watch pr start requires --repo <owner/name>",
+            )?;
+            require_flag(
+                parsed.pr_number.is_some(),
+                "watch pr start requires --pr <number>",
+            )?;
+            parse_pull_request_event_kinds(parsed.events.as_deref())?;
+        }
+        "list" | "tick" => {}
+        "show" | "poll" | "batches" => require_flag(
+            parsed.note_id.is_some(),
+            format!("watch pr {action} requires --id <watch-id>"),
+        )?,
+        "ack" => {
+            require_flag(
+                parsed.note_id.is_some(),
+                "watch pr ack requires --id <batch-id>",
+            )?;
+            require_flag(
+                matches!(
+                    parsed.outcome.as_deref(),
+                    Some(
+                        "addressed" | "stale" | "non-actionable" | "non_actionable" | "superseded"
+                    )
+                ),
+                "watch pr ack requires --outcome addressed|stale|non-actionable|superseded",
+            )?;
+            require_flag(
+                parsed.reason.is_some(),
+                "watch pr ack requires --reason <text>",
+            )?;
+        }
+        "pause" | "resume" | "stop" => require_flag(
+            parsed.note_id.is_some(),
+            format!("watch pr {action} requires --id <watch-id>"),
+        )?,
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown watch pr action {other:?} — expected start, list, show, poll, tick, batches, ack, pause, resume, or stop"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The refusals of `broker watch repo <action>` that read only the parsed
+/// arguments, with the messages its handler gives; run before the broker
+/// opens, for the same reason as [`validate_pull_request_watch_arguments`].
+fn validate_repository_watch_arguments(parsed: &Parsed, action: &str) -> Result<(), UsageError> {
+    match action {
+        "start" => {
+            require_flag(
+                parsed.session.is_some(),
+                "watch repo start requires --session <id>",
+            )?;
+            require_flag(
+                parsed.repository.is_some(),
+                "watch repo start requires --repo <owner/name>",
+            )?;
+            if let Some(events) = parsed.events.as_deref() {
+                events
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .try_for_each(|item| crate::RepositoryEventKind::parse(item).map(|_| ()))
+                    .map_err(UsageError::Message)?;
+            }
+        }
+        "list" => {}
+        "show" | "events" | "pause" | "resume" | "stop" => require_flag(
+            parsed.note_id.is_some(),
+            format!("watch repo {action} requires --id <repo-watch-id>"),
+        )?,
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown watch repo action {other:?} — expected start, list, show, events, pause, resume, or stop"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The refusals of `broker deliveries <action>` that read only the parsed
+/// arguments, in the order and with the messages its handler gives; run before
+/// the broker opens, for the same reason as
+/// [`validate_pull_request_watch_arguments`].
+fn validate_deliveries_arguments(parsed: &Parsed, action: &str) -> Result<(), UsageError> {
+    match action {
+        "dispatch" => require_flag(
+            parsed.worker.is_some(),
+            "deliveries dispatch requires --worker <id>",
+        )?,
+        "resolve-tab" => require_flag(
+            parsed.session.is_some(),
+            "deliveries resolve-tab requires --session <id>",
+        )?,
+        "subscribe" => {
+            require_flag(
+                parsed.adapter.is_some(),
+                "deliveries subscribe requires --adapter <name>",
+            )?;
+            require_flag(
+                parsed.target.is_some(),
+                "deliveries subscribe requires --target <opaque-id>",
+            )?;
+            if parsed.repo_watch_id.is_some() {
+                if parsed.watch_id.is_some() {
+                    return Err(UsageError::Message(
+                        "deliveries subscribe takes --watch <pr-watch-id> or --repo-watch <repo-watch-id>, not both".into(),
+                    ));
+                }
+                crate::RepositoryDeliveryPolicy::parse(
+                    parsed.policy.as_deref().unwrap_or("review"),
+                )
+                .map_err(UsageError::Message)?;
+            } else {
+                require_flag(
+                    parsed.watch_id.is_some(),
+                    "deliveries subscribe requires --watch <pr-watch-id> or --repo-watch <repo-watch-id>",
+                )?;
+                if parsed.policy.as_deref() == Some("review") {
+                    return Err(UsageError::Message(
+                        "--policy review applies to repository watches; use --repo-watch <id>, or review-and-push for a PR watch".into(),
+                    ));
+                }
+                parse_delivery_policy(parsed.policy.as_deref())?;
+            }
+        }
+        "list" => {}
+        "claim" => {
+            require_flag(
+                parsed.adapter.is_some(),
+                "deliveries claim requires --adapter <name>",
+            )?;
+            require_flag(
+                parsed.worker.is_some(),
+                "deliveries claim requires --worker <id>",
+            )?;
+        }
+        "complete" => {
+            require_flag(
+                parsed.note_id.is_some(),
+                "deliveries complete requires --id <delivery-id>",
+            )?;
+            require_flag(
+                parsed.worker.is_some(),
+                "deliveries complete requires --worker <id>",
+            )?;
+            require_flag(
+                parsed.generation.is_some(),
+                "deliveries complete requires --generation <n>",
+            )?;
+            require_flag(
+                matches!(
+                    parsed.outcome.as_deref(),
+                    Some("delivered" | "retry" | "failed")
+                ),
+                "deliveries complete requires --outcome delivered|retry|failed",
+            )?;
+        }
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown deliveries action {other:?} — expected subscribe, list, claim, or complete"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
     if parsed.positional.first().map(String::as_str) == Some("repo") {
         return run_repository_watch(parsed);
@@ -89,6 +298,7 @@ pub(super) fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
     if action == "service" {
         return run_service(&parsed);
     }
+    validate_pull_request_watch_arguments(&parsed, action)?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     match action {
         "monitoring" => {
@@ -372,6 +582,7 @@ pub(super) fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
         .ok_or_else(|| {
             UsageError::Message("deliveries requires subscribe, list, claim, or complete".into())
         })?;
+    validate_deliveries_arguments(&parsed, action)?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     match action {
         "dispatch" => {
@@ -845,6 +1056,7 @@ fn run_repository_watch(parsed: Parsed) -> Result<(), UsageError> {
                 "watch repo requires start, list, show, events, pause, resume, or stop".into(),
             )
         })?;
+    validate_repository_watch_arguments(&parsed, action)?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     let require_id = |action: &str| {
         parsed.note_id.ok_or_else(|| {

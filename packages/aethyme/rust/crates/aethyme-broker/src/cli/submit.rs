@@ -1277,6 +1277,22 @@ pub(super) fn run_checkpoint(parsed: Parsed) -> Result<(), UsageError> {
     let session = parsed.session.ok_or(UsageError::Message(
         "checkpoint plan/apply requires --session <id>".into(),
     ))?;
+    // Refuse a malformed command before the writable open below, whose
+    // startup maintenance a refused command must not trigger.
+    match action {
+        "plan" => {}
+        "apply" if parsed.confirm.is_none() => {
+            return Err(UsageError::Message(
+                "checkpoint apply requires --confirm <sha256>".into(),
+            ));
+        }
+        "apply" => {}
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown checkpoint action {other:?} — expected plan or apply"
+            )));
+        }
+    }
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     match action {
         "plan" => {
@@ -1357,6 +1373,19 @@ pub(super) fn run_checkpoint(parsed: Parsed) -> Result<(), UsageError> {
 
 /// `broker queue`.
 pub(super) fn run_queue(parsed: Parsed) -> Result<(), UsageError> {
+    // Refuse malformed selectors before the writable open below, whose
+    // startup maintenance a refused command must not trigger.
+    if parsed.positional.first().map(String::as_str) == Some("history") {
+        if parsed.positional.len() != 1 {
+            return Err(UsageError::Message(
+                "queue history accepts no positional arguments".into(),
+            ));
+        }
+    } else if !parsed.positional.is_empty() || parsed.limit.is_some() || parsed.before.is_some() {
+        return Err(UsageError::Message(
+            "queue accepts no selectors; use `queue history [--limit <n>] [--before <id>]`".into(),
+        ));
+    }
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     if parsed.positional.first().map(String::as_str) == Some("history") {
         if parsed.positional.len() != 1 {

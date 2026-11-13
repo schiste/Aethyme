@@ -1336,7 +1336,72 @@ fn render_host_operation_show(operation: &crate::HostOperation) {
 }
 
 /// Broker operations.
+/// The refusals of `broker operations` that read only the parsed arguments,
+/// with the messages each action gives. They run before the broker opens: a
+/// writable open runs startup maintenance, which a refused command must not
+/// trigger.
+fn validate_operations_arguments(parsed: &Parsed) -> Result<(), UsageError> {
+    match parsed.positional.first().map(String::as_str) {
+        None | Some("list") => {
+            if parsed.positional.len() > 1 {
+                return Err(UsageError::Message(
+                    "operations list does not accept positional arguments".into(),
+                ));
+            }
+            operation_history_query(parsed)?;
+        }
+        Some("show") => {
+            if parsed.positional.len() != 2 {
+                return Err(UsageError::Message(OPERATIONS_SHOW_USAGE.into()));
+            }
+            parse_operation_identifier(&parsed.positional[1]).map_err(|error| {
+                UsageError::Message(format!("{error}; {OPERATIONS_SHOW_USAGE}"))
+            })?;
+        }
+        Some("stats") => {
+            if parsed.positional.len() != 1 {
+                return Err(UsageError::Message(OPERATIONS_STATS_USAGE.into()));
+            }
+            let limit = parsed.limit.unwrap_or(crate::DEFAULT_OPERATION_STATS_LIMIT);
+            if limit == 0 || limit > crate::MAX_OPERATION_STATS_LIMIT {
+                return Err(UsageError::Message(format!(
+                    "--limit must be between 1 and {}\n{OPERATIONS_STATS_USAGE}",
+                    crate::MAX_OPERATION_STATS_LIMIT
+                )));
+            }
+        }
+        Some("reconcile") => {
+            let Some(operation) = parsed.operation.as_deref().filter(|_| {
+                parsed.inspect_remote != parsed.outcome.is_some()
+                    && parsed
+                        .reason
+                        .as_deref()
+                        .is_some_and(|reason| !reason.is_empty())
+            }) else {
+                return Err(operations_reconcile_error(
+                    "incomplete operation reconciliation request",
+                ));
+            };
+            parse_operation_identifier(operation).map_err(operations_reconcile_error)?;
+            if !parsed.inspect_remote
+                && !matches!(parsed.outcome.as_deref(), Some("succeeded" | "failed"))
+            {
+                return Err(operations_reconcile_error(
+                    "--outcome must be succeeded or failed",
+                ));
+            }
+        }
+        Some(other) => {
+            return Err(UsageError::Message(format!(
+                "unknown operations action {other:?} — expected list, show, stats, or reconcile"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn run_operations(parsed: Parsed) -> Result<(), UsageError> {
+    validate_operations_arguments(&parsed)?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     match parsed.positional.first().map(String::as_str) {
         None | Some("list") => {
