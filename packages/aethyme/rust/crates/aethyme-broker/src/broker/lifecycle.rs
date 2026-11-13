@@ -10101,11 +10101,37 @@ impl Broker {
         if maximum == 0 {
             return Ok(None);
         }
-        // Git's strict inventory includes its primary checkout. Count every
-        // other registration, including prunable ones and other placement
-        // roots, without opening or recursively sizing any checkout.
+        // Count every linked registration, including prunable ones and other
+        // placement roots, without opening or recursively sizing any checkout:
+        // one read of `<common>/worktrees/`, the records `git worktree list`
+        // enumerates. That listing also inspects every checkout, which took
+        // about 20 s over 884 checkouts on an external volume and starved the
+        // bounded removal passes that ask this. It stays the fallback when the
+        // registrations cannot be read.
+        if let Some(count) = self.registered_linked_checkout_count() {
+            return Ok(Some((count, maximum)));
+        }
         let count = self.repo.worktree_inventory()?.len().saturating_sub(1);
         Ok(Some((count, maximum)))
+    }
+
+    /// Linked-checkout registrations under `<common>/worktrees/`, or `None`
+    /// when that directory cannot be read completely.
+    pub(crate) fn registered_linked_checkout_count(&self) -> Option<usize> {
+        let common = self.repo.git_common_dir().ok()?;
+        match std::fs::read_dir(common.join("worktrees")) {
+            Ok(entries) => {
+                let mut count = 0usize;
+                for entry in entries {
+                    if entry.ok()?.file_type().ok()?.is_dir() {
+                        count += 1;
+                    }
+                }
+                Some(count)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(0),
+            Err(_) => None,
+        }
     }
 
     fn preflight_session_checkout_storage(

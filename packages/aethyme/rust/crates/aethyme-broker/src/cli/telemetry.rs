@@ -384,7 +384,12 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
         ),
         Some("review") => !matches!(args.get(1).map(String::as_str), Some("show")),
         Some("checkpoint") => args.get(1).map(String::as_str) == Some("apply"),
-        Some("gc") => matches!(args.get(1).map(String::as_str), Some("apply" | "sweep")),
+        // The detached artifact worker writes one phase-timing line per run,
+        // so its removal slices leave timing evidence.
+        Some("gc") => matches!(
+            args.get(1).map(String::as_str),
+            Some("apply" | "sweep" | "__continue-artifacts")
+        ),
         Some("storage") => match args.get(1).map(String::as_str) {
             Some("apply") => true,
             Some("attribute") => args.iter().any(|arg| arg == "--apply"),
@@ -467,7 +472,7 @@ fn command_records_outcome(args: &[String]) -> bool {
             args.first().map(String::as_str),
             args.get(1).map(String::as_str)
         ),
-        (Some("gates"), Some("affected"))
+        (Some("gates"), Some("affected")) | (Some("gc"), Some("__continue-artifacts"))
     ) && command_records_metric(args)
 }
 
@@ -568,6 +573,16 @@ mod tests {
             .map(str::to_string)
             .collect::<Vec<_>>();
         assert!(command_records_outcome(&run));
+    }
+
+    /// The detached artifact worker leaves a timing line per run (its removal
+    /// slices were otherwise invisible) but no broker outcome event, which
+    /// would add a database row every minute.
+    #[test]
+    fn the_artifact_worker_records_phase_metrics_without_an_outcome_event() {
+        let worker = ["gc", "__continue-artifacts", "/repository"].map(str::to_string);
+        assert!(command_records_metric(&worker));
+        assert!(!command_records_outcome(&worker));
     }
 
     #[test]
