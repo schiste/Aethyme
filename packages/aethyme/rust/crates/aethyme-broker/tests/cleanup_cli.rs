@@ -830,24 +830,29 @@ fn malformed_commands_refuse_before_the_writable_open_and_change_nothing() {
 
 /// Every command that refuses a malformed argument which needs no broker
 /// state must refuse before the writable open, as above: one row per command
-/// whose argument checks moved ahead of `Broker::open`.
+/// whose argument checks moved ahead of `Broker::open`, each in its public
+/// `advanced` spelling.
 #[test]
 fn more_malformed_commands_refuse_before_the_writable_open_and_change_nothing() {
     let (tmp, worktree) = eligible_closed_checkout_fixture();
     let refusals: [(&[&str], &str); 14] = [
-        (&["operations", "frobnicate"], "unknown operations action"),
-        (&["advisories"], "advisories requires an action"),
         (
-            &["exposures", "apply"],
+            &["advanced", "operations", "frobnicate"],
+            "unknown operations action",
+        ),
+        (&["advanced", "advisories"], "advisories requires an action"),
+        (
+            &["advanced", "exposures", "apply"],
             "exposures apply requires --session",
         ),
-        (&["note", "frobnicate"], "unknown note action"),
+        (&["advanced", "note", "frobnicate"], "unknown note action"),
         (
-            &["ownership", "claim"],
+            &["advanced", "ownership", "claim"],
             "ownership claim/release requires a name",
         ),
         (
             &[
+                "advanced",
                 "quality-report",
                 "frobnicate",
                 "report.json",
@@ -860,6 +865,7 @@ fn more_malformed_commands_refuse_before_the_writable_open_and_change_nothing() 
         ),
         (
             &[
+                "advanced",
                 "review",
                 "state",
                 "--repo",
@@ -877,6 +883,7 @@ fn more_malformed_commands_refuse_before_the_writable_open_and_change_nothing() 
         ),
         (
             &[
+                "advanced",
                 "review",
                 "waive",
                 "--repo",
@@ -893,20 +900,29 @@ fn more_malformed_commands_refuse_before_the_writable_open_and_change_nothing() 
             "is not a commit",
         ),
         (
-            &["handoff"],
+            &["advanced", "handoff"],
             "handoff requires --session <id> or --worktree <path>",
         ),
         (
-            &["checkpoint", "apply", "--session", "9999"],
+            &["advanced", "checkpoint", "apply", "--session", "9999"],
             "checkpoint apply requires --confirm",
         ),
-        (&["queue", "frobnicate"], "queue accepts no selectors"),
-        (&["watch", "pr", "frobnicate"], "unknown watch pr action"),
         (
-            &["watch", "repo", "frobnicate"],
+            &["advanced", "queue", "frobnicate"],
+            "queue accepts no selectors",
+        ),
+        (
+            &["advanced", "watch", "pr", "frobnicate"],
+            "unknown watch pr action",
+        ),
+        (
+            &["advanced", "watch", "repo", "frobnicate"],
             "unknown watch repo action",
         ),
-        (&["deliveries", "frobnicate"], "unknown deliveries action"),
+        (
+            &["advanced", "deliveries", "frobnicate"],
+            "unknown deliveries action",
+        ),
     ];
     for (args, refusal) in refusals {
         reset_sweep_witnesses(tmp.path());
