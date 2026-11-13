@@ -1611,25 +1611,38 @@ mod tests {
         drop(shared);
     }
 
-    /// `submit`'s plan-reuse hold has no journal row. A coordinated write
-    /// refused behind it now names it: kind, pid, session and hold time.
+    /// An unjournaled exclusive hold (maintenance) has no journal row. A
+    /// coordinated write refused behind it names it: kind, pid, session, hold
+    /// time, and the phase the holder last recorded, on the common-directory
+    /// lane it nests as well as its own.
     #[test]
-    fn a_refusal_behind_an_unjournaled_submit_hold_names_the_holder() {
+    fn a_refusal_behind_an_unjournaled_hold_names_the_holder_and_its_phase() {
         let root = repository_with_origin("https://github.com/example/repo.git");
         let root = root.path().canonicalize().unwrap();
         let checkout = crate::GitRepo::discover(&root).unwrap();
-        let (_repository, held) = crate::operations::try_acquire_local_repository_write_lock_as(
+        let (repository, mut held) = crate::operations::try_acquire_local_repository_write_lock_as(
             &root,
             &checkout,
-            "submit_plan_reuse",
+            "git_maintenance_lock_apply",
             Some(5),
         )
         .unwrap()
         .expect("an uncontended hold");
         let common_key = common_lock_key(&root).unwrap();
         let record = recorded_lock_holder(&root, &common_key).expect("a holder record");
-        assert_eq!(record.kind, "submit_plan_reuse");
+        assert_eq!(record.kind, "git_maintenance_lock_apply");
         assert_eq!(record.session_id, Some(5));
+        assert_eq!(record.phase, None);
+        held.record_phase("re-planning under the write locks");
+        for key in [common_key.as_str(), repository.as_str()] {
+            let record = recorded_lock_holder(&root, key).expect("a holder record");
+            assert_eq!(
+                record.phase.as_deref(),
+                Some("re-planning under the write locks"),
+                "{key}"
+            );
+            assert!(record.phase_started_at_ms.is_some(), "{key}");
+        }
 
         let refused = RepositoryWriteLock::acquire_mode(
             &root,
@@ -1651,15 +1664,18 @@ mod tests {
             &holder,
         );
         assert_eq!(details["reason"], "local_git_lane_unavailable");
-        assert_eq!(details["holder"]["scope"], "submit_plan_reuse");
+        assert_eq!(details["holder"]["scope"], "git_maintenance_lock_apply");
         assert_eq!(details["holder"]["session_id"], 5);
         assert_eq!(details["holder"]["pid"], i64::from(std::process::id()));
         assert!(details["holder"]["held_ms"].as_i64().is_some());
+        assert_eq!(
+            details["holder"]["phase"],
+            "re-planning under the write locks"
+        );
+        let description = details["holder"]["description"].as_str().unwrap();
         assert!(
-            details["holder"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("submit_plan_reuse"),
+            description.contains("git_maintenance_lock_apply")
+                && description.contains("now re-planning under the write locks"),
             "{details}"
         );
         assert!(
@@ -1670,6 +1686,58 @@ mod tests {
         );
         drop(held);
         assert!(recorded_lock_holder(&root, &common_key).is_none());
+    }
+
+    /// The shared read lanes `submit` holds for its short history-view checks
+    /// admit every narrow writer and exclude only exclusive (wide) ones, and
+    /// they yield to a wide writer already waiting at its intent lock.
+    #[test]
+    fn shared_read_lanes_admit_narrow_writers_and_exclude_wide_ones() {
+        let root = repository_with_origin("https://github.com/example/repo.git");
+        let root = root.path().canonicalize().unwrap();
+        let checkout = crate::GitRepo::discover(&root).unwrap();
+        let common_key = common_lock_key(&root).unwrap();
+        let (repository, read) =
+            crate::operations::try_acquire_local_repository_read_lanes(&root, &checkout)
+                .unwrap()
+                .expect("uncontended read lanes");
+        // A narrow writer's lanes: wide intent passed shared, then both lanes
+        // shared, exactly as `run_coordinated_operation` takes them.
+        for key in [
+            wide_intent_key(&common_key),
+            common_key.clone(),
+            wide_intent_key(&repository),
+            repository.clone(),
+        ] {
+            let narrow = RepositoryWriteLock::acquire_shared(
+                &root,
+                &key,
+                (21, Some(7)),
+                || Ok("test".into()),
+                QueueWait::Refuse,
+                |_, _| {},
+            );
+            assert!(narrow.is_ok(), "a narrow writer waited on {key}");
+        }
+        assert!(
+            RepositoryWriteLock::try_acquire_nonblocking(&root, &common_key)
+                .unwrap()
+                .is_none(),
+            "a wide writer must still be excluded while the read lanes are held"
+        );
+        drop(read);
+
+        let waiting_wide_writer =
+            RepositoryWriteLock::try_acquire_nonblocking(&root, &wide_intent_key(&common_key))
+                .unwrap()
+                .expect("an uncontended wide intent");
+        assert!(
+            crate::operations::try_acquire_local_repository_read_lanes(&root, &checkout)
+                .unwrap()
+                .is_none(),
+            "the read lanes must yield to a wide writer waiting at its intent"
+        );
+        drop(waiting_wide_writer);
     }
 
     /// `queue_wait_ms` is the whole wait, not only the last lock's: a 15 s

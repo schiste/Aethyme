@@ -1350,8 +1350,9 @@ pub(crate) struct RepositoryWriteLock {
     acquired_at: Instant,
     acquired_at_ms: i64,
     queue_wait_ms: i64,
-    /// The holder record this exclusive holder wrote; removed on drop.
-    holder_record: Option<PathBuf>,
+    /// The holder record this exclusive holder wrote, and where; removed on
+    /// drop.
+    holder_record: Option<(PathBuf, LockHolderRecord)>,
     _compatibility_guard: Option<Box<RepositoryWriteLock>>,
 }
 
@@ -1366,11 +1367,22 @@ impl RepositoryWriteLock {
         main_root: &Path,
         repository: &str,
     ) -> Result<Option<Self>, BrokerOpError> {
+        Self::try_acquire_nonblocking_mode(main_root, repository, false)
+    }
+
+    /// [`Self::try_acquire_nonblocking`], shared when `shared`: the form every
+    /// narrow Git writer holds, so it excludes only exclusive (wide) holders.
+    fn try_acquire_nonblocking_mode(
+        main_root: &Path,
+        repository: &str,
+        shared: bool,
+    ) -> Result<Option<Self>, BrokerOpError> {
+        let lock_mode = if shared { libc::LOCK_SH } else { libc::LOCK_EX };
         let path = repository_write_lock_path(main_root, repository);
         let file = open_repository_write_lock_file(main_root, &path)?;
         // SAFETY: `file` is a live descriptor opened above and remains owned by
         // this guard. `flock` only applies an advisory lock to that descriptor.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let rc = unsafe { libc::flock(file.as_raw_fd(), lock_mode | libc::LOCK_NB) };
         if rc == 0 {
             return Ok(Some(Self {
                 file,
@@ -1616,7 +1628,29 @@ impl RepositoryWriteLock {
     ) {
         let path = lock_holder_record_path(&lock_path);
         let record = LockHolderRecord::current(kind, session_id, operation_id, self.acquired_at_ms);
-        self.holder_record = write_lock_holder_record(&path, &record).ok().map(|()| path);
+        self.holder_record = write_lock_holder_record(&path, &record)
+            .ok()
+            .map(|()| (path, record));
+    }
+
+    /// Say what this exclusive holder is doing now, in its holder record and
+    /// in the record of the lane it nests (the common-directory lane), so a
+    /// refused waiter names the phase as well as the holder. Diagnostic only,
+    /// like the record itself.
+    pub(crate) fn record_phase(&mut self, phase: &str) {
+        let started = Instant::now();
+        if let Some((path, record)) = self.holder_record.as_mut() {
+            record.phase = Some(phase.to_owned());
+            record.phase_started_at_ms = Some(unix_now_ms());
+            crate::warn_unrecorded(
+                "update a write-lock holder record's phase",
+                write_lock_holder_record(path, record),
+            );
+        }
+        if let Some(guard) = self._compatibility_guard.as_mut() {
+            guard.record_phase(phase);
+        }
+        crate::phase_telemetry::add("lock_holder_phase_record", started.elapsed());
     }
 }
 
@@ -1697,6 +1731,93 @@ pub(crate) fn try_acquire_local_repository_write_lock_as(
             (repository, lock)
         }),
     )
+}
+
+/// Take the common-directory and repository lanes in their shared form,
+/// without waiting: the form every narrow Git writer (a strict push or fetch,
+/// a session-branch commit) already holds, so those writers never queue
+/// behind it. It excludes only an exclusive (repository-wide) writer, the one
+/// kind that can change the history view (replace refs, grafts, shallow).
+///
+/// It yields to a wide writer that is already waiting: if a wide-intent lock
+/// is held, it gives up instead of delaying that writer, so narrow writers
+/// queued behind the wide one wait no longer. Shared holders write no holder
+/// record; callers hold this for one short check, never across slow work.
+pub(crate) fn try_acquire_local_repository_read_lanes(
+    main_root: &Path,
+    checkout: &crate::GitRepo,
+) -> Result<Option<(String, RepositoryWriteLock)>, BrokerOpError> {
+    let Some(repository) = local_repository_coordination_key(checkout, None)? else {
+        return Ok(None);
+    };
+    let key = git_scopes::common_lock_key(checkout.root())?;
+    for intent in [wide_intent_key(&key), wide_intent_key(&repository)] {
+        if RepositoryWriteLock::try_acquire_nonblocking_mode(main_root, &intent, true)?.is_none() {
+            return Ok(None);
+        }
+    }
+    let Some(common) = RepositoryWriteLock::try_acquire_nonblocking_mode(main_root, &key, true)?
+    else {
+        return Ok(None);
+    };
+    Ok(
+        RepositoryWriteLock::try_acquire_nonblocking_mode(main_root, &repository, true)?.map(
+            |mut lock| {
+                lock._compatibility_guard = Some(Box::new(common));
+                (repository, lock)
+            },
+        ),
+    )
+}
+
+/// Whether a coordinated repository-wide Git write may have run on
+/// `repository` since `generation` was read: one queued after it, or one that
+/// was queued but not started then (`pending_at_generation`) and has started
+/// or settled since. Read with the shared lanes held at both ends, this proves
+/// no such writer held the exclusive lane in between, without holding any lane
+/// across that interval.
+pub(crate) fn repository_wide_write_since(
+    store: &crate::BrokerStore,
+    repository: &str,
+    generation: i64,
+    pending_at_generation: &[i64],
+) -> Result<bool, crate::BrokerError> {
+    let wide = |operation: &CoordinatedOperation| {
+        operation.provider == OperationProvider::Git && stored_resource_scope(operation).is_none()
+    };
+    if store
+        .coordinated_writes_queued_after(repository, generation)?
+        .iter()
+        .any(wide)
+    {
+        return Ok(true);
+    }
+    for id in pending_at_generation {
+        match store.coordinated_operation(*id)? {
+            Some(operation) if operation.status == OperationStatus::Prepared => {}
+            // Started, settled, or gone: it may have held the exclusive lane.
+            _ => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+/// Ids of the repository-wide Git writes queued (`Prepared`) on `repository`:
+/// they have not taken the exclusive lane yet, but may after this call.
+pub(crate) fn pending_repository_wide_writes(
+    store: &crate::BrokerStore,
+    repository: &str,
+) -> Result<Vec<i64>, crate::BrokerError> {
+    Ok(store
+        .unresolved_coordinated_operations(repository)?
+        .into_iter()
+        .filter(|operation| {
+            operation.status == OperationStatus::Prepared
+                && operation.provider == OperationProvider::Git
+                && stored_resource_scope(operation).is_none()
+        })
+        .map(|operation| operation.id)
+        .collect())
 }
 
 /// Whether a repo-wide mutating operation has an outcome that may still affect
@@ -2299,6 +2420,7 @@ fn lane_refusal_details(
             "scope": holder.scope.as_deref(),
             "started_at": holder.started_at,
             "held_ms": holder.started_at.map(|started| now.saturating_sub(started).max(0)),
+            "phase": holder.phase.as_deref(),
         },
         "coordination_timing": coordination_timing_value(
             lock_key,
@@ -2325,6 +2447,13 @@ pub(crate) struct LockHolderRecord {
     pub session_id: Option<i64>,
     pub operation_id: Option<i64>,
     pub acquired_at_ms: i64,
+    /// What the holder is doing now (`RepositoryWriteLock::record_phase`);
+    /// absent until a holder names one, and in records written before 0.8.90.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// When `phase` began, in epoch milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_started_at_ms: Option<i64>,
 }
 
 impl LockHolderRecord {
@@ -2342,6 +2471,8 @@ impl LockHolderRecord {
             session_id,
             operation_id,
             acquired_at_ms,
+            phase: None,
+            phase_started_at_ms: None,
         }
     }
 
@@ -2353,8 +2484,16 @@ impl LockHolderRecord {
         if let Some(operation) = self.operation_id {
             owner.push_str(&format!(", operation {operation}"));
         }
+        let phase = match (&self.phase, self.phase_started_at_ms) {
+            (Some(phase), Some(started)) => format!(
+                "; now {phase} (for {})",
+                humanize_duration(now_ms.saturating_sub(started).max(0) as u64 / 1_000)
+            ),
+            (Some(phase), None) => format!("; now {phase}"),
+            (None, _) => String::new(),
+        };
         format!(
-            "{} `{}` ({owner}) has held it for {}",
+            "{} `{}` ({owner}) has held it for {}{phase}",
             self.kind,
             self.command,
             humanize_duration(now_ms.saturating_sub(self.acquired_at_ms).max(0) as u64 / 1_000),
@@ -2420,6 +2559,7 @@ fn with_recorded_holder(holder: LockHolderInfo, main_root: &Path, key: &str) -> 
             pid: Some(i64::from(record.pid)),
             scope: Some(record.kind),
             started_at: Some(record.acquired_at_ms),
+            phase: record.phase,
         },
         None => holder,
     }
@@ -2433,6 +2573,9 @@ struct LockHolderInfo {
     pid: Option<i64>,
     scope: Option<String>,
     started_at: Option<i64>,
+    /// What an unjournaled holder said it is doing (its holder record's
+    /// `phase`); a journaled operation reports its phase through liveness.
+    phase: Option<String>,
 }
 
 /// Describe a known matching running operation, or report that the holder
@@ -2495,6 +2638,7 @@ fn lock_holder_info_for_domain(
             pid: Some(operation.pid),
             scope: Some(operation.scope),
             started_at: Some(operation.created_at),
+            phase: None,
         },
         None => unidentified_lock_holder(),
     }
@@ -2508,6 +2652,7 @@ fn unidentified_lock_holder() -> LockHolderInfo {
         pid: None,
         scope: None,
         started_at: None,
+        phase: None,
     }
 }
 
@@ -2539,7 +2684,7 @@ fn coordination_wait_details(
 impl Drop for RepositoryWriteLock {
     fn drop(&mut self) {
         // Still holding the lock, so no later holder's record is removed.
-        if let Some(path) = self.holder_record.take() {
+        if let Some((path, _)) = self.holder_record.take() {
             crate::warn_unrecorded(
                 "remove a write-lock holder record",
                 std::fs::remove_file(&path).or_else(|error| {
