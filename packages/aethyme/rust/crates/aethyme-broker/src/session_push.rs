@@ -544,10 +544,22 @@ fn foreign_remote_tip_refusal(
         "remote branch {remote}/{branch} is at {tip}, which this session's branch does not \
          contain and this session did not push (it is neither the oid broker push last \
          recorded nor one a succeeded push of this session sent), so broker push will not \
-         replace it; nothing was pushed. Inspect it with `git fetch {remote} {branch}` and \
-         `git log HEAD..{tip}`, then merge it in with `aethyme broker sync --session \
-         {session_id}` (or `git merge {tip}`) and push again"
+         replace it; nothing was pushed. {}",
+        remote_tip_next_steps(session_id, branch, remote, tip)
     ))
+}
+
+/// What to run, in the session worktree, when the remote branch holds `tip`
+/// (an oid, or `FETCH_HEAD` when it could not be read): inspect it, or merge
+/// it so HEAD contains it and the next `broker push` is a plain push.
+/// `broker sync` is not offered: it merges only the default branch.
+fn remote_tip_next_steps(session_id: i64, branch: &str, remote: &str, tip: &str) -> String {
+    format!(
+        "In the session worktree, inspect it with `git fetch {remote} {branch} && git log \
+         HEAD..{tip}`; to keep it, run `git fetch {remote} {branch} && git merge {tip}`, then \
+         `aethyme broker push --session {session_id}` (HEAD then contains it, so the push is a \
+         plain fast-forward)"
+    )
 }
 
 /// Whether Git refused the push because the remote ref was not where the
@@ -838,13 +850,16 @@ impl Broker {
             PushAttempt::Pushed(report) => Ok(*report),
             PushAttempt::RemoteTipMoved { remote, tip } => {
                 let branch = self.store().session(session_id)?.branch;
+                let next = match tip.as_deref() {
+                    Some(tip) => remote_tip_next_steps(session_id, &branch, &remote, tip),
+                    None => format!(
+                        "It was deleted; re-run `aethyme broker push --session {session_id}`"
+                    ),
+                };
                 Err(refused(format!(
                     "remote branch {remote}/{branch} moved again while broker push waited for \
-                     the push lock (it is now at {}); nothing was pushed. Inspect it with \
-                     `git fetch {remote} {branch}` and `git log HEAD..FETCH_HEAD`, merge it in \
-                     with `aethyme broker sync --session {session_id}` if it should be kept, \
-                     then re-run `aethyme broker push --session {session_id}`",
-                    tip.as_deref().unwrap_or("nothing: the branch was deleted"),
+                     the push lock (it is now at {}); nothing was pushed. {next}",
+                    tip.as_deref().unwrap_or("nothing"),
                 )))
             }
         }
@@ -1069,14 +1084,17 @@ impl Broker {
                     remote: default.remote,
                 }),
                 Err(error) => Err(refused(format!(
-                    "Git refused the push because remote branch {remote}/{branch} is no longer \
-                     where broker push expected it, and reading where it is failed ({error}); \
-                     nothing was pushed. Inspect it with `git fetch {remote} {branch}` and \
-                     `git log HEAD..FETCH_HEAD`, merge it in with `aethyme broker sync \
-                     --session {session_id}` if it should be kept, then re-run \
-                     `aethyme broker push --session {session_id}`",
-                    remote = default.remote,
-                    branch = session.branch,
+                    "Git refused the push because remote branch {}/{} is no longer where \
+                     broker push expected it, and reading where it is failed ({error}); \
+                     nothing was pushed. {}",
+                    default.remote,
+                    session.branch,
+                    remote_tip_next_steps(
+                        session_id,
+                        &session.branch,
+                        &default.remote,
+                        "FETCH_HEAD"
+                    ),
                 ))),
             };
         }

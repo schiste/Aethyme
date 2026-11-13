@@ -860,8 +860,12 @@ fn the_lease_refuses_when_the_remote_branch_moved_underneath() {
         "{message}"
     );
     assert!(
-        message.contains(&format!("aethyme broker sync --session {session}"))
-            && message.contains(&format!("git log HEAD..{theirs}")),
+        message.contains(&format!(
+            "`git fetch origin {branch} && git log HEAD..{theirs}`"
+        )) && message.contains(&format!(
+            "`git fetch origin {branch} && git merge {theirs}`, then \
+             `aethyme broker push --session {session}`"
+        )) && !message.contains("broker sync"),
         "{message}"
     );
     assert_eq!(
@@ -1065,8 +1069,12 @@ fn a_foreign_remote_tip_is_refused_before_git_runs() {
         "{message}"
     );
     assert!(
-        message.contains(&format!("aethyme broker sync --session {session}"))
-            && message.contains(&format!("git log HEAD..{theirs}")),
+        message.contains(&format!(
+            "`git fetch origin {branch} && git log HEAD..{theirs}`"
+        )) && message.contains(&format!(
+            "`git fetch origin {branch} && git merge {theirs}`, then \
+             `aethyme broker push --session {session}`"
+        )) && !message.contains("broker sync"),
         "{message}"
     );
     assert_eq!(
@@ -1074,6 +1082,34 @@ fn a_foreign_remote_tip_is_refused_before_git_runs() {
         Some(theirs.as_str())
     );
     assert_eq!(fixture.session_push_operations().len(), journaled_before);
+
+    // Following the message: fetch and merge the tip in the session
+    // worktree, after which it is an ancestor of HEAD and the push is plain.
+    let fetch = Command::new("git")
+        .args(["fetch", "-q", "origin", &branch])
+        .current_dir(&worktree)
+        .env("AETHYME_TEST_GIT_REMOTE", &fixture.remote)
+        .output()
+        .unwrap();
+    assert!(fetch.status.success(), "{}", stderr(&fetch));
+    git(&worktree, &["merge", "-q", "--no-edit", &theirs]);
+    let report = json(&fixture.push(session, &[]));
+    let head = git_output(&worktree, &["rev-parse", "HEAD"]);
+    assert_eq!(report["pushed_oid"], head);
+    assert_eq!(report["previous_remote_oid"], theirs.as_str());
+    assert_eq!(
+        fixture.remote_branch(&branch).as_deref(),
+        Some(head.as_str())
+    );
+    let operations = fixture.session_push_operations();
+    assert_eq!(operations.len(), journaled_before + 1);
+    let last = operations.last().unwrap();
+    assert_eq!(last.status.as_str(), "succeeded");
+    assert!(
+        !last.command_json.contains("--force-with-lease"),
+        "{}",
+        last.command_json
+    );
 }
 
 #[test]
