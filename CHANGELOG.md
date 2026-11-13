@@ -4,6 +4,16 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.92] - 2026-11-13
+
+### Fixed
+
+- The background worker's capacity removal slice now keeps working through a long backlog. A slice that ran out of time part-way through a lap of closed checkouts retries after one minute instead of ten, and a bounded pass resumes a part-built checkout index instead of ending with no inventory. The ten-minute wait applies only when a lap ended with nothing removable (#1662).
+
+### Added
+
+- The capacity removal slice records its own result, which later worker steps no longer overwrite: `auto_cleanup.capacity_removal` in `gc plan --json` and `capacity_removal` in `status --json`. It carries the outcome (`removed`, `lock_busy`, `inventory_unavailable`, `lap_unfinished`, `nothing_removable`), counts by keep code, the ignored directories that block removal with the `[cleanup]` config line that would release each, how much of the lap remains, and phase timings. `auto_cleanup.lanes` gains `removal_scan_ms` and `removal_inventory_unavailable` (#1662).
+
 ## [0.8.91] - 2026-11-13
 
 ### Fixed
