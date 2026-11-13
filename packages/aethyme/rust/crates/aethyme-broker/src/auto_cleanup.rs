@@ -749,6 +749,109 @@ pub struct AutoCleanupReport {
     /// Why an otherwise due session-retirement pass did not finish.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retirement_deferred_reasons: Vec<SessionRetirementDeferredReason>,
+    /// Open sessions idle past `session_landed_after_hours` that the landed
+    /// lane judged in this report.
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub landed_sessions_examined: usize,
+    /// Of those, the sessions it closed because their work is on the fetched
+    /// default branch, their worktree is clean and no process holds them.
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub landed_sessions_closed: usize,
+    /// Sessions the landed lane kept, counted per machine-readable reason
+    /// (`LandedSessionDecline::code`). A session the abandonment window
+    /// closed afterwards is not counted here.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub landed_sessions_declined: std::collections::BTreeMap<String, usize>,
+    /// Where the open-session retirement cursor stood when the report was
+    /// written: successive passes resume after it instead of restarting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement_cursor: Option<SessionRetirementCursorPosition>,
+    /// Milliseconds the landed lane spent judging sessions.
+    #[serde(default, skip_serializing_if = "is_zero_ms")]
+    pub landed_retirement_elapsed_ms: u64,
+}
+
+/// The retirement cursor as reported: the last session judged in the current
+/// lap and the highest open session id the lap covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionRetirementCursorPosition {
+    pub after_session_id: i64,
+    pub high_water_session_id: i64,
+}
+
+/// The landed-session retirement counts `broker status` shows, taken from the
+/// last automatic-maintenance report. Present only once the landed lane has
+/// judged at least one session.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LandedSessionRetirementView {
+    pub evaluated_at_ms: i64,
+    pub examined: usize,
+    pub closed: usize,
+    /// Kept sessions per reason; the reasons are `LandedSessionDecline` codes.
+    pub declined: std::collections::BTreeMap<String, usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<SessionRetirementCursorPosition>,
+}
+
+impl AutoCleanupReport {
+    /// Fold one retirement summary's landed-lane counts into this report.
+    fn absorb_landed_retirement(&mut self, retirement: &SessionRetirementSummary) {
+        self.landed_sessions_examined = self
+            .landed_sessions_examined
+            .saturating_add(retirement.landed_examined);
+        self.landed_sessions_closed = self
+            .landed_sessions_closed
+            .saturating_add(retirement.landed_closed);
+        for (reason, count) in &retirement.landed_declined {
+            let entry = self
+                .landed_sessions_declined
+                .entry((*reason).to_string())
+                .or_default();
+            *entry = entry.saturating_add(*count);
+        }
+        if retirement.cursor.is_some() {
+            self.retirement_cursor = retirement.cursor;
+        }
+        self.landed_retirement_elapsed_ms = self
+            .landed_retirement_elapsed_ms
+            .saturating_add(retirement.landed_elapsed_ms);
+    }
+
+    /// Fold a later report's landed-lane counts into this aggregate, as the
+    /// background retirement worker does across its passes.
+    pub(crate) fn absorb_landed_report(&mut self, later: &AutoCleanupReport) {
+        self.landed_sessions_examined = self
+            .landed_sessions_examined
+            .saturating_add(later.landed_sessions_examined);
+        self.landed_sessions_closed = self
+            .landed_sessions_closed
+            .saturating_add(later.landed_sessions_closed);
+        for (reason, count) in &later.landed_sessions_declined {
+            let entry = self
+                .landed_sessions_declined
+                .entry(reason.clone())
+                .or_default();
+            *entry = entry.saturating_add(*count);
+        }
+        if later.retirement_cursor.is_some() {
+            self.retirement_cursor = later.retirement_cursor;
+        }
+        self.landed_retirement_elapsed_ms = self
+            .landed_retirement_elapsed_ms
+            .saturating_add(later.landed_retirement_elapsed_ms);
+    }
+
+    /// What `broker status` reports about the landed lane, if it judged any
+    /// session in this report.
+    pub fn landed_session_retirement_view(&self) -> Option<LandedSessionRetirementView> {
+        (self.landed_sessions_examined > 0).then(|| LandedSessionRetirementView {
+            evaluated_at_ms: self.evaluated_at_ms,
+            examined: self.landed_sessions_examined,
+            closed: self.landed_sessions_closed,
+            declined: self.landed_sessions_declined.clone(),
+            cursor: self.retirement_cursor,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -788,10 +891,28 @@ struct SessionRetirementSummary {
     retired: usize,
     deferred: usize,
     reasons: Vec<SessionRetirementDeferredReason>,
+    landed_examined: usize,
+    landed_closed: usize,
+    landed_declined: std::collections::BTreeMap<&'static str, usize>,
+    landed_elapsed_ms: u64,
+    cursor: Option<SessionRetirementCursorPosition>,
+}
+
+impl SessionRetirementSummary {
+    fn record_cursor(&mut self, cursor: &SessionRetirementCursor) {
+        self.cursor = Some(SessionRetirementCursorPosition {
+            after_session_id: cursor.after_session_id,
+            high_water_session_id: cursor.high_water_session_id,
+        });
+    }
 }
 
 fn is_zero_count(count: &usize) -> bool {
     *count == 0
+}
+
+fn is_zero_ms(ms: &u64) -> bool {
+    *ms == 0
 }
 
 /// A closed checkout and every session that names it.
@@ -1361,9 +1482,12 @@ pub(crate) fn unclean_reason(
     main_root: &Path,
     policy: &AutoCleanupPolicy,
 ) -> Result<Option<String>, String> {
+    // `--no-optional-locks`: asking must not refresh the index, whose
+    // modification time is the worktree activity the idle windows read.
     let status = git(
         worktree,
         &[
+            "--no-optional-locks",
             "status",
             "--porcelain=v1",
             "-z",
@@ -2956,6 +3080,7 @@ impl Broker {
                 return Ok(summary);
             }
         }
+        summary.record_cursor(&cursor);
         if cursor.high_water_session_id == 0 {
             return Ok(summary);
         }
@@ -3044,27 +3169,68 @@ impl Broker {
                 window_ms,
             )
             .is_abandoned();
-            let outcome = if old_enough_for_abandonment {
-                self.try_close_abandoned_session(
-                    session.id,
+            let idle_enough_for_landed = landed_window_ms > 0
+                && crate::decide_abandonment(
+                    &crate::SessionActivity {
+                        session_id: session.id,
+                        last_activity_at: session.last_activity_at,
+                        created_at: session.created_at,
+                        agent_alive: None,
+                        closed: false,
+                    },
                     now,
-                    window_ms,
-                    &mut holder_process_table,
-                    allow_snapshot,
-                    deadline,
-                )?
-            } else if landed_window_ms > 0 && landed_window_ms < window_ms {
-                self.try_close_landed_session(
+                    landed_window_ms,
+                )
+                .is_abandoned();
+            // The landed lane is asked first, whatever the session's age: its
+            // proof (work on the default branch, clean worktree, no process)
+            // is stronger than idleness, so it may outlive a holder process
+            // the abandonment window must wait for. A decline that leaves the
+            // question open falls through to the abandonment window.
+            let mut landed_decline = None;
+            let mut outcome = crate::broker::AbandonedSessionCloseOutcome::NotDue;
+            if idle_enough_for_landed {
+                summary.landed_examined += 1;
+                crate::phase_telemetry::add("landed_sessions_examined", Duration::ZERO);
+                let started = Instant::now();
+                outcome = self.try_close_landed_session(
                     session.id,
                     now,
                     landed_window_ms,
                     &mut holder_process_table,
                     allow_snapshot,
                     deadline,
-                )?
-            } else {
-                crate::broker::AbandonedSessionCloseOutcome::NotDue
-            };
+                )?;
+                let elapsed = started.elapsed();
+                crate::phase_telemetry::add("landed_session_retirement", elapsed);
+                summary.landed_elapsed_ms = summary
+                    .landed_elapsed_ms
+                    .saturating_add(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+                landed_decline = crate::broker::LandedSessionDecline::from_outcome(outcome);
+                if landed_decline.is_none() {
+                    summary.landed_closed += 1;
+                    crate::phase_telemetry::add("landed_sessions_closed", elapsed);
+                }
+            }
+            let fall_through = landed_decline
+                .is_none_or(crate::broker::LandedSessionDecline::allows_abandonment_fallback)
+                && !matches!(outcome, crate::broker::AbandonedSessionCloseOutcome::Closed);
+            if fall_through && old_enough_for_abandonment {
+                outcome = self.try_close_abandoned_session(
+                    session.id,
+                    now,
+                    window_ms,
+                    &mut holder_process_table,
+                    allow_snapshot,
+                    deadline,
+                )?;
+            }
+            if let Some(reason) = landed_decline
+                && !matches!(outcome, crate::broker::AbandonedSessionCloseOutcome::Closed)
+            {
+                *summary.landed_declined.entry(reason.code()).or_default() += 1;
+                crate::phase_telemetry::add(reason.telemetry_name(), Duration::ZERO);
+            }
             match outcome {
                 crate::broker::AbandonedSessionCloseOutcome::Closed => summary.retired += 1,
                 crate::broker::AbandonedSessionCloseOutcome::HolderUnavailable => {
@@ -3137,7 +3303,8 @@ impl Broker {
                 }
                 crate::broker::AbandonedSessionCloseOutcome::NotDue
                 | crate::broker::AbandonedSessionCloseOutcome::Changed
-                | crate::broker::AbandonedSessionCloseOutcome::ActiveProcess => {}
+                | crate::broker::AbandonedSessionCloseOutcome::ActiveProcess
+                | crate::broker::AbandonedSessionCloseOutcome::LandedDeclined(_) => {}
             }
             cursor.after_session_id = session.id;
             if !self.persist_session_retirement_cursor(&cursor, &mut expected_raw)? {
@@ -3147,6 +3314,7 @@ impl Broker {
                     .push(SessionRetirementDeferredReason::CursorBusy);
                 return Ok(summary);
             }
+            summary.record_cursor(&cursor);
         }
 
         if deadline_expired(deadline) {
@@ -3165,7 +3333,9 @@ impl Broker {
         )?;
         if more.is_empty() {
             cursor.after_session_id = cursor.high_water_session_id;
-            if !self.persist_session_retirement_cursor(&cursor, &mut expected_raw)? {
+            if self.persist_session_retirement_cursor(&cursor, &mut expected_raw)? {
+                summary.record_cursor(&cursor);
+            } else {
                 summary.deferred += 1;
                 summary
                     .reasons
@@ -3195,15 +3365,17 @@ impl Broker {
             Ok(policy) => (policy.auto_remove, None),
             Err(error) => (false, Some(error)),
         };
-        Ok(AutoCleanupReport {
+        let mut report = AutoCleanupReport {
             enabled,
             config_error,
             evaluated_at_ms: now_ms(),
-            deferred: retirement.deferred,
-            sessions_retired: retirement.retired,
-            retirement_deferred_reasons: retirement.reasons,
             ..AutoCleanupReport::default()
-        })
+        };
+        report.absorb_landed_retirement(&retirement);
+        report.deferred = retirement.deferred;
+        report.sessions_retired = retirement.retired;
+        report.retirement_deferred_reasons = retirement.reasons;
+        Ok(report)
     }
 
     /// Run one auto-cleanup pass within `deadline`: select, then revalidate
@@ -3227,17 +3399,20 @@ impl Broker {
                 Ok(policy) => (policy.auto_remove, None),
                 Err(error) => (false, Some(error.to_string())),
             };
-            return Ok(AutoCleanupReport {
+            let mut report = AutoCleanupReport {
                 enabled,
                 config_error,
                 evaluated_at_ms: now_ms(),
-                deferred: retirement.deferred,
-                sessions_retired: retirement.retired,
-                retirement_deferred_reasons: retirement.reasons,
                 ..AutoCleanupReport::default()
-            });
+            };
+            report.absorb_landed_retirement(&retirement);
+            report.deferred = retirement.deferred;
+            report.sessions_retired = retirement.retired;
+            report.retirement_deferred_reasons = retirement.reasons;
+            return Ok(report);
         }
         let mut plan = self.auto_cleanup_plan(deadline)?;
+        plan.report.absorb_landed_retirement(&retirement);
         plan.report.sessions_retired = retirement.retired;
         plan.report.deferred += retirement.deferred;
         plan.report.retirement_deferred_reasons = retirement.reasons;
@@ -6365,6 +6540,370 @@ mod tests {
                 assert!(checkout.join("untracked-work").exists());
             }
         }
+    }
+
+    /// A repository whose default branch is on a local `origin`, with the
+    /// default 24-hour landed window, a 72-hour abandonment window and no
+    /// closed-checkout grace, so one pass can close and remove.
+    #[cfg(unix)]
+    fn landed_lane_fixture(
+        cleanup: Option<&str>,
+    ) -> (
+        tempfile::TempDir,
+        crate::test_storage::TestStorage,
+        crate::Broker,
+    ) {
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path().join("repository");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.name", "Auto cleanup test"]);
+        git(
+            &root,
+            &["config", "user.email", "auto-cleanup@example.invalid"],
+        );
+        std::fs::write(root.join(".gitignore"), "/.aethyme/\n").unwrap();
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", ".gitignore", "base.txt"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        aethyme_testkit::ensure_origin(&root);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nsession_abandoned_after_hours = 72\nclosed_worktree_grace_hours = 0\n",
+        )
+        .unwrap();
+        if let Some(cleanup) = cleanup {
+            std::fs::write(root.join(".aethyme/config.toml"), cleanup).unwrap();
+        }
+        let storage = crate::test_storage::TestStorage::new();
+        let broker = storage.open(&root).unwrap();
+        (owner, storage, broker)
+    }
+
+    /// Start a session and commit one file in it; land it by pull request
+    /// with `style`, or leave it unlanded.
+    #[cfg(unix)]
+    fn landed_lane_session(
+        broker: &mut crate::Broker,
+        label: &str,
+        style: Option<aethyme_testkit::MergeStyle>,
+    ) -> (crate::Session, PathBuf) {
+        let session = broker.start_worktree(label, None).unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        let file = format!("work-{}.txt", session.id);
+        std::fs::write(worktree.join(&file), format!("{label}\n")).unwrap();
+        git(&worktree, &["add", &file]);
+        git(&worktree, &["commit", "-qm", label]);
+        if let Some(style) = style {
+            let root = broker.main_root().to_path_buf();
+            aethyme_testkit::land_as_pull_request(&root, &session.branch, style);
+            if style == aethyme_testkit::MergeStyle::Squash {
+                aethyme_testkit::delete_remote_branch(&root, &session.branch);
+            }
+        }
+        (session, worktree)
+    }
+
+    /// Bind a holder process that no longer exists and push the session's
+    /// recorded and Git-visible activity `hours` into the past.
+    #[cfg(unix)]
+    fn quiet_with_gone_holder(broker: &mut crate::Broker, session: &crate::Session, hours: u64) {
+        let holder = crate::session_holder::AgentProcess {
+            pid: i64::MAX,
+            started: "Mon Jan 1 00:00:00 2024".into(),
+            command: "fixture-agent".into(),
+        };
+        broker
+            .store()
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session.id),
+                Some(&crate::events::session_holder_bound_payload(
+                    &holder, "fixture", None,
+                )),
+            )
+            .unwrap();
+        let old_time = std::time::SystemTime::now() - Duration::from_secs(hours * 60 * 60);
+        let old_ms = old_time
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let checkout = PathBuf::from(&session.worktree_path);
+        let git_dir = crate::git::checked_worktree_git_dir(&checkout)
+            .unwrap()
+            .unwrap();
+        for name in ["index", "HEAD"] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(git_dir.join(name))
+                .unwrap()
+                .set_modified(old_time)
+                .unwrap();
+        }
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE sessions SET created_at = ?1, updated_at = ?1, last_activity_at = ?1 WHERE id = ?2",
+                rusqlite::params![old_ms, session.id],
+            )
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn record_merged_pull_request(broker: &mut crate::Broker, session_id: i64, pr_number: i64) {
+        broker
+            .store()
+            .connection()
+            .execute(
+                "INSERT INTO pull_request_session_links (repository, pr_number, session_id, linked_at, link_source) VALUES ('fixture', ?1, ?2, 1, 'watch')",
+                rusqlite::params![pr_number, session_id],
+            )
+            .unwrap();
+        broker
+            .store()
+            .connection()
+            .execute(
+                "INSERT INTO pull_request_milestones (repository, pr_number, merged_at, first_seen_at, updated_at) VALUES ('fixture', ?1, 1, 1, 1)",
+                [pr_number],
+            )
+            .unwrap();
+    }
+
+    /// The busiest repository's backlog: a session whose pull request merged
+    /// and whose agent moved on is closed and its checkout removed by
+    /// unattended maintenance, by merge commit and by squash, with no
+    /// `finish`.
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_closes_and_removes_a_landed_session_without_finish() {
+        for style in [
+            aethyme_testkit::MergeStyle::MergeCommit,
+            aethyme_testkit::MergeStyle::Squash,
+        ] {
+            let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+            let (session, worktree) =
+                landed_lane_session(&mut broker, "landed by pull request", Some(style));
+            record_merged_pull_request(&mut broker, session.id, 11);
+            // Past the landed window, well inside the abandonment window.
+            quiet_with_gone_holder(&mut broker, &session, 30);
+
+            let report = broker.auto_cleanup_now(None).unwrap().unwrap();
+            assert_eq!(report.landed_sessions_examined, 1, "{style:?}: {report:#?}");
+            assert_eq!(report.landed_sessions_closed, 1, "{style:?}: {report:#?}");
+            assert_eq!(report.sessions_retired, 1, "{style:?}: {report:#?}");
+            assert!(report.landed_sessions_declined.is_empty(), "{report:#?}");
+            assert_ne!(
+                broker.store().session(session.id).unwrap().cleanup_state,
+                SessionCleanupState::Open,
+                "{style:?}"
+            );
+            // Removal is the existing whole-checkout lane; a later pass may be
+            // the one that reaches the newly closed checkout.
+            for _ in 0..2 {
+                if !worktree.exists() {
+                    break;
+                }
+                broker.auto_cleanup_now(None).unwrap().unwrap();
+            }
+            assert!(
+                !worktree.exists(),
+                "{style:?}: the landed checkout is removed without finish"
+            );
+        }
+    }
+
+    /// Every proof the landed lane cannot make keeps the session and its
+    /// checkout, and is counted under its own reason.
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_keeps_landed_lane_sessions_it_cannot_prove_and_says_why() {
+        type Case = (
+            &'static str,
+            Option<&'static str>,
+            fn(&mut crate::Broker) -> (crate::Session, PathBuf),
+        );
+        fn dirty(broker: &mut crate::Broker) -> (crate::Session, PathBuf) {
+            let (session, worktree) = landed_lane_session(
+                broker,
+                "dirty after landing",
+                Some(aethyme_testkit::MergeStyle::MergeCommit),
+            );
+            std::fs::write(worktree.join("unsaved.txt"), "keep me\n").unwrap();
+            (session, worktree)
+        }
+        fn unmerged(broker: &mut crate::Broker) -> (crate::Session, PathBuf) {
+            let (session, worktree) = landed_lane_session(
+                broker,
+                "open pull request",
+                Some(aethyme_testkit::MergeStyle::MergeCommit),
+            );
+            broker
+                .store()
+                .connection()
+                .execute(
+                    "INSERT INTO pull_request_session_links (repository, pr_number, session_id, linked_at, link_source) VALUES ('fixture', 21, ?1, 1, 'watch')",
+                    [session.id],
+                )
+                .unwrap();
+            (session, worktree)
+        }
+        fn never_landed(broker: &mut crate::Broker) -> (crate::Session, PathBuf) {
+            landed_lane_session(broker, "never landed", None)
+        }
+        fn follow_up_after_squash(broker: &mut crate::Broker) -> (crate::Session, PathBuf) {
+            let (session, worktree) = landed_lane_session(
+                broker,
+                "squashed then continued",
+                Some(aethyme_testkit::MergeStyle::Squash),
+            );
+            record_merged_pull_request(broker, session.id, 31);
+            std::fs::write(worktree.join("follow-up.txt"), "only here\n").unwrap();
+            git(&worktree, &["add", "follow-up.txt"]);
+            git(&worktree, &["commit", "-qm", "follow-up after the squash"]);
+            (session, worktree)
+        }
+        fn landed(broker: &mut crate::Broker) -> (crate::Session, PathBuf) {
+            landed_lane_session(
+                broker,
+                "landed but removal disabled",
+                Some(aethyme_testkit::MergeStyle::MergeCommit),
+            )
+        }
+        fn spawned_process_alive(broker: &mut crate::Broker) -> (crate::Session, PathBuf) {
+            let (session, worktree) = landed_lane_session(
+                broker,
+                "landed with its process running",
+                Some(aethyme_testkit::MergeStyle::MergeCommit),
+            );
+            broker
+                .store()
+                .connection()
+                .execute(
+                    "UPDATE sessions SET pid = ?1 WHERE id = ?2",
+                    rusqlite::params![i64::from(std::process::id()), session.id],
+                )
+                .unwrap();
+            (session, worktree)
+        }
+        let cases: [Case; 6] = [
+            ("worktree_unclean", None, dirty),
+            ("pull_request_unmerged", None, unmerged),
+            ("no_landing_evidence", None, never_landed),
+            ("not_landed", None, follow_up_after_squash),
+            (
+                "auto_remove_disabled",
+                Some("[cleanup]\nauto_remove = false\n"),
+                landed,
+            ),
+            ("process_alive", None, spawned_process_alive),
+        ];
+        for (reason, cleanup, make) in cases {
+            let (_owner, _storage, mut broker) = landed_lane_fixture(cleanup);
+            let (session, worktree) = make(&mut broker);
+            quiet_with_gone_holder(&mut broker, &session, 30);
+
+            let report = broker.auto_cleanup_now(None).unwrap().unwrap();
+
+            assert_eq!(report.landed_sessions_examined, 1, "{reason}: {report:#?}");
+            assert_eq!(report.landed_sessions_closed, 0, "{reason}: {report:#?}");
+            assert_eq!(
+                report.landed_sessions_declined.get(reason),
+                Some(&1),
+                "{reason}: {report:#?}"
+            );
+            assert_eq!(
+                broker.store().session(session.id).unwrap().cleanup_state,
+                SessionCleanupState::Open,
+                "{reason}"
+            );
+            assert!(worktree.exists(), "{reason}: the checkout is kept");
+        }
+    }
+
+    /// The retirement cursor resumes where the last pass stopped instead of
+    /// restarting from the oldest session, and the report says where it is.
+    #[cfg(unix)]
+    #[test]
+    fn landed_lane_resumes_from_the_retirement_cursor() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let mut sessions = Vec::new();
+        for label in [
+            "first never landed",
+            "second never landed",
+            "third never landed",
+        ] {
+            let (session, _) = landed_lane_session(&mut broker, label, None);
+            quiet_with_gone_holder(&mut broker, &session, 30);
+            sessions.push(session.id);
+        }
+        let high_water = broker.store().open_session_max_id().unwrap();
+        // A previous pass stopped after the first session of this lap.
+        let cursor = SessionRetirementCursor {
+            version: SESSION_RETIREMENT_CURSOR_VERSION,
+            after_session_id: sessions[0],
+            high_water_session_id: high_water,
+        };
+        broker
+            .store()
+            .meta_set(
+                SESSION_RETIREMENT_CURSOR_KEY,
+                &serde_json::to_string(&cursor).unwrap(),
+            )
+            .unwrap();
+
+        let resumed = broker.auto_cleanup_now(None).unwrap().unwrap();
+        assert_eq!(
+            resumed.landed_sessions_examined, 2,
+            "the pass judges only the sessions after the cursor: {resumed:#?}"
+        );
+        assert_eq!(
+            resumed.retirement_cursor,
+            Some(super::SessionRetirementCursorPosition {
+                after_session_id: high_water,
+                high_water_session_id: high_water,
+            })
+        );
+
+        let next_lap = broker.auto_cleanup_now(None).unwrap().unwrap();
+        assert_eq!(
+            next_lap.landed_sessions_examined, 3,
+            "a finished lap starts the next one from the oldest session: {next_lap:#?}"
+        );
+        assert_eq!(
+            next_lap.landed_sessions_declined.get("no_landing_evidence"),
+            Some(&3)
+        );
+    }
+
+    /// `broker status` shows the last pass's landed-lane counts per reason.
+    #[cfg(unix)]
+    #[test]
+    fn status_reports_landed_lane_counts_per_reason() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let (session, _) = landed_lane_session(&mut broker, "never landed", None);
+        quiet_with_gone_holder(&mut broker, &session, 30);
+        let fresh = broker.status(now_ms()).unwrap();
+        assert!(
+            fresh.landed_session_retirement.is_none(),
+            "nothing is reported before the landed lane judged a session"
+        );
+
+        broker.auto_cleanup_now(None).unwrap().unwrap();
+
+        let view = broker.status(now_ms()).unwrap();
+        let landed = view
+            .landed_session_retirement
+            .expect("status reports the landed lane");
+        assert_eq!(landed.examined, 1);
+        assert_eq!(landed.closed, 0);
+        assert_eq!(landed.declined.get("no_landing_evidence"), Some(&1));
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            json["landed_session_retirement"]["declined"]["no_landing_evidence"],
+            1
+        );
     }
 
     #[cfg(unix)]

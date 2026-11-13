@@ -190,6 +190,152 @@ pub(crate) enum AbandonedSessionCloseOutcome {
     OperationGuardBusy,
     OperationActive,
     OperationEvidenceUnavailable,
+    /// The landed-session lane kept the session open for a recorded reason.
+    LandedDeclined(LandedSessionDecline),
+}
+
+/// Why the landed-session lane kept one open session. Every reason keeps the
+/// session and its checkout; `code` is the machine-readable name counted in
+/// `AutoCleanupReport::landed_sessions_declined` and `broker status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum LandedSessionDecline {
+    /// Session or worktree activity is newer than the landed window.
+    RecentActivity,
+    /// The session row changed, or was closed, while it was checked.
+    Changed,
+    /// The broker-spawned process, or a holder whose identity could not be
+    /// re-read, is still running.
+    ProcessAlive,
+    /// The recorded holder runs and its task lease is current or absent.
+    HolderAlive,
+    /// No holder was recorded, or it is a shared agent service, so its
+    /// absence from this session cannot be proved.
+    HolderUnbound,
+    /// The recorded holder could not be checked.
+    HolderUnknown,
+    /// An explicit lease still holds.
+    LeaseHeld,
+    /// Explicit lease liveness could not be checked.
+    LeaseUnknown,
+    /// The checkout, its Git metadata or its HEAD could not be read.
+    WorktreeUnavailable,
+    /// Another lifecycle operation, session command or database writer was busy.
+    Busy,
+    /// A gate, operation, preparation or process still uses the session.
+    OperationActive,
+    /// Operation or process-use evidence could not be established.
+    OperationUnknown,
+    /// Retention or cleanup policy could not be read.
+    PolicyUnavailable,
+    /// `[cleanup] auto_remove = false`: closing would strand the checkout.
+    AutoRemoveDisabled,
+    /// The checkout matches a `[cleanup]` keep pin.
+    Pinned,
+    /// A pull request linked to the session is not merged.
+    PullRequestUnmerged,
+    /// The session never moved past its base and nothing records a landing.
+    NoSessionCommits,
+    /// No merged pull request, representation or ancestry suggests a landing,
+    /// so the content search is not attempted.
+    NoLandingEvidence,
+    /// The landing rule `finish` uses does not account for every commit.
+    NotLanded,
+    /// The landing rule could not be evaluated.
+    LandingUnknown,
+    /// Uncommitted, untracked, in-progress or protected ignored content.
+    WorktreeUnclean,
+}
+
+impl LandedSessionDecline {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::RecentActivity => "recent_activity",
+            Self::Changed => "changed",
+            Self::ProcessAlive => "process_alive",
+            Self::HolderAlive => "holder_alive",
+            Self::HolderUnbound => "holder_unbound",
+            Self::HolderUnknown => "holder_unknown",
+            Self::LeaseHeld => "lease_held",
+            Self::LeaseUnknown => "lease_unknown",
+            Self::WorktreeUnavailable => "worktree_unavailable",
+            Self::Busy => "busy",
+            Self::OperationActive => "operation_active",
+            Self::OperationUnknown => "operation_unknown",
+            Self::PolicyUnavailable => "policy_unavailable",
+            Self::AutoRemoveDisabled => "auto_remove_disabled",
+            Self::Pinned => "pinned",
+            Self::PullRequestUnmerged => "pull_request_unmerged",
+            Self::NoSessionCommits => "no_session_commits",
+            Self::NoLandingEvidence => "no_landing_evidence",
+            Self::NotLanded => "not_landed",
+            Self::LandingUnknown => "landing_unknown",
+            Self::WorktreeUnclean => "worktree_unclean",
+        }
+    }
+
+    /// The `phase_counts` name one decline adds to the command's metrics.
+    pub(crate) const fn telemetry_name(self) -> &'static str {
+        match self {
+            Self::RecentActivity => "landed_sessions_declined_recent_activity",
+            Self::Changed => "landed_sessions_declined_changed",
+            Self::ProcessAlive => "landed_sessions_declined_process_alive",
+            Self::HolderAlive => "landed_sessions_declined_holder_alive",
+            Self::HolderUnbound => "landed_sessions_declined_holder_unbound",
+            Self::HolderUnknown => "landed_sessions_declined_holder_unknown",
+            Self::LeaseHeld => "landed_sessions_declined_lease_held",
+            Self::LeaseUnknown => "landed_sessions_declined_lease_unknown",
+            Self::WorktreeUnavailable => "landed_sessions_declined_worktree_unavailable",
+            Self::Busy => "landed_sessions_declined_busy",
+            Self::OperationActive => "landed_sessions_declined_operation_active",
+            Self::OperationUnknown => "landed_sessions_declined_operation_unknown",
+            Self::PolicyUnavailable => "landed_sessions_declined_policy_unavailable",
+            Self::AutoRemoveDisabled => "landed_sessions_declined_auto_remove_disabled",
+            Self::Pinned => "landed_sessions_declined_pinned",
+            Self::PullRequestUnmerged => "landed_sessions_declined_pull_request_unmerged",
+            Self::NoSessionCommits => "landed_sessions_declined_no_session_commits",
+            Self::NoLandingEvidence => "landed_sessions_declined_no_landing_evidence",
+            Self::NotLanded => "landed_sessions_declined_not_landed",
+            Self::LandingUnknown => "landed_sessions_declined_landing_unknown",
+            Self::WorktreeUnclean => "landed_sessions_declined_worktree_unclean",
+        }
+    }
+
+    /// The reason a landed-lane outcome other than `Closed` kept the session.
+    pub(crate) fn from_outcome(outcome: AbandonedSessionCloseOutcome) -> Option<Self> {
+        Some(match outcome {
+            AbandonedSessionCloseOutcome::Closed => return None,
+            AbandonedSessionCloseOutcome::LandedDeclined(reason) => reason,
+            AbandonedSessionCloseOutcome::NotDue => Self::RecentActivity,
+            AbandonedSessionCloseOutcome::Changed => Self::Changed,
+            AbandonedSessionCloseOutcome::ActiveProcess => Self::ProcessAlive,
+            AbandonedSessionCloseOutcome::HolderUnavailable => Self::HolderUnknown,
+            AbandonedSessionCloseOutcome::LeaseHeld => Self::LeaseHeld,
+            AbandonedSessionCloseOutcome::LeaseUnavailable => Self::LeaseUnknown,
+            AbandonedSessionCloseOutcome::WorktreeActivityUnavailable => Self::WorktreeUnavailable,
+            AbandonedSessionCloseOutcome::LifecycleBusy
+            | AbandonedSessionCloseOutcome::DatabaseBusy
+            | AbandonedSessionCloseOutcome::OperationGuardBusy => Self::Busy,
+            AbandonedSessionCloseOutcome::OperationActive => Self::OperationActive,
+            AbandonedSessionCloseOutcome::OperationEvidenceUnavailable => Self::OperationUnknown,
+        })
+    }
+
+    /// Whether the abandonment lane may still judge the session by its own
+    /// rules after this decline. Contention and unknown or active process
+    /// evidence apply to both lanes alike, so they are reported once instead
+    /// of being asked twice. A missing checkout is not among them: the
+    /// abandonment lane closes such a session without reading it.
+    pub(crate) const fn allows_abandonment_fallback(self) -> bool {
+        !matches!(
+            self,
+            Self::Busy
+                | Self::HolderUnknown
+                | Self::LeaseHeld
+                | Self::LeaseUnknown
+                | Self::OperationActive
+                | Self::OperationUnknown
+        )
+    }
 }
 
 fn collect_worktree_directory_entries<I>(
@@ -694,53 +840,111 @@ impl Broker {
         )
     }
 
+    #[cfg(test)]
     fn landed_session_is_safe_to_retire(&self, session: &crate::Session) -> bool {
-        if !matches!(
-            self.store_ref()
-                .session_has_unmerged_pull_request_link(session.id),
-            Ok(false)
-        ) {
-            return false;
+        self.landed_session_decline(session).is_none()
+    }
+
+    /// Why `session` cannot be retired as landed, or `None` once every proof
+    /// holds: no linked pull request is unmerged, automatic removal applies to
+    /// the checkout, the fetched default branch holds every commit of its HEAD
+    /// by the landing rule `finish` uses (a representation recorded against
+    /// that branch, ancestry, or `default_branch_landing`, whose
+    /// `landing_covers` keeps a follow-up commit after a squash unlanded), and
+    /// the worktree is clean under the shared cleanup classifier. The content
+    /// search runs only when a merged pull request, a representation or
+    /// ancestry already suggests a landing, so an open session that never
+    /// landed costs one ancestry check per lap, not a history search.
+    pub(crate) fn landed_session_decline(
+        &self,
+        session: &crate::Session,
+    ) -> Option<LandedSessionDecline> {
+        match self
+            .store_ref()
+            .session_has_unmerged_pull_request_link(session.id)
+        {
+            Ok(false) => {}
+            Ok(true) => return Some(LandedSessionDecline::PullRequestUnmerged),
+            Err(_) => return Some(LandedSessionDecline::LandingUnknown),
         }
         let worktree = std::path::Path::new(&session.worktree_path);
         let Ok(policy) = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root()) else {
-            return false;
+            return Some(LandedSessionDecline::PolicyUnavailable);
         };
-        if !policy.auto_remove || policy.is_pinned(worktree) {
-            return false;
+        if !policy.auto_remove {
+            return Some(LandedSessionDecline::AutoRemoveDisabled);
+        }
+        if policy.is_pinned(worktree) {
+            return Some(LandedSessionDecline::Pinned);
         }
         let Ok(checkout) = crate::git::GitRepo::discover(worktree) else {
-            return false;
+            return Some(LandedSessionDecline::WorktreeUnavailable);
         };
         let Ok(head) = checkout.head_commit() else {
-            return false;
-        };
-        let Ok(Some(record)) = self.store_ref().session_representation(session.id, &head) else {
-            return false;
-        };
-        let Some(commit) = record.representing_commit else {
-            return false;
+            return Some(LandedSessionDecline::WorktreeUnavailable);
         };
         let Some((upstream_ref, upstream)) = self.repo_handle().upstream_default() else {
-            return false;
+            return Some(LandedSessionDecline::NoLandingEvidence);
         };
-        if record.representing_ref != upstream_ref
-            && record.representing_ref != format!("refs/remotes/{upstream_ref}")
-        {
-            return false;
+        let representation = match self.store_ref().session_representation(session.id, &head) {
+            Ok(record) => record,
+            Err(_) => return Some(LandedSessionDecline::LandingUnknown),
+        };
+        let represented_upstream = representation.as_ref().is_some_and(|record| {
+            (record.representing_ref == upstream_ref
+                || record.representing_ref == format!("refs/remotes/{upstream_ref}"))
+                && record
+                    .representing_commit
+                    .as_deref()
+                    .is_some_and(|commit| self.repo_handle().is_ancestor(commit, &upstream))
+        });
+        if !represented_upstream {
+            let merged_pull_request = match self
+                .store_ref()
+                .session_has_merged_pull_request_link(session.id)
+            {
+                Ok(merged) => merged,
+                Err(_) => return Some(LandedSessionDecline::LandingUnknown),
+            };
+            // A session that never committed and never merged a pull request
+            // has no work of its own to have landed; retiring it is the
+            // abandonment window's call.
+            if !merged_pull_request && session.diff_base.as_deref() == Some(head.as_str()) {
+                return Some(LandedSessionDecline::NoSessionCommits);
+            }
+            let on_upstream = match self.repo_handle().is_ancestor_checked(&head, &upstream) {
+                Ok(on_upstream) => on_upstream,
+                Err(_) => return Some(LandedSessionDecline::LandingUnknown),
+            };
+            if !merged_pull_request && !on_upstream && representation.is_none() {
+                return Some(LandedSessionDecline::NoLandingEvidence);
+            }
+            let queue = match self
+                .store_ref()
+                .latest_merge_queue_for_session_and_head(session.id, &head)
+            {
+                Ok(queue) => queue,
+                Err(_) => return Some(LandedSessionDecline::LandingUnknown),
+            };
+            let delivery = match self.head_delivery(session, &checkout, &head, &queue) {
+                Ok(delivery) => delivery,
+                Err(_) => return Some(LandedSessionDecline::LandingUnknown),
+            };
+            // Only the fetched default branch counts here: a local integration
+            // commit is not a landing a pull-request repository recognises.
+            if !(delivery.on_remote_default || delivery.default_landing.is_some()) {
+                return Some(LandedSessionDecline::NotLanded);
+            }
         }
-        if !self.repo_handle().is_ancestor(&commit, &upstream) {
-            return false;
+        match crate::auto_cleanup::unclean_reason(
+            worktree,
+            Some(session.branch.as_str()),
+            self.main_root(),
+            &policy,
+        ) {
+            Ok(None) => None,
+            Ok(Some(_)) | Err(_) => Some(LandedSessionDecline::WorktreeUnclean),
         }
-        matches!(
-            crate::auto_cleanup::unclean_reason(
-                worktree,
-                Some(session.branch.as_str()),
-                self.main_root(),
-                &policy
-            ),
-            Ok(None)
-        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -793,6 +997,12 @@ impl Broker {
         ) {
             return Ok(AbandonedSessionCloseOutcome::NotDue);
         }
+        // The landing proof is asked before any holder, lease or process
+        // evidence: most open sessions have not landed, and saying so costs
+        // one ancestry check. It is asked again under both claims below.
+        if require_landed && let Some(reason) = self.landed_session_decline(&candidate) {
+            return Ok(AbandonedSessionCloseOutcome::LandedDeclined(reason));
+        }
 
         let holder = crate::session_holder::recorded_holder_liveness(
             self.store_ref(),
@@ -800,10 +1010,6 @@ impl Broker {
             process_table,
             allow_process_snapshot,
         );
-        if require_landed && holder.liveness != crate::session_holder::RecordedHolderLiveness::Gone
-        {
-            return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
-        }
         let holder_event = self.store_ref().latest_session_holder_event(session_id)?;
         if holder_event.as_ref().map(|event| event.id) != holder.binding_event_id {
             return Ok(AbandonedSessionCloseOutcome::Changed);
@@ -813,8 +1019,12 @@ impl Broker {
             .is_some_and(crate::session_holder::task_lease_binding_present);
         let task_lease_expiry_enabled = crate::load_retention_policy(&self.main_root)
             .is_ok_and(|policy| policy.expire_abandoned_task_leases);
+        // A landed session needs no opt-in to outlive a live holder: its work
+        // is on the default branch and its worktree holds nothing else, so an
+        // expired task lease plus the process-use checks below suffice. The
+        // agent process itself routinely lives on, bound to later sessions.
         let holder_task_lease_expired = holder_event.as_ref().is_some_and(|event| {
-            task_lease_expiry_enabled
+            (task_lease_expiry_enabled || require_landed)
                 && crate::session_holder::task_lease_expired(
                     event,
                     candidate.last_activity_at,
@@ -836,6 +1046,28 @@ impl Broker {
         } else {
             None
         };
+        if require_landed {
+            match holder.liveness {
+                crate::session_holder::RecordedHolderLiveness::Gone => {}
+                crate::session_holder::RecordedHolderLiveness::Alive
+                    if live_task_holder.is_some() => {}
+                crate::session_holder::RecordedHolderLiveness::Alive => {
+                    return Ok(AbandonedSessionCloseOutcome::LandedDeclined(
+                        LandedSessionDecline::HolderAlive,
+                    ));
+                }
+                crate::session_holder::RecordedHolderLiveness::Unbound => {
+                    return Ok(AbandonedSessionCloseOutcome::LandedDeclined(
+                        LandedSessionDecline::HolderUnbound,
+                    ));
+                }
+                crate::session_holder::RecordedHolderLiveness::Unknown => {
+                    return Ok(AbandonedSessionCloseOutcome::LandedDeclined(
+                        LandedSessionDecline::HolderUnknown,
+                    ));
+                }
+            }
+        }
         match holder.liveness {
             crate::session_holder::RecordedHolderLiveness::Unknown => {
                 return Ok(AbandonedSessionCloseOutcome::HolderUnavailable);
@@ -1126,7 +1358,7 @@ impl Broker {
                     return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
                 }
             };
-            if !policy.expire_abandoned_task_leases
+            if !(policy.expire_abandoned_task_leases || require_landed)
                 || !current_holder_event.as_ref().is_some_and(|event| {
                     crate::session_holder::task_lease_expired(
                         event,
@@ -1150,9 +1382,11 @@ impl Broker {
             if policy.session_abandoned_after_hours == 0
                 || configured_ms <= 0
                 || idle_ms < configured_ms
-                || !self.landed_session_is_safe_to_retire(&current)
             {
                 return Ok(AbandonedSessionCloseOutcome::Changed);
+            }
+            if let Some(reason) = self.landed_session_decline(&current) {
+                return Ok(AbandonedSessionCloseOutcome::LandedDeclined(reason));
             }
         }
         let abandoned_payload = if require_landed {
@@ -1160,7 +1394,11 @@ impl Broker {
                 "idle_ms": idle_ms,
                 "abandon_after_ms": abandon_after_ms,
                 "pid_alive": current.pid.map(crate::broker::session_pid_alive),
-                "retirement_basis": "clean_recorded_landing_and_gone_holder",
+                "retirement_basis": if live_task_holder.is_some() {
+                    "clean_landing_and_expired_task_lease"
+                } else {
+                    "clean_recorded_landing_and_gone_holder"
+                },
             })
             .to_string()
         } else {
@@ -4159,7 +4397,7 @@ mod generic_guarded_exec_tests {
                     None
                 )
                 .unwrap(),
-            AbandonedSessionCloseOutcome::ActiveProcess
+            AbandonedSessionCloseOutcome::LandedDeclined(LandedSessionDecline::HolderUnbound)
         ));
         let holder = task_lease_holder(i64::MAX);
         broker
@@ -4198,6 +4436,140 @@ mod generic_guarded_exec_tests {
             started: "Mon Jan 1 00:00:00 2024".into(),
             command: "fixture-agent --task-lease".into(),
         }
+    }
+
+    /// A session with one commit landed on the fixture's `origin` the way a
+    /// merged pull request lands it.
+    fn landed_by_pull_request(
+        broker: &mut Broker,
+        repository: &Path,
+        label: &str,
+        style: aethyme_testkit::MergeStyle,
+    ) -> crate::Session {
+        aethyme_testkit::ensure_origin(repository);
+        let session = broker.start_worktree(label, None).unwrap();
+        let checkout = Path::new(&session.worktree_path);
+        std::fs::write(checkout.join("landed.txt"), format!("{label}\n")).unwrap();
+        git(checkout, &["add", "landed.txt"]);
+        git(checkout, &["commit", "-qm", label]);
+        aethyme_testkit::land_as_pull_request(repository, &session.branch, style);
+        if style == aethyme_testkit::MergeStyle::Squash {
+            // "Delete branch on merge": only the default branch's content
+            // proves the work landed.
+            aethyme_testkit::delete_remote_branch(repository, &session.branch);
+        }
+        session
+    }
+
+    /// The agent process that held a landed session usually lives on, bound
+    /// to later sessions. Once its task lease on this one has expired, the
+    /// landed proof closes the session without the abandonment opt-in; while
+    /// the lease is current the session is kept with a reason.
+    #[cfg(unix)]
+    #[test]
+    fn landed_session_outlives_a_live_holder_only_after_its_task_lease_expired() {
+        for lease_current in [true, false] {
+            let (repository, _storage, mut broker) = fixture();
+            let session = landed_by_pull_request(
+                &mut broker,
+                repository.path(),
+                "landed with a live holder",
+                aethyme_testkit::MergeStyle::MergeCommit,
+            );
+            let old = age_worktree_for_task_retirement(&mut broker, &session);
+            let holder = task_lease_holder(std::process::id() as i64);
+            let bound_at = if lease_current {
+                crate::clock::epoch_ms()
+            } else {
+                old
+            };
+            let binding_id = install_task_lease_binding(&mut broker, &session, &holder, bound_at);
+            let mut table = synthetic_holder_process_table(session.id, binding_id, &holder, true);
+            table.install_process_use_snapshot_for_test(
+                crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+            );
+
+            let outcome = broker
+                .try_close_landed_session(
+                    session.id,
+                    crate::clock::epoch_ms(),
+                    24 * 60 * 60 * 1_000,
+                    &mut table,
+                    true,
+                    None,
+                )
+                .unwrap();
+
+            let closed = broker
+                .store()
+                .session(session.id)
+                .unwrap()
+                .status
+                .is_closed();
+            if lease_current {
+                assert_eq!(
+                    outcome,
+                    AbandonedSessionCloseOutcome::LandedDeclined(LandedSessionDecline::HolderAlive)
+                );
+                assert!(
+                    !closed,
+                    "a live holder with a current lease keeps the session"
+                );
+            } else {
+                assert_eq!(outcome, AbandonedSessionCloseOutcome::Closed);
+                assert!(closed);
+            }
+            assert!(
+                Path::new(&session.worktree_path).exists(),
+                "closing never removes the checkout itself"
+            );
+        }
+    }
+
+    /// A squash leaves only content behind. With a merged pull request on
+    /// record the landing rule `finish` uses accepts it; a commit made after
+    /// the squash is not on the default branch, and keeps the session.
+    #[cfg(unix)]
+    #[test]
+    fn landed_decline_accepts_a_squash_but_not_a_follow_up_commit() {
+        let (repository, _storage, mut broker) = fixture();
+        let session = landed_by_pull_request(
+            &mut broker,
+            repository.path(),
+            "squash landed",
+            aethyme_testkit::MergeStyle::Squash,
+        );
+        assert_eq!(
+            broker.landed_session_decline(&session),
+            Some(LandedSessionDecline::NoLandingEvidence),
+            "without a merged pull request on record a squash is not searched for"
+        );
+        broker
+            .store()
+            .connection()
+            .execute(
+                "INSERT INTO pull_request_session_links (repository, pr_number, session_id, linked_at, link_source) VALUES ('fixture', 7, ?1, 1, 'watch')",
+                [session.id],
+            )
+            .unwrap();
+        broker
+            .store()
+            .connection()
+            .execute(
+                "INSERT INTO pull_request_milestones (repository, pr_number, merged_at, first_seen_at, updated_at) VALUES ('fixture', 7, 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(broker.landed_session_decline(&session), None);
+
+        let checkout = Path::new(&session.worktree_path);
+        std::fs::write(checkout.join("follow-up.txt"), "after the squash\n").unwrap();
+        git(checkout, &["add", "follow-up.txt"]);
+        git(checkout, &["commit", "-qm", "follow-up after the squash"]);
+        assert_eq!(
+            broker.landed_session_decline(&session),
+            Some(LandedSessionDecline::NotLanded)
+        );
     }
 
     fn install_task_lease_binding(

@@ -517,6 +517,26 @@ impl BrokerStore {
         ).map_err(Into::into)
     }
 
+    /// Whether the cached pull-request listing records a merged pull request
+    /// linked to the session. Read from the milestones the PR watch keeps, so
+    /// asking costs no provider call; it only steers the landing search, and
+    /// never stands in for the Git landing proof.
+    pub(crate) fn session_has_merged_pull_request_link(
+        &self,
+        session_id: i64,
+    ) -> Result<bool, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pull_request_session_links l
+                 JOIN pull_request_milestones m
+                   ON m.repository = l.repository AND m.pr_number = l.pr_number
+                 WHERE l.session_id = ?1 AND m.merged_at IS NOT NULL)",
+                [session_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     /// Sessions linked to one pull request.
     pub fn pull_request_sessions(
         &self,
