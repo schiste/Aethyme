@@ -131,12 +131,53 @@ the directory goes:
    ancestry or by the verbatim content/patch proof. Local `main` and the
    integration branch do not count.
 
-Anything the sweep cannot decide keeps the checkout, with the reason in
+Each pass splits its budget between two lanes: session retirement (closing
+abandoned or landed sessions) gets half, or a quarter once registered linked
+checkouts reach three quarters of `[worktrees].max_checkouts`, and removal of
+closed checkouts gets the rest. Removal frees capacity; retirement only prepares
+it, so retirement can no longer use a whole pass. `auto_cleanup.lanes` reports
+each lane's budget, time and the checkouts the removal lane judged.
+
+Within the retirement share, sessions that already show landing evidence (a
+merged pull request in the cached provider data, or a branch tip with its own
+commits already on the fetched default branch) are judged first, before the
+oldest-first cursor; a `no_session_commits` or `no_landing_evidence` decline is
+remembered until the session head, the default-branch tip or that evidence
+changes. The proofs are unchanged; only the order and repetition are.
+
+Anything the sweep cannot decide keeps the checkout, with the reason and a
+stable `code` in
 `aethyme broker gc plan --json` (`auto_cleanup.kept[]`) and a
 `cleanup.auto-removal` row in `broker status`. Once registered linked
 checkouts reach three quarters of `[worktrees].max_checkouts`, a
 `cleanup.checkout-capacity` row names the retained count and the commands that
-reclaim slots before `broker start` refuses. Each removal emits
+reclaim slots before `broker start` refuses.
+
+When a closed checkout is kept only for ignored leftovers, the removal lane
+lists every ignored root that blocks it (`kept[].ignored_blockers`) and
+remembers the verdict. It skips that checkout on later passes until its HEAD,
+the `[cleanup]` policy, or the modification time of the checkout root, a
+blocker or a blocker's parent changes, and re-proves it at least weekly
+(`auto_cleanup.lanes.removal_memo_skips` counts the skips). Across all
+remembered checkouts, `auto_cleanup.blocked_by_ignored` lists the most common
+blockers with the line that would release a directory, for example:
+
+```json
+{"name": "<dir>/", "checkouts": 300, "config_line": "[cleanup] regenerable = [\"<dir>\"]"}
+```
+
+and the `cleanup.checkout-capacity` row repeats the top five in its evidence.
+
+At the limit, `broker start` first runs the removal lane alone with a 20-second
+budget, waiting up to 5 seconds for a maintenance pass that holds the GC lock.
+If the limit still refuses, the error says how many closed checkouts that pass
+removed and kept, the top keep codes, and the ignored path whose configuration
+would release the most checkouts (or that the lock stayed busy).
+The repository decides: add the line only when the directory holds nothing but
+output its tools regenerate. A standalone ignored file is never released by
+configuration; review and delete it, or keep the checkout. The glob is matched
+against the ignored root itself, so name the directory (`"<dir>"`), not only
+its contents (`"<dir>/**"` does not match the root `<dir>`). Each removal emits
 `broker.cleanup.auto_removed` with its proof. Configure it in
 `.aethyme/config.toml`:
 
@@ -156,6 +197,22 @@ GC share this check; in-place artifact reclamation has its own retention rules.
 Automatic apply reloads retention before removal, so a newly raised grace
 period or unreadable policy retains the checkout. Explicit `finish cleanup`
 remains available without waiting for the window.
+
+Besides the named build outputs, three test-tool outputs count when their own
+layout proves them: `.hypothesis/` holding only Hypothesis's entries,
+`playwright-report/` holding only `index.html`, `data/` and `trace/`, and
+`test-results/` holding Playwright's `.last-run.json`, each only when the
+same protected-name walk described below finds nothing beneath it. Any ignored directory
+that carries a `CACHEDIR.TAG` beginning with the standard signature
+(`Signature: 8a477f597d28d172789f06886806bc55`, see bford.info/cachedir) is
+regenerable by its tool's own declaration, unless a bounded walk beneath it
+finds a protected name (`.env*`, `*.key`, `*.pem`, `*.p12`, `*.pfx`,
+`*.sqlite*`, `*.db`, `*.kdbx`, `id_*` private keys without `.pub`, `.netrc`,
+`.npmrc`, `.pypirc`, `credentials.json`, `.aethyme`), an unreadable entry or
+more than 20,000 entries; then it keeps
+the checkout. A tag only in a subdirectory does not cover its parent. Generic
+names (`logs`, `dist` without a manifest, `build`, `out`, `tmp`) are never
+recognised by name: configure them.
 
 Recognized or explicitly configured output directories are treated as opaque:
 cleanup does not inspect their nested contents. Unknown ignored directories and

@@ -47,6 +47,10 @@ use crate::{Broker, BrokerOpError, GitRepo};
 /// | `.venv` | `pyvenv.cfg` inside |
 /// | `build`, `dist` | a sibling `package.json`, `setup.py`, `pyproject.toml` or `CMakeLists.txt` |
 /// | `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache` | always (tool caches) |
+/// | `.hypothesis` | only Hypothesis's own entries (`examples`, `unicode_data`, ...), and no protected name beneath |
+/// | `playwright-report` | only `index.html`, `data/` and `trace/`, and no protected name beneath |
+/// | `test-results` | Playwright's `.last-run.json` status file inside, and no protected name beneath |
+/// | any other name | a `CACHEDIR.TAG` with the standard signature inside, and no protected name (`.env*`, keys, credentials, databases, `.aethyme`) anywhere beneath it |
 ///
 /// Names are compared as whole path components: `target-notes/`,
 /// `my_build/` and `targets.json` are not build output.
@@ -61,6 +65,9 @@ pub const BUILT_IN_REGENERABLE: &[&str] = &[
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
+    ".hypothesis",
+    "playwright-report",
+    "test-results",
 ];
 
 /// Manifests whose presence beside `build/` or `dist/` proves it is output.
@@ -91,6 +98,11 @@ pub(crate) const AUTO_CLEANUP_LAST_REPORT_KEY: &str = "auto_cleanup.last_report"
 const AUTO_CLEANUP_CURSOR_KEY: &str = "auto_cleanup.cursor";
 const AUTO_CLEANUP_CURSOR_VERSION: u32 = 3;
 const CLEANUP_COHORT_SCAN_PAGE_SIZE: usize = 16;
+/// Paging under capacity pressure never selects more checkouts for removal
+/// in one pass than a single page could before (32 groups), so removal is
+/// no faster per pass than it was; it only stops spending passes on pages
+/// of checkouts it keeps.
+const AUTO_CLEANUP_MAX_SELECTED_PER_PASS: usize = 32;
 const CLEANUP_COHORT_UNBOUNDED_PAGE_CAP: usize = 128;
 /// The background compact lane admits an archive attempt only when it can
 /// reserve this much time after the alias snapshot and ownership proof.
@@ -420,6 +432,9 @@ fn regenerable_dir(
         "node_modules" | "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache" => {
             Some(false)
         }
+        ".hypothesis" if hypothesis_database(&path) => Some(false),
+        "playwright-report" if playwright_html_report(&path) => Some(false),
+        "test-results" if playwright_output_directory(&path) => Some(false),
         "target" if parent.join("Cargo.toml").is_file() || path.join("CACHEDIR.TAG").is_file() => {
             Some(true)
         }
@@ -438,11 +453,173 @@ fn regenerable_dir(
             .filter(|witness| witness.confirms(&path))
             .map(|_| false),
     };
-    recognised.or_else(|| {
-        policy
-            .configured_regenerable_dir(relative_dir)
-            .then_some(false)
-    })
+    recognised
+        .or_else(|| tagged_cache_without_protected_entries(&path).then_some(false))
+        .or_else(|| {
+            policy
+                .configured_regenerable_dir(relative_dir)
+                .then_some(false)
+        })
+}
+
+/// The first bytes of a `CACHEDIR.TAG` under the Cache Directory Tagging
+/// specification (<https://bford.info/cachedir/>).
+const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+/// Entries a tagged cache may hold before cleanup stops checking it for
+/// protected names and keeps it.
+const TAGGED_CACHE_ENTRY_LIMIT: usize = 20_000;
+
+/// Whether `directory` holds a regular `CACHEDIR.TAG` that begins with the
+/// standard signature: the tool that wrote the cache declared it regenerable.
+fn has_cache_directory_tag(directory: &Path) -> bool {
+    use std::io::Read;
+    let tag = directory.join("CACHEDIR.TAG");
+    let Ok(metadata) = std::fs::symlink_metadata(&tag) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    let mut prefix = [0_u8; CACHEDIR_TAG_SIGNATURE.len()];
+    std::fs::File::open(&tag)
+        .and_then(|mut file| file.read_exact(&mut prefix))
+        .is_ok_and(|()| prefix.as_slice() == CACHEDIR_TAG_SIGNATURE)
+}
+
+/// Names that never become disposable because a cache tag or a test-tool
+/// witness sits above them: the secrets, keys, credentials, databases and
+/// broker state a configured `regenerable` glob may never match
+/// ([`GLOB_PROBES`]), plus SSH private keys (`id_*` without `.pub`) and
+/// package-manager and password-store credential files.
+fn protected_cache_entry(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == ".env"
+        || lower.starts_with(".env.")
+        || lower == ".aethyme"
+        || (lower.starts_with("id_") && !lower.ends_with(".pub"))
+        || [".netrc", ".npmrc", ".pypirc", "credentials.json"].contains(&lower.as_str())
+        || [
+            ".key", ".pem", ".p12", ".pfx", ".sqlite", ".sqlite3", ".db", ".kdbx",
+        ]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
+/// A tagged cache directory whose bounded walk finds no protected name.
+fn tagged_cache_without_protected_entries(directory: &Path) -> bool {
+    has_cache_directory_tag(directory) && subtree_free_of_protected_entries(directory)
+}
+
+/// A bounded walk of the whole subtree finds no protected name. Symlinks are
+/// judged by name and never followed; an unreadable entry, a non-Unicode
+/// name or a walk past [`TAGGED_CACHE_ENTRY_LIMIT`] keeps the directory.
+fn subtree_free_of_protected_entries(directory: &Path) -> bool {
+    let mut pending = vec![directory.to_path_buf()];
+    let mut examined = 0_usize;
+    while let Some(current) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            return false;
+        };
+        for entry in entries {
+            examined += 1;
+            if examined > TAGGED_CACHE_ENTRY_LIMIT {
+                return false;
+            }
+            let Ok(entry) = entry else {
+                return false;
+            };
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                return false;
+            };
+            if protected_cache_entry(&name) {
+                return false;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                return false;
+            };
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    true
+}
+
+/// Hypothesis's example database (`.hypothesis/`): only the subdirectories
+/// and ignore file Hypothesis writes, at least one of its stores, and no
+/// protected name anywhere beneath. Any other entry keeps it.
+fn hypothesis_database(directory: &Path) -> bool {
+    only_known_entries(
+        directory,
+        &[
+            "examples",
+            "unicode_data",
+            "constants",
+            "patches",
+            "observed",
+            ".gitignore",
+            ".DS_Store",
+        ],
+        &["examples", "unicode_data"],
+    ) && subtree_free_of_protected_entries(directory)
+}
+
+/// Playwright's HTML report: `index.html` plus its `data/` and `trace/`
+/// folders, nothing else, and no protected name anywhere beneath.
+fn playwright_html_report(directory: &Path) -> bool {
+    only_known_entries(
+        directory,
+        &["index.html", "data", "trace", ".DS_Store"],
+        &["index.html"],
+    ) && subtree_free_of_protected_entries(directory)
+}
+
+/// Playwright's test output folder, proved by the `.last-run.json` status
+/// file Playwright writes there. Playwright empties this folder at the start
+/// of every run, so nothing a person puts in it survives the next run; a
+/// protected name anywhere beneath still keeps it.
+fn playwright_output_directory(directory: &Path) -> bool {
+    let last_run = directory.join(".last-run.json");
+    let Ok(metadata) = std::fs::symlink_metadata(&last_run) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        return false;
+    }
+    std::fs::read(&last_run)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|value| {
+            value
+                .get("status")
+                .is_some_and(serde_json::Value::is_string)
+        })
+        && subtree_free_of_protected_entries(directory)
+}
+
+/// Every top-level entry of `directory` is in `allowed`, and at least one
+/// name in `required` is present. Unreadable entries keep the directory.
+fn only_known_entries(directory: &Path, allowed: &[&str], required: &[&str]) -> bool {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return false;
+    };
+    let mut seen = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            return false;
+        };
+        if !allowed.contains(&name.as_str()) {
+            return false;
+        }
+        seen.push(name);
+    }
+    required
+        .iter()
+        .any(|name| seen.iter().any(|seen| seen == name))
 }
 
 /// The nearest enclosing build-output directory of an ignored path, as
@@ -724,11 +901,90 @@ pub struct AutoRemovedCheckout {
 }
 
 /// One candidate auto-cleanup kept, and why.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AutoKeptCheckout {
     pub worktree: String,
     pub sessions: Vec<i64>,
     pub reason: String,
+    /// Machine-readable form of `reason` ([`kept_reason_code`]): stable
+    /// across wording changes, so tools can count keeps by cause.
+    #[serde(default)]
+    pub code: String,
+    /// Ignored paths, relative to the checkout, that keep it (code
+    /// `ignored_content`). Each is a root Git listed as ignored that no
+    /// built-in witness or `[cleanup] regenerable` glob recognises.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_blockers: Vec<String>,
+}
+
+/// Classify a keep reason into a stable code. The reasons are written by the
+/// proofs above; an unrecognised one is `other`, never a removal.
+pub fn kept_reason_code(reason: &str) -> &'static str {
+    let reason = reason
+        .strip_prefix("changed before removal: ")
+        .unwrap_or(reason);
+    const CODES: &[(&str, &str)] = &[
+        (
+            "ignored content requires explicit cleanup",
+            "ignored_content",
+        ),
+        ("ignored-path classification", "ignored_content_unverified"),
+        ("uncommitted or untracked path", "uncommitted_changes"),
+        ("is in progress", "operation_in_progress"),
+        ("a stash was made", "stash"),
+        ("closed-worktree grace period", "in_grace"),
+        ("is still open", "session_open"),
+        ("is open in this worktree", "session_open"),
+        ("is not closed", "session_open"),
+        (
+            "not contained in the remote default branch",
+            "not_contained",
+        ),
+        ("landing search hit its candidate cap", "not_contained"),
+        ("containment could not be proved", "containment_unproven"),
+        ("no fetched remote default branch", "no_remote_default"),
+        ("pinned by [cleanup] keep", "pinned"),
+        ("still holds", "lease_held"),
+        ("lease liveness", "lease_held"),
+        ("a gate may be running", "gate_running"),
+        ("artifact producer", "artifact_use"),
+        ("artifact-use", "artifact_use"),
+        ("open file", "process_use"),
+        ("spawn-time", "ownership_unproven"),
+        ("broker-owned worktree", "ownership_unproven"),
+        ("no recorded owner", "ownership_unproven"),
+        ("primary checkout", "primary_checkout"),
+        ("cleanup policy", "policy_changed"),
+        ("could not be resolved", "inventory_unresolved"),
+        ("removal failed", "removal_failed"),
+    ];
+    CODES
+        .iter()
+        .find(|(needle, _)| reason.contains(needle))
+        .map_or("other", |(_, code)| code)
+}
+
+/// Time and work each lane of one automatic maintenance pass received.
+/// Removal frees checkout capacity and retirement only prepares it, so the
+/// removal lane always keeps its own share of the pass (and the larger one
+/// once registered checkouts reach three quarters of `max_checkouts`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AutoCleanupLanes {
+    /// Registered linked checkouts were at or above three quarters of
+    /// `[worktrees] max_checkouts` when the pass started.
+    pub capacity_pressure: bool,
+    /// Budget the session-retirement lane was given; 0 when unbounded.
+    pub retirement_budget_ms: u64,
+    pub retirement_elapsed_ms: u64,
+    /// Budget left for closed-checkout removal; 0 when unbounded.
+    pub removal_budget_ms: u64,
+    /// Time the removal lane spent selecting, before revalidation and removal.
+    pub removal_elapsed_ms: u64,
+    /// Closed checkouts the removal lane judged in this pass.
+    pub removal_examined: usize,
+    /// Of those, kept checkouts skipped because the remembered keep verdict
+    /// still matched their HEAD and ignored leftovers.
+    pub removal_memo_skips: usize,
 }
 
 /// What one auto-cleanup pass did.
@@ -772,6 +1028,15 @@ pub struct AutoCleanupReport {
     /// Milliseconds the landed lane spent judging sessions.
     #[serde(default, skip_serializing_if = "is_zero_ms")]
     pub landed_retirement_elapsed_ms: u64,
+    /// How the pass divided its budget between retirement and removal.
+    /// Absent from reports written by the retirement-only worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lanes: Option<AutoCleanupLanes>,
+    /// Ignored paths that keep closed checkouts, across every checkout the
+    /// removal lane remembers keeping for ignored leftovers, most common
+    /// first, each with the config line that would release it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by_ignored: Vec<BlockedByIgnored>,
 }
 
 /// The retirement cursor as reported: the last session judged in the current
@@ -797,6 +1062,15 @@ pub struct LandedSessionRetirementView {
 }
 
 impl AutoCleanupReport {
+    /// Give every kept checkout its machine-readable code.
+    pub(crate) fn assign_kept_codes(&mut self) {
+        for kept in &mut self.kept {
+            if kept.code.is_empty() {
+                kept.code = kept_reason_code(&kept.reason).to_string();
+            }
+        }
+    }
+
     /// Fold one retirement summary's landed-lane counts into this report.
     fn absorb_landed_retirement(&mut self, retirement: &SessionRetirementSummary) {
         self.landed_sessions_examined = self
@@ -1568,6 +1842,20 @@ pub(crate) fn ignored_content_reason(
     worktree: &Path,
     policy: &AutoCleanupPolicy,
 ) -> Result<Option<String>, String> {
+    Ok(ignored_content_blockers(worktree, policy, 1)?
+        .into_iter()
+        .next()
+        .map(|(_, reason)| format!("ignored content requires explicit cleanup: {reason}")))
+}
+
+/// Up to `limit` ignored roots that keep the checkout, as
+/// `(relative path, reason)`; a directory ends in `/`. Empty means every
+/// ignored root is disposable under `policy`.
+pub(crate) fn ignored_content_blockers(
+    worktree: &Path,
+    policy: &AutoCleanupPolicy,
+    limit: usize,
+) -> Result<Vec<(String, String)>, String> {
     let deadline = Instant::now() + IGNORED_PATH_LISTING_BUDGET;
     crate::git::with_git_deadline(IGNORED_PATH_LISTING_BUDGET, || {
         ensure_ignored_content_before(deadline)?;
@@ -1588,6 +1876,7 @@ pub(crate) fn ignored_content_reason(
         // Git supplies ignored roots; never recursively walk their contents.
         // Keep every listed entry in the existing whole-checkout classifier:
         // typed protection here is only for future in-place artifact discovery.
+        let mut blockers = Vec::new();
         for entry in ignored {
             ensure_ignored_content_before(deadline)?;
             let relative = if entry.directory_marker {
@@ -1598,13 +1887,14 @@ pub(crate) fn ignored_content_reason(
             let classification = classify_ignored(worktree, &relative, policy);
             ensure_ignored_content_before(deadline)?;
             if let Err(reason) = classification {
-                return Ok(Some(format!(
-                    "ignored content requires explicit cleanup: {reason}"
-                )));
+                blockers.push((relative, reason));
+                if blockers.len() >= limit.max(1) {
+                    break;
+                }
             }
         }
         ensure_ignored_content_before(deadline)?;
-        Ok(None)
+        Ok(blockers)
     })
 }
 
@@ -1615,6 +1905,366 @@ fn ensure_ignored_content_before(deadline: Instant) -> Result<(), String> {
         Err("ignored-path classification exceeded its time budget".into())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the retirement lane consumes its whole deadline.
+    static RETIREMENT_EXHAUSTS_ITS_SHARE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Meta key of the remembered keep verdicts for closed checkouts held only by
+/// ignored leftovers.
+pub(crate) const KEEP_MEMO_KEY: &str = "auto_cleanup.keep_memo";
+const KEEP_MEMO_VERSION: u32 = 1;
+/// Remembered verdicts kept at most; the oldest go first.
+const KEEP_MEMO_MAX_ENTRIES: usize = 4096;
+/// A remembered verdict is re-proved at least this often even when nothing
+/// it fingerprints changed.
+const KEEP_MEMO_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+/// Ignored roots recorded per kept checkout.
+const IGNORED_BLOCKER_LIMIT: usize = 16;
+/// Names `blocked_by_ignored` lists, most common first.
+const BLOCKED_BY_IGNORED_LIMIT: usize = 10;
+
+/// One closed checkout the removal lane kept only for ignored leftovers.
+/// Re-examined as soon as its HEAD, the cleanup policy, or the modification
+/// time of the checkout root, a blocker or a blocker's parent changes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct KeepMemoEntry {
+    head: String,
+    policy: String,
+    fingerprint: Vec<String>,
+    blockers: Vec<String>,
+    sessions: Vec<i64>,
+    reason: String,
+    recorded_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct KeepMemo {
+    version: u32,
+    entries: std::collections::BTreeMap<String, KeepMemoEntry>,
+}
+
+fn decode_keep_memo(raw: Option<&str>) -> KeepMemo {
+    raw.and_then(|raw| serde_json::from_str::<KeepMemo>(raw).ok())
+        .filter(|memo| memo.version == KEEP_MEMO_VERSION)
+        .unwrap_or(KeepMemo {
+            version: KEEP_MEMO_VERSION,
+            entries: std::collections::BTreeMap::new(),
+        })
+}
+
+/// The part of the cleanup policy a keep verdict depends on.
+fn keep_memo_policy(policy: &AutoCleanupPolicy) -> String {
+    format!(
+        "strict={};regenerable={:?};keep={:?}",
+        policy.strict, policy.regenerable, policy.keep
+    )
+}
+
+fn checkout_head(worktree: &Path) -> Option<String> {
+    GitRepo::discover(worktree).ok()?.head_commit().ok()
+}
+
+fn modified_ns(path: &Path) -> String {
+    std::fs::symlink_metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or_else(|| "-".to_string(), |since| since.as_nanos().to_string())
+}
+
+/// Modification times that change when an ignored blocker is removed,
+/// replaced or joined by a new top-level entry. Cheap: no Git, no walk.
+fn keep_memo_fingerprint(worktree: &Path, blockers: &[String]) -> Vec<String> {
+    let mut paths = vec![String::new()];
+    for blocker in blockers {
+        let trimmed = blocker.trim_end_matches('/');
+        paths.push(trimmed.to_string());
+        if let Some((parent, _)) = trimmed.rsplit_once('/') {
+            paths.push(parent.to_string());
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .map(|relative| {
+            let path = if relative.is_empty() {
+                worktree.to_path_buf()
+            } else {
+                worktree.join(&relative)
+            };
+            format!("{relative}={}", modified_ns(&path))
+        })
+        .collect()
+}
+
+/// One ignored root that keeps closed checkouts, aggregated across every
+/// remembered keep verdict.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BlockedByIgnored {
+    /// The ignored path relative to the checkout; a directory ends in `/`.
+    pub name: String,
+    /// Closed checkouts it keeps.
+    pub checkouts: usize,
+    /// The `.aethyme/config.toml` line that would declare it regenerable, for
+    /// a directory. Absent for a standalone file, which no glob may release.
+    /// The repository decides: configure it only when the directory holds
+    /// nothing but output its tools regenerate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_line: Option<String>,
+}
+
+/// Aggregate remembered keep verdicts whose checkout still exists.
+fn blocked_by_ignored_from_memo(memo: &KeepMemo) -> Vec<BlockedByIgnored> {
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    for (worktree, entry) in &memo.entries {
+        if !Path::new(worktree).is_dir() {
+            continue;
+        }
+        for blocker in &entry.blockers {
+            *counts.entry(blocker.as_str()).or_default() += 1;
+        }
+    }
+    let mut rows = counts
+        .into_iter()
+        .map(|(name, checkouts)| BlockedByIgnored {
+            name: name.to_string(),
+            checkouts,
+            config_line: name
+                .strip_suffix('/')
+                .map(|directory| format!("[cleanup] regenerable = [{}]", toml_string(directory))),
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .checkouts
+            .cmp(&left.checkouts)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    rows.truncate(BLOCKED_BY_IGNORED_LIMIT);
+    rows
+}
+
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
+}
+
+/// What `broker start` says when the linked-checkout limit still refuses
+/// after its removal pass: what that pass removed and kept, the top keep
+/// codes, and the change that would release the most closed checkouts.
+pub(crate) fn checkout_capacity_refusal_detail(report: Option<&AutoCleanupReport>) -> String {
+    let Some(report) = report else {
+        return "the removal pass could not run (another maintenance pass held the GC lock); retry shortly or run `aethyme broker gc sweep --json`".into();
+    };
+    let mut codes = std::collections::BTreeMap::<&str, usize>::new();
+    for kept in &report.kept {
+        let code = if kept.code.is_empty() {
+            kept_reason_code(&kept.reason)
+        } else {
+            kept.code.as_str()
+        };
+        *codes.entry(code).or_default() += 1;
+    }
+    let mut codes = codes.into_iter().collect::<Vec<_>>();
+    codes.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    let top = codes
+        .iter()
+        .take(3)
+        .map(|(code, count)| format!("{code} {count}"))
+        .collect::<Vec<_>>();
+    let mut detail = format!(
+        "the removal pass removed {} closed checkout(s), kept {}{}, deferred {}",
+        report.removed.len(),
+        report.kept.len(),
+        if top.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", top.join(", "))
+        },
+        report.deferred
+    );
+    if let Some(blocked) = report.blocked_by_ignored.first() {
+        match &blocked.config_line {
+            Some(line) => detail.push_str(&format!(
+                "; ignored {} keeps {} closed checkout(s): if it holds only regenerable output, adding `{line}` to .aethyme/config.toml releases them",
+                blocked.name, blocked.checkouts
+            )),
+            None => detail.push_str(&format!(
+                "; ignored file {} keeps {} closed checkout(s): review and delete it",
+                blocked.name, blocked.checkouts
+            )),
+        }
+    } else if report.deferred > 0 {
+        detail.push_str("; run `aethyme broker gc sweep --json` to continue the removal lap");
+    }
+    detail
+}
+
+/// `blocked_by_ignored` from the stored keep memo, for `broker status`.
+pub(crate) fn blocked_by_ignored_from_meta(raw: Option<&str>) -> Vec<BlockedByIgnored> {
+    blocked_by_ignored_from_memo(&decode_keep_memo(raw))
+}
+
+/// Meta key of remembered landed-lane declines that cannot change while the
+/// session head, the fetched default-branch tip and the session's pull
+/// request and representation evidence stay the same.
+const LANDED_DECLINE_MEMO_KEY: &str = "auto_cleanup.landed_decline_memo";
+const LANDED_DECLINE_MEMO_MAX_ENTRIES: usize = 4096;
+/// Where the likely-landed queue resumes, so one session whose proof keeps
+/// running out of budget cannot hold the front of the queue.
+const LIKELY_LANDED_CURSOR_KEY: &str = "auto_cleanup.likely_landed_after";
+/// Likely-landed sessions one pass may take, before the oldest-first cursor.
+const LIKELY_LANDED_PASS_LIMIT: usize = 64;
+
+/// Landed-lane declines (`no_session_commits`, `no_landing_evidence`) keyed
+/// by everything their proof read. A remembered decline only skips the
+/// landed lane; it never closes anything, and the abandonment window still
+/// applies.
+#[derive(Debug, Default)]
+struct LandedDeclineMemo {
+    entries: std::collections::BTreeMap<i64, (String, String)>,
+}
+
+impl LandedDeclineMemo {
+    fn load(broker: &Broker) -> Self {
+        let entries = broker
+            .store_ref()
+            .meta_get(LANDED_DECLINE_MEMO_KEY)
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        Self { entries }
+    }
+
+    /// What the decline depended on, or `None` when it cannot be read (then
+    /// nothing is remembered or skipped).
+    fn key(
+        &self,
+        broker: &Broker,
+        session: &Session,
+        upstream_tip: Option<&str>,
+    ) -> Option<String> {
+        let tip = upstream_tip?;
+        let head = checkout_head(Path::new(&session.worktree_path))?;
+        let store = broker.store_ref();
+        let merged = store
+            .session_has_merged_pull_request_link(session.id)
+            .ok()?;
+        let represented = store
+            .session_representation(session.id, &head)
+            .ok()?
+            .is_some();
+        Some(format!(
+            "{head} {tip} merged={merged} represented={represented}"
+        ))
+    }
+
+    fn remembered(
+        &self,
+        session_id: i64,
+        key: &str,
+    ) -> Option<crate::broker::LandedSessionDecline> {
+        let (recorded, code) = self.entries.get(&session_id)?;
+        if recorded != key {
+            return None;
+        }
+        match code.as_str() {
+            "no_session_commits" => Some(crate::broker::LandedSessionDecline::NoSessionCommits),
+            "no_landing_evidence" => Some(crate::broker::LandedSessionDecline::NoLandingEvidence),
+            _ => None,
+        }
+    }
+
+    /// Remember a cacheable decline under the key read before the proof ran;
+    /// forget the session on any other outcome.
+    fn record(
+        &mut self,
+        broker: &Broker,
+        session_id: i64,
+        key: Option<&str>,
+        decline: Option<crate::broker::LandedSessionDecline>,
+    ) {
+        use crate::broker::LandedSessionDecline as Decline;
+        let entry = match (key, decline) {
+            (
+                Some(key),
+                Some(reason @ (Decline::NoSessionCommits | Decline::NoLandingEvidence)),
+            ) => Some((key.to_string(), reason.code().to_string())),
+            _ => None,
+        };
+        let changed = match entry {
+            Some(entry) => self.entries.insert(session_id, entry.clone()) != Some(entry),
+            None => self.entries.remove(&session_id).is_some(),
+        };
+        if !changed {
+            return;
+        }
+        while self.entries.len() > LANDED_DECLINE_MEMO_MAX_ENTRIES {
+            self.entries.pop_first();
+        }
+        if let Ok(text) = serde_json::to_string(&self.entries) {
+            crate::warn_unrecorded(
+                "remember a landed-lane decline",
+                broker.store_ref().meta_set(LANDED_DECLINE_MEMO_KEY, &text),
+            );
+        }
+    }
+}
+
+/// Passes shorter than this (a broker open's inline sweep) do not spend part
+/// of their budget counting registered checkouts.
+const CAPACITY_PROBE_MIN_BUDGET: Duration = Duration::from_secs(1);
+
+/// The share of a pass the session-retirement lane may use, as
+/// `(numerator, denominator)`: half normally, a quarter under capacity
+/// pressure, when removal is what frees a slot.
+fn retirement_share(capacity_pressure: bool) -> (u32, u32) {
+    if capacity_pressure { (1, 4) } else { (1, 2) }
+}
+
+/// The deadline of a lane that may use `share` of what is left of the pass.
+/// Unbounded passes stay unbounded.
+fn lane_deadline(
+    started: Instant,
+    deadline: Option<Instant>,
+    (numerator, denominator): (u32, u32),
+) -> Option<Instant> {
+    deadline.map(|end| {
+        let total = end.saturating_duration_since(started);
+        started + total * numerator / denominator.max(1)
+    })
+}
+
+fn duration_ms(duration: Option<Duration>) -> u64 {
+    duration.map_or(0, |duration| {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    })
+}
+
+/// Phase-level counters for one maintenance pass (`aethyme broker advanced
+/// metrics` and `command-metrics.jsonl`).
+fn record_lane_telemetry(report: &AutoCleanupReport) {
+    let Some(lanes) = report.lanes else {
+        return;
+    };
+    let count = |name: &'static str, times: usize| {
+        for _ in 0..times.min(4096) {
+            crate::phase_telemetry::add(name, Duration::ZERO);
+        }
+    };
+    count("auto_cleanup_removal_examined", lanes.removal_examined);
+    count("auto_cleanup_removal_memo_skips", lanes.removal_memo_skips);
+    count("auto_cleanup_removed", report.removed.len());
+    count("auto_cleanup_kept", report.kept.len());
+    if lanes.capacity_pressure {
+        count("auto_cleanup_capacity_pressure", 1);
     }
 }
 
@@ -2624,6 +3274,7 @@ impl Broker {
                 worktree: path.to_string_lossy().into_owned(),
                 sessions: ids.clone(),
                 reason,
+                ..Default::default()
             })
         };
         if !group.complete {
@@ -3038,6 +3689,21 @@ impl Broker {
         deadline: Option<Instant>,
     ) -> Result<SessionRetirementSummary, BrokerOpError> {
         let mut summary = SessionRetirementSummary::default();
+        #[cfg(test)]
+        if RETIREMENT_EXHAUSTS_ITS_SHARE.with(std::cell::Cell::get)
+            && let Some(deadline) = deadline
+        {
+            // Stand-in for a landed lap whose proofs use every millisecond
+            // the lane is given.
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            summary.deferred = 1;
+            summary
+                .reasons
+                .push(SessionRetirementDeferredReason::DeadlineExceeded {
+                    after_session_id: 0,
+                });
+            return Ok(summary);
+        }
         if deadline_expired(deadline) {
             summary.deferred = 1;
             summary
@@ -3103,6 +3769,25 @@ impl Broker {
             return Ok(summary);
         }
 
+        let landed_window_ms =
+            i64::from(policy.session_landed_after_hours).saturating_mul(3_600_000);
+        let mut decline_memo = LandedDeclineMemo::load(self);
+        let upstream_tip = self.repo_handle().upstream_default().map(|(_, tip)| tip);
+        // Sessions that already show landing evidence go first, ahead of
+        // the oldest-first cursor whose head is full of sessions that will
+        // never close. Same proof, same re-checks: only the order changes.
+        let prioritized = if landed_window_ms > 0 {
+            self.retire_likely_landed_sessions(
+                landed_window_ms,
+                lane_deadline(Instant::now(), deadline, (1, 2)),
+                upstream_tip.as_deref(),
+                &mut decline_memo,
+                &mut summary,
+            )?
+        } else {
+            std::collections::BTreeSet::new()
+        };
+
         let sessions = self.store().open_session_page(
             cursor.after_session_id,
             cursor.high_water_session_id,
@@ -3129,8 +3814,6 @@ impl Broker {
         }
 
         let retirement_now = now_ms();
-        let landed_window_ms =
-            i64::from(policy.session_landed_after_hours).saturating_mul(3_600_000);
         let candidate_window_ms = if landed_window_ms > 0 {
             window_ms.min(landed_window_ms)
         } else {
@@ -3190,6 +3873,7 @@ impl Broker {
             )
             .is_abandoned();
             let idle_enough_for_landed = landed_window_ms > 0
+                && !prioritized.contains(&session.id)
                 && crate::decide_abandonment(
                     &crate::SessionActivity {
                         session_id: session.id,
@@ -3209,7 +3893,22 @@ impl Broker {
             // question open falls through to the abandonment window.
             let mut landed_decline = None;
             let mut outcome = crate::broker::AbandonedSessionCloseOutcome::NotDue;
-            if idle_enough_for_landed {
+            let memo_key = if idle_enough_for_landed {
+                decline_memo.key(self, &session, upstream_tip.as_deref())
+            } else {
+                None
+            };
+            let remembered = memo_key
+                .as_deref()
+                .and_then(|key| decline_memo.remembered(session.id, key));
+            if let Some(reason) = remembered {
+                // Same head, same default-branch tip, same pull-request and
+                // representation evidence: the landed lane would decline
+                // again for the same reason. The abandonment window below
+                // still applies.
+                crate::phase_telemetry::add("landed_decline_memo_skips", Duration::ZERO);
+                landed_decline = Some(reason);
+            } else if idle_enough_for_landed {
                 landed_judged_in_pass += 1;
                 summary.landed_examined += 1;
                 crate::phase_telemetry::add("landed_sessions_examined", Duration::ZERO);
@@ -3232,6 +3931,7 @@ impl Broker {
                     summary.landed_closed += 1;
                     crate::phase_telemetry::add("landed_sessions_closed", elapsed);
                 }
+                decline_memo.record(self, session.id, memo_key.as_deref(), landed_decline);
                 // Leave the cursor on this session so the next pass, usually
                 // the background worker with its larger budget, resumes here;
                 // unless this one session alone used a long pass, which must
@@ -3394,6 +4094,147 @@ impl Broker {
         Ok(summary)
     }
 
+    /// Offer the landed lane, first, the open sessions idle past the landed
+    /// window that already show landing evidence: a merged pull request in
+    /// the cached provider data, or a branch tip (with commits of its own)
+    /// that is an ancestor of the fetched default branch, read with one
+    /// `for-each-ref --merged` listing. Every proof and re-check is
+    /// `try_close_landed_session`'s, unchanged; only the order differs from
+    /// the oldest-first cursor. Returns the sessions it judged, which the
+    /// cursor lane does not judge again in this pass.
+    fn retire_likely_landed_sessions(
+        &mut self,
+        landed_window_ms: i64,
+        deadline: Option<Instant>,
+        upstream_tip: Option<&str>,
+        decline_memo: &mut LandedDeclineMemo,
+        summary: &mut SessionRetirementSummary,
+    ) -> Result<std::collections::BTreeSet<i64>, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("landed_likely_queue");
+        let mut judged = std::collections::BTreeSet::new();
+        if deadline_expired(deadline) {
+            return Ok(judged);
+        }
+        let now = now_ms();
+        let merged_pull_requests = self
+            .store_ref()
+            .open_sessions_with_merged_pull_request()?
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let merged_branches = upstream_tip
+            .and_then(|tip| self.repo_handle().local_branches_merged_into(tip))
+            .unwrap_or_default();
+        let tips = self.repo_handle().local_branch_tips().unwrap_or_default();
+        let after = self
+            .store_ref()
+            .meta_get(LIKELY_LANDED_CURSOR_KEY)
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let mut likely = self
+            .store_ref()
+            .live_sessions()?
+            .into_iter()
+            .filter(|session| {
+                if session.cleanup_state != SessionCleanupState::Open {
+                    return false;
+                }
+                let branch_ref = format!("refs/heads/{}", session.branch);
+                let on_default = merged_branches.contains(&branch_ref)
+                    && tips
+                        .get(&branch_ref)
+                        .is_some_and(|tip| session.diff_base.as_deref() != Some(tip.as_str()));
+                (merged_pull_requests.contains(&session.id) || on_default)
+                    && crate::decide_abandonment(
+                        &crate::SessionActivity {
+                            session_id: session.id,
+                            last_activity_at: session.last_activity_at,
+                            created_at: session.created_at,
+                            agent_alive: None,
+                            closed: false,
+                        },
+                        now,
+                        landed_window_ms,
+                    )
+                    .is_abandoned()
+            })
+            .collect::<Vec<_>>();
+        likely.sort_by_key(|session| (session.id <= after, session.id));
+        likely.truncate(LIKELY_LANDED_PASS_LIMIT);
+        if likely.is_empty() {
+            return Ok(judged);
+        }
+        let ids = likely.iter().map(|session| session.id).collect::<Vec<_>>();
+        let mut process_table = crate::session_holder::RecordedHolderProcessTable::default();
+        process_table.prime(self.store_ref(), &ids, deadline);
+        for session in likely {
+            if deadline_expired(deadline) {
+                break;
+            }
+            let key = decline_memo.key(self, &session, upstream_tip);
+            if key
+                .as_deref()
+                .and_then(|key| decline_memo.remembered(session.id, key))
+                .is_some()
+            {
+                continue;
+            }
+            judged.insert(session.id);
+            let allow_snapshot = match deadline {
+                Some(deadline) => {
+                    deadline.saturating_duration_since(Instant::now())
+                        > crate::session_holder::PROCESS_TABLE_TIMEOUT + Duration::from_millis(100)
+                }
+                None => true,
+            };
+            summary.landed_examined += 1;
+            crate::phase_telemetry::add("landed_sessions_examined", Duration::ZERO);
+            crate::phase_telemetry::add("landed_likely_examined", Duration::ZERO);
+            let started = Instant::now();
+            let outcome = self.try_close_landed_session(
+                session.id,
+                now_ms(),
+                landed_window_ms,
+                &mut process_table,
+                allow_snapshot,
+                deadline,
+            )?;
+            let elapsed = started.elapsed();
+            crate::phase_telemetry::add("landed_session_retirement", elapsed);
+            summary.landed_elapsed_ms = summary
+                .landed_elapsed_ms
+                .saturating_add(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+            crate::warn_unrecorded(
+                "advance the likely-landed queue",
+                self.store_ref()
+                    .meta_set(LIKELY_LANDED_CURSOR_KEY, &session.id.to_string()),
+            );
+            let decline = crate::broker::LandedSessionDecline::from_outcome(outcome);
+            decline_memo.record(self, session.id, key.as_deref(), decline);
+            match decline {
+                None => {
+                    summary.landed_closed += 1;
+                    summary.retired += 1;
+                    crate::phase_telemetry::add("landed_sessions_closed", elapsed);
+                    crate::phase_telemetry::add("landed_likely_closed", elapsed);
+                }
+                Some(reason) => {
+                    *summary.landed_declined.entry(reason.code()).or_default() += 1;
+                    crate::phase_telemetry::add(reason.telemetry_name(), Duration::ZERO);
+                    if matches!(
+                        reason,
+                        crate::broker::LandedSessionDecline::BudgetExhausted
+                            | crate::broker::LandedSessionDecline::Busy
+                    ) {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(judged)
+    }
+
     /// Run one bounded session-retirement page without planning or applying
     /// whole-checkout cleanup. The detached retirement lane uses this while a
     /// closed checkout is still inside its independent cleanup grace period.
@@ -3425,7 +4266,30 @@ impl Broker {
         &mut self,
         deadline: Option<Instant>,
     ) -> Result<AutoCleanupReport, BrokerOpError> {
-        let retirement = self.retire_abandoned_sessions(deadline)?;
+        let pass_started = Instant::now();
+        let capacity_pressure = self.checkout_capacity_pressure(deadline);
+        // Retirement only prepares capacity (a closed checkout still waits
+        // out its grace); removal frees it. Retirement gets a bounded share
+        // and removal the rest of the pass, including whatever retirement
+        // leaves unused, so a heavy retirement lap can no longer starve the
+        // removal lane of every pass.
+        let retirement_deadline =
+            lane_deadline(pass_started, deadline, retirement_share(capacity_pressure));
+        let mut lanes = AutoCleanupLanes {
+            capacity_pressure,
+            retirement_budget_ms: duration_ms(
+                retirement_deadline.map(|end| end.saturating_duration_since(pass_started)),
+            ),
+            ..AutoCleanupLanes::default()
+        };
+        let retirement = {
+            let _span = crate::phase_telemetry::span("auto_cleanup_retirement_lane");
+            self.retire_abandoned_sessions(retirement_deadline)?
+        };
+        let removal_started = Instant::now();
+        lanes.retirement_elapsed_ms = duration_ms(Some(removal_started - pass_started));
+        lanes.removal_budget_ms =
+            duration_ms(deadline.map(|end| end.saturating_duration_since(removal_started)));
         if retirement.reasons.iter().any(|reason| {
             matches!(
                 reason,
@@ -3450,15 +4314,41 @@ impl Broker {
             report.deferred = retirement.deferred;
             report.sessions_retired = retirement.retired;
             report.retirement_deferred_reasons = retirement.reasons;
+            report.lanes = Some(lanes);
             return Ok(report);
         }
-        let mut plan = self.auto_cleanup_plan(deadline)?;
+        let mut plan = {
+            let _span = crate::phase_telemetry::span("auto_cleanup_removal_lane");
+            self.auto_cleanup_plan(deadline)?
+        };
         plan.report.absorb_landed_retirement(&retirement);
         plan.report.sessions_retired = retirement.retired;
         plan.report.deferred += retirement.deferred;
         plan.report.retirement_deferred_reasons = retirement.reasons;
+        let planned = plan.report.lanes.unwrap_or_default();
+        lanes.removal_examined = planned.removal_examined;
+        lanes.removal_memo_skips = planned.removal_memo_skips;
+        lanes.removal_elapsed_ms = duration_ms(Some(removal_started.elapsed()));
+        plan.report.lanes = Some(lanes);
         let report = self.auto_cleanup_apply(plan)?;
+        record_lane_telemetry(&report);
         Ok(report)
+    }
+
+    /// Whether registered linked checkouts are at or above three quarters of
+    /// `[worktrees] max_checkouts`. One `git worktree list`; skipped (false)
+    /// when the pass is too short to afford it or the limit is disabled.
+    fn checkout_capacity_pressure(&self, deadline: Option<Instant>) -> bool {
+        if deadline.is_some_and(|end| {
+            end.saturating_duration_since(Instant::now()) < CAPACITY_PROBE_MIN_BUDGET
+        }) {
+            return false;
+        }
+        matches!(
+            self.worktree_checkout_usage(),
+            Ok(Some((count, maximum)))
+                if count.saturating_mul(4) >= (maximum as usize).saturating_mul(3)
+        )
     }
 
     /// Select the checkouts every proof currently allows removing. Removes
@@ -3515,145 +4405,288 @@ impl Broker {
             }
         };
         let (mut cursor, mut expected_cursor) = self.auto_cleanup_cursor()?;
-        let cursor_before_scan = cursor;
-        let Some(scan) = self.auto_cleanup_checkout_groups(&mut cursor, deadline)? else {
-            report.deferred += 1;
-            return Ok(AutoCleanupPlan::nothing(report));
-        };
-        if scan.unresolved_rows > 0 {
-            report.kept.push(AutoKeptCheckout {
-                worktree: "<session checkout inventory>".into(),
-                sessions: Vec::new(),
-                reason: format!(
-                    "{} session checkout path(s) could not be resolved; cleanup remains blocked",
-                    scan.unresolved_rows
-                ),
-            });
-            return Ok(AutoCleanupPlan::nothing(report));
-        }
-        if cursor != cursor_before_scan {
-            self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
-        }
-        // Older installed routers do not write the close outbox atomically.
-        // Reconcile only this rotating, bounded cohort page so a closure made
-        // by one of those clients eventually receives its original grace
-        // without turning routine maintenance into a full-history query.
-        let legacy_closed_spawned_ids = scan
-            .groups
-            .iter()
-            .filter(|group| !policy.is_pinned(&group.worktree))
-            .flat_map(|group| group.sessions.iter())
-            .filter(|session| {
-                session.origin == SessionOrigin::Spawned
-                    && session.status.is_closed()
-                    && session.cleanup_state == SessionCleanupState::Closed
-            })
-            .map(|session| session.id)
-            .collect::<Vec<_>>();
-        self.store().request_closed_spawned_checkout_cleanups(
-            &legacy_closed_spawned_ids,
-            cleanup_grace_hours,
-            now_ms(),
-        )?;
-        let alias_refresh_generation = scan.alias_refresh_generation;
-
+        let memo_raw = self.store().meta_get(KEEP_MEMO_KEY)?;
+        let mut memo = decode_keep_memo(memo_raw.as_deref());
+        let memo_policy = keep_memo_policy(&policy);
+        let mut memo_changed = false;
         let mut upstream_checked = false;
         let mut upstream = None;
         let mut selected = Vec::new();
         let mut lease_process_table = LeaseProcessTableSnapshot::default();
-        for group in scan.groups {
-            if deadline_expired(deadline) {
+        let mut alias_refresh_generation = None;
+        let mut examined = 0_usize;
+        let mut memo_skips = 0_usize;
+        // Under capacity pressure a bounded pass keeps going page by page
+        // while time remains; otherwise each pass keeps its one-page tranche
+        // and the background worker paces the lap.
+        let multi_page = deadline.is_some() && self.checkout_capacity_pressure(deadline);
+        let mut first_page = true;
+        loop {
+            let cursor_before_scan = cursor;
+            let Some(scan) = self.auto_cleanup_checkout_groups(&mut cursor, deadline)? else {
+                if first_page {
+                    report.deferred += 1;
+                    return Ok(AutoCleanupPlan::nothing(report));
+                }
+                break;
+            };
+            if scan.unresolved_rows > 0 {
+                report.kept.push(AutoKeptCheckout {
+                    worktree: "<session checkout inventory>".into(),
+                    sessions: Vec::new(),
+                    reason: format!(
+                        "{} session checkout path(s) could not be resolved; cleanup remains blocked",
+                        scan.unresolved_rows
+                    ),
+                    ..Default::default()
+                });
+                return Ok(AutoCleanupPlan::nothing(report));
+            }
+            if cursor != cursor_before_scan {
+                self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
+            }
+            // Older installed routers do not write the close outbox atomically.
+            // Reconcile only this rotating, bounded cohort page so a closure made
+            // by one of those clients eventually receives its original grace
+            // without turning routine maintenance into a full-history query.
+            let legacy_closed_spawned_ids = scan
+                .groups
+                .iter()
+                .filter(|group| !policy.is_pinned(&group.worktree))
+                .flat_map(|group| group.sessions.iter())
+                .filter(|session| {
+                    session.origin == SessionOrigin::Spawned
+                        && session.status.is_closed()
+                        && session.cleanup_state == SessionCleanupState::Closed
+                })
+                .map(|session| session.id)
+                .collect::<Vec<_>>();
+            self.store().request_closed_spawned_checkout_cleanups(
+                &legacy_closed_spawned_ids,
+                cleanup_grace_hours,
+                now_ms(),
+            )?;
+            if alias_refresh_generation
+                .is_some_and(|generation| generation != scan.alias_refresh_generation)
+            {
+                // The path index moved under this pass; the next pass starts a
+                // fresh selection against the new lap.
                 break;
             }
-            let cursor_session_id = checkout_group_cursor_session_id(&group);
-            let inspection =
-                inspect_group(self, &group, &scan.live, &scan.live_worktrees, deadline)?;
-            let mut stop_for_deadline = false;
-            let inspection = if deadline_expired(deadline) {
-                stop_for_deadline = true;
-                AutoCleanupGroupInspection::Deferred
-            } else {
-                inspection
-            };
-            match inspection {
-                AutoCleanupGroupInspection::Candidate(candidate) => {
-                    let candidate = *candidate;
-                    if !upstream_checked {
-                        upstream_checked = true;
-                        upstream = {
-                            let _git_deadline = deadline.map(crate::git::limit_git_until);
-                            self.remote_default_ref_and_tip()
-                        };
-                    }
-                    if deadline_expired(deadline) {
-                        report.deferred += 1;
-                        stop_for_deadline = true;
-                    } else if let Some(upstream) = upstream.as_ref() {
-                        let verdict = self.auto_cleanup_verdict(
-                            &candidate,
-                            &policy,
-                            upstream,
-                            AutoCleanupVerdictOptions {
-                                deep: false,
-                                deadline,
-                                selected: None,
-                                lease_process_table: &mut lease_process_table,
-                            },
-                        );
-                        let verdict = match verdict {
-                            Err(NotRemoved::Defer) if !deadline_expired(deadline) => self
-                                .auto_cleanup_verdict(
-                                    &candidate,
-                                    &policy,
-                                    upstream,
-                                    AutoCleanupVerdictOptions {
-                                        deep: true,
-                                        deadline,
-                                        selected: None,
-                                        lease_process_table: &mut lease_process_table,
-                                    },
-                                ),
-                            verdict => verdict,
-                        };
-                        if deadline_expired(deadline) {
+            alias_refresh_generation = Some(scan.alias_refresh_generation);
+
+            let mut stop_pass = false;
+            for group in scan.groups {
+                if deadline_expired(deadline) {
+                    stop_pass = true;
+                    break;
+                }
+                examined += 1;
+                let cursor_session_id = checkout_group_cursor_session_id(&group);
+                let inspection =
+                    inspect_group(self, &group, &scan.live, &scan.live_worktrees, deadline)?;
+                let mut stop_for_deadline = false;
+                let inspection = if deadline_expired(deadline) {
+                    stop_for_deadline = true;
+                    AutoCleanupGroupInspection::Deferred
+                } else {
+                    inspection
+                };
+                match inspection {
+                    AutoCleanupGroupInspection::Candidate(candidate) => {
+                        let candidate = *candidate;
+                        if !upstream_checked {
+                            upstream_checked = true;
+                            upstream = {
+                                let _git_deadline = deadline.map(crate::git::limit_git_until);
+                                self.remote_default_ref_and_tip()
+                            };
+                        }
+                        let worktree_key = candidate.worktree.to_string_lossy().into_owned();
+                        let remembered = memo
+                            .entries
+                            .get(&worktree_key)
+                            .filter(|entry| {
+                                now_ms().saturating_sub(entry.recorded_at_ms) < KEEP_MEMO_MAX_AGE_MS
+                                    && entry.policy == memo_policy
+                                    && entry.sessions == candidate.session_ids()
+                                    && keep_memo_fingerprint(&candidate.worktree, &entry.blockers)
+                                        == entry.fingerprint
+                                    && checkout_head(&candidate.worktree).as_deref()
+                                        == Some(entry.head.as_str())
+                            })
+                            .cloned();
+                        if let Some(entry) = remembered {
+                            // Nothing the verdict depended on changed: keep it
+                            // without re-listing its ignored paths.
+                            memo_skips += 1;
+                            report.kept.push(AutoKeptCheckout {
+                                worktree: worktree_key,
+                                sessions: candidate.session_ids(),
+                                reason: entry.reason,
+                                code: "ignored_content".into(),
+                                ignored_blockers: entry.blockers,
+                            });
+                        } else if deadline_expired(deadline) {
                             report.deferred += 1;
                             stop_for_deadline = true;
-                        } else {
-                            match verdict {
-                                Ok(proof) => selected.push((candidate, proof)),
-                                Err(NotRemoved::Defer) => report.deferred += 1,
-                                Err(NotRemoved::Keep(reason)) => {
-                                    report.kept.push(AutoKeptCheckout {
-                                        worktree: candidate.worktree.to_string_lossy().into_owned(),
-                                        sessions: candidate.session_ids(),
-                                        reason,
-                                    })
+                        } else if let Some(upstream) = upstream.as_ref() {
+                            let verdict = self.auto_cleanup_verdict(
+                                &candidate,
+                                &policy,
+                                upstream,
+                                AutoCleanupVerdictOptions {
+                                    deep: false,
+                                    deadline,
+                                    selected: None,
+                                    lease_process_table: &mut lease_process_table,
+                                },
+                            );
+                            let verdict = match verdict {
+                                Err(NotRemoved::Defer) if !deadline_expired(deadline) => self
+                                    .auto_cleanup_verdict(
+                                        &candidate,
+                                        &policy,
+                                        upstream,
+                                        AutoCleanupVerdictOptions {
+                                            deep: true,
+                                            deadline,
+                                            selected: None,
+                                            lease_process_table: &mut lease_process_table,
+                                        },
+                                    ),
+                                verdict => verdict,
+                            };
+                            if deadline_expired(deadline) {
+                                report.deferred += 1;
+                                stop_for_deadline = true;
+                            } else {
+                                match verdict {
+                                    Ok(proof) => {
+                                        memo_changed |=
+                                            memo.entries.remove(&worktree_key).is_some();
+                                        selected.push((candidate, proof));
+                                    }
+                                    Err(NotRemoved::Defer) => report.deferred += 1,
+                                    Err(NotRemoved::Keep(reason)) => {
+                                        let code = kept_reason_code(&reason);
+                                        let mut ignored_blockers = Vec::new();
+                                        if code == "ignored_content" {
+                                            // The verdict stops at the first
+                                            // blocker; list them all once so the
+                                            // report can say what to configure.
+                                            if let Ok(blockers) = ignored_content_blockers(
+                                                &candidate.worktree,
+                                                &policy,
+                                                IGNORED_BLOCKER_LIMIT,
+                                            ) {
+                                                ignored_blockers = blockers
+                                                    .into_iter()
+                                                    .map(|(relative, _)| relative)
+                                                    .collect();
+                                            }
+                                            if !ignored_blockers.is_empty()
+                                                && let Some(head) =
+                                                    checkout_head(&candidate.worktree)
+                                            {
+                                                memo.entries.insert(
+                                                    worktree_key.clone(),
+                                                    KeepMemoEntry {
+                                                        head,
+                                                        policy: memo_policy.clone(),
+                                                        fingerprint: keep_memo_fingerprint(
+                                                            &candidate.worktree,
+                                                            &ignored_blockers,
+                                                        ),
+                                                        blockers: ignored_blockers.clone(),
+                                                        sessions: candidate.session_ids(),
+                                                        reason: reason.clone(),
+                                                        recorded_at_ms: now_ms(),
+                                                    },
+                                                );
+                                                memo_changed = true;
+                                            }
+                                        } else {
+                                            memo_changed |=
+                                                memo.entries.remove(&worktree_key).is_some();
+                                        }
+                                        report.kept.push(AutoKeptCheckout {
+                                            worktree: worktree_key,
+                                            sessions: candidate.session_ids(),
+                                            reason,
+                                            code: code.to_string(),
+                                            ignored_blockers,
+                                        })
+                                    }
                                 }
                             }
+                        } else {
+                            report.kept.push(AutoKeptCheckout {
+                                worktree: candidate.worktree.to_string_lossy().into_owned(),
+                                sessions: candidate.session_ids(),
+                                reason: "no fetched remote default branch (origin/HEAD) to prove containment against".into(),
+                                ..Default::default()
+                            });
                         }
-                    } else {
-                        report.kept.push(AutoKeptCheckout {
-                            worktree: candidate.worktree.to_string_lossy().into_owned(),
-                            sessions: candidate.session_ids(),
-                            reason: "no fetched remote default branch (origin/HEAD) to prove containment against".into(),
-                        });
+                    }
+                    AutoCleanupGroupInspection::Kept(kept) => report.kept.push(kept),
+                    AutoCleanupGroupInspection::Deferred => {
+                        report.deferred += 1;
+                        // A selected-group deferral means its proof exhausted
+                        // this tranche. Checkpoint it below, then let the next
+                        // pass resume at the following complete group.
+                        stop_for_deadline = true;
                     }
                 }
-                AutoCleanupGroupInspection::Kept(kept) => report.kept.push(kept),
-                AutoCleanupGroupInspection::Deferred => {
-                    report.deferred += 1;
-                    // A selected-group deferral means its proof exhausted
-                    // this tranche. Checkpoint it below, then let the next
-                    // pass resume at the following complete group.
-                    stop_for_deadline = true;
+                cursor.after_session_id = cursor_session_id;
+                self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
+                if stop_for_deadline {
+                    stop_pass = true;
+                    break;
                 }
             }
-            cursor.after_session_id = cursor_session_id;
-            self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
-            if stop_for_deadline {
+            first_page = false;
+            // Under capacity pressure, a bounded pass moves on to the next page
+            // of closed checkouts while time remains, up to the end of the
+            // current lap.
+            if stop_pass
+                || !multi_page
+                || selected.len() >= AUTO_CLEANUP_MAX_SELECTED_PER_PASS
+                || deadline_expired(deadline)
+                || self.store().cleanup_cohort_group_count(
+                    crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+                    cursor.after_session_id,
+                    cursor.high_water_session_id,
+                )? == 0
+            {
                 break;
             }
         }
+        if memo_changed {
+            memo.entries
+                .retain(|worktree, _| Path::new(worktree).is_dir());
+            if memo.entries.len() > KEEP_MEMO_MAX_ENTRIES {
+                let mut ages = memo
+                    .entries
+                    .iter()
+                    .map(|(worktree, entry)| (entry.recorded_at_ms, worktree.clone()))
+                    .collect::<Vec<_>>();
+                ages.sort();
+                let excess = memo.entries.len() - KEEP_MEMO_MAX_ENTRIES;
+                for (_, worktree) in ages.into_iter().take(excess) {
+                    memo.entries.remove(&worktree);
+                }
+            }
+            let text =
+                serde_json::to_string(&memo).expect("serializing the keep memo is infallible");
+            self.store().meta_set(KEEP_MEMO_KEY, &text)?;
+        }
+        report.blocked_by_ignored = blocked_by_ignored_from_memo(&memo);
+        report.lanes = Some(AutoCleanupLanes {
+            removal_examined: examined,
+            removal_memo_skips: memo_skips,
+            ..AutoCleanupLanes::default()
+        });
         // The current deferred group, if any, was counted above and the cursor
         // persisted through it. On an early deadline break it still points to
         // the prior group, so this adds the unvisited suffix in either case.
@@ -3668,7 +4701,7 @@ impl Broker {
             upstream,
             selected,
             deadline,
-            alias_refresh_generation: Some(alias_refresh_generation),
+            alias_refresh_generation,
         })
     }
 
@@ -3698,11 +4731,13 @@ impl Broker {
                 });
             if !alias_snapshot_current {
                 report.deferred = report.deferred.saturating_add(selected.len());
+                report.assign_kept_codes();
                 self.record_auto_cleanup_report(&report)?;
                 return Ok(report);
             }
         }
         let Some(upstream) = upstream.filter(|_| !selected.is_empty()) else {
+            report.assign_kept_codes();
             self.record_auto_cleanup_report(&report)?;
             return Ok(report);
         };
@@ -3710,6 +4745,7 @@ impl Broker {
             Ok(Some(claim)) => claim,
             Ok(None) => {
                 report.deferred = report.deferred.saturating_add(selected.len());
+                report.assign_kept_codes();
                 self.record_auto_cleanup_report(&report)?;
                 return Ok(report);
             }
@@ -3719,7 +4755,9 @@ impl Broker {
                     worktree: "<session checkout inventory>".into(),
                     sessions: Vec::new(),
                     reason: format!("could not claim the worktree lifecycle: {error}"),
+                    ..Default::default()
                 });
+                report.assign_kept_codes();
                 self.record_auto_cleanup_report(&report)?;
                 return Ok(report);
             }
@@ -3736,7 +4774,9 @@ impl Broker {
                 worktree: "<session checkout inventory>".into(),
                 sessions: Vec::new(),
                 reason: "registered checkout paths changed during filesystem alias verification; cleanup requires a fresh pass".into(),
+                ..Default::default()
             });
+            report.assign_kept_codes();
             self.record_auto_cleanup_report(&report)?;
             return Ok(report);
         }
@@ -3756,6 +4796,7 @@ impl Broker {
                     worktree: worktree_text.clone(),
                     sessions: candidate.session_ids(),
                     reason,
+                    ..Default::default()
                 });
             };
             let artifact_use_reclaimer =
@@ -3873,6 +4914,7 @@ impl Broker {
                 Err(error) => keep_it(&mut report, format!("removal failed: {error}")),
             }
         }
+        report.assign_kept_codes();
         self.record_auto_cleanup_report(&report)?;
         Ok(report)
     }
@@ -3917,7 +4959,23 @@ impl Broker {
         &mut self,
         report: &AutoCleanupReport,
     ) -> Result<(), BrokerOpError> {
-        let text = serde_json::to_string(report).unwrap_or_default();
+        let mut stored = report.clone();
+        stored.assign_kept_codes();
+        // A pass whose removal lane judged no checkout (a broker open's
+        // inline sliver, the retirement-only worker) must not erase the last
+        // removal verdicts: carry them so `status` and `gc plan` keep
+        // showing what holds each closed checkout.
+        let removal_judged = stored.lanes.is_some_and(|lanes| lanes.removal_examined > 0)
+            || !stored.removed.is_empty()
+            || !stored.kept.is_empty();
+        if !removal_judged && let Some(previous) = self.last_auto_cleanup_report() {
+            stored.kept = previous.kept;
+        }
+        if stored.blocked_by_ignored.is_empty() {
+            let memo = self.store().meta_get(KEEP_MEMO_KEY)?;
+            stored.blocked_by_ignored = blocked_by_ignored_from_meta(memo.as_deref());
+        }
+        let text = serde_json::to_string(&stored).unwrap_or_default();
         self.store().meta_set(AUTO_CLEANUP_LAST_REPORT_KEY, &text)?;
         Ok(())
     }
@@ -3951,6 +5009,50 @@ impl Broker {
             return Ok(None);
         };
         self.auto_cleanup_apply(plan).map(Some)
+    }
+
+    /// The removal lane alone, for `broker start` at the linked-checkout
+    /// limit: no retirement (it frees no slot now), the whole `budget` for
+    /// selecting and removing closed checkouts. Waits up to `lock_wait` for
+    /// a GC lock another maintenance pass holds instead of giving up at
+    /// once; `None` when it stays held.
+    pub(crate) fn auto_cleanup_for_checkout_capacity(
+        &mut self,
+        lock_wait: Duration,
+        budget: Duration,
+    ) -> Result<Option<AutoCleanupReport>, BrokerOpError> {
+        let waiting_since = Instant::now();
+        let _lock = loop {
+            match crate::gc::GcLock::acquire(self.main_root()) {
+                Ok(lock) => break lock,
+                Err(_) if waiting_since.elapsed() < lock_wait => {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(_) => {
+                    crate::phase_telemetry::add(
+                        "checkout_capacity_cleanup_lock_busy",
+                        waiting_since.elapsed(),
+                    );
+                    return Ok(None);
+                }
+            }
+        };
+        let started = Instant::now();
+        let deadline = started + budget;
+        let mut plan = {
+            let _span = crate::phase_telemetry::span("auto_cleanup_removal_lane");
+            self.auto_cleanup_plan(Some(deadline))?
+        };
+        let planned = plan.report.lanes.unwrap_or_default();
+        plan.report.lanes = Some(AutoCleanupLanes {
+            capacity_pressure: true,
+            removal_budget_ms: duration_ms(Some(budget)),
+            removal_elapsed_ms: duration_ms(Some(started.elapsed())),
+            ..planned
+        });
+        let report = self.auto_cleanup_apply(plan)?;
+        record_lane_telemetry(&report);
+        Ok(Some(report))
     }
 
     /// Run an auto-cleanup pass now, outside the sweep's cadence. Takes the
@@ -6262,6 +7364,7 @@ mod tests {
                     worktree: group.worktree.to_string_lossy().into_owned(),
                     sessions: group.sessions.iter().map(|session| session.id).collect(),
                     reason: "injected planner inspection".into(),
+                    ..Default::default()
                 }))
             })
             .unwrap();
@@ -6350,6 +7453,7 @@ mod tests {
                         worktree: group.worktree.to_string_lossy().into_owned(),
                         sessions: vec![session_id],
                         reason: "injected resumed inspection".into(),
+                        ..Default::default()
                     }))
                 }
             })
@@ -6376,6 +7480,7 @@ mod tests {
                     worktree: group.worktree.to_string_lossy().into_owned(),
                     sessions: vec![session_id],
                     reason: "injected resumed inspection".into(),
+                    ..Default::default()
                 }))
             })
             .unwrap();
@@ -6903,6 +8008,313 @@ mod tests {
         }
     }
 
+    /// A closed session whose checkout holds no commit of its own: contained
+    /// in the fetched default branch by ancestry and past its (zero) grace.
+    #[cfg(unix)]
+    fn closed_landed_checkout(
+        broker: &mut crate::Broker,
+        label: &str,
+    ) -> (crate::Session, PathBuf) {
+        // Containment is proved against the fetched `origin/HEAD`.
+        let root = broker.main_root().to_path_buf();
+        git(&root, &["remote", "set-head", "origin", "main"]);
+        let session = broker.start_worktree(label, None).unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        broker
+            .close_abandoning_unpushed(session.id, "closed landed checkout fixture")
+            .unwrap();
+        (session, worktree)
+    }
+
+    /// The busiest repository's starvation: a retirement lap that uses every
+    /// millisecond it is given no longer leaves the removal lane nothing.
+    /// Before the lanes had shares, retirement ran to the pass deadline and
+    /// the planner deferred with `removed: []` and `kept: []`.
+    #[cfg(unix)]
+    #[test]
+    fn removal_keeps_its_share_when_retirement_exhausts_its_own() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let (_session, worktree) =
+            closed_landed_checkout(&mut broker, "retirement exhausts its share");
+        super::RETIREMENT_EXHAUSTS_ITS_SHARE.with(|flag| flag.set(true));
+        let report =
+            broker.auto_remove_disposable_checkouts(Some(Instant::now() + Duration::from_secs(30)));
+        super::RETIREMENT_EXHAUSTS_ITS_SHARE.with(|flag| flag.set(false));
+        let report = report.unwrap();
+        assert!(
+            report
+                .retirement_deferred_reasons
+                .iter()
+                .any(|reason| matches!(
+                    reason,
+                    SessionRetirementDeferredReason::DeadlineExceeded { .. }
+                )),
+            "{report:#?}"
+        );
+        let lanes = report.lanes.expect("a maintenance pass reports its lanes");
+        assert!(!lanes.capacity_pressure, "{lanes:?}");
+        assert!(
+            (14_000..=15_000).contains(&lanes.retirement_budget_ms),
+            "retirement gets half of the pass: {lanes:?}"
+        );
+        assert!(lanes.removal_budget_ms > 0, "{lanes:?}");
+        assert!(lanes.removal_examined >= 1, "{lanes:?}");
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert!(!worktree.exists(), "the closed landed checkout is removed");
+    }
+
+    /// A closed landed checkout whose only leftover is a cache its tool
+    /// tagged is removed; the same cache holding a `.env` keeps its checkout,
+    /// reported as `ignored_content`.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_landed_checkout_holding_only_a_tagged_cache_is_removed() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let root = broker.main_root().to_path_buf();
+        std::fs::write(root.join(".git/info/exclude"), "tool-cache/\n").unwrap();
+        let (_tagged_session, tagged) = closed_landed_checkout(&mut broker, "tagged cache only");
+        touch(&tagged, "tool-cache/objects/ab/cdef");
+        std::fs::write(tagged.join("tool-cache/CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        let (_guarded_session, guarded) =
+            closed_landed_checkout(&mut broker, "tagged cache with a secret");
+        touch(&guarded, "tool-cache/objects/ab/cdef");
+        touch(&guarded, "tool-cache/.env");
+        std::fs::write(guarded.join("tool-cache/CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        let guarded_text = std::fs::canonicalize(&guarded)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let mut guarded_codes = Vec::new();
+        for _ in 0..3 {
+            let report = broker.auto_cleanup_now(None).unwrap().unwrap();
+            guarded_codes.extend(
+                report
+                    .kept
+                    .iter()
+                    .filter(|kept| kept.worktree == guarded_text)
+                    .map(|kept| kept.code.clone()),
+            );
+            if !tagged.exists() && !guarded_codes.is_empty() {
+                break;
+            }
+        }
+        assert!(!tagged.exists(), "the tagged cache alone does not keep it");
+        assert!(guarded.join("tool-cache/.env").is_file());
+        assert!(
+            guarded_codes.iter().any(|code| code == "ignored_content"),
+            "{guarded_codes:?}"
+        );
+    }
+
+    /// An ignored directory nothing recognises keeps its closed checkout,
+    /// is named in the report with the line that would release it, is not
+    /// re-listed while nothing changes, and is released once configured.
+    #[cfg(unix)]
+    #[test]
+    fn an_unknown_ignored_directory_is_named_remembered_and_released_by_configuration() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let root = broker.main_root().to_path_buf();
+        std::fs::write(root.join(".git/info/exclude"), "project-cache/\n").unwrap();
+        let (_session, worktree) = closed_landed_checkout(&mut broker, "unknown ignored cache");
+        touch(&worktree, "project-cache/quality/index.json");
+        let text = std::fs::canonicalize(&worktree)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let kept_entry = |report: &AutoCleanupReport| {
+            report
+                .kept
+                .iter()
+                .find(|kept| kept.worktree == text)
+                .cloned()
+                .unwrap_or_else(|| panic!("{report:#?}"))
+        };
+
+        let first = broker.auto_cleanup_now(None).unwrap().unwrap();
+        let kept = kept_entry(&first);
+        assert_eq!(kept.code, "ignored_content", "{kept:?}");
+        assert_eq!(kept.ignored_blockers, vec!["project-cache/".to_string()]);
+        assert_eq!(
+            first.blocked_by_ignored,
+            vec![super::BlockedByIgnored {
+                name: "project-cache/".into(),
+                checkouts: 1,
+                config_line: Some("[cleanup] regenerable = [\"project-cache\"]".into()),
+            }]
+        );
+        assert_eq!(first.lanes.unwrap().removal_memo_skips, 0);
+        let memo = broker.store().meta_get(super::KEEP_MEMO_KEY).unwrap();
+        assert_eq!(
+            super::blocked_by_ignored_from_meta(memo.as_deref()),
+            first.blocked_by_ignored,
+            "status reads the same aggregate"
+        );
+
+        // Unchanged: the remembered verdict is reused, still reported.
+        let second = broker.auto_cleanup_now(None).unwrap().unwrap();
+        assert_eq!(second.lanes.unwrap().removal_memo_skips, 1, "{second:#?}");
+        assert_eq!(kept_entry(&second).ignored_blockers, kept.ignored_blockers);
+
+        // A change inside the blocker re-proves the checkout.
+        touch(&worktree, "project-cache/new-report.json");
+        let third = broker.auto_cleanup_now(None).unwrap().unwrap();
+        assert_eq!(third.lanes.unwrap().removal_memo_skips, 0, "{third:#?}");
+        assert_eq!(kept_entry(&third).code, "ignored_content");
+        assert!(worktree.join("project-cache/quality/index.json").is_file());
+
+        // The repository declares it regenerable: the policy change alone
+        // invalidates the remembered verdict and the checkout goes.
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[cleanup]\nregenerable = [\"project-cache\"]\n",
+        )
+        .unwrap();
+        for _ in 0..2 {
+            if !worktree.exists() {
+                break;
+            }
+            broker.auto_cleanup_now(None).unwrap().unwrap();
+        }
+        assert!(
+            !worktree.exists(),
+            "the configured cache no longer keeps it"
+        );
+    }
+
+    #[test]
+    fn lane_shares_give_removal_the_larger_part_under_capacity_pressure() {
+        use std::time::{Duration, Instant};
+        let started = Instant::now();
+        let end = started + Duration::from_secs(40);
+        assert_eq!(
+            super::lane_deadline(started, Some(end), super::retirement_share(false)),
+            Some(started + Duration::from_secs(20))
+        );
+        assert_eq!(
+            super::lane_deadline(started, Some(end), super::retirement_share(true)),
+            Some(started + Duration::from_secs(10))
+        );
+        assert_eq!(
+            super::lane_deadline(started, None, super::retirement_share(true)),
+            None
+        );
+    }
+
+    #[test]
+    fn keep_reasons_have_stable_codes() {
+        for (reason, code) in [
+            (
+                "ignored content requires explicit cleanup: ignored path cache/ is not a recognised build-output directory",
+                "ignored_content",
+            ),
+            (
+                "changed before removal: 2 uncommitted or untracked path(s), first: a.txt",
+                "uncommitted_changes",
+            ),
+            (
+                "session 7 is within the 24 hour closed-worktree grace period",
+                "in_grace",
+            ),
+            (
+                "session 7 is still open (active) in this worktree",
+                "session_open",
+            ),
+            (
+                "commits are not contained in the remote default branch",
+                "not_contained",
+            ),
+            (
+                "no matching spawn-time worktree instance witness",
+                "ownership_unproven",
+            ),
+            ("something new", "other"),
+        ] {
+            assert_eq!(super::kept_reason_code(reason), code, "{reason}");
+        }
+        let mut report = super::AutoCleanupReport {
+            kept: vec![super::AutoKeptCheckout {
+                reason: "pinned by [cleanup] keep".into(),
+                ..Default::default()
+            }],
+            ..super::AutoCleanupReport::default()
+        };
+        report.assign_kept_codes();
+        assert_eq!(report.kept[0].code, "pinned");
+    }
+
+    /// The busiest repository's landed lane: the oldest-first cursor sat on
+    /// sessions that will never land while younger sessions with a merged
+    /// pull request were never reached. A likely-landed session now closes
+    /// in the first pass even while a lap over older sessions is in
+    /// progress, and the older sessions' unchangeable declines are
+    /// remembered instead of re-proved every lap.
+    #[cfg(unix)]
+    #[test]
+    fn a_likely_landed_session_behind_never_landing_older_ones_closes_first() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let root = broker.main_root().to_path_buf();
+        git(&root, &["remote", "set-head", "origin", "main"]);
+        let mut older = Vec::new();
+        for index in 0..5 {
+            let (session, _) =
+                landed_lane_session(&mut broker, &format!("never lands {index}"), None);
+            quiet_with_gone_holder(&mut broker, &session, 30);
+            older.push(session);
+        }
+        let (landed, _) = landed_lane_session(
+            &mut broker,
+            "landed behind older sessions",
+            Some(aethyme_testkit::MergeStyle::MergeCommit),
+        );
+        record_merged_pull_request(&mut broker, landed.id, 21);
+        quiet_with_gone_holder(&mut broker, &landed, 30);
+        // A fixed-high-water lap over the older sessions is in progress: the
+        // cursor alone would not reach the landed session in this pass.
+        let lap = SessionRetirementCursor {
+            version: SESSION_RETIREMENT_CURSOR_VERSION,
+            after_session_id: 0,
+            high_water_session_id: older.last().unwrap().id,
+        };
+        broker
+            .store()
+            .meta_set(
+                SESSION_RETIREMENT_CURSOR_KEY,
+                &serde_json::to_string(&lap).unwrap(),
+            )
+            .unwrap();
+
+        let report = broker.auto_cleanup_now(None).unwrap().unwrap();
+        assert_ne!(
+            broker.store().session(landed.id).unwrap().cleanup_state,
+            SessionCleanupState::Open,
+            "{report:#?}"
+        );
+        assert!(report.landed_sessions_closed >= 1, "{report:#?}");
+        for session in &older {
+            assert_eq!(
+                broker.store().session(session.id).unwrap().cleanup_state,
+                SessionCleanupState::Open,
+                "an unlanded session stays open"
+            );
+        }
+        let memo: std::collections::BTreeMap<i64, (String, String)> = serde_json::from_str(
+            &broker
+                .store()
+                .meta_get(super::LANDED_DECLINE_MEMO_KEY)
+                .unwrap()
+                .expect("unchangeable declines are remembered"),
+        )
+        .unwrap();
+        for session in &older {
+            assert_eq!(
+                memo.get(&session.id).map(|(_, code)| code.as_str()),
+                Some("no_landing_evidence"),
+                "{memo:?}"
+            );
+        }
+    }
+
     /// The retirement cursor resumes where the last pass stopped instead of
     /// restarting from the oldest session, and the report says where it is.
     #[cfg(unix)]
@@ -6948,8 +8360,12 @@ mod tests {
         );
 
         let next_lap = broker.auto_cleanup_now(None).unwrap().unwrap();
+        // The new lap starts again from the oldest session. The two
+        // `no_landing_evidence` declines the last pass proved are remembered
+        // (same head, tip and evidence), so only the first session is
+        // proved; all three are still counted under their decline.
         assert_eq!(
-            next_lap.landed_sessions_examined, 3,
+            next_lap.landed_sessions_examined, 1,
             "a finished lap starts the next one from the oldest session: {next_lap:#?}"
         );
         assert_eq!(
@@ -7454,6 +8870,174 @@ mod tests {
         )
         .unwrap();
         assert_eq!(classify(root, "node_modules/", &policy), Ok(()));
+    }
+
+    const CACHEDIR_TAG: &str =
+        "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag.\n";
+
+    #[test]
+    fn a_cache_directory_tag_declares_an_ignored_directory_regenerable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = AutoCleanupPolicy::default();
+        touch(root, "tool-cache/objects/ab/cdef");
+        std::fs::write(root.join("tool-cache/CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        assert_eq!(classify(root, "tool-cache/", &policy), Ok(()));
+
+        // A wrong signature, a tag in a subdirectory only, or a tag that is
+        // a symlink proves nothing.
+        touch(root, "near-miss/data.bin");
+        std::fs::write(
+            root.join("near-miss/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc56\n",
+        )
+        .unwrap();
+        assert!(classify(root, "near-miss/", &policy).is_err());
+        touch(root, "mixed/reports/summary.json");
+        std::fs::create_dir_all(root.join("mixed/tagged")).unwrap();
+        std::fs::write(root.join("mixed/tagged/CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        assert!(classify(root, "mixed/", &policy).is_err());
+        #[cfg(unix)]
+        {
+            touch(root, "linked-tag/data.bin");
+            std::os::unix::fs::symlink(
+                root.join("tool-cache/CACHEDIR.TAG"),
+                root.join("linked-tag/CACHEDIR.TAG"),
+            )
+            .unwrap();
+            assert!(classify(root, "linked-tag/", &policy).is_err());
+        }
+
+        // Secrets, keys, databases and broker state beneath the tag keep it.
+        for protected in [
+            "nested/.env",
+            "nested/.env.local",
+            "deploy.pem",
+            "state/app.sqlite",
+            "x/.aethyme/state.json",
+        ] {
+            let name = format!("guarded-{}", protected.len());
+            touch(root, &format!("{name}/{protected}"));
+            std::fs::write(root.join(&name).join("CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+            assert!(
+                classify(root, &format!("{name}/"), &policy).is_err(),
+                "{protected}"
+            );
+        }
+    }
+
+    #[test]
+    fn witnessed_test_tool_outputs_are_regenerable_and_lookalikes_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = AutoCleanupPolicy::default();
+        touch(root, ".hypothesis/examples/0a1b/2c3d");
+        touch(root, ".hypothesis/.gitignore");
+        assert_eq!(classify(root, ".hypothesis/", &policy), Ok(()));
+        touch(root, "playwright-report/index.html");
+        touch(root, "playwright-report/data/0123.png");
+        assert_eq!(classify(root, "playwright-report/", &policy), Ok(()));
+        std::fs::create_dir_all(root.join("test-results/spec-chromium")).unwrap();
+        std::fs::write(
+            root.join("test-results/.last-run.json"),
+            r#"{"status":"passed","failedTests":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(classify(root, "test-results/", &policy), Ok(()));
+
+        let other = tempfile::tempdir().unwrap();
+        let root = other.path();
+        // A person's notes beside the tool's entries, a report folder with
+        // extra files, or a results folder no Playwright run wrote.
+        touch(root, ".hypothesis/examples/0a1b/2c3d");
+        touch(root, ".hypothesis/notes.md");
+        assert!(classify(root, ".hypothesis/", &policy).is_err());
+        touch(root, "playwright-report/index.html");
+        touch(root, "playwright-report/summary.xlsx");
+        assert!(classify(root, "playwright-report/", &policy).is_err());
+        touch(root, "test-results/junit.xml");
+        assert!(classify(root, "test-results/", &policy).is_err());
+        std::fs::write(root.join("test-results/.last-run.json"), "not json").unwrap();
+        assert!(classify(root, "test-results/", &policy).is_err());
+    }
+
+    /// A protected file nested two levels deep keeps each witnessed test-tool
+    /// directory, however well its top level matches the tool's layout.
+    #[test]
+    fn witnessed_test_tool_outputs_keep_a_nested_protected_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = AutoCleanupPolicy::default();
+        touch(root, ".hypothesis/examples/0a1b/.env");
+        assert!(classify(root, ".hypothesis/", &policy).is_err());
+        touch(root, "playwright-report/index.html");
+        touch(root, "playwright-report/data/attachments/deploy.pem");
+        assert!(classify(root, "playwright-report/", &policy).is_err());
+        std::fs::create_dir_all(root.join("test-results")).unwrap();
+        std::fs::write(
+            root.join("test-results/.last-run.json"),
+            r#"{"status":"passed"}"#,
+        )
+        .unwrap();
+        touch(root, "test-results/spec-chromium/state/app.sqlite");
+        assert!(classify(root, "test-results/", &policy).is_err());
+    }
+
+    /// Every protected name keeps a tagged cache when it sits two levels
+    /// below the tag; a public key alone does not.
+    #[test]
+    fn every_protected_name_keeps_a_tagged_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = AutoCleanupPolicy::default();
+        for (index, name) in [
+            "server.key",
+            "bundle.p12",
+            "bundle.pfx",
+            "app.db",
+            "app.sqlite3",
+            "id_rsa",
+            "id_ed25519",
+            "id_ecdsa",
+            ".netrc",
+            ".npmrc",
+            ".pypirc",
+            "credentials.json",
+            "vault.kdbx",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let cache = format!("guarded-cache-{index}");
+            touch(root, &format!("{cache}/nested/deeper/{name}"));
+            std::fs::write(root.join(&cache).join("CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+            assert!(
+                classify(root, &format!("{cache}/"), &policy).is_err(),
+                "{name}"
+            );
+        }
+        touch(root, "public-cache/nested/deeper/id_ed25519.pub");
+        std::fs::write(root.join("public-cache/CACHEDIR.TAG"), CACHEDIR_TAG).unwrap();
+        assert_eq!(classify(root, "public-cache/", &policy), Ok(()));
+    }
+
+    /// `.hypothesis` needs one of its stores, not only its ignore file, and
+    /// an oversized `.last-run.json` proves nothing.
+    #[test]
+    fn test_tool_witnesses_require_their_store_and_a_bounded_status_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = AutoCleanupPolicy::default();
+        touch(root, ".hypothesis/.gitignore");
+        assert!(classify(root, ".hypothesis/", &policy).is_err());
+        std::fs::create_dir_all(root.join("test-results")).unwrap();
+        let padding = " ".repeat(1024 * 1024);
+        std::fs::write(
+            root.join("test-results/.last-run.json"),
+            format!(r#"{{"status":"passed"}}{padding}"#),
+        )
+        .unwrap();
+        assert!(classify(root, "test-results/", &policy).is_err());
     }
 
     #[test]

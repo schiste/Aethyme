@@ -277,9 +277,9 @@ pub use aethyme_graph_storage::{
 };
 pub use attribution::{Attribution, Identity};
 pub use auto_cleanup::{
-    AutoCleanupPlan, AutoCleanupPolicy, AutoCleanupReport, AutoKeptCheckout, AutoRemovedCheckout,
-    BUILT_IN_REGENERABLE, LandedSessionRetirementView, SessionRetirementCursorPosition,
-    SessionRetirementDeferredReason,
+    AutoCleanupLanes, AutoCleanupPlan, AutoCleanupPolicy, AutoCleanupReport, AutoKeptCheckout,
+    AutoRemovedCheckout, BUILT_IN_REGENERABLE, BlockedByIgnored, LandedSessionRetirementView,
+    SessionRetirementCursorPosition, SessionRetirementDeferredReason, kept_reason_code,
 };
 pub use blockers::{
     BLOCKER_CLEARED, Blocker, BlockerKind, BlockerRef, BlockerReport, BlockerScope,

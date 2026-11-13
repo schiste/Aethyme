@@ -16,6 +16,13 @@ const BROKER_OPEN_STORAGE_CONTEXT_MAX_BYTES: usize = 32 * 1024;
 const ARTIFACT_SWEEP_NAMESPACE_V2_DOMAIN: &[u8] = b"aethyme-artifact-sweep-context-v2\0";
 const ARTIFACT_SWEEP_NAMESPACE_V4_DOMAIN: &[u8] = b"aethyme-artifact-sweep-context-v4\0";
 
+/// How long `broker start` at the checkout limit waits for a maintenance
+/// pass that holds the GC lock before its own removal pass.
+const CHECKOUT_CAPACITY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// The removal budget `broker start` spends at the checkout limit before it
+/// refuses.
+const CHECKOUT_CAPACITY_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
 fn timed_start_phase<T>(
     phases: &mut std::collections::BTreeMap<String, u64>,
     name: &'static str,
@@ -7958,23 +7965,35 @@ impl Broker {
             // before asking the existing proof-based cleanup to make room,
             // then reacquire it and count again before allocating anything.
             drop(lifecycle_claim);
+            // Removal only, with a real budget: retirement frees no slot now,
+            // and a maintenance pass holding the GC lock is waited for briefly
+            // instead of refusing at once.
             let cleanup =
                 timed_start_phase(&mut phase_timings_ms, "checkout_capacity_cleanup", || {
-                    self.auto_cleanup_now(Some(
-                        std::time::Instant::now() + std::time::Duration::from_secs(5),
-                    ))
+                    self.auto_cleanup_for_checkout_capacity(
+                        CHECKOUT_CAPACITY_LOCK_WAIT,
+                        CHECKOUT_CAPACITY_CLEANUP_BUDGET,
+                    )
                 });
-            crate::warn_unrecorded("recover checkout capacity", cleanup.map(|_| ()));
+            let cleanup_report = match cleanup {
+                Ok(report) => report,
+                Err(error) => {
+                    crate::warn_unrecorded("recover checkout capacity", Err::<(), _>(error));
+                    None
+                }
+            };
             lifecycle_claim = timed_start_phase(
                 &mut phase_timings_ms,
                 "lifecycle_lock_wait_after_cleanup",
                 || self.claim_worktree_lifecycle(),
             )?;
             if let Some((count, maximum)) = self.worktree_checkout_limit()? {
+                let detail =
+                    crate::auto_cleanup::checkout_capacity_refusal_detail(cleanup_report.as_ref());
                 return Err(BrokerOpError::WorktreeRootUnavailable {
                     path: self.main_root.clone(),
                     reason: format!(
-                        "linked checkout limit reached ({count}/{maximum}); no checkout was allocated. Reuse an existing worktree with broker start --reuse <worktree>, finish delivered sessions, or inspect broker gc plan. Configure [worktrees].max_checkouts to change the limit; explicit zero disables it"
+                        "linked checkout limit reached ({count}/{maximum}); no checkout was allocated; {detail}. Reuse an existing worktree with broker start --reuse <worktree>, finish delivered sessions, or inspect broker gc plan. Configure [worktrees].max_checkouts to change the limit; explicit zero disables it"
                     ),
                 });
             }
@@ -10063,7 +10082,7 @@ impl Broker {
 
     /// Registered linked checkouts and the allocation limit `start` enforces,
     /// or `None` when the limit is disabled.
-    pub(super) fn worktree_checkout_usage(&self) -> Result<Option<(usize, u32)>, BrokerOpError> {
+    pub(crate) fn worktree_checkout_usage(&self) -> Result<Option<(usize, u32)>, BrokerOpError> {
         // Invalid placement configuration already has a documented host-root
         // fallback and diagnostic. Keep that behavior, with the bounded
         // default rather than letting invalid policy disable admission.
