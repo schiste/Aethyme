@@ -268,17 +268,29 @@ always against paths relative to the checkout root:
   not start releasing files named that way elsewhere. A glob that names the
   directory a file sits in releases the file through the directory rule.
 
-A protected name in any component of the path (`.env*`, `*.key`, `*.pem`,
-`*.p12`, `*.pfx`, `*.sqlite*`, `*.db`, `*.kdbx`, `id_*` private keys without
-`.pub`, `.netrc`, `.npmrc`, `.pypirc`, `credentials.json`, `.aethyme`) is
-never released by a standalone match, whatever the configuration says: the
+A protected name in any component of the path (the protected names listed
+below, matched without regard to case) is never released by a standalone match, whatever the configuration says: the
 checkout stays, with the reason `has a protected name, which [cleanup]
 regenerable never releases`. Links are judged as links and never followed: a
 link the glob names is unlinked on removal and its target is left alone,
 except that a link with a protected name stays too. `strict = true` still
 keeps every ignored leftover, configured or not. A glob that matches a secret
 or ordinary root-file probe (`.env`, `secrets.key`, `notes.txt`,
-`README.md`, ...) is refused when the policy loads, as before. Each removal emits
+`README.md`, ...) is refused when the policy loads, as before.
+
+**Upgrade note.** This widens what an existing `regenerable` list releases.
+Directory matching itself is unchanged, but a glob written for directories now
+also releases the standalone ignored files whose whole path it matches under
+the file rule above: `"<dir>/*"` releases the ignored files directly inside
+`<dir>`, `"*-cache"` releases a root-level file such as `tool-cache`, and a
+`"*.ext"` glob releases every root-level ignored `*.ext` file. Review the list
+before upgrading. The guard is the load-time probe: a glob that matches any of
+`.env`, `.env.local`, `secrets.key`, `cert.pem`, `data.sqlite`, `app.db`,
+`notes.txt`, `README.md` or `.aethyme` refuses the whole policy (so `"*"`,
+`"*.txt"`, `"*.md"` and `"*.db"` cannot be configured), and protected names
+stay whatever the glob says.
+
+Each removal emits
 `broker.cleanup.auto_removed` with its proof. Configure it in
 `.aethyme/config.toml`:
 
@@ -320,11 +332,24 @@ same protected-name walk described below finds nothing beneath it. Any ignored d
 that carries a `CACHEDIR.TAG` beginning with the standard signature
 (`Signature: 8a477f597d28d172789f06886806bc55`, see bford.info/cachedir) is
 regenerable by its tool's own declaration, unless a bounded walk beneath it
-finds a protected name (`.env*`, `*.key`, `*.pem`, `*.p12`, `*.pfx`,
-`*.sqlite*`, `*.db`, `*.kdbx`, `id_*` private keys without `.pub`, `.netrc`,
-`.npmrc`, `.pypirc`, `credentials.json`, `.aethyme`), an unreadable entry or
+finds a protected name, an unreadable entry or
 more than 20,000 entries; then it keeps
-the checkout. A tag only in a subdirectory does not cover its parent. Generic
+the checkout. A tag only in a subdirectory does not cover its parent.
+
+The protected names, compared without regard to case, are: anything starting
+with `.env` (`.env`, `.env.local`, `.envrc`, `.env-prod`); anything containing
+`.sqlite` (with its `-wal`, `-shm` and `-journal` siblings); `*.db`,
+`*.db-wal`, `*.db-shm` and `*.db-journal`; `*.key`, `*.pem`, `*.p12`, `*.pfx`,
+`*.kdbx`, `*.jks` and `*.keystore`; `*.tfstate` and `*.tfstate.*`; `id_*`
+private keys without `.pub`; `.netrc`, `.npmrc`, `.pypirc`, `.pgpass`,
+`.git-credentials` and `credentials.json`; and `.aethyme`. A tagged cache or a
+witnessed test-tool directory holding one of the names added on 2026-11-13
+(`.envrc`-style `.env` prefixes, `-wal`/`-shm`/`-journal` siblings, Terraform
+state, Java key stores, `.pgpass`, `.git-credentials`) now keeps its checkout;
+directories recognised by name (`node_modules`, `target`, `.venv` and the
+others) and configured directories are not walked, so they are unaffected.
+
+Generic
 names (`logs`, `dist` without a manifest, `build`, `out`, `tmp`) are never
 recognised by name: configure them.
 

@@ -461,13 +461,24 @@ pub(crate) fn regenerable_file_config_line(relative_file: &str) -> Result<String
                 .into(),
         );
     }
+    const UNNAMEABLE: &str = "this path cannot be named by a [cleanup] regenerable pattern (it contains a backslash or a control character); review and delete it, or keep the checkout";
+    // `globset::escape` leaves `\` as an escape and control characters make
+    // the line unreadable, so neither can be named exactly.
+    if relative_file
+        .chars()
+        .any(|character| character == '\\' || character.is_control())
+    {
+        return Err(UNNAMEABLE.into());
+    }
     let glob = globset::escape(relative_file);
+    if globset::Glob::new(&glob).is_err()
+        || !file_glob_set(std::slice::from_ref(&glob)).is_match(relative_file)
+    {
+        return Err(UNNAMEABLE.into());
+    }
     validate_regenerable_glob(&glob).map_err(|_| {
         "[cleanup] regenerable refuses a pattern naming it, since that pattern matches a secret or ordinary root-file name; review and delete it, or keep the checkout".to_string()
     })?;
-    if !file_glob_set(std::slice::from_ref(&glob)).is_match(relative_file) {
-        return Err("no [cleanup] regenerable pattern can name this path; review and delete it, or keep the checkout".into());
-    }
     Ok(format!("[cleanup] regenerable = [{}]", toml_string(&glob)))
 }
 
@@ -560,16 +571,40 @@ fn has_cache_directory_tag(directory: &Path) -> bool {
 /// witness sits above them: the secrets, keys, credentials, databases and
 /// broker state a configured `regenerable` glob may never match
 /// ([`GLOB_PROBES`]), plus SSH private keys (`id_*` without `.pub`) and
-/// package-manager and password-store credential files.
+/// package-manager and password-store credential files. Case-insensitive:
+/// `.env*`, anything containing `.sqlite` (its `-wal`, `-shm` and
+/// `-journal` siblings included), `*.db` and its `-wal`, `-shm` and
+/// `-journal` siblings, `*.tfstate` and `*.tfstate.*`, key stores and
+/// credential files.
 fn protected_cache_entry(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower == ".env"
-        || lower.starts_with(".env.")
+    lower.starts_with(".env")
         || lower == ".aethyme"
         || (lower.starts_with("id_") && !lower.ends_with(".pub"))
-        || [".netrc", ".npmrc", ".pypirc", "credentials.json"].contains(&lower.as_str())
+        || lower.contains(".sqlite")
+        || lower.contains(".tfstate.")
         || [
-            ".key", ".pem", ".p12", ".pfx", ".sqlite", ".sqlite3", ".db", ".kdbx",
+            ".netrc",
+            ".npmrc",
+            ".pypirc",
+            "credentials.json",
+            ".git-credentials",
+            ".pgpass",
+        ]
+        .contains(&lower.as_str())
+        || [
+            ".key",
+            ".pem",
+            ".p12",
+            ".pfx",
+            ".db",
+            ".db-wal",
+            ".db-shm",
+            ".db-journal",
+            ".kdbx",
+            ".tfstate",
+            ".jks",
+            ".keystore",
         ]
         .iter()
         .any(|suffix| lower.ends_with(suffix))
@@ -12101,6 +12136,15 @@ mod tests {
             ".pypirc",
             "credentials.json",
             "vault.kdbx",
+            ".envrc",
+            "app.db-wal",
+            "cache.sqlite-shm",
+            "infra.tfstate",
+            "infra.tfstate.backup",
+            ".git-credentials",
+            ".pgpass",
+            "release.jks",
+            "debug.keystore",
         ]
         .into_iter()
         .enumerate()
@@ -12251,15 +12295,72 @@ mod tests {
         for protected in [
             "reports/signing.pem",
             "reports/.env.ci",
+            "reports/.envrc",
+            "reports/.env-prod",
+            "reports/.ENV",
+            "reports/Signing.PEM",
             "reports/id_ed25519",
             "reports/cache.sqlite3",
+            "reports/cache.sqlite-wal",
+            "reports/app.db-wal",
+            "reports/app.db-shm",
+            "reports/app.db-journal",
             "reports/credentials.json",
             "reports/.npmrc",
+            "reports/.git-credentials",
+            "reports/.pgpass",
+            "reports/infra.tfstate",
+            "reports/infra.tfstate.backup",
+            "reports/release.jks",
+            "reports/debug.keystore",
         ] {
             touch(root, protected);
             let reason = classify(root, protected, &policy).unwrap_err();
             assert!(reason.contains("protected name"), "{protected}: {reason}");
         }
+
+        // A protected directory component keeps a file the pattern names,
+        // not only a protected basename. (A glob naming the directory itself
+        // would release it through the directory rule, which is unchanged.)
+        let nested = regenerable_policy(&["runs/*/out.json"]);
+        touch(root, "runs/run-1/out.json");
+        assert_eq!(classify(root, "runs/run-1/out.json", &nested), Ok(()));
+        for protected in [
+            "runs/.env.d/out.json",
+            "runs/state.tfstate.d/out.json",
+            "runs/VAULT.KDBX/out.json",
+        ] {
+            touch(root, protected);
+            let reason = classify(root, protected, &nested).unwrap_err();
+            assert!(reason.contains("protected name"), "{protected}: {reason}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_pattern_releases_only_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("reports")).unwrap();
+        let policy = regenerable_policy(&["reports/q-*"]);
+        assert!(
+            Command::new("mkfifo")
+                .arg(root.join("reports/q-pipe"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _listener =
+            std::os::unix::net::UnixListener::bind(root.join("reports/q-sock")).unwrap();
+        for special in ["reports/q-pipe", "reports/q-sock"] {
+            let reason = classify(root, special, &policy).unwrap_err();
+            assert!(
+                reason.contains("is not inside a recognised build-output directory"),
+                "{special}: {reason}"
+            );
+        }
+        touch(root, "reports/q-file");
+        assert_eq!(classify(root, "reports/q-file", &policy), Ok(()));
     }
 
     #[test]
@@ -12396,7 +12497,21 @@ mod tests {
         // root files gets no line either.
         let notes = row("notes.txt");
         assert_eq!(notes.config_line, None);
-        assert!(notes.config_refusal.is_some(), "{notes:?}");
+        assert!(
+            notes
+                .config_refusal
+                .as_deref()
+                .is_some_and(|refusal| refusal.contains("secret or ordinary root-file")),
+            "{notes:?}"
+        );
+        // A name the escaper cannot express says so, not that it is a secret.
+        for unnameable in ["reports/trailing\\", "reports/two\nlines.json"] {
+            let refusal = super::regenerable_file_config_line(unnameable).unwrap_err();
+            assert!(
+                refusal.contains("cannot be named by a [cleanup] regenerable pattern"),
+                "{unnameable:?}: {refusal}"
+            );
+        }
         let directory = row("project-cache/");
         assert_eq!(
             directory.config_line.as_deref(),
