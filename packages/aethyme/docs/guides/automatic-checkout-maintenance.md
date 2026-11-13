@@ -179,6 +179,36 @@ strict = true
 `auto_remove = false` disables automatic whole-checkout removal; it does not
 replace strict mode for in-place artifact reclamation.
 
+## Background deletion pace
+
+The detached cleanup worker deletes finished sessions' build output while
+nobody waits on it, so it runs as a background job: lowest CPU and disk I/O
+priority (macOS and Linux), a rate limit on unlinks, one deleter at a time
+across every repository on the machine, and a pause while memory pressure is
+above normal or load is far above the core count. Commands you wait on
+(`finish`, `finish cleanup <id>`, `gc apply`, `gc sweep`) keep full speed.
+
+```toml
+[cleanup]
+# Unlinks per second for the background worker. Default 1000.
+# 0 or "unlimited" restores full speed.
+unattended_unlinks_per_second = 1000
+```
+
+The limit is lifted automatically while free space is below the gate
+headroom, because freeing space is then the priority; the lowered priority and
+the pressure pause stay. Nothing deferred is dropped: a worker that pauses,
+reaches its time limit, or waits too long for another repository's deleter
+leaves its request durable, and the next broker open starts a worker again.
+
+`aethyme broker status --json` shows the last worker run under
+`cleanup_retention.last_artifact_sweep.unattended_pacing`: entries and bytes
+removed, the removal rate, time slept by the limiter, time paused for memory
+and for load, time waited for the host deleter lock, requests coalesced into
+the run, and whether priority lowering succeeded. See
+[cross-process consumers](../architecture/cross-process-consumers.md) for the
+field list.
+
 ## Inspecting retained checkouts
 
 Use the broker's normal cleanup workflow. A targeted cleanup avoids the full

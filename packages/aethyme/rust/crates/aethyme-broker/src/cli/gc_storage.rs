@@ -1743,6 +1743,9 @@ fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageErr
         parsed.positional.len(),
         artifact_worker_test_or_build_environment(),
     )?;
+    // Nobody waits on this process: drop to background CPU and I/O priority
+    // before anything else runs, so every later child inherits it.
+    let priority = crate::gc::lower_artifact_worker_priority();
     let requested_root = std::fs::canonicalize(&parsed.positional[1]).map_err(|error| {
         UsageError::Message(format!(
             "cannot resolve automatic artifact continuation repository: {error}"
@@ -1780,6 +1783,11 @@ fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageErr
             "automatic artifact continuation worker is already active".into(),
         ));
     };
+    // Hold the singleton briefly before reading the backlog: `finish` calls
+    // arriving in a burst find this worker alive and are served by this run.
+    std::thread::sleep(crate::gc::ARTIFACT_WORKER_COALESCE_WINDOW);
+    // Every unlink this process makes is unattended: pace it.
+    let _pacing = crate::gc::install_unattended_deletion_pacing(&repository_root, priority);
     let mut broker = Broker::open(&repository_root)?;
     broker.run_artifact_sweep_recovery_worker()?;
     Ok(())

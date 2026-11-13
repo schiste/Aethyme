@@ -22,12 +22,16 @@ use crate::{
     load_retention_policy, load_retention_policy_report,
 };
 
+mod background_priority;
 mod tree_removal;
+pub(crate) mod unattended_pacing;
+pub use background_priority::BackgroundPriority;
 pub(crate) use tree_removal::{
     PinnedTreeRemoval, TreeObjectIdentity, TreeRemoval, TreeRemovalError, remove_condemned_tree,
     remove_condemned_tree_with_progress_and_guard,
     remove_condemned_tree_with_progress_and_observed_file_bytes_and_guard,
 };
+pub use unattended_pacing::UnattendedPacingSummary;
 
 pub const GC_PLAN_SCHEMA_VERSION: u32 = 4;
 const GC_LEGACY_PLAN_SCHEMA_VERSION: u32 = 3;
@@ -240,6 +244,21 @@ const AUTO_COMPACT_BACKFILL_HIGH_WATER_KEY: &str = "gc.artifact_sweep.compact_ba
 const AUTO_COMPACT_POLICY_ENABLED_KEY: &str = "gc.artifact_sweep.compact_policy_enabled";
 /// Bounded last-worker result; overwritten each run rather than appended.
 const ARTIFACT_SWEEP_WORKER_STATUS_KEY: &str = "gc.artifact_sweep.worker_status";
+/// JSON [`UnattendedPacingSummary`] of the last detached worker run.
+const ARTIFACT_SWEEP_PACING_SUMMARY_KEY: &str = "gc.artifact_sweep.last_unattended_pacing";
+/// Deferred requests that found this repository's worker alive since the last
+/// run began.
+const ARTIFACT_SWEEP_COALESCED_REQUESTS_KEY: &str = "gc.artifact_sweep.coalesced_requests";
+/// The detached worker holds its repository singleton for this long before it
+/// reads the backlog, so a burst of `finish` calls is served by one run.
+pub(crate) const ARTIFACT_WORKER_COALESCE_WINDOW: Duration = Duration::from_secs(2);
+/// Host-wide single deleter: one unattended worker deletes at a time across
+/// every repository on the machine. A waiting worker keeps its repository
+/// singleton (so further requests coalesce behind it) and gives up after
+/// this long with its request still durable.
+const HOST_DELETER_LOCK_FILE: &str = "gc-unattended-deleter.lock";
+const HOST_DELETER_WAIT: Duration = Duration::from_secs(15 * 60);
+const HOST_DELETER_POLL: Duration = Duration::from_secs(2);
 const ARTIFACT_SWEEP_META_PREFIX: &str = "gc.artifact_sweep.";
 const ARTIFACT_SWEEP_LEGACY_SCALAR_MAX_BYTES: usize = 4 * 1024;
 /// Internal marker which keeps Broker::open from starting a second inline GC
@@ -434,6 +453,11 @@ pub struct ArtifactSweepLastReport {
     pub bytes_accounting_complete: bool,
     pub preparation_cache_bytes_reclaimed: u64,
     pub blockers: ArtifactSweepBlockerSummary,
+    /// The last detached worker run's pacing telemetry. Stored under its own
+    /// key and attached on read, so the persisted report keeps the shape older
+    /// binaries parse; absent until a paced worker has run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unattended_pacing: Option<UnattendedPacingSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -2587,6 +2611,86 @@ pub(crate) fn try_artifact_sweep_worker_lock(
     })
 }
 
+/// Outcome of waiting for the host-wide single-deleter lock.
+pub(crate) enum HostDeleterSlot {
+    /// This worker is the machine's only unattended deleter until it drops.
+    Held(crate::file_lock::ExclusiveFileLock),
+    /// No host state directory could hold the lock; proceed unserialised
+    /// rather than strand the reclaim.
+    Unavailable,
+    /// Another repository's worker kept the lock for the whole wait.
+    Busy,
+}
+
+/// The directory that holds the host deleter lock: the broker's host state
+/// directory, shared by every repository on this machine. Unit tests opt in
+/// per thread so parallel tests never contend on a real host directory.
+fn host_deleter_lock_directory() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        tests::HOST_DELETER_DIRECTORY.with(|directory| directory.borrow().clone())
+    }
+    #[cfg(not(test))]
+    {
+        crate::host_state::default_host_state_dir().map(|directory| directory.join("run"))
+    }
+}
+
+/// Wait up to `wait` for the host deleter lock in `directory`, polling with
+/// `sleep`. Returns the slot and the time spent waiting.
+pub(crate) fn wait_for_host_deleter_slot(
+    directory: Option<&Path>,
+    wait: Duration,
+    mut sleep: impl FnMut(Duration),
+) -> (HostDeleterSlot, Duration) {
+    let Some(directory) = directory else {
+        return (HostDeleterSlot::Unavailable, Duration::ZERO);
+    };
+    if std::fs::create_dir_all(directory).is_err() {
+        return (HostDeleterSlot::Unavailable, Duration::ZERO);
+    }
+    let path = directory.join(HOST_DELETER_LOCK_FILE);
+    let mut waited = Duration::ZERO;
+    loop {
+        let attempt = crate::file_lock::open_lock_file(&path)
+            .and_then(crate::file_lock::ExclusiveFileLock::try_acquire);
+        match attempt {
+            Ok(Some(lock)) => return (HostDeleterSlot::Held(lock), waited),
+            Ok(None) => {}
+            Err(_) => return (HostDeleterSlot::Unavailable, waited),
+        }
+        if waited >= wait {
+            return (HostDeleterSlot::Busy, waited);
+        }
+        let step = HOST_DELETER_POLL.min(wait - waited);
+        sleep(step);
+        waited += step;
+    }
+}
+
+/// Lower the detached worker to background CPU and I/O priority. Called first
+/// thing in the worker process, before any thread or child exists.
+pub(crate) fn lower_artifact_worker_priority() -> BackgroundPriority {
+    background_priority::lower_current_process()
+}
+
+/// Install the unattended-deletion pacer for the detached worker's thread,
+/// reading `[cleanup] unattended_unlinks_per_second` from `main_root`.
+pub(crate) fn install_unattended_deletion_pacing(
+    main_root: &Path,
+    priority: BackgroundPriority,
+) -> unattended_pacing::UnattendedPacingScope {
+    let (rate, config_error) = unattended_pacing::load_unlink_rate(main_root);
+    let scope = unattended_pacing::install(unattended_pacing::UnattendedPacer::new(
+        rate,
+        Box::new(unattended_pacing::SystemClock),
+        Box::new(unattended_pacing::SystemPressure::new()),
+    ));
+    unattended_pacing::record_priority(priority);
+    unattended_pacing::record_config_error(config_error);
+    scope
+}
+
 /// Worker entry acquires the same lock before Broker::open, so its open-time
 /// maintenance cannot overlap another worker or create an ordinary inline
 /// sweep ahead of cache-only continuation.
@@ -3597,12 +3701,62 @@ impl Broker {
         else {
             return Ok(None);
         };
-        serde_json::from_str(&value).map(Some).map_err(|error| {
-            BrokerOpError::InvalidStorageContext {
+        let mut report: ArtifactSweepLastReport =
+            serde_json::from_str(&value).map_err(|error| BrokerOpError::InvalidStorageContext {
                 reason: format!("scoped artifact-sweep report is invalid JSON: {error}")
                     .into_boxed_str(),
-            }
-        })
+            })?;
+        // Pacing telemetry is advisory: a missing or unreadable summary never
+        // hides the sweep report itself.
+        let pacing_key = scoped_artifact_sweep_key(&namespace, ARTIFACT_SWEEP_PACING_SUMMARY_KEY);
+        report.unattended_pacing = bounded_text_meta_get(
+            self.store_ref(),
+            &pacing_key,
+            ARTIFACT_SWEEP_LAST_REPORT_MAX_BYTES,
+            "unattended pacing summary",
+        )
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_str(&value).ok());
+        Ok(Some(report))
+    }
+
+    /// Persist the installed pacer's telemetry for this worker run. Foreground
+    /// commands have no pacer and record nothing.
+    fn persist_unattended_pacing_summary(&mut self) {
+        let Some(summary) = unattended_pacing::current_summary(now_ms()) else {
+            return;
+        };
+        let encoded = serde_json::json!(&summary).to_string();
+        crate::warn_unrecorded(
+            "record unattended deletion pacing summary",
+            self.artifact_sweep_meta_set(ARTIFACT_SWEEP_PACING_SUMMARY_KEY, &encoded),
+        );
+    }
+
+    /// A deferred request found this repository's worker already alive. The
+    /// running worker serves it; count it so the run can report coalescing.
+    fn record_coalesced_artifact_worker_request(&mut self) -> Result<(), BrokerOpError> {
+        let count = self
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_COALESCED_REQUESTS_KEY)?
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        self.artifact_sweep_meta_set(
+            ARTIFACT_SWEEP_COALESCED_REQUESTS_KEY,
+            &count.saturating_add(1).to_string(),
+        )
+    }
+
+    /// Read and reset the coalesced-request count at the start of a run.
+    fn take_coalesced_artifact_worker_requests(&mut self) -> Result<u64, BrokerOpError> {
+        let count = self
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_COALESCED_REQUESTS_KEY)?
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        if count > 0 {
+            self.artifact_sweep_meta_set(ARTIFACT_SWEEP_COALESCED_REQUESTS_KEY, "0")?;
+        }
+        Ok(count)
     }
 
     fn persist_last_artifact_sweep_report(
@@ -3621,6 +3775,7 @@ impl Broker {
             bytes_accounting_complete: outcome.bytes_accounting_complete,
             preparation_cache_bytes_reclaimed: outcome.preparation_cache_bytes_reclaimed,
             blockers: outcome.blockers.clone(),
+            unattended_pacing: None,
         };
         loop {
             let encoded = serde_json::json!(&report).to_string();
@@ -6979,6 +7134,14 @@ impl Broker {
             return Ok(());
         };
         let Some(lock) = try_artifact_sweep_worker_lock(&root)? else {
+            // This repository's worker is alive (running, coalescing or
+            // queued for the host deleter). It reads the backlog after this
+            // request became durable or re-reads it after its lanes; anything
+            // it misses stays durable for the next open. Never start a second.
+            crate::warn_unrecorded(
+                "count coalesced artifact worker request",
+                self.record_coalesced_artifact_worker_request(),
+            );
             return Ok(());
         };
         if !artifact_worker_runtime_is_aligned() {
@@ -7076,6 +7239,40 @@ impl Broker {
     /// tranche is cooperative and can overrun on a large cohort; the durable
     /// cursor bounds proof progress after discovery, not discovery time.
     pub(crate) fn run_artifact_sweep_recovery_worker(&mut self) -> Result<(), BrokerOpError> {
+        let result = self.run_artifact_sweep_recovery_worker_lanes();
+        // Recorded on every exit, including a busy host deleter, so status
+        // shows why a run removed nothing.
+        self.persist_unattended_pacing_summary();
+        result
+    }
+
+    /// Wait for the host-wide single-deleter slot. `None` means another
+    /// repository's worker kept it for the whole wait; this run then exits
+    /// with every request durable for the next worker.
+    fn acquire_host_deleter_slot(
+        &mut self,
+        directory: Option<&Path>,
+        wait: Duration,
+        sleep: impl FnMut(Duration),
+    ) -> Result<Option<Option<crate::file_lock::ExclusiveFileLock>>, BrokerOpError> {
+        let coalesced = self.take_coalesced_artifact_worker_requests()?;
+        unattended_pacing::record_requests_coalesced(coalesced);
+        let (slot, waited) = wait_for_host_deleter_slot(directory, wait, sleep);
+        unattended_pacing::record_host_lock_wait(waited);
+        match slot {
+            HostDeleterSlot::Held(lock) => Ok(Some(Some(lock))),
+            HostDeleterSlot::Unavailable => Ok(Some(None)),
+            HostDeleterSlot::Busy => {
+                self.write_artifact_sweep_worker_status(&format!(
+                    "host_deleter_busy waited_ms={}; request retained",
+                    waited.as_millis()
+                ))?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn run_artifact_sweep_recovery_worker_lanes(&mut self) -> Result<(), BrokerOpError> {
         if !matches!(std::env::var(ARTIFACT_SWEEP_WORKER_ENV).as_deref(), Ok("1")) {
             self.write_artifact_sweep_worker_status("refused_environment")?;
             return Ok(());
@@ -7144,6 +7341,17 @@ impl Broker {
             }
             return Ok(());
         }
+        // One unattended deleter per machine. Waiting happens before the
+        // worker's time budget starts, so a queued run keeps its full budget.
+        let host_lock_directory = host_deleter_lock_directory();
+        let Some(_host_deleter) = self.acquire_host_deleter_slot(
+            host_lock_directory.as_deref(),
+            HOST_DELETER_WAIT,
+            std::thread::sleep,
+        )?
+        else {
+            return Ok(());
+        };
         let worker_started = Instant::now();
         if let Some(request_generation) = session_retirement_generation {
             let remaining =
@@ -8439,6 +8647,12 @@ impl Broker {
         let main_root = self.main_root().to_path_buf();
         let now = now_ms();
         let (budget_ms, urgency) = self.artifact_sweep_budget(policy, scope);
+        // Below gate headroom, freeing space is the priority: lift the
+        // unattended rate limit for this pass (priority stays lowered and the
+        // memory/load back-off stays on). No-op without an installed pacer.
+        unattended_pacing::set_disk_pressure(
+            urgency == crate::disk_headroom::SweepUrgency::Pressured,
+        );
         // The total pass budget still covers both lanes. General sweeps reserve
         // a bounded tail for whole-checkout cleanup so cache discovery cannot
         // consume the entire foreground budget first.
@@ -10777,6 +10991,200 @@ mod tests {
             const { RefCell::new(Vec::new()) };
         static ARTIFACT_SWEEP_TEST_MUTATION_INTERRUPT: RefCell<Option<ArtifactSweepTestMutation>> =
             const { RefCell::new(None) };
+        // Host deleter lock directory for this test thread; `None` keeps
+        // worker tests off any real host state directory.
+        pub(super) static HOST_DELETER_DIRECTORY: RefCell<Option<PathBuf>> =
+            const { RefCell::new(None) };
+    }
+
+    fn pacing_fixture_broker(root: &Path) -> (crate::test_storage::TestStorage, Broker) {
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "init"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let broker = storage.open(root).unwrap();
+        (storage, broker)
+    }
+
+    #[test]
+    fn host_deleter_lock_serialises_workers_across_repositories() {
+        let host = tempfile::tempdir().unwrap();
+        let (first, waited) =
+            wait_for_host_deleter_slot(Some(host.path()), Duration::ZERO, |_| unreachable!());
+        assert!(matches!(first, HostDeleterSlot::Held(_)));
+        assert_eq!(waited, Duration::ZERO);
+
+        // A second repository's worker polls with a fake sleep and gives up
+        // after its wait, never deleting in parallel.
+        let mut slept = Duration::ZERO;
+        let (second, waited) =
+            wait_for_host_deleter_slot(Some(host.path()), Duration::from_secs(5), |step| {
+                slept += step
+            });
+        assert!(matches!(second, HostDeleterSlot::Busy));
+        assert_eq!(waited, Duration::from_secs(5));
+        assert_eq!(slept, Duration::from_secs(5));
+
+        // Released, the next worker takes it at once.
+        drop(first);
+        let (third, waited) =
+            wait_for_host_deleter_slot(Some(host.path()), Duration::ZERO, |_| unreachable!());
+        assert!(matches!(third, HostDeleterSlot::Held(_)));
+        assert_eq!(waited, Duration::ZERO);
+        // Without a host state directory the worker proceeds unserialised.
+        assert!(matches!(
+            wait_for_host_deleter_slot(None, Duration::ZERO, |_| unreachable!()).0,
+            HostDeleterSlot::Unavailable
+        ));
+    }
+
+    #[test]
+    fn a_worker_that_loses_the_host_deleter_lock_leaves_its_request_durable() {
+        let root = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let (_storage, mut broker) = pacing_fixture_broker(root.path());
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "5")
+            .unwrap();
+        broker.record_coalesced_artifact_worker_request().unwrap();
+        // Another repository's worker holds the machine's deleter slot.
+        let (held, _) =
+            wait_for_host_deleter_slot(Some(host.path()), Duration::ZERO, |_| unreachable!());
+        assert!(matches!(held, HostDeleterSlot::Held(_)));
+
+        let clock = unattended_pacing::FakeClock::new();
+        let scope = unattended_pacing::install(unattended_pacing::UnattendedPacer::new(
+            unattended_pacing::UnlinkRate::Limited(1_000),
+            Box::new(clock),
+            Box::new(unattended_pacing::Scripted {
+                samples: vec![unattended_pacing::PressureSample::default()],
+                reads: Default::default(),
+            }),
+        ));
+        let slot = broker
+            .acquire_host_deleter_slot(Some(host.path()), Duration::from_secs(4), |_| {})
+            .unwrap();
+        assert!(slot.is_none(), "the loser must not delete");
+        broker.persist_unattended_pacing_summary();
+        drop(scope);
+
+        assert!(broker.artifact_sweep_recovery_requested().unwrap());
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("host_deleter_busy waited_ms=4000; request retained")
+        );
+        let pacing = broker
+            .last_artifact_sweep_report()
+            .unwrap()
+            .map(|report| report.unattended_pacing);
+        // No sweep report exists yet, so the summary is read directly.
+        assert!(pacing.is_none());
+        let namespace = broker.artifact_sweep_namespace().unwrap().to_string();
+        let stored = broker
+            .store()
+            .meta_get(&scoped_artifact_sweep_key(
+                &namespace,
+                ARTIFACT_SWEEP_PACING_SUMMARY_KEY,
+            ))
+            .unwrap()
+            .unwrap();
+        let summary: UnattendedPacingSummary = serde_json::from_str(&stored).unwrap();
+        assert_eq!(summary.host_lock_wait_ms, 4_000);
+        assert_eq!(summary.requests_coalesced, 1);
+        assert_eq!(summary.entries_removed, 0);
+        // The count was consumed by this run.
+        assert_eq!(broker.take_coalesced_artifact_worker_requests().unwrap(), 0);
+    }
+
+    #[test]
+    fn coalesced_requests_are_counted_once_per_run() {
+        let root = tempfile::tempdir().unwrap();
+        let (_storage, mut broker) = pacing_fixture_broker(root.path());
+        assert_eq!(broker.take_coalesced_artifact_worker_requests().unwrap(), 0);
+        for _ in 0..3 {
+            broker.record_coalesced_artifact_worker_request().unwrap();
+        }
+        assert_eq!(broker.take_coalesced_artifact_worker_requests().unwrap(), 3);
+        assert_eq!(broker.take_coalesced_artifact_worker_requests().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_live_repository_worker_blocks_a_second_one() {
+        let root = tempfile::tempdir().unwrap();
+        let (_storage, _broker) = pacing_fixture_broker(root.path());
+        let held = acquire_artifact_sweep_worker_lock(root.path()).unwrap();
+        assert!(
+            try_artifact_sweep_worker_lock(root.path())
+                .unwrap()
+                .is_none()
+        );
+        drop(held);
+        assert!(
+            try_artifact_sweep_worker_lock(root.path())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn pacing_summary_is_attached_to_the_last_sweep_report() {
+        let root = tempfile::tempdir().unwrap();
+        let (_storage, mut broker) = pacing_fixture_broker(root.path());
+        broker
+            .persist_last_artifact_sweep_report(
+                1,
+                ArtifactSweepScope::AutomaticContinuation,
+                &ArtifactSweepOutcome::no_work(true, None),
+            )
+            .unwrap();
+        // Foreground: no pacer, nothing recorded, nothing attached.
+        broker.persist_unattended_pacing_summary();
+        let report = broker.last_artifact_sweep_report().unwrap().unwrap();
+        assert!(report.unattended_pacing.is_none());
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert!(encoded.get("unattended_pacing").is_none());
+
+        let scope = unattended_pacing::install(unattended_pacing::UnattendedPacer::new(
+            unattended_pacing::UnlinkRate::Unlimited,
+            Box::new(unattended_pacing::FakeClock::new()),
+            Box::new(unattended_pacing::Scripted {
+                samples: vec![unattended_pacing::PressureSample::default()],
+                reads: Default::default(),
+            }),
+        ));
+        unattended_pacing::record_priority(BackgroundPriority {
+            cpu_lowered: true,
+            io_lowered: false,
+        });
+        broker.persist_unattended_pacing_summary();
+        drop(scope);
+        let report = broker.last_artifact_sweep_report().unwrap().unwrap();
+        let pacing = report.unattended_pacing.unwrap();
+        assert!(pacing.priority.cpu_lowered);
+        assert!(!pacing.priority.io_lowered);
+        assert_eq!(pacing.unlinks_per_second_limit, None);
+        // The persisted sweep report itself keeps the shape older binaries
+        // parse with `deny_unknown_fields`.
+        let namespace = broker.artifact_sweep_namespace().unwrap().to_string();
+        let stored = broker
+            .store()
+            .meta_get(&scoped_artifact_sweep_key(
+                &namespace,
+                ARTIFACT_SWEEP_LAST_REPORT_KEY,
+            ))
+            .unwrap()
+            .unwrap();
+        assert!(!stored.contains("unattended_pacing"));
     }
 
     struct ArtifactSweepTestMutationInterrupt {
