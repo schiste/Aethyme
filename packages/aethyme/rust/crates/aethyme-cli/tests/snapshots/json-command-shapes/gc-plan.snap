@@ -17,10 +17,12 @@
     ],
     "lanes": {
       "capacity_pressure": "bool",
+      "removal_apply_reserve_ms": "integer",
       "removal_budget_ms": "integer",
       "removal_elapsed_ms": "integer",
       "removal_examined": "integer",
       "removal_memo_skips": "integer",
+      "removal_selected": "integer",
       "retirement_budget_ms": "integer",
       "retirement_elapsed_ms": "integer"
     },

@@ -514,6 +514,26 @@ pub(crate) fn after_unattended_unlink(logical_bytes: u64) {
     with_active((), |pacer| pacer.after_unlink(logical_bytes));
 }
 
+/// Charge `entries` unlinks made in one burst outside tree removal (Git
+/// removing a whole checkout) to the installed pacer: it sleeps off their
+/// share of the bucket and waits out memory or load pressure as it would for
+/// its own unlinks, never past `deadline`. Returns how many it charged. Call
+/// it with no lock held: the sleep is the throttle. Without a pacer (every
+/// foreground caller) it charges nothing and returns at once.
+pub(crate) fn charge_bulk_unattended_removal(entries: u64, deadline: Option<Instant>) -> u64 {
+    with_active(0, |pacer| {
+        let mut charged = 0;
+        while charged < entries
+            && deadline.is_none_or(|deadline| pacer.clock.now() < deadline)
+            && pacer.before_unlink(deadline)
+        {
+            pacer.after_unlink(0);
+            charged += 1;
+        }
+        charged
+    })
+}
+
 /// Disk-pressure mode lifts the rate limit (freeing space is then the
 /// priority) but keeps the priority lowering and the pressure back-off.
 pub(crate) fn set_disk_pressure(pressured: bool) {
@@ -645,6 +665,29 @@ mod tests {
         assert_eq!(summary.limiter_sleep_ms, 2_048);
         assert_eq!(summary.removal_rate_per_second, 1_000);
         assert_eq!(summary.unlinks_per_second_limit, Some(1_000));
+    }
+
+    /// A whole checkout Git removed in one burst is paid for at the limit
+    /// afterwards, so worker checkout removal averages the configured rate;
+    /// foreground callers, with no pacer, are never slowed.
+    #[test]
+    fn a_bulk_removal_is_charged_to_the_installed_pacer_only() {
+        assert_eq!(charge_bulk_unattended_removal(10_000, None), 0);
+        let clock = FakeClock::new();
+        let _scope = install(UnattendedPacer::new(
+            UnlinkRate::Limited(1_000),
+            Box::new(clock.clone()),
+            calm(),
+        ));
+        let entries = u64::from(PACING_BATCH_ENTRIES) * 8 + 1;
+        assert_eq!(charge_bulk_unattended_removal(entries, None), entries);
+        assert_eq!(clock.slept.get(), Duration::from_millis(2_048));
+        let summary = current_summary(0).expect("the pacer is installed");
+        assert_eq!(summary.entries_removed, entries);
+        // A deadline bounds the throttle.
+        let deadline = clock.now() + Duration::from_millis(300);
+        assert!(charge_bulk_unattended_removal(entries, Some(deadline)) < entries);
+        assert_eq!(clock.now(), deadline);
     }
 
     #[test]
