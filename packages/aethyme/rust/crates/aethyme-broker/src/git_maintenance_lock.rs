@@ -918,7 +918,7 @@ fn apply_with_boot_result(
         }
     };
     let main_root = &context.repository_root;
-    let (_repository_key, _write_guard) =
+    let (_repository_key, mut write_guard) =
         match crate::operations::try_acquire_local_repository_write_lock_as(
             main_root,
             &context.checkout,
@@ -942,6 +942,9 @@ fn apply_with_boot_result(
             }
         };
 
+    // Name each step in the holder record, so a write refused behind this
+    // exclusive hold says what it waits for.
+    write_guard.record_phase("re-planning under the write locks");
     let (locked_plan, binding) = collect_plan(cwd, boot_result.clone());
     if !locked_plan.eligible {
         report.refusals = locked_plan.refusals;
@@ -964,6 +967,7 @@ fn apply_with_boot_result(
         return report;
     };
 
+    write_guard.record_phase("writing the recovery intent");
     let recovery_directory = match ensure_recovery_directory(main_root) {
         Ok(path) => path,
         Err(message) => {
@@ -1035,6 +1039,7 @@ fn apply_with_boot_result(
         return report;
     }
 
+    write_guard.record_phase("removing the reviewed lock");
     let unlink_context = match capture_repository_context(cwd) {
         Ok(context) => context,
         Err(reason) => {

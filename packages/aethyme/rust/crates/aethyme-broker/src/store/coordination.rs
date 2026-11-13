@@ -308,6 +308,51 @@ impl BrokerStore {
         Ok(operations)
     }
 
+    /// The newest coordinated-operation id journaled for `repository`, or 0.
+    /// Ids only grow, so this is a generation: anything queued later has a
+    /// larger id. One seek on `coordinated_operations_history_by_repository`.
+    pub(crate) fn latest_coordinated_operation_id(
+        &self,
+        repository: &str,
+    ) -> Result<i64, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM coordinated_operations WHERE repository = ?1",
+                [repository],
+                |row| row.get(0),
+            )
+            .map_err(BrokerError::from)
+    }
+
+    /// Writes on `repository` queued after `after_id`, oldest first. A range
+    /// seek on `coordinated_operations_history_by_repository`, proportional to
+    /// the rows queued since, never to the repository's history.
+    pub(crate) fn coordinated_writes_queued_after(
+        &self,
+        repository: &str,
+        after_id: i64,
+    ) -> Result<Vec<CoordinatedOperation>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, provider, repository, scope, effect,
+                    status, authorization_reason, command_json, pid,
+                    exit_code, details_json,
+                    created_at, updated_at, finished_at,
+                    host_operation_id, identity_provenance, agent_provenance_json
+             FROM coordinated_operations
+             WHERE repository = ?1 AND id > ?2 AND effect <> 'read'
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(
+            params![repository, after_id],
+            coordinated_operation_from_row,
+        )?;
+        let mut operations = Vec::new();
+        for row in rows {
+            operations.push(row??);
+        }
+        Ok(operations)
+    }
+
     pub fn unresolved_coordinated_operations(
         &self,
         repository: &str,
