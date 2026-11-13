@@ -152,8 +152,8 @@ unattended_unlinks_per_second = 1000 # background worker pace; 0 or "unlimited" 
 
 The background worker's pace, priority, host-wide single deleter and pressure
 pause are described in
-[automatic checkout maintenance](automatic-checkout-maintenance.md#background-deletion-pace).
-`finish cleanup <id>` and `gc apply` are never throttled.
+[automatic checkout maintenance](automatic-checkout-maintenance.md), under
+"Background deletion pace". `finish cleanup <id>` and `gc apply` are never throttled.
 
 State-only closed checkouts also respect `[retention]
 closed_worktree_grace_hours` in `.aethyme/broker.toml` (24 hours / 1 day by default;
