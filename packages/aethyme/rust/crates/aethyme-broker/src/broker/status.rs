@@ -41,6 +41,9 @@ impl Broker {
             }
         }
         let auto_cleanup = self.last_auto_cleanup_report();
+        view.landed_session_retirement = auto_cleanup
+            .as_ref()
+            .and_then(crate::AutoCleanupReport::landed_session_retirement_view);
         push_auto_cleanup_advice(&mut view, auto_cleanup);
         self.push_checkout_capacity_advice(&mut view, deadline);
         push_environment_minimum_advice(&mut view, deadline);
@@ -453,6 +456,9 @@ impl Broker {
         self.grant_stale_lease_requests()?;
         let mut view = self.build_status(agents, overlaps, integration, now_ms, false)?;
         let auto_cleanup = self.last_auto_cleanup_report();
+        view.landed_session_retirement = auto_cleanup
+            .as_ref()
+            .and_then(crate::AutoCleanupReport::landed_session_retirement_view);
         push_auto_cleanup_advice(&mut view, auto_cleanup);
         self.push_checkout_capacity_advice(&mut view, deadline);
         push_environment_minimum_advice(&mut view, deadline);
@@ -1373,6 +1379,7 @@ impl Broker {
             unpushed_work,
             in_flight_submits,
             waiters: crate::waiters::current_waiters(&self.main_root, now_ms),
+            landed_session_retirement: None,
         })
     }
 

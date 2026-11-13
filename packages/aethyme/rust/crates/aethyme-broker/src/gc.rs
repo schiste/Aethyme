@@ -7387,6 +7387,7 @@ impl Broker {
             aggregate.sessions_retired = aggregate
                 .sessions_retired
                 .saturating_add(report.sessions_retired);
+            aggregate.absorb_landed_report(&report);
             let pagination_reasons = report
                 .retirement_deferred_reasons
                 .iter()

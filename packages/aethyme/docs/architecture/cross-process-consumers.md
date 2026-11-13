@@ -212,6 +212,89 @@ and `review_on_push_child_wait`. What is reviewed, written and reported is
 unchanged; the review still runs on every push to a non-draft pull request,
 including a repeated push of the same head.
 
+## Landed sessions close without `finish` (2026-11-13)
+
+Unattended session retirement (the inline sweep on a writable broker open and
+the shared background worker, `gc __continue-artifacts`) now asks the landed
+lane first for every open session idle past `session_landed_after_hours`
+(default 24), whatever its age, and falls back to the abandonment window only
+when the landed decline leaves the question open. The landed lane closes a
+session only when all of these hold, re-checked under the session operation
+guard and the lifecycle claim:
+
+- no pull request linked to it is unmerged in the cached listing the PR watch
+  keeps (`pull_request_session_links` and `pull_request_milestones`; no
+  provider call is made per session);
+- `[cleanup] auto_remove` is on and no keep pin matches the checkout;
+- the fetched default branch holds every commit of its HEAD by the rule
+  `finish` uses: a representation recorded against that branch, ancestry, or
+  `default_branch_landing`, whose `landing_covers` keeps a commit made after a
+  squash unlanded. The content search runs only when a merged pull request, a
+  representation or ancestry already suggests a landing; a session that never
+  committed and never merged a pull request is left to the abandonment window;
+- `unclean_reason` finds nothing: no uncommitted or untracked path, no merge,
+  rebase or stash in progress, and only ignored content the shared recovery
+  classifier treats as disposable. It now runs `git --no-optional-locks
+  status`, so asking never refreshes the index whose modification time is the
+  worktree activity both idle windows read;
+- no process holds it: the broker-spawned PID is gone, and the recorded holder
+  is gone or, when it still runs (one agent process routinely holds many
+  sessions in turn), its task lease on this session has expired and no gate,
+  unresolved operation, preparation or open file uses the worktree. The
+  holder's own working directory inside the worktree counts as use here
+  (the opt-in abandonment lane still tolerates it). The
+  `expire_abandoned_task_leases` opt-in is not needed for a landed session.
+
+The proof is computed once, before the claims, within the pass deadline (out
+of budget: `budget_exhausted`, and the cursor stays on that session for the
+next pass unless that one proof alone spent 10 s of a pass). Under the claims
+it is only verified: HEAD is the proved head, the fetched default-branch tip
+is unchanged (`upstream_moved` otherwise), and `git status` plus in-progress
+markers are clean. Immediately before the close HEAD and the worktree's
+index/HEAD modification times are read again; any change is
+`moved_before_close`. A head the search found unlanded is remembered in broker
+meta (`landed_lane.not_landed.<session id>` = `<head> <tip>`), so it is not
+searched again until either moves; `landed_landing_search` times searches and
+`landed_landing_search_memo_skipped` counts the ones skipped.
+
+Closing releases the session's leases in the same transaction and requests the
+existing whole-checkout cleanup, which removes the checkout after
+`closed_worktree_grace_hours` through the same containment proof as before.
+The `session.abandoned` payload's `retirement_basis` is
+`clean_recorded_landing_and_gone_holder` or, for a live holder with an expired
+task lease, `clean_landing_and_expired_task_lease`.
+
+The retirement pass keeps its keyset cursor over open sessions (128 per page,
+fixed high-water lap), so successive passes resume instead of restarting.
+`AutoCleanupReport` adds optional `landed_sessions_examined`,
+`landed_sessions_closed`, `landed_sessions_declined` (counts per reason code),
+`retirement_cursor` (`after_session_id`, `high_water_session_id`) and
+`landed_retirement_elapsed_ms`; all are omitted when zero or empty, and the
+background worker sums them across its passes. `broker status --json` (routine
+and `--refresh`; not `--summary`) adds an optional top-level `landed_session_retirement` object
+(`evaluated_at_ms`, `examined`, `closed`, `declined`, `cursor`) taken from the
+last report, omitted until the landed lane has judged a session. Routine
+declines do not raise the `cleanup.auto-removal` advice; `policy_unavailable`,
+`landing_unknown`, `holder_unknown` or `operation_unknown` do, and whenever the
+advice is shown it carries one evidence line with the same counts.
+Each pass adds `landed_sessions_examined`, `landed_sessions_closed`,
+`landed_session_retirement` (time) and one `landed_sessions_declined_<reason>`
+per kept session to the command's `phase_counts`. `status` output size is the
+existing `output_bytes` of its metric line.
+
+Reason codes: `recent_activity`, `changed`, `process_alive`, `holder_alive`,
+`holder_unbound`, `holder_unknown`, `lease_held`, `lease_unknown`,
+`worktree_unavailable`, `busy`, `operation_active`, `operation_unknown`,
+`policy_unavailable`, `auto_remove_disabled`, `pinned`,
+`pull_request_unmerged`, `no_session_commits`, `no_landing_evidence`,
+`not_landed`, `landing_unknown`, `worktree_unclean`, `moved_before_close`,
+`upstream_moved`, `budget_exhausted`. An ignored tool cache keeps a session as
+`worktree_unclean` until the repository names it in `[cleanup] regenerable`
+(a list of globs, relative to the worktree root, in `.aethyme/config.toml`).
+Fixtures that keep a
+checkout across broker opens with `[cleanup] auto_remove = false` keep their
+sessions open too (`auto_remove_disabled`).
+
 ## Automatic checkout maintenance (v0.8.44)
 
 `AutoCleanupReport` adds optional `sessions_retired` and

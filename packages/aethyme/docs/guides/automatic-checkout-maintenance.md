@@ -210,10 +210,15 @@ policy separately.
 | --- | --- |
 | `sessions_retired` | Number of sessions closed by this maintenance pass; omitted when zero. |
 | `retirement_deferred_reasons` | Typed reasons why retirement could not finish; omitted when empty. |
+| `landed_sessions_examined` | Open sessions idle past `session_landed_after_hours` that the landed lane judged; omitted when zero. |
+| `landed_sessions_closed` | Of those, the sessions it closed; omitted when zero. |
+| `landed_sessions_declined` | Sessions it kept, counted per reason code (`recent_activity`, `changed`, `process_alive`, `holder_alive`, `holder_unbound`, `holder_unknown`, `lease_held`, `lease_unknown`, `worktree_unavailable`, `busy`, `operation_active`, `operation_unknown`, `policy_unavailable`, `auto_remove_disabled`, `pinned`, `pull_request_unmerged`, `no_session_commits`, `no_landing_evidence`, `not_landed`, `landing_unknown`, `worktree_unclean`, `moved_before_close`, `upstream_moved`, `budget_exhausted`); omitted when empty. A session the abandonment window then closed is not counted. |
+| `retirement_cursor` | `{after_session_id, high_water_session_id}`: where the open-session retirement lap stood when the report was written; omitted before the first lap. |
+| `landed_retirement_elapsed_ms` | Milliseconds the landed lane spent; omitted when zero. |
 
 Readers must accept these fields being absent in older saved reports. A deferred
 session remains protected; `sessions_retired` counts session state transitions,
 not removed directories or reclaimed bytes. The checkout grace begins from
 closure, and content/ownership checks still decide whether removal is allowed.
 
-A clean session with an exact recorded landing on the fetched default branch and a proven-gone recorded holder can enter guarded retirement after `session_landed_after_hours` (default 24 hours). Set it to `0` to disable this earlier path. The ordinary `session_abandoned_after_hours = 0` also disables retirement. Unknown holders, changed heads, dirty or unproven work are preserved. Checkout removal still has its separate grace period and safety checks.
+A clean session whose work is on the fetched default branch can enter guarded retirement after `session_landed_after_hours` (default 24 hours), with no `finish`. The landing is the rule `finish` uses: a representation recorded against that branch, ancestry, or a content landing that accounts for every commit (a commit made after a squash keeps the session). The content search runs only when the cached pull-request listing records a merged pull request for the session, a representation exists, or the head is already an ancestor. Its recorded holder must be gone, or still running with an expired task lease and no gate, operation, preparation or open file in the worktree; the `expire_abandoned_task_leases` opt-in is not needed for a landed session. Set it to `0` to disable this earlier path. The ordinary `session_abandoned_after_hours = 0` also disables retirement, and `[cleanup] auto_remove = false` keeps every session out of it. Unknown holders, current task leases, unmerged linked pull requests, changed heads, dirty or unproven work are preserved, each counted under a reason in `landed_sessions_declined`. Checkout removal still has its separate grace period and safety checks.

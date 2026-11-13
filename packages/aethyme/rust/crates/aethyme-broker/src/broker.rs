@@ -1974,6 +1974,11 @@ pub struct StatusView {
     /// nobody waits.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub waiters: Vec<crate::CurrentWaiter>,
+    /// Landed-session retirement from the last automatic-maintenance report:
+    /// sessions judged, closed, and kept per reason, with the retirement
+    /// cursor. Omitted until that lane has judged a session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landed_session_retirement: Option<crate::LandedSessionRetirementView>,
 }
 
 /// How many refused reviews `broker status` carries.
@@ -2965,16 +2970,28 @@ fn push_auto_cleanup_advice(view: &mut StatusView, report: Option<crate::AutoCle
     let Some(report) = report else {
         return;
     };
-    let actionable_retirement_issue = report.retirement_deferred_reasons.iter().any(|reason| {
-        matches!(
-            reason,
-            crate::SessionRetirementDeferredReason::RetentionPolicyUnavailable { .. }
-                | crate::SessionRetirementDeferredReason::HolderLivenessUnavailable { .. }
-                | crate::SessionRetirementDeferredReason::WorktreeActivityUnavailable { .. }
-                | crate::SessionRetirementDeferredReason::LeaseLivenessUnavailable { .. }
-                | crate::SessionRetirementDeferredReason::OperationEvidenceUnavailable { .. }
-        )
-    });
+    // Routine landed-lane declines (not landed yet, holder still working,
+    // dirty worktree) are reported in `landed_session_retirement` only. Evidence
+    // the broker could not read is a reason to look.
+    let actionable_landed_issue = [
+        "policy_unavailable",
+        "landing_unknown",
+        "holder_unknown",
+        "operation_unknown",
+    ]
+    .iter()
+    .any(|reason| report.landed_sessions_declined.contains_key(*reason));
+    let actionable_retirement_issue = actionable_landed_issue
+        || report.retirement_deferred_reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                crate::SessionRetirementDeferredReason::RetentionPolicyUnavailable { .. }
+                    | crate::SessionRetirementDeferredReason::HolderLivenessUnavailable { .. }
+                    | crate::SessionRetirementDeferredReason::WorktreeActivityUnavailable { .. }
+                    | crate::SessionRetirementDeferredReason::LeaseLivenessUnavailable { .. }
+                    | crate::SessionRetirementDeferredReason::OperationEvidenceUnavailable { .. }
+            )
+        });
     if report.removed.is_empty()
         && report.kept.is_empty()
         && report.config_error.is_none()
@@ -3007,6 +3024,23 @@ fn push_auto_cleanup_advice(view: &mut StatusView, report: Option<crate::AutoCle
         evidence.push(format!(
             "retired {} abandoned session(s)",
             report.sessions_retired
+        ));
+    }
+    if report.landed_sessions_examined > 0 {
+        let declined = report
+            .landed_sessions_declined
+            .iter()
+            .map(|(reason, count)| format!("{reason}={count}"))
+            .collect::<Vec<_>>();
+        evidence.push(format!(
+            "landed lane judged {} session(s), closed {}, kept: {}",
+            report.landed_sessions_examined,
+            report.landed_sessions_closed,
+            if declined.is_empty() {
+                "none".to_string()
+            } else {
+                declined.join(", ")
+            }
         ));
     }
     evidence.extend(
@@ -3371,7 +3405,9 @@ mod gates;
 mod leases;
 mod owners;
 mod remote_heads;
-pub(crate) use leases::{AbandonedSessionCloseOutcome, validate_session_commit_args};
+pub(crate) use leases::{
+    AbandonedSessionCloseOutcome, LandedSessionDecline, validate_session_commit_args,
+};
 pub use owners::{CommitOwner, MAX_OWNER_COMMITS, OwnedCommit, OwnersReport};
 pub(crate) mod lifecycle;
 mod scope_capture;

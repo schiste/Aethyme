@@ -14,7 +14,11 @@
         "worktree": "string"
       }
     ],
-    "removed": []
+    "removed": [],
+    "retirement_cursor": {
+      "after_session_id": "integer",
+      "high_water_session_id": "integer"
+    }
   },
   "blocker_summary": [
     {
