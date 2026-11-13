@@ -4,6 +4,24 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.88] - 2026-11-13
+
+### Fixed
+
+- `broker push` decides against the remote branch's actual tip. A tip that HEAD contains gets a plain push. A rewritten branch leases only against a commit the session itself pushed, including pushes made through `broker advanced git`, which now record their commit. Anything else is refused with exit 3 before Git runs, with the commands that resolve it, instead of failing repeatedly with Git's `stale info` (#1650).
+- A session push holds only its branch lane in repositories that set `extensions.worktreeConfig`; that setting alone kept every push on the repository-wide lock. Other `extensions.*` keys still keep it wide (#1651).
+- `submit` no longer waits for a worktree lifecycle claim while holding the write lanes for plan reuse; it gives up the reuse instead (#1651).
+
+### Added
+
+- Every coordinated push, commit and fetch records in `coordination_timing` whether it took its narrow lane (`narrow_lane`, `narrow_lane_kind`) and, when it did not, a stable `narrow_lane_unavailable_reason`. `operations stats` counts these under `narrow_lanes` (`taken_count`, `unavailable_count`, `unavailable_by_reason`, `by_kind`) (#1651).
+- A write refused while waiting for a lock names the holder (command, session, pid, scope, time held), including holds that have no journal row. Exclusive holders write `<lock>.holder.json` while they hold the lock (#1651).
+- Push phase counts `push_plain_fast_forward`, `push_lease_recorded`, `push_lease_journal_proven`, `push_refused_foreign_remote_tip`, `push_remote_tip_redecided`, `push_remote_tip_rejected` (#1650).
+
+### Changed
+
+- `queue_wait_ms` is the total wait across every lock a write waited for. Its previous meaning is `lock_queue_wait_ms`; the other parts are `git_common_lane_wait_ms`, `local_ref_lane_wait_ms` and `repository_lane_wait_ms` (#1651).
+
 ## [0.8.87] - 2026-11-13
 
 ### Removed
