@@ -190,6 +190,66 @@ fn a_stale_duplicate_is_reported_but_only_as_info() {
     assert_eq!(row.severity.as_str(), "info", "{row:?}");
 }
 
+/// Duplicate work is decided from branches and tasks alone, so liveness is
+/// derived (and its transitions persisted) only for the sessions that match:
+/// an unrelated stale session keeps its recorded status until something that
+/// lists every agent looks at it.
+#[test]
+fn duplicate_work_derives_liveness_only_for_sessions_that_match() {
+    let fixture = FixtureRepository::new();
+    init_repo(fixture.path());
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
+    let quiet = broker
+        .adopt(
+            &add_worktree(fixture.path(), "quiet"),
+            Some("refresh PR #1149"),
+        )
+        .unwrap();
+    let live = broker
+        .adopt(
+            &add_worktree(fixture.path(), "live"),
+            Some("finish PR #1149"),
+        )
+        .unwrap();
+    let unrelated = broker
+        .adopt(
+            &add_worktree(fixture.path(), "unrelated"),
+            Some("Fix PR 1181 diagnostics"),
+        )
+        .unwrap();
+    make_stale(&mut broker, fixture.path(), quiet.id, "quiet");
+    make_stale(&mut broker, fixture.path(), unrelated.id, "unrelated");
+    let recorded = broker.store().session(unrelated.id).unwrap().status;
+    assert_ne!(
+        recorded,
+        SessionStatus::Stale,
+        "the fixture starts unlabelled"
+    );
+
+    let found = broker.duplicate_work_for(&live);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].session_id, quiet.id);
+    assert_eq!(found[0].status, SessionStatus::Stale);
+    // The matching session was derived exactly as `agents` derives it,
+    // including persisting its transition.
+    assert_eq!(
+        broker.store().session(quiet.id).unwrap().status,
+        SessionStatus::Stale
+    );
+    // The unrelated one was never looked at.
+    assert_eq!(
+        broker.store().session(unrelated.id).unwrap().status,
+        recorded
+    );
+
+    // The full agents view still derives everyone.
+    broker.agents(now_ms()).unwrap();
+    assert_eq!(
+        broker.store().session(unrelated.id).unwrap().status,
+        SessionStatus::Stale
+    );
+}
+
 #[test]
 fn a_worktree_mid_merge_is_reported_instead_of_failing_classification() {
     let fixture = FixtureRepository::new();

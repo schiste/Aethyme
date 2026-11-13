@@ -311,6 +311,26 @@ fn a_push_runs_one_review_and_a_repeated_push_posts_nothing_new() {
     assert_eq!(second["review_run"]["performed"], true, "{second:#}");
     assert_eq!(fixture.writes(), ["create"], "no new comment, no edit");
     assert_eq!(fixture.comments().len(), 1);
+
+    // The push's metric splits the review into its own steps.
+    let metrics = std::fs::read_to_string(fixture.repo.join(".aethyme/logs/command-metrics.jsonl"))
+        .expect("push writes command metrics");
+    let metric = metrics
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|metric| metric["command"] == "push")
+        .expect("push metric exists");
+    for phase in [
+        "review_on_push",
+        "review_on_push_policy",
+        "review_on_push_child_start",
+        "review_on_push_child_wait",
+    ] {
+        assert!(
+            metric["phase_timings_ms"][phase].as_u64().is_some(),
+            "missing {phase}: {metric}"
+        );
+    }
 }
 
 #[test]

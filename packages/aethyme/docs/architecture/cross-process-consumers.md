@@ -186,6 +186,32 @@ A coordinated `gh` write whose `--body-file`, `--notes-file`, `-F <file>`
 `-F key=@file` (under `api` and `workflow`) names a missing file, a directory
 or an empty regular file is refused before anything is journaled.
 
+## Push finalization and review-on-push reads (2026-11-13)
+
+`broker push` reports `duplicate_work` exactly as before, but derives liveness
+only for the live sessions whose branch, task or cached open-PR listing match
+the pushed session (usually none). The others are neither read for activity
+nor reconciled by the push: their status transitions and abandonment closes
+happen at the next `broker status`, `broker agents` or other full agents view.
+Each session left out counts once as `agents_view_sessions_skipped` in the
+command's `phase_counts`; `agents_view` times the part still done. The same
+applies to the duplicate-work list `start`, `adopt` and `reuse` print.
+
+`broker advanced review run` (and so `[review] run_on_push`) starts its
+read-only provider reads together instead of one after another: the change
+read stays on the calling thread (`review_run_change_read`), while the
+snapshot (`review_run_snapshot_read`), the projection facts
+(`review_run_pr_facts_read`: labels, comments and, now concurrently, the `gh`
+identity), and with `--from-provider` the diff (`review_run_diff_read`) run on
+threads that only call `gh`. Each is joined where the run used to make it, so
+errors surface in the same order; `review_run_prefetch_wait` is the time the
+run still waited for them. `review_run_classify` and `review_run_github_writes`
+time classification and the coordinated writes. A push's own metric splits
+`review_on_push` into `review_on_push_policy`, `review_on_push_child_start`
+and `review_on_push_child_wait`. What is reviewed, written and reported is
+unchanged; the review still runs on every push to a non-draft pull request,
+including a repeated push of the same head.
+
 ## Automatic checkout maintenance (v0.8.44)
 
 `AutoCleanupReport` adds optional `sessions_retired` and

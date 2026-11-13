@@ -617,15 +617,15 @@ pub(super) fn head_descends_from(root: &Path, previous: &str, head: &str) -> boo
 /// meant every rule keyed on `on`, `from_fork` or `first_time_contributor`
 /// parsed, loaded, and never matched. Returns the snapshot alongside the facts
 /// so the caller can record the observation once the tick has acted on it.
+/// `snapshot` is [`read_pull_request_snapshot`]'s answer, read by the caller
+/// alongside its other provider reads.
 pub(super) fn gather_change_facts(
     store_root: &Path,
-    repository: &str,
-    pull_request: i64,
+    snapshot: Option<crate::ProviderPullRequest>,
     paths: Vec<String>,
     classification: crate::CommitClassification,
     previous: Option<&crate::PullRequestObservation>,
 ) -> (crate::ChangeFacts, Option<crate::ProviderPullRequest>) {
-    let snapshot = read_pull_request_snapshot(store_root, repository, pull_request);
     let Some(snapshot) = snapshot else {
         return (
             crate::ChangeFacts {
@@ -711,14 +711,10 @@ pub(super) fn owned_comment_from_view(
 /// Without that identity, or with a marked comment whose REST id is
 /// unreadable, the answer is `None` and no rule comment is written.
 fn rule_comments_from_view(
-    root: &Path,
+    viewer: Option<std::process::Output>,
     comments: &[serde_json::Value],
 ) -> Option<std::collections::BTreeMap<String, crate::OwnedComment>> {
-    let viewer = std::process::Command::new("gh")
-        .current_dir(root)
-        .args(["api", "user", "--jq", ".login"])
-        .output()
-        .ok()
+    let viewer = viewer
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .filter(|login| !login.is_empty() && login != "null")?;
@@ -801,18 +797,23 @@ pub(super) fn read_pull_request_facts(
         pull_request,
         ..Default::default()
     };
-    // These provider reads are independent. Start the label lookup first so
-    // its network latency overlaps the PR view; collect both before planning
-    // any writes, including when either provider call fails.
-    let labels = std::process::Command::new("gh")
-        .current_dir(root)
-        .args([
-            "label", "list", "--repo", repository, "--limit", "200", "--json", "name",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
+    // These provider reads are independent. Start the label lookup and the
+    // `gh` identity lookup first so their network latency overlaps the PR
+    // view; collect all of them before planning any writes, including when
+    // any provider call fails.
+    let spawn_read = |args: &[&str]| {
+        std::process::Command::new("gh")
+            .current_dir(root)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+    };
+    let labels = spawn_read(&[
+        "label", "list", "--repo", repository, "--limit", "200", "--json", "name",
+    ]);
+    let viewer = spawn_read(&["api", "user", "--jq", ".login"]);
     let view = std::process::Command::new("gh")
         .current_dir(root)
         .args([
@@ -826,6 +827,7 @@ pub(super) fn read_pull_request_facts(
         ])
         .output();
     let labels = labels.and_then(|child| child.wait_with_output());
+    let viewer = viewer.and_then(|child| child.wait_with_output()).ok();
     if let Ok(output) = view
         && output.status.success()
         && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
@@ -848,7 +850,7 @@ pub(super) fn read_pull_request_facts(
                 .unwrap_or(&[]),
         )?;
         facts.rule_comments = rule_comments_from_view(
-            root,
+            viewer,
             json["comments"]
                 .as_array()
                 .map(Vec::as_slice)
@@ -866,6 +868,72 @@ pub(super) fn read_pull_request_facts(
             .collect();
     }
     Ok(facts)
+}
+
+/// The read-only provider reads a review run makes, started together.
+///
+/// They were sequential `gh` calls, most of `review_on_push`'s 4.2 s average
+/// (15 pushes, 2026-11-12), and none depends on another or on the change read.
+/// Each runs on its own thread under the run's span recorder. Only `gh` runs
+/// there: Git reads stay on the calling thread, whose deadline, isolation and
+/// telemetry are thread-local.
+struct ProviderPrefetch {
+    snapshot: std::thread::JoinHandle<Option<crate::ProviderPullRequest>>,
+    pr_facts: std::thread::JoinHandle<Result<crate::PrProjectionFacts, UsageError>>,
+    /// Only for `--from-provider`; a local change is classified from Git.
+    diff: Option<std::thread::JoinHandle<Option<Vec<String>>>>,
+}
+
+impl ProviderPrefetch {
+    fn start(
+        root: &Path,
+        change_root: &Path,
+        repository: &str,
+        pull_request: i64,
+        with_diff: bool,
+    ) -> Self {
+        fn spawn<T: Send + 'static>(
+            name: &'static str,
+            read: impl FnOnce() -> T + Send + 'static,
+        ) -> std::thread::JoinHandle<T> {
+            let recorder = crate::phase_telemetry::active();
+            std::thread::spawn(move || {
+                let _installed = recorder.map(crate::phase_telemetry::install);
+                let _span = crate::phase_telemetry::span(name);
+                read()
+            })
+        }
+        let snapshot = {
+            let (root, repository) = (root.to_path_buf(), repository.to_string());
+            spawn("review_run_snapshot_read", move || {
+                read_pull_request_snapshot(&root, &repository, pull_request)
+            })
+        };
+        let pr_facts = {
+            let (root, repository) = (change_root.to_path_buf(), repository.to_string());
+            spawn("review_run_pr_facts_read", move || {
+                read_pull_request_facts(&root, &repository, pull_request)
+            })
+        };
+        let diff = with_diff.then(|| {
+            let (root, repository) = (root.to_path_buf(), repository.to_string());
+            spawn("review_run_diff_read", move || {
+                read_pull_request_diff(&root, &repository, pull_request)
+            })
+        });
+        Self {
+            snapshot,
+            pr_facts,
+            diff,
+        }
+    }
+}
+
+/// One prefetched read's answer, `None` when its thread panicked. The time the
+/// run still waits for it is `review_run_prefetch_wait`.
+fn joined<T>(read: std::thread::JoinHandle<T>) -> Option<T> {
+    let _span = crate::phase_telemetry::span("review_run_prefetch_wait");
+    read.join().ok()
 }
 
 /// Perform one tick of the review router for one pull request.
@@ -911,11 +979,27 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
     let projection_policy = crate::PrProjectionPolicy::load(&root).map_err(to_usage)?;
     let classification_policy = crate::ChangeClassificationPolicy::load(&root).map_err(to_usage)?;
 
+    // The provider reads none of the steps below depend on, started now so
+    // their latency overlaps the change read and the ledger work. Each is
+    // joined where the run used to make it.
+    let ProviderPrefetch {
+        snapshot: snapshot_read,
+        pr_facts: pr_facts_read,
+        diff: diff_read,
+    } = ProviderPrefetch::start(
+        &root,
+        &change_root,
+        &repository,
+        pull_request,
+        parsed.from_provider,
+    );
+
     // Where the change is read from. The working directory is right for an
     // agent routing its own branch and impossible for a sweep, which visits
     // every open pull request and is standing in none of them; the git reads
     // below would fail on the first one. So the source is chosen before either
     // is attempted, never after.
+    let change_read = crate::phase_telemetry::span("review_run_change_read");
     let (paths, classification, head, provider_files) = if parsed.from_provider {
         let change =
             read_change_from_provider(&root, &repository, pull_request).ok_or_else(|| {
@@ -950,6 +1034,7 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
             .to_string();
         (paths, classification, head, None)
     };
+    drop(change_read);
 
     // Push-triggered runs must never classify a later head as the pushed one.
     // This check also happens before expiring or creating any ledger rows.
@@ -1034,7 +1119,11 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
         })
         .collect();
     let teardown = crate::finished_workspaces(&routing, &root, pull_request, &reconciled, &tabs);
-    let pr_facts = read_pull_request_facts(&change_root, &repository, pull_request)?;
+    let pr_facts = joined(pr_facts_read).unwrap_or_else(|| {
+        Err(UsageError::Message(format!(
+            "reading the facts of pull request {pull_request} from {repository} failed"
+        )))
+    })?;
 
     let previous = broker
         .store()
@@ -1042,20 +1131,19 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
         .map_err(to_usage)?;
     let (mut facts, snapshot) = gather_change_facts(
         &root,
-        &repository,
-        pull_request,
+        joined(snapshot_read).flatten(),
         paths.clone(),
         classification.clone(),
         previous.as_ref(),
     );
+    let classify = crate::phase_telemetry::span("review_run_classify");
     let change = match provider_files {
         Some(((files, complete), base_commit)) => classify_provider_change(
             &root,
-            &repository,
-            pull_request,
             base_commit.as_deref(),
             files,
             complete,
+            diff_read.and_then(joined).flatten(),
             snapshot.is_some(),
             &facts,
             &classification_policy,
@@ -1069,6 +1157,7 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
             &classification_policy,
         )?,
     };
+    drop(classify);
     facts.change = Some(change.clone());
     let eligible = crate::eligible_types(&trigger, &facts);
     let rule_actions = crate::rule_actions(&trigger, &facts, &eligible);
@@ -1331,6 +1420,7 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
     // ask about again, which is what turns a transient GitHub failure into a
     // retry instead of a silently missing review.
     let mut performed = Vec::new();
+    let _github_writes = crate::phase_telemetry::span("review_run_github_writes");
     for call in &plan.gh {
         let report = broker
             .run_coordinated_operation(crate::CoordinatedCommand {
@@ -2365,21 +2455,39 @@ pub(super) fn classify_local_change(
 /// Classify a pull request from what the provider reports.
 ///
 /// The diff text comes from `gh pr diff`; when it cannot be read the contract
-/// scan is reported unknown rather than clean.
+/// scan is reported unknown rather than clean. `diff` is
+/// [`read_pull_request_diff`]'s answer, read by the caller alongside its other
+/// provider reads.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn classify_provider_change(
     policy_root: &Path,
-    repository: &str,
-    pull_request: i64,
     base_commit: Option<&str>,
     files: Vec<crate::ChangedFile>,
     files_complete: bool,
+    diff: Option<Vec<String>>,
     provenance_known: bool,
     facts: &crate::ChangeFacts,
     policy: &crate::ChangeClassificationPolicy,
 ) -> crate::ChangeClassification {
-    let diff = std::process::Command::new("gh")
-        .current_dir(policy_root)
+    // Generated-file attributes come from the pull request's base commit;
+    // without it the attributes are unknown and every file counts.
+    classify_with(
+        policy_root,
+        base_commit.unwrap_or_default(),
+        files,
+        files_complete,
+        diff,
+        facts,
+        provenance_known,
+        policy,
+    )
+}
+
+/// The pull request's unified diff as lines, read-only; `None` when it cannot
+/// be read.
+fn read_pull_request_diff(root: &Path, repository: &str, pull_request: i64) -> Option<Vec<String>> {
+    std::process::Command::new("gh")
+        .current_dir(root)
         .args([
             "pr",
             "diff",
@@ -2397,19 +2505,7 @@ pub(super) fn classify_provider_change(
                 .lines()
                 .map(String::from)
                 .collect::<Vec<_>>()
-        });
-    // Generated-file attributes come from the pull request's base commit;
-    // without it the attributes are unknown and every file counts.
-    classify_with(
-        policy_root,
-        base_commit.unwrap_or_default(),
-        files,
-        files_complete,
-        diff,
-        facts,
-        provenance_known,
-        policy,
-    )
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
