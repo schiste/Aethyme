@@ -294,6 +294,31 @@ const ARTIFACT_WORKER_CAPACITY_REMOVAL_MIN_SLICE: Duration = Duration::from_secs
 const ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS: i64 = 10 * 60_000;
 /// After a slice that found the GC lock held before removing anything.
 const ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS: i64 = 60_000;
+/// After a slice that made progress (the path index or the closed-checkout
+/// cursor moved) but ran out of time before the lap ended: the rest of the
+/// lap has not been judged, so it is not "nothing removable" yet.
+const ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_RETRY_MS: i64 = 60_000;
+
+/// How long capacity pressure alone waits before the next removal slice:
+/// none after a removal, briefly after a held lock or a lap that progressed
+/// but did not end, and the full back-off only once a lap ended (or could
+/// not progress) with nothing removable.
+fn capacity_removal_retry_ms(
+    removed: usize,
+    lock_busy: bool,
+    lap_unfinished: bool,
+    progressed: bool,
+) -> Option<i64> {
+    if removed > 0 {
+        None
+    } else if lock_busy {
+        Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS)
+    } else if lap_unfinished && progressed {
+        Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_RETRY_MS)
+    } else {
+        Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS)
+    }
+}
 /// Removals one slice makes at most, each followed by its pacer charge.
 const ARTIFACT_WORKER_CAPACITY_REMOVALS_PER_SLICE: usize = 4;
 const ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_AFTER_KEY: &str =
@@ -7642,9 +7667,17 @@ impl Broker {
         if !self.recorded_checkout_capacity_pressure() {
             return Ok(None);
         }
+        let progress_before = self.auto_cleanup_progress_marker()?;
         let mut combined: Option<crate::AutoCleanupReport> = None;
         let mut paced_wait = Duration::ZERO;
         let mut lock_busy = false;
+        let mut passes = 0usize;
+        let mut examined = 0usize;
+        let mut selected = 0usize;
+        let mut scan_ms = 0u64;
+        let mut selection_ms = 0u64;
+        let mut apply_ms = 0u64;
+        let mut inventory_unavailable = false;
         while combined
             .as_ref()
             .is_none_or(|report| report.removed.len() < ARTIFACT_WORKER_CAPACITY_REMOVALS_PER_SLICE)
@@ -7653,14 +7686,25 @@ impl Broker {
             if remaining < ARTIFACT_WORKER_CAPACITY_REMOVAL_MIN_SLICE {
                 break;
             }
+            let pass_started = Instant::now();
             let pass = {
                 let _span = crate::phase_telemetry::span("artifact_worker_capacity_removal");
                 self.auto_cleanup_for_checkout_capacity(Duration::ZERO, remaining, Some(1))?
             };
+            let pass_ms = u64::try_from(pass_started.elapsed().as_millis()).unwrap_or(u64::MAX);
             let Some(pass) = pass else {
                 lock_busy = true;
                 break;
             };
+            passes += 1;
+            let pass_lanes = pass.lanes.unwrap_or_default();
+            examined += pass_lanes.removal_examined;
+            selected += pass_lanes.removal_selected;
+            scan_ms = scan_ms.saturating_add(pass_lanes.removal_scan_ms);
+            selection_ms = selection_ms.saturating_add(pass_lanes.removal_elapsed_ms);
+            apply_ms =
+                apply_ms.saturating_add(pass_ms.saturating_sub(pass_lanes.removal_elapsed_ms));
+            inventory_unavailable |= pass_lanes.removal_inventory_unavailable;
             let removed_now = pass.removed.len();
             let removed_ids = pass
                 .removed
@@ -7703,38 +7747,77 @@ impl Broker {
             );
         }
         let removed = combined.as_ref().map_or(0, |report| report.removed.len());
+        let position = self.capacity_removal_lap_position()?;
+        let progressed = self.auto_cleanup_progress_marker()? != progress_before;
+        let lap_unfinished =
+            inventory_unavailable || !position.index_complete || position.lap_remaining > 0;
         // Nothing removable: wait before pressure alone runs another slice.
-        // The lock busy with nothing removed yet: a short wait, so broker
-        // opens do not respawn the worker into the same held lock.
-        let retry_after = if removed > 0 {
-            String::new()
-        } else if lock_busy {
-            now_ms()
-                .saturating_add(ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS)
-                .to_string()
-        } else {
-            now_ms()
-                .saturating_add(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS)
-                .to_string()
-        };
+        // The lock busy, or a lap that moved but did not end: a short wait,
+        // so the rest of the lap is judged soon without broker opens
+        // respawning the worker into the same held lock.
+        let retry_ms = capacity_removal_retry_ms(removed, lock_busy, lap_unfinished, progressed);
+        let retry_after_ms = retry_ms.map(|wait| now_ms().saturating_add(wait));
         self.artifact_sweep_meta_set(
             ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_AFTER_KEY,
-            &retry_after,
+            &retry_after_ms.map(|at| at.to_string()).unwrap_or_default(),
         )?;
         for _ in 0..removed.min(4096) {
             crate::phase_telemetry::add("artifact_worker_capacity_removed", Duration::ZERO);
         }
-        let lanes = combined
-            .as_ref()
-            .and_then(|report| report.lanes)
-            .unwrap_or_default();
+        let outcome = if removed > 0 {
+            "removed"
+        } else if lock_busy {
+            "lock_busy"
+        } else if inventory_unavailable {
+            "inventory_unavailable"
+        } else if lap_unfinished {
+            "lap_unfinished"
+        } else {
+            "nothing_removable"
+        };
+        let telemetry_outcome = match outcome {
+            "removed" => "artifact_worker_capacity_removal_outcome_removed",
+            "lock_busy" => "artifact_worker_capacity_removal_outcome_lock_busy",
+            "inventory_unavailable" => {
+                "artifact_worker_capacity_removal_outcome_inventory_unavailable"
+            }
+            "lap_unfinished" => "artifact_worker_capacity_removal_outcome_lap_unfinished",
+            _ => "artifact_worker_capacity_removal_outcome_nothing_removable",
+        };
+        crate::phase_telemetry::add(telemetry_outcome, Duration::ZERO);
+        crate::phase_telemetry::add(
+            "artifact_worker_capacity_removal_scan",
+            Duration::from_millis(scan_ms),
+        );
+        crate::phase_telemetry::add(
+            "artifact_worker_capacity_removal_selection",
+            Duration::from_millis(selection_ms),
+        );
+        crate::phase_telemetry::add(
+            "artifact_worker_capacity_removal_apply",
+            Duration::from_millis(apply_ms),
+        );
+        let mut slice = crate::auto_cleanup::CapacityRemovalSlice::from_report(combined.as_ref());
+        slice.evaluated_at_ms = now_ms();
+        slice.outcome = outcome.to_string();
+        slice.examined = examined;
+        slice.selected = selected;
+        slice.index_complete = position.index_complete;
+        slice.lap_remaining = position.lap_remaining;
+        slice.cursor_after_session_id = position.after_session_id;
+        slice.cursor_high_water_session_id = position.high_water_session_id;
+        slice.passes = passes;
+        slice.budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+        slice.scan_ms = scan_ms;
+        slice.selection_ms = selection_ms;
+        slice.apply_ms = apply_ms;
+        slice.paced_ms = u64::try_from(paced_wait.as_millis()).unwrap_or(u64::MAX);
+        slice.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        slice.retry_after_ms = retry_after_ms;
+        self.record_capacity_removal_slice(&slice)?;
         self.write_artifact_sweep_worker_status(&format!(
-            "capacity_removal removed={removed} kept={} deferred={} examined={} lock_busy={lock_busy} paced_ms={} elapsed_ms={}",
-            combined.as_ref().map_or(0, |report| report.kept.len()),
-            combined.as_ref().map_or(0, |report| report.deferred),
-            lanes.removal_examined,
-            paced_wait.as_millis(),
-            started.elapsed().as_millis()
+            "capacity_removal removed={removed} kept={} deferred={} examined={examined} lock_busy={lock_busy} paced_ms={} elapsed_ms={} outcome={outcome}",
+            slice.kept, slice.deferred, slice.paced_ms, slice.elapsed_ms
         ))?;
         Ok(combined)
     }
@@ -11119,6 +11202,31 @@ mod tests {
     use super::*;
     use crate::disk_headroom::SweepUrgency;
     use std::cell::RefCell;
+
+    /// A capacity slice that ran out of time with the lap unfinished but
+    /// moved it forward comes back within a minute; only a lap that ended,
+    /// or could not move, earns the ten-minute back-off.
+    #[test]
+    fn an_unfinished_capacity_lap_retries_soon_and_a_finished_one_backs_off() {
+        assert_eq!(capacity_removal_retry_ms(1, false, true, true), None);
+        assert_eq!(
+            capacity_removal_retry_ms(0, true, true, true),
+            Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS)
+        );
+        assert_eq!(
+            capacity_removal_retry_ms(0, false, true, true),
+            Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_RETRY_MS)
+        );
+        assert_eq!(
+            capacity_removal_retry_ms(0, false, true, false),
+            Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS),
+            "a lap that could not move must not spin every minute"
+        );
+        assert_eq!(
+            capacity_removal_retry_ms(0, false, false, true),
+            Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS)
+        );
+    }
 
     #[test]
     fn an_old_environment_cache_journal_directs_archive_then_replan() {

@@ -1008,6 +1008,16 @@ pub struct AutoCleanupLanes {
     /// unbounded.
     #[serde(default)]
     pub removal_apply_reserve_ms: u64,
+    /// Time selection spent obtaining its inventory: finishing the checkout
+    /// path index, reading a page of closed-checkout groups and resolving
+    /// open sessions' paths.
+    #[serde(default)]
+    pub removal_scan_ms: u64,
+    /// Selection judged nothing because no complete checkout inventory was
+    /// available before its deadline (the path index was still mid-lap, or
+    /// the deadline passed while reading it).
+    #[serde(default)]
+    pub removal_inventory_unavailable: bool,
 }
 
 /// What one auto-cleanup pass did.
@@ -1060,6 +1070,102 @@ pub struct AutoCleanupReport {
     /// first, each with the config line that would release it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_by_ignored: Vec<BlockedByIgnored>,
+    /// The background worker's last capacity removal slice, read from its
+    /// own meta key when the report is shown (`gc plan`, `status`); never
+    /// stored inside the report, so no later pass overwrites it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_removal: Option<CapacityRemovalSlice>,
+}
+
+/// Meta key of the background worker's last capacity removal slice.
+pub(crate) const CAPACITY_REMOVAL_SLICE_KEY: &str = "auto_cleanup.capacity_removal";
+
+/// What the background worker's last capacity removal slice did, kept under
+/// its own meta key so the worker's later lanes cannot overwrite it. It says
+/// why a slice removed nothing: no inventory yet, time ran out mid-lap, or
+/// every examined checkout was kept, counted per keep code, with the ignored
+/// directories that keep the most checkouts and the line that would release
+/// each.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CapacityRemovalSlice {
+    pub evaluated_at_ms: i64,
+    /// `removed`; `lock_busy` (another maintenance pass held the GC lock);
+    /// `inventory_unavailable` (no complete checkout inventory before the
+    /// deadline); `lap_unfinished` (time ran out before the closed-checkout
+    /// lap reached its end); `nothing_removable` (the lap ended and every
+    /// examined checkout was kept or deferred).
+    pub outcome: String,
+    pub removed: usize,
+    pub examined: usize,
+    pub selected: usize,
+    pub kept: usize,
+    pub deferred: usize,
+    /// Kept checkouts per machine-readable keep code (`kept[].code`).
+    pub kept_by_code: std::collections::BTreeMap<String, usize>,
+    /// Ignored paths keeping the most closed checkouts, with the
+    /// `[cleanup] regenerable` line that would release a directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by_ignored: Vec<BlockedByIgnored>,
+    /// Whether the checkout path index was complete when the slice ended.
+    pub index_complete: bool,
+    /// Closed-checkout groups after the planner cursor in the current lap.
+    pub lap_remaining: usize,
+    pub cursor_after_session_id: i64,
+    pub cursor_high_water_session_id: i64,
+    /// Removal passes the slice ran (one removal each at most).
+    pub passes: usize,
+    pub budget_ms: u64,
+    /// Selection's inventory time (`lanes.removal_scan_ms`), summed.
+    pub scan_ms: u64,
+    /// Selection time including the inventory, summed.
+    pub selection_ms: u64,
+    /// Revalidation and removal time, summed.
+    pub apply_ms: u64,
+    /// Unattended pacer wait between removals.
+    pub paced_ms: u64,
+    pub elapsed_ms: u64,
+    /// When pressure alone may run the next slice; absent when the slice
+    /// removed something and the next one may run at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<i64>,
+}
+
+impl CapacityRemovalSlice {
+    /// Count `report`'s kept checkouts by code and carry its ignored-path
+    /// blockers; the caller fills the outcome, position and timings.
+    pub(crate) fn from_report(report: Option<&AutoCleanupReport>) -> Self {
+        let Some(report) = report else {
+            return Self::default();
+        };
+        let mut kept_by_code = std::collections::BTreeMap::<String, usize>::new();
+        for kept in &report.kept {
+            let code = if kept.code.is_empty() {
+                kept_reason_code(&kept.reason).to_string()
+            } else {
+                kept.code.clone()
+            };
+            *kept_by_code.entry(code).or_default() += 1;
+        }
+        Self {
+            removed: report.removed.len(),
+            kept: report.kept.len(),
+            deferred: report.deferred,
+            kept_by_code,
+            blocked_by_ignored: report.blocked_by_ignored.clone(),
+            ..Self::default()
+        }
+    }
+}
+
+/// Where the closed-checkout planner stands, for the capacity slice: whether
+/// the path index is complete, the groups left in the current lap, and the
+/// planner cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapacityRemovalLapPosition {
+    pub index_complete: bool,
+    pub lap_remaining: usize,
+    pub after_session_id: i64,
+    pub high_water_session_id: i64,
 }
 
 /// The retirement cursor as reported: the last session judged in the current
@@ -2085,6 +2191,29 @@ thread_local! {
     /// Test seam: selection consumes its whole deadline after selecting.
     static SELECTION_EXHAUSTS_ITS_SHARE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Test seam: cohort-index discovery pages of this many sessions, at
+    /// most this many pages per refresh call, so a small fixture can stand
+    /// in for a lap longer than one call covers.
+    static COHORT_SCAN_LIMITS: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Sessions per cohort-index discovery page.
+fn cleanup_cohort_scan_page_size() -> usize {
+    #[cfg(test)]
+    if let Some((page_size, _)) = COHORT_SCAN_LIMITS.with(std::cell::Cell::get) {
+        return page_size;
+    }
+    CLEANUP_COHORT_SCAN_PAGE_SIZE
+}
+
+/// Discovery pages one cohort-index refresh call may advance.
+fn cleanup_cohort_page_cap() -> usize {
+    #[cfg(test)]
+    if let Some((_, page_cap)) = COHORT_SCAN_LIMITS.with(std::cell::Cell::get) {
+        return page_cap;
+    }
+    CLEANUP_COHORT_UNBOUNDED_PAGE_CAP
 }
 
 /// Meta key of the remembered keep verdicts for closed checkouts held only by
@@ -2627,7 +2756,7 @@ impl Broker {
     ) -> Result<Option<crate::store::cleanup_cohort::CleanupCohortScanState>, BrokerOpError> {
         let page = self.store().cleanup_cohort_scan_page(
             crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
-            CLEANUP_COHORT_SCAN_PAGE_SIZE,
+            cleanup_cohort_scan_page_size(),
             now_ms(),
         )?;
         if !page.dirty_sessions.is_empty() {
@@ -2763,10 +2892,7 @@ impl Broker {
                 return Ok(None);
             };
             pages += 1;
-            if state.complete
-                || deadline_expired(deadline)
-                || pages >= CLEANUP_COHORT_UNBOUNDED_PAGE_CAP
-            {
+            if state.complete || deadline_expired(deadline) || pages >= cleanup_cohort_page_cap() {
                 return Ok(Some(state));
             }
         }
@@ -3420,10 +3546,34 @@ impl Broker {
         let existing = self.store().cleanup_cohort_scan_state(namespace)?;
         let index_state = match existing {
             Some(state) if state.complete => state,
-            _ => match self.refresh_cleanup_cohort_aliases(deadline)? {
-                Some(state) => state,
-                None => return Ok(None),
-            },
+            _ => {
+                // One refresh call advances a bounded number of pages. A
+                // bounded pass keeps resuming the same lap while its deadline
+                // allows and each call makes progress: a lap longer than one
+                // call (thousands of registered sessions) used to leave every
+                // pass without an inventory, so selection judged nothing.
+                // Resuming never rewinds a lap; an unbounded pass keeps the
+                // single bounded call.
+                let _span = crate::phase_telemetry::span("auto_cleanup_cohort_index_refresh");
+                let mut last_progress = None;
+                loop {
+                    let Some(state) = self.refresh_cleanup_cohort_aliases(deadline)? else {
+                        return Ok(None);
+                    };
+                    crate::phase_telemetry::add(
+                        "auto_cleanup_cohort_index_refresh_calls",
+                        Duration::ZERO,
+                    );
+                    if state.complete
+                        || deadline.is_none()
+                        || deadline_expired(deadline)
+                        || last_progress == Some(state.progress_sequence)
+                    {
+                        break state;
+                    }
+                    last_progress = Some(state.progress_sequence);
+                }
+            }
         };
         if !index_state.complete {
             return Ok(None);
@@ -4595,6 +4745,8 @@ impl Broker {
         let planned = plan.report.lanes.unwrap_or_default();
         lanes.removal_examined = planned.removal_examined;
         lanes.removal_memo_skips = planned.removal_memo_skips;
+        lanes.removal_scan_ms = planned.removal_scan_ms;
+        lanes.removal_inventory_unavailable = planned.removal_inventory_unavailable;
         lanes.removal_elapsed_ms = duration_ms(Some(removal_started.elapsed()));
         plan.report.lanes = Some(lanes);
         let report = self.auto_cleanup_apply(plan)?;
@@ -4773,11 +4925,25 @@ impl Broker {
         // and the background worker paces the lap.
         let multi_page = deadline.is_some() && self.checkout_capacity_pressure(deadline);
         let mut first_page = true;
+        let mut scan_elapsed = Duration::ZERO;
         loop {
             let cursor_before_scan = cursor;
-            let Some(scan) = self.auto_cleanup_checkout_groups(&mut cursor, deadline)? else {
+            let scan_started = Instant::now();
+            let scan = self.auto_cleanup_checkout_groups(&mut cursor, deadline)?;
+            scan_elapsed += scan_started.elapsed();
+            let Some(scan) = scan else {
                 if first_page {
                     report.deferred += 1;
+                    crate::phase_telemetry::add("auto_cleanup_removal_scan", scan_elapsed);
+                    crate::phase_telemetry::add(
+                        "auto_cleanup_removal_inventory_unavailable",
+                        Duration::ZERO,
+                    );
+                    report.lanes = Some(AutoCleanupLanes {
+                        removal_scan_ms: duration_ms(Some(scan_elapsed)),
+                        removal_inventory_unavailable: true,
+                        ..AutoCleanupLanes::default()
+                    });
                     return Ok(AutoCleanupPlan::nothing(report));
                 }
                 break;
@@ -5034,9 +5200,11 @@ impl Broker {
             self.store().meta_set(KEEP_MEMO_KEY, &text)?;
         }
         report.blocked_by_ignored = blocked_by_ignored_from_memo(&memo);
+        crate::phase_telemetry::add("auto_cleanup_removal_scan", scan_elapsed);
         report.lanes = Some(AutoCleanupLanes {
             removal_examined: examined,
             removal_memo_skips: memo_skips,
+            removal_scan_ms: duration_ms(Some(scan_elapsed)),
             ..AutoCleanupLanes::default()
         });
         // The current deferred group, if any, was counted above and the cursor
@@ -5378,6 +5546,8 @@ impl Broker {
     ) -> Result<(), BrokerOpError> {
         let mut stored = report.clone();
         stored.assign_kept_codes();
+        // The capacity slice keeps its own key; the report only shows it.
+        stored.capacity_removal = None;
         // A pass whose removal lane judged no checkout (a broker open's
         // inline sliver, the retirement-only worker) must not erase the last
         // removal verdicts: carry them so `status` and `gc plan` keep
@@ -5397,13 +5567,62 @@ impl Broker {
         Ok(())
     }
 
-    /// The last auto-cleanup report, for `status` and `gc plan`.
+    /// The last auto-cleanup report, for `status` and `gc plan`, with the
+    /// background worker's last capacity removal slice attached.
     pub fn last_auto_cleanup_report(&mut self) -> Option<AutoCleanupReport> {
-        self.store()
+        let mut report: AutoCleanupReport = self
+            .store()
             .meta_get(AUTO_CLEANUP_LAST_REPORT_KEY)
             .ok()
             .flatten()
+            .and_then(|text| serde_json::from_str(&text).ok())?;
+        report.capacity_removal = self.last_capacity_removal_slice();
+        Some(report)
+    }
+
+    /// The background worker's last capacity removal slice, from its own
+    /// meta key.
+    pub fn last_capacity_removal_slice(&mut self) -> Option<CapacityRemovalSlice> {
+        self.store()
+            .meta_get(CAPACITY_REMOVAL_SLICE_KEY)
+            .ok()
+            .flatten()
             .and_then(|text| serde_json::from_str(&text).ok())
+    }
+
+    pub(crate) fn record_capacity_removal_slice(
+        &mut self,
+        slice: &CapacityRemovalSlice,
+    ) -> Result<(), BrokerOpError> {
+        let text = serde_json::to_string(slice).expect("serializing the slice is infallible");
+        self.store().meta_set(CAPACITY_REMOVAL_SLICE_KEY, &text)?;
+        Ok(())
+    }
+
+    /// Where the closed-checkout planner stands; reads only the database.
+    pub(crate) fn capacity_removal_lap_position(
+        &mut self,
+    ) -> Result<CapacityRemovalLapPosition, BrokerOpError> {
+        let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
+        let index_complete = self
+            .store()
+            .cleanup_cohort_scan_state(namespace)?
+            .is_some_and(|state| state.complete);
+        let (cursor, _) = self.auto_cleanup_cursor()?;
+        let maximum_group_id = self
+            .store()
+            .cleanup_cohort_group_max_session_id(namespace)?;
+        let lap_remaining = self.store().cleanup_cohort_group_count(
+            namespace,
+            cursor.after_session_id,
+            cursor.high_water_session_id.max(maximum_group_id),
+        )?;
+        Ok(CapacityRemovalLapPosition {
+            index_complete,
+            lap_remaining,
+            after_session_id: cursor.after_session_id,
+            high_water_session_id: cursor.high_water_session_id,
+        })
     }
 
     /// Select under the GC lock, without removing anything.
@@ -8812,6 +9031,147 @@ mod tests {
         assert!(!broker.capacity_removal_due(super::now_ms()).unwrap());
         drop(held);
         assert!(landed.exists());
+        let slice = broker
+            .last_capacity_removal_slice()
+            .expect("a slice records itself");
+        assert_eq!(slice.outcome, "lock_busy", "{slice:#?}");
+        assert_eq!(slice.passes, 0, "{slice:#?}");
+    }
+
+    /// A slice whose checkout path index is mid-lap, with more of the lap
+    /// left than one refresh call advances, finishes the lap and then judges
+    /// checkouts. It used to find no inventory, examine nothing and back off
+    /// for ten minutes; on a repository with thousands of registered
+    /// sessions that happened whenever another lane had rewound the lap.
+    #[cfg(unix)]
+    #[test]
+    fn a_capacity_slice_finishes_a_long_cohort_index_lap_before_selecting() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let (_session, landed) = closed_landed_checkout(&mut broker, "long lap frees a slot");
+        let (_kept_session, kept) = closed_landed_checkout(&mut broker, "long lap keeps notes");
+        std::fs::write(kept.join("notes.txt"), "somebody's notes\n").unwrap();
+        let root = broker.main_root().to_path_buf();
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[worktrees]\nmax_checkouts = 1\n",
+        )
+        .unwrap();
+        let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
+        let mut complete = false;
+        for _ in 0..16 {
+            complete = broker
+                .refresh_cleanup_cohort_aliases(None)
+                .unwrap()
+                .is_some_and(|state| state.complete);
+            if complete {
+                break;
+            }
+        }
+        assert!(complete, "the fixture's path index completes");
+        // Another lane asks for fresh filesystem coverage: the completed lap
+        // is rewound to its start.
+        let rewound = broker
+            .store()
+            .begin_cleanup_cohort_alias_refresh(namespace, super::now_ms())
+            .unwrap();
+        assert!(!rewound.complete);
+        assert_eq!(rewound.after_session_id, 0);
+
+        // One session per page and one page per refresh call: the lap is
+        // longer than any single call, as thousands of sessions are.
+        super::COHORT_SCAN_LIMITS.with(|limits| limits.set(Some((1, 1))));
+        let report = broker.run_capacity_removal_slice(Instant::now());
+        super::COHORT_SCAN_LIMITS.with(|limits| limits.set(None));
+        let report = report.unwrap().expect("pressure runs a slice");
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert!(!landed.exists());
+        assert!(kept.join("notes.txt").is_file());
+        let slice = broker
+            .last_capacity_removal_slice()
+            .expect("a slice records itself");
+        assert_eq!(slice.outcome, "removed", "{slice:#?}");
+        assert!(slice.index_complete, "{slice:#?}");
+    }
+
+    /// The slice's own result survives a later pass's report: `gc plan` and
+    /// `status` show why it removed nothing, counted per keep code, with the
+    /// ignored directory that holds a checkout and the line that would
+    /// release it. Nothing kept is removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_capacity_slice_that_removes_nothing_says_why_in_its_own_record() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let root = broker.main_root().to_path_buf();
+        std::fs::write(root.join(".git/info/exclude"), "project-cache/\n").unwrap();
+        let (_cached_session, cached) = closed_landed_checkout(&mut broker, "slice keeps a cache");
+        touch(&cached, "project-cache/quality/index.json");
+        let (_noted_session, noted) = closed_landed_checkout(&mut broker, "slice keeps notes");
+        std::fs::write(noted.join("notes.txt"), "somebody's notes\n").unwrap();
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[worktrees]\nmax_checkouts = 1\n",
+        )
+        .unwrap();
+
+        let report = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("pressure runs a slice");
+        assert!(report.removed.is_empty(), "{report:#?}");
+        assert!(cached.join("project-cache/quality/index.json").is_file());
+        assert!(noted.join("notes.txt").is_file());
+        let slice = broker
+            .last_capacity_removal_slice()
+            .expect("a slice records itself");
+        assert_eq!(slice.outcome, "nothing_removable", "{slice:#?}");
+        assert_eq!(slice.removed, 0);
+        assert!(slice.examined >= 2, "{slice:#?}");
+        assert_eq!(
+            slice.kept_by_code.get("ignored_content"),
+            Some(&1),
+            "{slice:#?}"
+        );
+        assert_eq!(
+            slice.kept_by_code.get("uncommitted_changes"),
+            Some(&1),
+            "{slice:#?}"
+        );
+        assert_eq!(
+            slice.blocked_by_ignored,
+            vec![super::BlockedByIgnored {
+                name: "project-cache/".into(),
+                checkouts: 1,
+                config_line: Some("[cleanup] regenerable = [\"project-cache\"]".into()),
+            }]
+        );
+        assert!(slice.index_complete, "{slice:#?}");
+        assert_eq!(slice.lap_remaining, 0, "{slice:#?}");
+        assert!(
+            slice
+                .retry_after_ms
+                .is_some_and(|at| at > super::now_ms() + 5 * 60_000),
+            "a finished lap with nothing removable backs off fully: {slice:#?}"
+        );
+
+        // A broker open's pass writes the shared report; the slice record
+        // is not part of it and is still shown alongside it.
+        broker
+            .record_auto_cleanup_report(&AutoCleanupReport {
+                enabled: true,
+                deferred: 2,
+                ..AutoCleanupReport::default()
+            })
+            .unwrap();
+        let stored = broker
+            .store()
+            .meta_get(super::AUTO_CLEANUP_LAST_REPORT_KEY)
+            .unwrap()
+            .unwrap();
+        assert!(!stored.contains("capacity_removal"), "{stored}");
+        let shown = broker.last_auto_cleanup_report().unwrap();
+        assert_eq!(shown.capacity_removal.as_ref(), Some(&slice));
+        let status = broker.status(super::now_ms()).unwrap();
+        assert_eq!(status.capacity_removal.as_ref(), Some(&slice));
     }
 
     /// A closed landed checkout whose only leftover is a cache its tool
