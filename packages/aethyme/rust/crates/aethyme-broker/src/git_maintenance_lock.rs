@@ -919,9 +919,11 @@ fn apply_with_boot_result(
     };
     let main_root = &context.repository_root;
     let (_repository_key, _write_guard) =
-        match crate::operations::try_acquire_local_repository_write_lock(
+        match crate::operations::try_acquire_local_repository_write_lock_as(
             main_root,
             &context.checkout,
+            "git_maintenance_lock_apply",
+            None,
         ) {
             Ok(Some(lock)) => lock,
             Ok(None) => {

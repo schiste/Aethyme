@@ -308,6 +308,25 @@ pub(super) fn render_operation_stats(report: &crate::OperationStats) {
     render_timing_distribution("    narrow lock hold", &report.narrow_lanes.lock_hold_ms);
     render_timing_distribution("    narrow queue wait", &report.narrow_lanes.queue_wait_ms);
     out!(
+        "    lane decisions: {} taken, {} unavailable{}",
+        report.narrow_lanes.taken_count,
+        report.narrow_lanes.unavailable_count,
+        if report.narrow_lanes.unavailable_by_reason.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ({})",
+                report
+                    .narrow_lanes
+                    .unavailable_by_reason
+                    .iter()
+                    .map(|(reason, count)| format!("{reason}: {count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
+    );
+    out!(
         "  hooks outside lock: {} samples",
         report.hooks_outside_lock.sample_count
     );
