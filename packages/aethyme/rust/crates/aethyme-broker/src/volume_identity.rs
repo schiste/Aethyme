@@ -16,9 +16,12 @@
 //!   udev `by-uuid` links are not present everywhere (tmpfs, overlayfs and
 //!   network mounts have none). Records there keep the exact device check.
 //!
-//! The lookup never shells out. Results are cached per process, keyed by the
-//! device number together with the mount's source and mount point, so a
-//! device number later reused by a different mount misses the cache.
+//! The lookup never shells out and is deliberately not cached: on macOS the
+//! device number comes from the disk slot, so a different disk later mounted
+//! at the same slot and mount point (for example a second drive with the same
+//! default name) has the same device, mount source and mount point, and a
+//! cache keyed on them would hand a long-lived process the old volume's UUID.
+//! One `getattrlist` call is a single cheap system call.
 #![cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 
 use std::path::Path;
@@ -64,86 +67,17 @@ pub(crate) fn volume_identity(path: &Path, device: u64, inode: u64) -> VolumeIde
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use std::collections::HashMap;
     use std::path::Path;
-    use std::sync::{Mutex, OnceLock};
 
     use super::VolumeIdentity;
 
-    const MAX_CACHED_MOUNTS: usize = 64;
-
-    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-    struct MountKey {
-        device: u64,
-        mounted_from: Vec<u8>,
-        mounted_on: Vec<u8>,
-    }
-
-    fn cache() -> &'static Mutex<HashMap<MountKey, [u8; 16]>> {
-        static CACHE: OnceLock<Mutex<HashMap<MountKey, [u8; 16]>>> = OnceLock::new();
-        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-    }
-
-    fn c_text(raw: &[libc::c_char]) -> Vec<u8> {
-        raw.iter()
-            .take_while(|byte| **byte != 0)
-            .map(|byte| *byte as u8)
-            .collect()
-    }
-
-    fn mount_key(path: &Path, device: u64) -> Option<MountKey> {
-        use std::os::unix::ffi::OsStrExt;
-        let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-        let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
-        // SAFETY: encoded is NUL terminated and stat points to writable
-        // storage of the exact type statfs fills; it is read only on success.
-        if unsafe { libc::statfs(encoded.as_ptr(), stat.as_mut_ptr()) } != 0 {
-            return None;
-        }
-        // SAFETY: successful statfs initialized the structure (zeroed too).
-        let stat = unsafe { stat.assume_init() };
-        Some(MountKey {
-            device,
-            mounted_from: c_text(&stat.f_mntfromname),
-            mounted_on: c_text(&stat.f_mntonname),
-        })
-    }
-
-    fn object_unchanged(path: &Path, device: u64, inode: u64) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::symlink_metadata(path).is_ok_and(|metadata| {
-            !metadata.file_type().is_symlink()
-                && metadata.dev() == device
-                && metadata.ino() == inode
-        })
-    }
-
     pub(super) fn volume_identity(path: &Path, device: u64, inode: u64) -> VolumeIdentity {
-        let Some(key) = mount_key(path, device) else {
-            return VolumeIdentity::Unknown("the mount of the object could not be read");
-        };
-        let cached = cache()
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(&key).copied());
-        if let Some(uuid) = cached {
-            if object_unchanged(path, device, inode) {
-                return VolumeIdentity::Known(uuid);
-            }
-            return VolumeIdentity::Unknown("the object changed while its volume was read");
-        }
         match crate::worktree_registry::stable_volume_uuid_for_object(path, device, inode) {
-            Ok(uuid) if uuid.iter().any(|byte| *byte != 0) => {
-                if let Ok(mut cache) = cache().lock() {
-                    if cache.len() >= MAX_CACHED_MOUNTS {
-                        cache.clear();
-                    }
-                    cache.insert(key, uuid);
-                }
-                VolumeIdentity::Known(uuid)
-            }
+            Ok(uuid) if uuid.iter().any(|byte| *byte != 0) => VolumeIdentity::Known(uuid),
             Ok(_) => VolumeIdentity::Unknown("the filesystem returned a nil volume UUID"),
-            Err(_) => VolumeIdentity::Unknown("the filesystem did not report a volume UUID"),
+            Err(_) => VolumeIdentity::Unknown(
+                "the filesystem did not report a volume UUID for this object",
+            ),
         }
     }
 }
@@ -186,12 +120,12 @@ mod tests {
         let metadata = std::fs::symlink_metadata(directory.path()).unwrap();
         let first = volume_identity(directory.path(), metadata.dev(), metadata.ino());
         let second = volume_identity(directory.path(), metadata.dev(), metadata.ino());
-        assert_eq!(first, second, "the cached answer must equal the first one");
+        assert_eq!(first, second, "a repeated lookup must give the same answer");
         #[cfg(target_os = "macos")]
         assert!(matches!(first, VolumeIdentity::Known(_)), "{first:?}");
         #[cfg(not(target_os = "macos"))]
         assert!(matches!(first, VolumeIdentity::Unknown(_)), "{first:?}");
-        // A stale observation never borrows the cached identity.
+        // A stale observation of the object never yields an identity.
         assert!(matches!(
             volume_identity(directory.path(), metadata.dev(), metadata.ino() + 1),
             VolumeIdentity::Unknown(_)

@@ -1546,6 +1546,9 @@ pub enum SessionRetirementDeferredReason {
     OperationActive { session_id: i64 },
     /// Task operation or process-use evidence could not be established.
     OperationEvidenceUnavailable { session_id: i64 },
+    /// Artifact-use markers saved before a device renumber keep the checkout
+    /// (rule `legacy_marker_device_renumber`); `markers` counts them.
+    LegacyArtifactMarkers { session_id: i64, markers: usize },
     /// A concurrent SQLite writer prevented the atomic abandonment transition.
     DatabaseBusy { session_id: i64 },
     /// A concurrent SQLite writer prevented retirement cursor progress.
@@ -5361,6 +5364,15 @@ impl Broker {
                             session_id: session.id,
                         },
                     );
+                }
+                crate::broker::AbandonedSessionCloseOutcome::LegacyArtifactMarkers(markers) => {
+                    summary.deferred += 1;
+                    summary
+                        .reasons
+                        .push(SessionRetirementDeferredReason::LegacyArtifactMarkers {
+                            session_id: session.id,
+                            markers,
+                        });
                 }
                 crate::broker::AbandonedSessionCloseOutcome::DatabaseBusy => {
                     summary.deferred += 1;

@@ -25,6 +25,19 @@ const STABLE_MARKER_SCHEMA_VERSION: u32 = 2;
 /// Names the inventory rule that lists a schema-1 marker whose only
 /// difference from this checkout is its mount-scoped device numbers.
 pub(crate) const LEGACY_MARKER_DEVICE_RENUMBER_RULE: &str = "legacy_marker_device_renumber";
+
+/// What a user can do about markers listed through
+/// [`LEGACY_MARKER_DEVICE_RENUMBER_RULE`]. Reconciliation removes such a
+/// marker only when a spawn or registry record saw its old device numbers;
+/// one it retains for lack of that record is left to a manual decision.
+pub(crate) fn legacy_marker_review_hint(session_id: i64) -> String {
+    format!(
+        "`aethyme broker gc artifact-use reconcile plan {session_id}` removes such a marker only \
+         when a spawn or registry record saw its old device numbers; a marker it retains for \
+         lack of that record stays until you confirm its producer process is gone and delete \
+         the marker file under `.aethyme/run/artifact-use/` by hand"
+    )
+}
 // B1's fail-closed reclaimer allowances below stay item-scoped. The same
 // inventory bound also caps explicit marker reconciliation.
 const MAX_MARKERS_PER_CHECKOUT: usize = 256;
@@ -2032,6 +2045,41 @@ fn read_marker_inventory(
         markers.push(marker);
     }
     Ok((markers, legacy_device_renumbered))
+}
+
+/// Test support: leave a schema-1 marker for this checkout that saved device
+/// numbers another mount used, as markers written before a remount do.
+#[cfg(all(test, unix))]
+pub(crate) fn write_renumbered_legacy_marker_for_test(
+    primary_root: &Path,
+    checkout_root: &Path,
+    session_id: i64,
+) -> io::Result<()> {
+    let locations = ArtifactUseLocations::resolve(primary_root, checkout_root)?;
+    if !locations.initialize_layout(ARTIFACT_LAYOUT_LOCK_WAIT)? {
+        return Err(io::Error::other("artifact-use layout is busy"));
+    }
+    let nonce = next_nonce();
+    let marker = ArtifactUseMarker {
+        schema_version: LEGACY_MARKER_SCHEMA_VERSION,
+        nonce: nonce.clone(),
+        primary_root: path_text(&locations.primary_root)?,
+        primary_device: locations.primary_identity.device.wrapping_add(7),
+        primary_inode: locations.primary_identity.inode,
+        primary_volume_uuid: None,
+        checkout_root: path_text(&locations.checkout_root)?,
+        checkout_device: locations.checkout_identity.device.wrapping_add(7),
+        checkout_inode: locations.checkout_identity.inode,
+        checkout_volume_uuid: None,
+        checkout_key: locations.checkout_key.clone(),
+        session_id,
+        invocation_id: format!("test:{session_id}:renumbered"),
+        phase: ArtifactUsePhase::PreDispatch,
+        process: None,
+    };
+    let path = locations.marker_dir.join(format!("{nonce}.json"));
+    let file = create_marker_file(&path)?;
+    write_new_marker(&path, &file, &marker, &locations.marker_dir)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

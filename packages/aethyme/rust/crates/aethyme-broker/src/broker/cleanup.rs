@@ -4833,19 +4833,20 @@ impl Broker {
                             legacy_device_renumbered,
                             ..
                         } => {
-                            let renumbered = if legacy_device_renumbered == 0 {
-                                String::new()
+                            if legacy_device_renumbered == 0 {
+                                format!(
+                                    "artifact-use markers are unresolved; preserved the worktree; \
+                                     review them with `aethyme broker gc artifact-use reconcile plan {session_id}`"
+                                )
                             } else {
                                 format!(
-                                    " ({legacy_device_renumbered} legacy marker(s) matched this \
-                                     checkout after a device renumber: rule {})",
-                                    crate::file_lock::artifact_use::LEGACY_MARKER_DEVICE_RENUMBER_RULE
+                                    "artifact-use markers are unresolved; preserved the worktree; \
+                                     {legacy_device_renumbered} of them were saved before a device \
+                                     renumber (rule {}): {}",
+                                    crate::file_lock::artifact_use::LEGACY_MARKER_DEVICE_RENUMBER_RULE,
+                                    crate::file_lock::artifact_use::legacy_marker_review_hint(session_id)
                                 )
-                            };
-                            format!(
-                                "artifact-use markers are unresolved; preserved the worktree; \
-                                 review them with `aethyme broker gc artifact-use reconcile plan {session_id}`{renumbered}"
-                            )
+                            }
                         }
                         crate::file_lock::artifact_use::ArtifactUseReclaimBlock::ProtocolUnavailable => {
                             unreachable!("unavailable protocol is handled above")

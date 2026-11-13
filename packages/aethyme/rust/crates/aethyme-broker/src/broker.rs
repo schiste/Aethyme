@@ -3008,6 +3008,7 @@ fn push_auto_cleanup_advice(view: &mut StatusView, report: Option<crate::AutoCle
                     | crate::SessionRetirementDeferredReason::WorktreeActivityUnavailable { .. }
                     | crate::SessionRetirementDeferredReason::LeaseLivenessUnavailable { .. }
                     | crate::SessionRetirementDeferredReason::OperationEvidenceUnavailable { .. }
+                    | crate::SessionRetirementDeferredReason::LegacyArtifactMarkers { .. }
             )
         });
     if report.removed.is_empty()
@@ -3094,6 +3095,15 @@ fn push_auto_cleanup_advice(view: &mut StatusView, report: Option<crate::AutoCle
                 ),
                 crate::SessionRetirementDeferredReason::OperationEvidenceUnavailable { session_id } => format!(
                     "session {session_id} remains open because operation or child-use evidence could not be checked"
+                ),
+                crate::SessionRetirementDeferredReason::LegacyArtifactMarkers {
+                    session_id,
+                    markers,
+                } => format!(
+                    "session {session_id} remains open because {markers} artifact-use marker(s) \
+                     saved before a device renumber keep its checkout (rule {}); {}",
+                    crate::file_lock::artifact_use::LEGACY_MARKER_DEVICE_RENUMBER_RULE,
+                    crate::file_lock::artifact_use::legacy_marker_review_hint(*session_id)
                 ),
                 crate::SessionRetirementDeferredReason::LifecycleBusy { session_id } => format!(
                     "session {session_id} retirement will retry after the repository lifecycle operation"

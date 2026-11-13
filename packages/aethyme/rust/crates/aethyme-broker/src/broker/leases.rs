@@ -190,6 +190,10 @@ pub(crate) enum AbandonedSessionCloseOutcome {
     OperationGuardBusy,
     OperationActive,
     OperationEvidenceUnavailable,
+    /// Artifact-use markers saved before a device renumber keep the checkout
+    /// (rule `legacy_marker_device_renumber`); the count is how many. They
+    /// need review, so this stays actionable instead of reading as live work.
+    LegacyArtifactMarkers(usize),
     /// The landed-session lane kept the session open for a recorded reason.
     LandedDeclined(LandedSessionDecline),
 }
@@ -331,7 +335,8 @@ impl LandedSessionDecline {
             | AbandonedSessionCloseOutcome::DatabaseBusy
             | AbandonedSessionCloseOutcome::OperationGuardBusy => Self::Busy,
             AbandonedSessionCloseOutcome::OperationActive => Self::OperationActive,
-            AbandonedSessionCloseOutcome::OperationEvidenceUnavailable => Self::OperationUnknown,
+            AbandonedSessionCloseOutcome::OperationEvidenceUnavailable
+            | AbandonedSessionCloseOutcome::LegacyArtifactMarkers(_) => Self::OperationUnknown,
         })
     }
 
@@ -1349,6 +1354,16 @@ impl Broker {
             ) {
                 Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(reclaimer)) => {
                     _artifact_use_reclaimer = Some(reclaimer);
+                }
+                Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(
+                    crate::file_lock::artifact_use::ArtifactUseReclaimBlock::UnknownProducer {
+                        legacy_device_renumbered,
+                        ..
+                    },
+                )) if legacy_device_renumbered > 0 => {
+                    return Ok(AbandonedSessionCloseOutcome::LegacyArtifactMarkers(
+                        legacy_device_renumbered,
+                    ));
                 }
                 Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(
                     crate::file_lock::artifact_use::ArtifactUseReclaimBlock::Contended
@@ -5009,6 +5024,48 @@ mod generic_guarded_exec_tests {
             "typed task-lease expiry releases the session's explicit and implicit leases"
         );
         assert!(Path::new(&session.worktree_path).exists());
+    }
+
+    /// A marker saved before a device renumber keeps the session open, but
+    /// reports why (instead of reading as live work) so the user can act.
+    #[cfg(unix)]
+    #[test]
+    fn a_renumbered_legacy_artifact_marker_defers_close_distinctly() {
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker
+            .start_worktree("renumbered marker task", None)
+            .unwrap();
+        let old = age_worktree_for_task_retirement(&mut broker, &session);
+        let holder = task_lease_holder(i64::MAX);
+        let binding_id = install_task_lease_binding(&mut broker, &session, &holder, old);
+        crate::file_lock::artifact_use::write_renumbered_legacy_marker_for_test(
+            broker.main_root(),
+            Path::new(&session.worktree_path),
+            session.id,
+        )
+        .unwrap();
+        let mut process_table =
+            synthetic_holder_process_table(session.id, binding_id, &holder, false);
+
+        let outcome = broker
+            .try_close_abandoned_session(
+                session.id,
+                crate::clock::epoch_ms(),
+                72 * 60 * 60 * 1_000,
+                &mut process_table,
+                true,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            AbandonedSessionCloseOutcome::LegacyArtifactMarkers(1)
+        );
+        assert_eq!(
+            LandedSessionDecline::from_outcome(outcome),
+            Some(LandedSessionDecline::OperationUnknown)
+        );
     }
 
     #[cfg(unix)]
