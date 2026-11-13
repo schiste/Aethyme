@@ -7,6 +7,7 @@
     "evaluated_at_ms": "integer",
     "kept": [
       {
+        "code": "string",
         "reason": "string",
         "sessions": [
           "integer"
@@ -14,6 +15,15 @@
         "worktree": "string"
       }
     ],
+    "lanes": {
+      "capacity_pressure": "bool",
+      "removal_budget_ms": "integer",
+      "removal_elapsed_ms": "integer",
+      "removal_examined": "integer",
+      "removal_memo_skips": "integer",
+      "retirement_budget_ms": "integer",
+      "retirement_elapsed_ms": "integer"
+    },
     "removed": [],
     "retirement_cursor": {
       "after_session_id": "integer",

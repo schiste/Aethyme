@@ -10063,7 +10063,7 @@ impl Broker {
 
     /// Registered linked checkouts and the allocation limit `start` enforces,
     /// or `None` when the limit is disabled.
-    pub(super) fn worktree_checkout_usage(&self) -> Result<Option<(usize, u32)>, BrokerOpError> {
+    pub(crate) fn worktree_checkout_usage(&self) -> Result<Option<(usize, u32)>, BrokerOpError> {
         // Invalid placement configuration already has a documented host-root
         // fallback and diagnostic. Keep that behavior, with the bounded
         // default rather than letting invalid policy disable admission.

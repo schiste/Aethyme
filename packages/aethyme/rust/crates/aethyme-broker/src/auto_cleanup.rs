@@ -724,11 +724,90 @@ pub struct AutoRemovedCheckout {
 }
 
 /// One candidate auto-cleanup kept, and why.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AutoKeptCheckout {
     pub worktree: String,
     pub sessions: Vec<i64>,
     pub reason: String,
+    /// Machine-readable form of `reason` ([`kept_reason_code`]): stable
+    /// across wording changes, so tools can count keeps by cause.
+    #[serde(default)]
+    pub code: String,
+    /// Ignored paths, relative to the checkout, that keep it (code
+    /// `ignored_content`). Each is a root Git listed as ignored that no
+    /// built-in witness or `[cleanup] regenerable` glob recognises.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_blockers: Vec<String>,
+}
+
+/// Classify a keep reason into a stable code. The reasons are written by the
+/// proofs above; an unrecognised one is `other`, never a removal.
+pub fn kept_reason_code(reason: &str) -> &'static str {
+    let reason = reason
+        .strip_prefix("changed before removal: ")
+        .unwrap_or(reason);
+    const CODES: &[(&str, &str)] = &[
+        (
+            "ignored content requires explicit cleanup",
+            "ignored_content",
+        ),
+        ("ignored-path classification", "ignored_content_unverified"),
+        ("uncommitted or untracked path", "uncommitted_changes"),
+        ("is in progress", "operation_in_progress"),
+        ("a stash was made", "stash"),
+        ("closed-worktree grace period", "in_grace"),
+        ("is still open", "session_open"),
+        ("is open in this worktree", "session_open"),
+        ("is not closed", "session_open"),
+        (
+            "not contained in the remote default branch",
+            "not_contained",
+        ),
+        ("landing search hit its candidate cap", "not_contained"),
+        ("containment could not be proved", "containment_unproven"),
+        ("no fetched remote default branch", "no_remote_default"),
+        ("pinned by [cleanup] keep", "pinned"),
+        ("still holds", "lease_held"),
+        ("lease liveness", "lease_held"),
+        ("a gate may be running", "gate_running"),
+        ("artifact producer", "artifact_use"),
+        ("artifact-use", "artifact_use"),
+        ("open file", "process_use"),
+        ("spawn-time", "ownership_unproven"),
+        ("broker-owned worktree", "ownership_unproven"),
+        ("no recorded owner", "ownership_unproven"),
+        ("primary checkout", "primary_checkout"),
+        ("cleanup policy", "policy_changed"),
+        ("could not be resolved", "inventory_unresolved"),
+        ("removal failed", "removal_failed"),
+    ];
+    CODES
+        .iter()
+        .find(|(needle, _)| reason.contains(needle))
+        .map_or("other", |(_, code)| code)
+}
+
+/// Time and work each lane of one automatic maintenance pass received.
+/// Removal frees checkout capacity and retirement only prepares it, so the
+/// removal lane always keeps its own share of the pass (and the larger one
+/// once registered checkouts reach three quarters of `max_checkouts`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AutoCleanupLanes {
+    /// Registered linked checkouts were at or above three quarters of
+    /// `[worktrees] max_checkouts` when the pass started.
+    pub capacity_pressure: bool,
+    /// Budget the session-retirement lane was given; 0 when unbounded.
+    pub retirement_budget_ms: u64,
+    pub retirement_elapsed_ms: u64,
+    /// Budget left for closed-checkout removal; 0 when unbounded.
+    pub removal_budget_ms: u64,
+    /// Time the removal lane spent selecting, before revalidation and removal.
+    pub removal_elapsed_ms: u64,
+    /// Closed checkouts the removal lane judged in this pass.
+    pub removal_examined: usize,
+    /// Of those, kept checkouts skipped because the remembered keep verdict
+    /// still matched their HEAD and ignored leftovers.
+    pub removal_memo_skips: usize,
 }
 
 /// What one auto-cleanup pass did.
@@ -772,6 +851,10 @@ pub struct AutoCleanupReport {
     /// Milliseconds the landed lane spent judging sessions.
     #[serde(default, skip_serializing_if = "is_zero_ms")]
     pub landed_retirement_elapsed_ms: u64,
+    /// How the pass divided its budget between retirement and removal.
+    /// Absent from reports written by the retirement-only worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lanes: Option<AutoCleanupLanes>,
 }
 
 /// The retirement cursor as reported: the last session judged in the current
@@ -797,6 +880,15 @@ pub struct LandedSessionRetirementView {
 }
 
 impl AutoCleanupReport {
+    /// Give every kept checkout its machine-readable code.
+    pub(crate) fn assign_kept_codes(&mut self) {
+        for kept in &mut self.kept {
+            if kept.code.is_empty() {
+                kept.code = kept_reason_code(&kept.reason).to_string();
+            }
+        }
+    }
+
     /// Fold one retirement summary's landed-lane counts into this report.
     fn absorb_landed_retirement(&mut self, retirement: &SessionRetirementSummary) {
         self.landed_sessions_examined = self
@@ -1615,6 +1707,63 @@ fn ensure_ignored_content_before(deadline: Instant) -> Result<(), String> {
         Err("ignored-path classification exceeded its time budget".into())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the retirement lane consumes its whole deadline.
+    static RETIREMENT_EXHAUSTS_ITS_SHARE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Passes shorter than this (a broker open's inline sweep) do not spend part
+/// of their budget counting registered checkouts.
+const CAPACITY_PROBE_MIN_BUDGET: Duration = Duration::from_secs(1);
+
+/// The share of a pass the session-retirement lane may use, as
+/// `(numerator, denominator)`: half normally, a quarter under capacity
+/// pressure, when removal is what frees a slot.
+fn retirement_share(capacity_pressure: bool) -> (u32, u32) {
+    if capacity_pressure { (1, 4) } else { (1, 2) }
+}
+
+/// The deadline of a lane that may use `share` of what is left of the pass.
+/// Unbounded passes stay unbounded.
+fn lane_deadline(
+    started: Instant,
+    deadline: Option<Instant>,
+    (numerator, denominator): (u32, u32),
+) -> Option<Instant> {
+    deadline.map(|end| {
+        let total = end.saturating_duration_since(started);
+        started + total * numerator / denominator.max(1)
+    })
+}
+
+fn duration_ms(duration: Option<Duration>) -> u64 {
+    duration.map_or(0, |duration| {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    })
+}
+
+/// Phase-level counters for one maintenance pass (`aethyme broker advanced
+/// metrics` and `command-metrics.jsonl`).
+fn record_lane_telemetry(report: &AutoCleanupReport) {
+    let Some(lanes) = report.lanes else {
+        return;
+    };
+    let count = |name: &'static str, times: usize| {
+        for _ in 0..times.min(4096) {
+            crate::phase_telemetry::add(name, Duration::ZERO);
+        }
+    };
+    count("auto_cleanup_removal_examined", lanes.removal_examined);
+    count("auto_cleanup_removal_memo_skips", lanes.removal_memo_skips);
+    count("auto_cleanup_removed", report.removed.len());
+    count("auto_cleanup_kept", report.kept.len());
+    if lanes.capacity_pressure {
+        count("auto_cleanup_capacity_pressure", 1);
     }
 }
 
@@ -2624,6 +2773,7 @@ impl Broker {
                 worktree: path.to_string_lossy().into_owned(),
                 sessions: ids.clone(),
                 reason,
+                ..Default::default()
             })
         };
         if !group.complete {
@@ -3038,6 +3188,21 @@ impl Broker {
         deadline: Option<Instant>,
     ) -> Result<SessionRetirementSummary, BrokerOpError> {
         let mut summary = SessionRetirementSummary::default();
+        #[cfg(test)]
+        if RETIREMENT_EXHAUSTS_ITS_SHARE.with(std::cell::Cell::get)
+            && let Some(deadline) = deadline
+        {
+            // Stand-in for a landed lap whose proofs use every millisecond
+            // the lane is given.
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            summary.deferred = 1;
+            summary
+                .reasons
+                .push(SessionRetirementDeferredReason::DeadlineExceeded {
+                    after_session_id: 0,
+                });
+            return Ok(summary);
+        }
         if deadline_expired(deadline) {
             summary.deferred = 1;
             summary
@@ -3425,7 +3590,30 @@ impl Broker {
         &mut self,
         deadline: Option<Instant>,
     ) -> Result<AutoCleanupReport, BrokerOpError> {
-        let retirement = self.retire_abandoned_sessions(deadline)?;
+        let pass_started = Instant::now();
+        let capacity_pressure = self.checkout_capacity_pressure(deadline);
+        // Retirement only prepares capacity (a closed checkout still waits
+        // out its grace); removal frees it. Retirement gets a bounded share
+        // and removal the rest of the pass, including whatever retirement
+        // leaves unused, so a heavy retirement lap can no longer starve the
+        // removal lane of every pass.
+        let retirement_deadline =
+            lane_deadline(pass_started, deadline, retirement_share(capacity_pressure));
+        let mut lanes = AutoCleanupLanes {
+            capacity_pressure,
+            retirement_budget_ms: duration_ms(
+                retirement_deadline.map(|end| end.saturating_duration_since(pass_started)),
+            ),
+            ..AutoCleanupLanes::default()
+        };
+        let retirement = {
+            let _span = crate::phase_telemetry::span("auto_cleanup_retirement_lane");
+            self.retire_abandoned_sessions(retirement_deadline)?
+        };
+        let removal_started = Instant::now();
+        lanes.retirement_elapsed_ms = duration_ms(Some(removal_started - pass_started));
+        lanes.removal_budget_ms =
+            duration_ms(deadline.map(|end| end.saturating_duration_since(removal_started)));
         if retirement.reasons.iter().any(|reason| {
             matches!(
                 reason,
@@ -3450,15 +3638,41 @@ impl Broker {
             report.deferred = retirement.deferred;
             report.sessions_retired = retirement.retired;
             report.retirement_deferred_reasons = retirement.reasons;
+            report.lanes = Some(lanes);
             return Ok(report);
         }
-        let mut plan = self.auto_cleanup_plan(deadline)?;
+        let mut plan = {
+            let _span = crate::phase_telemetry::span("auto_cleanup_removal_lane");
+            self.auto_cleanup_plan(deadline)?
+        };
         plan.report.absorb_landed_retirement(&retirement);
         plan.report.sessions_retired = retirement.retired;
         plan.report.deferred += retirement.deferred;
         plan.report.retirement_deferred_reasons = retirement.reasons;
+        let planned = plan.report.lanes.unwrap_or_default();
+        lanes.removal_examined = planned.removal_examined;
+        lanes.removal_memo_skips = planned.removal_memo_skips;
+        lanes.removal_elapsed_ms = duration_ms(Some(removal_started.elapsed()));
+        plan.report.lanes = Some(lanes);
         let report = self.auto_cleanup_apply(plan)?;
+        record_lane_telemetry(&report);
         Ok(report)
+    }
+
+    /// Whether registered linked checkouts are at or above three quarters of
+    /// `[worktrees] max_checkouts`. One `git worktree list`; skipped (false)
+    /// when the pass is too short to afford it or the limit is disabled.
+    fn checkout_capacity_pressure(&self, deadline: Option<Instant>) -> bool {
+        if deadline.is_some_and(|end| {
+            end.saturating_duration_since(Instant::now()) < CAPACITY_PROBE_MIN_BUDGET
+        }) {
+            return false;
+        }
+        matches!(
+            self.worktree_checkout_usage(),
+            Ok(Some((count, maximum)))
+                if count.saturating_mul(4) >= (maximum as usize).saturating_mul(3)
+        )
     }
 
     /// Select the checkouts every proof currently allows removing. Removes
@@ -3515,145 +3729,191 @@ impl Broker {
             }
         };
         let (mut cursor, mut expected_cursor) = self.auto_cleanup_cursor()?;
-        let cursor_before_scan = cursor;
-        let Some(scan) = self.auto_cleanup_checkout_groups(&mut cursor, deadline)? else {
-            report.deferred += 1;
-            return Ok(AutoCleanupPlan::nothing(report));
-        };
-        if scan.unresolved_rows > 0 {
-            report.kept.push(AutoKeptCheckout {
-                worktree: "<session checkout inventory>".into(),
-                sessions: Vec::new(),
-                reason: format!(
-                    "{} session checkout path(s) could not be resolved; cleanup remains blocked",
-                    scan.unresolved_rows
-                ),
-            });
-            return Ok(AutoCleanupPlan::nothing(report));
-        }
-        if cursor != cursor_before_scan {
-            self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
-        }
-        // Older installed routers do not write the close outbox atomically.
-        // Reconcile only this rotating, bounded cohort page so a closure made
-        // by one of those clients eventually receives its original grace
-        // without turning routine maintenance into a full-history query.
-        let legacy_closed_spawned_ids = scan
-            .groups
-            .iter()
-            .filter(|group| !policy.is_pinned(&group.worktree))
-            .flat_map(|group| group.sessions.iter())
-            .filter(|session| {
-                session.origin == SessionOrigin::Spawned
-                    && session.status.is_closed()
-                    && session.cleanup_state == SessionCleanupState::Closed
-            })
-            .map(|session| session.id)
-            .collect::<Vec<_>>();
-        self.store().request_closed_spawned_checkout_cleanups(
-            &legacy_closed_spawned_ids,
-            cleanup_grace_hours,
-            now_ms(),
-        )?;
-        let alias_refresh_generation = scan.alias_refresh_generation;
-
         let mut upstream_checked = false;
         let mut upstream = None;
         let mut selected = Vec::new();
         let mut lease_process_table = LeaseProcessTableSnapshot::default();
-        for group in scan.groups {
-            if deadline_expired(deadline) {
+        let mut alias_refresh_generation = None;
+        let mut examined = 0_usize;
+        let memo_skips = 0_usize;
+        let mut first_page = true;
+        loop {
+            let cursor_before_scan = cursor;
+            let Some(scan) = self.auto_cleanup_checkout_groups(&mut cursor, deadline)? else {
+                if first_page {
+                    report.deferred += 1;
+                    return Ok(AutoCleanupPlan::nothing(report));
+                }
+                break;
+            };
+            if scan.unresolved_rows > 0 {
+                report.kept.push(AutoKeptCheckout {
+                    worktree: "<session checkout inventory>".into(),
+                    sessions: Vec::new(),
+                    reason: format!(
+                        "{} session checkout path(s) could not be resolved; cleanup remains blocked",
+                        scan.unresolved_rows
+                    ),
+                    ..Default::default()
+                });
+                return Ok(AutoCleanupPlan::nothing(report));
+            }
+            if cursor != cursor_before_scan {
+                self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
+            }
+            // Older installed routers do not write the close outbox atomically.
+            // Reconcile only this rotating, bounded cohort page so a closure made
+            // by one of those clients eventually receives its original grace
+            // without turning routine maintenance into a full-history query.
+            let legacy_closed_spawned_ids = scan
+                .groups
+                .iter()
+                .filter(|group| !policy.is_pinned(&group.worktree))
+                .flat_map(|group| group.sessions.iter())
+                .filter(|session| {
+                    session.origin == SessionOrigin::Spawned
+                        && session.status.is_closed()
+                        && session.cleanup_state == SessionCleanupState::Closed
+                })
+                .map(|session| session.id)
+                .collect::<Vec<_>>();
+            self.store().request_closed_spawned_checkout_cleanups(
+                &legacy_closed_spawned_ids,
+                cleanup_grace_hours,
+                now_ms(),
+            )?;
+            if alias_refresh_generation
+                .is_some_and(|generation| generation != scan.alias_refresh_generation)
+            {
+                // The path index moved under this pass; the next pass starts a
+                // fresh selection against the new lap.
                 break;
             }
-            let cursor_session_id = checkout_group_cursor_session_id(&group);
-            let inspection =
-                inspect_group(self, &group, &scan.live, &scan.live_worktrees, deadline)?;
-            let mut stop_for_deadline = false;
-            let inspection = if deadline_expired(deadline) {
-                stop_for_deadline = true;
-                AutoCleanupGroupInspection::Deferred
-            } else {
-                inspection
-            };
-            match inspection {
-                AutoCleanupGroupInspection::Candidate(candidate) => {
-                    let candidate = *candidate;
-                    if !upstream_checked {
-                        upstream_checked = true;
-                        upstream = {
-                            let _git_deadline = deadline.map(crate::git::limit_git_until);
-                            self.remote_default_ref_and_tip()
-                        };
-                    }
-                    if deadline_expired(deadline) {
-                        report.deferred += 1;
-                        stop_for_deadline = true;
-                    } else if let Some(upstream) = upstream.as_ref() {
-                        let verdict = self.auto_cleanup_verdict(
-                            &candidate,
-                            &policy,
-                            upstream,
-                            AutoCleanupVerdictOptions {
-                                deep: false,
-                                deadline,
-                                selected: None,
-                                lease_process_table: &mut lease_process_table,
-                            },
-                        );
-                        let verdict = match verdict {
-                            Err(NotRemoved::Defer) if !deadline_expired(deadline) => self
-                                .auto_cleanup_verdict(
-                                    &candidate,
-                                    &policy,
-                                    upstream,
-                                    AutoCleanupVerdictOptions {
-                                        deep: true,
-                                        deadline,
-                                        selected: None,
-                                        lease_process_table: &mut lease_process_table,
-                                    },
-                                ),
-                            verdict => verdict,
-                        };
+            alias_refresh_generation = Some(scan.alias_refresh_generation);
+
+            let mut stop_pass = false;
+            for group in scan.groups {
+                if deadline_expired(deadline) {
+                    stop_pass = true;
+                    break;
+                }
+                examined += 1;
+                let cursor_session_id = checkout_group_cursor_session_id(&group);
+                let inspection =
+                    inspect_group(self, &group, &scan.live, &scan.live_worktrees, deadline)?;
+                let mut stop_for_deadline = false;
+                let inspection = if deadline_expired(deadline) {
+                    stop_for_deadline = true;
+                    AutoCleanupGroupInspection::Deferred
+                } else {
+                    inspection
+                };
+                match inspection {
+                    AutoCleanupGroupInspection::Candidate(candidate) => {
+                        let candidate = *candidate;
+                        if !upstream_checked {
+                            upstream_checked = true;
+                            upstream = {
+                                let _git_deadline = deadline.map(crate::git::limit_git_until);
+                                self.remote_default_ref_and_tip()
+                            };
+                        }
                         if deadline_expired(deadline) {
                             report.deferred += 1;
                             stop_for_deadline = true;
-                        } else {
-                            match verdict {
-                                Ok(proof) => selected.push((candidate, proof)),
-                                Err(NotRemoved::Defer) => report.deferred += 1,
-                                Err(NotRemoved::Keep(reason)) => {
-                                    report.kept.push(AutoKeptCheckout {
-                                        worktree: candidate.worktree.to_string_lossy().into_owned(),
-                                        sessions: candidate.session_ids(),
-                                        reason,
-                                    })
+                        } else if let Some(upstream) = upstream.as_ref() {
+                            let verdict = self.auto_cleanup_verdict(
+                                &candidate,
+                                &policy,
+                                upstream,
+                                AutoCleanupVerdictOptions {
+                                    deep: false,
+                                    deadline,
+                                    selected: None,
+                                    lease_process_table: &mut lease_process_table,
+                                },
+                            );
+                            let verdict = match verdict {
+                                Err(NotRemoved::Defer) if !deadline_expired(deadline) => self
+                                    .auto_cleanup_verdict(
+                                        &candidate,
+                                        &policy,
+                                        upstream,
+                                        AutoCleanupVerdictOptions {
+                                            deep: true,
+                                            deadline,
+                                            selected: None,
+                                            lease_process_table: &mut lease_process_table,
+                                        },
+                                    ),
+                                verdict => verdict,
+                            };
+                            if deadline_expired(deadline) {
+                                report.deferred += 1;
+                                stop_for_deadline = true;
+                            } else {
+                                match verdict {
+                                    Ok(proof) => selected.push((candidate, proof)),
+                                    Err(NotRemoved::Defer) => report.deferred += 1,
+                                    Err(NotRemoved::Keep(reason)) => {
+                                        report.kept.push(AutoKeptCheckout {
+                                            worktree: candidate
+                                                .worktree
+                                                .to_string_lossy()
+                                                .into_owned(),
+                                            sessions: candidate.session_ids(),
+                                            reason,
+                                            ..Default::default()
+                                        })
+                                    }
                                 }
                             }
+                        } else {
+                            report.kept.push(AutoKeptCheckout {
+                                worktree: candidate.worktree.to_string_lossy().into_owned(),
+                                sessions: candidate.session_ids(),
+                                reason: "no fetched remote default branch (origin/HEAD) to prove containment against".into(),
+                                ..Default::default()
+                            });
                         }
-                    } else {
-                        report.kept.push(AutoKeptCheckout {
-                            worktree: candidate.worktree.to_string_lossy().into_owned(),
-                            sessions: candidate.session_ids(),
-                            reason: "no fetched remote default branch (origin/HEAD) to prove containment against".into(),
-                        });
+                    }
+                    AutoCleanupGroupInspection::Kept(kept) => report.kept.push(kept),
+                    AutoCleanupGroupInspection::Deferred => {
+                        report.deferred += 1;
+                        // A selected-group deferral means its proof exhausted
+                        // this tranche. Checkpoint it below, then let the next
+                        // pass resume at the following complete group.
+                        stop_for_deadline = true;
                     }
                 }
-                AutoCleanupGroupInspection::Kept(kept) => report.kept.push(kept),
-                AutoCleanupGroupInspection::Deferred => {
-                    report.deferred += 1;
-                    // A selected-group deferral means its proof exhausted
-                    // this tranche. Checkpoint it below, then let the next
-                    // pass resume at the following complete group.
-                    stop_for_deadline = true;
+                cursor.after_session_id = cursor_session_id;
+                self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
+                if stop_for_deadline {
+                    stop_pass = true;
+                    break;
                 }
             }
-            cursor.after_session_id = cursor_session_id;
-            self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
-            if stop_for_deadline {
+            first_page = false;
+            // Bounded passes move on to the next page of closed checkouts while
+            // time remains, up to the end of the current lap; an unbounded pass
+            // (an operator's or a test's) keeps its one-page tranche.
+            if stop_pass
+                || deadline.is_none()
+                || deadline_expired(deadline)
+                || self.store().cleanup_cohort_group_count(
+                    crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+                    cursor.after_session_id,
+                    cursor.high_water_session_id,
+                )? == 0
+            {
                 break;
             }
         }
+        report.lanes = Some(AutoCleanupLanes {
+            removal_examined: examined,
+            removal_memo_skips: memo_skips,
+            ..AutoCleanupLanes::default()
+        });
         // The current deferred group, if any, was counted above and the cursor
         // persisted through it. On an early deadline break it still points to
         // the prior group, so this adds the unvisited suffix in either case.
@@ -3668,7 +3928,7 @@ impl Broker {
             upstream,
             selected,
             deadline,
-            alias_refresh_generation: Some(alias_refresh_generation),
+            alias_refresh_generation,
         })
     }
 
@@ -3698,11 +3958,13 @@ impl Broker {
                 });
             if !alias_snapshot_current {
                 report.deferred = report.deferred.saturating_add(selected.len());
+                report.assign_kept_codes();
                 self.record_auto_cleanup_report(&report)?;
                 return Ok(report);
             }
         }
         let Some(upstream) = upstream.filter(|_| !selected.is_empty()) else {
+            report.assign_kept_codes();
             self.record_auto_cleanup_report(&report)?;
             return Ok(report);
         };
@@ -3710,6 +3972,7 @@ impl Broker {
             Ok(Some(claim)) => claim,
             Ok(None) => {
                 report.deferred = report.deferred.saturating_add(selected.len());
+                report.assign_kept_codes();
                 self.record_auto_cleanup_report(&report)?;
                 return Ok(report);
             }
@@ -3719,7 +3982,9 @@ impl Broker {
                     worktree: "<session checkout inventory>".into(),
                     sessions: Vec::new(),
                     reason: format!("could not claim the worktree lifecycle: {error}"),
+                    ..Default::default()
                 });
+                report.assign_kept_codes();
                 self.record_auto_cleanup_report(&report)?;
                 return Ok(report);
             }
@@ -3736,7 +4001,9 @@ impl Broker {
                 worktree: "<session checkout inventory>".into(),
                 sessions: Vec::new(),
                 reason: "registered checkout paths changed during filesystem alias verification; cleanup requires a fresh pass".into(),
+                ..Default::default()
             });
+            report.assign_kept_codes();
             self.record_auto_cleanup_report(&report)?;
             return Ok(report);
         }
@@ -3756,6 +4023,7 @@ impl Broker {
                     worktree: worktree_text.clone(),
                     sessions: candidate.session_ids(),
                     reason,
+                    ..Default::default()
                 });
             };
             let artifact_use_reclaimer =
@@ -3873,6 +4141,7 @@ impl Broker {
                 Err(error) => keep_it(&mut report, format!("removal failed: {error}")),
             }
         }
+        report.assign_kept_codes();
         self.record_auto_cleanup_report(&report)?;
         Ok(report)
     }
@@ -3917,7 +4186,19 @@ impl Broker {
         &mut self,
         report: &AutoCleanupReport,
     ) -> Result<(), BrokerOpError> {
-        let text = serde_json::to_string(report).unwrap_or_default();
+        let mut stored = report.clone();
+        stored.assign_kept_codes();
+        // A pass whose removal lane judged no checkout (a broker open's
+        // inline sliver, the retirement-only worker) must not erase the last
+        // removal verdicts: carry them so `status` and `gc plan` keep
+        // showing what holds each closed checkout.
+        let removal_judged = stored.lanes.is_some_and(|lanes| lanes.removal_examined > 0)
+            || !stored.removed.is_empty()
+            || !stored.kept.is_empty();
+        if !removal_judged && let Some(previous) = self.last_auto_cleanup_report() {
+            stored.kept = previous.kept;
+        }
+        let text = serde_json::to_string(&stored).unwrap_or_default();
         self.store().meta_set(AUTO_CLEANUP_LAST_REPORT_KEY, &text)?;
         Ok(())
     }
@@ -6262,6 +6543,7 @@ mod tests {
                     worktree: group.worktree.to_string_lossy().into_owned(),
                     sessions: group.sessions.iter().map(|session| session.id).collect(),
                     reason: "injected planner inspection".into(),
+                    ..Default::default()
                 }))
             })
             .unwrap();
@@ -6350,6 +6632,7 @@ mod tests {
                         worktree: group.worktree.to_string_lossy().into_owned(),
                         sessions: vec![session_id],
                         reason: "injected resumed inspection".into(),
+                        ..Default::default()
                     }))
                 }
             })
@@ -6376,6 +6659,7 @@ mod tests {
                     worktree: group.worktree.to_string_lossy().into_owned(),
                     sessions: vec![session_id],
                     reason: "injected resumed inspection".into(),
+                    ..Default::default()
                 }))
             })
             .unwrap();
@@ -6901,6 +7185,119 @@ mod tests {
                 assert!(worktree.join("tool-cache/entry.bin").exists());
             }
         }
+    }
+
+    /// A closed session whose checkout holds no commit of its own: contained
+    /// in the fetched default branch by ancestry and past its (zero) grace.
+    #[cfg(unix)]
+    fn closed_landed_checkout(
+        broker: &mut crate::Broker,
+        label: &str,
+    ) -> (crate::Session, PathBuf) {
+        let session = broker.start_worktree(label, None).unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        broker
+            .close_abandoning_unpushed(session.id, "closed landed checkout fixture")
+            .unwrap();
+        (session, worktree)
+    }
+
+    /// The busiest repository's starvation: a retirement lap that uses every
+    /// millisecond it is given no longer leaves the removal lane nothing.
+    /// Before the lanes had shares, retirement ran to the pass deadline and
+    /// the planner deferred with `removed: []` and `kept: []`.
+    #[cfg(unix)]
+    #[test]
+    fn removal_keeps_its_share_when_retirement_exhausts_its_own() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let (_session, worktree) =
+            closed_landed_checkout(&mut broker, "retirement exhausts its share");
+        super::RETIREMENT_EXHAUSTS_ITS_SHARE.with(|flag| flag.set(true));
+        let report =
+            broker.auto_remove_disposable_checkouts(Some(Instant::now() + Duration::from_secs(30)));
+        super::RETIREMENT_EXHAUSTS_ITS_SHARE.with(|flag| flag.set(false));
+        let report = report.unwrap();
+        assert!(
+            report
+                .retirement_deferred_reasons
+                .iter()
+                .any(|reason| matches!(
+                    reason,
+                    SessionRetirementDeferredReason::DeadlineExceeded { .. }
+                )),
+            "{report:#?}"
+        );
+        let lanes = report.lanes.expect("a maintenance pass reports its lanes");
+        assert!(!lanes.capacity_pressure, "{lanes:?}");
+        assert!(
+            (14_000..=15_000).contains(&lanes.retirement_budget_ms),
+            "retirement gets half of the pass: {lanes:?}"
+        );
+        assert!(lanes.removal_budget_ms > 0, "{lanes:?}");
+        assert!(lanes.removal_examined >= 1, "{lanes:?}");
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert!(!worktree.exists(), "the closed landed checkout is removed");
+    }
+
+    #[test]
+    fn lane_shares_give_removal_the_larger_part_under_capacity_pressure() {
+        use std::time::{Duration, Instant};
+        let started = Instant::now();
+        let end = started + Duration::from_secs(40);
+        assert_eq!(
+            super::lane_deadline(started, Some(end), super::retirement_share(false)),
+            Some(started + Duration::from_secs(20))
+        );
+        assert_eq!(
+            super::lane_deadline(started, Some(end), super::retirement_share(true)),
+            Some(started + Duration::from_secs(10))
+        );
+        assert_eq!(
+            super::lane_deadline(started, None, super::retirement_share(true)),
+            None
+        );
+    }
+
+    #[test]
+    fn keep_reasons_have_stable_codes() {
+        for (reason, code) in [
+            (
+                "ignored content requires explicit cleanup: ignored path cache/ is not a recognised build-output directory",
+                "ignored_content",
+            ),
+            (
+                "changed before removal: 2 uncommitted or untracked path(s), first: a.txt",
+                "uncommitted_changes",
+            ),
+            (
+                "session 7 is within the 24 hour closed-worktree grace period",
+                "in_grace",
+            ),
+            (
+                "session 7 is still open (active) in this worktree",
+                "session_open",
+            ),
+            (
+                "commits are not contained in the remote default branch",
+                "not_contained",
+            ),
+            (
+                "no matching spawn-time worktree instance witness",
+                "ownership_unproven",
+            ),
+            ("something new", "other"),
+        ] {
+            assert_eq!(super::kept_reason_code(reason), code, "{reason}");
+        }
+        let mut report = super::AutoCleanupReport {
+            kept: vec![super::AutoKeptCheckout {
+                reason: "pinned by [cleanup] keep".into(),
+                ..Default::default()
+            }],
+            ..super::AutoCleanupReport::default()
+        };
+        report.assign_kept_codes();
+        assert_eq!(report.kept[0].code, "pinned");
     }
 
     /// The retirement cursor resumes where the last pass stopped instead of

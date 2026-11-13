@@ -131,7 +131,15 @@ the directory goes:
    ancestry or by the verbatim content/patch proof. Local `main` and the
    integration branch do not count.
 
-Anything the sweep cannot decide keeps the checkout, with the reason in
+Each pass splits its budget between two lanes: session retirement (closing
+abandoned or landed sessions) gets half, or a quarter once registered linked
+checkouts reach three quarters of `[worktrees].max_checkouts`, and removal of
+closed checkouts gets the rest. Removal frees capacity; retirement only prepares
+it, so retirement can no longer use a whole pass. `auto_cleanup.lanes` reports
+each lane's budget, time and the checkouts the removal lane judged.
+
+Anything the sweep cannot decide keeps the checkout, with the reason and a
+stable `code` in
 `aethyme broker gc plan --json` (`auto_cleanup.kept[]`) and a
 `cleanup.auto-removal` row in `broker status`. Once registered linked
 checkouts reach three quarters of `[worktrees].max_checkouts`, a
