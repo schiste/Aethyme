@@ -1505,6 +1505,203 @@ fn ensure_root(
     }
 }
 
+/// Stable volume bindings for root rows. Additive at schema version 3: older
+/// binaries check only that `rotation_root` and `rotation_debt` exist, so they
+/// keep working and ignore this table. A row binds a volume UUID to the exact
+/// `root_identity` bytes it was recorded with; once the root row's identity
+/// changes (for example an older binary reset a clean root), the binding no
+/// longer applies and is ignored.
+const ROOT_VOLUME_TABLE: &str = "CREATE TABLE IF NOT EXISTS rotation_root_volume(
+    root_path BLOB PRIMARY KEY NOT NULL CHECK(length(root_path) BETWEEN 1 AND 4096),
+    root_identity BLOB NOT NULL CHECK(length(root_identity) BETWEEN 1 AND 512),
+    volume_uuid BLOB NOT NULL CHECK(length(volume_uuid)=16),
+    rule TEXT NOT NULL CHECK(length(rule) BETWEEN 1 AND 64),
+    recorded_at_ms INTEGER NOT NULL
+ ) WITHOUT ROWID;";
+
+/// Rule recorded when a root's volume UUID is first observed while the saved
+/// identity still matches the live root exactly.
+pub(crate) const ROOT_VOLUME_OBSERVED: &str = "observed";
+
+/// One root row's identity state, read without mutating the journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RootVolumeState {
+    pub(crate) saved_identity: Vec<u8>,
+    /// No debt rows and every lap counter settled: `ensure_root` may reset it.
+    pub(crate) clean: bool,
+    pub(crate) debt_rows: i64,
+    /// Volume UUID bound to exactly `saved_identity`, when one was recorded.
+    pub(crate) bound_volume: Option<[u8; 16]>,
+}
+
+/// Read a root row's saved identity, settlement and volume binding. `None`
+/// when the journal or the row does not exist.
+pub(crate) fn root_volume_state(
+    resource_db: &Path,
+    cache_root: &Path,
+) -> io::Result<Option<RootVolumeState>> {
+    let root = root_path_bytes(cache_root)?;
+    let path = path_for_resource_db(resource_db)?;
+    let Some(mut connection) = open_reader(&path)? else {
+        return Ok(None);
+    };
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(sqlite_error)?;
+    if !ensure_schema(&transaction, false)? {
+        return Ok(None);
+    }
+    let state: Option<RotationRootRow> = transaction
+        .query_row(
+            "SELECT root_identity, generation, completed_generation, lap_generation, cursor, \
+             lap_incomplete, lap_state FROM rotation_root WHERE root_path=?1",
+            params![root],
+            |row| {
+                Ok(RotationRootRow {
+                    root_identity: row.get(0)?,
+                    generation: row.get(1)?,
+                    completed_generation: row.get(2)?,
+                    lap_generation: row.get(3)?,
+                    cursor: row.get(4)?,
+                    lap_incomplete: row.get(5)?,
+                    lap_state: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    validate_root_row(&state)?;
+    let debt_rows: i64 = transaction
+        .query_row(
+            "SELECT count(*) FROM rotation_debt WHERE root_path=?1",
+            params![root],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let bound_volume = read_bound_volume(&transaction, root, &state.root_identity)?;
+    Ok(Some(RootVolumeState {
+        clean: root_state_is_clean(&state, debt_rows),
+        saved_identity: state.root_identity,
+        debt_rows,
+        bound_volume,
+    }))
+}
+
+fn read_bound_volume(
+    connection: &Connection,
+    root: &[u8],
+    identity: &[u8],
+) -> io::Result<Option<[u8; 16]>> {
+    let exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='rotation_root_volume'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .unwrap_or(false);
+    if !exists {
+        return Ok(None);
+    }
+    let uuid: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT volume_uuid FROM rotation_root_volume WHERE root_path=?1 AND root_identity=?2",
+            params![root, identity],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    Ok(uuid
+        .and_then(|bytes| <[u8; 16]>::try_from(bytes.as_slice()).ok())
+        .filter(|uuid| uuid.iter().any(|byte| *byte != 0)))
+}
+
+/// Bind `volume_uuid` to the root row under `rule`. When `expected_saved`
+/// differs from `live_identity`, first rewrite the row's identity to the live
+/// one, keeping its generations, cursor and lap state, but only while the row
+/// still holds `expected_saved` and the root has no debt rows (their payloads
+/// name the old identity). Returns false, changing nothing, when the row moved
+/// on in the meantime. The caller proves the same-object rule first.
+pub(crate) fn bind_root_volume(
+    resource_db: &Path,
+    cache_root: &Path,
+    expected_saved: &[u8],
+    live_identity: &[u8],
+    volume_uuid: [u8; 16],
+    rule: &str,
+    recorded_at_ms: i64,
+) -> io::Result<bool> {
+    validate_root(cache_root, expected_saved)?;
+    validate_root(cache_root, live_identity)?;
+    if rule.is_empty() || rule.len() > 64 || volume_uuid.iter().all(|byte| *byte == 0) {
+        return Err(invalid_input(
+            "preparation cache root volume binding is invalid",
+        ));
+    }
+    let root = root_path_bytes(cache_root)?;
+    let path = path_for_resource_db(resource_db)?;
+    let mut connection = open_writer(&path)?;
+    ensure_writer_schema(&mut connection)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error)?;
+    let saved: Option<Vec<u8>> = transaction
+        .query_row(
+            "SELECT root_identity FROM rotation_root WHERE root_path=?1",
+            params![root],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if saved.as_deref() != Some(expected_saved) {
+        return Ok(false);
+    }
+    if expected_saved != live_identity {
+        if root_has_debt_rows(&transaction, root)? {
+            return Ok(false);
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE rotation_root SET root_identity=?2 WHERE root_path=?1 AND root_identity=?3",
+                params![root, live_identity, expected_saved],
+            )
+            .map_err(sqlite_error)?;
+        if changed != 1 {
+            return Ok(false);
+        }
+    }
+    transaction
+        .execute_batch(ROOT_VOLUME_TABLE)
+        .map_err(sqlite_error)?;
+    transaction
+        .execute(
+            "DELETE FROM rotation_root_volume \
+             WHERE root_path NOT IN (SELECT root_path FROM rotation_root)",
+            [],
+        )
+        .map_err(sqlite_error)?;
+    transaction
+        .execute(
+            "INSERT OR REPLACE INTO rotation_root_volume(root_path, root_identity, volume_uuid, \
+             rule, recorded_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                root,
+                live_identity,
+                volume_uuid.to_vec(),
+                rule,
+                recorded_at_ms
+            ],
+        )
+        .map_err(sqlite_error)?;
+    transaction.commit().map_err(sqlite_error)?;
+    check_database_size(&path)?;
+    Ok(true)
+}
+
 fn validate_lap_state(state: i64) -> io::Result<()> {
     if matches!(state, LAP_IDLE | LAP_ACTIVE | LAP_EXHAUSTED) {
         Ok(())
@@ -2700,6 +2897,174 @@ mod tests {
                 &fixture._directory.path().join("other-cache")
             )
             .unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod root_volume_tests {
+    use super::*;
+
+    const SAVED: &[u8] = b"saved-root-identity";
+    const LIVE: &[u8] = b"live-root-identity";
+    const REPOSITORY: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const VOLUME: [u8; 16] = [0x42; 16];
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
+        let cache_root = base.join("preparation-cache");
+        std::fs::create_dir(&cache_root).unwrap();
+        (directory, base.join("host-resources.db"), cache_root)
+    }
+
+    fn generations(resource_db: &Path, cache_root: &Path) -> (i64, i64, i64) {
+        let connection = Connection::open(path_for_resource_db(resource_db).unwrap()).unwrap();
+        connection
+            .query_row(
+                "SELECT generation, completed_generation, lap_generation FROM rotation_root \
+                 WHERE root_path=?1",
+                params![cache_root.as_os_str().as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn rebinding_keeps_lap_state_and_refuses_a_moved_row_or_pending_debt() {
+        let (_directory, resource_db, cache_root) = fixture();
+        publish(&resource_db, &cache_root, SAVED, REPOSITORY, b"payload").unwrap();
+        record_fresh_store_identity(
+            &resource_db,
+            &cache_root,
+            SAVED,
+            REPOSITORY,
+            b"payload",
+            b"fresh",
+        )
+        .unwrap();
+
+        // Pending debt names the old identity: never rebind under it.
+        assert!(
+            !bind_root_volume(
+                &resource_db,
+                &cache_root,
+                SAVED,
+                LIVE,
+                VOLUME,
+                "volume_uuid",
+                1
+            )
+            .unwrap()
+        );
+        complete_verified(
+            &resource_db,
+            &cache_root,
+            SAVED,
+            REPOSITORY,
+            b"payload",
+            b"fresh",
+        )
+        .unwrap();
+        let before = generations(&resource_db, &cache_root);
+
+        // A caller that saw another saved identity changes nothing.
+        assert!(
+            !bind_root_volume(&resource_db, &cache_root, LIVE, LIVE, VOLUME, "observed", 1)
+                .unwrap()
+        );
+        assert_eq!(
+            root_volume_state(&resource_db, &cache_root)
+                .unwrap()
+                .unwrap()
+                .saved_identity,
+            SAVED
+        );
+
+        assert!(
+            bind_root_volume(
+                &resource_db,
+                &cache_root,
+                SAVED,
+                LIVE,
+                VOLUME,
+                "volume_uuid",
+                1
+            )
+            .unwrap()
+        );
+        let state = root_volume_state(&resource_db, &cache_root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.saved_identity, LIVE);
+        assert_eq!(state.bound_volume, Some(VOLUME));
+        assert!(!state.clean);
+        assert_eq!(generations(&resource_db, &cache_root), before);
+        assert!(
+            load_record(&resource_db, &cache_root, LIVE, REPOSITORY)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The binding table is additive: the schema version stays 3 and the
+    /// schema check older binaries run still accepts the journal.
+    #[test]
+    fn the_binding_table_keeps_the_journal_readable_at_schema_three() {
+        let (_directory, resource_db, cache_root) = fixture();
+        publish(&resource_db, &cache_root, SAVED, REPOSITORY, b"payload").unwrap();
+        assert!(
+            bind_root_volume(
+                &resource_db,
+                &cache_root,
+                SAVED,
+                SAVED,
+                VOLUME,
+                "observed",
+                1
+            )
+            .unwrap()
+        );
+        let connection = Connection::open(path_for_resource_db(&resource_db).unwrap()).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(ensure_schema(&connection, false).unwrap());
+        validate_schema_before_writer(&connection).unwrap();
+    }
+
+    /// A binding recorded for one saved identity does not apply to another.
+    #[test]
+    fn a_binding_applies_only_to_the_identity_it_was_recorded_with() {
+        let (_directory, resource_db, cache_root) = fixture();
+        publish(&resource_db, &cache_root, SAVED, REPOSITORY, b"payload").unwrap();
+        assert!(
+            bind_root_volume(
+                &resource_db,
+                &cache_root,
+                SAVED,
+                SAVED,
+                VOLUME,
+                "observed",
+                1
+            )
+            .unwrap()
+        );
+        let connection = Connection::open(path_for_resource_db(&resource_db).unwrap()).unwrap();
+        connection
+            .execute(
+                "UPDATE rotation_root SET root_identity=?2 WHERE root_path=?1",
+                params![cache_root.as_os_str().as_bytes(), LIVE],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            root_volume_state(&resource_db, &cache_root)
+                .unwrap()
+                .unwrap()
+                .bound_volume,
+            None
         );
     }
 }

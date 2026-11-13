@@ -22,6 +22,22 @@ use sha2::{Digest, Sha256};
 
 const LEGACY_MARKER_SCHEMA_VERSION: u32 = 1;
 const STABLE_MARKER_SCHEMA_VERSION: u32 = 2;
+/// Names the inventory rule that lists a schema-1 marker whose only
+/// difference from this checkout is its mount-scoped device numbers.
+pub(crate) const LEGACY_MARKER_DEVICE_RENUMBER_RULE: &str = "legacy_marker_device_renumber";
+
+/// What a user can do about markers listed through
+/// [`LEGACY_MARKER_DEVICE_RENUMBER_RULE`]. Reconciliation removes such a
+/// marker only when a spawn or registry record saw its old device numbers;
+/// one it retains for lack of that record is left to a manual decision.
+pub(crate) fn legacy_marker_review_hint(session_id: i64) -> String {
+    format!(
+        "`aethyme broker gc artifact-use reconcile plan {session_id}` removes such a marker only \
+         when a spawn or registry record saw its old device numbers; a marker it retains for \
+         lack of that record stays until you confirm its producer process is gone and delete \
+         the marker file under `.aethyme/run/artifact-use/` by hand"
+    )
+}
 // B1's fail-closed reclaimer allowances below stay item-scoped. The same
 // inventory bound also caps explicit marker reconciliation.
 const MAX_MARKERS_PER_CHECKOUT: usize = 256;
@@ -101,7 +117,14 @@ pub(crate) enum ArtifactUseReclaimBlock {
     /// A producer or another exclusive user currently holds the inode lock.
     Contended,
     /// The advisory lock was available, but durable producer markers remain.
-    UnknownProducer { markers: Vec<ArtifactUseMarker> },
+    /// `legacy_device_renumbered` counts schema-1 markers that matched this
+    /// checkout on every field except mount-scoped device numbers (rule
+    /// [`LEGACY_MARKER_DEVICE_RENUMBER_RULE`]). They block exactly like any
+    /// other unresolved marker; the count only explains why they are listed.
+    UnknownProducer {
+        markers: Vec<ArtifactUseMarker>,
+        legacy_device_renumbered: usize,
+    },
     /// This target does not support the protocol; automatic cleanup must stay off.
     ProtocolUnavailable,
 }
@@ -384,6 +407,21 @@ impl ArtifactUseLocations {
         Ok(())
     }
 
+    /// Validate one marker found by a collector's inventory. Returns true
+    /// when a schema-1 marker matched this checkout through rule
+    /// [`LEGACY_MARKER_DEVICE_RENUMBER_RULE`]: every path, inode, key and
+    /// schema check holds, and only its saved device numbers differ from
+    /// today's mount. Such a marker still blocks the collector.
+    fn inventory_marker_for(&self, marker: &ArtifactUseMarker) -> io::Result<bool> {
+        if let Some(reason) = marker_identity_mismatch(self, marker, LegacyDevicePolicy::Inventory)
+        {
+            return Err(invalid_marker(reason));
+        }
+        Ok(marker.schema_version == LEGACY_MARKER_SCHEMA_VERSION
+            && (marker.primary_device != self.primary_identity.device
+                || marker.checkout_device != self.checkout_identity.device))
+    }
+
     fn new_marker_volume_evidence(&self) -> (u32, Option<[u8; 16]>, Option<[u8; 16]>) {
         match (self.primary_volume_uuid, self.checkout_volume_uuid) {
             (Some(primary), Some(checkout))
@@ -426,6 +464,12 @@ enum LegacyDevicePolicy {
     /// registry or a spawn witness; the checkout device is accepted when a
     /// verified spawn witness saw it on this exact checkout root object.
     Review { checkout_device_witnessed: bool },
+    /// A collector's inventory. A marker found here can only block the
+    /// collector, never authorize removal, so a schema-1 marker is listed as
+    /// this checkout's unresolved marker when everything but its saved device
+    /// numbers matches. macOS renumbers mounts on remount; failing the whole
+    /// inventory on that difference only hid the marker behind an error.
+    Inventory,
 }
 
 /// Which checkout root object a marker must name.
@@ -516,6 +560,7 @@ fn marker_identity_mismatch_for(
                 LegacyDevicePolicy::Review {
                     checkout_device_witnessed,
                 } => (false, !checkout_device_witnessed),
+                LegacyDevicePolicy::Inventory => (false, false),
             };
             if check_primary && marker.primary_device != locations.primary_identity.device {
                 return Some("artifact-use marker primary root device does not match");
@@ -1911,21 +1956,31 @@ pub(crate) fn try_artifact_use_reclaimer(
     };
     locations.require_unchanged()?;
     super::verify_named_lock_file(&locations.lock_path, &lock.file)?;
-    let markers = read_marker_inventory(&locations)?;
+    let (markers, legacy_device_renumbered) = read_marker_inventory(&locations)?;
     locations.require_unchanged()?;
+    for _ in 0..legacy_device_renumbered {
+        crate::phase_telemetry::add("artifact_use_marker_legacy_device_renumber", Duration::ZERO);
+    }
     if markers.is_empty() {
         Ok(ArtifactUseReclaimTry::Acquired(ArtifactUseReclaimer {
             _lock: lock,
         }))
     } else {
         Ok(ArtifactUseReclaimTry::Blocked(
-            ArtifactUseReclaimBlock::UnknownProducer { markers },
+            ArtifactUseReclaimBlock::UnknownProducer {
+                markers,
+                legacy_device_renumbered,
+            },
         ))
     }
 }
 
+/// Every marker in the checkout's inventory, plus how many of them matched
+/// only through rule [`LEGACY_MARKER_DEVICE_RENUMBER_RULE`].
 #[cfg_attr(not(test), allow(dead_code))]
-fn read_marker_inventory(locations: &ArtifactUseLocations) -> io::Result<Vec<ArtifactUseMarker>> {
+fn read_marker_inventory(
+    locations: &ArtifactUseLocations,
+) -> io::Result<(Vec<ArtifactUseMarker>, usize)> {
     let directory_metadata = match fs::symlink_metadata(&locations.marker_dir) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1946,6 +2001,7 @@ fn read_marker_inventory(locations: &ArtifactUseLocations) -> io::Result<Vec<Art
 
     let entries = fs::read_dir(&locations.marker_dir)?;
     let mut markers = Vec::new();
+    let mut legacy_device_renumbered = 0_usize;
     let mut count = 0_usize;
     for entry in entries {
         let entry = entry?;
@@ -1976,16 +2032,54 @@ fn read_marker_inventory(locations: &ArtifactUseLocations) -> io::Result<Vec<Art
         }
         let path = entry.path();
         let marker = read_marker_file(&path)?;
-        locations.marker_for(&marker)?;
+        let device_renumbered = locations.inventory_marker_for(&marker)?;
         if marker.nonce != nonce {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "artifact-use marker nonce does not match its filename",
             ));
         }
+        if device_renumbered {
+            legacy_device_renumbered += 1;
+        }
         markers.push(marker);
     }
-    Ok(markers)
+    Ok((markers, legacy_device_renumbered))
+}
+
+/// Test support: leave a schema-1 marker for this checkout that saved device
+/// numbers another mount used, as markers written before a remount do.
+#[cfg(all(test, unix))]
+pub(crate) fn write_renumbered_legacy_marker_for_test(
+    primary_root: &Path,
+    checkout_root: &Path,
+    session_id: i64,
+) -> io::Result<()> {
+    let locations = ArtifactUseLocations::resolve(primary_root, checkout_root)?;
+    if !locations.initialize_layout(ARTIFACT_LAYOUT_LOCK_WAIT)? {
+        return Err(io::Error::other("artifact-use layout is busy"));
+    }
+    let nonce = next_nonce();
+    let marker = ArtifactUseMarker {
+        schema_version: LEGACY_MARKER_SCHEMA_VERSION,
+        nonce: nonce.clone(),
+        primary_root: path_text(&locations.primary_root)?,
+        primary_device: locations.primary_identity.device.wrapping_add(7),
+        primary_inode: locations.primary_identity.inode,
+        primary_volume_uuid: None,
+        checkout_root: path_text(&locations.checkout_root)?,
+        checkout_device: locations.checkout_identity.device.wrapping_add(7),
+        checkout_inode: locations.checkout_identity.inode,
+        checkout_volume_uuid: None,
+        checkout_key: locations.checkout_key.clone(),
+        session_id,
+        invocation_id: format!("test:{session_id}:renumbered"),
+        phase: ArtifactUsePhase::PreDispatch,
+        process: None,
+    };
+    let path = locations.marker_dir.join(format!("{nonce}.json"));
+    let file = create_marker_file(&path)?;
+    write_new_marker(&path, &file, &marker, &locations.marker_dir)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3140,6 +3234,7 @@ mod tests {
         let markers = match try_artifact_use_reclaimer(primary.path(), &checkout).unwrap() {
             ArtifactUseReclaimTry::Blocked(ArtifactUseReclaimBlock::UnknownProducer {
                 markers,
+                ..
             }) => markers,
             other => panic!("producer death should leave an unknown marker, got {other:?}"),
         };
@@ -3173,6 +3268,149 @@ mod tests {
         }
         let error = try_artifact_use_reclaimer(primary.path(), &checkout).unwrap_err();
         assert!(error.to_string().contains("exceeded its cap"));
+    }
+
+    fn write_inventory_marker(locations: &ArtifactUseLocations, marker: &ArtifactUseMarker) {
+        locations.ensure_marker_dir().unwrap();
+        let path = locations.marker_dir.join(format!("{}.json", marker.nonce));
+        fs::write(path, serde_json::to_vec(marker).unwrap()).unwrap();
+    }
+
+    fn renumbered_legacy_marker(locations: &ArtifactUseLocations) -> ArtifactUseMarker {
+        let mut marker = marker(locations, "renumbered-legacy".into());
+        marker.primary_device += 7;
+        marker.checkout_device += 7;
+        marker
+    }
+
+    /// Rule `legacy_marker_device_renumber`: a schema-1 marker whose only
+    /// difference is its saved device numbers is listed as this checkout's
+    /// unresolved marker, so the collector still blocks, instead of failing
+    /// the inventory with "device does not match".
+    #[test]
+    fn inventory_lists_a_renumbered_legacy_marker_as_an_unresolved_blocker() {
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = checkout(primary.path(), "checkout");
+        let locations = ArtifactUseLocations::resolve(primary.path(), &checkout).unwrap();
+        let marker = renumbered_legacy_marker(&locations);
+        write_inventory_marker(&locations, &marker);
+
+        match try_artifact_use_reclaimer(primary.path(), &checkout).unwrap() {
+            ArtifactUseReclaimTry::Blocked(ArtifactUseReclaimBlock::UnknownProducer {
+                markers,
+                legacy_device_renumbered,
+            }) => {
+                assert_eq!(markers, vec![marker]);
+                assert_eq!(legacy_device_renumbered, 1);
+            }
+            other => panic!("a renumbered legacy marker must still block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inventory_counts_only_markers_whose_devices_actually_differ() {
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = checkout(primary.path(), "checkout");
+        let locations = ArtifactUseLocations::resolve(primary.path(), &checkout).unwrap();
+        write_inventory_marker(&locations, &marker(&locations, "exact-legacy".into()));
+
+        assert!(matches!(
+            try_artifact_use_reclaimer(primary.path(), &checkout).unwrap(),
+            ArtifactUseReclaimTry::Blocked(ArtifactUseReclaimBlock::UnknownProducer {
+                legacy_device_renumbered: 0,
+                ..
+            })
+        ));
+    }
+
+    /// Each non-device condition of the inventory rule still fails closed.
+    #[test]
+    fn inventory_rule_still_requires_paths_inodes_key_and_nonce() {
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = checkout(primary.path(), "checkout");
+        let locations = ArtifactUseLocations::resolve(primary.path(), &checkout).unwrap();
+        let renumbered = renumbered_legacy_marker(&locations);
+        type MarkerChange = fn(&mut ArtifactUseMarker);
+        let cases: [(&str, MarkerChange); 5] = [
+            (
+                "artifact-use marker primary root inode does not match",
+                |marker| marker.primary_inode += 1,
+            ),
+            (
+                "artifact-use marker checkout root inode does not match",
+                |marker| marker.checkout_inode += 1,
+            ),
+            (
+                "artifact-use marker primary root path does not match",
+                |marker| marker.primary_root.push_str("-alias"),
+            ),
+            (
+                "artifact-use marker checkout root path does not match",
+                |marker| marker.checkout_root.push_str("-alias"),
+            ),
+            (
+                "artifact-use marker checkout key does not match",
+                |marker| marker.checkout_key.push('0'),
+            ),
+        ];
+        for (expected, change) in cases {
+            let mut marker = renumbered.clone();
+            change(&mut marker);
+            assert_eq!(
+                marker_identity_mismatch(&locations, &marker, LegacyDevicePolicy::Inventory),
+                Some(expected),
+                "{expected}"
+            );
+            write_inventory_marker(&locations, &marker);
+            assert!(
+                try_artifact_use_reclaimer(primary.path(), &checkout).is_err(),
+                "{expected} must still fail the inventory"
+            );
+            fs::remove_file(locations.marker_dir.join(format!("{}.json", marker.nonce))).unwrap();
+        }
+
+        let mut wrong_nonce = renumbered;
+        wrong_nonce.nonce = "other-nonce".into();
+        locations.ensure_marker_dir().unwrap();
+        fs::write(
+            locations.marker_dir.join("renumbered-legacy.json"),
+            serde_json::to_vec(&wrong_nonce).unwrap(),
+        )
+        .unwrap();
+        assert!(try_artifact_use_reclaimer(primary.path(), &checkout).is_err());
+    }
+
+    /// Live producers keep the exact device comparison for schema 1.
+    #[test]
+    fn producers_still_compare_legacy_devices_exactly() {
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = checkout(primary.path(), "checkout");
+        let locations = ArtifactUseLocations::resolve(primary.path(), &checkout).unwrap();
+        let marker = renumbered_legacy_marker(&locations);
+        assert_eq!(
+            marker_identity_mismatch(&locations, &marker, LegacyDevicePolicy::Exact),
+            Some("artifact-use marker primary root device does not match")
+        );
+        assert!(locations.marker_for(&marker).is_err());
+    }
+
+    /// A different volume at the same path with equal inode numbers: a
+    /// schema-2 marker naming another volume UUID never enters the inventory.
+    #[test]
+    fn inventory_refuses_a_marker_from_a_different_volume_with_equal_inodes() {
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = checkout(primary.path(), "checkout");
+        let locations = ArtifactUseLocations::resolve(primary.path(), &checkout).unwrap();
+        let mut marker = marker(&locations, "other-volume".into());
+        marker.schema_version = STABLE_MARKER_SCHEMA_VERSION;
+        marker.primary_volume_uuid = Some([0x5c; 16]);
+        marker.checkout_volume_uuid = Some([0x5d; 16]);
+        assert_ne!(locations.primary_volume_uuid, marker.primary_volume_uuid);
+        assert!(
+            marker_identity_mismatch(&locations, &marker, LegacyDevicePolicy::Inventory).is_some()
+        );
+        write_inventory_marker(&locations, &marker);
+        assert!(try_artifact_use_reclaimer(primary.path(), &checkout).is_err());
     }
 
     #[cfg(unix)]

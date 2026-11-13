@@ -392,6 +392,14 @@ the primary, and on the same checkout root path and inode for the checkout. A
 refusal names what is missing and whether planning again can help. Leaving a
 marker retained is always safe.
 
+An old marker whose only difference is the device numbers a remount changed is
+listed as that checkout's unresolved marker instead of failing with "marker
+primary root device does not match". It still keeps the checkout, and `finish
+cleanup` and session retirement say so. `reconcile plan` removes such a marker
+only when a spawn or registry record saw its old device numbers; a marker it
+retains for lack of that record stays until you confirm its producer process is
+gone and delete the marker file under `.aethyme/run/artifact-use/` by hand.
+
 Planning also refuses while any registered worktree root cannot be inspected. A
 root registered before volume UUIDs were saved needs a reviewed identity
 recovery after its mount was renumbered; the refusal prints the exact `gc storage
