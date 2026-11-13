@@ -5997,11 +5997,17 @@ mod root_volume_reproof_tests {
                 coordinator_db_path: self.resource_db.clone(),
                 nonce: NONCE.into(),
             };
-            std::fs::write(
-                self.parent.join(PREPARATION_ROOT_MARKER),
-                serde_json::to_vec(&marker).unwrap(),
-            )
-            .unwrap();
+            // Real markers are private, owner-only files; the reader insists.
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(self.parent.join(PREPARATION_ROOT_MARKER))
+                .unwrap()
+                .write_all(&serde_json::to_vec(&marker).unwrap())
+                .unwrap();
         }
 
         /// A journal row saved under `device_delta` more, with every lap
