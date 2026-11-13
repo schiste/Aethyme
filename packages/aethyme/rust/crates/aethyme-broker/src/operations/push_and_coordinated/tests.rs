@@ -2039,6 +2039,401 @@ fn push_without_a_hook_splits_at_the_ref_read_with_a_zero_hook() {
     assert!(push_process_split(&trace, std::time::Duration::from_secs(1)).is_none());
 }
 
+/// A real `git push https://host.invalid/o/r.git HEAD:refs/heads/x` (Git
+/// 2.55.0) that failed with "Could not resolve host", captured with
+/// `GIT_TRACE2_EVENT`. Version, parameter and nested start/exit events are
+/// dropped, and `thread`, `file`, `line`, `pid` and `repo` removed.
+const PUSH_TRACE_DNS_FAILURE: &str = r#"{"event":"start","sid":"20261113T104329.854526Z-He200009f-P0001269a","time":"2026-11-13T10:43:29.855026Z","t_abs":0.006079,"argv":["git","push","https://host.invalid/o/r.git","HEAD:refs/heads/x"]}
+{"event":"child_start","sid":"20261113T104329.854526Z-He200009f-P0001269a","time":"2026-11-13T10:43:29.856663Z","child_id":0,"child_class":"remote-https","use_shell":false,"argv":["git","remote-https","https://host.invalid/o/r.git","https://host.invalid/o/r.git"]}
+{"event":"child_start","sid":"20261113T104329.854526Z-He200009f-P0001269a/20261113T104329.870901Z-He200009f-P0001269c","time":"2026-11-13T10:43:29.871764Z","child_id":0,"child_class":"dashed","use_shell":false,"argv":["git-remote-https","https://host.invalid/o/r.git","https://host.invalid/o/r.git"]}
+{"event":"region_enter","sid":"20261113T104329.854526Z-He200009f-P0001269a","time":"2026-11-13T10:43:29.904270Z","nesting":1,"category":"push","label":"transport_push"}
+{"event":"region_enter","sid":"20261113T104329.854526Z-He200009f-P0001269a","time":"2026-11-13T10:43:29.905942Z","nesting":2,"category":"transport_push","label":"get_refs_list"}
+{"event":"error","sid":"20261113T104329.854526Z-He200009f-P0001269a/20261113T104329.870901Z-He200009f-P0001269c/20261113T104329.898233Z-He200009f-P000126a1","time":"2026-11-13T10:43:39.914747Z","msg":"unable to access 'https://host.invalid/o/r.git/': Could not resolve host: host.invalid"}
+{"event":"child_exit","sid":"20261113T104329.854526Z-He200009f-P0001269a/20261113T104329.870901Z-He200009f-P0001269c","time":"2026-11-13T10:43:39.915486Z","child_id":0,"code":128,"t_rel":10.043688}
+{"event":"exit","sid":"20261113T104329.854526Z-He200009f-P0001269a","time":"2026-11-13T10:43:39.916046Z","t_abs":10.067097,"code":128}
+{"event":"atexit","sid":"20261113T104329.854526Z-He200009f-P0001269a","time":"2026-11-13T10:43:39.916056Z","t_abs":10.067109,"code":128}
+"#;
+
+/// The same over SSH (`ssh://git@host.invalid/o/r.git`), top-level events.
+const PUSH_TRACE_SSH_RESOLVE_FAILURE: &str = r#"{"event":"start","sid":"20261113T104339.966031Z-He200009f-P00012d45","time":"2026-11-13T10:43:39.966293Z","t_abs":0.00432,"argv":["git","push","ssh://git@host.invalid/o/r.git","HEAD:refs/heads/x"]}
+{"event":"region_enter","sid":"20261113T104339.966031Z-He200009f-P00012d45","time":"2026-11-13T10:43:39.967151Z","nesting":1,"category":"push","label":"transport_push"}
+{"event":"region_enter","sid":"20261113T104339.966031Z-He200009f-P00012d45","time":"2026-11-13T10:43:39.968081Z","nesting":2,"category":"transport_push","label":"get_refs_list"}
+{"event":"child_start","sid":"20261113T104339.966031Z-He200009f-P00012d45","time":"2026-11-13T10:43:39.968122Z","child_id":0,"child_class":"transport/ssh","use_shell":false,"argv":["ssh","git@host.invalid","git-receive-pack '/o/r.git'"]}
+{"event":"error","sid":"20261113T104339.966031Z-He200009f-P00012d45","time":"2026-11-13T10:43:39.988603Z","msg":"Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists."}
+{"event":"exit","sid":"20261113T104339.966031Z-He200009f-P00012d45","time":"2026-11-13T10:43:39.988641Z","t_abs":0.026668,"code":128}
+{"event":"atexit","sid":"20261113T104339.966031Z-He200009f-P00012d45","time":"2026-11-13T10:43:39.988654Z","t_abs":0.02668,"code":128}
+"#;
+
+#[test]
+fn a_push_that_died_listing_remote_refs_provably_sent_no_update() {
+    for trace in [PUSH_TRACE_DNS_FAILURE, PUSH_TRACE_SSH_RESOLVE_FAILURE] {
+        let parsed = parse_git_transfer_trace(trace);
+        assert!(parsed.remote_refs_list_started);
+        assert!(!parsed.remote_refs_list_finished);
+        assert_eq!(parsed.exit_code, Some(128));
+        assert!(parsed.ended_before_remote_refs_listed(), "{trace}");
+    }
+}
+
+#[test]
+fn a_push_that_got_past_the_ref_listing_stays_unproven() {
+    // The listing finished and ref updates were being sent when the
+    // process failed: a reset or timeout here may follow a landed update.
+    let after_updates = PUSH_TRACE_WITHOUT_HOOK.replace(r#""code":0}"#, r#""code":1}"#);
+    assert_ne!(after_updates, PUSH_TRACE_WITHOUT_HOOK);
+    let parsed = parse_git_transfer_trace(&after_updates);
+    assert_eq!(parsed.exit_code, Some(1));
+    assert!(parsed.push_refs_started);
+    assert!(!parsed.ended_before_remote_refs_listed());
+
+    // The listing finished but the process died before `push_refs`: still a
+    // remote that answered, so it is left to the remote read.
+    let listed_then_died = PUSH_TRACE_WITHOUT_HOOK
+        .lines()
+        .filter(|line| !line.contains("push_refs") && !line.contains(r#""child_id":1"#))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace(r#""code":0}"#, r#""code":128}"#);
+    let parsed = parse_git_transfer_trace(&listed_then_died);
+    assert!(parsed.remote_refs_list_finished && !parsed.push_refs_started);
+    assert!(!parsed.ended_before_remote_refs_listed());
+
+    // A hook only runs after the listing, so its presence contradicts it.
+    let failed_hook = PUSH_TRACE_WITH_PRE_PUSH_HOOK.replace(r#""code":0}"#, r#""code":1}"#);
+    assert!(!parse_git_transfer_trace(&failed_hook).ended_before_remote_refs_listed());
+}
+
+#[test]
+fn an_incomplete_or_foreign_trace_proves_nothing_about_the_push() {
+    // Killed (signal, timeout): no exit event, so how it ended is unknown.
+    let killed = PUSH_TRACE_DNS_FAILURE
+        .lines()
+        .filter(|line| !line.contains(r#""event":"exit""#) && !line.contains(r#""event":"atexit""#))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let parsed = parse_git_transfer_trace(&killed);
+    assert!(parsed.remote_refs_list_started && parsed.exit_code.is_none());
+    assert!(!parsed.ended_before_remote_refs_listed());
+
+    // A clean exit is not a failure to explain.
+    let clean = PUSH_TRACE_DNS_FAILURE.replace(r#""code":128}"#, r#""code":0}"#);
+    assert!(!parse_git_transfer_trace(&clean).ended_before_remote_refs_listed());
+
+    // Only the top-level push's regions count: a nested process's listing
+    // (a hook's own `git push`, a submodule push) says nothing about it.
+    let nested = PUSH_TRACE_DNS_FAILURE.replace(
+        r#""sid":"20261113T104329.854526Z-He200009f-P0001269a","#,
+        r#""sid":"20261113T104329.854526Z-He200009f-P0001269a/nested","#,
+    );
+    assert!(!parse_git_transfer_trace(&nested).ended_before_remote_refs_listed());
+
+    // No trace at all.
+    assert!(!GitTransferTrace::default().ended_before_remote_refs_listed());
+    assert!(!parse_git_transfer_trace("").ended_before_remote_refs_listed());
+}
+
+#[test]
+fn only_transports_built_into_git_count_as_built_in() {
+    for url in [
+        "https://github.com/o/r.git",
+        "HTTP://github.com/o/r.git",
+        "ssh://git@github.com/o/r.git",
+        "git+ssh://git@github.com/o/r.git",
+        "git://example.com/o/r.git",
+        "file:///srv/repos/r.git",
+        "git@github.com:o/r.git",
+        "/srv/repos/r.git",
+        "../r.git",
+    ] {
+        assert!(is_builtin_transport_url(url), "{url}");
+    }
+    for url in [
+        "ext::sh -c touch% /tmp/x",
+        "gcrypt::rsync://example.com/r",
+        "custom::anything",
+        "svn://example.com/r",
+        "ftp://example.com/r.git",
+        "persistent-https://example.com/r.git",
+        "",
+    ] {
+        assert!(!is_builtin_transport_url(url), "{url:?}");
+    }
+}
+
+#[test]
+fn a_push_through_a_remote_helper_stays_unproven_whatever_its_trace_shows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["remote", "add", "origin", "https://example.com/o/r.git"]);
+    let trace = parse_git_transfer_trace(PUSH_TRACE_DNS_FAILURE);
+    let push = gh_args(&["push", "origin", "HEAD:refs/heads/x"]);
+    let decide = |remote: Option<&str>| {
+        push_provably_sent_no_update(&push, Some(&trace), tmp.path(), remote)
+    };
+    assert!(decide(Some("origin")), "a built-in transport qualifies");
+    assert!(!decide(None), "no resolved remote proves nothing");
+    assert!(!push_provably_sent_no_update(
+        &push,
+        None,
+        tmp.path(),
+        Some("origin")
+    ));
+
+    // A helper-style push URL runs the helper's code during the listing.
+    git(&[
+        "remote",
+        "set-url",
+        "--push",
+        "origin",
+        "custom::example.com/o/r",
+    ]);
+    assert!(!decide(Some("origin")), "helper push URL");
+    git(&["remote", "set-url", "--push", "origin", "ext::sh -c true"]);
+    assert!(!decide(Some("origin")), "ext:: push URL");
+    // One helper among several push URLs is enough.
+    git(&[
+        "remote",
+        "set-url",
+        "--push",
+        "origin",
+        "https://example.com/o/r.git",
+    ]);
+    git(&[
+        "remote",
+        "set-url",
+        "--add",
+        "--push",
+        "origin",
+        "custom::example.com/o/r",
+    ]);
+    assert!(!decide(Some("origin")), "one helper among push URLs");
+    git(&["config", "--unset-all", "remote.origin.pushurl"]);
+    assert!(decide(Some("origin")));
+    // `remote.<name>.vcs` routes every URL through a helper.
+    git(&["config", "remote.origin.vcs", "custom"]);
+    assert!(!decide(Some("origin")), "remote.<name>.vcs");
+    // A remote that cannot be read proves nothing.
+    assert!(!decide(Some("missing")));
+}
+
+#[test]
+fn a_failed_write_is_counted_as_a_remote_read_only_when_one_decided_it() {
+    let read = serde_json::json!({
+        "push_reconciliation": { "evidence": { "classification": "failed", "destinations": [] } }
+    });
+    assert_eq!(
+        failed_remote_write_outcome(OperationStatus::Failed, &read),
+        "remote_write_failed_by_remote_read"
+    );
+    assert_eq!(
+        failed_remote_write_outcome(OperationStatus::Succeeded, &read),
+        "remote_write_succeeded_by_remote_read"
+    );
+    let observed = serde_json::json!({
+        "create_reconciliation": { "evidence": { "source": "post_create_observation" } }
+    });
+    assert_eq!(
+        failed_remote_write_outcome(OperationStatus::Failed, &observed),
+        "remote_write_failed_by_remote_read"
+    );
+    // A URL gh printed is not a remote read, and neither is nothing at all.
+    let printed = serde_json::json!({
+        "create_reconciliation": { "evidence": { "source": "command_output" } }
+    });
+    assert_eq!(
+        failed_remote_write_outcome(OperationStatus::Succeeded, &printed),
+        "remote_write_succeeded_other"
+    );
+    let unexplained = serde_json::json!({
+        "push_reconciliation": { "evidence": { "reason": "exact_push_plan_unavailable" } }
+    });
+    assert_eq!(
+        failed_remote_write_outcome(OperationStatus::Failed, &unexplained),
+        "remote_write_failed_other"
+    );
+}
+
+#[test]
+fn a_push_failed_before_remote_refs_keeps_its_plan_and_says_why() {
+    let planning = PushPlanning::Unsupported {
+        reason: "push_uses_implicit_or_set_expanding_options",
+    };
+    let value = push_failed_before_remote_refs(&planning);
+    assert_eq!(value["failure_class"], PUSH_FAILED_BEFORE_REMOTE_REFS);
+    assert_eq!(value["remote_write_contact"], "not_contacted");
+    assert_eq!(value["push_reconciliation"]["planning"], "unsupported");
+    assert_eq!(
+        value["push_reconciliation"]["evidence"]["classification"],
+        "failed"
+    );
+    assert_eq!(
+        failed_remote_write_outcome(OperationStatus::Failed, &value),
+        "remote_write_failed_before_remote_refs"
+    );
+}
+
+#[test]
+fn a_gh_command_line_its_parser_rejected_sent_nothing() {
+    for stderr in [
+        "unknown flag: --bogus\n\nUsage:  gh pr create [flags]\n",
+        "unknown shorthand flag: 'z' in -z\n",
+        "accepts 1 arg(s), received 0\n",
+        "required flag(s) \"title\" not set\n",
+        "invalid argument \"x\" for \"-L, --limit\" flag: strconv.ParseInt: parsing \"x\": invalid syntax\n",
+        "flag needs an argument: --body-file\n",
+    ] {
+        let unsent = classify_github_unsent_request(
+            &gh_args(&["pr", "create", "--bogus"]),
+            true,
+            Some(1),
+            stderr.as_bytes(),
+        )
+        .unwrap_or_else(|| panic!("{stderr:?} is a parse-time rejection"));
+        assert_eq!(unsent["failure_class"], GITHUB_REQUEST_NOT_SENT);
+        assert_eq!(unsent["evidence"]["signature"], "argument_parse");
+    }
+    // The journal keeps the parser's verdict, never the echoed argument.
+    let unsent = classify_github_unsent_request(
+        &gh_args(&["pr", "create", "-zghp_not_a_real_token"]),
+        true,
+        Some(1),
+        b"unknown shorthand flag: 'z' in -zghp_not_a_real_token\n",
+    )
+    .unwrap();
+    assert_eq!(
+        unsent["evidence"]["parser_error"],
+        "unknown shorthand flag:"
+    );
+    assert!(!unsent.to_string().contains("ghp_not_a_real_token"));
+    // Not a built-in command: an extension or alias can print anything.
+    assert!(
+        classify_github_unsent_request(
+            &gh_args(&["my-extension", "--bogus"]),
+            false,
+            Some(1),
+            b"unknown flag: --bogus\n",
+        )
+        .is_none()
+    );
+    // The message must open stderr; quoted later it is no parser verdict.
+    assert!(
+        classify_github_unsent_request(
+            &gh_args(&["pr", "comment", "1", "--body", "x"]),
+            true,
+            Some(1),
+            b"GraphQL: something failed\nunknown flag: --x\n",
+        )
+        .is_none()
+    );
+    // Cancelled (2) or needing authentication (4) is not this exit.
+    assert!(
+        classify_github_unsent_request(
+            &gh_args(&["pr", "create"]),
+            true,
+            Some(2),
+            b"unknown flag: --bogus\n",
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn a_single_gh_api_request_that_never_connected_sent_nothing() {
+    let api = gh_args(&["api", "-X", "POST", "repos/o/r/issues", "-f", "title=x"]);
+    for (stderr, signature) in [
+        (
+            "error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com\n",
+            "dns_resolution",
+        ),
+        (
+            "Post \"https://api.github.com/repos/o/r/issues\": dial tcp 140.82.112.6:443: connect: connection refused\n",
+            "connection_not_established",
+        ),
+        (
+            "Post \"https://api.github.com/repos/o/r/issues\": dial tcp 140.82.112.6:443: connect: network is unreachable\n",
+            "connection_not_established",
+        ),
+        (
+            "Post \"https://api.github.com/repos/o/r/issues\": proxyconnect tcp: dial tcp 127.0.0.1:3128: connect: connection refused\n",
+            "connection_not_established",
+        ),
+        (
+            "Post \"https://api.github.com/repos/o/r/issues\": net/http: TLS handshake timeout\n",
+            "tls_handshake",
+        ),
+        (
+            "Post \"https://api.github.com/repos/o/r/issues\": tls: failed to verify certificate: x509: certificate signed by unknown authority\n",
+            "tls_handshake",
+        ),
+    ] {
+        let unsent = classify_github_unsent_request(&api, true, Some(1), stderr.as_bytes())
+            .unwrap_or_else(|| panic!("{stderr:?} never connected"));
+        assert_eq!(unsent["evidence"]["signature"], signature, "{stderr:?}");
+        assert_eq!(unsent["recovery"], "retry");
+    }
+}
+
+#[test]
+fn gh_failures_that_may_follow_a_sent_request_stay_unknown() {
+    let api = gh_args(&["api", "-X", "POST", "repos/o/r/issues", "-f", "title=x"]);
+    for stderr in [
+        // The request was written; the answer never arrived.
+        "Post \"https://api.github.com/repos/o/r/issues\": read tcp 10.0.0.2:51234->140.82.112.6:443: read: connection reset by peer\n",
+        "Post \"https://api.github.com/repos/o/r/issues\": net/http: timeout awaiting response headers\n",
+        "Post \"https://api.github.com/repos/o/r/issues\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)\n",
+        "Post \"https://api.github.com/repos/o/r/issues\": EOF\n",
+        "Post \"https://api.github.com/repos/o/r/issues\": local error: tls: bad record MAC\n",
+        // A status means a server answered.
+        "gh: Bad Gateway (HTTP 502)\ndial tcp 140.82.112.6:443: connect: connection refused\n",
+        "simulated ambiguous failure\n",
+    ] {
+        assert!(
+            classify_github_unsent_request(&api, true, Some(1), stderr.as_bytes()).is_none(),
+            "{stderr:?} may follow a sent request"
+        );
+    }
+    let dns = b"error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com\n";
+    // More than one request: the one that failed may follow a mutation that
+    // landed.
+    for args in [
+        gh_args(&["pr", "comment", "7", "--body", "x"]),
+        gh_args(&["pr", "merge", "7", "--squash"]),
+        gh_args(&["api", "--paginate", "-X", "POST", "repos/o/r/issues"]),
+    ] {
+        assert!(
+            classify_github_unsent_request(&args, true, Some(1), dns).is_none(),
+            "{args:?}"
+        );
+    }
+    // Every spelling that may paginate is more than one request; only an
+    // explicit `--paginate=false` is not.
+    for flag in ["--paginate=true", "--paginate=1", "--slurp", "--slurp=true"] {
+        let args = gh_args(&["api", flag, "-X", "POST", "repos/o/r/issues"]);
+        assert!(
+            classify_github_unsent_request(&args, true, Some(1), dns).is_none(),
+            "{flag} may paginate"
+        );
+    }
+    let explicit_single = gh_args(&["api", "--paginate=false", "-X", "POST", "repos/o/r/issues"]);
+    assert!(classify_github_unsent_request(&explicit_single, true, Some(1), dns).is_some());
+    // A truncated stderr is a prefix and proves nothing.
+    assert!(classify_github_unsent_request_if_complete(&api, true, Some(1), dns, true).is_none());
+    // A process that did not exit with gh's generic error status.
+    assert!(classify_github_unsent_request(&api, true, None, dns).is_none());
+    assert_eq!(
+        failed_remote_write_outcome(OperationStatus::OutcomeUnknown, &serde_json::json!({})),
+        "remote_write_outcome_unknown"
+    );
+}
+
 #[test]
 fn trace2_time_parses_as_microseconds_of_the_day() {
     let time = |text: &str| trace2_time_of_day_us(Some(&serde_json::json!(text)));

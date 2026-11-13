@@ -415,6 +415,18 @@ struct GitTransferTrace {
     pre_push_hook_started_ms: Option<u64>,
     /// How long that hook ran, in ms. Telemetry only.
     pre_push_hook_ms: Option<u64>,
+    /// The top-level `git push` entered its `transport_push/get_refs_list`
+    /// region: it began asking a remote for its refs.
+    remote_refs_list_started: bool,
+    /// The top-level `git push` left that region at least once: some remote
+    /// answered with its refs, after which Git may send ref updates.
+    remote_refs_list_finished: bool,
+    /// The top-level `git push` entered `transport_push/push_refs`, the
+    /// region that sends ref updates.
+    push_refs_started: bool,
+    /// The top-level process's own exit status, from its `exit` or `atexit`
+    /// event. `None` when the trace does not show the process ending.
+    exit_code: Option<i64>,
 }
 
 /// Trace2 seconds (`t_abs`, `t_rel`) as whole microseconds.
@@ -468,6 +480,27 @@ fn push_process_split(
 }
 
 impl GitTransferTrace {
+    /// Whether the push provably ended before it could send any ref update.
+    ///
+    /// `git push` asks each remote URL for its refs inside
+    /// `transport_push/get_refs_list` and only after leaving that region runs
+    /// `pre-push` and enters `push_refs`, the one place ref updates are sent.
+    /// A top-level process that entered the listing, never left it, never
+    /// reached `push_refs` or a hook, and then exited non-zero died while
+    /// connecting or reading the ref advertisement: DNS failure, refused or
+    /// unreachable connection, TLS or SSH handshake failure, authentication,
+    /// or a reset during the advertisement. Nothing that can change a remote
+    /// ref was ever sent. This rests on Git's own region structure, not on its
+    /// (localisable) messages. Anything less complete -- no trace, no exit
+    /// event, a listing that finished for any URL -- proves nothing.
+    fn ended_before_remote_refs_listed(&self) -> bool {
+        self.remote_refs_list_started
+            && !self.remote_refs_list_finished
+            && !self.push_refs_started
+            && !self.pre_push_hook
+            && self.exit_code.is_some_and(|code| code != 0)
+    }
+
     fn remote_contact(self) -> Option<RemoteContactEvidence> {
         if self.pre_push_hook_failed {
             Some(RemoteContactEvidence {
@@ -523,7 +556,29 @@ fn parse_git_transfer_trace(contents: &str) -> GitTransferTrace {
         // start at their own launch, so only top-level events are timed.
         let sid = event.get("sid").and_then(serde_json::Value::as_str);
         let top_level = sid.is_none_or(|sid| !sid.contains('/'));
-        match event.get("event").and_then(serde_json::Value::as_str) {
+        let kind = event.get("event").and_then(serde_json::Value::as_str);
+        if top_level {
+            let transport_push_region = |label: &str| {
+                event.get("category").and_then(serde_json::Value::as_str) == Some("transport_push")
+                    && event.get("label").and_then(serde_json::Value::as_str) == Some(label)
+            };
+            match kind {
+                Some("region_enter") if transport_push_region("get_refs_list") => {
+                    trace.remote_refs_list_started = true;
+                }
+                Some("region_leave") if transport_push_region("get_refs_list") => {
+                    trace.remote_refs_list_finished = true;
+                }
+                Some("region_enter") if transport_push_region("push_refs") => {
+                    trace.push_refs_started = true;
+                }
+                Some("exit" | "atexit") if trace.exit_code.is_none() => {
+                    trace.exit_code = event.get("code").and_then(serde_json::Value::as_i64);
+                }
+                _ => {}
+            }
+        }
+        match kind {
             Some("start") if top_level && process_start.is_none() => {
                 process_start =
                     trace2_time_of_day_us(event.get("time")).zip(trace2_us(event.get("t_abs")));
@@ -1208,6 +1263,245 @@ fn classify_github_refusal(
                 "evidence": { "message": message },
             })
         })
+}
+
+/// `failure_class` of a push whose Git trace proves no ref update was sent.
+const PUSH_FAILED_BEFORE_REMOTE_REFS: &str = "push_failed_before_remote_refs_listed";
+/// `failure_class` of a `gh` write whose own output proves it sent nothing.
+const GITHUB_REQUEST_NOT_SENT: &str = "github_request_not_sent";
+
+/// Journal fields for a push that [`GitTransferTrace::ended_before_remote_refs_listed`].
+fn push_failed_before_remote_refs(planning: &PushPlanning) -> serde_json::Value {
+    let mut push = planning.journal_value().unwrap_or_else(|| json!({}));
+    push["evidence"] = json!({
+        "classification": "failed",
+        "source": "git_trace2",
+        "reason": "push_ended_before_remote_refs_listed",
+        "remote_write_contact": "not_contacted",
+    });
+    json!({
+        "failure_class": PUSH_FAILED_BEFORE_REMOTE_REFS,
+        "remote_outcome": "not_sent",
+        "remote_write_contact": "not_contacted",
+        "recovery": "retry",
+        "push_reconciliation": push,
+    })
+}
+
+/// First lines `gh` prints when its flag and argument parser rejects the
+/// command line. pflag and cobra produce these, in English and unlocalised,
+/// while parsing -- before gh's own code runs, so before any request.
+const GH_ARGUMENT_PARSE_ERRORS: &[&str] = &[
+    "unknown flag: ",
+    "unknown shorthand flag: ",
+    "flag needs an argument: ",
+    "bad flag syntax: ",
+    "invalid argument \"",
+    "required flag(s) ",
+    "accepts ",
+    "requires at least ",
+];
+
+/// Evidence that a failed `gh` write sent no request, so it is safely
+/// `failed` rather than `outcome_unknown`.
+///
+/// Two signatures qualify, both on gh's generic exit status 1 with complete
+/// stderr. Argument parsing: the first stderr line is one of
+/// [`GH_ARGUMENT_PARSE_ERRORS`] and the command is a built-in gh command
+/// (`builtin`: the broker recognised its shape, so it is not an extension
+/// or alias that could print anything). Connection: a `gh api` call without
+/// `--paginate` -- exactly one request -- whose error says the connection was
+/// never established: gh's own DNS message, Go's `dial tcp` (DNS, refused,
+/// unreachable, dial timeout, proxy dial), or a certificate or handshake
+/// timeout, all of which happen before the request is written. Any HTTP
+/// status in stderr means a request reached a server and disqualifies it.
+/// Multi-request commands stay unknown: the failed request may follow a
+/// mutation that landed. Read or reset errors, response timeouts and any
+/// other TLS error stay unknown: they can follow a request that was sent.
+fn classify_github_unsent_request(
+    args: &[String],
+    builtin: bool,
+    exit_code: Option<i32>,
+    stderr: &[u8],
+) -> Option<serde_json::Value> {
+    if exit_code != Some(1) {
+        return None;
+    }
+    let stderr = String::from_utf8_lossy(stderr);
+    let first_line = stderr.lines().find(|line| !line.trim().is_empty())?.trim();
+    // Only the matched prefix is journaled: the rest of the line can echo
+    // an argument verbatim, and arguments may carry secrets.
+    if builtin
+        && let Some(prefix) = GH_ARGUMENT_PARSE_ERRORS
+            .iter()
+            .find(|prefix| first_line.starts_with(**prefix))
+    {
+        return Some(json!({
+            "failure_class": GITHUB_REQUEST_NOT_SENT,
+            "remote_outcome": "not_sent",
+            "recovery": "fix_arguments",
+            "evidence": { "signature": "argument_parse", "parser_error": prefix.trim_end() },
+        }));
+    }
+    let single_request =
+        args.first().map(String::as_str) == Some("api") && !gh_api_may_paginate(args);
+    if !single_request || !github_http_statuses(&stderr).is_empty() {
+        return None;
+    }
+    let lines = stderr.lines().map(str::trim).collect::<Vec<_>>();
+    let signature = if lines
+        .iter()
+        .any(|line| line.starts_with("error connecting to "))
+        && lines.contains(&"check your internet connection or https://githubstatus.com")
+    {
+        "dns_resolution"
+    } else if lines
+        .iter()
+        .any(|line| line.starts_with("dial tcp ") || line.contains(": dial tcp "))
+    {
+        "connection_not_established"
+    } else if lines.iter().any(|line| {
+        line.contains("net/http: TLS handshake timeout")
+            || line.contains("tls: failed to verify certificate")
+            || line.contains("x509: certificate")
+    }) {
+        "tls_handshake"
+    } else {
+        return None;
+    };
+    Some(json!({
+        "failure_class": GITHUB_REQUEST_NOT_SENT,
+        "remote_outcome": "not_sent",
+        "recovery": "retry",
+        "evidence": { "signature": signature },
+    }))
+}
+
+/// Whether a `gh api` command line may send more than one request.
+///
+/// `--paginate` in any spelling other than an explicit `--paginate=false`,
+/// and `--slurp` (which only works with pagination), count. A boolean value
+/// pflag would also read as false (`0`, `f`, ...) still counts: erring
+/// towards "may paginate" only keeps a write unknown.
+fn gh_api_may_paginate(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        arg == "--paginate"
+            || arg == "--slurp"
+            || arg.starts_with("--slurp=")
+            || arg
+                .strip_prefix("--paginate=")
+                .is_some_and(|value| value != "false")
+    })
+}
+
+fn classify_github_unsent_request_if_complete(
+    args: &[String],
+    builtin: bool,
+    exit_code: Option<i32>,
+    stderr: &[u8],
+    stderr_truncated: bool,
+) -> Option<serde_json::Value> {
+    if stderr_truncated {
+        return None;
+    }
+    classify_github_unsent_request(args, builtin, exit_code, stderr)
+}
+
+/// The phase-telemetry counter for how a failed remote write was settled.
+///
+/// `*_by_remote_read` only when the journal shows a post-failure remote
+/// observation decided it: the push re-read recorded what each destination
+/// held, or the create observation listed the collection. Anything else
+/// (a URL `gh` printed, a future path that sets no `failure_class`) is
+/// counted as `*_other` rather than claimed as a remote read.
+fn failed_remote_write_outcome(
+    status: OperationStatus,
+    details: &serde_json::Value,
+) -> &'static str {
+    let settled_by_remote_read = details["push_reconciliation"]["evidence"]["destinations"]
+        .is_array()
+        || details["create_reconciliation"]["evidence"]["source"] == "post_create_observation";
+    match details["failure_class"].as_str() {
+        Some(PUSH_FAILED_BEFORE_REMOTE_REFS) => "remote_write_failed_before_remote_refs",
+        Some(GITHUB_REQUEST_NOT_SENT) => "remote_write_failed_request_not_sent",
+        Some("github_refused") => "remote_write_failed_refused",
+        Some("repeatable_fetch_failed") => "remote_write_failed_repeatable_fetch",
+        _ => match status {
+            OperationStatus::Failed if settled_by_remote_read => {
+                "remote_write_failed_by_remote_read"
+            }
+            OperationStatus::Failed => "remote_write_failed_other",
+            OperationStatus::Succeeded if settled_by_remote_read => {
+                "remote_write_succeeded_by_remote_read"
+            }
+            OperationStatus::Succeeded => "remote_write_succeeded_other",
+            OperationStatus::OutcomeUnknown => "remote_write_outcome_unknown",
+            _ => "remote_write_outcome_other",
+        },
+    }
+}
+
+/// Whether every URL `remote` pushes to is reached through a transport built
+/// into Git (ssh, http(s), git, file or a local path), so that the push's
+/// ref listing runs only Git's own code.
+///
+/// A remote helper -- `<helper>::<address>`, a URL scheme Git hands to
+/// `git-remote-<scheme>`, `ext::`, or `remote.<name>.vcs` -- runs arbitrary
+/// code while listing refs, so a push through one proves nothing by where it
+/// died. The URLs are Git's effective push URLs (`remote get-url --push
+/// --all`, rewrites applied), read raw: the resolved target keeps only a
+/// sanitized spelling that drops a helper prefix. Any read that fails counts
+/// as not built-in.
+fn push_remote_uses_builtin_transports(cwd: &Path, remote: &str) -> bool {
+    let Ok(repo) = crate::GitRepo::discover(cwd) else {
+        return false;
+    };
+    if repo.config_get(&format!("remote.{remote}.vcs")).is_some() {
+        return false;
+    }
+    let Ok(urls) = repo.remote_push_urls(remote) else {
+        return false;
+    };
+    !urls.is_empty() && urls.iter().all(|url| is_builtin_transport_url(url))
+}
+
+/// Git's own transport selection (`transport_get`), restricted to transports
+/// that need no helper beyond the ones Git ships for HTTP.
+fn is_builtin_transport_url(url: &str) -> bool {
+    // A leading run of URL-scheme characters followed by `::` names a remote
+    // helper, whatever follows (`ext::`, `gcrypt::rsync://...`).
+    let scheme_len = url
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'-' | b'.'))
+        .count();
+    if url.is_empty() || url[scheme_len..].starts_with("::") {
+        return false;
+    }
+    match url.split_once("://") {
+        Some((scheme, _)) => {
+            scheme.len() == scheme_len
+                && ["http", "https", "ssh", "git+ssh", "ssh+git", "git", "file"]
+                    .iter()
+                    .any(|builtin| scheme.eq_ignore_ascii_case(builtin))
+        }
+        // `host:path` is SSH; anything else is a local path.
+        None => true,
+    }
+}
+
+/// Whether a failed push provably sent no ref update: its trace ended inside
+/// the ref listing ([`GitTransferTrace::ended_before_remote_refs_listed`])
+/// and every push URL uses a built-in transport.
+fn push_provably_sent_no_update(
+    args: &[String],
+    trace: Option<&GitTransferTrace>,
+    cwd: &Path,
+    remote: Option<&str>,
+) -> bool {
+    is_push(args)
+        && trace.is_some_and(GitTransferTrace::ended_before_remote_refs_listed)
+        // Read only on this rare path, after the trace already qualified.
+        && remote.is_some_and(|remote| push_remote_uses_builtin_transports(cwd, remote))
 }
 
 fn classify_github_refusal_if_complete(
@@ -3949,6 +4243,16 @@ impl Broker {
                 } else {
                     OperationStatus::Failed
                 };
+                if is_remote_write {
+                    crate::phase_telemetry::add(
+                        if status == OperationStatus::OutcomeUnknown {
+                            "remote_write_outcome_unknown_timeout"
+                        } else {
+                            "remote_write_failed_timeout"
+                        },
+                        Duration::ZERO,
+                    );
+                }
                 let mut details = journal_details(
                     classification,
                     resolved_target.as_ref(),
@@ -4100,6 +4404,14 @@ impl Broker {
                 ),
             }
         }
+        let push_never_listed_remote_refs = push_provably_sent_no_update(
+            &request.args,
+            transfer_trace.as_ref(),
+            cwd,
+            resolved_target
+                .as_ref()
+                .map(|target| target.remote_name.as_str()),
+        );
         let remote_contact = transfer_trace.and_then(GitTransferTrace::remote_contact);
         let exit_code = output.status.code().map(i64::from);
         let (status, mut details) = if output.status.success() {
@@ -4186,6 +4498,45 @@ impl Broker {
                     }),
                 ),
             )
+        } else if push_never_listed_remote_refs {
+            // Git's own trace shows the push died before any remote answered
+            // with its refs, so no ref update was ever sent. Recording that as
+            // unknown write-blocked every session over a DNS failure that
+            // could not have reached the remote (2026-11-13). Decided before
+            // the post-failure remote read, which fails the same way while
+            // the network is down.
+            (
+                OperationStatus::Failed,
+                journal_details(
+                    classification,
+                    resolved_target.as_ref(),
+                    github_target.as_ref(),
+                    push_failed_before_remote_refs(&push_planning),
+                ),
+            )
+        } else if let Some(unsent) = (request.provider == OperationProvider::Github)
+            .then(|| {
+                classify_github_unsent_request_if_complete(
+                    &request.args,
+                    inferred.is_some(),
+                    output.status.code(),
+                    &output.stderr,
+                    output.stderr_truncated,
+                )
+            })
+            .flatten()
+        {
+            // gh sent no request, so there is nothing to observe: proof
+            // before the create observation, which needs the same network.
+            (
+                OperationStatus::Failed,
+                journal_details(
+                    classification,
+                    resolved_target.as_ref(),
+                    github_target.as_ref(),
+                    unsent,
+                ),
+            )
         } else if let Some((status, push_reconciliation)) =
             reconcile_failed_push(cwd, &push_planning, remote_contact)
         {
@@ -4266,6 +4617,14 @@ impl Broker {
                 ),
             )
         };
+        // One counter per way a failed remote write was settled, so the share
+        // that still write-blocks is measurable.
+        if is_remote_write && !output.status.success() {
+            crate::phase_telemetry::add(
+                failed_remote_write_outcome(status, &details),
+                Duration::ZERO,
+            );
+        }
         // Keep complete stderr for failed Git writes: a failed local
         // `merge --ff-only` (main reconcile) is as undiagnosable without it as
         // a refused push (#415). A truncated capture is a prefix, not a tail.
