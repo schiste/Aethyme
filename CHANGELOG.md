@@ -4,6 +4,22 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.94] - 2026-11-13
+
+### Fixed
+
+- Capacity removal no longer stalls on a repository with many checkouts. The capacity-pressure probe ran a full worktree listing with no deadline and used the whole slice budget before selection. The checkout count for `start`, `status`, the worker and the probe is now one read of the registration directory, and the per-removal lock check reads the checkout's own registration; the full listing is only a fallback. A slice whose inventory stayed unavailable retries after one minute when it made progress and backs off to ten only without progress (#1668).
+
+### Added
+
+- `[cleanup] regenerable` can release standalone ignored files. A pattern releases a regular file when it matches the file's whole path with wildcards kept inside one path component; a pattern containing `**` never names a file. `blocked_by_ignored` rows for files carry the `config_line` that releases exactly that file, or a `config_refusal` when configuration cannot (#1667).
+- The capacity removal record says what a slice waited on: `probe_ms`, `waiting_on` and the index lap position; plan lanes gain `removal_probe_ms` and `removal_inventory_wait`. The background worker writes one command-metrics row per run with its phase timings (#1668).
+
+### Changed
+
+- Upgrade note: existing `regenerable` patterns now also release the standalone ignored files they match. `<dir>/*` releases ignored files directly in `<dir>`, and `*.ext` or `*-cache` release matching root-level files. The load-time probe still refuses patterns that match common secret or ordinary root-file names (#1667).
+- Protected names are wider and are never released by configuration: any name starting with `.env`, SQLite and `.db` files with their `-wal`, `-shm` and `-journal` siblings, `*.tfstate`, `*.jks`, `*.keystore`, `.git-credentials` and `.pgpass`, in addition to the existing set. A tagged cache directory holding one of these now keeps its checkout (#1667).
+
 ## [0.8.93] - 2026-11-13
 
 ### Fixed
