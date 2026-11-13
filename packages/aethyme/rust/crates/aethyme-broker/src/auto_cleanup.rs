@@ -4119,6 +4119,10 @@ impl Broker {
         let mut alias_refresh_generation = None;
         let mut examined = 0_usize;
         let mut memo_skips = 0_usize;
+        // Under capacity pressure a bounded pass keeps going page by page
+        // while time remains; otherwise each pass keeps its one-page tranche
+        // and the background worker paces the lap.
+        let multi_page = deadline.is_some() && self.checkout_capacity_pressure(deadline);
         let mut first_page = true;
         loop {
             let cursor_before_scan = cursor;
@@ -4345,11 +4349,11 @@ impl Broker {
                 }
             }
             first_page = false;
-            // Bounded passes move on to the next page of closed checkouts while
-            // time remains, up to the end of the current lap; an unbounded pass
-            // (an operator's or a test's) keeps its one-page tranche.
+            // Under capacity pressure, a bounded pass moves on to the next page
+            // of closed checkouts while time remains, up to the end of the
+            // current lap.
             if stop_pass
-                || deadline.is_none()
+                || !multi_page
                 || deadline_expired(deadline)
                 || self.store().cleanup_cohort_group_count(
                     crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
@@ -7713,6 +7717,9 @@ mod tests {
         broker: &mut crate::Broker,
         label: &str,
     ) -> (crate::Session, PathBuf) {
+        // Containment is proved against the fetched `origin/HEAD`.
+        let root = broker.main_root().to_path_buf();
+        git(&root, &["remote", "set-head", "origin", "main"]);
         let session = broker.start_worktree(label, None).unwrap();
         let worktree = PathBuf::from(&session.worktree_path);
         broker
