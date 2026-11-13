@@ -1179,6 +1179,198 @@ pub(crate) fn recover_with_journal(
     recover_with_journal_and_root_guard(cache_root, resource_db, repository, deadline, || Ok(()))
 }
 
+/// The journal row's saved root identity is re-proven through the volume UUID
+/// recorded for exactly that identity.
+pub(crate) const ROOT_REPROOF_VOLUME_UUID: &str = "volume_uuid";
+/// The journal row predates volume bindings; it is re-proven through the
+/// random nonce of the parent root marker that names this cache root.
+pub(crate) const ROOT_REPROOF_LEGACY_MARKER: &str = "legacy_root_marker_nonce";
+/// Prefix of the stop reason when neither rule proves the same root.
+pub(crate) const ROOT_REPROOF_REFUSED: &str = "root_volume_reproof_refused";
+
+/// What the parent root marker shows about a cache root, read through the
+/// parent's own directory handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootMarkerEvidence {
+    /// Identity the marker saved for the parent when it was written.
+    saved_parent: DirectoryIdentity,
+    /// The parent directory the marker was read through, now.
+    live_parent: DirectoryIdentity,
+}
+
+/// Decide whether a journal row whose saved root identity differs from the
+/// live root still names the same directory. `Ok` names the rule that proves
+/// it; `Err` names the first condition that failed. Every condition is needed:
+/// - the live volume UUID is known (otherwise the exact comparison stays);
+/// - the inode is unchanged;
+/// - no debt rows are pending (their payloads also name the old identity);
+/// - and either the volume UUID recorded for this exact saved identity equals
+///   the live one, or, for a row recorded before bindings existed, the parent
+///   root marker, whose random nonce names this cache root, still describes
+///   the live parent's inode and saved the same mount-scoped device and
+///   filesystem as the journal row, and the live parent shares the live
+///   root's filesystem.
+fn renumbered_root_decision(
+    saved: &DirectoryIdentity,
+    live: &DirectoryIdentity,
+    debt_rows: i64,
+    bound_volume: Option<[u8; 16]>,
+    live_volume: Option<[u8; 16]>,
+    marker: Option<&RootMarkerEvidence>,
+) -> Result<&'static str, &'static str> {
+    let Some(live_volume) = live_volume else {
+        return Err("the live volume UUID is unknown");
+    };
+    if saved.inode != live.inode {
+        return Err("the cache root inode differs");
+    }
+    if debt_rows != 0 {
+        return Err("rotation debt rows are pending and name the old identity");
+    }
+    if let Some(bound) = bound_volume {
+        return if crate::volume_identity::same_volume(
+            Some(bound),
+            saved.device,
+            Some(live_volume),
+            live.device,
+        ) {
+            Ok(ROOT_REPROOF_VOLUME_UUID)
+        } else {
+            Err("the volume UUID recorded for this root differs from the live volume")
+        };
+    }
+    let Some(marker) = marker else {
+        return Err("no parent root marker names this cache root");
+    };
+    if marker.saved_parent.inode != marker.live_parent.inode {
+        return Err("the parent root marker names another directory");
+    }
+    if !marker.saved_parent.same_filesystem(saved) {
+        return Err("the parent root marker was written under another mount than the journal row");
+    }
+    if !marker.live_parent.same_filesystem(live) {
+        return Err("the parent directory and the cache root are on different filesystems");
+    }
+    Ok(ROOT_REPROOF_LEGACY_MARKER)
+}
+
+/// Read the parent root marker that names `cache_root` as its nonce child.
+fn root_marker_evidence(cache_root: &Path) -> io::Result<Option<RootMarkerEvidence>> {
+    let (Some(parent), Some(name)) = (cache_root.parent(), cache_root.file_name()) else {
+        return Ok(None);
+    };
+    let deadline = Instant::now() + PREPARATION_ROOT_LOCK_WAIT;
+    let directory = open_real_directory_chain(parent, deadline)?;
+    let live_parent = identity_for_directory(&directory)?;
+    let marker_name = component(PREPARATION_ROOT_MARKER)?;
+    let Some(read) = read_component(directory.as_raw_fd(), &marker_name)? else {
+        return Ok(None);
+    };
+    let marker = decode_preparation_cache_root_marker(&read.bytes, parent, &live_parent)?;
+    let child = preparation_cache_child_component(&marker.nonce)?;
+    if child.to_bytes() != name.as_bytes() {
+        return Ok(None);
+    }
+    Ok(Some(RootMarkerEvidence {
+        saved_parent: marker.root_identity,
+        live_parent,
+    }))
+}
+
+/// Before the journal is read, re-prove a root row whose saved identity
+/// names an old mount-scoped device number, and record the root's stable
+/// volume UUID. A clean row is left to the journal's own reset; a matching
+/// row only gains a volume binding. A refused re-proof stops recovery with
+/// the same outcome as before, naming the failed condition.
+fn reconcile_journal_root_volume(
+    cache_root: &Path,
+    resource_db: &Path,
+    live: &DirectoryIdentity,
+    live_bytes: &[u8],
+) -> io::Result<()> {
+    // A journal that cannot be read here is left to `load_record`, which
+    // reports it exactly as before.
+    let Ok(Some(state)) = super::rotation_journal::root_volume_state(resource_db, cache_root)
+    else {
+        return Ok(());
+    };
+    let live_volume =
+        crate::volume_identity::volume_identity(cache_root, live.device, live.inode).uuid();
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64);
+    if state.saved_identity == live_bytes {
+        if let (Some(uuid), None) = (live_volume, state.bound_volume) {
+            crate::warn_unrecorded(
+                "record the preparation cache root volume",
+                super::rotation_journal::bind_root_volume(
+                    resource_db,
+                    cache_root,
+                    &state.saved_identity,
+                    live_bytes,
+                    uuid,
+                    super::rotation_journal::ROOT_VOLUME_OBSERVED,
+                    now_ms,
+                ),
+            );
+        }
+        return Ok(());
+    }
+    if state.clean {
+        return Ok(());
+    }
+    let Ok(saved) = decode_directory_identity(&state.saved_identity) else {
+        return Ok(());
+    };
+    let marker = root_marker_evidence(cache_root).ok().flatten();
+    match renumbered_root_decision(
+        &saved,
+        live,
+        state.debt_rows,
+        state.bound_volume,
+        live_volume,
+        marker.as_ref(),
+    ) {
+        Ok(rule) => {
+            let Some(uuid) = live_volume else {
+                return Ok(());
+            };
+            match super::rotation_journal::bind_root_volume(
+                resource_db,
+                cache_root,
+                &state.saved_identity,
+                live_bytes,
+                uuid,
+                rule,
+                now_ms,
+            ) {
+                // The binding row records `rule` and when it was accepted.
+                Ok(true) => crate::phase_telemetry::add(
+                    "preparation_rotation_root_reproved",
+                    Duration::ZERO,
+                ),
+                // The row moved on meanwhile: `load_record` judges what is there now.
+                Ok(false) => {}
+                Err(error) => crate::warn_unrecorded::<(), _>(
+                    "re-prove the preparation cache root",
+                    Err(error),
+                ),
+            }
+            Ok(())
+        }
+        Err(condition) => {
+            crate::phase_telemetry::add(
+                "preparation_rotation_root_reproof_refused",
+                Duration::ZERO,
+            );
+            Err(invalid_record(&format!(
+                "preparation cache root identity differs from its durable journal \
+                 ({ROOT_REPROOF_REFUSED}: {condition})"
+            )))
+        }
+    }
+}
+
 /// Recover one repository's rotation while revalidating the broker's captured
 /// cache-root binding immediately before every recovery mutation. The caller
 /// holds the repository-scoped preparation-cache lease for the full operation.
@@ -1232,6 +1424,14 @@ pub(crate) fn recover_with_journal_and_root_guard(
     let root_identity_bytes = root_identity
         .encode()
         .map_err(|source| recovery_error(progress, source))?;
+    validate_root().map_err(|source| recovery_error(progress, source))?;
+    reconcile_journal_root_volume(
+        cache_root,
+        resource_db,
+        &root_identity,
+        &root_identity_bytes,
+    )
+    .map_err(|source| recovery_error(progress, source))?;
 
     let mut journal_record = super::rotation_journal::load_record(
         resource_db,
@@ -5626,5 +5826,309 @@ mod tests {
         );
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
         assert_eq!(fs::read_dir(&old_root).unwrap().count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod root_volume_reproof_tests {
+    use super::{
+        DirectoryIdentity, PREPARATION_ROOT_MARKER, PREPARATION_ROOT_MARKER_SCHEMA,
+        PREPARATION_ROOT_MARKER_VERSION, PreparationCacheRootMarker, ROOT_REPROOF_LEGACY_MARKER,
+        ROOT_REPROOF_REFUSED, ROOT_REPROOF_VOLUME_UUID, RootMarkerEvidence,
+        reconcile_journal_root_volume, renumbered_root_decision,
+    };
+    use crate::preparation::rotation_journal;
+    use std::path::PathBuf;
+
+    const REPOSITORY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const NONCE: &str = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
+    const LIVE_VOLUME: [u8; 16] = [0x7f; 16];
+
+    fn identity(device: u64, inode: u64, filesystem_id: &str) -> DirectoryIdentity {
+        DirectoryIdentity {
+            device,
+            inode,
+            filesystem_id: filesystem_id.into(),
+        }
+    }
+
+    /// A journal row saved under device 45; the volume came back as 41.
+    fn renumbered() -> (DirectoryIdentity, DirectoryIdentity, RootMarkerEvidence) {
+        (
+            identity(45, 839, "1d00"),
+            identity(41, 839, "1900"),
+            RootMarkerEvidence {
+                saved_parent: identity(45, 836, "1d00"),
+                live_parent: identity(41, 836, "1900"),
+            },
+        )
+    }
+
+    #[test]
+    fn legacy_marker_rule_proves_a_renumbered_root() {
+        let (saved, live, marker) = renumbered();
+        assert_eq!(
+            renumbered_root_decision(&saved, &live, 0, None, Some(LIVE_VOLUME), Some(&marker)),
+            Ok(ROOT_REPROOF_LEGACY_MARKER)
+        );
+    }
+
+    /// Each condition of the rule is necessary: breaking any one refuses.
+    #[test]
+    fn every_condition_of_the_root_reproof_is_required() {
+        let (saved, live, marker) = renumbered();
+        let decide = |saved: &DirectoryIdentity,
+                      live: &DirectoryIdentity,
+                      debt_rows: i64,
+                      live_volume: Option<[u8; 16]>,
+                      marker: Option<&RootMarkerEvidence>| {
+            renumbered_root_decision(saved, live, debt_rows, None, live_volume, marker)
+        };
+        assert_eq!(
+            decide(&saved, &live, 0, None, Some(&marker)),
+            Err("the live volume UUID is unknown")
+        );
+        let mut moved = live.clone();
+        moved.inode += 1;
+        assert_eq!(
+            decide(&saved, &moved, 0, Some(LIVE_VOLUME), Some(&marker)),
+            Err("the cache root inode differs")
+        );
+        assert_eq!(
+            decide(&saved, &live, 1, Some(LIVE_VOLUME), Some(&marker)),
+            Err("rotation debt rows are pending and name the old identity")
+        );
+        assert_eq!(
+            decide(&saved, &live, 0, Some(LIVE_VOLUME), None),
+            Err("no parent root marker names this cache root")
+        );
+        let mut other_parent = marker.clone();
+        other_parent.live_parent.inode += 1;
+        assert_eq!(
+            decide(&saved, &live, 0, Some(LIVE_VOLUME), Some(&other_parent)),
+            Err("the parent root marker names another directory")
+        );
+        let mut other_epoch = marker.clone();
+        other_epoch.saved_parent.device += 1;
+        assert_eq!(
+            decide(&saved, &live, 0, Some(LIVE_VOLUME), Some(&other_epoch)),
+            Err("the parent root marker was written under another mount than the journal row")
+        );
+        let mut split = marker;
+        split.live_parent.filesystem_id = "2200".into();
+        assert_eq!(
+            decide(&saved, &live, 0, Some(LIVE_VOLUME), Some(&split)),
+            Err("the parent directory and the cache root are on different filesystems")
+        );
+    }
+
+    #[test]
+    fn a_recorded_volume_uuid_proves_the_root_without_a_marker() {
+        let (saved, live, _) = renumbered();
+        assert_eq!(
+            renumbered_root_decision(&saved, &live, 0, Some(LIVE_VOLUME), Some(LIVE_VOLUME), None),
+            Ok(ROOT_REPROOF_VOLUME_UUID)
+        );
+    }
+
+    /// A different volume mounted at the same path with equal inode numbers
+    /// is refused, even when it also carries a matching-looking marker.
+    #[test]
+    fn a_different_volume_at_the_same_path_with_equal_inodes_is_refused() {
+        let (saved, live, marker) = renumbered();
+        assert_eq!(
+            renumbered_root_decision(
+                &saved,
+                &live,
+                0,
+                Some([0x11; 16]),
+                Some(LIVE_VOLUME),
+                Some(&marker)
+            ),
+            Err("the volume UUID recorded for this root differs from the live volume")
+        );
+        assert_eq!(
+            renumbered_root_decision(&saved, &live, 0, None, Some(LIVE_VOLUME), None),
+            Err("no parent root marker names this cache root")
+        );
+    }
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        resource_db: PathBuf,
+        parent: PathBuf,
+        cache_root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let base = directory.path().canonicalize().unwrap();
+            let parent = base.join("placement");
+            std::fs::create_dir(&parent).unwrap();
+            let cache_root = parent.join(format!(".aethyme-preparation-cache-{NONCE}"));
+            std::fs::create_dir(&cache_root).unwrap();
+            Self {
+                resource_db: base.join("host-resources.db"),
+                _directory: directory,
+                parent,
+                cache_root,
+            }
+        }
+
+        /// Write the parent marker as if saved under `device_delta` more.
+        fn write_marker(&self, device_delta: u64) {
+            let mut root_identity = DirectoryIdentity::capture(&self.parent).unwrap();
+            root_identity.device += device_delta;
+            let marker = PreparationCacheRootMarker {
+                schema: PREPARATION_ROOT_MARKER_SCHEMA.into(),
+                version: PREPARATION_ROOT_MARKER_VERSION,
+                root_path: self.parent.clone(),
+                root_identity,
+                coordinator_db_path: self.resource_db.clone(),
+                nonce: NONCE.into(),
+            };
+            std::fs::write(
+                self.parent.join(PREPARATION_ROOT_MARKER),
+                serde_json::to_vec(&marker).unwrap(),
+            )
+            .unwrap();
+        }
+
+        /// A journal row saved under `device_delta` more, with every lap
+        /// counter unsettled but no debt rows left: the stalled shape.
+        fn stalled_row(&self, device_delta: u64) -> (Vec<u8>, Vec<u8>) {
+            let live = DirectoryIdentity::capture(&self.cache_root).unwrap();
+            let mut saved = live.clone();
+            saved.device += device_delta;
+            let saved = saved.encode().unwrap();
+            let payload = b"debt-payload";
+            rotation_journal::publish(
+                &self.resource_db,
+                &self.cache_root,
+                &saved,
+                REPOSITORY,
+                payload,
+            )
+            .unwrap();
+            rotation_journal::record_fresh_store_identity(
+                &self.resource_db,
+                &self.cache_root,
+                &saved,
+                REPOSITORY,
+                payload,
+                b"fresh-store",
+            )
+            .unwrap();
+            rotation_journal::complete_verified(
+                &self.resource_db,
+                &self.cache_root,
+                &saved,
+                REPOSITORY,
+                payload,
+                b"fresh-store",
+            )
+            .unwrap();
+            let state = rotation_journal::root_volume_state(&self.resource_db, &self.cache_root)
+                .unwrap()
+                .unwrap();
+            assert!(!state.clean, "the fixture must be the unsettled shape");
+            assert_eq!(state.debt_rows, 0);
+            (saved, live.encode().unwrap())
+        }
+
+        fn reconcile(&self) -> std::io::Result<()> {
+            let live = DirectoryIdentity::capture(&self.cache_root).unwrap();
+            reconcile_journal_root_volume(
+                &self.cache_root,
+                &self.resource_db,
+                &live,
+                &live.encode().unwrap(),
+            )
+        }
+    }
+
+    fn load(fixture: &Fixture, identity: &[u8]) -> std::io::Result<()> {
+        rotation_journal::load_record(
+            &fixture.resource_db,
+            &fixture.cache_root,
+            identity,
+            REPOSITORY,
+        )
+        .map(|_| ())
+    }
+
+    fn assert_refused(result: std::io::Result<()>, condition: &str) {
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains(ROOT_REPROOF_REFUSED), "{error}");
+        assert!(error.contains(condition), "{error}");
+    }
+
+    #[test]
+    fn a_renumbered_stalled_root_resumes_through_its_marker() {
+        let fixture = Fixture::new();
+        fixture.write_marker(4);
+        let (saved, live) = fixture.stalled_row(4);
+        assert!(load(&fixture, &live).is_err(), "today's comparison stalls");
+
+        let result = fixture.reconcile();
+        if cfg!(target_os = "macos") {
+            result.unwrap();
+            load(&fixture, &live).unwrap();
+            assert!(load(&fixture, &saved).is_err());
+            let state =
+                rotation_journal::root_volume_state(&fixture.resource_db, &fixture.cache_root)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(state.saved_identity, live);
+            assert!(!state.clean, "lap counters are kept, not reset");
+            assert!(state.bound_volume.is_some());
+            // With the binding recorded, a repeat pass needs no marker.
+            std::fs::remove_file(fixture.parent.join(PREPARATION_ROOT_MARKER)).unwrap();
+            fixture.reconcile().unwrap();
+        } else {
+            // No stable volume identifier: the exact comparison stays.
+            assert_refused(result, "the live volume UUID is unknown");
+            assert!(load(&fixture, &live).is_err());
+        }
+    }
+
+    #[test]
+    fn a_renumbered_root_without_its_marker_stays_stalled() {
+        let fixture = Fixture::new();
+        let (_, live) = fixture.stalled_row(4);
+        let expected = if cfg!(target_os = "macos") {
+            "no parent root marker names this cache root"
+        } else {
+            "the live volume UUID is unknown"
+        };
+        assert_refused(fixture.reconcile(), expected);
+        assert!(load(&fixture, &live).is_err());
+    }
+
+    #[test]
+    fn a_marker_from_another_mount_epoch_does_not_prove_the_root() {
+        let fixture = Fixture::new();
+        fixture.write_marker(9);
+        let (_, live) = fixture.stalled_row(4);
+        let expected = if cfg!(target_os = "macos") {
+            "the parent root marker was written under another mount than the journal row"
+        } else {
+            "the live volume UUID is unknown"
+        };
+        assert_refused(fixture.reconcile(), expected);
+        assert!(load(&fixture, &live).is_err());
+    }
+
+    #[test]
+    fn an_exact_root_gains_a_volume_binding_only_where_one_is_known() {
+        let fixture = Fixture::new();
+        let (_, live) = fixture.stalled_row(0);
+        fixture.reconcile().unwrap();
+        let state = rotation_journal::root_volume_state(&fixture.resource_db, &fixture.cache_root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.saved_identity, live);
+        assert_eq!(state.bound_volume.is_some(), cfg!(target_os = "macos"));
     }
 }

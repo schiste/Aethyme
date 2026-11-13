@@ -299,6 +299,20 @@ broker on the host must be 0.8.69 or later before a repository sets this: an
 older broker refuses the unknown setting, and its own sweep does not wait for
 sharing preparations. It cannot be combined with `managed_storage`.
 
+Finishing an interrupted rotation survives a remount. The host journal remembers
+each preparation-cache root by its device and inode, and macOS gives an external
+volume a new device number on every remount, so a journal row saved before a
+remount used to stall recovery for good ("preparation cache root identity
+differs from its durable journal"). Recovery now records the root's volume UUID
+and, when the device number alone changed, resumes on its own after proving the
+root is the same directory: the inode is unchanged, no rotation debt is pending,
+and either the volume UUID recorded for that row matches or, for a row written
+before UUIDs were recorded, the cache root's parent marker, whose random nonce
+names this root, was written under the same old device number. Anything else
+still stops with `root_volume_reproof_refused: <condition>` in the stop reason;
+Linux keeps the exact device comparison because it has no stable volume
+identifier here. See [cross-process consumers](../architecture/cross-process-consumers.md).
+
 An unspecified `shared_cache.root` keeps the historical Host placement for
 existing configurations. A new pnpm draft from `aethyme init` selects the
 worktree placement filesystem and passes its broker-managed store path with

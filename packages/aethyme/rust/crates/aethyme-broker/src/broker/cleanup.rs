@@ -4830,11 +4830,23 @@ impl Broker {
                             "an artifact producer is active; preserved the worktree".to_owned()
                         }
                         crate::file_lock::artifact_use::ArtifactUseReclaimBlock::UnknownProducer {
+                            legacy_device_renumbered,
                             ..
-                        } => format!(
-                            "artifact-use markers are unresolved; preserved the worktree; \
-                             review them with `aethyme broker gc artifact-use reconcile plan {session_id}`"
-                        ),
+                        } => {
+                            let renumbered = if legacy_device_renumbered == 0 {
+                                String::new()
+                            } else {
+                                format!(
+                                    " ({legacy_device_renumbered} legacy marker(s) matched this \
+                                     checkout after a device renumber: rule {})",
+                                    crate::file_lock::artifact_use::LEGACY_MARKER_DEVICE_RENUMBER_RULE
+                                )
+                            };
+                            format!(
+                                "artifact-use markers are unresolved; preserved the worktree; \
+                                 review them with `aethyme broker gc artifact-use reconcile plan {session_id}`{renumbered}"
+                            )
+                        }
                         crate::file_lock::artifact_use::ArtifactUseReclaimBlock::ProtocolUnavailable => {
                             unreachable!("unavailable protocol is handled above")
                         }
