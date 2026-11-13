@@ -1681,14 +1681,8 @@ fn open_repository_write_lock_file(main_root: &Path, path: &Path) -> Result<File
         })
 }
 
-/// Let concurrency regressions observe the actual first Git lock lane.
-#[cfg(test)]
-pub(crate) fn local_git_coordination_lock_key(cwd: &Path) -> Result<String, BrokerOpError> {
-    git_scopes::common_lock_key(cwd)
-}
-
 /// Acquire both the common-directory lane and canonical remote compatibility
-/// lane used by coordinated writers before reusing a submission plan.
+/// lane exclusively, as a repository-wide coordinated writer does.
 #[cfg(test)]
 pub(crate) fn try_acquire_local_repository_write_lock(
     main_root: &Path,
@@ -2435,11 +2429,12 @@ fn lane_refusal_details(
 
 /// Who holds a write lock, written next to the lock file by every exclusive
 /// holder, journaled or not. The journal names coordinated operations; this
-/// also names `submit`'s plan-reuse hold and maintenance, which have no row.
+/// also names maintenance, which has no row.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LockHolderRecord {
     pub schema_version: u32,
-    /// `coordinated_operation`, `submit_plan_reuse`, `git_maintenance_lock_apply`.
+    /// `coordinated_operation` or `git_maintenance_lock_apply`; binaries before
+    /// 0.8.90 also wrote `submit_plan_reuse`.
     pub kind: String,
     /// The holder's command words, without options or operands that follow one.
     pub command: String,
