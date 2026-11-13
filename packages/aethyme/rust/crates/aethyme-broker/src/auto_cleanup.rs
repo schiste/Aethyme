@@ -2338,7 +2338,7 @@ const CAPACITY_PROBE_MIN_BUDGET: Duration = Duration::from_secs(1);
 
 /// Meta key of the last linked-checkout count `git worktree list` gave, as
 /// `{"count":N,"maximum":M,"at_ms":T}`. `broker start` records it on every
-/// allocation and every pass long enough to count records it too, so a pass
+/// allocation and the background worker on every removal slice, so a pass
 /// too short to run the listing (a broker open's inline sweep) and the
 /// background worker's admission still see capacity pressure.
 pub(crate) const CHECKOUT_USAGE_KEY: &str = "auto_cleanup.checkout_usage";
@@ -4529,8 +4529,8 @@ impl Broker {
     /// when the pass is too short to afford it or the limit is disabled.
     ///
     /// A pass too short to list checkouts reads the count `broker start` or
-    /// a longer pass last recorded instead, while it is recent; without one
-    /// it reports no pressure, as before.
+    /// the background worker last recorded instead, while it is recent;
+    /// without one it reports no pressure, as before.
     pub(crate) fn checkout_capacity_pressure(&self, deadline: Option<Instant>) -> bool {
         if deadline.is_some_and(|end| {
             end.saturating_duration_since(Instant::now()) < CAPACITY_PROBE_MIN_BUDGET
@@ -4546,13 +4546,13 @@ impl Broker {
             );
             return recorded.is_some_and(|(count, maximum)| usage_under_pressure(count, maximum));
         }
-        match self.worktree_checkout_usage() {
-            Ok(Some((count, maximum))) => {
-                self.record_checkout_usage(count, maximum);
-                usage_under_pressure(count, maximum)
-            }
-            Ok(None) | Err(_) => false,
-        }
+        // Recording is left to `start` and the background worker: a pass
+        // here may run while another writer holds the database and must not
+        // wait on it.
+        matches!(
+            self.worktree_checkout_usage(),
+            Ok(Some((count, maximum))) if usage_under_pressure(count, maximum)
+        )
     }
 
     /// Remember a linked-checkout count for passes too short to list them.
@@ -5025,7 +5025,7 @@ impl Broker {
                     "auto_cleanup_alias_verification_deadline",
                     Duration::ZERO,
                 );
-                "filesystem alias verification ran out of time; selected checkouts wait for the next pass"
+                "registered checkout paths could not be verified before the deadline; selected checkouts wait for the next pass"
             } else {
                 "registered checkout paths changed during filesystem alias verification; cleanup requires a fresh pass"
             };

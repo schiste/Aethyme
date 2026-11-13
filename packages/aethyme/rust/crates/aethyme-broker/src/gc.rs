@@ -7626,7 +7626,11 @@ impl Broker {
         }
         // The worker can afford a fresh count; it also refreshes the
         // recorded one that broker opens read.
-        if !self.checkout_capacity_pressure(None) {
+        match self.worktree_checkout_usage() {
+            Ok(Some((count, maximum))) => self.record_checkout_usage(count, maximum),
+            Ok(None) | Err(_) => return Ok(None),
+        }
+        if !self.recorded_checkout_capacity_pressure() {
             return Ok(None);
         }
         let started = Instant::now();
