@@ -25,6 +25,8 @@ use std::path::Path;
 
 /// A volume's stable identifier, or the explicit reason it is not known.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Only macOS constructs `Known`; elsewhere every answer is `Unknown`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) enum VolumeIdentity {
     Known([u8; 16]),
     Unknown(&'static str),

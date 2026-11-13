@@ -3282,31 +3282,35 @@ mod tests {
         let checkout = checkout(primary.path(), "checkout");
         let locations = ArtifactUseLocations::resolve(primary.path(), &checkout).unwrap();
         let renumbered = renumbered_legacy_marker(&locations);
-        let cases: [(&str, fn(&mut ArtifactUseMarker)); 5] = [
-            ("primary root inode", |marker| marker.primary_inode += 1),
-            ("checkout root inode", |marker| marker.checkout_inode += 1),
-            ("primary root path", |marker| {
-                marker.primary_root.push_str("-alias")
-            }),
-            ("checkout root path", |marker| {
-                marker.checkout_root.push_str("-alias")
-            }),
-            ("checkout key", |marker| marker.checkout_key.push('0')),
+        type MarkerChange = fn(&mut ArtifactUseMarker);
+        let cases: [(&str, MarkerChange); 5] = [
+            (
+                "artifact-use marker primary root inode does not match",
+                |marker| marker.primary_inode += 1,
+            ),
+            (
+                "artifact-use marker checkout root inode does not match",
+                |marker| marker.checkout_inode += 1,
+            ),
+            (
+                "artifact-use marker primary root path does not match",
+                |marker| marker.primary_root.push_str("-alias"),
+            ),
+            (
+                "artifact-use marker checkout root path does not match",
+                |marker| marker.checkout_root.push_str("-alias"),
+            ),
+            (
+                "artifact-use marker checkout key does not match",
+                |marker| marker.checkout_key.push('0'),
+            ),
         ];
         for (expected, change) in cases {
             let mut marker = renumbered.clone();
             change(&mut marker);
             assert_eq!(
                 marker_identity_mismatch(&locations, &marker, LegacyDevicePolicy::Inventory),
-                Some(match expected {
-                    "primary root inode" => "artifact-use marker primary root inode does not match",
-                    "checkout root inode" => {
-                        "artifact-use marker checkout root inode does not match"
-                    }
-                    "primary root path" => "artifact-use marker primary root path does not match",
-                    "checkout root path" => "artifact-use marker checkout root path does not match",
-                    _ => "artifact-use marker checkout key does not match",
-                }),
+                Some(expected),
                 "{expected}"
             );
             write_inventory_marker(&locations, &marker);

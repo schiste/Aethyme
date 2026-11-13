@@ -1294,8 +1294,9 @@ fn reconcile_journal_root_volume(
     else {
         return Ok(());
     };
-    let live_volume =
-        crate::volume_identity::volume_identity(cache_root, live.device, live.inode).uuid();
+    let live_volume_identity =
+        crate::volume_identity::volume_identity(cache_root, live.device, live.inode);
+    let live_volume = live_volume_identity.uuid();
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as i64);
@@ -1363,9 +1364,17 @@ fn reconcile_journal_root_volume(
                 "preparation_rotation_root_reproof_refused",
                 Duration::ZERO,
             );
+            let detail = match live_volume_identity {
+                crate::volume_identity::VolumeIdentity::Unknown(reason)
+                    if live_volume.is_none() =>
+                {
+                    format!("{condition}: {reason}")
+                }
+                _ => condition.to_owned(),
+            };
             Err(invalid_record(&format!(
                 "preparation cache root identity differs from its durable journal \
-                 ({ROOT_REPROOF_REFUSED}: {condition})"
+                 ({ROOT_REPROOF_REFUSED}: {detail})"
             )))
         }
     }
