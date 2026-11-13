@@ -3518,7 +3518,7 @@ Current behavior:
 
 ## Local Runtime Notes
 
-- the router executes the engine in-process, auto-starting the engine daemon when needed; no interpreter is involved
+- the router executes the engine in-process and Explore reads the redb graph store directly; no daemon or interpreter is involved
 - the Aethyme-assisted evaluation prompt uses a compact rendered pack rather than the full raw JSON payload
 
 ### Graph Queries

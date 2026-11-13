@@ -25,7 +25,6 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
 mod branches_audit;
 mod graph_refresh;
@@ -35,11 +34,6 @@ mod repository_deploy;
 mod repository_enrollment;
 mod repository_upgrade;
 mod terminal_preview;
-
-/// Upper bound for waiting on a freshly-spawned engine daemon. The socket
-/// binds only after the initial map build (~70s on a 12K-file repo), so
-/// this is generous rather than snappy on purpose.
-const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(240);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ParsedCommand<'a> {
@@ -672,7 +666,7 @@ Usage: aethyme <command> [args...]
 
 Hot path:
   explore --repo <path> --request \"<task>\"
-                              in-process engine; auto-starts the engine daemon
+                              in-process engine over the local graph store
   explore-summary --from explore.json
                               compact decision surface from a saved answer-json
   verify-targets --repo <path> --from explore.json [--max-targets 2 --max-lines 80]
@@ -853,10 +847,8 @@ fn resolve_spelling(args: Vec<String>) -> Result<Vec<String>, ExitCode> {
 
 // ── explore ─────────────────────────────────────────────────────────────────
 //
-// In-process engine call via the shared front end. No Python involvement:
-// the Python explore orchestrator was deleted 2026-05-08, so the old
-// "fall back to Python" tail was already a dead path. The only recoverable
-// condition is "daemon not running", which the router now fixes itself.
+// In-process engine call via the shared front end. Explore reads the redb
+// graph store directly, so it neither needs nor starts the engine daemon.
 
 fn run_explore(args: &[String]) -> ExitCode {
     use aethyme_engine::explore_cli::{ExploreCliOutcome, run};
@@ -869,36 +861,6 @@ fn run_explore(args: &[String]) -> ExitCode {
         ExploreCliOutcome::Failed(msg) => {
             eprintln!("{msg}");
             ExitCode::from(1)
-        }
-        ExploreCliOutcome::DaemonNotRunning { repo } => {
-            eprintln!(
-                "explore: engine daemon not running for {} — starting it \
-                 (first map build can take a minute on large repos)…",
-                repo.display()
-            );
-            if let Err(msg) = start_engine_daemon_and_wait(&repo) {
-                eprintln!("explore: {msg}");
-                return ExitCode::from(1);
-            }
-            match run(args) {
-                ExploreCliOutcome::Done => ExitCode::SUCCESS,
-                ExploreCliOutcome::DaemonNotRunning { .. } => {
-                    eprintln!(
-                        "explore: engine daemon still not reachable after start; \
-                         check {}",
-                        aethyme_engine::daemon::logfile_path_for(&repo).display()
-                    );
-                    ExitCode::from(1)
-                }
-                ExploreCliOutcome::BadUsage(msg) => {
-                    eprintln!("{msg}");
-                    ExitCode::from(2)
-                }
-                ExploreCliOutcome::Failed(msg) => {
-                    eprintln!("{msg}");
-                    ExitCode::from(1)
-                }
-            }
         }
     }
 }
@@ -931,63 +893,6 @@ fn run_explore_summary(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
-}
-
-fn start_engine_daemon_and_wait(repo: &Path) -> Result<(), String> {
-    use aethyme_engine::daemon::{self, ReadyOutcome, StartOutcome};
-    let expected_identity = daemon::runtime_build_identity();
-    let router_exe = env::current_exe().map_err(|error| format!("current_exe: {error}"))?;
-    let managed_launch =
-        aethyme_broker::pin_runtime_pair_for_build(&router_exe, &expected_identity)?;
-    let serve_exe = managed_launch
-        .as_ref()
-        .map(|launch| launch.paths().engine_path().to_path_buf())
-        .unwrap_or_else(engine_cli_binary_path);
-    let runtime_pin = managed_launch.as_ref().map(|launch| launch.pin());
-    let opts = daemon::StartOptions::default();
-    let mut spawned =
-        match daemon::start_detached_with_runtime_pin(repo, &serve_exe, &opts, runtime_pin)? {
-            StartOutcome::Spawned(child) => Some(child),
-            // Already running but the socket refused just now — likely mid
-            // map-build. Don't watch a process we didn't spawn.
-            StartOutcome::AlreadyRunning(_) => None,
-        };
-    match daemon::wait_until_ready_for_identity(
-        repo,
-        spawned.as_mut(),
-        DAEMON_READY_TIMEOUT,
-        &expected_identity,
-    ) {
-        ReadyOutcome::Ready => Ok(()),
-        ReadyOutcome::IdentityMismatch => Err(format!(
-            "engine daemon answered with a different protocol or build identity; log: {}",
-            daemon::logfile_path_for(repo).display()
-        )),
-        ReadyOutcome::ProcessExited => Err(format!(
-            "engine daemon exited during startup (is the repo indexed? \
-             run `aethyme graph status --repo .`, then review and execute \
-             `aethyme graph refresh plan --repo .`). Log tail:\n{}",
-            daemon::log_tail(repo, 5)
-        )),
-        ReadyOutcome::TimedOut => Err(format!(
-            "engine daemon did not become ready within {}s; log: {}",
-            DAEMON_READY_TIMEOUT.as_secs(),
-            daemon::logfile_path_for(repo).display()
-        )),
-    }
-}
-
-/// Locate the engine for unmanaged development/archive layouts. Installer
-/// managed launches resolve an immutable full-identity pair instead.
-fn engine_cli_binary_path() -> PathBuf {
-    if let Ok(mut exe) = env::current_exe() {
-        exe.pop();
-        let candidate = exe.join("aethyme-engine-cli");
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    PathBuf::from("aethyme-engine-cli")
 }
 
 /// Unknown subcommand. Until python-retirement Phase 6 this fell through

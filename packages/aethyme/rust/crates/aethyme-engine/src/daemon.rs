@@ -918,7 +918,7 @@ fn take_inherited_pin_file_from_stdin() -> Result<Option<RuntimeBundlePin>, Stri
         return Err("inherited runtime pin stdin is not open".into());
     }
     let path = PathBuf::from(path_value);
-    // SAFETY: fd 0 is the descriptor supplied by start_detached and the
+    // SAFETY: fd 0 is the descriptor supplied by start_detached_with_runtime_pin and the
     // pin guard becomes its sole Rust owner in this child.
     let file = unsafe { File::from_raw_fd(0) };
     set_close_on_exec(file.as_raw_fd(), true).map_err(|error| error.to_string())?;
@@ -1226,13 +1226,13 @@ pub fn logfile_path_for_identity(repo: &Path, _identity: &str) -> PathBuf {
     repo.join(".aethyme").join("engine-daemon.log")
 }
 
-/// Options for [`start_detached`].
+/// Options for [`start_detached_with_runtime_pin`].
 #[derive(Default)]
 pub struct StartOptions {
     pub idle_timeout: Option<String>,
 }
 
-/// Outcome of [`start_detached`].
+/// Outcome of [`start_detached_with_runtime_pin`].
 pub enum StartOutcome {
     /// A live daemon already owns the pidfile.
     AlreadyRunning(i32),
@@ -1242,30 +1242,6 @@ pub enum StartOutcome {
     /// until reaped, so liveness must be checked with `try_wait()` on
     /// this handle — a `kill(pid, 0)` probe reports zombies as alive.
     Spawned(std::process::Child),
-}
-
-/// Spawn a detached engine-daemon server for `repo`, using `serve_exe` as
-/// the server binary (it must understand `daemon serve --repo <path>` —
-/// i.e. `aethyme-engine-cli`). Shared by both front-end binaries so the
-/// pidfile/logfile/setsid lifecycle cannot drift between them.
-///
-/// Idempotent: returns [`StartOutcome::AlreadyRunning`] when a live pid
-/// holds the pidfile; stale pidfiles are cleaned and respawned.
-pub fn start_detached(
-    repo: &Path,
-    serve_exe: &Path,
-    opts: &StartOptions,
-) -> Result<StartOutcome, String> {
-    let pin = RuntimeBundlePin::for_executable(serve_exe, &runtime_build_identity())?;
-    if let Some(pin) = pin.as_ref()
-        && fs::canonicalize(serve_exe).ok().as_deref() != Some(pin.engine_path().as_path())
-    {
-        return Err(
-            "managed daemon launch must use the engine binary from the validated runtime pair"
-                .into(),
-        );
-    }
-    start_detached_with_runtime_pin(repo, serve_exe, opts, pin.as_ref())
 }
 
 /// Spawn a detached daemon and, when managed, transfer the exact bundle pin
@@ -1358,117 +1334,6 @@ pub fn start_detached_with_runtime_pin(
     let pid = child.id();
     std::fs::write(&pidfile, pid.to_string()).map_err(|e| format!("write pidfile: {e}"))?;
     Ok(StartOutcome::Spawned(child))
-}
-
-/// Outcome of [`wait_until_ready`].
-#[derive(PartialEq, Eq, Debug)]
-pub enum ReadyOutcome {
-    /// The daemon reported the expected protocol and full build identity.
-    Ready,
-    /// A process answered on the identity-keyed socket with another protocol
-    /// or build identity; do not attach to it.
-    IdentityMismatch,
-    /// The watched server process exited before the socket appeared —
-    /// failing fast beats sitting out the timeout (a daemon that dies on
-    /// startup, e.g. un-indexed repo, dies within milliseconds).
-    ProcessExited,
-    /// Deadline passed with the process still alive but no socket.
-    TimedOut,
-}
-
-/// Block until the daemon for `repo` accepts a socket connection, the
-/// watched process dies, or the deadline passes. The socket binds only
-/// after the redb store has been opened and smoke-read.
-pub fn wait_until_ready(
-    repo: &Path,
-    watch: Option<&mut std::process::Child>,
-    timeout: std::time::Duration,
-) -> ReadyOutcome {
-    wait_until_ready_for_identity(repo, watch, timeout, &runtime_build_identity())
-}
-
-/// Wait for a daemon that proves the requested protocol and full source
-/// identity over the identity-specific socket.
-pub fn wait_until_ready_for_identity(
-    repo: &Path,
-    mut watch: Option<&mut std::process::Child>,
-    timeout: Duration,
-    expected_identity: &str,
-) -> ReadyOutcome {
-    let socket = socket_path_for_identity(repo, expected_identity);
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if let Some(matches) = daemon_identity_matches(&socket, expected_identity) {
-            return if matches {
-                ReadyOutcome::Ready
-            } else {
-                ReadyOutcome::IdentityMismatch
-            };
-        }
-        // try_wait() reaps: a kill(pid, 0) probe would report the child
-        // as alive forever once it zombifies under the waiting caller.
-        if let Some(child) = watch.as_deref_mut()
-            && matches!(child.try_wait(), Ok(Some(_)))
-        {
-            return ReadyOutcome::ProcessExited;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    ReadyOutcome::TimedOut
-}
-
-fn daemon_identity_matches(socket: &Path, expected_identity: &str) -> Option<bool> {
-    let mut stream = UnixStream::connect(socket).ok()?;
-    let timeout = Duration::from_millis(500);
-    if stream.set_read_timeout(Some(timeout)).is_err()
-        || stream.set_write_timeout(Some(timeout)).is_err()
-    {
-        return Some(false);
-    }
-    if stream.write_all(b"{\"command\":\"identity\"}\n").is_err()
-        || stream.shutdown(std::net::Shutdown::Write).is_err()
-    {
-        return Some(false);
-    }
-    let mut response = Vec::new();
-    if stream
-        .take((VERSION_PROBE_BYTES + 1) as u64)
-        .read_to_end(&mut response)
-        .is_err()
-        || response.len() > VERSION_PROBE_BYTES
-    {
-        return Some(false);
-    }
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&response) else {
-        return Some(false);
-    };
-    Some(daemon_identity_response_matches(&value, expected_identity))
-}
-
-fn daemon_identity_response_matches(value: &serde_json::Value, expected_identity: &str) -> bool {
-    value.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
-        && value
-            .get("protocol_version")
-            .and_then(serde_json::Value::as_u64)
-            == Some(ENGINE_PROTOCOL_VERSION as u64)
-        && value
-            .get("build_identity")
-            .and_then(serde_json::Value::as_str)
-            == Some(expected_identity)
-}
-
-/// Last few lines of the daemon logfile — the diagnostic callers show
-/// when startup fails.
-pub fn log_tail(repo: &Path, lines: usize) -> String {
-    let path = logfile_path_for(repo);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => {
-            let all: Vec<&str> = text.lines().collect();
-            let start = all.len().saturating_sub(lines);
-            all[start..].join("\n")
-        }
-        Err(_) => format!("(no log at {})", path.display()),
-    }
 }
 
 /// Server state held across requests.
@@ -1959,29 +1824,6 @@ mod tests {
             logfile_path_for_identity(repo, first),
             Path::new("/some/repo/.aethyme/engine-daemon.log")
         );
-    }
-
-    #[test]
-    fn daemon_identity_handshake_requires_protocol_and_full_identity() {
-        let identity = "0.8.51 (build_revision=abc build_commit=def)";
-        let exact = serde_json::json!({
-            "ok": true,
-            "protocol_version": ENGINE_PROTOCOL_VERSION,
-            "build_identity": identity,
-        });
-        assert!(daemon_identity_response_matches(&exact, identity));
-        let wrong_build = serde_json::json!({
-            "ok": true,
-            "protocol_version": ENGINE_PROTOCOL_VERSION,
-            "build_identity": "0.8.51 (build_revision=abc build_commit=xyz)",
-        });
-        assert!(!daemon_identity_response_matches(&wrong_build, identity));
-        let wrong_protocol = serde_json::json!({
-            "ok": true,
-            "protocol_version": ENGINE_PROTOCOL_VERSION + 1,
-            "build_identity": identity,
-        });
-        assert!(!daemon_identity_response_matches(&wrong_protocol, identity));
     }
 
     #[test]

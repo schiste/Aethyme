@@ -229,8 +229,6 @@ pub struct TrustPolicy {
 
 #[derive(Debug)]
 pub enum ExploreError {
-    DaemonNotRunning,
-    DaemonRpc(String),
     InvalidResponse(String),
     /// Engine analyzer failure — used by redb/source-text paths that do
     /// not have a more specific user-error variant.
@@ -251,8 +249,6 @@ pub enum ExploreError {
 impl std::fmt::Display for ExploreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::DaemonNotRunning => write!(f, "engine daemon not running"),
-            Self::DaemonRpc(msg) => write!(f, "engine daemon rpc: {msg}"),
             Self::InvalidResponse(msg) => write!(f, "invalid daemon response: {msg}"),
             Self::EngineAnalyzer(msg) => write!(f, "engine analyzer: {msg}"),
             Self::GraphUnavailable { status, reason } => {
