@@ -4,6 +4,19 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.90] - 2026-11-13
+
+### Added
+
+- Pace the background cleanup worker. It now runs at background CPU and disk priority, deletes at most `[cleanup] unattended_unlinks_per_second` entries per second (default 1000; `0` or `"unlimited"` restores full speed), pauses while memory pressure or load is high, and lets only one worker delete at a time on the machine. `finish`, `finish cleanup` and `gc apply` are not paced. The last run's pacing is reported as `cleanup_retention.last_artifact_sweep.unattended_pacing` (#1657).
+- Report which ignored directories keep a closed checkout from being removed: `gc plan --json` gains `auto_cleanup.blocked_by_ignored`, `auto_cleanup.lanes`, and a `code` plus `ignored_blockers` on each kept checkout (#1655).
+
+### Changed
+
+- Remove more checkouts of closed sessions whose work has landed. Each automatic pass is now shared between retiring landed idle sessions and removing closed checkouts, so neither starves the other, and retirement examines likely-landed sessions first. `.hypothesis`, `playwright-report`, `test-results` (when it holds `.last-run.json`) and any directory carrying a valid `CACHEDIR.TAG` count as regenerable tool output (#1655).
+- `broker start` at the checkout limit now removes a few removable checkouts itself, for at most about 20 seconds, before refusing (#1655).
+- `broker submit` no longer holds the repository's Git lane while it builds its plan and replays commits, so a concurrent `broker push` no longer waits on it. Submit takes two short shared holds, checks the operation journal for repository-wide writes made meanwhile, and rebuilds its plan when something changed (#1656).
+
 ## [0.8.89] - 2026-11-13
 
 ### Changed
