@@ -28,6 +28,12 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
     while [ ! -f "$AETHYME_READ_BARRIER/labels-started" ] && [ "$i" -lt 200 ]; do sleep 0.02; i=$((i + 1)); done
     [ -f "$AETHYME_READ_BARRIER/labels-started" ] && touch "$AETHYME_READ_BARRIER/view-overlapped"
   fi
+  if [ -n "$AETHYME_CHANGE_BARRIER" ] && [ "$7" = "files,commits,headRefOid,baseRefOid,changedFiles" ]; then
+    touch "$AETHYME_CHANGE_BARRIER/change-started"
+    i=0
+    while [ ! -f "$AETHYME_CHANGE_BARRIER/diff-started" ] && [ "$i" -lt 200 ]; do sleep 0.02; i=$((i + 1)); done
+    [ -f "$AETHYME_CHANGE_BARRIER/diff-started" ] && touch "$AETHYME_CHANGE_BARRIER/change-overlapped"
+  fi
   case "$*" in
     *"--json headRefOid")
       printf '{"headRefOid":"%s"}\n' "$AETHYME_FAKE_PR_HEAD"
@@ -38,6 +44,12 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "diff" ]; then
+  if [ -n "$AETHYME_CHANGE_BARRIER" ]; then
+    touch "$AETHYME_CHANGE_BARRIER/diff-started"
+    i=0
+    while [ ! -f "$AETHYME_CHANGE_BARRIER/change-started" ] && [ "$i" -lt 200 ]; do sleep 0.02; i=$((i + 1)); done
+    [ -f "$AETHYME_CHANGE_BARRIER/change-started" ] && touch "$AETHYME_CHANGE_BARRIER/diff-overlapped"
+  fi
   exit 0
 fi
 if [ "$1" = "label" ] && [ "$2" = "list" ]; then
@@ -249,6 +261,73 @@ fn review_fetches_pr_and_repository_labels_concurrently() {
         assert!(
             fixture.bin.path().join(marker).exists(),
             "provider reads did not overlap: {marker}"
+        );
+    }
+}
+
+/// The change read, the diff, the snapshot and the projection facts were
+/// sequential `gh` calls; they are independent, so the run overlaps them and
+/// records each one's time.
+#[test]
+fn review_overlaps_the_change_read_with_the_other_provider_reads() {
+    let fixture = Fixture::new();
+    let barrier = fixture.bin.path().to_str().unwrap();
+    let output = fixture.cli(
+        &[
+            "advanced",
+            "review",
+            "run",
+            "--session",
+            &fixture.session,
+            "--repo",
+            "acme/product",
+            "--pr",
+            "7",
+            "--from-provider",
+            "--json",
+        ],
+        &[("AETHYME_CHANGE_BARRIER", barrier)],
+    );
+    assert!(
+        output.status.success(),
+        "review failed: {}\n{}",
+        stderr(&output),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    for marker in ["change-overlapped", "diff-overlapped"] {
+        assert!(
+            fixture.bin.path().join(marker).exists(),
+            "provider reads did not overlap: {marker}"
+        );
+    }
+    let metrics = std::fs::read_to_string(
+        fixture
+            .repo
+            .path()
+            .join(".aethyme/logs/command-metrics.jsonl"),
+    )
+    .expect("review run writes command metrics");
+    let phases = metrics
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|metric| {
+            metric["phase_timings_ms"]
+                .get("review_run_change_read")
+                .is_some()
+                .then(|| metric["phase_timings_ms"].clone())
+        })
+        .expect("a review run metric with its phases");
+    for phase in [
+        "review_run_change_read",
+        "review_run_snapshot_read",
+        "review_run_pr_facts_read",
+        "review_run_diff_read",
+        "review_run_prefetch_wait",
+        "review_run_classify",
+    ] {
+        assert!(
+            phases[phase].as_u64().is_some(),
+            "missing {phase}: {phases}"
         );
     }
 }

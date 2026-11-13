@@ -186,18 +186,22 @@ fn duplicate_target(session: &Session, prs_by_head: &BTreeMap<String, i64>) -> T
 impl Broker {
     /// Other sessions that look like the same work as `session`, strongest
     /// reason first. Closed sessions never count.
-    pub(crate) fn duplicate_work_among(
-        &self,
-        session: &Session,
-        agents: &[AgentView],
-    ) -> Vec<DuplicateWork> {
-        duplicates_among(session, agents, &self.cached_open_prs_by_head())
-    }
-
-    /// [`Broker::duplicate_work_among`] against every live session now.
+    ///
+    /// Whether two sessions look like the same work depends only on their
+    /// branches, tasks and the cached PR listing, never on liveness. So
+    /// liveness is derived only for the sessions that match, usually none:
+    /// building the whole agents view here was all of `push`'s finalization
+    /// (785 ms on average, 15 pushes, 2026-11-12) to report nothing.
     pub fn duplicate_work_for(&mut self, session: &Session) -> Vec<DuplicateWork> {
-        let agents = self.agents(crate::clock::epoch_ms()).unwrap_or_default();
-        self.duplicate_work_among(session, &agents)
+        let prs_by_head = self.cached_open_prs_by_head();
+        let mine = duplicate_target(session, &prs_by_head);
+        let agents = self
+            .agents_where(crate::clock::epoch_ms(), |other| {
+                other.id != session.id
+                    && compare(&mine, &duplicate_target(other, &prs_by_head)).is_some()
+            })
+            .unwrap_or_default();
+        duplicates_among(session, &agents, &prs_by_head)
     }
 
     /// One `session.duplicate-work` advice row per pair of sessions that look

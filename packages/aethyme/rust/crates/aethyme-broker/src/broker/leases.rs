@@ -405,8 +405,32 @@ impl Broker {
     /// and PID liveness for spawned sessions. Reconciles dead spawned
     /// processes to `exited` in the store as a side effect.
     pub fn agents(&mut self, now_ms: i64) -> Result<Vec<AgentView>, BrokerOpError> {
+        self.agents_where(now_ms, |_| true)
+    }
+
+    /// [`Broker::agents`] for only the live sessions `keep` accepts.
+    ///
+    /// Each view is derived exactly as `agents` derives it, side effects
+    /// included, so a caller that needs a few sessions' liveness gets the same
+    /// answer for them without paying for, or reconciling, every other one.
+    /// Each session left out is counted as `agents_view_sessions_skipped`.
+    pub(crate) fn agents_where(
+        &mut self,
+        now_ms: i64,
+        keep: impl Fn(&Session) -> bool,
+    ) -> Result<Vec<AgentView>, BrokerOpError> {
         let _span = crate::phase_telemetry::span("agents_view");
-        let sessions = self.store.live_sessions()?;
+        let mut sessions = self.store.live_sessions()?;
+        sessions.retain(|session| {
+            let kept = keep(session);
+            if !kept {
+                crate::phase_telemetry::add(
+                    "agents_view_sessions_skipped",
+                    std::time::Duration::ZERO,
+                );
+            }
+            kept
+        });
         let abandon_after_ms = self.abandonment_window_ms();
         let mut views = Vec::with_capacity(sessions.len());
         let mut holder_process_table = crate::session_holder::RecordedHolderProcessTable::default();

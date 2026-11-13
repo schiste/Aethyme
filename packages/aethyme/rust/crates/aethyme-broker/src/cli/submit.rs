@@ -1077,7 +1077,14 @@ fn review_on_push_with(
     main_root: &std::path::Path,
     report: &crate::SessionPushReport,
 ) -> Option<serde_json::Value> {
-    let policy = match crate::ReviewPolicy::load(main_root) {
+    // Where the time goes: `_policy` reading `[review]`, `_child_start`
+    // starting the review process, `_child_wait` the run itself, whose own
+    // metric row (`review run`) splits it into `review_run_*` phases.
+    let loaded = {
+        let _span = crate::phase_telemetry::span("review_on_push_policy");
+        crate::ReviewPolicy::load(main_root)
+    };
+    let policy = match loaded {
         Ok(policy) if policy.run_on_push => policy,
         Ok(_) => return None,
         Err(error) => {
@@ -1120,13 +1127,16 @@ fn review_on_push_with(
             &format!("cannot write {}", log_path.display()),
         ));
     };
-    let child = std::process::Command::new(&program)
-        .args(review_run_args(report, pr.number))
-        .current_dir(main_root)
-        .stdin(std::process::Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr)
-        .spawn();
+    let child = {
+        let _span = crate::phase_telemetry::span("review_on_push_child_start");
+        std::process::Command::new(&program)
+            .args(review_run_args(report, pr.number))
+            .current_dir(main_root)
+            .stdin(std::process::Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+    };
     let mut child = match child {
         Ok(child) => child,
         Err(error) => {
@@ -1139,6 +1149,7 @@ fn review_on_push_with(
     };
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(policy.run_on_push_budget_secs);
+    let waiting = crate::phase_telemetry::span("review_on_push_child_wait");
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -1155,6 +1166,7 @@ fn review_on_push_with(
             }
         }
     };
+    drop(waiting);
     let output = std::fs::read_to_string(&log_path).unwrap_or_default();
     match status {
         None => Some(review_on_push_failure(
