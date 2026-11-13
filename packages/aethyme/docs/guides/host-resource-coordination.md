@@ -483,6 +483,50 @@ publishes atomically with mode 0600 on Unix, and omits the ownership token from
 stdout. Inventory and gate reports never contain that token, file contents,
 diffs, or absolute worktree paths.
 
+### Waiting order
+
+A request that meets ordinary contention while it waits (`--wait` above zero,
+`resources run --wait`, or a gate's `resource_wait_seconds`) records a waiter
+row in the host-resource store and is served in arrival order per resource:
+
+- A capacity request is granted only if its pool has room for the units of
+  every live waiter that arrived earlier, plus its own. A later, smaller
+  request can pass an earlier one only when it cannot take a unit the earlier
+  one could use, so a full-pool request is never starved by smaller ones.
+- An exclusive key is not granted to a request while an earlier live waiter
+  demands it.
+- A request that does not wait (`--wait` absent or zero) is admitted as if it
+  arrived after every live waiter: it fails with retryable
+  `resource_contention` instead of taking what a waiter needs.
+- TCP ports and namespaces are not queued; the operating system, not the
+  store, decides whether a port is free.
+
+The waiter row is removed on grant, on a refusal waiting cannot resolve, and on
+timeout. A row whose process is gone, whose own deadline has passed, or whose
+heartbeat is older than two minutes stops gating anyone at once and is deleted
+by the next acquisition; no reconcile is needed. Between attempts a waiter
+reads only SQLite's `data_version`: the head of a queue retries as soon as the
+store changes and at least every second, and waiters behind it retry at most
+once a second on a change and back off to five seconds without one.
+
+`explain --json` adds a `queue` object (schema
+`aethyme.host-resource-queue/v1`): `queued`, `position` (live waiters ahead on
+any queued resource it demands; 0 is the head), `enqueued_at`, `waited_ms`,
+`times_skipped`, and per-resource `resources[]` with `kind`, `resource`,
+`waiters_ahead`, `waiters_behind`, `units_ahead`, `units_requested`,
+`units_allocated`, `limit`, and `holders[]` (`lease_id`, `generation`, `units`,
+`holder_pid`). Contention JSON from `acquire --json` and `run --json` carries
+the same `queue` object at refusal. Human `list` prints the waiting requests in
+arrival order; `list --json` keeps its lease-array shape. Command metrics gain
+`resource_queue` with `waited_ms`, `attempts`, `poll_ticks`, `queued`,
+`position_at_enqueue`, `times_skipped`, and `reaped_dead_waiters`.
+
+Older binaries keep working on a store that has the waiter table: it is
+created additively and the store version is unchanged. They do not read it, so
+their polling acquire can still take units an earlier waiter has reserved;
+the queue bounds only current binaries and becomes complete once every running
+process has been upgraded.
+
 `reap` is an independent dead-holder sweep. It quarantines active leases whose
 holder PID is provably gone, releases ordinary leases' capacity allocations,
 and reports the reclaimed units. A supervised capacity hold is retained even
