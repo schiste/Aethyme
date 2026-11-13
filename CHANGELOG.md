@@ -4,6 +4,18 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.91] - 2026-11-13
+
+### Fixed
+
+- Closed checkouts are removed again on a repository near its checkout limit. The background cleanup worker now holds the GC lock for at most 30 seconds per cache pass and releases it between passes; under capacity pressure it removes closed landed checkouts itself, one at a time and at most four per slice, waiting out the deletion pacer between removals. Short passes read a recorded checkout count, so they see capacity pressure, and selection stops at three quarters of the removal budget so the removal step always has time (#1660).
+- A remote write that provably never reached the remote is recorded as `failed` with a retry hint instead of `outcome_unknown`, so it no longer write-blocks the repository. This covers a `git push` over a built-in transport that died while listing the remote's refs (DNS failure, refused connection, TLS or SSH handshake failure, authentication failure), a `gh` command rejected by its own argument parser, and a single-request `gh api` whose connection never opened. Timeouts, resets and multi-request `gh` commands still end `outcome_unknown` (#1659).
+
+### Added
+
+- A checkout whose automatic removal was interrupted is finished on a later pass. The broker records a removal attempt before it starts and resumes only a checkout with a matching record whose every change is a deleted tracked file. A checkout with tracked deletions and no record is kept and reported as `unmarked_tracked_deletions`; under `[cleanup] strict` a recorded one is kept as `strict_tracked_deletions` (#1660).
+- New report fields `auto_cleanup.lanes.removal_selected`, `auto_cleanup.lanes.removal_apply_reserve_ms` and `removed[].resumed_interrupted_removal`, and `remote_write_*` phase counts for how each failed remote write was classified (#1659, #1660).
+
 ## [0.8.90] - 2026-11-13
 
 ### Added
