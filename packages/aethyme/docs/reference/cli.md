@@ -2903,7 +2903,6 @@ posture first; it names the exact next command.
 ### Local Repo Intake
 - `aethyme repo ingest /path/to/repo`
 - `aethyme repo inspect /path/to/repo --json-output`
-- `aethyme repo clear-cache /path/to/repo`
 - `aethyme repo warm /path/to/repo`
 - `aethyme repo compile-skills /path/to/repo`
 - `aethyme repo init-onboarding-overrides /path/to/repo`
@@ -3520,9 +3519,6 @@ Current behavior:
 ## Local Runtime Notes
 
 - the router executes the engine in-process, auto-starting the engine daemon when needed; no interpreter is involved
-- local artifacts are cached by repository snapshot under `AETHYME_CACHE_DIR` or `/tmp/aethyme-cache`
-- Git repositories use commit plus dirty-state metadata for cache keys
-- `repo clear-cache` clears the current snapshot cache
 - the Aethyme-assisted evaluation prompt uses a compact rendered pack rather than the full raw JSON payload
 
 ### Graph Queries

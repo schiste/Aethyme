@@ -69,7 +69,6 @@ Setup:
   certify                     read-only certification checks for this repo
   deploy [verify|bridge] [--repo <path>]
                               enroll repository policy and agent guidance
-  root show|set <path>        developer checkout pointer (legacy compatibility)
 
 Graph and analysis:
   graph status|units|materialize|refresh|impact|node|callers|...

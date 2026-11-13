@@ -405,7 +405,6 @@ fn main_with_args(args: &[String]) -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => report_cli_error(error),
         },
-        "root" => run_root_subcommand(&args[1..]),
         // The agent-surface hook entry point the Aethyme plugin shims
         // to. One stable spelling so an installed plugin never has to
         // match an installed CLI version.
@@ -734,7 +733,6 @@ Setup:
   certify                     read-only certification checks for this repo
   deploy [verify|bridge] [--repo <path>]
                               enroll repository policy and agent guidance
-  root show|set <path>        developer checkout pointer (legacy compatibility)
 
 Graph and analysis:
   graph status|units|materialize|refresh|impact|node|callers|...
@@ -990,143 +988,6 @@ fn engine_cli_binary_path() -> PathBuf {
         }
     }
     PathBuf::from("aethyme-engine-cli")
-}
-
-// ── aethyme root — legacy developer checkout pointer ────────────────────────
-//
-// Repository deployment is self-contained and does not consult this pointer.
-// The command remains for developer compatibility and explicit inspection of
-// source checkouts configured by older installations.
-//
-// Resolution order:
-//   1. $AETHYME_ROOT (explicit override, highest priority)
-//   2. pointer file: $XDG_CONFIG_HOME/aethyme/root (default ~/.config/aethyme/root)
-//   3. upward walk from the current directory (covers working inside the
-//      Aethyme repo or any of its worktrees with zero configuration)
-//
-// Existing pointer files remain readable so upgrades do not destroy operator
-// configuration.
-
-fn config_pointer_path() -> Option<PathBuf> {
-    let base = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("aethyme").join("root"))
-}
-
-/// A directory qualifies as an Aethyme developer checkout when it holds the
-/// Rust workspace and canonical skill sources.
-fn is_aethyme_root(dir: &Path) -> bool {
-    dir.join("rust").join("Cargo.toml").is_file() && dir.join("skills").join("aethyme").is_dir()
-}
-
-fn resolve_aethyme_root() -> Option<(PathBuf, &'static str)> {
-    if let Ok(v) = env::var("AETHYME_ROOT")
-        && !v.is_empty()
-    {
-        return Some((PathBuf::from(v), "AETHYME_ROOT env"));
-    }
-    if let Some(pointer) = config_pointer_path()
-        && let Ok(text) = std::fs::read_to_string(&pointer)
-    {
-        let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            let path = PathBuf::from(trimmed);
-            if is_aethyme_root(&path) {
-                return Some((path, "pointer file"));
-            }
-        }
-    }
-    // Upward walk: <dir>/packages/aethyme (monorepo root or any worktree)
-    // or <dir> itself (running from inside the package).
-    let mut dir = env::current_dir().ok()?;
-    loop {
-        if is_aethyme_root(&dir) {
-            return Some((dir, "upward walk"));
-        }
-        let candidate = dir.join("packages").join("aethyme");
-        if is_aethyme_root(&candidate) {
-            return Some((candidate, "upward walk"));
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
-}
-
-fn run_root_subcommand(args: &[String]) -> ExitCode {
-    match args.first().map(String::as_str) {
-        Some("show") | None => match resolve_aethyme_root() {
-            Some((path, source)) => {
-                println!("{} (via {source})", path.display());
-                ExitCode::SUCCESS
-            }
-            None => {
-                eprintln!("aethyme root: not resolved. Fix one of:");
-                print_root_guidance();
-                ExitCode::from(1)
-            }
-        },
-        Some("set") => {
-            let Some(raw) = args.get(1) else {
-                eprintln!("usage: aethyme root set <path-to-aethyme-package>");
-                return ExitCode::from(2);
-            };
-            let path = match std::fs::canonicalize(raw) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("aethyme root set: {raw}: {e}");
-                    return ExitCode::from(1);
-                }
-            };
-            // Accept either the package dir or the monorepo root.
-            let target = if is_aethyme_root(&path) {
-                path
-            } else {
-                let nested = path.join("packages").join("aethyme");
-                if is_aethyme_root(&nested) {
-                    nested
-                } else {
-                    eprintln!(
-                        "aethyme root set: {} does not contain rust/Cargo.toml + skills/aethyme \
-                         (nor packages/aethyme/)",
-                        path.display()
-                    );
-                    return ExitCode::from(1);
-                }
-            };
-            let Some(pointer) = config_pointer_path() else {
-                eprintln!("aethyme root set: cannot resolve a config directory (no HOME)");
-                return ExitCode::from(1);
-            };
-            if let Some(parent) = pointer.parent()
-                && let Err(e) = std::fs::create_dir_all(parent)
-            {
-                eprintln!("aethyme root set: create {}: {e}", parent.display());
-                return ExitCode::from(1);
-            }
-            if let Err(e) = std::fs::write(&pointer, format!("{}\n", target.display())) {
-                eprintln!("aethyme root set: write {}: {e}", pointer.display());
-                return ExitCode::from(1);
-            }
-            println!(
-                "aethyme root -> {} ({})",
-                target.display(),
-                pointer.display()
-            );
-            ExitCode::SUCCESS
-        }
-        Some(other) => {
-            eprintln!("aethyme root: unknown action '{other}' (use show|set)");
-            ExitCode::from(2)
-        }
-    }
-}
-
-fn print_root_guidance() {
-    eprintln!("  - run from inside an Aethyme checkout (auto-discovered), or");
-    eprintln!("  - `aethyme root set /path/to/Aethyme` (writes ~/.config/aethyme/root), or");
-    eprintln!("  - export AETHYME_ROOT=/path/to/Aethyme/packages/aethyme");
 }
 
 /// Unknown subcommand. Until python-retirement Phase 6 this fell through
