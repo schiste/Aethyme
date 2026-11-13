@@ -4,6 +4,20 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.93] - 2026-11-13
+
+### Fixed
+
+- Closed checkouts whose ownership record went stale after a volume remount are removable again. Automatic removal now re-proves a spawned checkout whose only mismatch is renumbered devices: paths, inodes, the root generation, the Git registration on the session branch and the branch tip must all still match. A removal that used it carries `removed[].ownership_reproof`; a refusal is kept as `ownership_reproof_refused` with the failed condition (#1665).
+- Under capacity pressure, checkouts with a merged pull request or a due cleanup request are judged before the session-order lap, so removal follows what became removable instead of waiting for the lap to reach it. A checkout kept at the last step is remembered and no longer blocks the next one (#1665).
+- A removal slice that ran out of time before judging anything retries after one minute, backing off to ten on repeats, and records `out_of_time_before_selection` with the phase that used the budget. The checkout count no longer lists every worktree (#1665).
+- Host resource waits are served in arrival order. A request for a whole pool is no longer starved by later smaller requests; dead waiters are skipped and reaped automatically; waiters back off instead of polling the store four times a second (#1664).
+
+### Added
+
+- Distinct keep codes for checkouts automatic removal cannot prove: `ownership_witness_missing`, `ownership_witness_legacy`, `ownership_adopted_only`, `checkout_missing` and `cohort_unavailable`, each naming the manual route. New fields `lanes.removal_priority_examined` and, on the capacity removal record, `count_ms`, `pre_selection_ms` and `budget_consumed_by` (#1665).
+- Resource contention output reports the queue: position, units ahead, holders and time waited, in `acquire --json`, `run --json` and `explain`; `list` shows waiting requests in arrival order. Command metrics gain `resource_queue` with waited time, attempts, position at enqueue, times skipped and reaped waiters (#1664).
+
 ## [0.8.92] - 2026-11-13
 
 ### Fixed
