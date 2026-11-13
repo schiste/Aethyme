@@ -142,7 +142,6 @@ Usage:
       --no-methods            Exclude methods from the symbol set.
       --budget-ms <n>         Time budget in ms (default 10000).
       --max-evidence-per-symbol <n>  Evidence items per symbol (default 5).
-    Starts the engine daemon automatically when it is not running.
 "#,
     ),
     (
@@ -279,8 +278,6 @@ Usage:
       Show the repository map (default mode: full).
   aethyme repo warm <repo_path>
       Build the repository map once.
-  aethyme repo clear-cache <repo_path>
-      Delete the legacy output cache root ($AETHYME_CACHE_DIR, default /tmp/aethyme-cache).
   aethyme repo engine-info [--repo <path>] [--check] [--json-output]
       Binary, version, graph store, and daemon status; --check exits 1 when not ready.
   aethyme repo deploy-skills <repo_path> [--force | --remove]
@@ -309,17 +306,6 @@ Usage:
       Record a wrapper invocation in the telemetry ledger (used by hooks).
   aethyme repo branches audit [<repo_path>] [--remote <name>] [--no-gh] [--json-output]
       Read-only: classify local branches as on-remote, contained, merged-via-pr, or local-only.
-"#,
-    ),
-    (
-        "root",
-        r#"aethyme root — locate the Aethyme package root (legacy compatibility)
-
-Usage:
-  aethyme root show
-      Print the resolved root and how it was found (the default action).
-  aethyme root set <path>
-      Save the package or monorepo path to ~/.config/aethyme/root.
 "#,
     ),
     (

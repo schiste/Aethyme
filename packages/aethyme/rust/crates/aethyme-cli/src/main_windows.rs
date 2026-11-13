@@ -113,13 +113,6 @@ fn run_explore(args: &[String]) -> ExitCode {
             eprintln!("{message}");
             ExitCode::from(1)
         }
-        ExploreCliOutcome::DaemonNotRunning { repo } => {
-            eprintln!(
-                "explore: engine daemon is not yet supported on Windows for {}",
-                repo.display()
-            );
-            ExitCode::from(1)
-        }
     }
 }
 

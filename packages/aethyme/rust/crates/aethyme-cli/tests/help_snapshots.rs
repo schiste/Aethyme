@@ -28,7 +28,6 @@ const TOP_LEVEL: &[&str] = &[
     "repo",
     "task",
     "query",
-    "root",
     "hook",
     "plugin",
     "broker",

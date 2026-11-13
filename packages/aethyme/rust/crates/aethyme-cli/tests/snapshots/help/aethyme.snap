@@ -8,7 +8,7 @@ Usage: aethyme <command> [args...]
 
 Hot path:
   explore --repo <path> --request "<task>"
-                              in-process engine; auto-starts the engine daemon
+                              in-process engine over the local graph store
   explore-summary --from explore.json
                               compact decision surface from a saved answer-json
   verify-targets --repo <path> --from explore.json [--max-targets 2 --max-lines 80]
@@ -69,7 +69,6 @@ Setup:
   certify                     read-only certification checks for this repo
   deploy [verify|bridge] [--repo <path>]
                               enroll repository policy and agent guidance
-  root show|set <path>        developer checkout pointer (legacy compatibility)
 
 Graph and analysis:
   graph status|units|materialize|refresh|impact|node|callers|...
