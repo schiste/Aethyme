@@ -1899,3 +1899,7 @@ Introduced 2026-11-13. The removal lane walked closed checkouts only in session-
 - Phase telemetry adds the span `auto_cleanup_priority_selection` and the counter `auto_cleanup_priority_examined`.
 
 Consumers must tolerate the new field and key. Covered by `auto_cleanup.rs` `priority_groups_order_merged_pull_requests_then_due_requests` and `under_capacity_pressure_a_merged_checkout_is_judged_before_the_lap`.
+
+### Capacity removal slice: out of time before selection
+
+Introduced 2026-11-13. A capacity removal slice whose budget ran out before its first removal pass (on the busiest repository, counting about 900 registered checkouts took the whole 20-second budget) recorded `lap_unfinished` with `examined: 0, passes: 0` and backed off ten minutes as if nothing were removable. Such a slice now records outcome `out_of_time_before_selection` and retries after one minute. The `auto_cleanup.capacity_removal` record gains `count_ms` (time counting registered checkouts), `pre_selection_ms` (slice start to its first removal pass, or to giving up) and `budget_consumed_by` (`checkout_count` or `pre_selection`, only with that outcome). Phase telemetry adds the timed phase `artifact_worker_capacity_removal_count` and the counter `artifact_worker_capacity_removal_outcome_out_of_time_before_selection`. Consumers must tolerate the new outcome and fields. Covered by `gc.rs` `a_slice_that_ran_out_of_time_before_selection_retries_soon` and `an_unfinished_capacity_lap_retries_soon_and_a_finished_one_backs_off`.

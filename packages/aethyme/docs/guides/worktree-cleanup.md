@@ -200,7 +200,10 @@ an inventory. Each slice records its own result under the meta key
 `aethyme broker gc plan --json` and as `capacity_removal` in
 `aethyme broker status --json`; the worker's later lanes do not overwrite it.
 Its `outcome` is `removed`, `lock_busy`, `inventory_unavailable`,
-`lap_unfinished` or `nothing_removable`; `kept_by_code` counts the kept
+`lap_unfinished`, `out_of_time_before_selection` (the budget ran out before
+any checkout was judged; `budget_consumed_by` says whether counting checkouts
+or the other checks used it, and the slice retries after one minute) or
+`nothing_removable`; `kept_by_code` counts the kept
 checkouts per keep code, `blocked_by_ignored` names the ignored directories
 holding the most checkouts with the line that would release each,
 `lap_remaining` and the cursor say how far the lap got, and `scan_ms`,

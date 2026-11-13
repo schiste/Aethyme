@@ -1124,7 +1124,9 @@ pub struct CapacityRemovalSlice {
     /// `removed`; `lock_busy` (another maintenance pass held the GC lock);
     /// `inventory_unavailable` (no complete checkout inventory before the
     /// deadline); `lap_unfinished` (time ran out before the closed-checkout
-    /// lap reached its end); `nothing_removable` (the lap ended and every
+    /// lap reached its end); `out_of_time_before_selection` (the budget ran
+    /// out before one removal pass started, see `budget_consumed_by`; retried
+    /// after one minute); `nothing_removable` (the lap ended and every
     /// examined checkout was kept or deferred).
     pub outcome: String,
     pub removed: usize,
@@ -1160,6 +1162,16 @@ pub struct CapacityRemovalSlice {
     /// removed something and the next one may run at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<i64>,
+    /// Time the slice spent counting registered checkouts.
+    #[serde(default)]
+    pub count_ms: u64,
+    /// Time from the slice start to its first removal pass (or to giving up).
+    #[serde(default)]
+    pub pre_selection_ms: u64,
+    /// With outcome `out_of_time_before_selection`: what used the budget,
+    /// `checkout_count` or `pre_selection`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_consumed_by: Option<String>,
 }
 
 impl CapacityRemovalSlice {
