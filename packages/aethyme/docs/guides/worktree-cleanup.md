@@ -144,7 +144,27 @@ stable `code` in
 `cleanup.auto-removal` row in `broker status`. Once registered linked
 checkouts reach three quarters of `[worktrees].max_checkouts`, a
 `cleanup.checkout-capacity` row names the retained count and the commands that
-reclaim slots before `broker start` refuses. Each removal emits
+reclaim slots before `broker start` refuses.
+
+When a closed checkout is kept only for ignored leftovers, the removal lane
+lists every ignored root that blocks it (`kept[].ignored_blockers`) and
+remembers the verdict. It skips that checkout on later passes until its HEAD,
+the `[cleanup]` policy, or the modification time of the checkout root, a
+blocker or a blocker's parent changes, and re-proves it at least weekly
+(`auto_cleanup.lanes.removal_memo_skips` counts the skips). Across all
+remembered checkouts, `auto_cleanup.blocked_by_ignored` lists the most common
+blockers with the line that would release a directory, for example:
+
+```json
+{"name": "<dir>/", "checkouts": 300, "config_line": "[cleanup] regenerable = [\"<dir>\"]"}
+```
+
+and the `cleanup.checkout-capacity` row repeats the top five in its evidence.
+The repository decides: add the line only when the directory holds nothing but
+output its tools regenerate. A standalone ignored file is never released by
+configuration; review and delete it, or keep the checkout. The glob is matched
+against the ignored root itself, so name the directory (`"<dir>"`), not only
+its contents (`"<dir>/**"` does not match the root `<dir>`). Each removal emits
 `broker.cleanup.auto_removed` with its proof. Configure it in
 `.aethyme/config.toml`:
 

@@ -337,6 +337,35 @@ impl Broker {
             .filter(|agent| !agent.session.status.is_closed())
             .count();
         let retained = count.saturating_sub(open);
+        let mut evidence = vec![
+            format!("registered linked checkouts: {count}"),
+            format!("limit ([worktrees].max_checkouts): {maximum}"),
+            format!("open sessions: {open}"),
+            format!("retained checkouts: {retained}"),
+        ];
+        // What keeps closed checkouts that would otherwise go: ignored paths
+        // no witness or configured glob recognises. The repository decides
+        // whether each is regenerable; status only names the line.
+        let memo = self
+            .store
+            .meta_get(crate::auto_cleanup::KEEP_MEMO_KEY)
+            .ok()
+            .flatten();
+        for blocked in crate::auto_cleanup::blocked_by_ignored_from_meta(memo.as_deref())
+            .into_iter()
+            .take(5)
+        {
+            evidence.push(match &blocked.config_line {
+                Some(line) => format!(
+                    "kept for ignored {}: {} closed checkout(s); if it holds only regenerable output, the repository may add `{line}` to .aethyme/config.toml",
+                    blocked.name, blocked.checkouts
+                ),
+                None => format!(
+                    "kept for ignored file {}: {} closed checkout(s); a file is never released by configuration: review and delete it, or keep the checkout",
+                    blocked.name, blocked.checkouts
+                ),
+            });
+        }
         Ok(Some(StatusAdvice {
             id: "cleanup.checkout-capacity",
             severity: StatusAdviceSeverity::Warning,
@@ -346,15 +375,15 @@ impl Broker {
             ),
             session_id: None,
             queue_entry_id: None,
-            evidence: vec![
-                format!("registered linked checkouts: {count}"),
-                format!("limit ([worktrees].max_checkouts): {maximum}"),
-                format!("open sessions: {open}"),
-                format!("retained checkouts: {retained}"),
-            ],
+            evidence,
+            // The sweep runs the removal lane with its share of the pass;
+            // the plan shows `auto_cleanup.kept[]` (with codes) and
+            // `auto_cleanup.blocked_by_ignored`. The former second command,
+            // `finish cleanup --all-cleaned`, is a read-only inventory and
+            // freed nothing in this state.
             commands: vec![
                 "aethyme broker gc sweep --json".into(),
-                "aethyme broker finish cleanup --all-cleaned --json".into(),
+                "aethyme broker gc plan --json".into(),
             ],
         }))
     }

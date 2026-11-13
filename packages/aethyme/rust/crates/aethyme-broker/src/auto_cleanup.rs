@@ -1017,6 +1017,11 @@ pub struct AutoCleanupReport {
     /// Absent from reports written by the retirement-only worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lanes: Option<AutoCleanupLanes>,
+    /// Ignored paths that keep closed checkouts, across every checkout the
+    /// removal lane remembers keeping for ignored leftovers, most common
+    /// first, each with the config line that would release it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by_ignored: Vec<BlockedByIgnored>,
 }
 
 /// The retirement cursor as reported: the last session judged in the current
@@ -1822,6 +1827,20 @@ pub(crate) fn ignored_content_reason(
     worktree: &Path,
     policy: &AutoCleanupPolicy,
 ) -> Result<Option<String>, String> {
+    Ok(ignored_content_blockers(worktree, policy, 1)?
+        .into_iter()
+        .next()
+        .map(|(_, reason)| format!("ignored content requires explicit cleanup: {reason}")))
+}
+
+/// Up to `limit` ignored roots that keep the checkout, as
+/// `(relative path, reason)`; a directory ends in `/`. Empty means every
+/// ignored root is disposable under `policy`.
+pub(crate) fn ignored_content_blockers(
+    worktree: &Path,
+    policy: &AutoCleanupPolicy,
+    limit: usize,
+) -> Result<Vec<(String, String)>, String> {
     let deadline = Instant::now() + IGNORED_PATH_LISTING_BUDGET;
     crate::git::with_git_deadline(IGNORED_PATH_LISTING_BUDGET, || {
         ensure_ignored_content_before(deadline)?;
@@ -1842,6 +1861,7 @@ pub(crate) fn ignored_content_reason(
         // Git supplies ignored roots; never recursively walk their contents.
         // Keep every listed entry in the existing whole-checkout classifier:
         // typed protection here is only for future in-place artifact discovery.
+        let mut blockers = Vec::new();
         for entry in ignored {
             ensure_ignored_content_before(deadline)?;
             let relative = if entry.directory_marker {
@@ -1852,13 +1872,14 @@ pub(crate) fn ignored_content_reason(
             let classification = classify_ignored(worktree, &relative, policy);
             ensure_ignored_content_before(deadline)?;
             if let Err(reason) = classification {
-                return Ok(Some(format!(
-                    "ignored content requires explicit cleanup: {reason}"
-                )));
+                blockers.push((relative, reason));
+                if blockers.len() >= limit.max(1) {
+                    break;
+                }
             }
         }
         ensure_ignored_content_before(deadline)?;
-        Ok(None)
+        Ok(blockers)
     })
 }
 
@@ -1877,6 +1898,151 @@ thread_local! {
     /// Test seam: the retirement lane consumes its whole deadline.
     static RETIREMENT_EXHAUSTS_ITS_SHARE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+}
+
+/// Meta key of the remembered keep verdicts for closed checkouts held only by
+/// ignored leftovers.
+pub(crate) const KEEP_MEMO_KEY: &str = "auto_cleanup.keep_memo";
+const KEEP_MEMO_VERSION: u32 = 1;
+/// Remembered verdicts kept at most; the oldest go first.
+const KEEP_MEMO_MAX_ENTRIES: usize = 4096;
+/// A remembered verdict is re-proved at least this often even when nothing
+/// it fingerprints changed.
+const KEEP_MEMO_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+/// Ignored roots recorded per kept checkout.
+const IGNORED_BLOCKER_LIMIT: usize = 16;
+/// Names `blocked_by_ignored` lists, most common first.
+const BLOCKED_BY_IGNORED_LIMIT: usize = 10;
+
+/// One closed checkout the removal lane kept only for ignored leftovers.
+/// Re-examined as soon as its HEAD, the cleanup policy, or the modification
+/// time of the checkout root, a blocker or a blocker's parent changes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct KeepMemoEntry {
+    head: String,
+    policy: String,
+    fingerprint: Vec<String>,
+    blockers: Vec<String>,
+    sessions: Vec<i64>,
+    reason: String,
+    recorded_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct KeepMemo {
+    version: u32,
+    entries: std::collections::BTreeMap<String, KeepMemoEntry>,
+}
+
+fn decode_keep_memo(raw: Option<&str>) -> KeepMemo {
+    raw.and_then(|raw| serde_json::from_str::<KeepMemo>(raw).ok())
+        .filter(|memo| memo.version == KEEP_MEMO_VERSION)
+        .unwrap_or(KeepMemo {
+            version: KEEP_MEMO_VERSION,
+            entries: std::collections::BTreeMap::new(),
+        })
+}
+
+/// The part of the cleanup policy a keep verdict depends on.
+fn keep_memo_policy(policy: &AutoCleanupPolicy) -> String {
+    format!(
+        "strict={};regenerable={:?};keep={:?}",
+        policy.strict, policy.regenerable, policy.keep
+    )
+}
+
+fn checkout_head(worktree: &Path) -> Option<String> {
+    GitRepo::discover(worktree).ok()?.head_commit().ok()
+}
+
+fn modified_ns(path: &Path) -> String {
+    std::fs::symlink_metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or_else(|| "-".to_string(), |since| since.as_nanos().to_string())
+}
+
+/// Modification times that change when an ignored blocker is removed,
+/// replaced or joined by a new top-level entry. Cheap: no Git, no walk.
+fn keep_memo_fingerprint(worktree: &Path, blockers: &[String]) -> Vec<String> {
+    let mut paths = vec![String::new()];
+    for blocker in blockers {
+        let trimmed = blocker.trim_end_matches('/');
+        paths.push(trimmed.to_string());
+        if let Some((parent, _)) = trimmed.rsplit_once('/') {
+            paths.push(parent.to_string());
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .map(|relative| {
+            let path = if relative.is_empty() {
+                worktree.to_path_buf()
+            } else {
+                worktree.join(&relative)
+            };
+            format!("{relative}={}", modified_ns(&path))
+        })
+        .collect()
+}
+
+/// One ignored root that keeps closed checkouts, aggregated across every
+/// remembered keep verdict.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BlockedByIgnored {
+    /// The ignored path relative to the checkout; a directory ends in `/`.
+    pub name: String,
+    /// Closed checkouts it keeps.
+    pub checkouts: usize,
+    /// The `.aethyme/config.toml` line that would declare it regenerable, for
+    /// a directory. Absent for a standalone file, which no glob may release.
+    /// The repository decides: configure it only when the directory holds
+    /// nothing but output its tools regenerate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_line: Option<String>,
+}
+
+/// Aggregate remembered keep verdicts whose checkout still exists.
+fn blocked_by_ignored_from_memo(memo: &KeepMemo) -> Vec<BlockedByIgnored> {
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    for (worktree, entry) in &memo.entries {
+        if !Path::new(worktree).is_dir() {
+            continue;
+        }
+        for blocker in &entry.blockers {
+            *counts.entry(blocker.as_str()).or_default() += 1;
+        }
+    }
+    let mut rows = counts
+        .into_iter()
+        .map(|(name, checkouts)| BlockedByIgnored {
+            name: name.to_string(),
+            checkouts,
+            config_line: name
+                .strip_suffix('/')
+                .map(|directory| format!("[cleanup] regenerable = [{}]", toml_string(directory))),
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .checkouts
+            .cmp(&left.checkouts)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    rows.truncate(BLOCKED_BY_IGNORED_LIMIT);
+    rows
+}
+
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
+}
+
+/// `blocked_by_ignored` from the stored keep memo, for `broker status`.
+pub(crate) fn blocked_by_ignored_from_meta(raw: Option<&str>) -> Vec<BlockedByIgnored> {
+    blocked_by_ignored_from_memo(&decode_keep_memo(raw))
 }
 
 /// Passes shorter than this (a broker open's inline sweep) do not spend part
@@ -3891,13 +4057,17 @@ impl Broker {
             }
         };
         let (mut cursor, mut expected_cursor) = self.auto_cleanup_cursor()?;
+        let memo_raw = self.store().meta_get(KEEP_MEMO_KEY)?;
+        let mut memo = decode_keep_memo(memo_raw.as_deref());
+        let memo_policy = keep_memo_policy(&policy);
+        let mut memo_changed = false;
         let mut upstream_checked = false;
         let mut upstream = None;
         let mut selected = Vec::new();
         let mut lease_process_table = LeaseProcessTableSnapshot::default();
         let mut alias_refresh_generation = None;
         let mut examined = 0_usize;
-        let memo_skips = 0_usize;
+        let mut memo_skips = 0_usize;
         let mut first_page = true;
         loop {
             let cursor_before_scan = cursor;
@@ -3980,7 +4150,32 @@ impl Broker {
                                 self.remote_default_ref_and_tip()
                             };
                         }
-                        if deadline_expired(deadline) {
+                        let worktree_key = candidate.worktree.to_string_lossy().into_owned();
+                        let remembered = memo
+                            .entries
+                            .get(&worktree_key)
+                            .filter(|entry| {
+                                now_ms().saturating_sub(entry.recorded_at_ms) < KEEP_MEMO_MAX_AGE_MS
+                                    && entry.policy == memo_policy
+                                    && entry.sessions == candidate.session_ids()
+                                    && keep_memo_fingerprint(&candidate.worktree, &entry.blockers)
+                                        == entry.fingerprint
+                                    && checkout_head(&candidate.worktree).as_deref()
+                                        == Some(entry.head.as_str())
+                            })
+                            .cloned();
+                        if let Some(entry) = remembered {
+                            // Nothing the verdict depended on changed: keep it
+                            // without re-listing its ignored paths.
+                            memo_skips += 1;
+                            report.kept.push(AutoKeptCheckout {
+                                worktree: worktree_key,
+                                sessions: candidate.session_ids(),
+                                reason: entry.reason,
+                                code: "ignored_content".into(),
+                                ignored_blockers: entry.blockers,
+                            });
+                        } else if deadline_expired(deadline) {
                             report.deferred += 1;
                             stop_for_deadline = true;
                         } else if let Some(upstream) = upstream.as_ref() {
@@ -4015,17 +4210,60 @@ impl Broker {
                                 stop_for_deadline = true;
                             } else {
                                 match verdict {
-                                    Ok(proof) => selected.push((candidate, proof)),
+                                    Ok(proof) => {
+                                        memo_changed |=
+                                            memo.entries.remove(&worktree_key).is_some();
+                                        selected.push((candidate, proof));
+                                    }
                                     Err(NotRemoved::Defer) => report.deferred += 1,
                                     Err(NotRemoved::Keep(reason)) => {
+                                        let code = kept_reason_code(&reason);
+                                        let mut ignored_blockers = Vec::new();
+                                        if code == "ignored_content" {
+                                            // The verdict stops at the first
+                                            // blocker; list them all once so the
+                                            // report can say what to configure.
+                                            if let Ok(blockers) = ignored_content_blockers(
+                                                &candidate.worktree,
+                                                &policy,
+                                                IGNORED_BLOCKER_LIMIT,
+                                            ) {
+                                                ignored_blockers = blockers
+                                                    .into_iter()
+                                                    .map(|(relative, _)| relative)
+                                                    .collect();
+                                            }
+                                            if !ignored_blockers.is_empty()
+                                                && let Some(head) =
+                                                    checkout_head(&candidate.worktree)
+                                            {
+                                                memo.entries.insert(
+                                                    worktree_key.clone(),
+                                                    KeepMemoEntry {
+                                                        head,
+                                                        policy: memo_policy.clone(),
+                                                        fingerprint: keep_memo_fingerprint(
+                                                            &candidate.worktree,
+                                                            &ignored_blockers,
+                                                        ),
+                                                        blockers: ignored_blockers.clone(),
+                                                        sessions: candidate.session_ids(),
+                                                        reason: reason.clone(),
+                                                        recorded_at_ms: now_ms(),
+                                                    },
+                                                );
+                                                memo_changed = true;
+                                            }
+                                        } else {
+                                            memo_changed |=
+                                                memo.entries.remove(&worktree_key).is_some();
+                                        }
                                         report.kept.push(AutoKeptCheckout {
-                                            worktree: candidate
-                                                .worktree
-                                                .to_string_lossy()
-                                                .into_owned(),
+                                            worktree: worktree_key,
                                             sessions: candidate.session_ids(),
                                             reason,
-                                            ..Default::default()
+                                            code: code.to_string(),
+                                            ignored_blockers,
                                         })
                                     }
                                 }
@@ -4071,6 +4309,26 @@ impl Broker {
                 break;
             }
         }
+        if memo_changed {
+            memo.entries
+                .retain(|worktree, _| Path::new(worktree).is_dir());
+            if memo.entries.len() > KEEP_MEMO_MAX_ENTRIES {
+                let mut ages = memo
+                    .entries
+                    .iter()
+                    .map(|(worktree, entry)| (entry.recorded_at_ms, worktree.clone()))
+                    .collect::<Vec<_>>();
+                ages.sort();
+                let excess = memo.entries.len() - KEEP_MEMO_MAX_ENTRIES;
+                for (_, worktree) in ages.into_iter().take(excess) {
+                    memo.entries.remove(&worktree);
+                }
+            }
+            let text =
+                serde_json::to_string(&memo).expect("serializing the keep memo is infallible");
+            self.store().meta_set(KEEP_MEMO_KEY, &text)?;
+        }
+        report.blocked_by_ignored = blocked_by_ignored_from_memo(&memo);
         report.lanes = Some(AutoCleanupLanes {
             removal_examined: examined,
             removal_memo_skips: memo_skips,
@@ -4359,6 +4617,10 @@ impl Broker {
             || !stored.kept.is_empty();
         if !removal_judged && let Some(previous) = self.last_auto_cleanup_report() {
             stored.kept = previous.kept;
+        }
+        if stored.blocked_by_ignored.is_empty() {
+            let memo = self.store().meta_get(KEEP_MEMO_KEY)?;
+            stored.blocked_by_ignored = blocked_by_ignored_from_meta(memo.as_deref());
         }
         let text = serde_json::to_string(&stored).unwrap_or_default();
         self.store().meta_set(AUTO_CLEANUP_LAST_REPORT_KEY, &text)?;
@@ -7442,6 +7704,81 @@ mod tests {
         assert!(
             guarded_codes.iter().any(|code| code == "ignored_content"),
             "{guarded_codes:?}"
+        );
+    }
+
+    /// An ignored directory nothing recognises keeps its closed checkout,
+    /// is named in the report with the line that would release it, is not
+    /// re-listed while nothing changes, and is released once configured.
+    #[cfg(unix)]
+    #[test]
+    fn an_unknown_ignored_directory_is_named_remembered_and_released_by_configuration() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let root = broker.main_root().to_path_buf();
+        std::fs::write(root.join(".git/info/exclude"), "project-cache/\n").unwrap();
+        let (_session, worktree) = closed_landed_checkout(&mut broker, "unknown ignored cache");
+        touch(&worktree, "project-cache/quality/index.json");
+        let text = std::fs::canonicalize(&worktree)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let kept_entry = |report: &AutoCleanupReport| {
+            report
+                .kept
+                .iter()
+                .find(|kept| kept.worktree == text)
+                .cloned()
+                .unwrap_or_else(|| panic!("{report:#?}"))
+        };
+
+        let first = broker.auto_cleanup_now(None).unwrap().unwrap();
+        let kept = kept_entry(&first);
+        assert_eq!(kept.code, "ignored_content", "{kept:?}");
+        assert_eq!(kept.ignored_blockers, vec!["project-cache/".to_string()]);
+        assert_eq!(
+            first.blocked_by_ignored,
+            vec![super::BlockedByIgnored {
+                name: "project-cache/".into(),
+                checkouts: 1,
+                config_line: Some("[cleanup] regenerable = [\"project-cache\"]".into()),
+            }]
+        );
+        assert_eq!(first.lanes.unwrap().removal_memo_skips, 0);
+        let memo = broker.store().meta_get(super::KEEP_MEMO_KEY).unwrap();
+        assert_eq!(
+            super::blocked_by_ignored_from_meta(memo.as_deref()),
+            first.blocked_by_ignored,
+            "status reads the same aggregate"
+        );
+
+        // Unchanged: the remembered verdict is reused, still reported.
+        let second = broker.auto_cleanup_now(None).unwrap().unwrap();
+        assert_eq!(second.lanes.unwrap().removal_memo_skips, 1, "{second:#?}");
+        assert_eq!(kept_entry(&second).ignored_blockers, kept.ignored_blockers);
+
+        // A change inside the blocker re-proves the checkout.
+        touch(&worktree, "project-cache/new-report.json");
+        let third = broker.auto_cleanup_now(None).unwrap().unwrap();
+        assert_eq!(third.lanes.unwrap().removal_memo_skips, 0, "{third:#?}");
+        assert_eq!(kept_entry(&third).code, "ignored_content");
+        assert!(worktree.join("project-cache/quality/index.json").is_file());
+
+        // The repository declares it regenerable: the policy change alone
+        // invalidates the remembered verdict and the checkout goes.
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[cleanup]\nregenerable = [\"project-cache\"]\n",
+        )
+        .unwrap();
+        for _ in 0..2 {
+            if !worktree.exists() {
+                break;
+            }
+            broker.auto_cleanup_now(None).unwrap().unwrap();
+        }
+        assert!(
+            !worktree.exists(),
+            "the configured cache no longer keeps it"
         );
     }
 

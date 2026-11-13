@@ -904,7 +904,7 @@ fn status_warns_before_the_linked_checkout_limit_refuses_start() {
             row.commands,
             vec![
                 "aethyme broker gc sweep --json",
-                "aethyme broker finish cleanup --all-cleaned --json",
+                "aethyme broker gc plan --json",
             ],
             "{surface}"
         );
