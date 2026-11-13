@@ -9008,6 +9008,57 @@ mod tests {
         assert!(ignored_inventory(&checkout, repository, &strict, 1, None).is_err());
     }
 
+    #[test]
+    fn a_file_pattern_discards_its_files_and_protected_names_are_still_archived() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path();
+        git(repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            repository.join(".gitignore"),
+            "/reports/*\n!/reports/README.md\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repository.join("reports")).unwrap();
+        std::fs::write(repository.join("reports/README.md"), "fixture\n").unwrap();
+        git(repository, &["add", "-A"]);
+        git(repository, &["commit", "-qm", "initial"]);
+        std::fs::write(repository.join("reports/quality-1.json"), "generated\n").unwrap();
+        std::fs::write(repository.join("reports/signing.pem"), "private\n").unwrap();
+
+        let checkout = GitRepo::discover(repository).unwrap();
+        let unconfigured = ignored_inventory(
+            &checkout,
+            repository,
+            &crate::AutoCleanupPolicy::default(),
+            1,
+            None,
+        )
+        .unwrap()
+        .1;
+        assert_eq!(
+            unconfigured
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["reports/quality-1.json", "reports/signing.pem"]
+        );
+
+        let policy = crate::AutoCleanupPolicy {
+            regenerable: vec!["reports/*".into()],
+            ..Default::default()
+        };
+        let (roots, files) = ignored_inventory(&checkout, repository, &policy, 1, None).unwrap();
+        assert!(
+            roots
+                .iter()
+                .any(|root| root.path == "reports/quality-1.json"
+                    && root.classification == IgnoredPathClassification::DisposableOutput),
+            "{roots:?}"
+        );
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].path, "reports/signing.pem");
+    }
+
     #[cfg(unix)]
     #[test]
     fn ignored_special_files_fail_closed() {

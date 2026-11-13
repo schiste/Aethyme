@@ -178,13 +178,22 @@ the `[cleanup]` policy, or the modification time of the checkout root, a
 blocker or a blocker's parent changes, and re-proves it at least weekly
 (`auto_cleanup.lanes.removal_memo_skips` counts the skips). Across all
 remembered checkouts, `auto_cleanup.blocked_by_ignored` lists the most common
-blockers with the line that would release a directory, for example:
+blockers with the line that would release each one, for example:
 
 ```json
 {"name": "<dir>/", "checkouts": 300, "config_line": "[cleanup] regenerable = [\"<dir>\"]"}
+{"name": "reports/quality-summary.json", "checkouts": 40, "config_line": "[cleanup] regenerable = [\"reports/quality-summary.json\"]"}
+{"name": "keys/server.pem", "checkouts": 2, "config_refusal": "protected name: [cleanup] regenerable never releases it; review and delete it, or keep the checkout"}
 ```
 
-and the `cleanup.checkout-capacity` row repeats the top five in its evidence.
+A standalone file's `config_line` names exactly that path, with any glob
+metacharacter in it escaped; widen it to a pattern such as
+`"reports/quality-*.json"` yourself when every matching file is generated. A
+file no line can release carries `config_refusal` instead: a protected name
+(listed under "Besides the named build outputs" below), or a root name such as
+`notes.txt` that a pattern may not name. The same path in several checkouts is
+one row. The `cleanup.checkout-capacity` row repeats the top five in its
+evidence.
 
 From three quarters of the limit the background worker also removes closed
 checkouts itself: a 20-second removal slice before its other work and between
@@ -245,11 +254,47 @@ budget, waiting up to 5 seconds for a maintenance pass that holds the GC lock.
 If the limit still refuses, the error says how many closed checkouts that pass
 removed and kept, the top keep codes, and the ignored path whose configuration
 would release the most checkouts (or that the lock stayed busy).
-The repository decides: add the line only when the directory holds nothing but
-output its tools regenerate. A standalone ignored file is never released by
-configuration; review and delete it, or keep the checkout. The glob is matched
-against the ignored root itself, so name the directory (`"<dir>"`), not only
-its contents (`"<dir>/**"` does not match the root `<dir>`). Each removal emits
+The repository decides: add the line only when the path holds nothing but
+output its tools regenerate. Each `regenerable` glob is matched two ways,
+always against paths relative to the checkout root:
+
+- **Directories.** Against an ignored directory root Git lists, and against
+  each directory above an ignored entry, exactly as before; `*` may cross `/`
+  here. Name the directory (`"<dir>"`), not only its contents (`"<dir>/**"`
+  does not match the root `<dir>`). A matching directory is opaque: nothing
+  inside it is inspected.
+- **Standalone files.** Against the whole path of an ignored regular file that
+  no matching directory encloses. Here `*`, `?` and `[...]` stay within one
+  path component, and a glob containing `**` never names a file. So
+  `"docs/reports/i18n-*.json"` releases `docs/reports/i18n-fr.json` but not
+  `docs/reports/old/i18n-fr.json`, `"apps/*/public/_routes.json"` releases one
+  per app, and a directory glob such as `"*-cache"` or `"**/generated"` does
+  not start releasing files named that way elsewhere. A glob that names the
+  directory a file sits in releases the file through the directory rule.
+
+A protected name in any component of the path (the protected names listed
+below, matched without regard to case) is never released by a standalone match, whatever the configuration says: the
+checkout stays, with the reason `has a protected name, which [cleanup]
+regenerable never releases`. Links are judged as links and never followed: a
+link the glob names is unlinked on removal and its target is left alone,
+except that a link with a protected name stays too. `strict = true` still
+keeps every ignored leftover, configured or not. A glob that matches a secret
+or ordinary root-file probe (`.env`, `secrets.key`, `notes.txt`,
+`README.md`, ...) is refused when the policy loads, as before.
+
+**Upgrade note.** This widens what an existing `regenerable` list releases.
+Directory matching itself is unchanged, but a glob written for directories now
+also releases the standalone ignored files whose whole path it matches under
+the file rule above: `"<dir>/*"` releases the ignored files directly inside
+`<dir>`, `"*-cache"` releases a root-level file such as `tool-cache`, and a
+`"*.ext"` glob releases every root-level ignored `*.ext` file. Review the list
+before upgrading. The guard is the load-time probe: a glob that matches any of
+`.env`, `.env.local`, `secrets.key`, `cert.pem`, `data.sqlite`, `app.db`,
+`notes.txt`, `README.md` or `.aethyme` refuses the whole policy (so `"*"`,
+`"*.txt"`, `"*.md"` and `"*.db"` cannot be configured), and protected names
+stay whatever the glob says.
+
+Each removal emits
 `broker.cleanup.auto_removed` with its proof. Configure it in
 `.aethyme/config.toml`:
 
@@ -258,10 +303,17 @@ its contents (`"<dir>/**"` does not match the root `<dir>`). Each removal emits
 auto_remove = true             # the default; false turns checkout removal off
 strict = false                 # the default; recognized output directories disposable
 ignored_directory_sweep = false # opt in to reclaim ignored folders in retained checkouts
-regenerable = [".gradle/**"]    # extra explicitly disposable output directories
+regenerable = [".gradle", "reports/quality-*.json"] # extra disposable output directories and files
 keep = ["*-investigation"]     # worktrees never removed automatically
 unattended_unlinks_per_second = 1000 # background worker pace; 0 or "unlimited" = full speed
 ```
+
+Two phase counters show the file rule at work in `aethyme broker advanced
+metrics`: `cleanup_checkout_released_by_file_pattern` counts ignored-content
+verdicts that passed with at least one standalone file released by a file
+pattern (planning and the re-check before removal each count), and
+`cleanup_regenerable_protected_refused` counts protected entries a configured
+glob named and cleanup kept.
 
 The background worker's pace, priority, host-wide single deleter and pressure
 pause are described in
@@ -284,23 +336,43 @@ same protected-name walk described below finds nothing beneath it. Any ignored d
 that carries a `CACHEDIR.TAG` beginning with the standard signature
 (`Signature: 8a477f597d28d172789f06886806bc55`, see bford.info/cachedir) is
 regenerable by its tool's own declaration, unless a bounded walk beneath it
-finds a protected name (`.env*`, `*.key`, `*.pem`, `*.p12`, `*.pfx`,
-`*.sqlite*`, `*.db`, `*.kdbx`, `id_*` private keys without `.pub`, `.netrc`,
-`.npmrc`, `.pypirc`, `credentials.json`, `.aethyme`), an unreadable entry or
+finds a protected name, an unreadable entry or
 more than 20,000 entries; then it keeps
-the checkout. A tag only in a subdirectory does not cover its parent. Generic
+the checkout. A tag only in a subdirectory does not cover its parent.
+
+The protected names, compared without regard to case, are: anything starting
+with `.env` (`.env`, `.env.local`, `.envrc`, `.env-prod`); anything containing
+`.sqlite` (with its `-wal`, `-shm` and `-journal` siblings); `*.db`,
+`*.db-wal`, `*.db-shm` and `*.db-journal`; `*.key`, `*.pem`, `*.p12`, `*.pfx`,
+`*.kdbx`, `*.jks` and `*.keystore`; `*.tfstate` and `*.tfstate.*`; `id_*`
+private keys without `.pub`; `.netrc`, `.npmrc`, `.pypirc`, `.pgpass`,
+`.git-credentials` and `credentials.json`; and `.aethyme`. A tagged cache or a
+witnessed test-tool directory holding one of the names added on 2026-11-13
+(`.envrc`-style `.env` prefixes, `-wal`/`-shm`/`-journal` siblings, Terraform
+state, Java key stores, `.pgpass`, `.git-credentials`) now keeps its checkout;
+directories recognised by name (`node_modules`, `target`, `.venv` and the
+others) and configured directories are not walked, so they are unaffected.
+
+Generic
 names (`logs`, `dist` without a manifest, `build`, `out`, `tmp`) are never
 recognised by name: configure them.
 
 Recognized or explicitly configured output directories are treated as opaque:
 cleanup does not inspect their nested contents. Unknown ignored directories and
-standalone ignored files such as a root `.env` are retained. Removal unlinks
-symlinks without deleting their external targets.
+standalone ignored files a file pattern does not name, such as a root `.env`,
+are retained. Removal unlinks symlinks without deleting their external targets.
+The same classifier decides for automatic removal, `finish cleanup`,
+`finish cleanup --all-cleaned` and the recovery archive (`finish cleanup
+resolve --archive` discards released files and archives protected ones).
+Orphan recovery re-checks only the directory roots finish recorded with that
+classifier; a standalone file never gets a discard root, so one left behind
+after Git metadata is gone still needs a manual look, as before.
 
 `ignored_directory_sweep` controls a separate in-place lane for reclaiming
 ignored folders from retained closed checkouts. It defaults to `false`; setting
 it to `true` can reclaim opaque ignored folders while preserving the checkout,
-tracked work, standalone ignored files, and `keep` pins. This in-place lane also
+tracked work, standalone ignored files (file patterns do not apply to this
+lane), and `keep` pins. This in-place lane also
 excludes protected Git administration and broker metadata roots from selection.
 Metadata and nested repositories inside another disposable ignored directory
 remain disposable contents of that directory. It does not shorten

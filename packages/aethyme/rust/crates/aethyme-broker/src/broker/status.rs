@@ -364,8 +364,12 @@ impl Broker {
                     blocked.name, blocked.checkouts
                 ),
                 None => format!(
-                    "kept for ignored file {}: {} closed checkout(s); a file is never released by configuration: review and delete it, or keep the checkout",
-                    blocked.name, blocked.checkouts
+                    "kept for ignored file {}: {} closed checkout(s); {}",
+                    blocked.name,
+                    blocked.checkouts,
+                    blocked.config_refusal.as_deref().unwrap_or(
+                        "no configuration releases it: review and delete it, or keep the checkout"
+                    )
                 ),
             });
         }
