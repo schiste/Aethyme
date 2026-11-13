@@ -4,6 +4,18 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.95] - 2026-11-14
+
+### Fixed
+
+- Durable identity records start identifying a volume by its volume UUID instead of a device number, which changes on every remount of an external volume. A new shared volume-identity primitive reads the volume UUID on macOS; other platforms report it as unknown and keep the exact device comparison (#1670).
+- Preparation-cache rotation recovery no longer stalls forever after a remount. A journal root row that differs only by device number is rewritten to the live identity when the inode is unchanged, no debt is pending, and either a recorded volume UUID or the parent root marker proves it is the same directory. An exact match must also match a recorded volume UUID. A refusal ends with `root_volume_reproof_refused` and the failed condition (#1670).
+- An old artifact-use marker whose only mismatch is renumbered devices is reported as an unresolved marker of its checkout instead of failing with "artifact-use state could not be verified". The checkout is still kept; the message says how to resolve the marker (#1670).
+
+### Added
+
+- Session retirement reports renumbered legacy markers as their own deferred reason, `legacy_artifact_markers`, which `broker status` treats as actionable. Telemetry counts `artifact_use_marker_legacy_device_renumber`, `preparation_rotation_root_reproved` and `preparation_rotation_root_reproof_refused` (#1670).
+
 ## [0.8.94] - 2026-11-13
 
 ### Fixed
