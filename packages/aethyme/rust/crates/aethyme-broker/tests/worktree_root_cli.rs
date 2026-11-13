@@ -623,6 +623,94 @@ fn checkout_limit_reclaims_an_eligible_closed_checkout_before_refusing() {
 }
 
 #[test]
+fn checkout_limit_refusal_names_what_keeps_closed_checkouts_and_its_release() {
+    let tmp = common::canonical_tempdir();
+    let repo = tmp.path().join("project");
+    let state = tmp.path().join("state");
+    let origin = tmp.path().join("origin.git");
+    git(
+        tmp.path(),
+        &["init", "--bare", "-b", "main", origin.to_str().unwrap()],
+    );
+    fixture_at(&repo);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-u", "origin", "main"]);
+    git(&repo, &["remote", "set-head", "origin", "main"]);
+    std::fs::write(repo.join(".git/info/exclude"), "project-cache/\n").unwrap();
+    std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
+    std::fs::write(
+        repo.join(".aethyme/config.toml"),
+        "[worktrees]\nmax_checkouts = 1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".aethyme/broker.toml"),
+        "[retention]\nclosed_worktree_grace_hours = 0\nauto_cleanup_worktrees_on_finish = false\n",
+    )
+    .unwrap();
+
+    let first = json(run_with_host_state(
+        &repo,
+        &state,
+        &["start", "--task", "first", "--json"],
+    ));
+    let first_path = PathBuf::from(first["worktree_path"].as_str().unwrap());
+    let first_id = first["id"].as_i64().unwrap().to_string();
+    json(run(
+        &repo,
+        &state,
+        &["finish", "close", "--session", &first_id, "--json"],
+    ));
+    std::fs::create_dir_all(first_path.join("project-cache/quality")).unwrap();
+    std::fs::write(first_path.join("project-cache/quality/index.json"), "{}\n").unwrap();
+
+    let refused = run(&repo, &state, &["start", "--task", "over limit", "--json"]);
+    assert!(!refused.status.success());
+    let error = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        error.contains("linked checkout limit reached (1/1)"),
+        "{error}"
+    );
+    assert!(
+        error.contains("removed 0 closed checkout(s), kept 1"),
+        "{error}"
+    );
+    assert!(error.contains("ignored_content 1"), "{error}");
+    assert!(
+        error.contains("project-cache/ keeps 1 closed checkout(s)"),
+        "{error}"
+    );
+    assert!(error.contains("regenerable = ["), "{error}");
+    assert!(error.contains("--reuse"), "{error}");
+    assert!(
+        first_path
+            .join("project-cache/quality/index.json")
+            .is_file()
+    );
+
+    // The repository declares the cache regenerable: the next start frees
+    // the slot and succeeds.
+    std::fs::write(
+        repo.join(".aethyme/config.toml"),
+        "[worktrees]\nmax_checkouts = 1\n\n[cleanup]\nregenerable = [\"project-cache\"]\n",
+    )
+    .unwrap();
+    let next = json(run(&repo, &state, &["start", "--task", "next", "--json"]));
+    assert!(
+        !first_path.exists(),
+        "the configured cache no longer keeps it"
+    );
+    assert!(Path::new(next["worktree_path"].as_str().unwrap()).exists());
+}
+
+#[test]
 fn checkout_limit_reclaims_a_closed_checkout_holding_only_generated_harness_files() {
     let tmp = common::canonical_tempdir();
     let repo = tmp.path().join("project");

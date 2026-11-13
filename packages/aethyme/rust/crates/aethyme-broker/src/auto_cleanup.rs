@@ -2040,6 +2040,57 @@ fn toml_string(value: &str) -> String {
     toml::Value::String(value.to_string()).to_string()
 }
 
+/// What `broker start` says when the linked-checkout limit still refuses
+/// after its removal pass: what that pass removed and kept, the top keep
+/// codes, and the change that would release the most closed checkouts.
+pub(crate) fn checkout_capacity_refusal_detail(report: Option<&AutoCleanupReport>) -> String {
+    let Some(report) = report else {
+        return "the removal pass could not run (another maintenance pass held the GC lock); retry shortly or run `aethyme broker gc sweep --json`".into();
+    };
+    let mut codes = std::collections::BTreeMap::<&str, usize>::new();
+    for kept in &report.kept {
+        let code = if kept.code.is_empty() {
+            kept_reason_code(&kept.reason)
+        } else {
+            kept.code.as_str()
+        };
+        *codes.entry(code).or_default() += 1;
+    }
+    let mut codes = codes.into_iter().collect::<Vec<_>>();
+    codes.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    let top = codes
+        .iter()
+        .take(3)
+        .map(|(code, count)| format!("{code} {count}"))
+        .collect::<Vec<_>>();
+    let mut detail = format!(
+        "the removal pass removed {} closed checkout(s), kept {}{}, deferred {}",
+        report.removed.len(),
+        report.kept.len(),
+        if top.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", top.join(", "))
+        },
+        report.deferred
+    );
+    if let Some(blocked) = report.blocked_by_ignored.first() {
+        match &blocked.config_line {
+            Some(line) => detail.push_str(&format!(
+                "; ignored {} keeps {} closed checkout(s): if it holds only regenerable output, adding `{line}` to .aethyme/config.toml releases them",
+                blocked.name, blocked.checkouts
+            )),
+            None => detail.push_str(&format!(
+                "; ignored file {} keeps {} closed checkout(s): review and delete it",
+                blocked.name, blocked.checkouts
+            )),
+        }
+    } else if report.deferred > 0 {
+        detail.push_str("; run `aethyme broker gc sweep --json` to continue the removal lap");
+    }
+    detail
+}
+
 /// `blocked_by_ignored` from the stored keep memo, for `broker status`.
 pub(crate) fn blocked_by_ignored_from_meta(raw: Option<&str>) -> Vec<BlockedByIgnored> {
     blocked_by_ignored_from_memo(&decode_keep_memo(raw))
@@ -4656,6 +4707,50 @@ impl Broker {
             return Ok(None);
         };
         self.auto_cleanup_apply(plan).map(Some)
+    }
+
+    /// The removal lane alone, for `broker start` at the linked-checkout
+    /// limit: no retirement (it frees no slot now), the whole `budget` for
+    /// selecting and removing closed checkouts. Waits up to `lock_wait` for
+    /// a GC lock another maintenance pass holds instead of giving up at
+    /// once; `None` when it stays held.
+    pub(crate) fn auto_cleanup_for_checkout_capacity(
+        &mut self,
+        lock_wait: Duration,
+        budget: Duration,
+    ) -> Result<Option<AutoCleanupReport>, BrokerOpError> {
+        let waiting_since = Instant::now();
+        let _lock = loop {
+            match crate::gc::GcLock::acquire(self.main_root()) {
+                Ok(lock) => break lock,
+                Err(_) if waiting_since.elapsed() < lock_wait => {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(_) => {
+                    crate::phase_telemetry::add(
+                        "checkout_capacity_cleanup_lock_busy",
+                        waiting_since.elapsed(),
+                    );
+                    return Ok(None);
+                }
+            }
+        };
+        let started = Instant::now();
+        let deadline = started + budget;
+        let mut plan = {
+            let _span = crate::phase_telemetry::span("auto_cleanup_removal_lane");
+            self.auto_cleanup_plan(Some(deadline))?
+        };
+        let planned = plan.report.lanes.unwrap_or_default();
+        plan.report.lanes = Some(AutoCleanupLanes {
+            capacity_pressure: true,
+            removal_budget_ms: duration_ms(Some(budget)),
+            removal_elapsed_ms: duration_ms(Some(started.elapsed())),
+            ..planned
+        });
+        let report = self.auto_cleanup_apply(plan)?;
+        record_lane_telemetry(&report);
+        Ok(Some(report))
     }
 
     /// Run an auto-cleanup pass now, outside the sweep's cadence. Takes the

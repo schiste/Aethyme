@@ -160,6 +160,12 @@ blockers with the line that would release a directory, for example:
 ```
 
 and the `cleanup.checkout-capacity` row repeats the top five in its evidence.
+
+At the limit, `broker start` first runs the removal lane alone with a 20-second
+budget, waiting up to 5 seconds for a maintenance pass that holds the GC lock.
+If the limit still refuses, the error says how many closed checkouts that pass
+removed and kept, the top keep codes, and the ignored path whose configuration
+would release the most checkouts (or that the lock stayed busy).
 The repository decides: add the line only when the directory holds nothing but
 output its tools regenerate. A standalone ignored file is never released by
 configuration; review and delete it, or keep the checkout. The glob is matched
