@@ -377,6 +377,7 @@ pub(crate) enum CapacitySliceStop {
 }
 
 impl CapacitySliceStop {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 9] = [
         Self::Cap,
         Self::Budget,
@@ -8032,6 +8033,7 @@ impl Broker {
     /// with no GC lock or lifecycle claim held, and between passes it keeps
     /// the GC lock free at least as long as the last pass held it. Returns
     /// the slice's combined report, `None` when no removal pass ran.
+    #[cfg(test)]
     pub(crate) fn run_capacity_removal_slice(
         &mut self,
         worker_started: Instant,
@@ -8039,7 +8041,9 @@ impl Broker {
         self.run_capacity_removal_slice_with(worker_started, CapacitySliceLimits::WORKER)
     }
 
-    /// [`Self::run_capacity_removal_slice`] with explicit limits.
+    /// The capacity removal slice described on `run_capacity_removal_slice`,
+    /// with explicit limits (the worker passes [`CapacitySliceLimits::WORKER`]
+    /// within its run allowance).
     pub(crate) fn run_capacity_removal_slice_with(
         &mut self,
         worker_started: Instant,
