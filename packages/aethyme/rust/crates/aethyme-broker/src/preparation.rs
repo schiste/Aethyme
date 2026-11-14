@@ -7058,10 +7058,12 @@ mod tests {
         // SAFETY: fifo_c is a valid NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
 
+        // A budget the regular file cannot pass, so the scan reaches the
+        // FIFO instead of stopping early over budget.
         assert!(matches!(
             shared_cache_budget_at(
                 Some(&SharedCacheBudget {
-                    max_bytes: 1,
+                    max_bytes: 1_000_000,
                     ..SharedCacheBudget::default()
                 }),
                 &cache_root,
@@ -7089,9 +7091,11 @@ mod tests {
         fs::write(store.join("keep"), b"preserved until rotation").unwrap();
         let fifo = store.join("blocked-pipe");
         let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        // SAFETY: fifo_c is a valid NUL-terminated path.
-        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
-
+        // The FIFO appears after the inventory stopped over budget on the
+        // regular file and before the rotation removes the store, so only the
+        // remover meets it.
+        let (_lines, activity) = captured_activity(Duration::from_secs(3600));
+        let mut made_fifo = false;
         let refusal = shared_cache_budget_at_with_scan_limits(
             SharedCacheBudgetRequest {
                 budget: Some(&SharedCacheBudget {
@@ -7105,14 +7109,27 @@ mod tests {
                 expected_root_identity: None,
                 root_binding: None,
             },
-            &mut |_| Ok(()),
-            SharedCacheScanLimits {
-                max_entries: 0,
-                max_depth: SHARED_CACHE_SCAN_MAX_DEPTH,
-                max_elapsed: Duration::from_secs(5),
+            &mut |force| {
+                // The first lease check after the inventory started runs once
+                // it has stopped: the scan itself only makes unforced calls.
+                if force
+                    && !made_fifo
+                    && cache_activity::last_operation(
+                        cache_activity::PreparationCacheOperation::BudgetInventory,
+                    )
+                    .is_some()
+                {
+                    // SAFETY: fifo_c is a valid NUL-terminated path.
+                    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+                    made_fifo = true;
+                }
+                Ok(())
             },
+            SharedCacheScanLimits::default(),
         )
         .expect_err("the rotation remover must refuse the FIFO");
+        assert!(made_fifo);
+        drop(activity);
         assert!(
             refusal.to_string().contains("special cache entry"),
             "unexpected refusal: {refusal}"
