@@ -2247,7 +2247,7 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                     // the incomplete bit so this partial inventory cannot ack.
                     complete = false;
                 }
-                if let Some(root_identity) = walk_identity {
+                if let Some(mut root_identity) = walk_identity {
                     let generation = match crate::preparation::rotation_journal::begin_lap(
                         resource_db_path,
                         cache_root,
@@ -2293,6 +2293,29 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                             ) {
                                 Ok(page) => page,
                                 Err(_) => {
+                                    // Recovery of the last debt saved under an
+                                    // old identity moves the root row on to the
+                                    // live one, keeping its lap. Continue that
+                                    // same lap there, so this pass can settle
+                                    // it instead of leaving it incomplete for
+                                    // later passes to resume.
+                                    if let Some(live) = rotation_journal_lap
+                                        .as_ref()
+                                        .and_then(|lap| lap.live_identity.clone())
+                                        && crate::preparation::rotation_debt::journal_root_identity_for_walk(
+                                            resource_db_path,
+                                            cache_root,
+                                            Some(&live),
+                                        )
+                                        .as_deref()
+                                            == Some(live.as_slice())
+                                        && let Some(lap) = rotation_journal_lap.as_mut()
+                                    {
+                                        lap.root_identity = live.clone();
+                                        lap.live_identity = None;
+                                        root_identity = live;
+                                        continue;
+                                    }
                                     complete = false;
                                     break;
                                 }
@@ -7756,9 +7779,11 @@ mod tests {
             .unwrap();
             assert_eq!(state.saved_identity, live_identity);
             assert_eq!(state.debt_rows, 0);
-            // The first pass walked the lap under the saved identity, so it
-            // could not acknowledge it under the live one. The next pass
-            // must acknowledge the recovery the first one did. Its report's
+            // The first pass started its lap under the saved identity and
+            // recovery moved the root row on to the live one mid-lap. The
+            // lap must be settled by the next pass at the latest; it used to
+            // be resumed still marked incomplete and settle a pass later,
+            // after a failed acknowledgement. The report's
             // `complete` also needs the host consumer census, which this
             // fixture never enumerates; lap settlement is independent of it
             // and is read from the journal.
