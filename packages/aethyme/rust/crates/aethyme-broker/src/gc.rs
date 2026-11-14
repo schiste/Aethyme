@@ -7105,9 +7105,15 @@ impl Broker {
                         &cohort.session_ids(),
                         now_ms(),
                     )?;
-                self.write_artifact_sweep_worker_status(
-                    "compact_checkout_removed; next due rows remain wakeable",
-                )?;
+                // A removal the shared ownership re-proof authorized says so.
+                match cohort.ownership_reproof() {
+                    Some(reproof) => self.write_artifact_sweep_worker_status(&format!(
+                        "compact_checkout_removed ownership_reproof={reproof}; next due rows remain wakeable"
+                    ))?,
+                    None => self.write_artifact_sweep_worker_status(
+                        "compact_checkout_removed; next due rows remain wakeable",
+                    )?,
+                }
             }
             Some(_) | None => {
                 self.store().defer_checkout_cleanup_compactions(

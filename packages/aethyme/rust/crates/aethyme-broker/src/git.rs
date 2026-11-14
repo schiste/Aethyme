@@ -3614,6 +3614,8 @@ impl GitRepo {
             branch_tip,
             root_generation_sha256: witness.root_generation_sha256,
             disposable_ignored_root_prefixes: Vec::new(),
+            volume_uuids: witness.volume_uuids,
+            ownership_reproof: None,
         })
     }
 

@@ -1647,7 +1647,8 @@ pub(crate) struct ClosedArtifactCheckoutCohort {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     handed_over_predecessors: Vec<i64>,
     /// Set when a spawned row's saved witness matched only through
-    /// [`OWNERSHIP_REPROOF_DEVICE_RENUMBER`]. `CheckoutRemoval` only.
+    /// [`OWNERSHIP_REPROOF_DEVICE_RENUMBER`] or
+    /// [`OWNERSHIP_REPROOF_VOLUME_UUID`]. Reclaiming purposes only.
     #[serde(skip_serializing_if = "Option::is_none")]
     ownership_reproof: Option<&'static str>,
 }
@@ -1669,6 +1670,9 @@ pub(crate) enum ClosedArtifactCheckoutCohortUnavailableReason {
     CheckoutMissing,
     GitCheckoutUnavailable,
     SpawnedWitnessMismatch,
+    /// The saved spawn witness names the same objects under other device
+    /// numbers, but the Git half of the ownership re-proof refused.
+    OwnershipReproofRefused,
     SpawnedOwnerMissing,
     IndexChanged,
     WitnessChanged,
@@ -1692,6 +1696,7 @@ impl ClosedArtifactCheckoutCohortUnavailableReason {
             Self::CheckoutMissing => "checkout_missing",
             Self::GitCheckoutUnavailable => "git_checkout_unavailable",
             Self::SpawnedWitnessMismatch => "spawned_witness_mismatch",
+            Self::OwnershipReproofRefused => "ownership_reproof_refused",
             Self::SpawnedOwnerMissing => "spawned_owner_missing",
             Self::IndexChanged => "index_changed",
             Self::WitnessChanged => "witness_changed",
@@ -1701,13 +1706,16 @@ impl ClosedArtifactCheckoutCohortUnavailableReason {
 
 /// What a closed checkout cohort will authorize. Marker review removes only
 /// artifact-use markers, so it tolerates a renumbered mount on a witness saved
-/// without volume UUIDs and never advances the index. Reclaim can delete
-/// checkout contents and keeps the exact witness comparison.
+/// without volume UUIDs and never advances the index.
 ///
-/// `CheckoutRemoval` is reclaim for automatic whole-checkout removal: the same
-/// exact comparison, plus the device-renumber re-proof for a schema-2 witness
-/// (see [`renumber_reproof_refusal`]). Artifact reclamation keeps `Reclaim`,
-/// whose final unlink guard compares the live instance exactly.
+/// `Reclaim` (GC: ignored-directory reclamation, checkout compaction and its
+/// archive cleanup) and `CheckoutRemoval` (automatic whole-checkout removal)
+/// can delete checkout contents. Both compare the witness exactly and, when
+/// that fails, accept only the shared ownership re-proof
+/// ([`Broker::checkout_ownership_reproof`]); they differ only in the lane
+/// their telemetry names. Artifact reclamation's final unlink guard re-makes
+/// the filesystem half of the same re-proof
+/// ([`ClosedArtifactCheckoutCohort::matches_checkout_instance`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClosedCohortPurpose {
     Reclaim,
@@ -1719,11 +1727,179 @@ impl ClosedCohortPurpose {
     fn reclaims(self) -> bool {
         matches!(self, Self::Reclaim | Self::CheckoutRemoval)
     }
+
+    fn reproof_lane(self) -> OwnershipReproofLane {
+        match self {
+            Self::CheckoutRemoval | Self::MarkerReview => OwnershipReproofLane::Automatic,
+            Self::Reclaim => OwnershipReproofLane::Gc,
+        }
+    }
 }
 
 /// The re-proof that authorized a reclaim whose saved spawn witness no longer
 /// matched exactly: macOS renumbered the mounts of a schema-2 witness.
 pub(crate) const OWNERSHIP_REPROOF_DEVICE_RENUMBER: &str = "device_renumber";
+/// The re-proof that authorized a reclaim whose saved identity recorded
+/// volume UUIDs that still match today while the device numbers changed (a
+/// finish-cleanup recovery proof saved before a remount).
+pub(crate) const OWNERSHIP_REPROOF_VOLUME_UUID: &str = "volume_uuid";
+
+/// Which deletion lane asked for an ownership re-proof; it names the
+/// telemetry counters. Every lane uses the same proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnershipReproofLane {
+    /// Automatic whole-checkout removal (`auto_cleanup_ownership_reproof_*`).
+    Automatic,
+    /// GC reclamation and checkout compaction (`gc_ownership_reproof_*`).
+    Gc,
+    /// `finish` / `finish cleanup` and its interrupted-cleanup recovery
+    /// proof (`finish_ownership_reproof_*`).
+    Finish,
+    /// The same proof made again for a read-only plan, a report or a recheck
+    /// of a decision another call already counted: it records nothing, so
+    /// each decision and removal is counted once.
+    Quiet,
+}
+
+impl OwnershipReproofLane {
+    /// `(reproved, refused, unavailable, registration phase)` counter names.
+    fn counters(self) -> Option<(&'static str, &'static str, &'static str, &'static str)> {
+        match self {
+            Self::Automatic => Some((
+                "auto_cleanup_ownership_reproved",
+                "auto_cleanup_ownership_reproof_refused",
+                "auto_cleanup_ownership_reproof_unavailable",
+                "auto_cleanup_ownership_reproof_registration",
+            )),
+            Self::Gc => Some((
+                "gc_ownership_reproved",
+                "gc_ownership_reproof_refused",
+                "gc_ownership_reproof_unavailable",
+                "gc_ownership_reproof_registration",
+            )),
+            Self::Finish => Some((
+                "finish_ownership_reproved",
+                "finish_ownership_reproof_refused",
+                "finish_ownership_reproof_unavailable",
+                "finish_ownership_reproof_registration",
+            )),
+            Self::Quiet => None,
+        }
+    }
+
+    /// Count one accepted re-proof in this lane.
+    pub(crate) fn record_reproved(self) {
+        if let Some((reproved, ..)) = self.counters() {
+            crate::phase_telemetry::add(reproved, Duration::ZERO);
+        }
+    }
+
+    /// Count one refusal in this lane and under its reason's own counter.
+    pub(crate) fn record_refused(self, reason: &str) {
+        if let Some((_, refused, ..)) = self.counters() {
+            crate::phase_telemetry::add(refused, Duration::ZERO);
+            crate::phase_telemetry::add(ownership_reproof_refusal_counter(reason), Duration::ZERO);
+        }
+    }
+
+    fn record_unavailable(self) {
+        if let Some((_, _, unavailable, _)) = self.counters() {
+            crate::phase_telemetry::add(unavailable, Duration::ZERO);
+        }
+    }
+
+    fn record_registration(self, elapsed: Duration) {
+        if let Some((.., registration)) = self.counters() {
+            crate::phase_telemetry::add(registration, elapsed);
+        }
+    }
+}
+
+/// Refusal of a finish orphan recovery proof saved without volume UUIDs:
+/// Git has already deregistered the checkout, so the registration half of
+/// the re-proof cannot be made.
+pub(crate) const REPROOF_ORPHAN_LEGACY_PROOF: &str =
+    "a finish proof without volume UUIDs cannot be re-proven after Git deregistered the checkout";
+
+/// Every ownership re-proof refusal reason and the counter it adds, so each
+/// refusal is countable on its own.
+const OWNERSHIP_REPROOF_REFUSAL_COUNTERS: &[(&str, &str)] = &[
+    (
+        crate::events::IDENTITY_SAVED_UNSUPPORTED,
+        "ownership_reproof_refused_saved_unsupported",
+    ),
+    (
+        crate::events::IDENTITY_CURRENT_UNSUPPORTED,
+        "ownership_reproof_refused_current_unsupported",
+    ),
+    (
+        crate::events::IDENTITY_PATH_CHANGED,
+        "ownership_reproof_refused_path_changed",
+    ),
+    (
+        crate::events::IDENTITY_GENERATION_CHANGED,
+        "ownership_reproof_refused_generation_changed",
+    ),
+    (
+        crate::events::IDENTITY_INODE_CHANGED,
+        "ownership_reproof_refused_inode_changed",
+    ),
+    (
+        crate::events::IDENTITY_VOLUME_UUID_DIFFERS,
+        "ownership_reproof_refused_volume_uuid_differs",
+    ),
+    (
+        crate::events::IDENTITY_VOLUME_UUID_UNAVAILABLE,
+        "ownership_reproof_refused_volume_uuid_unavailable",
+    ),
+    (
+        crate::events::IDENTITY_DEVICE_SHARING_CHANGED,
+        "ownership_reproof_refused_device_sharing_changed",
+    ),
+    (
+        REPROOF_NOTHING_TO_REPROVE,
+        "ownership_reproof_refused_nothing_to_reprove",
+    ),
+    (REPROOF_NOT_SPAWNED, "ownership_reproof_refused_not_spawned"),
+    (REPROOF_NOT_CLOSED, "ownership_reproof_refused_not_closed"),
+    (
+        REPROOF_SESSION_PATH,
+        "ownership_reproof_refused_session_path",
+    ),
+    (
+        REPROOF_OUTSIDE_BROKER_ROOT,
+        "ownership_reproof_refused_outside_broker_root",
+    ),
+    (
+        REPROOF_OTHER_REPOSITORY,
+        "ownership_reproof_refused_other_repository",
+    ),
+    (
+        REGISTRATION_REFUSAL,
+        "ownership_reproof_refused_not_registered",
+    ),
+    (
+        REPROOF_NOT_ON_SESSION_BRANCH,
+        "ownership_reproof_refused_not_on_session_branch",
+    ),
+    (
+        REPROOF_HEAD_NOT_BRANCH_TIP,
+        "ownership_reproof_refused_head_not_branch_tip",
+    ),
+    (REPROOF_HEAD_MOVED, "ownership_reproof_refused_head_moved"),
+    (
+        REPROOF_ORPHAN_LEGACY_PROOF,
+        "ownership_reproof_refused_orphan_legacy_proof",
+    ),
+];
+
+/// The counter of one re-proof refusal reason.
+pub(crate) fn ownership_reproof_refusal_counter(reason: &str) -> &'static str {
+    OWNERSHIP_REPROOF_REFUSAL_COUNTERS
+        .iter()
+        .find(|(known, _)| *known == reason)
+        .map_or("ownership_reproof_refused_other", |(_, counter)| counter)
+}
 
 /// Keep-reason phrase for a spawned row that never persisted a witness.
 const OWNERSHIP_WITNESS_NEVER_RECORDED: &str =
@@ -1764,47 +1940,88 @@ pub(crate) struct RenumberReproofEvidence {
     pub checkout_branch: Option<String>,
     /// The commit that `HEAD` resolves to through this repository's refs.
     pub checkout_head: Option<String>,
-    /// The tip of `refs/heads/<session branch>` in this repository.
+    /// The tip of `refs/heads/<session branch>` in this repository. When
+    /// `HEAD` is a symbolic ref to that branch, both resolve the same ref, so
+    /// this alone only proves the branch resolves to a commit.
     pub branch_tip: Option<String>,
+    /// A commit the broker recorded for this checkout before the identity
+    /// changed (the finish recovery proof's head), when one exists. `HEAD`
+    /// must still be that commit. Witness lanes have no such record.
+    pub recorded_head: Option<String>,
 }
 
 const REGISTRATION_REFUSAL: &str = "this repository does not register the checkout";
+const REPROOF_NOTHING_TO_REPROVE: &str = "the identity matches exactly, so nothing was re-proven";
+const REPROOF_NOT_SPAWNED: &str = "the session was not spawned by the broker";
+const REPROOF_NOT_CLOSED: &str = "the session is not closed";
+const REPROOF_SESSION_PATH: &str = "the session row names another path";
+const REPROOF_OUTSIDE_BROKER_ROOT: &str = "the checkout is not under the broker worktree root";
+const REPROOF_OTHER_REPOSITORY: &str = "the checkout's .git does not point into this repository";
+const REPROOF_NOT_ON_SESSION_BRANCH: &str = "the checkout is not on the session branch";
+const REPROOF_HEAD_NOT_BRANCH_TIP: &str = "the checkout HEAD is not the session branch tip";
+const REPROOF_HEAD_MOVED: &str = "the checkout HEAD moved from the commit the broker recorded";
 
 /// Decide the device-renumber re-proof. `None` means every condition holds;
 /// otherwise the first failed condition, which keeps the checkout.
+#[cfg(test)]
 pub(crate) fn renumber_reproof_refusal(
     saved: &crate::events::SpawnedWorktreeInstanceWitness,
     current: &crate::events::SpawnedWorktreeInstanceWitness,
     session_branch: &str,
     evidence: &RenumberReproofEvidence,
 ) -> Option<&'static str> {
-    if !saved.matches_after_device_renumber(current) {
-        return Some("filesystem identity differs beyond a device renumber");
-    }
+    ownership_reproof_decision(saved, current, session_branch, evidence).err()
+}
+
+/// Decide the ownership re-proof every deletion lane shares. On success,
+/// the re-proof that held ([`OWNERSHIP_REPROOF_DEVICE_RENUMBER`] for a
+/// record saved without volume UUIDs, [`OWNERSHIP_REPROOF_VOLUME_UUID`] when
+/// every recorded UUID still matches); otherwise the first failed condition,
+/// which keeps the checkout. An exact identity is refused here because it
+/// needs no re-proof: callers compare exactly first.
+pub(crate) fn ownership_reproof_decision(
+    saved: &crate::events::SpawnedWorktreeInstanceWitness,
+    current: &crate::events::SpawnedWorktreeInstanceWitness,
+    session_branch: &str,
+    evidence: &RenumberReproofEvidence,
+) -> Result<&'static str, &'static str> {
+    use crate::events::CheckoutIdentityMatch;
+    let reproof = match saved.compare_checkout_identity(current) {
+        CheckoutIdentityMatch::DeviceRenumber => OWNERSHIP_REPROOF_DEVICE_RENUMBER,
+        CheckoutIdentityMatch::VolumeUuid => OWNERSHIP_REPROOF_VOLUME_UUID,
+        CheckoutIdentityMatch::Exact => return Err(REPROOF_NOTHING_TO_REPROVE),
+        CheckoutIdentityMatch::Differs(condition) => return Err(condition),
+    };
     if !evidence.origin_spawned {
-        return Some("the session was not spawned by the broker");
+        return Err(REPROOF_NOT_SPAWNED);
     }
     if !evidence.closed {
-        return Some("the session is not closed");
+        return Err(REPROOF_NOT_CLOSED);
     }
     if !evidence.session_path_matches {
-        return Some("the session row names another path");
+        return Err(REPROOF_SESSION_PATH);
     }
     if !evidence.under_broker_root {
-        return Some("the checkout is not under the broker worktree root");
+        return Err(REPROOF_OUTSIDE_BROKER_ROOT);
     }
     if !evidence.common_dir_is_this_repository {
-        return Some("the checkout's .git does not point into this repository");
+        return Err(REPROOF_OTHER_REPOSITORY);
     }
     if !evidence.registered {
-        return Some(REGISTRATION_REFUSAL);
+        return Err(REGISTRATION_REFUSAL);
     }
     if session_branch.is_empty() || evidence.checkout_branch.as_deref() != Some(session_branch) {
-        return Some("the checkout is not on the session branch");
+        return Err(REPROOF_NOT_ON_SESSION_BRANCH);
     }
     match (&evidence.checkout_head, &evidence.branch_tip) {
-        (Some(head), Some(tip)) if !head.is_empty() && head == tip => None,
-        _ => Some("the checkout HEAD is not the session branch tip"),
+        (Some(head), Some(tip)) if !head.is_empty() && head == tip => {}
+        _ => return Err(REPROOF_HEAD_NOT_BRANCH_TIP),
+    }
+    match &evidence.recorded_head {
+        Some(recorded) if evidence.checkout_head.as_ref() != Some(recorded) => {
+            Err(REPROOF_HEAD_MOVED)
+        }
+        _ => Ok(reproof),
     }
 }
 
@@ -1993,6 +2210,11 @@ impl ClosedArtifactCheckoutCohort {
         })
     }
 
+    /// The final mutation guard: the checkout is still the instance this
+    /// cohort proved. A cohort that needed an ownership re-proof accepts only
+    /// the same re-proof's filesystem half again (unchanged paths, inodes and
+    /// root generation under the same kind of device change); its Git half
+    /// was made when the cohort was built, moments before.
     pub(crate) fn matches_checkout_instance(&self, checkout: &GitRepo) -> bool {
         self.worktree.as_path() == checkout.root()
             && self
@@ -2004,9 +2226,34 @@ impl ClosedArtifactCheckoutCohort {
                     checkout
                         .spawned_worktree_instance_witness()
                         .as_ref()
-                        .is_some_and(|current| expected.matches_current_instance(current))
+                        .is_some_and(|current| {
+                            cohort_identity_still_holds(self.ownership_reproof, expected, current)
+                        })
                 })
     }
+}
+
+/// The final-guard rule of [`ClosedArtifactCheckoutCohort::matches_checkout_instance`]:
+/// an exact witness match, or the same kind of re-proof the cohort recorded.
+/// A cohort proven exactly never accepts a later renumber, and a re-proven
+/// cohort never accepts another kind of device change or changed objects.
+fn cohort_identity_still_holds(
+    cohort_reproof: Option<&'static str>,
+    expected: &crate::events::SpawnedWorktreeInstanceWitness,
+    current: &crate::events::SpawnedWorktreeInstanceWitness,
+) -> bool {
+    use crate::events::CheckoutIdentityMatch;
+    expected.matches_current_instance(current)
+        || matches!(
+            (cohort_reproof, expected.compare_checkout_identity(current)),
+            (
+                Some(OWNERSHIP_REPROOF_DEVICE_RENUMBER),
+                CheckoutIdentityMatch::DeviceRenumber
+            ) | (
+                Some(OWNERSHIP_REPROOF_VOLUME_UUID),
+                CheckoutIdentityMatch::VolumeUuid
+            )
+        )
 }
 
 fn proves_removed_historical_instance(
@@ -3925,30 +4172,43 @@ impl Broker {
                         })
                 });
                 if !exact {
-                    let reproved = purpose == ClosedCohortPurpose::CheckoutRemoval
-                        && match (saved, current_witness.as_ref()) {
-                            (Some(saved), Some(current)) => {
-                                match self.renumbered_witness_reproof(
-                                    session,
-                                    Path::new(&canonical_path),
-                                    saved,
-                                    current,
-                                    deadline,
-                                ) {
-                                    Ok(()) => true,
-                                    Err(ReproofFailure::Refused(_)) => false,
-                                    // Unproven for now, not refused: retry.
-                                    Err(ReproofFailure::Unavailable(_)) => {
-                                        return Ok(unavailable(Reason::DeadlineExceeded));
-                                    }
+                    let reproof = match (purpose.reclaims(), saved, current_witness.as_ref()) {
+                        (true, Some(saved), Some(current)) => {
+                            match self.checkout_ownership_reproof(
+                                purpose.reproof_lane(),
+                                session,
+                                Path::new(&canonical_path),
+                                saved,
+                                current,
+                                None,
+                                deadline,
+                            ) {
+                                Ok(reproof) => Some(reproof),
+                                // The objects are the same but the Git half
+                                // refused: a reason of its own, so the
+                                // refusal is countable apart from a replaced
+                                // checkout.
+                                Err(ReproofFailure::Refused(_))
+                                    if !matches!(
+                                        saved.compare_checkout_identity(current),
+                                        crate::events::CheckoutIdentityMatch::Differs(_)
+                                    ) =>
+                                {
+                                    return Ok(unavailable(Reason::OwnershipReproofRefused));
+                                }
+                                Err(ReproofFailure::Refused(_)) => None,
+                                // Unproven for now, not refused: retry.
+                                Err(ReproofFailure::Unavailable(_)) => {
+                                    return Ok(unavailable(Reason::DeadlineExceeded));
                                 }
                             }
-                            _ => false,
-                        };
-                    if !reproved {
+                        }
+                        _ => None,
+                    };
+                    let Some(reproof) = reproof else {
                         return Ok(unavailable(Reason::SpawnedWitnessMismatch));
-                    }
-                    ownership_reproof = Some(OWNERSHIP_REPROOF_DEVICE_RENUMBER);
+                    };
+                    ownership_reproof = Some(reproof);
                 }
             }
             if owner_session_id.is_none()
@@ -4125,10 +4385,13 @@ impl Broker {
     }
 
     /// Re-prove broker ownership of a closed checkout whose schema-2 spawn
-    /// witness differs from today's observation only by renumbered devices.
+    /// witness differs from today's observation only by renumbered devices,
+    /// for the automatic lane ([`Self::checkout_ownership_reproof`]).
     /// Gathers every condition of [`RenumberReproofEvidence`] and refuses on
     /// the first that fails. Callers must already have required that the
-    /// exact comparison failed; this never widens a schema-3 or legacy check.
+    /// exact comparison failed; this never widens a schema-1 check, and a
+    /// schema-3 witness reaches it only when a recorded UUID differs or
+    /// cannot be observed, which it refuses.
     ///
     /// Registration and branch evidence are read from this checkout's own
     /// registration files under the common directory, fresh on every call
@@ -4143,22 +4406,63 @@ impl Broker {
         current: &crate::events::SpawnedWorktreeInstanceWitness,
         deadline: Option<Instant>,
     ) -> Result<(), ReproofFailure> {
-        let refuse = |condition: &str| -> Result<(), ReproofFailure> {
-            crate::phase_telemetry::add("auto_cleanup_ownership_reproof_refused", Duration::ZERO);
+        self.checkout_ownership_reproof(
+            OwnershipReproofLane::Automatic,
+            session,
+            worktree,
+            saved,
+            current,
+            None,
+            deadline,
+        )
+        .map(|_| ())
+    }
+
+    /// The one ownership re-proof every deletion lane (automatic removal, GC
+    /// reclamation and compaction, `finish` and its interrupted-cleanup
+    /// recovery) uses when a saved identity no longer matches today's
+    /// checkout exactly. The filesystem half
+    /// ([`crate::events::SpawnedWorktreeInstanceWitness::compare_checkout_identity`])
+    /// requires unchanged paths, inodes and root generation, and either equal
+    /// recorded volume UUIDs or, for a record saved without them, an unchanged
+    /// device-sharing pattern; the Git half requires a closed spawned session
+    /// naming the checkout under the broker root, this repository's
+    /// registration of it, its `HEAD` on the session branch with that branch
+    /// resolving to the same commit, and, where the broker recorded a commit
+    /// for this checkout (`recorded_head`: the finish recovery proof's head),
+    /// `HEAD` still at that commit. Witness lanes record no commit, so for
+    /// them the branch condition binds `HEAD` to the branch, not to a commit.
+    /// Returns the re-proof that held. Each decision is counted in `lane`
+    /// (refusals also under the reason's own counter,
+    /// [`ownership_reproof_refusal_counter`]); [`OwnershipReproofLane::Quiet`]
+    /// counts nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn checkout_ownership_reproof(
+        &self,
+        lane: OwnershipReproofLane,
+        session: &Session,
+        worktree: &Path,
+        saved: &crate::events::SpawnedWorktreeInstanceWitness,
+        current: &crate::events::SpawnedWorktreeInstanceWitness,
+        recorded_head: Option<&str>,
+        deadline: Option<Instant>,
+    ) -> Result<&'static str, ReproofFailure> {
+        let refuse = |condition: &str| -> Result<&'static str, ReproofFailure> {
+            lane.record_refused(condition);
             Err(ReproofFailure::Refused(format!(
                 "spawn-time worktree identity device renumber re-proof refused: {condition}"
             )))
         };
-        let unavailable = |detail: String| -> Result<(), ReproofFailure> {
-            crate::phase_telemetry::add(
-                "auto_cleanup_ownership_reproof_unavailable",
-                Duration::ZERO,
-            );
+        let unavailable = |detail: String| -> Result<&'static str, ReproofFailure> {
+            lane.record_unavailable();
             Err(ReproofFailure::Unavailable(detail))
         };
         // The filesystem half first: it needs no Git process.
-        if !saved.matches_after_device_renumber(current) {
-            return refuse("filesystem identity differs beyond a device renumber");
+        use crate::events::CheckoutIdentityMatch;
+        match saved.compare_checkout_identity(current) {
+            CheckoutIdentityMatch::DeviceRenumber | CheckoutIdentityMatch::VolumeUuid => {}
+            CheckoutIdentityMatch::Exact => return refuse(REPROOF_NOTHING_TO_REPROVE),
+            CheckoutIdentityMatch::Differs(condition) => return refuse(condition),
         }
         if deadline_expired(deadline) {
             return unavailable("the pass deadline passed before the re-proof".into());
@@ -4193,10 +4497,7 @@ impl Broker {
         let (checkout_branch, checkout_head) = registration_head(common, admin);
         let branch_tip =
             resolve_branch_ref_in_common(common, &format!("refs/heads/{}", session.branch));
-        crate::phase_telemetry::add(
-            "auto_cleanup_ownership_reproof_registration",
-            registration_started.elapsed(),
-        );
+        lane.record_registration(registration_started.elapsed());
         let evidence = RenumberReproofEvidence {
             origin_spawned: session.origin == SessionOrigin::Spawned,
             closed: session.status.is_closed()
@@ -4208,19 +4509,21 @@ impl Broker {
             checkout_branch,
             checkout_head,
             branch_tip,
+            recorded_head: recorded_head.map(str::to_string),
         };
-        match renumber_reproof_refusal(saved, current, &session.branch, &evidence) {
-            None => {
-                crate::phase_telemetry::add("auto_cleanup_ownership_reproved", Duration::ZERO);
-                Ok(())
+        match ownership_reproof_decision(saved, current, &session.branch, &evidence) {
+            Ok(reproof) => {
+                lane.record_reproved();
+                Ok(reproof)
             }
-            Some(condition) => refuse(condition),
+            Err(condition) => refuse(condition),
         }
     }
 
     /// [`Self::closed_artifact_checkout_cohort_for_session_detailed`] for
-    /// automatic whole-checkout removal, which alone also accepts the
-    /// device-renumber re-proof ([`ClosedCohortPurpose::CheckoutRemoval`]).
+    /// automatic whole-checkout removal. It accepts the same ownership
+    /// re-proof as GC reclaim; only its telemetry lane differs
+    /// ([`ClosedCohortPurpose::CheckoutRemoval`]).
     fn closed_checkout_cohort_for_removal(
         &mut self,
         session_id: i64,
@@ -4789,17 +5092,20 @@ impl Broker {
                 // Only the re-proof the cohort itself accepted, re-made now
                 // against this fresh observation, may stand in for the exact
                 // comparison.
-                let reproved = if ownership_reproof == Some(OWNERSHIP_REPROOF_DEVICE_RENUMBER)
+                let reproved = if ownership_reproof.is_some()
                     && let Some(current) = current_witness.as_ref()
                 {
-                    match self.renumbered_witness_reproof(
+                    match self.checkout_ownership_reproof(
+                        OwnershipReproofLane::Automatic,
                         &owner,
                         &candidate.worktree,
                         expected,
                         current,
+                        None,
                         deadline,
                     ) {
-                        Ok(()) => true,
+                        // The same kind of re-proof the cohort accepted.
+                        Ok(reproof) => ownership_reproof == Some(reproof),
                         Err(ReproofFailure::Refused(_)) => false,
                         Err(ReproofFailure::Unavailable(_)) => return Err(NotRemoved::Defer),
                     }
@@ -4943,7 +5249,11 @@ impl Broker {
         if reason == ClosedArtifactCheckoutCohortUnavailableReason::DeadlineExceeded {
             return NotRemoved::Defer;
         }
-        if reason != ClosedArtifactCheckoutCohortUnavailableReason::SpawnedWitnessMismatch {
+        if !matches!(
+            reason,
+            ClosedArtifactCheckoutCohortUnavailableReason::SpawnedWitnessMismatch
+                | ClosedArtifactCheckoutCohortUnavailableReason::OwnershipReproofRefused
+        ) {
             return NotRemoved::Keep(format!("{PREFIX}: cohort unavailable ({})", reason.code()));
         }
         let manual = format!(
@@ -7478,7 +7788,7 @@ mod tests {
 
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     #[test]
-    fn marker_review_survives_a_renumbered_mount_that_reclaim_still_refuses() {
+    fn marker_review_survives_a_renumbered_mount_that_reclaim_only_reproves() {
         let mut fixture = ArtifactUseReconcileFixture::new();
         let invocation_id = "reconcile-renumbered-mount-fixture";
         let mut child = fixture.start_running_marker(invocation_id);
@@ -7500,19 +7810,20 @@ mod tests {
 
         let session_id = fixture.session.id;
         let checkout_root = fixture.checkout_root.clone();
-        assert!(matches!(
-            fixture
-                .broker
-                .closed_artifact_checkout_cohort_for_session_detailed(
-                    session_id,
-                    &checkout_root,
-                    None,
-                )
-                .unwrap(),
-            super::ClosedArtifactCheckoutCohortResolution::Unavailable(
-                super::ClosedArtifactCheckoutCohortUnavailableReason::SpawnedWitnessMismatch
-            )
-        ));
+        // Reclaim never accepts the renumbered witness as exact: this closed,
+        // registered checkout on its branch is re-proven through Git, and the
+        // cohort records the re-proof it needed.
+        match fixture
+            .broker
+            .closed_artifact_checkout_cohort_for_session_detailed(session_id, &checkout_root, None)
+            .unwrap()
+        {
+            super::ClosedArtifactCheckoutCohortResolution::Available(reclaim) => assert_eq!(
+                reclaim.ownership_reproof(),
+                Some(super::OWNERSHIP_REPROOF_DEVICE_RENUMBER)
+            ),
+            other => panic!("reclaim must re-prove the renumbered checkout: {other:?}"),
+        }
 
         let report = fixture.apply(&cohort, &registry, &plan.digest).unwrap();
         assert!(matches!(
@@ -8634,6 +8945,7 @@ mod tests {
             checkout_branch: Some("agent/task".into()),
             checkout_head: Some("1".repeat(40)),
             branch_tip: Some("1".repeat(40)),
+            recorded_head: None,
         }
     }
 
@@ -8674,7 +8986,7 @@ mod tests {
         current.worktree_inode += 1;
         assert_eq!(
             super::renumber_reproof_refusal(&saved, &current, "agent/task", &evidence),
-            Some("filesystem identity differs beyond a device renumber")
+            Some(crate::events::IDENTITY_INODE_CHANGED)
         );
     }
 
@@ -8747,6 +9059,190 @@ mod tests {
         assert_renumber_refused(
             |evidence| evidence.branch_tip = None,
             "the checkout HEAD is not the session branch tip",
+        );
+    }
+
+    #[test]
+    fn ownership_reproof_names_the_reproof_that_held() {
+        use crate::events::{IDENTITY_VOLUME_UUID_DIFFERS, IDENTITY_VOLUME_UUID_UNAVAILABLE};
+        let decide = |saved: &crate::events::SpawnedWorktreeInstanceWitness,
+                      current: &crate::events::SpawnedWorktreeInstanceWitness,
+                      evidence: &super::RenumberReproofEvidence| {
+            super::ownership_reproof_decision(saved, current, "agent/task", evidence)
+        };
+        let (saved, current) = renumber_witnesses();
+        let evidence = proven_renumber_evidence();
+        assert_eq!(
+            decide(&saved, &current, &evidence),
+            Ok(super::OWNERSHIP_REPROOF_DEVICE_RENUMBER)
+        );
+        // Recorded volume UUIDs that still match after every object's device
+        // was renumbered.
+        let mut saved_uuid = saved.clone();
+        saved_uuid.schema_version = 3;
+        saved_uuid.volume_uuids = Some(crate::events::SpawnedWorktreeVolumeUuids {
+            worktree: [1; 16],
+            git_pointer: [1; 16],
+            git_admin: [2; 16],
+            git_common: [2; 16],
+        });
+        let mut current_uuid = current.clone();
+        current_uuid.schema_version = 3;
+        current_uuid.volume_uuids = saved_uuid.volume_uuids.clone();
+        assert_eq!(
+            decide(&saved_uuid, &current_uuid, &evidence),
+            Ok(super::OWNERSHIP_REPROOF_VOLUME_UUID)
+        );
+        // A UUID match is not authority on its own: the Git half applies.
+        let mut detached = evidence.clone();
+        detached.checkout_branch = None;
+        assert_eq!(
+            decide(&saved_uuid, &current_uuid, &detached),
+            Err("the checkout is not on the session branch")
+        );
+        let mut moved = evidence.clone();
+        moved.branch_tip = Some("2".repeat(40));
+        assert_eq!(
+            decide(&saved_uuid, &current_uuid, &moved),
+            Err("the checkout HEAD is not the session branch tip")
+        );
+        let mut unregistered = evidence.clone();
+        unregistered.registered = false;
+        assert_eq!(
+            decide(&saved_uuid, &current_uuid, &unregistered),
+            Err(super::REGISTRATION_REFUSAL)
+        );
+        let mut other_volume = current_uuid.clone();
+        other_volume.volume_uuids.as_mut().unwrap().worktree = [9; 16];
+        assert_eq!(
+            decide(&saved_uuid, &other_volume, &evidence),
+            Err(IDENTITY_VOLUME_UUID_DIFFERS)
+        );
+        // Today's observation without UUIDs (an unknown platform).
+        assert_eq!(
+            decide(&saved_uuid, &current, &evidence),
+            Err(IDENTITY_VOLUME_UUID_UNAVAILABLE)
+        );
+        assert_eq!(
+            decide(&saved, &saved, &evidence),
+            Err(super::REPROOF_NOTHING_TO_REPROVE)
+        );
+    }
+
+    /// In production `HEAD` is a symbolic ref to the session branch, so the
+    /// checkout head and the branch tip always agree; only a recorded commit
+    /// can notice the branch moved since the broker recorded it.
+    #[test]
+    fn ownership_reproof_binds_head_to_the_recorded_commit() {
+        let (saved, current) = renumber_witnesses();
+        let mut evidence = proven_renumber_evidence();
+        evidence.checkout_head = Some("3".repeat(40));
+        evidence.branch_tip = Some("3".repeat(40));
+        assert_eq!(
+            super::ownership_reproof_decision(&saved, &current, "agent/task", &evidence),
+            Ok(super::OWNERSHIP_REPROOF_DEVICE_RENUMBER),
+            "without a recorded commit the branch condition alone applies"
+        );
+        evidence.recorded_head = Some("3".repeat(40));
+        assert_eq!(
+            super::ownership_reproof_decision(&saved, &current, "agent/task", &evidence),
+            Ok(super::OWNERSHIP_REPROOF_DEVICE_RENUMBER)
+        );
+        evidence.recorded_head = Some("1".repeat(40));
+        assert_eq!(
+            super::ownership_reproof_decision(&saved, &current, "agent/task", &evidence),
+            Err(super::REPROOF_HEAD_MOVED),
+            "the branch and HEAD moved together past the recorded commit"
+        );
+    }
+
+    #[test]
+    fn the_final_guard_accepts_only_the_cohorts_own_reproof() {
+        use super::{
+            OWNERSHIP_REPROOF_DEVICE_RENUMBER, OWNERSHIP_REPROOF_VOLUME_UUID,
+            cohort_identity_still_holds,
+        };
+        let (saved, current) = renumber_witnesses();
+        assert!(cohort_identity_still_holds(None, &saved, &saved));
+        assert!(cohort_identity_still_holds(
+            Some(OWNERSHIP_REPROOF_DEVICE_RENUMBER),
+            &saved,
+            &current
+        ));
+        // A cohort proven exactly, then a renumber before unlink.
+        assert!(!cohort_identity_still_holds(None, &saved, &current));
+        // A re-proven cohort, then another object at the path.
+        let mut replaced = current.clone();
+        replaced.worktree_inode += 1;
+        assert!(!cohort_identity_still_holds(
+            Some(OWNERSHIP_REPROOF_DEVICE_RENUMBER),
+            &saved,
+            &replaced
+        ));
+        // A device-renumber cohort against a volume-UUID observation, and
+        // the reverse.
+        let uuids = crate::events::SpawnedWorktreeVolumeUuids {
+            worktree: [1; 16],
+            git_pointer: [1; 16],
+            git_admin: [2; 16],
+            git_common: [2; 16],
+        };
+        let mut saved_uuid = saved.clone();
+        saved_uuid.schema_version = 3;
+        saved_uuid.volume_uuids = Some(uuids.clone());
+        let mut current_uuid = current.clone();
+        current_uuid.schema_version = 3;
+        current_uuid.volume_uuids = Some(uuids);
+        assert_eq!(
+            saved_uuid.compare_checkout_identity(&current_uuid),
+            crate::events::CheckoutIdentityMatch::VolumeUuid
+        );
+        assert!(!cohort_identity_still_holds(
+            Some(OWNERSHIP_REPROOF_VOLUME_UUID),
+            &saved,
+            &current
+        ));
+        // A schema-3 witness matches by UUID exactly, so the volume-UUID
+        // kind is checked through a legacy-shaped record here.
+        let mut legacy_saved = saved_uuid.clone();
+        legacy_saved.schema_version = 2;
+        legacy_saved.volume_uuids = None;
+        assert!(!cohort_identity_still_holds(
+            Some(OWNERSHIP_REPROOF_VOLUME_UUID),
+            &legacy_saved,
+            &current_uuid
+        ));
+        assert!(cohort_identity_still_holds(
+            Some(OWNERSHIP_REPROOF_DEVICE_RENUMBER),
+            &legacy_saved,
+            &current_uuid
+        ));
+    }
+
+    #[test]
+    fn every_ownership_reproof_refusal_has_its_own_counter() {
+        let table = super::OWNERSHIP_REPROOF_REFUSAL_COUNTERS;
+        let reasons = table
+            .iter()
+            .map(|(reason, _)| *reason)
+            .collect::<std::collections::BTreeSet<_>>();
+        let counters = table
+            .iter()
+            .map(|(_, counter)| *counter)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(reasons.len(), table.len(), "reasons are distinct");
+        assert_eq!(counters.len(), table.len(), "counters are distinct");
+        for (reason, counter) in table {
+            assert_eq!(super::ownership_reproof_refusal_counter(reason), *counter);
+            assert!(
+                counter.starts_with("ownership_reproof_refused_"),
+                "{counter}"
+            );
+            assert_ne!(*counter, "ownership_reproof_refused_other");
+        }
+        assert_eq!(
+            super::ownership_reproof_refusal_counter("an unlisted reason"),
+            "ownership_reproof_refused_other"
         );
     }
 
@@ -8836,12 +9332,17 @@ mod tests {
         saved.git_common_device += 1000;
         rewrite_spawn_witness(&mut broker, session.id, &saved);
 
+        let reclaim = broker
+            .closed_artifact_checkout_cohort_for_session(session.id, &path, None)
+            .unwrap()
+            .expect("GC reclaim shares the automatic lane's re-proof");
+        assert_eq!(
+            reclaim.ownership_reproof(),
+            Some(OWNERSHIP_REPROOF_DEVICE_RENUMBER)
+        );
         assert!(
-            broker
-                .closed_artifact_checkout_cohort_for_session(session.id, &path, None)
-                .unwrap()
-                .is_none(),
-            "artifact reclamation keeps the exact comparison"
+            reclaim.matches_checkout_instance(&GitRepo::discover(&path).unwrap()),
+            "the final unlink guard accepts the re-proven instance"
         );
         let cohort = match broker
             .closed_checkout_cohort_for_removal(session.id, &path, None)
@@ -8954,6 +9455,68 @@ mod tests {
                 super::ClosedArtifactCheckoutCohortUnavailableReason::SpawnedWitnessMismatch
             )
         ));
+    }
+
+    /// GC reclaim and compaction share the automatic lane's re-proof, and
+    /// keep each refusal apart: the Git half (a detached checkout) and the
+    /// filesystem half (another inode) have their own cohort codes.
+    #[cfg(unix)]
+    #[test]
+    fn gc_reclaim_reproves_a_renumbered_witness_and_reports_each_refusal() {
+        use super::{
+            ClosedArtifactCheckoutCohortResolution as Resolution,
+            ClosedArtifactCheckoutCohortUnavailableReason as Reason,
+        };
+
+        let (_owner, _storage, mut broker, session) = retirement_fixture();
+        broker
+            .close_abandoning_unpushed(session.id, "gc reclaim renumber fixture")
+            .unwrap();
+        let path = PathBuf::from(&session.worktree_path);
+        let mut saved = broker
+            .store()
+            .spawned_worktree_instance_witness(session.id)
+            .unwrap()
+            .expect("spawn captures a witness");
+        saved.schema_version = 2;
+        saved.volume_uuids = None;
+        saved.worktree_device += 1000;
+        saved.git_pointer_device += 1000;
+        saved.git_admin_device += 1000;
+        saved.git_common_device += 1000;
+        rewrite_spawn_witness(&mut broker, session.id, &saved);
+        let reclaim = |broker: &mut crate::Broker| {
+            broker
+                .closed_artifact_checkout_cohort_for_session_detailed(session.id, &path, None)
+                .unwrap()
+        };
+        match reclaim(&mut broker) {
+            Resolution::Available(cohort) => assert_eq!(
+                cohort.ownership_reproof(),
+                Some(super::OWNERSHIP_REPROOF_DEVICE_RENUMBER)
+            ),
+            other => panic!("GC reclaim must re-prove the renumbered checkout: {other:?}"),
+        }
+
+        git(&path, &["checkout", "-q", "--detach"]);
+        assert_eq!(
+            match reclaim(&mut broker) {
+                Resolution::Unavailable(reason) => reason,
+                Resolution::Available(_) => panic!("a detached checkout must not be re-proven"),
+            },
+            Reason::OwnershipReproofRefused
+        );
+        git(&path, &["checkout", "-q", session.branch.as_str()]);
+
+        saved.worktree_inode ^= 1 << 40;
+        rewrite_spawn_witness(&mut broker, session.id, &saved);
+        assert_eq!(
+            match reclaim(&mut broker) {
+                Resolution::Unavailable(reason) => reason,
+                Resolution::Available(_) => panic!("another inode must not be re-proven"),
+            },
+            Reason::SpawnedWitnessMismatch
+        );
     }
 
     /// A closed spawned checkout whose saved witness is a schema-2 record of

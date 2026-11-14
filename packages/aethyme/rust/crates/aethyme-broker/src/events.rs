@@ -429,40 +429,106 @@ impl SpawnedWorktreeInstanceWitness {
     /// spawn are unchanged, and the renumbering kept which of the four objects
     /// shared a device. It is never authority on its own: reclaim also needs
     /// the Git registration proof in `auto_cleanup`.
+    #[cfg(test)]
     pub(crate) fn matches_after_device_renumber(&self, current: &Self) -> bool {
-        let saved_devices = [
+        self.compare_checkout_identity(current) == CheckoutIdentityMatch::DeviceRenumber
+    }
+
+    /// The filesystem half of every ownership re-proof: how this saved
+    /// identity relates to today's observation of the same four objects.
+    /// Paths, inodes and the random root generation must be unchanged. When
+    /// device numbers differ, a volume UUID saved for an object must equal
+    /// today's UUID of that object (an unknown UUID today is a refusal, never
+    /// a fallback); a witness saved without UUIDs must keep the four objects'
+    /// device-sharing pattern. Neither non-exact answer is authority on its
+    /// own: the Git registration proof in `auto_cleanup` must also hold.
+    pub(crate) fn compare_checkout_identity(&self, current: &Self) -> CheckoutIdentityMatch {
+        use CheckoutIdentityMatch::{DeviceRenumber, Differs, Exact, VolumeUuid};
+        if !self.is_supported() {
+            return Differs(IDENTITY_SAVED_UNSUPPORTED);
+        }
+        if !current.is_supported() {
+            return Differs(IDENTITY_CURRENT_UNSUPPORTED);
+        }
+        if self.worktree_path != current.worktree_path
+            || self.git_admin_path != current.git_admin_path
+            || self.git_common_path != current.git_common_path
+        {
+            return Differs(IDENTITY_PATH_CHANGED);
+        }
+        if self.root_generation_sha256 != current.root_generation_sha256 {
+            return Differs(IDENTITY_GENERATION_CHANGED);
+        }
+        if self.worktree_inode != current.worktree_inode
+            || self.git_pointer_inode != current.git_pointer_inode
+            || self.git_admin_inode != current.git_admin_inode
+            || self.git_common_inode != current.git_common_inode
+        {
+            return Differs(IDENTITY_INODE_CHANGED);
+        }
+        let saved_devices = self.devices();
+        let current_devices = current.devices();
+        match (&self.volume_uuids, &current.volume_uuids) {
+            (Some(saved), Some(observed)) if saved != observed => {
+                Differs(IDENTITY_VOLUME_UUID_DIFFERS)
+            }
+            (Some(_), None) => Differs(IDENTITY_VOLUME_UUID_UNAVAILABLE),
+            _ if saved_devices == current_devices => Exact,
+            (Some(_), Some(_)) => VolumeUuid,
+            (None, _) => {
+                let same_sharing = (0..4).all(|left| {
+                    (0..4).all(|right| {
+                        (saved_devices[left] == saved_devices[right])
+                            == (current_devices[left] == current_devices[right])
+                    })
+                });
+                if same_sharing {
+                    DeviceRenumber
+                } else {
+                    Differs(IDENTITY_DEVICE_SHARING_CHANGED)
+                }
+            }
+        }
+    }
+
+    fn devices(&self) -> [u64; 4] {
+        [
             self.worktree_device,
             self.git_pointer_device,
             self.git_admin_device,
             self.git_common_device,
-        ];
-        let current_devices = [
-            current.worktree_device,
-            current.git_pointer_device,
-            current.git_admin_device,
-            current.git_common_device,
-        ];
-        let same_sharing = (0..4).all(|left| {
-            (0..4).all(|right| {
-                (saved_devices[left] == saved_devices[right])
-                    == (current_devices[left] == current_devices[right])
-            })
-        });
-        self.schema_version == 2
-            && self.volume_uuids.is_none()
-            && self.is_supported()
-            && current.is_supported()
-            && self.worktree_path == current.worktree_path
-            && self.git_admin_path == current.git_admin_path
-            && self.git_common_path == current.git_common_path
-            && self.root_generation_sha256 == current.root_generation_sha256
-            && self.worktree_inode == current.worktree_inode
-            && self.git_pointer_inode == current.git_pointer_inode
-            && self.git_admin_inode == current.git_admin_inode
-            && self.git_common_inode == current.git_common_inode
-            && same_sharing
+        ]
     }
 }
+
+/// How a saved checkout identity relates to today's observation of the same
+/// objects ([`SpawnedWorktreeInstanceWitness::compare_checkout_identity`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckoutIdentityMatch {
+    /// Paths, devices, inodes, generation and any recorded UUIDs are equal.
+    Exact,
+    /// Only device numbers differ, and every object's saved volume UUID
+    /// equals today's: the volume was remounted.
+    VolumeUuid,
+    /// Only device numbers differ on a record saved without volume UUIDs,
+    /// and the four objects kept their device-sharing pattern.
+    DeviceRenumber,
+    /// Anything else; the first differing condition.
+    Differs(&'static str),
+}
+
+pub(crate) const IDENTITY_SAVED_UNSUPPORTED: &str =
+    "the saved spawn identity is not a supported record";
+pub(crate) const IDENTITY_CURRENT_UNSUPPORTED: &str =
+    "today's checkout identity is not a supported record";
+pub(crate) const IDENTITY_PATH_CHANGED: &str = "a recorded checkout or Git path changed";
+pub(crate) const IDENTITY_GENERATION_CHANGED: &str = "the spawn root generation changed";
+pub(crate) const IDENTITY_INODE_CHANGED: &str = "a recorded inode changed";
+pub(crate) const IDENTITY_VOLUME_UUID_DIFFERS: &str = "a recorded volume UUID differs";
+pub(crate) const IDENTITY_VOLUME_UUID_UNAVAILABLE: &str =
+    "a recorded volume UUID cannot be observed today";
+pub(crate) const IDENTITY_DEVICE_SHARING_CHANGED: &str =
+    "the device-sharing pattern of the four objects changed";
 
 /// Immutable identity captured before `finish` begins physical cleanup. A
 /// later retry may use it only when the same registered checkout is still
@@ -495,9 +561,54 @@ pub(crate) struct FinishCleanupRecoveryProof {
     /// ignored files and directories elsewhere.
     #[serde(default)]
     pub(crate) disposable_ignored_root_prefixes: Vec<String>,
+    /// Volume UUIDs of the four objects, captured with the devices where the
+    /// platform reports them (macOS). Absent on proofs saved before 0.8.96
+    /// and on platforms without a stable volume identifier; those keep the
+    /// exact device comparison or the Git-registration re-proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) volume_uuids: Option<SpawnedWorktreeVolumeUuids>,
+    /// The ownership re-proof that validated this proof against today's
+    /// checkout, when its devices no longer matched exactly. Never stored.
+    #[serde(skip)]
+    pub(crate) ownership_reproof: Option<&'static str>,
 }
 
 impl FinishCleanupRecoveryProof {
+    /// This proof's four objects as a spawn witness, so it is compared by the
+    /// same rule ([`SpawnedWorktreeInstanceWitness::compare_checkout_identity`]).
+    pub(crate) fn instance_witness(&self) -> SpawnedWorktreeInstanceWitness {
+        SpawnedWorktreeInstanceWitness {
+            schema_version: if self.volume_uuids.is_some() { 3 } else { 2 },
+            worktree_path: self.worktree_path.clone(),
+            worktree_device: self.worktree_device,
+            worktree_inode: self.worktree_inode,
+            git_pointer_device: self.git_pointer_device,
+            git_pointer_inode: self.git_pointer_inode,
+            git_admin_path: self.git_admin_path.clone(),
+            git_admin_device: self.git_admin_device,
+            git_admin_inode: self.git_admin_inode,
+            git_common_path: self.git_common_path.clone(),
+            git_common_device: self.git_common_device,
+            git_common_inode: self.git_common_inode,
+            root_generation_sha256: self.root_generation_sha256.clone(),
+            volume_uuids: self.volume_uuids.clone(),
+        }
+    }
+
+    /// Whether `fresh`, built from today's checkout, equals this stored proof
+    /// on every field except the device numbers and volume UUIDs, which
+    /// [`SpawnedWorktreeInstanceWitness::compare_checkout_identity`] judges.
+    pub(crate) fn equal_apart_from_volume_identity(&self, fresh: &Self) -> bool {
+        let mut rebased = fresh.clone();
+        rebased.worktree_device = self.worktree_device;
+        rebased.git_pointer_device = self.git_pointer_device;
+        rebased.git_admin_device = self.git_admin_device;
+        rebased.git_common_device = self.git_common_device;
+        rebased.volume_uuids = self.volume_uuids.clone();
+        rebased.ownership_reproof = self.ownership_reproof;
+        rebased == *self
+    }
+
     /// A finish intent may use only the generation captured at spawn. The
     /// current checkout's metadata and root marker alone cannot reconstruct
     /// ownership after a path has been replaced.
@@ -1131,5 +1242,252 @@ mod spawned_instance_volume_tests {
         let mut malformed = legacy.clone();
         malformed.volume_uuids = current.volume_uuids.clone();
         assert!(!malformed.matches_current_instance(&current));
+    }
+
+    /// Every one of the four objects gets a new device number, as a remount
+    /// of both volumes does.
+    fn renumber_every_object(witness: &mut SpawnedWorktreeInstanceWitness) {
+        witness.worktree_device += 1000;
+        witness.git_pointer_device += 1000;
+        witness.git_admin_device += 1000;
+        witness.git_common_device += 1000;
+    }
+
+    #[test]
+    fn identity_with_matching_volume_uuids_survives_a_renumber_of_every_object() {
+        use super::CheckoutIdentityMatch;
+        let saved = witness();
+        assert_eq!(
+            saved.compare_checkout_identity(&saved),
+            CheckoutIdentityMatch::Exact
+        );
+        let mut current = saved.clone();
+        renumber_every_object(&mut current);
+        assert_eq!(
+            saved.compare_checkout_identity(&current),
+            CheckoutIdentityMatch::VolumeUuid
+        );
+    }
+
+    #[test]
+    fn identity_refuses_any_differing_volume_uuid() {
+        use super::{CheckoutIdentityMatch, IDENTITY_VOLUME_UUID_DIFFERS};
+        let saved = witness();
+        type Mutation = fn(&mut SpawnedWorktreeVolumeUuids);
+        let mutations: &[(&str, Mutation)] = &[
+            ("worktree", |v| v.worktree = [7; 16]),
+            ("pointer", |v| v.git_pointer = [7; 16]),
+            ("admin", |v| v.git_admin = [7; 16]),
+            ("common", |v| v.git_common = [7; 16]),
+        ];
+        for (name, mutate) in mutations {
+            for renumbered in [false, true] {
+                let mut current = saved.clone();
+                if renumbered {
+                    renumber_every_object(&mut current);
+                }
+                mutate(current.volume_uuids.as_mut().unwrap());
+                assert_eq!(
+                    saved.compare_checkout_identity(&current),
+                    CheckoutIdentityMatch::Differs(IDENTITY_VOLUME_UUID_DIFFERS),
+                    "{name} renumbered={renumbered}"
+                );
+            }
+        }
+    }
+
+    /// A platform without a stable volume identifier observes no UUID: a
+    /// recorded UUID is then a refusal, never a fallback to the device.
+    #[test]
+    fn identity_with_a_recorded_uuid_refuses_an_unknown_platform_observation() {
+        use super::{CheckoutIdentityMatch, IDENTITY_VOLUME_UUID_UNAVAILABLE};
+        let saved = witness();
+        let mut unknown = saved.clone();
+        unknown.schema_version = 2;
+        unknown.volume_uuids = None;
+        assert_eq!(
+            saved.compare_checkout_identity(&unknown),
+            CheckoutIdentityMatch::Differs(IDENTITY_VOLUME_UUID_UNAVAILABLE),
+            "same devices"
+        );
+        renumber_every_object(&mut unknown);
+        assert_eq!(
+            saved.compare_checkout_identity(&unknown),
+            CheckoutIdentityMatch::Differs(IDENTITY_VOLUME_UUID_UNAVAILABLE),
+            "renumbered devices"
+        );
+        // Without any recorded UUID, an unknown platform keeps the exact
+        // device comparison for an exact match.
+        let legacy = unknown.clone();
+        assert_eq!(
+            legacy.compare_checkout_identity(&unknown),
+            CheckoutIdentityMatch::Exact
+        );
+    }
+
+    #[test]
+    fn identity_of_a_legacy_record_is_a_device_renumber_only_for_the_same_objects() {
+        use super::{
+            CheckoutIdentityMatch, IDENTITY_DEVICE_SHARING_CHANGED, IDENTITY_GENERATION_CHANGED,
+            IDENTITY_INODE_CHANGED, IDENTITY_PATH_CHANGED,
+        };
+        let saved = uuid_less_witness();
+        // Today's observation, with or without UUIDs (macOS or elsewhere).
+        for observed_uuids in [true, false] {
+            let mut current = witness();
+            if !observed_uuids {
+                current.schema_version = 2;
+                current.volume_uuids = None;
+            }
+            assert_eq!(
+                saved.compare_checkout_identity(&current),
+                CheckoutIdentityMatch::Exact
+            );
+            renumber_every_object(&mut current);
+            assert_eq!(
+                saved.compare_checkout_identity(&current),
+                CheckoutIdentityMatch::DeviceRenumber
+            );
+            type Mutation = fn(&mut SpawnedWorktreeInstanceWitness);
+            let mutations: &[(&str, Mutation)] = &[
+                ("worktree inode", |v| v.worktree_inode += 1),
+                ("pointer inode", |v| v.git_pointer_inode += 1),
+                ("admin inode", |v| v.git_admin_inode += 1),
+                ("common inode", |v| v.git_common_inode += 1),
+            ];
+            for (name, mutate) in mutations {
+                let mut changed = current.clone();
+                mutate(&mut changed);
+                assert_eq!(
+                    saved.compare_checkout_identity(&changed),
+                    CheckoutIdentityMatch::Differs(IDENTITY_INODE_CHANGED),
+                    "{name}"
+                );
+            }
+            let mut moved = current.clone();
+            moved.git_admin_path.push('x');
+            assert_eq!(
+                saved.compare_checkout_identity(&moved),
+                CheckoutIdentityMatch::Differs(IDENTITY_PATH_CHANGED)
+            );
+            let mut replaced = current.clone();
+            replaced.root_generation_sha256 = Some("b".repeat(64));
+            assert_eq!(
+                saved.compare_checkout_identity(&replaced),
+                CheckoutIdentityMatch::Differs(IDENTITY_GENERATION_CHANGED)
+            );
+            let mut regrouped = current.clone();
+            regrouped.worktree_device = regrouped.git_common_device;
+            regrouped.git_pointer_device = regrouped.git_common_device;
+            assert_eq!(
+                saved.compare_checkout_identity(&regrouped),
+                CheckoutIdentityMatch::Differs(IDENTITY_DEVICE_SHARING_CHANGED)
+            );
+        }
+    }
+
+    fn recovery_proof() -> super::FinishCleanupRecoveryProof {
+        let witness = witness();
+        super::FinishCleanupRecoveryProof {
+            schema_version: 3,
+            worktree_path: witness.worktree_path,
+            worktree_device: witness.worktree_device,
+            worktree_inode: witness.worktree_inode,
+            git_pointer_device: witness.git_pointer_device,
+            git_pointer_inode: witness.git_pointer_inode,
+            git_admin_path: witness.git_admin_path,
+            git_admin_device: witness.git_admin_device,
+            git_admin_inode: witness.git_admin_inode,
+            git_common_path: witness.git_common_path,
+            git_common_device: witness.git_common_device,
+            git_common_inode: witness.git_common_inode,
+            branch_ref: "refs/heads/agent/task".into(),
+            head: "1".repeat(40),
+            branch_tip: "1".repeat(40),
+            root_generation_sha256: witness.root_generation_sha256,
+            disposable_ignored_root_prefixes: Vec::new(),
+            volume_uuids: witness.volume_uuids,
+            ownership_reproof: None,
+        }
+    }
+
+    #[test]
+    fn a_recovery_proof_is_judged_by_the_witness_identity_rule() {
+        use super::CheckoutIdentityMatch;
+        let saved = recovery_proof();
+        assert_eq!(saved.instance_witness(), witness());
+        let mut fresh = saved.clone();
+        fresh.worktree_device += 1000;
+        fresh.git_pointer_device += 1000;
+        fresh.git_admin_device += 1000;
+        fresh.git_common_device += 1000;
+        assert!(saved.equal_apart_from_volume_identity(&fresh));
+        assert_eq!(
+            saved
+                .instance_witness()
+                .compare_checkout_identity(&fresh.instance_witness()),
+            CheckoutIdentityMatch::VolumeUuid
+        );
+        // A proof saved before UUIDs were recorded is a legacy record.
+        let mut legacy = saved.clone();
+        legacy.volume_uuids = None;
+        assert_eq!(legacy.instance_witness().schema_version, 2);
+        assert!(legacy.equal_apart_from_volume_identity(&fresh));
+        assert_eq!(
+            legacy
+                .instance_witness()
+                .compare_checkout_identity(&fresh.instance_witness()),
+            CheckoutIdentityMatch::DeviceRenumber
+        );
+    }
+
+    #[test]
+    fn a_recovery_proof_differing_beyond_volume_identity_is_not_rebased() {
+        let saved = recovery_proof();
+        type Mutation = fn(&mut super::FinishCleanupRecoveryProof);
+        let mutations: &[(&str, Mutation)] = &[
+            ("worktree inode", |v| v.worktree_inode += 1),
+            ("pointer inode", |v| v.git_pointer_inode += 1),
+            ("admin inode", |v| v.git_admin_inode += 1),
+            ("common inode", |v| v.git_common_inode += 1),
+            ("worktree path", |v| v.worktree_path.push('x')),
+            ("head", |v| v.head = "2".repeat(40)),
+            ("branch tip moved", |v| v.branch_tip = "2".repeat(40)),
+            ("branch", |v| v.branch_ref.push('x')),
+            ("generation", |v| {
+                v.root_generation_sha256 = Some("b".repeat(64))
+            }),
+        ];
+        for (name, mutate) in mutations {
+            let mut fresh = saved.clone();
+            fresh.worktree_device += 1000;
+            mutate(&mut fresh);
+            assert!(!saved.equal_apart_from_volume_identity(&fresh), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_recovery_proof_stores_volume_uuids_additively_and_never_its_reproof() {
+        let mut proof = recovery_proof();
+        proof.ownership_reproof = Some("volume_uuid");
+        let encoded = serde_json::to_value(&proof).unwrap();
+        assert!(encoded.get("volume_uuids").is_some());
+        assert!(encoded.get("ownership_reproof").is_none());
+        let decoded: super::FinishCleanupRecoveryProof = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.ownership_reproof, None);
+        assert_eq!(decoded.volume_uuids, proof.volume_uuids);
+        // A proof written before this field existed still reads, without it.
+        let mut legacy = serde_json::to_value(recovery_proof()).unwrap();
+        legacy.as_object_mut().unwrap().remove("volume_uuids");
+        let decoded: super::FinishCleanupRecoveryProof = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.volume_uuids, None);
+        let mut without = recovery_proof();
+        without.volume_uuids = None;
+        assert!(
+            serde_json::to_value(&without)
+                .unwrap()
+                .get("volume_uuids")
+                .is_none()
+        );
     }
 }

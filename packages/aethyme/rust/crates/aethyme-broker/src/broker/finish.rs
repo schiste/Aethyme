@@ -1,5 +1,9 @@
 use super::*;
 
+/// Bound on the ownership re-proof `finish` makes before recording its
+/// recovery proof when no landing deadline is set.
+const FINISH_REPROOF_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl Broker {
     /// Retrieve the latest durable finish handoff for one session.
     pub fn latest_handoff_for_session(
@@ -343,7 +347,29 @@ impl Broker {
                         .and_then(|mut proof| {
                             let witness = spawned_witness.as_ref()?;
                             if !proof.matches_spawned_instance(witness) {
-                                return None;
+                                // The spawn witness predates a remount: only
+                                // the ownership re-proof every deletion lane
+                                // shares may accept other device numbers. It
+                                // judges the session as the cleanup start
+                                // below records it under this same lifecycle
+                                // claim (closed, cleanup pending), since this
+                                // proof is written by that very transition.
+                                let mut closing = session.clone();
+                                closing.status = SessionStatus::Cleaned;
+                                closing.cleanup_state = crate::SessionCleanupState::Closed;
+                                let deadline = self.landing_deadline.get().unwrap_or_else(|| {
+                                    std::time::Instant::now() + FINISH_REPROOF_BUDGET
+                                });
+                                self.checkout_ownership_reproof(
+                                    crate::auto_cleanup::OwnershipReproofLane::Finish,
+                                    &closing,
+                                    &worktree_path,
+                                    witness,
+                                    &proof.instance_witness(),
+                                    None,
+                                    Some(deadline),
+                                )
+                                .ok()?;
                             }
                             if item.as_ref().and_then(|item| item.branch_tip.as_deref())
                                 != Some(proof.branch_tip.as_str())
@@ -376,6 +402,7 @@ impl Broker {
             )?;
         }
         let cleanup_session = self.store.session(report.session_id)?;
+        self.cleanup_ownership_reproof.set(None);
         // `finish --timeout` bounds the checks that decide whether to close.
         // Once closed, reclaiming the worktree runs to completion: killing a
         // `git worktree remove` of a multi-gigabyte tree halfway leaves an
@@ -386,6 +413,8 @@ impl Broker {
             Ok(()) => {
                 report.status = FinishStatus::Cleaned;
                 report.cleanup.completed = true;
+                report.cleanup.ownership_reproof =
+                    self.cleanup_ownership_reproof.take().map(str::to_string);
                 report.cleanup.worktree_removed = worktree_present && !worktree_path.exists();
                 report.cleanup.branch_removed = branch_present
                     && report
