@@ -289,7 +289,7 @@ keeps a checkout, and `[cleanup] strict = true` keeps a recorded one too
 (`strict_tracked_deletions`).
 
 At the limit, `broker start` first runs the removal lane alone with a 20-second
-budget, waiting up to 5 seconds for a maintenance pass that holds the GC lock.
+budget, waiting up to 30 seconds for a maintenance pass that holds the GC lock.
 If the limit still refuses, the error says how many closed checkouts that pass
 removed and kept, the top keep codes, and the ignored path whose configuration
 would release the most checkouts (or that the lock stayed busy).
@@ -354,11 +354,31 @@ pattern (planning and the re-check before removal each count), and
 `cleanup_regenerable_protected_refused` counts protected entries a configured
 glob named and cleanup kept.
 
-Volume-identity work adds three more counters to the same report:
-`artifact_use_marker_legacy_device_renumber` (one per marker saved before a
-device renumber and listed as unresolved), `preparation_rotation_root_reproved`
-(a preparation-cache rotation journal root rewritten to its live identity after
-a remount) and `preparation_rotation_root_reproof_refused` (a rewrite refused).
+Volume-identity work adds more counters to the same report.
+`artifact_use_marker_legacy_device_renumber` counts markers saved before a
+device renumber and listed as unresolved. `preparation_rotation_root_reproved`
+and `preparation_rotation_root_reproof_refused` count a preparation-cache
+rotation journal root rewritten to its live identity after a remount, or
+refused; `preparation_rotation_debt_volume_reproved`,
+`preparation_rotation_debt_volume_reproof_refused` and the per-condition
+`preparation_rotation_debt_volume_refused_<condition>` do the same for a
+rotation debt. `fetch_journal_common_volume_reproved`,
+`fetch_journal_common_volume_refused` and `fetch_journal_common_identity_refused`
+count the same decisions for a coordinated fetch journal. The ownership
+re-proof counts `auto_cleanup_ownership_reproved`, `_reproof_refused` and
+`_reproof_unavailable` for automatic removal, the same names with a `gc_` or
+`finish_` prefix for GC and `finish`, and one
+`ownership_reproof_refused_<reason>` counter per refusal reason.
+
+The background worker's capacity removal slices add the counters
+`artifact_worker_capacity_removed`, `artifact_worker_capacity_removal_lock_busy`,
+`artifact_worker_capacity_removal_failed`,
+`artifact_worker_capacity_removal_outcome_<outcome>` and
+`artifact_worker_capacity_removal_stop_<stop_reason>`, and the timed phases
+`artifact_worker_capacity_removal_paced`, `_lock_held`, `_lock_wait`,
+`_lock_yield`, `_pressure_wait`, `_git_removal`, `_retry` and
+`_cache_lane_reserved`, plus `artifact_worker_cache_yielded_to_foreground`. The
+worker writes one `command-metrics.jsonl` row per run with these.
 
 The background worker's pace, priority, host-wide single deleter and pressure
 pause are described in

@@ -98,18 +98,20 @@ inodes and the original root-generation token. A remount may change a device
 number without changing the filesystem object; matching saved UUIDs and inodes
 permit that case in cohort checks and automatic checkout maintenance. A different
 volume, inode, path or generation still refuses. If a stable UUID cannot be
-captured, the new witness keeps the schema-2 exact-device behavior. Interrupted
-finish-cleanup recovery proofs also retain their exact device checks.
-Older witnesses have no saved volume UUID and keep their exact device checks
-everywhere except automatic whole-checkout removal, which re-proves a closed
-spawned checkout whose only mismatch is renumbered devices (paths, inodes, the
-spawn root generation, the Git registration on the session branch and the
-branch tip must all still match). See "Automatic removal" in the
-[worktree cleanup guide](worktree-cleanup.md) for the record it leaves and the
-keep code a refusal gets. Artifact reclamation and finish-cleanup recovery
-proofs for such a checkout still compare devices exactly, so use a separately
-reviewed archive resolution when one of those refuses. Older runtimes refuse schema-3 witnesses; use the new paired runtime
-for maintenance of repositories containing them.
+captured, the new witness keeps the schema-2 exact-device behavior.
+Older witnesses have no saved volume UUID. Automatic whole-checkout removal,
+GC reclamation and compaction (including in-place ignored-directory
+reclamation), `finish` and the recovery of an interrupted finish cleanup all
+use one ownership re-proof for a closed spawned checkout whose only mismatch
+is renumbered devices: paths, all four inodes, the spawn root generation and
+the way the four objects share devices must be unchanged, and the Git
+registration must still name the checkout on the session branch. A
+finish-cleanup recovery proof saved since 0.8.96 records volume UUIDs and is
+re-proven by UUID instead. See "Automatic removal" in the
+[worktree cleanup guide](worktree-cleanup.md) for the record each lane leaves
+and the keep code a refusal gets. Live artifact-use producers still compare
+devices exactly. Older runtimes refuse schema-3 witnesses; use the new paired
+runtime for maintenance of repositories containing them.
 
 This opt-in can compact a checkout during its ordinary one-day grace period.
 Every retirement archive records a minimum retention floor of at least 15 days

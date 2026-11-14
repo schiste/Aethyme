@@ -420,12 +420,28 @@ to inspect cleanup candidates. `broker status` warns with
 `cleanup.checkout-capacity` from three quarters of the limit.
 Raising `max_checkouts` is a stopgap: it delays the refusal and reclaims
 nothing. From three quarters of the limit the background worker also removes
-closed checkouts itself, and the durable lever for what blocks it is the
+closed checkouts itself, in slices of up to 120 seconds that remove at most
+twelve checkouts each, and the durable lever for what blocks it is the
 `[cleanup] regenerable` list in the same file. `status --json` reports the
 worker's last removal slice as `capacity_removal` (`auto_cleanup.capacity_removal`
-in `gc plan --json`) with its `outcome`, `kept_by_code` and `blocked_by_ignored`;
+in `gc plan --json`; absent until a slice has run). Its main fields are
+`outcome` (`removed`, `lock_busy`, `inventory_unavailable`, `lap_unfinished`,
+`out_of_time_before_selection` or `nothing_removable`), `stop_reason` (`cap`,
+`budget`, `pacer_backoff`, `slice_deadline`, `yielded_to_foreground`,
+`nothing_selected`, `kept_only_limit`, `lock_busy`, `failed` or
+`removal_failures`), `removed`, `kept`, `deferred`, `kept_by_code`,
+`blocked_by_ignored`, `retry_in_ms` and the time split (`scan_ms`,
+`selection_ms`, `apply_ms`, `paced_ms`, `lock_held_ms`, `lock_wait_ms`,
+`lock_yield_ms`, `git_removal_ms`, `pressure_wait_ms`, `elapsed_ms`);
 "Checkout count keeps growing" in
 [troubleshooting](../guides/troubleshooting.md) walks from that record to the fix for each keep code.
+`broker start` at the limit, `broker gc apply`, `broker gc abandon` and
+`broker gc forget-abandoned` wait up to 30 s for a GC lock holder instead of
+refusing at once, and the background worker steps aside while one of them
+waits. Commands that still fail fast or defer on a held GC lock: a broker open
+resuming a confirmed GC journal, a broker open's inline maintenance, and the
+cleanup wake after `finish` (it reports `reclaim_deferred` and the worker does
+the reclaim).
 A foreground lifecycle command (`start`, adoption, `finish`, `close`, `cleanup`,
 `submit`) waits up to 180 s for the repository's lifecycle claim, or until its
 own `--timeout` if that comes first. After 5 s it says on stderr who holds the
@@ -667,6 +683,21 @@ read-only: it hashes the declaration, exact input bytes, OS, architecture, and
 metadata for each declared runtime executable without launching repository
 commands or making network requests. The explicit `prepare` command is the
 only execution boundary.
+
+`prepare status --json` reports `state`, `reason`, `expected_digest`,
+`recorded_digest`, `source_digest`, `recorded_source_digest`,
+`missing_outputs`, `hook_required` and `next_action`. While the session's own
+preparation is running and holding or waiting for the repository's shared
+cache, it also reports `current_operation` (what it is doing: `operation`,
+`detail`, `items_done`, `items_total`, `bytes_observed` and timestamps) and,
+while it waits, `waiting_on` (the holder's `session_id`, `holder_pid` and the
+holder's own `current_operation`). Both are read from small activity records
+the running preparation rewrites every 15 seconds, are absent when nothing is
+running or the record is older than 90 seconds, and never decide anything. See
+"Prepare Dependencies For Isolated Worktrees" in
+[host resource coordination](../guides/host-resource-coordination.md). A
+running `prepare` prints the same progress on stderr, and the `Now:` line of
+the text output says it.
 
 ```toml
 schema_version = 1

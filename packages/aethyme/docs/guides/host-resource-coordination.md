@@ -302,14 +302,29 @@ older broker refuses the unknown setting, and its own sweep does not wait for
 sharing preparations. It cannot be combined with `managed_storage`.
 
 Work that runs while a preparation holds the store is visible. Finishing an
-interrupted rotation and removing a rotated store print a line when they start
-and every 15 seconds (entries unlinked so far, of how many, and how long the
-lease has been held); a budget measurement that takes longer than 15 seconds
-does the same. Other sessions see it too: `aethyme broker submit prepare status
---session <id> --json` reports a holder's `current_operation`, and a waiting
-session's `waiting_on` names the holder and what it is doing; the waiting
-notice says the same. Interrupting recovery is safe: unlinked entries stay
-removed and the next prepare resumes.
+interrupted rotation (once it finds a retired store to remove) and removing a
+rotated store print a line when they start and every 15 seconds: the entries
+unlinked so far, of how many, and how long the lease has been held. A budget
+measurement that takes longer than 15 seconds prints the same kind of line
+(entries and bytes measured so far). A preparation waiting for the store
+repeats a notice every 30 seconds that names the holder and what it is doing.
+
+Other sessions see the same state without reading stderr. While a session's
+preparation is running, `aethyme broker submit prepare status --session <id>
+--json` includes `current_operation` for that session: `operation`
+(`waiting_for_cache`, `rotation_recovery`, `budget_inventory`,
+`rotation_drain` or `preparation_step`), `detail` (the step name), `items_done`,
+`items_total` (null when unknown; `items_total_is_lower_bound` is true when the
+count stopped at a limit), `bytes_observed`, `lease_acquired_at_ms`,
+`operation_started_at_ms` and `updated_at_ms`. When that session is waiting
+for the store, `waiting_on` adds the holder's `session_id`, `holder_pid` and the
+holder's own `current_operation`. Both fields are absent when the preparation
+is current, nothing is running, or the reporter has not updated its record for
+90 seconds (it exited, or one filesystem call is stalled); `waiting_on` is also
+absent when no holder is reporting. The record is
+observational only: it never decides recovery or admission. The text output
+prints the same state on a `Now:` line. Interrupting recovery is safe:
+unlinked entries stay removed and the next prepare resumes.
 
 The budget is measured at most once an hour, and the measurement stops as soon
 as the store passes `max_bytes`, which rotates it. A measurement that reaches
@@ -318,8 +333,16 @@ inconclusive and keeps the store: a store is no longer rotated just because it
 is too large to measure in one check. Before 2026-11-14 the measurement
 stopped at 100,000 entries, below one monorepo's package stores, so every
 check rotated the store and the next prepare downloaded every package again.
-Runaway growth is left to the storage-pressure guard, and three inconclusive
-checks in a row show up as a `broker status` notice.
+Runaway growth is left to the storage-pressure guard. Three inconclusive
+checks in a row raise the `broker status` notice
+`preparation.shared-cache-budget-inconclusive`, which says how many checks were
+inconclusive, how many entries and bytes the last one saw and how long it took;
+it clears after a check that decides. The prepare report's `shared_cache_operations` (also in the command metric's
+`preparation` object) lists each operation run under the lease with its
+`elapsed_ms` and `items_done`; the budget inventory entry carries an `outcome`
+(`absent`, `within_budget`, `over_budget`, `inconclusive_time_limit` or
+`inconclusive_entry_limit`) and the command metric counts it as
+`shared_cache_inventory_<outcome>`.
 
 Finishing an interrupted rotation survives a remount. The host journal remembers
 each preparation-cache root by its device and inode, and macOS gives an external
@@ -350,8 +373,15 @@ when it is journaled, and after a remount resumes the debt only when the cache
 root's inode is unchanged and that UUID, or the one recorded for the cache
 root, matches the volume mounted now; a debt saved before UUIDs were recorded
 falls back to the parent marker rule above. Inode numbers are still compared
-for every object. Anything else stops with `debt_volume_reproof_refused:
-<condition>` in the stop reason, and Linux keeps the exact comparison.
+for every object. The background cache sweep reaches such a debt too: it walks
+the journal under the saved identity and hands each debt to its repository's
+recovery. Anything else stops with `debt_volume_reproof_refused:
+<condition>` in the stop reason, and Linux keeps the exact comparison. The
+order to recover from a refusal (mount the original volume at the same path and
+rerun `prepare`; as a last resort remove that preparation cache root, never edit
+the journal by hand) is in
+[troubleshooting](troubleshooting.md), under "Prepare Is Slow Or Silent While
+Holding The Shared Cache".
 
 An unspecified `shared_cache.root` keeps the historical Host placement for
 existing configurations. A new pnpm draft from `aethyme init` selects the

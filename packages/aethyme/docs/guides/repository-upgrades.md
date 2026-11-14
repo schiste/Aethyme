@@ -156,3 +156,29 @@ repository migration. For a canonical deployment, revert the migration commit
 with normal Git before using a binary that does not support the newer schema.
 For local-only deployment, restore a clean local state and redeploy with the
 selected older binary. Never restore only one executable from the binary pair.
+
+### Rolling back from 0.8.96
+
+Release 0.8.96 changes no broker schema version and no repository-owned file,
+so it needs no migration and has no `UPGRADING.md` section. It does write a few
+records an older binary reads differently. Install the older binary pair
+together, and expect this:
+
+- **Finish cleanup.** On macOS every recovery proof that 0.8.96 records for
+  `finish` carries `volume_uuids`, and an older binary refuses a proof with that
+  field. It therefore cannot resume a finish cleanup that 0.8.96 started and
+  that was interrupted; it keeps the checkout and removes nothing. Finish the
+  interrupted cleanup with 0.8.96, or inspect the checkout and run
+  `aethyme broker finish cleanup <session-id>` with the older binary.
+- **Fetch journals.** A coordinated Git fetch journal written by 0.8.96 can
+  carry `common_volume_uuid`. An older binary cannot parse it and falls back to
+  the repeatable-fetch resolution, so the operation reads "fetch again".
+- **Job service context.** 0.8.96 writes the sidecar
+  `broker-service-jobs-context-volumes.json` beside the context. Older binaries
+  ignore it, and a context they rewrite no longer matches the sidecar's digest.
+- **Preparation rotation journal.** The new journal tables are additive and
+  ignored by binaries from 0.8.2 on.
+- **Shared preparation cache.** 0.8.96 keeps a shared store whose budget check
+  could not finish (an inconclusive inventory) instead of rotating it. An older
+  binary rotates such a store on the next check, so the next prepare downloads
+  its packages again.
