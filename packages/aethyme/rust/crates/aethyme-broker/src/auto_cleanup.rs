@@ -1396,7 +1396,8 @@ pub struct CapacityRemovalSlice {
     /// slice), `yielded_to_foreground` (a foreground command waited for the
     /// GC lock), `nothing_selected` (a pass selected nothing),
     /// `kept_only_limit` (its passes that removed nothing ran out),
-    /// `lock_busy` or `failed`.
+    /// `lock_busy`, `failed` or `removal_failures` (Git failed to remove
+    /// two checkouts after it had started deleting).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     /// The slice's removal allowance; kept checkouts cost none of it.
@@ -1406,6 +1407,10 @@ pub struct CapacityRemovalSlice {
     /// deferred at the last step).
     #[serde(default)]
     pub kept_only_passes: usize,
+    /// Checkouts Git failed to remove after it had started deleting; the
+    /// slice stops after two.
+    #[serde(default)]
+    pub removal_failures: usize,
     /// Selection and revalidation budget of one pass.
     #[serde(default)]
     pub pass_budget_ms: u64,
@@ -3281,6 +3286,35 @@ pub(crate) fn estimated_removed_entries(main_root: &Path, report: &AutoCleanupRe
         .map(|removed| {
             records
                 .get(&removed.worktree)
+                .and_then(|record| record.inodes)
+                .unwrap_or(UNMEASURED_CHECKOUT_ENTRY_ESTIMATE)
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+/// How many filesystem entries `report`'s failed removals may have deleted
+/// before Git gave up (a removal that stopped part-way, such as `ENOTEMPTY`
+/// after most of the tree was gone), from the last recorded measurement of
+/// each checkout or a fixed estimate. Used only to pace the background
+/// worker when Git spent time removing but nothing was reported removed.
+pub(crate) fn estimated_failed_removal_entries(
+    main_root: &Path,
+    report: &AutoCleanupReport,
+) -> u64 {
+    let failed = report
+        .kept
+        .iter()
+        .filter(|kept| kept.code == "removal_failed")
+        .collect::<Vec<_>>();
+    if failed.is_empty() {
+        return 0;
+    }
+    let records = crate::measurement::load_size_records(main_root);
+    failed
+        .iter()
+        .map(|kept| {
+            records
+                .get(&kept.worktree)
                 .and_then(|record| record.inodes)
                 .unwrap_or(UNMEASURED_CHECKOUT_ENTRY_ESTIMATE)
         })
@@ -6845,12 +6879,16 @@ impl Broker {
         let waiting_since = Instant::now();
         // While it waits it says so: the background worker yields the GC
         // lock to a waiting foreground command instead of taking it again.
-        let Ok(_lock) = crate::gc::GcLock::acquire_waiting(self.main_root(), lock_wait) else {
-            crate::phase_telemetry::add(
-                "checkout_capacity_cleanup_lock_busy",
-                waiting_since.elapsed(),
-            );
-            return Ok(None);
+        let _lock = match crate::gc::GcLock::acquire_waiting(self.main_root(), lock_wait) {
+            Ok(lock) => lock,
+            Err(BrokerOpError::GcLocked { .. }) => {
+                crate::phase_telemetry::add(
+                    "checkout_capacity_cleanup_lock_busy",
+                    waiting_since.elapsed(),
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
         };
         let started = Instant::now();
         let deadline = started + budget;
@@ -11509,6 +11547,83 @@ mod tests {
             "{slice:#?}"
         );
         assert_eq!(slice.retry_in_ms, Some(600_000), "{slice:#?}");
+    }
+
+    /// With production ordering (a real clock, a slice deadline shorter than
+    /// the pacer's pause budget) sustained pressure still stops the slice as
+    /// `pacer_backoff` with its ten-minute back-off, not as `budget` with a
+    /// one-minute retry.
+    #[cfg(unix)]
+    #[test]
+    fn pressure_that_outlasts_a_short_slice_still_backs_off_ten_minutes() {
+        use crate::gc::unattended_pacing::{
+            self, Scripted, SystemClock, UnattendedPacer, UnlinkRate,
+        };
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let (_session, landed) = closed_landed_checkout(&mut broker, "short pressured slice");
+        limit_checkouts_to_one(&broker);
+        let scope = unattended_pacing::install(UnattendedPacer::new(
+            UnlinkRate::Limited(1_000),
+            Box::new(SystemClock),
+            Box::new(Scripted {
+                samples: vec![memory_pressure(true)],
+                reads: Default::default(),
+            }),
+        ));
+        let limits = crate::gc::CapacitySliceLimits {
+            budget: Duration::from_secs(6),
+            ..crate::gc::CapacitySliceLimits::WORKER
+        };
+        let report = broker.run_capacity_removal_slice_with(Instant::now(), limits);
+        drop(scope);
+        assert!(report.unwrap().is_none(), "no pass ran");
+        assert!(landed.exists());
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(
+            slice.stop_reason.as_deref(),
+            Some("pacer_backoff"),
+            "{slice:#?}"
+        );
+        assert_eq!(slice.retry_in_ms, Some(600_000), "{slice:#?}");
+        assert!(slice.pressure_wait_ms >= 1_000, "{slice:#?}");
+    }
+
+    /// A pacer wait the slice's end cuts short stops the slice as
+    /// `slice_deadline`, and the next slice waits at least what is owed.
+    #[cfg(unix)]
+    #[test]
+    fn a_pacer_wait_cut_by_the_slice_end_is_owed_by_the_next_slice() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let worktrees = (0..2)
+            .map(|index| closed_landed_checkout(&mut broker, &format!("owed {index}")).1)
+            .collect::<Vec<_>>();
+        limit_checkouts_to_one(&broker);
+        let (scope, _clock) = install_scripted_pacer(vec![memory_pressure(false)]);
+        let limits = crate::gc::CapacitySliceLimits {
+            budget: Duration::from_secs(6),
+            ..crate::gc::CapacitySliceLimits::WORKER
+        };
+        let report = broker.run_capacity_removal_slice_with(Instant::now(), limits);
+        drop(scope);
+        let report = report.unwrap().expect("a pass ran");
+        // An unmeasured checkout is charged 10,000 entries: 10 s at the
+        // default rate, longer than the 6 s slice.
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert_eq!(worktrees.iter().filter(|path| path.exists()).count(), 1);
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(
+            slice.stop_reason.as_deref(),
+            Some("slice_deadline"),
+            "{slice:#?}"
+        );
+        assert!(slice.pacer_unpaid_ms > 0, "{slice:#?}");
+        assert!(
+            slice
+                .retry_in_ms
+                .is_some_and(|wait| wait >= i64::try_from(slice.pacer_unpaid_ms).unwrap()),
+            "{slice:#?}"
+        );
+        assert!(!broker.capacity_removal_due(super::now_ms()).unwrap());
     }
 
     /// Passes whose selected checkout is kept at the last step are bounded:
