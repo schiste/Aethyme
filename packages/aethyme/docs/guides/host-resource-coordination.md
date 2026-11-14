@@ -294,10 +294,32 @@ an interrupted rotation, the budget check and rotation, the cache sweep and
 cache-root initialization each wait for every running preparation, and nothing
 starts while they hold the store. With sharing on, the budget is checked at
 most once an hour, by a preparation that finds the store free; when a check is
-a day late, preparations wait for the store alone until one has run it. Every
+a day late, preparations wait for the store alone until one has run it.
+Without sharing, the preparation that holds the store checks it when the last
+check is an hour old. Every
 broker on the host must be 0.8.69 or later before a repository sets this: an
 older broker refuses the unknown setting, and its own sweep does not wait for
 sharing preparations. It cannot be combined with `managed_storage`.
+
+Work that runs while a preparation holds the store is visible. Finishing an
+interrupted rotation and removing a rotated store print a line when they start
+and every 15 seconds (entries unlinked so far, of how many, and how long the
+lease has been held); a budget measurement that takes longer than 15 seconds
+does the same. Other sessions see it too: `aethyme broker submit prepare status
+--session <id> --json` reports a holder's `current_operation`, and a waiting
+session's `waiting_on` names the holder and what it is doing; the waiting
+notice says the same. Interrupting recovery is safe: unlinked entries stay
+removed and the next prepare resumes.
+
+The budget is measured at most once an hour, and the measurement stops as soon
+as the store passes `max_bytes`, which rotates it. A measurement that reaches
+its 30-second or 2,000,000-entry limit first, still under budget, is
+inconclusive and keeps the store: a store is no longer rotated just because it
+is too large to measure in one check. Before 2026-11-14 the measurement
+stopped at 100,000 entries, below one monorepo's package stores, so every
+check rotated the store and the next prepare downloaded every package again.
+Runaway growth is left to the storage-pressure guard, and three inconclusive
+checks in a row show up as a `broker status` notice.
 
 Finishing an interrupted rotation survives a remount. The host journal remembers
 each preparation-cache root by its device and inode, and macOS gives an external

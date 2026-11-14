@@ -218,6 +218,17 @@ impl RecoveryRecorder {
         self.had_record = true;
     }
 
+    /// What an earlier, unfinished attempt counted as left in the retired
+    /// store, and whether that count is a lower bound.
+    pub(crate) fn remaining_estimate(&self) -> Option<(u64, bool)> {
+        if self.record.state == RotationRecoveryState::Complete {
+            return None;
+        }
+        self.record
+            .remaining_entries
+            .map(|entries| (entries, self.record.remaining_entries_is_lower_bound))
+    }
+
     #[cfg(test)]
     pub(crate) fn record(&self) -> &RotationRecoveryRecord {
         &self.record

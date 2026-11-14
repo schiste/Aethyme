@@ -499,6 +499,10 @@ pub use pr_watch::{
     PullRequestWatch, PullRequestWatchError, PullRequestWatchPollReport, PullRequestWatchProvider,
     PullRequestWatchRequest, PullRequestWatchStatus,
 };
+pub use preparation::PreparationCacheWaitingOn;
+pub use preparation::cache_activity::{
+    PreparationCacheActivity, PreparationCacheOperation, PreparationCacheOperationSummary,
+};
 pub use preparation::recovery_state::{RotationRecoveryRecord, RotationRecoveryState};
 pub use preparation::{
     PREPARATION_CONFIG_RELPATH, PREPARATION_REPORT_SCHEMA_VERSION, PREPARATION_SCHEMA_VERSION,

@@ -49,6 +49,7 @@ impl Broker {
             .and_then(|report| report.capacity_removal.clone());
         push_auto_cleanup_advice(&mut view, auto_cleanup);
         self.push_checkout_capacity_advice(&mut view, deadline);
+        self.push_shared_cache_inventory_advice(&mut view);
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
@@ -397,6 +398,33 @@ impl Broker {
 
     /// Add the capacity row to a full status, or name the check in
     /// `deferred_checks` when the budget is spent or it could not run.
+    /// Advise when the shared preparation cache's budget checks keep
+    /// stopping at their time or entry limit under budget: the store is then
+    /// kept unmeasured instead of rotated. One metadata read.
+    fn push_shared_cache_inventory_advice(&self, view: &mut StatusView) {
+        let Some(record) = self.shared_cache_inventory_inconclusive() else {
+            return;
+        };
+        view.advice.push(StatusAdvice {
+            id: "preparation.shared-cache-budget-inconclusive",
+            severity: StatusAdviceSeverity::Notice,
+            reason: "a shared preparation cache whose budget check stops at its time or entry limit under budget is kept, not rotated, so its size against [shared_cache] max_bytes is unknown",
+            summary: format!(
+                "the last {} budget checks of this repository's shared preparation cache were inconclusive ({}); the store is kept unmeasured",
+                record.consecutive, record.outcome
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: vec![
+                format!("entries seen by the last check: {}", record.entries_seen),
+                format!("bytes seen by the last check: {}", record.bytes_seen),
+                format!("last check took: {} ms", record.elapsed_ms),
+                format!("last check at (ms since epoch): {}", record.last_at_ms),
+            ],
+            commands: vec!["aethyme broker advanced resources pressure --json".into()],
+        });
+    }
+
     fn push_checkout_capacity_advice(&self, view: &mut StatusView, deadline: std::time::Instant) {
         let advice = if std::time::Instant::now() >= deadline {
             None
@@ -500,6 +528,7 @@ impl Broker {
             .and_then(|report| report.capacity_removal.clone());
         push_auto_cleanup_advice(&mut view, auto_cleanup);
         self.push_checkout_capacity_advice(&mut view, deadline);
+        self.push_shared_cache_inventory_advice(&mut view);
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
