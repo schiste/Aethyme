@@ -1216,6 +1216,11 @@ pub struct AutoCleanupLanes {
     /// cleanup request is due. Included in `removal_examined`.
     #[serde(default)]
     pub removal_priority_examined: usize,
+    /// Of the checkouts selection handed on, those it judged ahead of the
+    /// lap (`removal_priority_examined`), so a removal can be credited to
+    /// the priority lane or to the lap.
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub removal_priority_selected: usize,
     /// Time the capacity-pressure probe took before selection's inventory.
     #[serde(default)]
     pub removal_probe_ms: u64,
@@ -1324,6 +1329,29 @@ pub(crate) const CAPACITY_REMOVAL_SLICE_KEY: &str = "auto_cleanup.capacity_remov
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CapacityRemovalSlice {
     pub evaluated_at_ms: i64,
+    /// What ran the slice: `pressure` (registered checkouts at three
+    /// quarters of `[worktrees] max_checkouts`, the capacity limits) or
+    /// `steady` (no pressure: checkouts whose work landed are removed at the
+    /// steady background rate, so the count follows merges). Empty in a
+    /// record written before the steady trigger existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub trigger: String,
+    /// Checkouts the priority lane (merged pull request, due cleanup
+    /// request) judged ahead of the oldest-first lap, and of those removed.
+    #[serde(default)]
+    pub priority_examined: usize,
+    #[serde(default)]
+    pub priority_removed: usize,
+    /// Checkouts the oldest-first lap judged, and of those removed.
+    #[serde(default)]
+    pub lap_examined: usize,
+    #[serde(default)]
+    pub lap_removed: usize,
+    /// With trigger `steady`: consecutive steady slices that removed
+    /// nothing; each doubles the wait before the next (5, 10, 20, then 30
+    /// minutes). 0 after a slice that removed a checkout.
+    #[serde(default)]
+    pub idle_streak: u32,
     /// `removed`; `lock_busy` (another maintenance pass held the GC lock);
     /// `inventory_unavailable` (no complete checkout inventory before the
     /// deadline); `lap_unfinished` (time ran out before the closed-checkout
@@ -1361,8 +1389,8 @@ pub struct CapacityRemovalSlice {
     /// Unattended pacer wait between removals.
     pub paced_ms: u64,
     pub elapsed_ms: u64,
-    /// When pressure alone may run the next slice; absent when the slice
-    /// removed something and the next one may run at once.
+    /// When the next slice with the same trigger may run; absent when a
+    /// pressure slice removed something and the next one may run at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<i64>,
     /// Time the slice spent counting registered checkouts.
@@ -1444,7 +1472,7 @@ pub struct CapacityRemovalSlice {
     /// the cache lane is not due).
     #[serde(default)]
     pub cache_lane_reserved_ms: u64,
-    /// The wait chosen before pressure alone runs the next slice; absent
+    /// The wait chosen before the next slice with the same trigger; absent
     /// when the next one may run at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_in_ms: Option<i64>,
@@ -3014,6 +3042,10 @@ thread_local! {
     /// before the verdict's own fresh re-check.
     static AFTER_REMOVAL_COHORT_HOOK: std::cell::RefCell<Option<RemovalCohortHook>> =
         const { std::cell::RefCell::new(None) };
+    /// Test seam: Git spends time deleting each checkout and then fails to
+    /// remove it, as a removal stopped part-way (`ENOTEMPTY`) does.
+    pub(crate) static GIT_REMOVAL_FAILS_PART_WAY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Sessions per cohort-index discovery page.
@@ -3051,6 +3083,24 @@ const IGNORED_BLOCKER_LIMIT: usize = 16;
 pub(crate) const PRIORITY_MEMO_KEY: &str = "auto_cleanup.priority_memo";
 /// Priority groups judged per pass, before the lap page.
 const PRIORITY_GROUPS_PER_PASS: usize = 8;
+/// Lap groups one steady (no capacity pressure) selection judges at most,
+/// after the priority lane, so the lap still reaches old removable
+/// checkouts the priority lane never names, at a lower rate than under
+/// pressure. Read with the existing cursor; never a full listing.
+pub(crate) const STEADY_LAP_GROUPS_PER_PASS: usize = 16;
+
+/// Which closed-checkout lanes one removal selection runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemovalSelection {
+    /// The capacity probe decides: under pressure the priority lane and a
+    /// lap that goes on page by page while time remains, otherwise one lap
+    /// page.
+    Probe,
+    /// The background worker without capacity pressure: the priority lane,
+    /// then at most [`STEADY_LAP_GROUPS_PER_PASS`] groups of the lap. No
+    /// capacity probe runs.
+    Steady,
+}
 /// Priority candidates read per pass before the memo filters them.
 const PRIORITY_CANDIDATE_LIMIT: usize = 256;
 /// A kept or selected priority group is judged again after this long, or at
@@ -6104,6 +6154,7 @@ impl Broker {
         lanes.removal_examined = planned.removal_examined;
         lanes.removal_memo_skips = planned.removal_memo_skips;
         lanes.removal_priority_examined = planned.removal_priority_examined;
+        lanes.removal_priority_selected = planned.removal_priority_selected;
         lanes.removal_scan_ms = planned.removal_scan_ms;
         lanes.removal_inventory_unavailable = planned.removal_inventory_unavailable;
         lanes.removal_probe_ms = planned.removal_probe_ms;
@@ -6174,13 +6225,17 @@ impl Broker {
         .then_some((usage.count, usage.maximum))
     }
 
-    /// The linked-checkout count from this repository's registrations: the
-    /// same cheap count `start` admission uses
-    /// ([`Self::worktree_checkout_usage`]).
-    pub(crate) fn worktree_checkout_usage_from_registrations(
-        &self,
-    ) -> Result<Option<(usize, u32)>, BrokerOpError> {
-        self.worktree_checkout_usage()
+    /// The linked-checkout count from this repository's registrations alone
+    /// (one directory read, never `git worktree list`), against the
+    /// configured limit: `Some(None)` when the limit is disabled, `None`
+    /// when the registrations cannot be read.
+    pub(crate) fn registered_checkout_usage(&self) -> Option<Option<(usize, u32)>> {
+        let maximum = self.configured_max_checkouts();
+        if maximum == 0 {
+            return Some(None);
+        }
+        self.registered_linked_checkout_count()
+            .map(|count| Some((count, maximum)))
     }
 
     /// Remember a linked-checkout count for passes too short to list them.
@@ -6211,6 +6266,29 @@ impl Broker {
             .then_some((usage.count, usage.maximum))
     }
 
+    /// `[worktrees] max_checkouts` as configured now (the default when the
+    /// configuration is missing or invalid); 0 when the limit is disabled.
+    pub(crate) fn configured_max_checkouts(&self) -> u32 {
+        match crate::worktree_location::WorktreeLocationConfig::load(self.main_root()) {
+            Ok(Some(config)) => config.max_checkouts(),
+            Ok(None) | Err(_) => {
+                crate::worktree_location::WorktreeLocationConfig::default().max_checkouts()
+            }
+        }
+    }
+
+    /// Whether the recorded count shows capacity pressure against the limit
+    /// configured now: a count recorded against another limit, or with the
+    /// limit since disabled, is not pressure. The worker's removal trigger
+    /// uses it, so a stale count never labels a slice `pressure`.
+    pub(crate) fn recorded_checkout_capacity_pressure_at_current_limit(&self) -> bool {
+        let configured = self.configured_max_checkouts();
+        self.recorded_checkout_usage(now_ms())
+            .is_some_and(|(count, maximum)| {
+                maximum == configured && usage_under_pressure(count, maximum)
+            })
+    }
+
     /// Whether the recorded count shows capacity pressure, without listing
     /// checkouts: cheap enough for a broker open deciding whether to wake
     /// the background worker.
@@ -6235,10 +6313,23 @@ impl Broker {
         deadline: Option<Instant>,
         max_selected: usize,
     ) -> Result<AutoCleanupPlan, BrokerOpError> {
+        self.auto_cleanup_plan_selecting(deadline, max_selected, RemovalSelection::Probe)
+    }
+
+    /// [`Self::auto_cleanup_plan_limited`] running the lanes `selection`
+    /// names. Only the order and number of groups judged differ; every
+    /// judged group goes through the same proofs.
+    pub(crate) fn auto_cleanup_plan_selecting(
+        &mut self,
+        deadline: Option<Instant>,
+        max_selected: usize,
+        selection: RemovalSelection,
+    ) -> Result<AutoCleanupPlan, BrokerOpError> {
         let _span = crate::phase_telemetry::span("auto_cleanup_plan");
         self.auto_cleanup_plan_with_group_inspector_limited(
             deadline,
             max_selected,
+            selection,
             |broker, group, live, live_worktrees, deadline| {
                 broker.auto_cleanup_candidate_for_group(group, live, live_worktrees, deadline)
             },
@@ -6265,6 +6356,7 @@ impl Broker {
         self.auto_cleanup_plan_with_group_inspector_limited(
             deadline,
             AUTO_CLEANUP_MAX_SELECTED_PER_PASS,
+            RemovalSelection::Probe,
             inspect_group,
         )
     }
@@ -6273,6 +6365,7 @@ impl Broker {
         &mut self,
         deadline: Option<Instant>,
         max_selected: usize,
+        selection: RemovalSelection,
         mut inspect_group: F,
     ) -> Result<AutoCleanupPlan, BrokerOpError>
     where
@@ -6319,6 +6412,8 @@ impl Broker {
         let mut examined = 0_usize;
         let mut memo_skips = 0_usize;
         let mut priority_examined = 0_usize;
+        let mut priority_selected = 0_usize;
+        let mut lap_examined = 0_usize;
         let mut priority_memo =
             PriorityMemo::decode(self.store().meta_get(PRIORITY_MEMO_KEY)?.as_deref());
         let mut priority_memo_changed = false;
@@ -6327,11 +6422,21 @@ impl Broker {
         let mut priority_paths = std::collections::BTreeSet::<PathBuf>::new();
         // Under capacity pressure a bounded pass keeps going page by page
         // while time remains; otherwise each pass keeps its one-page tranche
-        // and the background worker paces the lap.
+        // and the background worker paces the lap. The worker's steady
+        // removal (no pressure) runs the priority lane and a short stretch of
+        // the lap without probing.
         let probe_started = Instant::now();
-        let multi_page = deadline.is_some() && self.checkout_capacity_pressure(deadline);
+        let (priority_lane, multi_page, lap_limit) = match selection {
+            RemovalSelection::Probe => {
+                let pressure = deadline.is_some() && self.checkout_capacity_pressure(deadline);
+                (pressure, pressure, None)
+            }
+            RemovalSelection::Steady => (true, false, Some(STEADY_LAP_GROUPS_PER_PASS)),
+        };
         let probe_elapsed = probe_started.elapsed();
-        crate::phase_telemetry::add("auto_cleanup_capacity_probe", probe_elapsed);
+        if selection == RemovalSelection::Probe {
+            crate::phase_telemetry::add("auto_cleanup_capacity_probe", probe_elapsed);
+        }
         let mut first_page = true;
         let mut scan_elapsed = Duration::ZERO;
         loop {
@@ -6412,11 +6517,11 @@ impl Broker {
             }
             alias_refresh_generation = Some(scan.alias_refresh_generation);
 
-            // Under capacity pressure, judge what most likely became
-            // removable first: a merged pull request, then a due cleanup
-            // request. The lap below still visits every group in session
-            // order, so nothing is starved.
-            let priority_groups = if first_page && multi_page {
+            // Under capacity pressure, and in the worker's steady removal,
+            // judge what most likely became removable first: a merged pull
+            // request, then a due cleanup request. The lap below still
+            // visits every group in session order, so nothing is starved.
+            let priority_groups = if first_page && priority_lane {
                 let _span = crate::phase_telemetry::span("auto_cleanup_priority_selection");
                 self.auto_cleanup_priority_groups(&priority_memo, now_ms(), deadline)?
             } else {
@@ -6444,7 +6549,16 @@ impl Broker {
                     self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
                     continue;
                 }
+                if priority.is_none() && lap_limit.is_some_and(|limit| lap_examined >= limit) {
+                    // The steady lap's share of this pass is spent; the cursor
+                    // stays on the last group judged.
+                    stop_pass = true;
+                    break;
+                }
                 examined += 1;
+                if priority.is_none() {
+                    lap_examined += 1;
+                }
                 let deferred_before = report.deferred;
                 let selected_before = selected.len();
                 let inspection =
@@ -6614,6 +6728,7 @@ impl Broker {
                     priority_examined += 1;
                     crate::phase_telemetry::add("auto_cleanup_priority_examined", Duration::ZERO);
                     let outcome = if selected.len() > selected_before {
+                        priority_selected += 1;
                         PriorityOutcome::Selected
                     } else if stop_for_deadline || report.deferred > deferred_before {
                         PriorityOutcome::Deferred
@@ -6685,6 +6800,7 @@ impl Broker {
             removal_memo_skips: memo_skips,
             removal_scan_ms: duration_ms(Some(scan_elapsed)),
             removal_priority_examined: priority_examined,
+            removal_priority_selected: priority_selected,
             removal_probe_ms: duration_ms(Some(probe_elapsed)),
             ..AutoCleanupLanes::default()
         });
@@ -6992,6 +7108,15 @@ impl Broker {
         // only untracked file they let through is Finder's `.DS_Store`, which
         // a plain `worktree remove` refuses.
         let git_removal_started = Instant::now();
+        #[cfg(test)]
+        if GIT_REMOVAL_FAILS_PART_WAY.with(std::cell::Cell::get) {
+            note_git_removal_time(Duration::from_millis(1));
+            return Err(crate::BrokerError::Io {
+                path: candidate.worktree.clone(),
+                source: std::io::Error::other("simulated removal stopped part-way"),
+            }
+            .into());
+        }
         let git_removal = self
             .repo_handle()
             .worktree_remove_registered(&candidate.worktree, true);
@@ -7178,13 +7303,17 @@ impl Broker {
     /// `max_removals` caps the selection (`None`: the usual per-pass cap).
     /// `bound_revalidation` makes revalidation honor the budget too (see
     /// [`AutoCleanupPlan`]); Git's removal of a checkout already started is
-    /// never interrupted.
+    /// never interrupted. `selection` names the lanes selection runs: the
+    /// background worker's steady removal (no capacity pressure) passes
+    /// [`RemovalSelection::Steady`]; every other caller lets the capacity
+    /// probe decide.
     pub(crate) fn auto_cleanup_for_checkout_capacity(
         &mut self,
         lock_wait: Duration,
         budget: Duration,
         max_removals: Option<usize>,
         bound_revalidation: bool,
+        selection: RemovalSelection,
     ) -> Result<Option<AutoCleanupReport>, BrokerOpError> {
         let waiting_since = Instant::now();
         // While it waits it says so: the background worker yields the GC
@@ -7205,9 +7334,10 @@ impl Broker {
         let selection_deadline = lane_deadline(started, Some(deadline), REMOVAL_SELECTION_SHARE);
         let mut plan = {
             let _span = crate::phase_telemetry::span("auto_cleanup_removal_lane");
-            self.auto_cleanup_plan_limited(
+            self.auto_cleanup_plan_selecting(
                 selection_deadline,
                 max_removals.unwrap_or(AUTO_CLEANUP_MAX_SELECTED_PER_PASS),
+                selection,
             )?
         };
         // Revalidation and removal may use the whole budget.
@@ -7215,7 +7345,7 @@ impl Broker {
         plan.bound_revalidation = bound_revalidation;
         let planned = plan.report.lanes.unwrap_or_default();
         plan.report.lanes = Some(AutoCleanupLanes {
-            capacity_pressure: true,
+            capacity_pressure: selection == RemovalSelection::Probe,
             removal_budget_ms: duration_ms(Some(budget)),
             removal_elapsed_ms: duration_ms(Some(started.elapsed())),
             removal_selected: plan.selected.len(),
@@ -11861,6 +11991,12 @@ mod tests {
         assert_eq!(first.removed.len(), 1, "{first:#?}");
         assert!(!landed.exists());
         assert!(first.lanes.is_some_and(|lanes| lanes.capacity_pressure));
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(slice.trigger, "pressure", "{slice:#?}");
+        assert_eq!(
+            slice.removal_cap, 12,
+            "pressure keeps its limits: {slice:#?}"
+        );
 
         let second = broker
             .run_capacity_removal_slice(Instant::now())
@@ -12271,6 +12407,490 @@ mod tests {
         assert_eq!(slice.pass_budget_ms, 1, "{slice:#?}");
     }
 
+    /// Without capacity pressure the worker still removes a closed checkout
+    /// whose pull request merged: removal follows merges, not pressure. The
+    /// slice runs with the steady limits, the priority lane names the
+    /// checkout, and the next steady slice waits a minute.
+    #[cfg(unix)]
+    #[test]
+    fn without_pressure_the_worker_removes_a_merged_checkout() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let (session, landed) = closed_landed_checkout(&mut broker, "steady merged");
+        record_merged_pull_request(&mut broker, session.id, 301);
+        assert!(
+            !broker.checkout_capacity_pressure(Some(Instant::now() + Duration::from_secs(30))),
+            "one checkout of the default limit is no pressure"
+        );
+        assert_eq!(
+            broker
+                .checkout_removal_trigger_due(super::now_ms())
+                .unwrap(),
+            Some(crate::gc::CheckoutRemovalTrigger::Steady),
+            "landed removal is due without pressure"
+        );
+
+        let report = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("a steady slice runs without pressure");
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert!(!landed.exists());
+        assert!(
+            report.lanes.is_some_and(|lanes| !lanes.capacity_pressure),
+            "{report:#?}"
+        );
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(slice.trigger, "steady", "{slice:#?}");
+        assert_eq!(slice.outcome, "removed", "{slice:#?}");
+        assert_eq!(slice.removal_cap, 4, "the steady allowance: {slice:#?}");
+        assert!(slice.budget_ms <= 60_000, "{slice:#?}");
+        assert!(slice.priority_examined >= 1, "{slice:#?}");
+        assert_eq!(slice.priority_removed, 1, "{slice:#?}");
+        assert_eq!(slice.lap_removed, 0, "{slice:#?}");
+        assert_eq!(slice.idle_streak, 0, "{slice:#?}");
+        assert_eq!(slice.retry_in_ms, Some(60_000), "{slice:#?}");
+        assert!(
+            !broker.capacity_removal_due(super::now_ms()).unwrap(),
+            "the next steady slice waits its minute"
+        );
+    }
+
+    /// Without pressure a closed checkout whose work never landed is judged
+    /// and kept: the steady trigger changes when removal runs, never what
+    /// is removable.
+    #[cfg(unix)]
+    #[test]
+    fn without_pressure_a_checkout_whose_work_did_not_land_is_kept() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let root = broker.main_root().to_path_buf();
+        git(&root, &["remote", "set-head", "origin", "main"]);
+        let (session, worktree) = landed_lane_session(&mut broker, "steady unlanded", None);
+        broker
+            .close_abandoning_unpushed(session.id, "closed unlanded checkout fixture")
+            .unwrap();
+        // Even a recorded merge does not stand in for the landing proof.
+        record_merged_pull_request(&mut broker, session.id, 302);
+
+        let report = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("a steady slice runs without pressure");
+        assert!(report.removed.is_empty(), "{report:#?}");
+        assert!(worktree.join(format!("work-{}.txt", session.id)).is_file());
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(slice.trigger, "steady", "{slice:#?}");
+        assert_eq!(slice.removed, 0, "{slice:#?}");
+        assert!(slice.examined >= 1, "the checkout was judged: {slice:#?}");
+        assert!(
+            slice
+                .kept_by_code
+                .get("not_contained")
+                .is_some_and(|kept| *kept >= 1),
+            "kept because its commit is not on the default branch: {slice:#?}"
+        );
+    }
+
+    /// A steady slice that finds nothing removable backs off, and each such
+    /// slice in a row waits longer (5, then 10 minutes), so an idle
+    /// repository costs a worker run at most every half hour. A removal
+    /// resets the wait to a minute.
+    #[cfg(unix)]
+    #[test]
+    fn steady_removal_backs_off_while_nothing_is_removable() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let (_kept_session, kept) = closed_landed_checkout(&mut broker, "steady keeps notes");
+        std::fs::write(kept.join("notes.txt"), "somebody's notes\n").unwrap();
+
+        let first = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("a steady slice runs without pressure");
+        assert!(first.removed.is_empty(), "{first:#?}");
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(slice.trigger, "steady", "{slice:#?}");
+        assert_eq!(slice.idle_streak, 1, "{slice:#?}");
+        assert_eq!(slice.retry_in_ms, Some(5 * 60_000), "{slice:#?}");
+        assert!(!broker.capacity_removal_due(super::now_ms()).unwrap());
+        assert!(
+            broker
+                .run_capacity_removal_slice(Instant::now())
+                .unwrap()
+                .is_none(),
+            "no slice runs before the back-off ends"
+        );
+
+        // Past the back-off: the next empty slice waits twice as long.
+        broker.end_steady_removal_back_off_for_test();
+        assert!(broker.capacity_removal_due(super::now_ms()).unwrap());
+        broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("the back-off ended");
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(slice.idle_streak, 2, "{slice:#?}");
+        assert_eq!(slice.retry_in_ms, Some(10 * 60_000), "{slice:#?}");
+        assert!(kept.join("notes.txt").is_file());
+
+        // A landed checkout ends the idle run.
+        let (session, landed) = closed_landed_checkout(&mut broker, "steady after idle");
+        record_merged_pull_request(&mut broker, session.id, 303);
+        broker.end_steady_removal_back_off_for_test();
+        let report = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("the back-off ended");
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert!(!landed.exists());
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(slice.idle_streak, 0, "{slice:#?}");
+        assert_eq!(slice.retry_in_ms, Some(60_000), "{slice:#?}");
+    }
+
+    /// `[cleanup] auto_remove = false` turns the steady removal off too.
+    #[cfg(unix)]
+    #[test]
+    fn steady_removal_honors_auto_remove_off() {
+        let (_owner, _storage, mut broker) =
+            landed_lane_fixture(Some("[cleanup]\nauto_remove = false\n"));
+        let (session, landed) = closed_landed_checkout(&mut broker, "steady disabled");
+        record_merged_pull_request(&mut broker, session.id, 304);
+        assert_eq!(
+            broker
+                .checkout_removal_trigger_due(super::now_ms())
+                .unwrap(),
+            None
+        );
+        assert!(
+            broker
+                .run_capacity_removal_slice(Instant::now())
+                .unwrap()
+                .is_none()
+        );
+        assert!(landed.exists());
+    }
+
+    /// Git failing to remove checkouts after it started deleting stops the
+    /// slice at the second failure, with the ten-minute back-off, even
+    /// though removal allowance and passes remain.
+    #[cfg(unix)]
+    #[test]
+    fn a_slice_stops_after_two_failed_removals() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let worktrees = (0..4)
+            .map(|index| closed_landed_checkout(&mut broker, &format!("fails {index}")).1)
+            .collect::<Vec<_>>();
+        limit_checkouts_to_one(&broker);
+        super::GIT_REMOVAL_FAILS_PART_WAY.with(|flag| flag.set(true));
+        let report = broker.run_capacity_removal_slice(Instant::now());
+        super::GIT_REMOVAL_FAILS_PART_WAY.with(|flag| flag.set(false));
+        let report = report.unwrap().expect("pressure runs a slice");
+        assert!(report.removed.is_empty(), "{report:#?}");
+        assert!(worktrees.iter().all(|path| path.exists()));
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(slice.trigger, "pressure", "{slice:#?}");
+        assert_eq!(
+            slice.stop_reason.as_deref(),
+            Some("removal_failures"),
+            "{slice:#?}"
+        );
+        assert_eq!(slice.removal_failures, 2, "{slice:#?}");
+        assert_eq!(slice.passes, 2, "{slice:#?}");
+        assert_eq!(
+            slice.kept_by_code.get("removal_failed"),
+            Some(&2),
+            "{slice:#?}"
+        );
+        assert_eq!(slice.retry_in_ms, Some(600_000), "{slice:#?}");
+    }
+
+    /// Steady removal never touches an open session's checkout: it judges
+    /// closed checkouts only.
+    #[cfg(unix)]
+    #[test]
+    fn steady_removal_leaves_an_open_sessions_checkout() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let open = broker.start_worktree("steady open", None).unwrap();
+        let open_path = PathBuf::from(&open.worktree_path);
+        let (session, landed) = closed_landed_checkout(&mut broker, "steady closed");
+        record_merged_pull_request(&mut broker, session.id, 305);
+        record_merged_pull_request(&mut broker, open.id, 306);
+        let report = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("a closed checkout makes steady removal due");
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert!(!landed.exists());
+        assert!(open_path.is_dir(), "the open session keeps its checkout");
+        assert!(
+            report
+                .removed
+                .iter()
+                .all(|removed| !removed.sessions.contains(&open.id)),
+            "{report:#?}"
+        );
+    }
+
+    /// A landed checkout still inside `closed_worktree_grace_hours` is kept
+    /// (`in_grace`) by the steady slice and removed by a later one once the
+    /// grace no longer covers it.
+    #[cfg(unix)]
+    #[test]
+    fn steady_removal_waits_for_the_closed_worktree_grace() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let root = broker.main_root().to_path_buf();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nsession_abandoned_after_hours = 72\nclosed_worktree_grace_hours = 1\n",
+        )
+        .unwrap();
+        let (session, landed) = closed_landed_checkout(&mut broker, "steady in grace");
+        record_merged_pull_request(&mut broker, session.id, 307);
+        let report = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("a closed checkout makes steady removal due");
+        assert!(report.removed.is_empty(), "{report:#?}");
+        assert!(landed.exists());
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(slice.kept_by_code.get("in_grace"), Some(&1), "{slice:#?}");
+
+        // The grace no longer covers it (here: the grace is set to zero).
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nsession_abandoned_after_hours = 72\nclosed_worktree_grace_hours = 0\n",
+        )
+        .unwrap();
+        broker.end_steady_removal_back_off_for_test();
+        let report = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("the back-off ended");
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert!(!landed.exists());
+    }
+
+    /// One steady selection judges at most 16 groups of the lap, and the
+    /// lap cursor stops on the last group it judged, so the next steady
+    /// pass resumes there.
+    #[cfg(unix)]
+    #[test]
+    fn a_steady_selection_judges_at_most_sixteen_lap_groups() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let root = broker.main_root().to_path_buf();
+        // Cleanup requests not yet due: only the lap names these groups.
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nsession_abandoned_after_hours = 72\nclosed_worktree_grace_hours = 72\n",
+        )
+        .unwrap();
+        git(&root, &["remote", "set-head", "origin", "main"]);
+        let mut ids = Vec::new();
+        for index in 0..18 {
+            let session = broker
+                .start_worktree(&format!("steady lap {index}"), None)
+                .unwrap();
+            broker
+                .close_abandoning_unpushed(session.id, "steady lap fixture")
+                .unwrap();
+            ids.push(session.id);
+        }
+        ids.sort_unstable();
+        while !broker
+            .refresh_cleanup_cohort_aliases(None)
+            .unwrap()
+            .is_some_and(|state| state.complete)
+        {}
+        let mut judged = Vec::new();
+        let plan = broker
+            .auto_cleanup_plan_with_group_inspector_limited(
+                None,
+                1,
+                super::RemovalSelection::Steady,
+                |_, group, _, _, _| {
+                    judged.push(group.cursor_session_id);
+                    Ok(AutoCleanupGroupInspection::Kept(super::AutoKeptCheckout {
+                        worktree: group.worktree.to_string_lossy().into_owned(),
+                        sessions: group.sessions.iter().map(|session| session.id).collect(),
+                        reason: "injected steady inspection".into(),
+                        ..Default::default()
+                    }))
+                },
+            )
+            .unwrap();
+        let lanes = plan.report.lanes.unwrap();
+        assert_eq!(lanes.removal_priority_examined, 0, "{lanes:?}");
+        assert_eq!(
+            judged.len(),
+            super::STEADY_LAP_GROUPS_PER_PASS,
+            "{judged:?}"
+        );
+        assert_eq!(lanes.removal_examined, super::STEADY_LAP_GROUPS_PER_PASS);
+        assert_eq!(judged, ids[..16].to_vec(), "oldest first");
+        let cursor = decode_auto_cleanup_cursor(
+            broker
+                .store()
+                .meta_get(AUTO_CLEANUP_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+        );
+        assert_eq!(
+            cursor.after_session_id, ids[15],
+            "the cursor stops on the last group judged"
+        );
+    }
+
+    /// After a pressure episode ends (here the limit was raised) the worker
+    /// switches to steady removal at once: the pressure back-off does not
+    /// hold it.
+    #[cfg(unix)]
+    #[test]
+    fn steady_removal_follows_a_pressure_episode() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let (_kept_session, kept) = closed_landed_checkout(&mut broker, "pressure keeps notes");
+        std::fs::write(kept.join("notes.txt"), "somebody's notes\n").unwrap();
+        limit_checkouts_to_one(&broker);
+        broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("pressure runs a slice");
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(slice.trigger, "pressure", "{slice:#?}");
+        assert!(slice.retry_in_ms.is_some(), "{slice:#?}");
+
+        std::fs::remove_file(broker.main_root().join(".aethyme/config.toml")).unwrap();
+        let (session, landed) = closed_landed_checkout(&mut broker, "steady after pressure");
+        record_merged_pull_request(&mut broker, session.id, 308);
+        assert_eq!(
+            broker
+                .checkout_removal_trigger_due(super::now_ms())
+                .unwrap(),
+            Some(crate::gc::CheckoutRemovalTrigger::Steady)
+        );
+        let report = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("steady removal runs despite the pressure back-off");
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert!(!landed.exists());
+        assert!(kept.join("notes.txt").is_file());
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(slice.trigger, "steady", "{slice:#?}");
+    }
+
+    /// With `max_checkouts = 0` there is never pressure, even when a count
+    /// recorded against an earlier limit says otherwise: the slice runs as
+    /// steady removal.
+    #[cfg(unix)]
+    #[test]
+    fn a_disabled_limit_runs_steady_removal_despite_a_stale_count() {
+        let (_owner, _storage, mut broker) =
+            landed_lane_fixture(Some("[worktrees]\nmax_checkouts = 0\n"));
+        let (session, landed) = closed_landed_checkout(&mut broker, "no limit");
+        record_merged_pull_request(&mut broker, session.id, 309);
+        broker.record_checkout_usage(5, 1);
+        assert!(broker.recorded_checkout_capacity_pressure());
+        assert_eq!(
+            broker
+                .checkout_removal_trigger_due(super::now_ms())
+                .unwrap(),
+            Some(crate::gc::CheckoutRemovalTrigger::Steady)
+        );
+        let report = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("steady removal runs with the limit disabled");
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert!(!landed.exists());
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(slice.trigger, "steady", "{slice:#?}");
+        assert_eq!(slice.removal_cap, 4, "{slice:#?}");
+    }
+
+    /// The failed-removal cap holds on the steady path too, and its wait is
+    /// not shortened by a checkout that lands meanwhile.
+    #[cfg(unix)]
+    #[test]
+    fn a_steady_slice_stops_after_two_failed_removals() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let worktrees = (0..3)
+            .map(|index| closed_landed_checkout(&mut broker, &format!("steady fails {index}")).1)
+            .collect::<Vec<_>>();
+        super::GIT_REMOVAL_FAILS_PART_WAY.with(|flag| flag.set(true));
+        let report = broker.run_capacity_removal_slice(Instant::now());
+        super::GIT_REMOVAL_FAILS_PART_WAY.with(|flag| flag.set(false));
+        let report = report.unwrap().expect("a steady slice runs");
+        assert!(report.removed.is_empty(), "{report:#?}");
+        assert!(worktrees.iter().all(|path| path.exists()));
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(slice.trigger, "steady", "{slice:#?}");
+        assert_eq!(
+            slice.stop_reason.as_deref(),
+            Some("removal_failures"),
+            "{slice:#?}"
+        );
+        assert_eq!(slice.removal_failures, 2, "{slice:#?}");
+        assert_eq!(slice.retry_in_ms, Some(600_000), "{slice:#?}");
+        let (_session, _landed) = closed_landed_checkout(&mut broker, "lands during the wait");
+        assert!(
+            !broker.steady_removal_due(super::now_ms()).unwrap(),
+            "a new landing does not cut the failure back-off short"
+        );
+    }
+
+    /// Steady removal needs a closed checkout to be due: a repository with
+    /// none never wakes the worker for it.
+    #[cfg(unix)]
+    #[test]
+    fn steady_removal_is_not_due_without_a_closed_checkout() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let _open = broker.start_worktree("only open work", None).unwrap();
+        assert!(!broker.steady_removal_due(super::now_ms()).unwrap());
+        assert_eq!(
+            broker
+                .checkout_removal_trigger_due(super::now_ms())
+                .unwrap(),
+            None
+        );
+        assert!(
+            broker
+                .run_capacity_removal_slice(Instant::now())
+                .unwrap()
+                .is_none()
+        );
+        assert!(broker.last_capacity_removal_slice().is_none());
+    }
+
+    /// A cleanup request that becomes due after the last steady slice makes
+    /// the next one due at once, without waiting out the idle back-off, so
+    /// removal follows the landing.
+    #[cfg(unix)]
+    #[test]
+    fn a_newly_due_cleanup_request_ends_the_idle_back_off() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let (_kept_session, kept) = closed_landed_checkout(&mut broker, "idle keeps notes");
+        std::fs::write(kept.join("notes.txt"), "somebody's notes\n").unwrap();
+        broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("a steady slice runs");
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(slice.retry_in_ms, Some(5 * 60_000), "{slice:#?}");
+        assert!(!broker.steady_removal_due(super::now_ms()).unwrap());
+
+        std::thread::sleep(Duration::from_millis(5));
+        let (_session, landed) = closed_landed_checkout(&mut broker, "lands after idle");
+        assert!(
+            broker.steady_removal_due(super::now_ms()).unwrap(),
+            "its grace (zero here) ended after the last steady slice"
+        );
+        let report = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("due without waiting the back-off");
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert!(!landed.exists());
+    }
+
     /// `broker start` at the checkout limit, waiting for a held GC lock,
     /// announces itself so the worker yields, and runs its pass once the
     /// lock is free.
@@ -12303,6 +12923,7 @@ mod tests {
                 Duration::from_secs(20),
                 None,
                 false,
+                super::RemovalSelection::Probe,
             )
             .unwrap();
         assert!(holder.join().unwrap(), "the waiter announced itself");
