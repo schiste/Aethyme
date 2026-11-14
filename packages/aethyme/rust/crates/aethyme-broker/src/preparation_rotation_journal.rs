@@ -1702,6 +1702,185 @@ pub(crate) fn bind_root_volume(
     Ok(true)
 }
 
+/// Stable volume bindings for rotation debts. Additive at schema version 3,
+/// like `rotation_root_volume`: older binaries never read it. One row per
+/// cache root and repository binds the volume UUID observed for the debt with
+/// payload digest `payload_sha256` to the exact cache-root identity bytes the
+/// debt recorded (`root_identity`, device number included). A new debt for
+/// the same repository replaces the row. The row deliberately outlives its
+/// debt row: in-cache stage proofs of that debt can remain after the journal
+/// row is completed, and they name the same saved device.
+const DEBT_VOLUME_TABLE: &str = "CREATE TABLE IF NOT EXISTS rotation_debt_volume(
+    root_path BLOB NOT NULL CHECK(length(root_path) BETWEEN 1 AND 4096),
+    repository TEXT NOT NULL CHECK(length(repository)=64),
+    payload_sha256 BLOB NOT NULL CHECK(length(payload_sha256)=32),
+    root_identity BLOB NOT NULL CHECK(length(root_identity) BETWEEN 1 AND 512),
+    volume_uuid BLOB NOT NULL CHECK(length(volume_uuid)=16),
+    rule TEXT NOT NULL CHECK(length(rule) BETWEEN 1 AND 64),
+    recorded_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(root_path, repository)
+ ) WITHOUT ROWID;";
+
+/// Rows kept at most in `rotation_debt_volume`; orphans of removed roots are
+/// pruned first, and a full table refuses new bindings instead of growing.
+const MAX_DEBT_VOLUME_ROWS: i64 = 4 * MAX_DEBT_ROWS;
+
+/// One debt's volume binding, read without mutating the journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DebtVolumeBinding {
+    pub(crate) payload_sha256: [u8; 32],
+    /// The cache-root identity bytes the debt recorded when it was bound.
+    pub(crate) root_identity: Vec<u8>,
+    pub(crate) volume_uuid: [u8; 16],
+}
+
+impl DebtVolumeBinding {
+    /// Whether this binding was recorded for exactly `payload`.
+    pub(crate) fn names_payload(&self, payload: &[u8]) -> bool {
+        self.payload_sha256.as_slice() == Sha256::digest(payload).as_slice()
+    }
+}
+
+/// Read the volume binding recorded for `repository`'s latest debt under
+/// `cache_root`. `None` when the journal, the table or the row is absent.
+pub(crate) fn debt_volume_binding(
+    resource_db: &Path,
+    cache_root: &Path,
+    repository: &str,
+) -> io::Result<Option<DebtVolumeBinding>> {
+    let root = root_path_bytes(cache_root)?;
+    validate_repository(repository)?;
+    let path = path_for_resource_db(resource_db)?;
+    let Some(connection) = open_reader(&path)? else {
+        return Ok(None);
+    };
+    if !ensure_schema(&connection, false)? || !table_exists(&connection, "rotation_debt_volume")? {
+        return Ok(None);
+    }
+    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = connection
+        .query_row(
+            "SELECT payload_sha256, root_identity, volume_uuid FROM rotation_debt_volume \
+             WHERE root_path=?1 AND repository=?2",
+            params![root, repository],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    let Some((digest, root_identity, uuid)) = row else {
+        return Ok(None);
+    };
+    let (Ok(payload_sha256), Ok(volume_uuid)) = (
+        <[u8; 32]>::try_from(digest.as_slice()),
+        <[u8; 16]>::try_from(uuid.as_slice()),
+    ) else {
+        return Err(invalid_data("rotation debt volume binding is malformed"));
+    };
+    if volume_uuid.iter().all(|byte| *byte == 0)
+        || !(1..=MAX_ROOT_IDENTITY_BYTES).contains(&root_identity.len())
+    {
+        return Err(invalid_data("rotation debt volume binding is malformed"));
+    }
+    Ok(Some(DebtVolumeBinding {
+        payload_sha256,
+        root_identity,
+        volume_uuid,
+    }))
+}
+
+/// Bind `volume_uuid` to `repository`'s journaled debt under `rule`, recording
+/// the cache-root identity bytes `root_identity` the debt names and the time.
+/// Writes only
+/// while the debt row still holds exactly `payload`; returns false, changing
+/// nothing, when it does not or when the table is full. The caller proves the
+/// same-volume rule first.
+pub(crate) fn bind_debt_volume(
+    resource_db: &Path,
+    cache_root: &Path,
+    repository: &str,
+    payload: &[u8],
+    root_identity: &[u8],
+    volume_uuid: [u8; 16],
+    rule: &str,
+) -> io::Result<bool> {
+    validate_inputs(cache_root, root_identity, repository, payload)?;
+    let recorded_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64);
+    if rule.is_empty() || rule.len() > 64 || volume_uuid.iter().all(|byte| *byte == 0) {
+        return Err(invalid_input("rotation debt volume binding is invalid"));
+    }
+    let root = root_path_bytes(cache_root)?;
+    let path = path_for_resource_db(resource_db)?;
+    let mut connection = open_writer(&path)?;
+    ensure_writer_schema(&mut connection)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error)?;
+    let journaled: Option<i64> = transaction
+        .query_row(
+            "SELECT payload=?3 FROM rotation_debt WHERE root_path=?1 AND repository=?2",
+            params![root, repository, payload],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if journaled != Some(1) {
+        return Ok(false);
+    }
+    transaction
+        .execute_batch(DEBT_VOLUME_TABLE)
+        .map_err(sqlite_error)?;
+    transaction
+        .execute(
+            "DELETE FROM rotation_debt_volume \
+             WHERE root_path NOT IN (SELECT root_path FROM rotation_root)",
+            [],
+        )
+        .map_err(sqlite_error)?;
+    let rows: i64 = transaction
+        .query_row(
+            "SELECT count(*) FROM rotation_debt_volume \
+             WHERE NOT (root_path=?1 AND repository=?2)",
+            params![root, repository],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if rows >= MAX_DEBT_VOLUME_ROWS {
+        return Ok(false);
+    }
+    transaction
+        .execute(
+            "INSERT OR REPLACE INTO rotation_debt_volume(root_path, repository, payload_sha256, \
+             root_identity, volume_uuid, rule, recorded_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                root,
+                repository,
+                Sha256::digest(payload).to_vec(),
+                root_identity,
+                volume_uuid.to_vec(),
+                rule,
+                recorded_at_ms
+            ],
+        )
+        .map_err(sqlite_error)?;
+    transaction.commit().map_err(sqlite_error)?;
+    check_database_size(&path)?;
+    Ok(true)
+}
+
+fn table_exists(connection: &Connection, name: &str) -> io::Result<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1",
+            params![name],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .unwrap_or(false))
+}
+
 fn validate_lap_state(state: i64) -> io::Result<()> {
     if matches!(state, LAP_IDLE | LAP_ACTIVE | LAP_EXHAUSTED) {
         Ok(())
@@ -3065,6 +3244,140 @@ mod root_volume_tests {
                 .unwrap()
                 .bound_volume,
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod debt_volume_tests {
+    use super::*;
+
+    const ROOT: &[u8] = b"saved-root-identity";
+    const REPOSITORY: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const VOLUME: [u8; 16] = [0x24; 16];
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
+        let cache_root = base.join("preparation-cache");
+        std::fs::create_dir(&cache_root).unwrap();
+        (directory, base.join("host-resources.db"), cache_root)
+    }
+
+    fn bind(resource_db: &Path, cache_root: &Path, payload: &[u8]) -> bool {
+        bind_debt_volume(
+            resource_db,
+            cache_root,
+            REPOSITORY,
+            payload,
+            ROOT,
+            VOLUME,
+            ROOT_VOLUME_OBSERVED,
+        )
+        .unwrap()
+    }
+
+    /// A binding is written only for the exact journaled payload, and it
+    /// names only that payload afterwards.
+    #[test]
+    fn a_debt_binding_requires_and_names_the_exact_journaled_payload() {
+        let (_directory, resource_db, cache_root) = fixture();
+        assert!(
+            !bind(&resource_db, &cache_root, b"payload"),
+            "no journal yet"
+        );
+        assert!(
+            debt_volume_binding(&resource_db, &cache_root, REPOSITORY)
+                .unwrap()
+                .is_none()
+        );
+        publish(&resource_db, &cache_root, ROOT, REPOSITORY, b"payload").unwrap();
+        assert!(!bind(&resource_db, &cache_root, b"other payload"));
+        assert!(
+            debt_volume_binding(&resource_db, &cache_root, REPOSITORY)
+                .unwrap()
+                .is_none(),
+            "the table is created only by a binding that was written"
+        );
+        assert!(bind(&resource_db, &cache_root, b"payload"));
+        let binding = debt_volume_binding(&resource_db, &cache_root, REPOSITORY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.volume_uuid, VOLUME);
+        assert_eq!(binding.root_identity, ROOT);
+        assert!(binding.names_payload(b"payload"));
+        assert!(!binding.names_payload(b"a later debt"));
+    }
+
+    /// The binding outlives its completed debt row: stage proofs of that debt
+    /// can remain in the cache after the row is gone.
+    #[test]
+    fn a_debt_binding_outlives_its_completed_row() {
+        let (_directory, resource_db, cache_root) = fixture();
+        publish(&resource_db, &cache_root, ROOT, REPOSITORY, b"payload").unwrap();
+        record_fresh_store_identity(
+            &resource_db,
+            &cache_root,
+            ROOT,
+            REPOSITORY,
+            b"payload",
+            b"fresh",
+        )
+        .unwrap();
+        assert!(bind(&resource_db, &cache_root, b"payload"));
+        complete_verified(
+            &resource_db,
+            &cache_root,
+            ROOT,
+            REPOSITORY,
+            b"payload",
+            b"fresh",
+        )
+        .unwrap();
+        assert!(
+            debt_volume_binding(&resource_db, &cache_root, REPOSITORY)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Additive: the schema version stays 3 and the checks older binaries run
+    /// still accept the journal.
+    #[test]
+    fn the_debt_binding_table_keeps_the_journal_readable_at_schema_three() {
+        let (_directory, resource_db, cache_root) = fixture();
+        publish(&resource_db, &cache_root, ROOT, REPOSITORY, b"payload").unwrap();
+        assert!(bind(&resource_db, &cache_root, b"payload"));
+        let connection = Connection::open(path_for_resource_db(&resource_db).unwrap()).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(ensure_schema(&connection, false).unwrap());
+        validate_schema_before_writer(&connection).unwrap();
+        drop(connection);
+        assert!(
+            load_record(&resource_db, &cache_root, ROOT, REPOSITORY)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_nil_volume_uuid_is_never_bound() {
+        let (_directory, resource_db, cache_root) = fixture();
+        publish(&resource_db, &cache_root, ROOT, REPOSITORY, b"payload").unwrap();
+        assert!(
+            bind_debt_volume(
+                &resource_db,
+                &cache_root,
+                REPOSITORY,
+                b"payload",
+                ROOT,
+                [0; 16],
+                ROOT_VOLUME_OBSERVED,
+            )
+            .is_err()
         );
     }
 }

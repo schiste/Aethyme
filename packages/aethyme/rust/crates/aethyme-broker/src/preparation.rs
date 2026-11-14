@@ -3174,6 +3174,13 @@ fn shared_cache_budget_at_with_scan_limits(
             path: store.clone(),
             reason: format!("cannot durably journal shared-cache rotation intent: {source}"),
         })?;
+        rotation_debt::record_debt_volume(
+            resource_db_path,
+            cache_root,
+            repository,
+            &payload,
+            &cache_root_identity,
+        );
         ensure_preparation_cache_root_identity(cache_root, expected_root_identity)?;
         ensure_preparation_cache_root_binding(root_binding)?;
         progress(true)?;
