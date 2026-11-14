@@ -132,17 +132,33 @@ aethyme broker status --json
 
    | `outcome` | Meaning and next step |
    |---|---|
-   | `removed` | The slice freed slots and goes on. Check again in a few minutes. |
-   | `nothing_removable` | The lap ended and every examined checkout was kept. Go to step 3. |
-   | `lap_unfinished` | Time ran out before the lap reached its end. The next slice resumes it after one minute. |
-   | `lock_busy` | Another maintenance pass held the GC lock. The next slice retries after one minute. |
-   | `inventory_unavailable` | No complete checkout inventory before the deadline. `waiting_on` names what it waited on (`capacity_probe`, `cohort_index`, `group_page` or `live_paths`). Progress is kept; the retry is one minute after a slice that moved, and backs off to ten minutes when it did not. |
-   | `out_of_time_before_selection` | The budget ran out before any checkout was judged. `budget_consumed_by` is `checkout_count` or `pre_selection`. It retries after one minute and backs off to ten while it repeats. |
+   | `removed` | The slice freed slots. Check again in a few minutes. `stop_reason` says why it ended (see below). |
+   | `nothing_removable` | The lap ended and every examined checkout was kept, or nothing moved. The worker waits 10 minutes. Go to step 3. |
+   | `lap_unfinished` | Time ran out before the lap reached its end. The next slice resumes it after 20 seconds when the lap moved, and after 10 minutes when nothing moved. |
+   | `lock_busy` | Another process held the GC lock, or the slice stepped aside for a foreground command (`broker start` at the limit, `gc apply`, `gc abandon`, `gc forget-abandoned`) that was waiting for it. The next slice retries after one minute. |
+   | `inventory_unavailable` | No complete checkout inventory before the deadline. `waiting_on` names what it waited on (`capacity_probe`, `cohort_index`, `group_page` or `live_paths`). Progress is kept; the retry is 20 seconds after a slice that moved, and otherwise 1, 2, 4, 8 and then 10 minutes while it repeats. |
+   | `out_of_time_before_selection` | The budget ran out before any checkout was judged. `budget_consumed_by` is `checkout_count` or `pre_selection`. It retries after 1, 2, 4, 8 and then 10 minutes while it repeats. |
+
+   A slice runs up to 120 seconds and removes up to twelve checkouts, one per
+   pass (a pass has a 20-second budget). `stop_reason` says why it ended:
+   `cap` (twelve removed), `budget` (too little time left for another pass),
+   `nothing_selected` (the lap has nothing more to remove now),
+   `kept_only_limit` (four passes removed nothing because the checkout they
+   selected was kept or deferred at the last step), `pacer_backoff` (memory or load
+   pressure outlasted the pacer's pause budget; no slice for 10 minutes),
+   `slice_deadline` (the deadline cut the pacer wait after a removal short;
+   the next slice pays the rest first), `yielded_to_foreground`, `lock_busy`,
+   `failed` (a pass failed; retry after at least one minute) and
+   `removal_failures` (Git failed to remove a checkout twice; retry after 10
+   minutes). A slice that removed nothing after keeping a checkout at the last
+   step waits at least one minute. `retry_in_ms` is the wait the slice chose;
+   it is absent when the next slice may start at once.
 
    `lap_remaining` says how many closed-checkout groups the lap still has, and
-   `scan_ms`, `selection_ms`, `apply_ms`, `paced_ms` and `elapsed_ms` say where
-   the slice's time went. To run a pass now instead of waiting for the worker,
-   use `aethyme broker gc sweep --json`.
+   `scan_ms`, `selection_ms`, `apply_ms`, `paced_ms`, `lock_held_ms`,
+   `lock_wait_ms`, `lock_yield_ms`, `git_removal_ms`, `pressure_wait_ms` and
+   `elapsed_ms` say where the slice's time went. To run a pass now instead of
+   waiting for the worker, use `aethyme broker gc sweep --json`.
 3. Read `capacity_removal.kept_by_code`, the number of kept checkouts per keep
    code, and `aethyme broker gc plan --json` for the per-checkout reasons in
    `auto_cleanup.kept[]` (`code`, `reason`, and for ignored leftovers
@@ -170,7 +186,7 @@ aethyme broker status --json
 | `ownership_witness_missing` | The spawned session never recorded the witness that proves the broker created the directory. | Inspect the checkout, then `aethyme broker finish cleanup <session-id>`. |
 | `ownership_witness_legacy` | The witness is a schema-1 record without a spawn generation. | Same as above. |
 | `ownership_adopted_only` | Only adopted sessions use the checkout, so the broker cannot prove it created it. | Same as above. |
-| `ownership_reproof_refused` | The witness was saved before volume UUIDs and a remount renumbered the devices, and one re-proof condition failed. The reason names it. | Fix the named condition if it is cheap; otherwise `aethyme broker finish cleanup <session-id>`. |
+| `ownership_reproof_refused` | The checkout's saved identity no longer matches exactly (usually a remount renumbered the devices) and one condition of the shared ownership re-proof failed. The reason names it: a path, inode or spawn root generation changed (the directory is not the one the broker created); a recorded volume UUID differs or cannot be observed today (another volume is mounted at that path); the device-sharing pattern changed; the session is not spawned, not closed or names another path; the checkout is outside the broker worktree root, belongs to another repository, is not registered by this repository, is not on the session branch, or `HEAD` is not the branch tip. | Mount the original volume at the same path if the reason names a volume UUID. For a Git condition, inspect the checkout and fix the state the reason names. Otherwise run `aethyme broker finish cleanup <session-id>`. GC reclamation and an interrupted `finish` cleanup report the same refusal. |
 | `ownership_unproven` | Another ownership proof failed. | Same as above. |
 | `cohort_unavailable` | The closed checkout cohort could not be built. The reason carries the cohort code, for example `index_changed`. | Sweep again; if it persists, run `aethyme broker finish cleanup audit` and handle the checkout from its next action. |
 | `checkout_missing` | The directory is gone and only the Git registration remains. | Review `git worktree prune --dry-run --verbose`, then prune. |
@@ -185,6 +201,77 @@ part-way is finished on a later pass.
 If the count is still too high after the causes above are fixed, raising
 `[worktrees].max_checkouts` buys time. Treat it as a stopgap: land the
 configuration on the default branch and keep it finite.
+
+## Prepare Is Slow Or Silent While Holding The Shared Cache
+
+### Symptoms
+
+- `aethyme broker submit prepare` prints a `preparation cache:` line, or waits
+  with no output, while other sessions' prepares wait
+- a prepare waits for the shared cache and says what the holder is doing
+- `aethyme broker status` shows the notice
+  `preparation.shared-cache-budget-inconclusive`
+
+Work that moves or removes a repository's shared preparation store runs alone,
+under the host-wide cache lease, before any step starts: finishing an interrupted
+rotation, measuring the store against `[shared_cache] max_bytes`, and removing a
+rotated store. Every other prepare of that repository waits for it.
+
+### Checks
+
+1. Read the progress lines on stderr. Each reads `preparation cache: <what it
+   is doing> for <n>s: <done> of <total> entries ...; lease held <n>s, other
+   prepares of this repository wait`. Removing a rotated store or finishing a
+   rotation shows `entries unlinked` and a total (`of at least` when the count
+   stopped at a limit); a budget measurement shows `entries measured` and
+   `bytes`. The lines repeat every 15 seconds and say whether interrupting is
+   safe: interrupting recovery or a drain is safe (unlinked entries stay removed
+   and the next prepare resumes), and interrupting a budget measurement only
+   skips that check. A prepare that waits repeats a notice every 30 seconds that
+   names the holder's session, pid and operation.
+2. From another terminal, read the same state without waiting for a line:
+
+   ```bash
+   aethyme broker submit prepare status --session <id> --json
+   ```
+
+   `current_operation` is what that session's own running prepare is doing
+   (`operation`, `items_done`, `items_total`, `bytes_observed`, and the start
+   and last update times). For a session that is waiting, `waiting_on` names
+   the holder's `session_id` and `holder_pid` and its `current_operation`. Both
+   fields are absent when the preparation is current, nothing is running, or the
+   record has not been updated for 90 seconds; then the holder exited or one
+   filesystem call is stalled, so check the holder's process.
+3. A budget measurement that stops at its 30-second or 2,000,000-entry limit
+   with the bytes it saw still under `max_bytes` is inconclusive. The store is
+   kept, not rotated, and the prepare report's `shared_cache_operations` shows
+   `outcome: inconclusive_time_limit` or `inconclusive_entry_limit`. After three
+   inconclusive checks in a row, `broker status` raises
+   `preparation.shared-cache-budget-inconclusive` with the entries and bytes the
+   last check saw. The store's size against `max_bytes` is then unknown, and only
+   the storage-pressure guard limits its growth: run
+   `aethyme broker advanced resources pressure --json` to see the host's storage
+   pressure. The notice clears after a check that decides.
+
+### A rotation recovery refuses after a remount
+
+If recovery stops with `preparation cache root identity differs from its durable
+journal` and `root_volume_reproof_refused: <condition>` or
+`debt_volume_reproof_refused: <condition>` (the condition names the proof that
+failed), the cache root on disk is not the directory the host journal recorded,
+usually because the volume was remounted in another disk slot or replaced. A
+plain retry fails the same way until that changes. Read the cache root's
+`preparation_rotation_recovery` entry in
+`aethyme broker advanced resources pressure --json`, then, in this order:
+
+1. Mount the original volume at the same path and rerun
+   `aethyme broker submit prepare --session <id>`.
+2. If the refusal persists, remove that preparation cache root. It holds only
+   reproducible package caches, and the next prepare recreates it.
+3. Never edit the host journal by hand.
+
+A volume UUID that is unknown on this platform (Linux) cannot prove a remount,
+so the exact device comparison stays and the same order applies.
 
 ## First Debug Commands
 
