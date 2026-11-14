@@ -75,10 +75,10 @@ pub struct Server {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DirectoryIdentity {
-    device: u64,
-    inode: u64,
-    lock_device: u64,
-    lock_inode: u64,
+    pub(super) device: u64,
+    pub(super) inode: u64,
+    pub(super) lock_device: u64,
+    pub(super) lock_inode: u64,
 }
 
 /// Keeps the singleton lock held until every job and client has drained.
