@@ -301,6 +301,12 @@ pub(super) struct FetchJournal {
     pub common_directory: PathBuf,
     pub common_device: u64,
     pub common_inode: u64,
+    /// Stable volume UUID of the common directory, where the platform reports
+    /// one (macOS). Absent on other platforms and in journals written before
+    /// it was recorded; omitted when absent so those journals keep their
+    /// exact bytes. See [`fetch_common_directory_decision`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub common_volume_uuid: Option<[u8; 16]>,
     pub pre_destination: Option<String>,
     pub provider: Option<crate::file_lock::artifact_use::ProcessStartIdentity>,
     pub completion: Option<FetchCompletion>,
@@ -769,12 +775,19 @@ impl FetchJournal {
                 source,
             })?;
         let pre_destination = observe_ref(cwd, &footprint.destination_ref, deadline, repository)?;
+        let common_volume_uuid = crate::volume_identity::volume_identity(
+            &common_directory,
+            metadata.dev(),
+            metadata.ino(),
+        )
+        .uuid();
         Ok(Some(Self {
             schema_version: 1,
             operation_id,
             repository: repository.into(),
             footprint,
             common_directory,
+            common_volume_uuid,
             common_device: metadata.dev(),
             common_inode: metadata.ino(),
             pre_destination,
@@ -805,6 +818,10 @@ impl FetchJournal {
                 && (completion.success == (completion.exit_code == Some(0))))
     }
 
+    /// Whether the journal names the live common Git directory: same path and
+    /// inode, and the same volume (see [`fetch_common_directory_decision`]).
+    /// A refusal is counted and reported; it leaves the unknown outcome to
+    /// the repeatable-fetch resolution, exactly as before.
     pub(super) fn matches_repository(&self, cwd: &Path) -> bool {
         use std::os::unix::fs::MetadataExt;
         let Ok(common) = common_directory(cwd) else {
@@ -813,9 +830,117 @@ impl FetchJournal {
         let Ok(metadata) = std::fs::metadata(&common) else {
             return false;
         };
-        common == self.common_directory
-            && metadata.dev() == self.common_device
-            && metadata.ino() == self.common_inode
+        let live_volume =
+            crate::volume_identity::volume_identity(&common, metadata.dev(), metadata.ino());
+        match fetch_common_directory_decision(
+            self,
+            &common,
+            metadata.dev(),
+            metadata.ino(),
+            live_volume.uuid(),
+        ) {
+            Ok(None) => true,
+            Ok(Some(_rule)) => {
+                crate::phase_telemetry::add(
+                    "fetch_journal_common_volume_reproved",
+                    std::time::Duration::ZERO,
+                );
+                true
+            }
+            Err(condition) if FETCH_COMMON_OBJECT_CONDITIONS.contains(&condition) => {
+                // Another directory or object: the historical refusal, kept quiet.
+                crate::phase_telemetry::add(
+                    "fetch_journal_common_identity_refused",
+                    std::time::Duration::ZERO,
+                );
+                false
+            }
+            Err(condition) => {
+                crate::phase_telemetry::add(
+                    "fetch_journal_common_volume_refused",
+                    std::time::Duration::ZERO,
+                );
+                // Without a live UUID this is the historical exact device
+                // refusal (every platform but macOS); report only what the
+                // volume evidence itself decided.
+                if live_volume.uuid().is_some() {
+                    eprintln!(
+                        "[coordination] fetch evidence of operation {} was not used \
+                         ({FETCH_COMMON_VOLUME_REFUSED}: {condition})",
+                        self.operation_id
+                    );
+                }
+                false
+            }
+        }
+    }
+}
+
+/// The journal's saved common directory device differs from the live one,
+/// and the volume UUID recorded with it names the live volume.
+pub(crate) const FETCH_COMMON_REPROOF_VOLUME_UUID: &str = "volume_uuid";
+/// Prefix of the reported reason when the volume evidence refuses a journal
+/// whose path and inode match the live common Git directory.
+pub(crate) const FETCH_COMMON_VOLUME_REFUSED: &str = "fetch_common_volume_refused";
+const FETCH_COMMON_PATH_DIFFERS: &str = "the common Git directory path differs";
+const FETCH_COMMON_INODE_DIFFERS: &str = "the common Git directory inode differs";
+/// Refusals that name another object, which no volume evidence can change.
+const FETCH_COMMON_OBJECT_CONDITIONS: [&str; 2] =
+    [FETCH_COMMON_PATH_DIFFERS, FETCH_COMMON_INODE_DIFFERS];
+
+/// Decide whether a fetch journal names the live common Git directory.
+/// `Ok(None)`: the saved device matches (the historical rule); `Ok(Some)`
+/// names the rule that proves a renumbered device; `Err` names the first
+/// condition that failed. The path and inode must always match. A device
+/// number is assigned at mount time and macOS renumbers an external volume
+/// when it returns in another disk slot, so a different device is accepted
+/// only when the live volume UUID is known and equals the UUID recorded in
+/// the journal. A journal recorded before UUIDs were (or on a platform with
+/// none) keeps the exact device comparison: refusing there costs only the
+/// precise outcome, since the repeatable-fetch resolution still closes the
+/// operation as "fetch again". With equal devices, a recorded UUID that names
+/// another volume is refused too: a different disk mounted in the same slot
+/// can show the same device and inode numbers.
+fn fetch_common_directory_decision(
+    journal: &FetchJournal,
+    live_path: &Path,
+    live_device: u64,
+    live_inode: u64,
+    live_volume: Option<[u8; 16]>,
+) -> Result<Option<&'static str>, &'static str> {
+    if journal.common_directory != live_path {
+        return Err(FETCH_COMMON_PATH_DIFFERS);
+    }
+    if journal.common_inode != live_inode {
+        return Err(FETCH_COMMON_INODE_DIFFERS);
+    }
+    if journal.common_device == live_device {
+        return match (journal.common_volume_uuid, live_volume) {
+            (Some(saved), Some(live)) if saved != live => Err(
+                "the device matches but the volume UUID recorded for the common Git directory names another volume",
+            ),
+            _ => Ok(None),
+        };
+    }
+    let Some(live_volume) = live_volume else {
+        return Err("the common Git directory device differs and the live volume UUID is unknown");
+    };
+    let Some(saved_volume) = journal.common_volume_uuid else {
+        return Err(
+            "the common Git directory device differs and the journal predates volume UUIDs",
+        );
+    };
+    if crate::volume_identity::same_volume(
+        Some(saved_volume),
+        journal.common_device,
+        Some(live_volume),
+        live_device,
+    ) {
+        Ok(Some(FETCH_COMMON_REPROOF_VOLUME_UUID))
+    } else {
+        Err(
+            "the common Git directory device differs and its recorded volume UUID names another volume",
+        )
     }
 }
 
@@ -1341,6 +1466,7 @@ mod tests {
             common_directory: PathBuf::from("/not-used"),
             common_device: 1,
             common_inode: 2,
+            common_volume_uuid: None,
             pre_destination: None,
             provider: None,
             completion: None,
@@ -1849,5 +1975,184 @@ mod tests {
             ),
             None
         );
+    }
+
+    fn renumberable_journal(common: &Path) -> FetchJournal {
+        FetchJournal {
+            schema_version: 1,
+            operation_id: 7,
+            repository: "example/repo".into(),
+            footprint: fetch_footprint(&canonical_fetch_args("origin", "main").unwrap()).unwrap(),
+            common_directory: common.to_path_buf(),
+            common_device: 45,
+            common_inode: 839,
+            common_volume_uuid: Some(LIVE_COMMON_VOLUME),
+            pre_destination: None,
+            provider: None,
+            completion: None,
+        }
+    }
+
+    const LIVE_COMMON_VOLUME: [u8; 16] = [0x7f; 16];
+
+    /// Rule `volume_uuid`: the journal was saved while the drive had slot 45
+    /// and the common directory is now in slot 41. Same path, same inode,
+    /// and the recorded volume UUID names the live volume.
+    #[test]
+    fn a_renumbered_common_directory_is_proved_by_its_recorded_volume_uuid() {
+        let common = Path::new("/synthetic/repository/.git");
+        let journal = renumberable_journal(common);
+        assert_eq!(
+            fetch_common_directory_decision(&journal, common, 41, 839, Some(LIVE_COMMON_VOLUME)),
+            Ok(Some(FETCH_COMMON_REPROOF_VOLUME_UUID))
+        );
+        // The historical exact match still decides on its own.
+        assert_eq!(
+            fetch_common_directory_decision(&journal, common, 45, 839, Some(LIVE_COMMON_VOLUME)),
+            Ok(None)
+        );
+        let mut legacy = journal;
+        legacy.common_volume_uuid = None;
+        assert_eq!(
+            fetch_common_directory_decision(&legacy, common, 45, 839, Some(LIVE_COMMON_VOLUME)),
+            Ok(None)
+        );
+        assert_eq!(
+            fetch_common_directory_decision(&legacy, common, 45, 839, None),
+            Ok(None)
+        );
+    }
+
+    /// Each condition is necessary: breaking any one refuses with its own reason.
+    #[test]
+    fn every_condition_of_the_common_directory_reproof_is_required() {
+        let common = Path::new("/synthetic/repository/.git");
+        let journal = renumberable_journal(common);
+        assert_eq!(
+            fetch_common_directory_decision(
+                &journal,
+                Path::new("/synthetic/other/.git"),
+                41,
+                839,
+                Some(LIVE_COMMON_VOLUME)
+            ),
+            Err("the common Git directory path differs")
+        );
+        assert_eq!(
+            fetch_common_directory_decision(&journal, common, 41, 840, Some(LIVE_COMMON_VOLUME)),
+            Err("the common Git directory inode differs")
+        );
+        assert_eq!(
+            fetch_common_directory_decision(&journal, common, 41, 839, None),
+            Err("the common Git directory device differs and the live volume UUID is unknown")
+        );
+        let mut legacy = journal.clone();
+        legacy.common_volume_uuid = None;
+        assert_eq!(
+            fetch_common_directory_decision(&legacy, common, 41, 839, Some(LIVE_COMMON_VOLUME)),
+            Err("the common Git directory device differs and the journal predates volume UUIDs")
+        );
+        assert_eq!(
+            fetch_common_directory_decision(&journal, common, 41, 839, Some([0x11; 16])),
+            Err(
+                "the common Git directory device differs and its recorded volume UUID names another volume"
+            )
+        );
+        // A different disk in the same slot can repeat device and inode.
+        assert_eq!(
+            fetch_common_directory_decision(&journal, common, 45, 839, Some([0x11; 16])),
+            Err(
+                "the device matches but the volume UUID recorded for the common Git directory names another volume"
+            )
+        );
+    }
+
+    /// The production journal records the live volume UUID where the platform
+    /// has one, and `matches_repository` accepts a renumbered device only
+    /// through it: on macOS through the recorded UUID, elsewhere never.
+    #[cfg(unix)]
+    #[test]
+    fn a_prepared_journal_survives_a_device_renumber_only_through_its_volume_uuid() {
+        let root = repository_with_origin("https://example.invalid/acme/project.git");
+        let root = root.path().canonicalize().unwrap();
+        let journal = FetchJournal::prepare(
+            1,
+            &root,
+            &canonical_fetch_args("origin", "main").unwrap(),
+            AdmissionDeadline::start(QueueWait::Refuse),
+            "example/repo",
+        )
+        .unwrap()
+        .expect("a canonical fetch is journaled");
+        #[cfg(target_os = "macos")]
+        assert!(journal.common_volume_uuid.is_some());
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(journal.common_volume_uuid, None);
+        assert!(journal.matches_repository(&root));
+        // Without a UUID the journal keeps its old serialized shape.
+        let mut legacy = journal.clone();
+        legacy.common_volume_uuid = None;
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("common_volume_uuid")
+                .is_none()
+        );
+        assert!(legacy.matches_repository(&root));
+
+        let mut renumbered = journal.clone();
+        renumbered.common_device = renumbered.common_device.wrapping_add(7);
+        assert_eq!(
+            renumbered.matches_repository(&root),
+            cfg!(target_os = "macos"),
+            "only a known, recorded volume UUID proves a renumbered device"
+        );
+        let mut renumbered_legacy = legacy.clone();
+        renumbered_legacy.common_device = renumbered_legacy.common_device.wrapping_add(7);
+        assert!(!renumbered_legacy.matches_repository(&root));
+        let mut moved = renumbered.clone();
+        moved.common_inode += 1;
+        assert!(!moved.matches_repository(&root));
+        let mut other_volume = renumbered;
+        other_volume.common_volume_uuid = Some([0x5c; 16]);
+        assert!(!other_volume.matches_repository(&root));
+    }
+
+    /// The fetch counters fire under the command recorder: a re-proof, a
+    /// volume refusal and an object refusal are each counted apart.
+    #[cfg(unix)]
+    #[test]
+    fn fetch_journal_identity_decisions_are_counted_by_class() {
+        let root = repository_with_origin("https://example.invalid/acme/project.git");
+        let root = root.path().canonicalize().unwrap();
+        let journal = FetchJournal::prepare(
+            1,
+            &root,
+            &canonical_fetch_args("origin", "main").unwrap(),
+            AdmissionDeadline::start(QueueWait::Refuse),
+            "example/repo",
+        )
+        .unwrap()
+        .expect("a canonical fetch is journaled");
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _recording = crate::phase_telemetry::install(recorder.clone());
+
+        let mut renumbered = journal.clone();
+        renumbered.common_device = renumbered.common_device.wrapping_add(7);
+        renumbered.matches_repository(&root);
+        let mut moved = journal;
+        moved.common_inode += 1;
+        assert!(!moved.matches_repository(&root));
+
+        let (_, counts) = recorder.totals();
+        let count = |name: &str| counts.get(name).copied().unwrap_or(0);
+        assert_eq!(count("fetch_journal_common_identity_refused"), 1);
+        if cfg!(target_os = "macos") {
+            assert_eq!(count("fetch_journal_common_volume_reproved"), 1);
+            assert_eq!(count("fetch_journal_common_volume_refused"), 0);
+        } else {
+            assert_eq!(count("fetch_journal_common_volume_reproved"), 0);
+            assert_eq!(count("fetch_journal_common_volume_refused"), 1);
+        }
     }
 }
