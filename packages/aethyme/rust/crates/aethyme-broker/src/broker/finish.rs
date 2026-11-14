@@ -278,9 +278,17 @@ impl Broker {
         let worktree_path = PathBuf::from(&session.worktree_path);
         let item = self.cleanup_item(session)?;
         report.cleanup_safe = item.as_ref().is_none_or(|item| item.eligible());
-        let recovery_retry =
-            !report.cleanup_safe && self.interrupted_finish_cleanup_proof(session).is_some();
+        let interrupted_proof = self.interrupted_finish_cleanup_proof(session);
+        let recovery_retry = !report.cleanup_safe && interrupted_proof.is_some();
         report.cleanup_safe |= recovery_retry;
+        // The ownership re-proof an interrupted cleanup's proof needed after a
+        // remount, reported with the removal it authorizes.
+        let recovery_reproof = interrupted_proof
+            .and_then(|proof| proof.ownership_reproof)
+            .or_else(|| {
+                self.interrupted_finish_orphan_cleanup_proof(session)
+                    .and_then(|proof| proof.ownership_reproof)
+            });
         if !report.cleanup_safe {
             report.status = FinishStatus::Closed;
             report.cleanup.requested = true;
@@ -343,7 +351,18 @@ impl Broker {
                         .and_then(|mut proof| {
                             let witness = spawned_witness.as_ref()?;
                             if !proof.matches_spawned_instance(witness) {
-                                return None;
+                                // The spawn witness predates a remount: only
+                                // the ownership re-proof every deletion lane
+                                // shares may accept other device numbers.
+                                self.checkout_ownership_reproof(
+                                    crate::auto_cleanup::OwnershipReproofLane::Finish,
+                                    session,
+                                    &worktree_path,
+                                    witness,
+                                    &proof.instance_witness(),
+                                    None,
+                                )
+                                .ok()?;
                             }
                             if item.as_ref().and_then(|item| item.branch_tip.as_deref())
                                 != Some(proof.branch_tip.as_str())
@@ -386,6 +405,7 @@ impl Broker {
             Ok(()) => {
                 report.status = FinishStatus::Cleaned;
                 report.cleanup.completed = true;
+                report.cleanup.ownership_reproof = recovery_reproof.map(str::to_string);
                 report.cleanup.worktree_removed = worktree_present && !worktree_path.exists();
                 report.cleanup.branch_removed = branch_present
                     && report

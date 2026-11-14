@@ -171,6 +171,14 @@ spawned session that never recorded a witness), `ownership_witness_legacy`
 it). Inspect one, then run `aethyme broker finish cleanup <session-id>`. A
 closed checkout whose directory is already gone is `checkout_missing`.
 
+GC reclamation and compaction, `finish` and the recovery of an interrupted
+`finish` cleanup use the same re-proof. A recovery proof saved since 0.8.96
+also records the volume UUIDs, so after a remount it resumes when every UUID
+still matches and the checkout is still registered on the session branch at
+its tip (`cleanup.ownership_reproof: "volume_uuid"` in the finish report). A
+checkout Git has already deregistered resumes only by volume UUID; one whose
+proof predates UUIDs stays for inspection.
+
 When a closed checkout is kept only for ignored leftovers, the removal lane
 lists every ignored root that blocks it (`kept[].ignored_blockers`) and
 remembers the verdict. It skips that checkout on later passes until its HEAD,
