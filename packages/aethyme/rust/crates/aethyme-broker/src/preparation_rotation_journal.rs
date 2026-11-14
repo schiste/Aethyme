@@ -904,6 +904,9 @@ pub(crate) fn complete_verified(
             if deleted != 1 {
                 return Err(invalid_data("rotation debt changed during completion"));
             }
+            // The root's last debt row may be gone: its keys may no longer
+            // need protection.
+            prune_unprotected_volume_keys(&transaction, root, None)?;
         }
         None => {}
         Some(_) => return Err(invalid_data("rotation debt row changed before completion")),
@@ -1737,11 +1740,12 @@ const VOLUME_KEY_TABLE: &str = "CREATE TABLE IF NOT EXISTS rotation_volume_key(
 
 /// Rows kept at most in `rotation_debt_volume`. Orphans of removed roots are
 /// pruned first; at the cap, the oldest bindings no journaled debt row holds
-/// any more (leaked when a completed recovery never retired them) make room;
-/// only a table full of bindings of pending debts refuses a new one.
+/// any more (leaked when a completed recovery never retired them) make room.
+/// With at most [`MAX_DEBT_ROWS`] debt rows a full table always holds such a
+/// binding, so the refusal that follows is defensive only.
 const MAX_DEBT_VOLUME_ROWS: i64 = 4 * MAX_DEBT_ROWS;
-/// Keys kept per cache root and volume UUID in `rotation_volume_key`; the
-/// oldest goes first, unless a pending debt may still need it.
+/// Unprotected keys kept per cache root and volume UUID in
+/// `rotation_volume_key`; see [`prune_unprotected_volume_keys`].
 const MAX_VOLUME_KEYS_PER_ROOT: i64 = 16;
 /// Hard bound on the keys of one cache root and volume UUID while a pending
 /// debt protects them from pruning. A key past it is not recorded, so the
@@ -1854,7 +1858,7 @@ pub(crate) fn bind_debt_volume(
     if journaled != Some(1) {
         return Ok(false);
     }
-    if !insert_debt_volume(
+    let (written, evicted) = insert_debt_volume(
         &transaction,
         root,
         repository,
@@ -1862,12 +1866,24 @@ pub(crate) fn bind_debt_volume(
         root_identity,
         volume_uuid,
         rule,
-    )? {
+    )?;
+    if !written {
         return Ok(false);
     }
     transaction.commit().map_err(sqlite_error)?;
+    count_evicted_bindings(evicted);
     check_database_size(&path)?;
     Ok(true)
+}
+
+/// Count bindings evicted by a transaction that has committed.
+fn count_evicted_bindings(evicted: usize) {
+    for _ in 0..evicted {
+        crate::phase_telemetry::add(
+            "preparation_rotation_debt_volume_binding_evicted",
+            Duration::ZERO,
+        );
+    }
 }
 
 fn insert_debt_volume(
@@ -1878,7 +1894,7 @@ fn insert_debt_volume(
     root_identity: &[u8],
     volume_uuid: [u8; 16],
     rule: &str,
-) -> io::Result<bool> {
+) -> io::Result<(bool, usize)> {
     transaction
         .execute_batch(DEBT_VOLUME_TABLE)
         .map_err(sqlite_error)?;
@@ -1897,11 +1913,12 @@ fn insert_debt_volume(
             |row| row.get(0),
         )
         .map_err(sqlite_error)?;
+    let mut evicted = 0;
     if rows >= MAX_DEBT_VOLUME_ROWS {
         // Leaked bindings must not block new ones forever: evict the oldest
         // that no journaled debt row holds. A stage proof that still needed
         // one is then refused as unproven, never accepted.
-        let evicted = transaction
+        evicted = transaction
             .execute(
                 "DELETE FROM rotation_debt_volume WHERE (root_path, repository) IN \
                  (SELECT v.root_path, v.repository FROM rotation_debt_volume v \
@@ -1912,12 +1929,6 @@ fn insert_debt_volume(
                 params![root, repository, rows - MAX_DEBT_VOLUME_ROWS + 1],
             )
             .map_err(sqlite_error)?;
-        for _ in 0..evicted {
-            crate::phase_telemetry::add(
-                "preparation_rotation_debt_volume_binding_evicted",
-                Duration::ZERO,
-            );
-        }
     }
     let rows: i64 = transaction
         .query_row(
@@ -1932,7 +1943,8 @@ fn insert_debt_volume(
             "preparation_rotation_debt_volume_binding_cap_reached",
             Duration::ZERO,
         );
-        return Ok(false);
+        // The caller rolls back, evictions included.
+        return Ok((false, 0));
     }
     transaction
         .execute(
@@ -1950,7 +1962,7 @@ fn insert_debt_volume(
             ],
         )
         .map_err(sqlite_error)?;
-    Ok(true)
+    Ok((true, evicted))
 }
 
 /// Remove `repository`'s debt binding once the debt with `payload` is fully
@@ -1973,11 +1985,57 @@ pub(crate) fn forget_debt_volume(
     if !table_exists(&connection, "rotation_debt_volume")? {
         return Ok(());
     }
-    connection
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error)?;
+    transaction
         .execute(
             "DELETE FROM rotation_debt_volume \
              WHERE root_path=?1 AND repository=?2 AND payload_sha256=?3",
             params![root, repository, Sha256::digest(payload).to_vec()],
+        )
+        .map_err(sqlite_error)?;
+    // With the binding gone its volume's keys may no longer be protected.
+    prune_unprotected_volume_keys(&transaction, root, None)?;
+    transaction.commit().map_err(sqlite_error)?;
+    Ok(())
+}
+
+/// Trim `root`'s `rotation_volume_key` rows to the newest
+/// [`MAX_VOLUME_KEYS_PER_ROOT`] per volume UUID, for every UUID no pending
+/// debt can still need: nothing while the root has a `rotation_debt` row,
+/// and never a UUID that a `rotation_debt_volume` binding of the root names
+/// (its stage proofs can outlive the debt row). Runs when protection can
+/// lift (a debt row completes, a binding is forgotten) and before a new key
+/// is checked against the cap, so unprotected keys never cause a refusal.
+/// `keep` (the key just recorded) always counts among the newest.
+fn prune_unprotected_volume_keys(
+    connection: &Connection,
+    root: &[u8],
+    keep: Option<&str>,
+) -> io::Result<()> {
+    if !table_exists(connection, "rotation_volume_key")? {
+        return Ok(());
+    }
+    let binding_guard = if table_exists(connection, "rotation_debt_volume")? {
+        "AND NOT EXISTS (SELECT 1 FROM rotation_debt_volume d \
+           WHERE d.root_path=?1 AND d.volume_uuid=rotation_volume_key.volume_uuid)"
+    } else {
+        ""
+    };
+    connection
+        .execute(
+            &format!(
+                "DELETE FROM rotation_volume_key WHERE root_path=?1 \
+                 AND NOT EXISTS (SELECT 1 FROM rotation_debt WHERE root_path=?1) \
+                 {binding_guard} \
+                 AND filesystem_key NOT IN (SELECT i.filesystem_key FROM rotation_volume_key i \
+                   WHERE i.root_path=?1 AND i.volume_uuid=rotation_volume_key.volume_uuid \
+                   ORDER BY i.filesystem_key=?3 DESC, i.recorded_at_ms DESC, \
+                     i.filesystem_key DESC LIMIT ?2)"
+            ),
+            // An empty key never matches: recorded keys are 3 to 160 bytes.
+            params![root, MAX_VOLUME_KEYS_PER_ROOT, keep.unwrap_or("")],
         )
         .map_err(sqlite_error)?;
     Ok(())
@@ -1986,11 +2044,11 @@ pub(crate) fn forget_debt_volume(
 /// Record that `cache_root` was seen under `filesystem_key` on the volume
 /// `volume_uuid`. Returns whether the row is now durable. A row already
 /// holding exactly this key and UUID is left as it is: a sweep re-proving the
-/// same volume every pass writes nothing. Pruning keeps the newest
-/// [`MAX_VOLUME_KEYS_PER_ROOT`] keys per cache root and UUID, and never a key
-/// of a root with a pending debt row or of a UUID a debt binding of that
-/// root names; such protected keys stop at [`MAX_PROTECTED_VOLUME_KEYS`],
-/// past which the key is refused (`Ok(false)`).
+/// same volume every pass writes nothing. Unprotected keys are pruned first
+/// ([`prune_unprotected_volume_keys`]); keys a pending debt may still need
+/// stop at [`MAX_PROTECTED_VOLUME_KEYS`] per cache root and UUID, past which
+/// the key is refused (`Ok(false)`) and the recovery that needed it refuses.
+/// They are trimmed once their debt completes or its binding is forgotten.
 pub(crate) fn record_volume_key(
     resource_db: &Path,
     cache_root: &Path,
@@ -2033,6 +2091,9 @@ pub(crate) fn record_volume_key(
             [],
         )
         .map_err(sqlite_error)?;
+    // Unprotected keys are trimmed first, so only keys a pending debt may
+    // still need can ever reach the cap.
+    prune_unprotected_volume_keys(&transaction, root, None)?;
     let group: i64 = transaction
         .query_row(
             "SELECT count(*) FROM rotation_volume_key \
@@ -2055,21 +2116,8 @@ pub(crate) fn record_volume_key(
             params![root, filesystem_key, volume_uuid.to_vec(), now_ms()],
         )
         .map_err(sqlite_error)?;
-    // Prune per cache root and UUID, never a key a pending debt may still
-    // need: while the root has a debt row, or a debt binding of the root
-    // names this UUID (its stage proofs can outlive the row), keys stay.
-    transaction
-        .execute(
-            "DELETE FROM rotation_volume_key \
-             WHERE root_path=?1 AND volume_uuid=?2 \
-             AND filesystem_key NOT IN (SELECT filesystem_key FROM rotation_volume_key \
-               WHERE root_path=?1 AND volume_uuid=?2 ORDER BY recorded_at_ms DESC LIMIT ?3) \
-             AND NOT EXISTS (SELECT 1 FROM rotation_debt WHERE root_path=?1) \
-             AND NOT EXISTS (SELECT 1 FROM rotation_debt_volume \
-               WHERE root_path=?1 AND volume_uuid=?2)",
-            params![root, volume_uuid.to_vec(), MAX_VOLUME_KEYS_PER_ROOT],
-        )
-        .map_err(sqlite_error)?;
+    // Trim unprotected keys again, never the one just written.
+    prune_unprotected_volume_keys(&transaction, root, Some(filesystem_key))?;
     transaction.commit().map_err(sqlite_error)?;
     check_database_size(&path)?;
     Ok(true)
@@ -2130,7 +2178,7 @@ pub(crate) fn insert_debt_volume_for_test(
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite_error)?;
-    let written = insert_debt_volume(
+    let (written, evicted) = insert_debt_volume(
         &transaction,
         root,
         repository,
@@ -2140,6 +2188,7 @@ pub(crate) fn insert_debt_volume_for_test(
         ROOT_VOLUME_OBSERVED,
     )?;
     transaction.commit().map_err(sqlite_error)?;
+    count_evicted_bindings(evicted);
     Ok(written)
 }
 
@@ -3887,6 +3936,142 @@ mod debt_volume_tests {
         let (at, uuid) = recorded_at();
         assert_ne!(at, 7);
         assert_eq!(uuid, [0x25; 16].to_vec());
+    }
+
+    /// Complete `REPOSITORY`'s debt with `payload` the way recovery does:
+    /// the journal row first, then its binding.
+    fn complete_and_forget(resource_db: &Path, cache_root: &Path, payload: &[u8]) {
+        record_fresh_store_identity(resource_db, cache_root, ROOT, REPOSITORY, payload, b"fresh")
+            .unwrap();
+        complete_verified(resource_db, cache_root, ROOT, REPOSITORY, payload, b"fresh").unwrap();
+        forget_debt_volume(resource_db, cache_root, REPOSITORY, payload).unwrap();
+    }
+
+    /// Recovery records keys only while a debt protects them, so the trim
+    /// must happen when the protection lifts: the debt row completing trims
+    /// the UUIDs no binding names, and forgetting the binding trims the rest.
+    #[test]
+    fn keys_recorded_under_protection_are_trimmed_once_the_debt_completes() {
+        let (_directory, resource_db, cache_root) = fixture();
+        publish(&resource_db, &cache_root, ROOT, REPOSITORY, b"payload").unwrap();
+        assert!(bind(&resource_db, &cache_root, b"payload"));
+        let other = [0x25; 16];
+        for device in 0..(2 * MAX_VOLUME_KEYS_PER_ROOT) {
+            assert!(
+                record_volume_key(&resource_db, &cache_root, &format!("{device}:aa"), VOLUME)
+                    .unwrap()
+            );
+            assert!(
+                record_volume_key(&resource_db, &cache_root, &format!("{device}:bb"), other)
+                    .unwrap()
+            );
+        }
+        let count = |uuid| volume_keys(&resource_db, &cache_root, uuid).unwrap().len();
+        let all = (2 * MAX_VOLUME_KEYS_PER_ROOT) as usize;
+        assert_eq!((count(VOLUME), count(other)), (all, all), "protected");
+
+        record_fresh_store_identity(
+            &resource_db,
+            &cache_root,
+            ROOT,
+            REPOSITORY,
+            b"payload",
+            b"fresh",
+        )
+        .unwrap();
+        complete_verified(
+            &resource_db,
+            &cache_root,
+            ROOT,
+            REPOSITORY,
+            b"payload",
+            b"fresh",
+        )
+        .unwrap();
+        assert_eq!(
+            (count(VOLUME), count(other)),
+            (all, MAX_VOLUME_KEYS_PER_ROOT as usize),
+            "the binding still protects its own volume's keys"
+        );
+        forget_debt_volume(&resource_db, &cache_root, REPOSITORY, b"payload").unwrap();
+        assert_eq!(count(VOLUME), MAX_VOLUME_KEYS_PER_ROOT as usize);
+    }
+
+    /// A root and volume at the protected-key cap refuse new keys only while
+    /// the debt is pending; once it completes they record keys again.
+    #[test]
+    fn a_root_at_the_key_cap_records_keys_again_once_its_debt_completes() {
+        let (_directory, resource_db, cache_root) = fixture();
+        publish(&resource_db, &cache_root, ROOT, REPOSITORY, b"payload").unwrap();
+        assert!(bind(&resource_db, &cache_root, b"payload"));
+        for device in 0..MAX_PROTECTED_VOLUME_KEYS {
+            assert!(
+                record_volume_key(&resource_db, &cache_root, &format!("{device}:aa"), VOLUME)
+                    .unwrap()
+            );
+        }
+        assert!(
+            !record_volume_key(&resource_db, &cache_root, "99999:aa", VOLUME).unwrap(),
+            "refused while the debt still needs every key"
+        );
+        complete_and_forget(&resource_db, &cache_root, b"payload");
+        assert!(record_volume_key(&resource_db, &cache_root, "99999:aa", VOLUME).unwrap());
+        let keys = volume_keys(&resource_db, &cache_root, VOLUME).unwrap();
+        assert_eq!(keys.len(), MAX_VOLUME_KEYS_PER_ROOT as usize);
+        assert!(keys.contains(&"99999:aa".to_owned()));
+        // A later debt on the same root protects again from its first key.
+        publish(&resource_db, &cache_root, ROOT, REPOSITORY, b"later").unwrap();
+        for device in 100_000..100_020 {
+            assert!(
+                record_volume_key(&resource_db, &cache_root, &format!("{device}:aa"), VOLUME)
+                    .unwrap()
+            );
+        }
+        assert_eq!(
+            volume_keys(&resource_db, &cache_root, VOLUME)
+                .unwrap()
+                .len(),
+            MAX_VOLUME_KEYS_PER_ROOT as usize + 20
+        );
+    }
+
+    /// An eviction is counted only once its transaction commits: a binding
+    /// refused at the cap rolls its evictions back and counts none.
+    #[test]
+    fn binding_evictions_are_counted_only_when_committed() {
+        let (_directory, resource_db, cache_root) = fixture();
+        publish(&resource_db, &cache_root, ROOT, REPOSITORY, b"payload").unwrap();
+        for index in 0..MAX_DEBT_VOLUME_ROWS {
+            assert!(
+                insert_debt_volume_for_test(
+                    &resource_db,
+                    &cache_root,
+                    &format!("{index:064x}"),
+                    b"leaked",
+                    ROOT,
+                    VOLUME
+                )
+                .unwrap()
+            );
+        }
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let installed = crate::phase_telemetry::install(recorder.clone());
+        // Not journaled: refused before any eviction can commit.
+        assert!(!bind(&resource_db, &cache_root, b"other payload"));
+        let refused = recorder.totals().1;
+        assert!(bind(&resource_db, &cache_root, b"payload"));
+        drop(installed);
+        assert!(
+            !refused.contains_key("preparation_rotation_debt_volume_binding_evicted"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            recorder
+                .totals()
+                .1
+                .get("preparation_rotation_debt_volume_binding_evicted"),
+            Some(&1)
+        );
     }
 
     #[test]
