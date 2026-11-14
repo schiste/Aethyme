@@ -181,7 +181,10 @@ impl ActivityGuard {
             && let Some(path) = reporter.path.as_deref()
         {
             // The holder is done; a leftover record would only age out.
-            let _ = std::fs::remove_file(path);
+            crate::warn_unrecorded(
+                "remove the preparation-cache activity record",
+                std::fs::remove_file(path),
+            );
         }
         reporter.summaries
     }
@@ -477,7 +480,10 @@ fn write_record(path: &Path, record: &PreparationCacheActivity) -> std::io::Resu
         std::fs::rename(&temporary, path)
     })();
     if written.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+        crate::warn_unrecorded(
+            "remove a partial preparation-cache activity record",
+            std::fs::remove_file(&temporary),
+        );
     }
     written
 }
