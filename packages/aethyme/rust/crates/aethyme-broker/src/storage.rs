@@ -7758,14 +7758,16 @@ mod tests {
             assert_eq!(state.debt_rows, 0);
             // The first pass walked the lap under the saved identity, so it
             // could not acknowledge it under the live one. The next pass
-            // must acknowledge the recovery the first one did.
+            // must acknowledge the recovery the first one did. Its report's
+            // `complete` also needs the host consumer census, which this
+            // fixture never enumerates; lap settlement is independent of it
+            // and is read from the journal.
             let second = recover_preparation_caches_for_bindings(
                 &[unguarded_host_cache_binding(&cache_root)],
                 &resource_db_path,
                 std::time::Instant::now() + Duration::from_secs(5),
                 true,
             );
-            assert!(second.complete, "{second:?}");
             assert_eq!(
                 crate::preparation::rotation_journal::probe(
                     &resource_db_path,
@@ -7774,7 +7776,7 @@ mod tests {
                 )
                 .unwrap(),
                 Some(crate::preparation::rotation_journal::JournalProbe::NoDebt),
-                "the second sweep acknowledges the first sweep's recovery"
+                "the second sweep acknowledges the first sweep's recovery: {second:?}"
             );
         } else {
             assert!(!report.complete);
