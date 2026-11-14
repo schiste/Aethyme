@@ -478,9 +478,9 @@ broker. Other agents may be working in sibling worktrees right now. The
 check the paired runtime with `aethyme --version` and
 `aethyme-engine-cli --version`.
 
-Shared preparation-cache rotation uses a bounded no-follow inventory that
-stops as soon as the bytes seen pass `[shared_cache] max_bytes`; the report
-then marks the inventory incomplete, sets exact `bytes_before` to null and
+Shared preparation-cache rotation uses a bounded no-follow inventory. It stops
+as soon as the bytes seen pass `[shared_cache] max_bytes`; the report then marks
+the inventory incomplete, sets exact `bytes_before` to null and
 rotates the store. An inventory that reaches its time or entry cap with the
 bytes seen still within budget is inconclusive: the store is kept, not rotated,
 and three inconclusive checks in a row raise the
