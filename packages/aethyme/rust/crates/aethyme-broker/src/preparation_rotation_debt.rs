@@ -6661,6 +6661,9 @@ mod root_volume_reproof_tests {
                 &live,
                 &live.encode().unwrap(),
             )
+            .map(|pending| {
+                assert_eq!(pending, None, "these fixtures leave no debt rows pending");
+            })
         }
     }
 
