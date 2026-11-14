@@ -214,14 +214,30 @@ one row. The `cleanup.checkout-capacity` row repeats the top five in its
 evidence.
 
 From three quarters of the limit the background worker also removes closed
-checkouts itself: a 20-second removal slice before its other work and between
-its cache passes, each of which now holds the GC lock for at most 30 seconds.
-A slice removes one checkout at a time, at most four, and after each waits out
-what Git deleted at `[cleanup] unattended_unlinks_per_second` with no lock
-held. A slice that removes nothing waits 10 minutes before pressure alone
+checkouts itself: a removal slice of up to 120 seconds before its other work
+and between its cache passes, each of which holds the GC lock for at most 30
+seconds. When the cache lane is due, capacity slices leave it at least 90
+seconds of every worker run. A slice removes one checkout per pass, at most
+twelve (kept checkouts do not count), and stops after four passes that
+removed nothing. A pass bounds selection by 20 seconds and revalidation
+checks that budget between steps; a revalidation step already running (lease
+and gate checks, the cleanliness walk) and Git's removal of the one checkout
+it started can run past it. After each
+removal the slice waits out what Git deleted at
+`[cleanup] unattended_unlinks_per_second` with no lock held, crediting only
+the time Git itself spent deleting; disk-pressure mode does not lift that
+rate. Before every pass it waits out memory or load pressure, and pressure
+that outlasts the pacer's pause budget stops the slice with nothing more
+removed and no further slice for 10 minutes. Between passes the lock stays
+free at least as long as the last pass held it, and while `broker start` at
+the checkout limit, `gc apply`, `gc abandon` or `gc forget-abandoned` waits
+for it (up to 30 seconds) the worker takes it again neither for a removal
+pass nor for a cache pass. A broker open resuming a confirmed GC journal does
+not wait. A slice ends as soon as a pass selects nothing.
+A slice that removes nothing waits 10 minutes before pressure alone
 starts another once its lap of closed checkouts has ended; one that finds the
-GC lock held, or that moved the lap forward but ran out of time before its
-end, waits 1 minute. A slice first finishes the checkout path index if another
+GC lock held, or yields it, waits 1 minute, and one that moved the
+lap forward but ran out of time before its end waits 20 seconds. A slice first finishes the checkout path index if another
 lane left it mid-lap, so a long index lap no longer leaves selection without
 an inventory. Each slice records its own result under the meta key
 `auto_cleanup.capacity_removal`, shown as `auto_cleanup.capacity_removal` in
@@ -230,7 +246,7 @@ an inventory. Each slice records its own result under the meta key
 Its `outcome` is `removed`, `lock_busy`, `inventory_unavailable`
 (`waiting_on` names what the checkout inventory was waiting on and
 `index_after_session_id` / `index_high_water_session_id` how far its index lap
-got; that progress is kept for the next slice, which retries in a minute when
+got; that progress is kept for the next slice, which retries in 20 seconds when
 it moved and backs off when it did not), `lap_unfinished`,
 `out_of_time_before_selection` (the budget ran out before
 any checkout was judged; `budget_consumed_by` says whether counting checkouts
@@ -240,8 +256,13 @@ minutes while slices keep running out) or
 checkouts per keep code, `blocked_by_ignored` names the ignored directories
 holding the most checkouts with the line that would release each,
 `lap_remaining` and the cursor say how far the lap got, and `scan_ms`,
-`selection_ms`, `apply_ms`, `paced_ms` and `elapsed_ms` say where the time
-went. Broker opens too short to count checkouts read the count
+`selection_ms`, `apply_ms`, `paced_ms`, `lock_held_ms`, `lock_wait_ms`,
+`lock_yield_ms`, `git_removal_ms`, `pressure_wait_ms` and `elapsed_ms` say
+where the time went; `stop_reason` says why the slice stopped (`cap`,
+`budget`, `pacer_backoff`, `slice_deadline`, `yielded_to_foreground`,
+`nothing_selected`, `kept_only_limit`, `lock_busy`, `failed` or
+`removal_failures`) and
+`retry_in_ms` the wait it chose. Broker opens too short to count checkouts read the count
 `broker start` last recorded. Within the removal lane, selection uses at most
 three quarters of the budget, so revalidation and the first removal always
 have time (`auto_cleanup.lanes.removal_selected` and

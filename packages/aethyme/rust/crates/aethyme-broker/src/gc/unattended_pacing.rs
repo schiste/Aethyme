@@ -321,7 +321,27 @@ pub(crate) struct UnattendedPacer {
     memory_paused: Duration,
     load_paused: Duration,
     host_lock_waited: Duration,
+    /// A whole-checkout charge is running: the disk-pressure lift does not
+    /// apply to it, so checkout removal is always paced.
+    bulk_charge_active: bool,
     summary: UnattendedPacingSummary,
+}
+
+/// What [`charge_bulk_unattended_removal`] did for one whole-checkout removal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BulkCharge {
+    /// Entries paid for by sleeping after the removal.
+    pub(crate) charged: u64,
+    /// Entries Git's own removal already paid for at the configured rate:
+    /// the bucket measures from when Git began deleting, so that time is not
+    /// slept a second time. Never more than the entries charged for.
+    pub(crate) credited: u64,
+    /// Memory or load pressure outlasted the pacer's pause budget; the
+    /// charge stopped and the caller must back off.
+    pub(crate) pressure_backoff: bool,
+    /// What the deadline left unpaid at the configured rate; the caller must
+    /// not remove again before this much more time has passed.
+    pub(crate) unpaid: Duration,
 }
 
 impl UnattendedPacer {
@@ -345,6 +365,7 @@ impl UnattendedPacer {
             memory_paused: Duration::ZERO,
             load_paused: Duration::ZERO,
             host_lock_waited: Duration::ZERO,
+            bulk_charge_active: false,
             summary: UnattendedPacingSummary {
                 unlinks_per_second_limit: rate.limit(),
                 ..UnattendedPacingSummary::default()
@@ -353,10 +374,77 @@ impl UnattendedPacer {
     }
 
     fn effective_limit(&self) -> Option<u32> {
-        if self.disk_pressure {
+        if self.disk_pressure && !self.bulk_charge_active {
             None
         } else {
             self.rate.limit()
+        }
+    }
+
+    /// Pause while memory or load pressure lasts; `false` when it outlasted
+    /// the pause budget or the deadline.
+    fn pressure_clear(&mut self, deadline: Option<Instant>) -> bool {
+        if self.wait_out_pressure(deadline) {
+            true
+        } else {
+            self.summary.pressure_yields = self.summary.pressure_yields.saturating_add(1);
+            false
+        }
+    }
+
+    /// Pay for `entries` Git deleted in one removal that took
+    /// `removal_spent`. That duration is credited at the configured rate (so
+    /// the average over removal plus wait never exceeds it) and the rest is
+    /// slept off batch by batch, never at a disk-pressure-lifted rate.
+    /// Pressure is sampled first, so a removal under memory or load pressure
+    /// always waits it out (or stops the charge) even when the credit covers
+    /// every entry. A deadline that cuts the sleep short reports what is
+    /// still owed.
+    fn charge_bulk(
+        &mut self,
+        entries: u64,
+        removal_spent: Duration,
+        deadline: Option<Instant>,
+    ) -> BulkCharge {
+        if entries == 0 {
+            return BulkCharge::default();
+        }
+        if !self.pressure_clear(deadline) {
+            return BulkCharge {
+                pressure_backoff: true,
+                ..BulkCharge::default()
+            };
+        }
+        self.bulk_charge_active = true;
+        let limit = self.effective_limit();
+        let credited = limit.map_or(entries, |limit| {
+            let paid = removal_spent.as_millis().saturating_mul(u128::from(limit)) / 1_000;
+            u64::try_from(paid).unwrap_or(u64::MAX).min(entries)
+        });
+        let to_charge = entries - credited;
+        self.summary.entries_removed = self.summary.entries_removed.saturating_add(credited);
+        let mut charged = 0;
+        let mut pressure_backoff = false;
+        while charged < to_charge && deadline.is_none_or(|deadline| self.clock.now() < deadline) {
+            if !self.before_unlink(deadline) {
+                pressure_backoff = deadline.is_none_or(|deadline| self.clock.now() < deadline);
+                break;
+            }
+            self.after_unlink(0);
+            charged += 1;
+        }
+        self.bulk_charge_active = false;
+        let unpaid = match limit {
+            Some(limit) if !pressure_backoff && charged < to_charge => Duration::from_millis(
+                (to_charge - charged).saturating_mul(1_000) / u64::from(limit.max(1)),
+            ),
+            _ => Duration::ZERO,
+        };
+        BulkCharge {
+            charged,
+            credited,
+            pressure_backoff,
+            unpaid,
         }
     }
 
@@ -515,23 +603,29 @@ pub(crate) fn after_unattended_unlink(logical_bytes: u64) {
 }
 
 /// Charge `entries` unlinks made in one burst outside tree removal (Git
-/// removing a whole checkout) to the installed pacer: it sleeps off their
-/// share of the bucket and waits out memory or load pressure as it would for
-/// its own unlinks, never past `deadline`. Returns how many it charged. Call
-/// it with no lock held: the sleep is the throttle. Without a pacer (every
-/// foreground caller) it charges nothing and returns at once.
-pub(crate) fn charge_bulk_unattended_removal(entries: u64, deadline: Option<Instant>) -> u64 {
-    with_active(0, |pacer| {
-        let mut charged = 0;
-        while charged < entries
-            && deadline.is_none_or(|deadline| pacer.clock.now() < deadline)
-            && pacer.before_unlink(deadline)
-        {
-            pacer.after_unlink(0);
-            charged += 1;
-        }
-        charged
+/// removing a whole checkout, which took `removal_spent`) to the installed
+/// pacer: it credits Git's own removal time at the configured rate, sleeps
+/// off the rest of their share of the bucket (never lifted for disk
+/// pressure) and waits out memory or load pressure as it would for its own
+/// unlinks, never past `deadline`. Call it with no lock held: the sleep is
+/// the throttle. Without a pacer (every foreground caller) it charges
+/// nothing and returns at once.
+pub(crate) fn charge_bulk_unattended_removal(
+    entries: u64,
+    removal_spent: Duration,
+    deadline: Option<Instant>,
+) -> BulkCharge {
+    with_active(BulkCharge::default(), |pacer| {
+        pacer.charge_bulk(entries, removal_spent, deadline)
     })
+}
+
+/// Before an unattended removal starts: wait out memory or load pressure on
+/// the installed pacer, never past `deadline`. `false` means the pressure
+/// outlasted the pause budget or the deadline and the removal must not
+/// start. Without a pacer (every foreground caller) it is always `true`.
+pub(crate) fn unattended_pressure_clear(deadline: Option<Instant>) -> bool {
+    with_active(true, |pacer| pacer.pressure_clear(deadline))
 }
 
 /// Disk-pressure mode lifts the rate limit (freeing space is then the
@@ -672,7 +766,11 @@ mod tests {
     /// foreground callers, with no pacer, are never slowed.
     #[test]
     fn a_bulk_removal_is_charged_to_the_installed_pacer_only() {
-        assert_eq!(charge_bulk_unattended_removal(10_000, None), 0);
+        assert_eq!(
+            charge_bulk_unattended_removal(10_000, Duration::ZERO, None),
+            BulkCharge::default()
+        );
+        assert!(unattended_pressure_clear(None));
         let clock = FakeClock::new();
         let _scope = install(UnattendedPacer::new(
             UnlinkRate::Limited(1_000),
@@ -680,14 +778,101 @@ mod tests {
             calm(),
         ));
         let entries = u64::from(PACING_BATCH_ENTRIES) * 8 + 1;
-        assert_eq!(charge_bulk_unattended_removal(entries, None), entries);
+        let charge = charge_bulk_unattended_removal(entries, Duration::ZERO, None);
+        assert_eq!(charge.charged, entries);
+        assert!(!charge.pressure_backoff);
+        assert_eq!(charge.unpaid, Duration::ZERO);
         assert_eq!(clock.slept.get(), Duration::from_millis(2_048));
         let summary = current_summary(0).expect("the pacer is installed");
         assert_eq!(summary.entries_removed, entries);
-        // A deadline bounds the throttle.
+        // A deadline bounds the throttle and reports what it left unpaid.
         let deadline = clock.now() + Duration::from_millis(300);
-        assert!(charge_bulk_unattended_removal(entries, Some(deadline)) < entries);
+        let cut = charge_bulk_unattended_removal(entries, Duration::ZERO, Some(deadline));
+        assert!(cut.charged < entries && !cut.pressure_backoff);
+        assert!(cut.unpaid >= Duration::from_millis(1_500), "{cut:?}");
         assert_eq!(clock.now(), deadline);
+    }
+
+    /// Git's own removal time paid for part of a checkout at the configured
+    /// rate; only the rest is slept, and the credit never exceeds the charge.
+    #[test]
+    fn a_bulk_charge_credits_only_the_removals_own_duration() {
+        let clock = FakeClock::new();
+        let mut pacer =
+            UnattendedPacer::new(UnlinkRate::Limited(1_000), Box::new(clock.clone()), calm());
+        // 20,480 entries at 1,000/s is 20.48 s; Git took 8.192 s of it.
+        let entries = u64::from(PACING_BATCH_ENTRIES) * 80;
+        let charge = pacer.charge_bulk(entries, Duration::from_millis(8_192), None);
+        assert_eq!(charge.credited, 8_192);
+        assert_eq!(charge.charged, entries - 8_192);
+        // 12,288 charged entries are 48 batches of 256 ms; as for tree
+        // removal, a batch is paid when the next one starts, so the 48th is
+        // paid by the next unlink.
+        assert_eq!(clock.slept.get(), Duration::from_millis(47 * 256));
+        assert_eq!(pacer.summary(0).entries_removed, entries);
+        let before = clock.slept.get();
+        let charge = pacer.charge_bulk(1_000, Duration::from_secs(60), None);
+        assert_eq!((charge.credited, charge.charged), (1_000, 0));
+        assert_eq!(clock.slept.get(), before);
+    }
+
+    /// Disk-pressure mode lifts the rate for tree removal, never for a
+    /// whole-checkout charge: capacity removal is always paced.
+    #[test]
+    fn a_bulk_charge_ignores_the_disk_pressure_lift() {
+        let clock = FakeClock::new();
+        let mut pacer =
+            UnattendedPacer::new(UnlinkRate::Limited(1_000), Box::new(clock.clone()), calm());
+        pacer.disk_pressure = true;
+        let entries = u64::from(PACING_BATCH_ENTRIES) * 4 + 1;
+        let charge = pacer.charge_bulk(entries, Duration::ZERO, None);
+        assert_eq!((charge.credited, charge.charged), (0, entries));
+        assert_eq!(clock.slept.get(), Duration::from_millis(1_024));
+        assert_eq!(
+            pacer.effective_limit(),
+            None,
+            "the lift still applies elsewhere"
+        );
+    }
+
+    /// Pressure is read before the credit is applied, so a removal fully
+    /// paid for by its own duration still waits out memory pressure, and a
+    /// pressure that outlasts the pause budget asks the caller to back off.
+    /// The pre-removal gate reads the same signal.
+    #[test]
+    fn a_bulk_charge_and_the_pre_removal_gate_back_off_under_pressure() {
+        let clock = FakeClock::new();
+        let mut pacer = UnattendedPacer::new(
+            UnlinkRate::Limited(1_000),
+            Box::new(clock.clone()),
+            Box::new(Scripted {
+                samples: vec![memory(true), memory(true), memory(false)],
+                reads: Rc::new(Cell::new(0)),
+            }),
+        );
+        let charge = pacer.charge_bulk(1_000, Duration::from_secs(5), None);
+        assert_eq!((charge.credited, charge.charged), (1_000, 0));
+        assert!(!charge.pressure_backoff);
+        assert_eq!(clock.slept.get(), PRESSURE_POLL * 2);
+
+        let clock = FakeClock::new();
+        let _scope = install(UnattendedPacer::new(
+            UnlinkRate::Limited(1_000),
+            Box::new(clock.clone()),
+            Box::new(Scripted {
+                samples: vec![memory(true)],
+                reads: Rc::new(Cell::new(0)),
+            }),
+        ));
+        assert!(
+            !unattended_pressure_clear(None),
+            "pressure outlasts the budget"
+        );
+        assert_eq!(clock.slept.get(), MAX_PRESSURE_PAUSE_PER_RUN);
+        let charge = charge_bulk_unattended_removal(1_000, Duration::from_secs(5), None);
+        assert!(charge.pressure_backoff);
+        assert_eq!((charge.credited, charge.charged), (0, 0));
+        assert_eq!(current_summary(0).unwrap().pressure_yields, 2);
     }
 
     #[test]

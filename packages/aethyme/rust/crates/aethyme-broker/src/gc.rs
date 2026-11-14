@@ -285,8 +285,30 @@ const ARTIFACT_WORKER_CACHE_PASS_SLICE: Duration = Duration::from_secs(30);
 /// the checkout limit, so the waiter can take the lock.
 const ARTIFACT_WORKER_GC_LOCK_YIELD: Duration = Duration::from_millis(500);
 /// Under checkout capacity pressure the worker gives closed-checkout removal
-/// a slice of this length before its cache work and between cache passes.
-const ARTIFACT_WORKER_CAPACITY_REMOVAL_SLICE: Duration = Duration::from_secs(20);
+/// a slice of up to this length, pacer waits included, before its cache work
+/// and between cache passes, within the run's capacity allowance. A slice
+/// ends as soon as a pass selects nothing, so only a slice that keeps
+/// removing uses it all. It was 20 seconds, which one removal's pacer wait
+/// (about 22 s for a 22,000-entry checkout) used up, so every slice removed
+/// exactly one checkout.
+const ARTIFACT_WORKER_CAPACITY_REMOVAL_SLICE: Duration = Duration::from_secs(120);
+/// The budget of one removal pass inside a slice. Selection honors it and
+/// revalidation checks it between its steps (a checkout that cannot be
+/// revalidated in time is deferred). Not bounded by it: a revalidation step
+/// already running (lease and gate checks, the cleanliness walk) and Git's
+/// removal of the one checkout the pass started. Between passes the lock is
+/// free.
+const ARTIFACT_WORKER_CAPACITY_REMOVAL_PASS_BUDGET: Duration = Duration::from_secs(20);
+/// Passes that remove nothing (the selected checkout was kept or deferred
+/// at the last step) one slice may run before it stops.
+const ARTIFACT_WORKER_CAPACITY_KEPT_ONLY_PASSES: usize = 4;
+/// After a slice the pacer stopped because memory or load pressure outlasted
+/// its pause budget: no capacity slice for the rest of this worker run or
+/// the next ten minutes.
+const ARTIFACT_WORKER_CAPACITY_REMOVAL_PRESSURE_RETRY_MS: i64 = 10 * 60_000;
+/// When the cache lane is due, capacity slices leave it at least this much
+/// of every worker run: three 30-second cache passes.
+const ARTIFACT_WORKER_CACHE_LANE_MIN: Duration = Duration::from_secs(90);
 /// A removal slice shorter than this would only select; skip it.
 const ARTIFACT_WORKER_CAPACITY_REMOVAL_MIN_SLICE: Duration = Duration::from_secs(5);
 /// After a removal slice that removed nothing, capacity pressure alone does
@@ -298,11 +320,16 @@ const ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS: i64 = 60_000;
 /// cursor moved) but ran out of time before the lap ended: the rest of the
 /// lap has not been judged, so it is not "nothing removable" yet.
 const ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_RETRY_MS: i64 = 60_000;
+/// After a slice that removed nothing but moved the lap forward without
+/// ending it. The next cache-pass slice of the same worker run (about 30 s
+/// later) continues the lap instead of skipping it for a minute.
+const ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_PROGRESS_RETRY_MS: i64 = 20_000;
 
 /// How long capacity pressure alone waits before the next removal slice:
-/// none after a removal, briefly after a held lock or a lap that progressed
-/// but did not end, and the full back-off only once a lap ended (or could
-/// not progress) with nothing removable.
+/// none after a removal, briefly after a held lock (or a yield to a
+/// foreground waiter) or a lap that progressed but did not end, and the full
+/// back-off only once a lap ended (or could not progress) with nothing
+/// removable.
 fn capacity_removal_retry_ms(
     removed: usize,
     lock_busy: bool,
@@ -320,9 +347,185 @@ fn capacity_removal_retry_ms(
         // be unremovable.
         Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_RETRY_MS)
     } else if lap_unfinished && progressed {
-        Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_RETRY_MS)
+        Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_PROGRESS_RETRY_MS)
     } else {
         Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS)
+    }
+}
+
+/// Why a capacity removal slice stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapacitySliceStop {
+    /// It made its allowance of removals.
+    Cap,
+    /// Too little of its budget was left for another pass.
+    Budget,
+    /// Memory or load pressure outlasted the pacer's pause budget, before a
+    /// pass or while paying for a removal.
+    PacerBackoff,
+    /// The slice's deadline cut a pacer wait short; the rest is owed before
+    /// the next slice.
+    SliceDeadline,
+    /// A foreground command was waiting for the GC lock.
+    YieldedToForeground,
+    /// A pass selected nothing to remove.
+    NothingSelected,
+    /// Its allowance of passes that removed nothing ran out.
+    KeptOnlyLimit,
+    /// Another process held the GC lock.
+    LockBusy,
+    /// A pass or its bookkeeping failed.
+    Failed,
+    /// Git failed to remove checkouts `ARTIFACT_WORKER_CAPACITY_REMOVAL_FAILURES`
+    /// times in this slice.
+    RemovalFailures,
+}
+
+impl CapacitySliceStop {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 10] = [
+        Self::Cap,
+        Self::Budget,
+        Self::PacerBackoff,
+        Self::SliceDeadline,
+        Self::YieldedToForeground,
+        Self::NothingSelected,
+        Self::KeptOnlyLimit,
+        Self::LockBusy,
+        Self::Failed,
+        Self::RemovalFailures,
+    ];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Cap => "cap",
+            Self::Budget => "budget",
+            Self::PacerBackoff => "pacer_backoff",
+            Self::SliceDeadline => "slice_deadline",
+            Self::YieldedToForeground => "yielded_to_foreground",
+            Self::NothingSelected => "nothing_selected",
+            Self::KeptOnlyLimit => "kept_only_limit",
+            Self::LockBusy => "lock_busy",
+            Self::Failed => "failed",
+            Self::RemovalFailures => "removal_failures",
+        }
+    }
+
+    fn telemetry_phase(self) -> &'static str {
+        match self {
+            Self::Cap => "artifact_worker_capacity_removal_stop_cap",
+            Self::Budget => "artifact_worker_capacity_removal_stop_budget",
+            Self::PacerBackoff => "artifact_worker_capacity_removal_stop_pacer_backoff",
+            Self::SliceDeadline => "artifact_worker_capacity_removal_stop_slice_deadline",
+            Self::YieldedToForeground => {
+                "artifact_worker_capacity_removal_stop_yielded_to_foreground"
+            }
+            Self::NothingSelected => "artifact_worker_capacity_removal_stop_nothing_selected",
+            Self::KeptOnlyLimit => "artifact_worker_capacity_removal_stop_kept_only_limit",
+            Self::LockBusy => "artifact_worker_capacity_removal_stop_lock_busy",
+            Self::Failed => "artifact_worker_capacity_removal_stop_failed",
+            Self::RemovalFailures => "artifact_worker_capacity_removal_stop_removal_failures",
+        }
+    }
+}
+
+/// The retry a slice's stop forces on top of the lap-based one: pressure
+/// that outlasted the pacer backs off ten minutes, repeated Git removal
+/// failures ten minutes and a failure one minute, whatever was removed; a
+/// slice that removed nothing but kept checkouts at the last step waits at
+/// least a minute; a pacer wait the slice deadline cut short is paid before
+/// the next slice.
+fn capacity_stop_retry_ms(
+    stop: CapacitySliceStop,
+    lap_retry_ms: Option<i64>,
+    removed: usize,
+    kept_only_passes: usize,
+    unpaid: Duration,
+) -> Option<i64> {
+    let at_least = |retry: Option<i64>, floor: i64| Some(retry.unwrap_or(0).max(floor));
+    let retry = match stop {
+        CapacitySliceStop::PacerBackoff => {
+            return Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_PRESSURE_RETRY_MS);
+        }
+        CapacitySliceStop::RemovalFailures => {
+            return Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS);
+        }
+        CapacitySliceStop::Failed => at_least(
+            lap_retry_ms,
+            ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS,
+        ),
+        CapacitySliceStop::SliceDeadline => at_least(
+            lap_retry_ms,
+            i64::try_from(unpaid.as_millis()).unwrap_or(i64::MAX).max(1),
+        ),
+        _ => lap_retry_ms,
+    };
+    if removed == 0 && kept_only_passes > 0 {
+        at_least(retry, ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_RETRY_MS)
+    } else {
+        retry
+    }
+}
+
+/// Git removal failures one slice tolerates before it stops.
+const ARTIFACT_WORKER_CAPACITY_REMOVAL_FAILURES: usize = 2;
+
+/// How long the GC lock stays free after a pass that held it for `held`:
+/// at least as long (so a slice holds it at most half the time) and at
+/// least long enough for a waiting command's poll.
+fn capacity_lock_gap(held: Duration) -> Duration {
+    held.max(ARTIFACT_WORKER_GC_LOCK_YIELD)
+}
+
+/// The capacity removal time one worker run may spend across its slices:
+/// with the cache lane due (its duration given), all but
+/// `ARTIFACT_WORKER_CACHE_LANE_MIN` of that lane; otherwise the whole run.
+fn capacity_allowance_per_run(cache_lane: Option<Duration>) -> Duration {
+    cache_lane.map_or(ARTIFACT_SWEEP_WORKER_MAX_DURATION, |lane| {
+        lane.saturating_sub(ARTIFACT_WORKER_CACHE_LANE_MIN)
+    })
+}
+
+/// Limits of one capacity removal slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapacitySliceLimits {
+    /// Removals one slice makes at most. Only removals count: a checkout
+    /// judged and kept costs none of it.
+    pub(crate) removals: usize,
+    /// Passes that removed nothing one slice may run.
+    pub(crate) kept_only_passes: usize,
+    /// Wall time of the slice, pacer waits included.
+    pub(crate) budget: Duration,
+    /// Selection and revalidation budget of one removal pass.
+    pub(crate) pass_budget: Duration,
+    /// The cache lane time this worker run keeps from capacity slices,
+    /// reported in the slice record.
+    pub(crate) cache_lane_reserved: Duration,
+}
+
+impl CapacitySliceLimits {
+    pub(crate) const WORKER: Self = Self {
+        removals: ARTIFACT_WORKER_CAPACITY_REMOVALS_PER_SLICE,
+        kept_only_passes: ARTIFACT_WORKER_CAPACITY_KEPT_ONLY_PASSES,
+        budget: ARTIFACT_WORKER_CAPACITY_REMOVAL_SLICE,
+        pass_budget: ARTIFACT_WORKER_CAPACITY_REMOVAL_PASS_BUDGET,
+        cache_lane_reserved: Duration::ZERO,
+    };
+}
+
+/// Whether a capacity slice that has removal allowance left stops before
+/// its next pass, given the budget left and whether a foreground command
+/// waits for the GC lock (read only when the slice would otherwise go on).
+fn capacity_slice_stop_before_pass(
+    remaining: Duration,
+    foreground_waiting: impl FnOnce() -> bool,
+) -> Option<CapacitySliceStop> {
+    if remaining < ARTIFACT_WORKER_CAPACITY_REMOVAL_MIN_SLICE {
+        Some(CapacitySliceStop::Budget)
+    } else if foreground_waiting() {
+        Some(CapacitySliceStop::YieldedToForeground)
+    } else {
+        None
     }
 }
 /// Whether a capacity slice reached selection: it ran a removal pass, or it
@@ -357,8 +560,10 @@ fn out_of_time_retry_ms(streak: u32) -> i64 {
         .min(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS)
 }
 
-/// Removals one slice makes at most, each followed by its pacer charge.
-const ARTIFACT_WORKER_CAPACITY_REMOVALS_PER_SLICE: usize = 4;
+/// Removals one slice makes at most, each followed by its pacer charge. The
+/// slice budget bounds it first (about four 22,000-entry checkouts in 120 s
+/// at the default rate); the cap bounds a slice of small checkouts.
+const ARTIFACT_WORKER_CAPACITY_REMOVALS_PER_SLICE: usize = 12;
 const ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_AFTER_KEY: &str =
     "gc.artifact_sweep.capacity_removal_retry_after_ms";
 
@@ -2334,30 +2539,22 @@ impl GcLock {
     pub(crate) fn acquire(main_root: &Path) -> Result<Self, BrokerOpError> {
         let path = main_root.join(".aethyme/gc.lock");
         for _ in 0..2 {
-            match std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    writeln!(file, "{}", std::process::id()).map_err(|source| {
-                        crate::BrokerError::Io {
-                            path: path.clone(),
-                            source,
-                        }
-                    })?;
-                    file.sync_all().map_err(|source| crate::BrokerError::Io {
-                        path: path.clone(),
-                        source,
-                    })?;
-                    return Ok(Self { path });
-                }
+            match create_gc_lock_file(&path) {
+                Ok(()) => return Ok(Self { path }),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     let owner = std::fs::read_to_string(&path).unwrap_or_default();
                     let pid = owner.trim().parse::<i64>().ok();
                     if pid.is_some_and(crate::broker::pid_alive) {
                         return Err(BrokerOpError::GcLocked {
                             pid: owner.trim().to_owned(),
+                        });
+                    }
+                    // A lock file without a PID that was just created belongs
+                    // to a holder still writing it (an older binary creates
+                    // the file before writing the PID): it is held, not stale.
+                    if pid.is_none() && gc_lock_file_is_young(&path) {
+                        return Err(BrokerOpError::GcLocked {
+                            pid: "unknown".into(),
                         });
                     }
                     std::fs::remove_file(&path).map_err(|source| crate::BrokerError::Io {
@@ -2380,17 +2577,222 @@ impl GcLock {
     }
 }
 
+/// A lock file younger than this without a readable PID is being written.
+const GC_LOCK_FILE_WRITE_GRACE: Duration = Duration::from_secs(5);
+
+fn gc_lock_file_is_young(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age < GC_LOCK_FILE_WRITE_GRACE)
+}
+
+/// Create the GC lock file with this process's PID already in it, so no
+/// reader ever sees it empty: the PID is written to a private file that is
+/// then hard-linked into place (failing when the lock exists). Where hard
+/// links are unavailable it falls back to create-then-write.
+fn create_gc_lock_file(path: &Path) -> std::io::Result<()> {
+    let pid = std::process::id();
+    let write_pid = |file: &mut std::fs::File| -> std::io::Result<()> {
+        writeln!(file, "{pid}")?;
+        file.sync_all()
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let temporary = path.with_file_name(format!(".gc.lock.{pid}.{nanos}"));
+    let staged = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .and_then(|mut file| write_pid(&mut file));
+    if staged.is_ok() {
+        let linked = std::fs::hard_link(&temporary, path);
+        // Best effort: the staged name is private to this attempt.
+        std::fs::remove_file(&temporary).ok();
+        match linked {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Err(error),
+            // No hard links here: fall back below.
+            Err(_) => {}
+        }
+    } else {
+        std::fs::remove_file(&temporary).ok();
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)?;
+    write_pid(&mut file)
+}
+
+impl GcLock {
+    /// [`Self::acquire`], waiting up to `wait` while another live process
+    /// holds the lock. While it waits it keeps a [`GcLockWaiterNotice`], so
+    /// the background worker yields instead of taking the lock again.
+    pub(crate) fn acquire_waiting(main_root: &Path, wait: Duration) -> Result<Self, BrokerOpError> {
+        let waiting_since = Instant::now();
+        let mut notice = None;
+        loop {
+            match Self::acquire(main_root) {
+                Err(BrokerOpError::GcLocked { .. }) if waiting_since.elapsed() < wait => {
+                    if notice.is_none() {
+                        notice = GcLockWaiterNotice::announce(main_root);
+                    }
+                    std::thread::sleep(GC_LOCK_WAIT_POLL);
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
 impl Drop for GcLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
 }
 
+/// How often a foreground command waiting for the GC lock tries again.
+const GC_LOCK_WAIT_POLL: Duration = Duration::from_millis(250);
+/// How long a foreground command that needs the GC lock (`broker start` at
+/// the checkout limit, `gc apply`) waits for a holder before it refuses. It
+/// covers one background removal pass; while it waits the worker does not
+/// take the lock again.
+pub(crate) const GC_LOCK_FOREGROUND_WAIT: Duration = Duration::from_secs(30);
+
+/// Directory, under `.aethyme/run`, where a foreground command waiting for
+/// the GC lock keeps one empty file named after its PID for as long as it
+/// waits.
+const GC_LOCK_WAITERS_DIR: &str = "gc-lock-waiters";
+/// A waiter notice older than this is stale: no foreground command waits
+/// for the GC lock longer than 30 seconds, so a file this old was left by a
+/// waiter that was killed, and its PID may since belong to another process.
+const GC_LOCK_WAITER_NOTICE_MAX_AGE: Duration = Duration::from_secs(90);
+
+/// `.aethyme/run/gc-lock-waiters`, created when `create` and missing; `None`
+/// when it is missing, or it or a parent is not a real directory.
+fn gc_lock_waiters_dir(main_root: &Path, create: bool) -> Option<PathBuf> {
+    let directory = real_broker_run_dir(main_root)
+        .ok()?
+        .join(GC_LOCK_WAITERS_DIR);
+    match std::fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.file_type().is_dir() => Some(directory),
+        Ok(_) => None,
+        Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::create_dir(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return None,
+            }
+            std::fs::symlink_metadata(&directory)
+                .ok()
+                .filter(|metadata| metadata.file_type().is_dir())
+                .map(|_| directory)
+        }
+        Err(_) => None,
+    }
+}
+
+/// A foreground command's announcement that it is waiting for the GC lock.
+/// The background worker reads it before each removal pass and yields
+/// instead of taking the lock again. Removed when dropped.
+pub(crate) struct GcLockWaiterNotice {
+    path: PathBuf,
+}
+
+impl GcLockWaiterNotice {
+    /// Best effort: a waiter that cannot write the file still waits, it
+    /// just is not yielded to.
+    pub(crate) fn announce(main_root: &Path) -> Option<Self> {
+        let directory = gc_lock_waiters_dir(main_root, true)?;
+        let path = directory.join(std::process::id().to_string());
+        // A file this PID left in an earlier life is replaced, never written
+        // through: `create_new` refuses a symlink planted at the name.
+        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file()) {
+            std::fs::remove_file(&path).ok()?;
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .ok()?;
+        Some(Self { path })
+    }
+}
+
+impl Drop for GcLockWaiterNotice {
+    fn drop(&mut self) {
+        // Best effort: a file left behind expires after
+        // `GC_LOCK_WAITER_NOTICE_MAX_AGE` and is then cleared by the worker.
+        std::fs::remove_file(&self.path).ok();
+    }
+}
+
+/// Wait, up to `limit`, while a foreground command waits for the GC lock, so
+/// it can take the lock before the worker's next pass. Returns the time
+/// waited.
+fn wait_out_foreground_gc_lock_waiter(main_root: &Path, limit: Duration) -> Duration {
+    let started = Instant::now();
+    let mut yielded = false;
+    while started.elapsed() < limit && foreground_gc_lock_waiter(main_root).is_some() {
+        yielded = true;
+        std::thread::sleep(GC_LOCK_WAIT_POLL.min(limit.saturating_sub(started.elapsed())));
+    }
+    if !yielded {
+        return Duration::ZERO;
+    }
+    let waited = started.elapsed();
+    crate::phase_telemetry::add("artifact_worker_cache_yielded_to_foreground", waited);
+    waited
+}
+
+/// The PID of a live process, other than this one, waiting for the GC lock.
+/// Only an empty regular file named after a PID counts; one whose process is
+/// gone, or older than `GC_LOCK_WAITER_NOTICE_MAX_AGE`, is a stale notice
+/// and is removed. Anything else in the directory is left alone.
+pub(crate) fn foreground_gc_lock_waiter(main_root: &Path) -> Option<i64> {
+    let directory = gc_lock_waiters_dir(main_root, false)?;
+    let own = i64::from(std::process::id());
+    let mut live = None;
+    for entry in std::fs::read_dir(&directory).ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i64>().ok())
+            .filter(|pid| *pid > 0)
+        else {
+            continue;
+        };
+        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() || metadata.len() != 0 || pid == own {
+            continue;
+        }
+        let fresh = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age <= GC_LOCK_WAITER_NOTICE_MAX_AGE);
+        if fresh && crate::broker::pid_alive(pid) {
+            live.get_or_insert(pid);
+        } else {
+            // A stale notice: its waiter died or was killed mid-wait.
+            std::fs::remove_file(entry.path()).ok();
+        }
+    }
+    live
+}
+
 const ARTIFACT_SWEEP_WORKER_LOCK_RELPATH: &str = ".aethyme/run/gc-artifact-worker.lock";
 
 /// Create the dedicated broker runtime directory and prove it remains inside
 /// the repository before opening the worker's advisory singleton lock.
-fn artifact_sweep_worker_lock_path(main_root: &Path) -> Result<PathBuf, BrokerOpError> {
+/// This repository's `.aethyme/run`, created when missing, refused when it
+/// or `.aethyme` is not a real directory or resolves outside the repository.
+fn real_broker_run_dir(main_root: &Path) -> Result<PathBuf, BrokerOpError> {
     let root = std::fs::canonicalize(main_root).map_err(|source| crate::BrokerError::Io {
         path: main_root.to_path_buf(),
         source,
@@ -2460,7 +2862,11 @@ fn artifact_sweep_worker_lock_path(main_root: &Path) -> Result<PathBuf, BrokerOp
             "broker runtime path resolves outside the repository",
         ));
     }
+    Ok(canonical_run)
+}
 
+fn artifact_sweep_worker_lock_path(main_root: &Path) -> Result<PathBuf, BrokerOpError> {
+    let canonical_run = real_broker_run_dir(main_root)?;
     let lock_path = canonical_run.join("gc-artifact-worker.lock");
     match std::fs::symlink_metadata(&lock_path) {
         Ok(metadata) if metadata.file_type().is_file() => {
@@ -4636,7 +5042,7 @@ impl Broker {
         }
 
         let main_root = self.main_root().to_path_buf();
-        let _lock = GcLock::acquire(&main_root)?;
+        let _lock = GcLock::acquire_waiting(&main_root, GC_LOCK_FOREGROUND_WAIT)?;
         let state_directory = main_root.join(".aethyme");
         let directory_identity = gc_state_directory_identity(&state_directory)?;
         let journal_path = state_directory.join("gc-journal.json");
@@ -4728,7 +5134,7 @@ impl Broker {
         }
 
         let main_root = self.main_root().to_path_buf();
-        let _lock = GcLock::acquire(&main_root)?;
+        let _lock = GcLock::acquire_waiting(&main_root, GC_LOCK_FOREGROUND_WAIT)?;
         let state_directory = main_root.join(".aethyme");
         let state_identity = gc_state_directory_identity(&state_directory)?;
         let Some((archive_directory, archive_directory_identity)) =
@@ -5857,12 +6263,15 @@ impl Broker {
         exclude_orphans: bool,
     ) -> Result<GcApplyReport, BrokerOpError> {
         let planning_deadline = (!full_scan).then(|| Instant::now() + MANUAL_GC_PLAN_BUDGET);
+        // The operator's `gc apply` waits for a holder; every other apply
+        // (a broker open resuming a confirmed journal) fails fast.
         self.gc_apply_with_scope(
             confirm,
             None,
             include_active_gate_cache,
             planning_deadline,
             exclude_orphans,
+            GC_LOCK_FOREGROUND_WAIT,
         )
     }
 
@@ -7469,10 +7878,35 @@ impl Broker {
         };
         let worker_started = Instant::now();
         // Removal is what frees a checkout slot: under capacity pressure it
-        // goes first, before retirement and cache work.
+        // goes first, before retirement and cache work. Across the run's
+        // slices it may use all of the cache lane but
+        // `ARTIFACT_WORKER_CACHE_LANE_MIN`, so the cache lane always keeps
+        // that much of the run.
+        let cache_lane_reserved = if artifact_due {
+            ARTIFACT_WORKER_CACHE_LANE_MIN
+        } else {
+            Duration::ZERO
+        };
+        let capacity_allowance = capacity_allowance_per_run(artifact_due.then(|| {
+            artifact_worker_cache_lane_duration(
+                checkout_cleanup_due,
+                compact_due,
+                session_retirement_due,
+            )
+        }));
+        let capacity_spent = std::cell::Cell::new(Duration::ZERO);
+        let capacity_limits = || CapacitySliceLimits {
+            budget: ARTIFACT_WORKER_CAPACITY_REMOVAL_SLICE
+                .min(capacity_allowance.saturating_sub(capacity_spent.get())),
+            cache_lane_reserved,
+            ..CapacitySliceLimits::WORKER
+        };
+        let capacity_slice_started = Instant::now();
         if capacity_removal_due {
-            self.run_capacity_removal_slice_isolated(worker_started)?;
+            self.run_capacity_removal_slice_isolated(worker_started, capacity_limits())?;
         }
+        let capacity_slice_used = capacity_slice_started.elapsed();
+        capacity_spent.set(capacity_slice_used);
         if let Some(request_generation) = session_retirement_generation {
             let remaining =
                 ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
@@ -7501,7 +7935,8 @@ impl Broker {
                     checkout_cleanup_due,
                     compact_due,
                     session_retirement_due,
-                );
+                )
+                .saturating_sub(capacity_slice_used);
                 let mut cache_passes = 0usize;
                 self.run_artifact_sweep_recovery_worker_loop(
                     &policy,
@@ -7516,12 +7951,28 @@ impl Broker {
                             // removal take its slice before more cache work.
                             let started = Instant::now();
                             std::thread::sleep(ARTIFACT_WORKER_GC_LOCK_YIELD);
-                            broker.run_capacity_removal_slice_isolated(worker_started)?;
+                            broker.run_capacity_removal_slice_isolated(
+                                worker_started,
+                                capacity_limits(),
+                            )?;
                             let used = started.elapsed();
+                            capacity_spent.set(capacity_spent.get().saturating_add(used));
                             remaining = remaining.map(|remaining| remaining.saturating_sub(used));
                             if remaining.is_some_and(|remaining| remaining.is_zero()) {
                                 return Ok((ArtifactSweepOutcome::no_work(false, None), 0));
                             }
+                        }
+                        // A cache pass takes the GC lock too: let a waiting
+                        // foreground command have it first.
+                        let waited = wait_out_foreground_gc_lock_waiter(
+                            broker.main_root(),
+                            remaining
+                                .unwrap_or(GC_LOCK_FOREGROUND_WAIT)
+                                .min(GC_LOCK_FOREGROUND_WAIT),
+                        );
+                        remaining = remaining.map(|remaining| remaining.saturating_sub(waited));
+                        if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                            return Ok((ArtifactSweepOutcome::no_work(false, None), 0));
                         }
                         cache_passes += 1;
                         crate::phase_telemetry::add("artifact_worker_cache_passes", Duration::ZERO);
@@ -7651,14 +8102,15 @@ impl Broker {
         Ok(retry_after.is_none_or(|retry_after| retry_after <= now))
     }
 
-    /// [`Self::run_capacity_removal_slice`] for the worker: a failure other
-    /// than the database's is recorded in the worker status and never stops
-    /// the run's other lanes.
+    /// [`Self::run_capacity_removal_slice_with`] for the worker: a failure
+    /// other than the database's is recorded in the worker status and never
+    /// stops the run's other lanes.
     fn run_capacity_removal_slice_isolated(
         &mut self,
         worker_started: Instant,
+        limits: CapacitySliceLimits,
     ) -> Result<(), BrokerOpError> {
-        match self.run_capacity_removal_slice(worker_started) {
+        match self.run_capacity_removal_slice_with(worker_started, limits) {
             Ok(_) => Ok(()),
             Err(error) if matches!(error, BrokerOpError::Store(_)) => Err(error),
             Err(error) => {
@@ -7676,14 +8128,33 @@ impl Broker {
     /// One bounded closed-checkout removal slice of the detached worker,
     /// when registered checkouts are at three quarters of the limit. The
     /// worker already runs at background priority and holds the host's
-    /// single-deleter slot. It removes one checkout at a time, at most
-    /// `ARTIFACT_WORKER_CAPACITY_REMOVALS_PER_SLICE`, and after each one
-    /// waits out what Git deleted on the unattended pacer with no GC lock or
-    /// lifecycle claim held, so removals never run back to back. Returns the
-    /// slice's combined report, `None` when no removal pass ran.
+    /// single-deleter slot. Before each pass it yields to a foreground
+    /// command waiting for the GC lock and waits out memory or load pressure
+    /// on the unattended pacer (stopping the slice when the pressure
+    /// outlasts the pacer's pause budget). Each pass removes at most one
+    /// checkout; selection, and revalidation between its steps, honor
+    /// `ARTIFACT_WORKER_CAPACITY_REMOVAL_PASS_BUDGET`, while a revalidation
+    /// step already running (lease and gate checks, the cleanliness walk)
+    /// and Git's removal of the one checkout a pass started run to the end.
+    /// After each removal the slice waits out what Git deleted on the pacer
+    /// with no GC lock or lifecycle claim held, and between passes it keeps
+    /// the GC lock free at least as long as the last pass held it. Returns
+    /// the slice's combined report, `None` when no removal pass ran.
+    #[cfg(test)]
     pub(crate) fn run_capacity_removal_slice(
         &mut self,
         worker_started: Instant,
+    ) -> Result<Option<crate::AutoCleanupReport>, BrokerOpError> {
+        self.run_capacity_removal_slice_with(worker_started, CapacitySliceLimits::WORKER)
+    }
+
+    /// The capacity removal slice described on `run_capacity_removal_slice`,
+    /// with explicit limits (the worker passes [`CapacitySliceLimits::WORKER`]
+    /// within its run allowance).
+    pub(crate) fn run_capacity_removal_slice_with(
+        &mut self,
+        worker_started: Instant,
+        limits: CapacitySliceLimits,
     ) -> Result<Option<crate::AutoCleanupReport>, BrokerOpError> {
         let slice_end = |worker_started: Instant| {
             ARTIFACT_SWEEP_WORKER_MAX_DURATION
@@ -7691,7 +8162,7 @@ impl Broker {
                 .saturating_sub(SESSION_RETIREMENT_WORKER_RESERVE)
         };
         let started = Instant::now();
-        let budget = slice_end(worker_started).min(ARTIFACT_WORKER_CAPACITY_REMOVAL_SLICE);
+        let budget = slice_end(worker_started).min(limits.budget);
         if budget < ARTIFACT_WORKER_CAPACITY_REMOVAL_MIN_SLICE
             || !crate::AutoCleanupPolicy::load(self.main_root())
                 .is_ok_and(|policy| policy.auto_remove)
@@ -7718,11 +8189,25 @@ impl Broker {
         if !self.recorded_checkout_capacity_pressure() {
             return Ok(None);
         }
+        let main_root = self.main_root().to_path_buf();
+        // Nothing the slice does, pacer waits included, runs past this.
+        let slice_deadline = started + budget;
         let progress_before = self.auto_cleanup_progress_marker()?;
         let mut combined: Option<crate::AutoCleanupReport> = None;
+        let mut failure: Option<BrokerOpError> = None;
         let mut paced_wait = Duration::ZERO;
+        let mut pressure_wait = Duration::ZERO;
+        let mut lock_yield_wait = Duration::ZERO;
+        let mut lock_held = Duration::ZERO;
+        let mut lock_wait = Duration::ZERO;
+        let mut git_removal_time = Duration::ZERO;
+        let mut credited_entries = 0u64;
+        let mut charged_entries = 0u64;
+        let mut unpaid = Duration::ZERO;
         let mut lock_busy = false;
         let mut passes = 0usize;
+        let mut kept_only_passes = 0usize;
+        let mut removal_failures = 0usize;
         let mut examined = 0usize;
         let mut selected = 0usize;
         let mut scan_ms = 0u64;
@@ -7731,25 +8216,77 @@ impl Broker {
         let mut inventory_unavailable = false;
         let mut probe_ms = 0u64;
         let mut inventory_wait = None;
+        // When the last pass returned and how long it held the GC lock.
+        let mut last_pass: Option<(Instant, Duration)> = None;
         let pre_selection_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        while combined
-            .as_ref()
-            .is_none_or(|report| report.removed.len() < ARTIFACT_WORKER_CAPACITY_REMOVALS_PER_SLICE)
-        {
+        let stop = loop {
+            let removed_so_far = combined.as_ref().map_or(0, |report| report.removed.len());
+            if removed_so_far >= limits.removals {
+                break CapacitySliceStop::Cap;
+            }
+            if kept_only_passes >= limits.kept_only_passes {
+                break CapacitySliceStop::KeptOnlyLimit;
+            }
+            // Leave the GC lock free at least as long as the last pass held
+            // it (and long enough for a waiter's poll), pacer wait included.
+            if let Some((ended, held)) = last_pass {
+                let rest = capacity_lock_gap(held).saturating_sub(ended.elapsed());
+                let rest = rest.min(slice_deadline.saturating_duration_since(Instant::now()));
+                if !rest.is_zero() {
+                    std::thread::sleep(rest);
+                    lock_yield_wait += rest;
+                }
+            }
+            let remaining = budget.saturating_sub(started.elapsed());
+            if let Some(stop) = capacity_slice_stop_before_pass(remaining, || {
+                foreground_gc_lock_waiter(&main_root).is_some()
+            }) {
+                break stop;
+            }
+            // No removal starts under memory or load pressure.
+            let gate_started = Instant::now();
+            let clear = unattended_pacing::unattended_pressure_clear(Some(slice_deadline));
+            pressure_wait += gate_started.elapsed();
+            if !clear {
+                // The check only fails while pressure lasts, whether the
+                // pacer's pause budget or the slice's deadline ran out first.
+                break CapacitySliceStop::PacerBackoff;
+            }
             let remaining = budget.saturating_sub(started.elapsed());
             if remaining < ARTIFACT_WORKER_CAPACITY_REMOVAL_MIN_SLICE {
-                break;
+                break CapacitySliceStop::Budget;
             }
+            crate::auto_cleanup::take_git_removal_time();
             let pass_started = Instant::now();
             let pass = {
                 let _span = crate::phase_telemetry::span("artifact_worker_capacity_removal");
-                self.auto_cleanup_for_checkout_capacity(Duration::ZERO, remaining, Some(1))?
+                self.auto_cleanup_for_checkout_capacity(
+                    Duration::ZERO,
+                    remaining.min(limits.pass_budget),
+                    Some(1),
+                    true,
+                )
             };
-            let pass_ms = u64::try_from(pass_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let pass_elapsed = pass_started.elapsed();
+            let pass_git_removal = crate::auto_cleanup::take_git_removal_time();
+            git_removal_time += pass_git_removal;
+            let pass = match pass {
+                Ok(pass) => pass,
+                Err(error) => {
+                    lock_held += pass_elapsed;
+                    failure = Some(error);
+                    break CapacitySliceStop::Failed;
+                }
+            };
+            let pass_ms = u64::try_from(pass_elapsed.as_millis()).unwrap_or(u64::MAX);
             let Some(pass) = pass else {
+                lock_wait += pass_elapsed;
                 lock_busy = true;
-                break;
+                break CapacitySliceStop::LockBusy;
             };
+            // The pass took the GC lock first and released it on return.
+            lock_held += pass_elapsed;
+            last_pass = Some((Instant::now(), pass_elapsed));
             passes += 1;
             let pass_lanes = pass.lanes.unwrap_or_default();
             examined += pass_lanes.removal_examined;
@@ -7764,25 +8301,47 @@ impl Broker {
                 inventory_wait = pass_lanes.removal_inventory_wait;
             }
             let removed_now = pass.removed.len();
+            // A pass that selected a checkout and removed nothing: it was kept
+            // or deferred at the last step.
+            if removed_now == 0 && pass_lanes.removal_selected > 0 {
+                kept_only_passes += 1;
+            }
             let removed_ids = pass
                 .removed
                 .iter()
                 .flat_map(|checkout| checkout.sessions.iter().copied())
                 .collect::<Vec<_>>();
-            if !removed_ids.is_empty() {
-                self.store()
-                    .complete_checkout_cleanup_requests_after_removal(&removed_ids, now_ms())?;
+            if !removed_ids.is_empty()
+                && let Err(error) = self
+                    .store()
+                    .complete_checkout_cleanup_requests_after_removal(&removed_ids, now_ms())
+            {
+                failure = Some(error.into());
             }
             // Throttle: no lock is held here. Wait out what Git just deleted,
-            // at the unattended rate and under the same pressure back-off,
-            // before the next removal.
-            let entries = crate::auto_cleanup::estimated_removed_entries(self.main_root(), &pass);
+            // at the configured rate and under the same pressure back-off,
+            // before the next removal. The bucket measures from when Git
+            // began deleting, so only Git's own removal time is credited.
+            let mut entries = crate::auto_cleanup::estimated_removed_entries(&main_root, &pass);
+            if !pass_git_removal.is_zero() {
+                // Git spent time deleting a checkout it then failed to
+                // remove: what it deleted is paid for like a removal.
+                let failed_entries =
+                    crate::auto_cleanup::estimated_failed_removal_entries(&main_root, &pass);
+                if failed_entries > 0 {
+                    removal_failures += 1;
+                    entries = entries.saturating_add(failed_entries);
+                }
+            }
             let paced_started = Instant::now();
-            unattended_pacing::charge_bulk_unattended_removal(
+            let charge = unattended_pacing::charge_bulk_unattended_removal(
                 entries,
-                Some(Instant::now() + slice_end(worker_started)),
+                pass_git_removal,
+                Some(slice_deadline),
             );
             paced_wait += paced_started.elapsed();
+            credited_entries = credited_entries.saturating_add(charge.credited);
+            charged_entries = charged_entries.saturating_add(charge.charged);
             combined = Some(match combined.take() {
                 None => pass,
                 Some(mut so_far) => {
@@ -7793,15 +8352,46 @@ impl Broker {
                     so_far
                 }
             });
+            if failure.is_some() {
+                break CapacitySliceStop::Failed;
+            }
+            if charge.pressure_backoff {
+                break CapacitySliceStop::PacerBackoff;
+            }
+            if !charge.unpaid.is_zero() {
+                unpaid = charge.unpaid;
+                break CapacitySliceStop::SliceDeadline;
+            }
+            if removal_failures >= ARTIFACT_WORKER_CAPACITY_REMOVAL_FAILURES {
+                break CapacitySliceStop::RemovalFailures;
+            }
             // A pass that selected a checkout apply then kept (an open file,
             // an artifact-use marker, a failed removal) did not judge the
             // rest: the selected group is remembered or behind the cursor, so
-            // the next pass moves on instead of ending the slice on it.
+            // the next pass moves on instead of ending the slice on it. A
+            // kept checkout costs none of the removal allowance, but such
+            // passes are bounded by `kept_only_passes`.
             if removed_now == 0 && pass_lanes.removal_selected == 0 {
-                break;
+                break CapacitySliceStop::NothingSelected;
             }
-        }
+        };
+        let yielded = stop == CapacitySliceStop::YieldedToForeground;
         crate::phase_telemetry::add("artifact_worker_capacity_removal_paced", paced_wait);
+        crate::phase_telemetry::add(
+            "artifact_worker_capacity_removal_pressure_wait",
+            pressure_wait,
+        );
+        crate::phase_telemetry::add(
+            "artifact_worker_capacity_removal_lock_yield",
+            lock_yield_wait,
+        );
+        crate::phase_telemetry::add("artifact_worker_capacity_removal_lock_held", lock_held);
+        crate::phase_telemetry::add("artifact_worker_capacity_removal_lock_wait", lock_wait);
+        crate::phase_telemetry::add(
+            "artifact_worker_capacity_removal_git_removal",
+            git_removal_time,
+        );
+        crate::phase_telemetry::add(stop.telemetry_phase(), Duration::ZERO);
         if lock_busy {
             crate::phase_telemetry::add(
                 "artifact_worker_capacity_removal_lock_busy",
@@ -7816,13 +8406,15 @@ impl Broker {
         let lap_unfinished =
             inventory_unavailable || !position.index_complete || position.lap_remaining > 0;
         // Nothing removable: wait before pressure alone runs another slice.
-        // The lock busy, or a lap that moved but did not end: a short wait,
-        // so the rest of the lap is judged soon without broker opens
-        // respawning the worker into the same held lock.
-        let selection_ran = capacity_slice_selection_ran(passes, lock_busy);
+        // The lock busy (or yielded to a foreground waiter), or a lap that
+        // moved but did not end: a short wait, so the rest of the lap is
+        // judged soon without broker opens respawning the worker into the
+        // same held lock.
+        let lock_contended = lock_busy || yielded;
+        let selection_ran = capacity_slice_selection_ran(passes, lock_contended);
         let mut retry_ms = capacity_removal_retry_ms(
             removed,
-            lock_busy,
+            lock_contended,
             lap_unfinished,
             progressed,
             selection_ran,
@@ -7833,7 +8425,9 @@ impl Broker {
             .artifact_sweep_meta_get(ARTIFACT_WORKER_CAPACITY_REMOVAL_OUT_OF_TIME_STREAK_KEY)?
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(0);
-        if slice_made_no_progress(removed, selection_ran, inventory_unavailable, progressed) {
+        if stop != CapacitySliceStop::PacerBackoff
+            && slice_made_no_progress(removed, selection_ran, inventory_unavailable, progressed)
+        {
             let streak = streak.saturating_add(1);
             retry_ms = Some(out_of_time_retry_ms(streak));
             self.artifact_sweep_meta_set(
@@ -7846,17 +8440,22 @@ impl Broker {
                 "",
             )?;
         }
+        let retry_ms = capacity_stop_retry_ms(stop, retry_ms, removed, kept_only_passes, unpaid);
         let retry_after_ms = retry_ms.map(|wait| now_ms().saturating_add(wait));
         self.artifact_sweep_meta_set(
             ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_AFTER_KEY,
             &retry_after_ms.map(|at| at.to_string()).unwrap_or_default(),
         )?;
+        crate::phase_telemetry::add(
+            "artifact_worker_capacity_removal_retry",
+            Duration::from_millis(retry_ms.map_or(0, |wait| u64::try_from(wait).unwrap_or(0))),
+        );
         for _ in 0..removed.min(4096) {
             crate::phase_telemetry::add("artifact_worker_capacity_removed", Duration::ZERO);
         }
         let outcome = if removed > 0 {
             "removed"
-        } else if lock_busy {
+        } else if lock_contended {
             "lock_busy"
         } else if !selection_ran {
             "out_of_time_before_selection"
@@ -7892,9 +8491,18 @@ impl Broker {
             "artifact_worker_capacity_removal_apply",
             Duration::from_millis(apply_ms),
         );
+        crate::phase_telemetry::add(
+            "artifact_worker_capacity_removal_cache_lane_reserved",
+            limits.cache_lane_reserved,
+        );
+        let duration_ms =
+            |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
         let mut slice = crate::auto_cleanup::CapacityRemovalSlice::from_report(combined.as_ref());
         slice.evaluated_at_ms = now_ms();
         slice.outcome = outcome.to_string();
+        slice.stop_reason = Some(stop.as_str().to_string());
+        slice.removal_cap = limits.removals;
+        slice.pass_budget_ms = duration_ms(limits.pass_budget);
         slice.examined = examined;
         slice.selected = selected;
         slice.index_complete = position.index_complete;
@@ -7902,13 +8510,25 @@ impl Broker {
         slice.cursor_after_session_id = position.after_session_id;
         slice.cursor_high_water_session_id = position.high_water_session_id;
         slice.passes = passes;
-        slice.budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+        slice.kept_only_passes = kept_only_passes;
+        slice.removal_failures = removal_failures;
+        slice.budget_ms = duration_ms(budget);
         slice.scan_ms = scan_ms;
         slice.selection_ms = selection_ms;
         slice.apply_ms = apply_ms;
-        slice.paced_ms = u64::try_from(paced_wait.as_millis()).unwrap_or(u64::MAX);
-        slice.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        slice.git_removal_ms = duration_ms(git_removal_time);
+        slice.paced_ms = duration_ms(paced_wait);
+        slice.pressure_wait_ms = duration_ms(pressure_wait);
+        slice.lock_yield_ms = duration_ms(lock_yield_wait);
+        slice.lock_held_ms = duration_ms(lock_held);
+        slice.lock_wait_ms = duration_ms(lock_wait);
+        slice.pacer_credited_entries = credited_entries;
+        slice.pacer_charged_entries = charged_entries;
+        slice.pacer_unpaid_ms = duration_ms(unpaid);
+        slice.cache_lane_reserved_ms = duration_ms(limits.cache_lane_reserved);
+        slice.elapsed_ms = duration_ms(started.elapsed());
         slice.retry_after_ms = retry_after_ms;
+        slice.retry_in_ms = retry_ms;
         slice.count_ms = count_ms;
         slice.pre_selection_ms = pre_selection_ms;
         slice.probe_ms = probe_ms;
@@ -7929,10 +8549,17 @@ impl Broker {
         }
         self.record_capacity_removal_slice(&slice)?;
         self.write_artifact_sweep_worker_status(&format!(
-            "capacity_removal removed={removed} kept={} deferred={} examined={examined} lock_busy={lock_busy} paced_ms={} elapsed_ms={} outcome={outcome}",
-            slice.kept, slice.deferred, slice.paced_ms, slice.elapsed_ms
+            "capacity_removal removed={removed} kept={} deferred={} examined={examined} lock_busy={lock_busy} paced_ms={} elapsed_ms={} outcome={outcome} stop={}",
+            slice.kept,
+            slice.deferred,
+            slice.paced_ms,
+            slice.elapsed_ms,
+            stop.as_str()
         ))?;
-        Ok(combined)
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(combined),
+        }
     }
 
     fn run_cleanup_after_cache_lane(
@@ -10406,6 +11033,7 @@ impl Broker {
             include_active_gate_cache,
             planning_deadline,
             false,
+            Duration::ZERO,
         )
     }
 
@@ -10416,12 +11044,13 @@ impl Broker {
         include_active_gate_cache: bool,
         planning_deadline: Option<Instant>,
         exclude_orphans: bool,
+        lock_wait: Duration,
     ) -> Result<GcApplyReport, BrokerOpError> {
         if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BrokerOpError::GcConfirmationNotSha256);
         }
         let main_root = self.main_root().to_path_buf();
-        let _lock = GcLock::acquire(&main_root)?;
+        let _lock = GcLock::acquire_waiting(&main_root, lock_wait)?;
         let journal_path = main_root.join(".aethyme/gc-journal.json");
         let mut journal = match load_journal(&journal_path)? {
             Some(journal) => {
@@ -11317,8 +11946,9 @@ mod tests {
     use std::cell::RefCell;
 
     /// A capacity slice that ran out of time with the lap unfinished but
-    /// moved it forward comes back within a minute; only a lap that ended,
-    /// or could not move, earns the ten-minute back-off.
+    /// moved it forward comes back within twenty seconds, in time for the
+    /// same worker run's next cache-pass slice; only a lap that ended, or
+    /// could not move, earns the ten-minute back-off.
     #[test]
     fn an_unfinished_capacity_lap_retries_soon_and_a_finished_one_backs_off() {
         assert_eq!(capacity_removal_retry_ms(1, false, true, true, true), None);
@@ -11328,7 +11958,11 @@ mod tests {
         );
         assert_eq!(
             capacity_removal_retry_ms(0, false, true, true, true),
-            Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_RETRY_MS)
+            Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_PROGRESS_RETRY_MS)
+        );
+        assert_eq!(
+            ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_PROGRESS_RETRY_MS,
+            20_000
         );
         assert_eq!(
             capacity_removal_retry_ms(0, false, true, false, true),
@@ -11350,12 +11984,318 @@ mod tests {
         assert!(!slice_made_no_progress(0, true, true, true));
         assert_eq!(
             capacity_removal_retry_ms(0, false, true, true, true),
-            Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_RETRY_MS),
-            "progress toward the inventory retries in a minute"
+            Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_PROGRESS_RETRY_MS),
+            "progress toward the inventory retries soon"
         );
         assert!(slice_made_no_progress(0, false, false, false));
         assert!(!slice_made_no_progress(1, true, true, false));
         assert!(!slice_made_no_progress(0, true, false, false));
+    }
+
+    /// A slice with allowance left stops for lack of budget first, then for
+    /// a waiting foreground command, and reads the waiter only when it
+    /// would otherwise run another pass.
+    #[test]
+    fn a_capacity_slice_stops_for_budget_or_a_foreground_waiter() {
+        let enough = ARTIFACT_WORKER_CAPACITY_REMOVAL_MIN_SLICE;
+        let short = enough - Duration::from_millis(1);
+        assert_eq!(
+            capacity_slice_stop_before_pass(short, || unreachable!("not read")),
+            Some(CapacitySliceStop::Budget)
+        );
+        assert_eq!(
+            capacity_slice_stop_before_pass(enough, || true),
+            Some(CapacitySliceStop::YieldedToForeground)
+        );
+        assert_eq!(capacity_slice_stop_before_pass(enough, || false), None);
+    }
+
+    /// The worker's slice: more removals than the old four, a budget that
+    /// fits several paced removals, a bound on passes that remove nothing,
+    /// and a pass budget no longer than a cache pass's.
+    #[test]
+    fn the_worker_slice_limits_bound_the_lock_and_allow_a_backlog() {
+        let limits = CapacitySliceLimits::WORKER;
+        assert_eq!(limits.removals, 12);
+        assert_eq!(limits.kept_only_passes, 4);
+        assert_eq!(limits.budget, Duration::from_secs(120));
+        assert!(limits.pass_budget <= ARTIFACT_WORKER_CACHE_PASS_SLICE);
+        assert!(limits.pass_budget < GC_LOCK_FOREGROUND_WAIT);
+        for stop in CapacitySliceStop::ALL {
+            assert!(stop.telemetry_phase().ends_with(stop.as_str()), "{stop:?}");
+        }
+    }
+
+    /// After a pass the lock stays free at least as long as the pass held
+    /// it, so a slice holds the GC lock at most half the time.
+    #[test]
+    fn the_gc_lock_stays_free_at_least_as_long_as_a_pass_held_it() {
+        assert_eq!(
+            capacity_lock_gap(Duration::from_secs(13)),
+            Duration::from_secs(13)
+        );
+        assert_eq!(
+            capacity_lock_gap(Duration::from_millis(10)),
+            ARTIFACT_WORKER_GC_LOCK_YIELD
+        );
+    }
+
+    /// Capacity slices leave the cache lane at least 90 s of every run in
+    /// which it is due, and may use the whole run otherwise.
+    #[test]
+    fn capacity_slices_leave_the_cache_lane_its_minimum_share() {
+        let lane = artifact_worker_cache_lane_duration(false, false, false);
+        let allowance = capacity_allowance_per_run(Some(lane));
+        assert_eq!(allowance + ARTIFACT_WORKER_CACHE_LANE_MIN, lane);
+        assert_eq!(ARTIFACT_WORKER_CACHE_LANE_MIN, Duration::from_secs(90));
+        assert_eq!(
+            capacity_allowance_per_run(None),
+            ARTIFACT_SWEEP_WORKER_MAX_DURATION
+        );
+        // A busy lane can leave nothing for capacity removal, never less
+        // than the minimum for the cache.
+        assert_eq!(
+            capacity_allowance_per_run(Some(Duration::from_secs(60))),
+            Duration::ZERO
+        );
+    }
+
+    /// The stop overrides the lap-based retry: pressure backs off ten
+    /// minutes even after removals, a failure a minute, a kept-only lap at
+    /// least a minute, and an unpaid pacer wait is waited before the next
+    /// slice.
+    #[test]
+    fn a_slices_stop_sets_a_real_back_off() {
+        let ten_minutes = Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_PRESSURE_RETRY_MS);
+        assert_eq!(ten_minutes, Some(600_000));
+        let zero = Duration::ZERO;
+        assert_eq!(
+            capacity_stop_retry_ms(CapacitySliceStop::PacerBackoff, None, 3, 0, zero),
+            ten_minutes
+        );
+        assert_eq!(
+            capacity_stop_retry_ms(CapacitySliceStop::RemovalFailures, None, 1, 0, zero),
+            Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS)
+        );
+        assert_eq!(
+            capacity_stop_retry_ms(CapacitySliceStop::Failed, None, 2, 0, zero),
+            Some(60_000)
+        );
+        // Removed nothing but kept checkouts at the last step: at least a
+        // minute, whatever stopped the slice.
+        let lap = Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_LAP_PROGRESS_RETRY_MS);
+        for stop in [
+            CapacitySliceStop::KeptOnlyLimit,
+            CapacitySliceStop::NothingSelected,
+            CapacitySliceStop::Budget,
+        ] {
+            assert_eq!(
+                capacity_stop_retry_ms(stop, lap, 0, 2, zero),
+                Some(60_000),
+                "{stop:?}"
+            );
+        }
+        assert_eq!(
+            capacity_stop_retry_ms(CapacitySliceStop::NothingSelected, lap, 0, 0, zero),
+            lap
+        );
+        assert_eq!(
+            capacity_stop_retry_ms(CapacitySliceStop::KeptOnlyLimit, None, 1, 4, zero),
+            None
+        );
+        assert_eq!(
+            capacity_stop_retry_ms(
+                CapacitySliceStop::SliceDeadline,
+                None,
+                1,
+                0,
+                Duration::from_millis(9_000)
+            ),
+            Some(9_000)
+        );
+        assert_eq!(
+            capacity_stop_retry_ms(CapacitySliceStop::Cap, None, 12, 0, zero),
+            None
+        );
+    }
+
+    /// Resuming a confirmed journal inside a broker open fails fast on a held
+    /// GC lock and announces nothing: only the operator's `gc apply` waits.
+    #[test]
+    fn a_journal_resume_fails_fast_on_a_held_gc_lock_without_a_notice() {
+        let root = tempfile::tempdir().unwrap();
+        let (_storage, mut broker) = pacing_fixture_broker(root.path());
+        let held = GcLock::acquire(root.path()).unwrap();
+        let started = Instant::now();
+        let error = broker
+            .gc_apply_bounded(&"a".repeat(64), Some(25))
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        drop(held);
+        assert!(matches!(error, BrokerOpError::GcLocked { .. }), "{error:?}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        let notices = root.path().join(".aethyme/run").join(GC_LOCK_WAITERS_DIR);
+        assert!(
+            std::fs::read_dir(&notices)
+                .ok()
+                .is_none_or(|mut entries| entries.next().is_none()),
+            "a broker open must not ask the worker to yield"
+        );
+    }
+
+    /// The lock file never appears without its PID, and a PID-less lock file
+    /// is held while it is young (a holder still writing it) and stale only
+    /// once it is old.
+    #[test]
+    fn the_gc_lock_file_carries_its_pid_and_a_young_empty_one_is_held() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".aethyme")).unwrap();
+        let path = root.path().join(".aethyme/gc.lock");
+        let lock = GcLock::acquire(root.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        let leftovers = std::fs::read_dir(root.path().join(".aethyme"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".gc.lock."))
+            .count();
+        assert_eq!(leftovers, 0, "the staged PID file is removed");
+        drop(lock);
+        assert!(!path.exists());
+
+        std::fs::write(&path, b"").unwrap();
+        assert!(
+            matches!(
+                GcLock::acquire(root.path()),
+                Err(BrokerOpError::GcLocked { .. })
+            ),
+            "a young empty lock file is being written"
+        );
+        let old = std::time::SystemTime::now() - GC_LOCK_FILE_WRITE_GRACE - Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let lock = GcLock::acquire(root.path()).expect("an old empty lock file is stale");
+        drop(lock);
+    }
+
+    /// A temporary repository root with a real `.aethyme` directory.
+    #[cfg(unix)]
+    fn waiter_root() -> tempfile::TempDir {
+        let temporary = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temporary.path().join(".aethyme")).unwrap();
+        temporary
+    }
+
+    /// Only a fresh notice of a live process other than this one counts as a
+    /// waiting foreground command; a dead waiter's file is cleared, and a
+    /// notice is removed when its waiter stops waiting.
+    #[cfg(unix)]
+    #[test]
+    fn a_gc_lock_waiter_notice_counts_only_live_other_processes() {
+        let temporary = waiter_root();
+        let root = temporary.path();
+        assert_eq!(foreground_gc_lock_waiter(root), None, "no directory");
+        let own = GcLockWaiterNotice::announce(root).expect("announced");
+        assert!(own.path.is_file());
+        assert_eq!(
+            foreground_gc_lock_waiter(root),
+            None,
+            "this process is not a waiter"
+        );
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let directory = gc_lock_waiters_dir(root, false).unwrap();
+        let child_file = directory.join(child.id().to_string());
+        std::fs::write(&child_file, b"").unwrap();
+        // Something that is not an empty notice is never counted or removed.
+        let stranger = directory.join("not-a-pid");
+        std::fs::write(&stranger, b"x").unwrap();
+        let seen = foreground_gc_lock_waiter(root);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(seen, Some(i64::from(child.id())));
+        assert_eq!(
+            foreground_gc_lock_waiter(root),
+            None,
+            "a dead waiter does not count"
+        );
+        assert!(!child_file.exists(), "and its file is cleared");
+        assert!(stranger.is_file());
+        let own_file = own.path.clone();
+        drop(own);
+        assert!(!own_file.exists());
+    }
+
+    /// A notice older than any foreground wait is stale even when its PID
+    /// belongs to a live process (a killed waiter whose PID was reused): it
+    /// is removed instead of disabling background removal.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_gc_lock_waiter_notice_expires() {
+        let temporary = waiter_root();
+        let root = temporary.path();
+        let directory = gc_lock_waiters_dir(root, true).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let notice = directory.join(child.id().to_string());
+        std::fs::write(&notice, b"").unwrap();
+        let old =
+            std::time::SystemTime::now() - GC_LOCK_WAITER_NOTICE_MAX_AGE - Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&notice)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let seen = foreground_gc_lock_waiter(root);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(seen, None, "a stale notice does not count");
+        assert!(!notice.exists(), "and is removed");
+        assert!(GC_LOCK_WAITER_NOTICE_MAX_AGE > GC_LOCK_FOREGROUND_WAIT);
+    }
+
+    /// A foreground command waiting for a held GC lock announces itself for
+    /// as long as it waits, then takes the lock once it is released.
+    #[cfg(unix)]
+    #[test]
+    fn waiting_for_the_gc_lock_announces_the_waiter() {
+        let temporary = waiter_root();
+        let root = temporary.path().to_path_buf();
+        let held = GcLock::acquire(&root).unwrap();
+        let waiter_root = root.clone();
+        let waiter = std::thread::spawn(move || {
+            GcLock::acquire_waiting(&waiter_root, Duration::from_secs(20)).map(drop)
+        });
+        let notice = root
+            .join(".aethyme/run")
+            .join(GC_LOCK_WAITERS_DIR)
+            .join(std::process::id().to_string());
+        let mut announced = false;
+        for _ in 0..80 {
+            if notice.is_file() {
+                announced = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(held);
+        assert!(waiter.join().unwrap().is_ok(), "the waiter takes the lock");
+        assert!(announced, "the waiter announced itself while it waited");
+        assert!(!notice.exists(), "and withdrew the notice");
+        // Without a holder there is nothing to wait for or announce.
+        drop(GcLock::acquire_waiting(&root, Duration::from_secs(20)).unwrap());
+        assert!(!notice.exists());
     }
 
     #[test]
