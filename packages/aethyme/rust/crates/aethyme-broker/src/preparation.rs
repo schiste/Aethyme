@@ -596,6 +596,8 @@ fn acquire_preparation_cache_once(
     let deadline = Instant::now() + wait;
     let mut next_notice = Instant::now();
     let mut notice = |message: &str| {
+        // Keeps this waiter's own record fresh for `prepare status`.
+        cache_activity::tick();
         let now = Instant::now();
         if now >= next_notice {
             eprintln!(
@@ -667,8 +669,8 @@ fn acquire_preparation_cache_once(
 /// holder reports it, what the holder is doing.
 fn shared_cache_wait_notice(wait: Duration, conflict: &str, holder: Option<String>) -> String {
     let holder = holder.unwrap_or_else(|| {
-        "the holder has not reported its current work (an older broker, a cache sweep, \
-         or a moment between operations)"
+        "the holder has not reported its current work: it may be an older broker or a \
+         cache sweep, or it has been inside one filesystem call for more than 90 s"
             .into()
     });
     format!(
@@ -761,6 +763,10 @@ pub struct PreparationStatus {
     /// is running or the holder stopped reporting.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_operation: Option<cache_activity::PreparationCacheActivity>,
+    /// While this session waits for the shared cache: the holder's session
+    /// and what it reports doing; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<PreparationCacheWaitingOn>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1005,6 +1011,7 @@ impl Broker {
                     reason,
                     next_action,
                     current_operation: None,
+                    waiting_on: None,
                 });
             }
             Ok(Some(config)) => config,
@@ -1075,6 +1082,12 @@ impl Broker {
             ),
         };
         let expected_digest = Some(hash_text(&source_digest));
+        let current_operation = (state != PreparationState::Current)
+            .then(|| self.preparation_cache_activity(session_id))
+            .flatten();
+        let waiting_on = current_operation
+            .as_ref()
+            .and_then(|activity| self.preparation_cache_waiting_on(activity));
         Ok(PreparationStatus {
             schema_version: PREPARATION_SCHEMA_VERSION,
             session_id,
@@ -1088,9 +1101,8 @@ impl Broker {
             reason,
             next_action: (state != PreparationState::Current)
                 .then(|| format!("aethyme broker submit prepare --session {session_id}")),
-            current_operation: (state != PreparationState::Current)
-                .then(|| self.preparation_cache_activity(session_id))
-                .flatten(),
+            current_operation,
+            waiting_on,
         })
     }
 
@@ -1288,13 +1300,17 @@ impl Broker {
         // the live record other sessions read, and the report's summaries.
         let mut cache_activity_guard = None;
         let mut lease_held_span = None;
+        // Whether this preparation measures the store against its budget. A
+        // repository that shares the cache measures only when it holds it
+        // alone; one that never shares measures at most once an hour, like a
+        // sharing one, instead of on every preparation.
+        let mut measure_budget = true;
         let mut grant = if let Some(coordinator) = coordinator.as_mut() {
             let sharing = max_concurrent > 1;
-            let budget_check = if sharing
-                && config
-                    .shared_cache
-                    .as_ref()
-                    .is_some_and(|cache| cache.max_bytes > 0)
+            let budget_need = if config
+                .shared_cache
+                .as_ref()
+                .is_some_and(|cache| cache.max_bytes > 0)
                 && let Some(key) = budget_checked_key.as_deref()
             {
                 let last_checked = self
@@ -1305,6 +1321,10 @@ impl Broker {
             } else {
                 None
             };
+            let budget_check = if sharing { budget_need } else { None };
+            if !sharing {
+                measure_budget = budget_need.is_some();
+            }
             let binding = cache_root_binding
                 .as_ref()
                 .expect("shared cache has a binding");
@@ -1312,6 +1332,16 @@ impl Broker {
                 .as_deref()
                 .expect("shared cache has a host resource database");
             let repository = repository_identity(self);
+            cache_activity_guard = Some(cache_activity::install(
+                Some(probe_db),
+                &repository,
+                session_id,
+            ));
+            cache_activity::enter(
+                cache_activity::PreparationCacheOperation::WaitingForCache,
+                None,
+                false,
+            );
             let (acquired, mode, need) = acquire_preparation_cache(
                 coordinator,
                 &|mode| {
@@ -1338,18 +1368,12 @@ impl Broker {
                 },
                 &|| {
                     let now = now_ms();
-                    cache_activity::read_current(probe_db, Some(&repository), None, now)
-                        .into_iter()
-                        .find(|record| record.holder_pid != std::process::id())
+                    current_cache_holder(probe_db, &repository, session_id, now)
                         .map(|record| cache_activity::describe_holder(&record, now))
                 },
             )?;
-            cache_activity_guard = Some(cache_activity::install(
-                Some(probe_db),
-                &repository,
-                session_id,
-                now_ms(),
-            ));
+            cache_activity::lease_acquired();
+            cache_activity::leave();
             lease_held_span = Some(crate::phase_telemetry::span("shared_cache_lease_held"));
             cache_mode = mode;
             crate::phase_telemetry::add(
@@ -1425,7 +1449,7 @@ impl Broker {
                 Ok(())
             };
             shared_cache_budget(
-                config.shared_cache.as_ref(),
+                config.shared_cache.as_ref().filter(|_| measure_budget),
                 &digest,
                 self,
                 cache_root_binding
@@ -1447,12 +1471,18 @@ impl Broker {
             })?;
         if shared
             && cache_mode == SharedCacheMode::Exclusive
+            && measure_budget
             && let Some(key) = budget_checked_key.as_deref()
             && let Err(error) = self.store().meta_set(key, &now_ms().to_string())
         {
             // Only the next check's timing depends on this; the check that
             // just ran is unaffected.
             eprintln!("warning: could not record the shared-cache budget check: {error}");
+        }
+        if let Some(inventory) = cache_activity::last_operation(
+            cache_activity::PreparationCacheOperation::BudgetInventory,
+        ) {
+            self.record_shared_cache_inventory_outcome(&inventory);
         }
         if let Some(cache_dir) = &cache_dir {
             let create_cache_dir = require_preparation_storage_with_cache_root(
@@ -3190,10 +3220,17 @@ fn shared_cache_budget_at_with_scan_limits(
             None,
             true,
         );
-        directory_inventory_with_progress(&store, scan_limits, progress)?
+        // Stop as soon as the running total passes the budget: the store is
+        // over budget whatever the rest of it holds.
+        directory_inventory_with_budget(&store, scan_limits, Some(budget.max_bytes), progress)?
     };
-    record_shared_cache_inventory(inventory);
+    record_shared_cache_inventory(inventory, budget.max_bytes);
     progress(true)?;
+    // An inventory that stopped at its time or entry limit with the bytes it
+    // saw still within budget is inconclusive, and the store is kept: a store
+    // is no longer rotated just for being too large to measure in one check.
+    // Runaway growth is left to the storage-pressure guard, and repeated
+    // inconclusive checks surface in `broker status` advice.
     let (bytes_before, observed_bytes_lower_bound, inventory_complete, rotation_reason) =
         match inventory {
             SharedCacheInventory::Absent => return Ok(None),
@@ -3206,22 +3243,24 @@ fn shared_cache_budget_at_with_scan_limits(
                 true,
                 SharedCacheRotationReason::BudgetExceeded,
             ),
-            SharedCacheInventory::BoundedIncomplete {
+            SharedCacheInventory::OverBudget {
                 observed_bytes_lower_bound,
-                limit,
             } => (
                 None,
                 observed_bytes_lower_bound,
                 false,
-                match limit {
-                    SharedCacheInventoryLimit::Time => {
-                        SharedCacheRotationReason::InventoryTimeLimit
-                    }
-                    SharedCacheInventoryLimit::Entries => {
-                        SharedCacheRotationReason::InventoryEntryLimit
-                    }
-                },
+                SharedCacheRotationReason::BudgetExceeded,
             ),
+            SharedCacheInventory::BoundedIncomplete {
+                observed_bytes_lower_bound,
+                ..
+            } if observed_bytes_lower_bound > budget.max_bytes => (
+                None,
+                observed_bytes_lower_bound,
+                false,
+                SharedCacheRotationReason::BudgetExceeded,
+            ),
+            SharedCacheInventory::BoundedIncomplete { .. } => return Ok(None),
         };
     ensure_preparation_cache_root_identity(cache_root, expected_root_identity)?;
     ensure_preparation_cache_root_binding(root_binding)?;
@@ -3302,12 +3341,20 @@ fn shared_cache_budget_at_with_scan_limits(
             reason: format!("cannot publish shared-cache rotation intent: {source}"),
         })?;
         progress(true)?;
+        let measured = cache_activity::last_operation(
+            cache_activity::PreparationCacheOperation::BudgetInventory,
+        );
         let _span = crate::phase_telemetry::span("shared_cache_rotation_drain");
         cache_activity::enter(
             cache_activity::PreparationCacheOperation::RotationDrain,
             None,
             true,
         );
+        // The inventory already counted what the drain will unlink, at least
+        // up to where it stopped: no second scan under the lease.
+        if let Some(measured) = measured {
+            cache_activity::set_total(measured.items_done, !inventory_complete);
+        }
         let recovery = recover_rotation_debt(
             resource_db_path,
             cache_root,
@@ -3338,21 +3385,42 @@ fn shared_cache_budget_at_with_scan_limits(
     }))
 }
 
-/// Count the budget inventory's outcome in the command metric, so a rotation
-/// caused by an inventory limit is told apart from one caused by size.
-fn record_shared_cache_inventory(inventory: SharedCacheInventory) {
+/// The budget inventory's outcome, as reported in the operation summary.
+fn shared_cache_inventory_outcome(inventory: SharedCacheInventory, budget: u64) -> &'static str {
+    match inventory {
+        SharedCacheInventory::Absent => "absent",
+        SharedCacheInventory::Complete { bytes } if bytes <= budget => "within_budget",
+        SharedCacheInventory::Complete { .. } | SharedCacheInventory::OverBudget { .. } => {
+            "over_budget"
+        }
+        SharedCacheInventory::BoundedIncomplete {
+            observed_bytes_lower_bound,
+            ..
+        } if observed_bytes_lower_bound > budget => "over_budget",
+        SharedCacheInventory::BoundedIncomplete {
+            limit: SharedCacheInventoryLimit::Time,
+            ..
+        } => "inconclusive_time_limit",
+        SharedCacheInventory::BoundedIncomplete {
+            limit: SharedCacheInventoryLimit::Entries,
+            ..
+        } => "inconclusive_entry_limit",
+    }
+}
+
+/// Count the budget inventory's outcome in the command metric and the
+/// operation summary, so a kept unmeasurable store is told apart from a
+/// measured one.
+fn record_shared_cache_inventory(inventory: SharedCacheInventory, budget: u64) {
+    let outcome = shared_cache_inventory_outcome(inventory, budget);
+    cache_activity::set_outcome(outcome);
     crate::phase_telemetry::add(
-        match inventory {
-            SharedCacheInventory::Absent => "shared_cache_inventory_absent",
-            SharedCacheInventory::Complete { .. } => "shared_cache_inventory_complete",
-            SharedCacheInventory::BoundedIncomplete {
-                limit: SharedCacheInventoryLimit::Time,
-                ..
-            } => "shared_cache_inventory_time_limit",
-            SharedCacheInventory::BoundedIncomplete {
-                limit: SharedCacheInventoryLimit::Entries,
-                ..
-            } => "shared_cache_inventory_entry_limit",
+        match outcome {
+            "absent" => "shared_cache_inventory_absent",
+            "within_budget" => "shared_cache_inventory_within_budget",
+            "over_budget" => "shared_cache_inventory_over_budget",
+            "inconclusive_time_limit" => "shared_cache_inventory_inconclusive_time_limit",
+            _ => "shared_cache_inventory_inconclusive_entry_limit",
         },
         Duration::ZERO,
     );
@@ -3559,14 +3627,7 @@ fn recover_rotation_debt_with_limits(
         .ok()
         .flatten()
         .map(|retained| retained.debt.retired_component().to_owned());
-    if generation.is_some() {
-        // A retired store is waiting: this is the long part. Say so now, with
-        // a bounded count of what is left, instead of after the interval.
-        if let (_, Some((entries, lower_bound))) = remaining_rotation_debt(cache_root, repository) {
-            cache_activity::set_total(entries, lower_bound);
-        }
-        cache_activity::announce_now();
-    }
+    let has_debt = generation.is_some();
     let mut recorder = recovery_state::RecoveryRecorder::begin(
         resource_db_path,
         cache_root,
@@ -3574,6 +3635,15 @@ fn recover_rotation_debt_with_limits(
         generation,
         now_ms(),
     );
+    if has_debt {
+        // A retired store is waiting: this is the long part. Say so now, with
+        // what an earlier attempt counted as left, instead of scanning again
+        // under the lease.
+        if let Some((entries, lower_bound)) = recorder.remaining_estimate() {
+            cache_activity::set_total(entries, lower_bound);
+        }
+        cache_activity::announce_now();
+    }
     let outcome = run_rotation_recovery_slices(
         |deadline, heartbeat| {
             rotation_debt::recover_with_journal_and_root_guard(
@@ -3801,7 +3871,8 @@ fn run_rotation_recovery_slices(
 
 /// What journal recovery refuses with when the live cache root is not the
 /// directory its host journal row recorded. The text is owned by the journal
-/// and debt modules; this only recognizes it to add a recovery path.
+/// and debt modules, so a test feeds a real journal refusal through
+/// [`rotation_recovery_next_action`] and fails if the wording drifts.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const ROOT_IDENTITY_JOURNAL_MISMATCH: &str =
     "preparation cache root identity differs from its durable journal";
@@ -3817,16 +3888,16 @@ fn rotation_recovery_next_action(reason: &RotationRecoveryStopReason) -> Option<
         .to_string()
         .contains(ROOT_IDENTITY_JOURNAL_MISMATCH)
         .then_some(
-            "the cache root on disk is not the directory the host journal recorded, so recovery \
-             refuses to unlink anything and a plain retry fails the same way. Check that \
-             `aethyme --version` is 0.8.95 or later (it re-proves a root whose only change is a \
-             remounted volume's device number), then run \
-             `aethyme broker advanced resources pressure --json` and read this cache root's \
-             `preparation_rotation_recovery` entry (retired generation, remaining entries, last \
-             stop reason). A reason naming root_volume_reproof_refused states the failed \
-             condition; when the cache root now resolves to another volume, mount the original \
-             volume at the same path and rerun this prepare. Do not delete the journal or the \
-             cache root by hand",
+            "the cache root on disk is not the directory the host journal recorded (a \
+             remounted or replaced volume, for example), so recovery refuses to touch it and \
+             a plain retry fails the same way until that changes. Read this cache root's \
+             `preparation_rotation_recovery` entry in \
+             `aethyme broker advanced resources pressure --json`: a stop reason naming \
+             root_volume_reproof_refused or debt_volume_reproof_refused states the failed \
+             condition. First mount the original volume at the same path and rerun this \
+             prepare. If the refusal persists, the documented last resort is to remove that \
+             preparation cache root: it holds only reproducible package caches, and the next \
+             prepare recreates it. Never edit the host journal by hand",
         )
 }
 
@@ -3938,6 +4009,118 @@ impl Broker {
             .into_iter()
             .find(|record| record.repository == repository)
     }
+
+    /// What a waiting session waits on: the fresh record of the session that
+    /// holds this repository's shared cache.
+    fn preparation_cache_waiting_on(
+        &self,
+        waiter: &cache_activity::PreparationCacheActivity,
+    ) -> Option<PreparationCacheWaitingOn> {
+        if waiter.operation.holds_cache() {
+            return None;
+        }
+        let path = self.storage_context().host_resource_db_path.as_deref()?;
+        let holder = current_cache_holder(path, &waiter.repository, waiter.session_id, now_ms())?;
+        Some(PreparationCacheWaitingOn {
+            session_id: holder.session_id,
+            holder_pid: holder.holder_pid,
+            current_operation: holder,
+        })
+    }
+
+    /// Count consecutive budget inventories that could not decide, so a
+    /// store that is never measured is surfaced instead of silently kept.
+    fn record_shared_cache_inventory_outcome(
+        &mut self,
+        inventory: &cache_activity::PreparationCacheOperationSummary,
+    ) {
+        let previous = self
+            .store_ref()
+            .meta_get(SHARED_CACHE_INVENTORY_INCONCLUSIVE_KEY)
+            .ok()
+            .flatten()
+            .and_then(|value| {
+                serde_json::from_str::<SharedCacheInventoryInconclusive>(&value).ok()
+            });
+        let inconclusive = inventory
+            .outcome
+            .is_some_and(|outcome| outcome.starts_with("inconclusive"));
+        let record = SharedCacheInventoryInconclusive {
+            consecutive: if inconclusive {
+                previous.as_ref().map_or(0, |previous| previous.consecutive) + 1
+            } else {
+                0
+            },
+            last_at_ms: now_ms(),
+            outcome: inventory.outcome.unwrap_or("unknown").to_owned(),
+            entries_seen: inventory.items_done,
+            bytes_seen: inventory.bytes_observed.unwrap_or(0),
+            elapsed_ms: inventory.elapsed_ms,
+        };
+        if !inconclusive && previous.is_none_or(|previous| previous.consecutive == 0) {
+            return;
+        }
+        let written = serde_json::to_string(&record)
+            .map_err(|error| error.to_string())
+            .and_then(|value| {
+                self.store()
+                    .meta_set(SHARED_CACHE_INVENTORY_INCONCLUSIVE_KEY, &value)
+                    .map_err(|error| error.to_string())
+            });
+        crate::warn_unrecorded("record the shared-cache inventory outcome", written);
+    }
+
+    /// The repeated-inconclusive budget record, when it has reached the
+    /// advice threshold. Read-only.
+    pub(crate) fn shared_cache_inventory_inconclusive(
+        &self,
+    ) -> Option<SharedCacheInventoryInconclusive> {
+        self.store_ref()
+            .meta_get(SHARED_CACHE_INVENTORY_INCONCLUSIVE_KEY)
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_str::<SharedCacheInventoryInconclusive>(&value).ok())
+            .filter(|record| record.consecutive >= SHARED_CACHE_INVENTORY_INCONCLUSIVE_ADVICE_AFTER)
+    }
+}
+
+/// Broker metadata key counting consecutive inconclusive budget inventories.
+const SHARED_CACHE_INVENTORY_INCONCLUSIVE_KEY: &str =
+    "preparation.shared_cache_inventory_inconclusive";
+/// `broker status` advises once this many budget checks in a row could not
+/// decide.
+pub(crate) const SHARED_CACHE_INVENTORY_INCONCLUSIVE_ADVICE_AFTER: u64 = 3;
+
+/// Consecutive budget inventories that stopped at a limit under budget.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SharedCacheInventoryInconclusive {
+    pub(crate) consecutive: u64,
+    pub(crate) last_at_ms: i64,
+    pub(crate) outcome: String,
+    pub(crate) entries_seen: u64,
+    pub(crate) bytes_seen: u64,
+    pub(crate) elapsed_ms: u64,
+}
+
+/// What a waiting preparation waits on.
+#[derive(Debug, Clone, Serialize)]
+pub struct PreparationCacheWaitingOn {
+    pub session_id: i64,
+    pub holder_pid: u32,
+    pub current_operation: cache_activity::PreparationCacheActivity,
+}
+
+/// The fresh record of whoever holds `repository`'s shared cache, other than
+/// `session_id`: waiting records are not holders.
+fn current_cache_holder(
+    resource_db_path: &Path,
+    repository: &str,
+    session_id: i64,
+    now_ms: i64,
+) -> Option<cache_activity::PreparationCacheActivity> {
+    cache_activity::read_current(resource_db_path, Some(repository), None, now_ms)
+        .into_iter()
+        .find(|record| record.operation.holds_cache() && record.session_id != session_id)
 }
 
 fn validate_preparation_cache_binding_for_recovery(
@@ -4037,6 +4220,10 @@ enum SharedCacheInventory {
         observed_bytes_lower_bound: u64,
         limit: SharedCacheInventoryLimit,
     },
+    /// The scan stopped early because the bytes seen passed the budget.
+    OverBudget {
+        observed_bytes_lower_bound: u64,
+    },
 }
 
 impl Default for SharedCacheScanLimits {
@@ -4084,6 +4271,9 @@ fn directory_bytes_with_progress(
         SharedCacheInventory::BoundedIncomplete { limit, .. } => {
             Err(shared_cache_inventory_limit_refusal(path, limit))
         }
+        SharedCacheInventory::OverBudget {
+            observed_bytes_lower_bound,
+        } => Ok(Some(observed_bytes_lower_bound)),
     }
 }
 
@@ -4092,9 +4282,27 @@ fn directory_inventory_with_progress(
     limits: SharedCacheScanLimits,
     progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
 ) -> Result<SharedCacheInventory, PreparationError> {
+    directory_inventory_with_budget(path, limits, None, progress)
+}
+
+/// [`directory_inventory_with_progress`], stopping with
+/// [`SharedCacheInventory::OverBudget`] once the bytes seen pass
+/// `stop_above_bytes`.
+fn directory_inventory_with_budget(
+    path: &Path,
+    limits: SharedCacheScanLimits,
+    stop_above_bytes: Option<u64>,
+    progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
+) -> Result<SharedCacheInventory, PreparationError> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        directory_inventory_fd_relative_with_progress(path, limits, |_| {}, progress)
+        directory_inventory_fd_relative_with_progress(
+            path,
+            limits,
+            stop_above_bytes,
+            |_| {},
+            progress,
+        )
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -4217,13 +4425,21 @@ fn directory_bytes_fd_relative_with_hook<F>(
 where
     F: FnMut(SharedCacheScanOpenTarget),
 {
-    match directory_inventory_fd_relative_with_progress(path, limits, before_open, &mut |_| Ok(()))?
-    {
+    match directory_inventory_fd_relative_with_progress(
+        path,
+        limits,
+        None,
+        before_open,
+        &mut |_| Ok(()),
+    )? {
         SharedCacheInventory::Absent => Ok(None),
         SharedCacheInventory::Complete { bytes } => Ok(Some(bytes)),
         SharedCacheInventory::BoundedIncomplete { limit, .. } => {
             Err(shared_cache_inventory_limit_refusal(path, limit))
         }
+        SharedCacheInventory::OverBudget {
+            observed_bytes_lower_bound,
+        } => Ok(Some(observed_bytes_lower_bound)),
     }
 }
 
@@ -4231,6 +4447,7 @@ where
 fn directory_inventory_fd_relative_with_progress<F>(
     path: &Path,
     limits: SharedCacheScanLimits,
+    stop_above_bytes: Option<u64>,
     mut before_open: F,
     progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
 ) -> Result<SharedCacheInventory, PreparationError>
@@ -4466,6 +4683,12 @@ where
                 bytes = bytes.checked_add(size).ok_or_else(|| {
                     shared_cache_scan_refusal(path, "cache inventory byte count overflowed")
                 })?;
+                if stop_above_bytes.is_some_and(|limit| bytes > limit) {
+                    cache_activity::observe(visited_entries as u64, Some(bytes));
+                    return Ok(SharedCacheInventory::OverBudget {
+                        observed_bytes_lower_bound: bytes,
+                    });
+                }
             }
             _ => {
                 return Err(shared_cache_scan_refusal(
@@ -4750,6 +4973,7 @@ fn invalid_status(session_id: i64, reason: String) -> PreparationStatus {
             "fix {PREPARATION_CONFIG_RELPATH}, then run `aethyme broker submit prepare --session {session_id}`"
         )),
         current_operation: None,
+        waiting_on: None,
     }
 }
 
@@ -6258,12 +6482,14 @@ mod tests {
         )
         .expect("rotation is reported")
         .expect("over budget");
-        assert_eq!(rotation.bytes_before, Some(bytes));
+        // The scan stops the moment the running total passes the budget,
+        // here on the store's only file, so the size is a lower bound.
+        assert_eq!(rotation.bytes_before, None);
         assert_eq!(rotation.observed_bytes_lower_bound, bytes);
         assert_eq!(rotation.budget_bytes, budget.max_bytes);
         assert_eq!(rotation.key, "abcdef123456");
         assert!(rotation.removed, "the retired tree is reclaimed");
-        assert!(rotation.inventory_complete);
+        assert!(!rotation.inventory_complete);
         assert_eq!(
             rotation.rotation_reason,
             SharedCacheRotationReason::BudgetExceeded
@@ -6290,23 +6516,91 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn bounded_inventory_rotates_and_reports_unknown_exact_size() {
+    fn an_inventory_stopped_under_budget_is_inconclusive_and_keeps_the_store() {
         let tmp = tempfile::tempdir().unwrap();
         let fixture_root = tmp.path().canonicalize().unwrap();
         let cache_root = fixture_root.join("preparation-cache");
         let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
         fs::create_dir_all(&store).unwrap();
         fs::write(store.join("payload"), b"bounded inventory").unwrap();
-        let scan_limits = SharedCacheScanLimits {
-            max_entries: 0,
-            max_depth: SHARED_CACHE_SCAN_MAX_DEPTH,
-            max_elapsed: Duration::from_secs(5),
+        let budget = SharedCacheBudget {
+            max_bytes: 1_000_000,
+            ..SharedCacheBudget::default()
         };
+        for (limits, outcome) in [
+            (
+                SharedCacheScanLimits {
+                    max_entries: 0,
+                    max_depth: SHARED_CACHE_SCAN_MAX_DEPTH,
+                    max_elapsed: Duration::from_secs(5),
+                },
+                "inconclusive_entry_limit",
+            ),
+            (
+                SharedCacheScanLimits {
+                    max_entries: SHARED_CACHE_SCAN_MAX_ENTRIES,
+                    max_depth: SHARED_CACHE_SCAN_MAX_DEPTH,
+                    max_elapsed: Duration::ZERO,
+                },
+                "inconclusive_time_limit",
+            ),
+        ] {
+            let (_lines, guard) = captured_activity(Duration::from_secs(3600));
+            let rotation = shared_cache_budget_at_with_scan_limits(
+                SharedCacheBudgetRequest {
+                    budget: Some(&budget),
+                    cache_root: &cache_root,
+                    resource_db_path: &fixture_root.join(".aethyme-test-host-resources.sqlite3"),
+                    repository: SHARED_CACHE_TEST_REPOSITORY,
+                    digest: "0123456789ab",
+                    expected_root_identity: None,
+                    root_binding: None,
+                },
+                &mut |_| Ok(()),
+                limits,
+            )
+            .unwrap();
+            assert_eq!(
+                rotation, None,
+                "a store too large to measure is not rotated for that alone ({outcome})"
+            );
+            assert_eq!(
+                fs::read(store.join("payload")).unwrap(),
+                b"bounded inventory"
+            );
+            assert!(
+                rotation_debt::read(&cache_root, SHARED_CACHE_TEST_REPOSITORY)
+                    .unwrap()
+                    .is_none()
+            );
+            let inventory = guard
+                .finish()
+                .into_iter()
+                .find(|operation| {
+                    operation.operation
+                        == cache_activity::PreparationCacheOperation::BudgetInventory
+                })
+                .expect("the inventory is summarized");
+            assert_eq!(inventory.outcome, Some(outcome));
+        }
+    }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_inventory_stops_as_soon_as_the_store_passes_its_budget_and_rotates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture_root = tmp.path().canonicalize().unwrap();
+        let cache_root = fixture_root.join("preparation-cache");
+        let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
+        fs::create_dir_all(&store).unwrap();
+        for index in 0..20 {
+            fs::write(store.join(format!("file-{index}")), vec![0_u8; 100]).unwrap();
+        }
+        let (_lines, guard) = captured_activity(Duration::from_secs(3600));
         let rotation = shared_cache_budget_at_with_scan_limits(
             SharedCacheBudgetRequest {
                 budget: Some(&SharedCacheBudget {
-                    max_bytes: 1,
+                    max_bytes: 150,
                     ..SharedCacheBudget::default()
                 }),
                 cache_root: &cache_root,
@@ -6317,64 +6611,37 @@ mod tests {
                 root_binding: None,
             },
             &mut |_| Ok(()),
-            scan_limits,
+            SharedCacheScanLimits::default(),
         )
         .unwrap()
-        .expect("entry-limited inventory should rotate the disposable cache");
-
+        .expect("an over-budget store rotates");
         assert!(rotation.removed);
-        assert_eq!(rotation.bytes_before, None);
-        assert_eq!(rotation.observed_bytes_lower_bound, 0);
-        assert!(!rotation.inventory_complete);
         assert_eq!(
             rotation.rotation_reason,
-            SharedCacheRotationReason::InventoryEntryLimit
+            SharedCacheRotationReason::BudgetExceeded
         );
+        assert_eq!(rotation.bytes_before, None, "the scan stopped early");
+        assert!(!rotation.inventory_complete);
+        assert_eq!(rotation.observed_bytes_lower_bound, 200);
         assert!(store.is_dir());
         assert_eq!(fs::read_dir(&store).unwrap().count(), 0);
-        assert!(
-            rotation_debt::read(&cache_root, SHARED_CACHE_TEST_REPOSITORY)
-                .unwrap()
-                .is_none()
-        );
-        let json = serde_json::to_value(rotation).unwrap();
-        assert_eq!(json["bytes_before"], serde_json::Value::Null);
-        assert_eq!(json["inventory_complete"], false);
-        assert_eq!(json["rotation_reason"], "inventory_entry_limit");
-        assert_eq!(json["observed_bytes_lower_bound"], 0);
-
-        fs::write(store.join("payload"), b"time-limited inventory").unwrap();
-        let timed_rotation = shared_cache_budget_at_with_scan_limits(
-            SharedCacheBudgetRequest {
-                budget: Some(&SharedCacheBudget {
-                    max_bytes: 1,
-                    ..SharedCacheBudget::default()
-                }),
-                cache_root: &cache_root,
-                resource_db_path: &fixture_root.join(".aethyme-test-host-resources.sqlite3"),
-                repository: SHARED_CACHE_TEST_REPOSITORY,
-                digest: "0123456789ab",
-                expected_root_identity: None,
-                root_binding: None,
-            },
-            &mut |_| Ok(()),
-            SharedCacheScanLimits {
-                max_entries: SHARED_CACHE_SCAN_MAX_ENTRIES,
-                max_depth: SHARED_CACHE_SCAN_MAX_DEPTH,
-                max_elapsed: Duration::ZERO,
-            },
-        )
-        .unwrap()
-        .expect("time-limited inventory should rotate the disposable cache");
-        assert_eq!(timed_rotation.bytes_before, None);
-        assert_eq!(timed_rotation.observed_bytes_lower_bound, 0);
-        assert!(!timed_rotation.inventory_complete);
+        let summaries = guard.finish();
+        let inventory = summaries
+            .iter()
+            .find(|operation| {
+                operation.operation == cache_activity::PreparationCacheOperation::BudgetInventory
+            })
+            .expect("the inventory is summarized");
+        assert_eq!(inventory.outcome, Some("over_budget"));
         assert_eq!(
-            timed_rotation.rotation_reason,
-            SharedCacheRotationReason::InventoryTimeLimit
+            inventory.items_done, 2,
+            "the scan stopped at the second file"
         );
-        assert!(store.is_dir());
-        assert_eq!(fs::read_dir(&store).unwrap().count(), 0);
+        assert!(
+            summaries.iter().any(|operation| operation.operation
+                == cache_activity::PreparationCacheOperation::RotationDrain),
+            "{summaries:?}"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -7818,7 +8085,6 @@ mod tests {
             None,
             "repository",
             1,
-            now_ms(),
             interval,
             Box::new(move |line: &str| sink_lines.borrow_mut().push(line.to_owned())),
         );
@@ -7908,16 +8174,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_inventory_entry_limit_sits_far_above_one_healthy_package_store() {
-        // One monorepo's pnpm and uv stores held about 141,000 entries in the
-        // busiest repository; an inventory stopping below that rotated the
-        // store on every budget check. The time limit bounds the scan.
-        let limits = SharedCacheScanLimits::default();
-        assert!(limits.max_entries >= 1_000_000, "{}", limits.max_entries);
-        assert_eq!(limits.max_elapsed, SHARED_CACHE_SCAN_MAX_ELAPSED);
-    }
-
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_root_identity_refusal_names_its_recovery_path_and_other_stops_do_not() {
@@ -7938,8 +8194,49 @@ mod tests {
             reason.contains("aethyme broker advanced resources pressure --json"),
             "{reason}"
         );
-        assert!(reason.contains("0.8.95 or later"), "{reason}");
-        assert!(reason.contains("Do not delete the journal"), "{reason}");
+        assert!(reason.contains("mount the original volume"), "{reason}");
+        assert!(
+            reason.contains("remove that preparation cache root"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("Never edit the host journal by hand"),
+            "{reason}"
+        );
+        assert!(reason.contains("debt_volume_reproof_refused"), "{reason}");
+
+        // The real journal refusal, not a copy of its text.
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture_root = tmp.path().canonicalize().unwrap();
+        let resource_db = fixture_root.join("host-resources.db");
+        let cache_root = fixture_root.join("preparation-cache");
+        fs::create_dir(&cache_root).unwrap();
+        rotation_journal::publish(
+            &resource_db,
+            &cache_root,
+            b"recorded-root",
+            SHARED_CACHE_TEST_REPOSITORY,
+            b"pending-debt",
+        )
+        .unwrap();
+        let journal_refusal = rotation_journal::load(
+            &resource_db,
+            &cache_root,
+            b"replacement-root",
+            SHARED_CACHE_TEST_REPOSITORY,
+        )
+        .unwrap_err();
+        let real = RotationRecoveryIncomplete {
+            entries_reclaimed: 0,
+            slices: 1,
+            elapsed: Duration::ZERO,
+            reason: RotationRecoveryStopReason::Failed(journal_refusal),
+        };
+        assert!(
+            real.refusal_reason("no in-cache rotation record names the remaining store")
+                .contains("; next: "),
+            "the journal's own refusal must be recognized"
+        );
 
         let stalled = RotationRecoveryIncomplete {
             entries_reclaimed: 7,
@@ -8048,5 +8345,58 @@ mod tests {
                 .get("shared_cache_operations")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn repeated_inconclusive_budget_checks_become_status_advice_and_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(tmp.path())
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
+        run_git(&["add", "README.md"]);
+        run_git(&["commit", "-qm", "fixture"]);
+        let mut broker = Broker::open(tmp.path()).unwrap();
+        let inventory = |outcome: &'static str| cache_activity::PreparationCacheOperationSummary {
+            operation: cache_activity::PreparationCacheOperation::BudgetInventory,
+            detail: None,
+            elapsed_ms: 30_000,
+            items_done: 420_000,
+            bytes_observed: Some(3_000_000_000),
+            outcome: Some(outcome),
+        };
+        for _ in 1..SHARED_CACHE_INVENTORY_INCONCLUSIVE_ADVICE_AFTER {
+            broker.record_shared_cache_inventory_outcome(&inventory("inconclusive_time_limit"));
+            assert!(broker.shared_cache_inventory_inconclusive().is_none());
+        }
+        broker.record_shared_cache_inventory_outcome(&inventory("inconclusive_time_limit"));
+        let record = broker
+            .shared_cache_inventory_inconclusive()
+            .expect("repeated inconclusive checks are surfaced");
+        assert_eq!(
+            record.consecutive,
+            SHARED_CACHE_INVENTORY_INCONCLUSIVE_ADVICE_AFTER
+        );
+        assert_eq!(record.entries_seen, 420_000);
+        let advice = broker.status(now_ms()).unwrap().advice;
+        assert!(
+            advice
+                .iter()
+                .any(|row| row.id == "preparation.shared-cache-budget-inconclusive"),
+            "{advice:?}"
+        );
+
+        broker.record_shared_cache_inventory_outcome(&inventory("within_budget"));
+        assert!(broker.shared_cache_inventory_inconclusive().is_none());
     }
 }

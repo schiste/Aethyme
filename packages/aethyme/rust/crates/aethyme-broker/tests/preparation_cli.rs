@@ -643,6 +643,9 @@ cache = "repository_shared"
     std::fs::write(store.join("old-artifact"), "bytes over budget").unwrap();
     std::fs::write(temp.path().join("pnpm-lock.yaml"), "v2\n").unwrap();
     std::fs::remove_dir_all(temp.path().join("node_modules")).unwrap();
+    // The first run measured the store, so a repository that never shares
+    // the cache would not measure again within the hour: forget that check.
+    forget_shared_cache_budget_checks(temp.path());
 
     let rotated = run(
         temp.path(),
@@ -668,6 +671,7 @@ cache = "repository_shared"
     assert_eq!(
         operations,
         [
+            "waiting_for_cache",
             "rotation_recovery",
             "budget_inventory",
             "rotation_drain",
@@ -680,14 +684,68 @@ cache = "repository_shared"
         rotated["shared_cache_rotation"].is_object(),
         "the over-budget store must be reported as rotated: {rotated}"
     );
-    assert_eq!(rotated["shared_cache_rotation"]["inventory_complete"], true);
+    // The inventory stops as soon as it passes the one-byte budget.
+    assert_eq!(
+        rotated["shared_cache_rotation"]["inventory_complete"],
+        false
+    );
     assert_eq!(
         rotated["shared_cache_rotation"]["rotation_reason"],
         "budget_exceeded"
     );
-    assert!(rotated["shared_cache_rotation"]["bytes_before"].is_number());
+    assert!(rotated["shared_cache_rotation"]["bytes_before"].is_null());
+    assert!(
+        rotated["shared_cache_rotation"]["observed_bytes_lower_bound"]
+            .as_u64()
+            .unwrap()
+            > 1,
+        "{rotated}"
+    );
+    let inventory = rotated["shared_cache_operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|operation| operation["operation"] == "budget_inventory")
+        .unwrap();
+    assert_eq!(inventory["outcome"], "over_budget", "{rotated}");
     assert!(!store.join("old-artifact").exists());
     assert!(temp.path().join("node_modules").is_dir());
+
+    // Within the hour after a check, the next preparation skips the
+    // inventory even though the store is over budget again.
+    std::fs::write(store.join("old-artifact"), "bytes over budget").unwrap();
+    std::fs::write(temp.path().join("pnpm-lock.yaml"), "v3\n").unwrap();
+    std::fs::remove_dir_all(temp.path().join("node_modules")).unwrap();
+    let skipped = success_json(run(
+        temp.path(),
+        &state,
+        &["submit", "prepare", "--session", &session, "--json"],
+    ));
+    assert!(skipped.get("shared_cache_rotation").is_none(), "{skipped}");
+    assert!(
+        !skipped["shared_cache_operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|operation| operation["operation"] == "budget_inventory"),
+        "{skipped}"
+    );
+    assert!(store.join("old-artifact").exists());
+}
+
+/// Remove the record of when each shared-cache budget check last ran.
+fn forget_shared_cache_budget_checks(repo: &Path) {
+    let db = rusqlite::Connection::open(repo.join(".aethyme/broker.db")).unwrap();
+    let removed = db
+        .execute(
+            "DELETE FROM meta WHERE key LIKE 'preparation.shared_cache_budget_checked_at_ms.%'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        removed, 1,
+        "the first preparation recorded its budget check"
+    );
 }
 
 #[path = "common/json_error.rs"]
@@ -833,7 +891,8 @@ cache = "repository_shared"
     assert!(refusal.contains("preparation_cache"), "{refusal}");
 
     let waiting = {
-        let (repo, state, waiter_id) = (temp.path().to_path_buf(), state.clone(), waiter_id);
+        let (repo, state, waiter_id) =
+            (temp.path().to_path_buf(), state.clone(), waiter_id.clone());
         std::thread::spawn(move || {
             run(
                 &repo,
@@ -848,6 +907,32 @@ cache = "repository_shared"
     assert!(
         !waiting.is_finished(),
         "prepare without --wait must wait for the shared cache, not refuse"
+    );
+    // The waiting session says what it waits on.
+    let waiting_status = success_json(run(
+        temp.path(),
+        &state,
+        &[
+            "submit",
+            "prepare",
+            "status",
+            "--session",
+            &waiter_id,
+            "--json",
+        ],
+    ));
+    assert_eq!(
+        waiting_status["current_operation"]["operation"], "waiting_for_cache",
+        "{waiting_status}"
+    );
+    assert_eq!(
+        waiting_status["waiting_on"]["session_id"].to_string(),
+        holder_id,
+        "{waiting_status}"
+    );
+    assert_eq!(
+        waiting_status["waiting_on"]["current_operation"]["detail"], "deps",
+        "{waiting_status}"
     );
     std::fs::write(&release, "").unwrap();
 

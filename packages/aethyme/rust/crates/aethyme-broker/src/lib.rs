@@ -499,6 +499,7 @@ pub use pr_watch::{
     PullRequestWatch, PullRequestWatchError, PullRequestWatchPollReport, PullRequestWatchProvider,
     PullRequestWatchRequest, PullRequestWatchStatus,
 };
+pub use preparation::PreparationCacheWaitingOn;
 pub use preparation::cache_activity::{
     PreparationCacheActivity, PreparationCacheOperation, PreparationCacheOperationSummary,
 };
