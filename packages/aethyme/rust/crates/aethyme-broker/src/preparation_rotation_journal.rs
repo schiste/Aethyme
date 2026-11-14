@@ -1707,9 +1707,10 @@ pub(crate) fn bind_root_volume(
 /// cache root and repository binds the volume UUID observed for the debt with
 /// payload digest `payload_sha256` to the exact cache-root identity bytes the
 /// debt recorded (`root_identity`, device number included). A new debt for
-/// the same repository replaces the row. The row deliberately outlives its
-/// debt row: in-cache stage proofs of that debt can remain after the journal
-/// row is completed, and they name the same saved device.
+/// the same repository replaces the row, and a completed recovery removes it
+/// (`forget_debt_volume`). Until then it outlives the debt row: in-cache stage
+/// proofs of that debt can remain after the journal row is completed, and
+/// they name the same saved device.
 const DEBT_VOLUME_TABLE: &str = "CREATE TABLE IF NOT EXISTS rotation_debt_volume(
     root_path BLOB NOT NULL CHECK(length(root_path) BETWEEN 1 AND 4096),
     repository TEXT NOT NULL CHECK(length(repository)=64),
@@ -1721,9 +1722,24 @@ const DEBT_VOLUME_TABLE: &str = "CREATE TABLE IF NOT EXISTS rotation_debt_volume
     PRIMARY KEY(root_path, repository)
  ) WITHOUT ROWID;";
 
+/// Filesystem keys (device number and filesystem ID) a cache root was seen
+/// under while recovery wrote rotation records, each with the volume UUID it
+/// had then. Additive like the other volume tables. Records written during a
+/// re-proven recovery carry the live key; if the volume is renumbered again
+/// before the debt completes, this row is what proves that key too.
+const VOLUME_KEY_TABLE: &str = "CREATE TABLE IF NOT EXISTS rotation_volume_key(
+    root_path BLOB NOT NULL CHECK(length(root_path) BETWEEN 1 AND 4096),
+    filesystem_key TEXT NOT NULL CHECK(length(filesystem_key) BETWEEN 3 AND 160),
+    volume_uuid BLOB NOT NULL CHECK(length(volume_uuid)=16),
+    recorded_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(root_path, filesystem_key)
+ ) WITHOUT ROWID;";
+
 /// Rows kept at most in `rotation_debt_volume`; orphans of removed roots are
 /// pruned first, and a full table refuses new bindings instead of growing.
 const MAX_DEBT_VOLUME_ROWS: i64 = 4 * MAX_DEBT_ROWS;
+/// Keys kept per cache root in `rotation_volume_key`; the oldest goes first.
+const MAX_VOLUME_KEYS_PER_ROOT: i64 = 16;
 
 /// One debt's volume binding, read without mutating the journal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1732,6 +1748,8 @@ pub(crate) struct DebtVolumeBinding {
     /// The cache-root identity bytes the debt recorded when it was bound.
     pub(crate) root_identity: Vec<u8>,
     pub(crate) volume_uuid: [u8; 16],
+    /// The rule that proved the volume when the binding was written.
+    pub(crate) rule: String,
 }
 
 impl DebtVolumeBinding {
@@ -1757,16 +1775,16 @@ pub(crate) fn debt_volume_binding(
     if !ensure_schema(&connection, false)? || !table_exists(&connection, "rotation_debt_volume")? {
         return Ok(None);
     }
-    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = connection
+    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, String)> = connection
         .query_row(
-            "SELECT payload_sha256, root_identity, volume_uuid FROM rotation_debt_volume \
+            "SELECT payload_sha256, root_identity, volume_uuid, rule FROM rotation_debt_volume \
              WHERE root_path=?1 AND repository=?2",
             params![root, repository],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(sqlite_error)?;
-    let Some((digest, root_identity, uuid)) = row else {
+    let Some((digest, root_identity, uuid, rule)) = row else {
         return Ok(None);
     };
     let (Ok(payload_sha256), Ok(volume_uuid)) = (
@@ -1777,6 +1795,8 @@ pub(crate) fn debt_volume_binding(
     };
     if volume_uuid.iter().all(|byte| *byte == 0)
         || !(1..=MAX_ROOT_IDENTITY_BYTES).contains(&root_identity.len())
+        || rule.is_empty()
+        || rule.len() > 64
     {
         return Err(invalid_data("rotation debt volume binding is malformed"));
     }
@@ -1784,15 +1804,16 @@ pub(crate) fn debt_volume_binding(
         payload_sha256,
         root_identity,
         volume_uuid,
+        rule,
     }))
 }
 
 /// Bind `volume_uuid` to `repository`'s journaled debt under `rule`, recording
 /// the cache-root identity bytes `root_identity` the debt names and the time.
-/// Writes only
-/// while the debt row still holds exactly `payload`; returns false, changing
-/// nothing, when it does not or when the table is full. The caller proves the
-/// same-volume rule first.
+/// Writes only while the debt row still holds exactly `payload`; returns
+/// false, changing nothing, when it does not or when the table is full (then
+/// counted as `preparation_rotation_debt_volume_binding_cap_reached`). The
+/// caller proves the same-volume rule first.
 pub(crate) fn bind_debt_volume(
     resource_db: &Path,
     cache_root: &Path,
@@ -1803,9 +1824,6 @@ pub(crate) fn bind_debt_volume(
     rule: &str,
 ) -> io::Result<bool> {
     validate_inputs(cache_root, root_identity, repository, payload)?;
-    let recorded_at_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as i64);
     if rule.is_empty() || rule.len() > 64 || volume_uuid.iter().all(|byte| *byte == 0) {
         return Err(invalid_input("rotation debt volume binding is invalid"));
     }
@@ -1827,6 +1845,31 @@ pub(crate) fn bind_debt_volume(
     if journaled != Some(1) {
         return Ok(false);
     }
+    if !insert_debt_volume(
+        &transaction,
+        root,
+        repository,
+        &Sha256::digest(payload),
+        root_identity,
+        volume_uuid,
+        rule,
+    )? {
+        return Ok(false);
+    }
+    transaction.commit().map_err(sqlite_error)?;
+    check_database_size(&path)?;
+    Ok(true)
+}
+
+fn insert_debt_volume(
+    transaction: &rusqlite::Transaction<'_>,
+    root: &[u8],
+    repository: &str,
+    payload_sha256: &[u8],
+    root_identity: &[u8],
+    volume_uuid: [u8; 16],
+    rule: &str,
+) -> io::Result<bool> {
     transaction
         .execute_batch(DEBT_VOLUME_TABLE)
         .map_err(sqlite_error)?;
@@ -1846,6 +1889,10 @@ pub(crate) fn bind_debt_volume(
         )
         .map_err(sqlite_error)?;
     if rows >= MAX_DEBT_VOLUME_ROWS {
+        crate::phase_telemetry::add(
+            "preparation_rotation_debt_volume_binding_cap_reached",
+            Duration::ZERO,
+        );
         return Ok(false);
     }
     transaction
@@ -1856,17 +1903,161 @@ pub(crate) fn bind_debt_volume(
             params![
                 root,
                 repository,
-                Sha256::digest(payload).to_vec(),
+                payload_sha256,
                 root_identity,
                 volume_uuid.to_vec(),
                 rule,
-                recorded_at_ms
+                now_ms()
             ],
+        )
+        .map_err(sqlite_error)?;
+    Ok(true)
+}
+
+/// Remove `repository`'s debt binding once the debt with `payload` is fully
+/// recovered: no record of it remains to re-prove. A binding of another
+/// payload (a later debt) is kept.
+pub(crate) fn forget_debt_volume(
+    resource_db: &Path,
+    cache_root: &Path,
+    repository: &str,
+    payload: &[u8],
+) -> io::Result<()> {
+    let root = root_path_bytes(cache_root)?;
+    validate_repository(repository)?;
+    let path = path_for_resource_db(resource_db)?;
+    if open_reader(&path)?.is_none() {
+        return Ok(());
+    }
+    let mut connection = open_writer(&path)?;
+    ensure_writer_schema(&mut connection)?;
+    if !table_exists(&connection, "rotation_debt_volume")? {
+        return Ok(());
+    }
+    connection
+        .execute(
+            "DELETE FROM rotation_debt_volume \
+             WHERE root_path=?1 AND repository=?2 AND payload_sha256=?3",
+            params![root, repository, Sha256::digest(payload).to_vec()],
+        )
+        .map_err(sqlite_error)?;
+    Ok(())
+}
+
+/// Record that `cache_root` was seen under `filesystem_key` on the volume
+/// `volume_uuid`. Returns whether the row is now durable.
+pub(crate) fn record_volume_key(
+    resource_db: &Path,
+    cache_root: &Path,
+    filesystem_key: &str,
+    volume_uuid: [u8; 16],
+) -> io::Result<bool> {
+    let root = root_path_bytes(cache_root)?;
+    if !(3..=160).contains(&filesystem_key.len()) || volume_uuid.iter().all(|byte| *byte == 0) {
+        return Err(invalid_input("rotation volume key is invalid"));
+    }
+    let path = path_for_resource_db(resource_db)?;
+    let mut connection = open_writer(&path)?;
+    ensure_writer_schema(&mut connection)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error)?;
+    transaction
+        .execute_batch(VOLUME_KEY_TABLE)
+        .map_err(sqlite_error)?;
+    transaction
+        .execute(
+            "DELETE FROM rotation_volume_key \
+             WHERE root_path NOT IN (SELECT root_path FROM rotation_root)",
+            [],
+        )
+        .map_err(sqlite_error)?;
+    transaction
+        .execute(
+            "INSERT OR REPLACE INTO rotation_volume_key(root_path, filesystem_key, volume_uuid, \
+             recorded_at_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![root, filesystem_key, volume_uuid.to_vec(), now_ms()],
+        )
+        .map_err(sqlite_error)?;
+    transaction
+        .execute(
+            "DELETE FROM rotation_volume_key WHERE root_path=?1 AND filesystem_key NOT IN \
+             (SELECT filesystem_key FROM rotation_volume_key WHERE root_path=?1 \
+              ORDER BY recorded_at_ms DESC LIMIT ?2)",
+            params![root, MAX_VOLUME_KEYS_PER_ROOT],
         )
         .map_err(sqlite_error)?;
     transaction.commit().map_err(sqlite_error)?;
     check_database_size(&path)?;
     Ok(true)
+}
+
+/// The filesystem keys recorded for `cache_root` under exactly `volume_uuid`.
+pub(crate) fn volume_keys(
+    resource_db: &Path,
+    cache_root: &Path,
+    volume_uuid: [u8; 16],
+) -> io::Result<Vec<String>> {
+    let root = root_path_bytes(cache_root)?;
+    let path = path_for_resource_db(resource_db)?;
+    let Some(connection) = open_reader(&path)? else {
+        return Ok(Vec::new());
+    };
+    if !ensure_schema(&connection, false)? || !table_exists(&connection, "rotation_volume_key")? {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT filesystem_key FROM rotation_volume_key \
+             WHERE root_path=?1 AND volume_uuid=?2 LIMIT ?3",
+        )
+        .map_err(sqlite_error)?;
+    let keys = statement
+        .query_map(
+            params![root, volume_uuid.to_vec(), MAX_VOLUME_KEYS_PER_ROOT],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error)?;
+    Ok(keys)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64)
+}
+
+/// Test support: write a debt binding without the journaled-payload check,
+/// as a binding left by an earlier debt of the same repository looks.
+#[cfg(test)]
+pub(crate) fn insert_debt_volume_for_test(
+    resource_db: &Path,
+    cache_root: &Path,
+    repository: &str,
+    payload: &[u8],
+    root_identity: &[u8],
+    volume_uuid: [u8; 16],
+) -> io::Result<bool> {
+    let root = root_path_bytes(cache_root)?;
+    let path = path_for_resource_db(resource_db)?;
+    let mut connection = open_writer(&path)?;
+    ensure_writer_schema(&mut connection)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sqlite_error)?;
+    let written = insert_debt_volume(
+        &transaction,
+        root,
+        repository,
+        &Sha256::digest(payload),
+        root_identity,
+        volume_uuid,
+        ROOT_VOLUME_OBSERVED,
+    )?;
+    transaction.commit().map_err(sqlite_error)?;
+    Ok(written)
 }
 
 fn table_exists(connection: &Connection, name: &str) -> io::Result<bool> {
@@ -3361,6 +3552,95 @@ mod debt_volume_tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// A completed recovery retires the binding of exactly its payload.
+    #[test]
+    fn forgetting_a_debt_binding_keeps_a_later_debts_binding() {
+        let (_directory, resource_db, cache_root) = fixture();
+        forget_debt_volume(&resource_db, &cache_root, REPOSITORY, b"payload").unwrap();
+        publish(&resource_db, &cache_root, ROOT, REPOSITORY, b"payload").unwrap();
+        assert!(bind(&resource_db, &cache_root, b"payload"));
+        forget_debt_volume(&resource_db, &cache_root, REPOSITORY, b"a later debt").unwrap();
+        assert!(
+            debt_volume_binding(&resource_db, &cache_root, REPOSITORY)
+                .unwrap()
+                .is_some()
+        );
+        forget_debt_volume(&resource_db, &cache_root, REPOSITORY, b"payload").unwrap();
+        assert!(
+            debt_volume_binding(&resource_db, &cache_root, REPOSITORY)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A full binding table refuses new bindings instead of growing, and says
+    /// so in telemetry.
+    #[test]
+    fn a_full_binding_table_refuses_and_counts() {
+        let (_directory, resource_db, cache_root) = fixture();
+        publish(&resource_db, &cache_root, ROOT, REPOSITORY, b"payload").unwrap();
+        for index in 0..MAX_DEBT_VOLUME_ROWS {
+            let other = format!("{index:064x}");
+            assert!(
+                insert_debt_volume_for_test(
+                    &resource_db,
+                    &cache_root,
+                    &other,
+                    b"other",
+                    ROOT,
+                    VOLUME
+                )
+                .unwrap()
+            );
+        }
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let installed = crate::phase_telemetry::install(recorder.clone());
+        let bound = bind(&resource_db, &cache_root, b"payload");
+        drop(installed);
+        assert!(!bound);
+        assert_eq!(
+            recorder
+                .totals()
+                .1
+                .get("preparation_rotation_debt_volume_binding_cap_reached"),
+            Some(&1)
+        );
+        assert!(
+            debt_volume_binding(&resource_db, &cache_root, REPOSITORY)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Keys are read back only under the UUID they were recorded with, and
+    /// each root keeps a bounded number of them.
+    #[test]
+    fn volume_keys_are_read_per_uuid_and_bounded() {
+        let (_directory, resource_db, cache_root) = fixture();
+        publish(&resource_db, &cache_root, ROOT, REPOSITORY, b"payload").unwrap();
+        assert!(
+            volume_keys(&resource_db, &cache_root, VOLUME)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(record_volume_key(&resource_db, &cache_root, "41:1900", VOLUME).unwrap());
+        assert!(record_volume_key(&resource_db, &cache_root, "48:2400", [0x25; 16]).unwrap());
+        assert_eq!(
+            volume_keys(&resource_db, &cache_root, VOLUME).unwrap(),
+            vec!["41:1900".to_owned()]
+        );
+        for device in 0..(2 * MAX_VOLUME_KEYS_PER_ROOT) {
+            record_volume_key(&resource_db, &cache_root, &format!("{device}:aa"), VOLUME).unwrap();
+        }
+        assert!(
+            volume_keys(&resource_db, &cache_root, VOLUME)
+                .unwrap()
+                .len()
+                <= MAX_VOLUME_KEYS_PER_ROOT as usize
+        );
+        assert!(record_volume_key(&resource_db, &cache_root, "x", VOLUME).is_err());
     }
 
     #[test]

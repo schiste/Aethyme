@@ -66,15 +66,16 @@ impl DirectoryIdentity {
         self.inode == other.inode && self.same_filesystem(other)
     }
 
-    /// Equal device number and filesystem ID, or the two filesystem keys a
-    /// rotation recovery in progress on this thread proved to name one volume
-    /// (see [`RenumberedVolume`]). Outside such a recovery this is the exact
-    /// comparison.
+    /// Equal device number and filesystem ID, or two filesystem keys a
+    /// rotation recovery in progress on this thread proved to name the live
+    /// volume (see [`RenumberedVolume`]). Outside such a recovery this is the
+    /// exact comparison.
     pub(crate) fn same_filesystem(&self, other: &Self) -> bool {
         (self.device == other.device && self.filesystem_id == other.filesystem_id)
-            || RENUMBERED_VOLUME.with(|proven| {
-                proven
+            || VOLUME_PROOF.with(|proof| {
+                proof
                     .borrow()
+                    .renumbered
                     .as_ref()
                     .is_some_and(|volume| volume.equates(self, other))
             })
@@ -92,69 +93,123 @@ impl DirectoryIdentity {
     }
 }
 
-/// Two filesystem keys (device number and filesystem ID) that one recovery
-/// pass proved name the same volume: the key every rotation record of the
-/// debt saved, and the key the cache root shows now. macOS gives an external
-/// volume a new device number (and so a new filesystem ID) when it returns in
-/// another disk slot; every debt payload, in-cache witness, stage intent,
-/// stage proof and tree witness saved before that names the old key, and the
-/// exact comparison refused all of them forever.
+/// Filesystem keys (device number and filesystem ID) that one recovery pass
+/// proved name the same volume as the cache root shows now. macOS gives an
+/// external volume a new device number (and so a new filesystem ID) when it
+/// returns in another disk slot; every debt payload, in-cache witness, stage
+/// intent, stage proof and tree witness saved before that names an old key,
+/// and the exact comparison refused all of them forever.
 ///
 /// The proof is made once per recovery call (`prove_renumbered_debt_volume`)
-/// and held only for that call through [`RenumberedVolumeScope`]. It equates
-/// exactly these two keys and nothing else, so inode numbers still have to
-/// match and a third key (another volume) still differs. Linux and every
-/// other target never establish one, because they have no stable volume
+/// and held only for that call through [`RenumberedVolumeScope`]. Every key
+/// in it is bound to the live volume UUID: the key the debt saved, proven by
+/// a recorded UUID or the root marker, and any key recorded for this cache
+/// root under that same UUID by an earlier re-proven recovery (so a second
+/// renumber before the debt completes is proven too). It equates these keys
+/// with each other and with the live key, and nothing else: inode numbers
+/// still have to match and any other key still differs. Linux and every other
+/// target never establish one, because they have no stable volume
 /// identifier; their comparison stays exact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RenumberedVolume {
-    saved_device: u64,
-    saved_filesystem_id: String,
-    live_device: u64,
-    live_filesystem_id: String,
+    saved_keys: Vec<(u64, String)>,
+    live_key: (u64, String),
 }
 
 impl RenumberedVolume {
     fn new(saved: &DirectoryIdentity, live: &DirectoryIdentity) -> Self {
         Self {
-            saved_device: saved.device,
-            saved_filesystem_id: saved.filesystem_id.clone(),
-            live_device: live.device,
-            live_filesystem_id: live.filesystem_id.clone(),
+            saved_keys: vec![(saved.device, saved.filesystem_id.clone())],
+            live_key: (live.device, live.filesystem_id.clone()),
         }
     }
 
+    /// Add a key recorded under the live volume UUID.
+    fn with_key(mut self, key: (u64, String)) -> Self {
+        if key != self.live_key && !self.saved_keys.contains(&key) {
+            self.saved_keys.push(key);
+        }
+        self
+    }
+
+    fn proves(&self, key: (u64, &str)) -> bool {
+        (self.live_key.0, self.live_key.1.as_str()) == key
+            || self
+                .saved_keys
+                .iter()
+                .any(|(device, filesystem_id)| (*device, filesystem_id.as_str()) == key)
+    }
+
     fn equates(&self, left: &DirectoryIdentity, right: &DirectoryIdentity) -> bool {
-        let saved = (self.saved_device, self.saved_filesystem_id.as_str());
-        let live = (self.live_device, self.live_filesystem_id.as_str());
-        let (left, right) = (left.filesystem_key(), right.filesystem_key());
-        (left == saved && right == live) || (left == live && right == saved)
+        self.proves(left.filesystem_key()) && self.proves(right.filesystem_key())
     }
 }
 
-thread_local! {
-    /// The renumbered volume proven by the recovery call running on this
-    /// thread, if any. Rotation recovery runs on the caller's thread and
-    /// never hands its records to another one.
-    static RENUMBERED_VOLUME: std::cell::RefCell<Option<RenumberedVolume>> =
-        const { std::cell::RefCell::new(None) };
+/// What one recovery call established about renumbered records: the proven
+/// volume, or the condition a proof that was attempted but not required
+/// failed on, so a record that does need it is refused with that condition.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct VolumeProof {
+    renumbered: Option<RenumberedVolume>,
+    unproven: Option<&'static str>,
 }
 
-/// Holds a proven [`RenumberedVolume`] for one recovery call and restores
-/// the previous state when dropped, including on early return or panic.
-struct RenumberedVolumeScope(Option<RenumberedVolume>);
+thread_local! {
+    /// The proof of the recovery call running on this thread, if any.
+    /// Rotation recovery runs on the caller's thread and never hands its
+    /// records to another one.
+    static VOLUME_PROOF: std::cell::RefCell<VolumeProof> =
+        std::cell::RefCell::new(VolumeProof::default());
+}
+
+/// Holds a [`VolumeProof`] for one recovery call and restores the previous
+/// one when dropped, including on early return or panic, so scopes nest.
+struct RenumberedVolumeScope(Option<VolumeProof>);
 
 impl RenumberedVolumeScope {
-    fn enter(volume: Option<RenumberedVolume>) -> Self {
-        Self(RENUMBERED_VOLUME.with(|proven| proven.replace(volume)))
+    fn enter(proof: VolumeProof) -> Self {
+        Self(Some(VOLUME_PROOF.with(|current| current.replace(proof))))
     }
 }
 
 impl Drop for RenumberedVolumeScope {
     fn drop(&mut self) {
-        let previous = self.0.take();
-        RENUMBERED_VOLUME.with(|proven| *proven.borrow_mut() = previous);
+        if let Some(previous) = self.0.take() {
+            VOLUME_PROOF.with(|current| *current.borrow_mut() = previous);
+        }
     }
+}
+
+/// A refusal to re-prove renumbered rotation records. Carried inside the
+/// `io::Error` so that the recovery entry point counts it exactly once, under
+/// its condition, and diagnostic reads elsewhere never count anything.
+#[derive(Debug)]
+struct DebtVolumeRefusal {
+    condition: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for DebtVolumeRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DebtVolumeRefusal {}
+
+fn debt_volume_refusal(condition: &'static str, message: String) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        DebtVolumeRefusal { condition, message },
+    )
+}
+
+/// The refusal condition carried by `error`, if it is a debt re-proof refusal.
+fn debt_volume_refusal_condition(error: &io::Error) -> Option<&'static str> {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<DebtVolumeRefusal>())
+        .map(|refusal| refusal.condition)
 }
 
 const PREPARATION_ROOT_MARKER: &str = ".aethyme-preparation-cache-root-v2";
@@ -810,6 +865,11 @@ impl FreshStageIntent {
         let adoption_is_valid = match (&self.source, &self.adopted_identity) {
             (FreshStageSource::LegacyAdoption, Some(identity)) => {
                 identity.validate()?;
+                if let Some(error) =
+                    unproven_record_key(identity, &self.debt.cache_root, "fresh-stage intent")
+                {
+                    return Err(error);
+                }
                 identity.same_filesystem(&self.debt.cache_root)
             }
             (FreshStageSource::CanonicalOriginal | FreshStageSource::RetiredOriginal, None) => true,
@@ -842,6 +902,13 @@ impl FreshStageProof {
     fn validate(&self, expected: &RotationDebt) -> io::Result<()> {
         self.debt.validate()?;
         self.fresh_store.validate()?;
+        if let Some(error) = unproven_record_key(
+            &self.fresh_store,
+            &self.debt.cache_root,
+            "fresh-stage proof",
+        ) {
+            return Err(error);
+        }
         if self.schema != FRESH_STAGE_SCHEMA
             || self.version != FRESH_STAGE_VERSION
             || self.debt != *expected
@@ -1286,6 +1353,12 @@ const DEBT_VOLUME_DIFFERS: &str =
     "the volume UUID recorded for this debt differs from the live volume";
 const UNPROVEN_RECORD: &str =
     "no recorded volume UUID or root marker proves that its saved device names this volume";
+const BINDING_UNREADABLE: &str = "the recorded debt volume binding could not be read";
+const PROOF_UNRECORDED: &str =
+    "the volume proof could not be recorded durably before recovery mutates anything";
+const SAVED_IDENTITY_MALFORMED: &str = "the saved cache-root identity is malformed";
+const RECORD_KEY_UNPROVEN: &str =
+    "a record names a device number that no recorded volume UUID binds to this volume";
 
 /// A rotation debt pending across a device renumber is re-proven through
 /// the volume UUID recorded for that debt when it was journaled.
@@ -1620,33 +1693,52 @@ fn debt_refusal_counter(condition: &str) -> &'static str {
             "preparation_rotation_debt_volume_refused_marker_split_filesystem"
         }
         UNPROVEN_RECORD => "preparation_rotation_debt_volume_refused_unproven_record",
+        BINDING_UNREADABLE => "preparation_rotation_debt_volume_refused_binding_unreadable",
+        PROOF_UNRECORDED => "preparation_rotation_debt_volume_refused_proof_unrecorded",
+        SAVED_IDENTITY_MALFORMED => {
+            "preparation_rotation_debt_volume_refused_saved_identity_malformed"
+        }
+        RECORD_KEY_UNPROVEN => "preparation_rotation_debt_volume_refused_record_key_unproven",
         _ => "preparation_rotation_debt_volume_refused_other",
     }
 }
 
-fn debt_reproof_refusal(
-    condition: &'static str,
-    live_volume_identity: crate::volume_identity::VolumeIdentity,
-) -> io::Error {
+/// Count one debt re-proof refusal. Called only by the recovery entry point,
+/// once per refused call.
+fn count_debt_volume_refusal(condition: &'static str) {
     crate::phase_telemetry::add(
         "preparation_rotation_debt_volume_reproof_refused",
         Duration::ZERO,
     );
     crate::phase_telemetry::add(debt_refusal_counter(condition), Duration::ZERO);
+}
+
+/// The stop reason for a refused re-proof; an unknown live volume says why.
+fn debt_reproof_refusal(
+    condition: &'static str,
+    live_volume_identity: Option<crate::volume_identity::VolumeIdentity>,
+) -> io::Error {
     let detail = match live_volume_identity {
-        crate::volume_identity::VolumeIdentity::Unknown(reason) => format!("{condition}: {reason}"),
-        crate::volume_identity::VolumeIdentity::Known(_) => condition.to_owned(),
+        Some(crate::volume_identity::VolumeIdentity::Unknown(reason)) => {
+            format!("{condition}: {reason}")
+        }
+        _ => condition.to_owned(),
     };
-    invalid_record(&format!(
-        "preparation cache root identity differs from its durable journal \
-         ({DEBT_REPROOF_REFUSED}: {detail})"
-    ))
+    debt_volume_refusal(
+        condition,
+        format!(
+            "preparation cache root identity differs from its durable journal \
+             ({DEBT_REPROOF_REFUSED}: {detail})"
+        ),
+    )
 }
 
 /// A record whose saved cache-root identity differs from the live root only
 /// in its filesystem key (same inode) was saved before a device renumber that
-/// no proof covers in this recovery. Refuse it with that reason instead of a
-/// generic mismatch, so the stall says what would unblock it.
+/// no proof covers in this recovery. Refuse it with the condition the proof
+/// failed on, if one was attempted, instead of a generic mismatch, so the
+/// stall says what would unblock it. Counting is left to the recovery entry
+/// point, so diagnostic reads stay silent.
 fn unproven_renumbered_record(
     recorded: &DirectoryIdentity,
     live: &DirectoryIdentity,
@@ -1655,15 +1747,51 @@ fn unproven_renumbered_record(
     if recorded.inode != live.inode || recorded.same_filesystem(live) {
         return None;
     }
-    crate::phase_telemetry::add(
-        "preparation_rotation_debt_volume_reproof_refused",
-        Duration::ZERO,
-    );
-    crate::phase_telemetry::add(debt_refusal_counter(UNPROVEN_RECORD), Duration::ZERO);
-    Some(invalid_record(&format!(
-        "{record} names this cache root under another device number \
-         ({DEBT_REPROOF_REFUSED}: {UNPROVEN_RECORD})"
-    )))
+    let condition = VOLUME_PROOF
+        .with(|proof| proof.borrow().unproven)
+        .unwrap_or(UNPROVEN_RECORD);
+    Some(debt_volume_refusal(
+        condition,
+        format!(
+            "{record} names this cache root under another device number \
+             ({DEBT_REPROOF_REFUSED}: {condition})"
+        ),
+    ))
+}
+
+/// While a renumber proof is active, a record identity whose filesystem key
+/// the proof does not cover, though its debt's is covered, was written under
+/// a device number no recorded volume UUID binds (a second renumber whose
+/// intermediate key record was lost). Refuse it with that reason instead of
+/// a generic inconsistency.
+fn unproven_record_key(
+    recorded: &DirectoryIdentity,
+    debt_root: &DirectoryIdentity,
+    record: &str,
+) -> Option<io::Error> {
+    let active = VOLUME_PROOF.with(|proof| proof.borrow().renumbered.is_some());
+    if !active || recorded.same_filesystem(debt_root) {
+        return None;
+    }
+    Some(debt_volume_refusal(
+        RECORD_KEY_UNPROVEN,
+        format!(
+            "{record} names the cache root's volume under another device number \
+             ({DEBT_REPROOF_REFUSED}: {RECORD_KEY_UNPROVEN})"
+        ),
+    ))
+}
+
+/// The filesystem key a [`RenumberedVolume`] stores, as the journal keeps it.
+fn filesystem_key_text(identity: &DirectoryIdentity) -> String {
+    format!("{}:{}", identity.device, identity.filesystem_id)
+}
+
+fn parse_filesystem_key(text: &str) -> Option<(u64, String)> {
+    let (device, filesystem_id) = text.split_once(':')?;
+    let device = device.parse().ok()?;
+    (is_hex(filesystem_id, 2, 128) && filesystem_id.len().is_multiple_of(2))
+        .then(|| (device, filesystem_id.to_owned()))
 }
 
 /// Record the stable volume UUID of a debt just journaled under the live
@@ -1683,6 +1811,17 @@ pub(crate) fn record_debt_volume(
     else {
         return;
     };
+    bind_observed_debt_volume(resource_db, cache_root, repository, payload, root, uuid);
+}
+
+fn bind_observed_debt_volume(
+    resource_db: &Path,
+    cache_root: &Path,
+    repository: &str,
+    payload: &[u8],
+    root: &DirectoryIdentity,
+    uuid: [u8; 16],
+) {
     let Ok(root_bytes) = root.encode() else {
         return;
     };
@@ -1706,18 +1845,66 @@ pub(crate) fn record_debt_volume(
     }
 }
 
+/// The cache-root identity bytes a journal payload's debt saved.
+fn payload_cache_root_bytes(payload: &[u8]) -> Option<Vec<u8>> {
+    serde_json::from_slice::<RotationDebt>(payload)
+        .ok()?
+        .cache_root
+        .encode()
+        .ok()
+}
+
+/// Whether an in-cache record of `repository` (committed witness, its
+/// scratch, stage intent or stage proof) saved the cache-root identity
+/// `saved`. Read only; any unreadable record counts as not naming it.
+fn in_cache_records_name(cache_root: &Path, repository: &str, saved: &[u8]) -> bool {
+    let Ok(root) = open_cache_root(cache_root) else {
+        return false;
+    };
+    let names_saved = |debt: &RotationDebt| {
+        debt.cache_root
+            .encode()
+            .is_ok_and(|bytes| bytes.as_slice() == saved)
+    };
+    let read = |name: io::Result<CString>| -> Option<Vec<u8>> {
+        read_component(root.as_raw_fd(), &name.ok()?)
+            .ok()
+            .flatten()
+            .map(|file| file.bytes)
+    };
+    let witnesses = [
+        read(RotationDebt::record_component(repository)),
+        read(RotationDebt::scratch_component(repository)),
+    ];
+    if witnesses.iter().flatten().any(|bytes| {
+        serde_json::from_slice::<RotationDebt>(bytes).is_ok_and(|debt| names_saved(&debt))
+    }) {
+        return true;
+    }
+    read(RotationDebt::fresh_stage_proof_component(repository)).is_some_and(|bytes| {
+        serde_json::from_slice::<FreshStageProof>(&bytes)
+            .is_ok_and(|proof| names_saved(&proof.debt))
+    }) || read(RotationDebt::fresh_stage_intent_component(repository)).is_some_and(|bytes| {
+        serde_json::from_slice::<FreshStageIntent>(&bytes)
+            .is_ok_and(|intent| names_saved(&intent.debt))
+    })
+}
+
 /// Establish, for one recovery call, whether `repository`'s rotation records
 /// saved under an older identity of the live cache root still name it.
 ///
 /// The saved identity comes from the journal root row when debt rows are
 /// pending under an identity the live root no longer shows (`pending_root`):
 /// then the proof is required, and a failed one stops recovery with
-/// [`DEBT_REPROOF_REFUSED`] and the failed condition. Otherwise it comes from
-/// the debt binding of this repository, whose debt may have left stage
-/// proofs behind after its journal row completed; a failed proof there sets
-/// nothing, and a record that does need it is refused by
-/// [`unproven_renumbered_record`]. A debt whose records match the live root
-/// exactly gains an `observed` binding instead.
+/// [`DEBT_REPROOF_REFUSED`] and the failed condition. Otherwise a proof is
+/// attempted only when an in-cache record of this repository actually names
+/// the saved identity of its debt binding (stage proofs can outlive a
+/// completed journal row); a failed attempt sets nothing but its condition,
+/// which [`unproven_renumbered_record`] reports if a record needs it. A
+/// journaled debt whose identity matches the live root exactly is checked
+/// against its recorded UUID (a different disk in the same slot can show the
+/// same device number and inode) and gains an `observed` binding if it has
+/// none. Nothing is counted as re-proven unless a proof is established.
 fn prove_renumbered_debt_volume(
     cache_root: &Path,
     resource_db: &Path,
@@ -1726,53 +1913,67 @@ fn prove_renumbered_debt_volume(
     live_bytes: &[u8],
     pending_root: Option<&PendingRenumberedRoot>,
     payload: Option<&[u8]>,
-) -> io::Result<Option<RenumberedVolume>> {
+) -> io::Result<VolumeProof> {
     let _span = crate::phase_telemetry::span("preparation_rotation_debt_volume_proof");
-    // An unreadable binding is treated as absent: older rules or a refusal
-    // follow, never a weaker acceptance.
-    let binding = super::rotation_journal::debt_volume_binding(resource_db, cache_root, repository)
-        .ok()
-        .flatten()
+    let required = pending_root.is_some();
+    let binding =
+        match super::rotation_journal::debt_volume_binding(resource_db, cache_root, repository) {
+            Ok(binding) => binding,
+            // Never fall back to a weaker rule past a binding that might
+            // have refused.
+            Err(_) if required => {
+                return Err(debt_reproof_refusal(BINDING_UNREADABLE, None));
+            }
+            Err(_) => None,
+        }
         // A binding of an earlier debt of this repository says nothing
         // about the debt journaled now.
         .filter(|binding| payload.is_none_or(|payload| binding.names_payload(payload)));
-    let (saved_bytes, saved, root_volume, required) = match pending_root {
-        Some(root) => (
-            root.saved_bytes.clone(),
-            root.saved.clone(),
-            root.bound_volume,
-            true,
-        ),
+    let (saved_bytes, root_volume) = match pending_root {
+        Some(root) => (root.saved_bytes.clone(), root.bound_volume),
         None => {
-            if let Some(payload) = payload
-                && binding.is_none()
-            {
-                record_exact_debt_volume(
-                    cache_root,
-                    resource_db,
-                    repository,
-                    live,
-                    live_bytes,
-                    payload,
-                );
-                return Ok(None);
+            if let Some(payload) = payload {
+                if payload_cache_root_bytes(payload).as_deref() == Some(live_bytes) {
+                    exact_debt_volume(
+                        cache_root,
+                        resource_db,
+                        repository,
+                        live,
+                        payload,
+                        binding.as_ref(),
+                    )?;
+                }
+                // A journaled debt naming another identity than an exactly
+                // matching root row is refused by `from_journal_payload`.
+                return Ok(VolumeProof::default());
             }
             let Some(binding) = binding.as_ref() else {
-                return Ok(None);
+                return Ok(VolumeProof::default());
             };
-            if binding.root_identity == live_bytes {
-                return Ok(None);
+            if binding.root_identity == live_bytes
+                || !in_cache_records_name(cache_root, repository, &binding.root_identity)
+            {
+                return Ok(VolumeProof::default());
             }
-            let Ok(saved) = decode_directory_identity(&binding.root_identity) else {
-                return Ok(None);
-            };
-            (binding.root_identity.clone(), saved, None, false)
+            (binding.root_identity.clone(), None)
         }
     };
-    let debt_volume = binding
+    let saved = match pending_root {
+        Some(root) => root.saved.clone(),
+        None => match decode_directory_identity(&saved_bytes) {
+            Ok(saved) => saved,
+            Err(_) => {
+                return Ok(VolumeProof {
+                    renumbered: None,
+                    unproven: Some(SAVED_IDENTITY_MALFORMED),
+                });
+            }
+        },
+    };
+    let debt_binding = binding
         .as_ref()
-        .filter(|binding| binding.root_identity == saved_bytes)
-        .map(|binding| binding.volume_uuid);
+        .filter(|binding| binding.root_identity == saved_bytes);
+    let debt_volume = debt_binding.map(|binding| binding.volume_uuid);
     let live_volume_identity =
         crate::volume_identity::volume_identity(cache_root, live.device, live.inode);
     let live_volume = live_volume_identity.uuid();
@@ -1781,7 +1982,7 @@ fn prove_renumbered_debt_volume(
     } else {
         None
     };
-    let rule = match renumbered_debt_decision(
+    let decided = renumbered_debt_decision(
         &saved,
         live,
         debt_volume,
@@ -1789,16 +1990,95 @@ fn prove_renumbered_debt_volume(
         live_volume,
         marker.as_ref(),
         &canonical_coordinator_path(resource_db),
-    ) {
-        Ok(rule) => rule,
-        Err(condition) if required => {
-            return Err(debt_reproof_refusal(condition, live_volume_identity));
+    );
+    let (rule, uuid) = match (decided, live_volume) {
+        (Ok(rule), Some(uuid)) => (rule, uuid),
+        (Err(condition), _) if required => {
+            return Err(debt_reproof_refusal(condition, Some(live_volume_identity)));
         }
-        Err(_) => return Ok(None),
+        (Err(condition), _) => {
+            return Ok(VolumeProof {
+                renumbered: None,
+                unproven: Some(condition),
+            });
+        }
+        // A decision never accepts without a live UUID.
+        (Ok(_), None) => return Ok(VolumeProof::default()),
+    };
+    // Make what proved the volume durable before any record is acted on: the
+    // root binding lets the root row move on once the last debt completes,
+    // and the live key proves records written under it after another
+    // renumber. Without them a later pass could not finish what this one
+    // starts, so a failed write refuses here.
+    let refuse_unrecorded = |required: bool| -> io::Result<VolumeProof> {
+        if required {
+            Err(debt_reproof_refusal(PROOF_UNRECORDED, None))
+        } else {
+            Ok(VolumeProof {
+                renumbered: None,
+                unproven: Some(PROOF_UNRECORDED),
+            })
+        }
+    };
+    if required && root_volume.is_none() {
+        let bound = super::rotation_journal::bind_root_volume(
+            resource_db,
+            cache_root,
+            &saved_bytes,
+            &saved_bytes,
+            uuid,
+            rule,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis() as i64),
+        );
+        if !matches!(bound, Ok(true)) {
+            return refuse_unrecorded(required);
+        }
+    }
+    if !matches!(
+        super::rotation_journal::record_volume_key(
+            resource_db,
+            cache_root,
+            &filesystem_key_text(live),
+            uuid,
+        ),
+        Ok(true)
+    ) {
+        return refuse_unrecorded(required);
+    }
+    if let (Some(payload), None) = (payload, debt_volume) {
+        match super::rotation_journal::bind_debt_volume(
+            resource_db,
+            cache_root,
+            repository,
+            payload,
+            &saved_bytes,
+            uuid,
+            rule,
+        ) {
+            Ok(true) => crate::phase_telemetry::add(
+                "preparation_rotation_debt_volume_recorded",
+                Duration::ZERO,
+            ),
+            Ok(false) => {}
+            Err(error) => crate::warn_unrecorded::<(), _>(
+                "record the preparation rotation debt volume",
+                Err(error),
+            ),
+        }
+    }
+    // Report the rule that originally proved the volume: a binding written
+    // after a root-binding or marker proof keeps that rule.
+    let reported = match debt_binding {
+        Some(binding) if binding.rule != super::rotation_journal::ROOT_VOLUME_OBSERVED => {
+            binding.rule.as_str()
+        }
+        _ => rule,
     };
     crate::phase_telemetry::add("preparation_rotation_debt_volume_reproved", Duration::ZERO);
     crate::phase_telemetry::add(
-        match rule {
+        match reported {
             DEBT_REPROOF_VOLUME_UUID => "preparation_rotation_debt_volume_reproved_volume_uuid",
             DEBT_REPROOF_ROOT_BINDING => {
                 "preparation_rotation_debt_volume_reproved_root_volume_binding"
@@ -1807,79 +2087,184 @@ fn prove_renumbered_debt_volume(
         },
         Duration::ZERO,
     );
-    if let Some(uuid) = live_volume {
-        // Keep what proved the volume: a debt binding lets later recovery
-        // calls skip the older rules, and a root binding for the saved
-        // identity lets the root row move on once the last debt completes.
-        if let (Some(payload), None) = (payload, debt_volume) {
-            match super::rotation_journal::bind_debt_volume(
-                resource_db,
-                cache_root,
-                repository,
-                payload,
-                &saved_bytes,
-                uuid,
-                rule,
-            ) {
-                Ok(true) => crate::phase_telemetry::add(
-                    "preparation_rotation_debt_volume_recorded",
-                    Duration::ZERO,
-                ),
-                Ok(false) => {}
-                Err(error) => crate::warn_unrecorded::<(), _>(
-                    "record the preparation rotation debt volume",
-                    Err(error),
-                ),
-            }
-        }
-        if required && root_volume.is_none() {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_millis() as i64);
-            crate::warn_unrecorded(
-                "record the preparation cache root volume",
-                super::rotation_journal::bind_root_volume(
-                    resource_db,
-                    cache_root,
-                    &saved_bytes,
-                    &saved_bytes,
-                    uuid,
-                    rule,
-                    now_ms,
-                ),
-            );
-        }
-    }
-    Ok(Some(RenumberedVolume::new(&saved, live)))
+    // Keys an earlier re-proven recovery wrote records under, bound to this
+    // same volume UUID. Unreadable keys only make the proof narrower.
+    let volume = super::rotation_journal::volume_keys(resource_db, cache_root, uuid)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|key| parse_filesystem_key(key))
+        .fold(
+            RenumberedVolume::new(&saved, live),
+            RenumberedVolume::with_key,
+        );
+    Ok(VolumeProof {
+        renumbered: Some(volume),
+        unproven: None,
+    })
 }
 
-/// Backfill an `observed` binding for a journaled debt whose saved cache-root
-/// identity is exactly the live one, as debts journaled by older binaries
-/// are until the volume is renumbered.
-fn record_exact_debt_volume(
+/// A journaled debt whose saved cache-root identity equals the live one.
+/// When a UUID was recorded for it and the live UUID is known, they must be
+/// equal; otherwise the debt gains an `observed` binding, but only while the
+/// journal root row is bound to the same live UUID (the root re-proof has
+/// already refused a root row bound to another one), so a different disk in
+/// the same slot never has its UUID recorded for this debt.
+fn exact_debt_volume(
     cache_root: &Path,
     resource_db: &Path,
     repository: &str,
     live: &DirectoryIdentity,
-    live_bytes: &[u8],
     payload: &[u8],
-) {
-    let Ok(debt) = serde_json::from_slice::<RotationDebt>(payload) else {
-        return;
+    binding: Option<&super::rotation_journal::DebtVolumeBinding>,
+) -> io::Result<()> {
+    let live_volume_identity =
+        crate::volume_identity::volume_identity(cache_root, live.device, live.inode);
+    let Some(uuid) = live_volume_identity.uuid() else {
+        return Ok(());
     };
-    if debt
-        .cache_root
-        .encode()
-        .is_ok_and(|bytes| bytes == live_bytes)
-    {
-        record_debt_volume(resource_db, cache_root, repository, payload, live);
+    match binding {
+        Some(binding) if binding.volume_uuid != uuid => {
+            Err(debt_reproof_refusal(DEBT_VOLUME_DIFFERS, None))
+        }
+        Some(_) => Ok(()),
+        None => {
+            let root_bound = super::rotation_journal::root_volume_state(resource_db, cache_root)
+                .ok()
+                .flatten()
+                .and_then(|state| state.bound_volume);
+            if root_bound == Some(uuid) {
+                bind_observed_debt_volume(resource_db, cache_root, repository, payload, live, uuid);
+            }
+            Ok(())
+        }
     }
+}
+
+/// The root identity the journal holds this cache root's rows under, for a
+/// caller that walks the journal before recovering each repository (the gc
+/// cache sweep). Normally the live identity. When the journal root row names
+/// an older identity of the same root directory (same inode, another
+/// filesystem key) and debt rows are pending under it, those rows stay under
+/// the saved identity until each debt completes, so the walk must use it.
+/// This only routes the walk: it grants nothing, and each repository's
+/// recovery re-proves the volume under its own lease before acting.
+pub(crate) fn journal_root_identity_for_walk(
+    resource_db: &Path,
+    cache_root: &Path,
+    live: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    let live = live?;
+    let Ok(Some(state)) = super::rotation_journal::root_volume_state(resource_db, cache_root)
+    else {
+        return Some(live.to_vec());
+    };
+    if state.saved_identity == live || state.debt_rows == 0 {
+        return Some(live.to_vec());
+    }
+    match (
+        decode_directory_identity(&state.saved_identity),
+        decode_directory_identity(live),
+    ) {
+        (Ok(saved), Ok(live_identity))
+            if saved.inode == live_identity.inode && !saved.same_filesystem(&live_identity) =>
+        {
+            Some(state.saved_identity)
+        }
+        _ => Some(live.to_vec()),
+    }
+}
+
+/// Pre-check a journal payload before a walk takes the repository's lease.
+/// Under the live root identity this is [`RotationDebt::from_journal_payload`].
+/// Under a saved identity (see [`journal_root_identity_for_walk`]) the debt
+/// must be well formed, belong to `repository` and name exactly that saved
+/// identity; whether it still names the live root is decided by the
+/// repository's recovery, which re-proves the volume. Never authority.
+pub(crate) fn check_journal_payload_for_walk(
+    cache_root: &Path,
+    repository: &str,
+    payload: &[u8],
+    journal_root_identity: &[u8],
+) -> io::Result<()> {
+    let live = identity_for_directory(&open_cache_root(cache_root)?)?.encode()?;
+    if live == journal_root_identity {
+        return RotationDebt::from_journal_payload(cache_root, repository, payload).map(drop);
+    }
+    let debt: RotationDebt = serde_json::from_slice(payload)
+        .map_err(|error| invalid_record(&format!("journal rotation debt is malformed: {error}")))?;
+    debt.validate()?;
+    if debt.repository != repository
+        || debt.cache_root.encode()? != journal_root_identity
+        || encode(&debt)? != payload
+    {
+        return Err(invalid_record(
+            "journal rotation debt does not match its repository or saved cache root",
+        ));
+    }
+    Ok(())
+}
+
+/// The retired-store name of `repository`'s committed in-cache rotation
+/// record, for diagnostics only (labels and remaining-entry counts). The
+/// record must be well formed, belong to `repository` and name this cache
+/// root's inode; its filesystem key is not compared, because a renumbered
+/// record that recovery will re-prove must not read as refused here. Never
+/// authority for any mutation.
+pub(crate) fn recorded_retired_component(
+    cache_root: &Path,
+    repository: &str,
+) -> io::Result<Option<String>> {
+    let root = open_cache_root(cache_root)?;
+    let live = identity_for_directory(&root)?;
+    let Some(file) = read_component(
+        root.as_raw_fd(),
+        &RotationDebt::record_component(repository)?,
+    )?
+    else {
+        return Ok(None);
+    };
+    let debt: RotationDebt = serde_json::from_slice(&file.bytes)
+        .map_err(|error| invalid_record(&format!("rotation witness is malformed: {error}")))?;
+    debt.validate()?;
+    if debt.repository != repository
+        || !debt.cache_root.same_inode(&live)
+        || encode(&debt)? != file.bytes
+    {
+        return Err(invalid_record(
+            "rotation witness does not match its location",
+        ));
+    }
+    Ok(Some(debt.retired_component))
 }
 
 /// Recover one repository's rotation while revalidating the broker's captured
 /// cache-root binding immediately before every recovery mutation. The caller
 /// holds the repository-scoped preparation-cache lease for the full operation.
 pub(crate) fn recover_with_journal_and_root_guard(
+    cache_root: &Path,
+    resource_db: &Path,
+    repository: &str,
+    deadline: Instant,
+    validate_root: impl FnMut() -> io::Result<()>,
+) -> Result<RecoveryProgress, RecoveryError> {
+    let result = recover_with_journal_and_root_guard_inner(
+        cache_root,
+        resource_db,
+        repository,
+        deadline,
+        validate_root,
+    );
+    // A debt re-proof refusal is counted here, once, under its condition;
+    // the read paths that can construct one never count.
+    if let Err(error) = &result
+        && let Some(condition) = debt_volume_refusal_condition(&error.source)
+    {
+        count_debt_volume_refusal(condition);
+    }
+    result
+}
+
+fn recover_with_journal_and_root_guard_inner(
     cache_root: &Path,
     resource_db: &Path,
     repository: &str,
@@ -1951,7 +2336,7 @@ pub(crate) fn recover_with_journal_and_root_guard(
         repository,
     )
     .map_err(|source| recovery_error(progress, source))?;
-    let renumbered_volume = prove_renumbered_debt_volume(
+    let volume_proof = prove_renumbered_debt_volume(
         cache_root,
         resource_db,
         repository,
@@ -1965,7 +2350,7 @@ pub(crate) fn recover_with_journal_and_root_guard(
     .map_err(|source| recovery_error(progress, source))?;
     // Every identity comparison below, down to the last mutation, accepts the
     // proven old filesystem key of this volume; the scope ends with the call.
-    let renumbered_scope = RenumberedVolumeScope::enter(renumbered_volume);
+    let renumbered_scope = RenumberedVolumeScope::enter(volume_proof);
     if journal_record.is_none() {
         let retained =
             read(cache_root, repository).map_err(|source| recovery_error(progress, source))?;
@@ -2130,6 +2515,16 @@ pub(crate) fn recover_with_journal_and_root_guard(
             return Err(recovery_error(progress, source));
         }
         drop(renumbered_scope);
+        // No record of this debt remains to re-prove.
+        crate::warn_unrecorded(
+            "retire the preparation rotation debt volume binding",
+            super::rotation_journal::forget_debt_volume(
+                resource_db,
+                cache_root,
+                repository,
+                &payload,
+            ),
+        );
         if journal_root_bytes != root_identity_bytes {
             // The last debt under the saved identity may be done: let the
             // root row move on to the live identity now rather than on the
@@ -6790,6 +7185,7 @@ mod root_volume_reproof_tests {
 mod debt_volume_reproof_tests {
     use super::*;
     use crate::preparation::rotation_journal;
+    use std::collections::BTreeMap;
 
     const REPOSITORY: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
     const TRANSACTION: &str = "fedcba9876543210fedcba9876543210";
@@ -7018,15 +7414,26 @@ mod debt_volume_reproof_tests {
         assert!(!counters.contains("preparation_rotation_debt_volume_refused_other"));
     }
 
-    /// The scope equates exactly the two proven keys, in both directions,
-    /// still requires equal inodes, never a third key, and ends with the scope.
+    fn proven(volume: RenumberedVolume) -> VolumeProof {
+        VolumeProof {
+            renumbered: Some(volume),
+            unproven: None,
+        }
+    }
+
+    fn no_proof_is_active() -> bool {
+        VOLUME_PROOF.with(|proof| *proof.borrow() == VolumeProof::default())
+    }
+
+    /// The scope equates exactly the proven keys, in both directions, still
+    /// requires equal inodes, never another key, and ends with the scope.
     #[test]
     fn a_proven_renumber_equates_exactly_two_filesystem_keys_for_its_scope() {
         let (saved, live) = saved_and_live();
         let third = identity(52, 839, "2200");
         assert!(!saved.same_directory(&live));
         {
-            let _scope = RenumberedVolumeScope::enter(Some(RenumberedVolume::new(&saved, &live)));
+            let _scope = RenumberedVolumeScope::enter(proven(RenumberedVolume::new(&saved, &live)));
             assert!(saved.same_directory(&live));
             assert!(live.same_directory(&saved));
             assert!(saved.same_filesystem(&identity(41, 7, "1900")));
@@ -7036,6 +7443,45 @@ mod debt_volume_reproof_tests {
             assert!(!saved.same_filesystem(&identity(41, 839, "1d00")));
         }
         assert!(!saved.same_directory(&live));
+        assert!(no_proof_is_active());
+    }
+
+    /// A key recorded under the same volume UUID by an earlier re-proven
+    /// recovery (records written there carry it) is equated too, so a
+    /// second renumber before the debt completes does not strand them.
+    #[test]
+    fn a_key_recorded_under_the_live_uuid_is_equated_after_a_second_renumber() {
+        let (saved, _) = saved_and_live();
+        let first_live = identity(41, 900, "1900");
+        let second_live = identity(48, 900, "2400");
+        let volume = RenumberedVolume::new(&saved, &second_live);
+        {
+            let _scope = RenumberedVolumeScope::enter(proven(volume.clone()));
+            assert!(!first_live.same_directory(&second_live));
+        }
+        let _scope = RenumberedVolumeScope::enter(proven(volume.with_key((41, "1900".into()))));
+        assert!(first_live.same_directory(&second_live));
+        assert!(!identity(52, 900, "2200").same_directory(&second_live));
+    }
+
+    #[test]
+    fn nested_scopes_restore_the_enclosing_proof() {
+        let (saved, live) = saved_and_live();
+        let outer = proven(RenumberedVolume::new(&saved, &live));
+        let inner = VolumeProof {
+            renumbered: None,
+            unproven: Some(NO_ROOT_MARKER),
+        };
+        {
+            let _outer = RenumberedVolumeScope::enter(outer.clone());
+            {
+                let _inner = RenumberedVolumeScope::enter(inner);
+                assert!(!saved.same_directory(&live));
+            }
+            assert!(saved.same_directory(&live));
+            assert_eq!(VOLUME_PROOF.with(|proof| proof.borrow().clone()), outer);
+        }
+        assert!(no_proof_is_active());
     }
 
     // ---- Recovery over renumbered records ------------------------------------
@@ -7049,6 +7495,9 @@ mod debt_volume_reproof_tests {
         saved_root: Vec<u8>,
         payload: Vec<u8>,
         live_volume: Option<[u8; 16]>,
+        /// The key the stage proof was written under when it differs from
+        /// the debt's (a recovery after a first renumber wrote it).
+        intermediate_key: String,
     }
 
     impl Renumbered {
@@ -7056,6 +7505,17 @@ mod debt_volume_reproof_tests {
         /// every record saved under another disk slot. `root_inode_delta`
         /// also moves the saved cache-root inode.
         fn new(root_inode_delta: u64) -> Self {
+            Self::build(root_inode_delta, false)
+        }
+
+        /// As [`Self::new`], but the stage proof was written by a recovery
+        /// that ran after a first renumber, under that intermediate key, and
+        /// the volume has been renumbered again since.
+        fn with_stage_renumbered_twice() -> Self {
+            Self::build(0, true)
+        }
+
+        fn build(root_inode_delta: u64, stage_twice: bool) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let base = directory.path().canonicalize().unwrap();
             let parent = base.join("placement");
@@ -7073,7 +7533,17 @@ mod debt_volume_reproof_tests {
             let mut saved_root = renumber(&live_root);
             saved_root.inode += root_inode_delta;
             let saved_store = renumber(&DirectoryIdentity::capture(&store).unwrap());
-            let saved_stage = renumber(&DirectoryIdentity::capture(&stage).unwrap());
+            let live_stage = DirectoryIdentity::capture(&stage).unwrap();
+            let saved_stage = if stage_twice {
+                identity(
+                    live_stage.device.wrapping_add(8),
+                    live_stage.inode,
+                    "22222222dddddddd",
+                )
+            } else {
+                renumber(&live_stage)
+            };
+            let intermediate_key = filesystem_key_text(&saved_stage);
             assert!(!saved_root.same_filesystem(&live_root));
 
             let debt = RotationDebt::new(REPOSITORY, TRANSACTION, saved_root.clone(), saved_store)
@@ -7097,7 +7567,15 @@ mod debt_volume_reproof_tests {
                 &payload,
             );
             let intent = FreshStageIntent::new(&debt, FreshStageSource::CanonicalOriginal, None);
+            // The first recovery wrote the proof while it held S = intermediate.
+            let _first_recovery = stage_twice.then(|| {
+                RenumberedVolumeScope::enter(proven(RenumberedVolume::new(
+                    &saved_root,
+                    &saved_stage,
+                )))
+            });
             let proof = FreshStageProof::new(&intent, saved_stage.clone()).unwrap();
+            drop(_first_recovery);
             write_private(
                 &cache_root.join(format!("{FRESH_STAGE_PREFIX}{REPOSITORY}.proof")),
                 &proof.encode().unwrap(),
@@ -7120,6 +7598,7 @@ mod debt_volume_reproof_tests {
                 store,
                 saved_root: saved_root_bytes,
                 payload,
+                intermediate_key,
             }
         }
 
@@ -7290,17 +7769,16 @@ mod debt_volume_reproof_tests {
         let result = fixture.recover();
         if fixture.live_volume.is_some() {
             fixture.assert_resumed(result);
-            // What proved it is kept for the debt, under its saved identity.
-            let binding = rotation_journal::debt_volume_binding(
-                &fixture.resource_db,
-                &fixture.cache_root,
-                REPOSITORY,
-            )
-            .unwrap()
-            .unwrap();
-            assert_eq!(Some(binding.volume_uuid), fixture.live_volume);
-            assert_eq!(binding.root_identity, fixture.saved_root);
-            assert!(binding.names_payload(&fixture.payload));
+            // Once no record of the debt remains, its binding is retired.
+            assert!(
+                rotation_journal::debt_volume_binding(
+                    &fixture.resource_db,
+                    &fixture.cache_root,
+                    REPOSITORY,
+                )
+                .unwrap()
+                .is_none()
+            );
         } else {
             fixture.assert_refused(result, LIVE_VOLUME_UNKNOWN);
         }
@@ -7439,4 +7917,493 @@ mod debt_volume_reproof_tests {
             assert!(proof_path.exists());
         }
     }
+
+    // ---- Counting, filters, side paths ----------------------------------------
+
+    fn counters_during(run: impl FnOnce()) -> BTreeMap<String, u64> {
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let installed = crate::phase_telemetry::install(recorder.clone());
+        run();
+        drop(installed);
+        recorder.totals().1
+    }
+
+    fn refusals(counters: &BTreeMap<String, u64>) -> Vec<&String> {
+        counters
+            .keys()
+            .filter(|name| name.contains("refused"))
+            .collect()
+    }
+
+    /// A refused recovery is counted once, under its condition, and leaves no
+    /// proof active on the thread.
+    #[test]
+    fn a_refused_recovery_counts_once_under_its_condition_and_ends_its_scope() {
+        let fixture = Renumbered::new(0);
+        let expected = fixture.expected_refusal(NO_ROOT_MARKER);
+        let mut result = None;
+        let counters = counters_during(|| result = Some(fixture.recover()));
+        fixture.assert_refused(result.unwrap(), expected);
+        assert_eq!(
+            counters.get("preparation_rotation_debt_volume_reproof_refused"),
+            Some(&1)
+        );
+        assert_eq!(counters.get(debt_refusal_counter(expected)), Some(&1));
+        assert!(!counters.contains_key("preparation_rotation_debt_volume_reproved"));
+        assert!(no_proof_is_active());
+    }
+
+    /// A proven recovery stopped part-way ends its scope too.
+    #[test]
+    fn an_interrupted_proven_recovery_ends_its_scope() {
+        let fixture = Renumbered::new(0);
+        fixture.bind_debt(fixture.this_volume());
+        let mut calls = 0;
+        let result = recover_with_journal_and_root_guard(
+            &fixture.cache_root,
+            &fixture.resource_db,
+            REPOSITORY,
+            deadline(),
+            || {
+                calls += 1;
+                if calls == 4 {
+                    Err(io::Error::other("lease lost"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(result.is_err());
+        assert!(no_proof_is_active());
+        let (saved, live) = saved_and_live();
+        assert!(!saved.same_directory(&live));
+    }
+
+    #[test]
+    fn a_proof_reports_the_rule_that_first_proved_the_volume() {
+        let fixture = Renumbered::new(0);
+        fixture.bind_root(fixture.this_volume());
+        let mut result = None;
+        let counters = counters_during(|| result = Some(fixture.recover()));
+        if fixture.live_volume.is_some() {
+            fixture.assert_resumed(result.unwrap());
+            assert_eq!(
+                counters.get("preparation_rotation_debt_volume_reproved_root_volume_binding"),
+                Some(&1)
+            );
+            assert!(
+                !counters.contains_key("preparation_rotation_debt_volume_reproved_volume_uuid")
+            );
+        } else {
+            fixture.assert_refused(result.unwrap(), LIVE_VOLUME_UNKNOWN);
+        }
+    }
+
+    /// A binding left by an earlier debt of this repository (another payload)
+    /// proves nothing about the debt journaled now.
+    #[test]
+    fn a_stale_binding_of_an_earlier_debt_does_not_prove_a_later_one() {
+        let fixture = Renumbered::new(0);
+        assert!(
+            rotation_journal::insert_debt_volume_for_test(
+                &fixture.resource_db,
+                &fixture.cache_root,
+                REPOSITORY,
+                b"an earlier debt",
+                &fixture.saved_root,
+                fixture.this_volume(),
+            )
+            .unwrap()
+        );
+        let result = fixture.recover();
+        fixture.assert_refused(result, fixture.expected_refusal(NO_ROOT_MARKER));
+    }
+
+    /// A binding for this payload that recorded another cache-root identity
+    /// than the journal row saved does not prove the saved one.
+    #[test]
+    fn a_binding_of_another_root_identity_does_not_prove_the_saved_one() {
+        let fixture = Renumbered::new(0);
+        assert!(
+            rotation_journal::insert_debt_volume_for_test(
+                &fixture.resource_db,
+                &fixture.cache_root,
+                REPOSITORY,
+                &fixture.payload,
+                &fixture.live_root(),
+                fixture.this_volume(),
+            )
+            .unwrap()
+        );
+        let result = fixture.recover();
+        fixture.assert_refused(result, fixture.expected_refusal(NO_ROOT_MARKER));
+    }
+
+    /// Records written under a key an earlier re-proven recovery recorded for
+    /// this volume are accepted after a second renumber.
+    #[test]
+    fn a_second_renumber_resumes_through_the_recorded_intermediate_key() {
+        let fixture = Renumbered::with_stage_renumbered_twice();
+        fixture.bind_debt(fixture.this_volume());
+        assert!(
+            rotation_journal::record_volume_key(
+                &fixture.resource_db,
+                &fixture.cache_root,
+                &fixture.intermediate_key,
+                fixture.this_volume(),
+            )
+            .unwrap()
+        );
+        let result = fixture.recover();
+        if fixture.live_volume.is_some() {
+            fixture.assert_resumed(result);
+        } else {
+            fixture.assert_refused(result, LIVE_VOLUME_UNKNOWN);
+        }
+    }
+
+    #[test]
+    fn a_second_renumber_without_the_intermediate_key_is_refused() {
+        let fixture = Renumbered::with_stage_renumbered_twice();
+        fixture.bind_debt(fixture.this_volume());
+        let result = fixture.recover();
+        fixture.assert_refused(result, fixture.expected_refusal(RECORD_KEY_UNPROVEN));
+    }
+
+    /// The live key is recorded under the live UUID whenever a proof is made,
+    /// before anything is mutated.
+    #[test]
+    fn a_proven_recovery_records_its_live_key() {
+        let fixture = Renumbered::new(0);
+        fixture.bind_debt(fixture.this_volume());
+        let result = fixture.recover();
+        let live = DirectoryIdentity::capture(&fixture.cache_root).unwrap();
+        let keys = rotation_journal::volume_keys(
+            &fixture.resource_db,
+            &fixture.cache_root,
+            fixture.this_volume(),
+        )
+        .unwrap();
+        if fixture.live_volume.is_some() {
+            fixture.assert_resumed(result);
+            assert_eq!(keys, vec![filesystem_key_text(&live)]);
+        } else {
+            fixture.assert_refused(result, LIVE_VOLUME_UNKNOWN);
+            assert!(keys.is_empty());
+        }
+    }
+
+    // ---- Records read outside a proof -----------------------------------------
+
+    /// One renumbered debt with nothing written yet.
+    fn renumbered_debt() -> (tempfile::TempDir, PathBuf, RotationDebt) {
+        let directory = tempfile::tempdir().unwrap();
+        let cache_root = directory.path().canonicalize().unwrap().join("cache");
+        std::fs::create_dir(&cache_root).unwrap();
+        let store = cache_root.join(REPOSITORY);
+        std::fs::create_dir(&store).unwrap();
+        let debt = RotationDebt::new(
+            REPOSITORY,
+            TRANSACTION,
+            renumber(&DirectoryIdentity::capture(&cache_root).unwrap()),
+            renumber(&DirectoryIdentity::capture(&store).unwrap()),
+        )
+        .unwrap();
+        (directory, cache_root, debt)
+    }
+
+    fn assert_unproven(result: io::Result<impl std::fmt::Debug>) {
+        let error = result.unwrap_err();
+        assert_eq!(debt_volume_refusal_condition(&error), Some(UNPROVEN_RECORD));
+        assert!(error.to_string().contains(DEBT_REPROOF_REFUSED), "{error}");
+    }
+
+    /// Each record kind that names the cache root is refused with the
+    /// distinct reason when no proof covers its saved device, and reading it
+    /// counts nothing (only the recovery entry point counts).
+    #[test]
+    fn every_record_kind_refuses_an_unproven_renumber_without_counting() {
+        let counters = counters_during(|| {
+            let (_directory, cache_root, debt) = renumbered_debt();
+            assert_unproven(RotationDebt::from_journal_payload(
+                &cache_root,
+                REPOSITORY,
+                &encode(&debt).unwrap(),
+            ));
+
+            let (_directory, cache_root, debt) = renumbered_debt();
+            let intent = FreshStageIntent::new(&debt, FreshStageSource::CanonicalOriginal, None);
+            write_private(
+                &cache_root.join(format!("{FRESH_STAGE_PREFIX}{REPOSITORY}.intent")),
+                &encode_fresh_stage_intent(&intent).unwrap(),
+            );
+            assert_unproven(stage_transaction_debt(&cache_root, REPOSITORY));
+
+            let (_directory, cache_root, debt) = renumbered_debt();
+            let stage = cache_root.join(format!("{FRESH_STAGE_PREFIX}{REPOSITORY}"));
+            std::fs::create_dir(&stage).unwrap();
+            let intent = FreshStageIntent::new(&debt, FreshStageSource::CanonicalOriginal, None);
+            let proof = FreshStageProof::new(
+                &intent,
+                renumber(&DirectoryIdentity::capture(&stage).unwrap()),
+            )
+            .unwrap();
+            write_private(
+                &cache_root.join(format!("{FRESH_STAGE_PREFIX}{REPOSITORY}.proof")),
+                &proof.encode().unwrap(),
+            );
+            assert_unproven(stage_transaction_debt(&cache_root, REPOSITORY));
+
+            let (_directory, cache_root, debt) = renumbered_debt();
+            write_private(
+                &cache_root.join(format!("{RECORD_PREFIX}{REPOSITORY}{SCRATCH_SUFFIX}")),
+                &encode(&debt).unwrap(),
+            );
+            assert_unproven(read_or_promote_scratch_with_root_guard(
+                &cache_root,
+                REPOSITORY,
+                &mut || Ok(()),
+            ));
+
+            let (_directory, cache_root, debt) = renumbered_debt();
+            write_private(
+                &cache_root.join(format!("{RECORD_PREFIX}{REPOSITORY}.json")),
+                &encode(&debt).unwrap(),
+            );
+            assert_unproven(read(&cache_root, REPOSITORY));
+            // The diagnostic read still names the record.
+            assert_eq!(
+                recorded_retired_component(&cache_root, REPOSITORY).unwrap(),
+                Some(format!("{REPOSITORY}.retired"))
+            );
+        });
+        assert!(refusals(&counters).is_empty(), "{counters:?}");
+    }
+
+    /// The unproven reason carries the condition a non-required proof failed
+    /// on, when one was attempted.
+    #[test]
+    fn an_unproven_record_reports_the_condition_its_proof_failed_on() {
+        let (_directory, cache_root, debt) = renumbered_debt();
+        let _scope = RenumberedVolumeScope::enter(VolumeProof {
+            renumbered: None,
+            unproven: Some(DEBT_VOLUME_DIFFERS),
+        });
+        let error =
+            RotationDebt::from_journal_payload(&cache_root, REPOSITORY, &encode(&debt).unwrap())
+                .unwrap_err();
+        assert_eq!(
+            debt_volume_refusal_condition(&error),
+            Some(DEBT_VOLUME_DIFFERS)
+        );
+    }
+
+    // ---- Exact debts ----------------------------------------------------------
+
+    /// A journaled debt saved under the live identity, after the root re-proof
+    /// ran (it binds the root's UUID when one is known).
+    fn exact_debt(bind_root: bool) -> (tempfile::TempDir, PathBuf, PathBuf, Vec<u8>) {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
+        let cache_root = base.join("cache");
+        std::fs::create_dir(&cache_root).unwrap();
+        let store = cache_root.join(REPOSITORY);
+        std::fs::create_dir(&store).unwrap();
+        let resource_db = base.join("host-resources.db");
+        let root = DirectoryIdentity::capture(&cache_root).unwrap();
+        let debt = RotationDebt::new(
+            REPOSITORY,
+            TRANSACTION,
+            root.clone(),
+            DirectoryIdentity::capture(&store).unwrap(),
+        )
+        .unwrap();
+        let payload = encode(&debt).unwrap();
+        let root_bytes = root.encode().unwrap();
+        rotation_journal::publish(&resource_db, &cache_root, &root_bytes, REPOSITORY, &payload)
+            .unwrap();
+        if bind_root {
+            reconcile_journal_root_volume(&cache_root, &resource_db, &root, &root_bytes).unwrap();
+        }
+        (directory, cache_root, resource_db, payload)
+    }
+
+    fn prove_exact(
+        cache_root: &Path,
+        resource_db: &Path,
+        payload: &[u8],
+    ) -> io::Result<VolumeProof> {
+        let live = DirectoryIdentity::capture(cache_root).unwrap();
+        prove_renumbered_debt_volume(
+            cache_root,
+            resource_db,
+            REPOSITORY,
+            &live,
+            &live.encode().unwrap(),
+            None,
+            Some(payload),
+        )
+    }
+
+    #[test]
+    fn an_exact_legacy_debt_gains_an_observed_binding_where_a_uuid_is_known() {
+        let (_directory, cache_root, resource_db, payload) = exact_debt(true);
+        assert_eq!(
+            prove_exact(&cache_root, &resource_db, &payload).unwrap(),
+            VolumeProof::default()
+        );
+        let binding =
+            rotation_journal::debt_volume_binding(&resource_db, &cache_root, REPOSITORY).unwrap();
+        assert_eq!(binding.is_some(), live_volume(&cache_root).is_some());
+        if let Some(binding) = binding {
+            assert_eq!(binding.rule, rotation_journal::ROOT_VOLUME_OBSERVED);
+            assert!(binding.names_payload(&payload));
+        }
+    }
+
+    /// Without a root binding for the same UUID nothing shows the slot still
+    /// holds this volume, so no UUID is recorded for the debt.
+    #[test]
+    fn an_exact_debt_is_not_bound_while_its_root_has_no_matching_binding() {
+        let (_directory, cache_root, resource_db, payload) = exact_debt(false);
+        prove_exact(&cache_root, &resource_db, &payload).unwrap();
+        assert!(
+            rotation_journal::debt_volume_binding(&resource_db, &cache_root, REPOSITORY)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A different disk in the same slot can show the same device number and
+    /// inode: an exact debt whose recorded UUID differs is refused.
+    #[test]
+    fn an_exact_debt_whose_recorded_uuid_names_another_volume_is_refused() {
+        let (_directory, cache_root, resource_db, payload) = exact_debt(false);
+        let root = DirectoryIdentity::capture(&cache_root).unwrap();
+        assert!(
+            rotation_journal::insert_debt_volume_for_test(
+                &resource_db,
+                &cache_root,
+                REPOSITORY,
+                &payload,
+                &root.encode().unwrap(),
+                OTHER_VOLUME,
+            )
+            .unwrap()
+        );
+        let result = prove_exact(&cache_root, &resource_db, &payload);
+        if live_volume(&cache_root).is_some() {
+            assert_eq!(
+                debt_volume_refusal_condition(&result.unwrap_err()),
+                Some(DEBT_VOLUME_DIFFERS)
+            );
+        } else {
+            assert_eq!(result.unwrap(), VolumeProof::default());
+        }
+    }
+
+    // ---- No proof without a record that needs one ------------------------------
+
+    /// A binding kept after its journal row completed proves something only
+    /// while an in-cache record still names its saved identity; otherwise no
+    /// proof is made and nothing is counted.
+    #[test]
+    fn a_kept_binding_without_a_record_that_needs_it_proves_nothing() {
+        let fixture = Renumbered::new(0);
+        fixture.bind_debt(fixture.this_volume());
+        for name in [
+            format!("{RECORD_PREFIX}{REPOSITORY}.json"),
+            format!("{FRESH_STAGE_PREFIX}{REPOSITORY}.proof"),
+        ] {
+            std::fs::remove_file(fixture.cache_root.join(name)).unwrap();
+        }
+        let live = DirectoryIdentity::capture(&fixture.cache_root).unwrap();
+        let mut proof = None;
+        let counters = counters_during(|| {
+            proof = Some(
+                prove_renumbered_debt_volume(
+                    &fixture.cache_root,
+                    &fixture.resource_db,
+                    REPOSITORY,
+                    &live,
+                    &live.encode().unwrap(),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+        });
+        assert_eq!(proof.unwrap(), VolumeProof::default());
+        assert!(!counters.contains_key("preparation_rotation_debt_volume_reproved"));
+    }
+}
+
+/// Test support: the identity `live` had under another disk slot.
+#[cfg(test)]
+fn renumbered_for_test(live: &DirectoryIdentity) -> DirectoryIdentity {
+    let filesystem_id = if live.filesystem_id == "00000000ffffffff" {
+        "11111111eeeeeeee"
+    } else {
+        "00000000ffffffff"
+    };
+    DirectoryIdentity {
+        device: live.device.wrapping_add(4),
+        inode: live.inode,
+        filesystem_id: filesystem_id.into(),
+    }
+}
+
+/// Test support: journal a debt for `repository` whose every identity was
+/// saved under another disk slot, with no in-cache record yet (a crash right
+/// after journaling, then a remount). With `bind_live_volume`, the debt's
+/// volume UUID is recorded as the live one where the platform reports one.
+/// Returns whether the live volume UUID is known.
+#[cfg(test)]
+pub(crate) fn publish_renumbered_journal_debt_for_test(
+    resource_db: &Path,
+    cache_root: &Path,
+    repository: &str,
+    bind_live_volume: bool,
+) -> bool {
+    let store = cache_root.join(repository);
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("old-cache"), b"interrupted before a remount").unwrap();
+    let live_root = DirectoryIdentity::capture(cache_root).unwrap();
+    let saved_root = renumbered_for_test(&live_root);
+    let debt = RotationDebt::new(
+        repository,
+        &new_transaction_id(),
+        saved_root.clone(),
+        renumbered_for_test(&DirectoryIdentity::capture(&store).unwrap()),
+    )
+    .unwrap();
+    let payload = encode(&debt).unwrap();
+    let saved_bytes = saved_root.encode().unwrap();
+    super::rotation_journal::publish(resource_db, cache_root, &saved_bytes, repository, &payload)
+        .unwrap();
+    let live_volume =
+        crate::volume_identity::volume_identity(cache_root, live_root.device, live_root.inode)
+            .uuid();
+    if let (true, Some(uuid)) = (bind_live_volume, live_volume) {
+        assert!(
+            super::rotation_journal::bind_debt_volume(
+                resource_db,
+                cache_root,
+                repository,
+                &payload,
+                &saved_bytes,
+                uuid,
+                super::rotation_journal::ROOT_VOLUME_OBSERVED,
+            )
+            .unwrap()
+        );
+    }
+    live_volume.is_some()
+}
+
+/// Test support: the volume UUID the cache root reports, if any.
+#[cfg(test)]
+pub(crate) fn volume_uuid_for_test(cache_root: &Path) -> Option<[u8; 16]> {
+    let identity = DirectoryIdentity::capture(cache_root).ok()?;
+    crate::volume_identity::volume_identity(cache_root, identity.device, identity.inode).uuid()
 }

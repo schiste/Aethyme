@@ -3419,10 +3419,11 @@ fn recover_rotation_debt_with_limits(
 ) -> Result<rotation_debt::RecoveryProgress, PreparationError> {
     ensure_preparation_cache_root_identity(cache_root, expected_root_identity)?;
     ensure_preparation_cache_root_binding(root_binding)?;
-    let generation = rotation_debt::read(cache_root, repository)
+    // A diagnostic label only: read without the device comparison, so a
+    // renumbered record that recovery will re-prove is still named.
+    let generation = rotation_debt::recorded_retired_component(cache_root, repository)
         .ok()
-        .flatten()
-        .map(|retained| retained.debt.retired_component().to_owned());
+        .flatten();
     let mut recorder = recovery_state::RecoveryRecorder::begin(
         resource_db_path,
         cache_root,
@@ -3647,8 +3648,9 @@ fn run_rotation_recovery_slices(
 /// read-only count of the retired store named by the durable debt record.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn remaining_rotation_debt(cache_root: &Path, repository: &str) -> (String, Option<(u64, bool)>) {
-    let retained = match rotation_debt::read(cache_root, repository) {
-        Ok(Some(retained)) => retained,
+    let retired_component = match rotation_debt::recorded_retired_component(cache_root, repository)
+    {
+        Ok(Some(retired_component)) => retired_component,
         Ok(None) => {
             return (
                 "no in-cache rotation record names the remaining store".into(),
@@ -3662,7 +3664,7 @@ fn remaining_rotation_debt(cache_root: &Path, repository: &str) -> (String, Opti
             );
         }
     };
-    let retired = cache_root.join(retained.debt.retired_component());
+    let retired = cache_root.join(retired_component);
     match count_tree_entries_bounded(
         &retired,
         SHARED_CACHE_RECOVERY_REMAINING_MAX_ENTRIES,
@@ -6284,6 +6286,74 @@ mod tests {
         ));
         assert_eq!(checks, 4);
         assert_eq!(fs::read(store.join("payload")).unwrap(), b"preserve");
+    }
+
+    /// The debt's volume UUID is recorded when the rotation journals it, so
+    /// a crash right after journaling followed by a remount can still be
+    /// re-proven. The rotation is stopped at its first lease check after the
+    /// journal row exists, before any recovery could backfill the binding.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_journaled_rotation_debt_records_its_volume_uuid_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let cache_root = base.join("cache");
+        let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("payload"), vec![0_u8; 4096]).unwrap();
+        let resource_db = base.join("resources.db");
+        let journaled = || {
+            matches!(
+                rotation_journal::probe(&resource_db, &cache_root, None),
+                Ok(Some(rotation_journal::JournalProbe::Unknown))
+            )
+        };
+        let result = shared_cache_budget_at_with_guard(
+            Some(&SharedCacheBudget {
+                max_bytes: 1,
+                ..SharedCacheBudget::default()
+            }),
+            &cache_root,
+            &resource_db,
+            SHARED_CACHE_TEST_REPOSITORY,
+            "0123456789ab",
+            None,
+            None,
+            &mut |_| {
+                if journaled() {
+                    return Err(PreparationError::LivenessIncomplete {
+                        reason: "stop right after journaling".into(),
+                    });
+                }
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(PreparationError::LivenessIncomplete { .. })
+        ));
+        assert!(journaled(), "the rotation must have journaled its debt");
+        assert!(
+            rotation_debt::read(&cache_root, SHARED_CACHE_TEST_REPOSITORY)
+                .unwrap()
+                .is_none(),
+            "stopped before the in-cache witness"
+        );
+        let identity = rotation_debt::DirectoryIdentity::capture(&cache_root).unwrap();
+        let encoded = identity.encode().unwrap();
+        let uuid_known = rotation_debt::volume_uuid_for_test(&cache_root);
+        let binding = rotation_journal::debt_volume_binding(
+            &resource_db,
+            &cache_root,
+            SHARED_CACHE_TEST_REPOSITORY,
+        )
+        .unwrap();
+        assert_eq!(binding.is_some(), uuid_known.is_some());
+        if let Some(binding) = binding {
+            assert_eq!(Some(binding.volume_uuid), uuid_known);
+            assert_eq!(binding.root_identity, encoded);
+            assert_eq!(binding.rule, rotation_journal::ROOT_VOLUME_OBSERVED);
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
