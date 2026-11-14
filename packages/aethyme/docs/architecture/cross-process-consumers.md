@@ -1584,6 +1584,38 @@ and `shared_cache_exclusive_for_overdue_budget_check`. Step names are
 repository-declared; commands and arguments are not logged in this object.
 Failed preparation may have no metric breakdown.
 
+Since 2026-11-14 the work a preparation does while it holds the shared cache
+is reported, additively. The report and the
+metric's `preparation` object carry `shared_cache_operations`, omitted when
+empty: one entry per operation in order, with `operation` (one of
+`rotation_recovery`, `budget_inventory`, `rotation_drain`, `preparation_step`),
+`detail` (the step name, omitted otherwise), `elapsed_ms` and `items_done`
+(entries unlinked or measured; 0 for steps). The metric's `preparation` object
+also carries `shared_cache_rotation` when a rotation ran, with the report's
+fields. Metrics add the spans `shared_cache_lease_held`,
+`shared_cache_rotation_recovery`, `shared_cache_inventory`,
+`shared_cache_rotation_drain` and `preparation_step`, and one of the counters
+`shared_cache_inventory_absent`, `shared_cache_inventory_complete`,
+`shared_cache_inventory_time_limit` or `shared_cache_inventory_entry_limit`.
+While the cache is held, `submit prepare` writes a live record under
+`<host state>/preparation-cache-activity/` beside the host resource database,
+rewritten every 15 s and removed when the preparation ends: `schema`
+(`aethyme.preparation-cache-activity/v1`), `repository`, `session_id`,
+`holder_pid`, `operation`, nullable `detail`, `items_done`, nullable
+`items_total`, `items_total_is_lower_bound`, nullable `bytes_observed`,
+`lease_acquired_at_ms`, `operation_started_at_ms` and `updated_at_ms`. Readers
+skip a record not rewritten for 90 s. `submit prepare status --json` adds that
+record as `current_operation` for the session while it is fresh and the
+session is not current (omitted otherwise), and a waiting prepare's repeated
+notice names the holder's session, pid, operation and progress. Rotation
+recovery and drain print a stderr line when they start and every 15 s
+(`preparation cache: <operation> for <s>s: <done> of <total> entries unlinked;
+lease held <s>s, ...`); a budget inventory that runs longer than 15 s prints
+the same. The record is observational, never recovery or admission authority.
+The shared-cache inventory entry limit rose from 100,000 to 2,000,000 entries;
+its 30 s time limit is unchanged, so an inventory still stops, and rotates,
+only on time for a store that size.
+
 Successful `broker push` command metrics add `push_preflight`, `push_git`,
 `push_pr_and_watch`, `push_default_branch`, `push_overlap`, and
 `push_finalization` to `phase_timings_ms`. These are wall-clock milliseconds

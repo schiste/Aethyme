@@ -21,6 +21,8 @@ use crate::{
     HostResourceRequirement,
 };
 
+#[path = "preparation_cache_activity.rs"]
+pub(crate) mod cache_activity;
 #[path = "preparation_recovery_state.rs"]
 pub(crate) mod recovery_state;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -44,7 +46,16 @@ const SHARED_CACHE_WAIT_NOTICE_INTERVAL: Duration = Duration::from_secs(30);
 const PREPARATION_CACHE_HASH_BUFFER_BYTES: usize = 64 * 1024;
 // The scanner checks the deadline between filesystem operations. Individual
 // filesystem calls are not interruptible by this cooperative time limit.
-const SHARED_CACHE_SCAN_MAX_ENTRIES: usize = 100_000;
+//
+// The time limit is what bounds an inventory under the cache lease (the scan
+// keeps constant memory per entry); the entry limit only stops a runaway tree
+// and must sit far above one healthy store, because an inventory that stops at
+// a limit rotates the store. At 100,000 it sat below a single monorepo's pnpm
+// and uv stores (about 141,000 entries in the busiest repository, measured
+// 2026-11-14), so budget checks stopped at it and rotated the store whatever
+// its size against the 8 GiB budget: the drain then held the lease for minutes
+// in silence, and the next prepare downloaded every package again.
+const SHARED_CACHE_SCAN_MAX_ENTRIES: usize = 2_000_000;
 const SHARED_CACHE_SCAN_MAX_DEPTH: usize = 64;
 const SHARED_CACHE_SCAN_MAX_ELAPSED: Duration = Duration::from_secs(30);
 
@@ -455,6 +466,8 @@ fn shared_cache_wait_exhausted(
 /// has work that must not overlap a running step, the preparation holds the
 /// cache alone. `rotation_unsettled` runs only while a share is held: nothing
 /// can publish a rotation meanwhile, so "no debt" stays true until release.
+/// `holder_activity` says what the current holder reports doing, for the
+/// waiting notice.
 fn acquire_preparation_cache(
     coordinator: &mut HostResourceCoordinator,
     request_for: &dyn Fn(SharedCacheMode) -> Result<HostResourceRequest, PreparationError>,
@@ -462,6 +475,7 @@ fn acquire_preparation_cache(
     budget_check: Option<ExclusiveNeed>,
     wait: Duration,
     rotation_unsettled: &mut dyn FnMut() -> bool,
+    holder_activity: &dyn Fn() -> Option<String>,
 ) -> Result<
     (
         crate::HostResourceGrant,
@@ -488,6 +502,7 @@ fn acquire_preparation_cache(
             budget_check,
             remaining,
             &mut *rotation_unsettled,
+            holder_activity,
         );
         match attempt {
             Err(PreparationError::HostResource(error))
@@ -568,6 +583,7 @@ fn acquire_preparation_cache_once(
     budget_check: Option<ExclusiveNeed>,
     wait: Duration,
     rotation_unsettled: &mut dyn FnMut() -> bool,
+    holder_activity: &dyn Fn() -> Option<String>,
 ) -> Result<
     (
         crate::HostResourceGrant,
@@ -583,9 +599,8 @@ fn acquire_preparation_cache_once(
         let now = Instant::now();
         if now >= next_notice {
             eprintln!(
-                "waiting up to {}s for the shared preparation cache ({message}); \
-                 `--wait 0s` fails fast instead",
-                wait.as_secs()
+                "{}",
+                shared_cache_wait_notice(wait, message, holder_activity())
             );
             next_notice = now + SHARED_CACHE_WAIT_NOTICE_INTERVAL;
         }
@@ -646,6 +661,21 @@ fn acquire_preparation_cache_once(
         SharedCacheMode::Exclusive,
         Some(ExclusiveNeed::Recovery),
     ))
+}
+
+/// The line a waiting prepare repeats: what it waits for and, when the
+/// holder reports it, what the holder is doing.
+fn shared_cache_wait_notice(wait: Duration, conflict: &str, holder: Option<String>) -> String {
+    let holder = holder.unwrap_or_else(|| {
+        "the holder has not reported its current work (an older broker, a cache sweep, \
+         or a moment between operations)"
+            .into()
+    });
+    format!(
+        "waiting up to {}s for the shared preparation cache ({conflict}); {holder}; \
+         `--wait 0s` fails fast instead",
+        wait.as_secs()
+    )
 }
 
 fn default_shared_cache_max_bytes() -> u64 {
@@ -726,6 +756,11 @@ pub struct PreparationStatus {
     pub hook_required: bool,
     pub reason: String,
     pub next_action: Option<String>,
+    /// What a running preparation of this session is doing while it holds
+    /// the shared cache, from its live activity record; absent when nothing
+    /// is running or the holder stopped reporting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_operation: Option<cache_activity::PreparationCacheActivity>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -755,8 +790,34 @@ pub struct PreparationReport {
     /// Additive and `None` in the overwhelmingly common case.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_cache_rotation: Option<SharedCacheRotation>,
+    /// Each operation run while the shared cache was held (recovery, budget
+    /// inventory, rotation drain, steps), with its wall time and item count.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub shared_cache_operations: Vec<cache_activity::PreparationCacheOperationSummary>,
     pub steps: Vec<PreparationStepResult>,
     pub next_action: String,
+}
+
+impl PreparationReport {
+    /// The command metric's `preparation` object. It carries what ran while
+    /// the shared cache was held, so a long hold is attributed in the metric
+    /// row itself: the rotation and its reason, and each operation's time.
+    pub(crate) fn metric_details(&self) -> serde_json::Value {
+        let mut preparation = serde_json::json!({
+            "shared_cache_coordinated": self.shared_cache_coordinated,
+            "shared_cache_wait_ms": self.shared_cache_wait_ms,
+            "shared_cache_mode": self.shared_cache_mode.map(|mode| mode.as_str()),
+            "steps": self.steps,
+        });
+        if let Some(rotation) = &self.shared_cache_rotation {
+            preparation["shared_cache_rotation"] = serde_json::json!(rotation);
+        }
+        if !self.shared_cache_operations.is_empty() {
+            preparation["shared_cache_operations"] =
+                serde_json::json!(self.shared_cache_operations);
+        }
+        serde_json::json!({ "preparation": preparation })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -943,6 +1004,7 @@ impl Broker {
                     hook_required: false,
                     reason,
                     next_action,
+                    current_operation: None,
                 });
             }
             Ok(Some(config)) => config,
@@ -1026,6 +1088,9 @@ impl Broker {
             reason,
             next_action: (state != PreparationState::Current)
                 .then(|| format!("aethyme broker submit prepare --session {session_id}")),
+            current_operation: (state != PreparationState::Current)
+                .then(|| self.preparation_cache_activity(session_id))
+                .flatten(),
         })
     }
 
@@ -1063,6 +1128,7 @@ impl Broker {
                 shared_cache_wait_ms: 0,
                 shared_cache_mode: None,
                 shared_cache_rotation: None,
+                shared_cache_operations: Vec::new(),
                 steps: Vec::new(),
                 next_action: "dependencies are already current".into(),
             });
@@ -1218,6 +1284,10 @@ impl Broker {
             .as_ref()
             .map(|binding| shared_cache_budget_checked_key(&binding.path));
         let mut cache_mode = SharedCacheMode::Exclusive;
+        // Reports what runs while the shared cache is held: stderr progress,
+        // the live record other sessions read, and the report's summaries.
+        let mut cache_activity_guard = None;
+        let mut lease_held_span = None;
         let mut grant = if let Some(coordinator) = coordinator.as_mut() {
             let sharing = max_concurrent > 1;
             let budget_check = if sharing
@@ -1241,6 +1311,7 @@ impl Broker {
             let probe_db = resource_db_path
                 .as_deref()
                 .expect("shared cache has a host resource database");
+            let repository = repository_identity(self);
             let (acquired, mode, need) = acquire_preparation_cache(
                 coordinator,
                 &|mode| {
@@ -1265,7 +1336,21 @@ impl Broker {
                         Instant::now() + SHARED_CACHE_ROTATION_PROBE_BUDGET,
                     ) != rotation_debt::DebtProbe::NoDebt
                 },
+                &|| {
+                    let now = now_ms();
+                    cache_activity::read_current(probe_db, Some(&repository), None, now)
+                        .into_iter()
+                        .find(|record| record.holder_pid != std::process::id())
+                        .map(|record| cache_activity::describe_holder(&record, now))
+                },
             )?;
+            cache_activity_guard = Some(cache_activity::install(
+                Some(probe_db),
+                &repository,
+                session_id,
+                now_ms(),
+            ));
+            lease_held_span = Some(crate::phase_telemetry::span("shared_cache_lease_held"));
             cache_mode = mode;
             crate::phase_telemetry::add(
                 match mode {
@@ -1315,6 +1400,7 @@ impl Broker {
             ensure_preparation_cache_root_binding(cache_root_binding.as_ref()).map(|()| None)
         } else if shared {
             let mut progress = |force: bool| -> Result<(), PreparationError> {
+                cache_activity::tick();
                 if force || Instant::now() >= next_inventory_renewal {
                     require_preparation_storage_with_cache_root(
                         &storage_root,
@@ -1350,6 +1436,7 @@ impl Broker {
         } else {
             Ok(None)
         };
+        cache_activity::leave();
         let rotation =
             self.release_grant_after_error(rotation_result, &mut coordinator, &mut grant, || {
                 require_preparation_storage_with_cache_root(
@@ -1421,6 +1508,12 @@ impl Broker {
         let mut heartbeat = PreparationHeartbeat::new(Instant::now());
         for step in &config.steps {
             let step_started = Instant::now();
+            let _step_span = crate::phase_telemetry::span("preparation_step");
+            cache_activity::enter(
+                cache_activity::PreparationCacheOperation::PreparationStep,
+                Some(step.name.clone()),
+                false,
+            );
             let command = if offline {
                 step.offline_command
                     .as_ref()
@@ -1447,6 +1540,7 @@ impl Broker {
                     &environment,
                     supervisor,
                     || {
+                        cache_activity::tick();
                         heartbeat.tick(
                             Instant::now(),
                             || {
@@ -1597,6 +1691,11 @@ impl Broker {
             }
         }
         release_grant(&mut coordinator, &mut grant)?;
+        drop(lease_held_span);
+        let shared_cache_operations = cache_activity_guard
+            .take()
+            .map(cache_activity::ActivityGuard::finish)
+            .unwrap_or_default();
         record.state = PreparationState::Current;
         record.completed_at = Some(now_ms());
         record.host_lease_id = None;
@@ -1623,6 +1722,7 @@ impl Broker {
             shared_cache_wait_ms,
             shared_cache_mode: shared.then_some(cache_mode),
             shared_cache_rotation: rotation,
+            shared_cache_operations,
             steps: results,
             next_action: "continue work in the prepared session".into(),
         })
@@ -3061,21 +3161,38 @@ fn shared_cache_budget_at_with_scan_limits(
     ensure_preparation_cache_root_binding(root_binding)?;
     ensure_preparation_cache_root_identity(cache_root, expected_root_identity)?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    recover_rotation_debt(
-        resource_db_path,
-        cache_root,
-        repository,
-        expected_root_identity,
-        root_binding,
-        &mut *progress,
-    )?;
+    {
+        let _span = crate::phase_telemetry::span("shared_cache_rotation_recovery");
+        cache_activity::enter(
+            cache_activity::PreparationCacheOperation::RotationRecovery,
+            None,
+            false,
+        );
+        recover_rotation_debt(
+            resource_db_path,
+            cache_root,
+            repository,
+            expected_root_identity,
+            root_binding,
+            &mut *progress,
+        )?;
+    }
     progress(true)?;
 
     let Some(budget) = budget.filter(|budget| budget.max_bytes > 0) else {
         return Ok(None);
     };
     let store = cache_root.join(repository);
-    let inventory = directory_inventory_with_progress(&store, scan_limits, progress)?;
+    let inventory = {
+        let _span = crate::phase_telemetry::span("shared_cache_inventory");
+        cache_activity::enter(
+            cache_activity::PreparationCacheOperation::BudgetInventory,
+            None,
+            true,
+        );
+        directory_inventory_with_progress(&store, scan_limits, progress)?
+    };
+    record_shared_cache_inventory(inventory);
     progress(true)?;
     let (bytes_before, observed_bytes_lower_bound, inventory_complete, rotation_reason) =
         match inventory {
@@ -3185,6 +3302,12 @@ fn shared_cache_budget_at_with_scan_limits(
             reason: format!("cannot publish shared-cache rotation intent: {source}"),
         })?;
         progress(true)?;
+        let _span = crate::phase_telemetry::span("shared_cache_rotation_drain");
+        cache_activity::enter(
+            cache_activity::PreparationCacheOperation::RotationDrain,
+            None,
+            true,
+        );
         let recovery = recover_rotation_debt(
             resource_db_path,
             cache_root,
@@ -3213,6 +3336,26 @@ fn shared_cache_budget_at_with_scan_limits(
         inventory_complete,
         rotation_reason,
     }))
+}
+
+/// Count the budget inventory's outcome in the command metric, so a rotation
+/// caused by an inventory limit is told apart from one caused by size.
+fn record_shared_cache_inventory(inventory: SharedCacheInventory) {
+    crate::phase_telemetry::add(
+        match inventory {
+            SharedCacheInventory::Absent => "shared_cache_inventory_absent",
+            SharedCacheInventory::Complete { .. } => "shared_cache_inventory_complete",
+            SharedCacheInventory::BoundedIncomplete {
+                limit: SharedCacheInventoryLimit::Time,
+                ..
+            } => "shared_cache_inventory_time_limit",
+            SharedCacheInventory::BoundedIncomplete {
+                limit: SharedCacheInventoryLimit::Entries,
+                ..
+            } => "shared_cache_inventory_entry_limit",
+        },
+        Duration::ZERO,
+    );
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3416,6 +3559,14 @@ fn recover_rotation_debt_with_limits(
         .ok()
         .flatten()
         .map(|retained| retained.debt.retired_component().to_owned());
+    if generation.is_some() {
+        // A retired store is waiting: this is the long part. Say so now, with
+        // a bounded count of what is left, instead of after the interval.
+        if let (_, Some((entries, lower_bound))) = remaining_rotation_debt(cache_root, repository) {
+            cache_activity::set_total(entries, lower_bound);
+        }
+        cache_activity::announce_now();
+    }
     let mut recorder = recovery_state::RecoveryRecorder::begin(
         resource_db_path,
         cache_root,
@@ -3451,7 +3602,7 @@ fn recover_rotation_debt_with_limits(
         }
         Err(RotationRecoveryStop::Incomplete(incomplete)) => {
             let (remaining_text, remaining) = remaining_rotation_debt(cache_root, repository);
-            let reason = incomplete.describe(&remaining_text);
+            let reason = incomplete.refusal_reason(&remaining_text);
             recorder.incomplete(0, remaining, incomplete.reason.to_string(), now_ms());
             Err(PreparationError::StorageUnavailable {
                 path: cache_root.join(repository),
@@ -3557,6 +3708,17 @@ impl RotationRecoveryIncomplete {
             self.elapsed.as_secs_f64(),
         )
     }
+
+    /// [`Self::describe`], followed by the targeted recovery path when a
+    /// plain retry cannot clear the stop.
+    fn refusal_reason(&self, remaining: &str) -> String {
+        let mut reason = self.describe(remaining);
+        if let Some(next) = rotation_recovery_next_action(&self.reason) {
+            reason.push_str("; next: ");
+            reason.push_str(next);
+        }
+        reason
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3601,6 +3763,7 @@ fn run_rotation_recovery_slices(
             Err(error) => (error.progress, Some(error.source)),
         };
         entries_reclaimed = entries_reclaimed.saturating_add(slice_progress.entries_reclaimed);
+        cache_activity::observe(entries_reclaimed as u64, None);
         found_debt |= slice_progress.found_debt;
         observe(slice_progress.entries_reclaimed);
         let reason = match failure {
@@ -3634,6 +3797,37 @@ fn run_rotation_recovery_slices(
             },
         ));
     }
+}
+
+/// What journal recovery refuses with when the live cache root is not the
+/// directory its host journal row recorded. The text is owned by the journal
+/// and debt modules; this only recognizes it to add a recovery path.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const ROOT_IDENTITY_JOURNAL_MISMATCH: &str =
+    "preparation cache root identity differs from its durable journal";
+
+/// The targeted recovery path for a stop that a plain retry cannot clear.
+/// Recovery stays fail-closed: nothing here unlinks or rewrites anything.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rotation_recovery_next_action(reason: &RotationRecoveryStopReason) -> Option<&'static str> {
+    let RotationRecoveryStopReason::Failed(source) = reason else {
+        return None;
+    };
+    source
+        .to_string()
+        .contains(ROOT_IDENTITY_JOURNAL_MISMATCH)
+        .then_some(
+            "the cache root on disk is not the directory the host journal recorded, so recovery \
+             refuses to unlink anything and a plain retry fails the same way. Check that \
+             `aethyme --version` is 0.8.95 or later (it re-proves a root whose only change is a \
+             remounted volume's device number), then run \
+             `aethyme broker advanced resources pressure --json` and read this cache root's \
+             `preparation_rotation_recovery` entry (retired generation, remaining entries, last \
+             stop reason). A reason naming root_volume_reproof_refused states the failed \
+             condition; when the cache root now resolves to another volume, mount the original \
+             volume at the same path and rerun this prepare. Do not delete the journal or the \
+             cache root by hand",
+        )
 }
 
 /// Say how much of an interrupted rotation remains, from a bounded,
@@ -3722,6 +3916,27 @@ impl Broker {
             .as_deref()
             .map(|path| recovery_state::read_records(path, now_ms()))
             .unwrap_or_default()
+    }
+
+    /// What a running preparation of `session_id` reports doing while it
+    /// holds the shared cache. Read-only and bounded, like the records above.
+    fn preparation_cache_activity(
+        &self,
+        session_id: i64,
+    ) -> Option<cache_activity::PreparationCacheActivity> {
+        let path = self.storage_context().host_resource_db_path.as_deref()?;
+        let now = now_ms();
+        // Session ids are per repository, so confirm the repository, but
+        // only once a record names this session: resolving the repository
+        // identity can read Git configuration, and status runs often.
+        let candidates = cache_activity::read_current(path, None, Some(session_id), now);
+        if candidates.is_empty() {
+            return None;
+        }
+        let repository = repository_identity(self);
+        candidates
+            .into_iter()
+            .find(|record| record.repository == repository)
     }
 }
 
@@ -4136,6 +4351,7 @@ where
         visited_entries = visited_entries.checked_add(1).ok_or_else(|| {
             shared_cache_scan_refusal(path, "cache inventory entry count overflowed")
         })?;
+        cache_activity::observe(visited_entries as u64, Some(bytes));
         if visited_entries > limits.max_entries {
             return Ok(SharedCacheInventory::BoundedIncomplete {
                 observed_bytes_lower_bound: bytes,
@@ -4533,6 +4749,7 @@ fn invalid_status(session_id: i64, reason: String) -> PreparationStatus {
         next_action: Some(format!(
             "fix {PREPARATION_CONFIG_RELPATH}, then run `aethyme broker submit prepare --session {session_id}`"
         )),
+        current_operation: None,
     }
 }
 
@@ -5061,6 +5278,7 @@ mod tests {
             budget_check,
             Duration::ZERO,
             &mut || rotation_unsettled,
+            &|| None,
         )
     }
 
@@ -7583,6 +7801,251 @@ mod tests {
         assert_eq!(
             count_tree_entries_bounded(&root, 2, deadline).unwrap(),
             (2, false)
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn captured_activity(
+        interval: Duration,
+    ) -> (
+        std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        cache_activity::ActivityGuard,
+    ) {
+        let lines = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink_lines = std::rc::Rc::clone(&lines);
+        let guard = cache_activity::install_with(
+            None,
+            "repository",
+            1,
+            now_ms(),
+            interval,
+            Box::new(move |line: &str| sink_lines.borrow_mut().push(line.to_owned())),
+        );
+        (lines, guard)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn rotation_recovery_reports_its_cumulative_progress_while_the_lease_is_held() {
+        let (lines, guard) = captured_activity(Duration::ZERO);
+        cache_activity::enter(
+            cache_activity::PreparationCacheOperation::RotationDrain,
+            None,
+            true,
+        );
+        let mut remaining = 3_000usize;
+        run_rotation_recovery_slices(
+            |_deadline, heartbeat| {
+                heartbeat().unwrap();
+                let unlinked = remaining.min(1_000);
+                remaining -= unlinked;
+                if remaining == 0 {
+                    Ok(rotation_debt::RecoveryProgress {
+                        found_debt: true,
+                        complete: true,
+                        bytes_reclaimed: 0,
+                        entries_reclaimed: unlinked,
+                    })
+                } else {
+                    Err(timed_out_slice(unlinked))
+                }
+            },
+            &mut |_| {
+                cache_activity::tick();
+                Ok(())
+            },
+            &mut |_| {},
+            SharedCacheRecoveryLimits::default(),
+        )
+        .expect("progressing recovery completes");
+        let summaries = guard.finish();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].items_done, 3_000);
+        let lines = lines.borrow();
+        for expected in ["1000 entries unlinked", "2000 entries unlinked"] {
+            assert!(
+                lines.iter().any(|line| line.contains(expected)),
+                "no progress line with {expected:?}: {lines:?}"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_budget_inventory_reports_entries_and_bytes_as_it_measures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        fs::create_dir_all(store.join("nested")).unwrap();
+        for index in 0..20 {
+            fs::write(store.join("nested").join(format!("f{index}")), b"1234").unwrap();
+        }
+        let (lines, guard) = captured_activity(Duration::ZERO);
+        cache_activity::enter(
+            cache_activity::PreparationCacheOperation::BudgetInventory,
+            None,
+            true,
+        );
+        let inventory = directory_inventory_with_progress(
+            &store,
+            SharedCacheScanLimits::default(),
+            &mut |_| {
+                cache_activity::tick();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(inventory, SharedCacheInventory::Complete { bytes: 80 });
+        let summaries = guard.finish();
+        assert_eq!(summaries[0].items_done, 21, "one directory and 20 files");
+        assert!(
+            lines.borrow().iter().any(|line| line
+                .contains("measuring the shared cache against its budget")
+                && line.contains("entries measured")
+                && line.contains("bytes")),
+            "{:?}",
+            lines.borrow()
+        );
+    }
+
+    #[test]
+    fn the_inventory_entry_limit_sits_far_above_one_healthy_package_store() {
+        // One monorepo's pnpm and uv stores held about 141,000 entries in the
+        // busiest repository; an inventory stopping below that rotated the
+        // store on every budget check. The time limit bounds the scan.
+        let limits = SharedCacheScanLimits::default();
+        assert!(limits.max_entries >= 1_000_000, "{}", limits.max_entries);
+        assert_eq!(limits.max_elapsed, SHARED_CACHE_SCAN_MAX_ELAPSED);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_root_identity_refusal_names_its_recovery_path_and_other_stops_do_not() {
+        let refused = RotationRecoveryIncomplete {
+            entries_reclaimed: 0,
+            slices: 1,
+            elapsed: Duration::ZERO,
+            reason: RotationRecoveryStopReason::Failed(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid rotation journal: preparation cache root identity differs from its \
+                 durable journal (root_volume_reproof_refused: volume UUID differs)",
+            )),
+        };
+        let reason =
+            refused.refusal_reason("no in-cache rotation record names the remaining store");
+        assert!(reason.contains("; next: "), "{reason}");
+        assert!(
+            reason.contains("aethyme broker advanced resources pressure --json"),
+            "{reason}"
+        );
+        assert!(reason.contains("0.8.95 or later"), "{reason}");
+        assert!(reason.contains("Do not delete the journal"), "{reason}");
+
+        let stalled = RotationRecoveryIncomplete {
+            entries_reclaimed: 7,
+            slices: 2,
+            elapsed: Duration::ZERO,
+            reason: RotationRecoveryStopReason::NoProgress(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "deadline elapsed",
+            )),
+        };
+        let reason = stalled.refusal_reason("3 filesystem entries remain in the retired store");
+        assert!(!reason.contains("; next: "), "{reason}");
+    }
+
+    #[test]
+    fn a_waiting_prepare_says_what_the_holder_is_doing() {
+        let with_holder = shared_cache_wait_notice(
+            Duration::from_secs(600),
+            "exclusive key is held by lease abc",
+            Some("the holder, session 4 (pid 9), is removing the rotated shared cache".into()),
+        );
+        assert!(
+            with_holder.starts_with("waiting up to 600s"),
+            "{with_holder}"
+        );
+        assert!(with_holder.contains("exclusive key is held by lease abc"));
+        assert!(with_holder.contains("the holder, session 4 (pid 9)"));
+        let unreported = shared_cache_wait_notice(Duration::from_secs(600), "held", None);
+        assert!(
+            unreported.contains("has not reported its current work"),
+            "{unreported}"
+        );
+    }
+
+    #[test]
+    fn the_command_metric_attributes_a_rotation_and_each_held_operation() {
+        let report = PreparationReport {
+            schema_version: PREPARATION_REPORT_SCHEMA_VERSION,
+            session_id: 1,
+            digest: "0123456789abcdef".into(),
+            state: PreparationState::Current,
+            offline: false,
+            shared_cache_coordinated: true,
+            shared_cache_wait_ms: 5,
+            shared_cache_mode: Some(SharedCacheMode::Exclusive),
+            shared_cache_rotation: Some(SharedCacheRotation {
+                key: "0123456789ab".into(),
+                budget_bytes: 8,
+                bytes_before: None,
+                observed_bytes_lower_bound: 3,
+                bytes_after: 0,
+                removed: true,
+                inventory_complete: false,
+                rotation_reason: SharedCacheRotationReason::InventoryEntryLimit,
+            }),
+            shared_cache_operations: vec![
+                cache_activity::PreparationCacheOperationSummary {
+                    operation: cache_activity::PreparationCacheOperation::BudgetInventory,
+                    detail: None,
+                    elapsed_ms: 9_000,
+                    items_done: 100_001,
+                },
+                cache_activity::PreparationCacheOperationSummary {
+                    operation: cache_activity::PreparationCacheOperation::RotationDrain,
+                    detail: None,
+                    elapsed_ms: 208_000,
+                    items_done: 141_558,
+                },
+            ],
+            steps: Vec::new(),
+            next_action: "continue".into(),
+        };
+        let details = report.metric_details();
+        let preparation = &details["preparation"];
+        assert_eq!(preparation["shared_cache_mode"], "exclusive");
+        assert_eq!(
+            preparation["shared_cache_rotation"]["rotation_reason"],
+            "inventory_entry_limit"
+        );
+        assert_eq!(
+            preparation["shared_cache_operations"][1]["operation"],
+            "rotation_drain"
+        );
+        assert_eq!(
+            preparation["shared_cache_operations"][1]["elapsed_ms"],
+            208_000
+        );
+        assert_eq!(
+            preparation["shared_cache_operations"][1]["items_done"],
+            141_558
+        );
+
+        let quiet = PreparationReport {
+            shared_cache_rotation: None,
+            shared_cache_operations: Vec::new(),
+            ..report
+        };
+        let details = quiet.metric_details();
+        assert!(
+            details["preparation"]
+                .get("shared_cache_rotation")
+                .is_none()
+        );
+        assert!(
+            details["preparation"]
+                .get("shared_cache_operations")
+                .is_none()
         );
     }
 }

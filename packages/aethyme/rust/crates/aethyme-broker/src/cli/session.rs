@@ -361,6 +361,12 @@ pub(super) fn render_preparation_status(
             out!("  {path}");
         }
     }
+    if let Some(activity) = &status.current_operation {
+        out!(
+            "Now: {}",
+            crate::preparation::cache_activity::describe_holder(activity, now_ms())
+        );
+    }
     if let Some(next_action) = &status.next_action {
         out!("Next: {next_action}");
     }
@@ -1739,14 +1745,7 @@ pub(super) fn run_prepare(parsed: Parsed) -> Result<(), UsageError> {
                 .unwrap_or(DEFAULT_PREPARE_SHARED_CACHE_WAIT);
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             let report = broker.prepare_session(session_id, parsed.offline, wait)?;
-            telemetry::set_command_metric_details(serde_json::json!({
-                "preparation": {
-                    "shared_cache_coordinated": report.shared_cache_coordinated,
-                    "shared_cache_wait_ms": report.shared_cache_wait_ms,
-                    "shared_cache_mode": report.shared_cache_mode.map(|mode| mode.as_str()),
-                    "steps": report.steps,
-                }
-            }));
+            telemetry::set_command_metric_details(report.metric_details());
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&report)?);
             } else {

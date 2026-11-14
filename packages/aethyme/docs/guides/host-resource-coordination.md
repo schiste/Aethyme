@@ -299,6 +299,18 @@ broker on the host must be 0.8.69 or later before a repository sets this: an
 older broker refuses the unknown setting, and its own sweep does not wait for
 sharing preparations. It cannot be combined with `managed_storage`.
 
+Work that runs while a preparation holds the store is visible. Finishing an
+interrupted rotation and removing a rotated store print a line when they start
+and every 15 seconds (entries unlinked so far, of how many, and how long the
+lease has been held); a budget measurement that takes longer than 15 seconds
+does the same. Other sessions see it too: `aethyme broker submit prepare status
+--session <id> --json` reports the holder's `current_operation`, and a waiting
+prepare names the holder's session and what it is doing. Interrupting recovery
+is safe: unlinked entries stay removed and the next prepare resumes. The
+measurement stops at 30 seconds or 2,000,000 entries; it stopped at 100,000
+before 2026-11-14, below one monorepo's package stores, so every check rotated
+the store and the next prepare downloaded every package again.
+
 Finishing an interrupted rotation survives a remount. The host journal remembers
 each preparation-cache root by its device and inode, and macOS gives an external
 volume a new device number when it comes back in another disk slot, so a

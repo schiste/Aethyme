@@ -644,12 +644,37 @@ cache = "repository_shared"
     std::fs::write(temp.path().join("pnpm-lock.yaml"), "v2\n").unwrap();
     std::fs::remove_dir_all(temp.path().join("node_modules")).unwrap();
 
-    let rotated = success_json(run(
+    let rotated = run(
         temp.path(),
         &state,
         &["submit", "prepare", "--session", &session, "--json"],
-    ));
+    );
+    // The drain runs under the cache lease before any step: it must say so
+    // as soon as it starts instead of holding the lease in silence.
+    let stderr = String::from_utf8_lossy(&rotated.stderr).into_owned();
+    assert!(
+        stderr.contains("preparation cache: removing the rotated shared cache")
+            && stderr.contains("lease held"),
+        "stderr={stderr}"
+    );
+    let rotated = success_json(rotated);
     assert_eq!(rotated["state"], "current", "{rotated}");
+    let operations: Vec<_> = rotated["shared_cache_operations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the held operations are reported: {rotated}"))
+        .iter()
+        .map(|operation| operation["operation"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        operations,
+        [
+            "rotation_recovery",
+            "budget_inventory",
+            "rotation_drain",
+            "preparation_step"
+        ],
+        "{rotated}"
+    );
     assert_eq!(rotated["schema_version"], 2, "{rotated}");
     assert!(
         rotated["shared_cache_rotation"].is_object(),
@@ -726,7 +751,8 @@ cache = "repository_shared"
     std::fs::write(temp.path().join("hold"), "").unwrap();
 
     let holding = {
-        let (repo, state, holder_id) = (temp.path().to_path_buf(), state.clone(), holder_id);
+        let (repo, state, holder_id) =
+            (temp.path().to_path_buf(), state.clone(), holder_id.clone());
         std::thread::spawn(move || {
             run(
                 &repo,
@@ -743,6 +769,44 @@ cache = "repository_shared"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+
+    // Another session can read what the holder is doing.
+    let holder_status = success_json(run(
+        temp.path(),
+        &state,
+        &[
+            "submit",
+            "prepare",
+            "status",
+            "--session",
+            &holder_id,
+            "--json",
+        ],
+    ));
+    assert_eq!(
+        holder_status["current_operation"]["operation"], "preparation_step",
+        "{holder_status}"
+    );
+    assert_eq!(
+        holder_status["current_operation"]["detail"], "deps",
+        "{holder_status}"
+    );
+    let waiter_status = success_json(run(
+        temp.path(),
+        &state,
+        &[
+            "submit",
+            "prepare",
+            "status",
+            "--session",
+            &waiter_id,
+            "--json",
+        ],
+    ));
+    assert!(
+        waiter_status.get("current_operation").is_none(),
+        "{waiter_status}"
+    );
 
     let refused = run(
         temp.path(),
@@ -789,10 +853,16 @@ cache = "repository_shared"
 
     success_json(holding.join().unwrap());
     let waited = waiting.join().unwrap();
+    let waited_stderr = String::from_utf8_lossy(&waited.stderr).into_owned();
     assert!(
-        String::from_utf8_lossy(&waited.stderr).contains("waiting up to 600s"),
-        "stderr={}",
-        String::from_utf8_lossy(&waited.stderr)
+        waited_stderr.contains("waiting up to 600s"),
+        "stderr={waited_stderr}"
+    );
+    // The waiter names what the holder is doing, not only that it waits.
+    assert!(
+        waited_stderr.contains(&format!("the holder, session {holder_id}"))
+            && waited_stderr.contains("running preparation step \"deps\""),
+        "stderr={waited_stderr}"
     );
     let waited = success_json(waited);
     assert_eq!(waited["state"], "current", "{waited}");
