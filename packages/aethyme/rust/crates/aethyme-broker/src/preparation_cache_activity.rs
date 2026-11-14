@@ -558,8 +558,9 @@ mod tests {
     use std::rc::Rc;
 
     type Lines = Rc<RefCell<Vec<String>>>;
+    type Sink = Box<dyn FnMut(&str)>;
 
-    fn capture() -> (Lines, Box<dyn FnMut(&str)>) {
+    fn capture() -> (Lines, Sink) {
         let lines = Rc::new(RefCell::new(Vec::new()));
         let sink_lines = Rc::clone(&lines);
         (
