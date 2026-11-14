@@ -1768,30 +1768,37 @@ impl ClosedArtifactCheckoutCohortUnavailableReason {
 /// artifact-use markers, so it tolerates a renumbered mount on a witness saved
 /// without volume UUIDs and never advances the index.
 ///
-/// `Reclaim` (GC: ignored-directory reclamation, checkout compaction and its
-/// archive cleanup) and `CheckoutRemoval` (automatic whole-checkout removal)
-/// can delete checkout contents. Both compare the witness exactly and, when
-/// that fails, accept only the shared ownership re-proof
-/// ([`Broker::checkout_ownership_reproof`]); they differ only in the lane
-/// their telemetry names. Artifact reclamation's final unlink guard re-makes
+/// `Reclaim` (GC: ignored-directory reclamation and the checkout compaction
+/// decision), `Retirement` (the retirement plan and archive cleanup a
+/// compaction runs, which recheck that cohort) and `CheckoutRemoval`
+/// (automatic whole-checkout removal) can delete checkout contents. All
+/// three compare the witness exactly and, when that fails, accept only the
+/// shared ownership re-proof ([`Broker::checkout_ownership_reproof`]); they
+/// build the same cohort and differ only in the lane their telemetry names.
+/// Artifact reclamation's final unlink guard re-makes
 /// the filesystem half of the same re-proof
 /// ([`ClosedArtifactCheckoutCohort::matches_checkout_instance`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClosedCohortPurpose {
     Reclaim,
+    Retirement,
     CheckoutRemoval,
     MarkerReview,
 }
 
 impl ClosedCohortPurpose {
     fn reclaims(self) -> bool {
-        matches!(self, Self::Reclaim | Self::CheckoutRemoval)
+        matches!(
+            self,
+            Self::Reclaim | Self::Retirement | Self::CheckoutRemoval
+        )
     }
 
     fn reproof_lane(self) -> OwnershipReproofLane {
         match self {
             Self::CheckoutRemoval | Self::MarkerReview => OwnershipReproofLane::Automatic,
             Self::Reclaim => OwnershipReproofLane::Gc,
+            Self::Retirement => OwnershipReproofLane::Retirement,
         }
     }
 }
@@ -1812,6 +1819,9 @@ pub(crate) enum OwnershipReproofLane {
     Automatic,
     /// GC reclamation and checkout compaction (`gc_ownership_reproof_*`).
     Gc,
+    /// The retirement plan and archive cleanup a checkout compaction runs,
+    /// which recheck the cohort GC chose (`retirement_ownership_reproof_*`).
+    Retirement,
     /// `finish` / `finish cleanup` and its interrupted-cleanup recovery
     /// proof (`finish_ownership_reproof_*`).
     Finish,
@@ -1836,6 +1846,12 @@ impl OwnershipReproofLane {
                 "gc_ownership_reproof_refused",
                 "gc_ownership_reproof_unavailable",
                 "gc_ownership_reproof_registration",
+            )),
+            Self::Retirement => Some((
+                "retirement_ownership_reproved",
+                "retirement_ownership_reproof_refused",
+                "retirement_ownership_reproof_unavailable",
+                "retirement_ownership_reproof_registration",
             )),
             Self::Finish => Some((
                 "finish_ownership_reproved",
@@ -3988,6 +4004,24 @@ impl Broker {
         )
     }
 
+    /// [`Self::closed_artifact_checkout_cohort_for_session`] for the
+    /// retirement plan and archive cleanup a checkout compaction runs. It
+    /// builds the same cohort; its ownership re-proof decisions are counted
+    /// in their own lane ([`ClosedCohortPurpose::Retirement`]).
+    pub(crate) fn closed_artifact_checkout_cohort_for_retirement(
+        &mut self,
+        session_id: i64,
+        worktree: &Path,
+        deadline: Option<Instant>,
+    ) -> Result<Option<ClosedArtifactCheckoutCohort>, BrokerOpError> {
+        self.closed_artifact_checkout_cohort_for_session_mode(
+            session_id,
+            worktree,
+            deadline,
+            ClosedCohortPurpose::Retirement,
+        )
+    }
+
     /// Whether every pending index change provably leaves this checkout's
     /// indexed rows correct: the last discovery lap completed, no row is
     /// unresolved, and no pending session's new or previously indexed path
@@ -4276,7 +4310,9 @@ impl Broker {
                     current_witness
                         .as_ref()
                         .is_some_and(|current| match purpose {
-                            ClosedCohortPurpose::Reclaim | ClosedCohortPurpose::CheckoutRemoval => {
+                            ClosedCohortPurpose::Reclaim
+                            | ClosedCohortPurpose::Retirement
+                            | ClosedCohortPurpose::CheckoutRemoval => {
                                 witness.matches_current_instance(current)
                             }
                             ClosedCohortPurpose::MarkerReview => {
@@ -4348,7 +4384,9 @@ impl Broker {
         // unlike a fresh observation it shares the predecessor's mount epoch,
         // so a later remount's renumbering does not break the comparison.
         let saved_owner_witness = match purpose {
-            ClosedCohortPurpose::Reclaim | ClosedCohortPurpose::CheckoutRemoval => None,
+            ClosedCohortPurpose::Reclaim
+            | ClosedCohortPurpose::Retirement
+            | ClosedCohortPurpose::CheckoutRemoval => None,
             ClosedCohortPurpose::MarkerReview => snapshots
                 .iter()
                 .find(|snapshot| snapshot.id == owner_session_id)
@@ -9638,6 +9676,96 @@ mod tests {
                 Resolution::Available(_) => panic!("another inode must not be re-proven"),
             },
             Reason::SpawnedWitnessMismatch
+        );
+    }
+
+    /// The retirement rechecks a compaction runs build the GC cohort again,
+    /// so they must build the same cohort, but their re-proof decisions are
+    /// counted in their own lane, never under `gc_*`.
+    #[cfg(unix)]
+    #[test]
+    fn retirement_rechecks_count_their_reproof_apart_from_gc() {
+        let (_owner, _storage, mut broker, session) = retirement_fixture();
+        broker
+            .close_abandoning_unpushed(session.id, "retirement reproof lane fixture")
+            .unwrap();
+        let path = PathBuf::from(&session.worktree_path);
+        let mut saved = broker
+            .store()
+            .spawned_worktree_instance_witness(session.id)
+            .unwrap()
+            .expect("spawn captures a witness");
+        saved.schema_version = 2;
+        saved.volume_uuids = None;
+        saved.worktree_device += 1000;
+        saved.git_pointer_device += 1000;
+        saved.git_admin_device += 1000;
+        saved.git_common_device += 1000;
+        rewrite_spawn_witness(&mut broker, session.id, &saved);
+
+        let counts = |broker: &mut crate::Broker, retirement: bool| {
+            let recorder = crate::phase_telemetry::Recorder::default();
+            let cohort = {
+                let _installed = crate::phase_telemetry::install(recorder.clone());
+                let cohort = if retirement {
+                    broker.closed_artifact_checkout_cohort_for_retirement(session.id, &path, None)
+                } else {
+                    broker.closed_artifact_checkout_cohort_for_session(session.id, &path, None)
+                };
+                cohort
+                    .unwrap()
+                    .expect("the renumbered checkout is re-proven")
+            };
+            (cohort, recorder.totals().1)
+        };
+        let (gc_cohort, gc_counts) = counts(&mut broker, false);
+        let (retirement_cohort, retirement_counts) = counts(&mut broker, true);
+        assert_eq!(
+            retirement_cohort, gc_cohort,
+            "a retirement recheck must compare equal to the cohort GC chose"
+        );
+        assert_eq!(
+            retirement_cohort.ownership_reproof(),
+            Some(super::OWNERSHIP_REPROOF_DEVICE_RENUMBER)
+        );
+        assert_eq!(
+            gc_counts.get("gc_ownership_reproved"),
+            Some(&1),
+            "{gc_counts:?}"
+        );
+        assert_eq!(
+            retirement_counts.get("retirement_ownership_reproved"),
+            Some(&1),
+            "{retirement_counts:?}"
+        );
+        assert!(
+            !retirement_counts
+                .keys()
+                .any(|name| name.starts_with("gc_ownership")),
+            "{retirement_counts:?}"
+        );
+
+        git(&path, &["checkout", "-q", "--detach"]);
+        let recorder = crate::phase_telemetry::Recorder::default();
+        {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            assert!(
+                broker
+                    .closed_artifact_checkout_cohort_for_retirement(session.id, &path, None)
+                    .unwrap()
+                    .is_none(),
+                "a detached checkout must not be re-proven"
+            );
+        }
+        let (_, refused) = recorder.totals();
+        assert_eq!(
+            refused.get("retirement_ownership_reproof_refused"),
+            Some(&1),
+            "{refused:?}"
+        );
+        assert!(
+            !refused.keys().any(|name| name.starts_with("gc_ownership")),
+            "{refused:?}"
         );
     }
 
