@@ -2506,7 +2506,9 @@ impl GcLockWaiterNotice {
 
 impl Drop for GcLockWaiterNotice {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Best effort: a file left behind names a dead PID, which the
+        // worker ignores and clears.
+        std::fs::remove_file(&self.path).ok();
     }
 }
 
@@ -2530,7 +2532,8 @@ pub(crate) fn foreground_gc_lock_waiter(main_root: &Path) -> Option<i64> {
         if pid > 0 && crate::broker::pid_alive(pid) {
             live.get_or_insert(pid);
         } else {
-            let _ = std::fs::remove_file(entry.path());
+            // Best effort: a dead waiter's file is ignored either way.
+            std::fs::remove_file(entry.path()).ok();
         }
     }
     live
