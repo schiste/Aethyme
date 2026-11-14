@@ -1775,7 +1775,9 @@ pub(crate) fn debt_volume_binding(
     if !ensure_schema(&connection, false)? || !table_exists(&connection, "rotation_debt_volume")? {
         return Ok(None);
     }
-    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, String)> = connection
+    // payload digest, root identity, volume UUID, rule
+    type BindingRow = (Vec<u8>, Vec<u8>, Vec<u8>, String);
+    let row: Option<BindingRow> = connection
         .query_row(
             "SELECT payload_sha256, root_identity, volume_uuid, rule FROM rotation_debt_volume \
              WHERE root_path=?1 AND repository=?2",
