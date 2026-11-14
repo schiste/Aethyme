@@ -111,9 +111,13 @@ session that starts on a skewed machine is told before it does any work. Set
 
 Raising `[worktrees].max_checkouts` only delays the refusal and reclaims
 nothing. The durable fixes are the `[cleanup] regenerable` setting and the
-automatic removal of closed checkouts, which runs under capacity pressure
-(from three quarters of the limit) and when `start` reaches the limit. Find out
-what keeps each checkout, then fix that cause.
+automatic removal of closed checkouts. The background worker removes closed
+checkouts whose work landed whether or not the repository is near its limit
+(`trigger: "steady"` below three quarters of the limit, `"pressure"` from
+there), and `start` removes them when it reaches the limit. A count that keeps
+growing while slices run means the closed checkouts are kept, or the open
+sessions are most of the count. Find out what keeps each checkout, then fix
+that cause.
 
 ### Checks
 
@@ -128,19 +132,29 @@ aethyme broker status --json
    closed checkouts.
 2. Read `capacity_removal.outcome`, the background worker's last removal
    slice. The same record is `auto_cleanup.capacity_removal` in
-   `aethyme broker gc plan --json`.
+   `aethyme broker gc plan --json`. `trigger` says what ran it: `steady`
+   (no capacity pressure; removal of landed checkouts at the background rate)
+   or `pressure`. `priority_removed` and `lap_removed` say which lane removed
+   what; `priority_examined` and `lap_examined` what each judged. A missing
+   record, or an `evaluated_at_ms` hours old, means no slice ran: check that
+   `[cleanup] auto_remove` is not `false`.
 
    | `outcome` | Meaning and next step |
    |---|---|
    | `removed` | The slice freed slots. Check again in a few minutes. `stop_reason` says why it ended (see below). |
-   | `nothing_removable` | The lap ended and every examined checkout was kept, or nothing moved. The worker waits 10 minutes. Go to step 3. |
+   | `nothing_removable` | The lap ended and every examined checkout was kept, or nothing moved. Under pressure the worker waits 10 minutes; a steady slice waits 5, 10, 20, then 30 minutes while slices in a row remove nothing (`idle_streak`). Go to step 3. |
    | `lap_unfinished` | Time ran out before the lap reached its end. The next slice resumes it after 20 seconds when the lap moved, and after 10 minutes when nothing moved. |
    | `lock_busy` | Another process held the GC lock, or the slice stepped aside for a foreground command (`broker start` at the limit, `gc apply`, `gc abandon`, `gc forget-abandoned`) that was waiting for it. The next slice retries after one minute. |
    | `inventory_unavailable` | No complete checkout inventory before the deadline. `waiting_on` names what it waited on (`capacity_probe`, `cohort_index`, `group_page` or `live_paths`). Progress is kept; the retry is 20 seconds after a slice that moved, and otherwise 1, 2, 4, 8 and then 10 minutes while it repeats. |
    | `out_of_time_before_selection` | The budget ran out before any checkout was judged. `budget_consumed_by` is `checkout_count` or `pre_selection`. It retries after 1, 2, 4, 8 and then 10 minutes while it repeats. |
 
-   A slice runs up to 120 seconds and removes up to twelve checkouts, one per
-   pass (a pass has a 20-second budget). `stop_reason` says why it ended:
+   Under pressure a slice runs up to 120 seconds and removes up to twelve
+   checkouts, one per pass (a pass has a 20-second budget); a steady slice runs
+   up to 60 seconds, removes up to four, judges the priority lane and then at
+   most 16 checkouts of the lap per pass, ends when a pass selects nothing or
+   after two passes whose selected checkout was kept at the last step, and may
+   run again a minute after a removal (at once when a cleanup request's grace
+   ends after it). `stop_reason` says why it ended:
    `cap` (twelve removed), `budget` (too little time left for another pass),
    `nothing_selected` (the lap has nothing more to remove now),
    `kept_only_limit` (four passes removed nothing because the checkout they

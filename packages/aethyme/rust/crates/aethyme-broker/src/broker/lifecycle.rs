@@ -7984,6 +7984,7 @@ impl Broker {
                         CHECKOUT_CAPACITY_CLEANUP_BUDGET,
                         None,
                         false,
+                        crate::auto_cleanup::RemovalSelection::Probe,
                     )
                 });
             let cleanup_report = match cleanup {
