@@ -4436,6 +4436,7 @@ impl Broker {
     /// (refusals also under the reason's own counter,
     /// [`ownership_reproof_refusal_counter`]); [`OwnershipReproofLane::Quiet`]
     /// counts nothing.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn checkout_ownership_reproof(
         &self,
         lane: OwnershipReproofLane,
