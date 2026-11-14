@@ -3420,6 +3420,9 @@ pub struct Broker {
     /// stops at it instead of finishing one expensive worktree long past the
     /// pass's budget (#460).
     landing_deadline: std::cell::Cell<Option<std::time::Instant>>,
+    /// The ownership re-proof the last resumed interrupted finish cleanup
+    /// needed, set by that removal and read once by `finish` for its report.
+    cleanup_ownership_reproof: std::cell::Cell<Option<&'static str>>,
     /// Set only while a bulk cleanup pass runs: what each remote listed, so
     /// the pass asks a remote once rather than once per ref it checks.
     remote_heads: std::cell::RefCell<Option<remote_heads::RemoteHeadsSnapshot>>,

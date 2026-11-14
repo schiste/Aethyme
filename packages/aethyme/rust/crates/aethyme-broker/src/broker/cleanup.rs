@@ -507,39 +507,53 @@ fn mount_identity(fd: RawFd) -> std::io::Result<Vec<u8>> {
 }
 
 /// Whether the live object at `path`, observed as `live` (device, inode),
-/// is on the volume a finish recovery proof recorded for it. Equal device
-/// numbers match as before. Other device numbers match only when the proof
-/// recorded a volume UUID and today's UUID of this exact object equals it;
-/// `reproof` then names [`crate::auto_cleanup::OWNERSHIP_REPROOF_VOLUME_UUID`].
-/// A proof saved without UUIDs is refused: Git no longer registers an orphan,
-/// so the registration half of the shared ownership re-proof cannot be made.
+/// is on the volume a finish recovery proof recorded for it.
+///
+/// A recorded volume UUID is compared whenever today's UUID of this exact
+/// object can be read, as [`crate::events::SpawnedWorktreeInstanceWitness::compare_checkout_identity`]
+/// does: a different UUID refuses even under the same device number. With
+/// equal device numbers and no UUID readable today, the exact device match
+/// this check always made still holds. Other device numbers match only when
+/// the proof recorded a UUID and today's UUID equals it; `reproof` then names
+/// [`crate::auto_cleanup::OWNERSHIP_REPROOF_VOLUME_UUID`]. A proof saved
+/// without UUIDs is refused: Git no longer registers an orphan, so the
+/// registration half of the shared ownership re-proof cannot be made.
 /// Platforms without a stable volume identifier refuse as before.
+///
+/// Known limit: a byte-for-byte clone of the volume carries the same UUID
+/// and inode numbers, so it cannot be told apart here. The orphan removal
+/// that follows is bounded by content: it deletes only entries the proof's
+/// tracked tree, recorded `.git` pointer and disposable ignored prefixes
+/// account for, re-checks the root generation before each pass, and
+/// preserves anything else, so such a clone loses only what the session
+/// already represented on a delivery target.
 #[cfg(unix)]
 fn orphan_object_volume_matches(
     path: &Path,
     live: (u64, u64),
     saved_device: u64,
     saved_uuid: Option<[u8; 16]>,
+    lane: crate::auto_cleanup::OwnershipReproofLane,
     reproof: &mut Option<&'static str>,
 ) -> bool {
-    if live.0 == saved_device {
-        return true;
-    }
     let refuse = |reason: &str| {
-        crate::phase_telemetry::add(
-            "finish_ownership_reproof_refused",
-            std::time::Duration::ZERO,
-        );
-        crate::phase_telemetry::add(
-            crate::auto_cleanup::ownership_reproof_refusal_counter(reason),
-            std::time::Duration::ZERO,
-        );
+        lane.record_refused(reason);
         false
     };
+    let observed = saved_uuid
+        .and_then(|_| crate::volume_identity::volume_identity(path, live.0, live.1).uuid());
+    if live.0 == saved_device {
+        return match (saved_uuid, observed) {
+            (Some(saved), Some(observed)) if saved != observed => {
+                refuse(crate::events::IDENTITY_VOLUME_UUID_DIFFERS)
+            }
+            _ => true,
+        };
+    }
     let Some(saved_uuid) = saved_uuid else {
         return refuse(crate::auto_cleanup::REPROOF_ORPHAN_LEGACY_PROOF);
     };
-    match crate::volume_identity::volume_identity(path, live.0, live.1).uuid() {
+    match observed {
         Some(observed) if observed == saved_uuid => {
             *reproof = Some(crate::auto_cleanup::OWNERSHIP_REPROOF_VOLUME_UUID);
             true
@@ -575,6 +589,7 @@ fn rebind_orphan_proof_devices(
             (root.dev(), root.ino()),
             proof.worktree_device,
             Some(uuids.worktree),
+            crate::auto_cleanup::OwnershipReproofLane::Finish,
             &mut reproof,
         )
     {
@@ -594,6 +609,7 @@ fn rebind_orphan_proof_devices(
                     (pointer.dev(), pointer.ino()),
                     proof.git_pointer_device,
                     Some(uuids.git_pointer),
+                    crate::auto_cleanup::OwnershipReproofLane::Finish,
                     &mut reproof,
                 )
             {
@@ -4110,10 +4126,29 @@ impl Broker {
         )
     }
 
+    /// [`Self::interrupted_finish_cleanup_proof_in_lane`] for a check that
+    /// counts nothing (a report, a plan or a recheck).
     fn interrupted_finish_cleanup_proof_with_status_limits(
         &self,
         session: &Session,
         status_limits: CleanupStatusLimits,
+    ) -> Option<crate::events::FinishCleanupRecoveryProof> {
+        self.interrupted_finish_cleanup_proof_in_lane(
+            session,
+            status_limits,
+            crate::auto_cleanup::OwnershipReproofLane::Quiet,
+        )
+    }
+
+    /// The interrupted registered cleanup's durable proof, validated against
+    /// today's checkout. `lane` counts the ownership re-proof decision; the
+    /// cleanup that acts on the proof passes `Finish`, every other check
+    /// `Quiet`, so each decision is counted once.
+    fn interrupted_finish_cleanup_proof_in_lane(
+        &self,
+        session: &Session,
+        status_limits: CleanupStatusLimits,
+        lane: crate::auto_cleanup::OwnershipReproofLane,
     ) -> Option<crate::events::FinishCleanupRecoveryProof> {
         let current = self.store.session(session.id).ok()?;
         let mut proof = self.finish_cleanup_recovery_intent(&current)?;
@@ -4147,25 +4182,46 @@ impl Broker {
         }
         // Only device numbers or volume UUIDs differ from the saved proof
         // (a remount since finish began, or a proof saved before UUIDs were
-        // recorded). An exact identity needs nothing more; anything else must
-        // pass the ownership re-proof every deletion lane shares.
-        if checkout_proof != proof
-            && proof
+        // recorded). Identical device numbers keep the exact acceptance this
+        // check always made, even when a recorded UUID cannot be read today;
+        // a UUID that reads differently is still refused. Anything else must
+        // pass the ownership re-proof every deletion lane shares, bound to
+        // the head this proof recorded.
+        if checkout_proof != proof {
+            use crate::events::{CheckoutIdentityMatch, IDENTITY_VOLUME_UUID_UNAVAILABLE};
+            let devices_unchanged = (
+                proof.worktree_device,
+                proof.git_pointer_device,
+                proof.git_admin_device,
+                proof.git_common_device,
+            ) == (
+                checkout_proof.worktree_device,
+                checkout_proof.git_pointer_device,
+                checkout_proof.git_admin_device,
+                checkout_proof.git_common_device,
+            );
+            match proof
                 .instance_witness()
                 .compare_checkout_identity(&checkout_proof.instance_witness())
-                != crate::events::CheckoutIdentityMatch::Exact
-        {
-            let reproof = self
-                .checkout_ownership_reproof(
-                    crate::auto_cleanup::OwnershipReproofLane::Finish,
-                    &current,
-                    worktree_path,
-                    &proof.instance_witness(),
-                    &checkout_proof.instance_witness(),
-                    Some(status_limits.deadline),
-                )
-                .ok()?;
-            proof.ownership_reproof = Some(reproof);
+            {
+                CheckoutIdentityMatch::Exact => {}
+                CheckoutIdentityMatch::Differs(IDENTITY_VOLUME_UUID_UNAVAILABLE)
+                    if devices_unchanged => {}
+                _ => {
+                    let reproof = self
+                        .checkout_ownership_reproof(
+                            lane,
+                            &current,
+                            worktree_path,
+                            &proof.instance_witness(),
+                            &checkout_proof.instance_witness(),
+                            Some(proof.head.as_str()),
+                            Some(status_limits.deadline),
+                        )
+                        .ok()?;
+                    proof.ownership_reproof = Some(reproof);
+                }
+            }
         }
         let cleanup_policy = crate::AutoCleanupPolicy::load(self.main_root()).ok()?;
         if !checkout
@@ -4237,11 +4293,25 @@ impl Broker {
     /// because a partial `remove_dir_all` may have unlinked it before dying.
     pub(super) fn interrupted_finish_orphan_cleanup_proof(
         &self,
+        session: &Session,
+    ) -> Option<crate::events::FinishCleanupRecoveryProof> {
+        self.interrupted_finish_orphan_cleanup_proof_in_lane(
+            session,
+            crate::auto_cleanup::OwnershipReproofLane::Quiet,
+        )
+    }
+
+    /// [`Self::interrupted_finish_orphan_cleanup_proof`], counting its
+    /// volume re-proof decisions in `lane` (only the cleanup that acts on
+    /// the proof passes `Finish`).
+    fn interrupted_finish_orphan_cleanup_proof_in_lane(
+        &self,
         _session: &Session,
+        _lane: crate::auto_cleanup::OwnershipReproofLane,
     ) -> Option<crate::events::FinishCleanupRecoveryProof> {
         #[cfg(unix)]
         {
-            self.interrupted_finish_orphan_cleanup_proof_unix(_session)
+            self.interrupted_finish_orphan_cleanup_proof_unix(_session, _lane)
         }
         #[cfg(not(unix))]
         {
@@ -4253,6 +4323,7 @@ impl Broker {
     fn interrupted_finish_orphan_cleanup_proof_unix(
         &self,
         session: &Session,
+        lane: crate::auto_cleanup::OwnershipReproofLane,
     ) -> Option<crate::events::FinishCleanupRecoveryProof> {
         use std::os::unix::fs::MetadataExt;
 
@@ -4278,6 +4349,7 @@ impl Broker {
                 (path_metadata.dev(), path_metadata.ino()),
                 proof.worktree_device,
                 uuids.as_ref().map(|uuids| uuids.worktree),
+                lane,
                 &mut reproof,
             )
         {
@@ -4310,6 +4382,7 @@ impl Broker {
                 (common_metadata.dev(), common_metadata.ino()),
                 proof.git_common_device,
                 uuids.as_ref().map(|uuids| uuids.git_common),
+                lane,
                 &mut reproof,
             )
         {
@@ -4347,6 +4420,7 @@ impl Broker {
                         (witness.metadata.dev(), witness.metadata.ino()),
                         proof.git_pointer_device,
                         uuids.as_ref().map(|uuids| uuids.git_pointer),
+                        lane,
                         &mut reproof,
                     )
                 {
@@ -4399,7 +4473,7 @@ impl Broker {
             return None;
         }
         if reproof.is_some() {
-            crate::phase_telemetry::add("finish_ownership_reproved", std::time::Duration::ZERO);
+            lane.record_reproved();
         }
         proof.ownership_reproof = reproof;
         Some(proof)
@@ -4497,6 +4571,9 @@ impl Broker {
         self.repo
             .delete_branch_ref_checked(&session.branch, &expected_proof.branch_tip)?;
         self.mark_removed_checkout_sessions_cleaned(&[session.id], session.id)?;
+        // Reported once, by the removal it authorized.
+        self.cleanup_ownership_reproof
+            .set(expected_proof.ownership_reproof);
         Ok(())
     }
 
@@ -4611,6 +4688,9 @@ impl Broker {
         self.repo
             .delete_branch_ref_checked(&session.branch, &expected_proof.branch_tip)?;
         self.mark_removed_checkout_sessions_cleaned(&[session.id], session.id)?;
+        // Reported once, by the removal it authorized.
+        self.cleanup_ownership_reproof
+            .set(expected_proof.ownership_reproof);
         Ok(())
     }
 
@@ -5055,12 +5135,20 @@ impl Broker {
             });
         }
         if !force
-            && let Some(proof) =
-                self.interrupted_finish_cleanup_proof_with_status_limits(session, status_limits)
+            && let Some(proof) = self.interrupted_finish_cleanup_proof_in_lane(
+                session,
+                status_limits,
+                crate::auto_cleanup::OwnershipReproofLane::Finish,
+            )
         {
             return self.resume_interrupted_finish_cleanup(session, &proof, status_limits);
         }
-        if !force && let Some(proof) = self.interrupted_finish_orphan_cleanup_proof(session) {
+        if !force
+            && let Some(proof) = self.interrupted_finish_orphan_cleanup_proof_in_lane(
+                session,
+                crate::auto_cleanup::OwnershipReproofLane::Finish,
+            )
+        {
             return self.resume_interrupted_finish_orphan_cleanup(session, &proof);
         }
         let retirement_adopted =
@@ -7933,8 +8021,9 @@ mod registered_removal_failure_tests {
     }
 
     /// Where the platform reports no volume UUID, a proof that recorded one
-    /// is refused with or without a device change: never weaker than the
-    /// exact device comparison.
+    /// cannot be re-proven after a device change (only the re-proof refuses
+    /// here: every other field matches), while identical device numbers keep
+    /// the exact acceptance recovery always made.
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn finish_recovery_refuses_a_recorded_uuid_where_the_platform_has_none() {
@@ -7957,7 +8046,10 @@ mod registered_removal_failure_tests {
                 proof.volume_uuids = Some(uuids());
             });
         let closed = broker.store().session(session.id).unwrap();
-        assert!(broker.interrupted_finish_cleanup_proof(&closed).is_none());
+        let proof = broker
+            .interrupted_finish_cleanup_proof(&closed)
+            .expect("identical devices keep the exact acceptance");
+        assert_eq!(proof.ownership_reproof, None);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -8000,6 +8092,7 @@ mod registered_removal_failure_tests {
     #[cfg(unix)]
     fn finish_recovery_proof_after_aging_the_spawn_witness(
         label: &str,
+        close_first: bool,
         age: impl FnOnce(&mut crate::events::SpawnedWorktreeInstanceWitness),
     ) -> Option<crate::events::FinishCleanupRecoveryProof> {
         let owner = tempfile::tempdir().unwrap();
@@ -8007,9 +8100,11 @@ mod registered_removal_failure_tests {
         let storage = crate::test_storage::TestStorage::new();
         let mut broker = storage.open(&repository).unwrap();
         let (session, _worktree) = start_represented_cleanup_session(&mut broker, label);
-        broker
-            .close_abandoning_unpushed(session.id, "renumbered finish fixture")
-            .unwrap();
+        if close_first {
+            broker
+                .close_abandoning_unpushed(session.id, "renumbered finish fixture")
+                .unwrap();
+        }
         let mut saved = broker
             .store()
             .spawned_worktree_instance_witness(session.id)
@@ -8044,17 +8139,99 @@ mod registered_removal_failure_tests {
     #[test]
     fn finish_records_a_recovery_proof_for_a_renumbered_spawn_witness() {
         assert!(
-            finish_recovery_proof_after_aging_the_spawn_witness("renumbered finish", |_| {})
+            finish_recovery_proof_after_aging_the_spawn_witness("renumbered finish", true, |_| {})
                 .is_some(),
             "the shared re-proof lets finish record its recovery proof"
         );
+    }
+
+    /// The usual `finish` of an open session: the proof is recorded by the
+    /// same transition that closes the session, so the re-proof judges the
+    /// session as that transition leaves it.
+    #[cfg(unix)]
+    #[test]
+    fn finishing_an_open_session_records_a_recovery_proof_after_a_renumber() {
+        assert!(
+            finish_recovery_proof_after_aging_the_spawn_witness(
+                "open renumbered finish",
+                false,
+                |_| {}
+            )
+            .is_some(),
+            "finishing an open session must record its recovery proof through the re-proof"
+        );
+    }
+
+    /// Only the shared re-proof can refuse this on every platform: the paths,
+    /// inodes, head and branch all match, and the uniform renumber of the
+    /// same fixture is accepted, but the four objects no longer share devices
+    /// the way the proof recorded.
+    #[cfg(unix)]
+    #[test]
+    fn finish_recovery_refuses_a_renumber_that_regrouped_the_devices() {
+        let (_owner, _storage, mut broker, session, _worktree, _saved) =
+            renumbered_recovery_fixture("regrouped recovery", |proof| {
+                proof.volume_uuids = None;
+                let shared = proof.worktree_device == proof.git_common_device;
+                proof.worktree_device += 1000;
+                proof.git_pointer_device += 1000;
+                if shared {
+                    proof.git_admin_device += 2000;
+                    proof.git_common_device += 2000;
+                } else {
+                    proof.git_admin_device = proof.worktree_device;
+                    proof.git_common_device = proof.worktree_device;
+                }
+            });
+        let closed = broker.store().session(session.id).unwrap();
+        assert!(broker.interrupted_finish_cleanup_proof(&closed).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn orphan_rebind_requires_the_recorded_inodes_and_volume_uuids() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_owner, _storage, _broker, _session, worktree, saved) =
+            renumbered_recovery_fixture("orphan rebind", renumber_every_proof_object);
+        let mut rebound = saved.clone();
+        super::rebind_orphan_proof_devices(&mut rebound, &worktree).unwrap();
+        assert_eq!(
+            rebound.worktree_device,
+            std::fs::symlink_metadata(&worktree).unwrap().dev()
+        );
+        assert_eq!(
+            rebound.git_pointer_device,
+            std::fs::symlink_metadata(worktree.join(".git"))
+                .unwrap()
+                .dev()
+        );
+        type Mutation = fn(&mut crate::events::FinishCleanupRecoveryProof);
+        let mutations: &[(&str, Mutation)] = &[
+            ("root inode", |proof| proof.worktree_inode ^= 1 << 40),
+            ("pointer inode", |proof| proof.git_pointer_inode ^= 1 << 40),
+            ("root volume", |proof| {
+                proof.volume_uuids.as_mut().unwrap().worktree = [9; 16]
+            }),
+            ("pointer volume", |proof| {
+                proof.volume_uuids.as_mut().unwrap().git_pointer = [9; 16]
+            }),
+        ];
+        for (name, mutate) in mutations {
+            let mut changed = saved.clone();
+            mutate(&mut changed);
+            assert!(
+                super::rebind_orphan_proof_devices(&mut changed, &worktree).is_err(),
+                "{name}"
+            );
+        }
     }
 
     #[cfg(unix)]
     #[test]
     fn finish_records_no_recovery_proof_for_a_renumbered_witness_of_another_inode() {
         assert!(
-            finish_recovery_proof_after_aging_the_spawn_witness("replaced finish", |saved| {
+            finish_recovery_proof_after_aging_the_spawn_witness("replaced finish", true, |saved| {
                 saved.worktree_inode ^= 1 << 40;
             })
             .is_none()
