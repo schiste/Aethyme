@@ -424,8 +424,8 @@ closed checkouts itself, and the durable lever for what blocks it is the
 `[cleanup] regenerable` list in the same file. `status --json` reports the
 worker's last removal slice as `capacity_removal` (`auto_cleanup.capacity_removal`
 in `gc plan --json`) with its `outcome`, `kept_by_code` and `blocked_by_ignored`;
-[Checkout count keeps growing](../guides/troubleshooting.md#checkout-count-keeps-growing)
-walks from that record to the fix for each keep code.
+"Checkout count keeps growing" in
+[troubleshooting](../guides/troubleshooting.md) walks from that record to the fix for each keep code.
 A foreground lifecycle command (`start`, adoption, `finish`, `close`, `cleanup`,
 `submit`) waits up to 180 s for the repository's lifecycle claim, or until its
 own `--timeout` if that comes first. After 5 s it says on stderr who holds the
@@ -806,7 +806,7 @@ and `resources explain --json`, carry a `queue` object with the request's
 position, the units ahead of it, the holders and the time waited, and human
 `resources list` shows waiting requests in arrival order. Command metrics add
 `resource_queue`. Dead waiters are skipped and reaped automatically. See
-[host resource coordination](../guides/host-resource-coordination.md#waiting-order).
+"Waiting order" in [host resource coordination](../guides/host-resource-coordination.md).
 
 Successful `resources run --json` and `console run --json` reports include
 `phase_timings_ms`; the command-metrics row records the same map as each phase

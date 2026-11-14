@@ -112,7 +112,7 @@ checkout or a branch.
 
 If the retained checkout count keeps growing and `broker start` is close to
 refusing, follow
-[Checkout count keeps growing](troubleshooting.md#checkout-count-keeps-growing).
+"Checkout count keeps growing" in [troubleshooting](troubleshooting.md).
 Raising `[worktrees].max_checkouts` only delays the refusal; the durable levers
 are `[cleanup] regenerable` for ignored output and the automatic removal
 described here.
