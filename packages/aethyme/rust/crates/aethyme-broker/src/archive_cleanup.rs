@@ -31,6 +31,15 @@ const INTENT_DIRECTORY_RELATIVE: &str = ".aethyme/run/archive-cleanup-intents";
 ///
 /// The record is deliberately separate from the recovery archive directory,
 /// so writing it cannot change the archive manifest or its verified file set.
+///
+/// The `*_device` fields are mount-scoped: macOS renumbers an external volume
+/// when it returns in another disk slot. Today nothing compares them: no
+/// production code writes an intent, and the only reader refuses cleanup
+/// whenever an intent exists, whatever it records. A recovery consumer that
+/// later compares them with live objects must go through
+/// `volume_identity::same_volume` with a volume UUID recorded at write time,
+/// as the other durable identity records do, instead of comparing devices
+/// exactly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ArchiveCleanupIntent {
