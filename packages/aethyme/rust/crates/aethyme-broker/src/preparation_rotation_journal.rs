@@ -1735,11 +1735,18 @@ const VOLUME_KEY_TABLE: &str = "CREATE TABLE IF NOT EXISTS rotation_volume_key(
     PRIMARY KEY(root_path, filesystem_key)
  ) WITHOUT ROWID;";
 
-/// Rows kept at most in `rotation_debt_volume`; orphans of removed roots are
-/// pruned first, and a full table refuses new bindings instead of growing.
+/// Rows kept at most in `rotation_debt_volume`. Orphans of removed roots are
+/// pruned first; at the cap, the oldest bindings no journaled debt row holds
+/// any more (leaked when a completed recovery never retired them) make room;
+/// only a table full of bindings of pending debts refuses a new one.
 const MAX_DEBT_VOLUME_ROWS: i64 = 4 * MAX_DEBT_ROWS;
-/// Keys kept per cache root in `rotation_volume_key`; the oldest goes first.
+/// Keys kept per cache root and volume UUID in `rotation_volume_key`; the
+/// oldest goes first, unless a pending debt may still need it.
 const MAX_VOLUME_KEYS_PER_ROOT: i64 = 16;
+/// Hard bound on the keys of one cache root and volume UUID while a pending
+/// debt protects them from pruning. A key past it is not recorded, so the
+/// recovery that needed it refuses instead of the table growing.
+const MAX_PROTECTED_VOLUME_KEYS: i64 = 16 * MAX_VOLUME_KEYS_PER_ROOT;
 
 /// One debt's volume binding, read without mutating the journal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1891,6 +1898,36 @@ fn insert_debt_volume(
         )
         .map_err(sqlite_error)?;
     if rows >= MAX_DEBT_VOLUME_ROWS {
+        // Leaked bindings must not block new ones forever: evict the oldest
+        // that no journaled debt row holds. A stage proof that still needed
+        // one is then refused as unproven, never accepted.
+        let evicted = transaction
+            .execute(
+                "DELETE FROM rotation_debt_volume WHERE (root_path, repository) IN \
+                 (SELECT v.root_path, v.repository FROM rotation_debt_volume v \
+                  WHERE NOT (v.root_path=?1 AND v.repository=?2) \
+                  AND NOT EXISTS (SELECT 1 FROM rotation_debt d \
+                    WHERE d.root_path=v.root_path AND d.repository=v.repository) \
+                  ORDER BY v.recorded_at_ms ASC LIMIT ?3)",
+                params![root, repository, rows - MAX_DEBT_VOLUME_ROWS + 1],
+            )
+            .map_err(sqlite_error)?;
+        for _ in 0..evicted {
+            crate::phase_telemetry::add(
+                "preparation_rotation_debt_volume_binding_evicted",
+                Duration::ZERO,
+            );
+        }
+    }
+    let rows: i64 = transaction
+        .query_row(
+            "SELECT count(*) FROM rotation_debt_volume \
+             WHERE NOT (root_path=?1 AND repository=?2)",
+            params![root, repository],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if rows >= MAX_DEBT_VOLUME_ROWS {
         crate::phase_telemetry::add(
             "preparation_rotation_debt_volume_binding_cap_reached",
             Duration::ZERO,
@@ -1947,7 +1984,13 @@ pub(crate) fn forget_debt_volume(
 }
 
 /// Record that `cache_root` was seen under `filesystem_key` on the volume
-/// `volume_uuid`. Returns whether the row is now durable.
+/// `volume_uuid`. Returns whether the row is now durable. A row already
+/// holding exactly this key and UUID is left as it is: a sweep re-proving the
+/// same volume every pass writes nothing. Pruning keeps the newest
+/// [`MAX_VOLUME_KEYS_PER_ROOT`] keys per cache root and UUID, and never a key
+/// of a root with a pending debt row or of a UUID a debt binding of that
+/// root names; such protected keys stop at [`MAX_PROTECTED_VOLUME_KEYS`],
+/// past which the key is refused (`Ok(false)`).
 pub(crate) fn record_volume_key(
     resource_db: &Path,
     cache_root: &Path,
@@ -1968,12 +2011,43 @@ pub(crate) fn record_volume_key(
         .execute_batch(VOLUME_KEY_TABLE)
         .map_err(sqlite_error)?;
     transaction
+        .execute_batch(DEBT_VOLUME_TABLE)
+        .map_err(sqlite_error)?;
+    let unchanged: Option<i64> = transaction
+        .query_row(
+            "SELECT 1 FROM rotation_volume_key \
+             WHERE root_path=?1 AND filesystem_key=?2 AND volume_uuid=?3",
+            params![root, filesystem_key, volume_uuid.to_vec()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if unchanged.is_some() {
+        // Nothing to record; the transaction is dropped without a write.
+        return Ok(true);
+    }
+    transaction
         .execute(
             "DELETE FROM rotation_volume_key \
              WHERE root_path NOT IN (SELECT root_path FROM rotation_root)",
             [],
         )
         .map_err(sqlite_error)?;
+    let group: i64 = transaction
+        .query_row(
+            "SELECT count(*) FROM rotation_volume_key \
+             WHERE root_path=?1 AND volume_uuid=?2 AND filesystem_key<>?3",
+            params![root, volume_uuid.to_vec(), filesystem_key],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error)?;
+    if group >= MAX_PROTECTED_VOLUME_KEYS {
+        crate::phase_telemetry::add(
+            "preparation_rotation_volume_key_cap_reached",
+            Duration::ZERO,
+        );
+        return Ok(false);
+    }
     transaction
         .execute(
             "INSERT OR REPLACE INTO rotation_volume_key(root_path, filesystem_key, volume_uuid, \
@@ -1981,12 +2055,19 @@ pub(crate) fn record_volume_key(
             params![root, filesystem_key, volume_uuid.to_vec(), now_ms()],
         )
         .map_err(sqlite_error)?;
+    // Prune per cache root and UUID, never a key a pending debt may still
+    // need: while the root has a debt row, or a debt binding of the root
+    // names this UUID (its stage proofs can outlive the row), keys stay.
     transaction
         .execute(
-            "DELETE FROM rotation_volume_key WHERE root_path=?1 AND filesystem_key NOT IN \
-             (SELECT filesystem_key FROM rotation_volume_key WHERE root_path=?1 \
-              ORDER BY recorded_at_ms DESC LIMIT ?2)",
-            params![root, MAX_VOLUME_KEYS_PER_ROOT],
+            "DELETE FROM rotation_volume_key \
+             WHERE root_path=?1 AND volume_uuid=?2 \
+             AND filesystem_key NOT IN (SELECT filesystem_key FROM rotation_volume_key \
+               WHERE root_path=?1 AND volume_uuid=?2 ORDER BY recorded_at_ms DESC LIMIT ?3) \
+             AND NOT EXISTS (SELECT 1 FROM rotation_debt WHERE root_path=?1) \
+             AND NOT EXISTS (SELECT 1 FROM rotation_debt_volume \
+               WHERE root_path=?1 AND volume_uuid=?2)",
+            params![root, volume_uuid.to_vec(), MAX_VOLUME_KEYS_PER_ROOT],
         )
         .map_err(sqlite_error)?;
     transaction.commit().map_err(sqlite_error)?;
@@ -2011,12 +2092,12 @@ pub(crate) fn volume_keys(
     let mut statement = connection
         .prepare(
             "SELECT filesystem_key FROM rotation_volume_key \
-             WHERE root_path=?1 AND volume_uuid=?2 LIMIT ?3",
+             WHERE root_path=?1 AND volume_uuid=?2 ORDER BY recorded_at_ms DESC LIMIT ?3",
         )
         .map_err(sqlite_error)?;
     let keys = statement
         .query_map(
-            params![root, volume_uuid.to_vec(), MAX_VOLUME_KEYS_PER_ROOT],
+            params![root, volume_uuid.to_vec(), MAX_PROTECTED_VOLUME_KEYS],
             |row| row.get::<_, String>(0),
         )
         .map_err(sqlite_error)?
@@ -3577,51 +3658,110 @@ mod debt_volume_tests {
         );
     }
 
-    /// A full binding table refuses new bindings instead of growing, and says
-    /// so in telemetry.
+    /// A full binding table no longer blocks new bindings forever: the oldest
+    /// binding no journaled debt row holds (leaked) makes room, and a binding
+    /// of a pending debt is never evicted.
     #[test]
-    fn a_full_binding_table_refuses_and_counts() {
+    fn a_full_binding_table_evicts_the_oldest_leaked_binding() {
         let (_directory, resource_db, cache_root) = fixture();
         publish(&resource_db, &cache_root, ROOT, REPOSITORY, b"payload").unwrap();
-        for index in 0..MAX_DEBT_VOLUME_ROWS {
-            let other = format!("{index:064x}");
+        // A pending debt of another repository, bound first (the oldest row).
+        let pending = format!("{:064x}", u64::MAX);
+        publish(&resource_db, &cache_root, ROOT, &pending, b"pending").unwrap();
+        assert!(
+            bind_debt_volume(
+                &resource_db,
+                &cache_root,
+                &pending,
+                b"pending",
+                ROOT,
+                VOLUME,
+                ROOT_VOLUME_OBSERVED,
+            )
+            .unwrap()
+        );
+        let path = path_for_resource_db(&resource_db).unwrap();
+        let backdate = |repository: &str, at: i64| {
+            Connection::open(&path)
+                .unwrap()
+                .execute(
+                    "UPDATE rotation_debt_volume SET recorded_at_ms=?2 WHERE repository=?1",
+                    params![repository, at],
+                )
+                .unwrap();
+        };
+        backdate(&pending, 1);
+        for index in 0..(MAX_DEBT_VOLUME_ROWS - 1) {
+            let leaked = format!("{index:064x}");
             assert!(
                 insert_debt_volume_for_test(
                     &resource_db,
                     &cache_root,
-                    &other,
-                    b"other",
+                    &leaked,
+                    b"leaked",
                     ROOT,
                     VOLUME
                 )
                 .unwrap()
             );
+            backdate(&leaked, 10 + index);
         }
         let recorder = crate::phase_telemetry::Recorder::default();
         let installed = crate::phase_telemetry::install(recorder.clone());
         let bound = bind(&resource_db, &cache_root, b"payload");
         drop(installed);
-        assert!(!bound);
+        assert!(bound, "a leaked binding must make room");
+        let counts = recorder.totals().1;
         assert_eq!(
-            recorder
-                .totals()
-                .1
-                .get("preparation_rotation_debt_volume_binding_cap_reached"),
-            Some(&1)
+            counts.get("preparation_rotation_debt_volume_binding_evicted"),
+            Some(&1),
+            "{counts:?}"
+        );
+        assert!(!counts.contains_key("preparation_rotation_debt_volume_binding_cap_reached"));
+        assert!(
+            debt_volume_binding(&resource_db, &cache_root, &pending)
+                .unwrap()
+                .is_some(),
+            "the oldest row is a pending debt's binding and stays"
         );
         assert!(
-            debt_volume_binding(&resource_db, &cache_root, REPOSITORY)
+            debt_volume_binding(&resource_db, &cache_root, &format!("{:064x}", 0))
                 .unwrap()
-                .is_none()
+                .is_none(),
+            "the oldest leaked binding is the one evicted"
+        );
+        assert!(
+            debt_volume_binding(&resource_db, &cache_root, &format!("{:064x}", 1))
+                .unwrap()
+                .is_some()
         );
     }
 
     /// Keys are read back only under the UUID they were recorded with, and
-    /// each root keeps a bounded number of them.
+    /// each root keeps a bounded number of them per UUID.
     #[test]
     fn volume_keys_are_read_per_uuid_and_bounded() {
         let (_directory, resource_db, cache_root) = fixture();
+        // A root row with no pending debt: nothing protects old keys.
         publish(&resource_db, &cache_root, ROOT, REPOSITORY, b"payload").unwrap();
+        record_fresh_store_identity(
+            &resource_db,
+            &cache_root,
+            ROOT,
+            REPOSITORY,
+            b"payload",
+            b"fresh",
+        )
+        .unwrap();
+        complete_verified(
+            &resource_db,
+            &cache_root,
+            ROOT,
+            REPOSITORY,
+            b"payload",
+            b"fresh",
+        )
+        .unwrap();
         assert!(
             volume_keys(&resource_db, &cache_root, VOLUME)
                 .unwrap()
@@ -3636,13 +3776,117 @@ mod debt_volume_tests {
         for device in 0..(2 * MAX_VOLUME_KEYS_PER_ROOT) {
             record_volume_key(&resource_db, &cache_root, &format!("{device}:aa"), VOLUME).unwrap();
         }
+        assert_eq!(
+            volume_keys(&resource_db, &cache_root, VOLUME)
+                .unwrap()
+                .len(),
+            MAX_VOLUME_KEYS_PER_ROOT as usize
+        );
+        assert_eq!(
+            volume_keys(&resource_db, &cache_root, [0x25; 16]).unwrap(),
+            vec!["48:2400".to_owned()],
+            "pruning one UUID's keys never removes another UUID's"
+        );
+        assert!(record_volume_key(&resource_db, &cache_root, "x", VOLUME).is_err());
+    }
+
+    /// While the root has a pending debt, or a debt binding names the UUID,
+    /// no key of that UUID is pruned, up to a hard bound that refuses.
+    #[test]
+    fn volume_keys_a_pending_debt_may_need_are_never_pruned() {
+        let (_directory, resource_db, cache_root) = fixture();
+        publish(&resource_db, &cache_root, ROOT, REPOSITORY, b"payload").unwrap();
+        let first = "1:aa";
+        assert!(record_volume_key(&resource_db, &cache_root, first, VOLUME).unwrap());
+        for device in 2..(2 * MAX_VOLUME_KEYS_PER_ROOT) {
+            assert!(
+                record_volume_key(&resource_db, &cache_root, &format!("{device}:aa"), VOLUME)
+                    .unwrap()
+            );
+        }
+        let keys = volume_keys(&resource_db, &cache_root, VOLUME).unwrap();
+        assert!(keys.iter().any(|key| key == first), "{keys:?}");
+        assert_eq!(keys.len(), (2 * MAX_VOLUME_KEYS_PER_ROOT - 1) as usize);
+
+        // The debt row completes but its binding stays (a stage proof can
+        // outlive the row): its UUID's keys are still kept.
+        assert!(bind(&resource_db, &cache_root, b"payload"));
+        record_fresh_store_identity(
+            &resource_db,
+            &cache_root,
+            ROOT,
+            REPOSITORY,
+            b"payload",
+            b"fresh",
+        )
+        .unwrap();
+        complete_verified(
+            &resource_db,
+            &cache_root,
+            ROOT,
+            REPOSITORY,
+            b"payload",
+            b"fresh",
+        )
+        .unwrap();
+        assert!(record_volume_key(&resource_db, &cache_root, "900:aa", VOLUME).unwrap());
         assert!(
             volume_keys(&resource_db, &cache_root, VOLUME)
                 .unwrap()
-                .len()
-                <= MAX_VOLUME_KEYS_PER_ROOT as usize
+                .iter()
+                .any(|key| key == first)
         );
-        assert!(record_volume_key(&resource_db, &cache_root, "x", VOLUME).is_err());
+
+        // Protected keys stop at the hard bound: the next one is refused.
+        for device in 1000..(1000 + MAX_PROTECTED_VOLUME_KEYS) {
+            let _ = record_volume_key(&resource_db, &cache_root, &format!("{device}:aa"), VOLUME)
+                .unwrap();
+        }
+        assert!(
+            !record_volume_key(&resource_db, &cache_root, "99999:aa", VOLUME).unwrap(),
+            "past the bound a key is refused, never recorded by pruning another"
+        );
+        assert!(
+            volume_keys(&resource_db, &cache_root, VOLUME)
+                .unwrap()
+                .iter()
+                .any(|key| key == first)
+        );
+    }
+
+    /// Re-recording the same key and UUID writes nothing; a new UUID for the
+    /// key is a change and is written.
+    #[test]
+    fn recording_an_unchanged_volume_key_writes_nothing() {
+        let (_directory, resource_db, cache_root) = fixture();
+        publish(&resource_db, &cache_root, ROOT, REPOSITORY, b"payload").unwrap();
+        assert!(record_volume_key(&resource_db, &cache_root, "41:1900", VOLUME).unwrap());
+        let path = path_for_resource_db(&resource_db).unwrap();
+        let recorded_at = || -> (i64, Vec<u8>) {
+            Connection::open(&path)
+                .unwrap()
+                .query_row(
+                    "SELECT recorded_at_ms, volume_uuid FROM rotation_volume_key \
+                     WHERE filesystem_key='41:1900'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        };
+        Connection::open(&path)
+            .unwrap()
+            .execute("UPDATE rotation_volume_key SET recorded_at_ms=7", [])
+            .unwrap();
+        assert!(record_volume_key(&resource_db, &cache_root, "41:1900", VOLUME).unwrap());
+        assert_eq!(
+            recorded_at(),
+            (7, VOLUME.to_vec()),
+            "no write for no change"
+        );
+        assert!(record_volume_key(&resource_db, &cache_root, "41:1900", [0x25; 16]).unwrap());
+        let (at, uuid) = recorded_at();
+        assert_ne!(at, 7);
+        assert_eq!(uuid, [0x25; 16].to_vec());
     }
 
     #[test]
