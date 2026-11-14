@@ -1,6 +1,6 @@
 # Automatic checkout maintenance
 
-Last Updated: 2026-11-01
+Last Updated: 2026-11-14
 
 A session becoming closed and its checkout being removed are separate steps.
 Idle-session retirement makes a checkout eligible for later inspection; it does
@@ -100,11 +100,16 @@ permit that case in cohort checks and automatic checkout maintenance. A differen
 volume, inode, path or generation still refuses. If a stable UUID cannot be
 captured, the new witness keeps the schema-2 exact-device behavior. Interrupted
 finish-cleanup recovery proofs also retain their exact device checks.
-Older witnesses have no saved volume UUID and keep their exact device checks.
-They cannot be upgraded from a current observation: use a separately reviewed
-archive resolution for an old checkout whose device identity changed. Older
-runtimes refuse schema-3 witnesses; use the new paired runtime for maintenance
-of repositories containing them.
+Older witnesses have no saved volume UUID and keep their exact device checks
+everywhere except automatic whole-checkout removal, which re-proves a closed
+spawned checkout whose only mismatch is renumbered devices (paths, inodes, the
+spawn root generation, the Git registration on the session branch and the
+branch tip must all still match). See "Automatic removal" in the
+[worktree cleanup guide](worktree-cleanup.md) for the record it leaves and the
+keep code a refusal gets. Artifact reclamation and finish-cleanup recovery
+proofs for such a checkout still compare devices exactly, so use a separately
+reviewed archive resolution when one of those refuses. Older runtimes refuse schema-3 witnesses; use the new paired runtime
+for maintenance of repositories containing them.
 
 This opt-in can compact a checkout during its ordinary one-day grace period.
 Every retirement archive records a minimum retention floor of at least 15 days
@@ -119,7 +124,9 @@ remaining time; an incomplete archive is never permission to remove a checkout.
 
 Normal whole-checkout cleanup retains unknown Git-ignored directories, including
 local datasets and saved records. Recognized or explicitly configured build-output
-directories remain disposable; standalone ignored files remain protected.
+directories remain disposable; a standalone ignored file is released only when
+a `[cleanup] regenerable` pattern names its whole path, and a protected name is
+never released (see the [worktree cleanup guide](worktree-cleanup.md)).
 
 The background artifact sweep historically recognizes a catalog of generated
 folders. Broader in-place reclamation is separately opt-in in the primary

@@ -1,6 +1,6 @@
 # Closed-session worktree cleanup
 
-Last Updated: 2026-11-01
+Last Updated: 2026-11-14
 
 Removing a session worktree is a reviewed operation, with one deterministic
 exception described under *Automatic removal* below. A closed session is not
@@ -109,6 +109,13 @@ worktree prune --dry-run --verbose` handles them, separately from removing a
 checkout or a branch.
 
 ## Automatic removal (#588)
+
+If the retained checkout count keeps growing and `broker start` is close to
+refusing, follow
+"Checkout count keeps growing" in [troubleshooting](troubleshooting.md).
+Raising `[worktrees].max_checkouts` only delays the refusal; the durable levers
+are `[cleanup] regenerable` for ignored output and the automatic removal
+described here.
 
 The unattended sweep removes a closed checkout without a reviewed plan only
 when four proofs hold, each re-checked under the GC lock immediately before
@@ -323,6 +330,12 @@ pattern (planning and the re-check before removal each count), and
 `cleanup_regenerable_protected_refused` counts protected entries a configured
 glob named and cleanup kept.
 
+Volume-identity work adds three more counters to the same report:
+`artifact_use_marker_legacy_device_renumber` (one per marker saved before a
+device renumber and listed as unresolved), `preparation_rotation_root_reproved`
+(a preparation-cache rotation journal root rewritten to its live identity after
+a remount) and `preparation_rotation_root_reproof_refused` (a rewrite refused).
+
 The background worker's pace, priority, host-wide single deleter and pressure
 pause are described in
 [automatic checkout maintenance](automatic-checkout-maintenance.md), under
@@ -403,7 +416,11 @@ marker retained is always safe.
 An old marker whose only difference is the device numbers a remount changed is
 listed as that checkout's unresolved marker instead of failing with "marker
 primary root device does not match". It still keeps the checkout, and `finish
-cleanup` and session retirement say so. `reconcile plan` removes such a marker
+cleanup` and session retirement say so. Session retirement reports it as the deferred reason
+`legacy_artifact_markers` (`retirement_deferred_reasons[]` carries `kind`,
+`session_id` and `markers`), which `broker status` treats as actionable and
+answers with the same review command. The session stays open until the markers
+are resolved. `reconcile plan` removes such a marker
 only when a spawn or registry record saw its old device numbers; a marker it
 retains for lack of that record stays until you confirm its producer process is
 gone and delete the marker file under `.aethyme/run/artifact-use/` by hand.
