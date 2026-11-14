@@ -190,18 +190,29 @@ replace strict mode for in-place artifact reclamation.
 
 ## When closed checkouts are removed
 
-Removal follows merges, not capacity pressure. The detached worker removes a
-closed checkout whose work has landed (its pull request is recorded merged,
-its cleanup request is past the closed-worktree grace, or the oldest-first lap
-proves it contained in the fetched default branch) on every run it is due,
-whether or not the repository is near `[worktrees] max_checkouts`:
+Removal follows merges, not capacity pressure. On every run it is due, the
+detached worker judges closed checkouts and removes those whose work every
+removal proof shows landed, whether or not the repository is near
+`[worktrees] max_checkouts`. A recorded merged pull request or a cleanup
+request past the closed-worktree grace only moves a checkout ahead in the
+queue: removal still needs the checkout's commits proved contained in the
+fetched default branch, past its grace, with nothing unique in it. A merged
+pull request alone is not enough.
 
 - Below three quarters of the limit (or with no limit) it runs a `steady`
   slice: at most four removals in up to 60 seconds, the priority lane first
-  and then at most 16 checkouts of the lap. It is due again a minute after a
-  slice that removed something, and 5, 10, 20, then at most 30 minutes after
-  slices in a row that removed nothing. An idle repository therefore costs a
-  short worker run about twice an hour.
+  and then at most 16 checkouts of the lap per pass. It is due again a minute
+  after a slice that removed something, and 5, 10, 20, then at most 30
+  minutes after slices in a row that removed nothing. A cleanup request whose
+  grace ends after the last steady slice makes the next one due at once, so a
+  landed checkout goes within about a minute of its grace ending (the next
+  broker open wakes the worker). Steady removal is due only while some closed
+  session still holds its checkout: a repository with none never wakes the
+  worker for it. A repository whose closed checkouts are all kept (each with
+  a keep code) costs one short worker run about every 30 minutes, started by
+  a broker open. A run that cannot reach its slice (the host deleter slot is
+  busy, the runtime cannot be verified, the worker cannot start, no time is
+  left) holds steady removal off for one to five minutes.
 - From three quarters of the limit it runs the `pressure` slice with the
   capacity limits (up to twelve removals in 120 seconds, shorter retries).
 

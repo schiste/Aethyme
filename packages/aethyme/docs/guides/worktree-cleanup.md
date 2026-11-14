@@ -219,17 +219,22 @@ merges instead of drifting up to `[worktrees].max_checkouts`. Each slice
 records its `trigger`:
 
 - `steady` (below three quarters of the limit, or no limit set): a slice of up
-  to 60 seconds that removes at most four checkouts and stops after two passes
-  that removed nothing. Each pass judges the priority lane first (closed
+  to 60 seconds that removes at most four checkouts. It ends as soon as a pass
+  selects nothing, and after two passes whose selected checkout was kept or
+  deferred at the last step. Each pass judges the priority lane first (closed
   checkouts whose pull request is recorded merged or whose cleanup request is
-  past its grace, see below), then at most 16 closed checkouts of the
-  oldest-first lap from its stored cursor, so old landed checkouts no merge
-  signal names are reached too, more slowly. After a slice that removed a
-  checkout the next steady slice may run a minute later; after a slice that
-  removed nothing it waits 5 minutes, then 10, 20 and at most 30 minutes while
-  slices keep finding nothing (`idle_streak`), and a removal resets the wait.
-  It finds the GC lock held: 1 minute. No full checkout listing runs: the
-  count reads only the repository's checkout registrations.
+  past its grace, see below; this only orders them, every proof still
+  applies), then at most 16 closed checkouts of the oldest-first lap from its
+  stored cursor, so old landed checkouts no merge signal names are reached
+  too, more slowly. After a slice that removed a checkout the next steady
+  slice may run a minute later; after a slice that removed nothing it waits 5
+  minutes, then 10, 20 and at most 30 minutes while slices keep finding
+  nothing (`idle_streak`), and a removal resets the wait. A cleanup request
+  whose grace ends after the last steady slice ends that wait at once. A slice
+  stopped by memory or load pressure, failed removals or a held lock keeps
+  its wait (1 to 10 minutes) whatever lands. Steady removal is due only while
+  a closed session still holds its checkout. No full checkout listing runs:
+  the count reads only the repository's checkout registrations.
 - `pressure` (from three quarters of the limit): the capacity limits described
   next.
 
@@ -405,7 +410,9 @@ re-proof counts `auto_cleanup_ownership_reproved`, `_reproof_refused` and
 The background worker's removal slices add the counters
 `artifact_worker_capacity_removed`, `artifact_worker_capacity_removal_lock_busy`,
 `artifact_worker_capacity_removal_trigger_steady` and `_trigger_pressure` (one
-per slice that ran), `artifact_worker_capacity_removal_priority_examined`,
+per slice that ran), `artifact_worker_steady_removal_deferred` (a run due for
+steady removal that could not reach its slice),
+`artifact_worker_capacity_removal_priority_examined`,
 `_priority_removed`, `_lap_examined` and `_lap_removed`,
 `artifact_worker_capacity_removal_failed`,
 `artifact_worker_capacity_removal_outcome_<outcome>` and

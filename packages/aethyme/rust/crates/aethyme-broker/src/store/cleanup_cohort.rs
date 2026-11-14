@@ -440,6 +440,45 @@ impl BrokerStore {
         Ok(updated)
     }
 
+    /// Whether any spawned session is closed with its checkout not yet
+    /// removed: the cheap positive signal the worker's steady checkout
+    /// removal needs before it is due. One query of the sessions table;
+    /// reads no checkout.
+    pub(crate) fn closed_spawned_checkout_pending(&self) -> Result<bool, BrokerError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sessions
+                 WHERE origin = 'spawned' AND status = 'closed' AND cleanup_state = 'closed'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?)
+    }
+
+    /// Whether the cleanup request of a closed spawned checkout became due
+    /// (its grace ended) after `after_ms` and no later than `now_ms`: a
+    /// checkout that may have become removable since the worker's last
+    /// steady removal slice, so the next one need not wait out its idle
+    /// back-off.
+    pub(crate) fn checkout_cleanup_became_due_between(
+        &self,
+        after_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool, BrokerError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM closed_checkout_cleanup_requests r
+                 JOIN sessions s ON s.id = r.session_id
+                 WHERE r.completed_at_ms IS NULL
+                   AND r.not_before_ms > ?1 AND r.not_before_ms <= ?2
+                   AND s.origin = 'spawned' AND s.status = 'closed'
+                   AND s.cleanup_state = 'closed'
+             )",
+            params![after_ms, now_ms],
+            |row| row.get::<_, bool>(0),
+        )?)
+    }
+
     pub(crate) fn next_pending_checkout_cleanup_at(&self) -> Result<Option<i64>, BrokerError> {
         self.next_pending_checkout_cleanup_at_with_compaction(false)
     }

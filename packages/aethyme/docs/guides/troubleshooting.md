@@ -151,8 +151,10 @@ aethyme broker status --json
    Under pressure a slice runs up to 120 seconds and removes up to twelve
    checkouts, one per pass (a pass has a 20-second budget); a steady slice runs
    up to 60 seconds, removes up to four, judges the priority lane and then at
-   most 16 checkouts of the lap per pass, stops after two passes that removed
-   nothing, and may run again a minute after a removal. `stop_reason` says why it ended:
+   most 16 checkouts of the lap per pass, ends when a pass selects nothing or
+   after two passes whose selected checkout was kept at the last step, and may
+   run again a minute after a removal (at once when a cleanup request's grace
+   ends after it). `stop_reason` says why it ended:
    `cap` (twelve removed), `budget` (too little time left for another pass),
    `nothing_selected` (the lap has nothing more to remove now),
    `kept_only_limit` (four passes removed nothing because the checkout they
