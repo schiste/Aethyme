@@ -4,6 +4,23 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.97] - 2026-11-15
+
+### Fixed
+
+- The background worker removes closed checkouts whose work has landed whether or not the repository is near `[worktrees] max_checkouts`, so the checkout count follows merges instead of drifting up to the limit. Without pressure a steady slice runs: up to 4 removals in 60 seconds, checkouts with a merged pull request or a due cleanup request judged first, then 16 checkouts of the oldest-first lap. It is due only while a closed session still holds its checkout, runs again 1 minute after a removal and at once when a cleanup request's grace ends, and otherwise backs off 5, 10, 20, then 30 minutes. Every removal proof is unchanged, and behaviour under pressure is unchanged (#1681).
+- Session retirement yields to a foreground command waiting for the GC lock (#1681).
+
+### Changed
+
+- A recorded checkout count taken under a different `max_checkouts` no longer reports capacity pressure (#1681).
+- Correction to the 0.8.96 notes: they listed `service_context_volume_refused` as a counter. It is a refusal label only; the job service records no counters.
+
+### Added
+
+- `capacity_removal` gains `trigger` (`steady` or `pressure`), `priority_examined`, `priority_removed`, `lap_examined`, `lap_removed` and `idle_streak`. Counters `artifact_worker_capacity_removal_trigger_{steady,pressure}`, `artifact_worker_steady_removal_deferred` and `session_retirement_yielded_to_foreground` (#1681).
+- Documentation: a consistency pass for 0.8.96, a troubleshooting section for a slow or silent prepare, and rollback notes for 0.8.96 (#1679).
+
 ## [0.8.96] - 2026-11-14
 
 ### Fixed
