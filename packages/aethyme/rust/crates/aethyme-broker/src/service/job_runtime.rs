@@ -18,6 +18,7 @@ use crate::Broker;
 
 const DATABASE: &str = "broker-service-jobs.sqlite";
 const CONTEXT: &str = "broker-service-jobs-context.json";
+const CONTEXT_VOLUMES: &str = "broker-service-jobs-context-volumes.json";
 const MAX_JOB_MS: i64 = 30 * 60 * 1000;
 const MAX_OUTSTANDING: usize = 128;
 
@@ -130,6 +131,212 @@ struct Context {
     worker_generation: String,
 }
 
+/// Stable volume UUIDs of the objects a [`Context`] names, bound to the exact
+/// context bytes they were observed with. Kept beside the context instead of
+/// in it: the context refuses unknown fields, so an older binary would fail to
+/// start on a context that carried them, while it ignores this file. A context
+/// rewritten by an older binary no longer matches `context_sha256`, so its
+/// stale UUIDs are never applied to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextVolumes {
+    schema_version: u32,
+    context_sha256: String,
+    /// The runtime directory; its singleton lock and job database are files
+    /// directly inside it, so they share its volume.
+    runtime: Option<[u8; 16]>,
+    root: Option<[u8; 16]>,
+    common: Option<[u8; 16]>,
+}
+
+impl ContextVolumes {
+    fn any_known(&self) -> bool {
+        self.runtime.is_some() || self.root.is_some() || self.common.is_some()
+    }
+}
+
+/// The context's saved device numbers differ from the live ones, and the
+/// volume UUIDs recorded with that exact context name the live volumes.
+pub(crate) const SERVICE_CONTEXT_REPROOF_VOLUME_UUID: &str = "volume_uuid";
+/// Prefix of the reported reason when a saved context does not name the
+/// live runtime directory and repository.
+pub(crate) const SERVICE_CONTEXT_REFUSED: &str = "service_context_volume_refused";
+
+/// Same-volume decision for one group of objects that share a volume.
+/// `Ok(true)`: the devices differ and the recorded UUID proves the volume.
+fn volume_group_decision(
+    object: &'static str,
+    devices_match: bool,
+    saved_volume: Option<[u8; 16]>,
+    live_volume: Option<[u8; 16]>,
+) -> Result<bool, String> {
+    if devices_match {
+        return match (saved_volume, live_volume) {
+            (Some(saved), Some(live)) if saved != live => Err(format!(
+                "{object}: the device matches but the recorded volume UUID names another volume"
+            )),
+            _ => Ok(false),
+        };
+    }
+    let Some(live_volume) = live_volume else {
+        return Err(format!(
+            "{object}: the device differs and the live volume UUID is unknown"
+        ));
+    };
+    let Some(saved_volume) = saved_volume else {
+        return Err(format!(
+            "{object}: the device differs and the context predates volume UUIDs; \
+             review and remove {CONTEXT} and {DATABASE} in the service directory to start fresh"
+        ));
+    };
+    if saved_volume == live_volume {
+        Ok(true)
+    } else {
+        Err(format!(
+            "{object}: the device differs and its recorded volume UUID names another volume"
+        ))
+    }
+}
+
+/// Decide whether a saved context still names the live runtime directory,
+/// singleton lock, job database and repository. `Ok(None)`: every saved
+/// field matches as before; `Ok(Some)` names the rule that proves renumbered
+/// devices; `Err` names the first condition that failed. Paths, the
+/// repository UUID and every inode must always match. A device number is
+/// assigned at mount time and macOS renumbers an external volume when it
+/// returns in another disk slot, so a differing device is accepted only when
+/// the live volume UUID is known and equals the one recorded with this exact
+/// context; otherwise the exact device comparison stays. With equal devices a
+/// recorded UUID naming another volume is refused too: a different disk in
+/// the same slot can repeat device and inode numbers.
+fn context_identity_decision(
+    saved: &Context,
+    saved_volumes: Option<&ContextVolumes>,
+    live_directory: DirectoryIdentity,
+    live_repository: &Repository,
+    live_database: FileIdentity,
+    live_volumes: &ContextVolumes,
+) -> Result<Option<&'static str>, String> {
+    let saved_repository = &saved.repository;
+    if saved_repository.root != live_repository.root
+        || saved_repository.common_dir != live_repository.common_dir
+        || saved_repository.broker_database != live_repository.broker_database
+        || saved_repository.uuid != live_repository.uuid
+    {
+        return Err(
+            "the repository root, common directory, broker database path or repository UUID differs"
+                .into(),
+        );
+    }
+    if saved_repository.root_identity.inode != live_repository.root_identity.inode
+        || saved_repository.common_identity.inode != live_repository.common_identity.inode
+    {
+        return Err("the repository root or common Git directory inode differs".into());
+    }
+    if saved.directory.inode != live_directory.inode
+        || saved.directory.lock_inode != live_directory.lock_inode
+        || saved.database.inode != live_database.inode
+    {
+        return Err("the runtime directory, singleton lock or job database inode differs".into());
+    }
+    let saved_runtime = [
+        saved.directory.device,
+        saved.directory.lock_device,
+        saved.database.device,
+    ];
+    let live_runtime = [
+        live_directory.device,
+        live_directory.lock_device,
+        live_database.device,
+    ];
+    let runtime_renumbered = volume_group_decision(
+        "the runtime directory",
+        saved_runtime == live_runtime,
+        saved_volumes.and_then(|volumes| volumes.runtime),
+        live_volumes.runtime,
+    )?;
+    if runtime_renumbered
+        && (saved_runtime
+            .iter()
+            .any(|device| *device != saved_runtime[0])
+            || live_runtime.iter().any(|device| *device != live_runtime[0]))
+    {
+        return Err(
+            "the runtime directory, singleton lock and job database do not share one device".into(),
+        );
+    }
+    let root_renumbered = volume_group_decision(
+        "the repository root",
+        saved_repository.root_identity.device == live_repository.root_identity.device,
+        saved_volumes.and_then(|volumes| volumes.root),
+        live_volumes.root,
+    )?;
+    let common_renumbered = volume_group_decision(
+        "the common Git directory",
+        saved_repository.common_identity.device == live_repository.common_identity.device,
+        saved_volumes.and_then(|volumes| volumes.common),
+        live_volumes.common,
+    )?;
+    Ok((runtime_renumbered || root_renumbered || common_renumbered)
+        .then_some(SERVICE_CONTEXT_REPROOF_VOLUME_UUID))
+}
+
+fn context_digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// The volume UUIDs recorded for exactly `context_bytes`, if any. Anything
+/// unusable reads as none, which keeps the exact device comparison.
+fn read_context_volumes(directory: &Path, context_bytes: &[u8]) -> Option<ContextVolumes> {
+    let file = private_file(&directory.join(CONTEXT_VOLUMES)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(4097).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > 4096 {
+        return None;
+    }
+    let volumes: ContextVolumes = serde_json::from_slice(&bytes).ok()?;
+    (volumes.schema_version == 1 && volumes.context_sha256 == context_digest(context_bytes))
+        .then_some(volumes)
+}
+
+fn write_context_volumes(directory: &RuntimeDirectory, volumes: &ContextVolumes) -> io::Result<()> {
+    let bytes = serde_json::to_vec(volumes)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(directory.path())?;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    directory.validate()?;
+    temporary
+        .persist(directory.path().join(CONTEXT_VOLUMES))
+        .map_err(|error| error.error)?;
+    File::open(directory.path())?.sync_all()
+}
+
+fn live_context_volumes(directory: &RuntimeDirectory, repository: &Repository) -> ContextVolumes {
+    let runtime = directory.identity();
+    ContextVolumes {
+        schema_version: 1,
+        context_sha256: String::new(),
+        runtime: crate::volume_identity::volume_identity(
+            directory.path(),
+            runtime.device,
+            runtime.inode,
+        )
+        .uuid(),
+        root: crate::volume_identity::volume_identity(
+            &repository.root,
+            repository.root_identity.device,
+            repository.root_identity.inode,
+        )
+        .uuid(),
+        common: crate::volume_identity::volume_identity(
+            &repository.common_dir,
+            repository.common_identity.device,
+            repository.common_identity.inode,
+        )
+        .uuid(),
+    }
+}
+
 pub(crate) fn selected_repository_identity(path: &Path) -> io::Result<wire::RepositoryIdentity> {
     let (repository, broker) = Repository::open(path)?;
     drop(broker);
@@ -168,6 +375,7 @@ impl JobRuntime {
         let (repository, _) = Repository::open(path)?;
         let context_path = directory.path().join(CONTEXT);
         let database_path = directory.path().join(DATABASE);
+        let live_volumes = live_context_volumes(&directory, &repository);
         let previous = match private_file(&context_path) {
             Ok(file) => {
                 let mut bytes = Vec::new();
@@ -177,8 +385,6 @@ impl JobRuntime {
                 }
                 let context: Context = serde_json::from_slice(&bytes)?;
                 if context.schema_version != 1
-                    || context.directory != directory.identity()
-                    || context.repository != repository
                     || context.worker_generation.len() != 32
                     || !context
                         .worker_generation
@@ -187,8 +393,31 @@ impl JobRuntime {
                 {
                     return Err(io::Error::other("service job context identity changed"));
                 }
-                if identity(&private_file(&database_path)?.metadata()?) != context.database {
-                    return Err(io::Error::other("service job database was replaced"));
+                let live_database = identity(&private_file(&database_path)?.metadata()?);
+                let saved_volumes = read_context_volumes(directory.path(), &bytes);
+                match context_identity_decision(
+                    &context,
+                    saved_volumes.as_ref(),
+                    directory.identity(),
+                    &repository,
+                    live_database,
+                    &live_volumes,
+                ) {
+                    Ok(None) => {}
+                    Ok(Some(_rule)) => crate::phase_telemetry::add(
+                        "service_job_context_volume_reproved",
+                        Duration::ZERO,
+                    ),
+                    Err(condition) => {
+                        crate::phase_telemetry::add(
+                            "service_job_context_volume_refused",
+                            Duration::ZERO,
+                        );
+                        return Err(io::Error::other(format!(
+                            "service job context identity changed \
+                             ({SERVICE_CONTEXT_REFUSED}: {condition})"
+                        )));
+                    }
                 }
                 Some(context)
             }
@@ -250,6 +479,18 @@ impl JobRuntime {
             .read_to_end(&mut verified)?;
         if verified != bytes {
             return Err(io::Error::other("service context readback differs"));
+        }
+        // Recorded after the context, bound to its bytes: a crash in between
+        // leaves a context without UUIDs, which keeps the exact comparison.
+        if live_volumes.any_known() {
+            let volumes = ContextVolumes {
+                context_sha256: context_digest(&bytes),
+                ..live_volumes
+            };
+            crate::warn_unrecorded(
+                "record the service job context volumes",
+                write_context_volumes(&directory, &volumes),
+            );
         }
         Ok(Arc::new(Self {
             repository_key: repository.key()?,
@@ -918,6 +1159,309 @@ mod tests {
         fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(JobRuntime::open_with_planner(&server, &fixture.repository, planner).is_err());
         assert_eq!(fs::read(&database).unwrap(), b"replacement bytes");
+        assert_eq!(fs::read(fixture.runtime.join(CONTEXT)).unwrap(), context);
+    }
+
+    const RUNTIME_VOLUME: [u8; 16] = [0x71; 16];
+    const REPOSITORY_VOLUME: [u8; 16] = [0x72; 16];
+
+    /// A context saved while the runtime directory had slot 45 and the
+    /// repository slot 46.
+    fn saved_context() -> Context {
+        Context {
+            schema_version: 1,
+            directory: DirectoryIdentity {
+                device: 45,
+                inode: 100,
+                lock_device: 45,
+                lock_inode: 101,
+            },
+            repository: Repository {
+                root: PathBuf::from("/synthetic/repository"),
+                common_dir: PathBuf::from("/synthetic/repository/.git"),
+                broker_database: PathBuf::from("/synthetic/state/broker.db"),
+                uuid: "00000000-0000-4000-8000-000000000001".into(),
+                root_identity: FileIdentity {
+                    device: 46,
+                    inode: 200,
+                },
+                common_identity: FileIdentity {
+                    device: 46,
+                    inode: 201,
+                },
+            },
+            database: FileIdentity {
+                device: 45,
+                inode: 102,
+            },
+            worker_generation: "a".repeat(32),
+        }
+    }
+
+    fn recorded_volumes() -> ContextVolumes {
+        ContextVolumes {
+            schema_version: 1,
+            context_sha256: "b".repeat(64),
+            runtime: Some(RUNTIME_VOLUME),
+            root: Some(REPOSITORY_VOLUME),
+            common: Some(REPOSITORY_VOLUME),
+        }
+    }
+
+    /// The same objects after a remount renumbered every device.
+    fn renumbered_live() -> (DirectoryIdentity, Repository, FileIdentity) {
+        let saved = saved_context();
+        let mut directory = saved.directory;
+        directory.device += 10;
+        directory.lock_device += 10;
+        let mut repository = saved.repository;
+        repository.root_identity.device += 10;
+        repository.common_identity.device += 10;
+        let mut database = saved.database;
+        database.device += 10;
+        (directory, repository, database)
+    }
+
+    fn decide(
+        saved_volumes: Option<&ContextVolumes>,
+        live: &(DirectoryIdentity, Repository, FileIdentity),
+        live_volumes: &ContextVolumes,
+    ) -> Result<Option<&'static str>, String> {
+        context_identity_decision(
+            &saved_context(),
+            saved_volumes,
+            live.0,
+            &live.1,
+            live.2,
+            live_volumes,
+        )
+    }
+
+    #[test]
+    fn a_renumbered_context_is_proved_by_the_volume_uuids_recorded_with_it() {
+        let volumes = recorded_volumes();
+        assert_eq!(
+            decide(Some(&volumes), &renumbered_live(), &volumes),
+            Ok(Some(SERVICE_CONTEXT_REPROOF_VOLUME_UUID))
+        );
+        // Unchanged devices keep the historical exact rule, with or without
+        // recorded or live UUIDs.
+        let saved = saved_context();
+        let exact = (saved.directory, saved.repository, saved.database);
+        let unknown = ContextVolumes {
+            runtime: None,
+            root: None,
+            common: None,
+            ..recorded_volumes()
+        };
+        assert_eq!(decide(Some(&volumes), &exact, &volumes), Ok(None));
+        assert_eq!(decide(None, &exact, &volumes), Ok(None));
+        assert_eq!(decide(None, &exact, &unknown), Ok(None));
+        assert_eq!(decide(Some(&volumes), &exact, &unknown), Ok(None));
+    }
+
+    /// Each condition is necessary: breaking any one refuses with its own reason.
+    #[test]
+    fn every_condition_of_the_context_reproof_is_required() {
+        let volumes = recorded_volumes();
+        let refusal = |live: &(DirectoryIdentity, Repository, FileIdentity),
+                       saved_volumes: Option<&ContextVolumes>,
+                       live_volumes: &ContextVolumes| {
+            decide(saved_volumes, live, live_volumes).unwrap_err()
+        };
+
+        // Legacy context: no UUIDs were recorded with it.
+        let legacy = refusal(&renumbered_live(), None, &volumes);
+        assert!(
+            legacy.starts_with(
+                "the runtime directory: the device differs and the context predates volume UUIDs"
+            ),
+            "{legacy}"
+        );
+        // Unknown platform: no live UUIDs.
+        let unknown = ContextVolumes {
+            runtime: None,
+            root: None,
+            common: None,
+            ..recorded_volumes()
+        };
+        assert_eq!(
+            refusal(&renumbered_live(), Some(&volumes), &unknown),
+            "the runtime directory: the device differs and the live volume UUID is unknown"
+        );
+        // Each volume group needs its own recorded UUID to match.
+        for (field, object) in [
+            ("runtime", "the runtime directory"),
+            ("root", "the repository root"),
+            ("common", "the common Git directory"),
+        ] {
+            let mut other = recorded_volumes();
+            match field {
+                "runtime" => other.runtime = Some([0x11; 16]),
+                "root" => other.root = Some([0x11; 16]),
+                _ => other.common = Some([0x11; 16]),
+            }
+            assert_eq!(
+                refusal(&renumbered_live(), Some(&volumes), &other),
+                format!(
+                    "{object}: the device differs and its recorded volume UUID names another volume"
+                )
+            );
+            let mut missing = recorded_volumes();
+            match field {
+                "runtime" => missing.runtime = None,
+                "root" => missing.root = None,
+                _ => missing.common = None,
+            }
+            assert!(
+                refusal(&renumbered_live(), Some(&missing), &volumes).starts_with(&format!(
+                    "{object}: the device differs and the context predates"
+                )),
+                "{object}"
+            );
+        }
+        // Equal devices but a recorded UUID naming another volume.
+        let saved = saved_context();
+        let exact = (saved.directory, saved.repository, saved.database);
+        let mut other = recorded_volumes();
+        other.runtime = Some([0x11; 16]);
+        assert_eq!(
+            refusal(&exact, Some(&volumes), &other),
+            "the runtime directory: the device matches but the recorded volume UUID names another volume"
+        );
+
+        // Every inode must still match.
+        type Change = fn(&mut (DirectoryIdentity, Repository, FileIdentity));
+        let inode_changes: [(&str, Change); 5] = [
+            (
+                "the runtime directory, singleton lock or job database inode differs",
+                |live| live.0.inode += 1,
+            ),
+            (
+                "the runtime directory, singleton lock or job database inode differs",
+                |live| live.0.lock_inode += 1,
+            ),
+            (
+                "the runtime directory, singleton lock or job database inode differs",
+                |live| live.2.inode += 1,
+            ),
+            (
+                "the repository root or common Git directory inode differs",
+                |live| live.1.root_identity.inode += 1,
+            ),
+            (
+                "the repository root or common Git directory inode differs",
+                |live| live.1.common_identity.inode += 1,
+            ),
+        ];
+        for (expected, change) in inode_changes {
+            let mut live = renumbered_live();
+            change(&mut live);
+            assert_eq!(refusal(&live, Some(&volumes), &volumes), expected);
+        }
+        // Paths and the repository UUID must still match.
+        let path_changes: [Change; 4] = [
+            |live| live.1.root.push("other"),
+            |live| live.1.common_dir.push("other"),
+            |live| live.1.broker_database.push("other"),
+            |live| live.1.uuid.push('0'),
+        ];
+        for change in path_changes {
+            let mut live = renumbered_live();
+            change(&mut live);
+            assert_eq!(
+                refusal(&live, Some(&volumes), &volumes),
+                "the repository root, common directory, broker database path or repository UUID differs"
+            );
+        }
+        // One runtime UUID covers the lock and database only while they
+        // share the directory's device.
+        let mut split = renumbered_live();
+        split.2.device += 1;
+        assert_eq!(
+            refusal(&split, Some(&volumes), &volumes),
+            "the runtime directory, singleton lock and job database do not share one device"
+        );
+    }
+
+    /// Rewrite the saved context as if every device had been renumbered,
+    /// optionally re-binding the recorded volume UUIDs to the new bytes (as
+    /// a context saved with them before the remount would be).
+    fn renumber_saved_context(runtime: &Path, rebind_volumes: bool) {
+        let context_path = runtime.join(CONTEXT);
+        let mut context: serde_json::Value =
+            serde_json::from_slice(&fs::read(&context_path).unwrap()).unwrap();
+        for pointer in [
+            "/directory/device",
+            "/directory/lock_device",
+            "/repository/root_identity/device",
+            "/repository/common_identity/device",
+            "/database/device",
+        ] {
+            let value = context.pointer_mut(pointer).unwrap();
+            *value = serde_json::json!(value.as_u64().unwrap().wrapping_add(7));
+        }
+        let bytes = serde_json::to_vec(&context).unwrap();
+        fs::write(&context_path, &bytes).unwrap();
+        if rebind_volumes {
+            let volumes_path = runtime.join(CONTEXT_VOLUMES);
+            let mut volumes: ContextVolumes =
+                serde_json::from_slice(&fs::read(&volumes_path).unwrap()).unwrap();
+            volumes.context_sha256 = context_digest(&bytes);
+            fs::write(&volumes_path, serde_json::to_vec(&volumes).unwrap()).unwrap();
+        }
+    }
+
+    /// End to end: the service records the volume UUIDs beside its context
+    /// where the platform has them, and reopens after a renumber of every
+    /// device only through them. A legacy context (no UUIDs bound to its
+    /// bytes) keeps refusing with its own reason, and the context is left
+    /// untouched by a refusal.
+    #[test]
+    fn a_service_context_survives_a_device_renumber_only_through_recorded_volume_uuids() {
+        let fixture = Fixture::new();
+        let planner: Arc<Planner> = Arc::new(|_, _, _| Ok(serde_json::json!({})));
+        let (server, jobs) = fixture.open(planner.clone());
+        drop(jobs);
+        drop(server);
+        let volumes_path = fixture.runtime.join(CONTEXT_VOLUMES);
+        assert_eq!(volumes_path.exists(), cfg!(target_os = "macos"));
+
+        if cfg!(target_os = "macos") {
+            renumber_saved_context(&fixture.runtime, true);
+            let server = Server::bind(&fixture.runtime).unwrap();
+            let jobs = JobRuntime::open_with_planner(&server, &fixture.repository, planner.clone())
+                .expect("recorded volume UUIDs prove the renumbered context");
+            drop(jobs);
+            drop(server);
+            // The reopened service saved the live devices again.
+            let server = Server::bind(&fixture.runtime).unwrap();
+            drop(
+                JobRuntime::open_with_planner(&server, &fixture.repository, planner.clone())
+                    .unwrap(),
+            );
+            drop(server);
+        }
+
+        // Legacy: the UUIDs (if any) no longer match the context bytes.
+        renumber_saved_context(&fixture.runtime, false);
+        let context = fs::read(fixture.runtime.join(CONTEXT)).unwrap();
+        let server = Server::bind(&fixture.runtime).unwrap();
+        let error = match JobRuntime::open_with_planner(&server, &fixture.repository, planner) {
+            Ok(_) => panic!("a legacy renumbered context must be refused"),
+            Err(error) => error.to_string(),
+        };
+        let expected = if cfg!(target_os = "macos") {
+            "the device differs and the context predates volume UUIDs"
+        } else {
+            "the device differs and the live volume UUID is unknown"
+        };
+        assert!(
+            error.starts_with("service job context identity changed")
+                && error.contains(SERVICE_CONTEXT_REFUSED)
+                && error.contains(expected),
+            "{error}"
+        );
         assert_eq!(fs::read(fixture.runtime.join(CONTEXT)).unwrap(), context);
     }
 }
