@@ -418,6 +418,14 @@ closed checkouts it can prove disposable, then refuses if no slot was freed;
 reuse remains available and other checkouts are preserved. Run `broker gc plan`
 to inspect cleanup candidates. `broker status` warns with
 `cleanup.checkout-capacity` from three quarters of the limit.
+Raising `max_checkouts` is a stopgap: it delays the refusal and reclaims
+nothing. From three quarters of the limit the background worker also removes
+closed checkouts itself, and the durable lever for what blocks it is the
+`[cleanup] regenerable` list in the same file. `status --json` reports the
+worker's last removal slice as `capacity_removal` (`auto_cleanup.capacity_removal`
+in `gc plan --json`) with its `outcome`, `kept_by_code` and `blocked_by_ignored`;
+[Checkout count keeps growing](../guides/troubleshooting.md#checkout-count-keeps-growing)
+walks from that record to the fix for each keep code.
 A foreground lifecycle command (`start`, adoption, `finish`, `close`, `cleanup`,
 `submit`) waits up to 180 s for the repository's lifecycle claim, or until its
 own `--timeout` if that comes first. After 5 s it says on stderr who holds the
@@ -790,6 +798,15 @@ until an explicit fetch makes ancestry verification possible.
 - `aethyme broker advanced console [status|list] [--json]`
 - `aethyme broker advanced console plan [--allow-parallel] [--json]`
 - `aethyme broker advanced console run [--wait <duration>] [--allow-parallel] [--json] -- <command> ...`
+
+A request that waits (`--wait` above zero) is served in arrival order per
+resource, so a request for a whole pool is not starved by later smaller ones.
+Contention output from `resources acquire --json` and `resources run --json`,
+and `resources explain --json`, carry a `queue` object with the request's
+position, the units ahead of it, the holders and the time waited, and human
+`resources list` shows waiting requests in arrival order. Command metrics add
+`resource_queue`. Dead waiters are skipped and reaped automatically. See
+[host resource coordination](../guides/host-resource-coordination.md#waiting-order).
 
 Successful `resources run --json` and `console run --json` reports include
 `phase_timings_ms`; the command-metrics row records the same map as each phase
@@ -2428,7 +2445,17 @@ or kill an unowned descendant. If a process dies after starting, the next overla
 operation `outcome_unknown` and refuses to run. Inspect external state, then use
 `operations reconcile` to attest `succeeded` or `failed`; never retry an unknown
 operation blindly. A non-zero remote-capable write is also `outcome_unknown`,
-because it may apply only part of its requested change before failing. A
+because it may apply only part of its requested change before failing, unless
+the broker can prove nothing reached the remote: then it is recorded `failed`
+with a retry hint and does not write-block the repository. That proof covers a
+`git push` over a transport built into Git that died while listing the remote's
+refs (unresolvable host, refused connection, TLS or SSH handshake failure,
+rejected login), a `gh` command its own argument parser rejected, and a
+single-request `gh api` call whose connection was never established. A timeout,
+a reset after the ref listing and any multi-request `gh` command stay
+`outcome_unknown`. Each failed remote write adds one `remote_write_*` count
+to the command's `phase_counts` naming how it was settled (for example
+`remote_write_failed_before_remote_refs`). A
 non-zero local Git command is instead recorded as `failed` with
 `local_git_command_failed` recovery metadata: it cannot have an uncertain
 remote effect, so it does not trigger remote reconciliation or write-block the

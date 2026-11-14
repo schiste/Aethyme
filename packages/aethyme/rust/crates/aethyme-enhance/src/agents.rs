@@ -484,6 +484,16 @@ sets exact `bytes_before` to null; that limit can trigger whole-store rotation.
 Depth, read, mount, special-node and lease failures still refuse. The cache
 rotation remover independently refuses special nodes and leaves durable debt
 for recovery.
+Raising `[worktrees] max_checkouts` is a stopgap: it delays a `broker start`
+refusal and reclaims nothing. Closed checkouts are removed automatically from
+three quarters of the limit; when the count still grows, read `capacity_removal`
+in `aethyme broker status --json` (`outcome`, `kept_by_code`,
+`blocked_by_ignored`) and fix the most common keep code. For ignored output,
+add the reported `config_line` to `[cleanup] regenerable` only when the path
+holds nothing but output its tools regenerate; a `config_refusal` means no
+configuration releases it. For the ownership codes, inspect the checkout, then
+run `aethyme broker finish cleanup <session-id>`. Never use `--force` merely to
+clear a capacity refusal.
 When investigating retained worktrees, distinguish task identity from shared
 service uptime. A shared agent daemon can outlive many tasks; its PID alone
 proves neither that each task is active nor that its checkout is disposable.
