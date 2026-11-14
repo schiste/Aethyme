@@ -7805,6 +7805,7 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[allow(clippy::type_complexity)]
     fn captured_activity(
         interval: Duration,
     ) -> (

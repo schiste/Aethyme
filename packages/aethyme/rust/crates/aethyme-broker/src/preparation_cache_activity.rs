@@ -540,7 +540,7 @@ pub(crate) fn read_current(
                 && now_ms.saturating_sub(record.updated_at_ms) <= STALE_AFTER_MS
         })
         .collect();
-    records.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+    records.sort_by_key(|record| std::cmp::Reverse(record.updated_at_ms));
     records
 }
 
@@ -557,7 +557,9 @@ mod tests {
     use super::*;
     use std::rc::Rc;
 
-    fn capture() -> (Rc<RefCell<Vec<String>>>, Box<dyn FnMut(&str)>) {
+    type Lines = Rc<RefCell<Vec<String>>>;
+
+    fn capture() -> (Lines, Box<dyn FnMut(&str)>) {
         let lines = Rc::new(RefCell::new(Vec::new()));
         let sink_lines = Rc::clone(&lines);
         (
