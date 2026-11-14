@@ -7850,7 +7850,7 @@ mod registered_removal_failure_tests {
     #[cfg(unix)]
     #[test]
     fn finish_recovery_refuses_a_renumbered_proof_without_its_registration() {
-        let (_owner, _storage, broker, session, _worktree, saved) =
+        let (_owner, _storage, mut broker, session, _worktree, saved) =
             renumbered_recovery_fixture("renumbered recovery registration", legacy_renumbered);
         let gitdir = Path::new(&saved.git_admin_path).join("gitdir");
         let original = std::fs::read(&gitdir).unwrap();
@@ -7882,7 +7882,7 @@ mod registered_removal_failure_tests {
     #[cfg(unix)]
     #[test]
     fn finish_recovery_refuses_a_renumbered_proof_after_the_branch_moved() {
-        let (_owner, _storage, broker, session, worktree, _saved) =
+        let (_owner, _storage, mut broker, session, worktree, _saved) =
             renumbered_recovery_fixture("renumbered recovery branch", legacy_renumbered);
         let closed = broker.store().session(session.id).unwrap();
         assert!(broker.interrupted_finish_cleanup_proof(&closed).is_some());
@@ -7923,7 +7923,7 @@ mod registered_removal_failure_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn finish_recovery_refuses_another_volume_uuid() {
-        let (_owner, _storage, broker, session, _worktree, _saved) =
+        let (_owner, _storage, mut broker, session, _worktree, _saved) =
             renumbered_recovery_fixture("other volume recovery", |proof| {
                 renumber_every_proof_object(proof);
                 proof.volume_uuids.as_mut().unwrap().worktree = [9; 16];
@@ -7944,7 +7944,7 @@ mod registered_removal_failure_tests {
             git_admin: [8; 16],
             git_common: [8; 16],
         };
-        let (_owner, _storage, broker, session, _worktree, _saved) =
+        let (_owner, _storage, mut broker, session, _worktree, _saved) =
             renumbered_recovery_fixture("unknown platform recovery", |proof| {
                 assert!(proof.volume_uuids.is_none());
                 proof.volume_uuids = Some(uuids());
@@ -7952,7 +7952,7 @@ mod registered_removal_failure_tests {
             });
         let closed = broker.store().session(session.id).unwrap();
         assert!(broker.interrupted_finish_cleanup_proof(&closed).is_none());
-        let (_owner, _storage, broker, session, _worktree, _saved) =
+        let (_owner, _storage, mut broker, session, _worktree, _saved) =
             renumbered_recovery_fixture("unknown platform same device", |proof| {
                 proof.volume_uuids = Some(uuids());
             });
@@ -7963,7 +7963,7 @@ mod registered_removal_failure_tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn orphan_recovery_refuses_a_renumbered_proof_without_volume_uuids() {
-        let (_owner, _storage, broker, session, worktree, _saved) =
+        let (_owner, _storage, mut broker, session, worktree, _saved) =
             renumbered_recovery_fixture("renumbered legacy orphan", legacy_renumbered);
         remove_worktree_admin_directory(&worktree);
         let closed = broker.store().session(session.id).unwrap();
