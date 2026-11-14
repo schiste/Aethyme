@@ -188,6 +188,30 @@ strict = true
 `auto_remove = false` disables automatic whole-checkout removal; it does not
 replace strict mode for in-place artifact reclamation.
 
+## When closed checkouts are removed
+
+Removal follows merges, not capacity pressure. The detached worker removes a
+closed checkout whose work has landed (its pull request is recorded merged,
+its cleanup request is past the closed-worktree grace, or the oldest-first lap
+proves it contained in the fetched default branch) on every run it is due,
+whether or not the repository is near `[worktrees] max_checkouts`:
+
+- Below three quarters of the limit (or with no limit) it runs a `steady`
+  slice: at most four removals in up to 60 seconds, the priority lane first
+  and then at most 16 checkouts of the lap. It is due again a minute after a
+  slice that removed something, and 5, 10, 20, then at most 30 minutes after
+  slices in a row that removed nothing. An idle repository therefore costs a
+  short worker run about twice an hour.
+- From three quarters of the limit it runs the `pressure` slice with the
+  capacity limits (up to twelve removals in 120 seconds, shorter retries).
+
+Both triggers use the same proofs, pacer, memory and load gate, GC lock gap
+and yield to foreground commands, and `[cleanup] auto_remove = false` turns
+both off. The worker's last slice, with its `trigger`, is
+`capacity_removal` in `aethyme broker status --json` and
+`auto_cleanup.capacity_removal` in `aethyme broker gc plan --json`; see
+"Automatic removal" in [worktree cleanup](worktree-cleanup.md).
+
 ## Background deletion pace
 
 The detached cleanup worker deletes finished sessions' build output while
