@@ -441,14 +441,15 @@ impl BrokerStore {
     }
 
     /// Whether any spawned session is closed with its checkout not yet
-    /// removed: the cheap positive signal the worker's steady checkout
+    /// removed (`cleanup_state = 'closed'`; a closed session's `status` is
+    /// already `cleaned`): the cheap positive signal the worker's steady checkout
     /// removal needs before it is due. One query of the sessions table;
     /// reads no checkout.
     pub(crate) fn closed_spawned_checkout_pending(&self) -> Result<bool, BrokerError> {
         Ok(self.conn.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM sessions
-                 WHERE origin = 'spawned' AND status = 'closed' AND cleanup_state = 'closed'
+                 WHERE origin = 'spawned' AND cleanup_state = 'closed'
              )",
             [],
             |row| row.get::<_, bool>(0),
@@ -471,8 +472,7 @@ impl BrokerStore {
                  JOIN sessions s ON s.id = r.session_id
                  WHERE r.completed_at_ms IS NULL
                    AND r.not_before_ms > ?1 AND r.not_before_ms <= ?2
-                   AND s.origin = 'spawned' AND s.status = 'closed'
-                   AND s.cleanup_state = 'closed'
+                   AND s.origin = 'spawned' AND s.cleanup_state = 'closed'
              )",
             params![after_ms, now_ms],
             |row| row.get::<_, bool>(0),
