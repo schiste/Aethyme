@@ -12900,6 +12900,9 @@ mod tests {
         },
     }
 
+    /// Runs between judging a GC lock file stale and removing it.
+    pub(super) type StaleGcLockHook = Box<dyn FnOnce(&Path)>;
+
     std::thread_local! {
         // Observe the real launch boundary without bypassing test suppression
         // or spawning detached processes in the test runner.
@@ -12907,7 +12910,7 @@ mod tests {
             const { RefCell::new(Vec::new()) };
         // Runs once between judging a GC lock file stale and removing it, so
         // a test can stand in for a holder that takes the lock in between.
-        pub(super) static BEFORE_STALE_GC_LOCK_REMOVAL: RefCell<Option<Box<dyn FnOnce(&Path)>>> =
+        pub(super) static BEFORE_STALE_GC_LOCK_REMOVAL: RefCell<Option<StaleGcLockHook>> =
             const { RefCell::new(None) };
         static ARTIFACT_SWEEP_TEST_MUTATION_INTERRUPT: RefCell<Option<ArtifactSweepTestMutation>> =
             const { RefCell::new(None) };
