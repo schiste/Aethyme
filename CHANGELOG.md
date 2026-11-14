@@ -4,6 +4,27 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.96] - 2026-11-14
+
+### Fixed
+
+- `submit prepare` no longer drains and re-downloads a repository's shared preparation cache because its budget inventory stopped early. An inventory that stops on its entry or time limit with the bytes seen at or under budget is now inconclusive and keeps the store; one that passes the budget stops at once and rotates. The entry limit rises from 100,000 to 2,000,000, below which one monorepo's package stores no longer fall. After three inconclusive checks in a row `broker status --json` gives the notice `preparation.shared-cache-budget-inconclusive`. Repositories that never share the cache now use the hourly budget-check interval too (#1677).
+- A half-finished preparation-cache rotation resumes after an external macOS volume returns under a new device number, including after a second renumber, and the `gc` cache sweep now finishes such rotations. Each rotation debt records its volume UUID in the host rotation journal (new additive tables `rotation_debt_volume` and `rotation_volume_key`; schema version unchanged). Anything unproven stops with `debt_volume_reproof_refused: <condition>` (#1674).
+- GC reclamation and checkout compaction, `finish`, `finish cleanup` and resuming an interrupted finish cleanup no longer refuse a checkout after a remount. Every deletion lane uses the one ownership re-proof automatic removal had: unchanged paths, inodes and spawn generation, matching recorded volume UUIDs (or, for records saved without them, an unchanged device-sharing pattern), and the session's Git registration on its branch. Finish recovery proofs record volume UUIDs (additive field `volume_uuids`) and bind HEAD to the recorded commit (`head_moved`) (#1676).
+- The job service restarts after a remount instead of failing with "service job context identity changed", and fetch reconciliation survives a renumbered common directory. The service records its volume UUIDs in `broker-service-jobs-context-volumes.json`; a fetch journal records `common_volume_uuid` (#1673).
+
+### Changed
+
+- Background checkout removal under capacity pressure is several times faster (measured about 13 an hour on the busiest repository; expected about 90). A removal slice may run up to 120 seconds and remove up to 12 closed checkouts, one per pass with every proof unchanged. Each pass checks memory and load pressure first, the GC lock stays free at least as long as the last pass held it, and the unattended pacer credits only Git's own removal time and never lifts its rate for disk pressure. `broker start` at the checkout limit, `gc apply`, `gc abandon` and `gc forget-abandoned` wait up to 30 seconds for the GC lock, and the worker yields to them (#1675).
+- Upgrade note: a binary older than 0.8.96 cannot resume an interrupted finish cleanup that 0.8.96 started on macOS, and falls back to "fetch again" for a fetch journal 0.8.96 wrote. Both fail closed. Platforms without a stable volume identifier (Linux) keep the exact device comparison (#1673, #1676).
+
+### Added
+
+- Work done while the shared preparation cache is held is visible. Recovery, drain and long inventories print progress at start and every 15 seconds; `submit prepare status --json` gains `current_operation` and, for a waiting session, `waiting_on`; a waiting prepare names what the holder is doing. The prepare report and metric carry `shared_cache_operations` with an outcome per inventory, and the "root identity differs from its durable journal" refusal says what to check and run (#1677).
+- Removals that used a re-proof report it (`cleanup.ownership_reproof`, `compact_checkout_removed ownership_reproof=…`). Each refusal has its own reason and counter (`ownership_reproof_refused_<reason>`, `preparation_rotation_debt_volume_refused_<condition>`, `fetch_journal_common_volume_refused`, `service_context_volume_refused`) (#1673, #1674, #1676).
+- `auto_cleanup.capacity_removal` gains `stop_reason`, lock held, wait and yield times, Git removal and pressure-wait times, pacer credit, charge and unpaid amounts, `cache_lane_reserved_ms` and `retry_in_ms` (#1675).
+- Documentation: a "checkout count keeps growing" troubleshooting section that walks from `status --json` to the fix for each keep code (#1672).
+
 ## [0.8.95] - 2026-11-14
 
 ### Fixed
