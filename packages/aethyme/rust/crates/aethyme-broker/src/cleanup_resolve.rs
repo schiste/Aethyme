@@ -1727,7 +1727,7 @@ impl Broker {
                 .checked_add(crate::auto_cleanup::AUTO_COMPACTION_MIN_BUDGET)
                 .unwrap_or(deadline),
         );
-        let current = self.closed_artifact_checkout_cohort_for_session(
+        let current = self.closed_artifact_checkout_cohort_for_retirement(
             session_id,
             worktree,
             Some(attempt_deadline),
