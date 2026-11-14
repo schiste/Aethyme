@@ -1390,15 +1390,23 @@ pub struct CapacityRemovalSlice {
     pub index_high_water_session_id: i64,
     /// Why the slice stopped: `cap` (made its allowance of removals),
     /// `budget` (too little time left for another pass), `pacer_backoff`
-    /// (memory or load pressure outlasted the pacer's pause budget),
-    /// `yielded_to_foreground` (a foreground command waited for the GC
-    /// lock), `nothing_selected` (a pass selected nothing) or `lock_busy`.
+    /// (memory or load pressure outlasted the pacer's pause budget, before
+    /// a pass or while paying for a removal), `slice_deadline` (the slice
+    /// ended mid pacer wait; `pacer_unpaid_ms` is owed before the next
+    /// slice), `yielded_to_foreground` (a foreground command waited for the
+    /// GC lock), `nothing_selected` (a pass selected nothing),
+    /// `kept_only_limit` (its passes that removed nothing ran out),
+    /// `lock_busy` or `failed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     /// The slice's removal allowance; kept checkouts cost none of it.
     #[serde(default)]
     pub removal_cap: usize,
-    /// Budget of one removal pass, the longest the GC lock was held at once.
+    /// Passes that removed nothing (the selected checkout was kept or
+    /// deferred at the last step).
+    #[serde(default)]
+    pub kept_only_passes: usize,
+    /// Selection and revalidation budget of one pass.
     #[serde(default)]
     pub pass_budget_ms: u64,
     /// Time the passes held the GC lock, summed.
@@ -1407,20 +1415,30 @@ pub struct CapacityRemovalSlice {
     /// Time spent on a pass that found the GC lock held.
     #[serde(default)]
     pub lock_wait_ms: u64,
-    /// Time the slice left the GC lock free between passes beyond the pacer
-    /// wait, so a waiting foreground command could take it.
+    /// Time the slice kept the GC lock free between passes beyond the pacer
+    /// wait (at least as long as the last pass held it).
     #[serde(default)]
     pub lock_yield_ms: u64,
-    /// Entries the removals' own duration paid for at the configured rate
-    /// instead of a pacer sleep.
+    /// Time Git spent removing checkouts, the only time credited against
+    /// the pacer.
+    #[serde(default)]
+    pub git_removal_ms: u64,
+    /// Time waiting out memory or load pressure before passes.
+    #[serde(default)]
+    pub pressure_wait_ms: u64,
+    /// Entries Git's own removal time paid for at the configured rate.
     #[serde(default)]
     pub pacer_credited_entries: u64,
-    /// Entries the pacer slept (or paused) for after the removals.
+    /// Entries the pacer slept for after the removals.
     #[serde(default)]
     pub pacer_charged_entries: u64,
-    /// Removals paced at the idle rate because the host read idle.
+    /// Pacer wait the slice deadline left unpaid; the next slice waits it.
     #[serde(default)]
-    pub idle_rate_removals: usize,
+    pub pacer_unpaid_ms: u64,
+    /// Cache lane time this worker run keeps from capacity slices (0 when
+    /// the cache lane is not due).
+    #[serde(default)]
+    pub cache_lane_reserved_ms: u64,
     /// The wait chosen before pressure alone runs the next slice; absent
     /// when the next one may run at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2174,6 +2192,12 @@ pub struct AutoCleanupPlan {
     deadline: Option<Instant>,
     /// The complete filesystem alias lap used for selection.
     alias_refresh_generation: Option<i64>,
+    /// Revalidation before removal honors `deadline` too: a selected
+    /// checkout that cannot be revalidated in time is deferred, not removed.
+    /// Set for the background worker's capacity passes; elsewhere the first
+    /// selected checkout is revalidated without a deadline so a pass whose
+    /// selection spent its budget still converges.
+    bound_revalidation: bool,
 }
 
 impl AutoCleanupPlan {
@@ -2185,6 +2209,7 @@ impl AutoCleanupPlan {
             selected: Vec::new(),
             deadline: None,
             alias_refresh_generation: None,
+            bound_revalidation: false,
         }
     }
 
@@ -3219,6 +3244,23 @@ fn removal_attempt_key(worktree: &Path) -> String {
 /// Registered linked checkouts at or above three quarters of the limit.
 fn usage_under_pressure(count: usize, maximum: u32) -> bool {
     maximum > 0 && count.saturating_mul(4) >= (maximum as usize).saturating_mul(3)
+}
+
+thread_local! {
+    /// Time Git spent removing checkouts on this thread since the last
+    /// [`take_git_removal_time`]: the background worker credits it, and only
+    /// it, against its unlink pacer.
+    static GIT_REMOVAL_TIME: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+fn note_git_removal_time(spent: Duration) {
+    GIT_REMOVAL_TIME.with(|total| total.set(total.get().saturating_add(spent)));
+}
+
+/// Time Git spent removing checkouts on this thread since the last call.
+pub(crate) fn take_git_removal_time() -> Duration {
+    GIT_REMOVAL_TIME.with(|total| total.replace(Duration::ZERO))
 }
 
 /// Entries assumed for a removed checkout no measurement counted, when the
@@ -6325,6 +6367,7 @@ impl Broker {
             selected,
             deadline,
             alias_refresh_generation,
+            bound_revalidation: false,
         })
     }
 
@@ -6342,6 +6385,7 @@ impl Broker {
             selected,
             deadline,
             alias_refresh_generation,
+            bound_revalidation,
         } = plan;
         if let Some(expected_alias_generation) = alias_refresh_generation {
             let alias_snapshot_current = self
@@ -6503,7 +6547,7 @@ impl Broker {
                 &upstream,
                 AutoCleanupVerdictOptions {
                     deep: true,
-                    deadline: None,
+                    deadline: deadline.filter(|_| bound_revalidation),
                     selected: Some(&selected_proof),
                     lease_process_table: &mut lease_process_table,
                 },
@@ -6603,8 +6647,12 @@ impl Broker {
         // Forced: the proofs above are stricter than Git's own check, and the
         // only untracked file they let through is Finder's `.DS_Store`, which
         // a plain `worktree remove` refuses.
-        self.repo_handle()
-            .worktree_remove_registered(&candidate.worktree, true)?;
+        let git_removal_started = Instant::now();
+        let git_removal = self
+            .repo_handle()
+            .worktree_remove_registered(&candidate.worktree, true);
+        note_git_removal_time(git_removal_started.elapsed());
+        git_removal?;
         ensure_auto_cleanup_path_absent(&candidate.worktree)?;
         let branch = candidate.branch();
         if self
@@ -6784,36 +6832,25 @@ impl Broker {
     /// a GC lock another maintenance pass holds instead of giving up at
     /// once; `None` when it stays held.
     /// `max_removals` caps the selection (`None`: the usual per-pass cap).
+    /// `bound_revalidation` makes revalidation honor the budget too (see
+    /// [`AutoCleanupPlan`]); Git's removal of a checkout already started is
+    /// never interrupted.
     pub(crate) fn auto_cleanup_for_checkout_capacity(
         &mut self,
         lock_wait: Duration,
         budget: Duration,
         max_removals: Option<usize>,
+        bound_revalidation: bool,
     ) -> Result<Option<AutoCleanupReport>, BrokerOpError> {
         let waiting_since = Instant::now();
-        // While it waits, say so: the background worker yields the GC lock
-        // to a waiting foreground command instead of taking it again.
-        let mut waiting_notice = None;
-        let _lock = loop {
-            match crate::gc::GcLock::acquire(self.main_root()) {
-                Ok(lock) => {
-                    drop(waiting_notice.take());
-                    break lock;
-                }
-                Err(_) if waiting_since.elapsed() < lock_wait => {
-                    if waiting_notice.is_none() {
-                        waiting_notice = crate::gc::GcLockWaiterNotice::announce(self.main_root());
-                    }
-                    std::thread::sleep(Duration::from_millis(250));
-                }
-                Err(_) => {
-                    crate::phase_telemetry::add(
-                        "checkout_capacity_cleanup_lock_busy",
-                        waiting_since.elapsed(),
-                    );
-                    return Ok(None);
-                }
-            }
+        // While it waits it says so: the background worker yields the GC
+        // lock to a waiting foreground command instead of taking it again.
+        let Ok(_lock) = crate::gc::GcLock::acquire_waiting(self.main_root(), lock_wait) else {
+            crate::phase_telemetry::add(
+                "checkout_capacity_cleanup_lock_busy",
+                waiting_since.elapsed(),
+            );
+            return Ok(None);
         };
         let started = Instant::now();
         let deadline = started + budget;
@@ -6827,6 +6864,7 @@ impl Broker {
         };
         // Revalidation and removal may use the whole budget.
         plan.deadline = Some(deadline);
+        plan.bound_revalidation = bound_revalidation;
         let planned = plan.report.lanes.unwrap_or_default();
         plan.report.lanes = Some(AutoCleanupLanes {
             capacity_pressure: true,
@@ -9751,6 +9789,7 @@ mod tests {
             )],
             deadline: None,
             alias_refresh_generation: Some(initial.alias_refresh_generation),
+            bound_revalidation: false,
         };
         let report = broker.auto_cleanup_apply(plan).unwrap();
         assert_eq!(report.removed.len(), 0);
@@ -11377,37 +11416,57 @@ mod tests {
         assert!(!broker.capacity_removal_due(super::now_ms()).unwrap());
     }
 
-    /// Memory pressure that outlasts the pacer's pause budget ends the slice
-    /// after the removal it was paying for; the next removal waits for a
-    /// later slice.
+    /// Install a pacer on a fake clock whose pressure signal replays
+    /// `samples`, repeating the last.
     #[cfg(unix)]
-    #[test]
-    fn a_worker_capacity_slice_stops_when_the_pacer_backs_off_under_pressure() {
+    fn install_scripted_pacer(
+        samples: Vec<crate::gc::unattended_pacing::PressureSample>,
+    ) -> (
+        crate::gc::unattended_pacing::UnattendedPacingScope,
+        crate::gc::unattended_pacing::FakeClock,
+    ) {
         use crate::gc::unattended_pacing::{
-            self, FakeClock, PressureSample, Scripted, UnattendedPacer, UnlinkRate,
+            self, FakeClock, Scripted, UnattendedPacer, UnlinkRate,
         };
-        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
-        let worktrees = (0..2)
-            .map(|index| closed_landed_checkout(&mut broker, &format!("pressured {index}")).1)
-            .collect::<Vec<_>>();
-        limit_checkouts_to_one(&broker);
         let clock = FakeClock::new();
         let scope = unattended_pacing::install(UnattendedPacer::new(
             UnlinkRate::Limited(1_000),
             Box::new(clock.clone()),
             Box::new(Scripted {
-                samples: vec![PressureSample {
-                    memory_elevated: Some(true),
-                    load_elevated: Some(false),
-                }],
+                samples,
                 reads: Default::default(),
             }),
         ));
-        let report = broker.run_capacity_removal_slice(Instant::now());
+        (scope, clock)
+    }
+
+    #[cfg(unix)]
+    fn memory_pressure(elevated: bool) -> crate::gc::unattended_pacing::PressureSample {
+        crate::gc::unattended_pacing::PressureSample {
+            memory_elevated: Some(elevated),
+            load_elevated: Some(false),
+        }
+    }
+
+    /// No removal starts under memory pressure: the slice checks the pacer
+    /// before its first pass and stops, backs off ten minutes, and the next
+    /// slice of the same worker run does not remove either.
+    #[cfg(unix)]
+    #[test]
+    fn a_worker_capacity_slice_removes_nothing_under_pressure() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let worktrees = (0..2)
+            .map(|index| closed_landed_checkout(&mut broker, &format!("gated {index}")).1)
+            .collect::<Vec<_>>();
+        limit_checkouts_to_one(&broker);
+        let (scope, clock) = install_scripted_pacer(vec![memory_pressure(true)]);
+        let worker_started = Instant::now();
+        let first = broker.run_capacity_removal_slice(worker_started);
+        let second = broker.run_capacity_removal_slice(worker_started);
         drop(scope);
-        let report = report.unwrap().expect("pressure runs a slice");
-        assert_eq!(report.removed.len(), 1, "{report:#?}");
-        assert_eq!(worktrees.iter().filter(|path| path.exists()).count(), 1);
+        assert!(first.unwrap().is_none(), "no pass ran");
+        assert!(second.unwrap().is_none(), "the next slice is skipped");
+        assert!(worktrees.iter().all(|path| path.exists()));
         assert!(clock.slept.get() > Duration::ZERO, "the pacer paused first");
         let slice = broker.last_capacity_removal_slice().unwrap();
         assert_eq!(
@@ -11415,6 +11474,163 @@ mod tests {
             Some("pacer_backoff"),
             "{slice:#?}"
         );
+        assert_eq!(slice.passes, 0, "{slice:#?}");
+        assert_eq!(slice.retry_in_ms, Some(600_000), "{slice:#?}");
+        assert!(!broker.capacity_removal_due(super::now_ms()).unwrap());
+    }
+
+    /// Pressure that starts while a removal is paid for ends the slice after
+    /// that removal and backs off ten minutes even though it removed one, so
+    /// the next slice cannot remove again with the pacer's pause budget
+    /// spent.
+    #[cfg(unix)]
+    #[test]
+    fn pressure_after_a_removal_backs_off_instead_of_retrying_at_once() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let worktrees = (0..2)
+            .map(|index| closed_landed_checkout(&mut broker, &format!("pressured {index}")).1)
+            .collect::<Vec<_>>();
+        limit_checkouts_to_one(&broker);
+        // Calm for the gate before the first pass, then pressure for good.
+        let (scope, _clock) =
+            install_scripted_pacer(vec![memory_pressure(false), memory_pressure(true)]);
+        let worker_started = Instant::now();
+        let first = broker.run_capacity_removal_slice(worker_started);
+        let second = broker.run_capacity_removal_slice(worker_started);
+        drop(scope);
+        let first = first.unwrap().expect("the first slice ran a pass");
+        assert_eq!(first.removed.len(), 1, "{first:#?}");
+        assert!(second.unwrap().is_none(), "the next slice is skipped");
+        assert_eq!(worktrees.iter().filter(|path| path.exists()).count(), 1);
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(
+            slice.stop_reason.as_deref(),
+            Some("pacer_backoff"),
+            "{slice:#?}"
+        );
+        assert_eq!(slice.retry_in_ms, Some(600_000), "{slice:#?}");
+    }
+
+    /// Passes whose selected checkout is kept at the last step are bounded:
+    /// the slice stops after four of them, holds the lock at most about half
+    /// the time, never judges the same checkout twice, and waits a minute.
+    #[cfg(unix)]
+    #[test]
+    fn kept_only_passes_are_bounded_and_never_repeat_a_checkout() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let mut blocked = Vec::new();
+        for index in 0..5 {
+            let (session, worktree) =
+                closed_landed_checkout(&mut broker, &format!("kept at apply {index}"));
+            record_merged_pull_request(&mut broker, session.id, 200 + index);
+            let admission = crate::file_lock::artifact_use::begin_artifact_use(
+                broker.main_root(),
+                &worktree,
+                session.id,
+                "apply-only blocker",
+            )
+            .unwrap();
+            let crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer) =
+                admission
+            else {
+                panic!("artifact-use protocol should be available for this test");
+            };
+            drop(producer);
+            blocked.push(worktree);
+        }
+        limit_checkouts_to_one(&broker);
+        let report = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("pressure runs a slice");
+        assert!(report.removed.is_empty(), "{report:#?}");
+        assert!(blocked.iter().all(|path| path.exists()));
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(
+            slice.stop_reason.as_deref(),
+            Some("kept_only_limit"),
+            "{slice:#?}"
+        );
+        assert_eq!(slice.passes, 4, "{slice:#?}");
+        assert_eq!(slice.kept_only_passes, 4, "{slice:#?}");
+        let mut kept = report
+            .kept
+            .iter()
+            .map(|kept| kept.worktree.clone())
+            .collect::<Vec<_>>();
+        let judged = kept.len();
+        kept.sort();
+        kept.dedup();
+        assert_eq!(kept.len(), judged, "no checkout judged twice: {report:#?}");
+        assert!(
+            slice.retry_in_ms.is_some_and(|wait| wait >= 60_000),
+            "{slice:#?}"
+        );
+    }
+
+    /// A pass's selection and revalidation honor the pass budget, not the
+    /// slice's: with a pass budget too short to revalidate, nothing is
+    /// removed although the slice itself has time.
+    #[cfg(unix)]
+    #[test]
+    fn a_capacity_pass_is_bounded_by_the_pass_budget() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let (_session, landed) = closed_landed_checkout(&mut broker, "pass budget");
+        limit_checkouts_to_one(&broker);
+        let limits = crate::gc::CapacitySliceLimits {
+            pass_budget: Duration::from_millis(1),
+            ..crate::gc::CapacitySliceLimits::WORKER
+        };
+        let report = broker
+            .run_capacity_removal_slice_with(Instant::now(), limits)
+            .unwrap();
+        assert!(
+            report.is_none_or(|report| report.removed.is_empty()),
+            "nothing is removed inside a 1 ms pass"
+        );
+        assert!(landed.exists());
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(slice.pass_budget_ms, 1, "{slice:#?}");
+    }
+
+    /// `broker start` at the checkout limit, waiting for a held GC lock,
+    /// announces itself so the worker yields, and runs its pass once the
+    /// lock is free.
+    #[cfg(unix)]
+    #[test]
+    fn start_announces_itself_while_it_waits_for_the_gc_lock() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let (_session, landed) = closed_landed_checkout(&mut broker, "start waits");
+        limit_checkouts_to_one(&broker);
+        let root = broker.main_root().to_path_buf();
+        let held = crate::gc::GcLock::acquire(&root).unwrap();
+        let notice = root
+            .join(".aethyme/run/gc-lock-waiters")
+            .join(std::process::id().to_string());
+        let holder = std::thread::spawn(move || {
+            let mut announced = false;
+            for _ in 0..100 {
+                if notice.is_file() {
+                    announced = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            drop(held);
+            announced
+        });
+        let report = broker
+            .auto_cleanup_for_checkout_capacity(
+                Duration::from_secs(20),
+                Duration::from_secs(20),
+                None,
+                false,
+            )
+            .unwrap();
+        assert!(holder.join().unwrap(), "the waiter announced itself");
+        let report = report.expect("the lock was released within the wait");
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert!(!landed.exists());
     }
 
     /// A slice that finds the GC lock held backs off briefly instead of

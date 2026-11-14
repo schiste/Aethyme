@@ -18,10 +18,10 @@ const ARTIFACT_SWEEP_NAMESPACE_V2_DOMAIN: &[u8] = b"aethyme-artifact-sweep-conte
 const ARTIFACT_SWEEP_NAMESPACE_V4_DOMAIN: &[u8] = b"aethyme-artifact-sweep-context-v4\0";
 
 /// How long `broker start` at the checkout limit waits for a maintenance
-/// pass that holds the GC lock before its own removal pass. It covers one
-/// background removal pass (at most 20 s under the lock): while `start`
-/// waits, the worker sees its notice and does not take the lock again.
-const CHECKOUT_CAPACITY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// pass that holds the GC lock before its own removal pass: one background
+/// removal pass. While `start` waits, the worker does not take the lock
+/// again.
+const CHECKOUT_CAPACITY_LOCK_WAIT: std::time::Duration = crate::gc::GC_LOCK_FOREGROUND_WAIT;
 /// The removal budget `broker start` spends at the checkout limit before it
 /// refuses.
 const CHECKOUT_CAPACITY_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
@@ -7979,6 +7979,7 @@ impl Broker {
                         CHECKOUT_CAPACITY_LOCK_WAIT,
                         CHECKOUT_CAPACITY_CLEANUP_BUDGET,
                         None,
+                        false,
                     )
                 });
             let cleanup_report = match cleanup {

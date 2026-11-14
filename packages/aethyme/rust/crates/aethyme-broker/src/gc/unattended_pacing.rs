@@ -54,19 +54,6 @@ const LOAD_PER_CORE_LIMIT: f64 = 2.0;
 const PSI_MEMORY_SOME_AVG10_LIMIT: f64 = 10.0;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const PSI_IO_SOME_AVG10_LIMIT: f64 = 40.0;
-/// One-minute load average per core at or below which the host is idle
-/// enough for checkout removal's idle rate.
-const IDLE_LOAD_PER_CORE: f64 = 1.0;
-/// Linux PSI ceilings for an idle host.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const PSI_MEMORY_SOME_AVG10_IDLE: f64 = 1.0;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const PSI_IO_SOME_AVG10_IDLE: f64 = 10.0;
-/// While the host reads idle, a whole-checkout removal charged with
-/// [`charge_bulk_unattended_removal`] is paid at this multiple of the shipped
-/// default rate. A rate set in `[cleanup] unattended_unlinks_per_second` is
-/// honoured exactly and never multiplied.
-pub(crate) const IDLE_RATE_MULTIPLIER: u32 = 2;
 
 /// Configured unattended unlink rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,13 +147,6 @@ pub(crate) struct PressureSample {
 /// Source of pressure samples; tests inject a scripted one.
 pub(crate) trait PressureSignal {
     fn sample(&mut self) -> PressureSample;
-
-    /// Whether the host is idle: memory pressure normal and load at or below
-    /// the core count (on Linux also little memory and I/O stall). `None`
-    /// when unknown, which never earns the idle rate.
-    fn idle(&mut self) -> Option<bool> {
-        None
-    }
 }
 
 /// Reads the platform's cheap pressure signals: on macOS
@@ -188,15 +168,6 @@ impl PressureSignal for SystemPressure {
     fn sample(&mut self) -> PressureSample {
         platform::sample(self.cores)
     }
-
-    fn idle(&mut self) -> Option<bool> {
-        platform::idle(self.cores)
-    }
-}
-
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
-fn load_at_or_below_idle(load_one_minute: f64, cores: usize) -> bool {
-    load_one_minute <= IDLE_LOAD_PER_CORE * cores.max(1) as f64
 }
 
 /// `kern.memorystatus_vm_pressure_level`: 1 normal, 2 warning, 4 critical.
@@ -229,20 +200,7 @@ fn parse_loadavg(text: &str) -> Option<f64> {
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::{
-        PressureSample, load_at_or_below_idle, load_far_above_cores, memory_pressure_level_elevated,
-    };
-
-    pub(super) fn idle(cores: usize) -> Option<bool> {
-        let sample = sample(cores);
-        let memory_elevated = sample.memory_elevated?;
-        let mut load = [0f64; 1];
-        // SAFETY: `load` has room for the one element requested.
-        if unsafe { libc::getloadavg(load.as_mut_ptr(), 1) } != 1 {
-            return None;
-        }
-        Some(!memory_elevated && load_at_or_below_idle(load[0], cores))
-    }
+    use super::{PressureSample, load_far_above_cores, memory_pressure_level_elevated};
 
     pub(super) fn sample(cores: usize) -> PressureSample {
         let mut level: libc::c_int = 0;
@@ -272,8 +230,7 @@ mod platform {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::{
-        PSI_IO_SOME_AVG10_IDLE, PSI_IO_SOME_AVG10_LIMIT, PSI_MEMORY_SOME_AVG10_IDLE,
-        PSI_MEMORY_SOME_AVG10_LIMIT, PressureSample, load_at_or_below_idle, load_far_above_cores,
+        PSI_IO_SOME_AVG10_LIMIT, PSI_MEMORY_SOME_AVG10_LIMIT, PressureSample, load_far_above_cores,
         parse_loadavg, parse_psi_some_avg10,
     };
 
@@ -281,17 +238,6 @@ mod platform {
         std::fs::read_to_string(path)
             .ok()
             .and_then(|text| parse(&text))
-    }
-
-    pub(super) fn idle(cores: usize) -> Option<bool> {
-        let memory = read_value("/proc/pressure/memory", parse_psi_some_avg10)?;
-        let io = read_value("/proc/pressure/io", parse_psi_some_avg10)?;
-        let load = read_value("/proc/loadavg", parse_loadavg)?;
-        Some(
-            memory < PSI_MEMORY_SOME_AVG10_IDLE
-                && io < PSI_IO_SOME_AVG10_IDLE
-                && load_at_or_below_idle(load, cores),
-        )
     }
 
     pub(super) fn sample(cores: usize) -> PressureSample {
@@ -317,11 +263,6 @@ mod platform {
     /// No cheap signal is qualified here; proceed at the rate limit.
     pub(super) fn sample(_cores: usize) -> PressureSample {
         PressureSample::default()
-    }
-
-    /// Unknown, so never the idle rate.
-    pub(super) fn idle(_cores: usize) -> Option<bool> {
-        None
     }
 }
 
@@ -380,11 +321,9 @@ pub(crate) struct UnattendedPacer {
     memory_paused: Duration,
     load_paused: Duration,
     host_lock_waited: Duration,
-    /// The shipped default rate is in force, so a bulk checkout charge may
-    /// run at the idle rate while the host reads idle.
-    idle_rate_allowed: bool,
-    /// A bulk checkout charge is running at the idle rate.
-    idle_rate_active: bool,
+    /// A whole-checkout charge is running: the disk-pressure lift does not
+    /// apply to it, so checkout removal is always paced.
+    bulk_charge_active: bool,
     summary: UnattendedPacingSummary,
 }
 
@@ -393,15 +332,16 @@ pub(crate) struct UnattendedPacer {
 pub(crate) struct BulkCharge {
     /// Entries paid for by sleeping after the removal.
     pub(crate) charged: u64,
-    /// Entries the removal's own duration already paid for at the configured
-    /// rate: the bucket measures from when the removal began, so time Git
-    /// spent deleting is not slept a second time.
+    /// Entries Git's own removal already paid for at the configured rate:
+    /// the bucket measures from when Git began deleting, so that time is not
+    /// slept a second time. Never more than the entries charged for.
     pub(crate) credited: u64,
-    /// The charge stopped early: memory or load pressure outlasted the pause
-    /// budget, or the deadline came first.
-    pub(crate) cut_short: bool,
-    /// The host read idle and the charge ran at the idle rate.
-    pub(crate) idle_rate: bool,
+    /// Memory or load pressure outlasted the pacer's pause budget; the
+    /// charge stopped and the caller must back off.
+    pub(crate) pressure_backoff: bool,
+    /// What the deadline left unpaid at the configured rate; the caller must
+    /// not remove again before this much more time has passed.
+    pub(crate) unpaid: Duration,
 }
 
 impl UnattendedPacer {
@@ -425,8 +365,7 @@ impl UnattendedPacer {
             memory_paused: Duration::ZERO,
             load_paused: Duration::ZERO,
             host_lock_waited: Duration::ZERO,
-            idle_rate_allowed: rate == UnlinkRate::Limited(DEFAULT_UNATTENDED_UNLINKS_PER_SECOND),
-            idle_rate_active: false,
+            bulk_charge_active: false,
             summary: UnattendedPacingSummary {
                 unlinks_per_second_limit: rate.limit(),
                 ..UnattendedPacingSummary::default()
@@ -435,65 +374,77 @@ impl UnattendedPacer {
     }
 
     fn effective_limit(&self) -> Option<u32> {
-        if self.disk_pressure {
+        if self.disk_pressure && !self.bulk_charge_active {
             None
-        } else if self.idle_rate_active {
-            self.rate
-                .limit()
-                .map(|limit| limit.saturating_mul(IDLE_RATE_MULTIPLIER))
         } else {
             self.rate.limit()
         }
     }
 
+    /// Pause while memory or load pressure lasts; `false` when it outlasted
+    /// the pause budget or the deadline.
+    fn pressure_clear(&mut self, deadline: Option<Instant>) -> bool {
+        if self.wait_out_pressure(deadline) {
+            true
+        } else {
+            self.summary.pressure_yields = self.summary.pressure_yields.saturating_add(1);
+            false
+        }
+    }
+
     /// Pay for `entries` Git deleted in one removal that took
-    /// `already_spent`. The removal's duration is credited at the configured
-    /// rate (so the average over removal plus wait never exceeds it), the
-    /// rest is slept off batch by batch, at the idle rate when allowed and
-    /// the host reads idle. Pressure is sampled before anything else, so a
-    /// removal under memory or load pressure always waits it out (or stops
-    /// the charge) even when the credit covers every entry.
+    /// `removal_spent`. That duration is credited at the configured rate (so
+    /// the average over removal plus wait never exceeds it) and the rest is
+    /// slept off batch by batch, never at a disk-pressure-lifted rate.
+    /// Pressure is sampled first, so a removal under memory or load pressure
+    /// always waits it out (or stops the charge) even when the credit covers
+    /// every entry. A deadline that cuts the sleep short reports what is
+    /// still owed.
     fn charge_bulk(
         &mut self,
         entries: u64,
-        already_spent: Duration,
+        removal_spent: Duration,
         deadline: Option<Instant>,
     ) -> BulkCharge {
         if entries == 0 {
             return BulkCharge::default();
         }
-        if !self.wait_out_pressure(deadline) {
-            self.summary.pressure_yields = self.summary.pressure_yields.saturating_add(1);
+        if !self.pressure_clear(deadline) {
             return BulkCharge {
-                cut_short: true,
+                pressure_backoff: true,
                 ..BulkCharge::default()
             };
         }
-        let paid_by_removal = self.effective_limit().map_or(entries, |limit| {
-            let paid = already_spent.as_millis().saturating_mul(u128::from(limit)) / 1_000;
+        self.bulk_charge_active = true;
+        let limit = self.effective_limit();
+        let credited = limit.map_or(entries, |limit| {
+            let paid = removal_spent.as_millis().saturating_mul(u128::from(limit)) / 1_000;
             u64::try_from(paid).unwrap_or(u64::MAX).min(entries)
         });
-        let to_charge = entries - paid_by_removal;
-        self.summary.entries_removed = self.summary.entries_removed.saturating_add(paid_by_removal);
-        let idle_rate = to_charge > 0
-            && self.idle_rate_allowed
-            && self.effective_limit().is_some()
-            && self.pressure.idle() == Some(true);
-        self.idle_rate_active = idle_rate;
+        let to_charge = entries - credited;
+        self.summary.entries_removed = self.summary.entries_removed.saturating_add(credited);
         let mut charged = 0;
-        while charged < to_charge
-            && deadline.is_none_or(|deadline| self.clock.now() < deadline)
-            && self.before_unlink(deadline)
-        {
+        let mut pressure_backoff = false;
+        while charged < to_charge && deadline.is_none_or(|deadline| self.clock.now() < deadline) {
+            if !self.before_unlink(deadline) {
+                pressure_backoff = deadline.is_none_or(|deadline| self.clock.now() < deadline);
+                break;
+            }
             self.after_unlink(0);
             charged += 1;
         }
-        self.idle_rate_active = false;
+        self.bulk_charge_active = false;
+        let unpaid = match limit {
+            Some(limit) if !pressure_backoff && charged < to_charge => Duration::from_millis(
+                (to_charge - charged).saturating_mul(1_000) / u64::from(limit.max(1)),
+            ),
+            _ => Duration::ZERO,
+        };
         BulkCharge {
             charged,
-            credited: paid_by_removal,
-            cut_short: charged < to_charge,
-            idle_rate,
+            credited,
+            pressure_backoff,
+            unpaid,
         }
     }
 
@@ -652,22 +603,29 @@ pub(crate) fn after_unattended_unlink(logical_bytes: u64) {
 }
 
 /// Charge `entries` unlinks made in one burst outside tree removal (Git
-/// removing a whole checkout, which took `already_spent`) to the installed
-/// pacer: it credits the removal's own duration at the configured rate,
-/// sleeps off the rest of their share of the bucket (at
-/// [`IDLE_RATE_MULTIPLIER`] times the shipped default while the host reads
-/// idle) and waits out memory or load pressure as it would for its own
+/// removing a whole checkout, which took `removal_spent`) to the installed
+/// pacer: it credits Git's own removal time at the configured rate, sleeps
+/// off the rest of their share of the bucket (never lifted for disk
+/// pressure) and waits out memory or load pressure as it would for its own
 /// unlinks, never past `deadline`. Call it with no lock held: the sleep is
-/// the throttle. Without a pacer (every foreground caller) it charges nothing
-/// and returns at once.
+/// the throttle. Without a pacer (every foreground caller) it charges
+/// nothing and returns at once.
 pub(crate) fn charge_bulk_unattended_removal(
     entries: u64,
-    already_spent: Duration,
+    removal_spent: Duration,
     deadline: Option<Instant>,
 ) -> BulkCharge {
     with_active(BulkCharge::default(), |pacer| {
-        pacer.charge_bulk(entries, already_spent, deadline)
+        pacer.charge_bulk(entries, removal_spent, deadline)
     })
+}
+
+/// Before an unattended removal starts: wait out memory or load pressure on
+/// the installed pacer, never past `deadline`. `false` means the pressure
+/// outlasted the pause budget or the deadline and the removal must not
+/// start. Without a pacer (every foreground caller) it is always `true`.
+pub(crate) fn unattended_pressure_clear(deadline: Option<Instant>) -> bool {
+    with_active(true, |pacer| pacer.pressure_clear(deadline))
 }
 
 /// Disk-pressure mode lifts the rate limit (freeing space is then the
@@ -812,6 +770,7 @@ mod tests {
             charge_bulk_unattended_removal(10_000, Duration::ZERO, None),
             BulkCharge::default()
         );
+        assert!(unattended_pressure_clear(None));
         let clock = FakeClock::new();
         let _scope = install(UnattendedPacer::new(
             UnlinkRate::Limited(1_000),
@@ -821,51 +780,23 @@ mod tests {
         let entries = u64::from(PACING_BATCH_ENTRIES) * 8 + 1;
         let charge = charge_bulk_unattended_removal(entries, Duration::ZERO, None);
         assert_eq!(charge.charged, entries);
-        assert!(!charge.cut_short);
-        assert!(
-            !charge.idle_rate,
-            "an unknown idle signal never earns the idle rate"
-        );
+        assert!(!charge.pressure_backoff);
+        assert_eq!(charge.unpaid, Duration::ZERO);
         assert_eq!(clock.slept.get(), Duration::from_millis(2_048));
         let summary = current_summary(0).expect("the pacer is installed");
         assert_eq!(summary.entries_removed, entries);
-        // A deadline bounds the throttle.
+        // A deadline bounds the throttle and reports what it left unpaid.
         let deadline = clock.now() + Duration::from_millis(300);
-        assert!(charge_bulk_unattended_removal(entries, Duration::ZERO, Some(deadline)).cut_short);
+        let cut = charge_bulk_unattended_removal(entries, Duration::ZERO, Some(deadline));
+        assert!(cut.charged < entries && !cut.pressure_backoff);
+        assert!(cut.unpaid >= Duration::from_millis(1_500), "{cut:?}");
         assert_eq!(clock.now(), deadline);
     }
 
-    /// Idle-signal script for the bulk-charge tests.
-    struct IdleScript {
-        sample: PressureSample,
-        idle: Option<bool>,
-        idle_reads: Rc<Cell<usize>>,
-    }
-
-    impl PressureSignal for IdleScript {
-        fn sample(&mut self) -> PressureSample {
-            self.sample
-        }
-
-        fn idle(&mut self) -> Option<bool> {
-            self.idle_reads.set(self.idle_reads.get() + 1);
-            self.idle
-        }
-    }
-
-    fn idle_script(idle: Option<bool>) -> Box<dyn PressureSignal> {
-        Box::new(IdleScript {
-            sample: PressureSample::default(),
-            idle,
-            idle_reads: Rc::new(Cell::new(0)),
-        })
-    }
-
-    /// The time Git spent deleting a checkout already paid for part of it at
-    /// the configured rate; only the rest is slept. Without the credit the
-    /// worker slept the whole checkout after Git had deleted it.
+    /// Git's own removal time paid for part of a checkout at the configured
+    /// rate; only the rest is slept, and the credit never exceeds the charge.
     #[test]
-    fn a_bulk_charge_credits_the_removals_own_duration() {
+    fn a_bulk_charge_credits_only_the_removals_own_duration() {
         let clock = FakeClock::new();
         let mut pacer =
             UnattendedPacer::new(UnlinkRate::Limited(1_000), Box::new(clock.clone()), calm());
@@ -874,101 +805,74 @@ mod tests {
         let charge = pacer.charge_bulk(entries, Duration::from_millis(8_192), None);
         assert_eq!(charge.credited, 8_192);
         assert_eq!(charge.charged, entries - 8_192);
-        assert!(!charge.cut_short);
         // 12,288 charged entries are 48 batches of 256 ms; as for tree
         // removal, a batch is paid when the next one starts, so the 48th is
-        // paid by the next unlink. Without the credit this slept 79 batches.
+        // paid by the next unlink.
         assert_eq!(clock.slept.get(), Duration::from_millis(47 * 256));
         assert_eq!(pacer.summary(0).entries_removed, entries);
-        // A removal slower than the rate owes nothing more.
         let before = clock.slept.get();
-        let charge = pacer.charge_bulk(1_000, Duration::from_secs(2), None);
+        let charge = pacer.charge_bulk(1_000, Duration::from_secs(60), None);
         assert_eq!((charge.credited, charge.charged), (1_000, 0));
         assert_eq!(clock.slept.get(), before);
     }
 
-    /// On an idle host the shipped default rate doubles for a checkout
-    /// charge; on a busy host, with an unknown signal, or with a rate the
-    /// user configured, the charge runs at the configured rate.
+    /// Disk-pressure mode lifts the rate for tree removal, never for a
+    /// whole-checkout charge: capacity removal is always paced.
     #[test]
-    fn a_bulk_charge_runs_at_the_idle_rate_only_when_idle_and_not_configured() {
-        let entries = u64::from(PACING_BATCH_ENTRIES) * 40 + 1;
-        let sleep_for = |rate: UnlinkRate, idle: Option<bool>| {
-            let clock = FakeClock::new();
-            let mut pacer = UnattendedPacer::new(rate, Box::new(clock.clone()), idle_script(idle));
-            let charge = pacer.charge_bulk(entries, Duration::ZERO, None);
-            assert_eq!(charge.charged, entries);
-            (clock.slept.get(), charge.idle_rate)
-        };
-        let default_rate = UnlinkRate::Limited(DEFAULT_UNATTENDED_UNLINKS_PER_SECOND);
-        // 40 full batches of 256 at 1,000/s: 10.24 s; at 2,000/s: 5.12 s.
-        assert_eq!(
-            sleep_for(default_rate, Some(true)),
-            (Duration::from_millis(5_120), true)
-        );
-        assert_eq!(
-            sleep_for(default_rate, Some(false)),
-            (Duration::from_millis(10_240), false)
-        );
-        assert_eq!(
-            sleep_for(default_rate, None),
-            (Duration::from_millis(10_240), false)
-        );
-        // A configured rate is honoured exactly, idle or not.
-        let configured = UnlinkRate::Limited(500);
-        assert_eq!(
-            sleep_for(configured, Some(true)),
-            (Duration::from_millis(20_480), false)
-        );
-        // The idle rate does not outlive the charge.
+    fn a_bulk_charge_ignores_the_disk_pressure_lift() {
         let clock = FakeClock::new();
-        let mut pacer = UnattendedPacer::new(
-            default_rate,
-            Box::new(clock.clone()),
-            idle_script(Some(true)),
-        );
-        pacer.charge_bulk(entries, Duration::ZERO, None);
+        let mut pacer =
+            UnattendedPacer::new(UnlinkRate::Limited(1_000), Box::new(clock.clone()), calm());
+        pacer.disk_pressure = true;
+        let entries = u64::from(PACING_BATCH_ENTRIES) * 4 + 1;
+        let charge = pacer.charge_bulk(entries, Duration::ZERO, None);
+        assert_eq!((charge.credited, charge.charged), (0, entries));
+        assert_eq!(clock.slept.get(), Duration::from_millis(1_024));
         assert_eq!(
             pacer.effective_limit(),
-            Some(DEFAULT_UNATTENDED_UNLINKS_PER_SECOND)
+            None,
+            "the lift still applies elsewhere"
         );
     }
 
     /// Pressure is read before the credit is applied, so a removal fully
     /// paid for by its own duration still waits out memory pressure, and a
-    /// pressure that outlasts the pause budget cuts the charge short.
+    /// pressure that outlasts the pause budget asks the caller to back off.
+    /// The pre-removal gate reads the same signal.
     #[test]
-    fn a_bulk_charge_backs_off_under_pressure_even_when_fully_credited() {
+    fn a_bulk_charge_and_the_pre_removal_gate_back_off_under_pressure() {
         let clock = FakeClock::new();
-        let reads = Rc::new(Cell::new(0));
         let mut pacer = UnattendedPacer::new(
             UnlinkRate::Limited(1_000),
             Box::new(clock.clone()),
             Box::new(Scripted {
                 samples: vec![memory(true), memory(true), memory(false)],
-                reads: reads.clone(),
+                reads: Rc::new(Cell::new(0)),
             }),
         );
         let charge = pacer.charge_bulk(1_000, Duration::from_secs(5), None);
         assert_eq!((charge.credited, charge.charged), (1_000, 0));
-        assert!(!charge.cut_short);
+        assert!(!charge.pressure_backoff);
         assert_eq!(clock.slept.get(), PRESSURE_POLL * 2);
-        assert_eq!(pacer.summary(0).memory_pause_ms, 2_000);
 
         let clock = FakeClock::new();
-        let mut pacer = UnattendedPacer::new(
+        let _scope = install(UnattendedPacer::new(
             UnlinkRate::Limited(1_000),
             Box::new(clock.clone()),
             Box::new(Scripted {
                 samples: vec![memory(true)],
                 reads: Rc::new(Cell::new(0)),
             }),
+        ));
+        assert!(
+            !unattended_pressure_clear(None),
+            "pressure outlasts the budget"
         );
-        let charge = pacer.charge_bulk(1_000, Duration::from_secs(5), None);
-        assert!(charge.cut_short);
-        assert_eq!((charge.credited, charge.charged), (0, 0));
         assert_eq!(clock.slept.get(), MAX_PRESSURE_PAUSE_PER_RUN);
-        assert_eq!(pacer.summary(0).pressure_yields, 1);
+        let charge = charge_bulk_unattended_removal(1_000, Duration::from_secs(5), None);
+        assert!(charge.pressure_backoff);
+        assert_eq!((charge.credited, charge.charged), (0, 0));
+        assert_eq!(current_summary(0).unwrap().pressure_yields, 2);
     }
 
     #[test]
@@ -1192,7 +1096,5 @@ mod tests {
         assert!(memory_pressure_level_elevated(4));
         assert!(!load_far_above_cores(19.9, 10));
         assert!(load_far_above_cores(20.1, 10));
-        assert!(load_at_or_below_idle(10.0, 10));
-        assert!(!load_at_or_below_idle(10.1, 10));
     }
 }

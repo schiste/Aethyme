@@ -204,23 +204,24 @@ evidence.
 
 From three quarters of the limit the background worker also removes closed
 checkouts itself: a removal slice of up to 120 seconds before its other work
-and between its cache passes, each of which now holds the GC lock for at most
-30 seconds. A slice removes one checkout per pass, each pass holding the GC
-lock for at most 20 seconds, at most twelve removals (kept checkouts do not
-count), and after each removal waits out what Git deleted at
-`[cleanup] unattended_unlinks_per_second` with no lock held. The time Git
-spent removing the checkout counts toward that wait, so the average rate over
-removal and wait stays at the configured one. While the host is idle (memory
-pressure normal, load at or below the core count) and the rate is the shipped
-default, the wait runs at twice that rate; a configured rate is honoured
-exactly. Memory or load pressure pauses the wait as for any unattended
-deletion, and pressure that outlasts the pause budget ends the slice. The
-lock is left free for at least half a second between passes, and while
-`broker start` at the checkout limit waits for it (up to 30 seconds) the
-worker does not take it again. A slice ends as soon as a pass selects nothing.
+and between its cache passes, each of which holds the GC lock for at most 30
+seconds. When the cache lane is due, capacity slices leave it at least 90
+seconds of every worker run. A slice removes one checkout per pass, at most
+twelve (kept checkouts do not count), and stops after four passes that
+removed nothing. A pass bounds selection and revalidation by 20 seconds; only
+Git's removal of the one checkout it started can run past that. After each
+removal the slice waits out what Git deleted at
+`[cleanup] unattended_unlinks_per_second` with no lock held, crediting only
+the time Git itself spent deleting; disk-pressure mode does not lift that
+rate. Before every pass it waits out memory or load pressure, and pressure
+that outlasts the pacer's pause budget stops the slice with nothing more
+removed and no further slice for 10 minutes. Between passes the lock stays
+free at least as long as the last pass held it, and while `broker start` at
+the checkout limit or `gc apply` waits for it (up to 30 seconds) the worker
+does not take it again. A slice ends as soon as a pass selects nothing.
 A slice that removes nothing waits 10 minutes before pressure alone
 starts another once its lap of closed checkouts has ended; one that finds the
-GC lock held, or yields it to `start`, waits 1 minute, and one that moved the
+GC lock held, or yields it, waits 1 minute, and one that moved the
 lap forward but ran out of time before its end waits 20 seconds. A slice first finishes the checkout path index if another
 lane left it mid-lap, so a long index lap no longer leaves selection without
 an inventory. Each slice records its own result under the meta key
@@ -241,10 +242,11 @@ checkouts per keep code, `blocked_by_ignored` names the ignored directories
 holding the most checkouts with the line that would release each,
 `lap_remaining` and the cursor say how far the lap got, and `scan_ms`,
 `selection_ms`, `apply_ms`, `paced_ms`, `lock_held_ms`, `lock_wait_ms`,
-`lock_yield_ms` and `elapsed_ms` say where the time went; `stop_reason` says
-why the slice stopped (`cap`, `budget`, `pacer_backoff`,
-`yielded_to_foreground`, `nothing_selected` or `lock_busy`) and `retry_in_ms`
-the wait it chose. Broker opens too short to count checkouts read the count
+`lock_yield_ms`, `git_removal_ms`, `pressure_wait_ms` and `elapsed_ms` say
+where the time went; `stop_reason` says why the slice stopped (`cap`,
+`budget`, `pacer_backoff`, `slice_deadline`, `yielded_to_foreground`,
+`nothing_selected`, `kept_only_limit`, `lock_busy` or `failed`) and
+`retry_in_ms` the wait it chose. Broker opens too short to count checkouts read the count
 `broker start` last recorded. Within the removal lane, selection uses at most
 three quarters of the budget, so revalidation and the first removal always
 have time (`auto_cleanup.lanes.removal_selected` and
