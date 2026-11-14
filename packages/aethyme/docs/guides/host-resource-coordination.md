@@ -342,6 +342,17 @@ in the stop reason; Linux keeps the exact device comparison because it has no
 stable volume identifier here. See
 [cross-process consumers](../architecture/cross-process-consumers.md).
 
+The same holds for a rotation that the remount interrupted half-way. Its debt
+records (the journal row, the witness in the cache root, the staged
+replacement's intent and proof, and the witness inside the old store) all
+saved the old device number. Recovery now records the volume UUID of each debt
+when it is journaled, and after a remount resumes the debt only when the cache
+root's inode is unchanged and that UUID, or the one recorded for the cache
+root, matches the volume mounted now; a debt saved before UUIDs were recorded
+falls back to the parent marker rule above. Inode numbers are still compared
+for every object. Anything else stops with `debt_volume_reproof_refused:
+<condition>` in the stop reason, and Linux keeps the exact comparison.
+
 An unspecified `shared_cache.root` keeps the historical Host placement for
 existing configurations. A new pnpm draft from `aethyme init` selects the
 worktree placement filesystem and passes its broker-managed store path with

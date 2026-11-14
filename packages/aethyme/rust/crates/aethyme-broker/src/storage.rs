@@ -1614,7 +1614,11 @@ fn preparation_cache_sweep_report(
 struct PreparationRotationJournalLap {
     resource_db_path: PathBuf,
     cache_root: PathBuf,
+    /// The identity the journal holds the rows under: the live one, or the
+    /// saved one while debts pending across a device renumber finish.
     root_identity: Vec<u8>,
+    /// The live identity, when the lap walks rows under a saved one.
+    live_identity: Option<Vec<u8>>,
     generation: u64,
     finished: bool,
 }
@@ -1622,14 +1626,25 @@ struct PreparationRotationJournalLap {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl PreparationRotationJournalLap {
     fn keep_incomplete(&self) {
-        crate::warn_unrecorded(
-            "retain incomplete preparation rotation journal lap",
-            crate::preparation::rotation_journal::mark_lap_incomplete(
+        let marked = crate::preparation::rotation_journal::mark_lap_incomplete(
+            &self.resource_db_path,
+            &self.cache_root,
+            &self.root_identity,
+        );
+        // Recovery moves the root row on to the live identity once the last
+        // debt saved under the old one completes; the lap then lives there.
+        if marked.is_err()
+            && let Some(live) = self.live_identity.as_deref()
+            && crate::preparation::rotation_journal::mark_lap_incomplete(
                 &self.resource_db_path,
                 &self.cache_root,
-                &self.root_identity,
-            ),
-        );
+                live,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        crate::warn_unrecorded("retain incomplete preparation rotation journal lap", marked);
     }
 
     fn finish(&mut self, sweep_complete: bool) -> bool {
@@ -2050,7 +2065,7 @@ fn sweep_preparation_cache_with_coverage_and_observer(
     complete &= inventory.complete;
     let mut blocked_repositories = inventory.blocked_repositories.clone();
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let journal_root_identity = match preparation_rotation_journal_root_identity(
+    let live_root_identity = match preparation_rotation_journal_root_identity(
         cache_root,
         expected_root_identity,
         deadline,
@@ -2065,6 +2080,15 @@ fn sweep_preparation_cache_with_coverage_and_observer(
             );
         }
     };
+    // Debts pending across a device renumber stay journaled under the saved
+    // root identity; probing them under the live one would read Unknown and
+    // keep the sweep from ever reaching their recovery.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let journal_root_identity = crate::preparation::rotation_debt::journal_root_identity_for_walk(
+        resource_db_path,
+        cache_root,
+        live_root_identity.as_deref(),
+    );
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     match crate::preparation::rotation_journal::probe(
         resource_db_path,
@@ -2175,7 +2199,7 @@ fn sweep_preparation_cache_with_coverage_and_observer(
             expected_root_identity,
             deadline,
         ) {
-            Ok(identity) if identity == journal_root_identity => identity,
+            Ok(identity) if identity == live_root_identity => identity,
             _ => {
                 return preparation_cache_sweep_report(
                     removed,
@@ -2185,10 +2209,17 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                 );
             }
         };
-        let signal = match crate::preparation::rotation_journal::probe(
+        // Recovery above may have finished the last debt saved under an old
+        // identity and moved the root row on, so route the walk again.
+        let walk_identity = crate::preparation::rotation_debt::journal_root_identity_for_walk(
             resource_db_path,
             cache_root,
             current_identity.as_deref(),
+        );
+        let signal = match crate::preparation::rotation_journal::probe(
+            resource_db_path,
+            cache_root,
+            walk_identity.as_deref(),
         ) {
             Ok(signal) => signal,
             Err(_) => {
@@ -2216,7 +2247,7 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                     // the incomplete bit so this partial inventory cannot ack.
                     complete = false;
                 }
-                if let Some(root_identity) = current_identity {
+                if let Some(root_identity) = walk_identity {
                     let generation = match crate::preparation::rotation_journal::begin_lap(
                         resource_db_path,
                         cache_root,
@@ -2234,6 +2265,9 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                             resource_db_path: resource_db_path.to_path_buf(),
                             cache_root: cache_root.to_path_buf(),
                             root_identity: root_identity.clone(),
+                            live_identity: current_identity
+                                .clone()
+                                .filter(|live| *live != root_identity),
                             generation,
                             finished: false,
                         });
@@ -2294,10 +2328,11 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                                         continue;
                                     }
                                 };
-                                if crate::preparation::rotation_debt::RotationDebt::from_journal_payload(
+                                if crate::preparation::rotation_debt::check_journal_payload_for_walk(
                                     cache_root,
                                     &repository,
                                     &payload,
+                                    &root_identity,
                                 )
                                 .is_err()
                                 {
@@ -7665,6 +7700,69 @@ mod tests {
             .unwrap(),
             Some(crate::preparation::rotation_journal::JournalProbe::NoDebt)
         ));
+    }
+
+    /// A debt journaled before a device renumber, with no in-cache record
+    /// (crash right after journaling): the sweep walks the journal under the
+    /// saved root identity and hands the debt to its recovery, which re-proves
+    /// the volume. Without a stable volume identifier it stays pending.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn recovery_sweep_resumes_a_journal_only_debt_saved_before_a_device_renumber() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let cache_root = root.join("preparation-cache");
+        std::fs::create_dir(&cache_root).unwrap();
+        let resource_db_path = test_host_resource_db(&root);
+        let live_volume_known =
+            crate::preparation::rotation_debt::publish_renumbered_journal_debt_for_test(
+                &resource_db_path,
+                &cache_root,
+                TEST_PREPARATION_REPOSITORY,
+                true,
+            );
+        let old_cache = cache_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("old-cache");
+        let report = recover_preparation_caches_for_bindings(
+            &[unguarded_host_cache_binding(&cache_root)],
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+            true,
+        );
+        let live_identity =
+            crate::preparation::rotation_debt::DirectoryIdentity::capture(&cache_root)
+                .unwrap()
+                .encode()
+                .unwrap();
+        if live_volume_known {
+            assert!(!old_cache.exists(), "{report:?}");
+            assert!(report.filesystem_entries_reclaimed > 0, "{report:?}");
+            assert!(
+                crate::preparation::rotation_journal::load_record(
+                    &resource_db_path,
+                    &cache_root,
+                    &live_identity,
+                    TEST_PREPARATION_REPOSITORY,
+                )
+                .unwrap()
+                .is_none()
+            );
+            let state = crate::preparation::rotation_journal::root_volume_state(
+                &resource_db_path,
+                &cache_root,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(state.saved_identity, live_identity);
+            assert_eq!(state.debt_rows, 0);
+        } else {
+            assert!(!report.complete);
+            assert_eq!(
+                std::fs::read(&old_cache).unwrap(),
+                b"interrupted before a remount"
+            );
+        }
     }
 
     #[test]
