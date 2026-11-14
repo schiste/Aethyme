@@ -4277,6 +4277,7 @@ fn directory_bytes_with_progress(
     }
 }
 
+#[cfg(test)]
 fn directory_inventory_with_progress(
     path: &Path,
     limits: SharedCacheScanLimits,
@@ -4285,7 +4286,7 @@ fn directory_inventory_with_progress(
     directory_inventory_with_budget(path, limits, None, progress)
 }
 
-/// [`directory_inventory_with_progress`], stopping with
+/// The bounded no-follow inventory of `path`, stopping with
 /// [`SharedCacheInventory::OverBudget`] once the bytes seen pass
 /// `stop_above_bytes`.
 fn directory_inventory_with_budget(
@@ -8298,12 +8299,16 @@ mod tests {
                     detail: None,
                     elapsed_ms: 9_000,
                     items_done: 100_001,
+                    bytes_observed: Some(9_000_000_000),
+                    outcome: Some("over_budget"),
                 },
                 cache_activity::PreparationCacheOperationSummary {
                     operation: cache_activity::PreparationCacheOperation::RotationDrain,
                     detail: None,
                     elapsed_ms: 208_000,
                     items_done: 141_558,
+                    bytes_observed: None,
+                    outcome: None,
                 },
             ],
             steps: Vec::new(),
@@ -8327,6 +8332,10 @@ mod tests {
         assert_eq!(
             preparation["shared_cache_operations"][1]["items_done"],
             141_558
+        );
+        assert_eq!(
+            preparation["shared_cache_operations"][0]["outcome"],
+            "over_budget"
         );
 
         let quiet = PreparationReport {
