@@ -511,6 +511,110 @@ impl CapacitySliceLimits {
         pass_budget: ARTIFACT_WORKER_CAPACITY_REMOVAL_PASS_BUDGET,
         cache_lane_reserved: Duration::ZERO,
     };
+
+    /// These limits for a slice `trigger` ran: unchanged under capacity
+    /// pressure; a steady slice keeps at most the steady allowance of
+    /// removals, kept-only passes and wall time.
+    pub(crate) fn for_trigger(self, trigger: CheckoutRemovalTrigger) -> Self {
+        match trigger {
+            CheckoutRemovalTrigger::Pressure => self,
+            CheckoutRemovalTrigger::Steady => Self {
+                removals: self.removals.min(ARTIFACT_WORKER_STEADY_REMOVALS_PER_SLICE),
+                kept_only_passes: self
+                    .kept_only_passes
+                    .min(ARTIFACT_WORKER_STEADY_KEPT_ONLY_PASSES),
+                budget: self.budget.min(ARTIFACT_WORKER_STEADY_REMOVAL_SLICE),
+                ..self
+            },
+        }
+    }
+}
+
+/// What makes the background worker's checkout removal slice run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckoutRemovalTrigger {
+    /// Registered checkouts are at three quarters of `[worktrees]
+    /// max_checkouts`: the capacity limits and retries apply.
+    Pressure,
+    /// No capacity pressure: closed checkouts whose work landed (merged pull
+    /// request, due cleanup request, or the landing proof the lap accepts)
+    /// are removed at a steady background rate, so the checkout count
+    /// follows merges instead of drifting up to the pressure threshold.
+    Steady,
+}
+
+impl CheckoutRemovalTrigger {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Pressure => "pressure",
+            Self::Steady => "steady",
+        }
+    }
+
+    fn selection(self) -> crate::auto_cleanup::RemovalSelection {
+        match self {
+            Self::Pressure => crate::auto_cleanup::RemovalSelection::Probe,
+            Self::Steady => crate::auto_cleanup::RemovalSelection::Steady,
+        }
+    }
+
+    fn telemetry_phase(self) -> &'static str {
+        match self {
+            Self::Pressure => "artifact_worker_capacity_removal_trigger_pressure",
+            Self::Steady => "artifact_worker_capacity_removal_trigger_steady",
+        }
+    }
+}
+
+/// Removals one steady (no pressure) slice makes at most. With the minute
+/// between slices that removed something, at most about 240 an hour, far
+/// above the rate checkouts land at, while the pacer still bounds the I/O.
+const ARTIFACT_WORKER_STEADY_REMOVALS_PER_SLICE: usize = 4;
+/// Passes that removed nothing one steady slice may run.
+const ARTIFACT_WORKER_STEADY_KEPT_ONLY_PASSES: usize = 2;
+/// Wall time of one steady slice, pacer waits included.
+const ARTIFACT_WORKER_STEADY_REMOVAL_SLICE: Duration = Duration::from_secs(60);
+/// After a steady slice that removed something: the next one may run a
+/// minute later, so more landed checkouts go at a gentle background rate.
+const ARTIFACT_WORKER_STEADY_REMOVED_RETRY_MS: i64 = 60_000;
+/// After the first steady slice in a row that removed nothing.
+const ARTIFACT_WORKER_STEADY_IDLE_RETRY_MS: i64 = 5 * 60_000;
+/// The longest wait between steady slices that keep removing nothing.
+const ARTIFACT_WORKER_STEADY_IDLE_RETRY_MAX_MS: i64 = 30 * 60_000;
+const ARTIFACT_WORKER_STEADY_REMOVAL_RETRY_AFTER_KEY: &str =
+    "gc.artifact_sweep.steady_removal_retry_after_ms";
+/// Consecutive steady slices that removed nothing.
+const ARTIFACT_WORKER_STEADY_REMOVAL_IDLE_STREAK_KEY: &str =
+    "gc.artifact_sweep.steady_removal_idle_streak";
+/// A steady retry no new landing shortens: a slice stopped by memory or
+/// load pressure, failed removals, a failure or a held lock, or a worker
+/// run that could not reach its slice.
+const ARTIFACT_WORKER_STEADY_REMOVAL_HARD_RETRY_AFTER_KEY: &str =
+    "gc.artifact_sweep.steady_removal_hard_retry_after_ms";
+/// When the last steady slice started; a cleanup request that became due
+/// after it makes the next steady slice due at once.
+const ARTIFACT_WORKER_STEADY_REMOVAL_LAST_RUN_KEY: &str =
+    "gc.artifact_sweep.steady_removal_last_run_ms";
+
+/// The wait after the `streak`-th consecutive steady slice that removed
+/// nothing: 5, 10, 20, then 30 minutes.
+fn steady_idle_retry_ms(streak: u32) -> i64 {
+    let doublings = streak.saturating_sub(1).min(3);
+    (ARTIFACT_WORKER_STEADY_IDLE_RETRY_MS << doublings)
+        .min(ARTIFACT_WORKER_STEADY_IDLE_RETRY_MAX_MS)
+}
+
+/// The wait before the next steady slice, before the stop's own floor
+/// ([`capacity_stop_retry_ms`]): a minute after a removal, the short lock
+/// back-off when the GC lock was contended, otherwise the idle ladder.
+fn steady_removal_retry_ms(removed: usize, lock_contended: bool, idle_streak: u32) -> i64 {
+    if removed > 0 {
+        ARTIFACT_WORKER_STEADY_REMOVED_RETRY_MS
+    } else if lock_contended {
+        ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS
+    } else {
+        steady_idle_retry_ms(idle_streak)
+    }
 }
 
 /// Whether a capacity slice that has removal allowance left stops before
@@ -2732,8 +2836,12 @@ impl Drop for GcLockWaiterNotice {
 
 /// Wait, up to `limit`, while a foreground command waits for the GC lock, so
 /// it can take the lock before the worker's next pass. Returns the time
-/// waited.
-fn wait_out_foreground_gc_lock_waiter(main_root: &Path, limit: Duration) -> Duration {
+/// waited, also recorded under the telemetry `phase` when it yielded.
+fn wait_out_foreground_gc_lock_waiter(
+    main_root: &Path,
+    limit: Duration,
+    phase: &'static str,
+) -> Duration {
     let started = Instant::now();
     let mut yielded = false;
     while started.elapsed() < limit && foreground_gc_lock_waiter(main_root).is_some() {
@@ -2744,7 +2852,7 @@ fn wait_out_foreground_gc_lock_waiter(main_root: &Path, limit: Duration) -> Dura
         return Duration::ZERO;
     }
     let waited = started.elapsed();
-    crate::phase_telemetry::add("artifact_worker_cache_yielded_to_foreground", waited);
+    crate::phase_telemetry::add(phase, waited);
     waited
 }
 
@@ -7604,7 +7712,11 @@ impl Broker {
         let session_retirement_pending = self.session_retirement_recovery_requested()?;
         let compact_pending = self.compact_checkout_work_pending()?;
         // Recorded count only: listing checkouts is too slow for an open.
-        let capacity_removal_due = self.capacity_removal_due(now_ms())?;
+        let removal_trigger = self.checkout_removal_trigger_due(now_ms())?;
+        let capacity_removal_due = removal_trigger.is_some();
+        // A worker that cannot start must not be retried for steady removal
+        // on every broker open.
+        let steady_removal_due = removal_trigger == Some(CheckoutRemovalTrigger::Steady);
         if !(artifact_pending
             || checkout_cleanup_pending
             || session_retirement_pending
@@ -7633,6 +7745,9 @@ impl Broker {
             return Ok(());
         }
         let Some((router, _engine)) = artifact_worker_binaries() else {
+            if steady_removal_due {
+                self.defer_steady_removal(ARTIFACT_WORKER_STEADY_IDLE_RETRY_MS)?;
+            }
             if artifact_due {
                 self.defer_artifact_sweep_worker("runtime_unverified")?;
             }
@@ -7662,6 +7777,9 @@ impl Broker {
             return Ok(());
         };
         if !artifact_worker_runtime_is_aligned() {
+            if steady_removal_due {
+                self.defer_steady_removal(ARTIFACT_WORKER_STEADY_IDLE_RETRY_MS)?;
+            }
             if artifact_due {
                 self.defer_artifact_sweep_worker("runtime_pair_unverified")?;
             }
@@ -7692,6 +7810,9 @@ impl Broker {
         ) {
             Ok(command) => command,
             Err(_) => {
+                if steady_removal_due {
+                    self.defer_steady_removal(ARTIFACT_WORKER_STEADY_IDLE_RETRY_MS)?;
+                }
                 if artifact_due {
                     self.defer_artifact_sweep_worker("storage_context_unavailable")?;
                 }
@@ -7716,6 +7837,9 @@ impl Broker {
         let _child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
+                if steady_removal_due {
+                    self.defer_steady_removal(ARTIFACT_WORKER_STEADY_IDLE_RETRY_MS)?;
+                }
                 if artifact_due {
                     self.defer_artifact_sweep_worker(&format!("worker_launch_failed: {error}"))?;
                 }
@@ -7813,7 +7937,9 @@ impl Broker {
         let session_retirement_state = self.session_retirement_recovery_state()?;
         let session_retirement_pending = session_retirement_state.unwrap_or(false);
         let compact_pending = self.compact_checkout_work_pending()?;
-        let capacity_removal_due = self.capacity_removal_due(now_ms())?;
+        let removal_trigger = self.checkout_removal_trigger_due(now_ms())?;
+        let capacity_removal_due = removal_trigger.is_some();
+        let steady_removal_due = removal_trigger == Some(CheckoutRemovalTrigger::Steady);
         if !(artifact_pending
             || checkout_cleanup_pending
             || session_retirement_pending
@@ -7848,6 +7974,9 @@ impl Broker {
             return Ok(());
         }
         if !artifact_worker_runtime_is_aligned() {
+            if steady_removal_due {
+                self.defer_steady_removal(ARTIFACT_WORKER_STEADY_IDLE_RETRY_MS)?;
+            }
             if artifact_due {
                 self.defer_artifact_sweep_worker("runtime_pair_unverified")?;
             }
@@ -7874,12 +8003,19 @@ impl Broker {
             std::thread::sleep,
         )?
         else {
+            if steady_removal_due {
+                // Another repository's worker kept the host deleter slot:
+                // a minute before broker opens wake this one for it again.
+                self.defer_steady_removal(ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS)?;
+            }
             return Ok(());
         };
         let worker_started = Instant::now();
-        // Removal is what frees a checkout slot: under capacity pressure it
-        // goes first, before retirement and cache work. Across the run's
-        // slices it may use all of the cache lane but
+        // Removal is what frees a checkout slot: it goes first, before
+        // retirement and cache work, under capacity pressure with the
+        // capacity limits and otherwise as the steady removal of landed
+        // checkouts (a shorter slice, fewer removals, longer waits). Across
+        // the run's slices it may use all of the cache lane but
         // `ARTIFACT_WORKER_CACHE_LANE_MIN`, so the cache lane always keeps
         // that much of the run.
         let cache_lane_reserved = if artifact_due {
@@ -7969,6 +8105,7 @@ impl Broker {
                             remaining
                                 .unwrap_or(GC_LOCK_FOREGROUND_WAIT)
                                 .min(GC_LOCK_FOREGROUND_WAIT),
+                            "artifact_worker_cache_yielded_to_foreground",
                         );
                         remaining = remaining.map(|remaining| remaining.saturating_sub(waited));
                         if remaining.is_some_and(|remaining| remaining.is_zero()) {
@@ -8085,21 +8222,92 @@ impl Broker {
         Ok(())
     }
 
-    /// Whether checkout capacity pressure alone makes worker removal due: the
-    /// recorded linked-checkout count is at three quarters of the limit,
-    /// automatic removal is on, and the last removal slice either removed
-    /// something or is past its retry time. Reads no checkout.
+    /// Whether a worker checkout removal slice is due:
+    /// [`Self::checkout_removal_trigger_due`] names a trigger.
+    #[cfg(test)]
     pub(crate) fn capacity_removal_due(&mut self, now: i64) -> Result<bool, BrokerOpError> {
-        if !self.recorded_checkout_capacity_pressure()
-            || !crate::AutoCleanupPolicy::load(self.main_root())
-                .is_ok_and(|policy| policy.auto_remove)
+        Ok(self.checkout_removal_trigger_due(now)?.is_some())
+    }
+
+    /// What makes a worker checkout removal slice due now, if anything.
+    /// Automatic removal must be on. With the recorded linked-checkout count
+    /// at three quarters of the limit configured now it is capacity
+    /// pressure, once the last pressure slice's retry time has passed
+    /// (unchanged). Otherwise it is the steady removal of landed checkouts
+    /// when [`Self::steady_removal_due`] says so. Reads no checkout.
+    pub(crate) fn checkout_removal_trigger_due(
+        &mut self,
+        now: i64,
+    ) -> Result<Option<CheckoutRemovalTrigger>, BrokerOpError> {
+        if !crate::AutoCleanupPolicy::load(self.main_root()).is_ok_and(|policy| policy.auto_remove)
+        {
+            return Ok(None);
+        }
+        if self.recorded_checkout_capacity_pressure_at_current_limit() {
+            let pending =
+                self.removal_retry_pending(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_AFTER_KEY, now)?;
+            return Ok((!pending).then_some(CheckoutRemovalTrigger::Pressure));
+        }
+        Ok(self
+            .steady_removal_due(now)?
+            .then_some(CheckoutRemovalTrigger::Steady))
+    }
+
+    /// Whether the steady removal of landed checkouts is due, from the
+    /// database alone. A closed spawned session must still hold its
+    /// checkout (with none, the worker is never woken for it), and no hard
+    /// retry may be pending (memory or load pressure that outlasted the
+    /// pacer, failed removals, a held lock, a worker that could not run the
+    /// slice). Then it is due once its retry time passed (a minute after a
+    /// removal, 5 to 30 minutes after slices that found nothing), or at once
+    /// when a closed checkout's cleanup request became due since the last
+    /// steady slice, so removal follows a landing within about a minute of
+    /// its grace ending instead of waiting out the idle back-off.
+    pub(crate) fn steady_removal_due(&mut self, now: i64) -> Result<bool, BrokerOpError> {
+        if !self.store().closed_spawned_checkout_pending()?
+            || self
+                .removal_retry_pending(ARTIFACT_WORKER_STEADY_REMOVAL_HARD_RETRY_AFTER_KEY, now)?
         {
             return Ok(false);
         }
-        let retry_after = self
-            .artifact_sweep_meta_get(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_AFTER_KEY)?
-            .and_then(|value| value.parse::<i64>().ok());
-        Ok(retry_after.is_none_or(|retry_after| retry_after <= now))
+        if !self.removal_retry_pending(ARTIFACT_WORKER_STEADY_REMOVAL_RETRY_AFTER_KEY, now)? {
+            return Ok(true);
+        }
+        let last_run = self
+            .artifact_sweep_meta_get(ARTIFACT_WORKER_STEADY_REMOVAL_LAST_RUN_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        Ok(self
+            .store()
+            .checkout_cleanup_became_due_between(last_run, now)?)
+    }
+
+    /// Keep the worker from being woken again for steady removal for
+    /// `wait_ms`: a run that was due for it exited before its slice (the
+    /// host deleter slot was busy, the runtime could not be verified, the
+    /// worker could not start, or no time was left for a slice).
+    pub(crate) fn defer_steady_removal(&mut self, wait_ms: i64) -> Result<(), BrokerOpError> {
+        crate::phase_telemetry::add("artifact_worker_steady_removal_deferred", Duration::ZERO);
+        self.artifact_sweep_meta_set(
+            ARTIFACT_WORKER_STEADY_REMOVAL_HARD_RETRY_AFTER_KEY,
+            &now_ms().saturating_add(wait_ms).to_string(),
+        )
+    }
+
+    /// Whether the retry time stored under `key` is still ahead of `now`.
+    fn removal_retry_pending(&mut self, key: &str, now: i64) -> Result<bool, BrokerOpError> {
+        Ok(self
+            .artifact_sweep_meta_get(key)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .is_some_and(|retry_after| retry_after > now))
+    }
+
+    /// Test seam: end the steady removal back-off now, as if its wait had
+    /// passed, keeping the idle streak.
+    #[cfg(test)]
+    pub(crate) fn end_steady_removal_back_off_for_test(&mut self) {
+        self.artifact_sweep_meta_set(ARTIFACT_WORKER_STEADY_REMOVAL_RETRY_AFTER_KEY, "")
+            .unwrap();
     }
 
     /// [`Self::run_capacity_removal_slice_with`] for the worker: a failure
@@ -8125,10 +8333,13 @@ impl Broker {
         }
     }
 
-    /// One bounded closed-checkout removal slice of the detached worker,
-    /// when registered checkouts are at three quarters of the limit. The
-    /// worker already runs at background priority and holds the host's
-    /// single-deleter slot. Before each pass it yields to a foreground
+    /// One bounded closed-checkout removal slice of the detached worker.
+    /// With registered checkouts at three quarters of the limit it runs
+    /// with [`CapacitySliceLimits`] as given (trigger `pressure`); otherwise
+    /// it is the steady removal of landed checkouts (trigger `steady`): the
+    /// priority lane and a short stretch of the lap, within the steady
+    /// allowance, and the same proofs. The worker already runs at
+    /// background priority and holds the host's single-deleter slot. Before each pass it yields to a foreground
     /// command waiting for the GC lock and waits out memory or load pressure
     /// on the unattended pacer (stopping the slice when the pressure
     /// outlasts the pacer's pause budget). Each pass removes at most one
@@ -8162,21 +8373,45 @@ impl Broker {
                 .saturating_sub(SESSION_RETIREMENT_WORKER_RESERVE)
         };
         let started = Instant::now();
-        let budget = slice_end(worker_started).min(limits.budget);
-        if budget < ARTIFACT_WORKER_CAPACITY_REMOVAL_MIN_SLICE
-            || !crate::AutoCleanupPolicy::load(self.main_root())
-                .is_ok_and(|policy| policy.auto_remove)
-            || self
-                .artifact_sweep_meta_get(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_AFTER_KEY)?
-                .and_then(|value| value.parse::<i64>().ok())
-                .is_some_and(|retry_after| retry_after > now_ms())
+        let mut budget = slice_end(worker_started).min(limits.budget);
+        let now = now_ms();
+        if !crate::AutoCleanupPolicy::load(self.main_root()).is_ok_and(|policy| policy.auto_remove)
         {
             return Ok(None);
         }
+        let recorded_pressure = self.recorded_checkout_capacity_pressure_at_current_limit();
+        let pressure_retry_pending =
+            self.removal_retry_pending(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_AFTER_KEY, now)?;
+        // Before counting: under recorded pressure only the pressure retry
+        // gates the slice, as it always did; otherwise only the steady
+        // trigger can be due, and nothing is counted unless it is.
+        let due_before_count = if recorded_pressure {
+            !pressure_retry_pending
+        } else {
+            self.steady_removal_due(now)?
+        };
+        if !due_before_count {
+            return Ok(None);
+        }
+        if budget < ARTIFACT_WORKER_CAPACITY_REMOVAL_MIN_SLICE {
+            if !recorded_pressure {
+                // Due but no time left in this run: do not let the next
+                // broker open respawn the worker for it at once.
+                self.defer_steady_removal(ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS)?;
+            }
+            return Ok(None);
+        }
         // The worker can afford a fresh count; it also refreshes the
-        // recorded one that broker opens read.
+        // recorded one that broker opens read. Only the registrations are
+        // read; under recorded pressure an unreadable registration directory
+        // falls back to the full count as before, and without pressure the
+        // slice goes on without a count rather than listing every checkout.
         let count_started = Instant::now();
-        let usage = self.worktree_checkout_usage_from_registrations();
+        let usage = match self.registered_checkout_usage() {
+            Some(usage) => Ok(usage),
+            None if self.recorded_checkout_capacity_pressure() => self.worktree_checkout_usage(),
+            None => Ok(None),
+        };
         let count_ms = u64::try_from(count_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         crate::phase_telemetry::add(
             "artifact_worker_capacity_removal_count",
@@ -8184,11 +8419,41 @@ impl Broker {
         );
         match usage {
             Ok(Some((count, maximum))) => self.record_checkout_usage(count, maximum),
-            Ok(None) | Err(_) => return Ok(None),
+            // No limit configured: there is never pressure, but landed
+            // checkouts still go.
+            Ok(None) => {}
+            Err(_) => {
+                if !recorded_pressure {
+                    self.defer_steady_removal(ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS)?;
+                }
+                return Ok(None);
+            }
         }
-        if !self.recorded_checkout_capacity_pressure() {
+        // The fresh count, against the limit configured now, picks the
+        // trigger; a count recorded against another limit (or with the limit
+        // since disabled) never makes a slice `pressure`.
+        let trigger = if self.recorded_checkout_capacity_pressure_at_current_limit() {
+            CheckoutRemovalTrigger::Pressure
+        } else {
+            CheckoutRemovalTrigger::Steady
+        };
+        let due = match trigger {
+            CheckoutRemovalTrigger::Pressure => !pressure_retry_pending,
+            // Already proved due unless the count just ended pressure.
+            CheckoutRemovalTrigger::Steady => !recorded_pressure || self.steady_removal_due(now)?,
+        };
+        if !due {
             return Ok(None);
         }
+        if trigger == CheckoutRemovalTrigger::Steady {
+            self.artifact_sweep_meta_set(
+                ARTIFACT_WORKER_STEADY_REMOVAL_LAST_RUN_KEY,
+                &now.to_string(),
+            )?;
+        }
+        let limits = limits.for_trigger(trigger);
+        budget = budget.min(limits.budget);
+        crate::phase_telemetry::add(trigger.telemetry_phase(), Duration::ZERO);
         let main_root = self.main_root().to_path_buf();
         // Nothing the slice does, pacer waits included, runs past this.
         let slice_deadline = started + budget;
@@ -8210,6 +8475,9 @@ impl Broker {
         let mut removal_failures = 0usize;
         let mut examined = 0usize;
         let mut selected = 0usize;
+        let mut priority_examined = 0usize;
+        let mut priority_removed = 0usize;
+        let mut lap_removed = 0usize;
         let mut scan_ms = 0u64;
         let mut selection_ms = 0u64;
         let mut apply_ms = 0u64;
@@ -8265,6 +8533,7 @@ impl Broker {
                     remaining.min(limits.pass_budget),
                     Some(1),
                     true,
+                    trigger.selection(),
                 )
             };
             let pass_elapsed = pass_started.elapsed();
@@ -8301,6 +8570,14 @@ impl Broker {
                 inventory_wait = pass_lanes.removal_inventory_wait;
             }
             let removed_now = pass.removed.len();
+            priority_examined += pass_lanes.removal_priority_examined;
+            // A pass selects one checkout at most: a removal belongs to the
+            // lane that selected it.
+            if pass_lanes.removal_priority_selected > 0 {
+                priority_removed += removed_now;
+            } else {
+                lap_removed += removed_now;
+            }
             // A pass that selected a checkout and removed nothing: it was kept
             // or deferred at the last step.
             if removed_now == 0 && pass_lanes.removal_selected > 0 {
@@ -8412,38 +8689,99 @@ impl Broker {
         // same held lock.
         let lock_contended = lock_busy || yielded;
         let selection_ran = capacity_slice_selection_ran(passes, lock_contended);
-        let mut retry_ms = capacity_removal_retry_ms(
-            removed,
-            lock_contended,
-            lap_unfinished,
-            progressed,
-            selection_ran,
-        );
-        // Consecutive slices that never reached selection back off (1, 2, 4,
-        // 8, then 10 minutes); any slice that reaches selection resets it.
-        let streak = self
-            .artifact_sweep_meta_get(ARTIFACT_WORKER_CAPACITY_REMOVAL_OUT_OF_TIME_STREAK_KEY)?
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(0);
-        if stop != CapacitySliceStop::PacerBackoff
-            && slice_made_no_progress(removed, selection_ran, inventory_unavailable, progressed)
-        {
-            let streak = streak.saturating_add(1);
-            retry_ms = Some(out_of_time_retry_ms(streak));
-            self.artifact_sweep_meta_set(
-                ARTIFACT_WORKER_CAPACITY_REMOVAL_OUT_OF_TIME_STREAK_KEY,
-                &streak.to_string(),
-            )?;
-        } else if streak != 0 {
-            self.artifact_sweep_meta_set(
-                ARTIFACT_WORKER_CAPACITY_REMOVAL_OUT_OF_TIME_STREAK_KEY,
-                "",
-            )?;
-        }
-        let retry_ms = capacity_stop_retry_ms(stop, retry_ms, removed, kept_only_passes, unpaid);
+        let mut idle_streak = 0u32;
+        let retry_ms = match trigger {
+            CheckoutRemovalTrigger::Pressure => {
+                let mut retry_ms = capacity_removal_retry_ms(
+                    removed,
+                    lock_contended,
+                    lap_unfinished,
+                    progressed,
+                    selection_ran,
+                );
+                // Consecutive slices that never reached selection back off
+                // (1, 2, 4, 8, then 10 minutes); any slice that reaches
+                // selection resets it.
+                let streak = self
+                    .artifact_sweep_meta_get(
+                        ARTIFACT_WORKER_CAPACITY_REMOVAL_OUT_OF_TIME_STREAK_KEY,
+                    )?
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or(0);
+                if stop != CapacitySliceStop::PacerBackoff
+                    && slice_made_no_progress(
+                        removed,
+                        selection_ran,
+                        inventory_unavailable,
+                        progressed,
+                    )
+                {
+                    let streak = streak.saturating_add(1);
+                    retry_ms = Some(out_of_time_retry_ms(streak));
+                    self.artifact_sweep_meta_set(
+                        ARTIFACT_WORKER_CAPACITY_REMOVAL_OUT_OF_TIME_STREAK_KEY,
+                        &streak.to_string(),
+                    )?;
+                } else if streak != 0 {
+                    self.artifact_sweep_meta_set(
+                        ARTIFACT_WORKER_CAPACITY_REMOVAL_OUT_OF_TIME_STREAK_KEY,
+                        "",
+                    )?;
+                }
+                capacity_stop_retry_ms(stop, retry_ms, removed, kept_only_passes, unpaid)
+            }
+            CheckoutRemovalTrigger::Steady => {
+                // Removing nothing, for whatever reason short of a held
+                // lock, lengthens the wait (5, 10, 20, then 30 minutes); a
+                // removal resets it.
+                let previous = self
+                    .artifact_sweep_meta_get(ARTIFACT_WORKER_STEADY_REMOVAL_IDLE_STREAK_KEY)?
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or(0);
+                idle_streak = if removed > 0 {
+                    0
+                } else if lock_contended {
+                    previous
+                } else {
+                    previous.saturating_add(1)
+                };
+                if idle_streak != previous {
+                    self.artifact_sweep_meta_set(
+                        ARTIFACT_WORKER_STEADY_REMOVAL_IDLE_STREAK_KEY,
+                        &idle_streak.to_string(),
+                    )?;
+                }
+                let base = steady_removal_retry_ms(removed, lock_contended, idle_streak.max(1));
+                let retry =
+                    capacity_stop_retry_ms(stop, Some(base), removed, kept_only_passes, unpaid);
+                // A wait a stop forced is not shortened by a new landing.
+                let hard = lock_contended
+                    || matches!(
+                        stop,
+                        CapacitySliceStop::PacerBackoff
+                            | CapacitySliceStop::RemovalFailures
+                            | CapacitySliceStop::Failed
+                            | CapacitySliceStop::SliceDeadline
+                    );
+                let hard_retry_after = retry
+                    .filter(|_| hard)
+                    .map(|wait| now_ms().saturating_add(wait).to_string())
+                    .unwrap_or_default();
+                self.artifact_sweep_meta_set(
+                    ARTIFACT_WORKER_STEADY_REMOVAL_HARD_RETRY_AFTER_KEY,
+                    &hard_retry_after,
+                )?;
+                retry
+            }
+        };
         let retry_after_ms = retry_ms.map(|wait| now_ms().saturating_add(wait));
         self.artifact_sweep_meta_set(
-            ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_AFTER_KEY,
+            match trigger {
+                CheckoutRemovalTrigger::Pressure => {
+                    ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_AFTER_KEY
+                }
+                CheckoutRemovalTrigger::Steady => ARTIFACT_WORKER_STEADY_REMOVAL_RETRY_AFTER_KEY,
+            },
             &retry_after_ms.map(|at| at.to_string()).unwrap_or_default(),
         )?;
         crate::phase_telemetry::add(
@@ -8452,6 +8790,26 @@ impl Broker {
         );
         for _ in 0..removed.min(4096) {
             crate::phase_telemetry::add("artifact_worker_capacity_removed", Duration::ZERO);
+        }
+        let lap_examined = examined.saturating_sub(priority_examined);
+        for (phase, count) in [
+            (
+                "artifact_worker_capacity_removal_priority_examined",
+                priority_examined,
+            ),
+            (
+                "artifact_worker_capacity_removal_priority_removed",
+                priority_removed,
+            ),
+            (
+                "artifact_worker_capacity_removal_lap_examined",
+                lap_examined,
+            ),
+            ("artifact_worker_capacity_removal_lap_removed", lap_removed),
+        ] {
+            for _ in 0..count.min(4096) {
+                crate::phase_telemetry::add(phase, Duration::ZERO);
+            }
         }
         let outcome = if removed > 0 {
             "removed"
@@ -8499,6 +8857,12 @@ impl Broker {
             |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
         let mut slice = crate::auto_cleanup::CapacityRemovalSlice::from_report(combined.as_ref());
         slice.evaluated_at_ms = now_ms();
+        slice.trigger = trigger.as_str().to_string();
+        slice.priority_examined = priority_examined;
+        slice.priority_removed = priority_removed;
+        slice.lap_examined = lap_examined;
+        slice.lap_removed = lap_removed;
+        slice.idle_streak = idle_streak;
         slice.outcome = outcome.to_string();
         slice.stop_reason = Some(stop.as_str().to_string());
         slice.removal_cap = limits.removals;
@@ -8549,12 +8913,13 @@ impl Broker {
         }
         self.record_capacity_removal_slice(&slice)?;
         self.write_artifact_sweep_worker_status(&format!(
-            "capacity_removal removed={removed} kept={} deferred={} examined={examined} lock_busy={lock_busy} paced_ms={} elapsed_ms={} outcome={outcome} stop={}",
+            "capacity_removal removed={removed} kept={} deferred={} examined={examined} lock_busy={lock_busy} paced_ms={} elapsed_ms={} outcome={outcome} stop={} trigger={}",
             slice.kept,
             slice.deferred,
             slice.paced_ms,
             slice.elapsed_ms,
-            stop.as_str()
+            stop.as_str(),
+            trigger.as_str()
         ))?;
         match failure {
             Some(error) => Err(error),
@@ -8631,6 +8996,31 @@ impl Broker {
                 )?;
                 return Ok(());
             }
+            // A retirement pass takes the GC lock too: let a waiting
+            // foreground command (`start` at the checkout limit, `gc apply`)
+            // have it first, and give up the rest of this tranche when it is
+            // still waiting.
+            let root = self.main_root().to_path_buf();
+            let waited = wait_out_foreground_gc_lock_waiter(
+                &root,
+                remaining
+                    .unwrap_or(GC_LOCK_FOREGROUND_WAIT)
+                    .min(GC_LOCK_FOREGROUND_WAIT),
+                "session_retirement_yielded_to_foreground",
+            );
+            if !waited.is_zero() && foreground_gc_lock_waiter(&root).is_some() {
+                if let Some(reason) = continuation_reason.take() {
+                    aggregate.deferred = aggregate.deferred.saturating_add(1);
+                    aggregate.retirement_deferred_reasons.push(reason);
+                }
+                self.record_auto_cleanup_report(&aggregate)?;
+                self.defer_session_retirement_request(
+                    request_generation,
+                    &format!("session_retirement_yielded_to_foreground passes={passes}"),
+                )?;
+                return Ok(());
+            }
+            let remaining = remaining.map(|remaining| remaining.saturating_sub(waited));
             passes = passes.saturating_add(1);
             let pass_budget = remaining
                 .map(|remaining| remaining.min(SESSION_RETIREMENT_WORKER_PASS_BUDGET))
@@ -12184,6 +12574,43 @@ mod tests {
         drop(lock);
     }
 
+    /// Steady removal waits a minute after a removal, briefly after a held
+    /// lock, and 5, 10, 20, then at most 30 minutes after slices in a row
+    /// that removed nothing.
+    #[test]
+    fn steady_removal_backs_off_on_a_ladder_and_keeps_its_smaller_limits() {
+        assert_eq!(steady_removal_retry_ms(1, false, 3), 60_000);
+        assert_eq!(
+            steady_removal_retry_ms(0, true, 3),
+            ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS
+        );
+        let ladder = (1..=6)
+            .map(|streak| steady_removal_retry_ms(0, false, streak) / 60_000)
+            .collect::<Vec<_>>();
+        assert_eq!(ladder, vec![5, 10, 20, 30, 30, 30]);
+        let steady = CapacitySliceLimits::WORKER.for_trigger(CheckoutRemovalTrigger::Steady);
+        assert_eq!(steady.removals, 4);
+        assert_eq!(steady.kept_only_passes, 2);
+        assert_eq!(steady.budget, Duration::from_secs(60));
+        assert_eq!(steady.pass_budget, CapacitySliceLimits::WORKER.pass_budget);
+        assert_eq!(
+            CapacitySliceLimits::WORKER.for_trigger(CheckoutRemovalTrigger::Pressure),
+            CapacitySliceLimits::WORKER,
+            "pressure keeps the capacity limits"
+        );
+        // A pacer back-off or repeated failed removals still wait ten minutes.
+        assert_eq!(
+            capacity_stop_retry_ms(
+                CapacitySliceStop::RemovalFailures,
+                Some(steady_removal_retry_ms(0, false, 1)),
+                0,
+                0,
+                Duration::ZERO,
+            ),
+            Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS)
+        );
+    }
+
     /// A temporary repository root with a real `.aethyme` directory.
     #[cfg(unix)]
     fn waiter_root() -> tempfile::TempDir {
@@ -14316,6 +14743,73 @@ mod tests {
             (request_generation, request_generation),
             "the worker completes only the queued generation"
         );
+    }
+
+    /// A retirement pass takes the GC lock too: while a foreground command
+    /// waits for it, the retirement worker gives the rest of its tranche up
+    /// instead of taking the lock, and the request stays for a later run.
+    #[cfg(unix)]
+    #[test]
+    fn session_retirement_yields_to_a_waiting_foreground_command() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nsession_abandoned_after_hours = 72\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        let stale = broker
+            .start_worktree("retirement yields to a waiter", None)
+            .unwrap();
+        age_open_session_for_retirement(&mut broker, stale.id, Path::new(&stale.worktree_path));
+        broker
+            .store()
+            .meta_set(
+                SESSION_RETIREMENT_STATE_KEY,
+                &serde_json::to_string(&SessionRetirementRequestState::default()).unwrap(),
+            )
+            .unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_STAMP_KEY, &now_ms().to_string())
+            .unwrap();
+        let policy = load_retention_policy(root).unwrap();
+        let lock = GcLock::acquire(root).unwrap();
+        broker
+            .sweep_artifacts_autonomously_with_progress(&policy, ArtifactSweepScope::Inline)
+            .unwrap();
+        drop(lock);
+        let request_generation = broker.session_retirement_request_state().unwrap().0;
+        assert!(request_generation > 0);
+
+        let mut waiter = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let waiters = gc_lock_waiters_dir(root, true).unwrap();
+        std::fs::write(waiters.join(waiter.id().to_string()), b"").unwrap();
+        let result = broker.run_session_retirement_recovery_worker_loop(
+            request_generation,
+            Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
+            Some(Duration::from_millis(600)),
+        );
+        let _ = waiter.kill();
+        let _ = waiter.wait();
+        result.unwrap();
+        assert_ne!(
+            broker.store().session(stale.id).unwrap().cleanup_state,
+            crate::SessionCleanupState::Closed,
+            "no retirement pass ran while the command waited"
+        );
+        let (requested, completed) = broker.session_retirement_request_state().unwrap();
+        assert_eq!(requested, request_generation);
+        assert!(completed < request_generation, "the request stays");
     }
 
     #[test]

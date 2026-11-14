@@ -213,8 +213,39 @@ file no line can release carries `config_refusal` instead: a protected name
 one row. The `cleanup.checkout-capacity` row repeats the top five in its
 evidence.
 
-From three quarters of the limit the background worker also removes closed
-checkouts itself: a removal slice of up to 120 seconds before its other work
+The background worker removes closed checkouts whose work has landed itself,
+whether or not the repository is near its limit, so the checkout count follows
+merges instead of drifting up to `[worktrees].max_checkouts`. Each slice
+records its `trigger`:
+
+- `steady` (below three quarters of the limit, or no limit set): a slice of up
+  to 60 seconds that removes at most four checkouts. It ends as soon as a pass
+  selects nothing, and after two passes whose selected checkout was kept or
+  deferred at the last step. Each pass judges the priority lane first (closed
+  checkouts whose pull request is recorded merged or whose cleanup request is
+  past its grace, see below; this only orders them, every proof still
+  applies), then at most 16 closed checkouts of the oldest-first lap from its
+  stored cursor, so old landed checkouts no merge signal names are reached
+  too, more slowly. After a slice that removed a checkout the next steady
+  slice may run a minute later; after a slice that removed nothing it waits 5
+  minutes, then 10, 20 and at most 30 minutes while slices keep finding
+  nothing (`idle_streak`), and a removal resets the wait. A cleanup request
+  whose grace ends after the last steady slice ends that wait at once. A slice
+  stopped by memory or load pressure, failed removals or a held lock keeps
+  its wait (1 to 10 minutes) whatever lands. Steady removal is due only while
+  a closed session still holds its checkout. No full checkout listing runs:
+  the count reads only the repository's checkout registrations.
+- `pressure` (from three quarters of the limit): the capacity limits described
+  next.
+
+Every proof, keep code, artifact-use marker, the GC lock and its gap, the
+yield to a waiting foreground command, the memory and load gate before each
+pass and the unattended pacer apply to both triggers alike; the trigger
+changes only when and how much removal runs, never what is removable.
+`[cleanup] auto_remove = false` turns both off.
+
+From three quarters of the limit the worker's removal slice runs with the
+capacity limits: a removal slice of up to 120 seconds before its other work
 and between its cache passes, each of which holds the GC lock for at most 30
 seconds. When the cache lane is due, capacity slices leave it at least 90
 seconds of every worker run. A slice removes one checkout per pass, at most
@@ -234,8 +265,8 @@ the checkout limit, `gc apply`, `gc abandon` or `gc forget-abandoned` waits
 for it (up to 30 seconds) the worker takes it again neither for a removal
 pass nor for a cache pass. A broker open resuming a confirmed GC journal does
 not wait. A slice ends as soon as a pass selects nothing.
-A slice that removes nothing waits 10 minutes before pressure alone
-starts another once its lap of closed checkouts has ended; one that finds the
+Under pressure, a slice that removes nothing waits 10 minutes before
+pressure alone starts another once its lap of closed checkouts has ended; one that finds the
 GC lock held, or yields it, waits 1 minute, and one that moved the
 lap forward but ran out of time before its end waits 20 seconds. A slice first finishes the checkout path index if another
 lane left it mid-lap, so a long index lap no longer leaves selection without
@@ -262,13 +293,19 @@ where the time went; `stop_reason` says why the slice stopped (`cap`,
 `budget`, `pacer_backoff`, `slice_deadline`, `yielded_to_foreground`,
 `nothing_selected`, `kept_only_limit`, `lock_busy`, `failed` or
 `removal_failures`) and
-`retry_in_ms` the wait it chose. Broker opens too short to count checkouts read the count
+`retry_in_ms` the wait it chose. `trigger` says which trigger ran the slice
+(`steady` or `pressure`), `priority_examined` / `priority_removed` and
+`lap_examined` / `lap_removed` split its work between the priority lane and
+the lap, and `idle_streak` counts steady slices in a row that removed nothing.
+A slice stops after Git failed to remove two checkouts it had started
+deleting (`removal_failures`), and waits 10 minutes. Broker opens too short to count checkouts read the count
 `broker start` last recorded. Within the removal lane, selection uses at most
 three quarters of the budget, so revalidation and the first removal always
 have time (`auto_cleanup.lanes.removal_selected` and
 `removal_apply_reserve_ms`).
 
-Under capacity pressure each removal pass first judges up to eight closed
+In the worker's removal slices (both triggers), and in any pass under
+capacity pressure, each removal pass first judges up to eight closed
 checkouts most likely removable now: those whose pull request is recorded
 merged, most recently merged first, then those whose cleanup request is past
 its grace, most recently closed first. Every proof still applies; one kept this
@@ -370,14 +407,24 @@ re-proof counts `auto_cleanup_ownership_reproved`, `_reproof_refused` and
 `finish_` prefix for GC and `finish`, and one
 `ownership_reproof_refused_<reason>` counter per refusal reason.
 
-The background worker's capacity removal slices add the counters
+The background worker's removal slices add the counters
 `artifact_worker_capacity_removed`, `artifact_worker_capacity_removal_lock_busy`,
+`artifact_worker_capacity_removal_trigger_steady` and `_trigger_pressure` (one
+per slice that ran), `artifact_worker_steady_removal_deferred` (a run due for
+steady removal that could not reach its slice),
+`artifact_worker_capacity_removal_priority_examined`,
+`_priority_removed`, `_lap_examined` and `_lap_removed`,
 `artifact_worker_capacity_removal_failed`,
 `artifact_worker_capacity_removal_outcome_<outcome>` and
 `artifact_worker_capacity_removal_stop_<stop_reason>`, and the timed phases
 `artifact_worker_capacity_removal_paced`, `_lock_held`, `_lock_wait`,
 `_lock_yield`, `_pressure_wait`, `_git_removal`, `_retry` and
-`_cache_lane_reserved`, plus `artifact_worker_cache_yielded_to_foreground`. The
+`_cache_lane_reserved` (the count and the scan, selection and apply times
+are `_count`, `_scan`, `_selection` and `_apply`), plus
+`artifact_worker_cache_yielded_to_foreground` and
+`session_retirement_yielded_to_foreground` (time the retirement worker waited
+for a foreground command waiting on the GC lock; when it is still waiting the
+retirement request is deferred). The
 worker writes one `command-metrics.jsonl` row per run with these.
 
 The background worker's pace, priority, host-wide single deleter and pressure

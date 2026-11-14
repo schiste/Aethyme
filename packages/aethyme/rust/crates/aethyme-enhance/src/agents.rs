@@ -598,12 +598,13 @@ user has authorized that exception. Re-adoption invalidates old cleanup plans;
 never apply a retirement plan made for the previous owner of that path.
 
 Raising `[worktrees] max_checkouts` is a stopgap: it delays a `broker start`
-refusal and reclaims nothing. Closed checkouts are removed automatically from
-three quarters of the limit, in background slices of up to 120 seconds;
+refusal and reclaims nothing. Closed checkouts whose work landed are removed
+automatically in the background whether or not the repository is near the
+limit (`trigger` `steady` below three quarters of it, `pressure` from there);
 `broker start` at the limit, `gc apply`, `gc abandon` and `gc forget-abandoned`
 wait up to 30 seconds for the GC lock, and the worker steps aside while they
 wait. When the count still grows, read `capacity_removal` in
-`aethyme broker status --json` (`outcome`, `stop_reason`, `kept_by_code`,
+`aethyme broker status --json` (`trigger`, `outcome`, `stop_reason`, `kept_by_code`,
 `blocked_by_ignored`) and fix the most common keep code. For ignored output,
 add the reported `config_line` to `[cleanup] regenerable` only when the path
 holds nothing but output its tools regenerate; a `config_refusal` means no
