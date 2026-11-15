@@ -4,6 +4,23 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.103] - 2026-11-15
+
+### Changed
+
+- Background checkout removal judges much faster. Checkouts still inside their closed-worktree grace or used by an open session are kept without running Git. Keeps for uncommitted changes, unmarked tracked deletions and commits not on the default branch are remembered until the checkout or the default branch changes, and are re-proved within 7 days. Selection runs one verdict per checkout instead of two. No removal proof changed, and removal still re-reads and re-proves everything under its locks (#1692).
+- The oldest-first lap and the priority lane take turns, so the lap advances in every pass. A pass that removed nothing leaves the GC lock free for 500 ms instead of as long as it ran. A worker run keeps taking steady slices while the lap is unfinished, within its existing run budget (#1692).
+- `capacity_removal.idle_streak` reads 0 while the lap is unfinished; the back-off streak is reported as `empty_laps` (#1692).
+
+### Added
+
+- `capacity_removal` gains `check_timings` (count and milliseconds per check kind), `groups_judged_per_min`, `memo_hits`, `db_in_grace`, `db_session_open`, `priority_db_skips`, `continued` and `empty_laps`. Timed phases `auto_cleanup_check_<kind>`, counters `auto_cleanup_db_kept_*`, `auto_cleanup_memo_hit_<code>` and `artifact_worker_capacity_removal_continued`, and the timed phase `artifact_worker_host_slot_held` (#1692).
+
+### Known issues
+
+- The worker holds the host-wide deleter slot for its whole run, judging included, so other repositories' workers wait longer behind a run that now lasts up to five minutes.
+- While a worker run is judging, a session close can print "wake post-close checkout cleanup" more often. The cleanup request is already stored and is picked up by the next pass.
+
 ## [0.8.102] - 2026-11-15
 
 ### Changed
