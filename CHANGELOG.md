@@ -4,6 +4,17 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.99] - 2026-11-15
+
+### Fixed
+
+- Steady checkout removal keeps judging the closed-checkout lap within a slice while it moves, and starts its idle back-off (5 to 30 minutes) only after a full lap found nothing removable; an unfinished lap resumes a minute later. In 0.8.97 a slice stopped at the first pass that selected nothing and backed off with most of the lap unjudged, so nothing was removed on a repository with many kept checkouts (#1684).
+- The priority lane no longer re-judges a checkout kept for a reason only a state change can lift (unproven, legacy or adopted-only ownership, a missing directory, listed ignored leftovers) until its sessions, merged state or files change. Those checkouts filled the eight priority slots every run. Transient keeps (`gate_running`, `in_grace`, a held lease) are still retried (#1684).
+
+### Added
+
+- `capacity_removal` gains `lap_completed`, `priority_memo_skips` and `memo_skips`, and the stop reason `lap_complete`; `auto_cleanup.lanes` gains `removal_priority_memo_skips`. Counters `artifact_worker_capacity_removal_{pass,priority_memo_skips,memo_skips,lap_completed,stop_lap_complete}` and `auto_cleanup_priority_memo_skip` (#1684).
+
 ## [0.8.98] - 2026-11-15
 
 ### Fixed
