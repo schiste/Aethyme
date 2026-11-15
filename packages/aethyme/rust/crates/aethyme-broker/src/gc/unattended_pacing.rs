@@ -1035,6 +1035,41 @@ mod tests {
         assert_eq!(summary.entries_removed, 0);
     }
 
+    /// Memory pressure and elevated load in the same sample are handled as
+    /// memory pressure: a hard stop that spends the memory pause budget and
+    /// backs off, never a bounded load wait that proceeds throttled.
+    #[test]
+    fn memory_and_load_in_the_same_sample_is_a_memory_back_off() {
+        let both = PressureSample {
+            memory_elevated: Some(true),
+            load_elevated: Some(true),
+        };
+        let clock = FakeClock::new();
+        let mut pacer = UnattendedPacer::new(
+            UnlinkRate::Limited(1_000),
+            Box::new(clock.clone()),
+            Box::new(Scripted {
+                samples: vec![both],
+                reads: Rc::new(Cell::new(0)),
+            }),
+        );
+        assert_eq!(pacer.pressure_check(None), PressureVerdict::MemoryBackoff);
+        assert_eq!(clock.slept.get(), MAX_PRESSURE_PAUSE_PER_RUN);
+        assert!(
+            !pacer.before_unlink(None),
+            "no unlink under memory pressure"
+        );
+        let charge = pacer.charge_bulk(1_000, Duration::ZERO, None);
+        assert!(charge.memory_backoff, "{charge:?}");
+        assert_eq!((charge.credited, charge.charged), (0, 0));
+        let summary = pacer.summary(0);
+        assert_eq!(summary.memory_pause_ms, 120_000);
+        assert_eq!(summary.load_pause_ms, 0);
+        assert_eq!(summary.load_throttled, 0);
+        assert_eq!(summary.pressure_yields, 3);
+        assert_eq!(summary.entries_removed, 0);
+    }
+
     fn sustained_load() -> Box<dyn PressureSignal> {
         Box::new(Scripted {
             samples: vec![PressureSample {

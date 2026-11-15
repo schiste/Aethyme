@@ -291,10 +291,16 @@ with nothing more removed and no further slice for 10 minutes
 load average is above twice the core count (or Linux I/O pressure is high)
 the check waits at most 5 seconds, then the pass runs anyway, the slice
 removes at most one checkout (`load_throttled`) and the next slice keeps the
-normal cadence; the charge after the removal waits at most 1 second per
+normal cadence but comes no sooner than 30 seconds later (under capacity
+pressure it would otherwise run at once; `throttle_gap_ms` says what the
+gap added); the charge after the removal waits at most 1 second per
 256-entry batch on top of the rate limit. A slice that pressure kept from
 running any pass records `pressure_before_selection` and retries after 10
-minutes for memory, 1 minute for load alone. Between passes the lock stays
+minutes when memory pressure stopped it, or after 1 minute when it reached
+its pressure check with at least the 5-second minimum slice left and the
+bounded load wait left too little for a pass. A slice whose budget went on
+counting or other pre-selection work, or whose pass failed, keeps
+`out_of_time_before_selection` (or `failed`) whatever load it saw. Between passes the lock stays
 free at least as long as the last pass held it, and while `broker start` at
 the checkout limit, `gc apply`, `gc abandon` or `gc forget-abandoned` waits
 for it (up to 30 seconds) the worker takes it again neither for a removal

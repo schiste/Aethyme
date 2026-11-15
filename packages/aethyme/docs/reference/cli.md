@@ -439,6 +439,9 @@ in `gc plan --json`; absent until a slice has run). Its main fields are
 `nothing_selected`, `lap_complete`, `kept_only_limit`, `lock_busy`, `failed`
 or `removal_failures`; older records may say `pacer_backoff`),
 `pressure_seen` (`memory`, `load` or `memory_and_load`), `throttled`,
+`throttle_gap_ms`, the worker run so far (`run_slices`, `run_removed`,
+`run_elapsed_ms`, `run_deleting_ms`, `run_waiting_ms`, `run_deleting_pct`,
+`run_waiting_pct`),
 `removed`, `kept`, `deferred`, `kept_by_code`, `blocked_by_ignored`,
 `retry_in_ms`, the time split (`scan_ms`, `selection_ms`, `apply_ms`,
 `paced_ms`, `lock_held_ms`, `lock_wait_ms`, `lock_yield_ms`,
@@ -454,7 +457,7 @@ or nothing identifies where it runs; `kept[].gate_keep` is `own_session`,
 `path` or `unknown_owner`. Memory pressure stops a slice (`memory_backoff`,
 10-minute retry); a load average above twice the core count only throttles it
 to one removal after a wait of at most 5 seconds (`load_throttled`, normal
-cadence);
+cadence, at least 30 seconds before the next slice);
 "Checkout count keeps growing" in
 [troubleshooting](../guides/troubleshooting.md) walks from that record to the fix for each keep code.
 `broker start` at the limit, `broker gc apply`, `broker gc abandon` and

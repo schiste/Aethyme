@@ -250,7 +250,9 @@ is fine. While the one-minute load average is above twice the core count (or,
 on Linux, I/O pressure is high) the worker waits at most a few seconds for it
 to clear (5 seconds before a checkout removal, 1 second per batch of 256
 files) and then goes on: a checkout removal slice removes one checkout and
-the next slice runs at the normal cadence, and file deletion runs at about a
+the next slice runs at the normal cadence but at least 30 seconds later, so
+workers do not remove back to back while load stays high, and file deletion
+runs at about a
 fifth of the configured rate (about 200 files a second at the default).
 
 ```toml
