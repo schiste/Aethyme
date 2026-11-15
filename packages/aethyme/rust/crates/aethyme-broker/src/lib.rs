@@ -259,6 +259,7 @@ mod review_trigger;
 mod rule_comments;
 mod schema;
 mod session_abandonment;
+mod session_auto_close;
 mod session_push;
 mod session_sync;
 mod shared_edit_advice;

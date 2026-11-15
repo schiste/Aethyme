@@ -29,6 +29,8 @@ mod advisories_cli;
 mod artifact_claim_cli;
 #[path = "auto_cleanup.rs"]
 mod auto_cleanup;
+#[path = "auto_close_cli.rs"]
+mod auto_close_cli;
 #[path = "base_incidents_cli.rs"]
 mod base_incidents_cli;
 #[path = "blockers_cli.rs"]

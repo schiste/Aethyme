@@ -3003,7 +3003,17 @@ fn acquire_session_operation_context(
         Some(session_id) => session_id,
         None => match store.session_for_worktree(checkout.root().to_string_lossy().as_ref())? {
             Some(session) => session.id,
-            None => return Ok(None),
+            None => {
+                // Closed sessions do not resolve from their checkout. When the
+                // broker closed this one itself, say so; the command goes on.
+                if let Some(notice) = crate::session_auto_close::closed_checkout_notice(
+                    &store,
+                    checkout.root().to_string_lossy().as_ref(),
+                ) {
+                    eprintln!("note: {notice}");
+                }
+                return Ok(None);
+            }
         },
     };
     match store.session(session_id) {
@@ -3037,9 +3047,11 @@ fn acquire_session_operation_context(
     let session_open =
         current.cleanup_state == crate::SessionCleanupState::Open && !current.status.is_closed();
     if !session_open && !allow_closed {
-        return Err(UsageError::Message(format!(
-            "session {session_id} is already closed; it cannot start new session work"
-        )));
+        // Names an automatic close and how to continue, when the broker
+        // closed the session itself.
+        return Err(UsageError::Message(
+            crate::session_auto_close::closed_session_refusal(&current_store, session_id),
+        ));
     }
     if parsed.session.is_none() {
         let checkout_root = checkout.root().to_string_lossy().into_owned();
