@@ -82,13 +82,18 @@ fn a_command_on_an_automatically_closed_session_names_the_close() {
         )
         .unwrap();
     let id = session.id.to_string();
-    let mut explicit = child_command(&broker, repo, &["sync", "--session", &id, "--json"]);
-    let mut from_checkout = child_command(&broker, &worktree, &["sync", "--json"]);
+    let mut explicit = child_command(&broker, repo, &["sync", "--session", &id]);
+    let mut from_checkout = child_command(&broker, &worktree, &["sync"]);
     drop(broker);
 
     let refused = explicit.output().unwrap();
     assert!(!refused.status.success());
-    let stderr = String::from_utf8_lossy(&refused.stderr);
+    // The refusal is printed on stderr, or inside the JSON error envelope.
+    let stderr = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stderr),
+        String::from_utf8_lossy(&refused.stdout)
+    );
     assert!(
         stderr.contains(&format!("the broker closed session {id} automatically")),
         "{stderr}"
@@ -100,7 +105,11 @@ fn a_command_on_an_automatically_closed_session_names_the_close() {
     // Without `--session`, the closed session does not resolve from its
     // checkout; the command runs and a note explains the close.
     let observed = from_checkout.output().unwrap();
-    let stderr = String::from_utf8_lossy(&observed.stderr);
+    let stderr = format!(
+        "{}{}",
+        String::from_utf8_lossy(&observed.stderr),
+        String::from_utf8_lossy(&observed.stdout)
+    );
     assert!(
         stderr.contains(&format!("this checkout's session {id} is closed")),
         "{stderr}"
