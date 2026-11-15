@@ -4,6 +4,17 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.101] - 2026-11-15
+
+### Fixed
+
+- Background checkout removal no longer stops on a busy machine. Since 0.8.96, when the one-minute load average stayed above twice the core count, every removal slice waited out its budget and backed off for ten minutes (`pacer_backoff`), so no checkout was removed on a machine that is always that busy, even at its checkout limit. Load now only slows removal down: the worker waits at most 5 seconds, then removes one checkout per slice at the normal cadence, and file deletion waits at most 1 second per batch on top of `[cleanup] unattended_unlinks_per_second`. Memory pressure still stops removal (`memory_backoff`, 10-minute retry) (#1687).
+- A slice that pressure kept from running any pass records `pressure_before_selection` and no longer grows the idle back-off (#1687).
+
+### Added
+
+- The removal slice record gains `memory_wait_ms`, `load_wait_ms`, `pressure_seen` and `throttled`, and the stop reasons `memory_backoff` and `load_throttled`; new records no longer write `pacer_backoff`. Every worker run's metrics row shows its host-deleter wait and pacer waits (`artifact_worker_host_deleter_wait`, `artifact_worker_pacer_memory_pause`, `artifact_worker_pacer_load_wait`, `artifact_worker_pacer_limiter_sleep`) (#1687).
+
 ## [0.8.100] - 2026-11-15
 
 ### Changed
