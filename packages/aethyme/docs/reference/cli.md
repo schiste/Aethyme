@@ -431,8 +431,16 @@ is the
 worker's last removal slice as `capacity_removal` (`auto_cleanup.capacity_removal`
 in `gc plan --json`; absent until a slice has run). Its main fields are
 `trigger` (`steady` or `pressure`), `priority_examined`, `priority_removed`,
-`lap_examined`, `lap_removed`, `idle_streak`, `passes`, `lap_completed`,
-`priority_memo_skips`, `memo_skips`, `outcome` (`removed`, `lock_busy`, `inventory_unavailable`, `lap_unfinished`,
+`lap_examined`, `lap_removed`, `idle_streak` (0 while the lap is unfinished
+and moving), `empty_laps` (the stored back-off streak), `passes`,
+`lap_completed`, `continued` (the worker run took this slice right after its
+previous one), `priority_memo_skips`, `memo_skips`, `memo_hits` (per keep
+code), `db_in_grace`, `db_session_open`, `priority_db_skips` (checkouts the
+database alone kept), `check_timings` (`{count, ms}` per check kind:
+`database`, `memo`, `inspect`, `upstream`, `sessions`, `cohort`,
+`ownership`, `live_paths`, `leases`, `gates`, `status`, `ignored`,
+`containment`, `blocker_listing`; `auto_cleanup.lanes.removal_check_timings`
+per pass), `groups_judged_per_min`, `outcome` (`removed`, `lock_busy`, `inventory_unavailable`, `lap_unfinished`,
 `out_of_time_before_selection`, `pressure_before_selection` or
 `nothing_removable`), `stop_reason` (`cap`, `budget`, `memory_backoff`,
 `load_throttled`, `slice_deadline`, `yielded_to_foreground`,
