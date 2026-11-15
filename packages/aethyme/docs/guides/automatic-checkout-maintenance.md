@@ -201,9 +201,14 @@ pull request alone is not enough.
 
 - Below three quarters of the limit (or with no limit) it runs a `steady`
   slice: at most four removals in up to 60 seconds, the priority lane first
-  and then at most 16 checkouts of the lap per pass. It is due again a minute
-  after a slice that removed something, and 5, 10, 20, then at most 30
-  minutes after slices in a row that removed nothing. A cleanup request whose
+  and then at most 16 checkouts of the lap per pass. Passes go on while the
+  lap moves and the slice's time and the usual gates allow, so one slice can
+  judge most of a lap. It is due again a minute after a slice that removed
+  something, a minute after one that removed nothing with the lap still
+  unfinished, and 5, 10, 20, then at most 30 minutes after slices in a row
+  that reached the end of the lap with nothing removed. A priority checkout
+  kept for a stable reason (ownership, a missing directory, ignored
+  leftovers) is not judged ahead of the lap again until its state changes. A cleanup request whose
   grace ends after the last steady slice makes the next one due at once, so a
   landed checkout goes within about a minute of its grace ending (the next
   broker open wakes the worker). Steady removal is due only while some closed

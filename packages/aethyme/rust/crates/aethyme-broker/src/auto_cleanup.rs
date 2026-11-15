@@ -1221,6 +1221,13 @@ pub struct AutoCleanupLanes {
     /// the priority lane or to the lap.
     #[serde(default, skip_serializing_if = "is_zero_count")]
     pub removal_priority_selected: usize,
+    /// Priority candidates the priority memo skipped in this pass: judged
+    /// within the re-judge interval with the same merged state, or kept for
+    /// a reason only a state change lifts (adopted-only or unproven
+    /// ownership, a legacy or missing spawn witness, a missing checkout
+    /// directory, ignored leftovers) with that state unchanged.
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub removal_priority_memo_skips: usize,
     /// Time the capacity-pressure probe took before selection's inventory.
     #[serde(default)]
     pub removal_probe_ms: u64,
@@ -1347,11 +1354,25 @@ pub struct CapacityRemovalSlice {
     pub lap_examined: usize,
     #[serde(default)]
     pub lap_removed: usize,
-    /// With trigger `steady`: consecutive steady slices that removed
-    /// nothing; each doubles the wait before the next (5, 10, 20, then 30
-    /// minutes). 0 after a slice that removed a checkout.
+    /// With trigger `steady`: consecutive steady slices that reached the end
+    /// of the closed-checkout lap without removing anything; each doubles
+    /// the wait before the next (5, 10, 20, then 30 minutes). A slice that
+    /// removed nothing with the lap unfinished leaves it unchanged and the
+    /// next slice is due a minute later; a removal resets it to 0.
     #[serde(default)]
     pub idle_streak: u32,
+    /// Whether the slice's passes reached the end of the closed-checkout lap
+    /// (the cursor has no group left after it in a complete index).
+    #[serde(default)]
+    pub lap_completed: bool,
+    /// Priority candidates the priority memo skipped, summed over the
+    /// slice's passes (`lanes.removal_priority_memo_skips`).
+    #[serde(default)]
+    pub priority_memo_skips: usize,
+    /// Examined checkouts kept from the remembered ignored-content verdict
+    /// without re-listing their ignored paths, summed over the passes.
+    #[serde(default)]
+    pub memo_skips: usize,
     /// `removed`; `lock_busy` (another maintenance pass held the GC lock);
     /// `inventory_unavailable` (no complete checkout inventory before the
     /// deadline); `lap_unfinished` (time ran out before the closed-checkout
@@ -1422,7 +1443,9 @@ pub struct CapacityRemovalSlice {
     /// a pass or while paying for a removal), `slice_deadline` (the slice
     /// ended mid pacer wait; `pacer_unpaid_ms` is owed before the next
     /// slice), `yielded_to_foreground` (a foreground command waited for the
-    /// GC lock), `nothing_selected` (a pass selected nothing),
+    /// GC lock), `nothing_selected` (a pass selected nothing and moved
+    /// neither the lap nor the priority lane on), `lap_complete` (steady: a
+    /// pass that selected nothing reached the end of the lap),
     /// `kept_only_limit` (its passes that removed nothing ran out),
     /// `lock_busy`, `failed` or `removal_failures` (Git failed to remove
     /// two checkouts after it had started deleting).
@@ -3141,6 +3164,87 @@ struct PriorityMemoEntry {
     /// The keep code apply recorded when it kept a selected group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     apply_code: Option<String>,
+    /// Set when selection kept the group for a reason only a change of its
+    /// state can lift ([`stable_priority_keep_code`]): the group is not
+    /// judged ahead of the lap again until that state differs. The lap
+    /// still judges it on every pass over it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stable: Option<StablePriorityKeep>,
+}
+
+/// The state a stable priority keep depended on. A difference in any part
+/// makes the group a priority candidate again.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct StablePriorityKeep {
+    /// The keep code selection gave.
+    code: String,
+    /// Each session of the group: id, origin, status and cleanup state.
+    sessions: Vec<String>,
+    /// With code `ignored_content`: the ignored roots that kept it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    blockers: Vec<String>,
+    /// Modification times of the checkout root and of each blocker and its
+    /// parent (`-` for a path that does not exist), as the keep memo takes
+    /// them: no Git, no walk.
+    fingerprint: Vec<String>,
+}
+
+impl StablePriorityKeep {
+    /// The stable keep for a group selection kept with `code`, or `None`
+    /// when the code can lift without a state change (a running gate, the
+    /// grace period, a held lease, an open file...).
+    fn for_kept_group(
+        group: &AutoCleanupCheckoutGroup,
+        code: &str,
+        blockers: &[String],
+    ) -> Option<Self> {
+        if !stable_priority_keep_code(code) || (code == "ignored_content" && blockers.is_empty()) {
+            return None;
+        }
+        Some(Self {
+            code: code.to_string(),
+            sessions: priority_group_signature(&group.sessions),
+            blockers: blockers.to_vec(),
+            fingerprint: keep_memo_fingerprint(&group.worktree, blockers),
+        })
+    }
+
+    /// Whether the state this keep depended on is unchanged for `worktree`
+    /// and its current `sessions`.
+    fn still_holds(&self, worktree: &Path, sessions: &[Session]) -> bool {
+        self.sessions == priority_group_signature(sessions)
+            && keep_memo_fingerprint(worktree, &self.blockers) == self.fingerprint
+    }
+}
+
+/// Keep codes that no running process, timer or lock can lift: ownership
+/// that cannot be proved (adopted only, a legacy or missing spawn witness,
+/// an unreadable or foreign checkout), a checkout directory that is gone, and
+/// ignored leftovers. Each lifts only when the group's sessions or the
+/// checkout's files change, which [`StablePriorityKeep`] fingerprints.
+fn stable_priority_keep_code(code: &str) -> bool {
+    matches!(
+        code,
+        "ownership_adopted_only"
+            | "ownership_witness_legacy"
+            | "ownership_witness_missing"
+            | "ownership_unproven"
+            | "checkout_missing"
+            | "ignored_content"
+    )
+}
+
+/// The part of a group's session rows a stable keep depends on.
+fn priority_group_signature(sessions: &[Session]) -> Vec<String> {
+    sessions
+        .iter()
+        .map(|session| {
+            format!(
+                "{}:{:?}:{:?}:{:?}",
+                session.id, session.origin, session.status, session.cleanup_state
+            )
+        })
+        .collect()
 }
 
 /// How selection left a priority group.
@@ -3173,9 +3277,28 @@ impl PriorityMemo {
     /// Remember a judged priority group, whatever selection made of it: a
     /// selected one that apply then keeps, or a deferred one, must not be
     /// picked first on every pass and hold the lane.
+    #[cfg(test)]
     fn remember(&mut self, path: String, merged: bool, outcome: PriorityOutcome, now_ms: i64) {
+        self.remember_with(path, merged, outcome, None, now_ms);
+    }
+
+    /// [`Self::remember`], with the stable keep a kept group got. A stable
+    /// keep is not judged ahead of the lap again until its state changes
+    /// (checked by the caller against the group, see
+    /// [`StablePriorityKeep::still_holds`]) or its merged state does; the
+    /// time limit is the keep memo's own re-proof age, far longer than a lap.
+    fn remember_with(
+        &mut self,
+        path: String,
+        merged: bool,
+        outcome: PriorityOutcome,
+        stable: Option<StablePriorityKeep>,
+        now_ms: i64,
+    ) {
+        let stable = stable.filter(|_| outcome == PriorityOutcome::Kept);
         let (wait, outcome) = match outcome {
             PriorityOutcome::Selected => (PRIORITY_REJUDGE_MS, "selected"),
+            PriorityOutcome::Kept if stable.is_some() => (KEEP_MEMO_MAX_AGE_MS, "kept"),
             PriorityOutcome::Kept => (PRIORITY_REJUDGE_MS, "kept"),
             PriorityOutcome::Deferred => (PRIORITY_DEFER_MS, "deferred"),
         };
@@ -3187,6 +3310,7 @@ impl PriorityMemo {
                 retry_at_ms: now_ms.saturating_add(wait),
                 outcome: outcome.into(),
                 apply_code: None,
+                stable,
             },
         );
     }
@@ -4932,15 +5056,17 @@ impl Broker {
     /// Up to [`PRIORITY_GROUPS_PER_PASS`] complete closed-checkout groups
     /// most likely removable now (see `cleanup_cohort_priority_groups` in the
     /// store), skipping one
-    /// judged within [`PRIORITY_REJUDGE_MS`] with the same merged state. Each
-    /// is built exactly like a lap group and judged by the same proofs; only
-    /// the order changes. Returns each group with its merged state.
+    /// judged within [`PRIORITY_REJUDGE_MS`] with the same merged state, and
+    /// one kept for a stable reason whose state is unchanged
+    /// ([`StablePriorityKeep`]). Each is built exactly like a lap group and
+    /// judged by the same proofs; only the order changes. Returns each group
+    /// with its merged state, and how many candidates the memo skipped.
     fn auto_cleanup_priority_groups(
         &mut self,
         memo: &PriorityMemo,
         now_ms: i64,
         deadline: Option<Instant>,
-    ) -> Result<Vec<(AutoCleanupCheckoutGroup, bool)>, BrokerOpError> {
+    ) -> Result<(Vec<(AutoCleanupCheckoutGroup, bool)>, usize), BrokerOpError> {
         let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
         let candidates = self.store().cleanup_cohort_priority_groups(
             namespace,
@@ -4948,16 +5074,37 @@ impl Broker {
             PRIORITY_CANDIDATE_LIMIT,
         )?;
         let mut groups = Vec::new();
+        let mut memo_skips = 0_usize;
         for (canonical_path, first_session_id, merged) in candidates {
             if groups.len() >= PRIORITY_GROUPS_PER_PASS || deadline_expired(deadline) {
                 break;
             }
-            if memo.recently_judged(&canonical_path, merged, now_ms) {
-                continue;
-            }
+            let stable = if memo.recently_judged(&canonical_path, merged, now_ms) {
+                match memo
+                    .entries
+                    .get(&canonical_path)
+                    .and_then(|entry| entry.stable.as_ref())
+                {
+                    Some(stable) => Some(stable),
+                    None => {
+                        memo_skips += 1;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             let (sessions, truncated) = self
                 .store()
                 .cleanup_cohort_sessions_for_path(namespace, &canonical_path)?;
+            if stable
+                .is_some_and(|stable| stable.still_holds(Path::new(&canonical_path), &sessions))
+            {
+                // Kept for a reason only a state change lifts, and nothing
+                // changed: the lap still judges it when it reaches it.
+                memo_skips += 1;
+                continue;
+            }
             groups.push((
                 AutoCleanupCheckoutGroup {
                     worktree: PathBuf::from(canonical_path),
@@ -4968,7 +5115,7 @@ impl Broker {
                 merged,
             ));
         }
-        Ok(groups)
+        Ok((groups, memo_skips))
     }
 
     /// Make the existing ownership and live-session proofs for one complete
@@ -6455,6 +6602,7 @@ impl Broker {
         let mut priority_memo =
             PriorityMemo::decode(self.store().meta_get(PRIORITY_MEMO_KEY)?.as_deref());
         let mut priority_memo_changed = false;
+        let mut priority_memo_skips = 0_usize;
         // Groups judged ahead of the lap in this pass, skipped by every lap
         // page of the same pass.
         let mut priority_paths = std::collections::BTreeSet::<PathBuf>::new();
@@ -6561,7 +6709,13 @@ impl Broker {
             // visits every group in session order, so nothing is starved.
             let priority_groups = if first_page && priority_lane {
                 let _span = crate::phase_telemetry::span("auto_cleanup_priority_selection");
-                self.auto_cleanup_priority_groups(&priority_memo, now_ms(), deadline)?
+                let (groups, skips) =
+                    self.auto_cleanup_priority_groups(&priority_memo, now_ms(), deadline)?;
+                priority_memo_skips += skips;
+                for _ in 0..skips.min(4096) {
+                    crate::phase_telemetry::add("auto_cleanup_priority_memo_skip", Duration::ZERO);
+                }
+                groups
             } else {
                 Vec::new()
             };
@@ -6599,6 +6753,7 @@ impl Broker {
                 }
                 let deferred_before = report.deferred;
                 let selected_before = selected.len();
+                let kept_before = report.kept.len();
                 let inspection =
                     inspect_group(self, &group, &scan.live, &scan.live_worktrees, deadline)?;
                 let mut stop_for_deadline = false;
@@ -6773,10 +6928,24 @@ impl Broker {
                     } else {
                         PriorityOutcome::Kept
                     };
-                    priority_memo.remember(
+                    // A keep only a state change can lift is remembered with
+                    // that state, so later passes skip it until it changes.
+                    let stable = match report.kept.get(kept_before..) {
+                        Some([kept]) if outcome == PriorityOutcome::Kept => {
+                            let code = if kept.code.is_empty() {
+                                kept_reason_code(&kept.reason)
+                            } else {
+                                kept.code.as_str()
+                            };
+                            StablePriorityKeep::for_kept_group(&group, code, &kept.ignored_blockers)
+                        }
+                        _ => None,
+                    };
+                    priority_memo.remember_with(
                         group.worktree.to_string_lossy().into_owned(),
                         merged,
                         outcome,
+                        stable,
                         now_ms(),
                     );
                     priority_memo_changed = true;
@@ -6839,6 +7008,7 @@ impl Broker {
             removal_scan_ms: duration_ms(Some(scan_elapsed)),
             removal_priority_examined: priority_examined,
             removal_priority_selected: priority_selected,
+            removal_priority_memo_skips: priority_memo_skips,
             removal_probe_ms: duration_ms(Some(probe_elapsed)),
             ..AutoCleanupLanes::default()
         });
@@ -12865,6 +13035,278 @@ mod tests {
             cursor.after_session_id, ids[15],
             "the cursor stops on the last group judged"
         );
+    }
+
+    /// A closed checkout the removal proofs keep: its notes are uncommitted.
+    #[cfg(unix)]
+    fn closed_checkout_with_notes(
+        broker: &mut crate::Broker,
+        label: &str,
+    ) -> (crate::Session, PathBuf) {
+        let (session, worktree) = closed_landed_checkout(broker, label);
+        std::fs::write(worktree.join("notes.txt"), "somebody's notes\n").unwrap();
+        (session, worktree)
+    }
+
+    /// The busiest repository's stall: a steady pass that selects nothing
+    /// used to end the slice although most of the lap was never judged. Here
+    /// the first pass judges eight kept merged checkouts and sixteen kept lap
+    /// groups and selects nothing; the slice goes on and its next pass
+    /// reaches and removes the landed checkout.
+    #[cfg(unix)]
+    #[test]
+    fn an_unfinished_steady_lap_reaches_a_landed_checkout_in_the_same_slice() {
+        // No checkout limit: two dozen closed checkouts never make pressure.
+        let (_owner, _storage, mut broker) =
+            landed_lane_fixture(Some("[worktrees]\nmax_checkouts = 0\n"));
+        let mut kept = Vec::new();
+        for index in 0..8 {
+            let (session, worktree) =
+                closed_checkout_with_notes(&mut broker, &format!("merged kept {index}"));
+            record_merged_pull_request(&mut broker, session.id, 400 + index);
+            kept.push(worktree);
+        }
+        for index in 0..super::STEADY_LAP_GROUPS_PER_PASS {
+            kept.push(closed_checkout_with_notes(&mut broker, &format!("lap kept {index}")).1);
+        }
+        let (_session, landed) = closed_landed_checkout(&mut broker, "landed late in the lap");
+
+        let report = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("a steady slice runs without pressure");
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert!(
+            !landed.exists(),
+            "the landed checkout is removed in this slice"
+        );
+        assert!(kept.iter().all(|path| path.exists()));
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(slice.trigger, "steady", "{slice:#?}");
+        assert!(
+            slice.passes >= 2,
+            "the slice went on past its first pass: {slice:#?}"
+        );
+        assert!(
+            slice.priority_memo_skips >= 8,
+            "the kept merged checkouts are not judged again: {slice:#?}"
+        );
+        assert_eq!(slice.idle_streak, 0, "{slice:#?}");
+        assert_eq!(slice.retry_in_ms, Some(60_000), "{slice:#?}");
+    }
+
+    /// A steady slice that removes nothing while the lap is unfinished is
+    /// not idle: the next one is due a minute later and the back-off does
+    /// not grow. Only the slice that reaches the end of the lap with nothing
+    /// removed starts the back-off (5 minutes).
+    #[cfg(unix)]
+    #[test]
+    fn steady_removal_backs_off_only_after_a_full_empty_lap() {
+        // No checkout limit: thirty closed checkouts never make pressure.
+        let (_owner, _storage, mut broker) =
+            landed_lane_fixture(Some("[worktrees]\nmax_checkouts = 0\n"));
+        let kept = (0..30)
+            .map(|index| closed_checkout_with_notes(&mut broker, &format!("kept {index}")).1)
+            .collect::<Vec<_>>();
+        // Room for one pass only: the lock gap after it (at least half a
+        // second) leaves less than the five-second minimum slice.
+        let one_pass = crate::gc::CapacitySliceLimits {
+            budget: Duration::from_millis(5_400),
+            ..crate::gc::CapacitySliceLimits::WORKER
+        };
+        broker
+            .run_capacity_removal_slice_with(Instant::now(), one_pass)
+            .unwrap();
+        let first = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(first.trigger, "steady", "{first:#?}");
+        assert!(
+            !first.lap_completed,
+            "thirty groups need more than one pass: {first:#?}"
+        );
+        assert_eq!(first.outcome, "lap_unfinished", "{first:#?}");
+        assert_eq!(
+            first.idle_streak, 0,
+            "no back-off before a full lap: {first:#?}"
+        );
+        assert_eq!(first.retry_in_ms, Some(60_000), "{first:#?}");
+
+        let mut completed = None;
+        for _ in 0..4 {
+            broker.end_steady_removal_back_off_for_test();
+            broker
+                .run_capacity_removal_slice(Instant::now())
+                .unwrap()
+                .expect("a steady slice runs");
+            let slice = broker.last_capacity_removal_slice().unwrap();
+            assert_eq!(slice.removed, 0, "{slice:#?}");
+            if slice.lap_completed {
+                completed = Some(slice);
+                break;
+            }
+            assert_eq!(slice.idle_streak, 0, "{slice:#?}");
+            assert_eq!(slice.retry_in_ms, Some(60_000), "{slice:#?}");
+        }
+        let completed = completed.expect("the lap ends within a few slices");
+        assert_eq!(
+            completed.stop_reason.as_deref(),
+            Some("lap_complete"),
+            "{completed:#?}"
+        );
+        assert_eq!(completed.outcome, "nothing_removable", "{completed:#?}");
+        assert_eq!(completed.idle_streak, 1, "{completed:#?}");
+        assert_eq!(completed.retry_in_ms, Some(5 * 60_000), "{completed:#?}");
+        assert!(!broker.capacity_removal_due(super::now_ms()).unwrap());
+        assert!(kept.iter().all(|path| path.exists()));
+    }
+
+    /// A priority group kept for a reason only a state change can lift is
+    /// not judged ahead of the lap again while its state is unchanged; a
+    /// newly merged checkout is, and so is a kept one whose checkout changed.
+    #[cfg(unix)]
+    #[test]
+    fn stable_kept_priority_groups_are_skipped_until_their_state_changes() {
+        let (_owner, _storage, mut broker, sessions) = closed_priority_fixture(10);
+        for (index, session) in sessions.iter().take(8).enumerate() {
+            record_merged_pull_request(&mut broker, session.id, 600 + index as i64);
+        }
+        let pass = |broker: &mut crate::Broker| {
+            broker
+                .auto_cleanup_plan_with_group_inspector_limited(
+                    None,
+                    1,
+                    super::RemovalSelection::Steady,
+                    |_, group, _, _, _| {
+                        Ok(AutoCleanupGroupInspection::Kept(super::AutoKeptCheckout {
+                            worktree: group.worktree.to_string_lossy().into_owned(),
+                            sessions: group.sessions.iter().map(|session| session.id).collect(),
+                            reason: super::OWNERSHIP_ADOPTED_ONLY.to_string(),
+                            ..Default::default()
+                        }))
+                    },
+                )
+                .unwrap()
+                .report
+                .lanes
+                .unwrap()
+        };
+        let memo = |broker: &mut crate::Broker| {
+            super::PriorityMemo::decode(
+                broker
+                    .store()
+                    .meta_get(super::PRIORITY_MEMO_KEY)
+                    .unwrap()
+                    .as_deref(),
+            )
+        };
+        let key = |session: &crate::Session| {
+            std::fs::canonicalize(&session.worktree_path)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        let first = pass(&mut broker);
+        assert_eq!(first.removal_priority_examined, 8, "{first:?}");
+        let before = memo(&mut broker);
+        for session in sessions.iter().take(8) {
+            let entry = &before.entries[&key(session)];
+            assert_eq!(
+                entry.stable.as_ref().map(|stable| stable.code.as_str()),
+                Some("ownership_adopted_only"),
+                "{entry:?}"
+            );
+        }
+
+        // A pull request merges, and one kept checkout's files change.
+        record_merged_pull_request(&mut broker, sessions[9].id, 609);
+        std::fs::write(
+            PathBuf::from(&sessions[0].worktree_path).join("changed.txt"),
+            "x",
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        let second = pass(&mut broker);
+        assert_eq!(
+            second.removal_priority_examined, 2,
+            "the new merge and the changed checkout: {second:?}"
+        );
+        assert_eq!(second.removal_priority_memo_skips, 7, "{second:?}");
+        let after = memo(&mut broker);
+        for session in sessions.iter().take(8).skip(1) {
+            assert_eq!(
+                after.entries[&key(session)].judged_at_ms,
+                before.entries[&key(session)].judged_at_ms,
+                "an unchanged stable keep is not judged ahead of the lap again"
+            );
+        }
+        assert!(after.entries.contains_key(&key(&sessions[9])));
+        assert_ne!(
+            after.entries[&key(&sessions[0])].judged_at_ms,
+            before.entries[&key(&sessions[0])].judged_at_ms
+        );
+    }
+
+    /// Only a keep no running process, timer or lock can lift is remembered
+    /// past the usual re-judge interval; a running gate, the grace period or
+    /// a held lease stays retryable after it, and a changed merged state
+    /// ends either at once.
+    #[test]
+    fn transient_priority_keeps_stay_retryable() {
+        use super::{
+            AutoCleanupCheckoutGroup, KEEP_MEMO_MAX_AGE_MS, PRIORITY_REJUDGE_MS, PriorityMemo,
+            PriorityOutcome, StablePriorityKeep,
+        };
+        let group = AutoCleanupCheckoutGroup {
+            worktree: std::path::PathBuf::from("/nonexistent/priority/checkout"),
+            sessions: Vec::new(),
+            complete: true,
+            cursor_session_id: 1,
+        };
+        for code in [
+            "gate_running",
+            "in_grace",
+            "lease_held",
+            "process_use",
+            "artifact_use",
+            "not_contained",
+        ] {
+            assert!(
+                StablePriorityKeep::for_kept_group(&group, code, &[]).is_none(),
+                "{code}"
+            );
+        }
+        assert!(
+            StablePriorityKeep::for_kept_group(&group, "ignored_content", &[]).is_none(),
+            "ignored content without its blockers has nothing to fingerprint"
+        );
+        let stable = StablePriorityKeep::for_kept_group(&group, "checkout_missing", &[])
+            .expect("a missing checkout is a stable keep");
+        assert!(stable.still_holds(&group.worktree, &[]));
+
+        let now = 1_000_000;
+        let mut memo = PriorityMemo::default();
+        memo.remember_with(
+            "/stable".into(),
+            true,
+            PriorityOutcome::Kept,
+            Some(stable.clone()),
+            now,
+        );
+        memo.remember_with("/gate".into(), true, PriorityOutcome::Kept, None, now);
+        assert!(memo.recently_judged("/stable", true, now + PRIORITY_REJUDGE_MS));
+        assert!(!memo.recently_judged("/stable", true, now + KEEP_MEMO_MAX_AGE_MS));
+        assert!(!memo.recently_judged("/gate", true, now + PRIORITY_REJUDGE_MS));
+        assert!(
+            !memo.recently_judged("/stable", false, now),
+            "merged state changed"
+        );
+        memo.remember_with(
+            "/selected".into(),
+            true,
+            PriorityOutcome::Selected,
+            Some(stable),
+            now,
+        );
+        assert!(memo.entries["/selected"].stable.is_none());
     }
 
     /// After a pressure episode ends (here the limit was raised) the worker
