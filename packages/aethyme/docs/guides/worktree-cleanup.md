@@ -219,17 +219,27 @@ merges instead of drifting up to `[worktrees].max_checkouts`. Each slice
 records its `trigger`:
 
 - `steady` (below three quarters of the limit, or no limit set): a slice of up
-  to 60 seconds that removes at most four checkouts. It ends as soon as a pass
-  selects nothing, and after two passes whose selected checkout was kept or
-  deferred at the last step. Each pass judges the priority lane first (closed
-  checkouts whose pull request is recorded merged or whose cleanup request is
-  past its grace, see below; this only orders them, every proof still
-  applies), then at most 16 closed checkouts of the oldest-first lap from its
-  stored cursor, so old landed checkouts no merge signal names are reached
-  too, more slowly. After a slice that removed a checkout the next steady
-  slice may run a minute later; after a slice that removed nothing it waits 5
-  minutes, then 10, 20 and at most 30 minutes while slices keep finding
-  nothing (`idle_streak`), and a removal resets the wait. A cleanup request
+  to 60 seconds that removes at most four checkouts. Each pass judges the
+  priority lane first (closed checkouts whose pull request is recorded merged
+  or whose cleanup request is past its grace, see below; this only orders
+  them, every proof still applies), then at most 16 closed checkouts of the
+  oldest-first lap from its stored cursor, so old landed checkouts no merge
+  signal names are reached too. A pass that selects nothing but moved the lap
+  on does not end the slice: passes go on, within the slice's time, the GC
+  lock gap, the yield to a waiting foreground command and the memory and
+  load gate, until the lap reaches its end (`stop_reason` `lap_complete`) or
+  a pass moves nothing (`nothing_selected`). The slice also ends after two
+  passes whose selected checkout was kept or deferred at the last step. A
+  priority checkout kept for a reason only a change of its state can lift
+  (adopted-only or unproven ownership, a legacy or missing spawn witness, a
+  missing checkout directory, ignored leftovers) is not judged ahead of the
+  lap again until its sessions or its files change; the lap still judges it.
+  After a slice that removed a checkout the next steady slice may run a minute
+  later, and also a minute later while the lap is unfinished and moving.
+  Only a slice that reached the end of the lap (or could not move it) with
+  nothing removed starts the back-off: 5 minutes, then 10, 20 and at most 30
+  minutes while such slices follow each other (`idle_streak`), and a removal
+  resets the wait. A cleanup request
   whose grace ends after the last steady slice ends that wait at once. A slice
   stopped by memory or load pressure, failed removals or a held lock keeps
   its wait (1 to 10 minutes) whatever lands. Steady removal is due only while
@@ -291,12 +301,16 @@ holding the most checkouts with the line that would release each,
 `lock_yield_ms`, `git_removal_ms`, `pressure_wait_ms` and `elapsed_ms` say
 where the time went; `stop_reason` says why the slice stopped (`cap`,
 `budget`, `pacer_backoff`, `slice_deadline`, `yielded_to_foreground`,
-`nothing_selected`, `kept_only_limit`, `lock_busy`, `failed` or
-`removal_failures`) and
+`nothing_selected`, `lap_complete`, `kept_only_limit`, `lock_busy`, `failed`
+or `removal_failures`) and
 `retry_in_ms` the wait it chose. `trigger` says which trigger ran the slice
 (`steady` or `pressure`), `priority_examined` / `priority_removed` and
 `lap_examined` / `lap_removed` split its work between the priority lane and
-the lap, and `idle_streak` counts steady slices in a row that removed nothing.
+the lap, `passes` counts its removal passes, `lap_completed` says whether
+they reached the end of the lap, `priority_memo_skips` counts priority
+candidates the memo skipped, `memo_skips` checkouts kept from the remembered
+ignored-content verdict, and `idle_streak` counts steady slices in a row that
+reached the end of the lap with nothing removed.
 A slice stops after Git failed to remove two checkouts it had started
 deleting (`removal_failures`), and waits 10 minutes. Broker opens too short to count checkouts read the count
 `broker start` last recorded. Within the removal lane, selection uses at most
@@ -414,7 +428,10 @@ per slice that ran), `artifact_worker_steady_removal_deferred` (a run due for
 steady removal that could not reach its slice),
 `artifact_worker_capacity_removal_priority_examined`,
 `_priority_removed`, `_lap_examined` and `_lap_removed`,
-`artifact_worker_capacity_removal_failed`,
+`_pass` (one per removal pass), `_priority_memo_skips`, `_memo_skips` and
+`_lap_completed` (prefixed `artifact_worker_capacity_removal`),
+`auto_cleanup_priority_memo_skip` (one per priority candidate the memo
+skipped), `artifact_worker_capacity_removal_failed`,
 `artifact_worker_capacity_removal_outcome_<outcome>` and
 `artifact_worker_capacity_removal_stop_<stop_reason>`, and the timed phases
 `artifact_worker_capacity_removal_paced`, `_lock_held`, `_lock_wait`,

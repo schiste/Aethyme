@@ -422,19 +422,21 @@ Raising `max_checkouts` is a stopgap: it delays the refusal and reclaims
 nothing. The background worker removes closed checkouts whose work landed
 itself whether or not the repository is near the limit: below three quarters
 of it in steady slices of up to 60 seconds that remove at most four checkouts
-(due again a minute after a removal, and after 5, 10, 20, then 30 minutes
-while slices find nothing), and from three quarters of it in slices of up to
+(passes go on while the lap moves; due again a minute after a removal or
+while the lap is unfinished, and after 5, 10, 20, then 30 minutes while
+slices reach the end of the lap with nothing removed), and from three quarters of it in slices of up to
 120 seconds that remove at most twelve. The durable lever for what blocks it
 is the
 `[cleanup] regenerable` list in the same file. `status --json` reports the
 worker's last removal slice as `capacity_removal` (`auto_cleanup.capacity_removal`
 in `gc plan --json`; absent until a slice has run). Its main fields are
 `trigger` (`steady` or `pressure`), `priority_examined`, `priority_removed`,
-`lap_examined`, `lap_removed`, `idle_streak`, `outcome` (`removed`, `lock_busy`, `inventory_unavailable`, `lap_unfinished`,
+`lap_examined`, `lap_removed`, `idle_streak`, `passes`, `lap_completed`,
+`priority_memo_skips`, `memo_skips`, `outcome` (`removed`, `lock_busy`, `inventory_unavailable`, `lap_unfinished`,
 `out_of_time_before_selection` or `nothing_removable`), `stop_reason` (`cap`,
 `budget`, `pacer_backoff`, `slice_deadline`, `yielded_to_foreground`,
-`nothing_selected`, `kept_only_limit`, `lock_busy`, `failed` or
-`removal_failures`), `removed`, `kept`, `deferred`, `kept_by_code`,
+`nothing_selected`, `lap_complete`, `kept_only_limit`, `lock_busy`, `failed`
+or `removal_failures`), `removed`, `kept`, `deferred`, `kept_by_code`,
 `blocked_by_ignored`, `retry_in_ms` and the time split (`scan_ms`,
 `selection_ms`, `apply_ms`, `paced_ms`, `lock_held_ms`, `lock_wait_ms`,
 `lock_yield_ms`, `git_removal_ms`, `pressure_wait_ms`, `elapsed_ms`);
