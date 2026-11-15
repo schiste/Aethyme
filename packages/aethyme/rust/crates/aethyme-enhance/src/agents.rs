@@ -1050,6 +1050,10 @@ blocked.
    session. After verified publication or PR merge, finish the session with
    `aethyme broker finish --session <id>`, or point it at a follow-up task
    with `aethyme broker start --reuse --task "..." --short-name "<short name>"`.
+   The broker also closes a session itself after a period without activity
+   once every pull request of it merged and its work landed, and after a
+   longer one in any case (`[retention]` in `.aethyme/broker.toml`); closing
+   deletes nothing, and a command on the closed session says so.
    A successful `finish` may clean a safe session worktree and branch by
    default. Use `--keep-worktree` when pinned provenance or recovery needs the
    exact checkout; later reclaim a retained checkout with

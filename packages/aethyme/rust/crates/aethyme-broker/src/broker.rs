@@ -3069,6 +3069,14 @@ fn push_auto_cleanup_advice(view: &mut StatusView, report: Option<crate::AutoCle
                 declined.join(", ")
             }
         ));
+        if report.merged_pull_request_sessions_examined > 0 {
+            evidence.push(format!(
+                "of those, {} spawned session(s) with every pull request merged were judged \
+                 in the session_merged_after_hours window and {} closed",
+                report.merged_pull_request_sessions_examined,
+                report.merged_pull_request_sessions_closed
+            ));
+        }
     }
     evidence.extend(
         report
@@ -3451,7 +3459,7 @@ mod leases;
 mod owners;
 mod remote_heads;
 pub(crate) use leases::{
-    AbandonedSessionCloseOutcome, LandedSessionDecline, validate_session_commit_args,
+    AbandonedSessionCloseOutcome, LandedProof, LandedSessionDecline, validate_session_commit_args,
 };
 pub use owners::{CommitOwner, MAX_OWNER_COMMITS, OwnedCommit, OwnersReport};
 pub(crate) mod lifecycle;

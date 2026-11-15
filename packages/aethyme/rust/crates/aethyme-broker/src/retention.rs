@@ -29,6 +29,7 @@ const RETENTION_POLICY_FIELDS: &[&str] = &[
     "orphan_worktree_roots_days",
     "session_abandoned_after_hours",
     "session_landed_after_hours",
+    "session_merged_after_hours",
     "expire_abandoned_task_leases",
     "idle_session_artifact_hours",
     "artifact_sweep_budget_ms",
@@ -119,6 +120,16 @@ pub struct RetentionPolicy {
     /// a proven-gone holder can enter the normal guarded retirement path.
     /// Zero disables early landed-session retirement.
     pub session_landed_after_hours: u32,
+    /// Hours of inactivity, counted from the later of the session's last
+    /// activity and the merge of its last pull request, before a spawned
+    /// session whose every recorded pull request is merged, whose HEAD is
+    /// proven landed on the fetched default branch and whose checkout is clean
+    /// is closed automatically, as `finish` would close it. It shortens
+    /// `session_landed_after_hours` for that case only and keeps every one of
+    /// its proofs, and additionally requires that no gate, queue entry,
+    /// operation, preparation or artifact producer of the session is running.
+    /// Zero disables this earlier path.
+    pub session_merged_after_hours: u32,
     /// Opt in to guarded expiry of versioned task ownership after upgrading
     /// and draining older clients. Legacy or unknown holder evidence remains
     /// protected. This changes metadata eligibility, never deletion proofs.
@@ -193,6 +204,7 @@ impl Default for RetentionPolicy {
             orphan_worktree_roots_days: 1,
             session_abandoned_after_hours: 72,
             session_landed_after_hours: 24,
+            session_merged_after_hours: 2,
             expire_abandoned_task_leases: false,
             idle_session_artifact_hours: 24,
             artifact_sweep_budget_ms: 5_000,
@@ -306,6 +318,13 @@ impl RetentionPolicy {
             return Err(RetentionConfigError::InvalidValue {
                 field: "session_landed_after_hours",
                 value: self.session_landed_after_hours.to_string(),
+                constraint: "must be between 0 (disabled) and 8760 hours",
+            });
+        }
+        if self.session_merged_after_hours > 8_760 {
+            return Err(RetentionConfigError::InvalidValue {
+                field: "session_merged_after_hours",
+                value: self.session_merged_after_hours.to_string(),
                 constraint: "must be between 0 (disabled) and 8760 hours",
             });
         }
