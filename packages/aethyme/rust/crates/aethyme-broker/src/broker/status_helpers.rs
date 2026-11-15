@@ -1771,7 +1771,7 @@ pub(crate) fn pid_alive(pid: i64) -> bool {
     if let Some(alive) = kernel_pid_alive(pid) {
         return alive;
     }
-    match Command::new("ps")
+    match Command::new(crate::system_programs::ps())
         .args(["-o", "state=", "-p", &pid.to_string()])
         .stderr(Stdio::null())
         .output()
