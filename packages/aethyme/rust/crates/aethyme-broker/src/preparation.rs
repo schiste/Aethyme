@@ -1515,6 +1515,11 @@ impl Broker {
                     cache_root_binding.as_ref(),
                 )
             })?;
+        if rotation.is_some() {
+            // The measured store is gone: its result must not outlive it on
+            // an inode identity some filesystems reuse.
+            self.forget_shared_cache_measurement();
+        }
         if shared
             && cache_mode == SharedCacheMode::Exclusive
             && measure_budget
@@ -4606,6 +4611,15 @@ where
     .map(|(inventory, _)| inventory)
 }
 
+/// What a walk counted: entries it measured, and entries it skipped because
+/// they vanished or were replaced while it ran (concurrent walks only).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SharedCacheWalkCounts {
+    entries: u64,
+    skipped: u64,
+}
+
 /// Whether anything may change the tree while it is walked.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4621,7 +4635,7 @@ enum SharedCacheScanConcurrency {
 }
 
 /// The walk behind [`directory_inventory_fd_relative_with_progress`], also
-/// returning the entries it counted. `on_entry` sees the running entry and
+/// returning what it counted and skipped. `on_entry` sees the running entry and
 /// byte counts after each counted entry and may stop the walk with an error.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn directory_inventory_fd_relative_walk<F>(
@@ -4632,11 +4646,11 @@ fn directory_inventory_fd_relative_walk<F>(
     before_open: F,
     progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
     on_entry: &mut dyn FnMut(u64, u64) -> Result<(), PreparationError>,
-) -> Result<(SharedCacheInventory, u64), PreparationError>
+) -> Result<(SharedCacheInventory, SharedCacheWalkCounts), PreparationError>
 where
     F: FnMut(SharedCacheScanOpenTarget),
 {
-    let mut counted = 0_u64;
+    let mut counted = SharedCacheWalkCounts::default();
     let inventory = directory_inventory_fd_relative_walk_counted(
         path,
         limits,
@@ -4660,7 +4674,7 @@ fn directory_inventory_fd_relative_walk_counted<F>(
     mut before_open: F,
     progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
     on_entry: &mut dyn FnMut(u64, u64) -> Result<(), PreparationError>,
-    counted: &mut u64,
+    counted: &mut SharedCacheWalkCounts,
 ) -> Result<SharedCacheInventory, PreparationError>
 where
     F: FnMut(SharedCacheScanOpenTarget),
@@ -4789,7 +4803,7 @@ where
             shared_cache_scan_refusal(path, "cache inventory entry count overflowed")
         })?;
         cache_activity::observe(visited_entries as u64, Some(bytes));
-        *counted = visited_entries as u64;
+        counted.entries = visited_entries as u64;
         on_entry(visited_entries as u64, bytes)?;
         if visited_entries > limits.max_entries {
             return Ok(SharedCacheInventory::BoundedIncomplete {
@@ -4825,6 +4839,7 @@ where
             let source = std::io::Error::last_os_error();
             if vanished(&source) {
                 // Removed by a concurrent writer after it was listed.
+                counted.skipped += 1;
                 continue;
             }
             return Err(shared_cache_scan_io_refusal(path, &source));
@@ -4865,6 +4880,7 @@ where
                     let source = std::io::Error::last_os_error();
                     if vanished(&source) {
                         // Removed or replaced by a concurrent writer.
+                        counted.skipped += 1;
                         continue;
                     }
                     return Err(shared_cache_scan_io_refusal(path, &source));
@@ -4891,6 +4907,7 @@ where
                     if concurrent && child_stat.st_dev == root_device {
                         // Replaced by a concurrent writer between the listing
                         // and the open; never a filesystem crossing.
+                        counted.skipped += 1;
                         continue;
                     }
                     return Err(shared_cache_scan_refusal(

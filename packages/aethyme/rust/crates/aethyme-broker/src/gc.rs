@@ -3496,6 +3496,12 @@ fn host_deleter_lock_directory() -> Option<PathBuf> {
     }
 }
 
+/// The directory holding the host-wide shared preparation cache measurement
+/// lock: the same host state directory as the deleter lock.
+pub(crate) fn measurement_host_lock_directory() -> Option<PathBuf> {
+    host_deleter_lock_directory()
+}
+
 /// Wait up to `wait` for the host deleter lock in `directory`, polling with
 /// `sleep`. Returns the slot and the time spent waiting.
 pub(crate) fn wait_for_host_deleter_slot(
@@ -4604,6 +4610,10 @@ impl Broker {
             (
                 "artifact_worker_pacer_limiter_sleep",
                 summary.limiter_sleep_ms,
+            ),
+            (
+                "artifact_worker_pacer_scan_limiter_sleep",
+                summary.scan_limiter_sleep_ms,
             ),
         ] {
             crate::phase_telemetry::add(phase, Duration::from_millis(millis));
@@ -8170,20 +8180,29 @@ impl Broker {
     /// scans the full cohort before checking the pass deadline, so the reserved
     /// tranche is cooperative and can overrun on a large cohort; the durable
     /// cursor bounds proof progress after discovery, not discovery time.
-    pub(crate) fn run_artifact_sweep_recovery_worker(&mut self) -> Result<(), BrokerOpError> {
+    ///
+    /// The shared preparation cache measurement reads and never deletes, so
+    /// it runs last, after `release_worker_lock` has released this
+    /// repository's worker lock: a long walk must not hold back the next
+    /// deletion run. A second worker started meanwhile finds the request
+    /// marked running and does not walk.
+    pub(crate) fn run_artifact_sweep_recovery_worker(
+        &mut self,
+        release_worker_lock: impl FnOnce(),
+    ) -> Result<(), BrokerOpError> {
         let result = self.run_artifact_sweep_recovery_worker_lanes();
+        release_worker_lock();
+        self.run_preparation_cache_measurement_worker_lane();
         // Recorded on every exit, including a busy host deleter, so status
-        // shows why a run removed nothing.
+        // shows why a run removed nothing; after the measurement, so its
+        // pacer pauses are in the summary and the run's metric row.
         self.persist_unattended_pacing_summary();
         result
     }
 
-    /// The detached worker's last lane: the shared preparation cache
-    /// measurement. It reads and never deletes, so the worker runs it after
-    /// its deletion lanes and after releasing this repository's worker lock
-    /// (a long walk must not hold back the next deletion run), under its own
-    /// host-wide slot. Its request stays durable when it cannot finish.
-    pub(crate) fn run_preparation_cache_measurement_worker_lane(&mut self) {
+    /// The detached worker's measurement lane, under the host-wide
+    /// measurement slot. Its request stays durable when it cannot finish.
+    fn run_preparation_cache_measurement_worker_lane(&mut self) {
         if !matches!(std::env::var(ARTIFACT_SWEEP_WORKER_ENV).as_deref(), Ok("1"))
             || crate::host_state::path_is_ephemeral(self.main_root())
         {
@@ -8191,7 +8210,9 @@ impl Broker {
         }
         crate::warn_unrecorded(
             "measure the shared preparation cache",
-            self.run_preparation_cache_measurement_lane(host_deleter_lock_directory().as_deref()),
+            self.run_preparation_cache_measurement_lane(
+                measurement_host_lock_directory().as_deref(),
+            ),
         );
     }
 
@@ -13768,6 +13789,21 @@ mod tests {
         let storage = crate::test_storage::TestStorage::new();
         let broker = storage.open(root).unwrap();
         (storage, broker)
+    }
+
+    #[test]
+    fn the_measurement_lock_lives_in_the_host_deleter_directory() {
+        let host = tempfile::tempdir().unwrap();
+        HOST_DELETER_DIRECTORY.with(|directory| {
+            *directory.borrow_mut() = Some(host.path().to_path_buf());
+        });
+        assert_eq!(
+            measurement_host_lock_directory().as_deref(),
+            Some(host.path())
+        );
+        // Without one the measurement lane skips its walk.
+        HOST_DELETER_DIRECTORY.with(|directory| *directory.borrow_mut() = None);
+        assert_eq!(measurement_host_lock_directory(), None);
     }
 
     #[test]

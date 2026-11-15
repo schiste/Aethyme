@@ -1789,12 +1789,10 @@ fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageErr
     // Every unlink this process makes is unattended: pace it.
     let _pacing = crate::gc::install_unattended_deletion_pacing(&repository_root, priority);
     let mut broker = Broker::open(&repository_root)?;
-    let lanes = broker.run_artifact_sweep_recovery_worker();
-    // The read-only cache measurement may walk for minutes: release the
-    // repository's worker lock first, so the next deletion run can start.
-    drop(worker_lock);
-    broker.run_preparation_cache_measurement_worker_lane();
-    lanes?;
+    // The read-only cache measurement may walk for minutes: the worker
+    // releases this repository's lock before it, so the next deletion run
+    // can start.
+    broker.run_artifact_sweep_recovery_worker(move || drop(worker_lock))?;
     Ok(())
 }
 

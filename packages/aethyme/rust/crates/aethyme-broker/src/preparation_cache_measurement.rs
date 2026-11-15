@@ -19,33 +19,53 @@
 //!   notice keeps its threshold as the escalation for when the background
 //!   measurement itself cannot finish.
 //! - **Measure.** The detached `gc` artifact worker runs it after its own
-//!   lanes, at background CPU and I/O priority, one at a time per host (a
-//!   host-wide advisory lock beside the deleter lock), paced by the
-//!   unattended pacer (memory pressure stops it, load throttles it). The walk
-//!   is the same streaming, descriptor-relative, no-follow walk the
+//!   lanes and after releasing the repository worker lock, at background CPU
+//!   and I/O priority, one at a time per host (a host-wide advisory lock
+//!   beside the deleter lock; without a host state directory the walk is
+//!   skipped, never run unserialised), paced by the unattended pacer: a scan
+//!   rate limit, memory pressure stops it, load throttles it. The request is
+//!   marked running for the walk's duration (with the walker's pid), so no
+//!   second worker starts it and nothing overwrites it; a marker older than
+//!   the walk deadline plus slack, or whose process is gone, is taken over.
+//!   The walk is the same streaming, descriptor-relative, no-follow walk the
 //!   foreground uses (memory bounded by the directory depth), with no entry
-//!   limit, a 30-minute backstop, and an early stop once the bytes it has
-//!   seen pass the budget, which is already a conclusive answer.
+//!   limit, a deadline, and an early stop once the bytes it has seen pass the
+//!   budget plus [`BACKGROUND_MARGIN_PERCENT`].
 //! - **No lease.** The cache lease makes the foreground inventory exact and
 //!   keeps rotation and recovery away from running steps. The measurement
 //!   holds no lease, so it never makes a `prepare` wait. Entries that vanish
-//!   or are replaced while it walks are skipped (a running step may be
-//!   writing the store), so its total is an estimate. A rotation or a root
-//!   change during the walk is caught by comparing the root's and the
-//!   store's identity before and after; such a walk is discarded. The result
-//!   only decides whether a rotation is due: the rotation itself still runs
-//!   in the foreground, under the lease, through the existing journalled path
-//!   and its identity proofs.
+//!   or are replaced while it walks are skipped and counted (a running step
+//!   may be writing the store), and a step that unpacks into the store can
+//!   make it count transient or renamed bytes, so its total is an estimate.
+//!   Three guards keep an estimate from rotating a healthy store: over budget
+//!   means over the budget plus a margin; a rotation needs two consecutive
+//!   over-budget walks of the same store (the second queued after a short
+//!   delay; a within-budget, in-margin or interrupted walk in between resets
+//!   the count); and a rotation or root change during a walk is caught by
+//!   comparing the root's and the store's identity before and after, which
+//!   discards the walk. A walk that skipped entries or overlapped a running
+//!   `prepare` is marked `concurrent_activity`. The rotation itself still
+//!   runs in the foreground, under the lease, through the existing journalled
+//!   path and its identity proofs.
 //! - **Use.** The next foreground budget check that finds a result bound to
-//!   the same root and store identity, younger than one budget-check interval
-//!   (the same trust a foreground measurement gets before it is repeated),
-//!   decides from it instead of running its own inventory: over budget
-//!   rotates, within budget is conclusive. A within-budget result that is
-//!   used queues a refresh, so the next hourly check finds a fresh one.
+//!   the same root and store identity, within the trust the result was given,
+//!   decides from it instead of running its own inventory: a confirmed over
+//!   budget rotates, within budget is conclusive. Trust scales with headroom:
+//!   the time until the budget at the growth rate between the last two
+//!   results, clamped to 1 to 24 hours, or by the share of the budget used
+//!   when there is one result. A used result queues its refresh only in the
+//!   last quarter of that trust.
 //! - **Restart, not resume.** An interrupted walk is restarted from scratch
-//!   after a back-off. Directory order is not stable across opens and the
-//!   tree changes between runs, so a resumed partial sum would add up two
+//!   after a back-off (doubling for repeated deadline or refused walks of the
+//!   same store, up to a day). Directory order is not stable across opens and
+//!   the tree changes between runs, so a resumed partial sum would add up two
 //!   different snapshots; the walk reads only metadata, so a restart is cheap.
+//!
+//! The walk holds open directory descriptors on the cache volume while it
+//! runs, so an external volume cannot be ejected until it ends (at most the
+//! deadline). Killing the worker is safe: the request stays durable and the
+//! running marker is taken over once its process is gone. No broker signal
+//! asks gc workers to stop, and nothing waits for them to exit.
 //!
 //! Both records live in the repository's broker metadata (never under
 //! `.aethyme/`, which the cleanliness gates watch) and carry no path: the
@@ -67,29 +87,57 @@ use crate::{Broker, BrokerOpError};
 
 /// Broker metadata key of the pending measurement request (JSON, or `null`).
 pub(crate) const REQUEST_KEY: &str = "preparation.shared_cache_measurement.request";
-/// Broker metadata key of the last conclusive measurement (JSON).
+/// Broker metadata key of the last completed measurement (JSON, or `null`).
 pub(crate) const RESULT_KEY: &str = "preparation.shared_cache_measurement.result";
 pub(crate) const REQUEST_SCHEMA: &str = "aethyme.preparation-cache-measurement-request/v1";
 pub(crate) const RESULT_SCHEMA: &str = "aethyme.preparation-cache-measurement/v1";
-/// A result older than this is not used. It is the budget-check interval:
-/// a foreground measurement is trusted for exactly that long before the
-/// check repeats, and a background one gets the same trust, no more.
-pub(crate) const RESULT_MAX_AGE_MS: i64 = SHARED_CACHE_BUDGET_CHECK_INTERVAL_MS;
-/// Back-off after an interrupted walk before a worker restarts it.
+/// Shortest and longest trust a result gets. The shortest is the
+/// budget-check interval, the trust a foreground measurement gets.
+pub(crate) const MIN_TRUST_MS: i64 = SHARED_CACHE_BUDGET_CHECK_INTERVAL_MS;
+pub(crate) const MAX_TRUST_MS: i64 = 24 * 60 * 60 * 1000;
+/// Trust by share of the budget when no growth rate is known yet.
+const TRUST_AT_HALF_MS: i64 = MAX_TRUST_MS;
+const TRUST_AT_80_PERCENT_MS: i64 = 6 * 60 * 60 * 1000;
+/// Background over budget means over the budget plus this many percent. A
+/// lease-free walk can count bytes a running step is unpacking or renaming;
+/// "within budget" still means at or under the budget itself, and a result
+/// between the two decides nothing.
+pub(crate) const BACKGROUND_MARGIN_PERCENT: u64 = 5;
+/// Consecutive over-budget walks of one store needed before a rotation.
+pub(crate) const OVER_BUDGET_CONFIRMATIONS: u32 = 2;
+/// Delay before the confirming walk: long enough for a running step's
+/// download or unpack to finish, short enough to rotate the same hour.
+pub(crate) const CONFIRMATION_DELAY_MS: i64 = 2 * 60_000;
+/// Back-off after an interrupted walk before a worker restarts it; repeated
+/// deadline or refused walks of one store double it up to a day.
 pub(crate) const RETRY_AFTER_INTERRUPTION_MS: i64 = 10 * 60_000;
+pub(crate) const MAX_RETRY_AFTER_MS: i64 = 24 * 60 * 60 * 1000;
 /// Back-off when another repository's measurement holds the host slot.
 pub(crate) const RETRY_AFTER_HOST_BUSY_MS: i64 = 60_000;
-/// Wall-clock backstop for one walk. Not a measurement limit: a store that
-/// takes longer than this at background priority is reported, not guessed.
+/// Wall-clock backstop for one walk. At the scan rate limit it covers
+/// 18 million entries; a store that takes longer is reported, not guessed.
 pub(crate) const MAX_WALK_DURATION: Duration = Duration::from_secs(30 * 60);
-/// Entries between two pacer checks. A metadata walk visits tens of
-/// thousands of entries a second, so this is a fraction of a second.
+/// A running marker older than the deadline plus this slack is stale.
+pub(crate) const RUNNING_STALE_SLACK_MS: i64 = 10 * 60_000;
+/// Scan rate limit for the walk, in entries a second. Ten times the
+/// unattended unlink default (1,000/s): a metadata read writes nothing, wakes
+/// no file-event or indexing daemon and dirties no memory, but each entry
+/// still pulls a vnode and inode into the kernel caches, which this bounds.
+/// A 5-million-entry store takes about 8.5 minutes, inside the deadline.
+pub(crate) const SCAN_ENTRIES_PER_SECOND: u32 = 10_000;
+/// Entries between two pacer checks (rate, memory, load).
 pub(crate) const PACING_BATCH_ENTRIES: u64 = 4096;
 /// Host-wide advisory lock: one measurement per machine at a time.
 pub(crate) const HOST_LOCK_FILE: &str = "preparation-cache-measurement.lock";
 const ROTATION_PROBE_MAX_ENTRIES: usize = 4096;
 const ROTATION_PROBE_BUDGET: Duration = Duration::from_secs(2);
-const CAS_ATTEMPTS: usize = 4;
+const CAS_ATTEMPTS: usize = 8;
+
+/// The early-stop and rotation threshold of a background decision.
+pub(crate) fn over_budget_threshold(budget: u64) -> u64 {
+    let margin = u128::from(budget) * u128::from(BACKGROUND_MARGIN_PERCENT) / 100;
+    u64::try_from(u128::from(budget) + margin).unwrap_or(u64::MAX)
+}
 
 /// Why a background measurement stopped without an answer.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -137,6 +185,12 @@ impl MeasurementInterruptionReason {
     fn drops_request(self) -> bool {
         matches!(self, Self::RootChanged)
     }
+
+    /// Failures that repeat for the same store until it changes: back off
+    /// exponentially instead of re-walking it every ten minutes.
+    fn backs_off(self) -> bool {
+        matches!(self, Self::Deadline | Self::ScanRefused)
+    }
 }
 
 /// What an interrupted walk had seen when it stopped.
@@ -168,7 +222,7 @@ pub struct SharedCacheMeasurementRequest {
     pub root_identity: Option<String>,
     pub budget_bytes: u64,
     /// The foreground outcome that queued it (`inconclusive_time_limit`,
-    /// `inconclusive_entry_limit`), or `refresh`.
+    /// `inconclusive_entry_limit`), `refresh`, or `confirm_over_budget`.
     pub reason: String,
     pub queued_at_ms: i64,
     /// How many checks asked for it while it was pending.
@@ -181,14 +235,47 @@ pub struct SharedCacheMeasurementRequest {
     pub retry_after_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_interruption: Option<SharedCacheMeasurementInterruption>,
+    /// Set while a worker walks for this request: no other worker starts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_since_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_pid: Option<u32>,
+    /// Consecutive deadline or refused walks of `failure_store_identity`.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_store_identity: Option<String>,
+}
+
+impl SharedCacheMeasurementRequest {
+    /// Whether a live worker is walking for it now.
+    fn running(&self, now: i64) -> bool {
+        let Some(since) = self.running_since_ms else {
+            return false;
+        };
+        let deadline_ms = i64::try_from(MAX_WALK_DURATION.as_millis()).unwrap_or(i64::MAX);
+        let fresh = now.saturating_sub(since) < deadline_ms.saturating_add(RUNNING_STALE_SLACK_MS);
+        fresh
+            && self
+                .running_pid
+                .is_none_or(|pid| crate::blockers::process_alive(i64::from(pid)))
+    }
+
+    fn due(&self, now: i64) -> bool {
+        !self.running(now) && self.retry_after_ms.is_none_or(|after| after <= now)
+    }
 }
 
 /// The answer a completed measurement gives.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MeasurementOutcome {
+    /// Complete, at or under the budget.
     WithinBudget,
+    /// Over the budget plus the margin (`bytes` may be a lower bound).
     OverBudget,
+    /// Over the budget but within the margin: decides nothing.
+    WithinMargin,
 }
 
 impl MeasurementOutcome {
@@ -196,11 +283,16 @@ impl MeasurementOutcome {
         match self {
             Self::WithinBudget => "within_budget",
             Self::OverBudget => "over_budget",
+            Self::WithinMargin => "within_margin",
         }
     }
 }
 
-/// The last conclusive background measurement. Interrupted walks are kept in
+fn default_trusted_for_ms() -> i64 {
+    MIN_TRUST_MS
+}
+
+/// The last completed background measurement. Interrupted walks are kept in
 /// the request's `last_interruption` and never replace this record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SharedCacheMeasurement {
@@ -216,11 +308,24 @@ pub struct SharedCacheMeasurement {
     pub budget_bytes: u64,
     pub outcome: MeasurementOutcome,
     /// The walk reached the end of the store. False when it stopped early
-    /// because the bytes it had seen passed the budget (`bytes` is then a
+    /// because the bytes it had seen passed the threshold (`bytes` is then a
     /// lower bound).
     pub complete: bool,
     pub bytes: u64,
     pub entries: u64,
+    /// Entries skipped because they vanished or were replaced mid-walk.
+    #[serde(default)]
+    pub skipped_entries: u64,
+    /// The walk skipped entries or overlapped a `prepare` holding the cache.
+    #[serde(default)]
+    pub concurrent_activity: bool,
+    /// Consecutive over-budget walks of this store, this one included.
+    #[serde(default)]
+    pub over_budget_walks: u32,
+    /// An over-budget result confirmed by enough consecutive walks: only
+    /// then does a budget check rotate from it.
+    #[serde(default)]
+    pub over_budget_confirmed: bool,
     pub started_at_ms: i64,
     pub completed_at_ms: i64,
     pub duration_ms: u64,
@@ -228,7 +333,14 @@ pub struct SharedCacheMeasurement {
     pub bytes_per_second: u64,
     pub pacer_memory_pause_ms: u64,
     pub pacer_load_pause_ms: u64,
+    #[serde(default)]
+    pub pacer_scan_limiter_sleep_ms: u64,
     pub attempt: u64,
+    /// How long a budget check may decide from this record, and why.
+    #[serde(default = "default_trusted_for_ms")]
+    pub trusted_for_ms: i64,
+    #[serde(default)]
+    pub trust_reason: String,
     /// When a foreground budget check last decided from this record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub used_at_ms: Option<i64>,
@@ -241,10 +353,66 @@ impl SharedCacheMeasurement {
         now.saturating_sub(self.completed_at_ms)
     }
 
-    /// Whether this record answers the budget question for `budget`.
+    fn fresh(&self, now: i64) -> bool {
+        (0..self.trusted_for_ms.max(MIN_TRUST_MS)).contains(&self.age_ms(now))
+    }
+
+    /// Whether this record answers the budget question for `budget`: complete
+    /// and at or under it, or confirmed over it plus the margin.
     fn decides(&self, budget: u64) -> bool {
-        // Over budget, even as a lower bound, or complete (and so exact).
-        self.bytes > budget || self.complete
+        match self.outcome {
+            MeasurementOutcome::WithinBudget => self.complete && self.bytes <= budget,
+            MeasurementOutcome::OverBudget => {
+                self.over_budget_confirmed && self.bytes > over_budget_threshold(budget)
+            }
+            MeasurementOutcome::WithinMargin => false,
+        }
+    }
+
+    fn same_store(&self, other: &Self) -> bool {
+        self.repository == other.repository
+            && self.cache_root_key == other.cache_root_key
+            && self.root_identity == other.root_identity
+            && self.store_identity == other.store_identity
+    }
+}
+
+/// How long a within-budget result is trusted, and why.
+fn trust_for(
+    previous: Option<&SharedCacheMeasurement>,
+    current: &SharedCacheMeasurement,
+) -> (i64, &'static str) {
+    if current.outcome != MeasurementOutcome::WithinBudget {
+        return (MIN_TRUST_MS, "not_within_budget");
+    }
+    let budget = current.budget_bytes;
+    let headroom = budget.saturating_sub(current.bytes);
+    if let Some(previous) = previous.filter(|previous| {
+        previous.same_store(current)
+            && previous.outcome == MeasurementOutcome::WithinBudget
+            && previous.complete
+            && previous.completed_at_ms < current.completed_at_ms
+    }) {
+        let elapsed = current.completed_at_ms - previous.completed_at_ms;
+        let growth = current.bytes.saturating_sub(previous.bytes);
+        if growth == 0 {
+            return (MAX_TRUST_MS, "not_growing");
+        }
+        let until_budget =
+            u128::from(headroom) * elapsed.unsigned_abs() as u128 / u128::from(growth);
+        let until_budget = i64::try_from(until_budget).unwrap_or(i64::MAX);
+        return (
+            until_budget.clamp(MIN_TRUST_MS, MAX_TRUST_MS),
+            "growth_rate",
+        );
+    }
+    let used = u128::from(current.bytes) * 100;
+    if used <= u128::from(budget) * 50 {
+        (TRUST_AT_HALF_MS, "at_most_half_of_budget")
+    } else if used <= u128::from(budget) * 80 {
+        (TRUST_AT_80_PERCENT_MS, "at_most_80_percent_of_budget")
+    } else {
+        (MIN_TRUST_MS, "above_80_percent_of_budget")
     }
 }
 
@@ -255,9 +423,11 @@ pub struct SharedCacheMeasurementStatus {
     pub request: Option<SharedCacheMeasurementRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<SharedCacheMeasurement>,
-    /// Whether `result` is young enough for the next budget check to decide
-    /// from it; root and store identity are checked then.
+    /// Whether `result` is within its trust for the next budget check; root
+    /// and store identity are checked then.
     pub result_fresh: bool,
+    /// Whether a worker is walking for `request` now.
+    pub running: bool,
 }
 
 /// The background measurement a budget check decided from.
@@ -287,7 +457,11 @@ pub struct SharedCacheBackgroundMeasurementReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MeasurementLaneOutcome {
     NotDue,
+    /// Another worker is walking for the request; nothing was written.
+    AlreadyRunning,
     HostBusy,
+    /// No host state directory holds the measurement lock: skipped.
+    HostLockUnavailable,
     Completed(SharedCacheMeasurement),
     Interrupted(SharedCacheMeasurementInterruption),
 }
@@ -351,27 +525,27 @@ impl Broker {
         (raw, request)
     }
 
+    fn read_measurement_result(&self) -> (Option<String>, Option<SharedCacheMeasurement>) {
+        let raw = self.store_ref().meta_get(RESULT_KEY).ok().flatten();
+        let result = parse(raw.as_deref());
+        (raw, result)
+    }
+
     /// The pending background measurement request, if any.
     pub(crate) fn shared_cache_measurement_request(&self) -> Option<SharedCacheMeasurementRequest> {
         self.read_measurement_request().1
     }
 
-    /// The last conclusive background measurement, if any.
+    /// The last completed background measurement, if any.
     pub(crate) fn shared_cache_measurement_result(&self) -> Option<SharedCacheMeasurement> {
-        parse(
-            self.store_ref()
-                .meta_get(RESULT_KEY)
-                .ok()
-                .flatten()
-                .as_deref(),
-        )
+        self.read_measurement_result().1
     }
 
-    /// Whether a request is waiting and not backing off. One metadata read,
-    /// cheap enough for worker admission on every broker open.
+    /// Whether a request is waiting, not running and not backing off. One
+    /// metadata read, cheap enough for worker admission on every broker open.
     pub(crate) fn shared_cache_measurement_due(&self, now: i64) -> bool {
         self.shared_cache_measurement_request()
-            .is_some_and(|request| request.retry_after_ms.is_none_or(|after| after <= now))
+            .is_some_and(|request| request.due(now))
     }
 
     /// The status view, or `None` when nothing was ever queued or measured.
@@ -382,19 +556,28 @@ impl Broker {
             return None;
         }
         let now = now_ms();
-        let result_fresh = result
-            .as_ref()
-            .is_some_and(|result| (0..RESULT_MAX_AGE_MS).contains(&result.age_ms(now)));
         Some(SharedCacheMeasurementStatus {
+            result_fresh: result.as_ref().is_some_and(|result| result.fresh(now)),
+            running: request.as_ref().is_some_and(|request| request.running(now)),
             request,
             result,
-            result_fresh,
         })
     }
 
-    /// A conclusive measurement of `repository`'s store under `cache_root`
-    /// that is young enough and bound to the root's current identity. The
-    /// store's identity is checked later, under the lease.
+    /// Drop both records: the store they describe was rotated away.
+    pub(crate) fn forget_shared_cache_measurement(&mut self) {
+        for key in [REQUEST_KEY, RESULT_KEY] {
+            let written = self
+                .store()
+                .meta_set(key, "null")
+                .map_err(|error| error.to_string());
+            crate::warn_unrecorded("forget the shared-cache background measurement", written);
+        }
+    }
+
+    /// A measurement of `repository`'s store under `cache_root` that is within
+    /// its trust, bound to the root's current identity, and decides `budget`.
+    /// The store's identity is checked later, under the lease.
     pub(crate) fn fresh_shared_cache_measurement(
         &self,
         repository: &str,
@@ -406,7 +589,7 @@ impl Broker {
         if result.repository != repository || result.cache_root_key != cache_root_key(cache_root) {
             return None;
         }
-        if !(0..RESULT_MAX_AGE_MS).contains(&result.age_ms(now)) || !result.decides(budget) {
+        if !result.fresh(now) || !result.decides(budget) {
             return None;
         }
         let root_identity = identity_digest(cache_root);
@@ -421,7 +604,9 @@ impl Broker {
     }
 
     /// Queue (or coalesce into the pending) measurement of `repository`'s
-    /// store under `cache_root`. Returns whether the request is durable.
+    /// store under `cache_root`. Returns whether the request is durable. A
+    /// coalesce keeps a running walk's marker and attempt, so the walk still
+    /// clears or updates the request it started.
     pub(crate) fn queue_shared_cache_measurement(
         &mut self,
         repository: &str,
@@ -441,7 +626,10 @@ impl Broker {
                     pending.times_queued = pending.times_queued.saturating_add(1);
                     pending.budget_bytes = budget_bytes;
                     pending.root_identity = root_identity.clone();
-                    pending.reason = reason.to_string();
+                    // A confirming walk keeps its purpose.
+                    if pending.reason != "confirm_over_budget" {
+                        pending.reason = reason.to_string();
+                    }
                     (pending, "preparation_cache_measurement_coalesced")
                 }
                 _ => (
@@ -457,6 +645,10 @@ impl Broker {
                         attempts: 0,
                         retry_after_ms: None,
                         last_interruption: None,
+                        running_since_ms: None,
+                        running_pid: None,
+                        consecutive_failures: 0,
+                        failure_store_identity: None,
                     },
                     "preparation_cache_measurement_queued",
                 ),
@@ -491,6 +683,43 @@ impl Broker {
             .map_err(|error| error.to_string())
     }
 
+    /// The walker's final write: applied only while the request is still the
+    /// one this walk marked running (same attempt and start), whatever a
+    /// prepare coalesced into it meanwhile. Returns whether it was applied.
+    fn finish_measurement_request(
+        &mut self,
+        attempt: u64,
+        running_since_ms: i64,
+        update: impl Fn(SharedCacheMeasurementRequest) -> Option<SharedCacheMeasurementRequest>,
+    ) -> bool {
+        for _ in 0..CAS_ATTEMPTS {
+            let (raw, current) = self.read_measurement_request();
+            let Some(current) = current.filter(|current| {
+                current.attempts == attempt && current.running_since_ms == Some(running_since_ms)
+            }) else {
+                // Dropped by a rotation, or taken over as stale.
+                return false;
+            };
+            let next = update(current).map(|mut next| {
+                next.running_since_ms = None;
+                next.running_pid = None;
+                next
+            });
+            match self.replace_measurement_request(raw.as_deref(), next.as_ref()) {
+                Ok(true) => return true,
+                Ok(false) => continue,
+                Err(error) => {
+                    crate::warn_unrecorded(
+                        "finish the shared-cache background measurement request",
+                        Err::<(), _>(error),
+                    );
+                    return false;
+                }
+            }
+        }
+        false
+    }
+
     /// After a foreground budget check: note a decision taken from a
     /// background measurement and queue what the outcome calls for.
     pub(crate) fn follow_up_shared_cache_budget_check(
@@ -505,17 +734,23 @@ impl Broker {
         let now = now_ms();
         if let Some(measurement) = used.filter(|_| outcome.ends_with("_background")) {
             self.note_shared_cache_measurement_used(now);
+            let age_ms = measurement.age_ms(now);
             let decided_by = SharedCacheMeasurementUse {
                 outcome: measurement.outcome,
                 bytes: measurement.bytes,
                 entries: measurement.entries,
                 complete: measurement.complete,
                 completed_at_ms: measurement.completed_at_ms,
-                age_ms: measurement.age_ms(now),
+                age_ms,
             };
-            // A rotated store needs no refresh; a kept one is still too large
-            // to measure in the foreground, so the next check needs a new one.
+            // A rotated store needs no refresh. A kept one is still too large
+            // to measure in the foreground: refresh it in the last quarter of
+            // its trust, so the next checks find a fresh result without a
+            // full walk every hour.
+            let refresh_due =
+                age_ms.saturating_mul(4) >= measurement.trusted_for_ms.saturating_mul(3);
             let queued = (outcome == "within_budget_background"
+                && refresh_due
                 && self.queue_shared_cache_measurement(
                     repository,
                     cache_root,
@@ -541,10 +776,7 @@ impl Broker {
     }
 
     fn note_shared_cache_measurement_used(&mut self, now: i64) {
-        let Some(raw) = self.store_ref().meta_get(RESULT_KEY).ok().flatten() else {
-            return;
-        };
-        let Some(mut result) = parse::<SharedCacheMeasurement>(Some(raw.as_str())) else {
+        let (Some(raw), Some(mut result)) = self.read_measurement_result() else {
             return;
         };
         result.used_at_ms = Some(now);
@@ -560,9 +792,31 @@ impl Broker {
         crate::warn_unrecorded("record the shared-cache measurement use", written);
     }
 
+    /// An interrupted walk breaks a run of over-budget walks: the next one
+    /// must be confirmed again.
+    fn reset_over_budget_confirmation(&mut self) {
+        let (Some(raw), Some(mut result)) = self.read_measurement_result() else {
+            return;
+        };
+        if result.outcome != MeasurementOutcome::OverBudget || result.over_budget_walks == 0 {
+            return;
+        }
+        result.over_budget_walks = 0;
+        result.over_budget_confirmed = false;
+        let written = serde_json::to_string(&result)
+            .map_err(|error| error.to_string())
+            .and_then(|value| {
+                self.store()
+                    .meta_compare_and_set(RESULT_KEY, Some(&raw), &value)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            });
+        crate::warn_unrecorded("reset the over-budget confirmation", written);
+    }
+
     /// Update the repeated-inconclusive record after a background walk: a
-    /// conclusive result resets it (the status notice clears), an interrupted
-    /// one is noted in it so the notice says why it is still unmeasured.
+    /// result that decides resets it (the status notice clears), anything
+    /// else is noted in it so the notice says why it is still unmeasured.
     fn note_background_measurement_on_inconclusive_record(
         &mut self,
         settled: Option<&SharedCacheMeasurement>,
@@ -633,42 +887,83 @@ impl Broker {
         bindings: &[crate::broker::PreparationCacheRootBinding],
         resource_db_path: Option<&Path>,
     ) -> Result<MeasurementLaneOutcome, BrokerOpError> {
+        self.run_preparation_cache_measurement_lane_hooked(
+            host_lock_directory,
+            bindings,
+            resource_db_path,
+            &mut |_| {},
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_preparation_cache_measurement_lane_hooked(
+        &mut self,
+        host_lock_directory: Option<&Path>,
+        bindings: &[crate::broker::PreparationCacheRootBinding],
+        resource_db_path: Option<&Path>,
+        before_open: &mut dyn FnMut(super::SharedCacheScanOpenTarget),
+    ) -> Result<MeasurementLaneOutcome, BrokerOpError> {
         let now = now_ms();
         let (raw, Some(mut request)) = self.read_measurement_request() else {
             return Ok(MeasurementLaneOutcome::NotDue);
         };
+        if request.running(now) {
+            // Another worker walks for it: never write over its request.
+            crate::phase_telemetry::add(
+                "preparation_cache_measurement_already_running",
+                Duration::ZERO,
+            );
+            return Ok(MeasurementLaneOutcome::AlreadyRunning);
+        }
         if request.retry_after_ms.is_some_and(|after| after > now) {
             return Ok(MeasurementLaneOutcome::NotDue);
         }
+        let took_over = request.running_since_ms.is_some();
         let _lane = crate::phase_telemetry::span("preparation_cache_measurement_lane");
         let _host_slot = match acquire_host_measurement_slot(host_lock_directory) {
-            HostMeasurementSlot::Held(lock) => Some(lock),
-            HostMeasurementSlot::Unavailable => None,
-            HostMeasurementSlot::Busy => {
-                crate::phase_telemetry::add(
-                    "preparation_cache_measurement_host_busy",
-                    Duration::ZERO,
-                );
-                request.retry_after_ms = Some(now.saturating_add(RETRY_AFTER_HOST_BUSY_MS));
+            HostMeasurementSlot::Held(lock) => lock,
+            busy_or_unavailable => {
+                let (counter, retry, outcome) = match busy_or_unavailable {
+                    HostMeasurementSlot::Busy => (
+                        "preparation_cache_measurement_host_busy",
+                        RETRY_AFTER_HOST_BUSY_MS,
+                        MeasurementLaneOutcome::HostBusy,
+                    ),
+                    _ => (
+                        "preparation_cache_measurement_host_lock_unavailable",
+                        RETRY_AFTER_INTERRUPTION_MS,
+                        MeasurementLaneOutcome::HostLockUnavailable,
+                    ),
+                };
+                crate::phase_telemetry::add(counter, Duration::ZERO);
+                request.retry_after_ms = Some(now.saturating_add(retry));
                 let written = self.replace_measurement_request(raw.as_deref(), Some(&request));
                 crate::warn_unrecorded(
                     "defer the shared-cache background measurement",
                     written.map(|_| ()),
                 );
-                return Ok(MeasurementLaneOutcome::HostBusy);
+                return Ok(outcome);
             }
         };
+        let running_since_ms = now_ms();
         request.attempts = request.attempts.saturating_add(1);
         request.retry_after_ms = None;
+        request.running_since_ms = Some(running_since_ms);
+        request.running_pid = Some(std::process::id());
         let attempt = request.attempts;
         if !self
             .replace_measurement_request(raw.as_deref(), Some(&request))
             .unwrap_or(false)
         {
-            // A prepare changed the request meanwhile: the next pass reads it.
+            // Another worker or a prepare changed it meanwhile: next pass.
             return Ok(MeasurementLaneOutcome::NotDue);
         }
-        let started_raw = serde_json::to_string(&Some(&request)).ok();
+        if took_over {
+            crate::phase_telemetry::add(
+                "preparation_cache_measurement_took_over_stale",
+                Duration::ZERO,
+            );
+        }
         crate::phase_telemetry::add(
             if attempt > 1 {
                 "preparation_cache_measurement_restarted"
@@ -682,7 +977,6 @@ impl Broker {
             .find(|binding| cache_root_key(&binding.path) == request.cache_root_key);
         let pacing_before = unattended_pacing::current_summary(now_ms());
         let started = Instant::now();
-        let started_at_ms = now_ms();
         let run = match binding {
             None => Err(Interrupted::new(
                 MeasurementInterruptionReason::RootChanged,
@@ -701,6 +995,7 @@ impl Broker {
                     budget: request.budget_bytes,
                     resource_db_path,
                     max_elapsed: MAX_WALK_DURATION,
+                    before_open,
                 }),
             },
         };
@@ -715,6 +1010,7 @@ impl Broker {
         };
         let memory_pause_ms = pause(|summary| summary.memory_pause_ms);
         let load_pause_ms = pause(|summary| summary.load_pause_ms);
+        let scan_sleep_ms = pause(|summary| summary.scan_limiter_sleep_ms);
         crate::phase_telemetry::add("preparation_cache_measurement_walk", duration);
         crate::phase_telemetry::add(
             "preparation_cache_measurement_pacer_memory_pause",
@@ -723,6 +1019,10 @@ impl Broker {
         crate::phase_telemetry::add(
             "preparation_cache_measurement_pacer_load_wait",
             Duration::from_millis(load_pause_ms),
+        );
+        crate::phase_telemetry::add(
+            "preparation_cache_measurement_scan_limiter_sleep",
+            Duration::from_millis(scan_sleep_ms),
         );
         let completed_at_ms = now_ms();
         match run {
@@ -733,7 +1033,8 @@ impl Broker {
                         .checked_div(duration_ms.max(1))
                         .unwrap_or(0)
                 };
-                let result = SharedCacheMeasurement {
+                let previous = self.shared_cache_measurement_result();
+                let mut result = SharedCacheMeasurement {
                     schema: RESULT_SCHEMA.into(),
                     repository: request.repository.clone(),
                     cache_root_key: request.cache_root_key.clone(),
@@ -744,54 +1045,117 @@ impl Broker {
                     complete: measured.complete,
                     bytes: measured.bytes,
                     entries: measured.entries,
-                    started_at_ms,
+                    skipped_entries: measured.skipped,
+                    concurrent_activity: measured.concurrent_activity,
+                    over_budget_walks: 0,
+                    over_budget_confirmed: false,
+                    started_at_ms: running_since_ms,
                     completed_at_ms,
                     duration_ms,
                     entries_per_second: per_second(measured.entries),
                     bytes_per_second: per_second(measured.bytes),
                     pacer_memory_pause_ms: memory_pause_ms,
                     pacer_load_pause_ms: load_pause_ms,
+                    pacer_scan_limiter_sleep_ms: scan_sleep_ms,
                     attempt,
+                    trusted_for_ms: MIN_TRUST_MS,
+                    trust_reason: String::new(),
                     used_at_ms: None,
                     times_used: 0,
                 };
+                if result.outcome == MeasurementOutcome::OverBudget {
+                    let earlier = previous
+                        .as_ref()
+                        .filter(|previous| {
+                            previous.outcome == MeasurementOutcome::OverBudget
+                                && previous.same_store(&result)
+                        })
+                        .map_or(0, |previous| previous.over_budget_walks);
+                    result.over_budget_walks = earlier.saturating_add(1);
+                    result.over_budget_confirmed =
+                        result.over_budget_walks >= OVER_BUDGET_CONFIRMATIONS;
+                }
+                let (trusted_for_ms, trust_reason) = trust_for(previous.as_ref(), &result);
+                result.trusted_for_ms = trusted_for_ms;
+                result.trust_reason = trust_reason.to_string();
                 let value = serde_json::to_string(&result)?;
                 self.store().meta_set(RESULT_KEY, &value)?;
-                // Clear the request unless a prepare re-queued it meanwhile.
-                let cleared = self.replace_measurement_request(started_raw.as_deref(), None);
-                crate::warn_unrecorded(
-                    "clear the shared-cache background measurement request",
-                    cleared.map(|_| ()),
-                );
+                let awaiting_confirmation = result.outcome == MeasurementOutcome::OverBudget
+                    && !result.over_budget_confirmed;
+                // Clear the request (a coalesce during the walk is answered
+                // by it), or turn it into the confirming walk.
+                self.finish_measurement_request(attempt, running_since_ms, |current| {
+                    awaiting_confirmation.then(|| SharedCacheMeasurementRequest {
+                        reason: "confirm_over_budget".into(),
+                        queued_at_ms: completed_at_ms,
+                        times_queued: 1,
+                        attempts: 0,
+                        retry_after_ms: Some(completed_at_ms.saturating_add(CONFIRMATION_DELAY_MS)),
+                        last_interruption: None,
+                        consecutive_failures: 0,
+                        failure_store_identity: None,
+                        ..current
+                    })
+                });
                 crate::phase_telemetry::add(
-                    match result.outcome {
-                        MeasurementOutcome::WithinBudget => {
+                    match (result.outcome, result.over_budget_confirmed) {
+                        (MeasurementOutcome::WithinBudget, _) => {
                             "preparation_cache_measurement_completed_within_budget"
                         }
-                        MeasurementOutcome::OverBudget => {
+                        (MeasurementOutcome::OverBudget, true) => {
                             "preparation_cache_measurement_completed_over_budget"
+                        }
+                        (MeasurementOutcome::OverBudget, false) => {
+                            "preparation_cache_measurement_completed_over_budget_unconfirmed"
+                        }
+                        (MeasurementOutcome::WithinMargin, _) => {
+                            "preparation_cache_measurement_completed_within_margin"
                         }
                     },
                     Duration::ZERO,
                 );
-                if result.outcome == MeasurementOutcome::OverBudget
+                if result.concurrent_activity {
+                    crate::phase_telemetry::add(
+                        "preparation_cache_measurement_concurrent_activity",
+                        Duration::ZERO,
+                    );
+                }
+                let summary = format!(
+                    "{} ({} bytes, {} entries{}{})",
+                    result.outcome.as_str(),
+                    result.bytes,
+                    result.entries,
+                    if result.complete {
+                        ""
+                    } else {
+                        ", stopped once over the margin"
+                    },
+                    if result.concurrent_activity {
+                        ", concurrent activity"
+                    } else {
+                        ""
+                    }
+                );
+                let settles = result.outcome == MeasurementOutcome::WithinBudget
+                    || result.over_budget_confirmed;
+                if result.over_budget_confirmed
                     && let Some(binding) = binding
                 {
                     self.make_shared_cache_budget_check_due(&binding.path, completed_at_ms);
                 }
                 self.note_background_measurement_on_inconclusive_record(
-                    Some(&result),
-                    format!(
-                        "settled by a background measurement: {} ({} bytes, {} entries{})",
-                        result.outcome.as_str(),
-                        result.bytes,
-                        result.entries,
-                        if result.complete {
-                            ""
-                        } else {
-                            ", stopped once over budget"
-                        }
-                    ),
+                    settles.then_some(&result),
+                    if settles {
+                        format!("settled by a background measurement: {summary}")
+                    } else if awaiting_confirmation {
+                        format!(
+                            "a background measurement found {summary}; a confirming walk is queued before any rotation"
+                        )
+                    } else {
+                        format!(
+                            "a background measurement found {summary}: over the budget but within the {BACKGROUND_MARGIN_PERCENT}% margin, so the store is kept"
+                        )
+                    },
                 );
                 Ok(MeasurementLaneOutcome::Completed(result))
             }
@@ -799,7 +1163,7 @@ impl Broker {
                 crate::phase_telemetry::add(interrupted.reason.counter(), Duration::ZERO);
                 let interruption = SharedCacheMeasurementInterruption {
                     reason: interrupted.reason,
-                    detail: interrupted.detail,
+                    detail: interrupted.detail.clone(),
                     at_ms: completed_at_ms,
                     attempt,
                     entries: interrupted.entries,
@@ -808,19 +1172,35 @@ impl Broker {
                     pacer_memory_pause_ms: memory_pause_ms,
                     pacer_load_pause_ms: load_pause_ms,
                 };
-                let next = (!interrupted.reason.drops_request()).then(|| {
-                    let mut retained = request.clone();
-                    retained.retry_after_ms =
-                        Some(completed_at_ms.saturating_add(RETRY_AFTER_INTERRUPTION_MS));
-                    retained.last_interruption = Some(interruption.clone());
-                    retained
+                self.reset_over_budget_confirmation();
+                let reason = interrupted.reason;
+                let store_identity = interrupted.store_identity.clone();
+                let mut retry_after_ms = None;
+                self.finish_measurement_request(attempt, running_since_ms, |mut current| {
+                    if reason.drops_request() {
+                        return None;
+                    }
+                    let mut delay = RETRY_AFTER_INTERRUPTION_MS;
+                    if reason.backs_off() {
+                        // Reset when the store changed since the last failure.
+                        current.consecutive_failures =
+                            if current.failure_store_identity == store_identity {
+                                current.consecutive_failures.saturating_add(1)
+                            } else {
+                                1
+                            };
+                        current.failure_store_identity = store_identity.clone();
+                        delay = retry_delay_ms(current.consecutive_failures);
+                    }
+                    current.retry_after_ms = Some(completed_at_ms.saturating_add(delay));
+                    current.last_interruption = Some(interruption.clone());
+                    Some(current)
                 });
-                let written =
-                    self.replace_measurement_request(started_raw.as_deref(), next.as_ref());
-                crate::warn_unrecorded(
-                    "record the interrupted shared-cache background measurement",
-                    written.map(|_| ()),
-                );
+                if !reason.drops_request() {
+                    retry_after_ms = self
+                        .shared_cache_measurement_request()
+                        .and_then(|request| request.retry_after_ms);
+                }
                 self.note_background_measurement_on_inconclusive_record(
                     None,
                     format!(
@@ -828,10 +1208,12 @@ impl Broker {
                         interruption.reason.as_str(),
                         interruption.entries,
                         interruption.bytes,
-                        if interrupted.reason.drops_request() {
-                            "; the next inconclusive check queues the current root"
-                        } else {
-                            "; it restarts after a back-off"
+                        match retry_after_ms {
+                            _ if reason.drops_request() => {
+                                "; the next inconclusive check queues the current root".to_string()
+                            }
+                            Some(after) => format!("; it restarts after {after} (ms since epoch)"),
+                            None => String::new(),
                         }
                     ),
                 );
@@ -870,11 +1252,20 @@ impl Broker {
     }
 }
 
+/// Back-off after the `failures`-th consecutive deadline or refused walk of
+/// one store: 10 minutes, doubling, at most a day.
+pub(crate) fn retry_delay_ms(failures: u32) -> i64 {
+    let doublings = failures.saturating_sub(1).min(16);
+    RETRY_AFTER_INTERRUPTION_MS
+        .saturating_mul(1_i64 << doublings)
+        .min(MAX_RETRY_AFTER_MS)
+}
+
 enum HostMeasurementSlot {
     Held(crate::file_lock::ExclusiveFileLock),
-    /// No host state directory could hold the lock: proceed unserialised
-    /// rather than strand the request (the per-repository worker lock still
-    /// holds).
+    /// No host state directory could hold the lock. The repository worker
+    /// lock is already released when the walk would start, so nothing would
+    /// serialise it: the lane skips the measurement instead.
     Unavailable,
     Busy,
 }
@@ -901,6 +1292,8 @@ struct Interrupted {
     detail: Option<String>,
     entries: u64,
     bytes: u64,
+    /// The store's identity when the walk began, for the failure back-off.
+    store_identity: Option<String>,
 }
 
 impl Interrupted {
@@ -910,6 +1303,7 @@ impl Interrupted {
             detail,
             entries: 0,
             bytes: 0,
+            store_identity: None,
         }
     }
 }
@@ -922,6 +1316,8 @@ struct Measured {
     complete: bool,
     bytes: u64,
     entries: u64,
+    skipped: u64,
+    concurrent_activity: bool,
 }
 
 struct MeasureRequest<'a> {
@@ -932,6 +1328,19 @@ struct MeasureRequest<'a> {
     budget: u64,
     resource_db_path: Option<&'a Path>,
     max_elapsed: Duration,
+    /// Called before each directory open; tests use it to change the tree.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    before_open: &'a mut dyn FnMut(super::SharedCacheScanOpenTarget),
+}
+
+/// Whether a `prepare` of `repository` reports holding the shared cache now:
+/// one small directory read beside the host resource database.
+fn prepare_holds_cache(resource_db_path: Option<&Path>, repository: &str) -> bool {
+    resource_db_path.is_some_and(|path| {
+        super::cache_activity::read_current(path, Some(repository), None, now_ms())
+            .iter()
+            .any(|record| record.operation.holds_cache())
+    })
 }
 
 /// Walk one repository's store without a lease. See the module comment for
@@ -953,6 +1362,7 @@ fn measure_store(request: MeasureRequest<'_>) -> Result<Measured, Interrupted> {
         budget,
         resource_db_path,
         max_elapsed,
+        before_open,
     } = request;
     let Some(root_before) = identity_digest(cache_root) else {
         return Err(Interrupted::new(
@@ -982,6 +1392,8 @@ fn measure_store(request: MeasureRequest<'_>) -> Result<Measured, Interrupted> {
     }
     let store = cache_root.join(repository);
     let store_before = identity_digest(&store);
+    let held_at_start = prepare_holds_cache(resource_db_path, repository);
+    let threshold = over_budget_threshold(budget);
     let deadline = Instant::now() + max_elapsed;
     let seen = Cell::new((0_u64, 0_u64));
     let memory_stop = Cell::new(false);
@@ -989,8 +1401,15 @@ fn measure_store(request: MeasureRequest<'_>) -> Result<Measured, Interrupted> {
         seen.set((entries, bytes));
         // At the first entry and then once per batch.
         if (entries.saturating_sub(1)).is_multiple_of(PACING_BATCH_ENTRIES)
-            && unattended_pacing::before_unattended_scan_batch(Some(deadline))
-                == unattended_pacing::PressureVerdict::MemoryBackoff
+            && unattended_pacing::before_unattended_scan_batch(
+                Some(deadline),
+                if entries <= 1 {
+                    0
+                } else {
+                    PACING_BATCH_ENTRIES
+                },
+                SCAN_ENTRIES_PER_SECOND,
+            ) == unattended_pacing::PressureVerdict::MemoryBackoff
         {
             memory_stop.set(true);
             return Err(PreparationError::LivenessIncomplete {
@@ -1006,9 +1425,9 @@ fn measure_store(request: MeasureRequest<'_>) -> Result<Measured, Interrupted> {
             max_depth: SHARED_CACHE_SCAN_MAX_DEPTH,
             max_elapsed,
         },
-        Some(budget),
+        Some(threshold),
         SharedCacheScanConcurrency::Concurrent,
-        |_| {},
+        |target| before_open(target),
         &mut |_| Ok(()),
         &mut on_entry,
     );
@@ -1018,8 +1437,9 @@ fn measure_store(request: MeasureRequest<'_>) -> Result<Measured, Interrupted> {
         detail,
         entries: entries_seen,
         bytes: bytes_seen,
+        store_identity: store_before.clone(),
     };
-    let (inventory, entries) = match walked {
+    let (inventory, counts) = match walked {
         Ok(walked) => walked,
         Err(_) if memory_stop.get() => {
             return Err(interrupted(
@@ -1048,18 +1468,25 @@ fn measure_store(request: MeasureRequest<'_>) -> Result<Measured, Interrupted> {
             Some("the cache root or the store changed while it was measured".into()),
         ));
     }
+    let concurrent_activity =
+        counts.skipped > 0 || held_at_start || prepare_holds_cache(resource_db_path, repository);
     let measured = |outcome, complete, bytes| Measured {
         root_identity: Some(root_before.clone()),
         store_identity: store_before.clone(),
         outcome,
         complete,
         bytes,
-        entries,
+        entries: counts.entries,
+        skipped: counts.skipped,
+        concurrent_activity,
     };
     match inventory {
         SharedCacheInventory::Absent => Ok(measured(MeasurementOutcome::WithinBudget, true, 0)),
         SharedCacheInventory::Complete { bytes } if bytes <= budget => {
             Ok(measured(MeasurementOutcome::WithinBudget, true, bytes))
+        }
+        SharedCacheInventory::Complete { bytes } if bytes <= threshold => {
+            Ok(measured(MeasurementOutcome::WithinMargin, true, bytes))
         }
         SharedCacheInventory::Complete { bytes } => {
             Ok(measured(MeasurementOutcome::OverBudget, true, bytes))
@@ -1104,8 +1531,8 @@ mod tests {
     const REPOSITORY: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
     struct Fixture {
-        _repository: tempfile::TempDir,
-        _storage: crate::test_storage::TestStorage,
+        repository: tempfile::TempDir,
+        storage: crate::test_storage::TestStorage,
         broker: Broker,
         cache: tempfile::TempDir,
         cache_root: PathBuf,
@@ -1124,6 +1551,17 @@ mod tests {
                 instance_nonce: None,
                 root_guard: None,
             }]
+        }
+
+        fn db(&self) -> PathBuf {
+            self.cache_root
+                .with_file_name(".aethyme-test-host-resources.sqlite3")
+        }
+
+        /// A second broker handle on the same repository database, as
+        /// another process (a prepare or a second worker) would have.
+        fn other_broker(&self) -> Broker {
+            self.storage.open(self.repository.path()).unwrap()
         }
 
         fn queue(&mut self, budget: u64) {
@@ -1149,12 +1587,41 @@ mod tests {
                 .unwrap()
         }
 
+        fn run_lane_hooked(
+            &mut self,
+            before_open: &mut dyn FnMut(SharedCacheScanOpenTarget),
+        ) -> MeasurementLaneOutcome {
+            let bindings = self.bindings();
+            let host = self.host.path().to_path_buf();
+            self.broker
+                .run_preparation_cache_measurement_lane_hooked(
+                    Some(&host),
+                    &bindings,
+                    None,
+                    before_open,
+                )
+                .unwrap()
+        }
+
+        fn write_request(&mut self, request: &SharedCacheMeasurementRequest) {
+            let value = serde_json::to_string(&Some(request)).unwrap();
+            self.broker.store().meta_set(REQUEST_KEY, &value).unwrap();
+        }
+
+        fn write_result(&mut self, result: &SharedCacheMeasurement) {
+            let value = serde_json::to_string(result).unwrap();
+            self.broker.store().meta_set(RESULT_KEY, &value).unwrap();
+        }
+
         /// Let the request's back-off elapse, as time passing would.
         fn expire_retry(&mut self) {
             let mut request = self.broker.shared_cache_measurement_request().unwrap();
             request.retry_after_ms = Some(0);
-            let value = serde_json::to_string(&Some(&request)).unwrap();
-            self.broker.store().meta_set(REQUEST_KEY, &value).unwrap();
+            self.write_request(&request);
+        }
+
+        fn raw_request(&self) -> Option<String> {
+            self.broker.store_ref().meta_get(REQUEST_KEY).unwrap()
         }
 
         fn budget_request<'a>(
@@ -1171,6 +1638,19 @@ mod tests {
                 expected_root_identity: None,
                 root_binding: None,
             }
+        }
+
+        fn fill(&self, files: usize, file_bytes: usize) {
+            let nested = self.store().join("nested");
+            fs::create_dir_all(&nested).unwrap();
+            for index in 0..files {
+                fs::write(nested.join(format!("file-{index}")), vec![0_u8; file_bytes]).unwrap();
+            }
+        }
+
+        fn empty_store(&self) {
+            fs::remove_dir_all(self.store().join("nested")).unwrap();
+            fs::create_dir(self.store().join("nested")).unwrap();
         }
     }
 
@@ -1199,23 +1679,16 @@ mod tests {
             .canonicalize()
             .unwrap()
             .join("preparation-cache");
-        let store = cache_root.join(REPOSITORY);
-        fs::create_dir_all(store.join("nested")).unwrap();
-        for index in 0..files {
-            fs::write(
-                store.join("nested").join(format!("file-{index}")),
-                vec![0_u8; file_bytes],
-            )
-            .unwrap();
-        }
-        Fixture {
-            _repository: repository,
-            _storage: storage,
+        let fixture = Fixture {
+            repository,
+            storage,
             broker,
             cache,
             cache_root,
             host: tempfile::tempdir().unwrap(),
-        }
+        };
+        fixture.fill(files, file_bytes);
+        fixture
     }
 
     fn pacer(samples: Vec<PressureSample>) -> UnattendedPacingScope {
@@ -1289,6 +1762,20 @@ mod tests {
         }
     }
 
+    fn make_fifo(path: &Path) {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the path is NUL-terminated and outlives the call; the mode
+        // is a plain value.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+
+    fn budget(max_bytes: u64) -> SharedCacheBudget {
+        SharedCacheBudget {
+            max_bytes,
+            ..SharedCacheBudget::default()
+        }
+    }
+
     #[test]
     fn an_inconclusive_check_queues_one_coalesced_background_measurement() {
         let mut fixture = fixture(1, 10);
@@ -1303,7 +1790,6 @@ mod tests {
         assert_eq!((request.times_queued, request.attempts), (1, 0));
         assert!(fixture.broker.shared_cache_measurement_due(now_ms()));
 
-        // A second inconclusive check joins the pending request.
         let cache_root = fixture.cache_root.clone();
         fixture.broker.follow_up_shared_cache_budget_check(
             Some("inconclusive_entry_limit"),
@@ -1317,7 +1803,6 @@ mod tests {
         assert_eq!(request.reason, "inconclusive_entry_limit");
         assert_eq!(request.budget_bytes, 2_000);
 
-        // A conclusive foreground check queues nothing.
         assert!(
             fixture
                 .broker
@@ -1332,7 +1817,7 @@ mod tests {
         );
         let status = fixture.broker.shared_cache_measurement_status().unwrap();
         assert!(status.request.is_some() && status.result.is_none());
-        assert!(!status.result_fresh);
+        assert!(!status.result_fresh && !status.running);
     }
 
     #[test]
@@ -1345,25 +1830,21 @@ mod tests {
         assert!(result.complete);
         assert_eq!(result.bytes, 1_000);
         assert_eq!(result.entries, 11, "ten files and their directory");
-        assert_eq!(result.attempt, 1);
+        assert_eq!((result.skipped_entries, result.attempt), (0, 1));
+        assert!(!result.concurrent_activity);
         assert_eq!(result.store_identity, identity_digest(&fixture.store()));
-        assert!(
-            fixture.broker.shared_cache_measurement_request().is_none(),
-            "a completed measurement consumes its request"
-        );
+        // 10% of the budget and no growth rate yet: trusted for a day.
+        assert_eq!(result.trusted_for_ms, MAX_TRUST_MS);
+        assert_eq!(result.trust_reason, "at_most_half_of_budget");
+        assert!(fixture.broker.shared_cache_measurement_request().is_none());
         let fresh = fixture
             .broker
             .fresh_shared_cache_measurement(REPOSITORY, &fixture.cache_root, 10_000, now_ms())
             .expect("a fresh result bound to the root is used");
         assert_eq!(fresh, result);
 
-        let budget = SharedCacheBudget {
-            max_bytes: 10_000,
-            ..SharedCacheBudget::default()
-        };
-        let db = fixture
-            .cache_root
-            .with_file_name(".aethyme-test-host-resources.sqlite3");
+        let budget = budget(10_000);
+        let db = fixture.db();
         let guard = activity();
         let rotation = shared_cache_budget_with_background(
             fixture.budget_request(&budget, &db),
@@ -1378,6 +1859,7 @@ mod tests {
         assert_eq!(summary.items_done, 11);
         assert_eq!(summary.bytes_observed, Some(1_000));
 
+        // Young in its trust: decided from it, no refresh walk.
         let cache_root = fixture.cache_root.clone();
         let report = fixture
             .broker
@@ -1389,21 +1871,92 @@ mod tests {
                 Some(&fresh),
             )
             .unwrap();
-        let decided_by = report.decided_by.expect("the decision source is reported");
-        assert_eq!(decided_by.outcome, MeasurementOutcome::WithinBudget);
-        assert_eq!(decided_by.bytes, 1_000);
         assert_eq!(
-            report.queued.as_deref(),
-            Some("refresh"),
-            "a kept store is measured again before the next check"
+            report.decided_by.expect("the source is reported").bytes,
+            1_000
         );
+        assert_eq!(report.queued, None, "no hourly refresh of a healthy store");
         let stored = fixture.broker.shared_cache_measurement_result().unwrap();
         assert_eq!(stored.times_used, 1);
-        assert!(stored.used_at_ms.is_some());
+
+        // In the last quarter of its trust it queues a refresh.
+        let mut late = fresh.clone();
+        late.completed_at_ms = now_ms() - late.trusted_for_ms * 3 / 4 - 1_000;
+        let report = fixture
+            .broker
+            .follow_up_shared_cache_budget_check(
+                Some("within_budget_background"),
+                REPOSITORY,
+                &cache_root,
+                10_000,
+                Some(&late),
+            )
+            .unwrap();
+        assert_eq!(report.queued.as_deref(), Some("refresh"));
     }
 
     #[test]
-    fn an_over_budget_measurement_stops_early_and_rotates_through_the_existing_path() {
+    fn trust_scales_with_headroom_and_the_observed_growth_rate() {
+        let base = SharedCacheMeasurement {
+            schema: RESULT_SCHEMA.into(),
+            repository: REPOSITORY.into(),
+            cache_root_key: "key".into(),
+            root_identity: Some("root".into()),
+            store_identity: Some("store".into()),
+            budget_bytes: 1_000,
+            outcome: MeasurementOutcome::WithinBudget,
+            complete: true,
+            bytes: 400,
+            entries: 1,
+            skipped_entries: 0,
+            concurrent_activity: false,
+            over_budget_walks: 0,
+            over_budget_confirmed: false,
+            started_at_ms: 0,
+            completed_at_ms: 10 * MIN_TRUST_MS,
+            duration_ms: 1,
+            entries_per_second: 0,
+            bytes_per_second: 0,
+            pacer_memory_pause_ms: 0,
+            pacer_load_pause_ms: 0,
+            pacer_scan_limiter_sleep_ms: 0,
+            attempt: 1,
+            trusted_for_ms: MIN_TRUST_MS,
+            trust_reason: String::new(),
+            used_at_ms: None,
+            times_used: 0,
+        };
+        let at = |bytes| SharedCacheMeasurement {
+            bytes,
+            ..base.clone()
+        };
+        assert_eq!(trust_for(None, &at(400)).0, MAX_TRUST_MS);
+        assert_eq!(trust_for(None, &at(700)).0, 6 * 60 * 60 * 1000);
+        assert_eq!(trust_for(None, &at(900)).0, MIN_TRUST_MS);
+        // 100 bytes in 2 h with 500 left: 10 h until the budget.
+        let previous = SharedCacheMeasurement {
+            completed_at_ms: base.completed_at_ms - 2 * MIN_TRUST_MS,
+            bytes: 400,
+            ..base.clone()
+        };
+        let (trust, reason) = trust_for(Some(&previous), &at(500));
+        assert_eq!((trust, reason), (10 * MIN_TRUST_MS, "growth_rate"));
+        // Fast growth is clamped to the budget-check interval.
+        assert_eq!(trust_for(Some(&previous), &at(990)).0, MIN_TRUST_MS);
+        assert_eq!(trust_for(Some(&previous), &at(400)).1, "not_growing");
+        // Another store's result is not a growth sample.
+        let other = SharedCacheMeasurement {
+            store_identity: Some("other".into()),
+            ..previous
+        };
+        assert_eq!(
+            trust_for(Some(&other), &at(500)).1,
+            "at_most_half_of_budget"
+        );
+    }
+
+    #[test]
+    fn one_over_budget_walk_does_not_rotate_two_do_and_a_within_walk_resets() {
         let mut fixture = fixture(20, 100);
         let cache_root = fixture.cache_root.clone();
         let stamp = shared_cache_budget_checked_key(&cache_root);
@@ -1415,13 +1968,50 @@ mod tests {
             .unwrap();
         fixture.queue(150);
         let _pacing = pacer(vec![calm()]);
-        let result = completed(fixture.run_lane());
-        assert_eq!(result.outcome, MeasurementOutcome::OverBudget);
-        assert!(!result.complete, "the walk stops once over budget");
-        assert_eq!(result.bytes, 200, "it stopped at the second file");
-        assert!(result.entries <= 3, "{} entries", result.entries);
-        // The next prepare that finds the cache free checks the budget
-        // (due, not overdue: it does not make a prepare wait for it).
+
+        // First over-budget walk: recorded, unconfirmed, confirmation queued.
+        let first = completed(fixture.run_lane());
+        assert_eq!(first.outcome, MeasurementOutcome::OverBudget);
+        assert!(!first.complete, "the walk stops once over the margin");
+        assert_eq!(first.bytes, 200, "it stopped at the second file");
+        assert_eq!(
+            (first.over_budget_walks, first.over_budget_confirmed),
+            (1, false)
+        );
+        assert!(
+            fixture
+                .broker
+                .fresh_shared_cache_measurement(REPOSITORY, &cache_root, 150, now_ms())
+                .is_none(),
+            "an unconfirmed over-budget result never rotates"
+        );
+        let confirm = fixture.broker.shared_cache_measurement_request().unwrap();
+        assert_eq!(confirm.reason, "confirm_over_budget");
+        assert!(confirm.retry_after_ms.is_some_and(|after| after > now_ms()));
+        assert_eq!(
+            fixture.broker.store().meta_get(&stamp).unwrap(),
+            Some(checked_at.to_string())
+        );
+
+        // The store shrinks before the confirming walk: within budget resets.
+        fixture.empty_store();
+        fixture.expire_retry();
+        let within = completed(fixture.run_lane());
+        assert_eq!(within.outcome, MeasurementOutcome::WithinBudget);
+        assert_eq!(within.over_budget_walks, 0);
+        assert!(fixture.broker.shared_cache_measurement_request().is_none());
+
+        // It grows again: two consecutive over-budget walks confirm.
+        fixture.fill(20, 100);
+        fixture.queue(150);
+        assert!(!completed(fixture.run_lane()).over_budget_confirmed);
+        fixture.expire_retry();
+        let confirmed = completed(fixture.run_lane());
+        assert_eq!(
+            (confirmed.over_budget_walks, confirmed.over_budget_confirmed),
+            (2, true)
+        );
+        assert!(fixture.broker.shared_cache_measurement_request().is_none());
         let stamped: i64 = fixture
             .broker
             .store()
@@ -1430,41 +2020,138 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
-        assert!(stamped < checked_at);
         assert_eq!(
             crate::preparation::budget_check_need(Some(stamped), now_ms()),
             Some(crate::preparation::ExclusiveNeed::BudgetCheckDue)
         );
+        let fresh = fixture
+            .broker
+            .fresh_shared_cache_measurement(REPOSITORY, &cache_root, 150, now_ms())
+            .expect("a confirmed result decides");
 
-        let budget = SharedCacheBudget {
-            max_bytes: 150,
-            ..SharedCacheBudget::default()
-        };
-        let db = fixture
-            .cache_root
-            .with_file_name(".aethyme-test-host-resources.sqlite3");
+        let budget = budget(150);
+        let db = fixture.db();
         let guard = activity();
         let rotation = shared_cache_budget_with_background(
             fixture.budget_request(&budget, &db),
-            Some(&result),
+            Some(&fresh),
             &mut |_| Ok(()),
             no_time(),
         )
         .unwrap()
-        .expect("an over-budget measurement rotates the store");
+        .expect("a confirmed over-budget measurement rotates the store");
         assert!(rotation.removed);
         assert_eq!(
             rotation.rotation_reason,
             SharedCacheRotationReason::BudgetExceeded
         );
-        assert_eq!(rotation.bytes_before, None);
         assert_eq!(rotation.observed_bytes_lower_bound, 200);
-        assert!(fixture.store().is_dir());
         assert_eq!(fs::read_dir(fixture.store()).unwrap().count(), 0);
         assert_eq!(
             inventory_summary(guard).outcome,
             Some("over_budget_background")
         );
+        fixture.broker.forget_shared_cache_measurement();
+        assert!(fixture.broker.shared_cache_measurement_status().is_none());
+    }
+
+    #[test]
+    fn an_interrupted_walk_between_two_over_budget_walks_resets_the_count() {
+        let mut fixture = fixture(20, 100);
+        fixture.queue(150);
+        {
+            let _pacing = pacer(vec![calm()]);
+            completed(fixture.run_lane());
+        }
+        fixture.expire_retry();
+        {
+            let _pacing = pacer(vec![memory_pressure()]);
+            interrupted(fixture.run_lane());
+        }
+        assert_eq!(
+            fixture
+                .broker
+                .shared_cache_measurement_result()
+                .unwrap()
+                .over_budget_walks,
+            0
+        );
+        fixture.expire_retry();
+        let _pacing = pacer(vec![calm()]);
+        let again = completed(fixture.run_lane());
+        assert_eq!(
+            (again.over_budget_walks, again.over_budget_confirmed),
+            (1, false)
+        );
+    }
+
+    #[test]
+    fn a_result_between_the_budget_and_the_margin_neither_rotates_nor_settles() {
+        // 1,020 bytes against 1,000: over the budget, under the 5% margin.
+        let mut fixture = fixture(10, 102);
+        assert_eq!(over_budget_threshold(1_000), 1_050);
+        fixture.queue(1_000);
+        let _pacing = pacer(vec![calm()]);
+        let result = completed(fixture.run_lane());
+        assert_eq!(result.outcome, MeasurementOutcome::WithinMargin);
+        assert!(result.complete);
+        assert_eq!(result.bytes, 1_020);
+        assert!(
+            fixture
+                .broker
+                .fresh_shared_cache_measurement(REPOSITORY, &fixture.cache_root, 1_000, now_ms())
+                .is_none()
+        );
+        let budget = budget(1_000);
+        let db = fixture.db();
+        let guard = activity();
+        assert_eq!(
+            shared_cache_budget_with_background(
+                fixture.budget_request(&budget, &db),
+                Some(&result),
+                &mut |_| Ok(()),
+                no_time(),
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            inventory_summary(guard).outcome,
+            Some("inconclusive_time_limit"),
+            "the check stays inconclusive and the store is kept"
+        );
+    }
+
+    #[test]
+    fn transient_bytes_seen_by_one_walk_never_rotate() {
+        // A running step unpacks into the store while it is walked: the walk
+        // counts the transient bytes and calls the store over budget.
+        let mut fixture = fixture(1, 100);
+        fixture.queue(1_000);
+        let _pacing = pacer(vec![calm()]);
+        let transient = fixture.store().join("nested").join("unpacking");
+        let mut written = false;
+        let result = completed(fixture.run_lane_hooked(&mut |target| {
+            if matches!(target, SharedCacheScanOpenTarget::Child) && !written {
+                written = true;
+                fs::write(&transient, vec![0_u8; 4_000]).unwrap();
+            }
+        }));
+        assert_eq!(result.outcome, MeasurementOutcome::OverBudget);
+        assert!(!result.over_budget_confirmed);
+        assert!(
+            fixture
+                .broker
+                .fresh_shared_cache_measurement(REPOSITORY, &fixture.cache_root, 1_000, now_ms())
+                .is_none()
+        );
+        // The unpack finishes and moves its bytes elsewhere: the confirming
+        // walk sees the real store, within budget, and nothing rotates.
+        fs::remove_file(&transient).unwrap();
+        fixture.expire_retry();
+        let confirming = completed(fixture.run_lane());
+        assert_eq!(confirming.outcome, MeasurementOutcome::WithinBudget);
+        assert_eq!(confirming.over_budget_walks, 0);
     }
 
     #[test]
@@ -1474,18 +2161,11 @@ mod tests {
         let _pacing = pacer(vec![calm()]);
         let result = completed(fixture.run_lane());
 
-        // The store replaced (as a rotation and a later prepare would): the
-        // old directory still exists, so the new one has another inode.
         let store = fixture.store();
         fs::rename(&store, fixture.cache_root.join("retired")).unwrap();
         fs::create_dir(&store).unwrap();
-        let budget = SharedCacheBudget {
-            max_bytes: 10_000,
-            ..SharedCacheBudget::default()
-        };
-        let db = fixture
-            .cache_root
-            .with_file_name(".aethyme-test-host-resources.sqlite3");
+        let budget = budget(10_000);
+        let db = fixture.db();
         let guard = activity();
         let rotation = shared_cache_budget_with_background(
             fixture.budget_request(&budget, &db),
@@ -1501,8 +2181,6 @@ mod tests {
             "the foreground inventory ran instead"
         );
 
-        // Another root, another repository, a changed root identity, an
-        // aged result, or a budget the result cannot decide: not used.
         let now = now_ms();
         let other_root = fixture.cache.path().join("elsewhere");
         fs::create_dir_all(&other_root).unwrap();
@@ -1522,19 +2200,12 @@ mod tests {
             fixture
                 .broker
                 .fresh_shared_cache_measurement(REPOSITORY, &fixture.cache_root, 100, now)
-                .is_some(),
-            "a complete 400-byte result also decides a 100-byte budget (over it)"
+                .is_none(),
+            "a within-budget result does not decide a smaller budget it exceeds"
         );
-        let write = |fixture: &mut Fixture, result: &SharedCacheMeasurement| {
-            fixture
-                .broker
-                .store()
-                .meta_set(RESULT_KEY, &serde_json::to_string(result).unwrap())
-                .unwrap();
-        };
         let mut remounted = result.clone();
         remounted.root_identity = Some("0".repeat(32));
-        write(&mut fixture, &remounted);
+        fixture.write_result(&remounted);
         assert!(
             fixture
                 .broker
@@ -1542,8 +2213,8 @@ mod tests {
                 .is_none()
         );
         let mut aged = result.clone();
-        aged.completed_at_ms = now - RESULT_MAX_AGE_MS;
-        write(&mut fixture, &aged);
+        aged.completed_at_ms = now - aged.trusted_for_ms;
+        fixture.write_result(&aged);
         assert!(
             fixture
                 .broker
@@ -1553,7 +2224,7 @@ mod tests {
         let mut partial = result.clone();
         partial.complete = false;
         partial.bytes = 300;
-        write(&mut fixture, &partial);
+        fixture.write_result(&partial);
         assert!(
             fixture
                 .broker
@@ -1564,11 +2235,83 @@ mod tests {
     }
 
     #[test]
+    fn a_rotation_during_the_walk_discards_it() {
+        let mut fixture = fixture(3, 100);
+        fixture.queue(10_000);
+        let _pacing = pacer(vec![calm()]);
+        let store = fixture.store();
+        let retired = fixture.cache_root.join("retired");
+        let mut rotated = false;
+        let interruption = interrupted(fixture.run_lane_hooked(&mut |target| {
+            if matches!(target, SharedCacheScanOpenTarget::Child) && !rotated {
+                rotated = true;
+                fs::rename(&store, &retired).unwrap();
+                fs::create_dir(&store).unwrap();
+            }
+        }));
+        assert_eq!(
+            interruption.reason,
+            MeasurementInterruptionReason::RootChanged
+        );
+        assert!(fixture.broker.shared_cache_measurement_result().is_none());
+        assert!(
+            fixture.broker.shared_cache_measurement_request().is_none(),
+            "a changed root drops its request"
+        );
+    }
+
+    #[test]
+    fn a_pending_rotation_in_the_real_journal_stops_the_walk() {
+        let mut fixture = fixture(3, 100);
+        let db = fixture.db();
+        let root = rotation_debt::DirectoryIdentity::capture(&fixture.cache_root).unwrap();
+        let store = rotation_debt::DirectoryIdentity::capture(&fixture.store()).unwrap();
+        let debt = rotation_debt::RotationDebt::new(
+            REPOSITORY,
+            &rotation_debt::new_transaction_id(),
+            root.clone(),
+            store,
+        )
+        .unwrap();
+        let payload = rotation_debt::encode(&debt).unwrap();
+        crate::preparation::rotation_journal::publish(
+            &db,
+            &fixture.cache_root,
+            &root.encode().unwrap(),
+            REPOSITORY,
+            &payload,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::preparation::probe_rotation_recovery(
+                &fixture.cache_root,
+                None,
+                &db,
+                4096,
+                Instant::now() + Duration::from_secs(2),
+            ),
+            rotation_debt::DebtProbe::Pending
+        );
+        fixture.queue(10_000);
+        let _pacing = pacer(vec![calm()]);
+        let bindings = fixture.bindings();
+        let host = fixture.host.path().to_path_buf();
+        let outcome = fixture
+            .broker
+            .run_preparation_cache_measurement_lane_with(Some(&host), &bindings, Some(&db))
+            .unwrap();
+        assert_eq!(
+            interrupted(outcome).reason,
+            MeasurementInterruptionReason::RotationPending
+        );
+        assert!(fixture.broker.shared_cache_measurement_request().is_some());
+    }
+
+    #[test]
     fn memory_pressure_pauses_the_walk_and_a_persistent_one_interrupts_it() {
         let mut fixture = fixture(3, 100);
         fixture.queue(10_000);
         {
-            // Two pressured samples, then calm: the walk waits and finishes.
             let _pacing = pacer(vec![memory_pressure(), memory_pressure(), calm()]);
             let result = completed(fixture.run_lane());
             assert!(
@@ -1576,7 +2319,6 @@ mod tests {
                 "{} ms paused",
                 result.pacer_memory_pause_ms
             );
-            assert_eq!(result.outcome, MeasurementOutcome::WithinBudget);
         }
 
         fixture.queue(10_000);
@@ -1586,14 +2328,29 @@ mod tests {
             interruption.reason,
             MeasurementInterruptionReason::MemoryPressure
         );
-        assert!(interruption.pacer_memory_pause_ms > 0);
         let request = fixture
             .broker
             .shared_cache_measurement_request()
             .expect("the request stays durable");
         assert_eq!(request.attempts, 1);
+        assert_eq!(request.running_since_ms, None);
         assert!(request.retry_after_ms.is_some_and(|after| after > now_ms()));
         assert_eq!(request.last_interruption, Some(interruption));
+    }
+
+    #[test]
+    fn the_scan_rate_limit_paces_the_walk() {
+        let mut fixture = fixture(PACING_BATCH_ENTRIES as usize + 10, 1);
+        fixture.queue(u64::MAX / 2);
+        let _pacing = pacer(vec![calm()]);
+        let result = completed(fixture.run_lane());
+        // One full batch at 10,000 entries a second: about 410 ms slept on
+        // the pacer's (fake) clock.
+        assert!(
+            result.pacer_scan_limiter_sleep_ms >= 400,
+            "{} ms",
+            result.pacer_scan_limiter_sleep_ms
+        );
     }
 
     #[test]
@@ -1615,11 +2372,162 @@ mod tests {
     }
 
     #[test]
+    fn repeated_refused_walks_back_off_exponentially_until_the_store_changes() {
+        assert_eq!(retry_delay_ms(1), RETRY_AFTER_INTERRUPTION_MS);
+        assert_eq!(retry_delay_ms(2), 2 * RETRY_AFTER_INTERRUPTION_MS);
+        assert_eq!(retry_delay_ms(3), 4 * RETRY_AFTER_INTERRUPTION_MS);
+        assert_eq!(retry_delay_ms(40), MAX_RETRY_AFTER_MS);
+
+        let mut fixture = fixture(1, 100);
+        // A special file makes every walk of this store refuse.
+        make_fifo(&fixture.store().join("nested").join("fifo"));
+        fixture.queue(10_000);
+        let _pacing = pacer(vec![calm()]);
+        let mut delays = Vec::new();
+        for _ in 0..3 {
+            let before = now_ms();
+            let interruption = interrupted(fixture.run_lane());
+            assert_eq!(
+                interruption.reason,
+                MeasurementInterruptionReason::ScanRefused
+            );
+            let request = fixture.broker.shared_cache_measurement_request().unwrap();
+            delays.push((
+                request.consecutive_failures,
+                request.retry_after_ms.unwrap() - before,
+            ));
+            fixture.expire_retry();
+        }
+        assert_eq!(
+            delays.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(delays[2].1 >= 4 * RETRY_AFTER_INTERRUPTION_MS);
+
+        // A new store (another identity) starts the back-off again.
+        let store = fixture.store();
+        fs::rename(&store, fixture.cache_root.join("retired")).unwrap();
+        fs::create_dir_all(store.join("nested")).unwrap();
+        make_fifo(&store.join("nested").join("fifo"));
+        interrupted(fixture.run_lane());
+        assert_eq!(
+            fixture
+                .broker
+                .shared_cache_measurement_request()
+                .unwrap()
+                .consecutive_failures,
+            1
+        );
+    }
+
+    #[test]
+    fn a_running_walk_is_never_restarted_or_overwritten() {
+        let mut fixture = fixture(3, 100);
+        fixture.queue(10_000);
+        let mut request = fixture.broker.shared_cache_measurement_request().unwrap();
+        request.attempts = 1;
+        request.running_since_ms = Some(now_ms());
+        request.running_pid = Some(std::process::id());
+        fixture.write_request(&request);
+        let before = fixture.raw_request();
+        // Worker admission on broker open reads exactly this.
+        assert!(!fixture.broker.shared_cache_measurement_due(now_ms()));
+        let _pacing = pacer(vec![calm()]);
+        assert_eq!(fixture.run_lane(), MeasurementLaneOutcome::AlreadyRunning);
+        assert_eq!(fixture.raw_request(), before, "nothing was written");
+        assert!(
+            fixture
+                .broker
+                .shared_cache_measurement_status()
+                .unwrap()
+                .running
+        );
+    }
+
+    #[test]
+    fn a_walk_clears_its_request_despite_a_second_worker_and_a_coalesce() {
+        let mut fixture = fixture(3, 100);
+        fixture.queue(10_000);
+        let mut other = fixture.other_broker();
+        let bindings = fixture.bindings();
+        let host = fixture.host.path().to_path_buf();
+        let cache_root = fixture.cache_root.clone();
+        let _pacing = pacer(vec![calm()]);
+        let mut during = None;
+        let result = completed(fixture.run_lane_hooked(&mut |target| {
+            if matches!(target, SharedCacheScanOpenTarget::Child) && during.is_none() {
+                // A broker open spawns a second worker: it must not walk or
+                // write. A prepare's inconclusive check coalesces.
+                let second = other
+                    .run_preparation_cache_measurement_lane_with(Some(&host), &bindings, None)
+                    .unwrap();
+                other.queue_shared_cache_measurement(
+                    REPOSITORY,
+                    &cache_root,
+                    10_000,
+                    "inconclusive_time_limit",
+                );
+                during = Some(second);
+            }
+        }));
+        assert_eq!(during, Some(MeasurementLaneOutcome::AlreadyRunning));
+        assert_eq!(result.outcome, MeasurementOutcome::WithinBudget);
+        assert!(
+            fixture.broker.shared_cache_measurement_request().is_none(),
+            "the completed walk answers the coalesced check too"
+        );
+    }
+
+    #[test]
+    fn an_interruption_keeps_its_back_off_despite_a_coalesce() {
+        let mut fixture = fixture(3, 100);
+        fixture.queue(10_000);
+        let mut other = fixture.other_broker();
+        let cache_root = fixture.cache_root.clone();
+        let _pacing = pacer(vec![memory_pressure()]);
+        let interruption = interrupted(fixture.run_lane_hooked(&mut |_| {
+            other.queue_shared_cache_measurement(REPOSITORY, &cache_root, 10_000, "refresh");
+        }));
+        let request = fixture.broker.shared_cache_measurement_request().unwrap();
+        assert!(request.retry_after_ms.is_some_and(|after| after > now_ms()));
+        assert_eq!(request.last_interruption, Some(interruption));
+        assert_eq!(request.running_since_ms, None);
+    }
+
+    #[test]
+    fn a_stale_running_marker_is_taken_over() {
+        for (since, pid) in [
+            // Older than the walk deadline plus slack.
+            (
+                now_ms()
+                    - i64::try_from(MAX_WALK_DURATION.as_millis()).unwrap()
+                    - RUNNING_STALE_SLACK_MS
+                    - 1,
+                Some(std::process::id()),
+            ),
+            // Recent, but its process is gone.
+            (now_ms(), Some(u32::MAX)),
+        ] {
+            let mut fixture = fixture(3, 100);
+            fixture.queue(10_000);
+            let mut request = fixture.broker.shared_cache_measurement_request().unwrap();
+            request.attempts = 1;
+            request.running_since_ms = Some(since);
+            request.running_pid = pid;
+            fixture.write_request(&request);
+            assert!(fixture.broker.shared_cache_measurement_due(now_ms()));
+            let _pacing = pacer(vec![calm()]);
+            let result = completed(fixture.run_lane());
+            assert_eq!(result.attempt, 2);
+            assert!(fixture.broker.shared_cache_measurement_request().is_none());
+        }
+    }
+
+    #[test]
     fn two_workers_never_measure_at_once() {
         let mut fixture = fixture(3, 100);
         fixture.queue(10_000);
         let _pacing = pacer(vec![calm()]);
-        // Another repository's worker holds this host's measurement slot.
         let held = acquire_host_measurement_slot(Some(fixture.host.path()));
         assert!(matches!(held, HostMeasurementSlot::Held(_)));
         assert!(matches!(
@@ -1635,6 +2543,52 @@ mod tests {
         drop(held);
         fixture.expire_retry();
         completed(fixture.run_lane());
+    }
+
+    #[test]
+    fn without_a_host_lock_directory_the_walk_is_skipped() {
+        let mut fixture = fixture(3, 100);
+        fixture.queue(10_000);
+        let bindings = fixture.bindings();
+        let outcome = fixture
+            .broker
+            .run_preparation_cache_measurement_lane_with(None, &bindings, None)
+            .unwrap();
+        assert_eq!(outcome, MeasurementLaneOutcome::HostLockUnavailable);
+        let request = fixture.broker.shared_cache_measurement_request().unwrap();
+        assert_eq!(request.attempts, 0);
+        assert!(request.retry_after_ms.is_some());
+    }
+
+    #[test]
+    fn the_lane_resolves_the_brokers_own_cache_root_binding() {
+        let mut fixture = fixture(1, 10);
+        let binding = fixture
+            .broker
+            .preparation_cache_root_bindings_for_maintenance()
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the fixture broker has a preparation cache root");
+        let store = binding.path.join(REPOSITORY);
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("payload"), vec![0_u8; 64]).unwrap();
+        fixture.broker.queue_shared_cache_measurement(
+            REPOSITORY,
+            &binding.path,
+            10_000,
+            "inconclusive_time_limit",
+        );
+        let _pacing = pacer(vec![calm()]);
+        let host = fixture.host.path().to_path_buf();
+        let result = completed(
+            fixture
+                .broker
+                .run_preparation_cache_measurement_lane(Some(&host))
+                .unwrap(),
+        );
+        assert_eq!(result.bytes, 64);
+        assert!(host.join(HOST_LOCK_FILE).exists());
     }
 
     #[test]
@@ -1675,7 +2629,6 @@ mod tests {
                 .is_some_and(|note| note.contains("memory_pressure")),
             "{notice:?}"
         );
-        // Still inconclusive in the foreground: the note stays with it.
         fixture
             .broker
             .record_shared_cache_inventory_outcome(&inventory);
@@ -1700,7 +2653,7 @@ mod tests {
     }
 
     #[test]
-    fn a_concurrent_walk_skips_entries_that_vanish_and_an_exclusive_one_refuses() {
+    fn a_concurrent_walk_skips_and_counts_entries_that_vanish_and_an_exclusive_one_refuses() {
         let fixture = fixture(2, 100);
         let store = fixture.store();
         let walk = |concurrency| {
@@ -1712,7 +2665,6 @@ mod tests {
                 None,
                 concurrency,
                 |target| {
-                    // A writer removes the directory between listing and open.
                     if matches!(target, SharedCacheScanOpenTarget::Child) && !removed {
                         removed = true;
                         fs::rename(&nested, store.join("..").join("moved-away")).unwrap();
@@ -1722,8 +2674,9 @@ mod tests {
                 &mut |_, _| Ok(()),
             )
         };
-        let (inventory, _) = walk(SharedCacheScanConcurrency::Concurrent).unwrap();
+        let (inventory, counts) = walk(SharedCacheScanConcurrency::Concurrent).unwrap();
         assert_eq!(inventory, SharedCacheInventory::Complete { bytes: 0 });
+        assert_eq!(counts.skipped, 1);
         fs::rename(fixture.cache_root.join("moved-away"), store.join("nested")).unwrap();
         assert!(walk(SharedCacheScanConcurrency::Exclusive).is_err());
     }
