@@ -3659,6 +3659,9 @@ thread_local! {
     /// before the verdict's own fresh re-check.
     static AFTER_REMOVAL_COHORT_HOOK: std::cell::RefCell<Option<RemovalCohortHook>> =
         const { std::cell::RefCell::new(None) };
+    /// Test seam: another pass moves the lap cursor while a put-off group
+    /// moves it back.
+    static PUT_OFF_CURSOR_RACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Test seam: Git spends time deleting each checkout and then fails to
     /// remove it, as a removal stopped part-way (`ENOTEMPTY`) does.
     pub(crate) static GIT_REMOVAL_FAILS_PART_WAY: std::cell::Cell<bool> =
@@ -8189,8 +8192,10 @@ impl Broker {
         }
         report.assign_kept_codes();
         self.note_priority_apply_keeps(&report)?;
-        self.judge_put_off_groups_first(&deletion_put_off)?;
+        // The report first: it names checkouts already removed, and nothing
+        // about ordering the next pass may lose it.
         self.record_auto_cleanup_report(&report)?;
+        self.judge_put_off_groups_first(&deletion_put_off)?;
         Ok(report)
     }
 
@@ -8206,6 +8211,14 @@ impl Broker {
             return Ok(());
         }
         let (mut cursor, mut expected_cursor) = self.auto_cleanup_cursor()?;
+        #[cfg(test)]
+        if PUT_OFF_CURSOR_RACE.with(std::cell::Cell::get) {
+            // Another pass moves the cursor between the read and the write.
+            let mut moved = cursor;
+            moved.after_session_id = moved.after_session_id.saturating_add(1);
+            let mut raw = expected_cursor.clone();
+            self.persist_auto_cleanup_cursor(&moved, &mut raw)?;
+        }
         if let Some(first) = groups
             .iter()
             .map(|(_, cursor_session_id)| *cursor_session_id)
@@ -8213,7 +8226,18 @@ impl Broker {
             .min()
         {
             cursor.after_session_id = first - 1;
-            self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
+            // Only a hint for ordering: if another pass moved the cursor
+            // meanwhile, leave its cursor and count the conflict.
+            match self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor) {
+                Ok(()) => {}
+                Err(BrokerOpError::AutoCleanupCursorChanged) => {
+                    crate::phase_telemetry::add(
+                        "auto_cleanup_put_off_cursor_conflict",
+                        Duration::ZERO,
+                    );
+                }
+                Err(error) => return Err(error),
+            }
         }
         let raw = self.store().meta_get(PRIORITY_MEMO_KEY)?;
         let mut memo = PriorityMemo::decode(raw.as_deref());
@@ -17779,6 +17803,69 @@ mod tests {
             .judge_put_off_groups_first(&[(String::new(), sessions[2].id)])
             .unwrap();
         assert_eq!(broker.capacity_removal_lap_position().unwrap(), rewound);
+    }
+
+    /// Moving the lap cursor back for a put-off group is only an ordering
+    /// hint: when another pass moved the cursor meanwhile, the conflict is
+    /// counted and not an error, the other pass's cursor stays, and the
+    /// priority memo entry is still dropped.
+    #[cfg(unix)]
+    #[test]
+    fn a_cursor_conflict_while_moving_back_is_not_an_error() {
+        let (_owner, _storage, mut broker, sessions) = closed_priority_fixture(2);
+        broker
+            .auto_cleanup_plan_with_group_inspector_limited(
+                None,
+                1,
+                super::RemovalSelection::Probe,
+                false,
+                |_, group, _, _, _| {
+                    Ok(AutoCleanupGroupInspection::Kept(super::AutoKeptCheckout {
+                        worktree: group.worktree.to_string_lossy().into_owned(),
+                        sessions: group.sessions.iter().map(|session| session.id).collect(),
+                        reason: "injected inspection".into(),
+                        ..Default::default()
+                    }))
+                },
+            )
+            .unwrap();
+        let passed = broker.capacity_removal_lap_position().unwrap();
+        let first = std::fs::canonicalize(&sessions[0].worktree_path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut memo = super::PriorityMemo::decode(None);
+        memo.remember(
+            first.clone(),
+            true,
+            super::PriorityOutcome::Selected,
+            now_ms(),
+        );
+        broker
+            .store()
+            .meta_set(
+                super::PRIORITY_MEMO_KEY,
+                &serde_json::to_string(&memo).unwrap(),
+            )
+            .unwrap();
+        super::PUT_OFF_CURSOR_RACE.with(|flag| flag.set(true));
+        let result = broker.judge_put_off_groups_first(&[(first.clone(), sessions[0].id)]);
+        super::PUT_OFF_CURSOR_RACE.with(|flag| flag.set(false));
+        result.expect("a cursor conflict is not an error");
+        let after = broker.capacity_removal_lap_position().unwrap();
+        assert_eq!(
+            after.after_session_id,
+            passed.after_session_id + 1,
+            "the other pass's cursor stays: {after:?}"
+        );
+        let memo = super::PriorityMemo::decode(
+            broker
+                .store()
+                .meta_get(super::PRIORITY_MEMO_KEY)
+                .unwrap()
+                .as_deref(),
+        );
+        assert!(!memo.entries.contains_key(&first), "{memo:?}");
     }
 
     /// A hard retry set while a worker run is going (a held lock, memory
