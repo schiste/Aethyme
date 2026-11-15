@@ -15626,7 +15626,7 @@ mod tests {
             .execute(
                 "INSERT INTO sessions (worktree_path, branch, origin, status, cleanup_state,
                  created_at, updated_at, last_activity_at, closed_at)
-             VALUES (?1, 'agent/just-closed', 'spawned', 'closed', 'closed', 1, 1, 1, 1)",
+             VALUES (?1, 'agent/just-closed', 'spawned', 'cleaned', 'closed', 1, 1, 1, 1)",
                 [root.join("just-closed").to_string_lossy().as_ref()],
             )
             .unwrap();

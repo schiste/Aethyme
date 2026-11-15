@@ -17534,11 +17534,15 @@ mod tests {
         let report = broker.auto_cleanup_apply_now(plan).unwrap().unwrap();
         assert!(report.removed.is_empty(), "{report:#?}");
         assert!(worktree.exists());
-        let kept = kept_for(&report, &key);
+        // The fresh read refuses it: kept (the open session overlaps it) or
+        // deferred (its path cannot be resolved against the open one yet),
+        // never removed.
+        let kept = report.kept.iter().find(|kept| kept.worktree == key);
         assert!(
-            kept.reason.starts_with("changed before removal: ")
-                || kept.reason.starts_with("removal failed: "),
-            "{kept:?}"
+            kept.is_some_and(|kept| kept.reason.starts_with("changed before removal: ")
+                || kept.reason.starts_with("removal failed: "))
+                || (kept.is_none() && report.deferred == 1),
+            "{report:#?}"
         );
     }
 
