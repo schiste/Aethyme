@@ -4,6 +4,24 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.104] - 2026-11-15
+
+### Changed
+
+- Each Git binary is checked for output-rewriting wrappers once per user instead of in every `aethyme` process. Accepted and rejected verdicts are cached in `<host cache dir>/git-probe/verdicts.json`, keyed on the binary's exact file identity, `PATH` and the dynamic-loader variables, and expire after 24 hours. A cached rejection only ever skips a candidate. Set `AETHYME_GIT_PROBE_CACHE=off` to disable the cache, or delete the file to force a new check (#1695).
+- Deleting on Git evidence never rests on a cached acceptance. The deletion primitives (`worktree remove`, branch deletion, tree removal, pinned condemned-tree removal) and the commands that delete (`finish`, `close`, `cleanup`, `gc`, `reclaim`, `storage`, `worktrees`, and the GC worker) re-prove Git with a fresh probe and refuse if it fails; the ignored-directory sweep and GC journal replay inside broker open do the same before they gather evidence (#1695).
+- On macOS `ps` and `sysctl` are spawned by absolute path; Linux keeps `PATH` order for `ps` (#1695).
+- Probe directories are named `aethyme-git-probe-*`. The GC worker removes stale ones through the paced removal path, including legacy `.tmp*` directories that exactly match the probe's layout; only the worker's own temporary directory is swept (#1695).
+
+### Added
+
+- Counters for probe cache hits, misses, rejected hits and write failures, and the blocked reason `git_verdict_unconfirmed` (#1695).
+
+### Known issues
+
+- Hooks and shells that run with different `PATH` values each probe once, because `PATH` is part of the cache key.
+- A process that deletes runs one fresh probe when its verdict came from the cache.
+
 ## [0.8.103] - 2026-11-15
 
 ### Changed
