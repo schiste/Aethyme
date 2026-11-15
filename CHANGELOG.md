@@ -4,6 +4,28 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.105] - 2026-11-15
+
+### Changed
+
+- Background checkout removal no longer queues a whole worker run behind another repository's. The host-wide single-deleter slot is held only while deleting: one checkout removal and its rate-limit charge, or a tree removal's batches, and both hand it over after 20 seconds. No unattended unlink happens without it. Each deletion waits at most 2 seconds; a busy slot puts the removal off (`stop_reason` `host_deleter_busy`), the next pass judges that checkout first, and lanes pinned by a busy slot retry after one minute (#1694).
+- At most two repositories judge closed checkouts at once (#1694).
+- The removal gate samples memory pressure even when there is no host directory to serialise through (#1694).
+
+### Fixed
+
+- `finish` and `close` no longer warn "wake post-close checkout cleanup" when the worker holds the GC lock; the worker reconciles the cleanup outbox before its requested-cleanup lane. A close made after the running worker has passed that lane waits for the next broker open or worker start (#1694).
+- The oldest-first lap cursor advances on a memo hit, and process-group probes keep polling on `EPERM` instead of failing (#1694).
+
+### Added
+
+- `host_slot_*` and `judge_permit_*` in the pacing summary and the slice record, including `host_slot_busy` per slice (#1694).
+
+### Known issues
+
+- A checkout put off by a busy slot is fully judged again on the next pass.
+- Single control-file unlinks during preparation-cache rotation recovery are not serialised through the deleter slot.
+
 ## [0.8.104] - 2026-11-15
 
 ### Changed
