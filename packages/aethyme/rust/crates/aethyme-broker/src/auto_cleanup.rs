@@ -218,6 +218,192 @@ struct AutoCleanupVerdictOptions<'a> {
     deadline: Option<Instant>,
     selected: Option<&'a ContainmentProof>,
     lease_process_table: &'a mut LeaseProcessTableSnapshot,
+    gate_witnesses: &'a mut GateWitnessSnapshot,
+}
+
+/// Run-directory entries the per-session gate inventory may read before it
+/// reports itself unknown, which keeps the checkout.
+const SESSION_GATE_INVENTORY_ENTRY_BUDGET: usize = 4096;
+
+/// The repository's running-gate witnesses, read lazily like the process
+/// table above. Selection shares one across its pass, so the gate pidfiles and
+/// owner locks are read once per pass rather than once per checkout;
+/// revalidation gives each checkout its own instance under the lifecycle
+/// claim, so a removal is only ever authorized by a read made immediately
+/// before it.
+#[derive(Default)]
+struct GateWitnessSnapshot {
+    witnesses: Option<Vec<ResolvedGateWitness>>,
+    stats: AutoCleanupGateChecks,
+    elapsed: Duration,
+}
+
+/// A witness with its recorded checkout resolved once per read.
+struct ResolvedGateWitness {
+    witness: crate::gates::RunningGateWitness,
+    checkout: Option<ResolvedWorktreePath>,
+}
+
+/// Whom one running-gate witness keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateAttribution {
+    /// It names one of the checkout's own sessions.
+    OwnSession,
+    /// Its recorded checkout is the judged one, inside it or contains it.
+    Path,
+    /// Its recorded checkout is positively some other checkout.
+    Elsewhere,
+    /// Nothing identifies where it runs: it keeps every checkout.
+    Unknown,
+}
+
+/// Attribute one witness to the judged checkout. Only a recorded checkout
+/// that resolves disjoint from the candidate, with neither path nor Git
+/// directory overlapping, sets a gate aside; everything else keeps it.
+fn attribute_gate_witness(
+    witness: &crate::gates::RunningGateWitness,
+    resolved: Option<&ResolvedWorktreePath>,
+    candidate: &ResolvedWorktreePath,
+    cohort: &[i64],
+) -> GateAttribution {
+    if witness
+        .session_id
+        .is_some_and(|session| cohort.contains(&session))
+    {
+        return GateAttribution::OwnSession;
+    }
+    match (&witness.checkout, resolved) {
+        (crate::gates::GateWitnessCheckout::Recorded(_), Some(resolved)) => {
+            match live_worktree_overlap(candidate, resolved) {
+                LiveOverlapEvidence::Overlap => GateAttribution::Path,
+                LiveOverlapEvidence::Unknown => GateAttribution::Unknown,
+                LiveOverlapEvidence::Disjoint => GateAttribution::Elsewhere,
+            }
+        }
+        _ => GateAttribution::Unknown,
+    }
+}
+
+impl GateWitnessSnapshot {
+    /// Why a running gate keeps `candidate`, or `None` when every running
+    /// gate is positively identified as running somewhere else.
+    ///
+    /// A gate keeps the checkout when one of its own sessions (`cohort`)
+    /// runs it, when its recorded checkout overlaps the candidate, or when
+    /// nothing identifies its checkout: an older binary's record, an
+    /// unreadable or malformed one, or a per-session inventory that could not
+    /// complete. Only the last kind can keep a checkout no gate is using, and
+    /// it keeps every candidate exactly as the repository-wide check did.
+    fn keep_reason(
+        &mut self,
+        main_root: &Path,
+        candidate: &ResolvedWorktreePath,
+        cohort: &[i64],
+    ) -> Option<String> {
+        let started = Instant::now();
+        let reason = self.judge(main_root, candidate, cohort);
+        let elapsed = started.elapsed();
+        self.elapsed += elapsed;
+        self.stats.elapsed_ms = duration_ms(Some(self.elapsed));
+        crate::phase_telemetry::add("auto_cleanup_gate_check", elapsed);
+        reason
+    }
+
+    fn judge(
+        &mut self,
+        main_root: &Path,
+        candidate: &ResolvedWorktreePath,
+        cohort: &[i64],
+    ) -> Option<String> {
+        self.stats.checks = self.stats.checks.saturating_add(1);
+        if self.witnesses.is_none() {
+            self.stats.scans = self.stats.scans.saturating_add(1);
+            let read = crate::gates::running_gate_witnesses_until(main_root, || false, None)
+                .expect("unbounded gate witness scan completes");
+            self.witnesses = Some(
+                read.into_iter()
+                    .map(|witness| {
+                        let resolved = match &witness.checkout {
+                            crate::gates::GateWitnessCheckout::Recorded(path) => {
+                                Some(ResolvedWorktreePath::resolve(path))
+                            }
+                            crate::gates::GateWitnessCheckout::Unknown => None,
+                        };
+                        ResolvedGateWitness {
+                            witness,
+                            checkout: resolved,
+                        }
+                    })
+                    .collect(),
+            );
+        }
+        let witnesses = self.witnesses.as_deref().unwrap_or_default();
+        let mut own_session = None;
+        let mut path = None;
+        let mut unknown = None;
+        for ResolvedGateWitness {
+            witness,
+            checkout: resolved,
+        } in witnesses
+        {
+            self.stats.gates_seen = self.stats.gates_seen.saturating_add(1);
+            match attribute_gate_witness(witness, resolved.as_ref(), candidate, cohort) {
+                GateAttribution::OwnSession => {
+                    self.stats.attributed_here = self.stats.attributed_here.saturating_add(1);
+                    crate::phase_telemetry::add("auto_cleanup_gate_own_session", Duration::ZERO);
+                    own_session = own_session.or_else(|| Some(witness.evidence.clone()));
+                }
+                GateAttribution::Path => {
+                    self.stats.attributed_here = self.stats.attributed_here.saturating_add(1);
+                    crate::phase_telemetry::add("auto_cleanup_gate_path", Duration::ZERO);
+                    path = path.or_else(|| Some(witness.evidence.clone()));
+                }
+                GateAttribution::Elsewhere => {
+                    self.stats.attributed_elsewhere =
+                        self.stats.attributed_elsewhere.saturating_add(1);
+                    crate::phase_telemetry::add("auto_cleanup_gate_elsewhere", Duration::ZERO);
+                }
+                GateAttribution::Unknown => {
+                    self.stats.unknown_owner = self.stats.unknown_owner.saturating_add(1);
+                    crate::phase_telemetry::add("auto_cleanup_gate_unknown_owner", Duration::ZERO);
+                    unknown = unknown.or_else(|| Some(witness.evidence.clone()));
+                }
+            }
+        }
+        if let Some(evidence) = own_session {
+            return Some(format!("{GATE_RUNNING_OWN_SESSION}: {evidence}"));
+        }
+        // The strict per-session inventory guarded retirement uses: it also
+        // counts a gate whose leader exited while its process group lives on,
+        // and anything it cannot read or verify is unknown, never "idle".
+        for &session in cohort {
+            match crate::gates::checked_running_session_gates_until(
+                main_root,
+                session,
+                || false,
+                SESSION_GATE_INVENTORY_ENTRY_BUDGET,
+            ) {
+                Some(gates) if gates.is_empty() => {}
+                Some(gates) => {
+                    return Some(format!(
+                        "{GATE_RUNNING_OWN_SESSION}: session {session} is running gate {}",
+                        gates.join(", ")
+                    ));
+                }
+                None => {
+                    unknown = unknown.or_else(|| {
+                        Some(format!(
+                            "the gate records of session {session} could not be verified"
+                        ))
+                    });
+                }
+            }
+        }
+        if let Some(evidence) = path {
+            return Some(format!("{GATE_RUNNING_PATH}: {evidence}"));
+        }
+        unknown.map(|evidence| format!("{GATE_RUNNING_UNKNOWN_OWNER}: {evidence}"))
+    }
 }
 
 fn checkout_group_cursor_session_id(group: &AutoCleanupCheckoutGroup) -> i64 {
@@ -1098,6 +1284,76 @@ pub struct AutoKeptCheckout {
     /// `ownership_reproof_refused`); the reason names the failed condition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ownership_reproof: Option<String>,
+    /// With code `gate_running`: which gate witness kept the checkout,
+    /// `own_session` (a gate of one of the checkout's own sessions),
+    /// `path` (a gate whose recorded checkout is this one, inside it or
+    /// contains it) or `unknown_owner` (a gate whose checkout no record
+    /// positively identifies). Absent for other codes and for keeps written
+    /// before the gate check was narrowed to the checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_keep: Option<String>,
+}
+
+/// Keep-reason prefixes of the gate check. Each contains the
+/// `a gate may be running` needle, so all three keep code `gate_running`.
+pub(crate) const GATE_RUNNING_OWN_SESSION: &str = "a gate may be running (own session)";
+pub(crate) const GATE_RUNNING_PATH: &str = "a gate may be running (this checkout's path)";
+pub(crate) const GATE_RUNNING_UNKNOWN_OWNER: &str = "a gate may be running (owner unknown)";
+
+/// The `gate_keep` value of a `gate_running` keep reason, if it says which
+/// witness kept the checkout.
+pub(crate) fn gate_keep_kind(reason: &str) -> Option<&'static str> {
+    [
+        (GATE_RUNNING_OWN_SESSION, "own_session"),
+        (GATE_RUNNING_PATH, "path"),
+        (GATE_RUNNING_UNKNOWN_OWNER, "unknown_owner"),
+    ]
+    .into_iter()
+    .find(|(needle, _)| reason.contains(needle))
+    .map(|(_, kind)| kind)
+}
+
+/// What the gate check of automatic checkout removal saw, summed over the
+/// checks of a pass (or of a capacity slice's passes).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AutoCleanupGateChecks {
+    /// Candidate checkouts the gate check judged.
+    pub checks: usize,
+    /// Repository-wide reads of the gate pidfiles and owner locks. Selection
+    /// reads them once per pass; revalidation reads them fresh for each
+    /// checkout immediately before removing it.
+    pub scans: usize,
+    /// Running-gate witnesses seen, summed over the checks.
+    pub gates_seen: usize,
+    /// Of those, witnesses attributed to the judged checkout: one of its own
+    /// sessions' gates, or a gate whose recorded checkout overlaps it.
+    pub attributed_here: usize,
+    /// Witnesses positively identified as running in another checkout; they
+    /// no longer keep the judged one.
+    pub attributed_elsewhere: usize,
+    /// Witnesses whose checkout no record identifies (an older binary's
+    /// record, an unreadable or malformed one); each still keeps the checkout.
+    pub unknown_owner: usize,
+    /// Time the gate checks took, including the reads.
+    pub elapsed_ms: u64,
+}
+
+impl AutoCleanupGateChecks {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub(crate) fn absorb(&mut self, other: &Self) {
+        self.checks = self.checks.saturating_add(other.checks);
+        self.scans = self.scans.saturating_add(other.scans);
+        self.gates_seen = self.gates_seen.saturating_add(other.gates_seen);
+        self.attributed_here = self.attributed_here.saturating_add(other.attributed_here);
+        self.attributed_elsewhere = self
+            .attributed_elsewhere
+            .saturating_add(other.attributed_elsewhere);
+        self.unknown_owner = self.unknown_owner.saturating_add(other.unknown_owner);
+        self.elapsed_ms = self.elapsed_ms.saturating_add(other.elapsed_ms);
+    }
 }
 
 /// Classify a keep reason into a stable code. The reasons are written by the
@@ -1235,6 +1491,9 @@ pub struct AutoCleanupLanes {
     /// on when the deadline passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub removal_inventory_wait: Option<InventoryWait>,
+    /// What the gate check saw in selection and revalidation.
+    #[serde(default, skip_serializing_if = "AutoCleanupGateChecks::is_empty")]
+    pub removal_gate_checks: AutoCleanupGateChecks,
 }
 
 /// What selection's checkout inventory was waiting on when it ran out of time.
@@ -1427,6 +1686,10 @@ pub struct CapacityRemovalSlice {
     /// Time the removal passes' capacity-pressure probes took, summed.
     #[serde(default)]
     pub probe_ms: u64,
+    /// What the removal passes' gate checks saw, summed
+    /// (`lanes.removal_gate_checks`).
+    #[serde(default, skip_serializing_if = "AutoCleanupGateChecks::is_empty")]
+    pub gate_checks: AutoCleanupGateChecks,
     /// With outcome `inventory_unavailable`: what the inventory was waiting
     /// on (`capacity_probe`, `cohort_index`, `group_page`, `live_paths`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1574,6 +1837,9 @@ impl AutoCleanupReport {
             }
             if kept.code == "ownership_reproof_refused" && kept.ownership_reproof.is_none() {
                 kept.ownership_reproof = Some(OWNERSHIP_REPROOF_DEVICE_RENUMBER.to_string());
+            }
+            if kept.code == "gate_running" && kept.gate_keep.is_none() {
+                kept.gate_keep = gate_keep_kind(&kept.reason).map(str::to_string);
             }
         }
     }
@@ -5331,6 +5597,7 @@ impl Broker {
             deadline,
             selected,
             lease_process_table,
+            gate_witnesses,
         } = options;
         let keep = NotRemoved::Keep;
         // Only a checkout a broker session record proves it created may go.
@@ -5534,9 +5801,16 @@ impl Broker {
                 )));
             }
         }
-        let gates = crate::gates::running_gate_evidence(self.main_root());
-        if let Some(gate) = gates.first() {
-            return Err(keep(format!("a gate may be running: {gate}")));
+        // Only a gate that could be using this checkout keeps it: one of its
+        // own sessions' gates, one whose recorded checkout overlaps it, or one
+        // whose checkout nothing identifies. A gate positively recorded in
+        // another checkout no longer does. Gate admission takes the lifecycle
+        // claim apply holds and registers an artifact-use producer the apply
+        // reclaimer excludes, so no gate starts in this checkout after this.
+        if let Some(reason) =
+            gate_witnesses.keep_reason(self.main_root(), &candidate_worktree, &ids)
+        {
+            return Err(keep(reason));
         }
 
         // Proof 3. Tracked files an interrupted removal already deleted do
@@ -6344,6 +6618,7 @@ impl Broker {
         lanes.removal_inventory_unavailable = planned.removal_inventory_unavailable;
         lanes.removal_probe_ms = planned.removal_probe_ms;
         lanes.removal_inventory_wait = planned.removal_inventory_wait;
+        lanes.removal_gate_checks = planned.removal_gate_checks;
         lanes.removal_elapsed_ms = duration_ms(Some(removal_started.elapsed()));
         plan.report.lanes = Some(lanes);
         let report = self.auto_cleanup_apply(plan)?;
@@ -6593,6 +6868,7 @@ impl Broker {
         let mut upstream = None;
         let mut selected = Vec::new();
         let mut lease_process_table = LeaseProcessTableSnapshot::default();
+        let mut gate_witnesses = GateWitnessSnapshot::default();
         let mut alias_refresh_generation = None;
         let mut examined = 0_usize;
         let mut memo_skips = 0_usize;
@@ -6798,6 +7074,7 @@ impl Broker {
                                 code: "ignored_content".into(),
                                 ignored_blockers: entry.blockers,
                                 ownership_reproof: None,
+                                gate_keep: None,
                             });
                         } else if deadline_expired(deadline) {
                             report.deferred += 1;
@@ -6812,6 +7089,7 @@ impl Broker {
                                     deadline,
                                     selected: None,
                                     lease_process_table: &mut lease_process_table,
+                                    gate_witnesses: &mut gate_witnesses,
                                 },
                             );
                             let verdict = match verdict {
@@ -6825,6 +7103,7 @@ impl Broker {
                                             deadline,
                                             selected: None,
                                             lease_process_table: &mut lease_process_table,
+                                            gate_witnesses: &mut gate_witnesses,
                                         },
                                     ),
                                 verdict => verdict,
@@ -6885,6 +7164,10 @@ impl Broker {
                                         let ownership_reproof = (code
                                             == "ownership_reproof_refused")
                                             .then(|| OWNERSHIP_REPROOF_DEVICE_RENUMBER.to_string());
+                                        let gate_keep = (code == "gate_running")
+                                            .then(|| gate_keep_kind(&reason))
+                                            .flatten()
+                                            .map(str::to_string);
                                         report.kept.push(AutoKeptCheckout {
                                             worktree: worktree_key,
                                             sessions: candidate.session_ids(),
@@ -6892,6 +7175,7 @@ impl Broker {
                                             code: code.to_string(),
                                             ignored_blockers,
                                             ownership_reproof,
+                                            gate_keep,
                                         })
                                     }
                                 }
@@ -7010,6 +7294,7 @@ impl Broker {
             removal_priority_selected: priority_selected,
             removal_priority_memo_skips: priority_memo_skips,
             removal_probe_ms: duration_ms(Some(probe_elapsed)),
+            removal_gate_checks: gate_witnesses.stats,
             ..AutoCleanupLanes::default()
         });
         // The current deferred group, if any, was counted above and the cursor
@@ -7127,6 +7412,7 @@ impl Broker {
             return Ok(report);
         }
         let mut attempted_any = false;
+        let mut apply_gate_checks = AutoCleanupGateChecks::default();
         for (candidate, selected_proof) in selected {
             // The first selected checkout always goes, so a pass whose
             // selection spent the budget still converges; the rest wait for
@@ -7209,7 +7495,9 @@ impl Broker {
             }
             // Revalidate every proof now, under the lock, right before removal.
             let mut lease_process_table = LeaseProcessTableSnapshot::default();
-            let proof = match self.auto_cleanup_verdict(
+            // A fresh gate read for each checkout, under the lifecycle claim.
+            let mut gate_witnesses = GateWitnessSnapshot::default();
+            let verdict = self.auto_cleanup_verdict(
                 &candidate,
                 &policy,
                 &upstream,
@@ -7218,8 +7506,11 @@ impl Broker {
                     deadline: deadline.filter(|_| bound_revalidation),
                     selected: Some(&selected_proof),
                     lease_process_table: &mut lease_process_table,
+                    gate_witnesses: &mut gate_witnesses,
                 },
-            ) {
+            );
+            apply_gate_checks.absorb(&gate_witnesses.stats);
+            let proof = match verdict {
                 Ok(proof) => proof,
                 Err(NotRemoved::Keep(reason)) => {
                     keep_it(&mut report, format!("changed before removal: {reason}"));
@@ -7261,6 +7552,9 @@ impl Broker {
                 }
                 Err(error) => keep_it(&mut report, format!("removal failed: {error}")),
             }
+        }
+        if let Some(lanes) = report.lanes.as_mut() {
+            lanes.removal_gate_checks.absorb(&apply_gate_checks);
         }
         report.assign_kept_codes();
         self.note_priority_apply_keeps(&report)?;
@@ -7659,6 +7953,166 @@ mod tests {
             first_live_worktree_overlap(&candidate, &[sibling]),
             None,
             "path-prefix checks compare components rather than string prefixes"
+        );
+    }
+
+    #[test]
+    fn a_gate_keeps_a_checkout_only_when_it_could_be_using_it() {
+        use super::{GateAttribution, attribute_gate_witness};
+        use crate::gates::{GateWitnessCheckout, RunningGateWitness};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let candidate_path = temporary.path().join("foo");
+        let sibling_path = temporary.path().join("foo-2");
+        std::fs::create_dir_all(candidate_path.join("sub")).unwrap();
+        std::fs::create_dir_all(&sibling_path).unwrap();
+        let candidate = ResolvedWorktreePath::resolve(&candidate_path);
+        let witness = |session_id: Option<i64>, checkout: Option<&Path>| RunningGateWitness {
+            evidence: "gate pidfile x.pid names running process 1".into(),
+            session_id,
+            checkout: checkout.map_or(GateWitnessCheckout::Unknown, |path| {
+                GateWitnessCheckout::Recorded(path.to_path_buf())
+            }),
+        };
+        let attribute = |witness: &RunningGateWitness| {
+            let resolved = match &witness.checkout {
+                GateWitnessCheckout::Recorded(path) => Some(ResolvedWorktreePath::resolve(path)),
+                GateWitnessCheckout::Unknown => None,
+            };
+            attribute_gate_witness(witness, resolved.as_ref(), &candidate, &[7, 9])
+        };
+
+        assert_eq!(
+            attribute(&witness(Some(9), Some(&sibling_path))),
+            GateAttribution::OwnSession,
+            "one of the checkout's own sessions keeps it wherever its gate runs"
+        );
+        assert_eq!(
+            attribute(&witness(Some(8), Some(&candidate_path))),
+            GateAttribution::Path
+        );
+        assert_eq!(
+            attribute(&witness(None, Some(&candidate_path.join("sub")))),
+            GateAttribution::Path
+        );
+        assert_eq!(
+            attribute(&witness(None, Some(temporary.path()))),
+            GateAttribution::Path,
+            "a gate in a directory containing the checkout can walk into it"
+        );
+        assert_eq!(
+            attribute(&witness(Some(8), Some(&sibling_path))),
+            GateAttribution::Elsewhere,
+            "a string prefix of another checkout is not this checkout"
+        );
+        assert_eq!(
+            attribute(&witness(Some(8), None)),
+            GateAttribution::Unknown,
+            "a record naming no checkout keeps every checkout"
+        );
+        assert_eq!(attribute(&witness(None, None)), GateAttribution::Unknown);
+        #[cfg(unix)]
+        {
+            let alias = temporary.path().join("alias");
+            std::os::unix::fs::symlink(&candidate_path, &alias).unwrap();
+            assert_eq!(
+                attribute(&witness(Some(8), Some(&alias))),
+                GateAttribution::Path,
+                "a symlinked spelling of the checkout is still the checkout"
+            );
+            let canonical = std::fs::canonicalize(&candidate_path).unwrap();
+            let canonical_candidate = ResolvedWorktreePath::resolve(&canonical);
+            let raw = witness(Some(8), Some(&candidate_path));
+            let resolved = ResolvedWorktreePath::resolve(&candidate_path);
+            assert_eq!(
+                attribute_gate_witness(&raw, Some(&resolved), &canonical_candidate, &[7]),
+                GateAttribution::Path,
+                "a /private-style alias of the candidate still matches"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gate_check_reads_once_per_snapshot_and_keeps_on_unknown_owners() {
+        use super::{
+            GATE_RUNNING_OWN_SESSION, GATE_RUNNING_PATH, GATE_RUNNING_UNKNOWN_OWNER,
+            GateWitnessSnapshot, gate_keep_kind, kept_reason_code,
+        };
+        use crate::gates::{GatePidRecord, encode_gate_checkout, running_dir};
+
+        let root = tempfile::tempdir().unwrap();
+        let candidate_path = root.path().join("checkout");
+        let elsewhere_path = root.path().join("elsewhere");
+        std::fs::create_dir_all(&candidate_path).unwrap();
+        std::fs::create_dir_all(&elsewhere_path).unwrap();
+        let candidate = ResolvedWorktreePath::resolve(&candidate_path);
+        let run_dir = running_dir(root.path());
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let me = std::process::id();
+        let pidfile = |name: &str, checkout: Option<&Path>| {
+            let checkout = checkout.map_or_else(|| "-".to_string(), encode_gate_checkout);
+            std::fs::write(run_dir.join(name), format!("{me} tree {me} - - {checkout}")).unwrap();
+        };
+
+        // Only a gate in another checkout: nothing keeps the candidate.
+        pidfile("41-unit.pid", Some(&elsewhere_path));
+        assert!(
+            GatePidRecord::parse(&std::fs::read_to_string(run_dir.join("41-unit.pid")).unwrap())
+                .unwrap()
+                .checkout
+                .is_some()
+        );
+        let mut snapshot = GateWitnessSnapshot::default();
+        assert_eq!(snapshot.keep_reason(root.path(), &candidate, &[7]), None);
+        assert_eq!(snapshot.keep_reason(root.path(), &candidate, &[7]), None);
+        assert_eq!(snapshot.stats.checks, 2);
+        assert_eq!(snapshot.stats.scans, 1, "one read serves the whole pass");
+        assert_eq!(snapshot.stats.gates_seen, 2);
+        assert_eq!(snapshot.stats.attributed_elsewhere, 2);
+        assert_eq!(snapshot.stats.attributed_here, 0);
+        assert_eq!(snapshot.stats.unknown_owner, 0);
+
+        // The checkout's own session.
+        let mut snapshot = GateWitnessSnapshot::default();
+        let reason = snapshot
+            .keep_reason(root.path(), &candidate, &[41])
+            .unwrap();
+        assert!(reason.starts_with(GATE_RUNNING_OWN_SESSION), "{reason}");
+        assert_eq!(gate_keep_kind(&reason), Some("own_session"));
+        assert_eq!(kept_reason_code(&reason), "gate_running");
+
+        // A gate recorded in the checkout itself.
+        pidfile("42-unit.pid", Some(&candidate_path));
+        let mut snapshot = GateWitnessSnapshot::default();
+        let reason = snapshot.keep_reason(root.path(), &candidate, &[7]).unwrap();
+        assert!(reason.starts_with(GATE_RUNNING_PATH), "{reason}");
+        assert_eq!(gate_keep_kind(&reason), Some("path"));
+        assert_eq!(kept_reason_code(&reason), "gate_running");
+        std::fs::remove_file(run_dir.join("42-unit.pid")).unwrap();
+
+        // A record that names no checkout, then a malformed one.
+        pidfile("43-unit.pid", None);
+        let mut snapshot = GateWitnessSnapshot::default();
+        let reason = snapshot.keep_reason(root.path(), &candidate, &[7]).unwrap();
+        assert!(reason.starts_with(GATE_RUNNING_UNKNOWN_OWNER), "{reason}");
+        assert_eq!(gate_keep_kind(&reason), Some("unknown_owner"));
+        assert_eq!(kept_reason_code(&reason), "gate_running");
+        assert_eq!(snapshot.stats.unknown_owner, 1);
+        std::fs::remove_file(run_dir.join("43-unit.pid")).unwrap();
+        std::fs::write(run_dir.join("44-unit.pid"), "malformed").unwrap();
+        let mut snapshot = GateWitnessSnapshot::default();
+        let reason = snapshot.keep_reason(root.path(), &candidate, &[7]).unwrap();
+        assert!(reason.starts_with(GATE_RUNNING_UNKNOWN_OWNER), "{reason}");
+        std::fs::remove_file(run_dir.join("44-unit.pid")).unwrap();
+
+        // An unverifiable record of the checkout's own session is unknown.
+        std::fs::write(run_dir.join("7-unit.pid"), "malformed").unwrap();
+        let mut snapshot = GateWitnessSnapshot::default();
+        let reason = snapshot.keep_reason(root.path(), &candidate, &[7]).unwrap();
+        assert!(
+            reason.starts_with(GATE_RUNNING_OWN_SESSION)
+                || reason.starts_with(GATE_RUNNING_UNKNOWN_OWNER),
+            "{reason}"
         );
     }
 
@@ -9768,8 +10222,8 @@ mod tests {
     fn checkout_removal_reproves_a_schema_two_witness_after_a_device_renumber() {
         use super::{
             AutoCleanupCheckoutGroup, AutoCleanupVerdictOptions,
-            ClosedArtifactCheckoutCohortResolution, LeaseProcessTableSnapshot, NotRemoved,
-            OWNERSHIP_REPROOF_DEVICE_RENUMBER,
+            ClosedArtifactCheckoutCohortResolution, GateWitnessSnapshot, LeaseProcessTableSnapshot,
+            NotRemoved, OWNERSHIP_REPROOF_DEVICE_RENUMBER,
         };
 
         let (_owner, _storage, mut broker, session) = retirement_fixture();
@@ -9855,6 +10309,7 @@ mod tests {
                     deadline: None,
                     selected: Some(&selected),
                     lease_process_table: &mut lease_process_table,
+                    gate_witnesses: &mut GateWitnessSnapshot::default(),
                 },
             )
         };
@@ -10297,8 +10752,8 @@ mod tests {
     #[test]
     fn the_verdict_recheck_refuses_a_checkout_changed_after_the_cohort() {
         use super::{
-            AutoCleanupCheckoutGroup, AutoCleanupVerdictOptions, LeaseProcessTableSnapshot,
-            NotRemoved,
+            AutoCleanupCheckoutGroup, AutoCleanupVerdictOptions, GateWitnessSnapshot,
+            LeaseProcessTableSnapshot, NotRemoved,
         };
 
         let mut fixture = RenumberFixture::new();
@@ -10355,6 +10810,7 @@ mod tests {
                 deadline: None,
                 selected: Some(&selected),
                 lease_process_table: &mut lease_process_table,
+                gate_witnesses: &mut GateWitnessSnapshot::default(),
             },
         );
         super::AFTER_REMOVAL_COHORT_HOOK.with(|hook| *hook.borrow_mut() = None);
@@ -10615,7 +11071,8 @@ mod tests {
     #[test]
     fn closed_cohort_accepts_remounted_git_volume_with_spawn_time_uuid() {
         use super::{
-            AutoCleanupCheckoutGroup, AutoCleanupVerdictOptions, LeaseProcessTableSnapshot,
+            AutoCleanupCheckoutGroup, AutoCleanupVerdictOptions, GateWitnessSnapshot,
+            LeaseProcessTableSnapshot,
         };
 
         let (_owner, _storage, mut broker, session) = retirement_fixture();
@@ -10700,6 +11157,7 @@ mod tests {
                 deadline: None,
                 selected: Some(&proof),
                 lease_process_table: &mut lease_process_table,
+                gate_witnesses: &mut GateWitnessSnapshot::default(),
             },
         );
         assert!(

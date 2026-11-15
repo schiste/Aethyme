@@ -1168,8 +1168,14 @@ fn same_gate_directory_version(left: &std::fs::Metadata, right: &std::fs::Metada
 }
 
 fn parse_checked_gate_pid_record(content: &str) -> Option<GatePidRecord> {
-    let fields = content.split_whitespace().take(6).collect::<Vec<_>>();
-    if !matches!(fields.len(), 2..=5) {
+    let fields = content.split_whitespace().take(7).collect::<Vec<_>>();
+    if !matches!(fields.len(), 2..=6) {
+        return None;
+    }
+    if let Some(checkout) = fields.get(5)
+        && *checkout != "-"
+        && decode_gate_checkout(checkout).is_none()
+    {
         return None;
     }
     let record = GatePidRecord::parse(content)?;
@@ -1251,9 +1257,62 @@ pub(crate) fn running_gate_evidence(main_root: &Path) -> Vec<String> {
 /// result is unknown: callers must not use it to authorize cache removal.
 pub(crate) fn running_gate_evidence_until(
     main_root: &Path,
-    mut expired: impl FnMut() -> bool,
+    expired: impl FnMut() -> bool,
     entry_budget: Option<usize>,
 ) -> Option<Vec<String>> {
+    running_gate_witnesses_until(main_root, expired, entry_budget).map(|witnesses| {
+        witnesses
+            .into_iter()
+            .map(|witness| witness.evidence)
+            .collect()
+    })
+}
+
+/// Where a running-gate witness says its gate runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GateWitnessCheckout {
+    /// The canonical checkout the gate command runs in, as a current record
+    /// written by this or a later binary states it.
+    Recorded(PathBuf),
+    /// Nothing positively identifies where the gate runs: a record written
+    /// by an older binary, an unreadable or malformed one, an owner lock
+    /// whose holder line is incomplete or names a process that is no longer
+    /// running, or a directory that could not be read at all.
+    Unknown,
+}
+
+/// One witness of [`running_gate_evidence`], with what it says about the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunningGateWitness {
+    /// The human-readable evidence line `running_gate_evidence` reports.
+    pub(crate) evidence: String,
+    /// The session the witness names: the `<session>` of a
+    /// `<session>-<gate>.pid` pidfile, or the `s<session>` worker of an owner
+    /// lock's holder line. An owner-lock holder line can be stale, so this
+    /// only ever adds reasons to keep, never removes one.
+    pub(crate) session_id: Option<i64>,
+    pub(crate) checkout: GateWitnessCheckout,
+}
+
+impl RunningGateWitness {
+    fn unknown(evidence: String) -> Self {
+        Self {
+            evidence,
+            session_id: None,
+            checkout: GateWitnessCheckout::Unknown,
+        }
+    }
+}
+
+/// The structured form of [`running_gate_evidence_until`]: the same scan, the
+/// same witnesses, each with the session and checkout it names, so a caller
+/// asking about one checkout can set aside gates positively identified as
+/// running somewhere else. Every witness the plain scan reports is here.
+pub(crate) fn running_gate_witnesses_until(
+    main_root: &Path,
+    mut expired: impl FnMut() -> bool,
+    entry_budget: Option<usize>,
+) -> Option<Vec<RunningGateWitness>> {
     fn confirmed_absent_until(path: &Path, expired: &mut impl FnMut() -> bool) -> Option<bool> {
         if expired() {
             return None;
@@ -1266,7 +1325,7 @@ pub(crate) fn running_gate_evidence_until(
     }
 
     let run_dir = running_dir(main_root);
-    let mut evidence = Vec::new();
+    let mut witnesses = Vec::new();
     let mut entries_seen = 0_usize;
     if expired() {
         return None;
@@ -1285,7 +1344,9 @@ pub(crate) fn running_gate_evidence_until(
                     Ok(entry) => entry,
                     Err(_) if entry_budget.is_some() => return None,
                     Err(error) => {
-                        evidence.push(format!("gate run directory entry cannot be read: {error}"));
+                        witnesses.push(RunningGateWitness::unknown(format!(
+                            "gate run directory entry cannot be read: {error}"
+                        )));
                         continue;
                     }
                 };
@@ -1299,17 +1360,27 @@ pub(crate) fn running_gate_evidence_until(
                     Ok(record) => record,
                     Err(()) if entry_budget.is_some() => return None,
                     Err(()) => {
-                        evidence.push(format!("gate pidfile {name} is unreadable"));
+                        witnesses.push(RunningGateWitness::unknown(format!(
+                            "gate pidfile {name} is unreadable"
+                        )));
                         continue;
                     }
                 };
                 let Some(record) = record else {
-                    evidence.push(format!("gate pidfile {name} is unreadable"));
+                    witnesses.push(RunningGateWitness::unknown(format!(
+                        "gate pidfile {name} is unreadable"
+                    )));
                     continue;
                 };
                 let pid = record.pid.unwrap_or(record.pgid);
                 if record.names_running_process() {
-                    evidence.push(format!("gate pidfile {name} names running process {pid}"));
+                    witnesses.push(RunningGateWitness {
+                        evidence: format!("gate pidfile {name} names running process {pid}"),
+                        session_id: gate_pidfile_session(&name),
+                        checkout: record
+                            .checkout
+                            .map_or(GateWitnessCheckout::Unknown, GateWitnessCheckout::Recorded),
+                    });
                 }
                 if expired() {
                     return None;
@@ -1321,13 +1392,17 @@ pub(crate) fn running_gate_evidence_until(
                 Some(true) => {}
                 Some(false) if entry_budget.is_some() => return None,
                 Some(false) => {
-                    evidence.push(format!("gate run directory cannot be read: {error}"));
+                    witnesses.push(RunningGateWitness::unknown(format!(
+                        "gate run directory cannot be read: {error}"
+                    )));
                 }
                 None => return None,
             }
         }
         Err(_) if entry_budget.is_some() => return None,
-        Err(error) => evidence.push(format!("gate run directory cannot be read: {error}")),
+        Err(error) => witnesses.push(RunningGateWitness::unknown(format!(
+            "gate run directory cannot be read: {error}"
+        ))),
     }
     let owners_dir = run_dir.join("owners");
     if expired() {
@@ -1347,9 +1422,9 @@ pub(crate) fn running_gate_evidence_until(
                     Ok(entry) => entry,
                     Err(_) if entry_budget.is_some() => return None,
                     Err(error) => {
-                        evidence.push(format!(
+                        witnesses.push(RunningGateWitness::unknown(format!(
                             "gate owner directory entry cannot be read: {error}"
-                        ));
+                        )));
                         continue;
                     }
                 };
@@ -1364,7 +1439,9 @@ pub(crate) fn running_gate_evidence_until(
                 let file = match open_gate_owner_lock_probe(&entry.path()) {
                     Ok(file) => file,
                     Err(error) => {
-                        evidence.push(format!("gate owner lock {name} cannot be opened: {error}"));
+                        witnesses.push(RunningGateWitness::unknown(format!(
+                            "gate owner lock {name} cannot be opened: {error}"
+                        )));
                         continue;
                     }
                 };
@@ -1376,10 +1453,23 @@ pub(crate) fn running_gate_evidence_until(
                         crate::warn_unrecorded("release a gate owner lock probe", file.unlock());
                     }
                     Err(std::fs::TryLockError::WouldBlock) => {
-                        evidence.push(format!("gate owner lock {name} is held by a running gate"));
+                        let holder = read_gate_owner_holder(&file);
+                        witnesses.push(RunningGateWitness {
+                            evidence: format!("gate owner lock {name} is held by a running gate"),
+                            session_id: holder.as_deref().and_then(gate_owner_holder_session),
+                            checkout: holder
+                                .as_deref()
+                                .and_then(verified_gate_owner_holder_checkout)
+                                .map_or(
+                                    GateWitnessCheckout::Unknown,
+                                    GateWitnessCheckout::Recorded,
+                                ),
+                        });
                     }
                     Err(std::fs::TryLockError::Error(error)) => {
-                        evidence.push(format!("gate owner lock {name} cannot be probed: {error}"));
+                        witnesses.push(RunningGateWitness::unknown(format!(
+                            "gate owner lock {name} cannot be probed: {error}"
+                        )));
                     }
                 }
                 if expired() {
@@ -1392,16 +1482,94 @@ pub(crate) fn running_gate_evidence_until(
                 Some(true) => {}
                 Some(false) if entry_budget.is_some() => return None,
                 Some(false) => {
-                    evidence.push(format!("gate owner directory cannot be read: {error}"));
+                    witnesses.push(RunningGateWitness::unknown(format!(
+                        "gate owner directory cannot be read: {error}"
+                    )));
                 }
                 None => return None,
             }
         }
         Err(_) if entry_budget.is_some() => return None,
-        Err(error) => evidence.push(format!("gate owner directory cannot be read: {error}")),
+        Err(error) => witnesses.push(RunningGateWitness::unknown(format!(
+            "gate owner directory cannot be read: {error}"
+        ))),
     }
-    evidence.sort();
-    (!expired()).then_some(evidence)
+    witnesses.sort_by(|left, right| left.evidence.cmp(&right.evidence));
+    (!expired()).then_some(witnesses)
+}
+
+/// The session a `<session>-<gate>.pid` file name names.
+fn gate_pidfile_session(name: &str) -> Option<i64> {
+    let (session, _) = name.split_once('-')?;
+    session.parse::<i64>().ok().filter(|session| *session > 0)
+}
+
+/// The last token of every complete owner-lock holder line this binary
+/// writes. A line without it was cut short mid-write (or comes from an older
+/// binary) and names no checkout.
+const GATE_OWNER_HOLDER_END: &str = "end";
+const GATE_OWNER_HOLDER_READ_LIMIT_BYTES: u64 = 4 * 1024;
+
+/// The holder line a gate writes into each owner lock it takes:
+/// `<worker> since=<ms> pid=<pid> start=<start|-> checkout=<hex> end`.
+///
+/// Older readers use only the first token and `since=`, so the added fields
+/// are invisible to them. `pid` and `start` name the broker process holding
+/// the lock, which lets a reader tell a current line from one a crashed
+/// holder left behind; `checkout` is the canonical checkout the gate runs in.
+fn gate_owner_holder_record(worker_id: &str, since_ms: i64, checkout: Option<&Path>) -> String {
+    let mut line = format!("{worker_id} since={since_ms}");
+    if let Some(checkout) = checkout {
+        let pid = std::process::id() as i32;
+        let start = process_start_time(pid).map_or_else(|| "-".to_string(), |s| s.to_string());
+        line.push_str(&format!(
+            " pid={pid} start={start} checkout={} {GATE_OWNER_HOLDER_END}",
+            encode_gate_checkout(checkout)
+        ));
+    }
+    line
+}
+
+fn read_gate_owner_holder(file: &std::fs::File) -> Option<String> {
+    let mut text = String::new();
+    file.take(GATE_OWNER_HOLDER_READ_LIMIT_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
+}
+
+/// The session an owner-lock holder line's `s<session>-<gate>` worker names.
+fn gate_owner_holder_session(text: &str) -> Option<i64> {
+    let worker = text.split_whitespace().next()?;
+    let (session, _) = worker.strip_prefix('s')?.split_once('-')?;
+    session.parse::<i64>().ok().filter(|session| *session > 0)
+}
+
+/// The checkout a held owner lock's holder line names, only when the line is
+/// complete and its recorded holder process is still the one running under
+/// that PID. A holder clears its line before releasing the lock, so a line
+/// whose process is gone was left by a crash and may describe a different
+/// run than the one now holding the lock: that is "owner unknown".
+fn verified_gate_owner_holder_checkout(text: &str) -> Option<PathBuf> {
+    let fields = text.split_whitespace().collect::<Vec<_>>();
+    if fields.last() != Some(&GATE_OWNER_HOLDER_END) {
+        return None;
+    }
+    let field = |key: &str| {
+        fields
+            .iter()
+            .filter_map(|field| field.strip_prefix(key))
+            .collect::<Vec<_>>()
+    };
+    let (pids, starts, checkouts) = (field("pid="), field("start="), field("checkout="));
+    let ([pid], [start], [checkout]) = (pids.as_slice(), starts.as_slice(), checkouts.as_slice())
+    else {
+        return None;
+    };
+    let pid = pid.parse::<i32>().ok().filter(|pid| *pid > 1)?;
+    let start = start.parse::<u64>().ok()?;
+    let checkout = decode_gate_checkout(checkout)?;
+    (process_start_time(pid)? == start).then_some(checkout)
 }
 
 const GATE_PIDFILE_READ_LIMIT_BYTES: usize = 64 * 1024;
@@ -1545,6 +1713,11 @@ pub(crate) struct GatePidRecord {
     /// labelled container can be matched to the run that started it (#287).
     /// Absent from pidfiles written before it was recorded.
     pub(crate) run: Option<String>,
+    /// The canonical checkout the gate command runs in, so automatic checkout
+    /// removal can tell a gate in another checkout from one in the checkout
+    /// it is about to delete. Absent from pidfiles written before it was
+    /// recorded, which therefore name no checkout ("owner unknown").
+    pub(crate) checkout: Option<PathBuf>,
 }
 
 impl GatePidRecord {
@@ -1567,12 +1740,13 @@ impl GatePidRecord {
     fn render(&self) -> String {
         let field = |value: Option<String>| value.unwrap_or_else(|| "-".to_string());
         format!(
-            "{} {} {} {} {}",
+            "{} {} {} {} {} {}",
             self.pgid,
             self.tree,
             field(self.pid.map(|pid| pid.to_string())),
             field(self.start.map(|start| start.to_string())),
             field(self.run.clone()),
+            field(self.checkout.as_deref().map(encode_gate_checkout)),
         )
     }
 
@@ -1583,14 +1757,56 @@ impl GatePidRecord {
         let pid = parts.next().and_then(|pid| pid.parse().ok());
         let start = parts.next().and_then(|start| start.parse().ok());
         let run = parts.next().filter(|run| *run != "-").map(str::to_string);
+        // A sixth field that does not decode names no checkout: the record
+        // is then "owner unknown", never attributed elsewhere.
+        let checkout = parts.next().and_then(decode_gate_checkout);
         Some(Self {
             pgid,
             tree,
             pid,
             start,
             run,
+            checkout,
         })
     }
+}
+
+/// A checkout path as one whitespace-free token: lowercase hex of its bytes.
+/// Checkout paths may contain spaces, and both the pidfile and the owner-lock
+/// holder line are split on whitespace by older readers.
+pub(crate) fn encode_gate_checkout(path: &Path) -> String {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let bytes = path.to_string_lossy().as_bytes().to_vec();
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The absolute path [`encode_gate_checkout`] wrote, or `None` for anything
+/// else (`-`, odd length, non-hex, a relative path).
+pub(crate) fn decode_gate_checkout(token: &str) -> Option<PathBuf> {
+    if token.is_empty()
+        || !token.len().is_multiple_of(2)
+        || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(token.len() / 2);
+    for pair in token.as_bytes().chunks(2) {
+        let pair = std::str::from_utf8(pair).ok()?;
+        bytes.push(u8::from_str_radix(pair, 16).ok()?);
+    }
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(bytes))
+    };
+    #[cfg(not(unix))]
+    let path = PathBuf::from(String::from_utf8(bytes).ok()?);
+    path.is_absolute().then_some(path)
 }
 
 /// Why a recorded gate process group must not be signalled.
@@ -2085,7 +2301,20 @@ pub(crate) fn run_named_in(
 }
 
 struct GateOwnerLocks {
-    _locks: Vec<crate::file_lock::ExclusiveFileLock>,
+    locks: Vec<crate::file_lock::ExclusiveFileLock>,
+}
+
+impl Drop for GateOwnerLocks {
+    /// Clear each holder line while the lock is still held, so the next run
+    /// to take the lock never shows this run's checkout before it writes its
+    /// own line: a reader then sees an empty line ("owner unknown"), not a
+    /// stale one. A crash skips this, which is why readers also require the
+    /// recorded holder process to still be running.
+    fn drop(&mut self) {
+        for lock in &self.locks {
+            crate::warn_unrecorded("clear a gate owner lock holder line", lock.clear_holder());
+        }
+    }
 }
 
 impl GateOwnerLocks {
@@ -2189,7 +2418,7 @@ impl GateOwnerLocks {
             lock.record_holder(holder)?;
             locks.push(lock);
         }
-        Ok(Self { _locks: locks })
+        Ok(Self { locks })
     }
 }
 
@@ -2197,7 +2426,10 @@ const OWNER_LOCK_POLL: Duration = Duration::from_millis(250);
 
 /// Who an owner lock file says holds it: `session 812 for 3m10s`.
 fn describe_owner_lock_holder(path: &Path) -> String {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    describe_owner_lock_holder_text(&std::fs::read_to_string(path).unwrap_or_default())
+}
+
+fn describe_owner_lock_holder_text(text: &str) -> String {
     let text = text.trim();
     if text.is_empty() {
         return "another gate run".into();
@@ -3156,6 +3388,9 @@ where
 
     let log_dir = main_root.join(".aethyme/logs/gates");
     let run_dir = running_dir(main_root);
+    // Written into each owner lock so automatic checkout removal can tell
+    // this run's checkout from others; unresolvable means "owner unknown".
+    let gate_checkout_root = std::fs::canonicalize(checkout.root()).ok();
 
     let mut outcomes = Vec::new();
     let mut expensive_advisories_surfaced = false;
@@ -3437,7 +3672,11 @@ where
             &owner_dir,
             &gate.name,
             &selection.owner_paths,
-            &format!("{worker_id} since={}", crate::clock::epoch_ms()),
+            &gate_owner_holder_record(
+                &worker_id,
+                crate::clock::epoch_ms(),
+                gate_checkout_root.as_deref(),
+            ),
             heartbeat_interval(),
             progress,
             (main_root, session_id),
@@ -5008,6 +5247,9 @@ fn run_gate_command_inner(
             pid: Some(pid),
             start: process_start_time(pid),
             run: Some(context.run_labels.run.clone()),
+            // Unresolvable: record no checkout, so readers treat the run as
+            // "owner unknown" rather than as a gate somewhere else.
+            checkout: std::fs::canonicalize(context.cwd).ok(),
         };
         if let Err(error) = write_gate_pidfile(pidfile, &record) {
             // Without a pidfile the run cannot be cancelled from outside, so
@@ -6066,6 +6308,7 @@ mod tests {
                 pid: Some(1),
                 start: None,
                 run: None,
+                checkout: None,
             }
             .render(),
         )
@@ -6867,6 +7110,7 @@ mod tests {
             pid: Some(i32::MAX),
             start: Some(1),
             run: None,
+            checkout: None,
         };
         let checked_active = checked_gate_record_active(&record);
         // Signal only this still-owned, unreaped child, never a saved group id.
@@ -7423,6 +7667,7 @@ mod tests {
             pid: Some(pgid),
             start,
             run: None,
+            checkout: None,
         }
     }
 
@@ -7646,23 +7891,231 @@ mod tests {
 
     #[test]
     fn checked_gate_pid_parser_preserves_legacy_records_and_refuses_ambiguous_fields() {
-        for valid in ["42 tree", "42 tree 42 100", "42 tree 42 100 run-id"] {
-            assert!(parse_checked_gate_pid_record(valid).is_some(), "{valid}");
+        let checkout = encode_gate_checkout(Path::new("/work/checkout"));
+        for valid in [
+            "42 tree".to_string(),
+            "42 tree 42 100".to_string(),
+            "42 tree 42 100 run-id".to_string(),
+            "42 tree 42 100 run-id -".to_string(),
+            format!("42 tree 42 100 run-id {checkout}"),
+        ] {
+            assert!(parse_checked_gate_pid_record(&valid).is_some(), "{valid}");
         }
         for invalid in [
-            "0 tree",
-            "-42 tree",
-            "1 tree",
-            "42 tree nope 100",
-            "42 tree 0 100",
-            "42 tree 42 nope",
-            "42 tree 42 100 run-id extra",
+            "0 tree".to_string(),
+            "-42 tree".to_string(),
+            "1 tree".to_string(),
+            "42 tree nope 100".to_string(),
+            "42 tree 0 100".to_string(),
+            "42 tree 42 nope".to_string(),
+            "42 tree 42 100 run-id extra".to_string(),
+            "42 tree 42 100 run-id +f".to_string(),
+            format!("42 tree 42 100 run-id {checkout} extra"),
         ] {
             assert!(
                 parse_checked_gate_pid_record(invalid).is_none(),
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn a_pidfile_records_its_checkout_and_older_records_name_none() {
+        let checkout = PathBuf::from("/work/with space/checkout-2");
+        let record = GatePidRecord {
+            checkout: Some(checkout.clone()),
+            ..pid_record(4242, Some(99))
+        };
+        let rendered = record.render();
+        assert_eq!(rendered.split_whitespace().count(), 6, "{rendered}");
+        let parsed = GatePidRecord::parse(&rendered).unwrap();
+        assert_eq!(parsed.checkout, Some(checkout));
+        assert_eq!(parsed, record);
+        // Older readers keep reading the fields they know.
+        assert_eq!(rendered.split_whitespace().nth(4), Some("-"));
+        // Five fields (an older binary) or an undecodable sixth: no checkout.
+        assert_eq!(
+            GatePidRecord::parse("42 tree 42 100 run").unwrap().checkout,
+            None
+        );
+        assert_eq!(
+            GatePidRecord::parse("42 tree 42 100 run zz")
+                .unwrap()
+                .checkout,
+            None
+        );
+        assert_eq!(
+            GatePidRecord::parse(&format!(
+                "42 tree 42 100 run {}",
+                encode_gate_checkout(Path::new("relative"))
+            ))
+            .unwrap()
+            .checkout,
+            None,
+            "a relative path is not a checkout"
+        );
+    }
+
+    #[test]
+    fn an_owner_lock_holder_line_names_its_checkout_only_while_complete_and_current() {
+        let checkout = Path::new("/work/checkout");
+        let line = gate_owner_holder_record("s12-unit", 1, Some(checkout));
+        assert_eq!(gate_owner_holder_session(&line), Some(12));
+        assert_eq!(
+            verified_gate_owner_holder_checkout(&line),
+            Some(checkout.to_path_buf())
+        );
+        // Older readers still find the worker and `since=`.
+        assert!(
+            describe_owner_lock_holder_text(&line).starts_with("s12-unit for "),
+            "{}",
+            describe_owner_lock_holder_text(&line)
+        );
+        // An older binary's line, a line cut short mid-write, and no checkout.
+        assert_eq!(
+            verified_gate_owner_holder_checkout("s12-unit since=1"),
+            None
+        );
+        assert_eq!(
+            verified_gate_owner_holder_checkout(line.trim_end_matches(" end")),
+            None
+        );
+        assert_eq!(
+            verified_gate_owner_holder_checkout(&gate_owner_holder_record("s12-unit", 1, None)),
+            None
+        );
+        // A holder process that is gone, or a PID now naming another process.
+        let me = std::process::id() as i32;
+        let start = process_start_time(me).unwrap();
+        let hex = encode_gate_checkout(checkout);
+        assert_eq!(
+            verified_gate_owner_holder_checkout(&format!(
+                "s12-unit since=1 pid={me} start={} checkout={hex} end",
+                start + 1
+            )),
+            None
+        );
+        assert_eq!(
+            verified_gate_owner_holder_checkout(&format!(
+                "s12-unit since=1 pid={me} start=- checkout={hex} end"
+            )),
+            None
+        );
+        assert_eq!(
+            verified_gate_owner_holder_checkout(&format!(
+                "s12-unit since=1 pid={me} start={start} checkout={hex} checkout={hex} end"
+            )),
+            None,
+            "an ambiguous line names no checkout"
+        );
+        assert_eq!(gate_owner_holder_session("p77-unit since=1"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gate_witnesses_name_the_checkout_of_a_held_owner_lock_and_clear_it_on_release() {
+        let root = tempfile::tempdir().unwrap();
+        let owners = running_dir(root.path()).join("owners");
+        let checkout = root.path().join("checkout");
+        let paths = vec!["src/lib.rs".to_string()];
+        let quiet = Lines::default();
+        let held = GateOwnerLocks::acquire(
+            &owners,
+            "unit",
+            &paths,
+            &gate_owner_holder_record("s12-unit", 1, Some(&checkout)),
+            Duration::from_secs(60),
+            &quiet,
+            (root.path(), Some(12)),
+        )
+        .unwrap();
+        let witnesses = running_gate_witnesses_until(root.path(), || false, None).unwrap();
+        assert_eq!(witnesses.len(), 1, "{witnesses:?}");
+        assert_eq!(witnesses[0].session_id, Some(12));
+        assert_eq!(
+            witnesses[0].checkout,
+            GateWitnessCheckout::Recorded(checkout.clone())
+        );
+        assert_eq!(
+            running_gate_evidence(root.path()),
+            vec![witnesses[0].evidence.clone()],
+            "the plain scan reports the same witnesses"
+        );
+        let lock_file = std::fs::read_dir(&owners)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".lock"))
+            .unwrap()
+            .path();
+        drop(held);
+        assert_eq!(
+            std::fs::read_to_string(&lock_file).unwrap(),
+            "",
+            "a released lock keeps no holder line a later run could be mistaken for"
+        );
+
+        // An older binary's holder line: held, but owner unknown.
+        let held = GateOwnerLocks::acquire(
+            &owners,
+            "unit",
+            &paths,
+            "s12-unit since=1",
+            Duration::from_secs(60),
+            &quiet,
+            (root.path(), Some(12)),
+        )
+        .unwrap();
+        let witnesses = running_gate_witnesses_until(root.path(), || false, None).unwrap();
+        assert_eq!(witnesses.len(), 1, "{witnesses:?}");
+        assert_eq!(witnesses[0].checkout, GateWitnessCheckout::Unknown);
+        drop(held);
+        assert!(
+            running_gate_witnesses_until(root.path(), || false, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn gate_witnesses_name_the_session_and_checkout_of_a_live_pidfile() {
+        let root = tempfile::tempdir().unwrap();
+        let run_dir = running_dir(root.path());
+        let me = std::process::id() as i32;
+        let checkout = PathBuf::from("/work/checkout");
+        write_gate_pidfile(
+            &run_dir.join("41-unit.pid"),
+            &GatePidRecord {
+                checkout: Some(checkout.clone()),
+                ..pid_record(me, process_start_time(me))
+            },
+        )
+        .unwrap();
+        write_gate_pidfile(&run_dir.join("42-unit.pid"), &pid_record(me, None)).unwrap();
+        std::fs::write(run_dir.join("43-unit.pid"), "malformed").unwrap();
+        let witnesses = running_gate_witnesses_until(root.path(), || false, None).unwrap();
+        let by_name = |name: &str| {
+            witnesses
+                .iter()
+                .find(|witness| witness.evidence.contains(name))
+                .unwrap_or_else(|| panic!("{name}: {witnesses:?}"))
+        };
+        assert_eq!(by_name("41-unit.pid").session_id, Some(41));
+        assert_eq!(
+            by_name("41-unit.pid").checkout,
+            GateWitnessCheckout::Recorded(checkout)
+        );
+        assert_eq!(by_name("42-unit.pid").session_id, Some(42));
+        assert_eq!(
+            by_name("42-unit.pid").checkout,
+            GateWitnessCheckout::Unknown
+        );
+        assert_eq!(by_name("43-unit.pid").session_id, None);
+        assert_eq!(
+            by_name("43-unit.pid").checkout,
+            GateWitnessCheckout::Unknown
+        );
+        assert_eq!(gate_pidfile_session("cargo-test.pid"), None);
+        assert_eq!(gate_pidfile_session("0-unit.pid"), None);
     }
 
     #[test]
