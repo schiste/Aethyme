@@ -1357,8 +1357,9 @@ pub struct CapacityRemovalSlice {
     /// With trigger `steady`: consecutive steady slices that reached the end
     /// of the closed-checkout lap without removing anything; each doubles
     /// the wait before the next (5, 10, 20, then 30 minutes). A slice that
-    /// removed nothing with the lap unfinished leaves it unchanged and the
-    /// next slice is due a minute later; a removal resets it to 0.
+    /// removed nothing with the lap unfinished, or that pressure kept from
+    /// running any pass (`pressure_before_selection`), leaves it unchanged;
+    /// a removal resets it to 0.
     #[serde(default)]
     pub idle_streak: u32,
     /// Whether the slice's passes reached the end of the closed-checkout lap
@@ -1378,8 +1379,11 @@ pub struct CapacityRemovalSlice {
     /// deadline); `lap_unfinished` (time ran out before the closed-checkout
     /// lap reached its end); `out_of_time_before_selection` (the budget ran
     /// out before one removal pass started, see `budget_consumed_by`; retried
-    /// after one minute); `nothing_removable` (the lap ended and every
-    /// examined checkout was kept or deferred).
+    /// after one minute); `pressure_before_selection` (pressure kept the
+    /// slice from running any pass, see `pressure_seen`: memory pressure
+    /// retries after ten minutes, load alone after one; neither counts as an
+    /// idle lap); `nothing_removable` (the lap ended and every examined
+    /// checkout was kept or deferred).
     pub outcome: String,
     pub removed: usize,
     pub examined: usize,
@@ -1438,9 +1442,12 @@ pub struct CapacityRemovalSlice {
     #[serde(default)]
     pub index_high_water_session_id: i64,
     /// Why the slice stopped: `cap` (made its allowance of removals),
-    /// `budget` (too little time left for another pass), `pacer_backoff`
-    /// (memory or load pressure outlasted the pacer's pause budget, before
-    /// a pass or while paying for a removal), `slice_deadline` (the slice
+    /// `budget` (too little time left for another pass), `memory_backoff`
+    /// (memory pressure outlasted the pacer's pause budget, before a pass or
+    /// while paying for a removal; ten-minute retry), `load_throttled`
+    /// (load stayed elevated through a pre-pass check's bounded wait, so
+    /// the slice made one removal and stopped; the next slice runs at the
+    /// normal cadence; load is never a back-off), `slice_deadline` (the slice
     /// ended mid pacer wait; `pacer_unpaid_ms` is owed before the next
     /// slice), `yielded_to_foreground` (a foreground command waited for the
     /// GC lock), `nothing_selected` (a pass selected nothing and moved
@@ -1448,7 +1455,9 @@ pub struct CapacityRemovalSlice {
     /// pass that selected nothing reached the end of the lap),
     /// `kept_only_limit` (its passes that removed nothing ran out),
     /// `lock_busy`, `failed` or `removal_failures` (Git failed to remove
-    /// two checkouts after it had started deleting).
+    /// two checkouts after it had started deleting). Records written by
+    /// older binaries may say `pacer_backoff` (memory or load pressure
+    /// outlasted the pacer's pause budget).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     /// The slice's removal allowance; kept checkouts cost none of it.
@@ -1479,9 +1488,27 @@ pub struct CapacityRemovalSlice {
     /// the pacer.
     #[serde(default)]
     pub git_removal_ms: u64,
-    /// Time waiting out memory or load pressure before passes.
+    /// Time spent in the pressure checks before passes (memory waits and
+    /// bounded load waits).
     #[serde(default)]
     pub pressure_wait_ms: u64,
+    /// Time the pacer paused for memory pressure during the slice, pre-pass
+    /// checks and removal charges together.
+    #[serde(default)]
+    pub memory_wait_ms: u64,
+    /// Time the pacer waited for elevated load (or Linux I/O pressure)
+    /// during the slice, each wait bounded, pre-pass checks and removal
+    /// charges together.
+    #[serde(default)]
+    pub load_wait_ms: u64,
+    /// Which pressure the slice saw: `memory`, `load` or `memory_and_load`;
+    /// absent when it saw none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure_seen: Option<String>,
+    /// A pre-pass check found load still elevated after its bounded wait,
+    /// so the slice ran throttled (one removal at most).
+    #[serde(default)]
+    pub throttled: bool,
     /// Entries Git's own removal time paid for at the configured rate.
     #[serde(default)]
     pub pacer_credited_entries: u64,
@@ -12460,12 +12487,25 @@ mod tests {
         crate::gc::unattended_pacing::UnattendedPacingScope,
         crate::gc::unattended_pacing::FakeClock,
     ) {
-        use crate::gc::unattended_pacing::{
-            self, FakeClock, Scripted, UnattendedPacer, UnlinkRate,
-        };
+        install_scripted_pacer_at(
+            crate::gc::unattended_pacing::UnlinkRate::Limited(1_000),
+            samples,
+        )
+    }
+
+    /// [`install_scripted_pacer`] at `rate`.
+    #[cfg(unix)]
+    fn install_scripted_pacer_at(
+        rate: crate::gc::unattended_pacing::UnlinkRate,
+        samples: Vec<crate::gc::unattended_pacing::PressureSample>,
+    ) -> (
+        crate::gc::unattended_pacing::UnattendedPacingScope,
+        crate::gc::unattended_pacing::FakeClock,
+    ) {
+        use crate::gc::unattended_pacing::{self, FakeClock, Scripted, UnattendedPacer};
         let clock = FakeClock::new();
         let scope = unattended_pacing::install(UnattendedPacer::new(
-            UnlinkRate::Limited(1_000),
+            rate,
             Box::new(clock.clone()),
             Box::new(Scripted {
                 samples,
@@ -12485,7 +12525,8 @@ mod tests {
 
     /// No removal starts under memory pressure: the slice checks the pacer
     /// before its first pass and stops, backs off ten minutes, and the next
-    /// slice of the same worker run does not remove either.
+    /// slice of the same worker run does not remove either. The record says
+    /// memory kept it from selection.
     #[cfg(unix)]
     #[test]
     fn a_worker_capacity_slice_removes_nothing_under_pressure() {
@@ -12506,10 +12547,15 @@ mod tests {
         let slice = broker.last_capacity_removal_slice().unwrap();
         assert_eq!(
             slice.stop_reason.as_deref(),
-            Some("pacer_backoff"),
+            Some("memory_backoff"),
             "{slice:#?}"
         );
         assert_eq!(slice.passes, 0, "{slice:#?}");
+        assert_eq!(slice.outcome, "pressure_before_selection", "{slice:#?}");
+        assert_eq!(slice.pressure_seen.as_deref(), Some("memory"), "{slice:#?}");
+        assert!(slice.memory_wait_ms > 0, "{slice:#?}");
+        assert!(!slice.throttled, "{slice:#?}");
+        assert!(slice.budget_consumed_by.is_none(), "{slice:#?}");
         assert_eq!(slice.retry_in_ms, Some(600_000), "{slice:#?}");
         assert!(!broker.capacity_removal_due(super::now_ms()).unwrap());
     }
@@ -12540,16 +12586,16 @@ mod tests {
         let slice = broker.last_capacity_removal_slice().unwrap();
         assert_eq!(
             slice.stop_reason.as_deref(),
-            Some("pacer_backoff"),
+            Some("memory_backoff"),
             "{slice:#?}"
         );
         assert_eq!(slice.retry_in_ms, Some(600_000), "{slice:#?}");
     }
 
     /// With production ordering (a real clock, a slice deadline shorter than
-    /// the pacer's pause budget) sustained pressure still stops the slice as
-    /// `pacer_backoff` with its ten-minute back-off, not as `budget` with a
-    /// one-minute retry.
+    /// the pacer's pause budget) sustained memory pressure still stops the
+    /// slice as `memory_backoff` with its ten-minute back-off, not as
+    /// `budget` with a one-minute retry.
     #[cfg(unix)]
     #[test]
     fn pressure_that_outlasts_a_short_slice_still_backs_off_ten_minutes() {
@@ -12578,11 +12624,210 @@ mod tests {
         let slice = broker.last_capacity_removal_slice().unwrap();
         assert_eq!(
             slice.stop_reason.as_deref(),
-            Some("pacer_backoff"),
+            Some("memory_backoff"),
             "{slice:#?}"
         );
         assert_eq!(slice.retry_in_ms, Some(600_000), "{slice:#?}");
         assert!(slice.pressure_wait_ms >= 1_000, "{slice:#?}");
+        assert!(slice.memory_wait_ms >= 1_000, "{slice:#?}");
+        assert_eq!(slice.load_wait_ms, 0, "{slice:#?}");
+    }
+
+    #[cfg(unix)]
+    fn load_pressure(elevated: bool) -> crate::gc::unattended_pacing::PressureSample {
+        crate::gc::unattended_pacing::PressureSample {
+            memory_elevated: Some(false),
+            load_elevated: Some(elevated),
+        }
+    }
+
+    /// [`install_scripted_pacer`] with the unlink limiter off, so a removal's
+    /// charge costs no fake time beyond its pressure checks.
+    #[cfg(unix)]
+    fn install_unlimited_scripted_pacer(
+        samples: Vec<crate::gc::unattended_pacing::PressureSample>,
+    ) -> (
+        crate::gc::unattended_pacing::UnattendedPacingScope,
+        crate::gc::unattended_pacing::FakeClock,
+    ) {
+        install_scripted_pacer_at(crate::gc::unattended_pacing::UnlinkRate::Unlimited, samples)
+    }
+
+    /// A busy machine's normal state, load far above the core count with
+    /// memory fine, throttles steady removal and never stops it: after a
+    /// bounded wait the slice removes one landed checkout, says it ran
+    /// throttled because of load, keeps the idle streak, and the next slice
+    /// is due at the normal minute rather than a ten-minute back-off.
+    #[cfg(unix)]
+    #[test]
+    fn sustained_load_still_removes_a_landed_checkout_per_steady_slice() {
+        let (_owner, _storage, mut broker) =
+            landed_lane_fixture(Some("[worktrees]\nmax_checkouts = 0\n"));
+        let landed = (0..2)
+            .map(|index| {
+                let (session, worktree) =
+                    closed_landed_checkout(&mut broker, &format!("loaded {index}"));
+                record_merged_pull_request(&mut broker, session.id, 400 + index);
+                worktree
+            })
+            .collect::<Vec<_>>();
+        let (scope, clock) = install_unlimited_scripted_pacer(vec![load_pressure(true)]);
+        let report = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("load never stops a steady slice");
+        assert_eq!(
+            report.removed.len(),
+            1,
+            "one removal under load: {report:#?}"
+        );
+        assert_eq!(landed.iter().filter(|path| path.exists()).count(), 1);
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(slice.trigger, "steady", "{slice:#?}");
+        assert_eq!(slice.outcome, "removed", "{slice:#?}");
+        assert_eq!(
+            slice.stop_reason.as_deref(),
+            Some("load_throttled"),
+            "{slice:#?}"
+        );
+        assert!(slice.throttled, "{slice:#?}");
+        assert_eq!(slice.pressure_seen.as_deref(), Some("load"), "{slice:#?}");
+        assert_eq!(slice.memory_wait_ms, 0, "{slice:#?}");
+        assert!(
+            slice.load_wait_ms >= 5_000,
+            "the bounded gate wait: {slice:#?}"
+        );
+        assert!(
+            clock.slept.get() < Duration::from_secs(10),
+            "bounded waits, not the slice: {slice:#?}"
+        );
+        assert_eq!(slice.idle_streak, 0, "{slice:#?}");
+        assert_eq!(slice.retry_in_ms, Some(60_000), "{slice:#?}");
+        // No hard back-off: once the minute passes the next slice is due and
+        // removes the other landed checkout, still under load.
+        broker.end_steady_removal_back_off_for_test();
+        assert!(broker.capacity_removal_due(super::now_ms()).unwrap());
+        let report = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("the next slice runs");
+        drop(scope);
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert!(landed.iter().all(|path| !path.exists()));
+    }
+
+    /// Sustained memory pressure stops a steady slice before any pass: no
+    /// removal, the longer ten-minute retry that a landing does not shorten,
+    /// and the idle streak is left as it was, not counted as an idle lap.
+    #[cfg(unix)]
+    #[test]
+    fn sustained_memory_pressure_backs_off_without_growing_the_idle_streak() {
+        let (_owner, _storage, mut broker) =
+            landed_lane_fixture(Some("[worktrees]\nmax_checkouts = 0\n"));
+        let (_kept_session, kept) = closed_landed_checkout(&mut broker, "memory keeps notes");
+        std::fs::write(kept.join("notes.txt"), "somebody's notes\n").unwrap();
+        broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("a steady slice runs");
+        assert_eq!(broker.last_capacity_removal_slice().unwrap().idle_streak, 1);
+        let (session, landed) = closed_landed_checkout(&mut broker, "memory landed");
+        record_merged_pull_request(&mut broker, session.id, 410);
+        broker.end_steady_removal_back_off_for_test();
+
+        let (scope, _clock) = install_unlimited_scripted_pacer(vec![memory_pressure(true)]);
+        let report = broker.run_capacity_removal_slice(Instant::now());
+        drop(scope);
+        assert!(report.unwrap().is_none(), "no pass ran");
+        assert!(landed.exists());
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(
+            slice.stop_reason.as_deref(),
+            Some("memory_backoff"),
+            "{slice:#?}"
+        );
+        assert_eq!(slice.outcome, "pressure_before_selection", "{slice:#?}");
+        assert_eq!(slice.pressure_seen.as_deref(), Some("memory"), "{slice:#?}");
+        assert_eq!(slice.passes, 0, "{slice:#?}");
+        assert_eq!(slice.idle_streak, 1, "not an idle lap: {slice:#?}");
+        assert_eq!(slice.retry_in_ms, Some(600_000), "{slice:#?}");
+        broker.end_steady_removal_back_off_for_test();
+        assert!(
+            !broker.capacity_removal_due(super::now_ms()).unwrap(),
+            "the memory back-off is a hard retry"
+        );
+    }
+
+    /// Load that clears during the bounded wait leaves a normal slice: it
+    /// is not throttled and removes every landed checkout its allowance
+    /// covers, while still reporting the load it waited for.
+    #[cfg(unix)]
+    #[test]
+    fn load_that_clears_mid_wait_leaves_a_normal_steady_slice() {
+        let (_owner, _storage, mut broker) =
+            landed_lane_fixture(Some("[worktrees]\nmax_checkouts = 0\n"));
+        let landed = (0..2)
+            .map(|index| {
+                let (session, worktree) =
+                    closed_landed_checkout(&mut broker, &format!("clearing {index}"));
+                record_merged_pull_request(&mut broker, session.id, 420 + index);
+                worktree
+            })
+            .collect::<Vec<_>>();
+        let (scope, _clock) = install_unlimited_scripted_pacer(vec![
+            load_pressure(true),
+            load_pressure(true),
+            load_pressure(false),
+        ]);
+        let report = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("a steady slice runs");
+        drop(scope);
+        assert_eq!(report.removed.len(), 2, "{report:#?}");
+        assert!(landed.iter().all(|path| !path.exists()));
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert!(!slice.throttled, "{slice:#?}");
+        assert_ne!(slice.stop_reason.as_deref(), Some("load_throttled"));
+        assert_eq!(slice.pressure_seen.as_deref(), Some("load"), "{slice:#?}");
+        assert_eq!(slice.load_wait_ms, 2_000, "{slice:#?}");
+    }
+
+    /// At the checkout limit, sustained load cannot starve removal: each
+    /// pressure slice removes one checkout after its bounded wait, and the
+    /// next slice may run at once instead of backing off ten minutes.
+    #[cfg(unix)]
+    #[test]
+    fn capacity_pressure_makes_progress_under_sustained_load() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let worktrees = (0..3)
+            .map(|index| closed_landed_checkout(&mut broker, &format!("at limit {index}")).1)
+            .collect::<Vec<_>>();
+        limit_checkouts_to_one(&broker);
+        let (scope, _clock) = install_unlimited_scripted_pacer(vec![load_pressure(true)]);
+        let worker_started = Instant::now();
+        for slice_number in 1..=2 {
+            let report = broker
+                .run_capacity_removal_slice(worker_started)
+                .unwrap()
+                .expect("load never stops a pressure slice");
+            assert_eq!(report.removed.len(), 1, "{report:#?}");
+            let slice = broker.last_capacity_removal_slice().unwrap();
+            assert_eq!(slice.trigger, "pressure", "{slice:#?}");
+            assert_eq!(
+                slice.stop_reason.as_deref(),
+                Some("load_throttled"),
+                "{slice:#?}"
+            );
+            assert!(slice.throttled, "{slice:#?}");
+            assert_eq!(slice.retry_in_ms, None, "{slice:#?}");
+            assert_eq!(
+                worktrees.iter().filter(|path| path.exists()).count(),
+                3 - slice_number
+            );
+            assert!(broker.capacity_removal_due(super::now_ms()).unwrap());
+        }
+        drop(scope);
     }
 
     /// A pacer wait the slice's end cuts short stops the slice as

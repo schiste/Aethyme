@@ -17,10 +17,22 @@
 //! * sleeps off the batch's share of the token bucket
 //!   (`[cleanup] unattended_unlinks_per_second`), unless the sweep is in
 //!   disk-pressure mode, where freeing space is the priority; and
-//! * reads cheap system signals and pauses, bounded by the caller's deadline
-//!   and a per-run cap, while memory pressure is above normal or load is far
-//!   above the core count. When the pause budget is spent it asks removal to
-//!   stop resumably; the reclaim request stays durable for the next run.
+//! * reads cheap system signals. Memory pressure above normal is a hard
+//!   stop: the pacer pauses, bounded by the caller's deadline and a per-run
+//!   cap, and when that budget is spent it asks removal to stop resumably;
+//!   the reclaim request stays durable for the next run. Load far above the
+//!   core count (or Linux I/O pressure) is a throttle, never a stop: the
+//!   pacer waits a bounded time for it to clear ([`LOAD_BATCH_WAIT`] per
+//!   batch, [`LOAD_GATE_WAIT`] before a removal starts) and then proceeds,
+//!   so a machine whose normal state is a high load average still makes
+//!   progress, at a reduced rate.
+//!
+//! The pacer exists because unthrottled unattended deletion once filled
+//! file-backed memory and contributed to memory-pressure kills. Memory
+//! pressure is that hazard; a high load average on its own is not (many
+//! short-lived processes and I/O waits on a busy machine keep it far above
+//! the core count for days while memory is fine), and background CPU and
+//! I/O priority plus the unlink rate limit already bound the impact.
 //!
 //! Everything here is observational: pacing never changes what is deleted.
 
@@ -43,11 +55,19 @@ const MAX_UNATTENDED_UNLINKS_PER_SECOND: i64 = 1_000_000;
 pub(crate) const PACING_BATCH_ENTRIES: u32 = 256;
 /// How long one pressure pause sleeps before sampling again.
 const PRESSURE_POLL: Duration = Duration::from_secs(1);
-/// Total time one worker run may spend paused for pressure before it yields
-/// with its request retained.
+/// Total time one worker run may spend paused for memory pressure before it
+/// yields with its request retained. Load waits do not count against it.
 const MAX_PRESSURE_PAUSE_PER_RUN: Duration = Duration::from_secs(120);
+/// How long each pacing batch waits while load stays elevated before it
+/// proceeds anyway: the throttle. At the default rate a 256-entry batch
+/// takes 256 ms, so sustained load cuts tree removal to about a fifth of
+/// the configured rate (about 200 entries a second), never to zero.
+pub(crate) const LOAD_BATCH_WAIT: Duration = PRESSURE_POLL;
+/// How long the check before an unattended removal starts waits for
+/// elevated load to clear before the removal proceeds throttled.
+pub(crate) const LOAD_GATE_WAIT: Duration = Duration::from_secs(5);
 /// One-minute load average per core above which the machine is "far above"
-/// its capacity.
+/// its capacity. Only a throttle signal: load never stops removal.
 const LOAD_PER_CORE_LIMIT: f64 = 2.0;
 /// Linux PSI thresholds (percent of the last ten seconds some task stalled).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -291,12 +311,17 @@ pub struct UnattendedPacingSummary {
     pub limiter_sleep_ms: u64,
     /// Milliseconds paused because memory pressure was above normal.
     pub memory_pause_ms: u64,
-    /// Milliseconds paused because load (or Linux I/O pressure) was far above
-    /// the core count.
+    /// Milliseconds waited because load (or Linux I/O pressure) was far
+    /// above the core count, each wait bounded before removal proceeded.
     pub load_pause_ms: u64,
-    /// Times removal stopped resumably because the pressure pause budget or
-    /// the deadline ran out while pressure persisted.
+    /// Times removal stopped resumably because the memory pressure pause
+    /// budget or the deadline ran out while memory pressure persisted. Load
+    /// never stops removal.
     pub pressure_yields: u64,
+    /// Times a pressure check proceeded at the throttled rate because load
+    /// (or Linux I/O pressure) stayed elevated through its bounded wait.
+    #[serde(default)]
+    pub load_throttled: u64,
     /// Milliseconds spent waiting for the host-wide single-deleter lock.
     pub host_lock_wait_ms: u64,
     /// Deferred requests that found this repository's worker already alive
@@ -316,7 +341,6 @@ pub(crate) struct UnattendedPacer {
     in_batch: u32,
     batch_started: Option<Instant>,
     installed_at: Instant,
-    pressure_paused: Duration,
     limiter_slept: Duration,
     memory_paused: Duration,
     load_paused: Duration,
@@ -336,12 +360,25 @@ pub(crate) struct BulkCharge {
     /// the bucket measures from when Git began deleting, so that time is not
     /// slept a second time. Never more than the entries charged for.
     pub(crate) credited: u64,
-    /// Memory or load pressure outlasted the pacer's pause budget; the
-    /// charge stopped and the caller must back off.
-    pub(crate) pressure_backoff: bool,
+    /// Memory pressure outlasted the pacer's pause budget; the charge
+    /// stopped and the caller must back off. Load never sets it.
+    pub(crate) memory_backoff: bool,
     /// What the deadline left unpaid at the configured rate; the caller must
     /// not remove again before this much more time has passed.
     pub(crate) unpaid: Duration,
+}
+
+/// What a pressure check concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PressureVerdict {
+    /// No pressure, or load cleared within the bounded wait.
+    Clear,
+    /// Load (or Linux I/O pressure) stayed elevated through the bounded
+    /// wait: proceed, throttled.
+    LoadThrottled,
+    /// Memory pressure outlasted the run's pause budget or the deadline: do
+    /// not start (or stop resumably).
+    MemoryBackoff,
 }
 
 impl UnattendedPacer {
@@ -360,7 +397,6 @@ impl UnattendedPacer {
             in_batch: 0,
             batch_started: None,
             installed_at,
-            pressure_paused: Duration::ZERO,
             limiter_slept: Duration::ZERO,
             memory_paused: Duration::ZERO,
             load_paused: Duration::ZERO,
@@ -381,25 +417,31 @@ impl UnattendedPacer {
         }
     }
 
-    /// Pause while memory or load pressure lasts; `false` when it outlasted
-    /// the pause budget or the deadline.
-    fn pressure_clear(&mut self, deadline: Option<Instant>) -> bool {
-        if self.wait_out_pressure(deadline) {
-            true
-        } else {
+    /// The check before an unattended removal starts: pause while memory
+    /// pressure lasts, wait at most [`LOAD_GATE_WAIT`] for elevated load to
+    /// clear.
+    fn pressure_check(&mut self, deadline: Option<Instant>) -> PressureVerdict {
+        self.checked_wait(deadline, LOAD_GATE_WAIT)
+    }
+
+    /// [`Self::wait_out_pressure`], counting a memory back-off as a yield.
+    fn checked_wait(&mut self, deadline: Option<Instant>, load_wait: Duration) -> PressureVerdict {
+        let verdict = self.wait_out_pressure(deadline, load_wait);
+        if verdict == PressureVerdict::MemoryBackoff {
             self.summary.pressure_yields = self.summary.pressure_yields.saturating_add(1);
-            false
         }
+        verdict
     }
 
     /// Pay for `entries` Git deleted in one removal that took
     /// `removal_spent`. That duration is credited at the configured rate (so
     /// the average over removal plus wait never exceeds it) and the rest is
     /// slept off batch by batch, never at a disk-pressure-lifted rate.
-    /// Pressure is sampled first, so a removal under memory or load pressure
-    /// always waits it out (or stops the charge) even when the credit covers
-    /// every entry. A deadline that cuts the sleep short reports what is
-    /// still owed.
+    /// Pressure is sampled first, so a removal under memory pressure always
+    /// waits it out (or stops the charge) even when the credit covers every
+    /// entry; under load each batch waits at most [`LOAD_BATCH_WAIT`] and
+    /// the charge goes on. A deadline that cuts the sleep short reports what
+    /// is still owed.
     fn charge_bulk(
         &mut self,
         entries: u64,
@@ -409,9 +451,9 @@ impl UnattendedPacer {
         if entries == 0 {
             return BulkCharge::default();
         }
-        if !self.pressure_clear(deadline) {
+        if self.checked_wait(deadline, LOAD_BATCH_WAIT) == PressureVerdict::MemoryBackoff {
             return BulkCharge {
-                pressure_backoff: true,
+                memory_backoff: true,
                 ..BulkCharge::default()
             };
         }
@@ -424,10 +466,10 @@ impl UnattendedPacer {
         let to_charge = entries - credited;
         self.summary.entries_removed = self.summary.entries_removed.saturating_add(credited);
         let mut charged = 0;
-        let mut pressure_backoff = false;
+        let mut memory_backoff = false;
         while charged < to_charge && deadline.is_none_or(|deadline| self.clock.now() < deadline) {
             if !self.before_unlink(deadline) {
-                pressure_backoff = deadline.is_none_or(|deadline| self.clock.now() < deadline);
+                memory_backoff = deadline.is_none_or(|deadline| self.clock.now() < deadline);
                 break;
             }
             self.after_unlink(0);
@@ -435,7 +477,7 @@ impl UnattendedPacer {
         }
         self.bulk_charge_active = false;
         let unpaid = match limit {
-            Some(limit) if !pressure_backoff && charged < to_charge => Duration::from_millis(
+            Some(limit) if !memory_backoff && charged < to_charge => Duration::from_millis(
                 (to_charge - charged).saturating_mul(1_000) / u64::from(limit.max(1)),
             ),
             _ => Duration::ZERO,
@@ -443,20 +485,20 @@ impl UnattendedPacer {
         BulkCharge {
             charged,
             credited,
-            pressure_backoff,
+            memory_backoff,
             unpaid,
         }
     }
 
     /// Gate one unlink. `false` asks the caller to stop resumably, exactly as
-    /// an expired deadline does.
+    /// an expired deadline does; only memory pressure does that. Under load
+    /// each batch waits at most [`LOAD_BATCH_WAIT`] and goes on.
     pub(crate) fn before_unlink(&mut self, deadline: Option<Instant>) -> bool {
         if self.in_batch == 0 {
             if let Some(started) = self.batch_started.take() {
                 self.pay_batch(started, deadline);
             }
-            if !self.wait_out_pressure(deadline) {
-                self.summary.pressure_yields = self.summary.pressure_yields.saturating_add(1);
+            if self.checked_wait(deadline, LOAD_BATCH_WAIT) == PressureVerdict::MemoryBackoff {
                 return false;
             }
             self.batch_started = Some(self.clock.now());
@@ -496,29 +538,44 @@ impl UnattendedPacer {
         }
     }
 
-    /// Pause while a signal reports pressure. Returns `false` when the pause
-    /// budget or the deadline is spent with pressure still present.
-    fn wait_out_pressure(&mut self, deadline: Option<Instant>) -> bool {
+    /// Wait while a signal reports pressure. Memory pressure pauses until it
+    /// clears, or until the run's memory pause budget or the deadline is
+    /// spent ([`PressureVerdict::MemoryBackoff`]). Load (or Linux I/O
+    /// pressure) waits at most `load_wait` in this call, never past the
+    /// deadline, and then proceeds ([`PressureVerdict::LoadThrottled`]);
+    /// load waits never spend the memory pause budget.
+    fn wait_out_pressure(
+        &mut self,
+        deadline: Option<Instant>,
+        load_wait: Duration,
+    ) -> PressureVerdict {
+        let mut load_waited = Duration::ZERO;
         loop {
             let sample = self.pressure.sample();
-            let memory = sample.memory_elevated == Some(true);
-            let load = sample.load_elevated == Some(true);
-            if !memory && !load {
-                return true;
-            }
             let now = self.clock.now();
-            let budget = MAX_PRESSURE_PAUSE_PER_RUN.saturating_sub(self.pressure_paused);
-            let step = cap_to_deadline(PRESSURE_POLL.min(budget), now, deadline);
-            if step.is_zero() {
-                return false;
-            }
-            self.clock.sleep(step);
-            self.pressure_paused += step;
-            if memory {
+            if sample.memory_elevated == Some(true) {
+                let budget = MAX_PRESSURE_PAUSE_PER_RUN.saturating_sub(self.memory_paused);
+                let step = cap_to_deadline(PRESSURE_POLL.min(budget), now, deadline);
+                if step.is_zero() {
+                    return PressureVerdict::MemoryBackoff;
+                }
+                self.clock.sleep(step);
                 self.memory_paused += step;
-            } else {
-                self.load_paused += step;
+                continue;
             }
+            if sample.load_elevated == Some(true) {
+                let left = load_wait.saturating_sub(load_waited);
+                let step = cap_to_deadline(PRESSURE_POLL.min(left), now, deadline);
+                if step.is_zero() {
+                    self.summary.load_throttled = self.summary.load_throttled.saturating_add(1);
+                    return PressureVerdict::LoadThrottled;
+                }
+                self.clock.sleep(step);
+                self.load_paused += step;
+                load_waited += step;
+                continue;
+            }
+            return PressureVerdict::Clear;
         }
     }
 
@@ -606,8 +663,8 @@ pub(crate) fn after_unattended_unlink(logical_bytes: u64) {
 /// removing a whole checkout, which took `removal_spent`) to the installed
 /// pacer: it credits Git's own removal time at the configured rate, sleeps
 /// off the rest of their share of the bucket (never lifted for disk
-/// pressure) and waits out memory or load pressure as it would for its own
-/// unlinks, never past `deadline`. Call it with no lock held: the sleep is
+/// pressure), waits out memory pressure and is throttled by load as it
+/// would be for its own unlinks, never past `deadline`. Call it with no lock held: the sleep is
 /// the throttle. Without a pacer (every foreground caller) it charges
 /// nothing and returns at once.
 pub(crate) fn charge_bulk_unattended_removal(
@@ -620,12 +677,17 @@ pub(crate) fn charge_bulk_unattended_removal(
     })
 }
 
-/// Before an unattended removal starts: wait out memory or load pressure on
-/// the installed pacer, never past `deadline`. `false` means the pressure
-/// outlasted the pause budget or the deadline and the removal must not
-/// start. Without a pacer (every foreground caller) it is always `true`.
-pub(crate) fn unattended_pressure_clear(deadline: Option<Instant>) -> bool {
-    with_active(true, |pacer| pacer.pressure_clear(deadline))
+/// Before an unattended removal starts: on the installed pacer, wait out
+/// memory pressure and wait at most [`LOAD_GATE_WAIT`] for elevated load to
+/// clear, never past `deadline`. [`PressureVerdict::MemoryBackoff`] means
+/// memory pressure outlasted the pause budget or the deadline and the
+/// removal must not start; [`PressureVerdict::LoadThrottled`] means load
+/// stayed elevated and the removal proceeds at the caller's throttled rate.
+/// Without a pacer (every foreground caller) it is always `Clear`.
+pub(crate) fn unattended_pressure_check(deadline: Option<Instant>) -> PressureVerdict {
+    with_active(PressureVerdict::Clear, |pacer| {
+        pacer.pressure_check(deadline)
+    })
 }
 
 /// Disk-pressure mode lifts the rate limit (freeing space is then the
@@ -770,7 +832,7 @@ mod tests {
             charge_bulk_unattended_removal(10_000, Duration::ZERO, None),
             BulkCharge::default()
         );
-        assert!(unattended_pressure_clear(None));
+        assert_eq!(unattended_pressure_check(None), PressureVerdict::Clear);
         let clock = FakeClock::new();
         let _scope = install(UnattendedPacer::new(
             UnlinkRate::Limited(1_000),
@@ -780,7 +842,7 @@ mod tests {
         let entries = u64::from(PACING_BATCH_ENTRIES) * 8 + 1;
         let charge = charge_bulk_unattended_removal(entries, Duration::ZERO, None);
         assert_eq!(charge.charged, entries);
-        assert!(!charge.pressure_backoff);
+        assert!(!charge.memory_backoff);
         assert_eq!(charge.unpaid, Duration::ZERO);
         assert_eq!(clock.slept.get(), Duration::from_millis(2_048));
         let summary = current_summary(0).expect("the pacer is installed");
@@ -788,7 +850,7 @@ mod tests {
         // A deadline bounds the throttle and reports what it left unpaid.
         let deadline = clock.now() + Duration::from_millis(300);
         let cut = charge_bulk_unattended_removal(entries, Duration::ZERO, Some(deadline));
-        assert!(cut.charged < entries && !cut.pressure_backoff);
+        assert!(cut.charged < entries && !cut.memory_backoff);
         assert!(cut.unpaid >= Duration::from_millis(1_500), "{cut:?}");
         assert_eq!(clock.now(), deadline);
     }
@@ -852,7 +914,7 @@ mod tests {
         );
         let charge = pacer.charge_bulk(1_000, Duration::from_secs(5), None);
         assert_eq!((charge.credited, charge.charged), (1_000, 0));
-        assert!(!charge.pressure_backoff);
+        assert!(!charge.memory_backoff);
         assert_eq!(clock.slept.get(), PRESSURE_POLL * 2);
 
         let clock = FakeClock::new();
@@ -864,13 +926,14 @@ mod tests {
                 reads: Rc::new(Cell::new(0)),
             }),
         ));
-        assert!(
-            !unattended_pressure_clear(None),
-            "pressure outlasts the budget"
+        assert_eq!(
+            unattended_pressure_check(None),
+            PressureVerdict::MemoryBackoff,
+            "memory pressure outlasts the budget"
         );
         assert_eq!(clock.slept.get(), MAX_PRESSURE_PAUSE_PER_RUN);
         let charge = charge_bulk_unattended_removal(1_000, Duration::from_secs(5), None);
-        assert!(charge.pressure_backoff);
+        assert!(charge.memory_backoff);
         assert_eq!((charge.credited, charge.charged), (0, 0));
         assert_eq!(current_summary(0).unwrap().pressure_yields, 2);
     }
@@ -949,17 +1012,13 @@ mod tests {
     }
 
     #[test]
-    fn persistent_pressure_yields_within_the_deadline_and_the_run_budget() {
+    fn persistent_memory_pressure_yields_within_the_deadline_and_the_run_budget() {
         let clock = FakeClock::new();
-        let load = PressureSample {
-            memory_elevated: Some(false),
-            load_elevated: Some(true),
-        };
         let mut pacer = UnattendedPacer::new(
             UnlinkRate::Unlimited,
             Box::new(clock.clone()),
             Box::new(Scripted {
-                samples: vec![load],
+                samples: vec![memory(true)],
                 reads: Rc::new(Cell::new(0)),
             }),
         );
@@ -971,8 +1030,136 @@ mod tests {
         assert_eq!(clock.slept.get(), MAX_PRESSURE_PAUSE_PER_RUN);
         let summary = pacer.summary(0);
         assert_eq!(summary.pressure_yields, 2);
-        assert_eq!(summary.load_pause_ms, 120_000);
+        assert_eq!(summary.memory_pause_ms, 120_000);
+        assert_eq!(summary.load_pause_ms, 0);
         assert_eq!(summary.entries_removed, 0);
+    }
+
+    fn sustained_load() -> Box<dyn PressureSignal> {
+        Box::new(Scripted {
+            samples: vec![PressureSample {
+                memory_elevated: Some(false),
+                load_elevated: Some(true),
+            }],
+            reads: Rc::new(Cell::new(0)),
+        })
+    }
+
+    /// Sustained load (a busy machine whose normal load average is far above
+    /// the core count) throttles tree removal and never stops it: each batch
+    /// waits one bounded load wait and goes on, for longer than the memory
+    /// pause budget, and the load waits spend none of that budget.
+    #[test]
+    fn sustained_load_throttles_tree_removal_and_never_stops_it() {
+        let clock = FakeClock::new();
+        let mut pacer = UnattendedPacer::new(
+            UnlinkRate::Limited(1_000),
+            Box::new(clock.clone()),
+            sustained_load(),
+        );
+        // 200 batches: 200 s of load waits, past the 120 s memory budget.
+        let batches = 200u32;
+        for _ in 0..(PACING_BATCH_ENTRIES * batches) {
+            assert!(pacer.before_unlink(None), "load never stops removal");
+            pacer.after_unlink(0);
+        }
+        let summary = pacer.summary(0);
+        assert_eq!(
+            summary.entries_removed,
+            u64::from(PACING_BATCH_ENTRIES * batches)
+        );
+        assert_eq!(summary.pressure_yields, 0);
+        assert_eq!(summary.load_throttled, u64::from(batches));
+        assert_eq!(summary.load_pause_ms, u64::from(batches) * 1_000);
+        assert_eq!(summary.memory_pause_ms, 0);
+        // The rate limit still applies on top of the load wait: 199 paid
+        // batches of 256 ms plus 200 load waits of one second.
+        assert_eq!(summary.limiter_sleep_ms, 199 * 256);
+        assert!(summary.removal_rate_per_second > 150, "{summary:?}");
+        assert!(summary.removal_rate_per_second < 300, "{summary:?}");
+        // Memory pressure after all that still gets its whole pause budget.
+        let mut pacer = UnattendedPacer::new(
+            UnlinkRate::Unlimited,
+            Box::new(clock.clone()),
+            Box::new(Scripted {
+                samples: vec![
+                    PressureSample {
+                        memory_elevated: Some(false),
+                        load_elevated: Some(true),
+                    },
+                    memory(true),
+                ],
+                reads: Rc::new(Cell::new(0)),
+            }),
+        );
+        let before = clock.slept.get();
+        assert!(!pacer.before_unlink(None));
+        assert_eq!(
+            clock.slept.get() - before,
+            LOAD_BATCH_WAIT + MAX_PRESSURE_PAUSE_PER_RUN
+        );
+    }
+
+    /// The check before a removal waits at most [`LOAD_GATE_WAIT`] for load
+    /// to clear and then lets the removal proceed throttled, however long
+    /// the load lasts; a removal's bulk charge under the same load is paid
+    /// in full at the throttled rate, never abandoned.
+    #[test]
+    fn sustained_load_lets_a_removal_start_after_a_bounded_wait() {
+        let clock = FakeClock::new();
+        let _scope = install(UnattendedPacer::new(
+            UnlinkRate::Limited(1_000),
+            Box::new(clock.clone()),
+            sustained_load(),
+        ));
+        for round in 1..=60u64 {
+            assert_eq!(
+                unattended_pressure_check(None),
+                PressureVerdict::LoadThrottled
+            );
+            assert_eq!(clock.slept.get(), LOAD_GATE_WAIT * round as u32);
+        }
+        let summary = current_summary(0).unwrap();
+        assert_eq!(summary.pressure_yields, 0);
+        assert_eq!(summary.load_throttled, 60);
+        // A deadline shorter than the wait bounds it too.
+        let before = clock.slept.get();
+        let deadline = clock.now() + Duration::from_millis(1_500);
+        assert_eq!(
+            unattended_pressure_check(Some(deadline)),
+            PressureVerdict::LoadThrottled
+        );
+        assert_eq!(clock.slept.get() - before, Duration::from_millis(1_500));
+        let entries = u64::from(PACING_BATCH_ENTRIES) * 4 + 1;
+        let charge = charge_bulk_unattended_removal(entries, Duration::ZERO, None);
+        assert!(!charge.memory_backoff);
+        assert_eq!(charge.charged, entries);
+        assert_eq!(charge.unpaid, Duration::ZERO);
+    }
+
+    /// Load that clears during the bounded wait is a normal, unthrottled
+    /// verdict.
+    #[test]
+    fn load_that_clears_mid_wait_is_clear() {
+        let clock = FakeClock::new();
+        let load = PressureSample {
+            memory_elevated: Some(false),
+            load_elevated: Some(true),
+        };
+        let mut pacer = UnattendedPacer::new(
+            UnlinkRate::Limited(1_000),
+            Box::new(clock.clone()),
+            Box::new(Scripted {
+                samples: vec![load, load, PressureSample::default()],
+                reads: Rc::new(Cell::new(0)),
+            }),
+        );
+        assert_eq!(pacer.pressure_check(None), PressureVerdict::Clear);
+        assert_eq!(clock.slept.get(), PRESSURE_POLL * 2);
+        let summary = pacer.summary(0);
+        assert_eq!(summary.load_pause_ms, 2_000);
+        assert_eq!(summary.load_throttled, 0);
+        assert_eq!(summary.pressure_yields, 0);
     }
 
     #[test]
