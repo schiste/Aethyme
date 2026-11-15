@@ -2987,7 +2987,17 @@ fn acquire_session_operation_context(
         Some(session_id) => session_id,
         None => match store.session_for_worktree(checkout.root().to_string_lossy().as_ref())? {
             Some(session) => session.id,
-            None => return Ok(None),
+            None => {
+                // Closed sessions do not resolve from their checkout. When the
+                // broker closed this one itself, say so; the command goes on.
+                if let Some(notice) = crate::session_auto_close::closed_checkout_notice(
+                    &store,
+                    checkout.root().to_string_lossy().as_ref(),
+                ) {
+                    eprintln!("note: {notice}");
+                }
+                return Ok(None);
+            }
         },
     };
     match store.session(session_id) {

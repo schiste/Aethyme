@@ -554,6 +554,40 @@ impl BrokerStore {
             .map_err(BrokerError::from)
     }
 
+    /// Open adopted sessions whose checkout path and branch are those of an
+    /// earlier session the broker spawned: a follow-up task started with
+    /// `start --reuse` on a checkout the broker created, after its first
+    /// session was closed.
+    pub(crate) fn open_adopted_sessions_on_spawned_checkouts(
+        &self,
+    ) -> Result<std::collections::BTreeSet<i64>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT a.id FROM sessions a
+             JOIN sessions s
+               ON s.worktree_path = a.worktree_path AND s.branch = a.branch
+              AND s.origin = 'spawned' AND s.id < a.id
+             WHERE a.origin = 'adopted' AND a.cleanup_state = 'open'",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        rows.collect::<Result<std::collections::BTreeSet<_>, _>>()
+            .map_err(BrokerError::from)
+    }
+
+    /// When the session last received a follow-up task (`start --reuse`),
+    /// from its latest `session.reused` event.
+    pub(crate) fn session_last_reused_at(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<i64>, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT MAX(ts) FROM events WHERE session_id = ?1 AND kind = ?2",
+                params![session_id, crate::events::SESSION_REUSED],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(BrokerError::from)
+    }
+
     /// Every pull request recorded for one session, as
     /// `(repository, number, merged_at)`, ordered by repository and number.
     /// `merged_at` is `None` for an open or closed-unmerged pull request and

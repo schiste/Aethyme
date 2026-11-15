@@ -2326,10 +2326,12 @@ struct SessionRetirementSummary {
 fn merged_pull_request_lane(
     session: &Session,
     merged_pull_requests: &std::collections::BTreeSet<i64>,
+    follow_ups_on_spawned_checkouts: &std::collections::BTreeSet<i64>,
     merged_window_ms: i64,
 ) -> bool {
     merged_window_ms > 0
-        && session.origin == SessionOrigin::Spawned
+        && (session.origin == SessionOrigin::Spawned
+            || follow_ups_on_spawned_checkouts.contains(&session.id))
         && merged_pull_requests.contains(&session.id)
 }
 
@@ -4320,8 +4322,15 @@ impl LandedDeclineMemo {
             .session_representation(session.id, &head)
             .ok()?
             .is_some();
+        // A `holder_unbound` decline holds until a holder is bound, which
+        // appends a holder event; `holder_alive` is never remembered, since
+        // a process can exit without any event.
+        let holder = store
+            .latest_session_holder_event(session.id)
+            .ok()?
+            .map_or_else(|| "none".to_string(), |event| event.id.to_string());
         Some(format!(
-            "{head} {tip} merged={merged} represented={represented}"
+            "{head} {tip} merged={merged} represented={represented} holder={holder}"
         ))
     }
 
@@ -4337,6 +4346,7 @@ impl LandedDeclineMemo {
         match code.as_str() {
             "no_session_commits" => Some(crate::broker::LandedSessionDecline::NoSessionCommits),
             "no_landing_evidence" => Some(crate::broker::LandedSessionDecline::NoLandingEvidence),
+            "holder_unbound" => Some(crate::broker::LandedSessionDecline::HolderUnbound),
             _ => None,
         }
     }
@@ -4354,7 +4364,11 @@ impl LandedDeclineMemo {
         let entry = match (key, decline) {
             (
                 Some(key),
-                Some(reason @ (Decline::NoSessionCommits | Decline::NoLandingEvidence)),
+                Some(
+                    reason @ (Decline::NoSessionCommits
+                    | Decline::NoLandingEvidence
+                    | Decline::HolderUnbound),
+                ),
             ) => Some((key.to_string(), reason.code().to_string())),
             _ => None,
         };
@@ -6951,6 +6965,10 @@ impl Broker {
             .open_sessions_with_merged_pull_request()?
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
+        let follow_ups = self
+            .store_ref()
+            .open_adopted_sessions_on_spawned_checkouts()
+            .unwrap_or_default();
         // One `for-each-ref --merged` walk over every local branch: bounded by
         // the lane deadline and timed, since it runs before any session.
         let (merged_branches, tips) = {
@@ -7000,8 +7018,12 @@ impl Broker {
                 };
                 ((merged_pull_requests.contains(&session.id) || on_default)
                     && idle_past(landed_window_ms))
-                    || (merged_pull_request_lane(session, &merged_pull_requests, merged_window_ms)
-                        && idle_past(merged_window_ms))
+                    || (merged_pull_request_lane(
+                        session,
+                        &merged_pull_requests,
+                        &follow_ups,
+                        merged_window_ms,
+                    ) && idle_past(merged_window_ms))
             })
             .collect::<Vec<_>>();
         // Sessions with a merged pull request first: they are the ones that
@@ -7047,8 +7069,12 @@ impl Broker {
             // A spawned session whose every pull request merged takes the
             // shorter merged window and its stricter running-work checks; any
             // other session keeps the landed window.
-            let merged_lane =
-                merged_pull_request_lane(&session, &merged_pull_requests, merged_window_ms);
+            let merged_lane = merged_pull_request_lane(
+                &session,
+                &merged_pull_requests,
+                &follow_ups,
+                merged_window_ms,
+            );
             let outcome = if merged_lane {
                 summary.merged_examined += 1;
                 crate::phase_telemetry::add("landed_merged_pr_examined", Duration::ZERO);
@@ -7070,6 +7096,42 @@ impl Broker {
                     deadline,
                 )?
             };
+            // Evidence the merged lane cannot read (an unknown gate, operation
+            // or artifact inventory) used to wait only for the landed window;
+            // past that window the landed lane decides, as it did before.
+            let merged_unknown = merged_lane
+                && matches!(
+                    crate::broker::LandedSessionDecline::from_outcome(outcome),
+                    Some(crate::broker::LandedSessionDecline::OperationUnknown)
+                );
+            let past_landed_window = landed_window_ms > 0
+                && crate::decide_abandonment(
+                    &crate::SessionActivity {
+                        session_id: session.id,
+                        last_activity_at: session.last_activity_at,
+                        created_at: session.created_at,
+                        agent_alive: None,
+                        closed: false,
+                    },
+                    now_ms(),
+                    landed_window_ms,
+                )
+                .is_abandoned();
+            let fell_back = merged_unknown && past_landed_window;
+            let outcome = if fell_back {
+                crate::phase_telemetry::add("landed_merged_pr_fallback_to_landed", Duration::ZERO);
+                self.try_close_landed_session(
+                    session.id,
+                    now_ms(),
+                    landed_window_ms,
+                    &mut process_table,
+                    allow_snapshot,
+                    deadline,
+                )?
+            } else {
+                outcome
+            };
+            let merged_lane = merged_lane && !fell_back;
             let elapsed = started.elapsed();
             crate::phase_telemetry::add("landed_session_retirement", elapsed);
             summary.landed_elapsed_ms = summary
@@ -8556,7 +8618,9 @@ impl Broker {
         if (!removal_judged || !retirement_judged)
             && let Some(previous) = self.last_auto_cleanup_report()
         {
-            if !retirement_judged {
+            let previous_has_counts = previous.landed_sessions_examined > 0
+                || !previous.sessions_closed_by_reason.is_empty();
+            if !retirement_judged && previous_has_counts {
                 stored.carry_retirement_counts(&previous);
             }
             if !removal_judged {

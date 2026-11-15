@@ -378,6 +378,9 @@ pub(crate) struct LandedProof {
     /// default branch), `ancestry`, or `content` (every commit accounted for
     /// by the landing search after a squash or rebase).
     pub evidence: &'static str,
+    /// The landing came from the remembered proof for this head, not a fresh
+    /// search; a close resting on it searches again under the claims.
+    pub memoized: bool,
 }
 
 /// Which window and which proofs an automatic close uses.
@@ -943,14 +946,50 @@ impl Broker {
         )
     }
 
+    /// A whitespace-free fingerprint of the session's recorded pull requests
+    /// and their merge times, or `unknown` when they cannot be read.
+    fn pull_request_fingerprint(&self, session_id: i64) -> String {
+        crate::session_auto_close::PullRequestMerges::read(self.store_ref(), session_id)
+            .map_or_else(|| "unknown".to_string(), |merges| merges.fingerprint())
+    }
+
     /// The pull requests of a session the merged-pull-request lane may close,
     /// and when the last of them merged; the decline otherwise.
     fn merged_pull_request_evidence(
         &self,
         session: &crate::Session,
     ) -> Result<(crate::session_auto_close::PullRequestMerges, i64), LandedSessionDecline> {
-        if session.origin != crate::SessionOrigin::Spawned {
+        // A follow-up task started with `start --reuse` on a checkout the
+        // broker created after its first session closed is adopted by
+        // construction, yet the checkout is provably the broker's: same path
+        // and branch as an earlier spawned session.
+        let follow_up_on_spawned_checkout = session.origin == crate::SessionOrigin::Adopted
+            && self
+                .store_ref()
+                .open_adopted_sessions_on_spawned_checkouts()
+                .map_err(|_| LandedSessionDecline::LandingUnknown)?
+                .contains(&session.id);
+        if session.origin != crate::SessionOrigin::Spawned && !follow_up_on_spawned_checkout {
             return Err(LandedSessionDecline::Adopted);
+        }
+        // A follow-up task keeps its session for the whole landed window,
+        // whoever holds it: the caller may be unidentifiable and the previous
+        // holder gone, so neither holder evidence nor two quiet hours prove
+        // that the new task is over.
+        let follow_up_at = if follow_up_on_spawned_checkout {
+            Some(session.created_at)
+        } else {
+            self.store_ref()
+                .session_last_reused_at(session.id)
+                .map_err(|_| LandedSessionDecline::LandingUnknown)?
+        };
+        if let Some(follow_up_at) = follow_up_at {
+            let landed_window_ms = crate::load_retention_policy(self.main_root())
+                .map(|policy| i64::from(policy.session_landed_after_hours) * 3_600_000)
+                .map_err(|_| LandedSessionDecline::PolicyUnavailable)?;
+            if crate::clock::epoch_ms().saturating_sub(follow_up_at) < landed_window_ms {
+                return Err(LandedSessionDecline::RecentActivity);
+            }
         }
         let merges =
             crate::session_auto_close::PullRequestMerges::read(self.store_ref(), session.id)
@@ -986,6 +1025,18 @@ impl Broker {
         &self,
         session: &crate::Session,
         deadline: Option<std::time::Instant>,
+    ) -> Result<LandedProof, LandedSessionDecline> {
+        self.landed_session_decline_with_memo(session, deadline, true)
+    }
+
+    /// [`Self::landed_session_decline`]; with `use_memo` false a remembered
+    /// landing is not trusted and the search runs again, as it does under
+    /// the claims before a close that rested on one.
+    fn landed_session_decline_with_memo(
+        &self,
+        session: &crate::Session,
+        deadline: Option<std::time::Instant>,
+        use_memo: bool,
     ) -> Result<LandedProof, LandedSessionDecline> {
         let _git_deadline = deadline.map(crate::git::limit_git_until);
         let out_of_budget =
@@ -1023,6 +1074,7 @@ impl Broker {
                     .is_some_and(|commit| self.repo_handle().is_ancestor(commit, &upstream))
         });
         let mut evidence = "representation";
+        let mut memoized = false;
         if !represented_upstream {
             let merged_pull_request = self
                 .store_ref()
@@ -1063,26 +1115,34 @@ impl Broker {
             // A head already proved landed against an earlier default-branch
             // tip stays landed on any later tip: the default branch only moves
             // forward. One ancestry check replaces the content search.
+            // The memo is bound to the head, the tip it was proved against
+            // and the session's pull-request evidence (a new, reopened or
+            // re-merged pull request changes the fingerprint).
             let landed_key = landed_proof_memo_key(session.id);
+            let pull_request_fingerprint = self.pull_request_fingerprint(session.id);
             let remembered = self
                 .store_ref()
                 .meta_get(&landed_key)
                 .ok()
                 .flatten()
+                .filter(|_| use_memo)
                 .and_then(|value| {
                     let mut parts = value.split(' ');
-                    let (recorded_head, recorded_tip, recorded_evidence) =
-                        (parts.next()?, parts.next()?, parts.next()?);
+                    let (recorded_head, recorded_tip, recorded_evidence, recorded_prs) =
+                        (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
                     (recorded_head == head
+                        && recorded_prs == pull_request_fingerprint
                         && self.repo_handle().is_ancestor(recorded_tip, &upstream))
-                    .then(|| match recorded_evidence {
-                        "ancestry" => "ancestry",
-                        _ => "content",
+                    .then_some(if recorded_evidence == "ancestry" {
+                        "ancestry"
+                    } else {
+                        "content"
                     })
                 });
             if let Some(recorded) = remembered {
                 crate::phase_telemetry::add("landed_landing_memo_hit", std::time::Duration::ZERO);
                 evidence = recorded;
+                memoized = true;
             }
             let queue = self
                 .store_ref()
@@ -1106,8 +1166,10 @@ impl Broker {
             if landed && remembered.is_none() {
                 crate::warn_unrecorded(
                     "remember a landed session head",
-                    self.store_ref()
-                        .meta_set(&landed_key, &format!("{head} {upstream} {evidence}")),
+                    self.store_ref().meta_set(
+                        &landed_key,
+                        &format!("{head} {upstream} {evidence} {pull_request_fingerprint}"),
+                    ),
                 );
             }
             if !landed {
@@ -1133,6 +1195,7 @@ impl Broker {
                 head,
                 upstream_tip: upstream,
                 evidence,
+                memoized,
             }),
             Ok(Some(_)) => Err(LandedSessionDecline::WorktreeUnclean),
             Err(_) => Err(unknown(LandedSessionDecline::WorktreeUnclean)),
@@ -1560,9 +1623,10 @@ impl Broker {
                 return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
             }
         }
-        // A live task holder is excused only after this open-file check; a
-        // gone or unbound holder has no process to look for.
-        if task_lease_binding_present {
+        // A live task holder is excused only after this open-file check. The
+        // merged-pull-request lane runs it for every holder, a legacy binding
+        // included: two quiet hours alone do not show nobody works there.
+        if task_lease_binding_present || merged_lane {
             let worktree = std::path::Path::new(&current.worktree_path);
             let Some(open_files) =
                 process_table.process_use_snapshot_for_retirement(self.main_root(), deadline)
@@ -1685,7 +1749,7 @@ impl Broker {
         {
             return Ok(AbandonedSessionCloseOutcome::Changed);
         }
-        if task_lease_binding_present
+        if (task_lease_binding_present || merged_lane)
             && (deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
                 || process_table
                     .process_use_snapshot_for_retirement(self.main_root(), deadline)
@@ -1741,12 +1805,17 @@ impl Broker {
             if let Some(reason) = self.landed_proof_still_holds(&current, proof) {
                 return Ok(AbandonedSessionCloseOutcome::LandedDeclined(reason));
             }
-            // The pull requests are read again under the claims: a new pull
-            // request, a reopened one or a later merge changes the evidence.
-            if let Some((merges, _)) = merged_evidence.as_ref() {
-                match self.merged_pull_request_evidence(&current) {
-                    Ok((current_merges, _)) if current_merges == *merges => {}
-                    Ok(_) => return Ok(AbandonedSessionCloseOutcome::Changed),
+            // A remembered landing is a shortcut for judging, never for the
+            // close: prove it again, fully, under both claims.
+            if proof.memoized {
+                let _span = crate::phase_telemetry::span("landed_reproof_under_claims");
+                match self.landed_session_decline_with_memo(&current, deadline, false) {
+                    Ok(fresh) if fresh.head == proof.head => {}
+                    Ok(_) => {
+                        return Ok(AbandonedSessionCloseOutcome::LandedDeclined(
+                            LandedSessionDecline::MovedBeforeClose,
+                        ));
+                    }
                     Err(reason) => {
                         return Ok(AbandonedSessionCloseOutcome::LandedDeclined(reason));
                     }
@@ -1767,6 +1836,17 @@ impl Broker {
                 return Ok(AbandonedSessionCloseOutcome::LandedDeclined(
                     LandedSessionDecline::MovedBeforeClose,
                 ));
+            }
+            // The pull requests are read again under the claims, last: a new pull
+            // request, a reopened one or a later merge changes the evidence.
+            if let Some((merges, _)) = merged_evidence.as_ref() {
+                match self.merged_pull_request_evidence(&current) {
+                    Ok((current_merges, _)) if current_merges == *merges => {}
+                    Ok(_) => return Ok(AbandonedSessionCloseOutcome::Changed),
+                    Err(reason) => {
+                        return Ok(AbandonedSessionCloseOutcome::LandedDeclined(reason));
+                    }
+                }
             }
             // A file written since the proof is work too: the shared
             // classifier looks once more, after every other check.
@@ -1865,7 +1945,11 @@ impl Broker {
                         .record_automation_note(
                             crate::session_auto_close::NOTE_SENDER,
                             session_id,
-                            &crate::session_auto_close::close_note(session_id, &abandoned_payload),
+                            &crate::session_auto_close::close_note(
+                                session_id,
+                                &current.worktree_path,
+                                &abandoned_payload,
+                            ),
                             Some(crate::session_auto_close::NOTE_FINGERPRINT),
                         )
                         .map(|_| ()),

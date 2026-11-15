@@ -364,6 +364,23 @@ pub(crate) enum RecordedHolderLiveness {
     Unknown,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The open-file observation retirement passes on this test thread use
+    /// instead of running `lsof`.
+    static TEST_PROCESS_USE_SNAPSHOT: std::cell::RefCell<Option<crate::reclaim::OpenFileSnapshot>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Make retirement passes on this test thread observe `snapshot` instead of
+/// running `lsof`; `None` restores the real observation.
+#[cfg(test)]
+pub(crate) fn set_process_use_snapshot_for_tests(
+    snapshot: Option<crate::reclaim::OpenFileSnapshot>,
+) {
+    TEST_PROCESS_USE_SNAPSHOT.with(|cell| *cell.borrow_mut() = snapshot);
+}
+
 /// The process snapshot is valid only for the holder event it observed.
 /// Holder events are append-only identities, so a rebind forces a fresh
 /// snapshot instead of reusing a process table captured for another owner.
@@ -510,6 +527,12 @@ impl RecordedHolderProcessTable {
         if aged && room_for_another {
             crate::phase_telemetry::add("retirement_process_use_resnapshot", Duration::ZERO);
             self.process_use_snapshot = None;
+        }
+        #[cfg(test)]
+        if self.process_use_snapshot.is_none()
+            && let Some(snapshot) = TEST_PROCESS_USE_SNAPSHOT.with(|cell| cell.borrow().clone())
+        {
+            self.process_use_snapshot = Some((Instant::now(), snapshot));
         }
         if self.process_use_snapshot.is_none() {
             let budget = deadline.map_or(Duration::from_secs(10), |deadline| {

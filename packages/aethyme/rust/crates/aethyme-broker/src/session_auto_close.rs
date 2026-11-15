@@ -59,6 +59,22 @@ impl PullRequestMerges {
         self.links.iter().filter_map(|(_, _, merged)| *merged).max()
     }
 
+    /// A whitespace-free digest of every recorded pull request and its merge
+    /// time: a change signal for memos that depend on them.
+    pub(crate) fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for (repository, number, merged_at) in &self.links {
+            hasher.update(format!("{repository}#{number}@{merged_at:?};").as_bytes());
+        }
+        let digest = hasher.finalize();
+        digest
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     pub(crate) fn to_json(&self) -> Value {
         Value::Array(
             self.links
@@ -179,14 +195,31 @@ fn close_reason_text(payload: &Value) -> String {
     }
 }
 
+/// How to go on after an automatic close, depending on whether the checkout
+/// is still on disk (automatic removal takes it once its grace has passed
+/// and its work is contained).
+fn continuation(worktree_path: &str) -> String {
+    match std::fs::symlink_metadata(worktree_path) {
+        Ok(_) => format!(
+            "Its checkout {worktree_path} is still on disk. To continue there, run \
+             `aethyme broker start --reuse --task \"<task>\" --short-name \"<name>\"` from \
+             inside that checkout"
+        ),
+        Err(_) => "Its checkout has since been removed by automatic cleanup; start a new \
+                   session with `aethyme broker start --task \"<task>\" --short-name \
+                   \"<name>\"`"
+            .to_string(),
+    }
+}
+
 /// The note left for a session the broker just closed automatically.
-pub(crate) fn close_note(session_id: i64, payload: &str) -> String {
+pub(crate) fn close_note(session_id: i64, worktree_path: &str, payload: &str) -> String {
     let payload = serde_json::from_str::<Value>(payload).unwrap_or(Value::Null);
     format!(
-        "The broker closed session {session_id} automatically: {}. Nothing was deleted. \
-         To continue, run `aethyme broker start --reuse --task \"<task>\" --short-name \
-         \"<name>\"`.",
-        close_reason_text(&payload)
+        "The broker closed session {session_id} automatically: {}. Closing deleted nothing. \
+         {}.",
+        close_reason_text(&payload),
+        continuation(worktree_path)
     )
 }
 
@@ -198,16 +231,17 @@ pub(crate) fn explain_automatic_close(
     session_id: i64,
 ) -> Option<String> {
     let event = store.latest_session_abandoned_event(session_id).ok()??;
+    let worktree_path = store.session(session_id).ok()?.worktree_path;
     let payload = event
         .payload_json
         .as_deref()
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
         .unwrap_or(Value::Null);
     Some(format!(
-        "the broker closed session {session_id} automatically because {}; nothing was \
-         deleted. Continue with `aethyme broker start --reuse --task \"<task>\" --short-name \
-         \"<name>\"`",
-        close_reason_text(&payload)
+        "the broker closed session {session_id} automatically because {}; closing deleted \
+         nothing. {}",
+        close_reason_text(&payload),
+        continuation(&worktree_path)
     ))
 }
 
@@ -220,6 +254,27 @@ pub(crate) fn closed_session_refusal(store: &crate::BrokerStore, session_id: i64
         ),
         None => format!("session {session_id} is already closed; it cannot start new session work"),
     }
+}
+
+/// For a command run from a checkout without `--session`: when the latest
+/// session of this checkout is closed and the broker closed it itself, the
+/// explanation; the command itself is not refused here.
+pub(crate) fn closed_checkout_notice(
+    store: &crate::BrokerStore,
+    worktree_path: &str,
+) -> Option<String> {
+    let session = store
+        .latest_session_for_worktree_any_state(worktree_path)
+        .ok()??;
+    if session.cleanup_state == crate::SessionCleanupState::Open {
+        return None;
+    }
+    explain_automatic_close(store, session.id).map(|explanation| {
+        format!(
+            "this checkout's session {} is closed: {explanation}",
+            session.id
+        )
+    })
 }
 
 #[cfg(test)]
@@ -263,11 +318,11 @@ mod tests {
             abandonment_close_payload(&base, Some(&merges(&[(4, None)])), Some("abc"), None);
         let value: Value = serde_json::from_str(&with_pr).unwrap();
         assert_eq!(value["close_reason"], CLOSE_REASON_INACTIVE);
-        let note = close_note(9, &none);
+        let note = close_note(9, "/nonexistent/auto-close-fixture", &none);
         assert!(note.contains("no pull request was recorded"), "{note}");
         assert!(note.contains("3 days"), "{note}");
         assert!(note.contains("branch and checkout are kept"), "{note}");
-        assert!(note.contains("broker start --reuse"), "{note}");
+        assert!(note.contains("has since been removed"), "{note}");
     }
 
     #[test]
@@ -279,11 +334,11 @@ mod tests {
             "pull_requests": [{"repository": "fixture", "number": 12, "merged_at": 1}],
         })
         .to_string();
-        let note = close_note(5, &payload);
+        let note = close_note(5, "/nonexistent/auto-close-fixture", &payload);
         assert!(note.contains("#12"), "{note}");
         assert!(note.contains("0123456789ab"), "{note}");
         assert!(note.contains("3 hours"), "{note}");
-        assert!(note.contains("Nothing was deleted"), "{note}");
+        assert!(note.contains("Closing deleted nothing"), "{note}");
     }
 }
 
@@ -355,6 +410,11 @@ mod lane_tests {
         .unwrap();
         let storage = crate::test_storage::TestStorage::new();
         let broker = storage.open(&root).unwrap();
+        // No process on this test thread uses any checkout: the open-file
+        // observation is fixed instead of running `lsof`.
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+        ));
         (owner, storage, broker)
     }
 
@@ -407,16 +467,35 @@ mod lane_tests {
             started: "Mon Jan 1 00:00:00 2024".into(),
             command: "fixture-agent".into(),
         };
+        bind_holder(broker, session, &holder);
+        age(broker, session, hours);
+    }
+
+    fn bind_holder(
+        broker: &mut crate::Broker,
+        session: &crate::Session,
+        holder: &crate::session_holder::AgentProcess,
+    ) -> i64 {
         broker
             .store()
             .append_event(
                 crate::events::SESSION_HOLDER_BOUND,
                 Some(session.id),
                 Some(&crate::events::session_holder_bound_payload(
-                    &holder, "fixture", None,
+                    holder, "fixture", None,
                 )),
             )
             .unwrap();
+        broker
+            .store_ref()
+            .latest_session_holder_event(session.id)
+            .unwrap()
+            .unwrap()
+            .id
+    }
+
+    /// Push the session's recorded and Git-visible activity `hours` back.
+    fn age(broker: &mut crate::Broker, session: &crate::Session, hours: u64) {
         let old_time = std::time::SystemTime::now() - Duration::from_secs(hours * 60 * 60);
         let old_ms = old_time
             .duration_since(std::time::UNIX_EPOCH)
@@ -819,5 +898,219 @@ mod lane_tests {
             .as_deref(),
             Some(git_head.as_str())
         );
+    }
+
+    /// One merged, landed, clean session quiet for three hours, closed or
+    /// kept by a direct call with `table` as its process observation.
+    fn merged_candidate(broker: &mut crate::Broker, label: &str) -> (crate::Session, PathBuf) {
+        let (session, worktree) = session(broker, label, true);
+        link_pull_request(broker, session.id, 1_000 + session.id, Some(1));
+        (session, worktree)
+    }
+
+    fn close_directly(
+        broker: &mut crate::Broker,
+        session: &crate::Session,
+        table: &mut crate::session_holder::RecordedHolderProcessTable,
+    ) -> crate::broker::AbandonedSessionCloseOutcome {
+        broker
+            .try_close_merged_pull_request_session(
+                session.id,
+                now_ms(),
+                2 * HOUR_MS,
+                table,
+                true,
+                None,
+            )
+            .unwrap()
+    }
+
+    fn declined(
+        reason: crate::broker::LandedSessionDecline,
+    ) -> crate::broker::AbandonedSessionCloseOutcome {
+        crate::broker::AbandonedSessionCloseOutcome::LandedDeclined(reason)
+    }
+
+    /// Running work the merged lane checks for every holder: a submission
+    /// in flight, an unresolved guarded command, a process working in the
+    /// checkout (with a legacy holder binding, which has no task lease).
+    #[test]
+    fn the_merged_lane_keeps_sessions_with_running_work() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (queued, queued_tree) = merged_candidate(&mut broker, "submission in flight");
+        let head = crate::git::GitRepo::discover(&queued_tree)
+            .unwrap()
+            .head_commit()
+            .unwrap();
+        broker
+            .store()
+            .connection()
+            .execute(
+                "INSERT INTO merge_queue (session_id, head_commit, base_commit, status, created_at, updated_at) VALUES (?1, ?2, ?2, 'submitted', 1, 1)",
+                rusqlite::params![queued.id, head],
+            )
+            .unwrap();
+        quiet(&mut broker, &queued, 3);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_directly(&mut broker, &queued, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::OperationActive
+        );
+
+        let (guarded, _) = merged_candidate(&mut broker, "guarded command running");
+        broker
+            .store()
+            .connection()
+            .execute(
+                "INSERT INTO guarded_exec_receipts (receipt_id, session_id, phase, command_outcome, ownership_audit, process_group_cleanup, created_at_ms, updated_at_ms) VALUES (?1, ?2, 'running', 'unknown', 'not_run', 'unknown', 1, 1)",
+                rusqlite::params!["0123456789abcdef0123456789abcdef", guarded.id],
+            )
+            .unwrap();
+        quiet(&mut broker, &guarded, 3);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_directly(&mut broker, &guarded, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::OperationActive
+        );
+
+        let (occupied, occupied_tree) = merged_candidate(&mut broker, "someone works here");
+        quiet(&mut broker, &occupied, 3);
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+                pid: std::process::id(),
+                command: "editor".into(),
+                descriptor: "cwd".into(),
+                file_type: Some("DIR".into()),
+                path: std::fs::canonicalize(&occupied_tree).unwrap(),
+            }]),
+        ));
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_directly(&mut broker, &occupied, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::OperationActive
+        );
+        for session in [&queued, &guarded, &occupied] {
+            assert!(is_open(&broker, session.id), "{:?}", session.task);
+        }
+    }
+
+    /// A live holder, and a session no holder was ever bound to, keep the
+    /// session in the merged lane, decided before any landing proof.
+    #[test]
+    fn the_merged_lane_keeps_live_and_unbound_holders() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (alive, _) = merged_candidate(&mut broker, "holder still running");
+        let holder = crate::session_holder::AgentProcess {
+            pid: i64::from(std::process::id()),
+            started: "Mon Jan 1 00:00:00 2024".into(),
+            command: "fixture-agent".into(),
+        };
+        let event_id = bind_holder(&mut broker, &alive, &holder);
+        age(&mut broker, &alive, 3);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        table.install_holder_process_table_for_test(
+            alive.id,
+            event_id,
+            crate::session_holder::ProcessTable::parse(&format!(
+                "{} 1 {} {}\n",
+                holder.pid, holder.started, holder.command
+            )),
+        );
+        assert_eq!(
+            close_directly(&mut broker, &alive, &mut table),
+            declined(crate::broker::LandedSessionDecline::HolderAlive)
+        );
+
+        let (unbound, _) = merged_candidate(&mut broker, "no holder ever bound");
+        age(&mut broker, &unbound, 3);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_directly(&mut broker, &unbound, &mut table),
+            declined(crate::broker::LandedSessionDecline::HolderUnbound)
+        );
+        assert!(
+            broker
+                .store_ref()
+                .meta_get(&format!("landed_lane.landed.{}", unbound.id))
+                .unwrap()
+                .is_none(),
+            "the holder is asked before the landing proof"
+        );
+        assert!(is_open(&broker, alive.id));
+        assert!(is_open(&broker, unbound.id));
+    }
+
+    /// A pull request recorded for the session after the proof, before the
+    /// close, keeps it: the pull requests are read again last.
+    #[test]
+    fn a_pull_request_recorded_during_the_close_keeps_the_session() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (session, _) = merged_candidate(&mut broker, "new pull request meanwhile");
+        quiet(&mut broker, &session, 3);
+        let database = broker.store_ref().db_path().to_path_buf();
+        let session_id = session.id;
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        table.install_before_landed_close_for_test(Box::new(move || {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO pull_request_session_links (repository, pr_number, session_id, linked_at, link_source) VALUES ('fixture', 77, ?1, 1, 'watch')",
+                    [session_id],
+                )
+                .unwrap();
+        }));
+        let outcome = close_directly(&mut broker, &session, &mut table);
+        assert_ne!(outcome, crate::broker::AbandonedSessionCloseOutcome::Closed);
+        assert!(is_open(&broker, session.id));
+    }
+
+    /// A follow-up task protects its session for the landed window whatever
+    /// the holder evidence, both for a reused open session and for a new
+    /// session adopted on the broker's checkout after an automatic close;
+    /// past that window the adopted follow-up is closed by the merged lane
+    /// like a spawned session.
+    #[test]
+    fn a_follow_up_task_is_protected_for_the_landed_window() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (reused, _) = merged_candidate(&mut broker, "reused for a follow-up");
+        quiet(&mut broker, &reused, 3);
+        broker
+            .store()
+            .append_event(crate::events::SESSION_REUSED, Some(reused.id), None)
+            .unwrap();
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_directly(&mut broker, &reused, &mut table),
+            declined(crate::broker::LandedSessionDecline::RecentActivity)
+        );
+
+        for (hours, closes) in [(3_u64, false), (30, true)] {
+            let (first, worktree) = merged_candidate(&mut broker, "first task");
+            broker
+                .store()
+                .connection()
+                .execute(
+                    "UPDATE sessions SET status = 'cleaned', cleanup_state = 'closed', closed_at = 1 WHERE id = ?1",
+                    [first.id],
+                )
+                .unwrap();
+            let follow_up = broker.adopt(&worktree, Some("follow-up task")).unwrap();
+            assert_eq!(follow_up.origin, crate::SessionOrigin::Adopted);
+            link_pull_request(&mut broker, follow_up.id, 900 + hours as i64, Some(1));
+            quiet(&mut broker, &follow_up, hours);
+
+            let report = broker.retire_abandoned_sessions_for_recovery(None).unwrap();
+
+            assert_eq!(
+                !is_open(&broker, follow_up.id),
+                closes,
+                "{hours} h: {report:#?}"
+            );
+            assert_eq!(
+                report.merged_pull_request_sessions_closed,
+                usize::from(closes),
+                "{hours} h: {report:#?}"
+            );
+        }
     }
 }

@@ -604,6 +604,21 @@ impl BrokerStore {
     /// The non-cleaned session registered for exactly this worktree
     /// path, if any — what `adopt` consults to give a useful answer
     /// instead of a bare constraint violation.
+    /// The latest session recorded for `worktree_path`, whatever its state.
+    pub(crate) fn latest_session_for_worktree_any_state(
+        &self,
+        worktree_path: &str,
+    ) -> Result<Option<Session>, BrokerError> {
+        self.conn
+            .query_row(
+                &format!("{SESSION_SELECT} WHERE worktree_path = ?1 ORDER BY id DESC LIMIT 1"),
+                params![worktree_path],
+                session_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
     pub fn session_for_worktree(
         &self,
         worktree_path: &str,
