@@ -709,7 +709,8 @@ impl Broker {
                 {
                     crate::warn_unrecorded(
                         "wake post-close checkout cleanup",
-                        self.request_checkout_cleanup_after_close(session.id),
+                        self.request_checkout_cleanup_after_close(session.id)
+                            .map(|_| ()),
                     );
                 }
             }

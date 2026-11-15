@@ -7409,7 +7409,8 @@ impl Broker {
         if should_wake_checkout_cleanup {
             crate::warn_unrecorded(
                 "wake post-close checkout cleanup",
-                self.request_checkout_cleanup_after_close(session_id),
+                self.request_checkout_cleanup_after_close(session_id)
+                    .map(|_| ()),
             );
         }
         // Closing must not fail because a best-effort artifact sweep did;
