@@ -499,6 +499,14 @@ mod lane_tests {
             .unwrap();
         assert_eq!(payload["head"], head.as_str());
         assert_eq!(payload["checkout_deleted"], false);
+        // The landing proof is remembered for this head, so the next lap
+        // answers with one ancestry check instead of searching again.
+        let remembered = broker
+            .store_ref()
+            .meta_get(&format!("landed_lane.landed.{}", session.id))
+            .unwrap()
+            .expect("a proved landing is remembered");
+        assert!(remembered.starts_with(head.as_str()), "{remembered}");
 
         let notes = broker
             .store_ref()
@@ -723,6 +731,93 @@ mod lane_tests {
             closed.cleanup_state,
             SessionCleanupState::Closed,
             "never recorded as cleaned while its checkout is kept"
+        );
+    }
+
+    /// A session already past the abandonment window is closed by that
+    /// window first, without the landed proof: the proof used to run first
+    /// for every such session and starve the lane.
+    #[test]
+    fn a_session_past_the_abandonment_window_closes_without_the_landed_proof() {
+        let (_owner, _storage, mut broker) = fixture("");
+        // Unlanded and without a pull request, so only the oldest-first lap
+        // reaches it, where the landed proof used to be asked first.
+        let (session, worktree) = session(&mut broker, "quiet for days", false);
+        quiet(&mut broker, &session, 80);
+
+        let report = broker.retire_abandoned_sessions_for_recovery(None).unwrap();
+
+        assert!(!is_open(&broker, session.id), "{report:#?}");
+        assert_eq!(report.landed_sessions_examined, 0, "{report:#?}");
+        assert_eq!(
+            report.sessions_closed_by_reason.get("abandoned"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert!(worktree.exists());
+    }
+
+    /// A pass whose retirement lane judged nothing (a broker open's sliver,
+    /// `gc plan`'s zero-budget pass) keeps the last counts `status` shows.
+    #[test]
+    fn a_report_without_retirement_keeps_the_last_retirement_counts() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let mut worked = crate::AutoCleanupReport {
+            evaluated_at_ms: 1_000,
+            landed_sessions_examined: 4,
+            landed_sessions_closed: 2,
+            ..crate::AutoCleanupReport::default()
+        };
+        worked
+            .sessions_closed_by_reason
+            .insert(super::CLOSE_REASON_MERGED_PULL_REQUEST.into(), 2);
+        broker.record_auto_cleanup_report(&worked).unwrap();
+        broker
+            .record_auto_cleanup_report(&crate::AutoCleanupReport {
+                evaluated_at_ms: 2_000,
+                ..crate::AutoCleanupReport::default()
+            })
+            .unwrap();
+
+        let last = broker.last_auto_cleanup_report().unwrap();
+        assert_eq!(last.evaluated_at_ms, 2_000);
+        let view = last.landed_session_retirement_view().expect("counts kept");
+        assert_eq!(view.examined, 4);
+        assert_eq!(view.closed, 2);
+        assert_eq!(
+            view.evaluated_at_ms, 1_000,
+            "the counts keep their own time"
+        );
+        assert_eq!(
+            view.closed_by_reason
+                .get(super::CLOSE_REASON_MERGED_PULL_REQUEST),
+            Some(&2)
+        );
+    }
+
+    /// The memo key reads a checkout's HEAD from its files, and agrees with
+    /// Git, on a branch and detached.
+    #[test]
+    fn a_checkout_head_read_from_its_files_matches_git() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (_, worktree) = session(&mut broker, "head from files", false);
+        let tips = broker.repo_handle().local_branch_tips().unwrap();
+        let git_head = crate::git::GitRepo::discover(&worktree)
+            .unwrap()
+            .head_commit()
+            .unwrap();
+        assert_eq!(
+            crate::auto_cleanup::head_from_checkout_files(&worktree, &tips).as_deref(),
+            Some(git_head.as_str())
+        );
+        git(&worktree, &["checkout", "-q", "--detach"]);
+        assert_eq!(
+            crate::auto_cleanup::head_from_checkout_files(
+                &worktree,
+                &std::collections::BTreeMap::new()
+            )
+            .as_deref(),
+            Some(git_head.as_str())
         );
     }
 }

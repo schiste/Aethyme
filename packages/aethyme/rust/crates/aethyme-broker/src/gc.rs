@@ -9712,12 +9712,31 @@ impl Broker {
             aggregate.deferred = aggregate
                 .deferred
                 .saturating_add(report.deferred.saturating_sub(pagination_reasons));
-            let has_more_sessions = report.retirement_deferred_reasons.iter().any(|reason| {
-                matches!(
-                    reason,
-                    SessionRetirementDeferredReason::MoreSessionsRemain { .. }
-                )
-            });
+            // A pass that ran out of time after judging or closing sessions
+            // continues in the next pass of this run, as a paged lap does;
+            // it used to end the run and wait for the next request, so each
+            // run judged one pass's worth of sessions.
+            let deadline_after_progress = (report.landed_sessions_examined > 0
+                || report.sessions_retired > 0)
+                && report.retirement_deferred_reasons.iter().any(|reason| {
+                    matches!(
+                        reason,
+                        SessionRetirementDeferredReason::DeadlineExceeded { .. }
+                    )
+                });
+            if deadline_after_progress {
+                crate::phase_telemetry::add(
+                    "session_retirement_continued_after_deadline",
+                    Duration::ZERO,
+                );
+            }
+            let has_more_sessions = deadline_after_progress
+                || report.retirement_deferred_reasons.iter().any(|reason| {
+                    matches!(
+                        reason,
+                        SessionRetirementDeferredReason::MoreSessionsRemain { .. }
+                    )
+                });
             continuation_reason = report
                 .retirement_deferred_reasons
                 .iter()

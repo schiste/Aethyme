@@ -1755,6 +1755,14 @@ pub struct AutoCleanupReport {
     pub merged_pull_request_sessions_examined: usize,
     #[serde(default, skip_serializing_if = "is_zero_count")]
     pub merged_pull_request_sessions_closed: usize,
+    /// Sessions this report closed, per lane reason
+    /// (`merged_pull_request_landed`, `landed`, `abandoned`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sessions_closed_by_reason: std::collections::BTreeMap<String, usize>,
+    /// When the retirement counts above were evaluated, when they were
+    /// carried from an earlier report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement_evaluated_at_ms: Option<i64>,
     /// How the pass divided its budget between retirement and removal.
     /// Absent from reports written by the retirement-only worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2119,6 +2127,10 @@ pub struct LandedSessionRetirementView {
     pub merged_pull_request_examined: usize,
     #[serde(skip_serializing_if = "is_zero_count")]
     pub merged_pull_request_closed: usize,
+    /// Sessions closed per lane reason (`merged_pull_request_landed`,
+    /// `landed`, `abandoned`).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub closed_by_reason: std::collections::BTreeMap<String, usize>,
     /// Kept sessions per reason; the reasons are `LandedSessionDecline` codes.
     pub declined: std::collections::BTreeMap<String, usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2168,6 +2180,13 @@ impl AutoCleanupReport {
         self.merged_pull_request_sessions_closed = self
             .merged_pull_request_sessions_closed
             .saturating_add(retirement.merged_closed);
+        for (reason, count) in &retirement.closed_by_reason {
+            let entry = self
+                .sessions_closed_by_reason
+                .entry((*reason).to_string())
+                .or_default();
+            *entry = entry.saturating_add(*count);
+        }
     }
 
     /// Fold a later report's landed-lane counts into this aggregate, as the
@@ -2198,20 +2217,51 @@ impl AutoCleanupReport {
         self.merged_pull_request_sessions_closed = self
             .merged_pull_request_sessions_closed
             .saturating_add(later.merged_pull_request_sessions_closed);
+        for (reason, count) in &later.sessions_closed_by_reason {
+            let entry = self
+                .sessions_closed_by_reason
+                .entry(reason.clone())
+                .or_default();
+            *entry = entry.saturating_add(*count);
+        }
+    }
+
+    /// Carry the retirement counts of `previous` into a report whose own
+    /// retirement lane judged nothing (a broker open's sliver, `gc plan`'s
+    /// zero-budget pass), so `status` keeps showing what the worker did.
+    fn carry_retirement_counts(&mut self, previous: &AutoCleanupReport) {
+        self.landed_sessions_examined = previous.landed_sessions_examined;
+        self.landed_sessions_closed = previous.landed_sessions_closed;
+        self.landed_sessions_declined = previous.landed_sessions_declined.clone();
+        self.landed_retirement_elapsed_ms = previous.landed_retirement_elapsed_ms;
+        self.merged_pull_request_sessions_examined = previous.merged_pull_request_sessions_examined;
+        self.merged_pull_request_sessions_closed = previous.merged_pull_request_sessions_closed;
+        self.sessions_closed_by_reason = previous.sessions_closed_by_reason.clone();
+        self.retirement_evaluated_at_ms = previous
+            .retirement_evaluated_at_ms
+            .or(Some(previous.evaluated_at_ms));
+        if self.retirement_cursor.is_none() {
+            self.retirement_cursor = previous.retirement_cursor;
+        }
     }
 
     /// What `broker status` reports about the landed lane, if it judged any
     /// session in this report.
     pub fn landed_session_retirement_view(&self) -> Option<LandedSessionRetirementView> {
-        (self.landed_sessions_examined > 0).then(|| LandedSessionRetirementView {
-            evaluated_at_ms: self.evaluated_at_ms,
-            examined: self.landed_sessions_examined,
-            closed: self.landed_sessions_closed,
-            merged_pull_request_examined: self.merged_pull_request_sessions_examined,
-            merged_pull_request_closed: self.merged_pull_request_sessions_closed,
-            declined: self.landed_sessions_declined.clone(),
-            cursor: self.retirement_cursor,
-        })
+        (self.landed_sessions_examined > 0 || !self.sessions_closed_by_reason.is_empty()).then(
+            || LandedSessionRetirementView {
+                evaluated_at_ms: self
+                    .retirement_evaluated_at_ms
+                    .unwrap_or(self.evaluated_at_ms),
+                closed_by_reason: self.sessions_closed_by_reason.clone(),
+                examined: self.landed_sessions_examined,
+                closed: self.landed_sessions_closed,
+                merged_pull_request_examined: self.merged_pull_request_sessions_examined,
+                merged_pull_request_closed: self.merged_pull_request_sessions_closed,
+                declined: self.landed_sessions_declined.clone(),
+                cursor: self.retirement_cursor,
+            },
+        )
     }
 }
 
@@ -2263,6 +2313,9 @@ struct SessionRetirementSummary {
     /// merged-pull-request window (`session_merged_after_hours`).
     merged_examined: usize,
     merged_closed: usize,
+    /// Sessions closed, per lane reason: `merged_pull_request_landed`,
+    /// `landed`, `abandoned`.
+    closed_by_reason: std::collections::BTreeMap<&'static str, usize>,
     cursor: Option<SessionRetirementCursorPosition>,
 }
 
@@ -2281,6 +2334,20 @@ fn merged_pull_request_lane(
 }
 
 impl SessionRetirementSummary {
+    fn record_close(&mut self, reason: &'static str) {
+        *self.closed_by_reason.entry(reason).or_default() += 1;
+        crate::phase_telemetry::add(
+            match reason {
+                crate::session_auto_close::CLOSE_REASON_MERGED_PULL_REQUEST => {
+                    "sessions_closed_merged_pull_request_landed"
+                }
+                crate::session_auto_close::CLOSE_REASON_LANDED => "sessions_closed_landed",
+                _ => "sessions_closed_abandoned",
+            },
+            Duration::ZERO,
+        );
+    }
+
     fn record_cursor(&mut self, cursor: &SessionRetirementCursor) {
         self.cursor = Some(SessionRetirementCursorPosition {
             after_session_id: cursor.after_session_id,
@@ -3994,6 +4061,32 @@ fn checkout_head(worktree: &Path) -> Option<String> {
     GitRepo::discover(worktree).ok()?.head_commit().ok()
 }
 
+/// A linked checkout's HEAD commit read from its files: the `.git` pointer,
+/// then the worktree's `HEAD`, resolved against `tips` (one `for-each-ref`
+/// listing) when it names a branch. `None` whenever anything is unusual, so
+/// the caller falls back to Git.
+pub(crate) fn head_from_checkout_files(
+    worktree: &Path,
+    tips: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    let pointer = std::fs::read_to_string(worktree.join(".git")).ok()?;
+    let git_dir = PathBuf::from(pointer.trim().strip_prefix("gitdir:")?.trim());
+    let git_dir = if git_dir.is_absolute() {
+        git_dir
+    } else {
+        worktree.join(git_dir)
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    match head.strip_prefix("ref:") {
+        Some(reference) => tips.get(reference.trim()).cloned(),
+        None if head.len() >= 40 && head.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
+            Some(head.to_string())
+        }
+        None => None,
+    }
+}
+
 fn modified_ns(path: &Path) -> String {
     std::fs::symlink_metadata(path)
         .and_then(|metadata| metadata.modified())
@@ -4174,6 +4267,9 @@ const LIKELY_LANDED_PASS_LIMIT: usize = 64;
 #[derive(Debug, Default)]
 struct LandedDeclineMemo {
     entries: std::collections::BTreeMap<i64, (String, String)>,
+    /// Local branch tips from one `for-each-ref` listing, so a memo key
+    /// reads a checkout's HEAD from its files instead of two Git processes.
+    branch_tips: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl LandedDeclineMemo {
@@ -4185,7 +4281,14 @@ impl LandedDeclineMemo {
             .flatten()
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default();
-        Self { entries }
+        let branch_tips = {
+            let _span = crate::phase_telemetry::span("landed_memo_branch_tips");
+            broker.repo_handle().local_branch_tips()
+        };
+        Self {
+            entries,
+            branch_tips,
+        }
     }
 
     /// What the decline depended on, or `None` when it cannot be read (then
@@ -4197,7 +4300,18 @@ impl LandedDeclineMemo {
         upstream_tip: Option<&str>,
     ) -> Option<String> {
         let tip = upstream_tip?;
-        let head = checkout_head(Path::new(&session.worktree_path))?;
+        let worktree = Path::new(&session.worktree_path);
+        let head = match self
+            .branch_tips
+            .as_ref()
+            .and_then(|tips| head_from_checkout_files(worktree, tips))
+        {
+            Some(head) => {
+                crate::phase_telemetry::add("landed_memo_head_from_files", Duration::ZERO);
+                head
+            }
+            None => checkout_head(worktree)?,
+        };
         let store = broker.store_ref();
         let merged = store
             .session_has_merged_pull_request_link(session.id)
@@ -6551,7 +6665,43 @@ impl Broker {
             // the abandonment window must wait for. A decline that leaves the
             // question open falls through to the abandonment window.
             let mut landed_decline = None;
-            let mut outcome = crate::broker::AbandonedSessionCloseOutcome::NotDue;
+            // A session already past the abandonment window is asked that
+            // question first: it needs no Git, and closing deletes nothing
+            // whichever lane closes it. The landed proof used to run first
+            // for every such session and spend the pass on content searches
+            // and worktree scans, so sessions days past the window stayed
+            // open behind them. The landed lane is still asked when only it
+            // could close the session: a live holder whose task lease expired.
+            let abandonment_tried = old_enough_for_abandonment;
+            let mut outcome = if abandonment_tried {
+                let _span = crate::phase_telemetry::span("retirement_abandonment_first");
+                self.try_close_abandoned_session(
+                    session.id,
+                    now,
+                    window_ms,
+                    &mut holder_process_table,
+                    allow_snapshot,
+                    deadline,
+                )?
+            } else {
+                crate::broker::AbandonedSessionCloseOutcome::NotDue
+            };
+            if abandonment_tried {
+                crate::phase_telemetry::add(
+                    if matches!(outcome, crate::broker::AbandonedSessionCloseOutcome::Closed) {
+                        "retirement_abandonment_first_closed"
+                    } else {
+                        "retirement_abandonment_first_kept"
+                    },
+                    Duration::ZERO,
+                );
+            }
+            let idle_enough_for_landed = idle_enough_for_landed
+                && matches!(
+                    outcome,
+                    crate::broker::AbandonedSessionCloseOutcome::NotDue
+                        | crate::broker::AbandonedSessionCloseOutcome::ActiveProcess
+                );
             let memo_key = if idle_enough_for_landed {
                 decline_memo.key(self, &session, upstream_tip.as_deref())
             } else {
@@ -6615,7 +6765,7 @@ impl Broker {
             let fall_through = landed_decline
                 .is_none_or(crate::broker::LandedSessionDecline::allows_abandonment_fallback)
                 && !matches!(outcome, crate::broker::AbandonedSessionCloseOutcome::Closed);
-            if fall_through && old_enough_for_abandonment {
+            if fall_through && old_enough_for_abandonment && !abandonment_tried {
                 outcome = self.try_close_abandoned_session(
                     session.id,
                     now,
@@ -6632,7 +6782,18 @@ impl Broker {
                 crate::phase_telemetry::add(reason.telemetry_name(), Duration::ZERO);
             }
             match outcome {
-                crate::broker::AbandonedSessionCloseOutcome::Closed => summary.retired += 1,
+                crate::broker::AbandonedSessionCloseOutcome::Closed => {
+                    summary.retired += 1;
+                    // The cursor lane closes by the landed window or the
+                    // abandonment window; merged-pull-request closes happen
+                    // in the likely-landed queue.
+                    let reason = if landed_decline.is_none() && idle_enough_for_landed {
+                        crate::session_auto_close::CLOSE_REASON_LANDED
+                    } else {
+                        "abandoned"
+                    };
+                    summary.record_close(reason);
+                }
                 crate::broker::AbandonedSessionCloseOutcome::HolderUnavailable => {
                     summary.deferred += 1;
                     summary.reasons.push(
@@ -6790,10 +6951,18 @@ impl Broker {
             .open_sessions_with_merged_pull_request()?
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
-        let merged_branches = upstream_tip
-            .and_then(|tip| self.repo_handle().local_branches_merged_into(tip))
-            .unwrap_or_default();
-        let tips = self.repo_handle().local_branch_tips().unwrap_or_default();
+        // One `for-each-ref --merged` walk over every local branch: bounded by
+        // the lane deadline and timed, since it runs before any session.
+        let (merged_branches, tips) = {
+            let _span = crate::phase_telemetry::span("landed_likely_branch_listing");
+            let _git_deadline = deadline.map(crate::git::limit_git_until);
+            (
+                upstream_tip
+                    .and_then(|tip| self.repo_handle().local_branches_merged_into(tip))
+                    .unwrap_or_default(),
+                self.repo_handle().local_branch_tips().unwrap_or_default(),
+            )
+        };
         let after = self
             .store_ref()
             .meta_get(LIKELY_LANDED_CURSOR_KEY)
@@ -6835,7 +7004,15 @@ impl Broker {
                         && idle_past(merged_window_ms))
             })
             .collect::<Vec<_>>();
-        likely.sort_by_key(|session| (session.id <= after, session.id));
+        // Sessions with a merged pull request first: they are the ones that
+        // usually close. Branch ancestry alone follows, then the rotation.
+        likely.sort_by_key(|session| {
+            (
+                !merged_pull_requests.contains(&session.id),
+                session.id <= after,
+                session.id,
+            )
+        });
         likely.truncate(LIKELY_LANDED_PASS_LIMIT);
         if likely.is_empty() {
             return Ok(judged);
@@ -6909,6 +7086,11 @@ impl Broker {
                 None => {
                     summary.landed_closed += 1;
                     summary.retired += 1;
+                    summary.record_close(if merged_lane {
+                        crate::session_auto_close::CLOSE_REASON_MERGED_PULL_REQUEST
+                    } else {
+                        crate::session_auto_close::CLOSE_REASON_LANDED
+                    });
                     crate::phase_telemetry::add("landed_sessions_closed", elapsed);
                     crate::phase_telemetry::add("landed_likely_closed", elapsed);
                     if merged_lane {
@@ -8370,8 +8552,16 @@ impl Broker {
         let removal_judged = stored.lanes.is_some_and(|lanes| lanes.removal_examined > 0)
             || !stored.removed.is_empty()
             || !stored.kept.is_empty();
-        if !removal_judged && let Some(previous) = self.last_auto_cleanup_report() {
-            stored.kept = previous.kept;
+        let retirement_judged = stored.landed_sessions_examined > 0 || stored.sessions_retired > 0;
+        if (!removal_judged || !retirement_judged)
+            && let Some(previous) = self.last_auto_cleanup_report()
+        {
+            if !retirement_judged {
+                stored.carry_retirement_counts(&previous);
+            }
+            if !removal_judged {
+                stored.kept = previous.kept;
+            }
         }
         if stored.blocked_by_ignored.is_empty() {
             let memo = self.store().meta_get(KEEP_MEMO_KEY)?;

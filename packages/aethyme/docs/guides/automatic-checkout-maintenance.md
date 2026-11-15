@@ -328,6 +328,8 @@ policy separately.
 | `landed_retirement_elapsed_ms` | Milliseconds the landed lane spent; omitted when zero. |
 | `merged_pull_request_sessions_examined` | Of `landed_sessions_examined`, spawned sessions with every pull request merged judged in the `session_merged_after_hours` window; omitted when zero. |
 | `merged_pull_request_sessions_closed` | Of `landed_sessions_closed`, the ones that window closed; omitted when zero. |
+| `sessions_closed_by_reason` | Sessions closed per lane reason: `merged_pull_request_landed`, `landed`, `abandoned`; omitted when empty. Shown as `landed_session_retirement.closed_by_reason` in `broker status --json`. |
+| `retirement_evaluated_at_ms` | When the retirement counts were evaluated, present when a later pass whose retirement lane judged nothing carried them forward. |
 
 Readers must accept these fields being absent in older saved reports. A deferred
 session remains protected; `sessions_retired` counts session state transitions,

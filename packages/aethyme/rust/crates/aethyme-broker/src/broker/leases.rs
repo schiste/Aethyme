@@ -409,6 +409,13 @@ fn landed_search_memo_key(session_id: i64) -> String {
     format!("landed_lane.not_landed.{session_id}")
 }
 
+/// Meta key holding `"<head> <default-branch tip> <evidence>"` for the last
+/// HEAD the landing search proved landed, so a later lap answers with one
+/// ancestry check of the recorded tip instead of searching again.
+fn landed_proof_memo_key(session_id: i64) -> String {
+    format!("landed_lane.landed.{session_id}")
+}
+
 fn collect_worktree_directory_entries<I>(
     entries: I,
     observed: &mut Vec<crate::worktree_reconcile::ObservedDirectory>,
@@ -1053,11 +1060,35 @@ impl Broker {
             if out_of_budget() {
                 return Err(LandedSessionDecline::BudgetExhausted);
             }
+            // A head already proved landed against an earlier default-branch
+            // tip stays landed on any later tip: the default branch only moves
+            // forward. One ancestry check replaces the content search.
+            let landed_key = landed_proof_memo_key(session.id);
+            let remembered = self
+                .store_ref()
+                .meta_get(&landed_key)
+                .ok()
+                .flatten()
+                .and_then(|value| {
+                    let mut parts = value.split(' ');
+                    let (recorded_head, recorded_tip, recorded_evidence) =
+                        (parts.next()?, parts.next()?, parts.next()?);
+                    (recorded_head == head
+                        && self.repo_handle().is_ancestor(recorded_tip, &upstream))
+                    .then(|| match recorded_evidence {
+                        "ancestry" => "ancestry",
+                        _ => "content",
+                    })
+                });
+            if let Some(recorded) = remembered {
+                crate::phase_telemetry::add("landed_landing_memo_hit", std::time::Duration::ZERO);
+                evidence = recorded;
+            }
             let queue = self
                 .store_ref()
                 .latest_merge_queue_for_session_and_head(session.id, &head)
                 .map_err(|_| LandedSessionDecline::LandingUnknown)?;
-            let landed = {
+            let landed = remembered.is_some() || {
                 let _span = crate::phase_telemetry::span("landed_landing_search");
                 let delivery = self
                     .head_delivery(session, &checkout, &head, &queue)
@@ -1072,6 +1103,13 @@ impl Broker {
                 }
                 delivery.on_remote_default || delivery.default_landing.is_some()
             };
+            if landed && remembered.is_none() {
+                crate::warn_unrecorded(
+                    "remember a landed session head",
+                    self.store_ref()
+                        .meta_set(&landed_key, &format!("{head} {upstream} {evidence}")),
+                );
+            }
             if !landed {
                 if out_of_budget() {
                     return Err(LandedSessionDecline::BudgetExhausted);
@@ -1229,7 +1267,11 @@ impl Broker {
         // The landing proof is asked before any holder, lease or process
         // evidence: most open sessions have not landed, and saying so costs
         // one ancestry check. It is asked again under both claims below.
-        let landed_proof = if require_landed {
+        // The merged-pull-request lane is the exception: its sessions usually
+        // have landed, so the proof is the content search that costs seconds,
+        // and the holder (one process table per pass) is asked first.
+        let mut landed_proof = if require_landed && !merged_lane {
+            let _span = crate::phase_telemetry::span("landed_proof");
             match self.landed_session_decline(&candidate, deadline) {
                 Ok(proof) => Some(proof),
                 Err(reason) => return Ok(AbandonedSessionCloseOutcome::LandedDeclined(reason)),
@@ -1238,12 +1280,15 @@ impl Broker {
             None
         };
 
-        let holder = crate::session_holder::recorded_holder_liveness(
-            self.store_ref(),
-            session_id,
-            process_table,
-            allow_process_snapshot,
-        );
+        let holder = {
+            let _span = crate::phase_telemetry::span("landed_holder_check");
+            crate::session_holder::recorded_holder_liveness(
+                self.store_ref(),
+                session_id,
+                process_table,
+                allow_process_snapshot,
+            )
+        };
         let holder_event = self.store_ref().latest_session_holder_event(session_id)?;
         if holder_event.as_ref().map(|event| event.id) != holder.binding_event_id {
             return Ok(AbandonedSessionCloseOutcome::Changed);
@@ -1295,11 +1340,32 @@ impl Broker {
                         LandedSessionDecline::HolderUnbound,
                     ));
                 }
+                // No process table may be taken this late in the pass: that
+                // is the pass running out of time, not a holder nobody can
+                // check, and the next pass asks again.
+                crate::session_holder::RecordedHolderLiveness::Unknown
+                    if !allow_process_snapshot && holder.binding_event_id.is_some() =>
+                {
+                    return Ok(AbandonedSessionCloseOutcome::LandedDeclined(
+                        LandedSessionDecline::BudgetExhausted,
+                    ));
+                }
                 crate::session_holder::RecordedHolderLiveness::Unknown => {
                     return Ok(AbandonedSessionCloseOutcome::LandedDeclined(
                         LandedSessionDecline::HolderUnknown,
                     ));
                 }
+            }
+        }
+        if merged_lane {
+            crate::phase_telemetry::add(
+                "landed_merged_pr_reached_proof",
+                std::time::Duration::ZERO,
+            );
+            let _span = crate::phase_telemetry::span("landed_proof");
+            match self.landed_session_decline(&candidate, deadline) {
+                Ok(proof) => landed_proof = Some(proof),
+                Err(reason) => return Ok(AbandonedSessionCloseOutcome::LandedDeclined(reason)),
             }
         }
         match holder.liveness {
@@ -1318,6 +1384,8 @@ impl Broker {
         // Broker::open (and its maintenance pass) through completion. The
         // exclusive side closes the startup-admission race and stays held
         // through the final lifecycle/CAS checks.
+        // Both claims below are non-blocking: a busy one declines the session
+        // (`busy`) instead of waiting, so this pass never waits on a lock here.
         let _operation_claim = match crate::file_lock::try_acquire_session_operation_guard(
             self.main_root(),
             session_id,
@@ -1776,6 +1844,7 @@ impl Broker {
             }
         };
         let cleanup_request = self.checkout_cleanup_request_policy(&current);
+        let _close_span = crate::phase_telemetry::span("session_close_cas");
         match self
             .store()
             .abandon_session_if_unchanged_with_cleanup_request(

@@ -35,6 +35,9 @@ pub(crate) const TASK_LEASE_VERSION: u32 = 1;
 pub(crate) const TASK_LEASE_DURATION_MS: i64 = 24 * 60 * 60 * 1_000;
 pub(crate) const TASK_LEASE_RENEWAL_INTERVAL_MS: i64 = 5 * 60 * 1_000;
 pub(crate) const TASK_CLOSE_PROCESS_USE_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(2);
+/// A pass takes another open-file observation for a later retirement
+/// candidate only while at least this much of its deadline remains.
+const PROCESS_USE_RESNAPSHOT_MIN_BUDGET: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -369,6 +372,9 @@ pub(crate) struct RecordedHolderProcessTable {
     prefetched_event_ids: HashMap<i64, i64>,
     observed_event_ids: HashMap<i64, i64>,
     snapshot: Option<Option<ProcessTable>>,
+    /// A failed process-table snapshot (`ps` timed out or failed) is retried
+    /// once per pass instead of answering "unknown" for every later holder.
+    snapshot_retried: bool,
     process_use_snapshot: Option<(Instant, crate::reclaim::OpenFileSnapshot)>,
     #[cfg(test)]
     snapshots_taken: usize,
@@ -404,6 +410,11 @@ impl RecordedHolderProcessTable {
         event_id: i64,
         allow_snapshot: bool,
     ) -> Option<&ProcessTable> {
+        if matches!(self.snapshot, Some(None)) && allow_snapshot && !self.snapshot_retried {
+            crate::phase_telemetry::add("holder_process_table_retried", Duration::ZERO);
+            self.snapshot_retried = true;
+            self.snapshot = None;
+        }
         if self.snapshot.is_none() {
             if !allow_snapshot {
                 return None;
@@ -483,6 +494,23 @@ impl RecordedHolderProcessTable {
         root: &Path,
         deadline: Option<Instant>,
     ) -> Option<&crate::reclaim::OpenFileSnapshot> {
+        // An observation older than the freshness bound is not evidence for a
+        // later session of the same pass. It used to answer "unknown" for
+        // every such session (`operation_unknown`) until the next pass; take
+        // a fresh one instead while the caller's deadline still leaves time.
+        let aged = self
+            .process_use_snapshot
+            .as_ref()
+            .is_some_and(|(captured_at, _)| {
+                captured_at.elapsed() > TASK_CLOSE_PROCESS_USE_SNAPSHOT_MAX_AGE
+            });
+        let room_for_another = deadline.is_none_or(|deadline| {
+            deadline.saturating_duration_since(Instant::now()) >= PROCESS_USE_RESNAPSHOT_MIN_BUDGET
+        });
+        if aged && room_for_another {
+            crate::phase_telemetry::add("retirement_process_use_resnapshot", Duration::ZERO);
+            self.process_use_snapshot = None;
+        }
         if self.process_use_snapshot.is_none() {
             let budget = deadline.map_or(Duration::from_secs(10), |deadline| {
                 deadline.saturating_duration_since(Instant::now())
@@ -1598,6 +1626,7 @@ mod tests {
             prefetched_event_ids: HashMap::from([(session.id, holder_event_id)]),
             observed_event_ids: HashMap::from([(session.id, holder_event_id)]),
             snapshot: Some(Some(table)),
+            snapshot_retried: false,
             process_use_snapshot: None,
             snapshots_taken: 0,
             before_landed_close: None,
@@ -1610,6 +1639,7 @@ mod tests {
             prefetched_event_ids: HashMap::from([(session.id, holder_event_id)]),
             observed_event_ids: HashMap::from([(session.id, holder_event_id)]),
             snapshot: Some(Some(ProcessTable::parse(""))),
+            snapshot_retried: false,
             process_use_snapshot: None,
             snapshots_taken: 0,
             before_landed_close: None,
