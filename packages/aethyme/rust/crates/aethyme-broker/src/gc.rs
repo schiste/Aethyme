@@ -8371,7 +8371,14 @@ impl Broker {
         // it, so the run starts judging at once instead of queueing behind
         // another repository's whole run.
         let worker_started = Instant::now();
-        crate::git_probe_cache::sweep_stale_probe_directories(); // leaked probe dirs, paced, inside the host deleter slot
+        // Leaked Git probe directories. Each goes through the pinned tree
+        // removal, so it is paced and takes the host deleter slot (with its
+        // pressure check) only while it deletes; the fresh Git verdict check
+        // runs when the removal opens the tree, before any pacer gate. A slot
+        // busy for one directory ends the sweep's waiting for the others;
+        // the cache lane starts with a fresh pass either way.
+        crate::git_probe_cache::sweep_stale_probe_directories();
+        unattended_pacing::clear_host_deleter_busy();
         // Removal is what frees a checkout slot: it goes first, before
         // retirement and cache work, under capacity pressure with the
         // capacity limits and otherwise as the steady removal of landed
