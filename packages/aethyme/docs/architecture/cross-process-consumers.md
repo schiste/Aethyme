@@ -190,11 +190,14 @@ broker open) are unchanged and run at full speed.
 - **Pressure back-off.** Once per batch the worker reads
   `kern.memorystatus_vm_pressure_level` and the one-minute load average
   (macOS) or `/proc/pressure/memory`, `/proc/pressure/io` and `/proc/loadavg`
-  (Linux). While memory pressure is above normal, PSI memory `some avg10 >= 10`,
-  PSI I/O `some avg10 >= 40`, or load exceeds twice the core count, it sleeps
-  in one-second steps, never past the pass deadline and at most 120 s per run;
-  then removal stops resumably exactly as at a deadline. An unreadable signal
-  means proceed at the rate limit.
+  (Linux). While memory pressure is above normal (PSI memory
+  `some avg10 >= 10` on Linux) it sleeps in one-second steps, never past the
+  pass deadline and at most 120 s per run; then removal stops resumably
+  exactly as at a deadline. Since 2026-11-15 load is a throttle, never a stop:
+  while PSI I/O `some avg10 >= 40` or load exceeds twice the core count, each
+  batch waits at most one second and goes on (see "Load throttles unattended
+  removal instead of stopping it" below). An unreadable signal means proceed
+  at the rate limit.
 - **One deleter per machine.** After its due checks the worker takes
   `<host state dir>/run/gc-unattended-deleter.lock` (an advisory `flock`),
   polling every 2 s for up to 15 minutes while it keeps its repository
@@ -218,7 +221,8 @@ persisted sweep report keeps the shape older binaries parse. Fields:
 `entries_removed`, `logical_bytes_removed`, `elapsed_ms`,
 `removal_rate_per_second`, `limiter_sleep_ms`, `memory_pause_ms`,
 `load_pause_ms`, `pressure_yields`, `host_lock_wait_ms`, `requests_coalesced`,
-`rate_lifted_for_disk_pressure`. Tree-removal progress itself is not
+`rate_lifted_for_disk_pressure`, and since 2026-11-15 `load_throttled`
+(absent in summaries written before). Tree-removal progress itself is not
 journalled per file: the ignored-directory queue is written once per removed
 directory, and the sweep cursor once per pass.
 
@@ -1987,6 +1991,19 @@ Introduced 2026-11-14. On the busiest repository the worker removed about 13 che
 - `.aethyme/gc.lock` is now created with the holder's PID already in it (a staged file hard-linked into place, falling back to create-then-write where hard links are unavailable), and a PID-less lock file younger than 5 seconds is treated as held rather than stale. `artifact_worker_capacity_removal_paced` is unchanged.
 
 Consumers must tolerate the new fields, counters, status suffix and notice directory. Covered by `auto_cleanup.rs` `a_worker_capacity_slice_caps_its_removals`, `the_worker_slice_removes_more_than_four_while_the_backlog_lasts`, `a_kept_checkout_does_not_consume_the_removal_allowance`, `a_worker_capacity_slice_yields_to_a_waiting_foreground_command`, `a_worker_capacity_slice_removes_nothing_under_pressure`, `pressure_after_a_removal_backs_off_instead_of_retrying_at_once`, `kept_only_passes_are_bounded_and_never_repeat_a_checkout`, `a_capacity_pass_is_bounded_by_the_pass_budget`, `start_announces_itself_while_it_waits_for_the_gc_lock`, `pressure_that_outlasts_a_short_slice_still_backs_off_ten_minutes` and `a_pacer_wait_cut_by_the_slice_end_is_owed_by_the_next_slice`; `gc.rs` `a_capacity_slice_stops_for_budget_or_a_foreground_waiter`, `the_worker_slice_limits_bound_the_lock_and_allow_a_backlog`, `the_gc_lock_stays_free_at_least_as_long_as_a_pass_held_it`, `capacity_slices_leave_the_cache_lane_its_minimum_share`, `a_slices_stop_sets_a_real_back_off`, `a_gc_lock_waiter_notice_counts_only_live_other_processes`, `a_stale_gc_lock_waiter_notice_expires`, `waiting_for_the_gc_lock_announces_the_waiter`, `a_journal_resume_fails_fast_on_a_held_gc_lock_without_a_notice`, `the_gc_lock_file_carries_its_pid_and_a_young_empty_one_is_held` and `an_unfinished_capacity_lap_retries_soon_and_a_finished_one_backs_off`; and `gc/unattended_pacing.rs` `a_bulk_removal_is_charged_to_the_installed_pacer_only`, `a_bulk_charge_credits_only_the_removals_own_duration`, `a_bulk_charge_ignores_the_disk_pressure_lift` and `a_bulk_charge_and_the_pre_removal_gate_back_off_under_pressure`.
+
+### Load throttles unattended removal instead of stopping it
+
+Introduced 2026-11-15. On the busiest repository (10 cores, memory fine, a one-minute load average around 50 for more than a day from many short-lived processes and I/O waits) no background checkout removal ran from 0.8.96 on: the pre-pass check waited out "load far above the core count" for the whole slice and stopped it (`stop_reason` `pacer_backoff`, `passes` 0, `retry_in_ms` 600000), for both triggers, and every such slice also grew the steady idle streak. The checkout count kept climbing at the limit. Memory pressure is the hazard the pacer exists for; load on its own is not. Changes:
+
+- Memory pressure (macOS `kern.memorystatus_vm_pressure_level` above normal, Linux PSI memory) is unchanged: no removal starts while it lasts, it is waited out in one-second steps at most 120 s per worker run and never past the deadline, and when it outlasts that the slice stops with the new `stop_reason` `memory_backoff` (ten-minute retry, a hard steady retry as before). `pacer_backoff` is no longer written; records written by older binaries keep it.
+- Load (one-minute load average above twice the core count, or Linux PSI I/O `some avg10 >= 40`) never stops unattended work. The check before a capacity removal pass waits at most 5 seconds for it to clear; when it has not, the pass runs anyway and the slice makes at most one removal, then stops with the new `stop_reason` `load_throttled` and keeps the normal cadence (no retry after a pressure slice that removed, one minute after a steady one); it is not a hard retry. Tree removal (cache lane, artifact reclaim, closed-session reclaim) and the bulk charge after a checkout removal wait at most 1 second per 256-entry batch while load lasts, on top of `[cleanup] unattended_unlinks_per_second`, and go on; load waits never spend the 120-second memory pause budget. At the default rate that is about 200 entries a second under sustained load instead of 1,000.
+- A slice that ran no pass because of pressure records the new outcome `pressure_before_selection` (not `out_of_time_before_selection`), does not grow `gc.artifact_sweep.steady_removal_idle_streak` and neither grows nor resets `gc.artifact_sweep.capacity_removal_out_of_time_streak`; it retries after 10 minutes when memory stopped it and after 1 minute when only load was seen (its bounded wait left too little of the budget for a pass).
+- The `auto_cleanup.capacity_removal` record gains `memory_wait_ms` and `load_wait_ms` (pacer waits during the slice, pre-pass checks and removal charges together), `pressure_seen` (`memory`, `load` or `memory_and_load`; omitted when none) and `throttled`. `pressure_wait_ms` keeps its meaning (time in the pre-pass checks). The worker status after a slice appends ` pressure=<memory|load|memory_and_load|none> throttled=<bool>`.
+- The unattended pacing summary (`last_artifact_sweep.unattended_pacing`) gains `load_throttled` (checks that proceeded throttled under load); `pressure_yields` and `memory_pause_ms` now count memory pressure only.
+- Phase telemetry (the worker's `command-metrics.jsonl` row) adds the timed phases `artifact_worker_capacity_removal_memory_wait` and `_load_wait`, the counters `artifact_worker_capacity_removal_throttled`, `_stop_memory_backoff`, `_stop_load_throttled` and `_outcome_pressure_before_selection` (prefixed `artifact_worker_capacity_removal`), and, for every worker run, the timed phases `artifact_worker_host_deleter_wait`, `artifact_worker_pacer_memory_pause`, `artifact_worker_pacer_load_wait` and `artifact_worker_pacer_limiter_sleep` and the counters `artifact_worker_pacer_memory_backoffs` and `artifact_worker_pacer_load_throttled`. A worker run writes its row when it exits, after up to 15 minutes waiting for the host deleter slot plus its five-minute budget, so a row can arrive more than 20 minutes after the run's first slice record; the host deleter wait is now visible in it.
+
+Consumers must tolerate the new stop reasons, outcome, fields, counters and status suffix, and the absence of `pacer_backoff` in new records. Every removal proof and safety gate is unchanged. Covered by `unattended_pacing.rs` `sustained_load_throttles_tree_removal_and_never_stops_it`, `sustained_load_lets_a_removal_start_after_a_bounded_wait`, `load_that_clears_mid_wait_is_clear` and `persistent_memory_pressure_yields_within_the_deadline_and_the_run_budget`; `tree_removal.rs` `sustained_load_throttles_unattended_removal_without_stopping_it`; `auto_cleanup.rs` `sustained_load_still_removes_a_landed_checkout_per_steady_slice`, `sustained_memory_pressure_backs_off_without_growing_the_idle_streak`, `load_that_clears_mid_wait_leaves_a_normal_steady_slice`, `capacity_pressure_makes_progress_under_sustained_load` and `a_worker_capacity_slice_removes_nothing_under_pressure`; and `gc.rs` `a_slices_stop_sets_a_real_back_off`.
 
 ### Steady checkout removal finishes its lap before backing off
 

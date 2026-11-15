@@ -234,8 +234,19 @@ The detached cleanup worker deletes finished sessions' build output while
 nobody waits on it, so it runs as a background job: lowest CPU and disk I/O
 priority (macOS and Linux), a rate limit on unlinks, one deleter at a time
 across every repository on the machine, and a pause while memory pressure is
-above normal or load is far above the core count. Commands you wait on
-(`finish`, `finish cleanup <id>`, `gc apply`, `gc sweep`) keep full speed.
+above normal. Commands you wait on (`finish`, `finish cleanup <id>`,
+`gc apply`, `gc sweep`) keep full speed.
+
+Memory pressure is a hard stop: no removal starts while it lasts, and when it
+outlasts the worker's pause budget (120 seconds per run) the work stops and
+waits for a later run. A high load average is only a throttle, never a stop:
+on a busy machine it can stay far above the core count for days while memory
+is fine. While the one-minute load average is above twice the core count (or,
+on Linux, I/O pressure is high) the worker waits at most a few seconds for it
+to clear (5 seconds before a checkout removal, 1 second per batch of 256
+files) and then goes on: a checkout removal slice removes one checkout and
+the next slice runs at the normal cadence, and file deletion runs at about a
+fifth of the configured rate (about 200 files a second at the default).
 
 ```toml
 [cleanup]
@@ -245,16 +256,23 @@ unattended_unlinks_per_second = 1000
 ```
 
 The limit is lifted automatically while free space is below the gate
-headroom, because freeing space is then the priority; the lowered priority and
-the pressure pause stay. Nothing deferred is dropped: a worker that pauses,
+headroom, because freeing space is then the priority; the lowered priority,
+the memory pause and the load throttle stay. The limit also applies under
+load, on top of the load wait. Nothing deferred is dropped: a worker that pauses,
 reaches its time limit, or waits too long for another repository's deleter
 leaves its request durable, and the next broker open starts a worker again.
 
 `aethyme broker status --json` shows the last worker run under
 `cleanup_retention.last_artifact_sweep.unattended_pacing`: entries and bytes
 removed, the removal rate, time slept by the limiter, time paused for memory
-and for load, time waited for the host deleter lock, requests coalesced into
-the run, and whether priority lowering succeeded. See
+and waited for load, how often work went on throttled under load
+(`load_throttled`), time waited for the host deleter lock, requests
+coalesced into the run, and whether priority lowering succeeded. The worker's
+`command-metrics.jsonl` row carries the same waits as phases
+(`artifact_worker_host_deleter_wait`, `artifact_worker_pacer_memory_pause`,
+`artifact_worker_pacer_load_wait`, `artifact_worker_pacer_limiter_sleep`); it
+is written when the run exits, which can be more than 20 minutes after it
+started when it first waited for another repository's deleter. See
 [cross-process consumers](../architecture/cross-process-consumers.md) for the
 field list.
 

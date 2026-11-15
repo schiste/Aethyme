@@ -433,13 +433,19 @@ in `gc plan --json`; absent until a slice has run). Its main fields are
 `trigger` (`steady` or `pressure`), `priority_examined`, `priority_removed`,
 `lap_examined`, `lap_removed`, `idle_streak`, `passes`, `lap_completed`,
 `priority_memo_skips`, `memo_skips`, `outcome` (`removed`, `lock_busy`, `inventory_unavailable`, `lap_unfinished`,
-`out_of_time_before_selection` or `nothing_removable`), `stop_reason` (`cap`,
-`budget`, `pacer_backoff`, `slice_deadline`, `yielded_to_foreground`,
+`out_of_time_before_selection`, `pressure_before_selection` or
+`nothing_removable`), `stop_reason` (`cap`, `budget`, `memory_backoff`,
+`load_throttled`, `slice_deadline`, `yielded_to_foreground`,
 `nothing_selected`, `lap_complete`, `kept_only_limit`, `lock_busy`, `failed`
-or `removal_failures`), `removed`, `kept`, `deferred`, `kept_by_code`,
-`blocked_by_ignored`, `retry_in_ms` and the time split (`scan_ms`,
-`selection_ms`, `apply_ms`, `paced_ms`, `lock_held_ms`, `lock_wait_ms`,
-`lock_yield_ms`, `git_removal_ms`, `pressure_wait_ms`, `elapsed_ms`);
+or `removal_failures`; older records may say `pacer_backoff`),
+`pressure_seen` (`memory`, `load` or `memory_and_load`), `throttled`,
+`removed`, `kept`, `deferred`, `kept_by_code`, `blocked_by_ignored`,
+`retry_in_ms` and the time split (`scan_ms`, `selection_ms`, `apply_ms`,
+`paced_ms`, `lock_held_ms`, `lock_wait_ms`, `lock_yield_ms`,
+`git_removal_ms`, `pressure_wait_ms`, `memory_wait_ms`, `load_wait_ms`,
+`elapsed_ms`). Memory pressure stops a slice (`memory_backoff`, 10-minute
+retry); a load average above twice the core count only throttles it to one
+removal after a wait of at most 5 seconds (`load_throttled`, normal cadence);
 "Checkout count keeps growing" in
 [troubleshooting](../guides/troubleshooting.md) walks from that record to the fix for each keep code.
 `broker start` at the limit, `broker gc apply`, `broker gc abandon` and
