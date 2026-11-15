@@ -1,6 +1,6 @@
 # Preparation report
 
-Last Updated: 2026-11-14
+Last Updated: 2026-11-15
 
 `aethyme broker submit prepare --session <id> --json` reports completed
 preparation steps in `steps`. Each step's `duration_ms` is the elapsed wall
@@ -17,6 +17,16 @@ each operation it ran under the cache lease in `shared_cache_operations`
 `budget_inventory`, `rotation_drain` or `preparation_step`), `detail` (the step
 name), `elapsed_ms`, `items_done`, `bytes_observed` and, for the budget
 inventory, `outcome` (`absent`, `within_budget`, `over_budget`,
+`within_budget_background`, `over_budget_background`,
 `inconclusive_time_limit` or `inconclusive_entry_limit`). An inconclusive
 inventory keeps the shared store; it is not rotated. The command metric's
 `preparation` object carries the same list.
+
+`shared_cache_background_measurement` (additive, omitted otherwise) is set when
+the budget decision came from a background measurement or when this prepare
+queued one: `decided_by` (`outcome`, `bytes`, `entries`, `complete`,
+`completed_at_ms`, `age_ms` of the measurement used; the inventory entry's
+`outcome` then ends in `_background` and no walk ran under the lease) and
+`queued` (the reason: `inconclusive_time_limit`, `inconclusive_entry_limit`, or
+`refresh` after a decision taken from a measurement that kept the store). The
+command metric's `preparation` object carries the same object.

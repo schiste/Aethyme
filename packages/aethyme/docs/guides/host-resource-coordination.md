@@ -1,6 +1,6 @@
 # Concurrent Host Resource Coordination
 
-Last Updated: 2026-10-01
+Last Updated: 2026-11-15
 
 Aethyme can run validation concurrently from independent clones without
 sharing fixed ports, Docker project names, database names, or host-capacity
@@ -333,14 +333,32 @@ inconclusive and keeps the store: a store is no longer rotated just because it
 is too large to measure in one check. Before 2026-11-14 the measurement
 stopped at 100,000 entries, below one monorepo's package stores, so every
 check rotated the store and the next prepare downloaded every package again.
-Runaway growth is left to the storage-pressure guard. Three inconclusive
-checks in a row raise the `broker status` notice
+The first inconclusive check queues a full measurement in the background. The
+detached `gc` artifact worker runs it after its deletion lanes and after
+releasing the repository's worker lock, at background CPU and I/O priority,
+one measurement per host at a time (a host-wide lock beside the deleter lock),
+paced by the unattended pacer: memory pressure pauses and then stops it, heavy
+load slows it. It walks the store the same way as the foreground check, with no
+entry limit, a 30-minute backstop, and an early stop as soon as the bytes seen
+pass `max_bytes`. It holds no cache lease: entries a running step removes are
+skipped, so its total is an estimate, and a walk during which the cache root or
+the store changed identity (a rotation, a remount) is discarded. The result is
+bound to the root's and the store's identity. A budget check that finds one
+younger than one check interval (an hour), for the same root and store, decides
+from it instead of running its own inventory: over budget rotates through the
+usual journalled path under the lease, within budget keeps the store and queues
+a fresh measurement for the next check. An interrupted measurement keeps its
+request and restarts from scratch after 10 minutes. Three inconclusive checks
+in a row still raise the `broker status` notice
 `preparation.shared-cache-budget-inconclusive`, which says how many checks were
-inconclusive, how many entries and bytes the last one saw and how long it took;
-it clears after a check that decides. The prepare report's `shared_cache_operations` (also in the command metric's
+inconclusive, how many entries and bytes the last one saw, how long it took
+and, when the background measurement could not finish, why; it clears after a
+check that decides or a background measurement that completes. Until then
+runaway growth is left to the storage-pressure guard. The prepare report's `shared_cache_operations` (also in the command metric's
 `preparation` object) lists each operation run under the lease with its
 `elapsed_ms` and `items_done`; the budget inventory entry carries an `outcome`
-(`absent`, `within_budget`, `over_budget`, `inconclusive_time_limit` or
+(`absent`, `within_budget`, `over_budget`, `within_budget_background`,
+`over_budget_background`, `inconclusive_time_limit` or
 `inconclusive_entry_limit`) and the command metric counts it as
 `shared_cache_inventory_<outcome>`.
 

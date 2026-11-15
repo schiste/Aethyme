@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Last Updated: 2026-11-14
+Last Updated: 2026-11-15
 
 ## Explore Returns `degraded`
 
@@ -292,13 +292,44 @@ rotated store. Every other prepare of that repository waits for it.
 3. A budget measurement that stops at its 30-second or 2,000,000-entry limit
    with the bytes it saw still under `max_bytes` is inconclusive. The store is
    kept, not rotated, and the prepare report's `shared_cache_operations` shows
-   `outcome: inconclusive_time_limit` or `inconclusive_entry_limit`. After three
-   inconclusive checks in a row, `broker status` raises
+   `outcome: inconclusive_time_limit` or `inconclusive_entry_limit`. The first
+   inconclusive check queues a full measurement of the store in the background
+   (the report's `shared_cache_background_measurement.queued`). The detached
+   `gc` worker runs it after its cleanup work, at background priority, one
+   measurement per host at a time, without holding the cache lease, so no
+   prepare waits for it. It pauses under memory pressure and slows under heavy
+   load. The next budget check that finds a result younger than an hour, for
+   the same cache root and store, decides from it without measuring: over
+   budget rotates the store as usual, within budget keeps it. The budget
+   inventory entry's `outcome` is then `within_budget_background` or
+   `over_budget_background`, and the report's
+   `shared_cache_background_measurement.decided_by` gives the bytes, entries
+   and age of the measurement it used.
+4. Read where the background measurement stands:
+
+   ```bash
+   aethyme broker submit prepare status --session <id> --json
+   ```
+
+   `shared_cache_background_measurement.request` is a measurement still
+   waiting or retrying (`attempts`, `retry_after_ms`, and `last_interruption`
+   with its `reason`: `memory_pressure`, `deadline`, `root_changed`,
+   `rotation_pending`, `root_unavailable` or `scan_refused`).
+   `shared_cache_background_measurement.result` is the last completed one
+   (`outcome`, `bytes`, `entries`, `complete`, `completed_at_ms`, the walk's
+   rates and pacer pauses, and `used_at_ms` once a check decided from it), and
+   `result_fresh` says whether the next check can still use it. An interrupted
+   measurement restarts by itself after 10 minutes; one that found the root
+   rotated or replaced is dropped, and the next inconclusive check queues the
+   current root.
+5. After three inconclusive checks in a row, `broker status` raises
    `preparation.shared-cache-budget-inconclusive` with the entries and bytes the
-   last check saw. The store's size against `max_bytes` is then unknown, and only
-   the storage-pressure guard limits its growth: run
+   last check saw and, when the background measurement could not finish, why.
+   Until a measurement completes, the store's size against `max_bytes` is
+   unknown and only the storage-pressure guard limits its growth: run
    `aethyme broker advanced resources pressure --json` to see the host's storage
-   pressure. The notice clears after a check that decides.
+   pressure. The notice clears after a check that decides or a background
+   measurement that completes.
 
 ### A rotation recovery refuses after a remount
 
