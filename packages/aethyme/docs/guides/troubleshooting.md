@@ -295,13 +295,20 @@ rotated store. Every other prepare of that repository waits for it.
    `outcome: inconclusive_time_limit` or `inconclusive_entry_limit`. The first
    inconclusive check queues a full measurement of the store in the background
    (the report's `shared_cache_background_measurement.queued`). The detached
-   `gc` worker runs it after its cleanup work, at background priority, one
-   measurement per host at a time, without holding the cache lease, so no
-   prepare waits for it. It pauses under memory pressure and slows under heavy
-   load. The next budget check that finds a result younger than an hour, for
-   the same cache root and store, decides from it without measuring: over
-   budget rotates the store as usual, within budget keeps it. The budget
-   inventory entry's `outcome` is then `within_budget_background` or
+   `gc` worker runs it after its cleanup work, at background priority and at
+   most 10,000 entries a second, one measurement per host at a time, without
+   holding the cache lease, so no prepare waits for it. It pauses under memory
+   pressure and slows under heavy load. Because it holds no lease, a running
+   prepare can make it count bytes that are only passing through, so over
+   budget means more than 5% over `max_bytes`, and a store is rotated only
+   after two consecutive walks find it so (the second starts about two minutes
+   after the first). A walk between the budget and that margin keeps the store.
+   The next budget check that finds a trusted result for the same cache root
+   and store decides from it without measuring: a confirmed over budget
+   rotates the store as usual, within budget keeps it. A result is trusted for
+   1 to 24 hours depending on how much room is left under the budget and how
+   fast the store grew between the last two results. The budget inventory
+   entry's `outcome` is then `within_budget_background` or
    `over_budget_background`, and the report's
    `shared_cache_background_measurement.decided_by` gives the bytes, entries
    and age of the measurement it used.
@@ -312,16 +319,25 @@ rotated store. Every other prepare of that repository waits for it.
    ```
 
    `shared_cache_background_measurement.request` is a measurement still
-   waiting or retrying (`attempts`, `retry_after_ms`, and `last_interruption`
-   with its `reason`: `memory_pressure`, `deadline`, `root_changed`,
-   `rotation_pending`, `root_unavailable` or `scan_refused`).
+   waiting, running (`running: true`, `running_since_ms`, `running_pid`) or
+   retrying (`attempts`, `retry_after_ms`, `consecutive_failures`, and
+   `last_interruption` with its `reason`: `memory_pressure`, `deadline`,
+   `root_changed`, `rotation_pending`, `root_unavailable` or `scan_refused`).
    `shared_cache_background_measurement.result` is the last completed one
-   (`outcome`, `bytes`, `entries`, `complete`, `completed_at_ms`, the walk's
-   rates and pacer pauses, and `used_at_ms` once a check decided from it), and
-   `result_fresh` says whether the next check can still use it. An interrupted
-   measurement restarts by itself after 10 minutes; one that found the root
-   rotated or replaced is dropped, and the next inconclusive check queues the
-   current root.
+   (`outcome`: `within_budget`, `over_budget` or `within_margin`; `bytes`,
+   `entries`, `complete`, `skipped_entries`, `concurrent_activity`,
+   `over_budget_walks`, `over_budget_confirmed`, `trusted_for_ms`,
+   `trust_reason`, the walk's rates and pacer pauses, and `used_at_ms` once a
+   check decided from it), and `result_fresh` says whether the next check can
+   still use it. An interrupted measurement restarts by itself after 10
+   minutes; repeated `deadline` or `scan_refused` walks of the same store wait
+   twice as long each time, up to a day. One that found the root rotated or
+   replaced is dropped, and the next inconclusive check queues the current
+   root. A completed rotation drops both records.
+   While it walks, the measurement holds open directory handles on the cache
+   volume, so an external volume cannot be ejected until the walk ends (at
+   most 30 minutes). Ending the worker process is safe: the request stays,
+   and the next worker takes it over once that process is gone.
 5. After three inconclusive checks in a row, `broker status` raises
    `preparation.shared-cache-budget-inconclusive` with the entries and bytes the
    last check saw and, when the background measurement could not finish, why.

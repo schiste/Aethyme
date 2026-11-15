@@ -28,5 +28,7 @@ queued one: `decided_by` (`outcome`, `bytes`, `entries`, `complete`,
 `completed_at_ms`, `age_ms` of the measurement used; the inventory entry's
 `outcome` then ends in `_background` and no walk ran under the lease) and
 `queued` (the reason: `inconclusive_time_limit`, `inconclusive_entry_limit`, or
-`refresh` after a decision taken from a measurement that kept the store). The
-command metric's `preparation` object carries the same object.
+`refresh` when a decision was taken from a measurement in the last quarter of
+its trust). An `over_budget_background` decision only comes from a result
+confirmed by two consecutive walks more than 5% over the budget. The command
+metric's `preparation` object carries the same object.
