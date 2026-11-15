@@ -603,6 +603,10 @@ mod unix {
         {
             let mut entries_reclaimed = 0;
             let mut observed_regular_bytes = 0u64;
+            // Unattended removal takes the host deleter slot at its first
+            // batch; whatever this removal took goes back when it returns,
+            // so the caller's judging that follows never holds it.
+            let _host_slot = super::super::unattended_pacing::TreeRemovalSlotScope::enter();
             let result = (|| -> io::Result<TreeRemoval> {
                 let keep = keep_until_last.map(CString::new).transpose().map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidInput, "witness name contains NUL")
@@ -640,6 +644,27 @@ mod unix {
                         &mut entries_reclaimed,
                         &mut observed_regular_bytes,
                     ) {
+                        // The witness and the root are unlinked below
+                        // outside the batch gate: hold the host deleter slot
+                        // for them too (an empty tree took none yet). The
+                        // witness is in place here, so stopping is resumable.
+                        Ok(TreeRemoval::Complete)
+                            if !super::super::unattended_pacing::ensure_host_deleter_slot(
+                                deadline,
+                            ) =>
+                        {
+                            if witness_removed {
+                                restore_witness(
+                                    self.root.as_raw_fd(),
+                                    keep.as_ref().expect("removed witness has a name"),
+                                    witness_backup
+                                        .as_ref()
+                                        .expect("removed witness has a backup"),
+                                    before_mutation,
+                                )?;
+                            }
+                            return Ok(TreeRemoval::Interrupted);
+                        }
                         Ok(TreeRemoval::Complete) => {}
                         Ok(TreeRemoval::Interrupted) => {
                             if witness_removed {
