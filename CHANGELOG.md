@@ -4,6 +4,30 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.106] - 2026-11-16
+
+### Added
+
+- The broker closes a spawned session whose every recorded pull request merged, whose HEAD is proven landed on the default branch and whose checkout is clean, after `[retention] session_merged_after_hours` (default 2, `0` disables) hours without activity, counted from the later of its last activity and the merge. Nothing is deleted; the checkout follows normal closed-checkout removal. A follow-up task is protected for the longer of the landed and abandonment windows (#1697).
+- Every automatic close records its reason and evidence in `session.abandoned` and leaves a note for the session. A command on the closed session, or run from its checkout, explains the close and how to continue (#1697).
+- `landed_session_retirement` in `broker status --json` gains `closed_by_reason`, `merged_pull_request_examined`, `merged_pull_request_closed` and `abandonment_examined`, and keeps the last retirement counts across passes that judged nothing. New spans and counters cover the landed proof, holder check, close, memo hits and open-file observations (#1697).
+- Pacing counters `host_slot_unavailable` and `host_slot_recovered` (#1700).
+
+### Fixed
+
+- Session retirement no longer starves. Sessions past the abandonment window are closed by it first, without Git; merged-pull-request sessions are judged next; landing proofs are remembered per head and searched again before any close; holders and process use are no longer reported unknown merely because a pass ran short; open-file observations are throttled per pass and the last one before a close is always evaluated. The background worker spends up to 120 seconds per run on retirement and stops on memory pressure (#1697).
+- Tree removals always take the host deleter slot at their first unlink, witness and root unlinks read memory pressure first, a transient host-directory error no longer leaves deletion unserialised for the rest of a run, and a borrowed refusal stops the slice (#1700).
+- Preparation-cache rotation-debt recovery runs under the deleter slot and waits for the next pass when it is busy (#1700).
+- Moving a put-off group's lap cursor back can no longer drop the cleanup report (#1700).
+
+### Changed
+
+- Upgrade note: the new retention field changes GC plan digests. Re-plan any plan made by an older binary before applying it (#1697).
+
+### Known issues
+
+- Closed sessions whose checkout is already gone are not yet finished automatically.
+
 ## [0.8.105] - 2026-11-15
 
 ### Changed
