@@ -17289,10 +17289,19 @@ mod tests {
         let kept = (0..34)
             .map(|index| closed_checkout_with_notes(&mut broker, &format!("run kept {index}")).1)
             .collect::<Vec<_>>();
+        // A complete path index, so the short passes go to judging.
+        while !broker
+            .refresh_cleanup_cohort_aliases(None)
+            .unwrap()
+            .is_some_and(|state| state.complete)
+        {}
         broker.set_steady_removal_idle_streak_for_test(27);
-        // Room for one pass per slice (see the full-empty-lap test).
+        // Room for one pass per slice (see the full-empty-lap test), and a
+        // short pass, so neither one slice nor the run's first finishes the
+        // lap.
         let one_pass = crate::gc::CapacitySliceLimits {
             budget: Duration::from_millis(5_400),
+            pass_budget: Duration::from_millis(400),
             ..crate::gc::CapacitySliceLimits::WORKER
         };
         broker
