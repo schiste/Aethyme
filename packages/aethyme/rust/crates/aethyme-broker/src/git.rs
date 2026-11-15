@@ -1084,13 +1084,13 @@ fn resolve_git_program_with(
             let _span = crate::phase_telemetry::span("git_probe_run");
             probe(&candidate)
         };
-        let unchanged = |key: &Option<probe_cache::ProgramKey>| {
-            key.as_ref()
-                .filter(|key| probe_cache::program_key(&candidate, path_env).as_ref() == Some(*key))
-        };
+        // Record only a verdict about the file that was actually probed.
+        let recordable = key
+            .clone()
+            .filter(|key| probe_cache::program_key(&candidate, path_env).as_ref() == Some(key));
         let rejection = match verdict {
             PorcelainProbe::Undecorated => {
-                if let Some(key) = unchanged(&key) {
+                if let Some(key) = &recordable {
                     probe_cache::record(
                         cache,
                         key,
@@ -1129,7 +1129,7 @@ fn resolve_git_program_with(
                 continue;
             }
         };
-        if let Some(key) = unchanged(&key) {
+        if let Some(key) = &recordable {
             probe_cache::record(
                 cache,
                 key,
