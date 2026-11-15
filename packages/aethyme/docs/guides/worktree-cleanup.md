@@ -132,7 +132,13 @@ the directory goes:
    unreadable or malformed record, or an owner lock whose recorded holder
    process is gone. A gate positively recorded in another session's checkout
    no longer keeps it. `kept[].gate_keep` says which it was: `own_session`,
-   `path` or `unknown_owner`.
+   `path` or `unknown_owner`. A gate is attributed only to the checkout it
+   runs in: a gate command that works in a sibling checkout (by changing
+   into it, or by taking its path as an argument) does not keep that
+   checkout, and a checkout moved or remounted after its gate started is
+   matched by the path recorded at start. The artifact-use marker every gate
+   registers for its own checkout, and the open-file check, still guard
+   those cases.
 3. **Clean** -- no tracked, staged or untracked change, no stash made on its
    branch, no rebase, merge, cherry-pick, revert or bisect in progress, and no
    protected ignored content. Only recognized or configured output directories

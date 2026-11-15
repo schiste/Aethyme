@@ -441,7 +441,8 @@ or `removal_failures`), `removed`, `kept`, `deferred`, `kept_by_code`,
 `selection_ms`, `apply_ms`, `paced_ms`, `lock_held_ms`, `lock_wait_ms`,
 `lock_yield_ms`, `git_removal_ms`, `pressure_wait_ms`, `elapsed_ms`), and
 `gate_checks` (absent when no gate check ran): `checks`, `scans`, `gates_seen`,
-`attributed_here`, `attributed_elsewhere`, `unknown_owner` and `elapsed_ms`,
+`attributed_here`, `attributed_elsewhere`, `unknown_owner`, `inventory_unknown`
+and `elapsed_ms`,
 summed over the slice's passes (`auto_cleanup.lanes.removal_gate_checks` per
 pass). A running gate keeps a closed checkout (`kept[].code` `gate_running`)
 only when one of its own sessions runs it, its recorded checkout overlaps it,
