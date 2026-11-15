@@ -223,7 +223,12 @@ pull request alone is not enough.
 
 Both triggers use the same proofs, pacer, memory and load gate, GC lock gap
 and yield to foreground commands, and `[cleanup] auto_remove = false` turns
-both off. The worker's last slice, with its `trigger`, is
+both off. A running gate keeps a closed checkout (`gate_running`) only when
+one of that checkout's own sessions runs it, when the gate's recorded
+checkout is the checkout, inside it or contains it, or when nothing
+identifies where the gate runs (a record from an older binary, or a
+malformed one); a gate in another session's checkout does not keep it.
+`kept[].gate_keep` and the `gate_checks` counters say which. The worker's last slice, with its `trigger`, is
 `capacity_removal` in `aethyme broker status --json` and
 `auto_cleanup.capacity_removal` in `aethyme broker gc plan --json`; see
 "Automatic removal" in [worktree cleanup](worktree-cleanup.md).
