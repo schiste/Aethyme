@@ -482,18 +482,23 @@ impl Broker {
 
     /// Queue post-close checkout cleanup. When another process already holds
     /// the GC lock, say so in `cleanup` so a JSON reader can tell reclaim was
-    /// deferred to it rather than skipped; the stderr warning is kept.
+    /// deferred to it rather than skipped. That is the expected case while
+    /// the background worker runs, and the request is durable in the close
+    /// outbox, so it prints no warning; only a real failure does.
     pub(super) fn wake_checkout_cleanup_after_close(
         &mut self,
         session_id: i64,
         cleanup: &mut FinishCleanupReport,
     ) {
-        if let Err(error) = self.request_checkout_cleanup_after_close(session_id) {
-            if let BrokerOpError::GcLocked { pid } = &error {
+        match self.request_checkout_cleanup_after_close(session_id) {
+            Ok(crate::gc::PostCloseCleanupWake::Queued) => {}
+            Ok(crate::gc::PostCloseCleanupWake::DeferredToHolder { pid }) => {
                 cleanup.reclaim_deferred = true;
                 cleanup.reclaim_worker_pid = pid.trim().parse().ok();
             }
-            crate::warn_unrecorded("wake post-close checkout cleanup", Err::<(), _>(error));
+            Err(error) => {
+                crate::warn_unrecorded("wake post-close checkout cleanup", Err::<(), _>(error));
+            }
         }
     }
 

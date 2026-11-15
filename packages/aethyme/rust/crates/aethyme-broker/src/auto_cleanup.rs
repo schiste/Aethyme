@@ -1967,6 +1967,27 @@ pub struct CapacityRemovalSlice {
     /// Time spent on a pass that found the GC lock held.
     #[serde(default)]
     pub lock_wait_ms: u64,
+    /// Time the slice waited for the host-wide single-deleter slot right
+    /// before its removals (each wait bounded).
+    #[serde(default)]
+    pub host_slot_wait_ms: u64,
+    /// Time the slice held the host deleter slot: each removal and the
+    /// pacer charge that paid for it, nothing else.
+    #[serde(default)]
+    pub host_slot_held_ms: u64,
+    /// Of `host_slot_held_ms`, the time not spent in the rate limiter's
+    /// sleep: Git deleting and the bookkeeping around it.
+    #[serde(default)]
+    pub host_slot_deleting_ms: u64,
+    /// Times in this slice the host deleter slot stayed with another
+    /// repository's worker through a bounded wait (a removal put off, or a
+    /// charge that went on without it after handing it over).
+    #[serde(default)]
+    pub host_slot_busy: u64,
+    /// Time the slice waited for a host-wide judging permit before it
+    /// counted and judged.
+    #[serde(default)]
+    pub judge_permit_wait_ms: u64,
     /// Time the slice kept the GC lock free between passes beyond the pacer
     /// wait: a short fixed gap (long enough for a waiting command's poll)
     /// after a pass that removed nothing, and at least as long as the last
@@ -7542,7 +7563,11 @@ impl Broker {
                                 "auto_cleanup_priority_examined",
                                 Duration::ZERO,
                             );
-                        } else {
+                        }
+                        // As after a full judgment: the lap moves past every
+                        // group it reached, a queued priority one included
+                        // (otherwise the lap's last group needs a pass more).
+                        if priority.is_none() {
                             cursor.after_session_id = cursor_session_id;
                             self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
                         }
@@ -7989,6 +8014,8 @@ impl Broker {
         }
         let mut attempted_any = false;
         let mut apply_gate_checks = AutoCleanupGateChecks::default();
+        // Checkouts whose removal the deletion gate put off.
+        let mut deletion_put_off = Vec::new();
         for (candidate, selected_proof) in selected {
             // The first selected checkout always goes, so a pass whose
             // selection spent the budget still converges; the rest wait for
@@ -8099,6 +8126,30 @@ impl Broker {
                     continue;
                 }
             };
+            // Unattended removal takes the machine's single-deleter slot only
+            // now, every proof re-read, and checks memory pressure once it
+            // holds it. A slot another repository's worker keeps through the
+            // bounded wait, or memory pressure, puts this removal off, and
+            // the next pass judges the group again: its priority memo entry
+            // is dropped (the priority lane takes it first if it is a
+            // priority candidate) and the lap cursor is moved back before it
+            // (the lap reaches it first if it is not). Foreground callers
+            // have no pacer and pass.
+            if crate::gc::unattended_pacing::enter_unattended_deletion()
+                != crate::gc::unattended_pacing::DeletionGate::Proceed
+            {
+                report.deferred += 1;
+                deletion_put_off.push((
+                    worktree_text.clone(),
+                    candidate
+                        .sessions
+                        .iter()
+                        .map(|session| session.id)
+                        .min()
+                        .unwrap_or_default(),
+                ));
+                continue;
+            }
             match self.remove_auto_cleanup_candidate(&candidate, &proof) {
                 Ok(()) => {
                     let removed = AutoRemovedCheckout {
@@ -8138,8 +8189,44 @@ impl Broker {
         }
         report.assign_kept_codes();
         self.note_priority_apply_keeps(&report)?;
+        self.judge_put_off_groups_first(&deletion_put_off)?;
         self.record_auto_cleanup_report(&report)?;
         Ok(report)
+    }
+
+    /// Make the next pass judge again the groups (worktree, cursor session
+    /// id) whose removal was put off at the last step for a reason that does
+    /// not concern the checkout: drop their priority memo entries, and move
+    /// the lap cursor back before the first of them the lap already passed.
+    fn judge_put_off_groups_first(
+        &mut self,
+        groups: &[(String, i64)],
+    ) -> Result<(), BrokerOpError> {
+        if groups.is_empty() {
+            return Ok(());
+        }
+        let (mut cursor, mut expected_cursor) = self.auto_cleanup_cursor()?;
+        if let Some(first) = groups
+            .iter()
+            .map(|(_, cursor_session_id)| *cursor_session_id)
+            .filter(|id| *id > 0 && *id <= cursor.after_session_id)
+            .min()
+        {
+            cursor.after_session_id = first - 1;
+            self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
+        }
+        let raw = self.store().meta_get(PRIORITY_MEMO_KEY)?;
+        let mut memo = PriorityMemo::decode(raw.as_deref());
+        let before = memo.entries.len();
+        for (worktree, _) in groups {
+            memo.entries.remove(worktree);
+        }
+        if memo.entries.len() != before {
+            let text =
+                serde_json::to_string(&memo).expect("serializing the priority memo is infallible");
+            self.store().meta_set(PRIORITY_MEMO_KEY, &text)?;
+        }
+        Ok(())
     }
 
     /// Record, on the priority memo entry of each checkout apply kept, the
@@ -13724,9 +13811,13 @@ mod tests {
             .map(|index| closed_landed_checkout(&mut broker, &format!("pressured {index}")).1)
             .collect::<Vec<_>>();
         limit_checkouts_to_one(&broker);
-        // Calm for the gate before the first pass, then pressure for good.
-        let (scope, _clock) =
-            install_scripted_pacer(vec![memory_pressure(false), memory_pressure(true)]);
+        // Calm for the gate before the first pass and for the check right
+        // before Git deletes, then pressure for good.
+        let (scope, _clock) = install_scripted_pacer(vec![
+            memory_pressure(false),
+            memory_pressure(false),
+            memory_pressure(true),
+        ]);
         let worker_started = Instant::now();
         let first = broker.run_capacity_removal_slice(worker_started);
         let second = broker.run_capacity_removal_slice(worker_started);
@@ -17248,6 +17339,480 @@ mod tests {
         broker.store().meta_set(super::KEEP_MEMO_KEY, "").unwrap();
         let judged = broker.auto_cleanup_plan(None).unwrap();
         assert_eq!(judged.selected_worktrees(), vec![key]);
+    }
+
+    /// A memo hit on a lap group still queued for the priority lane moves
+    /// the lap cursor on, as a full judgment does: when it is the lap's last
+    /// group, the lap ends in this pass instead of needing one more.
+    #[cfg(unix)]
+    #[test]
+    fn a_memo_hit_on_a_queued_priority_group_moves_the_lap_on() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let (first, _) = closed_checkout_with_notes(&mut broker, "judged first");
+        let (last, last_worktree) = closed_checkout_with_notes(&mut broker, "remembered last");
+        record_merged_pull_request(&mut broker, first.id, 901);
+        record_merged_pull_request(&mut broker, last.id, 902);
+        // The first group closed most recently, so the priority lane judges
+        // it first; the remembered one waits behind it there, and is the
+        // lap's last group.
+        let now = now_ms();
+        for (session_id, closed_at) in [(last.id, now - 3_600_000), (first.id, now - 60_000)] {
+            broker
+                .store()
+                .connection()
+                .execute(
+                    "UPDATE sessions SET closed_at = ?1 WHERE id = ?2",
+                    rusqlite::params![closed_at, session_id],
+                )
+                .unwrap();
+        }
+        let canonical = std::fs::canonicalize(&last_worktree).unwrap();
+        let key = canonical.to_string_lossy().into_owned();
+        let memo_policy =
+            super::keep_memo_policy(&AutoCleanupPolicy::load(broker.main_root()).unwrap());
+        let ids = vec![last.id];
+        let signal =
+            super::fast_judging::checkout_signal(&canonical).expect("a linked checkout's files");
+        let entry = super::fast_judging::keep_memo_entry_for(
+            "uncommitted_changes",
+            "1 uncommitted or untracked path(s), first: notes.txt",
+            &super::fast_judging::MemoContext {
+                worktree: &canonical,
+                session_ids: &ids,
+                policy: &memo_policy,
+                upstream_tip: None,
+                removal_attempt_recorded: false,
+                now_ms: now_ms(),
+            },
+            Some(&signal),
+            // As if judged long after every file here last changed.
+            now_ms() + 3_600_000,
+        )
+        .expect("an unchanged checkout can be remembered");
+        let mut memo = super::decode_keep_memo(None);
+        memo.entries.insert(key.clone(), entry);
+        broker
+            .store()
+            .meta_set(super::KEEP_MEMO_KEY, &serde_json::to_string(&memo).unwrap())
+            .unwrap();
+        while !broker
+            .refresh_cleanup_cohort_aliases(None)
+            .unwrap()
+            .is_some_and(|state| state.complete)
+        {}
+
+        let mut judged = Vec::new();
+        let plan = broker
+            .auto_cleanup_plan_with_group_inspector_limited(
+                None,
+                1,
+                super::RemovalSelection::Steady,
+                true,
+                |_, group, _, _, _| {
+                    judged.push(group.cursor_session_id);
+                    Ok(AutoCleanupGroupInspection::Kept(super::AutoKeptCheckout {
+                        worktree: group.worktree.to_string_lossy().into_owned(),
+                        sessions: group.sessions.iter().map(|session| session.id).collect(),
+                        reason: "injected inspection".into(),
+                        ..Default::default()
+                    }))
+                },
+            )
+            .unwrap();
+        assert_eq!(judged, vec![first.id], "{:#?}", plan.report);
+        let lanes = plan.report.lanes.unwrap();
+        assert_eq!(lanes.removal_memo_hits.uncommitted_changes, 1, "{lanes:?}");
+        assert_eq!(kept_for(&plan.report, &key).code, "uncommitted_changes");
+        let position = broker.capacity_removal_lap_position().unwrap();
+        assert_eq!(position.after_session_id, last.id, "{position:?}");
+        assert_eq!(position.lap_remaining, 0, "{position:?}");
+    }
+
+    /// An unmarked tracked deletion is remembered like uncommitted changes,
+    /// and the memo stops holding once a removal attempt is recorded for the
+    /// checkout (the record can make the deletions resumable): the checkout
+    /// is judged again.
+    #[cfg(unix)]
+    #[test]
+    fn an_unmarked_deletion_keep_is_remembered_until_a_removal_attempt_is_recorded() {
+        let _fresh = RememberFreshFiles::new();
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let (session, worktree) = closed_landed_checkout(&mut broker, "remembered deletion");
+        std::fs::remove_file(worktree.join("base.txt")).unwrap();
+        let canonical = std::fs::canonicalize(&worktree).unwrap();
+        let key = canonical.to_string_lossy().into_owned();
+        let first = broker.auto_cleanup_plan(None).unwrap();
+        assert_eq!(
+            kept_for(&first.report, &key).code,
+            "unmarked_tracked_deletions"
+        );
+        let memo = super::decode_keep_memo(
+            broker
+                .store()
+                .meta_get(super::KEEP_MEMO_KEY)
+                .unwrap()
+                .as_deref(),
+        );
+        assert_eq!(
+            memo.entries.get(&key).map(|entry| entry.code.as_str()),
+            Some("unmarked_tracked_deletions"),
+            "{memo:?}"
+        );
+
+        let second = broker.auto_cleanup_plan(None).unwrap();
+        let lanes = second.report.lanes.unwrap();
+        assert_eq!(
+            lanes.removal_memo_hits.unmarked_tracked_deletions, 1,
+            "{lanes:?}"
+        );
+        assert_eq!(lanes.removal_check_timings.inspect.count, 0, "{lanes:?}");
+
+        broker
+            .record_removal_attempt(&canonical, session.id, &checkout_head_of(&worktree))
+            .unwrap();
+        let third = broker.auto_cleanup_plan(None).unwrap();
+        let lanes = third.report.lanes.unwrap();
+        assert_eq!(
+            lanes.removal_memo_hits.unmarked_tracked_deletions, 0,
+            "{lanes:?}"
+        );
+        assert!(lanes.removal_check_timings.inspect.count >= 1, "{lanes:?}");
+        assert!(
+            !third
+                .report
+                .kept
+                .iter()
+                .any(|kept| kept.worktree == key && kept.code == "unmarked_tracked_deletions"),
+            "a recorded removal makes the deletion resumable: {:#?}",
+            third.report
+        );
+    }
+
+    /// A keep is remembered only if the checkout's change signal reads the
+    /// same before and after the judgment: one that moved during it (here
+    /// the index, as a `git add` while the checkout was being judged)
+    /// records nothing, and the next pass judges the checkout again.
+    #[cfg(unix)]
+    #[test]
+    fn no_keep_is_remembered_when_the_checkout_changes_during_its_judgment() {
+        let _fresh = RememberFreshFiles::new();
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let (_session, worktree) = closed_checkout_with_notes(&mut broker, "staged mid-judgment");
+        let key = std::fs::canonicalize(&worktree)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut staged = false;
+        let plan = broker
+            .auto_cleanup_plan_with_group_inspector_limited(
+                None,
+                1,
+                super::RemovalSelection::Probe,
+                true,
+                |broker, group, live, live_worktrees, deadline| {
+                    let inspection = broker.auto_cleanup_candidate_for_group(
+                        group,
+                        live,
+                        live_worktrees,
+                        deadline,
+                    );
+                    if !staged {
+                        staged = true;
+                        git(&worktree, &["add", "notes.txt"]);
+                    }
+                    inspection
+                },
+            )
+            .unwrap();
+        assert!(staged);
+        assert_eq!(kept_for(&plan.report, &key).code, "uncommitted_changes");
+        let memo = super::decode_keep_memo(
+            broker
+                .store()
+                .meta_get(super::KEEP_MEMO_KEY)
+                .unwrap()
+                .as_deref(),
+        );
+        assert!(!memo.entries.contains_key(&key), "{memo:?}");
+
+        let next = broker.auto_cleanup_plan(None).unwrap();
+        let lanes = next.report.lanes.unwrap();
+        assert_eq!(lanes.removal_memo_hits.uncommitted_changes, 0, "{lanes:?}");
+        assert!(lanes.removal_check_timings.inspect.count >= 1, "{lanes:?}");
+        assert_eq!(kept_for(&next.report, &key).code, "uncommitted_changes");
+    }
+
+    /// Apply re-reads the open sessions under its locks: an open session
+    /// that starts on a selected checkout after selection keeps it.
+    #[cfg(unix)]
+    #[test]
+    fn apply_refuses_a_checkout_an_open_session_started_on_after_selection() {
+        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        let (_session, worktree) = closed_landed_checkout(&mut broker, "opened after selection");
+        let key = std::fs::canonicalize(&worktree)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let plan = broker.auto_cleanup_plan_now(None).unwrap().unwrap();
+        assert_eq!(plan.selected_worktrees(), vec![key.clone()]);
+        let at = now_ms();
+        rusqlite::Connection::open(broker.store().db_path())
+            .unwrap()
+            .execute(
+                "INSERT INTO sessions (worktree_path, branch, origin, status,
+                 cleanup_state, created_at, updated_at, last_activity_at)
+                 VALUES (?1, 'agent/late-open', 'spawned', 'active', 'open', ?2, ?2, ?2)",
+                rusqlite::params![worktree.to_string_lossy(), at],
+            )
+            .unwrap();
+        let report = broker.auto_cleanup_apply_now(plan).unwrap().unwrap();
+        assert!(report.removed.is_empty(), "{report:#?}");
+        assert!(worktree.exists());
+        // The fresh read refuses it: kept (the open session overlaps it) or
+        // deferred (its path cannot be resolved against the open one yet),
+        // never removed.
+        let kept = report.kept.iter().find(|kept| kept.worktree == key);
+        assert!(
+            kept.is_some_and(|kept| kept.reason.starts_with("changed before removal: ")
+                || kept.reason.starts_with("removal failed: "))
+                || (kept.is_none() && report.deferred == 1),
+            "{report:#?}"
+        );
+    }
+
+    /// The host deleter slot is taken only right before Git removes a
+    /// checkout. A removal that finds it kept by another repository's worker
+    /// waits the bounded wait and is put off (the checkout stays, the slice
+    /// ends `host_deleter_busy` with a minute's retry) instead of the run
+    /// queueing for minutes; with the slot free the next slice removes the
+    /// checkout and gives the slot back.
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_waits_only_briefly_for_the_host_deleter_slot() {
+        use crate::gc::unattended_pacing::{
+            self, FakeClock, PressureSample, Scripted, UnattendedPacer, UnlinkRate,
+        };
+        let (_owner, _storage, mut broker) =
+            landed_lane_fixture(Some("[worktrees]\nmax_checkouts = 0\n"));
+        let (_session, worktree) = closed_landed_checkout(&mut broker, "removed once it is free");
+        let host = tempfile::tempdir().unwrap();
+        let take = |host: &std::path::Path| match crate::gc::wait_for_host_deleter_slot(
+            Some(host),
+            Duration::ZERO,
+            Duration::from_millis(1),
+            |_| unreachable!(),
+        )
+        .0
+        {
+            crate::gc::HostDeleterSlot::Held(lock) => Some(lock),
+            _ => None,
+        };
+        let other = take(host.path()).expect("another worker deletes");
+        let clock = FakeClock::new();
+        let _scope = unattended_pacing::install(
+            UnattendedPacer::new(
+                UnlinkRate::Unlimited,
+                Box::new(clock.clone()),
+                Box::new(Scripted {
+                    samples: vec![PressureSample::default()],
+                    reads: Default::default(),
+                }),
+            )
+            .with_host_directory(Some(host.path().to_path_buf())),
+        );
+
+        broker.run_capacity_removal_slice(Instant::now()).unwrap();
+        let busy = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(busy.trigger, "steady", "{busy:#?}");
+        assert_eq!(
+            busy.stop_reason.as_deref(),
+            Some("host_deleter_busy"),
+            "{busy:#?}"
+        );
+        assert_eq!(busy.outcome, "lock_busy", "{busy:#?}");
+        assert_eq!(busy.removed, 0, "{busy:#?}");
+        assert_eq!(busy.host_slot_wait_ms, 2_000, "{busy:#?}");
+        assert_eq!(busy.host_slot_held_ms, 0, "{busy:#?}");
+        assert_eq!(busy.retry_in_ms, Some(60_000), "{busy:#?}");
+        assert!(worktree.exists());
+        assert!(!unattended_pacing::host_deleter_slot_held());
+
+        drop(other);
+        broker.end_steady_removal_back_off_for_test();
+        broker.end_steady_removal_hard_retry_for_test();
+        broker.run_capacity_removal_slice(Instant::now()).unwrap();
+        let removed = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(removed.removed, 1, "{removed:#?}");
+        assert!(!worktree.exists());
+        assert_eq!(removed.host_slot_wait_ms, 0, "{removed:#?}");
+        assert!(
+            !unattended_pacing::host_deleter_slot_held(),
+            "given back after the removal's charge"
+        );
+        assert!(take(host.path()).is_some(), "free for the other worker");
+    }
+
+    /// A group whose removal a busy host deleter slot put off is judged
+    /// again by the next slice: the lap cursor is never left past it, and
+    /// the next slice removes it.
+    #[cfg(unix)]
+    #[test]
+    fn a_lap_group_put_off_by_a_busy_slot_is_judged_first_again() {
+        use crate::gc::unattended_pacing::{
+            self, FakeClock, PressureSample, Scripted, UnattendedPacer, UnlinkRate,
+        };
+        let (_owner, _storage, mut broker) =
+            landed_lane_fixture(Some("[worktrees]\nmax_checkouts = 0\n"));
+        let (session, worktree) = closed_landed_checkout(&mut broker, "lap group put off");
+        while !broker
+            .refresh_cleanup_cohort_aliases(None)
+            .unwrap()
+            .is_some_and(|state| state.complete)
+        {}
+        let host = tempfile::tempdir().unwrap();
+        let other = match crate::gc::wait_for_host_deleter_slot(
+            Some(host.path()),
+            Duration::ZERO,
+            Duration::from_millis(1),
+            |_| unreachable!(),
+        )
+        .0
+        {
+            crate::gc::HostDeleterSlot::Held(lock) => lock,
+            _ => panic!("another worker deletes"),
+        };
+        let _scope = unattended_pacing::install(
+            UnattendedPacer::new(
+                UnlinkRate::Unlimited,
+                Box::new(FakeClock::new()),
+                Box::new(Scripted {
+                    samples: vec![PressureSample::default()],
+                    reads: Default::default(),
+                }),
+            )
+            .with_host_directory(Some(host.path().to_path_buf())),
+        );
+        broker.run_capacity_removal_slice(Instant::now()).unwrap();
+        let busy = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(
+            busy.stop_reason.as_deref(),
+            Some("host_deleter_busy"),
+            "{busy:#?}"
+        );
+        assert_eq!(busy.host_slot_busy, 1, "{busy:#?}");
+        let position = broker.capacity_removal_lap_position().unwrap();
+        assert!(
+            position.after_session_id < session.id && position.lap_remaining >= 1,
+            "the cursor went back before it: {position:?}"
+        );
+        assert!(worktree.exists());
+
+        drop(other);
+        broker.end_steady_removal_back_off_for_test();
+        broker.end_steady_removal_hard_retry_for_test();
+        broker.run_capacity_removal_slice(Instant::now()).unwrap();
+        let removed = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(removed.removed, 1, "{removed:#?}");
+        assert!(!worktree.exists());
+    }
+
+    /// A put-off group the lap had already passed has its priority memo
+    /// entry dropped and the lap cursor moved back before it, so the lap
+    /// reaches it again first.
+    #[cfg(unix)]
+    #[test]
+    fn a_put_off_group_moves_the_lap_cursor_back_before_it() {
+        let (_owner, _storage, mut broker, sessions) = closed_priority_fixture(3);
+        broker
+            .auto_cleanup_plan_with_group_inspector_limited(
+                None,
+                1,
+                super::RemovalSelection::Probe,
+                false,
+                |_, group, _, _, _| {
+                    Ok(AutoCleanupGroupInspection::Kept(super::AutoKeptCheckout {
+                        worktree: group.worktree.to_string_lossy().into_owned(),
+                        sessions: group.sessions.iter().map(|session| session.id).collect(),
+                        reason: "injected inspection".into(),
+                        ..Default::default()
+                    }))
+                },
+            )
+            .unwrap();
+        let passed = broker.capacity_removal_lap_position().unwrap();
+        assert_eq!(passed.after_session_id, sessions[2].id, "{passed:?}");
+        let middle = std::fs::canonicalize(&sessions[1].worktree_path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut memo = super::PriorityMemo::decode(None);
+        memo.remember(
+            middle.clone(),
+            true,
+            super::PriorityOutcome::Selected,
+            now_ms(),
+        );
+        broker
+            .store()
+            .meta_set(
+                super::PRIORITY_MEMO_KEY,
+                &serde_json::to_string(&memo).unwrap(),
+            )
+            .unwrap();
+
+        broker
+            .judge_put_off_groups_first(&[(middle.clone(), sessions[1].id)])
+            .unwrap();
+        let rewound = broker.capacity_removal_lap_position().unwrap();
+        assert_eq!(rewound.after_session_id, sessions[1].id - 1, "{rewound:?}");
+        assert!(rewound.lap_remaining >= 2, "{rewound:?}");
+        let memo = super::PriorityMemo::decode(
+            broker
+                .store()
+                .meta_get(super::PRIORITY_MEMO_KEY)
+                .unwrap()
+                .as_deref(),
+        );
+        assert!(!memo.entries.contains_key(&middle), "{memo:?}");
+        // A group the lap has not reached yet leaves the cursor alone.
+        broker
+            .judge_put_off_groups_first(&[(String::new(), sessions[2].id)])
+            .unwrap();
+        assert_eq!(broker.capacity_removal_lap_position().unwrap(), rewound);
+    }
+
+    /// A hard retry set while a worker run is going (a held lock, memory
+    /// pressure, failures in another lane) stops its continuation slices.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_retry_set_mid_run_stops_continuation_slices() {
+        // No checkout limit: thirty-four closed checkouts never make pressure.
+        let (_owner, _storage, mut broker) =
+            landed_lane_fixture(Some("[worktrees]\nmax_checkouts = 0\n"));
+        let kept = (0..34)
+            .map(|index| closed_checkout_with_notes(&mut broker, &format!("hard kept {index}")).1)
+            .collect::<Vec<_>>();
+        while !broker
+            .refresh_cleanup_cohort_aliases(None)
+            .unwrap()
+            .is_some_and(|state| state.complete)
+        {}
+        let one_pass = crate::gc::CapacitySliceLimits {
+            budget: Duration::from_millis(5_400),
+            pass_budget: Duration::from_millis(400),
+            ..crate::gc::CapacitySliceLimits::WORKER
+        };
+        crate::gc::HARD_RETRY_BETWEEN_SLICES.with(|flag| flag.set(true));
+        let run =
+            broker.run_capacity_removal_slices(Instant::now(), Duration::from_secs(20), one_pass);
+        crate::gc::HARD_RETRY_BETWEEN_SLICES.with(|flag| flag.set(false));
+        run.unwrap();
+        let last = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(last.outcome, "lap_unfinished", "{last:#?}");
+        assert_eq!(last.run_slices, 1, "{last:#?}");
+        assert!(!last.continued, "{last:#?}");
+        assert!(broker.steady_removal_hard_retry_pending_for_test());
+        assert!(kept.iter().all(|path| path.exists()));
     }
 
     /// Selection that reuses the pass's open-session index and runs one deep
