@@ -8215,7 +8215,7 @@ impl Broker {
         if PUT_OFF_CURSOR_RACE.with(std::cell::Cell::get) {
             // Another pass moves the cursor between the read and the write.
             let mut moved = cursor;
-            moved.after_session_id = moved.after_session_id.saturating_add(1);
+            moved.high_water_session_id = moved.high_water_session_id.saturating_add(1);
             let mut raw = expected_cursor.clone();
             self.persist_auto_cleanup_cursor(&moved, &mut raw)?;
         }
@@ -17854,9 +17854,13 @@ mod tests {
         result.expect("a cursor conflict is not an error");
         let after = broker.capacity_removal_lap_position().unwrap();
         assert_eq!(
-            after.after_session_id,
-            passed.after_session_id + 1,
-            "the other pass's cursor stays: {after:?}"
+            after.after_session_id, passed.after_session_id,
+            "not moved back over the other pass's cursor: {after:?}"
+        );
+        assert_eq!(
+            after.high_water_session_id,
+            passed.high_water_session_id + 1,
+            "the other pass's write stays: {after:?}"
         );
         let memo = super::PriorityMemo::decode(
             broker

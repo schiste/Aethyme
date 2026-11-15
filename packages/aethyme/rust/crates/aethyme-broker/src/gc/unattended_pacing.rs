@@ -1179,6 +1179,7 @@ impl Drop for HostDeleterSlotRelease {
 }
 
 /// Whether the installed pacer holds the host deleter slot.
+#[cfg(test)]
 pub(crate) fn host_deleter_slot_held() -> bool {
     with_active(false, |pacer| pacer.host_slot.is_some())
 }
