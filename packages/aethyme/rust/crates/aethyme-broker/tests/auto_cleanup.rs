@@ -652,6 +652,222 @@ fn a_running_gate_keeps_the_checkout() {
     assert!(worktree.exists());
 }
 
+/// A gate pidfile as this binary writes it: the sixth field is the gate's
+/// checkout, hex-encoded. The leader is this test process, so it is running.
+fn write_gate_pidfile(fx: &Fixture, name: &str, checkout: Option<&Path>) {
+    let run_dir = fx.repo.join(".aethyme/run/gates");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let pid = std::process::id();
+    let checkout = checkout.map_or_else(
+        || "-".to_string(),
+        |path| {
+            path.to_string_lossy()
+                .bytes()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        },
+    );
+    std::fs::write(
+        run_dir.join(name),
+        format!("{pid} deadbeef {pid} - - {checkout}\n"),
+    )
+    .unwrap();
+}
+
+fn kept_gate_keep(report: &AutoCleanupReport, worktree: &Path) -> Option<String> {
+    let canonical = std::fs::canonicalize(worktree)
+        .unwrap_or_else(|_| worktree.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    report
+        .kept
+        .iter()
+        .find(|kept| kept.worktree == canonical || kept.worktree == worktree.to_string_lossy())
+        .and_then(|kept| kept.gate_keep.clone())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_gate_recorded_in_another_sessions_checkout_does_not_keep_a_landed_closed_checkout() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let other = broker.start_worktree("busy elsewhere", None).unwrap();
+    let other_checkout = std::fs::canonicalize(&other.worktree_path).unwrap();
+    write_gate_pidfile(
+        &fx,
+        &format!("{}-cargo-test.pid", other.id),
+        Some(&other_checkout),
+    );
+    let report = run(&mut broker);
+    assert_eq!(report.removed.len(), 1, "{report:#?}");
+    assert!(!worktree.exists());
+    assert!(other_checkout.exists());
+    let checks = report.lanes.expect("selection ran").removal_gate_checks;
+    assert!(checks.attributed_elsewhere >= 1, "{checks:#?}");
+    assert_eq!(checks.unknown_owner, 0, "{checks:#?}");
+    assert_eq!(checks.attributed_here, 0, "{checks:#?}");
+}
+
+#[test]
+fn a_gate_of_the_checkouts_own_session_keeps_it_wherever_it_runs() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (session_id, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let elsewhere = fx._tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let elsewhere = std::fs::canonicalize(elsewhere).unwrap();
+    write_gate_pidfile(
+        &fx,
+        &format!("{session_id}-cargo-test.pid"),
+        Some(&elsewhere),
+    );
+    let report = run(&mut broker);
+    assert!(report.removed.is_empty(), "{report:#?}");
+    #[cfg(unix)]
+    {
+        let reason = kept_reason(&report, &worktree);
+        assert!(
+            reason.contains("a gate may be running (own session)"),
+            "{report:#?}"
+        );
+        assert_eq!(
+            kept_gate_keep(&report, &worktree).as_deref(),
+            Some("own_session")
+        );
+        assert!(report.kept.iter().any(|kept| kept.code == "gate_running"));
+    }
+    assert!(worktree.exists());
+}
+
+#[test]
+fn a_gate_recorded_in_the_checkout_keeps_it_whichever_session_runs_it() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let canonical = std::fs::canonicalize(&worktree).unwrap();
+    write_gate_pidfile(&fx, "987654-cargo-test.pid", Some(&canonical.join("sub")));
+    let report = run(&mut broker);
+    assert!(report.removed.is_empty(), "{report:#?}");
+    #[cfg(unix)]
+    {
+        let reason = kept_reason(&report, &worktree);
+        assert!(
+            reason.contains("a gate may be running (this checkout's path)"),
+            "{report:#?}"
+        );
+        assert_eq!(kept_gate_keep(&report, &worktree).as_deref(), Some("path"));
+    }
+    assert!(worktree.exists());
+}
+
+#[test]
+fn a_gate_record_from_an_older_binary_still_keeps_every_checkout() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let run_dir = fx.repo.join(".aethyme/run/gates");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let pid = std::process::id();
+    // Five fields: written before the checkout was recorded.
+    std::fs::write(
+        run_dir.join("987654-cargo-test.pid"),
+        format!("{pid} deadbeef {pid} - run-1\n"),
+    )
+    .unwrap();
+    let report = run(&mut broker);
+    assert!(report.removed.is_empty(), "{report:#?}");
+    #[cfg(unix)]
+    {
+        let reason = kept_reason(&report, &worktree);
+        assert!(
+            reason.contains("a gate may be running (owner unknown)"),
+            "{report:#?}"
+        );
+        assert_eq!(
+            kept_gate_keep(&report, &worktree).as_deref(),
+            Some("unknown_owner")
+        );
+    }
+    assert!(worktree.exists());
+}
+
+#[test]
+fn a_malformed_gate_record_still_keeps_every_checkout() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let run_dir = fx.repo.join(".aethyme/run/gates");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    std::fs::write(run_dir.join("987654-cargo-test.pid"), "not a pidfile\n").unwrap();
+    let report = run(&mut broker);
+    assert!(report.removed.is_empty(), "{report:#?}");
+    #[cfg(unix)]
+    assert!(
+        kept_reason(&report, &worktree).contains("a gate may be running (owner unknown)"),
+        "{report:#?}"
+    );
+    assert!(worktree.exists());
+}
+
+/// A gate in the main checkout keeps a closed checkout only when that
+/// checkout is nested inside the main checkout, where the gate's tools can
+/// walk into it; a checkout placed outside the repository is not kept.
+#[cfg(unix)]
+#[test]
+fn a_gate_in_the_main_checkout_keeps_only_a_checkout_nested_inside_it() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let main = std::fs::canonicalize(&fx.repo).unwrap();
+    write_gate_pidfile(&fx, "987654-cargo-test.pid", Some(&main));
+    let nested = std::fs::canonicalize(&worktree).unwrap().starts_with(&main);
+    let report = run(&mut broker);
+    if nested {
+        assert!(report.removed.is_empty(), "{report:#?}");
+        assert_eq!(kept_gate_keep(&report, &worktree).as_deref(), Some("path"));
+    } else {
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert!(!worktree.exists());
+    }
+}
+
+/// Selection's read of the gate records only selects: the revalidation
+/// immediately before removal reads them again, so a gate recorded in the
+/// checkout after selection keeps it.
+#[cfg(unix)]
+#[test]
+fn removal_rereads_the_gate_records_after_selection() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let plan = broker
+        .auto_cleanup_plan_now(None)
+        .unwrap()
+        .expect("no other GC holds the lock");
+    let canonical = std::fs::canonicalize(&worktree).unwrap();
+    assert!(
+        plan.selected_worktrees()
+            .iter()
+            .any(|selected| Path::new(selected) == canonical || Path::new(selected) == worktree),
+        "{:?}",
+        plan.selected_worktrees()
+    );
+    write_gate_pidfile(&fx, "987654-cargo-test.pid", Some(&canonical));
+    let report = broker
+        .auto_cleanup_apply_now(plan)
+        .unwrap()
+        .expect("no other GC holds the lock");
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(
+        kept_reason(&report, &worktree)
+            .contains("changed before removal: a gate may be running (this checkout's path)"),
+        "{report:#?}"
+    );
+    assert_eq!(kept_gate_keep(&report, &worktree).as_deref(), Some("path"));
+    assert!(worktree.exists());
+}
+
 #[test]
 fn a_process_in_the_checkout_keeps_it() {
     let fx = fixture();

@@ -8532,6 +8532,7 @@ impl Broker {
         let mut apply_ms = 0u64;
         let mut inventory_unavailable = false;
         let mut probe_ms = 0u64;
+        let mut gate_checks = crate::auto_cleanup::AutoCleanupGateChecks::default();
         let mut inventory_wait = None;
         let mut memo_skips = 0usize;
         let mut priority_memo_skips = 0usize;
@@ -8642,6 +8643,7 @@ impl Broker {
                 apply_ms.saturating_add(pass_ms.saturating_sub(pass_lanes.removal_elapsed_ms));
             inventory_unavailable |= pass_lanes.removal_inventory_unavailable;
             probe_ms = probe_ms.saturating_add(pass_lanes.removal_probe_ms);
+            gate_checks.absorb(&pass_lanes.removal_gate_checks);
             if pass_lanes.removal_inventory_wait.is_some() {
                 inventory_wait = pass_lanes.removal_inventory_wait;
             }
@@ -9000,6 +9002,7 @@ impl Broker {
         slice.count_ms = count_ms;
         slice.pre_selection_ms = pre_selection_ms;
         slice.probe_ms = probe_ms;
+        slice.gate_checks = gate_checks;
         slice.waiting_on = inventory_wait.map(|wait| wait.as_str().to_string());
         slice.index_after_session_id = position.index_after_session_id;
         slice.index_high_water_session_id = position.index_high_water_session_id;
