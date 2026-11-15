@@ -1427,7 +1427,7 @@ fn measure_store(request: MeasureRequest<'_>) -> Result<Measured, Interrupted> {
         },
         Some(threshold),
         SharedCacheScanConcurrency::Concurrent,
-        |target| before_open(target),
+        before_open,
         &mut |_| Ok(()),
         &mut on_entry,
     );
