@@ -1290,7 +1290,7 @@ mod lane_tests {
 
         let mut first_failure = crate::session_holder::RecordedHolderProcessTable::default();
         first_failure.fail_process_table_for_test(session.id, event_id, false);
-        let _ = crate::session_holder::recorded_holder_liveness(
+        crate::session_holder::recorded_holder_liveness(
             broker.store_ref(),
             session.id,
             &mut first_failure,
