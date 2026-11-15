@@ -130,6 +130,26 @@ aethyme broker status --json
    (closed or unowned) checkouts. If the open sessions are most of the count,
    finish or close the sessions you no longer need; removal only touches
    closed checkouts.
+
+   Open sessions whose pull request merged but whose agent never ran
+   `finish` are the usual leak. The broker closes them itself once they are
+   spawned, every recorded pull request merged, the HEAD is landed on the
+   fetched default branch, the checkout is clean, nothing runs for them and
+   they have been inactive for `session_merged_after_hours` (default 2) since
+   the later of their last activity and the merge; every other open session
+   waits for `session_landed_after_hours` (24) when landed, or for the
+   abandonment window (`session_abandoned_after_hours`, 72). To see why such
+   sessions stay open, read `landed_session_retirement` in
+   `aethyme broker status --json` (or `auto_cleanup` in
+   `aethyme broker gc plan --json`): `merged_pull_request_examined` and
+   `merged_pull_request_closed` count the 2-hour path, and `declined` names
+   the reason each kept session stayed open. `holder_unbound` and
+   `holder_alive` mean the agent process could not be proved gone;
+   `not_landed` means commits after the merge; `worktree_unclean` means
+   uncommitted or unclassified ignored content; `operation_active` or
+   `operation_unknown` means a gate, queue entry, operation, preparation or
+   artifact producer was found or could not be checked. A closed session's
+   `session.abandoned` event records the `close_reason` and its evidence.
 2. Read `capacity_removal.outcome`, the background worker's last removal
    slice. The same record is `auto_cleanup.capacity_removal` in
    `aethyme broker gc plan --json`. `trigger` says what ran it: `steady`

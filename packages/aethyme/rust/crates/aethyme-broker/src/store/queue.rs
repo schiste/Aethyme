@@ -554,6 +554,33 @@ impl BrokerStore {
             .map_err(BrokerError::from)
     }
 
+    /// Every pull request recorded for one session, as
+    /// `(repository, number, merged_at)`, ordered by repository and number.
+    /// `merged_at` is `None` for an open or closed-unmerged pull request and
+    /// for one whose milestone is not cached; none of those is a merge.
+    pub(crate) fn session_pull_request_merges(
+        &self,
+        session_id: i64,
+    ) -> Result<Vec<(String, i64, Option<i64>)>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.repository, l.pr_number, m.merged_at
+             FROM pull_request_session_links l
+             LEFT JOIN pull_request_milestones m
+               ON m.repository = l.repository AND m.pr_number = l.pr_number
+             WHERE l.session_id = ?1
+             ORDER BY l.repository, l.pr_number",
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(BrokerError::from)
+    }
+
     /// Sessions linked to one pull request.
     pub fn pull_request_sessions(
         &self,

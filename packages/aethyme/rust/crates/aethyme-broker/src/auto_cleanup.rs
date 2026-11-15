@@ -1748,6 +1748,13 @@ pub struct AutoCleanupReport {
     /// Milliseconds the landed lane spent judging sessions.
     #[serde(default, skip_serializing_if = "is_zero_ms")]
     pub landed_retirement_elapsed_ms: u64,
+    /// Of `landed_sessions_examined`, the spawned sessions with every pull
+    /// request merged that the shorter `session_merged_after_hours` window
+    /// judged, and of `landed_sessions_closed`, the ones it closed.
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub merged_pull_request_sessions_examined: usize,
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub merged_pull_request_sessions_closed: usize,
     /// How the pass divided its budget between retirement and removal.
     /// Absent from reports written by the retirement-only worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2106,6 +2113,12 @@ pub struct LandedSessionRetirementView {
     pub evaluated_at_ms: i64,
     pub examined: usize,
     pub closed: usize,
+    /// Of `examined` and `closed`, the sessions judged in the merged-pull-
+    /// request window (`session_merged_after_hours`).
+    #[serde(skip_serializing_if = "is_zero_count")]
+    pub merged_pull_request_examined: usize,
+    #[serde(skip_serializing_if = "is_zero_count")]
+    pub merged_pull_request_closed: usize,
     /// Kept sessions per reason; the reasons are `LandedSessionDecline` codes.
     pub declined: std::collections::BTreeMap<String, usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2149,6 +2162,12 @@ impl AutoCleanupReport {
         self.landed_retirement_elapsed_ms = self
             .landed_retirement_elapsed_ms
             .saturating_add(retirement.landed_elapsed_ms);
+        self.merged_pull_request_sessions_examined = self
+            .merged_pull_request_sessions_examined
+            .saturating_add(retirement.merged_examined);
+        self.merged_pull_request_sessions_closed = self
+            .merged_pull_request_sessions_closed
+            .saturating_add(retirement.merged_closed);
     }
 
     /// Fold a later report's landed-lane counts into this aggregate, as the
@@ -2173,6 +2192,12 @@ impl AutoCleanupReport {
         self.landed_retirement_elapsed_ms = self
             .landed_retirement_elapsed_ms
             .saturating_add(later.landed_retirement_elapsed_ms);
+        self.merged_pull_request_sessions_examined = self
+            .merged_pull_request_sessions_examined
+            .saturating_add(later.merged_pull_request_sessions_examined);
+        self.merged_pull_request_sessions_closed = self
+            .merged_pull_request_sessions_closed
+            .saturating_add(later.merged_pull_request_sessions_closed);
     }
 
     /// What `broker status` reports about the landed lane, if it judged any
@@ -2182,6 +2207,8 @@ impl AutoCleanupReport {
             evaluated_at_ms: self.evaluated_at_ms,
             examined: self.landed_sessions_examined,
             closed: self.landed_sessions_closed,
+            merged_pull_request_examined: self.merged_pull_request_sessions_examined,
+            merged_pull_request_closed: self.merged_pull_request_sessions_closed,
             declined: self.landed_sessions_declined.clone(),
             cursor: self.retirement_cursor,
         })
@@ -2232,7 +2259,25 @@ struct SessionRetirementSummary {
     landed_closed: usize,
     landed_declined: std::collections::BTreeMap<&'static str, usize>,
     landed_elapsed_ms: u64,
+    /// Of `landed_examined`/`landed_closed`, the sessions judged in the
+    /// merged-pull-request window (`session_merged_after_hours`).
+    merged_examined: usize,
+    merged_closed: usize,
     cursor: Option<SessionRetirementCursorPosition>,
+}
+
+/// Whether the merged-pull-request window applies to `session`: it is
+/// enabled, the broker spawned the session and the cached provider data
+/// records a merged pull request for it. The close itself proves that every
+/// recorded pull request merged and the work landed.
+fn merged_pull_request_lane(
+    session: &Session,
+    merged_pull_requests: &std::collections::BTreeSet<i64>,
+    merged_window_ms: i64,
+) -> bool {
+    merged_window_ms > 0
+        && session.origin == SessionOrigin::Spawned
+        && merged_pull_requests.contains(&session.id)
 }
 
 impl SessionRetirementSummary {
@@ -6387,9 +6432,12 @@ impl Broker {
         // Sessions that already show landing evidence go first, ahead of
         // the oldest-first cursor whose head is full of sessions that will
         // never close. Same proof, same re-checks: only the order changes.
-        let prioritized = if landed_window_ms > 0 {
+        let merged_window_ms =
+            i64::from(policy.session_merged_after_hours).saturating_mul(3_600_000);
+        let prioritized = if landed_window_ms > 0 || merged_window_ms > 0 {
             self.retire_likely_landed_sessions(
                 landed_window_ms,
+                merged_window_ms,
                 lane_deadline(Instant::now(), deadline, (1, 2)),
                 upstream_tip.as_deref(),
                 &mut decline_memo,
@@ -6725,6 +6773,7 @@ impl Broker {
     fn retire_likely_landed_sessions(
         &mut self,
         landed_window_ms: i64,
+        merged_window_ms: i64,
         deadline: Option<Instant>,
         upstream_tip: Option<&str>,
         decline_memo: &mut LandedDeclineMemo,
@@ -6765,19 +6814,25 @@ impl Broker {
                     && tips
                         .get(&branch_ref)
                         .is_some_and(|tip| session.diff_base.as_deref() != Some(tip.as_str()));
-                (merged_pull_requests.contains(&session.id) || on_default)
-                    && crate::decide_abandonment(
-                        &crate::SessionActivity {
-                            session_id: session.id,
-                            last_activity_at: session.last_activity_at,
-                            created_at: session.created_at,
-                            agent_alive: None,
-                            closed: false,
-                        },
-                        now,
-                        landed_window_ms,
-                    )
-                    .is_abandoned()
+                let idle_past = |window_ms: i64| {
+                    window_ms > 0
+                        && crate::decide_abandonment(
+                            &crate::SessionActivity {
+                                session_id: session.id,
+                                last_activity_at: session.last_activity_at,
+                                created_at: session.created_at,
+                                agent_alive: None,
+                                closed: false,
+                            },
+                            now,
+                            window_ms,
+                        )
+                        .is_abandoned()
+                };
+                ((merged_pull_requests.contains(&session.id) || on_default)
+                    && idle_past(landed_window_ms))
+                    || (merged_pull_request_lane(session, &merged_pull_requests, merged_window_ms)
+                        && idle_past(merged_window_ms))
             })
             .collect::<Vec<_>>();
         likely.sort_by_key(|session| (session.id <= after, session.id));
@@ -6812,14 +6867,32 @@ impl Broker {
             crate::phase_telemetry::add("landed_sessions_examined", Duration::ZERO);
             crate::phase_telemetry::add("landed_likely_examined", Duration::ZERO);
             let started = Instant::now();
-            let outcome = self.try_close_landed_session(
-                session.id,
-                now_ms(),
-                landed_window_ms,
-                &mut process_table,
-                allow_snapshot,
-                deadline,
-            )?;
+            // A spawned session whose every pull request merged takes the
+            // shorter merged window and its stricter running-work checks; any
+            // other session keeps the landed window.
+            let merged_lane =
+                merged_pull_request_lane(&session, &merged_pull_requests, merged_window_ms);
+            let outcome = if merged_lane {
+                summary.merged_examined += 1;
+                crate::phase_telemetry::add("landed_merged_pr_examined", Duration::ZERO);
+                self.try_close_merged_pull_request_session(
+                    session.id,
+                    now_ms(),
+                    merged_window_ms,
+                    &mut process_table,
+                    allow_snapshot,
+                    deadline,
+                )?
+            } else {
+                self.try_close_landed_session(
+                    session.id,
+                    now_ms(),
+                    landed_window_ms,
+                    &mut process_table,
+                    allow_snapshot,
+                    deadline,
+                )?
+            };
             let elapsed = started.elapsed();
             crate::phase_telemetry::add("landed_session_retirement", elapsed);
             summary.landed_elapsed_ms = summary
@@ -6838,6 +6911,10 @@ impl Broker {
                     summary.retired += 1;
                     crate::phase_telemetry::add("landed_sessions_closed", elapsed);
                     crate::phase_telemetry::add("landed_likely_closed", elapsed);
+                    if merged_lane {
+                        summary.merged_closed += 1;
+                        crate::phase_telemetry::add("landed_merged_pr_closed", elapsed);
+                    }
                 }
                 Some(reason) => {
                     *summary.landed_declined.entry(reason.code()).or_default() += 1;

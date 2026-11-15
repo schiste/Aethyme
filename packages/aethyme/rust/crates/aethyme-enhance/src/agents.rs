@@ -387,6 +387,9 @@ session; reconcile before merging. Resolve blockers and refusals.
 3. When done: `aethyme broker submit --session <id>` runs the gates and lands
    nothing. Merge the PR on GitHub, then `aethyme broker finish --session <id>`
    (it refuses while commits are unpushed).
+   The broker closes an idle session itself once every pull request of it
+   merged and its work landed (after 2 hours), or after 3 days without
+   activity; nothing is deleted, and `aethyme broker start --reuse` continues.
 
 This repository's `push_session_branches` policy authorizes pushing your own
 session branch and opening a draft PR; nothing else. Other remote or shared Git
@@ -414,6 +417,9 @@ session; reconcile before merging. Resolve blockers and refusals.
    is explicit; do not assume a fresh worktree has installed dependencies.
 2. When done: `aethyme broker submit --session <id>` runs the gates and lands
    nothing. Then `aethyme broker finish --session <id>`.
+   The broker closes an idle session itself once every pull request of it
+   merged and its work landed (after 2 hours), or after 3 days without
+   activity; nothing is deleted, and `aethyme broker start --reuse` continues.
 
 For a local commit in your own active session, use
 `aethyme broker commit --session <id> -- <git-commit-args>`. It checks the

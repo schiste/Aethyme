@@ -3021,9 +3021,11 @@ fn acquire_session_operation_context(
     let session_open =
         current.cleanup_state == crate::SessionCleanupState::Open && !current.status.is_closed();
     if !session_open && !allow_closed {
-        return Err(UsageError::Message(format!(
-            "session {session_id} is already closed; it cannot start new session work"
-        )));
+        // Names an automatic close and how to continue, when the broker
+        // closed the session itself.
+        return Err(UsageError::Message(
+            crate::session_auto_close::closed_session_refusal(&current_store, session_id),
+        ));
     }
     if parsed.session.is_none() {
         let checkout_root = checkout.root().to_string_lossy().into_owned();

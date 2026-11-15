@@ -16,7 +16,14 @@ size, and a clean `git status` are all compatible with unique work.
 
 A session, its worktree, and its branch have separate lifecycles. Closing a
 session (`finish close`) ends broker ownership and retains both the checkout and
-its branch. `finish` closes and then, for a broker-spawned worktree whose cleanup
+its branch. The broker makes the same close itself, with no `finish`, for an
+open session that has been inactive long enough: a spawned session whose every
+pull request merged and whose landed, clean checkout nothing uses
+(`session_merged_after_hours`, default 2 hours), any other landed clean session
+(`session_landed_after_hours`, 24 hours), and any session without a live agent
+(`session_abandoned_after_hours`, 72 hours). See
+[automatic checkout maintenance](automatic-checkout-maintenance.md). `finish`
+closes and then, for a broker-spawned worktree whose cleanup
 is already proven safe, removes the checkout and its local session branch in the
 same step, unless `--keep-worktree` is given or the repository's retention policy
 sets `auto_cleanup_worktrees_on_finish = false`; an adopted worktree is always
