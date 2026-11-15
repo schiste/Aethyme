@@ -147,7 +147,7 @@ aethyme broker status --json
    | `lock_busy` | Another process held the GC lock, or the slice stepped aside for a foreground command (`broker start` at the limit, `gc apply`, `gc abandon`, `gc forget-abandoned`) that was waiting for it. The next slice retries after one minute. |
    | `inventory_unavailable` | No complete checkout inventory before the deadline. `waiting_on` names what it waited on (`capacity_probe`, `cohort_index`, `group_page` or `live_paths`). Progress is kept; the retry is 20 seconds after a slice that moved, and otherwise 1, 2, 4, 8 and then 10 minutes while it repeats. |
    | `out_of_time_before_selection` | The budget ran out before any checkout was judged. `budget_consumed_by` is `checkout_count` or `pre_selection`. It retries after 1, 2, 4, 8 and then 10 minutes while it repeats. |
-   | `pressure_before_selection` | Pressure kept the slice from running any pass; `pressure_seen` says which. `memory` (`stop_reason` `memory_backoff`): memory pressure outlasted the worker's 120-second pause budget; it retries after 10 minutes. Check memory pressure (`memory_pressure` on macOS, `/proc/pressure/memory` on Linux) and what fills memory. `load`: the bounded load wait left too little of the slice's budget for a pass; it retries after 1 minute. Neither grows `idle_streak`. |
+   | `pressure_before_selection` | Pressure kept the slice from running any pass; `pressure_seen` says which. `memory` (`stop_reason` `memory_backoff`): memory pressure outlasted the worker's 120-second pause budget; it retries after 10 minutes. Check memory pressure (`memory_pressure` on macOS, `/proc/pressure/memory` on Linux) and what fills memory. `load` (`stop_reason` `budget`): the slice reached its pressure check with at least the 5-second minimum slice left and the bounded load wait then left too little for a pass; it retries after 1 minute. Neither grows `idle_streak`. A slice whose budget went on counting checkouts or other checks before the pressure check, or whose pass failed, is never `pressure_before_selection`, whatever load it saw: it stays `out_of_time_before_selection` with `budget_consumed_by` and its 1, 2, 4, 8 and 10-minute retries. |
    | `out_of_time_before_selection` with `stop_reason` `pacer_backoff`, `passes: 0`, `retry_in_ms: 600000` and a large `pressure_wait_ms`, repeating | Written by a binary from before load became a throttle: a load average above twice the core count (normal on a busy machine) stopped every slice and nothing was removed. Upgrade; with this change load only slows removal (`stop_reason` `load_throttled`, `throttled: true`), and only memory pressure stops it. |
 
    Under pressure a slice runs up to 120 seconds and removes up to twelve
@@ -170,9 +170,9 @@ aethyme broker status --json
    `load_throttled` (the load average stayed above twice the core count, or
    Linux I/O pressure stayed high, through the 5-second wait before a pass, so
    the slice removed one checkout and stopped; the next slice runs at the
-   normal cadence: a minute later for a steady slice, at once under capacity
-   pressure; records from older binaries may say `pacer_backoff`, where load
-   stopped the slice too),
+   normal cadence: a minute later for a steady slice, 30 seconds later under
+   capacity pressure (`throttle_gap_ms`); records from older binaries may say
+   `pacer_backoff`, where load stopped the slice too),
    `slice_deadline` (the deadline cut the pacer wait after a removal short;
    the next slice pays the rest first), `yielded_to_foreground`, `lock_busy`,
    `failed` (a pass failed; retry after at least one minute) and
@@ -187,7 +187,13 @@ aethyme broker status --json
    (time in the pressure checks before passes), `memory_wait_ms`,
    `load_wait_ms` and `elapsed_ms` say where the slice's time went;
    `pressure_seen` and `throttled` say which pressure it saw and whether it
-   ran throttled. Under sustained load expect about one removal per slice. To run a pass now instead of
+   ran throttled. Under sustained load expect about one removal per slice
+   and, under capacity pressure, at least 30 seconds between slices.
+   `run_slices`, `run_removed`, `run_elapsed_ms`, `run_deleting_ms`,
+   `run_waiting_ms`, `run_deleting_pct` and `run_waiting_pct` describe the
+   worker run the slice belongs to so far: how many slices it held, what they
+   removed and how much of the run Git spent deleting versus waiting. To run
+   a pass now instead of
    waiting for the worker, use `aethyme broker gc sweep --json`.
 3. Read `capacity_removal.kept_by_code`, the number of kept checkouts per keep
    code, and `aethyme broker gc plan --json` for the per-checkout reasons in

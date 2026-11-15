@@ -308,11 +308,23 @@ const ARTIFACT_WORKER_CAPACITY_KEPT_ONLY_PASSES: usize = 4;
 const ARTIFACT_WORKER_CAPACITY_REMOVAL_PRESSURE_RETRY_MS: i64 = 10 * 60_000;
 /// Removals one slice makes once a pre-pass check found load (or Linux I/O
 /// pressure) still elevated after its bounded wait: the slice proceeds,
-/// throttled, and the next one runs at the normal cadence.
+/// throttled, and the next one runs at the normal cadence, no sooner than
+/// [`ARTIFACT_WORKER_LOAD_THROTTLE_GAP_MS`].
 const ARTIFACT_WORKER_LOAD_THROTTLED_REMOVALS: usize = 1;
 /// After a slice that ran no pass because its bounded load wait left too
 /// little of its budget: load alone never backs off longer than this.
 const ARTIFACT_WORKER_LOAD_BLOCKED_RETRY_MS: i64 = 60_000;
+/// The shortest wait before the next slice after one that stopped
+/// `load_throttled`. Under capacity pressure a slice that removed one
+/// checkout otherwise clears its retry, and broker opens start the next
+/// worker run as soon as the last exits, so on a machine whose load stays
+/// above the threshold removal ran with no gap for as long as the
+/// repository stayed at its limit. Thirty seconds is one cache pass
+/// (`ARTIFACT_WORKER_CACHE_PASS_SLICE`), the gap a slice between full cache
+/// passes already gets, and half the steady minute, so pressure still
+/// removes about twice as fast as steady removal under the same load. A
+/// steady slice keeps its minute; without load nothing changes.
+const ARTIFACT_WORKER_LOAD_THROTTLE_GAP_MS: i64 = 30_000;
 /// When the cache lane is due, capacity slices leave it at least this much
 /// of every worker run: three 30-second cache passes.
 const ARTIFACT_WORKER_CACHE_LANE_MIN: Duration = Duration::from_secs(90);
@@ -373,7 +385,8 @@ pub(crate) enum CapacitySliceStop {
     /// Load (or Linux I/O pressure) stayed elevated through a pre-pass
     /// check's bounded wait: the slice made its throttled allowance of
     /// removals ([`ARTIFACT_WORKER_LOAD_THROTTLED_REMOVALS`]) and stopped;
-    /// the next slice runs at the normal cadence.
+    /// the next slice runs at the normal cadence, no sooner than
+    /// [`ARTIFACT_WORKER_LOAD_THROTTLE_GAP_MS`].
     LoadThrottled,
     /// The slice's deadline cut a pacer wait short; the rest is owed before
     /// the next slice.
@@ -453,8 +466,9 @@ impl CapacitySliceStop {
 }
 
 /// The retry a slice's stop forces on top of the lap-based one: memory
-/// pressure that outlasted the pacer backs off ten minutes (a load-throttled
-/// slice keeps the lap-based cadence), repeated Git removal
+/// pressure that outlasted the pacer backs off ten minutes, a load-throttled
+/// slice keeps the lap-based cadence but waits at least
+/// [`ARTIFACT_WORKER_LOAD_THROTTLE_GAP_MS`], repeated Git removal
 /// failures ten minutes and a failure one minute, whatever was removed; a
 /// slice that removed nothing but kept checkouts at the last step waits at
 /// least a minute; a pacer wait the slice deadline cut short is paid before
@@ -478,6 +492,9 @@ fn capacity_stop_retry_ms(
             lap_retry_ms,
             ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS,
         ),
+        CapacitySliceStop::LoadThrottled => {
+            at_least(lap_retry_ms, ARTIFACT_WORKER_LOAD_THROTTLE_GAP_MS)
+        }
         CapacitySliceStop::SliceDeadline => at_least(
             lap_retry_ms,
             i64::try_from(unpaid.as_millis()).unwrap_or(i64::MAX).max(1),
@@ -739,24 +756,85 @@ impl SlicePressure {
 }
 
 /// Which pressure kept a slice that removed nothing from ever reaching
-/// selection: memory when it stopped the slice, otherwise load when the
-/// slice saw it (its bounded wait left too little of the budget for a
-/// pass). `None` when the slice reached selection or saw no pressure.
+/// selection, only when pressure is what actually prevented its pass:
+/// memory when it stopped the slice (`stop` `memory_backoff`); load when
+/// the slice reached the pre-pass check with at least the minimum slice
+/// left (`remaining_at_check`), saw load, and then stopped for budget, so
+/// the bounded load wait is what left too little for a pass. `None` when
+/// the slice reached selection, saw no pressure, or stopped for another
+/// reason: a budget spent on counting or other pre-selection work before
+/// the check (under permanent load every slice sees load, so seeing it
+/// proves nothing) or a failed pass keeps its own classification.
 fn capacity_slice_blocked_by_pressure(
     removed: usize,
     selection_ran: bool,
-    memory_backoff: bool,
+    stop: CapacitySliceStop,
+    remaining_at_check: Option<Duration>,
     pressure: SlicePressure,
 ) -> Option<SliceBlockedBy> {
     if removed > 0 || selection_ran {
         None
-    } else if memory_backoff {
+    } else if stop == CapacitySliceStop::MemoryBackoff {
         Some(SliceBlockedBy::Memory)
-    } else if pressure.load {
+    } else if stop == CapacitySliceStop::Budget
+        && pressure.load
+        && remaining_at_check
+            .is_some_and(|remaining| remaining >= ARTIFACT_WORKER_CAPACITY_REMOVAL_MIN_SLICE)
+    {
         Some(SliceBlockedBy::Load)
     } else {
         None
     }
+}
+
+/// What one worker run's capacity slices did so far, so a slice record and
+/// the run's metrics row say how many slices the run held, what they
+/// removed and how much of the run went on Git deleting versus waiting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WorkerRunTally {
+    pub(crate) slices: usize,
+    pub(crate) removed: usize,
+    pub(crate) deleting: Duration,
+    pub(crate) waiting: Duration,
+}
+
+std::thread_local! {
+    /// The current worker run's tally, keyed by the instant the run started:
+    /// the worker runs its slices one after another on one thread, and a
+    /// slice of another run starts a new tally.
+    static WORKER_RUN_TALLY: std::cell::Cell<Option<(Instant, WorkerRunTally)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Add one slice to the tally of the worker run started at
+/// `worker_started` and return the run's tally so far.
+fn tally_worker_run_slice(
+    worker_started: Instant,
+    removed: usize,
+    deleting: Duration,
+    waiting: Duration,
+) -> WorkerRunTally {
+    WORKER_RUN_TALLY.with(|cell| {
+        let mut tally = match cell.get() {
+            Some((started, tally)) if started == worker_started => tally,
+            _ => WorkerRunTally::default(),
+        };
+        tally.slices = tally.slices.saturating_add(1);
+        tally.removed = tally.removed.saturating_add(removed);
+        tally.deleting = tally.deleting.saturating_add(deleting);
+        tally.waiting = tally.waiting.saturating_add(waiting);
+        cell.set(Some((worker_started, tally)));
+        tally
+    })
+}
+
+/// `part` as whole percent of `whole`, at most 100; 0 for an empty whole.
+fn percent_of(part: Duration, whole: Duration) -> u64 {
+    if whole.is_zero() {
+        return 0;
+    }
+    let percent = part.as_nanos().saturating_mul(100) / whole.as_nanos();
+    u64::try_from(percent).unwrap_or(100).min(100)
 }
 
 /// What kept a slice from selection; see
@@ -8470,6 +8548,25 @@ impl Broker {
             .unwrap();
     }
 
+    /// Test seam: end the capacity pressure retry now, as if its wait had
+    /// passed, keeping the out-of-time streak.
+    #[cfg(test)]
+    pub(crate) fn end_capacity_removal_back_off_for_test(&mut self) {
+        self.artifact_sweep_meta_set(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_AFTER_KEY, "")
+            .unwrap();
+    }
+
+    /// Test seam: set the steady idle streak, as if that many idle steady
+    /// slices had run.
+    #[cfg(test)]
+    pub(crate) fn set_steady_removal_idle_streak_for_test(&mut self, streak: u32) {
+        self.artifact_sweep_meta_set(
+            ARTIFACT_WORKER_STEADY_REMOVAL_IDLE_STREAK_KEY,
+            &streak.to_string(),
+        )
+        .unwrap();
+    }
+
     /// [`Self::run_capacity_removal_slice_with`] for the worker: a failure
     /// other than the database's is recorded in the worker status and never
     /// stops the run's other lanes.
@@ -8506,7 +8603,8 @@ impl Broker {
     /// I/O pressure) is waited for at most `LOAD_GATE_WAIT`, after which the
     /// pass runs anyway and the slice makes at most
     /// `ARTIFACT_WORKER_LOAD_THROTTLED_REMOVALS` removal (`load_throttled`),
-    /// with the next slice at the normal cadence. Each pass removes at most one
+    /// with the next slice at the normal cadence but no sooner than
+    /// `ARTIFACT_WORKER_LOAD_THROTTLE_GAP_MS`. Each pass removes at most one
     /// checkout; selection, and revalidation between its steps, honor
     /// `ARTIFACT_WORKER_CAPACITY_REMOVAL_PASS_BUDGET`, while a revalidation
     /// step already running (lease and gate checks, the cleanliness walk)
@@ -8658,6 +8756,9 @@ impl Broker {
         // A pre-pass check found load still elevated after its bounded wait:
         // the slice runs throttled, one removal at most.
         let mut throttled = false;
+        // The budget left when the slice last reached its pre-pass pressure
+        // check; `None` when it never did.
+        let mut remaining_at_check: Option<Duration> = None;
         // The pacer's memory and load waits so far in this worker run; the
         // slice reports its own share.
         let pacing_before = unattended_pacing::current_summary(0);
@@ -8692,6 +8793,7 @@ impl Broker {
                 break stop;
             }
             // No removal starts under memory pressure; load only throttles.
+            remaining_at_check = Some(remaining);
             let gate_started = Instant::now();
             let verdict = unattended_pacing::unattended_pressure_check(Some(slice_deadline));
             pressure_wait += gate_started.elapsed();
@@ -8940,16 +9042,18 @@ impl Broker {
         // same held lock.
         let lock_contended = lock_busy || yielded;
         let selection_ran = capacity_slice_selection_ran(passes, lock_contended);
-        // A slice that ran no pass because of pressure judged nothing: it is
-        // not an idle lap and not an out-of-time slice.
+        // A slice that pressure kept from running any pass judged nothing:
+        // it is not an idle lap and not an out-of-time slice.
         let blocked_by = capacity_slice_blocked_by_pressure(
             removed,
             selection_ran,
-            stop == CapacitySliceStop::MemoryBackoff,
+            stop,
+            remaining_at_check,
             pressure,
         );
         let mut idle_streak = 0u32;
-        let retry_ms = match trigger {
+        // The lap-based retry before the stop's own floor, and the retry.
+        let (lap_retry_ms, retry_ms) = match trigger {
             CheckoutRemovalTrigger::Pressure => {
                 let mut retry_ms = capacity_removal_retry_ms(
                     removed,
@@ -8991,7 +9095,10 @@ impl Broker {
                         "",
                     )?;
                 }
-                capacity_stop_retry_ms(stop, retry_ms, removed, kept_only_passes, unpaid)
+                (
+                    retry_ms,
+                    capacity_stop_retry_ms(stop, retry_ms, removed, kept_only_passes, unpaid),
+                )
             }
             CheckoutRemovalTrigger::Steady => {
                 // Removing nothing, for whatever reason short of a held
@@ -9046,8 +9153,21 @@ impl Broker {
                     ARTIFACT_WORKER_STEADY_REMOVAL_HARD_RETRY_AFTER_KEY,
                     &hard_retry_after,
                 )?;
-                retry
+                (Some(base), retry)
             }
+        };
+        // How much the load throttle lengthened the wait (a pressure slice
+        // that removed would otherwise run again at once).
+        let throttle_gap_ms = if stop == CapacitySliceStop::LoadThrottled {
+            u64::try_from(
+                retry_ms
+                    .unwrap_or(0)
+                    .saturating_sub(lap_retry_ms.unwrap_or(0))
+                    .max(0),
+            )
+            .unwrap_or(0)
+        } else {
+            0
         };
         let retry_after_ms = retry_ms.map(|wait| now_ms().saturating_add(wait));
         self.artifact_sweep_meta_set(
@@ -9063,6 +9183,26 @@ impl Broker {
             "artifact_worker_capacity_removal_retry",
             Duration::from_millis(retry_ms.map_or(0, |wait| u64::try_from(wait).unwrap_or(0))),
         );
+        // The worker run so far: its slices, removals, and how much of its
+        // wall time went on Git deleting versus waiting, so back-to-back
+        // slices and runs can be read from the slice record and the run's
+        // metrics row (slices: `_slice` count; removals:
+        // `artifact_worker_capacity_removed` count; deleting: `_git_removal`;
+        // waiting: `_waiting`; the throttle gap: `_throttle_gap`).
+        let slice_waiting = paced_wait
+            .saturating_add(pressure_wait)
+            .saturating_add(lock_yield_wait)
+            .saturating_add(lock_wait);
+        let run = tally_worker_run_slice(worker_started, removed, git_removal_time, slice_waiting);
+        let run_elapsed = worker_started.elapsed();
+        crate::phase_telemetry::add("artifact_worker_capacity_removal_slice", Duration::ZERO);
+        crate::phase_telemetry::add("artifact_worker_capacity_removal_waiting", slice_waiting);
+        if throttle_gap_ms > 0 {
+            crate::phase_telemetry::add(
+                "artifact_worker_capacity_removal_throttle_gap",
+                Duration::from_millis(throttle_gap_ms),
+            );
+        }
         for _ in 0..removed.min(4096) {
             crate::phase_telemetry::add("artifact_worker_capacity_removed", Duration::ZERO);
         }
@@ -9179,6 +9319,14 @@ impl Broker {
         slice.load_wait_ms = load_wait_ms;
         slice.pressure_seen = pressure.as_str().map(str::to_string);
         slice.throttled = throttled;
+        slice.throttle_gap_ms = throttle_gap_ms;
+        slice.run_slices = run.slices;
+        slice.run_removed = run.removed;
+        slice.run_elapsed_ms = duration_ms(run_elapsed);
+        slice.run_deleting_ms = duration_ms(run.deleting);
+        slice.run_waiting_ms = duration_ms(run.waiting);
+        slice.run_deleting_pct = percent_of(run.deleting, run_elapsed);
+        slice.run_waiting_pct = percent_of(run.waiting, run_elapsed);
         slice.lock_yield_ms = duration_ms(lock_yield_wait);
         slice.lock_held_ms = duration_ms(lock_held);
         slice.lock_wait_ms = duration_ms(lock_wait);
@@ -9210,14 +9358,18 @@ impl Broker {
         }
         self.record_capacity_removal_slice(&slice)?;
         self.write_artifact_sweep_worker_status(&format!(
-            "capacity_removal removed={removed} kept={} deferred={} examined={examined} lock_busy={lock_busy} paced_ms={} elapsed_ms={} outcome={outcome} stop={} trigger={} passes={passes} lap_completed={lap_completed} pressure={} throttled={throttled}",
+            "capacity_removal removed={removed} kept={} deferred={} examined={examined} lock_busy={lock_busy} paced_ms={} elapsed_ms={} outcome={outcome} stop={} trigger={} passes={passes} lap_completed={lap_completed} pressure={} throttled={throttled} throttle_gap_ms={throttle_gap_ms} run_slices={} run_removed={} run_deleting_pct={} run_waiting_pct={}",
             slice.kept,
             slice.deferred,
             slice.paced_ms,
             slice.elapsed_ms,
             stop.as_str(),
             trigger.as_str(),
-            pressure.as_str().unwrap_or("none")
+            pressure.as_str().unwrap_or("none"),
+            slice.run_slices,
+            slice.run_removed,
+            slice.run_deleting_pct,
+            slice.run_waiting_pct
         ))?;
         match failure {
             Some(error) => Err(error),
@@ -12750,8 +12902,9 @@ mod tests {
 
     /// The stop overrides the lap-based retry: memory pressure backs off
     /// ten minutes even after removals, a load-throttled slice keeps the
-    /// lap-based cadence, a failure a minute, a kept-only lap at least a
-    /// minute, and an unpaid pacer wait is waited before the next slice.
+    /// lap-based cadence but waits at least the throttle gap, a failure a
+    /// minute, a kept-only lap at least a minute, and an unpaid pacer wait
+    /// is waited before the next slice.
     #[test]
     fn a_slices_stop_sets_a_real_back_off() {
         let ten_minutes = Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_PRESSURE_RETRY_MS);
@@ -12761,35 +12914,71 @@ mod tests {
             capacity_stop_retry_ms(CapacitySliceStop::MemoryBackoff, None, 3, 0, zero),
             ten_minutes
         );
+        assert_eq!(ARTIFACT_WORKER_LOAD_THROTTLE_GAP_MS, 30_000);
         assert_eq!(
             capacity_stop_retry_ms(CapacitySliceStop::LoadThrottled, None, 1, 0, zero),
-            None,
-            "a throttled pressure slice that removed one runs again at once"
+            Some(ARTIFACT_WORKER_LOAD_THROTTLE_GAP_MS),
+            "a throttled pressure slice that removed one waits the throttle gap"
         );
         assert_eq!(
             capacity_stop_retry_ms(CapacitySliceStop::LoadThrottled, Some(60_000), 1, 0, zero),
             Some(60_000),
             "a throttled steady slice keeps the steady minute"
         );
+        assert_eq!(
+            capacity_stop_retry_ms(CapacitySliceStop::Cap, None, 1, 0, zero),
+            None,
+            "without load a pressure slice that removed runs again at once"
+        );
         // Pressure that kept a slice from selection: memory waits ten
-        // minutes, load alone a minute; a slice that reached selection or
-        // saw no pressure is not pressure-blocked.
+        // minutes, load a minute but only when the load wait is what left
+        // too little for a pass; a slice that reached selection, saw no
+        // pressure, spent its budget before the pressure check or failed is
+        // not pressure-blocked.
         let load = SlicePressure {
             memory: false,
             load: true,
         };
-        let blocked = |removed, selection_ran, memory_backoff, pressure| {
-            capacity_slice_blocked_by_pressure(removed, selection_ran, memory_backoff, pressure)
-                .map(pressure_blocked_retry_ms)
+        let enough = Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_MIN_SLICE);
+        let blocked = |removed, selection_ran, stop, remaining_at_check, pressure| {
+            capacity_slice_blocked_by_pressure(
+                removed,
+                selection_ran,
+                stop,
+                remaining_at_check,
+                pressure,
+            )
+            .map(pressure_blocked_retry_ms)
         };
+        use CapacitySliceStop::{Budget, Failed, MemoryBackoff};
         assert_eq!(
-            blocked(0, false, true, SlicePressure::default()),
+            blocked(0, false, MemoryBackoff, enough, SlicePressure::default()),
             ten_minutes
         );
-        assert_eq!(blocked(0, false, false, load), Some(60_000));
-        assert_eq!(blocked(0, true, false, load), None);
-        assert_eq!(blocked(1, false, false, load), None);
-        assert_eq!(blocked(0, false, false, SlicePressure::default()), None);
+        assert_eq!(blocked(0, false, MemoryBackoff, None, load), ten_minutes);
+        assert_eq!(blocked(0, false, Budget, enough, load), Some(60_000));
+        // The budget ran out on counting or other pre-selection work: the
+        // slice never reached the pressure check, or reached it with less
+        // than a minimum slice left, whatever load it saw.
+        assert_eq!(blocked(0, false, Budget, None, load), None);
+        assert_eq!(
+            blocked(
+                0,
+                false,
+                Budget,
+                Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_MIN_SLICE - Duration::from_millis(1)),
+                load
+            ),
+            None
+        );
+        // A pass that failed under load is a failure, not pressure.
+        assert_eq!(blocked(0, false, Failed, enough, load), None);
+        assert_eq!(blocked(0, true, Budget, enough, load), None);
+        assert_eq!(blocked(1, false, Budget, enough, load), None);
+        assert_eq!(
+            blocked(0, false, Budget, enough, SlicePressure::default()),
+            None
+        );
         assert_eq!(load.as_str(), Some("load"));
         assert_eq!(SlicePressure::default().as_str(), None);
         assert_eq!(
@@ -12844,6 +13033,25 @@ mod tests {
             capacity_stop_retry_ms(CapacitySliceStop::Cap, None, 12, 0, zero),
             None
         );
+    }
+
+    /// A worker run's tally adds up its own slices and starts over for the
+    /// next run; its duty cycle is a whole percent of the run's wall time.
+    #[test]
+    fn a_worker_run_tally_counts_its_own_slices() {
+        let run = Instant::now();
+        let second = Duration::from_secs(1);
+        let first = tally_worker_run_slice(run, 1, second, second * 3);
+        assert_eq!((first.slices, first.removed), (1, 1));
+        let both = tally_worker_run_slice(run, 0, second, second);
+        assert_eq!((both.slices, both.removed), (2, 1));
+        assert_eq!((both.deleting, both.waiting), (second * 2, second * 4));
+        let next_run = run + Duration::from_millis(1);
+        let fresh = tally_worker_run_slice(next_run, 2, Duration::ZERO, second);
+        assert_eq!((fresh.slices, fresh.removed), (1, 2));
+        assert_eq!(percent_of(second, second * 4), 25);
+        assert_eq!(percent_of(second * 5, second * 4), 100);
+        assert_eq!(percent_of(second, Duration::ZERO), 0);
     }
 
     /// Resuming a confirmed journal inside a broker open fails fast on a held
