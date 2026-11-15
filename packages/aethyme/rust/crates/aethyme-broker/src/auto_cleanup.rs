@@ -7252,8 +7252,8 @@ impl Broker {
             PriorityMemo::decode(self.store().meta_get(PRIORITY_MEMO_KEY)?.as_deref());
         let mut priority_memo_changed = false;
         let mut priority_memo_skips = 0_usize;
-        // Groups queued for the priority lane in this pass, left to it by
-        // every lap page of the same pass.
+        // Groups the priority lane judged in this pass, skipped by every lap
+        // page of the same pass.
         let mut priority_paths = std::collections::BTreeSet::<PathBuf>::new();
         // Under capacity pressure a bounded pass keeps going page by page
         // while time remains; otherwise each pass keeps its one-page tranche
@@ -7399,10 +7399,6 @@ impl Broker {
                         );
                         continue;
                     }
-                    // The lap leaves every queued group to the priority lane,
-                    // which judges it in this pass or, once its share is
-                    // spent, in a later one.
-                    priority_paths.insert(group.worktree.clone());
                     priority_queue.push_back((group, merged));
                 }
             }
@@ -7441,11 +7437,25 @@ impl Broker {
                 };
                 let cursor_session_id = checkout_group_cursor_session_id(&group);
                 if priority.is_none() && priority_paths.contains(&group.worktree) {
-                    // The priority lane judges it, in this pass or a later one.
+                    // Already judged by the priority lane in this pass.
                     cursor.after_session_id = cursor_session_id;
                     self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
                     continue;
                 }
+                if priority.is_some() {
+                    priority_paths.insert(group.worktree.clone());
+                }
+                // A lap group still queued for the priority lane is judged
+                // here, once, and remembered as the priority lane would.
+                let queued_merged = if priority.is_none() {
+                    priority_queue
+                        .iter()
+                        .position(|(queued, _)| queued.worktree == group.worktree)
+                        .and_then(|index| priority_queue.remove(index))
+                        .map(|(_, merged)| merged)
+                } else {
+                    None
+                };
                 let worktree_key = group.worktree.to_string_lossy().into_owned();
                 if cheap_keeps {
                     // Decided by the database alone: no Git process, no walk.
@@ -7526,33 +7536,36 @@ impl Broker {
                         memo_hits.count(&kept.code);
                         examined += 1;
                         report.kept.push(kept);
-                        match priority {
-                            None => {
-                                cursor.after_session_id = cursor_session_id;
-                                self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
-                            }
-                            Some(merged) => {
-                                priority_examined += 1;
-                                crate::phase_telemetry::add(
-                                    "auto_cleanup_priority_examined",
-                                    Duration::ZERO,
-                                );
-                                priority_memo.remember_with(
-                                    worktree_key,
-                                    merged,
-                                    PriorityOutcome::Kept,
-                                    None,
-                                    now_ms(),
-                                );
-                                priority_memo_changed = true;
-                            }
+                        if priority.is_some() || queued_merged.is_some() {
+                            priority_examined += 1;
+                            crate::phase_telemetry::add(
+                                "auto_cleanup_priority_examined",
+                                Duration::ZERO,
+                            );
+                        } else {
+                            cursor.after_session_id = cursor_session_id;
+                            self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
+                        }
+                        if let Some(merged) = priority.or(queued_merged) {
+                            priority_memo.remember_with(
+                                worktree_key,
+                                merged,
+                                PriorityOutcome::Kept,
+                                None,
+                                now_ms(),
+                            );
+                            priority_memo_changed = true;
                         }
                         continue;
                     }
                 }
                 if priority.is_none() && lap_limit.is_some_and(|limit| lap_judged >= limit) {
                     // The steady lap's share of this pass is spent; the cursor
-                    // stays on the last group it passed.
+                    // stays on the last group it passed, and a queued priority
+                    // group goes back to the priority lane.
+                    if let Some(merged) = queued_merged {
+                        priority_queue.push_front((group.clone(), merged));
+                    }
                     lap_queue.push_front(group);
                     lap_closed = true;
                     continue;
@@ -7755,12 +7768,19 @@ impl Broker {
                         stop_for_deadline = true;
                     }
                 }
-                if let Some(merged) = priority {
-                    // A priority group never moves the lap cursor. Remember
-                    // every judged one, selected and deferred included, so the
-                    // next pass judges others and the lap moves on.
+                if priority.is_some() || queued_merged.is_some() {
                     priority_examined += 1;
                     crate::phase_telemetry::add("auto_cleanup_priority_examined", Duration::ZERO);
+                }
+                if priority.is_none() {
+                    cursor.after_session_id = cursor_session_id;
+                    self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
+                }
+                if let Some(merged) = priority.or(queued_merged) {
+                    // A priority group never moves the lap cursor. Remember
+                    // every judged one, selected and deferred included (and a
+                    // queued one the lap judged), so the next pass judges
+                    // others and the lap moves on.
                     let outcome = if selected.len() > selected_before {
                         priority_selected += 1;
                         PriorityOutcome::Selected
@@ -7784,9 +7804,6 @@ impl Broker {
                     };
                     priority_memo.remember_with(worktree_key, merged, outcome, stable, now_ms());
                     priority_memo_changed = true;
-                } else {
-                    cursor.after_session_id = cursor_session_id;
-                    self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
                 }
                 if stop_for_deadline || selected.len() >= max_selected.max(1) {
                     stop_pass = true;
