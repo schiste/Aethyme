@@ -4,6 +4,25 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.98] - 2026-11-15
+
+### Fixed
+
+- `rotation_volume_key` keeps only the keys a pending rotation debt may still need. Unprotected keys are trimmed to the 16 newest per cache root and volume UUID when the debt completes or its binding is retired, and before each cap check, so the table no longer grows until it refuses that root for good. An unchanged key is not rewritten on every pass (#1680).
+- Leaked `rotation_debt_volume` bindings no longer block new bindings at the 512-row cap; the oldest binding with no debt row is evicted (#1680).
+- The `gc` cache sweep settles a rotation journal lap in the same pass when recovery moves the root row to the live identity mid-walk; it used to settle two passes later after a failed-acknowledgement warning (#1680).
+- A clean `finish` after a remount reports `cleanup.ownership_reproof`, and the orphan device rebind no longer counts a refusal twice (#1680).
+
+### Changed
+
+- Rechecks made during checkout compaction count under `retirement_ownership_reproof_*` instead of `gc_*` (#1680).
+- Upgrade note: the volume-key protections hold only while every broker on the host runs 0.8.98 or later. An older binary may prune a protected key; the record that needed it is then refused, never accepted (#1680).
+
+### Added
+
+- Counters `retirement_ownership_reproved`, `retirement_ownership_reproof_refused`, `retirement_ownership_reproof_unavailable`, `preparation_rotation_debt_volume_binding_evicted` and `preparation_rotation_volume_key_cap_reached`, and the timed phase `retirement_ownership_reproof_registration` (#1680).
+- Documentation states when a disk that reuses a device slot is refused and when an exact identity is accepted without a volume UUID check (#1680).
+
 ## [0.8.97] - 2026-11-15
 
 ### Fixed
