@@ -1746,6 +1746,9 @@ fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageErr
     // Nobody waits on this process: drop to background CPU and I/O priority
     // before anything else runs, so every later child inherits it.
     let priority = crate::gc::lower_artifact_worker_priority();
+    // This worker removes checkouts unattended: its Git is probed here, never
+    // taken from the per-user probe cache.
+    crate::git::require_fresh_git_probe();
     let requested_root = std::fs::canonicalize(&parsed.positional[1]).map_err(|error| {
         UsageError::Message(format!(
             "cannot resolve automatic artifact continuation repository: {error}"

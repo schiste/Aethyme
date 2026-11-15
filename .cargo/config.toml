@@ -23,6 +23,13 @@ AETHYME_TEST_AVAILABLE_BYTES = "1099511627776"
 # repository, and a test that picks a root under the temp dir keeps it.
 AETHYME_TEST_CONTAIN_WORKTREES = "1"
 
+# Test-only: never read or write the developer's per-user Git probe verdict
+# cache. Child processes the suites spawn rely on starting with an unprobed
+# Git program, and a test must not leave verdicts in the host's real cache.
+# Tests of the cache itself name their own file. See
+# `aethyme-broker/src/git_probe_cache.rs`.
+AETHYME_GIT_PROBE_CACHE = "off"
+
 # Exact root fingerprint for the source-identity build scripts. This keeps a
 # shared Cargo target correct across worktrees. Invocations from outside the
 # repository must pass this file with `--config` to retain warm reuse; without

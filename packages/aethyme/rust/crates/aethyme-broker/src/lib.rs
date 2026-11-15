@@ -62,6 +62,7 @@ mod duplicate_work;
 pub mod exit_status;
 mod resource_pressure;
 mod root_generation;
+mod system_programs;
 // The T03 mapping adapter is compiled for the experimental contract tests but is not activated by a provider.
 #[allow(dead_code)]
 pub mod experimental_symbol_mapping;
@@ -110,6 +111,7 @@ mod gc;
 mod gh_ref_guard;
 mod git;
 mod git_maintenance_lock;
+mod git_probe_cache;
 mod github_target;
 mod graph_impact;
 mod graph_impact_envelope;

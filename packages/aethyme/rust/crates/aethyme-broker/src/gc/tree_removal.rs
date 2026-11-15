@@ -387,6 +387,7 @@ mod unix {
         }
 
         pub(super) fn open_optional(path: &Path) -> io::Result<Option<Self>> {
+            crate::git::ensure_fresh_git_verdict_io()?; // every pinned removal: never on a cached Git verdict
             let absolute = if path.is_absolute() {
                 path.to_path_buf()
             } else {

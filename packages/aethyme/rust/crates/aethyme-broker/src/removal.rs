@@ -74,7 +74,21 @@ pub(crate) fn tree_size(path: &Path) -> u64 {
 /// actually freed rather than only whole successes.
 ///
 /// Already-absent counts as removed: the caller wanted the path gone and it is.
+///
+/// Refuses (nothing removed, `error` set) unless this process's Git verdict
+/// was proven by a probe it ran: callers delete on Git evidence (a checkout
+/// judged clean, a directory judged ignored), and a primitive every deleter
+/// shares is the one place a new caller cannot forget the check. One fresh
+/// probe per process is cheap next to a recursive removal.
 pub(crate) fn remove_tree(path: &Path) -> RemovalOutcome {
+    if let Err(error) = crate::git::ensure_fresh_git_verdict() {
+        return RemovalOutcome {
+            freed_bytes: 0,
+            removed: false,
+            error: Some(error.to_string()),
+            attempts: 0,
+        };
+    }
     remove_tree_with(path, |target| std::fs::remove_dir_all(target))
 }
 

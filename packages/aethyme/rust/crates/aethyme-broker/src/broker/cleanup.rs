@@ -4802,6 +4802,8 @@ impl Broker {
                 reason: "the orphan identity changed before removal; preserved the checkout".into(),
             });
         }
+        // A recursive removal never rests on a cached Git probe verdict.
+        crate::git::ensure_fresh_git_verdict()?;
         let outcome = crate::removal::remove_tree(worktree_path);
         if !outcome.removed {
             return Err(BrokerOpError::DirtyWorktree {

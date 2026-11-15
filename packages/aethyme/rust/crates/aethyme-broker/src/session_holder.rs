@@ -127,7 +127,7 @@ impl ProcessTable {
     /// Snapshot the host's process table, or `None` when the complete
     /// observation is unavailable. Never parse a timed-out or truncated prefix.
     pub fn snapshot() -> Option<Self> {
-        let mut command = Command::new("ps");
+        let mut command = Command::new(crate::system_programs::ps());
         command.args(["-A", "-o", "pid=,ppid=,lstart=,args="]);
         Self::snapshot_with_budget(
             &mut command,
