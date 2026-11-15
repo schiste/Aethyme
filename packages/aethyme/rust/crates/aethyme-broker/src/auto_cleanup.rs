@@ -17652,9 +17652,9 @@ mod tests {
         assert!(take(host.path()).is_some(), "free for the other worker");
     }
 
-    /// A lap group (no merged pull request, no due cleanup request) whose
-    /// removal a busy host deleter slot put off is judged first again: the
-    /// lap cursor goes back before it, and the next slice removes it.
+    /// A group whose removal a busy host deleter slot put off is judged
+    /// again by the next slice: the lap cursor is never left past it, and
+    /// the next slice removes it.
     #[cfg(unix)]
     #[test]
     fn a_lap_group_put_off_by_a_busy_slot_is_judged_first_again() {
@@ -17664,11 +17664,6 @@ mod tests {
         let (_owner, _storage, mut broker) =
             landed_lane_fixture(Some("[worktrees]\nmax_checkouts = 0\n"));
         let (session, worktree) = closed_landed_checkout(&mut broker, "lap group put off");
-        broker
-            .store()
-            .connection()
-            .execute("DELETE FROM closed_checkout_cleanup_requests", [])
-            .unwrap();
         while !broker
             .refresh_cleanup_cohort_aliases(None)
             .unwrap()
@@ -17704,7 +17699,6 @@ mod tests {
             Some("host_deleter_busy"),
             "{busy:#?}"
         );
-        assert_eq!(busy.priority_examined, 0, "a lap group: {busy:#?}");
         assert_eq!(busy.host_slot_busy, 1, "{busy:#?}");
         let position = broker.capacity_removal_lap_position().unwrap();
         assert!(
@@ -17720,6 +17714,71 @@ mod tests {
         let removed = broker.last_capacity_removal_slice().unwrap();
         assert_eq!(removed.removed, 1, "{removed:#?}");
         assert!(!worktree.exists());
+    }
+
+    /// A put-off group the lap had already passed has its priority memo
+    /// entry dropped and the lap cursor moved back before it, so the lap
+    /// reaches it again first.
+    #[cfg(unix)]
+    #[test]
+    fn a_put_off_group_moves_the_lap_cursor_back_before_it() {
+        let (_owner, _storage, mut broker, sessions) = closed_priority_fixture(3);
+        broker
+            .auto_cleanup_plan_with_group_inspector_limited(
+                None,
+                1,
+                super::RemovalSelection::Probe,
+                false,
+                |_, group, _, _, _| {
+                    Ok(AutoCleanupGroupInspection::Kept(super::AutoKeptCheckout {
+                        worktree: group.worktree.to_string_lossy().into_owned(),
+                        sessions: group.sessions.iter().map(|session| session.id).collect(),
+                        reason: "injected inspection".into(),
+                        ..Default::default()
+                    }))
+                },
+            )
+            .unwrap();
+        let passed = broker.capacity_removal_lap_position().unwrap();
+        assert_eq!(passed.after_session_id, sessions[2].id, "{passed:?}");
+        let middle = std::fs::canonicalize(&sessions[1].worktree_path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let mut memo = super::PriorityMemo::decode(None);
+        memo.remember(
+            middle.clone(),
+            true,
+            super::PriorityOutcome::Selected,
+            now_ms(),
+        );
+        broker
+            .store()
+            .meta_set(
+                super::PRIORITY_MEMO_KEY,
+                &serde_json::to_string(&memo).unwrap(),
+            )
+            .unwrap();
+
+        broker
+            .judge_put_off_groups_first(&[(middle.clone(), sessions[1].id)])
+            .unwrap();
+        let rewound = broker.capacity_removal_lap_position().unwrap();
+        assert_eq!(rewound.after_session_id, sessions[1].id - 1, "{rewound:?}");
+        assert!(rewound.lap_remaining >= 2, "{rewound:?}");
+        let memo = super::PriorityMemo::decode(
+            broker
+                .store()
+                .meta_get(super::PRIORITY_MEMO_KEY)
+                .unwrap()
+                .as_deref(),
+        );
+        assert!(!memo.entries.contains_key(&middle), "{memo:?}");
+        // A group the lap has not reached yet leaves the cursor alone.
+        broker
+            .judge_put_off_groups_first(&[(String::new(), sessions[2].id)])
+            .unwrap();
+        assert_eq!(broker.capacity_removal_lap_position().unwrap(), rewound);
     }
 
     /// A hard retry set while a worker run is going (a held lock, memory

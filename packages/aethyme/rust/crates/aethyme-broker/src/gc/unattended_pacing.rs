@@ -865,7 +865,8 @@ impl UnattendedPacer {
                 // over like a tree removal, and pays the rest without it if
                 // another worker takes it: the deletion it pays for is over.
                 if self.hand_over_if_held_too_long(deadline) {
-                    let _ = self.take_host_slot(deadline, HOST_DELETER_ACQUIRE_WAIT);
+                    // Busy is counted and the charge goes on without it.
+                    self.take_host_slot(deadline, HOST_DELETER_ACQUIRE_WAIT);
                 }
                 if self.checked_wait(deadline, LOAD_BATCH_WAIT) == PressureVerdict::MemoryBackoff {
                     return false;
