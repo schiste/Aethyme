@@ -1047,10 +1047,60 @@ pub(crate) fn running_session_gates(main_root: &Path, session_id: i64) -> Vec<St
 pub(crate) fn checked_running_session_gates_until(
     main_root: &Path,
     session_id: i64,
-    mut expired: impl FnMut() -> bool,
+    expired: impl FnMut() -> bool,
     entry_budget: usize,
 ) -> Option<Vec<String>> {
-    if session_id <= 0 || expired() {
+    if session_id <= 0 {
+        return None;
+    }
+    checked_session_gate_inventory_until(main_root, expired, entry_budget, |session| {
+        session == session_id
+    })?
+    .session(session_id)
+}
+
+/// The same checked evidence as [`checked_running_session_gates_until`], for
+/// every session at once: one read of the run directory under one stable
+/// directory version. A session whose own records are malformed, unreadable
+/// or unverifiable is unknown on its own; a directory that changed, could not
+/// be read, or held a name that is not UTF-8 makes the whole inventory
+/// unknown (`None`).
+pub(crate) fn checked_session_gate_inventory_all_until(
+    main_root: &Path,
+    expired: impl FnMut() -> bool,
+    entry_budget: usize,
+) -> Option<CheckedSessionGates> {
+    checked_session_gate_inventory_until(main_root, expired, entry_budget, |_| true)
+}
+
+/// Checked running gates per session, from one read of the run directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CheckedSessionGates {
+    /// Sessions with at least one pidfile read; `None` is unknown.
+    sessions: std::collections::BTreeMap<i64, Option<Vec<String>>>,
+}
+
+impl CheckedSessionGates {
+    /// The gates running for `session_id`: empty when it has no pidfile,
+    /// `None` when its records could not be verified.
+    pub(crate) fn session(&self, session_id: i64) -> Option<Vec<String>> {
+        if session_id <= 0 {
+            return None;
+        }
+        match self.sessions.get(&session_id) {
+            None => Some(Vec::new()),
+            Some(gates) => gates.clone(),
+        }
+    }
+}
+
+fn checked_session_gate_inventory_until(
+    main_root: &Path,
+    mut expired: impl FnMut() -> bool,
+    entry_budget: usize,
+    wanted: impl Fn(i64) -> bool,
+) -> Option<CheckedSessionGates> {
+    if expired() {
         return None;
     }
     let mut directories = Vec::new();
@@ -1084,15 +1134,14 @@ pub(crate) fn checked_running_session_gates_until(
                 {
                     return None;
                 }
-                return (!expired()).then(Vec::new);
+                return (!expired()).then(CheckedSessionGates::default);
             }
             _ => return None,
         }
     }
     let run_dir = running_dir(main_root);
     let entries = std::fs::read_dir(&run_dir).ok()?;
-    let prefix = format!("{session_id}-");
-    let mut running = Vec::new();
+    let mut inventory = CheckedSessionGates::default();
     for (seen, entry) in entries.enumerate() {
         if expired() || seen >= entry_budget {
             return None;
@@ -1100,23 +1149,54 @@ pub(crate) fn checked_running_session_gates_until(
         let entry = entry.ok()?;
         let name = entry.file_name();
         let name = name.to_str()?;
-        let Some(gate) = name
-            .strip_prefix(&prefix)
-            .and_then(|rest| rest.strip_suffix(".pid"))
+        let Some((session, gate)) = name
+            .strip_suffix(".pid")
+            .and_then(|stem| stem.split_once('-'))
         else {
             continue;
         };
-        if gate.is_empty() {
-            return None;
+        // Only a positive decimal session id is a session pidfile, exactly
+        // as the `<session>-` prefix match of a single-session read.
+        let Some(session) = (!session.starts_with('0')
+            && session.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| session.parse::<i64>().ok())
+        .flatten()
+        .filter(|session| *session > 0) else {
+            continue;
+        };
+        if !wanted(session) {
+            continue;
         }
-        let record = read_gate_pidfile_with_parser_until(
+        let slot = inventory
+            .sessions
+            .entry(session)
+            .or_insert_with(|| Some(Vec::new()));
+        if gate.is_empty() {
+            *slot = None;
+            continue;
+        }
+        let record = match read_gate_pidfile_with_parser_until(
             &entry.path(),
             &mut expired,
             parse_checked_gate_pid_record,
-        )
-        .ok()??;
-        if checked_gate_record_active(&record)? {
-            running.push(gate.to_string());
+        ) {
+            Ok(Some(record)) => record,
+            Ok(None) | Err(()) => {
+                if expired() {
+                    return None;
+                }
+                *slot = None;
+                continue;
+            }
+        };
+        match checked_gate_record_active(&record) {
+            Some(true) => {
+                if let Some(running) = slot.as_mut() {
+                    running.push(gate.to_string());
+                }
+            }
+            Some(false) => {}
+            None => *slot = None,
         }
     }
     // Recheck the complete path version, including ancestors, so a transient
@@ -1130,8 +1210,10 @@ pub(crate) fn checked_running_session_gates_until(
             return None;
         }
     }
-    running.sort();
-    (!expired()).then_some(running)
+    for running in inventory.sessions.values_mut().flatten() {
+        running.sort();
+    }
+    (!expired()).then_some(inventory)
 }
 
 fn same_gate_directory_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
@@ -2362,7 +2444,12 @@ impl GateOwnerLocks {
         paths.sort();
         paths.dedup();
 
-        let mut locks = Vec::with_capacity(paths.len());
+        // Every lock goes into the guard as soon as it is taken, so a later
+        // lock that times out or fails still clears the holder lines of the
+        // ones already taken before they are released.
+        let mut acquired = Self {
+            locks: Vec::with_capacity(paths.len()),
+        };
         for path in paths {
             let started = Instant::now();
             let mut next_report = Duration::ZERO;
@@ -2415,14 +2502,45 @@ impl GateOwnerLocks {
                     .unwrap_or(OWNER_LOCK_POLL);
                 std::thread::sleep(sleep);
             };
-            lock.record_holder(holder)?;
-            locks.push(lock);
+            acquired.locks.push(lock);
+            acquired
+                .locks
+                .last()
+                .expect("the lock was just pushed")
+                .record_holder(holder)?;
         }
-        Ok(Self { locks })
+        Ok(acquired)
     }
 }
 
 const OWNER_LOCK_POLL: Duration = Duration::from_millis(250);
+
+/// Hold one owner lock of `main_root` with the holder line this binary
+/// writes for `worker` running in `checkout`, until the returned guard drops.
+#[cfg(test)]
+pub(crate) fn hold_gate_owner_lock_for_tests(
+    main_root: &Path,
+    gate_name: &str,
+    worker: &str,
+    checkout: Option<&Path>,
+) -> Box<dyn std::any::Any> {
+    struct Quiet;
+    impl GateProgressSink for Quiet {
+        fn report(&self, _line: &str) {}
+    }
+    Box::new(
+        GateOwnerLocks::acquire(
+            &running_dir(main_root).join("owners"),
+            gate_name,
+            &[],
+            &gate_owner_holder_record(worker, 1, checkout),
+            Duration::from_secs(60),
+            &Quiet,
+            (main_root, None),
+        )
+        .expect("take a test owner lock"),
+    )
+}
 
 /// Who an owner lock file says holds it: `session 812 for 3m10s`.
 fn describe_owner_lock_holder(path: &Path) -> String {
@@ -8073,6 +8191,77 @@ mod tests {
             running_gate_witnesses_until(root.path(), || false, None)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_partial_owner_lock_acquisition_clears_the_lines_it_wrote() {
+        let root = tempfile::tempdir().unwrap();
+        let owners = running_dir(root.path()).join("owners");
+        let quiet = Lines::default();
+        let checkout = root.path().join("checkout");
+        // Hold the second scope's lock: the first is taken, the second times out.
+        let blocker = GateOwnerLocks::acquire(
+            &owners,
+            "unit",
+            &["b".to_string()],
+            "s9-unit since=1",
+            Duration::from_secs(60),
+            &quiet,
+            (root.path(), Some(9)),
+        )
+        .unwrap();
+        let error = GateOwnerLocks::acquire_bounded(
+            &owners,
+            "unit",
+            &["a".to_string(), "b".to_string()],
+            &gate_owner_holder_record("s12-unit", 1, Some(&checkout)),
+            Duration::from_secs(60),
+            &quiet,
+            (root.path(), Some(12)),
+            Some(Instant::now() + Duration::from_millis(600)),
+        )
+        .err()
+        .expect("the second lock times out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let first = gate_owner_lock_paths(&owners, "unit", &["a".to_string()]).remove(0);
+        assert!(first.is_file(), "the first lock was taken");
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            "",
+            "a lock released after a partial acquisition keeps no holder line"
+        );
+        drop(blocker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_session_inventory_reads_every_session_once_and_matches_the_single_session_read() {
+        let root = tempfile::tempdir().unwrap();
+        let run_dir = running_dir(root.path());
+        let me = std::process::id() as i32;
+        write_gate_pidfile(&run_dir.join("7-unit.pid"), &pid_record(me, None)).unwrap();
+        std::fs::write(run_dir.join("8-unit.pid"), "malformed").unwrap();
+        // Not session pidfiles: a leading zero, a non-numeric owner.
+        std::fs::write(run_dir.join("07-unit.pid"), "malformed").unwrap();
+        std::fs::write(run_dir.join("cargo-test.pid"), "malformed").unwrap();
+        let inventory = checked_session_gate_inventory_all_until(root.path(), || false, 64)
+            .expect("a stable directory reads");
+        for session in [7, 8, 9] {
+            assert_eq!(
+                inventory.session(session),
+                checked_running_session_gates_until(root.path(), session, || false, 64),
+                "session {session}"
+            );
+        }
+        assert_eq!(inventory.session(7), Some(vec!["unit".to_string()]));
+        assert_eq!(inventory.session(8), None);
+        assert_eq!(inventory.session(9), Some(Vec::new()));
+        assert_eq!(inventory.session(0), None);
+        assert_eq!(
+            checked_session_gate_inventory_all_until(root.path(), || false, 2),
+            None,
+            "an exhausted entry budget is unknown"
         );
     }
 

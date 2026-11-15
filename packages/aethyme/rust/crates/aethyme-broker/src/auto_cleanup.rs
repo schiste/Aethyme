@@ -234,6 +234,10 @@ const SESSION_GATE_INVENTORY_ENTRY_BUDGET: usize = 4096;
 #[derive(Default)]
 struct GateWitnessSnapshot {
     witnesses: Option<Vec<ResolvedGateWitness>>,
+    /// The strict per-session inventory, read with the witnesses' freshness:
+    /// once per selection pass, fresh for each checkout at revalidation. The
+    /// inner `None` is an inventory that could not complete (unknown).
+    session_inventory: Option<Option<crate::gates::CheckedSessionGates>>,
     stats: AutoCleanupGateChecks,
     elapsed: Duration,
 }
@@ -376,13 +380,19 @@ impl GateWitnessSnapshot {
         // The strict per-session inventory guarded retirement uses: it also
         // counts a gate whose leader exited while its process group lives on,
         // and anything it cannot read or verify is unknown, never "idle".
-        for &session in cohort {
-            match crate::gates::checked_running_session_gates_until(
+        let inventory = self.session_inventory.get_or_insert_with(|| {
+            crate::gates::checked_session_gate_inventory_all_until(
                 main_root,
-                session,
                 || false,
                 SESSION_GATE_INVENTORY_ENTRY_BUDGET,
-            ) {
+            )
+        });
+        let mut inventory_unknown = false;
+        for &session in cohort {
+            let gates = inventory
+                .as_ref()
+                .and_then(|inventory| inventory.session(session));
+            match gates {
                 Some(gates) if gates.is_empty() => {}
                 Some(gates) => {
                     return Some(format!(
@@ -391,6 +401,7 @@ impl GateWitnessSnapshot {
                     ));
                 }
                 None => {
+                    inventory_unknown = true;
                     unknown = unknown.or_else(|| {
                         Some(format!(
                             "the gate records of session {session} could not be verified"
@@ -398,6 +409,10 @@ impl GateWitnessSnapshot {
                     });
                 }
             }
+        }
+        if inventory_unknown {
+            self.stats.inventory_unknown = self.stats.inventory_unknown.saturating_add(1);
+            crate::phase_telemetry::add("auto_cleanup_gate_inventory_unknown", Duration::ZERO);
         }
         if let Some(evidence) = path {
             return Some(format!("{GATE_RUNNING_PATH}: {evidence}"));
@@ -1334,6 +1349,11 @@ pub struct AutoCleanupGateChecks {
     /// Witnesses whose checkout no record identifies (an older binary's
     /// record, an unreadable or malformed one); each still keeps the checkout.
     pub unknown_owner: usize,
+    /// Checks whose strict per-session inventory of the checkout's own
+    /// sessions came back unknown (the run directory changed during the
+    /// read, or a record could not be verified); each keeps the checkout.
+    #[serde(default)]
+    pub inventory_unknown: usize,
     /// Time the gate checks took, including the reads.
     pub elapsed_ms: u64,
 }
@@ -1352,6 +1372,9 @@ impl AutoCleanupGateChecks {
             .attributed_elsewhere
             .saturating_add(other.attributed_elsewhere);
         self.unknown_owner = self.unknown_owner.saturating_add(other.unknown_owner);
+        self.inventory_unknown = self
+            .inventory_unknown
+            .saturating_add(other.inventory_unknown);
         self.elapsed_ms = self.elapsed_ms.saturating_add(other.elapsed_ms);
     }
 }
@@ -8114,6 +8137,131 @@ mod tests {
                 || reason.starts_with(GATE_RUNNING_UNKNOWN_OWNER),
             "{reason}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_checkout_that_cannot_be_resolved_is_owner_unknown() {
+        use super::{GateAttribution, attribute_gate_witness};
+        use crate::gates::{GateWitnessCheckout, RunningGateWitness};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let candidate_path = temporary.path().join("checkout");
+        std::fs::create_dir_all(&candidate_path).unwrap();
+        let file = temporary.path().join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        // A path through a regular file fails with ENOTDIR, not NotFound.
+        let unresolvable = file.join("checkout");
+        let witness = RunningGateWitness {
+            evidence: "gate pidfile 8-unit.pid names running process 1".into(),
+            session_id: Some(8),
+            checkout: GateWitnessCheckout::Recorded(unresolvable.clone()),
+        };
+        let resolved = ResolvedWorktreePath::resolve(&unresolvable);
+        assert_eq!(
+            attribute_gate_witness(
+                &witness,
+                Some(&resolved),
+                &ResolvedWorktreePath::resolve(&candidate_path),
+                &[7],
+            ),
+            GateAttribution::Unknown
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_own_session_inventory_decides_when_no_witness_does() {
+        use super::{GATE_RUNNING_OWN_SESSION, GATE_RUNNING_UNKNOWN_OWNER, GateWitnessSnapshot};
+        use crate::gates::running_dir;
+
+        let root = tempfile::tempdir().unwrap();
+        let candidate_path = root.path().join("checkout");
+        std::fs::create_dir_all(&candidate_path).unwrap();
+        let candidate = ResolvedWorktreePath::resolve(&candidate_path);
+        let run_dir = running_dir(root.path());
+        std::fs::create_dir_all(&run_dir).unwrap();
+        // A leader that has exited, in a process group that is still alive
+        // (this test's own): no witness sees it running, the strict inventory
+        // does.
+        let mut child = Command::new("true").spawn().unwrap();
+        let dead_leader = child.id();
+        child.wait().unwrap();
+        // SAFETY: getpgrp takes no arguments and cannot fail.
+        let group = unsafe { libc::getpgrp() };
+        assert!(group > 1);
+        std::fs::write(
+            run_dir.join("7-unit.pid"),
+            format!("{group} tree {dead_leader} - -"),
+        )
+        .unwrap();
+        let mut snapshot = GateWitnessSnapshot::default();
+        let reason = snapshot.keep_reason(root.path(), &candidate, &[7]).unwrap();
+        assert!(
+            reason.starts_with(&format!(
+                "{GATE_RUNNING_OWN_SESSION}: session 7 is running gate unit"
+            )),
+            "{reason}"
+        );
+        assert_eq!(snapshot.stats.gates_seen, 0, "no witness decided it");
+        assert_eq!(
+            snapshot.keep_reason(root.path(), &candidate, &[8]),
+            None,
+            "another session's gate record does not keep this checkout"
+        );
+        std::fs::remove_file(run_dir.join("7-unit.pid")).unwrap();
+
+        // A record of the checkout's own session the inventory cannot verify
+        // (no gate name) and no witness sees running: unknown keeps.
+        std::fs::write(
+            run_dir.join("7-.pid"),
+            format!("{dead_leader} tree {dead_leader} - -"),
+        )
+        .unwrap();
+        let mut snapshot = GateWitnessSnapshot::default();
+        let reason = snapshot.keep_reason(root.path(), &candidate, &[7]).unwrap();
+        assert!(reason.starts_with(GATE_RUNNING_UNKNOWN_OWNER), "{reason}");
+        assert_eq!(snapshot.stats.gates_seen, 0, "no witness decided it");
+        assert_eq!(snapshot.stats.inventory_unknown, 1);
+        assert_eq!(snapshot.keep_reason(root.path(), &candidate, &[8]), None);
+        assert_eq!(
+            snapshot.stats.inventory_unknown, 1,
+            "only the checkout whose own session is unverifiable counts"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_held_owner_lock_keeps_only_the_checkout_its_line_names() {
+        use super::{GATE_RUNNING_PATH, GATE_RUNNING_UNKNOWN_OWNER, GateWitnessSnapshot};
+        use crate::gates::hold_gate_owner_lock_for_tests;
+
+        let root = tempfile::tempdir().unwrap();
+        let candidate_path = root.path().join("checkout");
+        let elsewhere_path = root.path().join("checkout-2");
+        std::fs::create_dir_all(&candidate_path).unwrap();
+        std::fs::create_dir_all(&elsewhere_path).unwrap();
+        let candidate = ResolvedWorktreePath::resolve(&candidate_path);
+
+        let held =
+            hold_gate_owner_lock_for_tests(root.path(), "unit", "s41-unit", Some(&elsewhere_path));
+        let mut snapshot = GateWitnessSnapshot::default();
+        assert_eq!(snapshot.keep_reason(root.path(), &candidate, &[7]), None);
+        assert_eq!(snapshot.stats.attributed_elsewhere, 1);
+        drop(held);
+
+        let held =
+            hold_gate_owner_lock_for_tests(root.path(), "unit", "p77-unit", Some(&candidate_path));
+        let mut snapshot = GateWitnessSnapshot::default();
+        let reason = snapshot.keep_reason(root.path(), &candidate, &[7]).unwrap();
+        assert!(reason.starts_with(GATE_RUNNING_PATH), "{reason}");
+        drop(held);
+
+        let held = hold_gate_owner_lock_for_tests(root.path(), "unit", "p77-unit", None);
+        let mut snapshot = GateWitnessSnapshot::default();
+        let reason = snapshot.keep_reason(root.path(), &candidate, &[7]).unwrap();
+        assert!(reason.starts_with(GATE_RUNNING_UNKNOWN_OWNER), "{reason}");
+        drop(held);
     }
 
     #[cfg(unix)]

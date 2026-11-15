@@ -832,6 +832,42 @@ fn a_gate_in_the_main_checkout_keeps_only_a_checkout_nested_inside_it() {
     }
 }
 
+/// Selection's read of the gate records only selects: the revalidation
+/// immediately before removal reads them again, so a gate recorded in the
+/// checkout after selection keeps it.
+#[cfg(unix)]
+#[test]
+fn removal_rereads_the_gate_records_after_selection() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let plan = broker
+        .auto_cleanup_plan_now(None)
+        .unwrap()
+        .expect("no other GC holds the lock");
+    let canonical = std::fs::canonicalize(&worktree).unwrap();
+    assert!(
+        plan.selected_worktrees()
+            .iter()
+            .any(|selected| Path::new(selected) == canonical || Path::new(selected) == worktree),
+        "{:?}",
+        plan.selected_worktrees()
+    );
+    write_gate_pidfile(&fx, "987654-cargo-test.pid", Some(&canonical));
+    let report = broker
+        .auto_cleanup_apply_now(plan)
+        .unwrap()
+        .expect("no other GC holds the lock");
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(
+        kept_reason(&report, &worktree)
+            .contains("changed before removal: a gate may be running (this checkout's path)"),
+        "{report:#?}"
+    );
+    assert_eq!(kept_gate_keep(&report, &worktree).as_deref(), Some("path"));
+    assert!(worktree.exists());
+}
+
 #[test]
 fn a_process_in_the_checkout_keeps_it() {
     let fx = fixture();
