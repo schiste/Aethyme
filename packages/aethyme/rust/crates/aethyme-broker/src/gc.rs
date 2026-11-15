@@ -368,8 +368,13 @@ pub(crate) enum CapacitySliceStop {
     SliceDeadline,
     /// A foreground command was waiting for the GC lock.
     YieldedToForeground,
-    /// A pass selected nothing to remove.
+    /// A pass selected nothing to remove and moved neither the lap cursor
+    /// nor the priority lane on (or, under pressure, any pass that selected
+    /// nothing).
     NothingSelected,
+    /// Steady removal: a pass that selected nothing reached the end of the
+    /// closed-checkout lap.
+    LapComplete,
     /// Its allowance of passes that removed nothing ran out.
     KeptOnlyLimit,
     /// Another process held the GC lock.
@@ -383,13 +388,14 @@ pub(crate) enum CapacitySliceStop {
 
 impl CapacitySliceStop {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::Cap,
         Self::Budget,
         Self::PacerBackoff,
         Self::SliceDeadline,
         Self::YieldedToForeground,
         Self::NothingSelected,
+        Self::LapComplete,
         Self::KeptOnlyLimit,
         Self::LockBusy,
         Self::Failed,
@@ -404,6 +410,7 @@ impl CapacitySliceStop {
             Self::SliceDeadline => "slice_deadline",
             Self::YieldedToForeground => "yielded_to_foreground",
             Self::NothingSelected => "nothing_selected",
+            Self::LapComplete => "lap_complete",
             Self::KeptOnlyLimit => "kept_only_limit",
             Self::LockBusy => "lock_busy",
             Self::Failed => "failed",
@@ -421,6 +428,7 @@ impl CapacitySliceStop {
                 "artifact_worker_capacity_removal_stop_yielded_to_foreground"
             }
             Self::NothingSelected => "artifact_worker_capacity_removal_stop_nothing_selected",
+            Self::LapComplete => "artifact_worker_capacity_removal_stop_lap_complete",
             Self::KeptOnlyLimit => "artifact_worker_capacity_removal_stop_kept_only_limit",
             Self::LockBusy => "artifact_worker_capacity_removal_stop_lock_busy",
             Self::Failed => "artifact_worker_capacity_removal_stop_failed",
@@ -577,7 +585,12 @@ const ARTIFACT_WORKER_STEADY_REMOVAL_SLICE: Duration = Duration::from_secs(60);
 /// After a steady slice that removed something: the next one may run a
 /// minute later, so more landed checkouts go at a gentle background rate.
 const ARTIFACT_WORKER_STEADY_REMOVED_RETRY_MS: i64 = 60_000;
-/// After the first steady slice in a row that removed nothing.
+/// After a steady slice that removed nothing but moved the lap on without
+/// reaching its end: the rest of the lap is judged a minute later instead of
+/// waiting out the idle back-off.
+const ARTIFACT_WORKER_STEADY_LAP_UNFINISHED_RETRY_MS: i64 = 60_000;
+/// After the first steady slice in a row that reached the end of the lap
+/// (or could not move it) with nothing removed.
 const ARTIFACT_WORKER_STEADY_IDLE_RETRY_MS: i64 = 5 * 60_000;
 /// The longest wait between steady slices that keep removing nothing.
 const ARTIFACT_WORKER_STEADY_IDLE_RETRY_MAX_MS: i64 = 30 * 60_000;
@@ -596,8 +609,9 @@ const ARTIFACT_WORKER_STEADY_REMOVAL_HARD_RETRY_AFTER_KEY: &str =
 const ARTIFACT_WORKER_STEADY_REMOVAL_LAST_RUN_KEY: &str =
     "gc.artifact_sweep.steady_removal_last_run_ms";
 
-/// The wait after the `streak`-th consecutive steady slice that removed
-/// nothing: 5, 10, 20, then 30 minutes.
+/// The wait after the `streak`-th consecutive steady slice that finished
+/// the lap (or could not move it) with nothing removed: 5, 10, 20, then 30
+/// minutes.
 fn steady_idle_retry_ms(streak: u32) -> i64 {
     let doublings = streak.saturating_sub(1).min(3);
     (ARTIFACT_WORKER_STEADY_IDLE_RETRY_MS << doublings)
@@ -606,14 +620,49 @@ fn steady_idle_retry_ms(streak: u32) -> i64 {
 
 /// The wait before the next steady slice, before the stop's own floor
 /// ([`capacity_stop_retry_ms`]): a minute after a removal, the short lock
-/// back-off when the GC lock was contended, otherwise the idle ladder.
-fn steady_removal_retry_ms(removed: usize, lock_contended: bool, idle_streak: u32) -> i64 {
+/// back-off when the GC lock was contended, a minute while the lap is
+/// unfinished and still moving, otherwise (the lap ended, or did not move)
+/// the idle ladder.
+fn steady_removal_retry_ms(
+    removed: usize,
+    lock_contended: bool,
+    lap_idle: bool,
+    idle_streak: u32,
+) -> i64 {
     if removed > 0 {
         ARTIFACT_WORKER_STEADY_REMOVED_RETRY_MS
     } else if lock_contended {
         ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS
+    } else if !lap_idle {
+        ARTIFACT_WORKER_STEADY_LAP_UNFINISHED_RETRY_MS
     } else {
         steady_idle_retry_ms(idle_streak)
+    }
+}
+
+/// Whether a steady slice that removed nothing counts toward the idle
+/// back-off: its passes reached the end of the lap, or none of them moved
+/// the lap cursor or judged anything (an inventory that cannot progress must
+/// not wake the worker every minute).
+fn steady_slice_lap_idle(lap_completed: bool, lap_progressed: bool) -> bool {
+    lap_completed || !lap_progressed
+}
+
+/// What a steady pass that selected nothing does next: stop at the end of
+/// the lap, go on while it moved the lap cursor or judged a checkout (each
+/// judged group is behind the cursor or in the priority memo, so the next
+/// pass judges others), and stop otherwise.
+fn steady_pass_continues(
+    lap_ended: bool,
+    cursor_moved: bool,
+    examined: usize,
+) -> Option<CapacitySliceStop> {
+    if lap_ended {
+        Some(CapacitySliceStop::LapComplete)
+    } else if cursor_moved || examined > 0 {
+        None
+    } else {
+        Some(CapacitySliceStop::NothingSelected)
     }
 }
 
@@ -8484,6 +8533,12 @@ impl Broker {
         let mut inventory_unavailable = false;
         let mut probe_ms = 0u64;
         let mut inventory_wait = None;
+        let mut memo_skips = 0usize;
+        let mut priority_memo_skips = 0usize;
+        // Steady only: a pass reached the end of the lap, and some pass moved
+        // the lap cursor or judged a checkout.
+        let mut lap_completed = false;
+        let mut lap_progressed = false;
         // When the last pass returned and how long it held the GC lock.
         let mut last_pass: Option<(Instant, Duration)> = None;
         let pre_selection_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -8525,6 +8580,12 @@ impl Broker {
                 break CapacitySliceStop::Budget;
             }
             crate::auto_cleanup::take_git_removal_time();
+            let lap_before = if trigger == CheckoutRemovalTrigger::Steady {
+                let position = self.capacity_removal_lap_position()?;
+                Some((position.after_session_id, position.high_water_session_id))
+            } else {
+                None
+            };
             let pass_started = Instant::now();
             let pass = {
                 let _span = crate::phase_telemetry::span("artifact_worker_capacity_removal");
@@ -8557,7 +8618,22 @@ impl Broker {
             lock_held += pass_elapsed;
             last_pass = Some((Instant::now(), pass_elapsed));
             passes += 1;
+            crate::phase_telemetry::add("artifact_worker_capacity_removal_pass", Duration::ZERO);
             let pass_lanes = pass.lanes.unwrap_or_default();
+            memo_skips += pass_lanes.removal_memo_skips;
+            priority_memo_skips += pass_lanes.removal_priority_memo_skips;
+            // Steady: where the lap stands after this pass.
+            let mut lap_ended = false;
+            let mut cursor_moved = false;
+            if let Some(before) = lap_before {
+                let after = self.capacity_removal_lap_position()?;
+                lap_ended = !pass_lanes.removal_inventory_unavailable
+                    && after.index_complete
+                    && after.lap_remaining == 0;
+                cursor_moved = before != (after.after_session_id, after.high_water_session_id);
+                lap_completed |= lap_ended;
+                lap_progressed |= cursor_moved || pass_lanes.removal_examined > 0;
+            }
             examined += pass_lanes.removal_examined;
             selected += pass_lanes.removal_selected;
             scan_ms = scan_ms.saturating_add(pass_lanes.removal_scan_ms);
@@ -8648,8 +8724,19 @@ impl Broker {
             // the next pass moves on instead of ending the slice on it. A
             // kept checkout costs none of the removal allowance, but such
             // passes are bounded by `kept_only_passes`.
+            // A steady pass that selected nothing but moved the lap on is
+            // progress, not an empty slice: the slice goes on (within its
+            // budget, the lock gap, the foreground yield and the pacer, all
+            // checked again before the next pass) until the lap ends.
             if removed_now == 0 && pass_lanes.removal_selected == 0 {
-                break CapacitySliceStop::NothingSelected;
+                if lap_before.is_none() {
+                    break CapacitySliceStop::NothingSelected;
+                }
+                if let Some(stop) =
+                    steady_pass_continues(lap_ended, cursor_moved, pass_lanes.removal_examined)
+                {
+                    break stop;
+                }
             }
         };
         let yielded = stop == CapacitySliceStop::YieldedToForeground;
@@ -8738,9 +8825,13 @@ impl Broker {
                     .artifact_sweep_meta_get(ARTIFACT_WORKER_STEADY_REMOVAL_IDLE_STREAK_KEY)?
                     .and_then(|value| value.parse::<u32>().ok())
                     .unwrap_or(0);
+                // Only a lap that ended (or could not move) with nothing
+                // removed counts toward the idle back-off; an unfinished lap
+                // that moved is judged on a minute later.
+                let lap_idle = steady_slice_lap_idle(lap_completed, lap_progressed);
                 idle_streak = if removed > 0 {
                     0
-                } else if lock_contended {
+                } else if lock_contended || !lap_idle {
                     previous
                 } else {
                     previous.saturating_add(1)
@@ -8751,7 +8842,8 @@ impl Broker {
                         &idle_streak.to_string(),
                     )?;
                 }
-                let base = steady_removal_retry_ms(removed, lock_contended, idle_streak.max(1));
+                let base =
+                    steady_removal_retry_ms(removed, lock_contended, lap_idle, idle_streak.max(1));
                 let retry =
                     capacity_stop_retry_ms(stop, Some(base), removed, kept_only_passes, unpaid);
                 // A wait a stop forced is not shortened by a new landing.
@@ -8806,6 +8898,15 @@ impl Broker {
                 lap_examined,
             ),
             ("artifact_worker_capacity_removal_lap_removed", lap_removed),
+            (
+                "artifact_worker_capacity_removal_priority_memo_skips",
+                priority_memo_skips,
+            ),
+            ("artifact_worker_capacity_removal_memo_skips", memo_skips),
+            (
+                "artifact_worker_capacity_removal_lap_completed",
+                usize::from(lap_completed),
+            ),
         ] {
             for _ in 0..count.min(4096) {
                 crate::phase_telemetry::add(phase, Duration::ZERO);
@@ -8863,6 +8964,9 @@ impl Broker {
         slice.lap_examined = lap_examined;
         slice.lap_removed = lap_removed;
         slice.idle_streak = idle_streak;
+        slice.lap_completed = lap_completed;
+        slice.priority_memo_skips = priority_memo_skips;
+        slice.memo_skips = memo_skips;
         slice.outcome = outcome.to_string();
         slice.stop_reason = Some(stop.as_str().to_string());
         slice.removal_cap = limits.removals;
@@ -8913,7 +9017,7 @@ impl Broker {
         }
         self.record_capacity_removal_slice(&slice)?;
         self.write_artifact_sweep_worker_status(&format!(
-            "capacity_removal removed={removed} kept={} deferred={} examined={examined} lock_busy={lock_busy} paced_ms={} elapsed_ms={} outcome={outcome} stop={} trigger={}",
+            "capacity_removal removed={removed} kept={} deferred={} examined={examined} lock_busy={lock_busy} paced_ms={} elapsed_ms={} outcome={outcome} stop={} trigger={} passes={passes} lap_completed={lap_completed}",
             slice.kept,
             slice.deferred,
             slice.paced_ms,
@@ -12579,15 +12683,19 @@ mod tests {
     /// that removed nothing.
     #[test]
     fn steady_removal_backs_off_on_a_ladder_and_keeps_its_smaller_limits() {
-        assert_eq!(steady_removal_retry_ms(1, false, 3), 60_000);
+        assert_eq!(steady_removal_retry_ms(1, false, true, 3), 60_000);
         assert_eq!(
-            steady_removal_retry_ms(0, true, 3),
+            steady_removal_retry_ms(0, true, true, 3),
             ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS
         );
         let ladder = (1..=6)
-            .map(|streak| steady_removal_retry_ms(0, false, streak) / 60_000)
+            .map(|streak| steady_removal_retry_ms(0, false, true, streak) / 60_000)
             .collect::<Vec<_>>();
         assert_eq!(ladder, vec![5, 10, 20, 30, 30, 30]);
+        // An unfinished lap that moved: a minute, whatever the streak.
+        for streak in 1..=6 {
+            assert_eq!(steady_removal_retry_ms(0, false, false, streak), 60_000);
+        }
         let steady = CapacitySliceLimits::WORKER.for_trigger(CheckoutRemovalTrigger::Steady);
         assert_eq!(steady.removals, 4);
         assert_eq!(steady.kept_only_passes, 2);
@@ -12602,13 +12710,33 @@ mod tests {
         assert_eq!(
             capacity_stop_retry_ms(
                 CapacitySliceStop::RemovalFailures,
-                Some(steady_removal_retry_ms(0, false, 1)),
+                Some(steady_removal_retry_ms(0, false, true, 1)),
                 0,
                 0,
                 Duration::ZERO,
             ),
             Some(ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_MS)
         );
+    }
+
+    /// A steady pass that selected nothing goes on while it moved the lap
+    /// or judged something, stops at the end of the lap, and stops when it
+    /// moved nothing; only a finished (or stuck) lap counts as idle.
+    #[test]
+    fn a_steady_pass_that_moved_the_lap_is_progress_not_an_empty_slice() {
+        assert_eq!(steady_pass_continues(false, true, 0), None);
+        assert_eq!(steady_pass_continues(false, false, 9), None);
+        assert_eq!(
+            steady_pass_continues(true, true, 9),
+            Some(CapacitySliceStop::LapComplete)
+        );
+        assert_eq!(
+            steady_pass_continues(false, false, 0),
+            Some(CapacitySliceStop::NothingSelected)
+        );
+        assert!(!steady_slice_lap_idle(false, true), "unfinished and moving");
+        assert!(steady_slice_lap_idle(true, true), "the lap ended");
+        assert!(steady_slice_lap_idle(false, false), "nothing moved");
     }
 
     /// A temporary repository root with a real `.aethyme` directory.
