@@ -49,12 +49,12 @@ const PREPARATION_CACHE_HASH_BUFFER_BYTES: usize = 64 * 1024;
 //
 // The time limit is what bounds an inventory under the cache lease (the scan
 // keeps constant memory per entry); the entry limit only stops a runaway tree
-// and must sit far above one healthy store, because an inventory that stops at
-// a limit rotates the store. At 100,000 it sat below a single monorepo's pnpm
-// and uv stores (about 141,000 entries in the busiest repository, measured
-// 2026-11-14), so budget checks stopped at it and rotated the store whatever
-// its size against the 8 GiB budget: the drain then held the lease for minutes
-// in silence, and the next prepare downloaded every package again.
+// and sits far above one healthy store. An inventory that stops at either limit
+// with the bytes it saw still within budget is inconclusive and keeps the store
+// (see `shared_cache_budget_at_with_scan_limits`); only bytes proven over budget rotate it.
+// The limit used to be 100,000, below a single monorepo's pnpm and uv stores
+// (about 141,000 entries in the busiest repository, measured 2026-11-14), when
+// a stopped inventory still rotated the store whatever its size.
 const SHARED_CACHE_SCAN_MAX_ENTRIES: usize = 2_000_000;
 const SHARED_CACHE_SCAN_MAX_DEPTH: usize = 64;
 const SHARED_CACHE_SCAN_MAX_ELAPSED: Duration = Duration::from_secs(30);

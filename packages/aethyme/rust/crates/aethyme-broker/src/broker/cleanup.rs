@@ -567,6 +567,10 @@ fn orphan_object_volume_matches(
 /// devices to today's numbers of the same objects, so the removal's fd-level
 /// checks compare against the live mount. Each object must keep its inode
 /// and its recorded volume UUID.
+///
+/// This is a recheck of the decision the orphan proof already counted in the
+/// `Finish` lane, so it counts nothing: a refusal here surfaces as the
+/// cleanup's error, not as a second re-proof decision.
 #[cfg(unix)]
 fn rebind_orphan_proof_devices(
     proof: &mut crate::events::FinishCleanupRecoveryProof,
@@ -589,7 +593,7 @@ fn rebind_orphan_proof_devices(
             (root.dev(), root.ino()),
             proof.worktree_device,
             Some(uuids.worktree),
-            crate::auto_cleanup::OwnershipReproofLane::Finish,
+            crate::auto_cleanup::OwnershipReproofLane::Quiet,
             &mut reproof,
         )
     {
@@ -609,7 +613,7 @@ fn rebind_orphan_proof_devices(
                     (pointer.dev(), pointer.ino()),
                     proof.git_pointer_device,
                     Some(uuids.git_pointer),
-                    crate::auto_cleanup::OwnershipReproofLane::Finish,
+                    crate::auto_cleanup::OwnershipReproofLane::Quiet,
                     &mut reproof,
                 )
             {
@@ -4208,6 +4212,13 @@ impl Broker {
                 CheckoutIdentityMatch::Differs(IDENTITY_VOLUME_UUID_UNAVAILABLE)
                     if devices_unchanged => {}
                 _ => {
+                    // `equal_apart_from_volume_identity` above already bound
+                    // `proof.head` to the HEAD Git reported, and the re-proof
+                    // binds it again (`recorded_head`, refusal `head_moved`)
+                    // against the registration files it reads later. The
+                    // repeat is deliberate: the first is the only HEAD
+                    // binding on the exact path, and the later read catches a
+                    // HEAD that moved after it, closer to the removal.
                     let reproof = self
                         .checkout_ownership_reproof(
                             lane,
@@ -5316,7 +5327,7 @@ impl Broker {
                             .into(),
                     });
                 }
-                let current_cohort = self.closed_artifact_checkout_cohort_for_session(
+                let current_cohort = self.closed_artifact_checkout_cohort_for_retirement(
                     expected_cohort.owner_session_id(),
                     archived_worktree,
                     Some(status_limits.deadline),
@@ -8095,6 +8106,20 @@ mod registered_removal_failure_tests {
         close_first: bool,
         age: impl FnOnce(&mut crate::events::SpawnedWorktreeInstanceWitness),
     ) -> Option<crate::events::FinishCleanupRecoveryProof> {
+        finish_after_aging_the_spawn_witness(label, close_first, age).0
+    }
+
+    /// [`finish_recovery_proof_after_aging_the_spawn_witness`], also
+    /// returning the finish report.
+    #[cfg(unix)]
+    fn finish_after_aging_the_spawn_witness(
+        label: &str,
+        close_first: bool,
+        age: impl FnOnce(&mut crate::events::SpawnedWorktreeInstanceWitness),
+    ) -> (
+        Option<crate::events::FinishCleanupRecoveryProof>,
+        crate::FinishReport,
+    ) {
         let owner = tempfile::tempdir().unwrap();
         let repository = repository_with_ignored_cleanup_fixture(owner.path());
         let storage = crate::test_storage::TestStorage::new();
@@ -8124,7 +8149,7 @@ mod registered_removal_failure_tests {
                 rusqlite::params![session.id, serde_json::to_string(&saved).unwrap()],
             )
             .unwrap();
-        broker.finish(session.id).unwrap();
+        let report = broker.finish(session.id).unwrap();
         let event = broker
             .store()
             .latest_session_finish_cleanup_started_event(session.id)
@@ -8132,7 +8157,38 @@ mod registered_removal_failure_tests {
             .expect("finish began physical cleanup");
         let payload: serde_json::Value =
             serde_json::from_str(event.payload_json.as_deref().unwrap()).unwrap();
-        serde_json::from_value(payload["recovery_proof"].clone()).ok()
+        (
+            serde_json::from_value(payload["recovery_proof"].clone()).ok(),
+            report,
+        )
+    }
+
+    /// A clean `finish` after a remount needs no interrupted-cleanup resume,
+    /// so only the re-proof `finish` made to record its recovery proof can
+    /// tell the report that the spawn witness did not match exactly.
+    #[cfg(unix)]
+    #[test]
+    fn a_clean_finish_after_a_renumber_reports_its_ownership_reproof() {
+        let (proof, report) =
+            finish_after_aging_the_spawn_witness("reported renumbered finish", false, |_| {});
+        assert!(proof.is_some(), "the re-proof lets finish record its proof");
+        assert_eq!(
+            report.cleanup.ownership_reproof.as_deref(),
+            Some(crate::auto_cleanup::OWNERSHIP_REPROOF_DEVICE_RENUMBER),
+            "{report:?}"
+        );
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["cleanup"]["ownership_reproof"],
+            crate::auto_cleanup::OWNERSHIP_REPROOF_DEVICE_RENUMBER
+        );
+        let (_, exact) =
+            finish_after_aging_the_spawn_witness("reported exact finish", false, |saved| {
+                saved.worktree_device -= 1000;
+                saved.git_pointer_device -= 1000;
+                saved.git_admin_device -= 1000;
+                saved.git_common_device -= 1000;
+            });
+        assert_eq!(exact.cleanup.ownership_reproof, None, "{exact:?}");
     }
 
     #[cfg(unix)]
@@ -8217,14 +8273,25 @@ mod registered_removal_failure_tests {
                 proof.volume_uuids.as_mut().unwrap().git_pointer = [9; 16]
             }),
         ];
-        for (name, mutate) in mutations {
-            let mut changed = saved.clone();
-            mutate(&mut changed);
-            assert!(
-                super::rebind_orphan_proof_devices(&mut changed, &worktree).is_err(),
-                "{name}"
-            );
+        // The rebind rechecks a decision the orphan proof already counted:
+        // its refusals add no re-proof counter.
+        let recorder = crate::phase_telemetry::Recorder::default();
+        {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            for (name, mutate) in mutations {
+                let mut changed = saved.clone();
+                mutate(&mut changed);
+                assert!(
+                    super::rebind_orphan_proof_devices(&mut changed, &worktree).is_err(),
+                    "{name}"
+                );
+            }
         }
+        let (_, counts) = recorder.totals();
+        assert!(
+            !counts.keys().any(|name| name.contains("ownership_reproof")),
+            "{counts:?}"
+        );
     }
 
     #[cfg(unix)]

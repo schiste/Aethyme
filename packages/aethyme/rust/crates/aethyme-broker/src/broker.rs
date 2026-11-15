@@ -2663,10 +2663,12 @@ pub struct FinishCleanupReport {
     pub branch_tip: Option<String>,
     pub failure: Option<String>,
     pub recovery_action: Option<String>,
-    /// The ownership re-proof that let an interrupted cleanup resume after
-    /// its saved device numbers changed: `volume_uuid` (every recorded
-    /// volume UUID still matched) or `device_renumber` (a proof saved without
-    /// UUIDs, re-proven through Git). Omitted for an exact match.
+    /// The ownership re-proof this cleanup needed because saved device
+    /// numbers changed: the one that let an interrupted cleanup resume, or
+    /// else the one `finish` made to record its recovery proof when the spawn
+    /// witness predates a remount. `volume_uuid` (every recorded volume UUID
+    /// still matched) or `device_renumber` (a record saved without UUIDs,
+    /// re-proven through Git). Omitted for an exact match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ownership_reproof: Option<String>,
 }

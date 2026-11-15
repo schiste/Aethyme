@@ -325,6 +325,10 @@ impl Broker {
             report.session_id
         ));
 
+        // The ownership re-proof `finish` itself needed to record its
+        // recovery proof (the spawn witness predates a remount). Reported
+        // even when the removal that follows is clean and needs none.
+        let mut finish_reproof: Option<&'static str> = None;
         if !recovery_retry {
             let spawned_witness = if session.origin == SessionOrigin::Spawned {
                 self.store()
@@ -360,16 +364,18 @@ impl Broker {
                                 let deadline = self.landing_deadline.get().unwrap_or_else(|| {
                                     std::time::Instant::now() + FINISH_REPROOF_BUDGET
                                 });
-                                self.checkout_ownership_reproof(
-                                    crate::auto_cleanup::OwnershipReproofLane::Finish,
-                                    &closing,
-                                    &worktree_path,
-                                    witness,
-                                    &proof.instance_witness(),
-                                    None,
-                                    Some(deadline),
-                                )
-                                .ok()?;
+                                proof.ownership_reproof = Some(
+                                    self.checkout_ownership_reproof(
+                                        crate::auto_cleanup::OwnershipReproofLane::Finish,
+                                        &closing,
+                                        &worktree_path,
+                                        witness,
+                                        &proof.instance_witness(),
+                                        None,
+                                        Some(deadline),
+                                    )
+                                    .ok()?,
+                                );
                             }
                             if item.as_ref().and_then(|item| item.branch_tip.as_deref())
                                 != Some(proof.branch_tip.as_str())
@@ -389,6 +395,9 @@ impl Broker {
                 } else {
                     None
                 };
+            finish_reproof = recovery_proof
+                .as_ref()
+                .and_then(|proof| proof.ownership_reproof);
             let start_payload = crate::events::session_finish_cleanup_started_payload_with_proof(
                 worktree_present,
                 branch_present,
@@ -413,8 +422,13 @@ impl Broker {
             Ok(()) => {
                 report.status = FinishStatus::Cleaned;
                 report.cleanup.completed = true;
-                report.cleanup.ownership_reproof =
-                    self.cleanup_ownership_reproof.take().map(str::to_string);
+                // The removal reports the re-proof a resumed interrupted
+                // cleanup needed; otherwise the one `finish` made above.
+                report.cleanup.ownership_reproof = self
+                    .cleanup_ownership_reproof
+                    .take()
+                    .or(finish_reproof)
+                    .map(str::to_string);
                 report.cleanup.worktree_removed = worktree_present && !worktree_path.exists();
                 report.cleanup.branch_removed = branch_present
                     && report
@@ -433,6 +447,7 @@ impl Broker {
             Err(error) => {
                 report.status = FinishStatus::Closed;
                 report.cleanup.completed = false;
+                report.cleanup.ownership_reproof = finish_reproof.map(str::to_string);
                 report.cleanup.worktree_removed = worktree_present && !worktree_path.exists();
                 report.cleanup.branch_removed = branch_present
                     && report
