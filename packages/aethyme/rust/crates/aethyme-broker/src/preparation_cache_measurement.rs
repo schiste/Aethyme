@@ -243,7 +243,8 @@ impl SharedCacheMeasurement {
 
     /// Whether this record answers the budget question for `budget`.
     fn decides(&self, budget: u64) -> bool {
-        self.bytes > budget || (self.complete && self.bytes <= budget)
+        // Over budget, even as a lower bound, or complete (and so exact).
+        self.bytes > budget || self.complete
     }
 }
 
@@ -1099,7 +1100,8 @@ mod tests {
         shared_cache_budget_with_background,
     };
 
-    const REPOSITORY: &str = "repository-identity";
+    // Rotation recovery validates the store name as a repository digest.
+    const REPOSITORY: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
     struct Fixture {
         _repository: tempfile::TempDir,
@@ -1418,7 +1420,8 @@ mod tests {
         assert!(!result.complete, "the walk stops once over budget");
         assert_eq!(result.bytes, 200, "it stopped at the second file");
         assert!(result.entries <= 3, "{} entries", result.entries);
-        // The next prepare that finds the cache free checks the budget.
+        // The next prepare that finds the cache free checks the budget
+        // (due, not overdue: it does not make a prepare wait for it).
         let stamped: i64 = fixture
             .broker
             .store()
@@ -1427,7 +1430,11 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
-        assert!(stamped <= checked_at - SHARED_CACHE_BUDGET_CHECK_INTERVAL_MS);
+        assert!(stamped < checked_at);
+        assert_eq!(
+            crate::preparation::budget_check_need(Some(stamped), now_ms()),
+            Some(crate::preparation::ExclusiveNeed::BudgetCheckDue)
+        );
 
         let budget = SharedCacheBudget {
             max_bytes: 150,
@@ -1708,7 +1715,7 @@ mod tests {
                     // A writer removes the directory between listing and open.
                     if matches!(target, SharedCacheScanOpenTarget::Child) && !removed {
                         removed = true;
-                        let _ = fs::rename(&nested, store.join("..").join("moved-away"));
+                        fs::rename(&nested, store.join("..").join("moved-away")).unwrap();
                     }
                 },
                 &mut |_| Ok(()),
