@@ -256,16 +256,18 @@ records its `trigger`:
   minutes while such slices follow each other (`idle_streak`), and a removal
   resets the wait. A cleanup request
   whose grace ends after the last steady slice ends that wait at once. A slice
-  stopped by memory or load pressure, failed removals or a held lock keeps
-  its wait (1 to 10 minutes) whatever lands. Steady removal is due only while
+  stopped by memory pressure, failed removals or a held lock keeps its wait
+  (1 to 10 minutes) whatever lands. Load never stops a slice (see below), and
+  a slice that pressure kept from running any pass does not count toward the
+  back-off. Steady removal is due only while
   a closed session still holds its checkout. No full checkout listing runs:
   the count reads only the repository's checkout registrations.
 - `pressure` (from three quarters of the limit): the capacity limits described
   next.
 
 Every proof, keep code, artifact-use marker, the GC lock and its gap, the
-yield to a waiting foreground command, the memory and load gate before each
-pass and the unattended pacer apply to both triggers alike; the trigger
+yield to a waiting foreground command, the pressure check before each pass
+and the unattended pacer apply to both triggers alike; the trigger
 changes only when and how much removal runs, never what is removable.
 `[cleanup] auto_remove = false` turns both off.
 
@@ -282,9 +284,17 @@ it started can run past it. After each
 removal the slice waits out what Git deleted at
 `[cleanup] unattended_unlinks_per_second` with no lock held, crediting only
 the time Git itself spent deleting; disk-pressure mode does not lift that
-rate. Before every pass it waits out memory or load pressure, and pressure
-that outlasts the pacer's pause budget stops the slice with nothing more
-removed and no further slice for 10 minutes. Between passes the lock stays
+rate. Before every pass it checks pressure. Memory pressure is waited out,
+and memory pressure that outlasts the pacer's pause budget stops the slice
+with nothing more removed and no further slice for 10 minutes
+(`memory_backoff`). Load is a throttle, never a stop: while the one-minute
+load average is above twice the core count (or Linux I/O pressure is high)
+the check waits at most 5 seconds, then the pass runs anyway, the slice
+removes at most one checkout (`load_throttled`) and the next slice keeps the
+normal cadence; the charge after the removal waits at most 1 second per
+256-entry batch on top of the rate limit. A slice that pressure kept from
+running any pass records `pressure_before_selection` and retries after 10
+minutes for memory, 1 minute for load alone. Between passes the lock stays
 free at least as long as the last pass held it, and while `broker start` at
 the checkout limit, `gc apply`, `gc abandon` or `gc forget-abandoned` waits
 for it (up to 30 seconds) the worker takes it again neither for a removal
@@ -307,17 +317,21 @@ it moved and backs off when it did not), `lap_unfinished`,
 `out_of_time_before_selection` (the budget ran out before
 any checkout was judged; `budget_consumed_by` says whether counting checkouts
 or the other checks used it; it retries after one minute, backing off to ten
-minutes while slices keep running out) or
-`nothing_removable`; `kept_by_code` counts the kept
+minutes while slices keep running out), `pressure_before_selection`
+(pressure kept the slice from running any pass; `pressure_seen` says which)
+or `nothing_removable`; `kept_by_code` counts the kept
 checkouts per keep code, `blocked_by_ignored` names the ignored directories
 holding the most checkouts with the line that would release each,
 `lap_remaining` and the cursor say how far the lap got, and `scan_ms`,
 `selection_ms`, `apply_ms`, `paced_ms`, `lock_held_ms`, `lock_wait_ms`,
-`lock_yield_ms`, `git_removal_ms`, `pressure_wait_ms` and `elapsed_ms` say
-where the time went; `stop_reason` says why the slice stopped (`cap`,
-`budget`, `pacer_backoff`, `slice_deadline`, `yielded_to_foreground`,
-`nothing_selected`, `lap_complete`, `kept_only_limit`, `lock_busy`, `failed`
-or `removal_failures`) and
+`lock_yield_ms`, `git_removal_ms`, `pressure_wait_ms`, `memory_wait_ms`,
+`load_wait_ms` and `elapsed_ms` say where the time went; `pressure_seen`
+(`memory`, `load` or `memory_and_load`) and `throttled` say which pressure the
+slice saw and whether it ran throttled; `stop_reason` says why the slice
+stopped (`cap`, `budget`, `memory_backoff`, `load_throttled`,
+`slice_deadline`, `yielded_to_foreground`, `nothing_selected`,
+`lap_complete`, `kept_only_limit`, `lock_busy`, `failed` or
+`removal_failures`; records from older binaries may say `pacer_backoff`) and
 `retry_in_ms` the wait it chose. `trigger` says which trigger ran the slice
 (`steady` or `pressure`), `priority_examined` / `priority_removed` and
 `lap_examined` / `lap_removed` split its work between the priority lane and
@@ -410,7 +424,7 @@ strict = false                 # the default; recognized output directories disp
 ignored_directory_sweep = false # opt in to reclaim ignored folders in retained checkouts
 regenerable = [".gradle", "reports/quality-*.json"] # extra disposable output directories and files
 keep = ["*-investigation"]     # worktrees never removed automatically
-unattended_unlinks_per_second = 1000 # background worker pace; 0 or "unlimited" = full speed
+unattended_unlinks_per_second = 1000 # background worker pace, also under load; 0 or "unlimited" = full speed
 ```
 
 Two phase counters show the file rule at work in `aethyme broker advanced

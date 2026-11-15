@@ -1825,6 +1825,51 @@ mod unix {
             assert_eq!(clock.slept.get(), std::time::Duration::from_secs(3));
         }
 
+        /// Sustained load (the cache lane and artifact reclaim remove trees
+        /// through this path) throttles unattended removal and never stops
+        /// it: every batch waits one bounded load wait on top of the rate
+        /// limit, and the tree is removed completely.
+        #[test]
+        fn sustained_load_throttles_unattended_removal_without_stopping_it() {
+            use crate::gc::unattended_pacing::{
+                self, FakeClock, LOAD_BATCH_WAIT, PACING_BATCH_ENTRIES, PressureSample, Scripted,
+                UnattendedPacer, UnlinkRate,
+            };
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("root");
+            let files = PACING_BATCH_ENTRIES as usize * 3;
+            wide_tree(&root, files);
+            let clock = FakeClock::new();
+            let scope = unattended_pacing::install(UnattendedPacer::new(
+                UnlinkRate::Limited(PACING_BATCH_ENTRIES),
+                Box::new(clock.clone()),
+                Box::new(Scripted {
+                    samples: vec![PressureSample {
+                        memory_elevated: Some(false),
+                        load_elevated: Some(true),
+                    }],
+                    reads: Default::default(),
+                }),
+            ));
+
+            let (outcome, entries) =
+                remove_condemned_tree_with_progress(&root, None, None).unwrap();
+            let summary = unattended_pacing::current_summary(0).unwrap();
+            drop(scope);
+
+            assert_eq!(outcome, TreeRemoval::Complete);
+            assert!(!root.exists());
+            assert_eq!(entries, files + 2);
+            assert_eq!(summary.pressure_yields, 0);
+            // Four batches (768 payload entries plus `nested`) each waited
+            // once for load; three full batches paid the one-second limit.
+            assert_eq!(summary.load_throttled, 4);
+            assert_eq!(
+                clock.slept.get(),
+                LOAD_BATCH_WAIT * 4 + std::time::Duration::from_secs(3)
+            );
+        }
+
         #[test]
         fn persistent_pressure_stops_unattended_removal_resumably() {
             use crate::gc::unattended_pacing::{
