@@ -415,12 +415,17 @@ impl Broker {
             ),
             session_id: None,
             queue_entry_id: None,
-            evidence: vec![
+            evidence: [
                 format!("entries seen by the last check: {}", record.entries_seen),
                 format!("bytes seen by the last check: {}", record.bytes_seen),
                 format!("last check took: {} ms", record.elapsed_ms),
                 format!("last check at (ms since epoch): {}", record.last_at_ms),
-            ],
+            ]
+            .into_iter()
+            // Why the background measurement queued by the first
+            // inconclusive check has not settled it yet.
+            .chain(record.background_measurement.clone())
+            .collect(),
             commands: vec!["aethyme broker advanced resources pressure --json".into()],
         });
     }

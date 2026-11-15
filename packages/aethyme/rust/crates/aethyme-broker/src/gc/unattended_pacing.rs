@@ -690,6 +690,18 @@ pub(crate) fn unattended_pressure_check(deadline: Option<Instant>) -> PressureVe
     })
 }
 
+/// Before one batch of a read-only background walk (the shared preparation
+/// cache measurement): on the installed pacer, wait out memory pressure and
+/// wait at most [`LOAD_BATCH_WAIT`] for elevated load to clear, never past
+/// `deadline`. A walk unlinks nothing, so the token bucket does not apply;
+/// a [`PressureVerdict::MemoryBackoff`] asks the walk to stop. Without a
+/// pacer (a foreground caller) it is always `Clear`.
+pub(crate) fn before_unattended_scan_batch(deadline: Option<Instant>) -> PressureVerdict {
+    with_active(PressureVerdict::Clear, |pacer| {
+        pacer.checked_wait(deadline, LOAD_BATCH_WAIT)
+    })
+}
+
 /// Disk-pressure mode lifts the rate limit (freeing space is then the
 /// priority) but keeps the priority lowering and the pressure back-off.
 pub(crate) fn set_disk_pressure(pressured: bool) {

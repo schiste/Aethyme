@@ -8004,11 +8004,14 @@ impl Broker {
         // A worker that cannot start must not be retried for steady removal
         // on every broker open.
         let steady_removal_due = removal_trigger == Some(CheckoutRemovalTrigger::Steady);
+        // A queued shared preparation cache measurement (one metadata read).
+        let measurement_due = self.shared_cache_measurement_due(now_ms());
         if !(artifact_pending
             || checkout_cleanup_pending
             || session_retirement_pending
             || compact_pending
-            || capacity_removal_due)
+            || capacity_removal_due
+            || measurement_due)
         {
             return Ok(());
         }
@@ -8027,7 +8030,8 @@ impl Broker {
             || checkout_cleanup_due
             || session_retirement_due
             || compact_due
-            || capacity_removal_due)
+            || capacity_removal_due
+            || measurement_due)
         {
             return Ok(());
         }
@@ -8172,6 +8176,33 @@ impl Broker {
         // shows why a run removed nothing.
         self.persist_unattended_pacing_summary();
         result
+    }
+
+    /// The detached worker's last lane: the shared preparation cache
+    /// measurement. It reads and never deletes, so the worker runs it after
+    /// its deletion lanes and after releasing this repository's worker lock
+    /// (a long walk must not hold back the next deletion run), under its own
+    /// host-wide slot. Its request stays durable when it cannot finish.
+    pub(crate) fn run_preparation_cache_measurement_worker_lane(&mut self) {
+        if !matches!(std::env::var(ARTIFACT_SWEEP_WORKER_ENV).as_deref(), Ok("1"))
+            || crate::host_state::path_is_ephemeral(self.main_root())
+        {
+            return;
+        }
+        crate::warn_unrecorded(
+            "measure the shared preparation cache",
+            self.run_preparation_cache_measurement_lane(host_deleter_lock_directory().as_deref()),
+        );
+    }
+
+    /// Start the detached worker for a queued shared preparation cache
+    /// measurement. Best effort: the request is durable, and the next broker
+    /// open admits the worker if this launch does not happen.
+    pub(crate) fn start_preparation_cache_measurement_worker(&mut self) {
+        crate::warn_unrecorded(
+            "start the shared preparation cache measurement worker",
+            self.maybe_start_artifact_sweep_worker(false),
+        );
     }
 
     /// Wait for the host-wide single-deleter slot. `None` means another

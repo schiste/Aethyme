@@ -23,6 +23,8 @@ use crate::{
 
 #[path = "preparation_cache_activity.rs"]
 pub(crate) mod cache_activity;
+#[path = "preparation_cache_measurement.rs"]
+pub(crate) mod cache_measurement;
 #[path = "preparation_recovery_state.rs"]
 pub(crate) mod recovery_state;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -767,6 +769,12 @@ pub struct PreparationStatus {
     /// and what it reports doing; absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting_on: Option<PreparationCacheWaitingOn>,
+    /// The repository's background measurement of its shared cache: a
+    /// pending request and the last conclusive result, which the next budget
+    /// check decides from while it is fresh. Absent when none was queued.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_cache_background_measurement:
+        Option<cache_measurement::SharedCacheMeasurementStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -800,6 +808,11 @@ pub struct PreparationReport {
     /// inventory, rotation drain, steps), with its wall time and item count.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub shared_cache_operations: Vec<cache_activity::PreparationCacheOperationSummary>,
+    /// Set when this prepare's budget decision came from a background
+    /// measurement, or when it queued one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_cache_background_measurement:
+        Option<cache_measurement::SharedCacheBackgroundMeasurementReport>,
     pub steps: Vec<PreparationStepResult>,
     pub next_action: String,
 }
@@ -821,6 +834,9 @@ impl PreparationReport {
         if !self.shared_cache_operations.is_empty() {
             preparation["shared_cache_operations"] =
                 serde_json::json!(self.shared_cache_operations);
+        }
+        if let Some(background) = &self.shared_cache_background_measurement {
+            preparation["shared_cache_background_measurement"] = serde_json::json!(background);
         }
         serde_json::json!({ "preparation": preparation })
     }
@@ -1012,6 +1028,7 @@ impl Broker {
                     next_action,
                     current_operation: None,
                     waiting_on: None,
+                    shared_cache_background_measurement: None,
                 });
             }
             Ok(Some(config)) => config,
@@ -1103,6 +1120,12 @@ impl Broker {
                 .then(|| format!("aethyme broker submit prepare --session {session_id}")),
             current_operation,
             waiting_on,
+            shared_cache_background_measurement: config
+                .steps
+                .iter()
+                .any(|step| step.cache == PreparationCachePolicy::RepositoryShared)
+                .then(|| self.shared_cache_measurement_status())
+                .flatten(),
         })
     }
 
@@ -1141,6 +1164,7 @@ impl Broker {
                 shared_cache_mode: None,
                 shared_cache_rotation: None,
                 shared_cache_operations: Vec::new(),
+                shared_cache_background_measurement: None,
                 steps: Vec::new(),
                 next_action: "dependencies are already current".into(),
             });
@@ -1417,6 +1441,27 @@ impl Broker {
         // It also runs before this run's directory is created, because it
         // moves the whole repository store away, that directory included.
         let mut next_inventory_renewal = Instant::now();
+        // A fresh background measurement of this store, bound to the root's
+        // current identity, decides the budget check instead of a foreground
+        // inventory (the store's identity is checked under the lease).
+        let background_measurement = config
+            .shared_cache
+            .as_ref()
+            .filter(|cache| {
+                shared
+                    && cache_mode == SharedCacheMode::Exclusive
+                    && measure_budget
+                    && cache.max_bytes > 0
+            })
+            .zip(cache_root_binding.as_ref())
+            .and_then(|(cache, binding)| {
+                self.fresh_shared_cache_measurement(
+                    &repository_identity(self),
+                    &binding.path,
+                    cache.max_bytes,
+                    now_ms(),
+                )
+            });
         // Recovery, measurement and rotation move or remove the whole store,
         // so they run only when this preparation holds the cache alone. A
         // sharing holder has already seen that no rotation is unfinished.
@@ -1455,6 +1500,7 @@ impl Broker {
                 cache_root_binding
                     .as_ref()
                     .expect("shared cache has a binding"),
+                background_measurement.as_ref(),
                 &mut progress,
             )
         } else {
@@ -1479,10 +1525,25 @@ impl Broker {
             // just ran is unaffected.
             eprintln!("warning: could not record the shared-cache budget check: {error}");
         }
+        let mut shared_cache_background_measurement = None;
         if let Some(inventory) = cache_activity::last_operation(
             cache_activity::PreparationCacheOperation::BudgetInventory,
         ) {
             self.record_shared_cache_inventory_outcome(&inventory);
+            // An inconclusive check queues a background measurement; a
+            // decision taken from one is reported and refreshed.
+            if let (Some(binding), Some(cache)) =
+                (cache_root_binding.as_ref(), config.shared_cache.as_ref())
+            {
+                let repository = repository_identity(self);
+                shared_cache_background_measurement = self.follow_up_shared_cache_budget_check(
+                    inventory.outcome,
+                    &repository,
+                    &binding.path,
+                    cache.max_bytes,
+                    background_measurement.as_ref(),
+                );
+            }
         }
         if let Some(cache_dir) = &cache_dir {
             let create_cache_dir = require_preparation_storage_with_cache_root(
@@ -1742,6 +1803,14 @@ impl Broker {
                 )
             },
         )?;
+        // The lease is released: the measurement holds none, but it should
+        // not compete with this prepare's own steps either.
+        if shared_cache_background_measurement
+            .as_ref()
+            .is_some_and(|report| report.queued.is_some())
+        {
+            self.start_preparation_cache_measurement_worker();
+        }
         Ok(PreparationReport {
             schema_version: PREPARATION_REPORT_SCHEMA_VERSION,
             session_id,
@@ -1753,6 +1822,7 @@ impl Broker {
             shared_cache_mode: shared.then_some(cache_mode),
             shared_cache_rotation: rotation,
             shared_cache_operations,
+            shared_cache_background_measurement,
             steps: results,
             next_action: "continue work in the prepared session".into(),
         })
@@ -2993,6 +3063,7 @@ fn shared_cache_budget(
     digest: &str,
     broker: &Broker,
     cache_root_binding: &crate::broker::PreparationCacheRootBinding,
+    background: Option<&cache_measurement::SharedCacheMeasurement>,
     progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
 ) -> Result<Option<SharedCacheRotation>, PreparationError> {
     let cache_root = cache_root_binding.path.clone();
@@ -3004,15 +3075,20 @@ fn shared_cache_budget(
             path: cache_root.clone(),
             reason: "the broker's captured host resource database path is unavailable".into(),
         })?;
-    shared_cache_budget_at_with_guard(
-        budget,
-        &cache_root,
-        resource_db_path,
-        &repository_identity(broker),
-        digest,
-        cache_root_binding.identity.as_deref(),
-        Some(cache_root_binding),
+    let repository = repository_identity(broker);
+    shared_cache_budget_with_background(
+        SharedCacheBudgetRequest {
+            budget,
+            cache_root: &cache_root,
+            resource_db_path,
+            repository: &repository,
+            digest,
+            expected_root_identity: cache_root_binding.identity.as_deref(),
+            root_binding: Some(cache_root_binding),
+        },
+        background,
         progress,
+        SharedCacheScanLimits::default(),
     )
 }
 
@@ -3137,6 +3213,7 @@ fn shared_cache_budget_at_with_resource_db_and_identity_and_binding(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn shared_cache_budget_at_with_guard(
     budget: Option<&SharedCacheBudget>,
@@ -3173,8 +3250,22 @@ struct SharedCacheBudgetRequest<'a> {
     root_binding: Option<&'a crate::broker::PreparationCacheRootBinding>,
 }
 
+#[cfg(test)]
 fn shared_cache_budget_at_with_scan_limits(
     request: SharedCacheBudgetRequest<'_>,
+    progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
+    scan_limits: SharedCacheScanLimits,
+) -> Result<Option<SharedCacheRotation>, PreparationError> {
+    shared_cache_budget_with_background(request, None, progress, scan_limits)
+}
+
+/// Recover any unfinished rotation, then apply the budget: from
+/// `background` when that measurement still describes the store (see
+/// `cache_measurement::inventory_for_current_store`), otherwise from a
+/// bounded foreground inventory.
+fn shared_cache_budget_with_background(
+    request: SharedCacheBudgetRequest<'_>,
+    background: Option<&cache_measurement::SharedCacheMeasurement>,
     progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
     scan_limits: SharedCacheScanLimits,
 ) -> Result<Option<SharedCacheRotation>, PreparationError> {
@@ -3213,7 +3304,23 @@ fn shared_cache_budget_at_with_scan_limits(
         return Ok(None);
     };
     let store = cache_root.join(repository);
-    let inventory = {
+    // Checked here, with the lease held and after recovery, so a store that
+    // was rotated or replaced since the background walk is not judged by it.
+    let from_background = background.and_then(|measurement| {
+        cache_measurement::inventory_for_current_store(measurement, &store, budget.max_bytes)
+            .map(|inventory| (measurement, inventory))
+    });
+    let inventory = if let Some((measurement, inventory)) = from_background {
+        // No walk under the lease: the summary carries what the background
+        // measurement counted.
+        cache_activity::enter(
+            cache_activity::PreparationCacheOperation::BudgetInventory,
+            None,
+            false,
+        );
+        cache_activity::observe(measurement.entries, Some(measurement.bytes));
+        inventory
+    } else {
         let _span = crate::phase_telemetry::span("shared_cache_inventory");
         cache_activity::enter(
             cache_activity::PreparationCacheOperation::BudgetInventory,
@@ -3224,7 +3331,7 @@ fn shared_cache_budget_at_with_scan_limits(
         // over budget whatever the rest of it holds.
         directory_inventory_with_budget(&store, scan_limits, Some(budget.max_bytes), progress)?
     };
-    record_shared_cache_inventory(inventory, budget.max_bytes);
+    record_shared_cache_inventory(inventory, budget.max_bytes, from_background.is_some());
     progress(true)?;
     // An inventory that stopped at its time or entry limit with the bytes it
     // saw still within budget is inconclusive, and the store is kept: a store
@@ -3418,14 +3525,24 @@ fn shared_cache_inventory_outcome(inventory: SharedCacheInventory, budget: u64) 
 /// Count the budget inventory's outcome in the command metric and the
 /// operation summary, so a kept unmeasurable store is told apart from a
 /// measured one.
-fn record_shared_cache_inventory(inventory: SharedCacheInventory, budget: u64) {
-    let outcome = shared_cache_inventory_outcome(inventory, budget);
+fn record_shared_cache_inventory(inventory: SharedCacheInventory, budget: u64, background: bool) {
+    let outcome = match (
+        shared_cache_inventory_outcome(inventory, budget),
+        background,
+    ) {
+        // A decision taken from a background measurement says so.
+        ("absent" | "within_budget", true) => "within_budget_background",
+        ("over_budget", true) => "over_budget_background",
+        (outcome, _) => outcome,
+    };
     cache_activity::set_outcome(outcome);
     crate::phase_telemetry::add(
         match outcome {
             "absent" => "shared_cache_inventory_absent",
             "within_budget" => "shared_cache_inventory_within_budget",
             "over_budget" => "shared_cache_inventory_over_budget",
+            "within_budget_background" => "shared_cache_inventory_within_budget_background",
+            "over_budget_background" => "shared_cache_inventory_over_budget_background",
             "inconclusive_time_limit" => "shared_cache_inventory_inconclusive_time_limit",
             _ => "shared_cache_inventory_inconclusive_entry_limit",
         },
@@ -4065,6 +4182,15 @@ impl Broker {
             entries_seen: inventory.items_done,
             bytes_seen: inventory.bytes_observed.unwrap_or(0),
             elapsed_ms: inventory.elapsed_ms,
+            // What the background measurement last reported stays with the
+            // notice while checks keep being inconclusive.
+            background_measurement: if inconclusive {
+                previous
+                    .as_ref()
+                    .and_then(|previous| previous.background_measurement.clone())
+            } else {
+                None
+            },
         };
         if !inconclusive && previous.is_none_or(|previous| previous.consecutive == 0) {
             return;
@@ -4109,6 +4235,10 @@ pub(crate) struct SharedCacheInventoryInconclusive {
     pub(crate) entries_seen: u64,
     pub(crate) bytes_seen: u64,
     pub(crate) elapsed_ms: u64,
+    /// What the background measurement queued by these checks last did:
+    /// settled the question, or why it could not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) background_measurement: Option<String>,
 }
 
 /// What a waiting preparation waits on.
@@ -4458,13 +4588,93 @@ fn directory_inventory_fd_relative_with_progress<F>(
     path: &Path,
     limits: SharedCacheScanLimits,
     stop_above_bytes: Option<u64>,
-    mut before_open: F,
+    before_open: F,
     progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
 ) -> Result<SharedCacheInventory, PreparationError>
 where
     F: FnMut(SharedCacheScanOpenTarget),
 {
+    directory_inventory_fd_relative_walk(
+        path,
+        limits,
+        stop_above_bytes,
+        SharedCacheScanConcurrency::Exclusive,
+        before_open,
+        progress,
+        &mut |_, _| Ok(()),
+    )
+    .map(|(inventory, _)| inventory)
+}
+
+/// Whether anything may change the tree while it is walked.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedCacheScanConcurrency {
+    /// The caller holds the cache alone: any change is a refusal.
+    Exclusive,
+    /// The caller holds no lease (the background measurement): an entry
+    /// that vanishes or is replaced between listing and inspection is
+    /// skipped, because a running preparation step may be writing the store.
+    /// The total is then an estimate; it decides only whether a rotation is
+    /// due, and the rotation itself runs under the lease with its own proofs.
+    Concurrent,
+}
+
+/// The walk behind [`directory_inventory_fd_relative_with_progress`], also
+/// returning the entries it counted. `on_entry` sees the running entry and
+/// byte counts after each counted entry and may stop the walk with an error.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn directory_inventory_fd_relative_walk<F>(
+    path: &Path,
+    limits: SharedCacheScanLimits,
+    stop_above_bytes: Option<u64>,
+    concurrency: SharedCacheScanConcurrency,
+    before_open: F,
+    progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
+    on_entry: &mut dyn FnMut(u64, u64) -> Result<(), PreparationError>,
+) -> Result<(SharedCacheInventory, u64), PreparationError>
+where
+    F: FnMut(SharedCacheScanOpenTarget),
+{
+    let mut counted = 0_u64;
+    let inventory = directory_inventory_fd_relative_walk_counted(
+        path,
+        limits,
+        stop_above_bytes,
+        concurrency,
+        before_open,
+        progress,
+        on_entry,
+        &mut counted,
+    )?;
+    Ok((inventory, counted))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn directory_inventory_fd_relative_walk_counted<F>(
+    path: &Path,
+    limits: SharedCacheScanLimits,
+    stop_above_bytes: Option<u64>,
+    concurrency: SharedCacheScanConcurrency,
+    mut before_open: F,
+    progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
+    on_entry: &mut dyn FnMut(u64, u64) -> Result<(), PreparationError>,
+    counted: &mut u64,
+) -> Result<SharedCacheInventory, PreparationError>
+where
+    F: FnMut(SharedCacheScanOpenTarget),
+{
     use std::mem::MaybeUninit;
+
+    let concurrent = concurrency == SharedCacheScanConcurrency::Concurrent;
+    let vanished = |error: &std::io::Error| {
+        concurrent
+            && matches!(
+                error.raw_os_error(),
+                Some(libc::ENOENT) | Some(libc::ENOTDIR) | Some(libc::ELOOP)
+            )
+    };
 
     let started = Instant::now();
     let root_metadata = match fs::symlink_metadata(path) {
@@ -4579,6 +4789,8 @@ where
             shared_cache_scan_refusal(path, "cache inventory entry count overflowed")
         })?;
         cache_activity::observe(visited_entries as u64, Some(bytes));
+        *counted = visited_entries as u64;
+        on_entry(visited_entries as u64, bytes)?;
         if visited_entries > limits.max_entries {
             return Ok(SharedCacheInventory::BoundedIncomplete {
                 observed_bytes_lower_bound: bytes,
@@ -4610,10 +4822,12 @@ where
             )
         } != 0
         {
-            return Err(shared_cache_scan_io_refusal(
-                path,
-                &std::io::Error::last_os_error(),
-            ));
+            let source = std::io::Error::last_os_error();
+            if vanished(&source) {
+                // Removed by a concurrent writer after it was listed.
+                continue;
+            }
+            return Err(shared_cache_scan_io_refusal(path, &source));
         }
         if shared_cache_scan_deadline_exceeded(started, limits) {
             return Ok(SharedCacheInventory::BoundedIncomplete {
@@ -4648,10 +4862,12 @@ where
                 // SAFETY: name is NUL-terminated and parent_fd remains live.
                 let child_fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
                 if child_fd < 0 {
-                    return Err(shared_cache_scan_io_refusal(
-                        path,
-                        &std::io::Error::last_os_error(),
-                    ));
+                    let source = std::io::Error::last_os_error();
+                    if vanished(&source) {
+                        // Removed or replaced by a concurrent writer.
+                        continue;
+                    }
+                    return Err(shared_cache_scan_io_refusal(path, &source));
                 }
                 let mut child_stat = MaybeUninit::<libc::stat>::uninit();
                 // SAFETY: child_fd is open and child_stat is writable storage.
@@ -4672,6 +4888,11 @@ where
                     // SAFETY: child_fd remains owned here because fdopendir was
                     // not called after validation failed.
                     unsafe { libc::close(child_fd) };
+                    if concurrent && child_stat.st_dev == root_device {
+                        // Replaced by a concurrent writer between the listing
+                        // and the open; never a filesystem crossing.
+                        continue;
+                    }
                     return Err(shared_cache_scan_refusal(
                         path,
                         "cache directory changed or crossed a filesystem boundary",
@@ -4984,6 +5205,7 @@ fn invalid_status(session_id: i64, reason: String) -> PreparationStatus {
         )),
         current_operation: None,
         waiting_on: None,
+        shared_cache_background_measurement: None,
     }
 }
 
@@ -8405,10 +8627,20 @@ mod tests {
                     outcome: None,
                 },
             ],
+            shared_cache_background_measurement: Some(
+                cache_measurement::SharedCacheBackgroundMeasurementReport {
+                    decided_by: None,
+                    queued: Some("inconclusive_time_limit".into()),
+                },
+            ),
             steps: Vec::new(),
             next_action: "continue".into(),
         };
         let details = report.metric_details();
+        assert_eq!(
+            details["preparation"]["shared_cache_background_measurement"]["queued"],
+            "inconclusive_time_limit"
+        );
         let preparation = &details["preparation"];
         assert_eq!(preparation["shared_cache_mode"], "exclusive");
         assert_eq!(
@@ -8435,8 +8667,16 @@ mod tests {
         let quiet = PreparationReport {
             shared_cache_rotation: None,
             shared_cache_operations: Vec::new(),
+            shared_cache_background_measurement: None,
             ..report
         };
+        assert!(
+            quiet
+                .metric_details()
+                .get("preparation")
+                .and_then(|preparation| preparation.get("shared_cache_background_measurement"))
+                .is_none()
+        );
         let details = quiet.metric_details();
         assert!(
             details["preparation"]
