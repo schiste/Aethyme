@@ -9480,11 +9480,10 @@ impl Broker {
                 .saturating_add(db_session_open),
         )
         .unwrap_or(u64::MAX);
-        slice.groups_judged_per_min = if selection_ms == 0 {
-            0
-        } else {
-            judged.saturating_mul(60_000) / selection_ms
-        };
+        slice.groups_judged_per_min = judged
+            .saturating_mul(60_000)
+            .checked_div(selection_ms)
+            .unwrap_or(0);
         slice.outcome = outcome.to_string();
         slice.stop_reason = Some(stop.as_str().to_string());
         slice.removal_cap = limits.removals;
