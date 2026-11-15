@@ -1746,6 +1746,9 @@ fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageErr
     // Nobody waits on this process: drop to background CPU and I/O priority
     // before anything else runs, so every later child inherits it.
     let priority = crate::gc::lower_artifact_worker_priority();
+    // This worker removes checkouts unattended: its Git is probed here, never
+    // taken from the per-user probe cache.
+    crate::git::require_fresh_git_probe();
     let requested_root = std::fs::canonicalize(&parsed.positional[1]).map_err(|error| {
         UsageError::Message(format!(
             "cannot resolve automatic artifact continuation repository: {error}"
@@ -1789,6 +1792,9 @@ fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageErr
     // Every unlink this process makes is unattended: pace it.
     let _pacing = crate::gc::install_unattended_deletion_pacing(&repository_root, priority);
     let mut broker = Broker::open(&repository_root)?;
+    // Probe directories that killed processes left in the temporary directory.
+    // Bounded and shape-checked; never fails the worker.
+    let _ = crate::git_probe_cache::sweep_stale_probe_directories();
     broker.run_artifact_sweep_recovery_worker()?;
     Ok(())
 }

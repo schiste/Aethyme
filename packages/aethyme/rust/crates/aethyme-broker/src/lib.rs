@@ -110,6 +110,7 @@ mod gc;
 mod gh_ref_guard;
 mod git;
 mod git_maintenance_lock;
+mod git_probe_cache;
 mod github_target;
 mod graph_impact;
 mod graph_impact_envelope;

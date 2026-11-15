@@ -16,7 +16,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 static NEXT_PRIVATE_INDEX_ID: AtomicU64 = AtomicU64::new(1);
@@ -716,6 +716,10 @@ struct GitProgram {
     /// that a machine with such a wrapper still needs to do.
     program: PathBuf,
     trust: GitOutputTrust,
+    /// The accepted candidate's verdict came from the per-user probe cache
+    /// rather than from a probe this process ran. Rejected candidates ahead of
+    /// it are always probed, so `bypassed` is this process's own evidence.
+    verdict_from_cache: bool,
 }
 
 /// What this machine's `git` was proven to do with porcelain output.
@@ -773,8 +777,90 @@ impl std::fmt::Display for BypassedGit {
 
 static GIT_PROGRAM: OnceLock<GitProgram> = OnceLock::new();
 
+/// Set by commands that can discard work: their Git program is resolved by a
+/// probe this process runs, never from the per-user cache.
+static FRESH_GIT_PROBE_REQUIRED: AtomicBool = AtomicBool::new(false);
+
+/// The outcome of re-proving a cached verdict, once per process.
+static FRESH_GIT_CONFIRMATION: OnceLock<Result<(), String>> = OnceLock::new();
+
 fn git_program() -> &'static GitProgram {
     GIT_PROGRAM.get_or_init(resolve_git_program)
+}
+
+/// Make this process resolve its Git program with a probe of its own rather
+/// than the per-user cache. For commands that can delete or discard work
+/// (`finish`, `close`, `cleanup`, `gc`, `storage`, `worktrees` and the detached
+/// GC worker), called before their first Git command. If Git was already
+/// resolved from the cache, the next [`ensure_fresh_git_verdict`] re-proves
+/// it, so calling this late is never weaker, only slower.
+pub fn require_fresh_git_probe() {
+    FRESH_GIT_PROBE_REQUIRED.store(true, Ordering::SeqCst);
+}
+
+/// Refuse unless the Git program this process uses was accepted by a probe
+/// this process ran.
+///
+/// Every primitive that deletes a checkout or a branch, and `paths_equal`
+/// (the evidence for discarding a superseded promotion), calls this. It is a
+/// no-op when the verdict was probed fresh (always, for the commands that call
+/// [`require_fresh_git_probe`]); after a cache hit it re-runs the whole
+/// resolution once per process, refreshes or drops the cache entry, and
+/// refuses if the program in use is no longer the one an honest probe picks.
+/// This is the line that keeps a wrapper whose behaviour changed without its
+/// file changing from ever authorising a deletion through a cached verdict.
+pub(crate) fn ensure_fresh_git_verdict() -> Result<(), GitError> {
+    let program = git_program();
+    if !program.verdict_from_cache {
+        return Ok(());
+    }
+    FRESH_GIT_CONFIRMATION
+        .get_or_init(|| {
+            crate::phase_telemetry::add("git_probe_fresh_forced", Duration::ZERO);
+            let fresh = resolve_git_program_with(
+                &path_candidates("git"),
+                std::env::var_os("PATH").as_deref(),
+                &crate::git_probe_cache::CacheLocation::for_process(),
+                true,
+                porcelain_probe,
+            );
+            confirm_cached_verdict(program, &fresh)
+        })
+        .clone()
+        .map_err(|detail| GitError::UntrustedOutput { detail })
+}
+
+/// `Ok` when a fresh resolution accepts the same program the cached one did.
+fn confirm_cached_verdict(cached: &GitProgram, fresh: &GitProgram) -> Result<(), String> {
+    match (&cached.trust, &fresh.trust) {
+        (
+            GitOutputTrust::Undecorated { resolved: was, .. },
+            GitOutputTrust::Undecorated { resolved: now, .. },
+        ) if was == now => Ok(()),
+        (
+            GitOutputTrust::Undecorated { resolved: was, .. },
+            GitOutputTrust::Undecorated { resolved: now, .. },
+        ) => Err(format!(
+            "this process trusted {} from the git probe cache, but a fresh probe now selects {}; \
+             refusing to discard work on the cached verdict, rerun the command",
+            was.display(),
+            now.display()
+        )),
+        (
+            GitOutputTrust::Undecorated { resolved: was, .. },
+            GitOutputTrust::Decorated { detail },
+        )
+        | (
+            GitOutputTrust::Undecorated { resolved: was, .. },
+            GitOutputTrust::Indeterminate { detail },
+        ) => Err(format!(
+            "this process trusted {} from the git probe cache, but a fresh probe no longer \
+             accepts it ({detail}); refusing to discard work on the cached verdict",
+            was.display()
+        )),
+        // A cached verdict is only ever an acceptance.
+        _ => Ok(()),
+    }
 }
 
 /// What `aethyme certify` reports about git output, from the same probe the
@@ -820,11 +906,79 @@ pub(crate) fn drop_inherited_git_environment_on_this_thread() {
 }
 
 fn resolve_git_program() -> GitProgram {
+    let _span = crate::phase_telemetry::span("git_program_resolve");
+    let fresh = FRESH_GIT_PROBE_REQUIRED.load(Ordering::SeqCst);
+    if fresh {
+        crate::phase_telemetry::add("git_probe_fresh_forced", Duration::ZERO);
+    }
+    resolve_git_program_with(
+        &path_candidates("git"),
+        std::env::var_os("PATH").as_deref(),
+        &crate::git_probe_cache::CacheLocation::for_process(),
+        fresh,
+        porcelain_probe,
+    )
+}
+
+/// Pick the first candidate that is not a lying wrapper.
+///
+/// A candidate whose exact key has an unexpired acceptance in `cache` is
+/// taken without probing, unless `fresh`. Every other candidate is probed;
+/// an acceptance is recorded (only if the key did not change while the probe
+/// ran) and anything else drops whatever the cache held for that candidate.
+/// Rejections are never recorded, so a wrapper placed ahead of an accepted
+/// git on PATH is probed -- and refused -- by every process.
+fn resolve_git_program_with(
+    candidates: &[PathBuf],
+    path_env: Option<&std::ffi::OsStr>,
+    cache: &crate::git_probe_cache::CacheLocation,
+    fresh: bool,
+    probe: impl Fn(&Path) -> PorcelainProbe,
+) -> GitProgram {
+    use crate::git_probe_cache as probe_cache;
+
     let mut dishonest: Vec<BypassedGit> = Vec::new();
     let mut unusable: Vec<BypassedGit> = Vec::new();
-    for candidate in path_candidates("git") {
-        match porcelain_probe(&candidate) {
+    for candidate in candidates.iter().cloned() {
+        let key = probe_cache::program_key(&candidate, path_env);
+        if !fresh {
+            let lookup = match &key {
+                Some(key) => probe_cache::lookup(cache, key, std::time::SystemTime::now()),
+                None => probe_cache::Lookup::Miss(probe_cache::MissReason::Unkeyable),
+            };
+            match lookup {
+                probe_cache::Lookup::Hit => {
+                    crate::phase_telemetry::add("git_probe_cache_hit", Duration::ZERO);
+                    let mut bypassed = dishonest;
+                    bypassed.append(&mut unusable);
+                    return GitProgram {
+                        program: candidate.clone(),
+                        trust: GitOutputTrust::Undecorated {
+                            resolved: candidate,
+                            bypassed,
+                        },
+                        verdict_from_cache: true,
+                    };
+                }
+                probe_cache::Lookup::Miss(reason) => {
+                    crate::phase_telemetry::add(reason.counter(), Duration::ZERO);
+                }
+            }
+        }
+        let verdict = {
+            let _span = crate::phase_telemetry::span("git_probe_run");
+            probe(&candidate)
+        };
+        if verdict != PorcelainProbe::Undecorated {
+            probe_cache::forget(cache, &candidate);
+        }
+        match verdict {
             PorcelainProbe::Undecorated => {
+                if let Some(key) = key
+                    && probe_cache::program_key(&candidate, path_env).as_ref() == Some(&key)
+                {
+                    probe_cache::record_acceptance(cache, &key, std::time::SystemTime::now());
+                }
                 let mut bypassed = dishonest;
                 bypassed.append(&mut unusable);
                 return GitProgram {
@@ -833,6 +987,7 @@ fn resolve_git_program() -> GitProgram {
                         resolved: candidate,
                         bypassed,
                     },
+                    verdict_from_cache: false,
                 };
             }
             PorcelainProbe::Decorated { bytes } => dishonest.push(BypassedGit {
@@ -880,6 +1035,7 @@ fn resolve_git_program() -> GitProgram {
     GitProgram {
         program: PathBuf::from("git"),
         trust,
+        verdict_from_cache: false,
     }
 }
 
@@ -1081,7 +1237,13 @@ enum PorcelainProbe {
 /// aliases: a `status.showUntrackedFiles` setting or a template hook that
 /// prints would otherwise be indistinguishable from a wrapper.
 fn porcelain_probe(program: &Path) -> PorcelainProbe {
-    let probe = match tempfile::tempdir() {
+    // A recognisable name: a process killed mid-probe (or one that replaces
+    // itself) leaves this directory behind, and the background worker removes
+    // stale ones by this prefix and shape (`git_probe_cache`).
+    let probe = match tempfile::Builder::new()
+        .prefix(crate::git_probe_cache::PROBE_DIRECTORY_PREFIX)
+        .tempdir()
+    {
         Ok(probe) => probe,
         Err(err) => {
             return PorcelainProbe::Unusable {
@@ -5955,6 +6117,9 @@ impl GitRepo {
             return Ok(true);
         }
         require_trustworthy_porcelain()?;
+        // The sole automatic evidence for discarding a superseded promotion:
+        // never answered on a cached probe verdict.
+        ensure_fresh_git_verdict()?;
         const DIFF_ARGS: &str = "diff --literal-pathspecs --name-only --no-renames";
         const DIFF_COMMAND: &[&str] = &[
             "--literal-pathspecs",
@@ -8241,6 +8406,9 @@ impl GitRepo {
 
     pub fn worktree_remove(&self, worktree: &Path, force: bool) -> Result<(), GitError> {
         let _span = crate::phase_telemetry::span("worktree_remove");
+        // Checked here as well as in `worktree_remove_registered`: a refusal
+        // there must not fall through to the orphan removal below.
+        ensure_fresh_git_verdict()?;
         let Err(error) = self.worktree_remove_registered(worktree, force) else {
             return Ok(());
         };
@@ -8279,6 +8447,9 @@ impl GitRepo {
         worktree: &Path,
         force: bool,
     ) -> Result<(), GitError> {
+        // Whatever judged this checkout removable ran on this process's Git;
+        // a deletion never rests on a cached verdict about that Git.
+        ensure_fresh_git_verdict()?;
         // Environments are destroyed before their worktree goes: their
         // destroy hooks usually live in it (#1211). A worktree whose
         // environments could not be destroyed is kept, with the reason.
@@ -8313,6 +8484,7 @@ impl GitRepo {
     /// object. Used to roll back a just-created session worktree if its
     /// atomic database registration loses a planned-lease race.
     pub fn delete_branch_ref_checked(&self, branch: &str, expected: &str) -> Result<(), GitError> {
+        ensure_fresh_git_verdict()?;
         run_git(
             &self.root,
             &[
@@ -13422,5 +13594,352 @@ mod sparse_worktree_tests {
         let base = repo.head_commit().unwrap();
         assert!(repo.commit_has_directory(&base, "included").unwrap());
         assert!(!repo.commit_has_directory(&base, "alias").unwrap());
+    }
+}
+
+/// The per-user probe cache as the resolver uses it: what a hit skips, what
+/// forces a probe, and what is never recorded. Every test names its own cache
+/// file; the process default is disabled under test.
+#[cfg(all(test, unix))]
+mod git_probe_cache_resolution_tests {
+    use super::*;
+    use crate::git_probe_cache::{self as probe_cache, CacheLocation, Lookup, MissReason};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    const PATH_ENV: &str = "/usr/bin:/bin";
+
+    fn trustworthy_git() -> Option<PathBuf> {
+        match git_output_trust() {
+            GitOutputTrust::Undecorated { resolved, .. } => Some(resolved.clone()),
+            _ => None,
+        }
+    }
+
+    /// Write `body` as an executable `git` in a fresh directory under `root`,
+    /// through a rename so the final path never has an open write handle.
+    fn install(root: &Path, dir: &str, body: &str) -> PathBuf {
+        let dir = root.join(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let staged = dir.join(".git-staged");
+        std::fs::write(&staged, body).unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join("git");
+        std::fs::rename(&staged, &path).unwrap();
+        path
+    }
+
+    /// A faithful wrapper that appends a line to `counter` per Git spawn.
+    fn counting(root: &Path, dir: &str, real: &Path, counter: &Path) -> PathBuf {
+        install(
+            root,
+            dir,
+            &format!(
+                "#!/bin/sh\necho spawn >> \"{}\"\nexec \"{}\" \"$@\"\n",
+                counter.display(),
+                real.display()
+            ),
+        )
+    }
+
+    /// Counts spawns, and lies about `diff --quiet` while `mode` says `lie`:
+    /// the residual a key cannot see, because the wrapper file never changes.
+    fn moody(root: &Path, real: &Path, counter: &Path, mode: &Path) -> PathBuf {
+        install(
+            root,
+            "moody",
+            &format!(
+                r#"#!/bin/sh
+echo spawn >> "{counter}"
+"{real}" "$@"
+status=$?
+if [ "$(cat "{mode}" 2>/dev/null)" = "lie" ]; then
+    for arg in "$@"; do
+        if [ "$arg" = "--quiet" ]; then exit 0; fi
+    done
+fi
+exit $status
+"#,
+                counter = counter.display(),
+                real = real.display(),
+                mode = mode.display()
+            ),
+        )
+    }
+
+    fn spawns(counter: &Path) -> usize {
+        std::fs::read_to_string(counter)
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// `porcelain_probe`, retrying only Linux's ETXTBSY from a sibling test's
+    /// fork holding a write handle (see `git_program_tests::probe`).
+    fn probe(path: &Path) -> PorcelainProbe {
+        for _ in 0..50 {
+            let result = porcelain_probe(path);
+            if !matches!(&result, PorcelainProbe::Unusable { reason } if reason.contains("Text file busy"))
+            {
+                return result;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        porcelain_probe(path)
+    }
+
+    fn resolve(candidates: &[PathBuf], cache: &CacheLocation, fresh: bool) -> GitProgram {
+        resolve_git_program_with(
+            candidates,
+            Some(std::ffi::OsStr::new(PATH_ENV)),
+            cache,
+            fresh,
+            probe,
+        )
+    }
+
+    fn resolved(program: &GitProgram) -> Option<&Path> {
+        match &program.trust {
+            GitOutputTrust::Undecorated { resolved, .. } => Some(resolved),
+            _ => None,
+        }
+    }
+
+    fn key(path: &Path) -> probe_cache::ProgramKey {
+        probe_cache::program_key(path, Some(std::ffi::OsStr::new(PATH_ENV))).unwrap()
+    }
+
+    struct Fixture {
+        _root: tempfile::TempDir,
+        root: PathBuf,
+        real: PathBuf,
+        cache: CacheLocation,
+    }
+
+    fn fixture() -> Option<Fixture> {
+        let Some(real) = trustworthy_git() else {
+            eprintln!("every git on PATH is wrapped; nothing honest to wrap");
+            return None;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_path_buf();
+        Some(Fixture {
+            cache: CacheLocation::File(path.join("cache/git-probe/verdicts.json")),
+            _root: root,
+            root: path,
+            real,
+        })
+    }
+
+    #[test]
+    fn a_cache_hit_spawns_no_git_and_fresh_mode_probes_anyway() {
+        let Some(f) = fixture() else { return };
+        let counter = f.root.join("count");
+        let git = counting(&f.root, "a", &f.real, &counter);
+
+        let first = resolve(std::slice::from_ref(&git), &f.cache, false);
+        assert_eq!(resolved(&first), Some(git.as_path()));
+        assert!(!first.verdict_from_cache);
+        let probed = spawns(&counter);
+        assert!(
+            probed >= 8,
+            "the probe runs about ten git commands, saw {probed}"
+        );
+
+        let second = resolve(std::slice::from_ref(&git), &f.cache, false);
+        assert_eq!(resolved(&second), Some(git.as_path()));
+        assert!(second.verdict_from_cache);
+        assert_eq!(spawns(&counter), probed, "a hit must not spawn git");
+
+        // Destructive commands: never answered from the cache.
+        let forced = resolve(std::slice::from_ref(&git), &f.cache, true);
+        assert!(!forced.verdict_from_cache);
+        assert_eq!(spawns(&counter), probed * 2);
+        assert_eq!(confirm_cached_verdict(&second, &forced), Ok(()));
+    }
+
+    #[test]
+    fn replacing_the_binary_forces_a_probe() {
+        let Some(f) = fixture() else { return };
+        let counter = f.root.join("count");
+        let git = counting(&f.root, "a", &f.real, &counter);
+        resolve(std::slice::from_ref(&git), &f.cache, false);
+        let probed = spawns(&counter);
+
+        // Same path, new file (as a package upgrade does).
+        let replaced = counting(&f.root, "a", &f.real, &counter);
+        assert_eq!(replaced, git);
+        assert_eq!(
+            probe_cache::lookup(&f.cache, &key(&git), std::time::SystemTime::now()),
+            Lookup::Miss(MissReason::KeyMismatch)
+        );
+        let again = resolve(std::slice::from_ref(&git), &f.cache, false);
+        assert!(!again.verdict_from_cache);
+        assert!(spawns(&counter) > probed);
+    }
+
+    #[test]
+    fn retargeting_a_symlink_hop_forces_a_probe() {
+        let Some(f) = fixture() else { return };
+        let counter = f.root.join("count");
+        let one = counting(&f.root, "one", &f.real, &counter);
+        let two = counting(&f.root, "two", &f.real, &counter);
+        let link_dir = f.root.join("link");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let link = link_dir.join("git");
+        std::os::unix::fs::symlink(&one, &link).unwrap();
+        resolve(std::slice::from_ref(&link), &f.cache, false);
+        assert!(resolve(std::slice::from_ref(&link), &f.cache, false).verdict_from_cache);
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&two, &link).unwrap();
+        let before = spawns(&counter);
+        let retargeted = resolve(std::slice::from_ref(&link), &f.cache, false);
+        assert!(!retargeted.verdict_from_cache);
+        assert!(spawns(&counter) > before);
+    }
+
+    #[test]
+    fn a_different_path_winner_is_probed_not_borrowed() {
+        let Some(f) = fixture() else { return };
+        let counter_a = f.root.join("count-a");
+        let counter_b = f.root.join("count-b");
+        let a = counting(&f.root, "a", &f.real, &counter_a);
+        let b = counting(&f.root, "b", &f.real, &counter_b);
+        resolve(std::slice::from_ref(&a), &f.cache, false);
+
+        let program = resolve(&[b.clone(), a.clone()], &f.cache, false);
+        assert_eq!(resolved(&program), Some(b.as_path()));
+        assert!(!program.verdict_from_cache);
+        assert!(spawns(&counter_b) > 0, "the new winner is probed");
+    }
+
+    #[test]
+    fn a_rejected_binary_is_never_cached() {
+        let Some(f) = fixture() else { return };
+        let liar = install(
+            &f.root,
+            "liar",
+            &format!(
+                "#!/bin/sh\n\"{}\" \"$@\"\nstatus=$?\nprintf 'ok'\nexit $status\n",
+                f.real.display()
+            ),
+        );
+        let program = resolve(std::slice::from_ref(&liar), &f.cache, false);
+        assert!(matches!(program.trust, GitOutputTrust::Decorated { .. }));
+        assert!(
+            !f.cache.path().unwrap().exists(),
+            "a rejection writes nothing"
+        );
+        assert_eq!(
+            probe_cache::lookup(&f.cache, &key(&liar), std::time::SystemTime::now()),
+            Lookup::Miss(MissReason::Absent)
+        );
+    }
+
+    /// The adversarial case the cache must not weaken: the real git was
+    /// accepted and cached, then a lying wrapper appears earlier on PATH. It
+    /// has its own path and metadata, so it is probed and refused, and the
+    /// broker keeps the cached honest git with the wrapper on record.
+    #[test]
+    fn a_wrapper_placed_ahead_of_a_cached_git_is_probed_and_rejected() {
+        let Some(f) = fixture() else { return };
+        let honest_counter = f.root.join("count-honest");
+        let honest = counting(&f.root, "honest", &f.real, &honest_counter);
+        resolve(std::slice::from_ref(&honest), &f.cache, false);
+
+        let liar_counter = f.root.join("count-liar");
+        let liar = install(
+            &f.root,
+            "liar",
+            &format!(
+                "#!/bin/sh\necho spawn >> \"{}\"\n\"{}\" \"$@\"\nstatus=$?\nfor arg in \"$@\"; do\n    if [ \"$arg\" = \"--quiet\" ]; then exit 0; fi\ndone\nexit $status\n",
+                liar_counter.display(),
+                f.real.display()
+            ),
+        );
+        let program = resolve(&[liar.clone(), honest.clone()], &f.cache, false);
+        assert!(spawns(&liar_counter) > 0, "the wrapper is probed");
+        match &program.trust {
+            GitOutputTrust::Undecorated { resolved, bypassed } => {
+                assert_eq!(resolved, &honest);
+                assert!(
+                    bypassed
+                        .iter()
+                        .any(|entry| entry.path == liar && entry.dishonest),
+                    "{bypassed:?}"
+                );
+            }
+            other => panic!("expected the cached honest git, got {other:?}"),
+        }
+        assert_eq!(
+            probe_cache::lookup(&f.cache, &key(&liar), std::time::SystemTime::now()),
+            Lookup::Miss(MissReason::Absent)
+        );
+    }
+
+    /// The residual, stated as a test: a wrapper that starts lying without its
+    /// file changing is still a cache hit for non-destructive work, and the
+    /// fresh confirmation every deletion runs refuses it and drops the entry.
+    #[test]
+    fn a_wrapper_that_changes_behaviour_in_place_is_refused_by_the_fresh_check() {
+        let Some(f) = fixture() else { return };
+        let counter = f.root.join("count");
+        let mode = f.root.join("mode");
+        std::fs::write(&mode, "honest").unwrap();
+        let git = moody(&f.root, &f.real, &counter, &mode);
+        let accepted = resolve(std::slice::from_ref(&git), &f.cache, false);
+        assert!(resolved(&accepted).is_some());
+
+        std::fs::write(&mode, "lie").unwrap();
+        let cached = resolve(std::slice::from_ref(&git), &f.cache, false);
+        assert!(
+            cached.verdict_from_cache,
+            "the key cannot see a config change"
+        );
+
+        let fresh = resolve(std::slice::from_ref(&git), &f.cache, true);
+        assert!(matches!(fresh.trust, GitOutputTrust::Decorated { .. }));
+        let refusal = confirm_cached_verdict(&cached, &fresh).unwrap_err();
+        assert!(refusal.contains("refusing to discard work"), "{refusal}");
+        assert_eq!(
+            probe_cache::lookup(&f.cache, &key(&git), std::time::SystemTime::now()),
+            Lookup::Miss(MissReason::Absent),
+            "a probe that did not accept drops the stale acceptance"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_cache_means_probe_never_accept() {
+        let Some(f) = fixture() else { return };
+        let counter = f.root.join("count");
+        let git = counting(&f.root, "a", &f.real, &counter);
+        resolve(std::slice::from_ref(&git), &f.cache, false);
+        let path = f.cache.path().unwrap().to_path_buf();
+
+        std::fs::write(&path, b"[]").unwrap();
+        let before = spawns(&counter);
+        let program = resolve(std::slice::from_ref(&git), &f.cache, false);
+        assert!(!program.verdict_from_cache);
+        assert!(spawns(&counter) > before);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let before = spawns(&counter);
+        let program = resolve(std::slice::from_ref(&git), &f.cache, false);
+        assert!(
+            !program.verdict_from_cache,
+            "a world-writable file is ignored"
+        );
+        assert!(spawns(&counter) > before);
+    }
+
+    #[test]
+    fn a_disabled_cache_always_probes() {
+        let Some(f) = fixture() else { return };
+        let counter = f.root.join("count");
+        let git = counting(&f.root, "a", &f.real, &counter);
+        resolve(std::slice::from_ref(&git), &CacheLocation::Disabled, false);
+        let once = spawns(&counter);
+        let program = resolve(std::slice::from_ref(&git), &CacheLocation::Disabled, false);
+        assert!(!program.verdict_from_cache);
+        assert_eq!(spawns(&counter), once * 2);
     }
 }
