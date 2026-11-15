@@ -2342,3 +2342,35 @@ fn scheduled_gc_flags_require_specific_actions_and_confirmation_format() {
     .unwrap_or_else(|_| panic!("parse before digest validation"));
     assert!(super::gc_storage::service_confirmation(&parsed).is_err());
 }
+
+/// Commands that can delete resolve Git with a fresh probe, never the cache.
+#[test]
+fn deleting_commands_require_a_fresh_git_probe() {
+    let args = |words: &[&str]| {
+        words
+            .iter()
+            .map(|word| (*word).to_string())
+            .collect::<Vec<_>>()
+    };
+    for deleting in [
+        &["reclaim", "apply"][..],
+        &["reclaim", "plan"][..],
+        &["finish"][..],
+        &["close"][..],
+        &["cleanup"][..],
+        &["gc", "apply"][..],
+        &["storage", "apply"][..],
+        &["worktrees"][..],
+    ] {
+        assert!(
+            super::command_can_discard_work(&args(deleting)),
+            "{deleting:?}"
+        );
+    }
+    for reading in [&["status"][..], &["hooks", "status"][..], &["push"][..]] {
+        assert!(
+            !super::command_can_discard_work(&args(reading)),
+            "{reading:?}"
+        );
+    }
+}
