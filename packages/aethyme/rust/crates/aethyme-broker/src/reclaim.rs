@@ -1561,6 +1561,17 @@ pub fn apply(plan: &ReclaimPlan) -> ReclaimOutcome {
         skipped: Vec::new(),
         not_reviewed: Vec::new(),
     };
+    // The plan's "ignored, untracked" evidence came from Git: nothing goes on
+    // a cached verdict about that Git (`remove_tree` checks again).
+    if plan
+        .candidates
+        .iter()
+        .any(|candidate| candidate.reclaimable)
+        && let Err(error) = crate::git::ensure_fresh_git_verdict()
+    {
+        outcome.skipped.push(format!("nothing removed: {error}"));
+        return outcome;
+    }
     for candidate in &plan.candidates {
         if !candidate.reclaimable {
             continue;

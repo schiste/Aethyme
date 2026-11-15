@@ -1,35 +1,39 @@
-//! A per-user record of Git binaries the wrapper probe accepted, so that the
-//! probe runs once per binary rather than once per process.
+//! A per-user record of the wrapper probe's verdict on each Git binary, so
+//! that the probe runs once per binary rather than once per process.
 //!
 //! Every `aethyme` process that runs Git first proves its candidate `git` is
 //! not a wrapper that decorates porcelain output or rewrites exit codes
 //! (#176, #178): about ten Git processes in a temporary repository. Hooks fire
 //! on every agent tool use, so on a busy machine that was 25 Git spawns a
-//! second and 150-250 ms on every command, spent re-proving the same file.
+//! second and 150-250 ms on every command, spent re-proving the same files.
 //!
-//! The record is only ever an acceptance, and only for exactly the file that
-//! was probed:
+//! The record holds acceptances and rejections, each only for exactly the file
+//! that was probed under exactly the environment it was probed in:
 //!
 //! - **Keyed on everything that selects the bytes that run.** The candidate's
 //!   absolute PATH spelling; device, inode, size, mode, mtime and ctime (to the
 //!   nanosecond) of that path and of every symlink hop to the final file; the
-//!   probe's own version; the user id; the variables that redirect a `git`
-//!   without changing its file (`DEVELOPER_DIR` and the `xcode-select` link for
-//!   the macOS `/usr/bin/git` shim, plus the selected developer directory's
-//!   own `git`); and for a script, the whole `PATH`, because a script resolves
-//!   what it forwards to through it. A hit needs every field to match exactly.
-//!   Rejections are never recorded: a wrapper ahead of an accepted git on PATH
-//!   has its own path and metadata, so it is probed and refused every time.
-//! - **Bounded in time.** An acceptance expires after [`CACHE_TTL`]. The one
-//!   thing a key cannot see is a wrapper whose behaviour changes while its
-//!   file does not (it reads a config file or an environment variable). The
-//!   expiry bounds how long such a change can go unnoticed by non-destructive
-//!   commands; destructive ones never rely on the record at all (see
-//!   `git::require_fresh_git_probe` and `git::ensure_fresh_git_verdict`).
+//!   probe's own version; the user id; a digest of `PATH` (a forwarder, script
+//!   or binary, resolves what it runs through it); a digest of the dynamic
+//!   loader variables (`DYLD_*`, `LD_PRELOAD`, `LD_LIBRARY_PATH`); and for the
+//!   macOS `/usr/bin/git` shim, `DEVELOPER_DIR`, the `xcode-select` link and
+//!   the selected developer directory's own `git`. A hit needs every field to
+//!   match exactly.
+//! - **A cached rejection fails safe.** It skips the candidate exactly as a
+//!   fresh rejection would, so the worst a stale one can do is pass over a
+//!   binary that has since become honest -- and changing that binary changes
+//!   its key. A probe that could not run (`Unusable`) is never recorded.
+//! - **Bounded in time.** Entries expire after [`CACHE_TTL`]. What a key cannot
+//!   see is a wrapper whose behaviour changes while its file and the keyed
+//!   environment do not (it reads a config file or another variable), and
+//!   shared libraries the binary loads. The expiry bounds how long that can go
+//!   unnoticed by commands that cannot delete; anything that deletes on Git
+//!   evidence re-proves a cached acceptance first (see
+//!   `git::ensure_fresh_git_verdict`).
 //! - **Distrusted unless it is plainly ours.** The file must be a regular file
 //!   (never a symlink), owned by this user, mode 0600, in a directory owned by
-//!   this user that nobody else can write, below a size cap, and parse
-//!   completely. Anything else is treated as absent: probe, never accept.
+//!   this user that nobody else can write, below a size and entry cap, and
+//!   parse completely. Anything else is treated as absent: probe, never trust.
 //!
 //! `AETHYME_GIT_PROBE_CACHE=off` disables reading and writing it. An
 //! environment variable can only ever force a probe here, never supply a
@@ -60,8 +64,8 @@ pub(crate) const CACHE_ENV: &str = "AETHYME_GIT_PROBE_CACHE";
 
 const CACHE_DIRECTORY: &str = "git-probe";
 const CACHE_FILE: &str = "verdicts.json";
-const CACHE_SCHEMA: u32 = 1;
-const MAX_ENTRIES: usize = 16;
+const CACHE_SCHEMA: u32 = 2;
+const MAX_ENTRIES: usize = 32;
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 const MAX_SYMLINK_HOPS: usize = 40;
 /// An acceptance dated further ahead than this is not one this host wrote
@@ -145,7 +149,19 @@ pub(crate) struct ProgramKey {
     pub selectors: Vec<(String, String)>,
 }
 
-/// Why a lookup did not produce an acceptance. Each is a telemetry counter.
+/// What the probe concluded about one key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CachedVerdict {
+    Accepted,
+    /// Caught decorating output or rewriting exit codes; `reason` is the
+    /// operator-facing explanation, already naming the candidate.
+    Rejected {
+        reason: String,
+    },
+}
+
+/// Why a lookup did not produce a verdict. Each is a telemetry counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MissReason {
     Disabled,
@@ -171,16 +187,17 @@ impl MissReason {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Lookup {
-    Hit,
+    Hit(CachedVerdict),
     Miss(MissReason),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheEntry {
     key: ProgramKey,
-    accepted_at_ms: u64,
+    verdict: CachedVerdict,
+    recorded_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +218,27 @@ pub(crate) fn program_key(candidate: &Path, path_env: Option<&OsStr>) -> Option<
 pub(crate) struct SystemSelectors {
     pub developer_dir: Option<String>,
     pub xcode_select_link: Option<String>,
+    /// Dynamic-loader variables that change what any binary executes, as
+    /// name/value, in a fixed order.
+    pub loader_env: Vec<(String, String)>,
+}
+
+/// Loader variables keyed for every candidate: cheap to read, and each can
+/// make an honest binary run other code.
+const LOADER_ENV: &[&str] = &[
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_FRAMEWORK_PATH",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+];
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 impl SystemSelectors {
@@ -216,6 +254,13 @@ impl SystemSelectors {
             } else {
                 None
             },
+            loader_env: LOADER_ENV
+                .iter()
+                .filter_map(|name| {
+                    std::env::var_os(name)
+                        .map(|value| ((*name).to_string(), value.to_string_lossy().into_owned()))
+                })
+                .collect(),
         }
     }
 }
@@ -261,16 +306,24 @@ pub(crate) fn program_key_with(
             }
         }
     }
-    // A script resolves whatever it forwards to through PATH, so the same
-    // script file can run a different git under a different PATH.
-    if is_script(Path::new(&target)) {
-        selectors.push((
-            "PATH".to_string(),
-            path_env
-                .map(|value| value.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-        ));
-    }
+    // Any forwarder -- a script or a binary -- resolves what it runs through
+    // PATH, so the same file can run a different git under a different PATH.
+    // Keyed for every candidate: the cost is one probe when PATH changes.
+    let path_bytes = path_env.map_or(&[][..], |value| {
+        use std::os::unix::ffi::OsStrExt as _;
+        value.as_bytes()
+    });
+    selectors.push(("PATH_sha256".to_string(), sha256_hex(path_bytes)));
+    let loader = system
+        .loader_env
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("\0");
+    selectors.push((
+        "loader_env_sha256".to_string(),
+        sha256_hex(loader.as_bytes()),
+    ));
     Some(ProgramKey {
         probe_version: PROBE_VERSION,
         uid: effective_uid(),
@@ -346,16 +399,6 @@ fn identity_chain(path: &Path) -> Option<Vec<FileIdentity>> {
     None
 }
 
-#[cfg(unix)]
-fn is_script(path: &Path) -> bool {
-    use std::io::Read as _;
-
-    let mut head = [0_u8; 2];
-    std::fs::File::open(path)
-        .and_then(|mut file| file.read_exact(&mut head))
-        .is_ok_and(|()| &head == b"#!")
-}
-
 pub(crate) fn effective_uid() -> u32 {
     #[cfg(unix)]
     {
@@ -374,7 +417,7 @@ fn unix_ms(at: SystemTime) -> u64 {
     })
 }
 
-/// Whether `location` holds an unexpired acceptance for exactly `key`.
+/// The unexpired verdict `location` holds for exactly `key`, if any.
 pub(crate) fn lookup(location: &CacheLocation, key: &ProgramKey, now: SystemTime) -> Lookup {
     let CacheLocation::File(path) = location else {
         return Lookup::Miss(MissReason::Disabled);
@@ -395,14 +438,14 @@ pub(crate) fn lookup(location: &CacheLocation, key: &ProgramKey, now: SystemTime
             continue;
         }
         let skew = u64::try_from(FUTURE_SKEW.as_millis()).unwrap_or(u64::MAX);
-        if entry.accepted_at_ms > now_ms.saturating_add(skew) {
+        if entry.recorded_at_ms > now_ms.saturating_add(skew) {
             return Lookup::Miss(MissReason::Invalid);
         }
         let ttl = u64::try_from(CACHE_TTL.as_millis()).unwrap_or(u64::MAX);
-        if now_ms.saturating_sub(entry.accepted_at_ms) >= ttl {
+        if now_ms.saturating_sub(entry.recorded_at_ms) >= ttl {
             return Lookup::Miss(MissReason::Expired);
         }
-        return Lookup::Hit;
+        return Lookup::Hit(entry.verdict.clone());
     }
     Lookup::Miss(if same_candidate {
         MissReason::KeyMismatch
@@ -411,10 +454,15 @@ pub(crate) fn lookup(location: &CacheLocation, key: &ProgramKey, now: SystemTime
     })
 }
 
-/// Record that the probe accepted exactly `key`, replacing any earlier entry
-/// for the same candidate. Best effort: a cache that cannot be written only
-/// costs the next process a probe.
-pub(crate) fn record_acceptance(location: &CacheLocation, key: &ProgramKey, now: SystemTime) {
+/// Record the probe's verdict on exactly `key`, replacing any earlier entry for
+/// the same candidate under the same keyed environment. Best effort: a cache
+/// that cannot be written only costs the next process a probe.
+pub(crate) fn record(
+    location: &CacheLocation,
+    key: &ProgramKey,
+    verdict: CachedVerdict,
+    now: SystemTime,
+) {
     let CacheLocation::File(path) = location else {
         return;
     };
@@ -422,19 +470,22 @@ pub(crate) fn record_acceptance(location: &CacheLocation, key: &ProgramKey, now:
         Ok(Some(file)) => file.entries,
         Ok(None) | Err(()) => Vec::new(),
     };
-    entries.retain(|entry| entry.key.candidate != key.candidate);
+    entries.retain(|entry| {
+        entry.key.candidate != key.candidate || entry.key.selectors != key.selectors
+    });
     entries.push(CacheEntry {
         key: key.clone(),
-        accepted_at_ms: unix_ms(now),
+        verdict,
+        recorded_at_ms: unix_ms(now),
     });
-    entries.sort_by_key(|entry| std::cmp::Reverse(entry.accepted_at_ms));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.recorded_at_ms));
     entries.truncate(MAX_ENTRIES);
     note_write(write_cache(path, entries));
 }
 
-/// Drop every acceptance recorded for `candidate`. Called whenever a probe of
-/// it does not accept, so a binary that started lying is never vouched for
-/// again by an older record. Writes only when there was something to drop.
+/// Drop every verdict recorded for `candidate`. Called when a probe of it could
+/// not run, so nothing older speaks for it. Writes only when there was
+/// something to drop.
 pub(crate) fn forget(location: &CacheLocation, candidate: &Path) {
     let CacheLocation::File(path) = location else {
         return;
@@ -466,10 +517,16 @@ fn note_write(result: std::io::Result<()>) {
 /// believe.
 #[cfg(unix)]
 fn read_cache(path: &Path) -> Result<Option<CacheFile>, ()> {
+    read_cache_owned_by(path, effective_uid())
+}
+
+/// [`read_cache`] for an expected owner, so a test can prove an owner
+/// mismatch is refused without being root.
+#[cfg(unix)]
+fn read_cache_owned_by(path: &Path, uid: u32) -> Result<Option<CacheFile>, ()> {
     use std::io::Read as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
-    let uid = effective_uid();
     let Some(parent) = path.parent() else {
         return Err(());
     };
@@ -580,7 +637,9 @@ pub(crate) struct ProbeDirectorySweep {
 
 /// Remove probe directories that a killed process left in the system
 /// temporary directory. Bounded, best effort, and never touches a directory
-/// whose shape is not exactly a probe's.
+/// whose shape is not exactly a probe's. Only this process's temporary
+/// directory (`$TMPDIR`) is swept: probes run under another `TMPDIR` leave
+/// their leftovers until a worker with that `TMPDIR` runs.
 pub(crate) fn sweep_stale_probe_directories() -> ProbeDirectorySweep {
     let started = std::time::Instant::now();
     let sweep = sweep_probe_directories_in(
@@ -629,10 +688,12 @@ pub(crate) fn sweep_probe_directories_in(
         if !is_stale_probe_directory(&path, legacy, now, min_age) {
             continue;
         }
-        match std::fs::remove_dir_all(&path) {
-            Ok(()) if legacy => sweep.legacy_removed += 1,
-            Ok(()) => sweep.removed += 1,
-            Err(_) => sweep.failed += 1,
+        // The shared pinned, no-follow tree removal: paced by the unattended
+        // pacer the worker installs, and refused unless Git is freshly proven.
+        match crate::gc::remove_condemned_tree(&path, None, None) {
+            Ok(crate::gc::TreeRemoval::Complete) if legacy => sweep.legacy_removed += 1,
+            Ok(crate::gc::TreeRemoval::Complete) => sweep.removed += 1,
+            Ok(_) | Err(_) => sweep.failed += 1,
         }
     }
     sweep
@@ -709,6 +770,7 @@ fn is_stale_probe_directory(path: &Path, legacy: bool, now: SystemTime, min_age:
                             .iter()
                             .all(|entry| entry == ".git" || entry == "probe.txt")
                     })
+                    && is_probe_git_directory(&child.join(".git"), uid)
             }
             _ => false,
         };
@@ -717,6 +779,40 @@ fn is_stale_probe_directory(path: &Path, legacy: bool, now: SystemTime, min_age:
         }
     }
     true
+}
+
+/// What `git init --template=<empty>` and the probe's two commits leave in
+/// `.git`. Absent is fine (a probe killed before `init`); anything else --
+/// hooks, a worktree link, a symlink -- is not a probe's repository.
+#[cfg(unix)]
+fn is_probe_git_directory(git: &Path, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    const PROBE_GIT_ENTRIES: [&str; 8] = [
+        "COMMIT_EDITMSG",
+        "HEAD",
+        "config",
+        "index",
+        "logs",
+        "objects",
+        "refs",
+        "description",
+    ];
+    let metadata = match std::fs::symlink_metadata(git) {
+        Ok(metadata) => metadata,
+        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+    };
+    if !metadata.is_dir() || metadata.uid() != uid {
+        return false;
+    }
+    let Some(entries) = child_names(git, PROBE_GIT_ENTRIES.len()) else {
+        return false;
+    };
+    entries.iter().all(|name| {
+        PROBE_GIT_ENTRIES.contains(&name.as_str())
+            && std::fs::symlink_metadata(git.join(name))
+                .is_ok_and(|entry| !entry.file_type().is_symlink() && entry.uid() == uid)
+    })
 }
 
 /// Sorted names of `dir`'s entries, or `None` when it cannot be read or holds
@@ -767,8 +863,11 @@ mod tests {
         let key = key_for(&bin);
         let now = SystemTime::now();
         assert_eq!(lookup(&cache, &key, now), Lookup::Miss(MissReason::Absent));
-        record_acceptance(&cache, &key, now);
-        assert_eq!(lookup(&cache, &key, now), Lookup::Hit);
+        record(&cache, &key, CachedVerdict::Accepted, now);
+        assert_eq!(
+            lookup(&cache, &key, now),
+            Lookup::Hit(CachedVerdict::Accepted)
+        );
         let mode = std::fs::metadata(cache.path().unwrap())
             .unwrap()
             .permissions()
@@ -783,7 +882,7 @@ mod tests {
         executable(&bin, "one");
         let cache = location(dir.path());
         let now = SystemTime::now();
-        record_acceptance(&cache, &key_for(&bin), now);
+        record(&cache, &key_for(&bin), CachedVerdict::Accepted, now);
         // A new file at the same path: new inode (and size), so new key.
         let staged = dir.path().join("git.new");
         executable(&staged, "two two");
@@ -840,7 +939,7 @@ mod tests {
         executable(&second, "x");
         let cache = location(dir.path());
         let now = SystemTime::now();
-        record_acceptance(&cache, &key_for(&first), now);
+        record(&cache, &key_for(&first), CachedVerdict::Accepted, now);
         assert_eq!(
             lookup(&cache, &key_for(&second), now),
             Lookup::Miss(MissReason::Absent),
@@ -849,19 +948,134 @@ mod tests {
     }
 
     #[test]
-    fn a_script_is_keyed_on_path_and_a_binary_is_not() {
+    fn every_candidate_is_keyed_on_path_and_the_loader_environment() {
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("git");
-        executable(&script, "#!/bin/sh\nexec git \"$@\"\n");
         let system = SystemSelectors::default();
-        let a = program_key_with(&script, Some(OsStr::new("/a:/b")), &system).unwrap();
-        let b = program_key_with(&script, Some(OsStr::new("/b:/a")), &system).unwrap();
-        assert_ne!(a, b);
-        let binary = dir.path().join("bin-git");
-        executable(&binary, "\x7fELF");
-        let a = program_key_with(&binary, Some(OsStr::new("/a:/b")), &system).unwrap();
-        let b = program_key_with(&binary, Some(OsStr::new("/b:/a")), &system).unwrap();
-        assert_eq!(a, b);
+        for (name, body) in [
+            ("script-git", "#!/bin/sh\nexec git \"$@\"\n"),
+            ("bin-git", "\x7fELF"),
+        ] {
+            let path = dir.path().join(name);
+            executable(&path, body);
+            let a = program_key_with(&path, Some(OsStr::new("/a:/b")), &system).unwrap();
+            let b = program_key_with(&path, Some(OsStr::new("/b:/a")), &system).unwrap();
+            assert_ne!(a, b, "{name}: a forwarder resolves through PATH");
+            let preload = SystemSelectors {
+                loader_env: vec![("LD_PRELOAD".into(), "/tmp/evil.so".into())],
+                ..SystemSelectors::default()
+            };
+            let c = program_key_with(&path, Some(OsStr::new("/a:/b")), &preload).unwrap();
+            assert_ne!(a, c, "{name}: a preloaded library changes what runs");
+        }
+    }
+
+    #[test]
+    fn uid_and_probe_version_are_part_of_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("git");
+        executable(&bin, "x");
+        let cache = location(dir.path());
+        let now = SystemTime::now();
+        let key = key_for(&bin);
+        assert_eq!(key.uid, effective_uid());
+        assert_eq!(key.probe_version, PROBE_VERSION);
+        for other in [
+            ProgramKey {
+                uid: key.uid.wrapping_add(1),
+                ..key.clone()
+            },
+            ProgramKey {
+                probe_version: PROBE_VERSION + 1,
+                ..key.clone()
+            },
+        ] {
+            std::fs::remove_dir_all(dir.path().join("git-probe")).ok();
+            record(&cache, &other, CachedVerdict::Accepted, now);
+            assert_eq!(
+                lookup(&cache, &key, now),
+                Lookup::Miss(MissReason::KeyMismatch),
+                "an entry for another user or an older probe proves nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejection_is_recorded_and_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("git");
+        executable(&bin, "x");
+        let cache = location(dir.path());
+        let now = SystemTime::now();
+        let rejected = CachedVerdict::Rejected {
+            reason: "rewrites exit codes".into(),
+        };
+        record(&cache, &key_for(&bin), rejected.clone(), now);
+        assert_eq!(lookup(&cache, &key_for(&bin), now), Lookup::Hit(rejected));
+        record(&cache, &key_for(&bin), CachedVerdict::Accepted, now);
+        assert_eq!(
+            lookup(&cache, &key_for(&bin), now),
+            Lookup::Hit(CachedVerdict::Accepted),
+            "a later probe replaces the entry either way"
+        );
+    }
+
+    #[test]
+    fn size_entry_and_owner_caps_are_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = location(dir.path());
+        let now = SystemTime::now();
+        // More candidates than the cap: the oldest are dropped, never an
+        // oversized file written.
+        for index in 0..(MAX_ENTRIES + 5) {
+            let bin = dir.path().join(format!("git-{index}"));
+            executable(&bin, "x");
+            record(
+                &cache,
+                &key_for(&bin),
+                CachedVerdict::Accepted,
+                now + Duration::from_millis(index as u64),
+            );
+        }
+        let path = cache.path().unwrap().to_path_buf();
+        let file = read_cache(&path).unwrap().unwrap();
+        assert_eq!(file.entries.len(), MAX_ENTRIES);
+        // An owner mismatch is refused.
+        assert!(read_cache_owned_by(&path, effective_uid().wrapping_add(1)).is_err());
+        // A hand-written file over the entry cap is refused.
+        let mut over = file.clone();
+        over.entries.push(over.entries[0].clone());
+        std::fs::write(&path, serde_json::to_vec(&over).unwrap()).unwrap();
+        assert!(read_cache(&path).is_err());
+        // A file over the size cap is refused before parsing.
+        std::fs::write(&path, vec![b' '; MAX_FILE_BYTES as usize + 1]).unwrap();
+        assert!(read_cache(&path).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_xcode_shim_is_keyed_on_its_selectors() {
+        let shim = Path::new("/usr/bin/git");
+        let Some(canonical) = identity_chain(shim) else {
+            return;
+        };
+        if canonical.last().map(|identity| identity.path.as_str()) != Some("/usr/bin/git") {
+            return;
+        }
+        let path = Some(OsStr::new("/usr/bin"));
+        let base = SystemSelectors::default();
+        let developer = SystemSelectors {
+            developer_dir: Some("/Library/Developer/CommandLineTools".into()),
+            ..SystemSelectors::default()
+        };
+        let xcode = SystemSelectors {
+            xcode_select_link: Some("/Applications/Xcode.app/Contents/Developer".into()),
+            ..SystemSelectors::default()
+        };
+        let keys =
+            [&base, &developer, &xcode].map(|system| program_key_with(shim, path, system).unwrap());
+        assert_ne!(keys[0], keys[1]);
+        assert_ne!(keys[0], keys[2]);
+        assert_ne!(keys[1], keys[2]);
     }
 
     #[test]
@@ -872,7 +1086,7 @@ mod tests {
         let cache = location(dir.path());
         let key = key_for(&bin);
         let now = SystemTime::now();
-        record_acceptance(&cache, &key, now);
+        record(&cache, &key, CachedVerdict::Accepted, now);
         assert_eq!(
             lookup(&cache, &key, now + CACHE_TTL),
             Lookup::Miss(MissReason::Expired)
@@ -891,13 +1105,16 @@ mod tests {
         let cache = location(dir.path());
         let key = key_for(&bin);
         let now = SystemTime::now();
-        record_acceptance(&cache, &key, now);
+        record(&cache, &key, CachedVerdict::Accepted, now);
         let path = cache.path().unwrap().to_path_buf();
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(lookup(&cache, &key, now), Lookup::Miss(MissReason::Invalid));
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(lookup(&cache, &key, now), Lookup::Hit);
+        assert_eq!(
+            lookup(&cache, &key, now),
+            Lookup::Hit(CachedVerdict::Accepted)
+        );
 
         // A group-writable directory could have had the file swapped.
         let parent = path.parent().unwrap();
@@ -909,7 +1126,7 @@ mod tests {
         assert_eq!(lookup(&cache, &key, now), Lookup::Miss(MissReason::Invalid));
 
         // A symlink to an otherwise valid file is not the file.
-        record_acceptance(&cache, &key, now);
+        record(&cache, &key, CachedVerdict::Accepted, now);
         let real = parent.join("elsewhere.json");
         std::fs::rename(&path, &real).unwrap();
         std::os::unix::fs::symlink(&real, &path).unwrap();
@@ -926,14 +1143,17 @@ mod tests {
         executable(&second, "y");
         let cache = location(dir.path());
         let now = SystemTime::now();
-        record_acceptance(&cache, &key_for(&first), now);
-        record_acceptance(&cache, &key_for(&second), now);
+        record(&cache, &key_for(&first), CachedVerdict::Accepted, now);
+        record(&cache, &key_for(&second), CachedVerdict::Accepted, now);
         forget(&cache, &first);
         assert_eq!(
             lookup(&cache, &key_for(&first), now),
             Lookup::Miss(MissReason::Absent)
         );
-        assert_eq!(lookup(&cache, &key_for(&second), now), Lookup::Hit);
+        assert_eq!(
+            lookup(&cache, &key_for(&second), now),
+            Lookup::Hit(CachedVerdict::Accepted)
+        );
     }
 
     #[test]
@@ -967,6 +1187,9 @@ mod tests {
         // Same names, wrong kind: a non-empty template.
         probe_shape(&root.join(".tmpWRONGKIND"), true);
         std::fs::write(root.join(".tmpWRONGKIND/empty-template/hook"), b"").unwrap();
+        // Right names, but its repository has hooks: not a probe's `.git`.
+        probe_shape(&root.join(".tmpHOOKS"), true);
+        std::fs::create_dir(root.join(".tmpHOOKS/repo/.git/hooks")).unwrap();
         // Unrelated `.tmp*` directory and file.
         std::fs::create_dir(root.join(".tmpOTHER")).unwrap();
         std::fs::write(root.join(".tmpOTHER/data"), b"x").unwrap();
@@ -1007,6 +1230,7 @@ mod tests {
             ".tmpOTHER/data",
             ".tmpFILE",
             ".tmpMISSING/repo",
+            ".tmpHOOKS/repo/.git/hooks",
             "target-shape/repo/probe.txt",
         ] {
             assert!(root.join(kept).exists(), "{kept} must never be touched");

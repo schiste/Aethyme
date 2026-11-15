@@ -173,60 +173,84 @@ Readers of saved reports must treat a missing field as `false` / absent.
 Before its first Git command every `aethyme` process proves that the `git` it
 will run is not a PATH wrapper that decorates porcelain output or rewrites exit
 codes (#176, #178): about ten Git processes in a temporary repository. The
-accepted verdict is now recorded per user, so the probe runs once per Git
-binary instead of once per process.
+probe's verdict on each candidate is now recorded per user, so the probe runs
+once per Git binary (and environment) instead of once per process.
 
 - **File.** `<host cache dir>/git-probe/verdicts.json`, where the host cache
   dir is `AETHYME_HOST_CACHE_DIR`, else `$XDG_CACHE_HOME/aethyme`, else
   `~/Library/Caches/Aethyme` (macOS) or `~/.cache/aethyme`. The directory is
   0700 and the file 0600; it is written through a private temporary file and a
-  rename. JSON `{"schema": 1, "entries": [{"key": {...}, "accepted_at_ms": n}]}`,
-  at most 16 entries (one per candidate path, newest first). Private to the
-  broker: no other tool reads it, and its shape may change with the schema.
+  rename. JSON `{"schema": 2, "entries": [{"key": {...}, "verdict": "accepted" |
+  {"rejected": {"reason": "..."}}, "recorded_at_ms": n}]}`, at most 32 entries,
+  newest first. Private to the broker: no other tool reads it, and its shape
+  changes with `schema` (a file of another schema is ignored and rewritten).
 - **Key.** Probe version, effective uid, the candidate's absolute PATH
   spelling, and for that path and every symlink hop to the final file: device,
   inode, size, mode, mtime and ctime with nanoseconds, plus the link text. For
-  the macOS `/usr/bin/git` shim also `DEVELOPER_DIR`, the `xcode-select` link
-  and the selected developer directory's `usr/bin/git` identity. For a script
-  (`#!`) also the whole `PATH`. A hit requires every field to match exactly.
-- **What is recorded.** Only acceptances. A rejected or unprobeable candidate is
-  never recorded, and a probe that does not accept drops any entry for that
-  candidate. A wrapper placed ahead of an accepted git on PATH has its own key,
-  so every process probes and refuses it.
-- **Expiry and distrust.** An acceptance expires after 24 hours; one dated more
-  than five minutes in the future is invalid. A file that is not a regular file
+  every candidate also a SHA-256 of `PATH` (any forwarder, script or binary,
+  resolves what it runs through PATH; the cost is a re-probe when PATH changes)
+  and of the loader variables `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH`,
+  `DYLD_FALLBACK_LIBRARY_PATH`, `DYLD_FRAMEWORK_PATH`,
+  `DYLD_FALLBACK_FRAMEWORK_PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH` and
+  `LD_AUDIT`. For the macOS `/usr/bin/git` shim also `DEVELOPER_DIR`, the
+  `xcode-select` link and the selected developer directory's `usr/bin/git`
+  identity. A hit requires every field to match exactly.
+- **What is recorded.** Acceptances and rejections (decorated output or
+  rewritten exit codes). A cached rejection skips the candidate exactly as a
+  fresh one would, so a stale one can only pass over a binary that has since
+  become honest, and changing that binary changes its key. A probe that could
+  not run (`Unusable`) is never recorded and drops any entry for that
+  candidate. A verdict is recorded only if the candidate's key did not change
+  while it was probed.
+- **Expiry and distrust.** Entries expire after 24 hours; one dated more than
+  five minutes in the future is invalid. A file that is not a regular file
   owned by the user with mode 0600, in a directory owned by the user that group
-  and others cannot write, larger than 64 KiB, or that does not parse is
-  ignored: the process probes and never accepts on it.
-- **Commands that never use it.** `broker finish`, `close`, `cleanup`, `gc`
-  (including the detached `gc __continue-artifacts` worker), `storage` and
-  `worktrees` probe fresh. Independently, every Git-level deletion primitive
-  (`worktree remove`, branch-ref deletion, the orphan-checkout filesystem
-  removal) and `paths_equal` re-prove a cached verdict once per process before
-  acting, and refuse with `UntrustedOutput` if a fresh probe no longer accepts
-  the program in use. Automatic checkout removal is covered by those primitives
-  wherever it runs.
-- **Residual.** A wrapper whose behaviour changes while its file does not (it
-  reads a config file or an environment variable) keeps a cached acceptance for
-  up to 24 hours on commands that cannot discard work. Deletions never rely on
-  the cache.
+  and others cannot write, larger than 64 KiB, over the entry cap, or that does
+  not parse is ignored: the process probes and never trusts it.
+- **Deleting on Git evidence never rests on a cached acceptance.** The rule as
+  built:
+  - `broker finish`, `close`, `cleanup`, `gc` (including the detached
+    `gc __continue-artifacts` worker), `reclaim`, `storage` and `worktrees`
+    resolve Git with a probe of their own.
+  - Every deletion primitive re-proves a cached acceptance once per process
+    before it acts and refuses if a fresh probe no longer accepts the program
+    in use: the pinned tree removal every GC, sweep, storage and registry
+    deletion goes through, `removal::remove_tree` (reclaim, orphan checkouts),
+    `git worktree remove` and branch-ref deletion. `paths_equal`, the evidence
+    for a superseded promotion, does the same.
+  - The ignored-directory sweep at broker open and GC journal replay
+    (artifacts, recovery archives) confirm the verdict before they re-prove
+    their evidence, and retain everything with a reason when it fails.
+
+  A command that cannot delete may still run Git on a cached acceptance.
+- **Residual.** A wrapper whose behaviour changes while its file and the keyed
+  environment do not (it reads a config file or another variable), shared
+  libraries the binary loads, and `GIT_EXEC_PATH` (stripped by the probe,
+  inherited by real Git calls, as before this change) are not keyed. For
+  commands that cannot delete, such a change goes unnoticed for up to 24 hours.
 - **Switch.** `AETHYME_GIT_PROBE_CACHE=off` (also `0`, `false`, `no`) disables
   reading and writing it. The test harness sets it through `.cargo/config.toml`,
   and a process with `CARGO_MANIFEST_DIR`, `CARGO_BIN_EXE_aethyme` or
   `AETHYME_TEST_DB_SUFFIX` set never uses it either.
 - **Probe directories.** The probe directory is now
   `$TMPDIR/aethyme-git-probe-XXXXXX` (it was `.tmpXXXXXX`). A process killed
-  mid-probe leaves it behind; the detached GC worker removes up to 200 per run
-  that are older than an hour, owned by the user and contain only
-  `empty-template`, `empty-gitconfig` and `repo`. A legacy `.tmp*` directory is
-  removed only when it holds exactly those three entries, each of exactly the
-  kind the probe makes (an empty directory, an empty file, a directory holding
-  at most `.git` and `probe.txt`); any other `.tmp*` entry is never touched.
+  mid-probe leaves it behind. The detached GC worker, inside the host deleter
+  slot and through the paced pinned tree removal, removes up to 200 per run that
+  are older than an hour, owned by the user and contain only `empty-template`,
+  `empty-gitconfig` and `repo`, whose `.git` (if present) holds only what an
+  empty-template `git init` and two commits create. A legacy `.tmp*` directory
+  is removed only when it holds exactly those three entries of exactly the kind
+  the probe makes; any other `.tmp*` entry is never touched. Only the worker's
+  own `$TMPDIR` is swept: leftovers under another `TMPDIR` wait for a worker
+  started with it.
 - **Telemetry.** Command metric spans: `git_program_resolve` and
   `git_probe_run` (timed), and the counters `git_probe_cache_hit`,
+  `git_probe_cache_hit_rejected`,
   `git_probe_cache_miss_{absent,expired,key_mismatch,invalid,disabled,unkeyable}`,
   `git_probe_fresh_forced`, `git_probe_cache_write_failed`,
   `git_probe_dirs_sweep` (timed) and `git_probe_dirs_removed`.
+- **`ps`.** Spawned as `/bin/ps` on macOS; PATH order on Linux, where busybox
+  and procps can both be installed and the broker parses procps columns.
 
 ## Unattended deletion is paced (2026-11-13)
 

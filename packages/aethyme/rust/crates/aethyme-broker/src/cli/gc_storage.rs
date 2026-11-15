@@ -1792,9 +1792,6 @@ fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageErr
     // Every unlink this process makes is unattended: pace it.
     let _pacing = crate::gc::install_unattended_deletion_pacing(&repository_root, priority);
     let mut broker = Broker::open(&repository_root)?;
-    // Probe directories that killed processes left in the temporary directory.
-    // Bounded and shape-checked; never fails the worker.
-    crate::git_probe_cache::sweep_stale_probe_directories();
     broker.run_artifact_sweep_recovery_worker()?;
     Ok(())
 }

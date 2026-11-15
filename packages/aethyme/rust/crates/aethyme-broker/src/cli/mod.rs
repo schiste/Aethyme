@@ -2927,7 +2927,7 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
 fn command_can_discard_work(args: &[String]) -> bool {
     matches!(
         args.first().map(String::as_str),
-        Some("finish" | "close" | "cleanup" | "gc" | "storage" | "worktrees")
+        Some("finish" | "close" | "cleanup" | "gc" | "reclaim" | "storage" | "worktrees")
     )
 }
 

@@ -6,25 +6,40 @@
 //! call failing through about fourteen of them before reaching `/bin/ps`. The
 //! utility's location does not change during a process, so resolve it once.
 //!
-//! The fixed locations are the operating system's own; PATH stays the
-//! fallback for a system that keeps them elsewhere.
+//! The fixed locations are the operating system's own and are used only on
+//! macOS; PATH stays the fallback, and the rule on Linux (see [`ps`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Test seam: a `ps` stub for integration tests that observe how the broker
-/// calls it. Honoured only in a process started by the test harness, so an
-/// ordinary environment cannot redirect it.
+/// calls it. Compiled only into debug builds (the test profile), and honoured
+/// only in a process started by the test harness, so a release binary has no
+/// way to redirect it.
+#[cfg(debug_assertions)]
 pub(crate) const TEST_PS_ENV: &str = "AETHYME_TEST_PS";
 
-/// `ps`: `/bin/ps` on macOS and most Linux systems, `/usr/bin/ps` on others.
+/// `ps`. On macOS, `/bin/ps`: the system's only `ps`, and the platform where a
+/// long PATH made every spawn walk a dozen entries first. On Linux, PATH order
+/// as before: a distribution may ship both busybox `/bin/ps` and procps
+/// `/usr/bin/ps`, and the `-o lstart=`/`-ww` columns the broker parses are
+/// procps's, so guessing an absolute path could pick the wrong one.
 pub(crate) fn ps() -> &'static Path {
     static PS: OnceLock<PathBuf> = OnceLock::new();
     PS.get_or_init(|| {
-        test_override(TEST_PS_ENV).unwrap_or_else(|| resolve("ps", &["/bin/ps", "/usr/bin/ps"]))
+        #[cfg(debug_assertions)]
+        if let Some(stub) = test_override(TEST_PS_ENV) {
+            return stub;
+        }
+        if cfg!(target_os = "macos") {
+            resolve("ps", &["/bin/ps"])
+        } else {
+            PathBuf::from("ps")
+        }
     })
 }
 
+#[cfg(debug_assertions)]
 fn test_override(name: &str) -> Option<PathBuf> {
     let under_test = ["CARGO_MANIFEST_DIR", "CARGO_BIN_EXE_aethyme"]
         .iter()
@@ -36,10 +51,10 @@ fn test_override(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// `sysctl`: `/usr/sbin/sysctl` on macOS, `/sbin/sysctl` on Linux.
+/// `sysctl`, read only on macOS: `/usr/sbin/sysctl`.
 pub(crate) fn sysctl() -> &'static Path {
     static SYSCTL: OnceLock<PathBuf> = OnceLock::new();
-    SYSCTL.get_or_init(|| resolve("sysctl", &["/usr/sbin/sysctl", "/sbin/sysctl"]))
+    SYSCTL.get_or_init(|| resolve("sysctl", &["/usr/sbin/sysctl"]))
 }
 
 /// The first of `fixed` that is an executable file, else the bare `name` so
@@ -69,16 +84,15 @@ fn is_executable_file(_path: &Path) -> bool {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
-    fn ps_resolves_to_an_absolute_system_path_when_one_exists() {
+    fn ps_is_absolute_on_macos_and_path_ordered_elsewhere() {
         let resolved = ps();
-        if ["/bin/ps", "/usr/bin/ps"]
-            .iter()
-            .any(|path| is_executable_file(Path::new(path)))
-        {
-            assert!(resolved.is_absolute(), "{}", resolved.display());
-        } else {
+        if std::env::var_os("AETHYME_TEST_PS").is_some() {
+            return;
+        }
+        if cfg!(target_os = "macos") && is_executable_file(Path::new("/bin/ps")) {
+            assert_eq!(resolved, Path::new("/bin/ps"));
+        } else if !cfg!(target_os = "macos") {
             assert_eq!(resolved, Path::new("ps"));
         }
     }
