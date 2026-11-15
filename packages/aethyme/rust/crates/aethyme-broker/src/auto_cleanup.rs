@@ -1759,6 +1759,10 @@ pub struct AutoCleanupReport {
     /// (`merged_pull_request_landed`, `landed`, `abandoned`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub sessions_closed_by_reason: std::collections::BTreeMap<String, usize>,
+    /// Sessions past the abandonment window that the oldest-first lap asked
+    /// that window first, closed or not.
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub abandonment_sessions_examined: usize,
     /// When the retirement counts above were evaluated, when they were
     /// carried from an earlier report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2152,6 +2156,9 @@ pub struct LandedSessionRetirementView {
     /// `landed`, `abandoned`).
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub closed_by_reason: std::collections::BTreeMap<String, usize>,
+    /// Sessions past the abandonment window asked that window first.
+    #[serde(skip_serializing_if = "is_zero_count")]
+    pub abandonment_examined: usize,
     /// Kept sessions per reason; the reasons are `LandedSessionDecline` codes.
     pub declined: std::collections::BTreeMap<String, usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2201,6 +2208,9 @@ impl AutoCleanupReport {
         self.merged_pull_request_sessions_closed = self
             .merged_pull_request_sessions_closed
             .saturating_add(retirement.merged_closed);
+        self.abandonment_sessions_examined = self
+            .abandonment_sessions_examined
+            .saturating_add(retirement.abandonment_examined);
         for (reason, count) in &retirement.closed_by_reason {
             let entry = self
                 .sessions_closed_by_reason
@@ -2238,6 +2248,9 @@ impl AutoCleanupReport {
         self.merged_pull_request_sessions_closed = self
             .merged_pull_request_sessions_closed
             .saturating_add(later.merged_pull_request_sessions_closed);
+        self.abandonment_sessions_examined = self
+            .abandonment_sessions_examined
+            .saturating_add(later.abandonment_sessions_examined);
         for (reason, count) in &later.sessions_closed_by_reason {
             let entry = self
                 .sessions_closed_by_reason
@@ -2258,6 +2271,7 @@ impl AutoCleanupReport {
         self.merged_pull_request_sessions_examined = previous.merged_pull_request_sessions_examined;
         self.merged_pull_request_sessions_closed = previous.merged_pull_request_sessions_closed;
         self.sessions_closed_by_reason = previous.sessions_closed_by_reason.clone();
+        self.abandonment_sessions_examined = previous.abandonment_sessions_examined;
         self.retirement_evaluated_at_ms = previous
             .retirement_evaluated_at_ms
             .or(Some(previous.evaluated_at_ms));
@@ -2269,20 +2283,22 @@ impl AutoCleanupReport {
     /// What `broker status` reports about the landed lane, if it judged any
     /// session in this report.
     pub fn landed_session_retirement_view(&self) -> Option<LandedSessionRetirementView> {
-        (self.landed_sessions_examined > 0 || !self.sessions_closed_by_reason.is_empty()).then(
-            || LandedSessionRetirementView {
-                evaluated_at_ms: self
-                    .retirement_evaluated_at_ms
-                    .unwrap_or(self.evaluated_at_ms),
-                closed_by_reason: self.sessions_closed_by_reason.clone(),
-                examined: self.landed_sessions_examined,
-                closed: self.landed_sessions_closed,
-                merged_pull_request_examined: self.merged_pull_request_sessions_examined,
-                merged_pull_request_closed: self.merged_pull_request_sessions_closed,
-                declined: self.landed_sessions_declined.clone(),
-                cursor: self.retirement_cursor,
-            },
-        )
+        (self.landed_sessions_examined > 0
+            || self.abandonment_sessions_examined > 0
+            || !self.sessions_closed_by_reason.is_empty())
+        .then(|| LandedSessionRetirementView {
+            abandonment_examined: self.abandonment_sessions_examined,
+            evaluated_at_ms: self
+                .retirement_evaluated_at_ms
+                .unwrap_or(self.evaluated_at_ms),
+            closed_by_reason: self.sessions_closed_by_reason.clone(),
+            examined: self.landed_sessions_examined,
+            closed: self.landed_sessions_closed,
+            merged_pull_request_examined: self.merged_pull_request_sessions_examined,
+            merged_pull_request_closed: self.merged_pull_request_sessions_closed,
+            declined: self.landed_sessions_declined.clone(),
+            cursor: self.retirement_cursor,
+        })
     }
 }
 
@@ -2337,7 +2353,23 @@ struct SessionRetirementSummary {
     /// Sessions closed, per lane reason: `merged_pull_request_landed`,
     /// `landed`, `abandoned`.
     closed_by_reason: std::collections::BTreeMap<&'static str, usize>,
+    /// Sessions the oldest-first lap asked the abandonment window first.
+    abandonment_examined: usize,
     cursor: Option<SessionRetirementCursorPosition>,
+}
+
+/// The order of the likely-landed queue: sessions with a merged pull
+/// request first, then the rotation after the session last judged, then id.
+pub(crate) fn likely_landed_order(
+    session_id: i64,
+    merged_pull_requests: &std::collections::BTreeSet<i64>,
+    after: i64,
+) -> (bool, bool, i64) {
+    (
+        !merged_pull_requests.contains(&session_id),
+        session_id <= after,
+        session_id,
+    )
 }
 
 /// Whether the merged-pull-request window applies to `session`: it is
@@ -4084,6 +4116,33 @@ fn checkout_head(worktree: &Path) -> Option<String> {
     GitRepo::discover(worktree).ok()?.head_commit().ok()
 }
 
+/// The contents of a small regular file, or `None` for anything else: the
+/// file is opened without following a symlink and without blocking (a FIFO
+/// or device never stalls the pass), then checked to be a regular file of at
+/// most 4 KiB.
+fn read_small_regular_file(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > 4096 {
+        return None;
+    }
+    let mut contents = String::new();
+    file.take(4096).read_to_string(&mut contents).ok()?;
+    Some(contents)
+}
+
 /// A linked checkout's HEAD commit read from its files: the `.git` pointer,
 /// then the worktree's `HEAD`, resolved against `tips` (one `for-each-ref`
 /// listing) when it names a branch. `None` whenever anything is unusual, so
@@ -4092,14 +4151,14 @@ pub(crate) fn head_from_checkout_files(
     worktree: &Path,
     tips: &std::collections::BTreeMap<String, String>,
 ) -> Option<String> {
-    let pointer = std::fs::read_to_string(worktree.join(".git")).ok()?;
+    let pointer = read_small_regular_file(&worktree.join(".git"))?;
     let git_dir = PathBuf::from(pointer.trim().strip_prefix("gitdir:")?.trim());
     let git_dir = if git_dir.is_absolute() {
         git_dir
     } else {
         worktree.join(git_dir)
     };
-    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = read_small_regular_file(&git_dir.join("HEAD"))?;
     let head = head.trim();
     match head.strip_prefix("ref:") {
         Some(reference) => tips.get(reference.trim()).cloned(),
@@ -6722,6 +6781,7 @@ impl Broker {
                 crate::broker::AbandonedSessionCloseOutcome::NotDue
             };
             if abandonment_tried {
+                summary.abandonment_examined += 1;
                 crate::phase_telemetry::add(
                     if matches!(outcome, crate::broker::AbandonedSessionCloseOutcome::Closed) {
                         "retirement_abandonment_first_closed"
@@ -7049,13 +7109,7 @@ impl Broker {
             .collect::<Vec<_>>();
         // Sessions with a merged pull request first: they are the ones that
         // usually close. Branch ancestry alone follows, then the rotation.
-        likely.sort_by_key(|session| {
-            (
-                !merged_pull_requests.contains(&session.id),
-                session.id <= after,
-                session.id,
-            )
-        });
+        likely.sort_by_key(|session| likely_landed_order(session.id, &merged_pull_requests, after));
         likely.truncate(LIKELY_LANDED_PASS_LIMIT);
         if likely.is_empty() {
             return Ok(judged);
@@ -8701,11 +8755,14 @@ impl Broker {
         let removal_judged = stored.lanes.is_some_and(|lanes| lanes.removal_examined > 0)
             || !stored.removed.is_empty()
             || !stored.kept.is_empty();
-        let retirement_judged = stored.landed_sessions_examined > 0 || stored.sessions_retired > 0;
+        let retirement_judged = stored.landed_sessions_examined > 0
+            || stored.sessions_retired > 0
+            || stored.abandonment_sessions_examined > 0;
         if (!removal_judged || !retirement_judged)
             && let Some(previous) = self.last_auto_cleanup_report()
         {
             let previous_has_counts = previous.landed_sessions_examined > 0
+                || previous.abandonment_sessions_examined > 0
                 || !previous.sessions_closed_by_reason.is_empty();
             if !retirement_judged && previous_has_counts {
                 stored.carry_retirement_counts(&previous);

@@ -38,6 +38,10 @@ pub(crate) const TASK_CLOSE_PROCESS_USE_SNAPSHOT_MAX_AGE: Duration = Duration::f
 /// A pass takes another open-file observation for a later retirement
 /// candidate only while at least this much of its deadline remains.
 const PROCESS_USE_RESNAPSHOT_MIN_BUDGET: Duration = Duration::from_secs(3);
+/// At most one open-file observation per this interval within a pass.
+const PROCESS_USE_RESNAPSHOT_MIN_INTERVAL: Duration = Duration::from_secs(10);
+/// At most this many open-file observations per pass.
+const PROCESS_USE_MAX_SNAPSHOTS_PER_PASS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -372,6 +376,27 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Observations taken, in order, before falling back to the fixed one.
+    static TEST_PROCESS_USE_QUEUE: std::cell::RefCell<std::collections::VecDeque<crate::reclaim::OpenFileSnapshot>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    /// Treat every held observation as aged and unthrottled, so the next
+    /// request takes a new one.
+    static TEST_FORCE_PROCESS_USE_RESNAPSHOT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Queue observations retirement passes on this test thread take in order,
+/// and whether a held observation is always re-taken.
+#[cfg(test)]
+pub(crate) fn queue_process_use_snapshots_for_tests(
+    snapshots: Vec<crate::reclaim::OpenFileSnapshot>,
+    force_resnapshot: bool,
+) {
+    TEST_PROCESS_USE_QUEUE.with(|queue| *queue.borrow_mut() = snapshots.into());
+    TEST_FORCE_PROCESS_USE_RESNAPSHOT.with(|force| force.set(force_resnapshot));
+}
+
 /// Make retirement passes on this test thread observe `snapshot` instead of
 /// running `lsof`; `None` restores the real observation.
 #[cfg(test)]
@@ -393,6 +418,11 @@ pub(crate) struct RecordedHolderProcessTable {
     /// once per pass instead of answering "unknown" for every later holder.
     snapshot_retried: bool,
     process_use_snapshot: Option<(Instant, crate::reclaim::OpenFileSnapshot)>,
+    /// Open-file observations this pass took, when the last one started, and
+    /// whether the last request was refused by the per-pass throttle.
+    process_use_snapshots_taken: usize,
+    process_use_last_taken: Option<Instant>,
+    process_use_throttled: bool,
     #[cfg(test)]
     snapshots_taken: usize,
     /// Runs immediately before the landed lane's last HEAD and activity
@@ -502,52 +532,116 @@ impl RecordedHolderProcessTable {
             .flatten()
     }
 
-    /// Share one complete-or-unknown `lsof` observation across all retirement
-    /// candidates in this maintenance pass. The caller supplies its remaining
-    /// deadline; once this pass's snapshot ages out, later rows defer instead
-    /// of starting another ten-second process scan.
+    /// Share one complete-or-unknown `lsof` observation across retirement
+    /// candidates in this maintenance pass. An observation older than its
+    /// two-second freshness bound is taken again, but at most once per
+    /// [`PROCESS_USE_RESNAPSHOT_MIN_INTERVAL`] and
+    /// [`PROCESS_USE_MAX_SNAPSHOTS_PER_PASS`] times per pass, and only while
+    /// [`PROCESS_USE_RESNAPSHOT_MIN_BUDGET`] of the deadline remains: a
+    /// system-wide `lsof` every two seconds for a whole pass is the kind of
+    /// unthrottled background work that hurts the machine. When no fresh
+    /// observation may be taken the answer is `None` and
+    /// [`Self::process_use_throttled`] says that the pass, not the evidence,
+    /// ran out; the caller retries the session next pass.
     pub(crate) fn process_use_snapshot_for_retirement(
         &mut self,
         root: &Path,
         deadline: Option<Instant>,
     ) -> Option<&crate::reclaim::OpenFileSnapshot> {
-        // An observation older than the freshness bound is not evidence for a
-        // later session of the same pass. It used to answer "unknown" for
-        // every such session (`operation_unknown`) until the next pass; take
-        // a fresh one instead while the caller's deadline still leaves time.
+        self.process_use_throttled = false;
         let aged = self
             .process_use_snapshot
             .as_ref()
             .is_some_and(|(captured_at, _)| {
                 captured_at.elapsed() > TASK_CLOSE_PROCESS_USE_SNAPSHOT_MAX_AGE
             });
-        let room_for_another = deadline.is_none_or(|deadline| {
-            deadline.saturating_duration_since(Instant::now()) >= PROCESS_USE_RESNAPSHOT_MIN_BUDGET
-        });
-        if aged && room_for_another {
-            crate::phase_telemetry::add("retirement_process_use_resnapshot", Duration::ZERO);
+        #[cfg(test)]
+        let aged = if self.process_use_snapshot.is_some()
+            && TEST_FORCE_PROCESS_USE_RESNAPSHOT.with(std::cell::Cell::get)
+        {
+            self.process_use_last_taken = None;
+            true
+        } else {
+            aged
+        };
+        if aged {
+            let room_for_another = deadline.is_none_or(|deadline| {
+                deadline.saturating_duration_since(Instant::now())
+                    >= PROCESS_USE_RESNAPSHOT_MIN_BUDGET
+            });
+            let interval_elapsed = self
+                .process_use_last_taken
+                .is_none_or(|taken| taken.elapsed() >= PROCESS_USE_RESNAPSHOT_MIN_INTERVAL);
+            let under_cap = self.process_use_snapshots_taken < PROCESS_USE_MAX_SNAPSHOTS_PER_PASS;
+            if !(room_for_another && interval_elapsed && under_cap) {
+                crate::phase_telemetry::add("retirement_process_use_throttled", Duration::ZERO);
+                self.process_use_throttled = true;
+                return None;
+            }
             self.process_use_snapshot = None;
         }
-        #[cfg(test)]
-        if self.process_use_snapshot.is_none()
-            && let Some(snapshot) = TEST_PROCESS_USE_SNAPSHOT.with(|cell| cell.borrow().clone())
-        {
-            self.process_use_snapshot = Some((Instant::now(), snapshot));
-        }
         if self.process_use_snapshot.is_none() {
+            #[cfg(test)]
+            if let Some(snapshot) = TEST_PROCESS_USE_QUEUE
+                .with(|queue| queue.borrow_mut().pop_front())
+                .or_else(|| TEST_PROCESS_USE_SNAPSHOT.with(|cell| cell.borrow().clone()))
+            {
+                self.record_process_use_take(Instant::now(), snapshot, Duration::ZERO);
+                let (_, snapshot) = self.process_use_snapshot.as_ref()?;
+                return Some(snapshot);
+            }
             let budget = deadline.map_or(Duration::from_secs(10), |deadline| {
                 deadline.saturating_duration_since(Instant::now())
             });
             if budget.is_zero() {
                 return None;
             }
-            self.process_use_snapshot = Some((
-                Instant::now(),
-                crate::reclaim::open_file_snapshot_under_with_budget(root, budget),
-            ));
+            let started = Instant::now();
+            let snapshot = crate::reclaim::open_file_snapshot_under_with_budget(root, budget);
+            self.record_process_use_take(started, snapshot, started.elapsed());
         }
         let (captured_at, snapshot) = self.process_use_snapshot.as_ref()?;
         (captured_at.elapsed() <= TASK_CLOSE_PROCESS_USE_SNAPSHOT_MAX_AGE).then_some(snapshot)
+    }
+
+    fn record_process_use_take(
+        &mut self,
+        captured_at: Instant,
+        snapshot: crate::reclaim::OpenFileSnapshot,
+        elapsed: Duration,
+    ) {
+        if self.process_use_snapshots_taken > 0 {
+            crate::phase_telemetry::add("retirement_process_use_resnapshot", elapsed);
+        } else {
+            crate::phase_telemetry::add("retirement_process_use_snapshot", elapsed);
+        }
+        self.process_use_snapshots_taken += 1;
+        self.process_use_last_taken = Some(captured_at);
+        self.process_use_snapshot = Some((captured_at, snapshot));
+    }
+
+    /// Whether the last [`Self::process_use_snapshot_for_retirement`] answered
+    /// `None` because this pass may not take another observation now.
+    pub(crate) fn process_use_throttled(&self) -> bool {
+        self.process_use_throttled
+    }
+
+    /// Record a failed process-table snapshot, already retried or not.
+    #[cfg(test)]
+    pub(crate) fn fail_process_table_for_test(
+        &mut self,
+        session_id: i64,
+        event_id: i64,
+        retried: bool,
+    ) {
+        self.observed_event_ids.insert(session_id, event_id);
+        self.snapshot = Some(None);
+        self.snapshot_retried = retried;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshots_taken_for_test(&self) -> usize {
+        self.snapshots_taken
     }
 
     #[cfg(test)]
@@ -1651,6 +1745,9 @@ mod tests {
             snapshot: Some(Some(table)),
             snapshot_retried: false,
             process_use_snapshot: None,
+            process_use_snapshots_taken: 0,
+            process_use_last_taken: None,
+            process_use_throttled: false,
             snapshots_taken: 0,
             before_landed_close: None,
         };
@@ -1664,6 +1761,9 @@ mod tests {
             snapshot: Some(Some(ProcessTable::parse(""))),
             snapshot_retried: false,
             process_use_snapshot: None,
+            process_use_snapshots_taken: 0,
+            process_use_last_taken: None,
+            process_use_throttled: false,
             snapshots_taken: 0,
             before_landed_close: None,
         };

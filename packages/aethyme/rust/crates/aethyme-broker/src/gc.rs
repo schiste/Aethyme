@@ -1020,6 +1020,16 @@ const AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET: Duration = Duration::from_secs(3
 /// worker, even when the physical checkout-cleanup lane is cooling down.
 const SESSION_RETIREMENT_WORKER_RESERVE: Duration = Duration::from_secs(30);
 const SESSION_RETIREMENT_WORKER_PASS_BUDGET: Duration = Duration::from_secs(30);
+/// Wall time one background worker run may spend on session retirement, in
+/// passes of at most [`SESSION_RETIREMENT_WORKER_PASS_BUDGET`]. A database-only
+/// decline or a memo hit costs milliseconds and an abandonment-window close
+/// tens of milliseconds; a full landed proof costs the content search (2.5 to
+/// 27 s measured) plus a worktree scan and at most one throttled open-file
+/// observation. Two minutes per run covers roughly ten full proofs, or
+/// hundreds of cheap judgements, so about 280 open sessions are examined
+/// within an hour of worker runs. Each pass still yields to a waiting
+/// foreground GC command and stops on memory pressure.
+const SESSION_RETIREMENT_WORKER_RUN_BUDGET: Duration = Duration::from_secs(120);
 // One pass can inspect up to 128 open sessions. Keep serialized report size
 // bounded even when every inspected session has an unresolved reason.
 const SESSION_RETIREMENT_WORKER_MAX_PASSES: usize = 16;
@@ -8403,12 +8413,12 @@ impl Broker {
         if let Some(request_generation) = session_retirement_generation {
             let remaining =
                 ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
-            let pass_budget = remaining.min(SESSION_RETIREMENT_WORKER_PASS_BUDGET);
+            let run_budget = remaining.min(SESSION_RETIREMENT_WORKER_RUN_BUDGET);
             let ran = self.with_host_deleter_pin(|broker| {
                 broker.run_session_retirement_recovery_worker_loop_isolated(
                     request_generation,
                     Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
-                    Some(pass_budget),
+                    Some(run_budget),
                 )
             })?;
             if ran.is_none() {
@@ -8608,7 +8618,7 @@ impl Broker {
                         broker.run_session_retirement_recovery_worker_loop_isolated(
                             request_generation,
                             Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
-                            Some(remaining.min(SESSION_RETIREMENT_WORKER_PASS_BUDGET)),
+                            Some(remaining.min(SESSION_RETIREMENT_WORKER_RUN_BUDGET)),
                         )
                     })?;
                     if ran.is_none() {
@@ -9900,6 +9910,25 @@ impl Broker {
                 return Ok(());
             }
             let remaining = remaining.map(|remaining| remaining.saturating_sub(waited));
+            // Memory pressure stops the run between passes, resumably; load
+            // only slows it (the pacer's bounded wait).
+            if passes > 0
+                && unattended_pacing::unattended_pressure_check(
+                    remaining.map(|remaining| Instant::now() + remaining),
+                ) == unattended_pacing::PressureVerdict::MemoryBackoff
+            {
+                crate::phase_telemetry::add("session_retirement_memory_backoff", Duration::ZERO);
+                if let Some(reason) = continuation_reason.take() {
+                    aggregate.deferred = aggregate.deferred.saturating_add(1);
+                    aggregate.retirement_deferred_reasons.push(reason);
+                }
+                self.record_auto_cleanup_report(&aggregate)?;
+                self.defer_session_retirement_request(
+                    request_generation,
+                    &format!("session_retirement_memory_backoff passes={passes}"),
+                )?;
+                return Ok(());
+            }
             passes = passes.saturating_add(1);
             let pass_budget = remaining
                 .map(|remaining| remaining.min(SESSION_RETIREMENT_WORKER_PASS_BUDGET))
@@ -9949,7 +9978,8 @@ impl Broker {
             // it used to end the run and wait for the next request, so each
             // run judged one pass's worth of sessions.
             let deadline_after_progress = (report.landed_sessions_examined > 0
-                || report.sessions_retired > 0)
+                || report.sessions_retired > 0
+                || report.abandonment_sessions_examined > 0)
                 && report.retirement_deferred_reasons.iter().any(|reason| {
                     matches!(
                         reason,

@@ -1064,11 +1064,11 @@ mod lane_tests {
         assert!(is_open(&broker, session.id));
     }
 
-    /// A follow-up task protects its session for the landed window whatever
-    /// the holder evidence, both for a reused open session and for a new
-    /// session adopted on the broker's checkout after an automatic close;
-    /// past that window the adopted follow-up is closed by the merged lane
-    /// like a spawned session.
+    /// A follow-up task protects its session for the longer of the landed and
+    /// abandonment windows (here 72 h) whatever the holder evidence, both for
+    /// a reused open session and for a new session adopted on the broker's
+    /// checkout after an automatic close; past that the adopted follow-up is
+    /// closed by the merged lane like a spawned session.
     #[test]
     fn a_follow_up_task_is_protected_for_the_landed_window() {
         let (_owner, _storage, mut broker) = fixture("");
@@ -1084,7 +1084,7 @@ mod lane_tests {
             declined(crate::broker::LandedSessionDecline::RecentActivity)
         );
 
-        for (hours, closes) in [(3_u64, false), (30, true)] {
+        for (hours, closes) in [(3_u64, false), (30, false), (80, true)] {
             let (first, worktree) = merged_candidate(&mut broker, "first task");
             broker
                 .store()
@@ -1112,5 +1112,190 @@ mod lane_tests {
                 "{hours} h: {report:#?}"
             );
         }
+    }
+
+    fn opened_in(worktree: &Path) -> crate::reclaim::OpenFileSnapshot {
+        crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+            pid: std::process::id(),
+            command: "build".into(),
+            descriptor: "cwd".into(),
+            file_type: Some("DIR".into()),
+            path: std::fs::canonicalize(worktree).unwrap(),
+        }])
+    }
+
+    /// A process that starts in the checkout between the first open-file
+    /// look and the final one keeps the session: the final look's
+    /// observation, re-taken here, is checked like the first.
+    #[test]
+    fn work_started_between_the_two_open_file_looks_keeps_the_session() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (session, worktree) = merged_candidate(&mut broker, "build started late");
+        quiet(&mut broker, &session, 3);
+        crate::session_holder::queue_process_use_snapshots_for_tests(
+            vec![
+                crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+                opened_in(&worktree),
+            ],
+            true,
+        );
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        let outcome = close_directly(&mut broker, &session, &mut table);
+        crate::session_holder::queue_process_use_snapshots_for_tests(Vec::new(), false);
+        assert_eq!(
+            outcome,
+            crate::broker::AbandonedSessionCloseOutcome::OperationActive
+        );
+        assert!(is_open(&broker, session.id));
+    }
+
+    /// Plant a remembered landing for an unlanded session with a merged pull
+    /// request: `tip` and `fingerprint` as given.
+    fn plant_landing_memo(
+        broker: &mut crate::Broker,
+        session: &crate::Session,
+        tip: &str,
+        fingerprint: &str,
+    ) -> String {
+        let head = crate::git::GitRepo::discover(Path::new(&session.worktree_path))
+            .unwrap()
+            .head_commit()
+            .unwrap();
+        broker
+            .store_ref()
+            .meta_set(
+                &format!("landed_lane.landed.{}", session.id),
+                &format!("{head} {tip} content {fingerprint}"),
+            )
+            .unwrap();
+        head
+    }
+
+    /// The memo is a judging shortcut bound to its evidence: a changed
+    /// pull-request fingerprint or a tip that is not an ancestor of the
+    /// default branch voids it, and a close resting on a valid one searches
+    /// again without it (here finding the work unlanded).
+    #[test]
+    fn a_remembered_landing_is_bound_to_its_evidence_and_never_closes_alone() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (session, _) = session(&mut broker, "not on the default branch", false);
+        link_pull_request(&mut broker, session.id, 41, Some(1));
+        let (_, tip) = broker.repo_handle().upstream_default().unwrap();
+        let fingerprint = super::PullRequestMerges::read(broker.store_ref(), session.id)
+            .unwrap()
+            .fingerprint();
+
+        let head = plant_landing_memo(&mut broker, &session, &tip, "0000000000000000");
+        assert_eq!(
+            broker.landed_session_decline(&session, None).err(),
+            Some(crate::broker::LandedSessionDecline::NotLanded),
+            "a different pull-request fingerprint voids the memo"
+        );
+        broker
+            .store_ref()
+            .meta_set(&format!("landed_lane.not_landed.{}", session.id), "")
+            .unwrap();
+        plant_landing_memo(&mut broker, &session, &head, &fingerprint);
+        assert_eq!(
+            broker.landed_session_decline(&session, None).err(),
+            Some(crate::broker::LandedSessionDecline::NotLanded),
+            "a tip that is not an ancestor of the default branch voids the memo"
+        );
+        broker
+            .store_ref()
+            .meta_set(&format!("landed_lane.not_landed.{}", session.id), "")
+            .unwrap();
+        plant_landing_memo(&mut broker, &session, &tip, &fingerprint);
+        let judged = broker.landed_session_decline(&session, None).unwrap();
+        assert!(judged.memoized, "a valid memo answers the judgement");
+
+        quiet(&mut broker, &session, 3);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_directly(&mut broker, &session, &mut table),
+            declined(crate::broker::LandedSessionDecline::NotLanded),
+            "the close searched again without the memo"
+        );
+        assert!(is_open(&broker, session.id));
+    }
+
+    /// An adopted checkout the broker never spawned stays out of the merged
+    /// lane.
+    #[test]
+    fn an_adopted_checkout_without_a_spawned_owner_is_refused() {
+        let (owner, _storage, mut broker) = fixture("");
+        let root = broker.main_root().to_path_buf();
+        let worktree = owner.path().join("own-checkout");
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent/own",
+                worktree.to_str().unwrap(),
+                "main",
+            ],
+        );
+        let session = broker
+            .adopt(&worktree, Some("someone's own checkout"))
+            .unwrap();
+        link_pull_request(&mut broker, session.id, 51, Some(1));
+        quiet(&mut broker, &session, 3);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_directly(&mut broker, &session, &mut table),
+            declined(crate::broker::LandedSessionDecline::Adopted)
+        );
+        assert!(is_open(&broker, session.id));
+    }
+
+    /// The likely-landed queue judges sessions with a merged pull request
+    /// before branch-ancestry-only ones, whatever the rotation.
+    #[test]
+    fn the_likely_landed_queue_orders_merged_pull_requests_first() {
+        let merged = std::collections::BTreeSet::from([30_i64]);
+        let mut ids = vec![10_i64, 20, 30, 40];
+        ids.sort_by_key(|id| crate::auto_cleanup::likely_landed_order(*id, &merged, 15));
+        assert_eq!(ids, vec![30, 20, 40, 10]);
+    }
+
+    /// A failed process-table snapshot is retried once per pass; after that
+    /// the holder stays unknown instead of a second retry.
+    #[test]
+    fn a_failed_process_table_is_retried_once_then_stays_unknown() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (session, _) = session(&mut broker, "process table failed", false);
+        quiet(&mut broker, &session, 3);
+        let event_id = broker
+            .store_ref()
+            .latest_session_holder_event(session.id)
+            .unwrap()
+            .unwrap()
+            .id;
+        let mut retried = crate::session_holder::RecordedHolderProcessTable::default();
+        retried.fail_process_table_for_test(session.id, event_id, true);
+        assert_eq!(
+            crate::session_holder::recorded_holder_liveness(
+                broker.store_ref(),
+                session.id,
+                &mut retried,
+                true
+            )
+            .liveness,
+            crate::session_holder::RecordedHolderLiveness::Unknown
+        );
+        assert_eq!(retried.snapshots_taken_for_test(), 0, "no second retry");
+
+        let mut first_failure = crate::session_holder::RecordedHolderProcessTable::default();
+        first_failure.fail_process_table_for_test(session.id, event_id, false);
+        let _ = crate::session_holder::recorded_holder_liveness(
+            broker.store_ref(),
+            session.id,
+            &mut first_failure,
+            true,
+        );
+        assert_eq!(first_failure.snapshots_taken_for_test(), 1, "one retry");
     }
 }

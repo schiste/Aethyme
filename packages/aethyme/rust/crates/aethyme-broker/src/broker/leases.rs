@@ -397,6 +397,40 @@ enum SessionCloseLane {
     MergedPullRequest,
 }
 
+/// Why the open-file observation keeps the session, or `None` when it shows
+/// no process using `worktree` (besides `exempt_holder`). A landed-lane
+/// session that cannot get a fresh observation this pass because of the
+/// per-pass throttle is `budget_exhausted` and retried next pass.
+fn process_use_verdict(
+    process_table: &mut crate::session_holder::RecordedHolderProcessTable,
+    root: &std::path::Path,
+    worktree: &std::path::Path,
+    deadline: Option<std::time::Instant>,
+    exempt_holder: Option<i64>,
+    require_landed: bool,
+) -> Option<AbandonedSessionCloseOutcome> {
+    let Some(open_files) = process_table.process_use_snapshot_for_retirement(root, deadline) else {
+        return Some(if require_landed && process_table.process_use_throttled() {
+            AbandonedSessionCloseOutcome::LandedDeclined(LandedSessionDecline::BudgetExhausted)
+        } else {
+            AbandonedSessionCloseOutcome::OperationEvidenceUnavailable
+        });
+    };
+    match open_files {
+        crate::reclaim::OpenFileSnapshot::Complete(_) => {
+            crate::reclaim::open_file_snapshot_blocker_for_session_worktree(
+                open_files,
+                worktree,
+                exempt_holder,
+            )
+            .map(|_| AbandonedSessionCloseOutcome::OperationActive)
+        }
+        crate::reclaim::OpenFileSnapshot::Incomplete { .. } => {
+            Some(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable)
+        }
+    }
+}
+
 /// The checkout's HEAD commit, or `None` when it cannot be read.
 fn current_checkout_head(worktree: &std::path::Path) -> Option<String> {
     crate::git::GitRepo::discover(worktree)
@@ -954,6 +988,35 @@ impl Broker {
             .map_or_else(|| "unknown".to_string(), |merges| merges.fingerprint())
     }
 
+    /// Whether a follow-up task (its latest `session.reused` event, or the
+    /// creation of an adopted follow-up on a checkout the broker spawned)
+    /// started less than the longer of `session_landed_after_hours` and
+    /// `session_abandoned_after_hours` ago.
+    fn follow_up_protected(
+        &self,
+        session: &crate::Session,
+        follow_up_on_spawned_checkout: bool,
+    ) -> Result<bool, LandedSessionDecline> {
+        let follow_up_at = if follow_up_on_spawned_checkout {
+            Some(session.created_at)
+        } else {
+            self.store_ref()
+                .session_last_reused_at(session.id)
+                .map_err(|_| LandedSessionDecline::LandingUnknown)?
+        };
+        let Some(follow_up_at) = follow_up_at else {
+            return Ok(false);
+        };
+        let policy = crate::load_retention_policy(self.main_root())
+            .map_err(|_| LandedSessionDecline::PolicyUnavailable)?;
+        let window_ms = i64::from(
+            policy
+                .session_landed_after_hours
+                .max(policy.session_abandoned_after_hours),
+        ) * 3_600_000;
+        Ok(crate::clock::epoch_ms().saturating_sub(follow_up_at) < window_ms)
+    }
+
     /// The pull requests of a session the merged-pull-request lane may close,
     /// and when the last of them merged; the decline otherwise.
     fn merged_pull_request_evidence(
@@ -973,24 +1036,14 @@ impl Broker {
         if session.origin != crate::SessionOrigin::Spawned && !follow_up_on_spawned_checkout {
             return Err(LandedSessionDecline::Adopted);
         }
-        // A follow-up task keeps its session for the whole landed window,
-        // whoever holds it: the caller may be unidentifiable and the previous
-        // holder gone, so neither holder evidence nor two quiet hours prove
-        // that the new task is over.
-        let follow_up_at = if follow_up_on_spawned_checkout {
-            Some(session.created_at)
-        } else {
-            self.store_ref()
-                .session_last_reused_at(session.id)
-                .map_err(|_| LandedSessionDecline::LandingUnknown)?
-        };
-        if let Some(follow_up_at) = follow_up_at {
-            let landed_window_ms = crate::load_retention_policy(self.main_root())
-                .map(|policy| i64::from(policy.session_landed_after_hours) * 3_600_000)
-                .map_err(|_| LandedSessionDecline::PolicyUnavailable)?;
-            if crate::clock::epoch_ms().saturating_sub(follow_up_at) < landed_window_ms {
-                return Err(LandedSessionDecline::RecentActivity);
-            }
+        // A follow-up task keeps its session for the longer of the landed and
+        // abandonment windows, whoever holds it: the caller may be
+        // unidentifiable and the previous holder gone, so neither holder
+        // evidence nor two quiet hours prove that the new task is over.
+        match self.follow_up_protected(session, follow_up_on_spawned_checkout) {
+            Ok(false) => {}
+            Ok(true) => return Err(LandedSessionDecline::RecentActivity),
+            Err(reason) => return Err(reason),
         }
         let merges =
             crate::session_auto_close::PullRequestMerges::read(self.store_ref(), session.id)
@@ -1296,6 +1349,24 @@ impl Broker {
         if candidate.pid.is_some_and(crate::broker::session_pid_alive) {
             return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
         }
+        // Nothing makes `session_abandoned_after_hours` at least
+        // `session_landed_after_hours`. When it is shorter, the abandonment
+        // window must not close a follow-up task the landed lanes protect.
+        if lane == SessionCloseLane::Abandonment
+            && let Ok(policy) = crate::load_retention_policy(self.main_root())
+            && policy.session_abandoned_after_hours < policy.session_landed_after_hours
+        {
+            let follow_up_on_spawned_checkout = candidate.origin == crate::SessionOrigin::Adopted
+                && self
+                    .store_ref()
+                    .open_adopted_sessions_on_spawned_checkouts()
+                    .map(|ids| ids.contains(&candidate.id))
+                    .unwrap_or(true);
+            match self.follow_up_protected(&candidate, follow_up_on_spawned_checkout) {
+                Ok(false) => {}
+                Ok(true) | Err(_) => return Ok(AbandonedSessionCloseOutcome::NotDue),
+            }
+        }
         // The merged-pull-request lane counts its window from the last merge
         // too: an agent that merged a minute ago may still be about to look.
         let merged_evidence = if merged_lane {
@@ -1448,6 +1519,26 @@ impl Broker {
         // Broker::open (and its maintenance pass) through completion. The
         // exclusive side closes the startup-admission race and stays held
         // through the final lifecycle/CAS checks.
+        // A remembered landing is a shortcut for judging, never for the
+        // close. Before the claims are taken (so the lifecycle claim is never
+        // held through a content search), search again without the memo; the
+        // claims then re-check only that HEAD and the default-branch tip are
+        // those this fresh search proved, and that nothing new is in the
+        // checkout.
+        if let Some(remembered) = landed_proof.as_ref().filter(|proof| proof.memoized) {
+            let _span = crate::phase_telemetry::span("landed_reproof_before_claims");
+            match self.landed_session_decline_with_memo(&candidate, deadline, false) {
+                Ok(fresh) if fresh.head == remembered.head && !fresh.memoized => {
+                    landed_proof = Some(fresh);
+                }
+                Ok(_) => {
+                    return Ok(AbandonedSessionCloseOutcome::LandedDeclined(
+                        LandedSessionDecline::MovedBeforeClose,
+                    ));
+                }
+                Err(reason) => return Ok(AbandonedSessionCloseOutcome::LandedDeclined(reason)),
+            }
+        }
         // Both claims below are non-blocking: a busy one declines the session
         // (`busy`) instead of waiting, so this pass never waits on a lock here.
         let _operation_claim = match crate::file_lock::try_acquire_session_operation_guard(
@@ -1627,37 +1718,26 @@ impl Broker {
         // A live task holder is excused only after this open-file check. The
         // merged-pull-request lane runs it for every holder, a legacy binding
         // included: two quiet hours alone do not show nobody works there.
-        if task_lease_binding_present || merged_lane {
-            let worktree = std::path::Path::new(&current.worktree_path);
-            let Some(open_files) =
-                process_table.process_use_snapshot_for_retirement(self.main_root(), deadline)
-            else {
-                return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
-            };
-            match open_files {
-                crate::reclaim::OpenFileSnapshot::Complete(_) => {
-                    // The opt-in abandonment lane tolerates the live holder's
-                    // own working directory; the landed lane does not: an
-                    // agent sitting in its worktree is using it.
-                    let exempt_holder = if require_landed {
-                        None
-                    } else {
-                        live_task_holder.as_ref().map(|agent| agent.pid)
-                    };
-                    if crate::reclaim::open_file_snapshot_blocker_for_session_worktree(
-                        open_files,
-                        worktree,
-                        exempt_holder,
-                    )
-                    .is_some()
-                    {
-                        return Ok(AbandonedSessionCloseOutcome::OperationActive);
-                    }
-                }
-                crate::reclaim::OpenFileSnapshot::Incomplete { .. } => {
-                    return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
-                }
-            }
+        // The opt-in abandonment lane tolerates the live holder's own working
+        // directory; the landed lane does not: an agent sitting in its
+        // worktree is using it.
+        let exempt_holder = if require_landed {
+            None
+        } else {
+            live_task_holder.as_ref().map(|agent| agent.pid)
+        };
+        let process_use_checked = task_lease_binding_present || merged_lane;
+        if process_use_checked
+            && let Some(kept) = process_use_verdict(
+                process_table,
+                self.main_root(),
+                std::path::Path::new(&current.worktree_path),
+                deadline,
+                exempt_holder,
+                require_landed,
+            )
+        {
+            return Ok(kept);
         }
 
         let leases = self
@@ -1750,13 +1830,24 @@ impl Broker {
         {
             return Ok(AbandonedSessionCloseOutcome::Changed);
         }
-        if (task_lease_binding_present || merged_lane)
-            && (deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
-                || process_table
-                    .process_use_snapshot_for_retirement(self.main_root(), deadline)
-                    .is_none())
-        {
-            return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+        // The final look is real evidence: whatever observation it returns,
+        // fresh or re-taken, is checked for processes in the checkout again.
+        // (It used to check only that one existed, so a re-taken observation
+        // that showed new work there was never read.)
+        if process_use_checked {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+            }
+            if let Some(kept) = process_use_verdict(
+                process_table,
+                self.main_root(),
+                std::path::Path::new(&current.worktree_path),
+                deadline,
+                exempt_holder,
+                require_landed,
+            ) {
+                return Ok(kept);
+            }
         }
 
         // Retention policy can be edited while the process and filesystem
@@ -1806,21 +1897,10 @@ impl Broker {
             if let Some(reason) = self.landed_proof_still_holds(&current, proof) {
                 return Ok(AbandonedSessionCloseOutcome::LandedDeclined(reason));
             }
-            // A remembered landing is a shortcut for judging, never for the
-            // close: prove it again, fully, under both claims.
+            // A memoised proof was replaced by a fresh search before the
+            // claims were taken (see above); a close never rests on the memo.
             if proof.memoized {
-                let _span = crate::phase_telemetry::span("landed_reproof_under_claims");
-                match self.landed_session_decline_with_memo(&current, deadline, false) {
-                    Ok(fresh) if fresh.head == proof.head => {}
-                    Ok(_) => {
-                        return Ok(AbandonedSessionCloseOutcome::LandedDeclined(
-                            LandedSessionDecline::MovedBeforeClose,
-                        ));
-                    }
-                    Err(reason) => {
-                        return Ok(AbandonedSessionCloseOutcome::LandedDeclined(reason));
-                    }
-                }
+                return Ok(AbandonedSessionCloseOutcome::Changed);
             }
             // Last look before the state transition: a commit or any index
             // write since the proof means the agent is still working here.
