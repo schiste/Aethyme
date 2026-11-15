@@ -5063,16 +5063,64 @@ pub(crate) fn gate_process_group_absent(process_group: i32) -> bool {
         return false;
     }
     let deadline = Instant::now() + Duration::from_millis(200);
-    loop {
+    process_group_absent_by(deadline, || {
         // SAFETY: signal zero only probes the integer process-group identifier.
         // It does not stop any process, including a group that reused the id.
-        if unsafe { libc::killpg(process_group, 0) } != 0 {
-            return std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if unsafe { libc::killpg(process_group, 0) } == 0 {
+            None
+        } else {
+            std::io::Error::last_os_error().raw_os_error()
+        }
+    })
+}
+
+/// Poll `probe` (a signal-zero probe of a process group: `None` when the
+/// group exists, otherwise the errno) until `deadline`. Only `ESRCH` proves
+/// the group gone. `EPERM` and `EINTR` prove nothing (on macOS a group whose
+/// last member is exiting, or is a zombie, answers `EPERM`), so polling goes
+/// on; any other error, or the deadline, leaves it unproven.
+fn process_group_absent_by(deadline: Instant, mut probe: impl FnMut() -> Option<i32>) -> bool {
+    loop {
+        match probe() {
+            Some(libc::ESRCH) => return true,
+            None | Some(libc::EPERM | libc::EINTR) => {}
+            Some(_) => return false,
         }
         if Instant::now() >= deadline {
             return false;
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(test)]
+mod process_group_absence_tests {
+    use super::process_group_absent_by;
+    use std::time::{Duration, Instant};
+
+    /// `EPERM` from the probe (a group whose last member is exiting) is not
+    /// proof of absence and not a reason to give up: polling goes on until
+    /// `ESRCH` or the deadline.
+    #[test]
+    fn eperm_keeps_polling_and_never_proves_absence() {
+        let mut answers = vec![
+            Some(libc::ESRCH),
+            Some(libc::EPERM),
+            Some(libc::EPERM),
+            None,
+        ];
+        assert!(process_group_absent_by(
+            Instant::now() + Duration::from_secs(5),
+            || answers.pop().unwrap()
+        ));
+        assert!(!process_group_absent_by(
+            Instant::now() + Duration::from_millis(50),
+            || Some(libc::EPERM)
+        ));
+        assert!(!process_group_absent_by(
+            Instant::now() + Duration::from_secs(5),
+            || Some(libc::EINVAL)
+        ));
     }
 }
 
