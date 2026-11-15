@@ -1160,6 +1160,9 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
     if args.first().map(String::as_str) == Some("service") {
         return service::run_service(&args[1..]);
     }
+    if command_can_discard_work(args) {
+        crate::git::require_fresh_git_probe();
+    }
     maybe_fast_forward_main_checkout(args, &mode);
     // Dispatched before the shared parser: the contract check is a CI/gate
     // entry point with its own flags (`--base`, `--pr-body`) and its own
@@ -2913,6 +2916,19 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         }
     }
     Ok(())
+}
+
+/// Commands that can delete a checkout, a branch or reclaimed storage. They
+/// resolve Git with a probe this process runs, never from the per-user probe
+/// cache: a cached acceptance cannot see a wrapper whose behaviour changed
+/// while its file did not. Deletion primitives re-check on their own
+/// (`git::ensure_fresh_git_verdict`), so a command missing here is slower to
+/// refuse, never weaker.
+fn command_can_discard_work(args: &[String]) -> bool {
+    matches!(
+        args.first().map(String::as_str),
+        Some("finish" | "close" | "cleanup" | "gc" | "reclaim" | "storage" | "worktrees")
+    )
 }
 
 /// Commands that act for a session, and so must come from its holder (#393).

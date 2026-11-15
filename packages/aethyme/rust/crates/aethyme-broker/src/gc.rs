@@ -8298,6 +8298,7 @@ impl Broker {
             return Ok(());
         };
         let worker_started = Instant::now();
+        crate::git_probe_cache::sweep_stale_probe_directories(); // leaked probe dirs, paced, inside the host deleter slot
         // Removal is what frees a checkout slot: it goes first, before
         // retirement and cache work, under capacity pressure with the
         // capacity limits and otherwise as the steady removal of landed
@@ -10305,6 +10306,13 @@ impl Broker {
     ) -> Result<ArtifactSweepRemovalProgress, BrokerOpError> {
         if candidates.is_empty() {
             return Ok(ArtifactSweepRemovalProgress::no_work(true));
+        }
+        if crate::git::ensure_fresh_git_verdict().is_err() {
+            blocked.extend(candidates.iter().map(|path| BlockedInterruptedPath {
+                path: Some(path.to_string_lossy().into_owned()),
+                reason: "git_verdict_unconfirmed",
+            }));
+            return Ok(ArtifactSweepRemovalProgress::no_work(false));
         }
         let Some(expected_cohort) = expected_cohort else {
             for path in candidates {
@@ -12402,7 +12410,12 @@ impl Broker {
             .iter()
             .map(|session| PathBuf::from(&session.worktree_path))
             .collect::<Vec<_>>();
-        while !journal.remaining_artifacts.is_empty() && !check_deadline(deadline) {
+        let artifacts_git_confirmed = journal.remaining_artifacts.is_empty()
+            || crate::git::fresh_git_verdict_or_report(&mut failures);
+        while artifacts_git_confirmed
+            && !journal.remaining_artifacts.is_empty()
+            && !check_deadline(deadline)
+        {
             let candidate = journal.remaining_artifacts[0].clone();
             let root = PathBuf::from(&candidate.worktree_path);
             let dir = root.join(&candidate.relative_dir);
@@ -12795,7 +12808,12 @@ impl Broker {
             write_journal(&journal_path, &journal)?;
         }
 
-        while !journal.remaining_recovery_archives.is_empty() && !check_deadline(deadline) {
+        let archives_git_confirmed = journal.remaining_recovery_archives.is_empty()
+            || crate::git::fresh_git_verdict_or_report(&mut failures);
+        while archives_git_confirmed
+            && !journal.remaining_recovery_archives.is_empty()
+            && !check_deadline(deadline)
+        {
             let candidate = journal.remaining_recovery_archives[0].clone();
             let dir = PathBuf::from(&candidate.path);
             if std::fs::symlink_metadata(&dir).is_err() {

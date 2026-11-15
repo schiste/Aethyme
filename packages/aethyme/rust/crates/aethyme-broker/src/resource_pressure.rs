@@ -104,7 +104,12 @@ impl MemorySnapshot {
 
     fn capture() -> Option<Self> {
         let output = crate::bounded_output::output_limited(
-            Command::new("ps").args(["-A", "-ww", "-o", "pid=,ppid=,rss=,lstart=,args="]),
+            Command::new(crate::system_programs::ps()).args([
+                "-A",
+                "-ww",
+                "-o",
+                "pid=,ppid=,rss=,lstart=,args=",
+            ]),
             Duration::from_secs(2),
             4 * 1024 * 1024,
         )

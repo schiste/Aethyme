@@ -61,7 +61,7 @@ pub struct ProcessRow {
 /// One `ps` snapshot of every process: shared by all environments sampled in
 /// a tick, so the cost is one process per tick, not one per environment.
 pub fn process_table() -> Result<Vec<ProcessRow>, String> {
-    let mut command = Command::new("ps");
+    let mut command = Command::new(crate::system_programs::ps());
     // `ps` formats numbers per locale: `0,0` under a decimal-comma locale
     // would make every row unparseable.
     command
@@ -246,7 +246,7 @@ pub fn sample(
 /// Physical memory of this host, if the platform says.
 pub fn host_memory_bytes() -> Option<u64> {
     if cfg!(target_os = "macos") {
-        let out = Command::new("sysctl")
+        let out = Command::new(crate::system_programs::sysctl())
             .args(["-n", "hw.memsize"])
             .output()
             .ok()?;
