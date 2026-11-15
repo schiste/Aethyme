@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Last Updated: 2026-11-14
+Last Updated: 2026-11-15
 
 ## Explore Returns `degraded`
 
@@ -319,6 +319,35 @@ plain retry fails the same way until that changes. Read the cache root's
 
 A volume UUID that is unknown on this platform (Linux) cannot prove a remount,
 so the exact device comparison stays and the same order applies.
+
+## Git Wrapper Verdict Looks Stale
+
+### Symptoms
+
+- You fixed or removed a PATH `git` wrapper, or changed its configuration, and
+  a read-only command (`broker status`, hooks) still behaves as before.
+- A deletion (`finish`, `cleanup`, automatic checkout removal) refuses with
+  "this process trusted ... from the git probe cache, but a fresh probe ...".
+
+### Checks
+
+Each process proves its `git` honest once and records the acceptance per user
+in `<host cache dir>/git-probe/verdicts.json` for up to 24 hours (see
+`docs/architecture/cross-process-consumers.md`, "Git wrapper probe verdict
+cache"). Replacing or retargeting the binary, or changing PATH so another
+`git` wins, already forces a new probe. Only a wrapper that changes behaviour
+without its file changing outlives that, and deletions always re-probe, which
+is the refusal above. It is safe: rerun the command and it probes fresh.
+
+To force a re-probe everywhere, delete the file:
+
+```bash
+rm -f "${AETHYME_HOST_CACHE_DIR:-$HOME/Library/Caches/Aethyme}/git-probe/verdicts.json"  # macOS default
+rm -f "${AETHYME_HOST_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/aethyme}/git-probe/verdicts.json"  # Linux default
+```
+
+To disable the cache for one shell, `export AETHYME_GIT_PROBE_CACHE=off`.
+`aethyme certify` reports which `git` was selected and which were bypassed.
 
 ## First Debug Commands
 
