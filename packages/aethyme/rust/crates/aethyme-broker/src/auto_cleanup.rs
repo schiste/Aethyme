@@ -13056,7 +13056,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unfinished_steady_lap_reaches_a_landed_checkout_in_the_same_slice() {
-        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        // No checkout limit: two dozen closed checkouts never make pressure.
+        let (_owner, _storage, mut broker) =
+            landed_lane_fixture(Some("[worktrees]\nmax_checkouts = 0\n"));
         let mut kept = Vec::new();
         for index in 0..8 {
             let (session, worktree) =
@@ -13100,14 +13102,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn steady_removal_backs_off_only_after_a_full_empty_lap() {
-        let (_owner, _storage, mut broker) = landed_lane_fixture(None);
+        // No checkout limit: thirty closed checkouts never make pressure.
+        let (_owner, _storage, mut broker) =
+            landed_lane_fixture(Some("[worktrees]\nmax_checkouts = 0\n"));
         let kept = (0..30)
             .map(|index| closed_checkout_with_notes(&mut broker, &format!("kept {index}")).1)
             .collect::<Vec<_>>();
-        // Room for one pass only: the lock gap after it leaves less than
-        // the minimum slice.
+        // Room for one pass only: the lock gap after it (at least half a
+        // second) leaves less than the five-second minimum slice.
         let one_pass = crate::gc::CapacitySliceLimits {
-            budget: Duration::from_millis(5_900),
+            budget: Duration::from_millis(5_400),
             ..crate::gc::CapacitySliceLimits::WORKER
         };
         broker
