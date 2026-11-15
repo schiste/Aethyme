@@ -4,6 +4,22 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.100] - 2026-11-15
+
+### Changed
+
+- Automatic checkout removal no longer keeps a closed checkout just because some other session's gate is running. A gate keeps a checkout only when one of that checkout's own sessions runs it, when the gate's recorded checkout is the checkout (or inside it, or contains it), or when nothing identifies where the gate runs. Records written by older binaries, malformed records and unverifiable per-session inventories still keep every checkout, so the narrowing takes effect as gates are started by 0.8.100 or later (#1686).
+- Residual to know: a gate command that works in a sibling checkout (by changing into it or taking its path as an argument) is not attributed to that checkout, and a checkout moved after its gate started is matched by the path recorded at start. The artifact-use marker and the open-file check before removal remain the guards in both cases (#1686).
+
+### Added
+
+- Gate pidfiles gain a sixth field and owner-lock holder lines gain `pid=`, `start=`, `checkout=` and `end`, recording the gate's checkout. Holder lines are cleared on release, including after a partial acquisition. Older binaries read both formats (#1686).
+- `kept[].gate_keep` (`own_session`, `path`, `unknown_owner`) and the counters `lanes.removal_gate_checks` and `capacity_removal.gate_checks` (`checks`, `scans`, `gates_seen`, `attributed_here`, `attributed_elsewhere`, `unknown_owner`, `inventory_unknown`, `elapsed_ms`) show which gates kept or no longer keep checkouts. Gate records are read once per selection pass and fresh for each checkout immediately before removal (#1686).
+
+### Known issue
+
+- Background checkout removal does not start while the one-minute load average is above twice the core count (since 0.8.96). On a machine that is always that busy it never runs. A fix that keeps memory pressure as the only hard stop is in progress.
+
 ## [0.8.99] - 2026-11-15
 
 ### Fixed
