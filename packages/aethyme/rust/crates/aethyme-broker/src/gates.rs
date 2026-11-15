@@ -7913,7 +7913,7 @@ mod tests {
             format!("42 tree 42 100 run-id {checkout} extra"),
         ] {
             assert!(
-                parse_checked_gate_pid_record(invalid).is_none(),
+                parse_checked_gate_pid_record(&invalid).is_none(),
                 "{invalid}"
             );
         }
