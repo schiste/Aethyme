@@ -3579,6 +3579,21 @@ pub(crate) fn recover_rotation_debt_for_cache_sweep_with_binding(
             progress: rotation_debt::RecoveryProgress::default(),
         }
     })?;
+    // Recovery unlinks single control files (intent, proof, scratch,
+    // completed witness) between its tree removals, outside the pacer's
+    // per-unlink gate, in a crash-safe sequence that must not fail half-way
+    // for a busy slot. So the unattended worker pins the host deleter slot
+    // for the whole step, waiting as briefly as one deletion does; when
+    // another repository's worker keeps it, the step is left for the next
+    // pass as an unfinished, counted outcome, never a recovery error.
+    // Foreground callers have no pacer and are not serialised, as before.
+    let Some(_host_slot) = crate::gc::unattended_pacing::pin_host_deleter_slot_briefly() else {
+        crate::phase_telemetry::add(
+            "preparation_rotation_recovery_host_deleter_busy",
+            Duration::ZERO,
+        );
+        return Ok(rotation_debt::RecoveryProgress::default());
+    };
     rotation_debt::recover_with_journal_and_root_guard(
         cache_root,
         resource_db_path,
