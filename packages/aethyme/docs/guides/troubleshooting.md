@@ -164,7 +164,7 @@ aethyme broker status --json
    | `removed` | The slice freed slots. Check again in a few minutes. `stop_reason` says why it ended (see below). |
    | `nothing_removable` | The lap ended and every examined checkout was kept, or nothing moved. Under pressure the worker waits 10 minutes; a steady slice waits 5, 10, 20, then 30 minutes while slices in a row reach the end of the lap with nothing removed (`empty_laps`, shown as `idle_streak` here). Go to step 3. |
    | `lap_unfinished` | Time ran out before the lap reached its end. Under pressure the next slice resumes it after 20 seconds when the lap moved, and after 10 minutes when nothing moved; a steady slice resumes it a minute later while it moves, or at once in the same worker run when nothing blocks (`continued`); `idle_streak` reads 0 and `empty_laps` does not grow. |
-   | `lock_busy` | Another process held the GC lock, or the slice stepped aside for a foreground command (`broker start` at the limit, `gc apply`, `gc abandon`, `gc forget-abandoned`) that was waiting for it. The next slice retries after one minute. |
+   | `lock_busy` | Another process held the GC lock, or the slice stepped aside for a foreground command (`broker start` at the limit, `gc apply`, `gc abandon`, `gc forget-abandoned`) that was waiting for it, or (`stop_reason` `host_deleter_busy`) another repository's worker kept the machine's single-deleter slot through the two-second wait right before a removal; that checkout stays and is judged first again. The next slice retries after one minute. `host_slot_wait_ms` says how long the slice waited for the slot. |
    | `inventory_unavailable` | No complete checkout inventory before the deadline. `waiting_on` names what it waited on (`capacity_probe`, `cohort_index`, `group_page` or `live_paths`). Progress is kept; the retry is 20 seconds after a slice that moved, and otherwise 1, 2, 4, 8 and then 10 minutes while it repeats. |
    | `out_of_time_before_selection` | The budget ran out before any checkout was judged. `budget_consumed_by` is `checkout_count` or `pre_selection`. It retries after 1, 2, 4, 8 and then 10 minutes while it repeats. |
    | `pressure_before_selection` | Pressure kept the slice from running any pass; `pressure_seen` says which. `memory` (`stop_reason` `memory_backoff`): memory pressure outlasted the worker's 120-second pause budget; it retries after 10 minutes. Check memory pressure (`memory_pressure` on macOS, `/proc/pressure/memory` on Linux) and what fills memory. `load` (`stop_reason` `budget`): the slice reached its pressure check with at least the 5-second minimum slice left and the bounded load wait then left too little for a pass; it retries after 1 minute. Neither grows `idle_streak`. A slice whose budget went on counting checkouts or other checks before the pressure check, or whose pass failed, is never `pressure_before_selection`, whatever load it saw: it stays `out_of_time_before_selection` with `budget_consumed_by` and its 1, 2, 4, 8 and 10-minute retries. |
@@ -195,9 +195,10 @@ aethyme broker status --json
    `pacer_backoff`, where load stopped the slice too),
    `slice_deadline` (the deadline cut the pacer wait after a removal short;
    the next slice pays the rest first), `yielded_to_foreground`, `lock_busy`,
-   `failed` (a pass failed; retry after at least one minute) and
+   `failed` (a pass failed; retry after at least one minute),
    `removal_failures` (Git failed to remove a checkout twice; retry after 10
-   minutes). A slice that removed nothing after keeping a checkout at the last
+   minutes) and `host_deleter_busy` (another repository's worker was
+   deleting; retry after one minute). A slice that removed nothing after keeping a checkout at the last
    step waits at least one minute. `retry_in_ms` is the wait the slice chose;
    it is absent when the next slice may start at once.
 
@@ -213,6 +214,13 @@ aethyme broker status --json
    `run_waiting_ms`, `run_deleting_pct` and `run_waiting_pct` describe the
    worker run the slice belongs to so far: how many slices it held, what they
    removed and how much of the run Git spent deleting versus waiting.
+   `host_slot_wait_ms`, `host_slot_held_ms` and `host_slot_deleting_ms` say
+   how long the slice waited for and held the machine's single-deleter slot
+   (taken only around each removal and its rate-limit sleep) and how much of
+   that was deleting; `judge_permit_wait_ms` how long it waited for one of
+   the two host-wide judging permits. A worker that finds both permits taken
+   for five seconds records no slice and retries a minute later (worker
+   status `capacity_removal judge_permit_busy`).
    If removal judges too slowly to keep up, read `groups_judged_per_min` and
    `check_timings`: each check kind's count and milliseconds (`inspect` is Git
    discovery and ownership, `status` the `git status` walk, `ignored` the

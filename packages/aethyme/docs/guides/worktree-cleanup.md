@@ -361,8 +361,11 @@ holding the most checkouts with the line that would release each,
 slice saw and whether it ran throttled; `stop_reason` says why the slice
 stopped (`cap`, `budget`, `memory_backoff`, `load_throttled`,
 `slice_deadline`, `yielded_to_foreground`, `nothing_selected`,
-`lap_complete`, `kept_only_limit`, `lock_busy`, `failed` or
-`removal_failures`; records from older binaries may say `pacer_backoff`) and
+`lap_complete`, `kept_only_limit`, `lock_busy`, `failed`,
+`removal_failures` or `host_deleter_busy`, when another repository's worker
+kept the host deleter slot through the two-second wait before a removal:
+the outcome is then `lock_busy`, the checkout stays and the next pass judges it again (its priority entry dropped, the lap cursor moved back before it)
+about a minute later; records from older binaries may say `pacer_backoff`) and
 `retry_in_ms` the wait it chose. `trigger` says which trigger ran the slice
 (`steady` or `pressure`), `priority_examined` / `priority_removed` and
 `lap_examined` / `lap_removed` split its work between the priority lane and
@@ -518,9 +521,16 @@ and the counters `auto_cleanup_db_kept_in_grace`,
 `auto_cleanup_db_kept_session_open`, `auto_cleanup_priority_db_skip`,
 `auto_cleanup_removal_db_kept` and `auto_cleanup_memo_hit_<code>`; a worker
 run adds `artifact_worker_capacity_removal_continued` (one per slice taken
-right after the previous one) and the timed phase
-`artifact_worker_host_slot_held` (how long it held the host deleter slot, to
-compare with `_git_removal`). The
+right after the previous one) and the timed phases
+`artifact_worker_host_slot_held` and `artifact_worker_host_slot_deleting`
+(how long it held the host deleter slot, which it takes only around each
+removal, and how much of that was not the rate limiter's sleep; compare with
+`_git_removal`), `artifact_worker_capacity_removal_host_slot_wait`,
+`_host_slot_held` and `_judge_permit_wait`, and the counters
+`artifact_worker_capacity_removal_stop_host_deleter_busy` and
+`_judge_permit_busy`. The slice record carries the same as
+`host_slot_wait_ms`, `host_slot_held_ms`, `host_slot_deleting_ms` and
+`judge_permit_wait_ms`. The
 worker writes one `command-metrics.jsonl` row per run with these.
 
 The background worker's pace, priority, host-wide single deleter and pressure

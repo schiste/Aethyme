@@ -222,9 +222,13 @@ pull request alone is not enough.
   session still holds its checkout: a repository with none never wakes the
   worker for it. A repository whose closed checkouts are all kept (each with
   a keep code) costs one short worker run about every 30 minutes, started by
-  a broker open. A run that cannot reach its slice (the host deleter slot is
-  busy, the runtime cannot be verified, the worker cannot start, no time is
-  left) holds steady removal off for one to five minutes.
+  a broker open. A run that cannot reach its slice (every host judging
+  permit is taken, the runtime cannot be verified, the worker cannot start,
+  no time is left) holds steady removal off for one to five minutes. A
+  removal that finds another repository's worker deleting waits at most two
+  seconds, then is put off: the slice stops `host_deleter_busy` and the
+  checkout is judged again (the priority lane or the lap reaches it first)
+  about a minute later.
 - From three quarters of the limit it runs the `pressure` slice with the
   capacity limits (up to twelve removals in 120 seconds, shorter retries).
 
@@ -248,6 +252,19 @@ priority (macOS and Linux), a rate limit on unlinks, one deleter at a time
 across every repository on the machine, and a pause while memory pressure is
 above normal. Commands you wait on (`finish`, `finish cleanup <id>`,
 `gc apply`, `gc sweep`) keep full speed.
+
+The one-deleter rule is a host-wide slot the worker holds only while it
+deletes: one checkout removal and the rate-limit sleep that pays for it, or
+a run of file-deletion batches (handed over after 20 seconds). Judging,
+counting, lock gaps and pressure waits never hold it, and each deletion waits
+at most two seconds for it; if another repository's worker is still
+deleting, this one goes back to judging and retries shortly. Lanes that
+delete in ways the pacer cannot see batch by batch (session retirement,
+checkout archives, the requested checkout cleanup) hold it for their whole
+pass, waiting at most ten seconds. At most two repositories judge closed
+checkouts at the same time; a third waits up to five seconds and otherwise
+retries a minute later. The slot and the judging permits are released by
+the operating system if a worker dies.
 
 Memory pressure is a hard stop: no removal starts while it lasts, and when it
 outlasts the worker's pause budget (120 seconds per run) the work stops and
@@ -273,20 +290,24 @@ The limit is lifted automatically while free space is below the gate
 headroom, because freeing space is then the priority; the lowered priority,
 the memory pause and the load throttle stay. The limit also applies under
 load, on top of the load wait. Nothing deferred is dropped: a worker that pauses,
-reaches its time limit, or waits too long for another repository's deleter
+reaches its time limit, or finds another repository's worker deleting
 leaves its request durable, and the next broker open starts a worker again.
 
 `aethyme broker status --json` shows the last worker run under
 `cleanup_retention.last_artifact_sweep.unattended_pacing`: entries and bytes
 removed, the removal rate, time slept by the limiter, time paused for memory
 and waited for load, how often work went on throttled under load
-(`load_throttled`), time waited for the host deleter lock, requests
-coalesced into the run, and whether priority lowering succeeded. The worker's
+(`load_throttled`), time waited for, held and spent deleting under the host
+deleter slot (`host_lock_wait_ms`, `host_slot_held_ms`,
+`host_slot_deleting_ms`, `host_slot_busy`), time waited for a judging permit
+(`judge_permit_wait_ms`, `judge_permit_busy`), requests coalesced into the
+run, and whether priority lowering succeeded. The worker's
 `command-metrics.jsonl` row carries the same waits as phases
-(`artifact_worker_host_deleter_wait`, `artifact_worker_pacer_memory_pause`,
-`artifact_worker_pacer_load_wait`, `artifact_worker_pacer_limiter_sleep`); it
-is written when the run exits, which can be more than 20 minutes after it
-started when it first waited for another repository's deleter. See
+(`artifact_worker_host_deleter_wait`, `artifact_worker_host_slot_held`,
+`artifact_worker_host_slot_deleting`, `artifact_worker_judge_permit_wait`,
+`artifact_worker_pacer_memory_pause`, `artifact_worker_pacer_load_wait`,
+`artifact_worker_pacer_limiter_sleep`); it is written when the run exits,
+at most about five minutes after it started. See
 [cross-process consumers](../architecture/cross-process-consumers.md) for the
 field list.
 

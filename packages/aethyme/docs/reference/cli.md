@@ -444,8 +444,13 @@ per pass), `groups_judged_per_min`, `outcome` (`removed`, `lock_busy`, `inventor
 `out_of_time_before_selection`, `pressure_before_selection` or
 `nothing_removable`), `stop_reason` (`cap`, `budget`, `memory_backoff`,
 `load_throttled`, `slice_deadline`, `yielded_to_foreground`,
-`nothing_selected`, `lap_complete`, `kept_only_limit`, `lock_busy`, `failed`
-or `removal_failures`; older records may say `pacer_backoff`),
+`nothing_selected`, `lap_complete`, `kept_only_limit`, `lock_busy`, `failed`,
+`removal_failures` or `host_deleter_busy`; older records may say
+`pacer_backoff`), the host deleter slot (`host_slot_wait_ms`,
+`host_slot_held_ms`, `host_slot_deleting_ms`: the worker takes the
+machine's single-deleter slot only around each removal and its rate-limit
+sleep, waiting at most 2 s) and `judge_permit_wait_ms` (at most two
+repositories judge at once),
 `pressure_seen` (`memory`, `load` or `memory_and_load`), `throttled`,
 `throttle_gap_ms`, the worker run so far (`run_slices`, `run_removed`,
 `run_elapsed_ms`, `run_deleting_ms`, `run_waiting_ms`, `run_deleting_pct`,
@@ -473,8 +478,9 @@ cadence, at least 30 seconds before the next slice);
 refusing at once, and the background worker steps aside while one of them
 waits. Commands that still fail fast or defer on a held GC lock: a broker open
 resuming a confirmed GC journal, a broker open's inline maintenance, and the
-cleanup wake after `finish` (it reports `reclaim_deferred` and the worker does
-the reclaim).
+cleanup wake after `finish`, `close` and abandoned-session closes (it reports
+`reclaim_deferred`, prints no warning since the request is already in the
+close outbox, and the worker queues and does the reclaim).
 A foreground lifecycle command (`start`, adoption, `finish`, `close`, `cleanup`,
 `submit`) waits up to 180 s for the repository's lifecycle claim, or until its
 own `--timeout` if that comes first. After 5 s it says on stderr who holds the

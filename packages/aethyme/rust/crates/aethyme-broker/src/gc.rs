@@ -253,12 +253,11 @@ const ARTIFACT_SWEEP_COALESCED_REQUESTS_KEY: &str = "gc.artifact_sweep.coalesced
 /// reads the backlog, so a burst of `finish` calls is served by one run.
 pub(crate) const ARTIFACT_WORKER_COALESCE_WINDOW: Duration = Duration::from_secs(2);
 /// Host-wide single deleter: one unattended worker deletes at a time across
-/// every repository on the machine. A waiting worker keeps its repository
-/// singleton (so further requests coalesce behind it) and gives up after
-/// this long with its request still durable.
+/// every repository on the machine. The unattended pacer takes this lock
+/// right before each deletion and gives it back after it (see
+/// `unattended_pacing`); judging, counting and waits never hold it. It is an
+/// OS advisory lock, so a holder that dies releases it.
 const HOST_DELETER_LOCK_FILE: &str = "gc-unattended-deleter.lock";
-const HOST_DELETER_WAIT: Duration = Duration::from_secs(15 * 60);
-const HOST_DELETER_POLL: Duration = Duration::from_secs(2);
 const ARTIFACT_SWEEP_META_PREFIX: &str = "gc.artifact_sweep.";
 const ARTIFACT_SWEEP_LEGACY_SCALAR_MAX_BYTES: usize = 4 * 1024;
 /// Internal marker which keeps Broker::open from starting a second inline GC
@@ -409,11 +408,14 @@ pub(crate) enum CapacitySliceStop {
     /// Git failed to remove checkouts `ARTIFACT_WORKER_CAPACITY_REMOVAL_FAILURES`
     /// times in this slice.
     RemovalFailures,
+    /// Another repository's worker kept the host deleter slot through the
+    /// bounded wait right before a removal; the removal was put off.
+    HostDeleterBusy,
 }
 
 impl CapacitySliceStop {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 12] = [
+    pub(crate) const ALL: [Self; 13] = [
         Self::Cap,
         Self::Budget,
         Self::MemoryBackoff,
@@ -426,6 +428,7 @@ impl CapacitySliceStop {
         Self::LockBusy,
         Self::Failed,
         Self::RemovalFailures,
+        Self::HostDeleterBusy,
     ];
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -442,6 +445,7 @@ impl CapacitySliceStop {
             Self::LockBusy => "lock_busy",
             Self::Failed => "failed",
             Self::RemovalFailures => "removal_failures",
+            Self::HostDeleterBusy => "host_deleter_busy",
         }
     }
 
@@ -461,6 +465,7 @@ impl CapacitySliceStop {
             Self::LockBusy => "artifact_worker_capacity_removal_stop_lock_busy",
             Self::Failed => "artifact_worker_capacity_removal_stop_failed",
             Self::RemovalFailures => "artifact_worker_capacity_removal_stop_removal_failures",
+            Self::HostDeleterBusy => "artifact_worker_capacity_removal_stop_host_deleter_busy",
         }
     }
 }
@@ -2891,6 +2896,16 @@ pub(crate) struct GcLock {
     path: PathBuf,
 }
 
+/// What waking post-close checkout cleanup did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PostCloseCleanupWake {
+    /// The cleanup generation is queued (or nothing was owed).
+    Queued,
+    /// Another process (usually the background worker) holds the GC lock;
+    /// the request stays in the outbox and the holder's reconcile queues it.
+    DeferredToHolder { pid: String },
+}
+
 impl GcLock {
     pub(crate) fn acquire(main_root: &Path) -> Result<Self, BrokerOpError> {
         let path = main_root.join(".aethyme/gc.lock");
@@ -3471,6 +3486,14 @@ pub(crate) fn try_artifact_sweep_worker_lock(
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: a hard steady retry is set between a worker run's slices,
+    /// as another lane would set one mid-run.
+    pub(crate) static HARD_RETRY_BETWEEN_SLICES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// Outcome of waiting for the host-wide single-deleter lock.
 pub(crate) enum HostDeleterSlot {
     /// This worker is the machine's only unattended deleter until it drops.
@@ -3482,9 +3505,10 @@ pub(crate) enum HostDeleterSlot {
     Busy,
 }
 
-/// The directory that holds the host deleter lock: the broker's host state
-/// directory, shared by every repository on this machine. Unit tests opt in
-/// per thread so parallel tests never contend on a real host directory.
+/// The directory that holds the host deleter lock (and the host judging
+/// permits): the broker's host state directory, shared by every repository
+/// on this machine. Unit tests opt in per thread so parallel tests never
+/// contend on a real host directory.
 fn host_deleter_lock_directory() -> Option<PathBuf> {
     #[cfg(test)]
     {
@@ -3496,11 +3520,13 @@ fn host_deleter_lock_directory() -> Option<PathBuf> {
     }
 }
 
-/// Wait up to `wait` for the host deleter lock in `directory`, polling with
-/// `sleep`. Returns the slot and the time spent waiting.
+/// Wait up to `wait` for the host deleter lock in `directory`, trying again
+/// every `poll` and sleeping with `sleep`. Returns the slot and the time
+/// spent waiting.
 pub(crate) fn wait_for_host_deleter_slot(
     directory: Option<&Path>,
     wait: Duration,
+    poll: Duration,
     mut sleep: impl FnMut(Duration),
 ) -> (HostDeleterSlot, Duration) {
     let Some(directory) = directory else {
@@ -3522,7 +3548,9 @@ pub(crate) fn wait_for_host_deleter_slot(
         if waited >= wait {
             return (HostDeleterSlot::Busy, waited);
         }
-        let step = HOST_DELETER_POLL.min(wait.saturating_sub(waited));
+        let step = poll
+            .max(Duration::from_millis(1))
+            .min(wait.saturating_sub(waited));
         sleep(step);
         waited += step;
     }
@@ -3541,11 +3569,14 @@ pub(crate) fn install_unattended_deletion_pacing(
     priority: BackgroundPriority,
 ) -> unattended_pacing::UnattendedPacingScope {
     let (rate, config_error) = unattended_pacing::load_unlink_rate(main_root);
-    let scope = unattended_pacing::install(unattended_pacing::UnattendedPacer::new(
-        rate,
-        Box::new(unattended_pacing::SystemClock),
-        Box::new(unattended_pacing::SystemPressure::new()),
-    ));
+    let scope = unattended_pacing::install(
+        unattended_pacing::UnattendedPacer::new(
+            rate,
+            Box::new(unattended_pacing::SystemClock),
+            Box::new(unattended_pacing::SystemPressure::new()),
+        )
+        .with_host_directory(host_deleter_lock_directory()),
+    );
     unattended_pacing::record_priority(priority);
     unattended_pacing::record_config_error(config_error);
     scope
@@ -4583,11 +4614,12 @@ impl Broker {
 
     /// Persist the installed pacer's telemetry for this worker run and add it
     /// to the run's phase timings, so the run's `command-metrics.jsonl` row
-    /// says where its wall time went (a run can wait up to
-    /// `HOST_DELETER_WAIT` for the host's deleter slot before its own
-    /// five-minute budget starts). Foreground commands have no pacer and
-    /// record nothing.
+    /// says where its wall time went: how long it waited for, held and
+    /// deleted under the host's deleter slot, and waited for a judging
+    /// permit. Foreground commands have no pacer and record nothing.
     fn persist_unattended_pacing_summary(&mut self) {
+        // Whatever the run still holds goes back before it is counted.
+        unattended_pacing::release_host_deleter_slot();
         let Some(summary) = unattended_pacing::current_summary(now_ms()) else {
             return;
         };
@@ -4595,6 +4627,15 @@ impl Broker {
             (
                 "artifact_worker_host_deleter_wait",
                 summary.host_lock_wait_ms,
+            ),
+            ("artifact_worker_host_slot_held", summary.host_slot_held_ms),
+            (
+                "artifact_worker_host_slot_deleting",
+                summary.host_slot_deleting_ms,
+            ),
+            (
+                "artifact_worker_judge_permit_wait",
+                summary.judge_permit_wait_ms,
             ),
             (
                 "artifact_worker_pacer_memory_pause",
@@ -4616,6 +4657,11 @@ impl Broker {
             (
                 "artifact_worker_pacer_load_throttled",
                 summary.load_throttled,
+            ),
+            ("artifact_worker_host_slot_busy", summary.host_slot_busy),
+            (
+                "artifact_worker_judge_permit_busy",
+                summary.judge_permit_busy,
             ),
         ] {
             for _ in 0..count.min(4096) {
@@ -6950,14 +6996,29 @@ impl Broker {
 
     /// Persist a whole-checkout cleanup generation for an atomically queued
     /// terminal obligation. This is used after the close transaction and
-    /// acquires the GC lock itself.
+    /// tries the GC lock itself, without waiting.
+    ///
+    /// A held GC lock is the expected case, not a failure: the background
+    /// worker holds it for most of a run. The cleanup request is already
+    /// committed in the close transaction's outbox, and whoever holds the
+    /// lock is followed by an outbox reconcile that queues it (the running
+    /// worker before its requested-cleanup lane, every broker open, every
+    /// worker start), so nothing waits and nothing warns.
     pub(crate) fn request_checkout_cleanup_after_close(
         &mut self,
         session_id: i64,
-    ) -> Result<(), BrokerOpError> {
+    ) -> Result<PostCloseCleanupWake, BrokerOpError> {
         let root = self.main_root().to_path_buf();
-        let _lock = GcLock::acquire(&root)?;
-        self.request_checkout_cleanup_after_close_under_gc_lock(session_id)
+        let _lock = match GcLock::acquire(&root) {
+            Ok(lock) => lock,
+            Err(BrokerOpError::GcLocked { pid }) => {
+                crate::phase_telemetry::add("post_close_cleanup_wake_deferred", Duration::ZERO);
+                return Ok(PostCloseCleanupWake::DeferredToHolder { pid });
+            }
+            Err(error) => return Err(error),
+        };
+        self.request_checkout_cleanup_after_close_under_gc_lock(session_id)?;
+        Ok(PostCloseCleanupWake::Queued)
     }
 
     /// Under-lock half of [`Self::request_checkout_cleanup_after_close`].
@@ -7335,6 +7396,21 @@ impl Broker {
         request_generation: i64,
         reason: &str,
     ) -> Result<(), BrokerOpError> {
+        self.defer_session_retirement_request_for(
+            request_generation,
+            reason,
+            SESSION_RETIREMENT_WORKER_RETRY_MS,
+        )
+    }
+
+    /// [`Self::defer_session_retirement_request`] with its own retry: a
+    /// busy host deleter slot retries after a minute, not ten.
+    fn defer_session_retirement_request_for(
+        &mut self,
+        request_generation: i64,
+        reason: &str,
+        retry_ms: i64,
+    ) -> Result<(), BrokerOpError> {
         for _ in 0..SESSION_RETIREMENT_STATE_CAS_ATTEMPTS {
             let (raw, mut state) = self.load_session_retirement_state()?;
             if state.requested_generation != request_generation
@@ -7342,7 +7418,7 @@ impl Broker {
             {
                 return Ok(());
             }
-            state.retry_after_ms = now_ms().saturating_add(SESSION_RETIREMENT_WORKER_RETRY_MS);
+            state.retry_after_ms = now_ms().saturating_add(retry_ms);
             if self.store_session_retirement_state(raw.as_deref(), &state)? {
                 return self.write_artifact_sweep_worker_status(reason);
             }
@@ -8174,30 +8250,27 @@ impl Broker {
         result
     }
 
-    /// Wait for the host-wide single-deleter slot. `None` means another
-    /// repository's worker kept it for the whole wait; this run then exits
-    /// with every request durable for the next worker.
-    fn acquire_host_deleter_slot(
+    /// Run `lane` with the host deleter slot pinned for its whole length:
+    /// the lane deletes through paths that have no per-deletion gate (Git
+    /// checkout removal inside session retirement, checkout archives, the
+    /// requested checkout cleanup). `None` when another repository's worker
+    /// kept the slot through the pin's bounded wait; the caller defers the
+    /// lane with its request durable. Taken with no GC lock held, and the
+    /// lane takes its GC lock under the pin: the same order as a
+    /// whole-checkout removal, whose GC lock is taken before the slot,
+    /// never conflicts, because a pin waits only a bounded time and no
+    /// worker waits for another repository's GC lock.
+    fn with_host_deleter_pin<T>(
         &mut self,
-        directory: Option<&Path>,
-        wait: Duration,
-        sleep: impl FnMut(Duration),
-    ) -> Result<Option<Option<crate::file_lock::ExclusiveFileLock>>, BrokerOpError> {
-        let coalesced = self.take_coalesced_artifact_worker_requests()?;
-        unattended_pacing::record_requests_coalesced(coalesced);
-        let (slot, waited) = wait_for_host_deleter_slot(directory, wait, sleep);
-        unattended_pacing::record_host_lock_wait(waited);
-        match slot {
-            HostDeleterSlot::Held(lock) => Ok(Some(Some(lock))),
-            HostDeleterSlot::Unavailable => Ok(Some(None)),
-            HostDeleterSlot::Busy => {
-                self.write_artifact_sweep_worker_status(&format!(
-                    "host_deleter_busy waited_ms={}; request retained",
-                    waited.as_millis()
-                ))?;
-                Ok(None)
-            }
-        }
+        lane: impl FnOnce(&mut Self) -> Result<T, BrokerOpError>,
+    ) -> Result<Option<T>, BrokerOpError> {
+        let Some(pin) = unattended_pacing::pin_host_deleter_slot() else {
+            crate::phase_telemetry::add("artifact_worker_host_slot_pin_busy", Duration::ZERO);
+            return Ok(None);
+        };
+        let result = lane(self);
+        drop(pin);
+        result.map(Some)
     }
 
     fn run_artifact_sweep_recovery_worker_lanes(&mut self) -> Result<(), BrokerOpError> {
@@ -8281,22 +8354,12 @@ impl Broker {
             }
             return Ok(());
         }
-        // One unattended deleter per machine. Waiting happens before the
-        // worker's time budget starts, so a queued run keeps its full budget.
-        let host_lock_directory = host_deleter_lock_directory();
-        let Some(_host_deleter) = self.acquire_host_deleter_slot(
-            host_lock_directory.as_deref(),
-            HOST_DELETER_WAIT,
-            std::thread::sleep,
-        )?
-        else {
-            if steady_removal_due {
-                // Another repository's worker kept the host deleter slot:
-                // a minute before broker opens wake this one for it again.
-                self.defer_steady_removal(ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS)?;
-            }
-            return Ok(());
-        };
+        let coalesced = self.take_coalesced_artifact_worker_requests()?;
+        unattended_pacing::record_requests_coalesced(coalesced);
+        // One unattended deleter per machine: the pacer takes the host
+        // deleter slot right before each deletion and gives it back after
+        // it, so the run starts judging at once instead of queueing behind
+        // another repository's whole run.
         let worker_started = Instant::now();
         crate::git_probe_cache::sweep_stale_probe_directories(); // leaked probe dirs, paced, inside the host deleter slot
         // Removal is what frees a checkout slot: it goes first, before
@@ -8341,11 +8404,20 @@ impl Broker {
             let remaining =
                 ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
             let pass_budget = remaining.min(SESSION_RETIREMENT_WORKER_PASS_BUDGET);
-            self.run_session_retirement_recovery_worker_loop_isolated(
-                request_generation,
-                Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
-                Some(pass_budget),
-            )?;
+            let ran = self.with_host_deleter_pin(|broker| {
+                broker.run_session_retirement_recovery_worker_loop_isolated(
+                    request_generation,
+                    Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
+                    Some(pass_budget),
+                )
+            })?;
+            if ran.is_none() {
+                self.defer_session_retirement_request_for(
+                    request_generation,
+                    "session_retirement_host_deleter_busy",
+                    ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS,
+                )?;
+            }
         }
         let cache_lane_result = if artifact_due {
             (|| {
@@ -8410,11 +8482,17 @@ impl Broker {
                         crate::phase_telemetry::add("artifact_worker_cache_passes", Duration::ZERO);
                         let deadline =
                             Instant::now() + artifact_worker_cache_pass_budget(remaining);
-                        broker.sweep_artifacts_autonomously_with_deadline(
+                        unattended_pacing::clear_host_deleter_busy();
+                        let pass = broker.sweep_artifacts_autonomously_with_deadline(
                             policy,
                             ArtifactSweepScope::AutomaticContinuation,
                             Some(deadline),
-                        )
+                        );
+                        // Each tree removal gives the deleter slot back when
+                        // it returns; nothing of this pass keeps it into the
+                        // next one's discovery.
+                        unattended_pacing::release_host_deleter_slot();
+                        pass
                     },
                 )
             })()
@@ -8445,14 +8523,24 @@ impl Broker {
                     cleanup_due_before_compact,
                 ) {
                     let deadline = Instant::now() + pass_budget;
-                    if let Err(error) = broker.auto_compact_checkout_recovery_pass(deadline) {
-                        if matches!(error, BrokerOpError::Store(_)) {
-                            return Err(error);
+                    let pass = broker.with_host_deleter_pin(|broker| {
+                        Ok(broker.auto_compact_checkout_recovery_pass(deadline))
+                    })?;
+                    match pass {
+                        None => broker.defer_auto_compact_checkout_worker(
+                            "compact_checkout_host_deleter_busy",
+                            ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS,
+                        )?,
+                        Some(Err(error)) => {
+                            if matches!(error, BrokerOpError::Store(_)) {
+                                return Err(error);
+                            }
+                            broker.defer_auto_compact_checkout_worker(
+                                &format!("compact_checkout_pass_failed: {error}"),
+                                AUTO_COMPACT_CHECKOUT_RETRY_MS,
+                            )?;
                         }
-                        broker.defer_auto_compact_checkout_worker(
-                            &format!("compact_checkout_pass_failed: {error}"),
-                            AUTO_COMPACT_CHECKOUT_RETRY_MS,
-                        )?;
+                        Some(Ok(_)) => {}
                     }
                 } else {
                     broker.defer_auto_compact_checkout_worker(
@@ -8465,6 +8553,9 @@ impl Broker {
             // A cleanup request may have arrived while the cache lane was
             // working. Re-read its generation instead of letting the worker
             // exit with newly queued work stranded behind its singleton lock.
+            // A close that found this worker holding the GC lock left its
+            // request in the outbox without a generation: queue it first.
+            broker.reconcile_checkout_cleanup_outbox()?;
             let cleanup_pending = broker.auto_checkout_cleanup_recovery_requested()?;
             let cleanup_due =
                 cleanup_pending && !broker.auto_checkout_cleanup_retry_pending(now_ms())?;
@@ -8475,18 +8566,26 @@ impl Broker {
                     .unwrap_or(0);
                 let remaining =
                     ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
-                broker.run_auto_checkout_cleanup_recovery_worker_loop(
-                    request_generation,
-                    Some(AUTO_CHECKOUT_CLEANUP_WORKER_MAX_PASSES),
-                    Some(remaining.saturating_sub(SESSION_RETIREMENT_WORKER_RESERVE)),
-                    |broker, generation, pass_budget| {
-                        let Some(pass_budget) = pass_budget else {
-                            return Ok(None);
-                        };
-                        let deadline = Instant::now() + pass_budget;
-                        broker.auto_checkout_cleanup_recovery_pass(generation, deadline)
-                    },
-                )?;
+                let ran = broker.with_host_deleter_pin(|broker| {
+                    broker.run_auto_checkout_cleanup_recovery_worker_loop(
+                        request_generation,
+                        Some(AUTO_CHECKOUT_CLEANUP_WORKER_MAX_PASSES),
+                        Some(remaining.saturating_sub(SESSION_RETIREMENT_WORKER_RESERVE)),
+                        |broker, generation, pass_budget| {
+                            let Some(pass_budget) = pass_budget else {
+                                return Ok(None);
+                            };
+                            let deadline = Instant::now() + pass_budget;
+                            broker.auto_checkout_cleanup_recovery_pass(generation, deadline)
+                        },
+                    )
+                })?;
+                if ran.is_none() {
+                    broker.defer_auto_checkout_cleanup_worker_for(
+                        "checkout_cleanup_host_deleter_busy",
+                        ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS,
+                    )?;
+                }
             }
 
             // A request may arrive while this process owns the singleton
@@ -8505,18 +8604,27 @@ impl Broker {
                         "session_retirement_post_cache_reserve_unavailable",
                     )?;
                 } else {
-                    broker.run_session_retirement_recovery_worker_loop_isolated(
-                        request_generation,
-                        Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
-                        Some(remaining.min(SESSION_RETIREMENT_WORKER_PASS_BUDGET)),
-                    )?;
+                    let ran = broker.with_host_deleter_pin(|broker| {
+                        broker.run_session_retirement_recovery_worker_loop_isolated(
+                            request_generation,
+                            Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
+                            Some(remaining.min(SESSION_RETIREMENT_WORKER_PASS_BUDGET)),
+                        )
+                    })?;
+                    if ran.is_none() {
+                        broker.defer_session_retirement_request_for(
+                            request_generation,
+                            "session_retirement_host_deleter_busy",
+                            ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS,
+                        )?;
+                    }
                 }
             }
             Ok(())
         })?;
-        // How long this run held the host's single-deleter slot; the run's
-        // Git deleting time is `artifact_worker_capacity_removal_git_removal`.
-        crate::phase_telemetry::add("artifact_worker_host_slot_held", worker_started.elapsed());
+        // How long this run held the host's single-deleter slot is the
+        // pacer's `host_slot_held_ms`, recorded with the run's summary as
+        // `artifact_worker_host_slot_held`.
         Ok(())
     }
 
@@ -8619,6 +8727,24 @@ impl Broker {
             .unwrap();
     }
 
+    /// Test seam: end a hard steady retry (a held lock, memory pressure,
+    /// failures) now, as if its wait had passed.
+    #[cfg(test)]
+    pub(crate) fn end_steady_removal_hard_retry_for_test(&mut self) {
+        self.artifact_sweep_meta_set(ARTIFACT_WORKER_STEADY_REMOVAL_HARD_RETRY_AFTER_KEY, "")
+            .unwrap();
+    }
+
+    /// Test seam: whether a hard steady retry is pending now.
+    #[cfg(test)]
+    pub(crate) fn steady_removal_hard_retry_pending_for_test(&mut self) -> bool {
+        self.removal_retry_pending(
+            ARTIFACT_WORKER_STEADY_REMOVAL_HARD_RETRY_AFTER_KEY,
+            now_ms(),
+        )
+        .unwrap()
+    }
+
     /// Test seam: end the capacity pressure retry now, as if its wait had
     /// passed, keeping the out-of-time streak.
     #[cfg(test)]
@@ -8706,6 +8832,10 @@ impl Broker {
                 Duration::ZERO,
             );
             std::thread::sleep(ARTIFACT_WORKER_GC_LOCK_YIELD);
+            #[cfg(test)]
+            if HARD_RETRY_BETWEEN_SLICES.with(std::cell::Cell::get) {
+                self.defer_steady_removal(ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS)?;
+            }
             continuation = true;
         }
         Ok(started.elapsed())
@@ -8717,7 +8847,11 @@ impl Broker {
     /// it is the steady removal of landed checkouts (trigger `steady`): the
     /// priority lane and a short stretch of the lap, within the steady
     /// allowance, and the same proofs. The worker already runs at
-    /// background priority and holds the host's single-deleter slot. Before each pass it yields to a foreground
+    /// background priority. The slice first takes a host-wide judging
+    /// permit (ending with a short retry when all are taken); it takes the
+    /// host's single-deleter slot only right before Git removes a checkout
+    /// (`host_deleter_busy` when another worker keeps it through the
+    /// bounded wait) and gives it back after that removal's charge. Before each pass it yields to a foreground
     /// command waiting for the GC lock and checks pressure on the unattended
     /// pacer: memory pressure is waited out and stops the slice when it
     /// outlasts the pacer's pause budget (`memory_backoff`); load (or Linux
@@ -8855,6 +8989,40 @@ impl Broker {
         if !due {
             return Ok((None, None));
         }
+        // At most `HOST_JUDGING_PERMITS` repositories judge at once on this
+        // machine. Taken with nothing else held (the deleter slot is given
+        // back after every deletion), before the GC lock: permit, then GC
+        // lock, then deleter slot, always in that order and every wait
+        // bounded. With every permit taken the slice ends with a short retry.
+        let permit_started = Instant::now();
+        let Some(_judging_permit) = unattended_pacing::take_judging_permit() else {
+            crate::phase_telemetry::add(
+                "artifact_worker_capacity_removal_judge_permit_busy",
+                permit_started.elapsed(),
+            );
+            let retry_after = now_ms()
+                .saturating_add(ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS)
+                .to_string();
+            match trigger {
+                CheckoutRemovalTrigger::Pressure => self.artifact_sweep_meta_set(
+                    ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_AFTER_KEY,
+                    &retry_after,
+                )?,
+                CheckoutRemovalTrigger::Steady => {
+                    self.defer_steady_removal(ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS)?;
+                }
+            }
+            self.write_artifact_sweep_worker_status(&format!(
+                "capacity_removal judge_permit_busy waited_ms={}; retry in {} ms",
+                permit_started.elapsed().as_millis(),
+                ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS
+            ))?;
+            return Ok((None, None));
+        };
+        let judge_permit_wait = permit_started.elapsed();
+        // Whatever exit the slice takes (a `?` on a failed bookkeeping write
+        // included), the deleter slot never outlives it.
+        let _slot_release = unattended_pacing::HostDeleterSlotRelease;
         if trigger == CheckoutRemovalTrigger::Steady {
             self.artifact_sweep_meta_set(
                 ARTIFACT_WORKER_STEADY_REMOVAL_LAST_RUN_KEY,
@@ -8880,6 +9048,9 @@ impl Broker {
         let mut charged_entries = 0u64;
         let mut unpaid = Duration::ZERO;
         let mut lock_busy = false;
+        let mut host_deleter_busy = false;
+        // A refusal left by an earlier deletion gate is not this slice's.
+        unattended_pacing::take_deletion_refusal();
         let mut passes = 0usize;
         let mut kept_only_passes = 0usize;
         let mut removal_failures = 0usize;
@@ -9095,6 +9266,9 @@ impl Broker {
                 Some(slice_deadline),
             );
             paced_wait += paced_started.elapsed();
+            // The removal and its charge are done: the machine's deleter slot
+            // goes back before the lock gap and the next pass's judging.
+            unattended_pacing::release_host_deleter_slot();
             credited_entries = credited_entries.saturating_add(charge.credited);
             charged_entries = charged_entries.saturating_add(charge.charged);
             combined = Some(match combined.take() {
@@ -9109,6 +9283,20 @@ impl Broker {
             });
             if failure.is_some() {
                 break CapacitySliceStop::Failed;
+            }
+            // Apply put its removal off at the last step: another
+            // repository's worker kept the deleter slot through the bounded
+            // wait (the slice ends with a short retry, the group is judged
+            // again first), or memory pressure rose (the hard stop).
+            match unattended_pacing::take_deletion_refusal() {
+                Some(unattended_pacing::DeletionGate::HostDeleterBusy) => {
+                    host_deleter_busy = true;
+                    break CapacitySliceStop::HostDeleterBusy;
+                }
+                Some(unattended_pacing::DeletionGate::MemoryBackoff) => {
+                    break CapacitySliceStop::MemoryBackoff;
+                }
+                Some(unattended_pacing::DeletionGate::Proceed) | None => {}
             }
             if charge.memory_backoff {
                 break CapacitySliceStop::MemoryBackoff;
@@ -9141,16 +9329,40 @@ impl Broker {
                 }
             }
         };
+        // Whatever exit the loop took, the slot is not held past it.
+        unattended_pacing::release_host_deleter_slot();
         let yielded = stop == CapacitySliceStop::YieldedToForeground;
         // Which pressure the slice saw and how long it waited for each,
-        // gates and removal charges together.
-        let (memory_wait_ms, load_wait_ms) =
-            match (pacing_before, unattended_pacing::current_summary(0)) {
+        // gates and removal charges together; and its share of the host
+        // deleter slot.
+        let pacing_after = unattended_pacing::current_summary(0);
+        let (memory_wait_ms, load_wait_ms) = match (&pacing_before, &pacing_after) {
+            (Some(before), Some(after)) => (
+                after.memory_pause_ms.saturating_sub(before.memory_pause_ms),
+                after.load_pause_ms.saturating_sub(before.load_pause_ms),
+            ),
+            _ => (0, 0),
+        };
+        let host_slot_busy = match (&pacing_before, &pacing_after) {
+            (Some(before), Some(after)) => {
+                after.host_slot_busy.saturating_sub(before.host_slot_busy)
+            }
+            _ => 0,
+        };
+        let (host_slot_wait_ms, host_slot_held_ms, host_slot_deleting_ms) =
+            match (&pacing_before, &pacing_after) {
                 (Some(before), Some(after)) => (
-                    after.memory_pause_ms.saturating_sub(before.memory_pause_ms),
-                    after.load_pause_ms.saturating_sub(before.load_pause_ms),
+                    after
+                        .host_lock_wait_ms
+                        .saturating_sub(before.host_lock_wait_ms),
+                    after
+                        .host_slot_held_ms
+                        .saturating_sub(before.host_slot_held_ms),
+                    after
+                        .host_slot_deleting_ms
+                        .saturating_sub(before.host_slot_deleting_ms),
                 ),
-                _ => (0, 0),
+                _ => (0, 0, 0),
             };
         let pressure = SlicePressure {
             memory: stop == CapacitySliceStop::MemoryBackoff || memory_wait_ms > 0,
@@ -9182,6 +9394,18 @@ impl Broker {
         crate::phase_telemetry::add("artifact_worker_capacity_removal_lock_held", lock_held);
         crate::phase_telemetry::add("artifact_worker_capacity_removal_lock_wait", lock_wait);
         crate::phase_telemetry::add(
+            "artifact_worker_capacity_removal_host_slot_wait",
+            Duration::from_millis(host_slot_wait_ms),
+        );
+        crate::phase_telemetry::add(
+            "artifact_worker_capacity_removal_host_slot_held",
+            Duration::from_millis(host_slot_held_ms),
+        );
+        crate::phase_telemetry::add(
+            "artifact_worker_capacity_removal_judge_permit_wait",
+            judge_permit_wait,
+        );
+        crate::phase_telemetry::add(
             "artifact_worker_capacity_removal_git_removal",
             git_removal_time,
         );
@@ -9204,7 +9428,9 @@ impl Broker {
         // moved but did not end: a short wait, so the rest of the lap is
         // judged soon without broker opens respawning the worker into the
         // same held lock.
-        let lock_contended = lock_busy || yielded;
+        // Another repository's worker keeping the host deleter slot is a
+        // held lock too: a short retry, no idle streak.
+        let lock_contended = lock_busy || yielded || host_deleter_busy;
         let selection_ran = capacity_slice_selection_ran(passes, lock_contended);
         // A slice that pressure kept from running any pass judged nothing:
         // it is not an idle lap and not an out-of-time slice.
@@ -9520,6 +9746,11 @@ impl Broker {
         slice.lock_yield_ms = duration_ms(lock_yield_wait);
         slice.lock_held_ms = duration_ms(lock_held);
         slice.lock_wait_ms = duration_ms(lock_wait);
+        slice.host_slot_wait_ms = host_slot_wait_ms;
+        slice.host_slot_held_ms = host_slot_held_ms;
+        slice.host_slot_deleting_ms = host_slot_deleting_ms;
+        slice.host_slot_busy = host_slot_busy;
+        slice.judge_permit_wait_ms = duration_ms(judge_permit_wait);
         slice.pacer_credited_entries = credited_entries;
         slice.pacer_charged_entries = charged_entries;
         slice.pacer_unpaid_ms = duration_ms(unpaid);
@@ -9985,7 +10216,16 @@ impl Broker {
     }
 
     fn defer_auto_checkout_cleanup_worker(&mut self, reason: &str) -> Result<(), BrokerOpError> {
-        let retry_after = now_ms().saturating_add(ARTIFACT_SWEEP_WORKER_RETRY_MS);
+        self.defer_auto_checkout_cleanup_worker_for(reason, ARTIFACT_SWEEP_WORKER_RETRY_MS)
+    }
+
+    /// [`Self::defer_auto_checkout_cleanup_worker`] with its own retry.
+    fn defer_auto_checkout_cleanup_worker_for(
+        &mut self,
+        reason: &str,
+        retry_ms: i64,
+    ) -> Result<(), BrokerOpError> {
+        let retry_after = now_ms().saturating_add(retry_ms);
         self.artifact_sweep_meta_set(
             AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY,
             &retry_after.to_string(),
@@ -10657,6 +10897,11 @@ impl Broker {
                     entries_reclaimed = entries_reclaimed.saturating_add(count);
                     observed_logical_file_bytes = observed_logical_file_bytes.saturating_add(bytes);
                     complete = false;
+                    // Another repository's worker is deleting: end the pass
+                    // rather than wait again for each remaining directory.
+                    if unattended_pacing::host_deleter_busy_this_pass() {
+                        break;
+                    }
                 }
                 Err(error) => {
                     entries_reclaimed = entries_reclaimed.saturating_add(error.entries_reclaimed);
@@ -11799,8 +12044,12 @@ impl Broker {
                         session_scan_complete = false;
                     }
                 }
+                // A busy host deleter slot ends the pass too: the next pass
+                // retries after the worker's short gap instead of each
+                // directory waiting for the slot under the GC lock.
                 if check_deadline(Some(discovery_deadline))
                     || check_deadline(Some(removal_deadline))
+                    || unattended_pacing::host_deleter_busy_this_pass()
                 {
                     session_scan_complete = false;
                     break;
@@ -13779,8 +14028,9 @@ mod tests {
     #[test]
     fn host_deleter_lock_serialises_workers_across_repositories() {
         let host = tempfile::tempdir().unwrap();
+        let poll = Duration::from_secs(2);
         let (first, waited) =
-            wait_for_host_deleter_slot(Some(host.path()), Duration::ZERO, |_| unreachable!());
+            wait_for_host_deleter_slot(Some(host.path()), Duration::ZERO, poll, |_| unreachable!());
         assert!(matches!(first, HostDeleterSlot::Held(_)));
         assert_eq!(waited, Duration::ZERO);
 
@@ -13788,7 +14038,7 @@ mod tests {
         // after its wait, never deleting in parallel.
         let mut slept = Duration::ZERO;
         let (second, waited) =
-            wait_for_host_deleter_slot(Some(host.path()), Duration::from_secs(5), |step| {
+            wait_for_host_deleter_slot(Some(host.path()), Duration::from_secs(5), poll, |step| {
                 slept += step
             });
         assert!(matches!(second, HostDeleterSlot::Busy));
@@ -13798,18 +14048,21 @@ mod tests {
         // Released, the next worker takes it at once.
         drop(first);
         let (third, waited) =
-            wait_for_host_deleter_slot(Some(host.path()), Duration::ZERO, |_| unreachable!());
+            wait_for_host_deleter_slot(Some(host.path()), Duration::ZERO, poll, |_| unreachable!());
         assert!(matches!(third, HostDeleterSlot::Held(_)));
         assert_eq!(waited, Duration::ZERO);
         // Without a host state directory the worker proceeds unserialised.
         assert!(matches!(
-            wait_for_host_deleter_slot(None, Duration::ZERO, |_| unreachable!()).0,
+            wait_for_host_deleter_slot(None, Duration::ZERO, poll, |_| unreachable!()).0,
             HostDeleterSlot::Unavailable
         ));
     }
 
+    /// A pinned lane that cannot get the host deleter slot leaves its
+    /// request durable and runs nothing; the run records how long it waited
+    /// and how many deferred requests it served.
     #[test]
-    fn a_worker_that_loses_the_host_deleter_lock_leaves_its_request_durable() {
+    fn a_lane_that_cannot_pin_the_host_deleter_slot_leaves_its_request_durable() {
         let root = tempfile::tempdir().unwrap();
         let host = tempfile::tempdir().unwrap();
         let (_storage, mut broker) = pacing_fixture_broker(root.path());
@@ -13818,34 +14071,40 @@ mod tests {
             .unwrap();
         broker.record_coalesced_artifact_worker_request().unwrap();
         // Another repository's worker holds the machine's deleter slot.
-        let (held, _) =
-            wait_for_host_deleter_slot(Some(host.path()), Duration::ZERO, |_| unreachable!());
+        let (held, _) = wait_for_host_deleter_slot(
+            Some(host.path()),
+            Duration::ZERO,
+            Duration::from_millis(1),
+            |_| unreachable!(),
+        );
         assert!(matches!(held, HostDeleterSlot::Held(_)));
 
         let clock = unattended_pacing::FakeClock::new();
-        let scope = unattended_pacing::install(unattended_pacing::UnattendedPacer::new(
-            unattended_pacing::UnlinkRate::Limited(1_000),
-            Box::new(clock),
-            Box::new(unattended_pacing::Scripted {
-                samples: vec![unattended_pacing::PressureSample::default()],
-                reads: Default::default(),
-            }),
-        ));
-        let slot = broker
-            .acquire_host_deleter_slot(Some(host.path()), Duration::from_secs(4), |_| {})
+        let scope = unattended_pacing::install(
+            unattended_pacing::UnattendedPacer::new(
+                unattended_pacing::UnlinkRate::Limited(1_000),
+                Box::new(clock),
+                Box::new(unattended_pacing::Scripted {
+                    samples: vec![unattended_pacing::PressureSample::default()],
+                    reads: Default::default(),
+                }),
+            )
+            .with_host_directory(Some(host.path().to_path_buf())),
+        );
+        let coalesced = broker.take_coalesced_artifact_worker_requests().unwrap();
+        unattended_pacing::record_requests_coalesced(coalesced);
+        let mut ran = false;
+        let lane = broker
+            .with_host_deleter_pin(|_| {
+                ran = true;
+                Ok(())
+            })
             .unwrap();
-        assert!(slot.is_none(), "the loser must not delete");
+        assert!(lane.is_none() && !ran, "the loser must not delete");
         broker.persist_unattended_pacing_summary();
         drop(scope);
 
         assert!(broker.artifact_sweep_recovery_requested().unwrap());
-        assert_eq!(
-            broker
-                .artifact_sweep_meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
-                .unwrap()
-                .as_deref(),
-            Some("host_deleter_busy waited_ms=4000; request retained")
-        );
         let pacing = broker
             .last_artifact_sweep_report()
             .unwrap()
@@ -13862,7 +14121,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let summary: UnattendedPacingSummary = serde_json::from_str(&stored).unwrap();
-        assert_eq!(summary.host_lock_wait_ms, 4_000);
+        // The pin's bounded wait, not a quarter of an hour.
+        assert_eq!(summary.host_lock_wait_ms, 10_000);
+        assert_eq!(summary.host_slot_busy, 1);
+        assert_eq!(summary.host_slot_held_ms, 0);
         assert_eq!(summary.requests_coalesced, 1);
         assert_eq!(summary.entries_removed, 0);
         // The count was consumed by this run.
@@ -15425,6 +15687,96 @@ mod tests {
                 .auto_checkout_cleanup_retry_pending(now_ms())
                 .unwrap(),
             "actual discovery progress must not be treated as a stalled worker"
+        );
+    }
+
+    /// A close that finds the GC lock held (the background worker holds it
+    /// for most of a run) is the expected case, not a failure: the wake
+    /// names the holder without waiting, the request stays in the close
+    /// outbox, and the holder's own reconcile (the running worker's, before
+    /// its requested-cleanup lane) queues it.
+    #[cfg(unix)]
+    #[test]
+    fn a_close_that_finds_the_gc_lock_held_leaves_its_request_for_the_holder() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        let connection = rusqlite::Connection::open(broker.store().db_path()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (worktree_path, branch, origin, status, cleanup_state,
+                 created_at, updated_at, last_activity_at, closed_at)
+             VALUES (?1, 'agent/just-closed', 'spawned', 'cleaned', 'closed', 1, 1, 1, 1)",
+                [root.join("just-closed").to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        let session_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO closed_checkout_cleanup_requests
+                 (session_id, requested_at_ms, not_before_ms, last_progress_at_ms)
+             VALUES (?1, 1, 1, 1)",
+                [session_id],
+            )
+            .unwrap();
+        drop(connection);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        // A live process (this one) holds the GC lock, as the worker does.
+        std::fs::write(
+            root.join(".aethyme/gc.lock"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let wake = broker
+            .request_checkout_cleanup_after_close(session_id)
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a close never waits"
+        );
+        assert_eq!(
+            wake,
+            PostCloseCleanupWake::DeferredToHolder {
+                pid: std::process::id().to_string()
+            }
+        );
+        let generation = |broker: &mut Broker| {
+            broker
+                .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)
+                .unwrap()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            generation(&mut broker),
+            0,
+            "no generation queued while the holder has the lock"
+        );
+        assert!(
+            broker
+                .store()
+                .pending_checkout_cleanup_request(session_id)
+                .unwrap()
+                .is_some(),
+            "the close outbox keeps the request"
+        );
+
+        // The holder releases the lock; its reconcile queues the request.
+        std::fs::remove_file(root.join(".aethyme/gc.lock")).unwrap();
+        broker.reconcile_checkout_cleanup_outbox().unwrap();
+        assert!(generation(&mut broker) > 0);
+        assert!(broker.auto_checkout_cleanup_recovery_requested().unwrap());
+        assert_eq!(
+            broker
+                .request_checkout_cleanup_after_close(session_id)
+                .unwrap(),
+            PostCloseCleanupWake::Queued
         );
     }
 
@@ -19600,13 +19952,16 @@ mod tests {
             loop {
                 // SAFETY: signal zero only probes the captured positive child
                 // process-group ID and never delivers a signal after its leader
-                // is reaped. ESRCH proves teardown; unexpected errors refuse.
+                // is reaped. ESRCH proves teardown; EPERM (on macOS, a group
+                // whose last member is still exiting or a zombie) and EINTR
+                // prove nothing and are polled until the deadline; other
+                // errors refuse.
                 let result = unsafe { libc::kill(-supervisor_group, 0) };
                 if result == -1 {
                     let error = std::io::Error::last_os_error();
                     match error.raw_os_error() {
                         Some(libc::ESRCH) => break,
-                        Some(libc::EINTR) => {}
+                        Some(libc::EINTR | libc::EPERM) => {}
                         _ => panic!("could not prove supervisor group teardown: {error}"),
                     }
                 }
