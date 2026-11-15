@@ -511,11 +511,60 @@ fn capacity_stop_retry_ms(
 /// Git removal failures one slice tolerates before it stops.
 const ARTIFACT_WORKER_CAPACITY_REMOVAL_FAILURES: usize = 2;
 
-/// How long the GC lock stays free after a pass that held it for `held`:
-/// at least as long (so a slice holds it at most half the time) and at
-/// least long enough for a waiting command's poll.
-fn capacity_lock_gap(held: Duration) -> Duration {
-    held.max(ARTIFACT_WORKER_GC_LOCK_YIELD)
+/// How long the GC lock stays free after a pass that held it for `held`.
+/// After a pass in which Git deleted a checkout, at least as long (so a
+/// removing slice holds it at most half the time). After a pass that only
+/// judged, the fixed gap, long enough for a waiting command's poll: a
+/// foreground command that wants the lock announces itself and the slice
+/// yields to it before its next pass, so judging no longer sleeps as long
+/// as it worked.
+fn capacity_lock_gap(held: Duration, deleted: bool) -> Duration {
+    if deleted {
+        held.max(ARTIFACT_WORKER_GC_LOCK_YIELD)
+    } else {
+        ARTIFACT_WORKER_GC_LOCK_YIELD
+    }
+}
+
+/// A capacity slice's combined report and its summary, both `None` when no
+/// slice ran.
+type CapacitySliceRun = (
+    Option<crate::AutoCleanupReport>,
+    Option<CapacitySliceSummary>,
+);
+
+/// What a capacity slice that ran tells its worker run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapacitySliceSummary {
+    trigger: CheckoutRemovalTrigger,
+    stop: CapacitySliceStop,
+    /// The closed-checkout lap had groups left (or the inventory was not
+    /// complete) when the slice ended.
+    lap_unfinished: bool,
+    inventory_unavailable: bool,
+    /// The slice ran at least one removal pass.
+    selection_ran: bool,
+    /// Memory or load pressure kept the slice from selection.
+    blocked: bool,
+}
+
+/// Whether a worker run takes another steady slice right after this one:
+/// a steady slice that ran passes, stopped only because its own time or
+/// removal allowance ran out (`budget`, `cap`, `kept_only_limit`), with the
+/// lap unfinished and its inventory available. Memory pressure, load, a
+/// foreground waiter, a held lock, failures, a pacer debt, the end of the
+/// lap and a pass that moved nothing all end the run's slices; the run's
+/// budget bounds the rest.
+fn steady_slice_may_continue(summary: &CapacitySliceSummary) -> bool {
+    summary.trigger == CheckoutRemovalTrigger::Steady
+        && summary.selection_ran
+        && !summary.blocked
+        && summary.lap_unfinished
+        && !summary.inventory_unavailable
+        && matches!(
+            summary.stop,
+            CapacitySliceStop::Budget | CapacitySliceStop::Cap | CapacitySliceStop::KeptOnlyLimit
+        )
 }
 
 /// The capacity removal time one worker run may spend across its slices:
@@ -8277,7 +8326,13 @@ impl Broker {
         };
         let capacity_slice_started = Instant::now();
         if capacity_removal_due {
-            self.run_capacity_removal_slice_isolated(worker_started, capacity_limits())?;
+            // Steady removal keeps taking slices while its lap is unfinished
+            // and nothing blocks, within the capacity allowance of the run.
+            self.run_capacity_removal_slices(
+                worker_started,
+                capacity_allowance,
+                capacity_limits(),
+            )?;
         }
         let capacity_slice_used = capacity_slice_started.elapsed();
         capacity_spent.set(capacity_slice_used);
@@ -8328,6 +8383,7 @@ impl Broker {
                             broker.run_capacity_removal_slice_isolated(
                                 worker_started,
                                 capacity_limits(),
+                                false,
                             )?;
                             let used = started.elapsed();
                             capacity_spent.set(capacity_spent.get().saturating_add(used));
@@ -8457,6 +8513,9 @@ impl Broker {
             }
             Ok(())
         })?;
+        // How long this run held the host's single-deleter slot; the run's
+        // Git deleting time is `artifact_worker_capacity_removal_git_removal`.
+        crate::phase_telemetry::add("artifact_worker_host_slot_held", worker_started.elapsed());
         Ok(())
     }
 
@@ -8520,6 +8579,17 @@ impl Broker {
             .checkout_cleanup_became_due_between(last_run, now)?)
     }
 
+    /// Whether a worker run may take another steady slice right after one
+    /// that stopped with the lap unfinished: a closed spawned session still
+    /// holds its checkout and no hard retry is pending. The steady retry
+    /// the last slice set is not waited out; it paces broker opens, not a
+    /// run that is still going.
+    fn steady_removal_continuable(&mut self, now: i64) -> Result<bool, BrokerOpError> {
+        Ok(self.store().closed_spawned_checkout_pending()?
+            && !self
+                .removal_retry_pending(ARTIFACT_WORKER_STEADY_REMOVAL_HARD_RETRY_AFTER_KEY, now)?)
+    }
+
     /// Keep the worker from being woken again for steady removal for
     /// `wait_ms`: a run that was due for it exited before its slice (the
     /// host deleter slot was busy, the runtime could not be verified, the
@@ -8569,14 +8639,16 @@ impl Broker {
 
     /// [`Self::run_capacity_removal_slice_with`] for the worker: a failure
     /// other than the database's is recorded in the worker status and never
-    /// stops the run's other lanes.
+    /// stops the run's other lanes. Returns the slice's summary, `None` when
+    /// no slice ran or it failed.
     fn run_capacity_removal_slice_isolated(
         &mut self,
         worker_started: Instant,
         limits: CapacitySliceLimits,
-    ) -> Result<(), BrokerOpError> {
-        match self.run_capacity_removal_slice_with(worker_started, limits) {
-            Ok(_) => Ok(()),
+        continuation: bool,
+    ) -> Result<Option<CapacitySliceSummary>, BrokerOpError> {
+        match self.run_capacity_removal_slice_inner(worker_started, limits, continuation) {
+            Ok((_, summary)) => Ok(summary),
             Err(error) if matches!(error, BrokerOpError::Store(_)) => Err(error),
             Err(error) => {
                 crate::phase_telemetry::add(
@@ -8585,9 +8657,57 @@ impl Broker {
                 );
                 self.write_artifact_sweep_worker_status(&format!(
                     "capacity_removal_failed: {error}"
-                ))
+                ))?;
+                Ok(None)
             }
         }
+    }
+
+    /// The worker run's checkout removal slices, within `allowance` of the
+    /// run: one slice, then more back to back while each stops with the
+    /// steady lap unfinished and nothing blocking
+    /// ([`steady_slice_may_continue`]) and at least two minimum slices of
+    /// the allowance remain. Each slice's budget is the rest of the
+    /// allowance at most; between slices the GC lock stays free for a
+    /// waiting command's poll. Returns the time the slices used.
+    pub(crate) fn run_capacity_removal_slices(
+        &mut self,
+        worker_started: Instant,
+        allowance: Duration,
+        limits: CapacitySliceLimits,
+    ) -> Result<Duration, BrokerOpError> {
+        let started = Instant::now();
+        let mut continuation = false;
+        loop {
+            let left = allowance.saturating_sub(started.elapsed());
+            let slice_limits = CapacitySliceLimits {
+                budget: limits.budget.min(left),
+                ..limits
+            };
+            let summary = self.run_capacity_removal_slice_isolated(
+                worker_started,
+                slice_limits,
+                continuation,
+            )?;
+            let left = allowance.saturating_sub(started.elapsed());
+            let run_left = ARTIFACT_SWEEP_WORKER_MAX_DURATION
+                .saturating_sub(worker_started.elapsed())
+                .saturating_sub(SESSION_RETIREMENT_WORKER_RESERVE);
+            let room = ARTIFACT_WORKER_CAPACITY_REMOVAL_MIN_SLICE.saturating_mul(2);
+            if !summary.is_some_and(|summary| steady_slice_may_continue(&summary))
+                || left < room
+                || run_left < room
+            {
+                break;
+            }
+            crate::phase_telemetry::add(
+                "artifact_worker_capacity_removal_continued",
+                Duration::ZERO,
+            );
+            std::thread::sleep(ARTIFACT_WORKER_GC_LOCK_YIELD);
+            continuation = true;
+        }
+        Ok(started.elapsed())
     }
 
     /// One bounded closed-checkout removal slice of the detached worker.
@@ -8610,9 +8730,10 @@ impl Broker {
     /// step already running (lease and gate checks, the cleanliness walk)
     /// and Git's removal of the one checkout a pass started run to the end.
     /// After each removal the slice waits out what Git deleted on the pacer
-    /// with no GC lock or lifecycle claim held, and between passes it keeps
-    /// the GC lock free at least as long as the last pass held it. Returns
-    /// the slice's combined report, `None` when no removal pass ran.
+    /// with no GC lock or lifecycle claim held. Between passes it keeps the
+    /// GC lock free long enough for a waiting command's poll, and at least
+    /// as long as the last pass held it when Git deleted in that pass.
+    /// Returns the slice's combined report, `None` when no removal pass ran.
     #[cfg(test)]
     pub(crate) fn run_capacity_removal_slice(
         &mut self,
@@ -8624,11 +8745,28 @@ impl Broker {
     /// The capacity removal slice described on `run_capacity_removal_slice`,
     /// with explicit limits (the worker passes [`CapacitySliceLimits::WORKER`]
     /// within its run allowance).
+    #[cfg(test)]
     pub(crate) fn run_capacity_removal_slice_with(
         &mut self,
         worker_started: Instant,
         limits: CapacitySliceLimits,
     ) -> Result<Option<crate::AutoCleanupReport>, BrokerOpError> {
+        self.run_capacity_removal_slice_inner(worker_started, limits, false)
+            .map(|(report, _)| report)
+    }
+
+    /// [`Self::run_capacity_removal_slice_with`], also returning what the
+    /// worker needs to decide whether to take another slice right away
+    /// (`None` when no slice ran). A `continuation` slice follows one of
+    /// the same run that stopped with the steady lap unfinished: it skips
+    /// the steady retry that slice set, but not a hard retry, and is due
+    /// only while a closed spawned session still holds its checkout.
+    fn run_capacity_removal_slice_inner(
+        &mut self,
+        worker_started: Instant,
+        limits: CapacitySliceLimits,
+        continuation: bool,
+    ) -> Result<CapacitySliceRun, BrokerOpError> {
         let slice_end = |worker_started: Instant| {
             ARTIFACT_SWEEP_WORKER_MAX_DURATION
                 .saturating_sub(worker_started.elapsed())
@@ -8639,7 +8777,7 @@ impl Broker {
         let now = now_ms();
         if !crate::AutoCleanupPolicy::load(self.main_root()).is_ok_and(|policy| policy.auto_remove)
         {
-            return Ok(None);
+            return Ok((None, None));
         }
         let recorded_pressure = self.recorded_checkout_capacity_pressure_at_current_limit();
         let pressure_retry_pending =
@@ -8649,11 +8787,13 @@ impl Broker {
         // trigger can be due, and nothing is counted unless it is.
         let due_before_count = if recorded_pressure {
             !pressure_retry_pending
+        } else if continuation {
+            self.steady_removal_continuable(now)?
         } else {
             self.steady_removal_due(now)?
         };
         if !due_before_count {
-            return Ok(None);
+            return Ok((None, None));
         }
         if budget < ARTIFACT_WORKER_CAPACITY_REMOVAL_MIN_SLICE {
             if !recorded_pressure {
@@ -8661,7 +8801,7 @@ impl Broker {
                 // broker open respawn the worker for it at once.
                 self.defer_steady_removal(ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS)?;
             }
-            return Ok(None);
+            return Ok((None, None));
         }
         // The worker can afford a fresh count; it also refreshes the
         // recorded one that broker opens read. Only the registrations are
@@ -8688,7 +8828,7 @@ impl Broker {
                 if !recorded_pressure {
                     self.defer_steady_removal(ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS)?;
                 }
-                return Ok(None);
+                return Ok((None, None));
             }
         }
         // The fresh count, against the limit configured now, picks the
@@ -8702,10 +8842,17 @@ impl Broker {
         let due = match trigger {
             CheckoutRemovalTrigger::Pressure => !pressure_retry_pending,
             // Already proved due unless the count just ended pressure.
-            CheckoutRemovalTrigger::Steady => !recorded_pressure || self.steady_removal_due(now)?,
+            CheckoutRemovalTrigger::Steady => {
+                !recorded_pressure
+                    || if continuation {
+                        self.steady_removal_continuable(now)?
+                    } else {
+                        self.steady_removal_due(now)?
+                    }
+            }
         };
         if !due {
-            return Ok(None);
+            return Ok((None, None));
         }
         if trigger == CheckoutRemovalTrigger::Steady {
             self.artifact_sweep_meta_set(
@@ -8749,6 +8896,11 @@ impl Broker {
         let mut inventory_wait = None;
         let mut memo_skips = 0usize;
         let mut priority_memo_skips = 0usize;
+        let mut db_in_grace = 0usize;
+        let mut db_session_open = 0usize;
+        let mut priority_db_skips = 0usize;
+        let mut memo_hits = crate::auto_cleanup::AutoCleanupMemoHits::default();
+        let mut check_timings = crate::auto_cleanup::AutoCleanupCheckTimings::default();
         // Steady only: a pass reached the end of the lap, and some pass moved
         // the lap cursor or judged a checkout.
         let mut lap_completed = false;
@@ -8762,8 +8914,9 @@ impl Broker {
         // The pacer's memory and load waits so far in this worker run; the
         // slice reports its own share.
         let pacing_before = unattended_pacing::current_summary(0);
-        // When the last pass returned and how long it held the GC lock.
-        let mut last_pass: Option<(Instant, Duration)> = None;
+        // When the last pass returned, how long it held the GC lock, and
+        // whether Git deleted anything in it.
+        let mut last_pass: Option<(Instant, Duration, bool)> = None;
         let pre_selection_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let stop = loop {
             let removed_so_far = combined.as_ref().map_or(0, |report| report.removed.len());
@@ -8776,10 +8929,11 @@ impl Broker {
             if throttled && removed_so_far >= ARTIFACT_WORKER_LOAD_THROTTLED_REMOVALS {
                 break CapacitySliceStop::LoadThrottled;
             }
-            // Leave the GC lock free at least as long as the last pass held
-            // it (and long enough for a waiter's poll), pacer wait included.
-            if let Some((ended, held)) = last_pass {
-                let rest = capacity_lock_gap(held).saturating_sub(ended.elapsed());
+            // Leave the GC lock free long enough for a waiter's poll, and
+            // after a pass that deleted, at least as long as it held the
+            // lock, pacer wait included.
+            if let Some((ended, held, deleted)) = last_pass {
+                let rest = capacity_lock_gap(held, deleted).saturating_sub(ended.elapsed());
                 let rest = rest.min(slice_deadline.saturating_duration_since(Instant::now()));
                 if !rest.is_zero() {
                     std::thread::sleep(rest);
@@ -8852,12 +9006,21 @@ impl Broker {
             };
             // The pass took the GC lock first and released it on return.
             lock_held += pass_elapsed;
-            last_pass = Some((Instant::now(), pass_elapsed));
+            last_pass = Some((
+                Instant::now(),
+                pass_elapsed,
+                !pass.removed.is_empty() || !pass_git_removal.is_zero(),
+            ));
             passes += 1;
             crate::phase_telemetry::add("artifact_worker_capacity_removal_pass", Duration::ZERO);
             let pass_lanes = pass.lanes.unwrap_or_default();
             memo_skips += pass_lanes.removal_memo_skips;
             priority_memo_skips += pass_lanes.removal_priority_memo_skips;
+            db_in_grace += pass_lanes.removal_db_in_grace;
+            db_session_open += pass_lanes.removal_db_session_open;
+            priority_db_skips += pass_lanes.removal_priority_db_skips;
+            memo_hits.absorb(&pass_lanes.removal_memo_hits);
+            check_timings.absorb(&pass_lanes.removal_check_timings);
             // Steady: where the lap stands after this pass.
             let mut lap_ended = false;
             let mut cursor_moved = false;
@@ -9052,6 +9215,9 @@ impl Broker {
             pressure,
         );
         let mut idle_streak = 0u32;
+        // Steady: whether the slice ended the lap (or moved nothing); only
+        // then does the idle streak set its retry.
+        let lap_idle = steady_slice_lap_idle(lap_completed, lap_progressed);
         // The lap-based retry before the stop's own floor, and the retry.
         let (lap_retry_ms, retry_ms) = match trigger {
             CheckoutRemovalTrigger::Pressure => {
@@ -9111,7 +9277,6 @@ impl Broker {
                 // Only a lap that ended (or could not move) with nothing
                 // removed counts toward the idle back-off; an unfinished lap
                 // that moved is judged on a minute later.
-                let lap_idle = steady_slice_lap_idle(lap_completed, lap_progressed);
                 idle_streak = if removed > 0 {
                     0
                 } else if lock_contended || !lap_idle || blocked_by.is_some() {
@@ -9291,10 +9456,34 @@ impl Broker {
         slice.priority_removed = priority_removed;
         slice.lap_examined = lap_examined;
         slice.lap_removed = lap_removed;
-        slice.idle_streak = idle_streak;
+        // The streak only sets the retry of a slice that ended the lap (or
+        // moved nothing); while the lap is unfinished and moving the next
+        // slice is due a minute later whatever it says.
+        slice.empty_laps = idle_streak;
+        slice.idle_streak = if trigger == CheckoutRemovalTrigger::Steady && !lap_idle {
+            0
+        } else {
+            idle_streak
+        };
         slice.lap_completed = lap_completed;
         slice.priority_memo_skips = priority_memo_skips;
         slice.memo_skips = memo_skips;
+        slice.db_in_grace = db_in_grace;
+        slice.db_session_open = db_session_open;
+        slice.priority_db_skips = priority_db_skips;
+        slice.memo_hits = memo_hits;
+        slice.check_timings = check_timings;
+        slice.continued = continuation;
+        let judged = u64::try_from(
+            examined
+                .saturating_add(db_in_grace)
+                .saturating_add(db_session_open),
+        )
+        .unwrap_or(u64::MAX);
+        slice.groups_judged_per_min = judged
+            .saturating_mul(60_000)
+            .checked_div(selection_ms)
+            .unwrap_or(0);
         slice.outcome = outcome.to_string();
         slice.stop_reason = Some(stop.as_str().to_string());
         slice.removal_cap = limits.removals;
@@ -9371,9 +9560,17 @@ impl Broker {
             slice.run_deleting_pct,
             slice.run_waiting_pct
         ))?;
+        let summary = CapacitySliceSummary {
+            trigger,
+            stop,
+            lap_unfinished,
+            inventory_unavailable,
+            selection_ran: passes > 0,
+            blocked: blocked_by.is_some(),
+        };
         match failure {
             Some(error) => Err(error),
-            None => Ok(combined),
+            None => Ok((combined, Some(summary))),
         }
     }
 
@@ -12866,18 +13063,89 @@ mod tests {
         }
     }
 
-    /// After a pass the lock stays free at least as long as the pass held
-    /// it, so a slice holds the GC lock at most half the time.
+    /// After a pass in which Git deleted, the lock stays free at least as
+    /// long as the pass held it, so a removing slice holds the GC lock at
+    /// most half the time. After a pass that only judged it stays free just
+    /// long enough for a waiting command's poll: a 22-second judging pass no
+    /// longer costs a 22-second sleep.
     #[test]
-    fn the_gc_lock_stays_free_at_least_as_long_as_a_pass_held_it() {
+    fn the_gc_lock_gap_is_long_only_after_a_pass_that_deleted() {
         assert_eq!(
-            capacity_lock_gap(Duration::from_secs(13)),
+            capacity_lock_gap(Duration::from_secs(13), true),
             Duration::from_secs(13)
         );
         assert_eq!(
-            capacity_lock_gap(Duration::from_millis(10)),
+            capacity_lock_gap(Duration::from_millis(10), true),
             ARTIFACT_WORKER_GC_LOCK_YIELD
         );
+        assert_eq!(
+            capacity_lock_gap(Duration::from_secs(22), false),
+            ARTIFACT_WORKER_GC_LOCK_YIELD
+        );
+        assert_eq!(
+            capacity_lock_gap(Duration::from_millis(10), false),
+            ARTIFACT_WORKER_GC_LOCK_YIELD
+        );
+    }
+
+    /// A worker run takes another steady slice only after one that ran
+    /// passes and stopped for its own time or removal allowance with the
+    /// lap unfinished; pressure, a foreground waiter, a held lock, failures,
+    /// the end of the lap and the pressure trigger all end its slices.
+    #[test]
+    fn only_an_unfinished_unblocked_steady_slice_continues() {
+        let base = CapacitySliceSummary {
+            trigger: CheckoutRemovalTrigger::Steady,
+            stop: CapacitySliceStop::Budget,
+            lap_unfinished: true,
+            inventory_unavailable: false,
+            selection_ran: true,
+            blocked: false,
+        };
+        assert!(steady_slice_may_continue(&base));
+        for stop in [CapacitySliceStop::Cap, CapacitySliceStop::KeptOnlyLimit] {
+            assert!(
+                steady_slice_may_continue(&CapacitySliceSummary { stop, ..base }),
+                "{stop:?}"
+            );
+        }
+        for stop in CapacitySliceStop::ALL.into_iter().filter(|stop| {
+            !matches!(
+                stop,
+                CapacitySliceStop::Budget
+                    | CapacitySliceStop::Cap
+                    | CapacitySliceStop::KeptOnlyLimit
+            )
+        }) {
+            assert!(
+                !steady_slice_may_continue(&CapacitySliceSummary { stop, ..base }),
+                "{stop:?}"
+            );
+        }
+        for summary in [
+            CapacitySliceSummary {
+                trigger: CheckoutRemovalTrigger::Pressure,
+                ..base
+            },
+            CapacitySliceSummary {
+                lap_unfinished: false,
+                ..base
+            },
+            CapacitySliceSummary {
+                inventory_unavailable: true,
+                ..base
+            },
+            CapacitySliceSummary {
+                selection_ran: false,
+                ..base
+            },
+            CapacitySliceSummary {
+                blocked: true,
+                ..base
+            },
+        ] {
+            assert!(!steady_slice_may_continue(&summary), "{summary:?}");
+        }
     }
 
     /// Capacity slices leave the cache lane at least 90 s of every run in

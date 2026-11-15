@@ -19,6 +19,13 @@
       "capacity_pressure": "bool",
       "removal_apply_reserve_ms": "integer",
       "removal_budget_ms": "integer",
+      "removal_check_timings": {
+        "database": {
+          "count": "integer",
+          "ms": "integer"
+        }
+      },
+      "removal_db_in_grace": "integer",
       "removal_elapsed_ms": "integer",
       "removal_examined": "integer",
       "removal_inventory_unavailable": "bool",

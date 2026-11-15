@@ -209,7 +209,16 @@ lists every ignored root that blocks it (`kept[].ignored_blockers`) and
 remembers the verdict. It skips that checkout on later passes until its HEAD,
 the `[cleanup]` policy, or the modification time of the checkout root, a
 blocker or a blocker's parent changes, and re-proves it at least weekly
-(`auto_cleanup.lanes.removal_memo_skips` counts the skips). Across all
+(`auto_cleanup.lanes.removal_memo_skips` counts the skips). The same memo
+remembers three other keeps by what would lift them, read from files without
+starting Git: uncommitted changes and tracked deletions with no recorded
+removal attempt (until HEAD, the index, the checkout root, the exclude files,
+or the first changed path or its directory changes, or a removal attempt is
+recorded), and commits not contained in the remote default branch (until
+HEAD or the default branch tip moves). A keep is remembered only when those
+files read the same before and after it was judged; a remembered keep only
+ever keeps the checkout, and `removal_memo_hits` counts the hits per code.
+Across all
 remembered checkouts, `auto_cleanup.blocked_by_ignored` lists the most common
 blockers with the line that would release each one, for example:
 
@@ -235,11 +244,14 @@ records its `trigger`:
 
 - `steady` (below three quarters of the limit, or no limit set): a slice of up
   to 60 seconds that removes at most four checkouts. Each pass judges the
-  priority lane first (closed checkouts whose pull request is recorded merged
+  priority lane (closed checkouts whose pull request is recorded merged
   or whose cleanup request is past its grace, see below; this only orders
-  them, every proof still applies), then at most 16 closed checkouts of the
-  oldest-first lap from its stored cursor, so old landed checkouts no merge
-  signal names are reached too. A pass that selects nothing but moved the lap
+  them, every proof still applies) and at most 16 closed checkouts of the
+  oldest-first lap from its stored cursor, taking turns, so old landed
+  checkouts no merge signal names are reached in every pass. A checkout the
+  database alone keeps (inside its closed-worktree grace, or used by an open
+  session) or a remembered keep (above) costs none of those shares and no
+  Git process. A pass that selects nothing but moved the lap
   on does not end the slice: passes go on, within the slice's time, the GC
   lock gap, the yield to a waiting foreground command and the memory and
   load gate, until the lap reaches its end (`stop_reason` `lap_complete`) or
@@ -253,8 +265,12 @@ records its `trigger`:
   later, and also a minute later while the lap is unfinished and moving.
   Only a slice that reached the end of the lap (or could not move it) with
   nothing removed starts the back-off: 5 minutes, then 10, 20 and at most 30
-  minutes while such slices follow each other (`idle_streak`), and a removal
-  resets the wait. A cleanup request
+  minutes while such slices follow each other (`empty_laps`; `idle_streak`
+  shows 0 while the lap is unfinished and moving), and a removal resets the
+  wait. While the lap is unfinished and nothing blocks (memory pressure, load,
+  a waiting foreground command, a held lock), the same worker run takes the
+  next steady slice at once instead of exiting, within the run's time
+  (`continued`, `run_slices`). A cleanup request
   whose grace ends after the last steady slice ends that wait at once. A slice
   stopped by memory pressure, failed removals or a held lock keeps its wait
   (1 to 10 minutes) whatever lands. Load never stops a slice (see below), and
@@ -301,7 +317,9 @@ its pressure check with at least the 5-second minimum slice left and the
 bounded load wait left too little for a pass. A slice whose budget went on
 counting or other pre-selection work, or whose pass failed, keeps
 `out_of_time_before_selection` (or `failed`) whatever load it saw. Between passes the lock stays
-free at least as long as the last pass held it, and while `broker start` at
+free for 500 ms after a pass that removed nothing (a waiting command
+announces itself and the slice yields to it before its next pass), and at
+least as long as the last pass held it after one in which Git deleted, and while `broker start` at
 the checkout limit, `gc apply`, `gc abandon` or `gc forget-abandoned` waits
 for it (up to 30 seconds) the worker takes it again neither for a removal
 pass nor for a cache pass. A broker open resuming a confirmed GC journal does
@@ -343,9 +361,17 @@ stopped (`cap`, `budget`, `memory_backoff`, `load_throttled`,
 `lap_examined` / `lap_removed` split its work between the priority lane and
 the lap, `passes` counts its removal passes, `lap_completed` says whether
 they reached the end of the lap, `priority_memo_skips` counts priority
-candidates the memo skipped, `memo_skips` checkouts kept from the remembered
-ignored-content verdict, and `idle_streak` counts steady slices in a row that
-reached the end of the lap with nothing removed.
+candidates the memo skipped, `memo_skips` checkouts kept from a remembered
+keep (`memo_hits` per code), `db_in_grace` / `db_session_open` lap checkouts
+the database alone kept and `priority_db_skips` priority candidates it left
+out, `empty_laps` counts steady slices in a row that reached the end of the
+lap with nothing removed and `idle_streak` the part of it that set this
+slice's retry (0 while the lap is unfinished and moving). `check_timings`
+counts and times each check kind (`database`, `memo`, `inspect`, `upstream`,
+`sessions`, `cohort`, `ownership`, `live_paths`, `leases`, `gates`,
+`status`, `ignored`, `containment`, `blocker_listing`),
+`groups_judged_per_min` is the judging rate over `selection_ms`, and
+`continued` says the run took this slice right after its previous one.
 A slice stops after Git failed to remove two checkouts it had started
 deleting (`removal_failures`), and waits 10 minutes. Broker opens too short to count checkouts read the count
 `broker start` last recorded. Within the removal lane, selection uses at most
@@ -354,10 +380,13 @@ have time (`auto_cleanup.lanes.removal_selected` and
 `removal_apply_reserve_ms`).
 
 In the worker's removal slices (both triggers), and in any pass under
-capacity pressure, each removal pass first judges up to eight closed
-checkouts most likely removable now: those whose pull request is recorded
-merged, most recently merged first, then those whose cleanup request is past
-its grace, most recently closed first. Every proof still applies; one kept this
+capacity pressure, each removal pass judges up to eight closed checkouts
+most likely removable now, taking turns with the lap: those whose
+closed-worktree grace has passed first, then those whose pull request is
+recorded merged, most recently merged first, then those whose cleanup
+request is past its grace, most recently closed first. One still inside its
+grace, or used by an open session, is left to the lap. Every proof still
+applies; one kept this
 way is not judged ahead of the lap again for 30 minutes or until its pull
 request merges (`auto_cleanup.priority_memo`), and
 `auto_cleanup.lanes.removal_priority_examined` counts them. The session-order
@@ -476,7 +505,15 @@ are `_count`, `_scan`, `_selection` and `_apply`), plus
 `artifact_worker_cache_yielded_to_foreground` and
 `session_retirement_yielded_to_foreground` (time the retirement worker waited
 for a foreground command waiting on the GC lock; when it is still waiting the
-retirement request is deferred). The
+retirement request is deferred). Judging adds the timed phases
+`auto_cleanup_check_<kind>` (one per check, the kinds of `check_timings`)
+and the counters `auto_cleanup_db_kept_in_grace`,
+`auto_cleanup_db_kept_session_open`, `auto_cleanup_priority_db_skip`,
+`auto_cleanup_removal_db_kept` and `auto_cleanup_memo_hit_<code>`; a worker
+run adds `artifact_worker_capacity_removal_continued` (one per slice taken
+right after the previous one) and the timed phase
+`artifact_worker_host_slot_held` (how long it held the host deleter slot, to
+compare with `_git_removal`). The
 worker writes one `command-metrics.jsonl` row per run with these.
 
 The background worker's pace, priority, host-wide single deleter and pressure

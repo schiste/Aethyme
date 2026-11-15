@@ -142,8 +142,8 @@ aethyme broker status --json
    | `outcome` | Meaning and next step |
    |---|---|
    | `removed` | The slice freed slots. Check again in a few minutes. `stop_reason` says why it ended (see below). |
-   | `nothing_removable` | The lap ended and every examined checkout was kept, or nothing moved. Under pressure the worker waits 10 minutes; a steady slice waits 5, 10, 20, then 30 minutes while slices in a row reach the end of the lap with nothing removed (`idle_streak`). Go to step 3. |
-   | `lap_unfinished` | Time ran out before the lap reached its end. Under pressure the next slice resumes it after 20 seconds when the lap moved, and after 10 minutes when nothing moved; a steady slice resumes it a minute later while it moves (`idle_streak` does not grow). |
+   | `nothing_removable` | The lap ended and every examined checkout was kept, or nothing moved. Under pressure the worker waits 10 minutes; a steady slice waits 5, 10, 20, then 30 minutes while slices in a row reach the end of the lap with nothing removed (`empty_laps`, shown as `idle_streak` here). Go to step 3. |
+   | `lap_unfinished` | Time ran out before the lap reached its end. Under pressure the next slice resumes it after 20 seconds when the lap moved, and after 10 minutes when nothing moved; a steady slice resumes it a minute later while it moves, or at once in the same worker run when nothing blocks (`continued`); `idle_streak` reads 0 and `empty_laps` does not grow. |
    | `lock_busy` | Another process held the GC lock, or the slice stepped aside for a foreground command (`broker start` at the limit, `gc apply`, `gc abandon`, `gc forget-abandoned`) that was waiting for it. The next slice retries after one minute. |
    | `inventory_unavailable` | No complete checkout inventory before the deadline. `waiting_on` names what it waited on (`capacity_probe`, `cohort_index`, `group_page` or `live_paths`). Progress is kept; the retry is 20 seconds after a slice that moved, and otherwise 1, 2, 4, 8 and then 10 minutes while it repeats. |
    | `out_of_time_before_selection` | The budget ran out before any checkout was judged. `budget_consumed_by` is `checkout_count` or `pre_selection`. It retries after 1, 2, 4, 8 and then 10 minutes while it repeats. |
@@ -152,8 +152,8 @@ aethyme broker status --json
 
    Under pressure a slice runs up to 120 seconds and removes up to twelve
    checkouts, one per pass (a pass has a 20-second budget); a steady slice runs
-   up to 60 seconds, removes up to four, judges the priority lane and then at
-   most 16 checkouts of the lap per pass, keeps running passes while the lap
+   up to 60 seconds, removes up to four, judges the priority lane and at
+   most 16 checkouts of the lap per pass in turns, keeps running passes while the lap
    moves, ends at the end of the lap, when a pass moves nothing, or after two
    passes whose selected checkout was kept at the last step, and may run again
    a minute after a removal or while the lap is unfinished (at once when a
@@ -192,7 +192,18 @@ aethyme broker status --json
    `run_slices`, `run_removed`, `run_elapsed_ms`, `run_deleting_ms`,
    `run_waiting_ms`, `run_deleting_pct` and `run_waiting_pct` describe the
    worker run the slice belongs to so far: how many slices it held, what they
-   removed and how much of the run Git spent deleting versus waiting. To run
+   removed and how much of the run Git spent deleting versus waiting.
+   If removal judges too slowly to keep up, read `groups_judged_per_min` and
+   `check_timings`: each check kind's count and milliseconds (`inspect` is Git
+   discovery and ownership, `status` the `git status` walk, `ignored` the
+   ignored-path listing, `containment` the landing proof, `cohort`,
+   `live_paths`, `leases`, `gates` and `sessions` the other proofs,
+   `database` and `memo` the checks that keep a checkout without Git).
+   `db_in_grace`, `db_session_open` and `priority_db_skips` count checkouts
+   the database alone kept, and `memo_hits` remembered keeps per code; a high
+   count there with a low `examined` is the fast path working. A large
+   `lock_yield_ms` after passes that removed nothing means an older binary:
+   the gap after a judging-only pass is now 500 ms. To run
    a pass now instead of
    waiting for the worker, use `aethyme broker gc sweep --json`.
 3. Read `capacity_removal.kept_by_code`, the number of kept checkouts per keep
