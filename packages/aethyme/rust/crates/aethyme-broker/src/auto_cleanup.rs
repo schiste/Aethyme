@@ -1979,6 +1979,11 @@ pub struct CapacityRemovalSlice {
     /// sleep: Git deleting and the bookkeeping around it.
     #[serde(default)]
     pub host_slot_deleting_ms: u64,
+    /// Times in this slice the host deleter slot stayed with another
+    /// repository's worker through a bounded wait (a removal put off, or a
+    /// charge that went on without it after handing it over).
+    #[serde(default)]
+    pub host_slot_busy: u64,
     /// Time the slice waited for a host-wide judging permit before it
     /// counted and judged.
     #[serde(default)]
@@ -8124,14 +8129,25 @@ impl Broker {
             // Unattended removal takes the machine's single-deleter slot only
             // now, every proof re-read, and checks memory pressure once it
             // holds it. A slot another repository's worker keeps through the
-            // bounded wait, or memory pressure, puts this removal off: the
-            // group is judged again first (its priority memo entry is
-            // dropped below). Foreground callers have no pacer and pass.
+            // bounded wait, or memory pressure, puts this removal off, and
+            // the next pass judges the group again: its priority memo entry
+            // is dropped (the priority lane takes it first if it is a
+            // priority candidate) and the lap cursor is moved back before it
+            // (the lap reaches it first if it is not). Foreground callers
+            // have no pacer and pass.
             if crate::gc::unattended_pacing::enter_unattended_deletion()
                 != crate::gc::unattended_pacing::DeletionGate::Proceed
             {
                 report.deferred += 1;
-                deletion_put_off.push(worktree_text.clone());
+                deletion_put_off.push((
+                    worktree_text.clone(),
+                    candidate
+                        .sessions
+                        .iter()
+                        .map(|session| session.id)
+                        .min()
+                        .unwrap_or_default(),
+                ));
                 continue;
             }
             match self.remove_auto_cleanup_candidate(&candidate, &proof) {
@@ -8173,22 +8189,36 @@ impl Broker {
         }
         report.assign_kept_codes();
         self.note_priority_apply_keeps(&report)?;
-        self.forget_priority_memo_entries(&deletion_put_off)?;
+        self.judge_put_off_groups_first(&deletion_put_off)?;
         self.record_auto_cleanup_report(&report)?;
         Ok(report)
     }
 
-    /// Drop the priority memo entries of `worktrees`, so the priority lane
-    /// judges them first again: their removal was put off at the last step
-    /// for a reason that does not concern the checkout.
-    fn forget_priority_memo_entries(&mut self, worktrees: &[String]) -> Result<(), BrokerOpError> {
-        if worktrees.is_empty() {
+    /// Make the next pass judge again the groups (worktree, cursor session
+    /// id) whose removal was put off at the last step for a reason that does
+    /// not concern the checkout: drop their priority memo entries, and move
+    /// the lap cursor back before the first of them the lap already passed.
+    fn judge_put_off_groups_first(
+        &mut self,
+        groups: &[(String, i64)],
+    ) -> Result<(), BrokerOpError> {
+        if groups.is_empty() {
             return Ok(());
+        }
+        let (mut cursor, mut expected_cursor) = self.auto_cleanup_cursor()?;
+        if let Some(first) = groups
+            .iter()
+            .map(|(_, cursor_session_id)| *cursor_session_id)
+            .filter(|id| *id > 0 && *id <= cursor.after_session_id)
+            .min()
+        {
+            cursor.after_session_id = first - 1;
+            self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
         }
         let raw = self.store().meta_get(PRIORITY_MEMO_KEY)?;
         let mut memo = PriorityMemo::decode(raw.as_deref());
         let before = memo.entries.len();
-        for worktree in worktrees {
+        for (worktree, _) in groups {
             memo.entries.remove(worktree);
         }
         if memo.entries.len() != before {
@@ -13781,9 +13811,13 @@ mod tests {
             .map(|index| closed_landed_checkout(&mut broker, &format!("pressured {index}")).1)
             .collect::<Vec<_>>();
         limit_checkouts_to_one(&broker);
-        // Calm for the gate before the first pass, then pressure for good.
-        let (scope, _clock) =
-            install_scripted_pacer(vec![memory_pressure(false), memory_pressure(true)]);
+        // Calm for the gate before the first pass and for the check right
+        // before Git deletes, then pressure for good.
+        let (scope, _clock) = install_scripted_pacer(vec![
+            memory_pressure(false),
+            memory_pressure(false),
+            memory_pressure(true),
+        ]);
         let worker_started = Instant::now();
         let first = broker.run_capacity_removal_slice(worker_started);
         let second = broker.run_capacity_removal_slice(worker_started);
@@ -17616,6 +17650,76 @@ mod tests {
             "given back after the removal's charge"
         );
         assert!(take(host.path()).is_some(), "free for the other worker");
+    }
+
+    /// A lap group (no merged pull request, no due cleanup request) whose
+    /// removal a busy host deleter slot put off is judged first again: the
+    /// lap cursor goes back before it, and the next slice removes it.
+    #[cfg(unix)]
+    #[test]
+    fn a_lap_group_put_off_by_a_busy_slot_is_judged_first_again() {
+        use crate::gc::unattended_pacing::{
+            self, FakeClock, PressureSample, Scripted, UnattendedPacer, UnlinkRate,
+        };
+        let (_owner, _storage, mut broker) =
+            landed_lane_fixture(Some("[worktrees]\nmax_checkouts = 0\n"));
+        let (session, worktree) = closed_landed_checkout(&mut broker, "lap group put off");
+        broker
+            .store()
+            .connection()
+            .execute("DELETE FROM closed_checkout_cleanup_requests", [])
+            .unwrap();
+        while !broker
+            .refresh_cleanup_cohort_aliases(None)
+            .unwrap()
+            .is_some_and(|state| state.complete)
+        {}
+        let host = tempfile::tempdir().unwrap();
+        let other = match crate::gc::wait_for_host_deleter_slot(
+            Some(host.path()),
+            Duration::ZERO,
+            Duration::from_millis(1),
+            |_| unreachable!(),
+        )
+        .0
+        {
+            crate::gc::HostDeleterSlot::Held(lock) => lock,
+            _ => panic!("another worker deletes"),
+        };
+        let _scope = unattended_pacing::install(
+            UnattendedPacer::new(
+                UnlinkRate::Unlimited,
+                Box::new(FakeClock::new()),
+                Box::new(Scripted {
+                    samples: vec![PressureSample::default()],
+                    reads: Default::default(),
+                }),
+            )
+            .with_host_directory(Some(host.path().to_path_buf())),
+        );
+        broker.run_capacity_removal_slice(Instant::now()).unwrap();
+        let busy = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(
+            busy.stop_reason.as_deref(),
+            Some("host_deleter_busy"),
+            "{busy:#?}"
+        );
+        assert_eq!(busy.priority_examined, 0, "a lap group: {busy:#?}");
+        assert_eq!(busy.host_slot_busy, 1, "{busy:#?}");
+        let position = broker.capacity_removal_lap_position().unwrap();
+        assert!(
+            position.after_session_id < session.id && position.lap_remaining >= 1,
+            "the cursor went back before it: {position:?}"
+        );
+        assert!(worktree.exists());
+
+        drop(other);
+        broker.end_steady_removal_back_off_for_test();
+        broker.end_steady_removal_hard_retry_for_test();
+        broker.run_capacity_removal_slice(Instant::now()).unwrap();
+        let removed = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(removed.removed, 1, "{removed:#?}");
+        assert!(!worktree.exists());
     }
 
     /// A hard retry set while a worker run is going (a held lock, memory

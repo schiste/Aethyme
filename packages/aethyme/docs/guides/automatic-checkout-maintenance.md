@@ -226,7 +226,8 @@ pull request alone is not enough.
   no time is left) holds steady removal off for one to five minutes. A
   removal that finds another repository's worker deleting waits at most two
   seconds, then is put off: the slice stops `host_deleter_busy` and the
-  checkout is judged first again about a minute later.
+  checkout is judged again (the priority lane or the lap reaches it first)
+  about a minute later.
 - From three quarters of the limit it runs the `pressure` slice with the
   capacity limits (up to twelve removals in 120 seconds, shorter retries).
 

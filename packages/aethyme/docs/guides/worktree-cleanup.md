@@ -357,7 +357,7 @@ stopped (`cap`, `budget`, `memory_backoff`, `load_throttled`,
 `lap_complete`, `kept_only_limit`, `lock_busy`, `failed`,
 `removal_failures` or `host_deleter_busy`, when another repository's worker
 kept the host deleter slot through the two-second wait before a removal:
-the outcome is then `lock_busy`, the checkout stays and is judged first again
+the outcome is then `lock_busy`, the checkout stays and the next pass judges it again (its priority entry dropped, the lap cursor moved back before it)
 about a minute later; records from older binaries may say `pacer_backoff`) and
 `retry_in_ms` the wait it chose. `trigger` says which trigger ran the slice
 (`steady` or `pressure`), `priority_examined` / `priority_removed` and

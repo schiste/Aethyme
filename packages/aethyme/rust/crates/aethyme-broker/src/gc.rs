@@ -7396,6 +7396,21 @@ impl Broker {
         request_generation: i64,
         reason: &str,
     ) -> Result<(), BrokerOpError> {
+        self.defer_session_retirement_request_for(
+            request_generation,
+            reason,
+            SESSION_RETIREMENT_WORKER_RETRY_MS,
+        )
+    }
+
+    /// [`Self::defer_session_retirement_request`] with its own retry: a
+    /// busy host deleter slot retries after a minute, not ten.
+    fn defer_session_retirement_request_for(
+        &mut self,
+        request_generation: i64,
+        reason: &str,
+        retry_ms: i64,
+    ) -> Result<(), BrokerOpError> {
         for _ in 0..SESSION_RETIREMENT_STATE_CAS_ATTEMPTS {
             let (raw, mut state) = self.load_session_retirement_state()?;
             if state.requested_generation != request_generation
@@ -7403,7 +7418,7 @@ impl Broker {
             {
                 return Ok(());
             }
-            state.retry_after_ms = now_ms().saturating_add(SESSION_RETIREMENT_WORKER_RETRY_MS);
+            state.retry_after_ms = now_ms().saturating_add(retry_ms);
             if self.store_session_retirement_state(raw.as_deref(), &state)? {
                 return self.write_artifact_sweep_worker_status(reason);
             }
@@ -8396,9 +8411,10 @@ impl Broker {
                 )
             })?;
             if ran.is_none() {
-                self.defer_session_retirement_request(
+                self.defer_session_retirement_request_for(
                     request_generation,
                     "session_retirement_host_deleter_busy",
+                    ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS,
                 )?;
             }
         }
@@ -8465,6 +8481,7 @@ impl Broker {
                         crate::phase_telemetry::add("artifact_worker_cache_passes", Duration::ZERO);
                         let deadline =
                             Instant::now() + artifact_worker_cache_pass_budget(remaining);
+                        unattended_pacing::clear_host_deleter_busy();
                         let pass = broker.sweep_artifacts_autonomously_with_deadline(
                             policy,
                             ArtifactSweepScope::AutomaticContinuation,
@@ -8563,8 +8580,10 @@ impl Broker {
                     )
                 })?;
                 if ran.is_none() {
-                    broker
-                        .defer_auto_checkout_cleanup_worker("checkout_cleanup_host_deleter_busy")?;
+                    broker.defer_auto_checkout_cleanup_worker_for(
+                        "checkout_cleanup_host_deleter_busy",
+                        ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS,
+                    )?;
                 }
             }
 
@@ -8592,9 +8611,10 @@ impl Broker {
                         )
                     })?;
                     if ran.is_none() {
-                        broker.defer_session_retirement_request(
+                        broker.defer_session_retirement_request_for(
                             request_generation,
                             "session_retirement_host_deleter_busy",
+                            ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS,
                         )?;
                     }
                 }
@@ -8999,6 +9019,9 @@ impl Broker {
             return Ok((None, None));
         };
         let judge_permit_wait = permit_started.elapsed();
+        // Whatever exit the slice takes (a `?` on a failed bookkeeping write
+        // included), the deleter slot never outlives it.
+        let _slot_release = unattended_pacing::HostDeleterSlotRelease;
         if trigger == CheckoutRemovalTrigger::Steady {
             self.artifact_sweep_meta_set(
                 ARTIFACT_WORKER_STEADY_REMOVAL_LAST_RUN_KEY,
@@ -9318,6 +9341,12 @@ impl Broker {
                 after.load_pause_ms.saturating_sub(before.load_pause_ms),
             ),
             _ => (0, 0),
+        };
+        let host_slot_busy = match (&pacing_before, &pacing_after) {
+            (Some(before), Some(after)) => {
+                after.host_slot_busy.saturating_sub(before.host_slot_busy)
+            }
+            _ => 0,
         };
         let (host_slot_wait_ms, host_slot_held_ms, host_slot_deleting_ms) =
             match (&pacing_before, &pacing_after) {
@@ -9719,6 +9748,7 @@ impl Broker {
         slice.host_slot_wait_ms = host_slot_wait_ms;
         slice.host_slot_held_ms = host_slot_held_ms;
         slice.host_slot_deleting_ms = host_slot_deleting_ms;
+        slice.host_slot_busy = host_slot_busy;
         slice.judge_permit_wait_ms = duration_ms(judge_permit_wait);
         slice.pacer_credited_entries = credited_entries;
         slice.pacer_charged_entries = charged_entries;
@@ -10166,7 +10196,16 @@ impl Broker {
     }
 
     fn defer_auto_checkout_cleanup_worker(&mut self, reason: &str) -> Result<(), BrokerOpError> {
-        let retry_after = now_ms().saturating_add(ARTIFACT_SWEEP_WORKER_RETRY_MS);
+        self.defer_auto_checkout_cleanup_worker_for(reason, ARTIFACT_SWEEP_WORKER_RETRY_MS)
+    }
+
+    /// [`Self::defer_auto_checkout_cleanup_worker`] with its own retry.
+    fn defer_auto_checkout_cleanup_worker_for(
+        &mut self,
+        reason: &str,
+        retry_ms: i64,
+    ) -> Result<(), BrokerOpError> {
+        let retry_after = now_ms().saturating_add(retry_ms);
         self.artifact_sweep_meta_set(
             AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY,
             &retry_after.to_string(),
@@ -10831,6 +10870,11 @@ impl Broker {
                     entries_reclaimed = entries_reclaimed.saturating_add(count);
                     observed_logical_file_bytes = observed_logical_file_bytes.saturating_add(bytes);
                     complete = false;
+                    // Another repository's worker is deleting: end the pass
+                    // rather than wait again for each remaining directory.
+                    if unattended_pacing::host_deleter_busy_this_pass() {
+                        break;
+                    }
                 }
                 Err(error) => {
                     entries_reclaimed = entries_reclaimed.saturating_add(error.entries_reclaimed);
@@ -11973,8 +12017,12 @@ impl Broker {
                         session_scan_complete = false;
                     }
                 }
+                // A busy host deleter slot ends the pass too: the next pass
+                // retries after the worker's short gap instead of each
+                // directory waiting for the slot under the GC lock.
                 if check_deadline(Some(discovery_deadline))
                     || check_deadline(Some(removal_deadline))
+                    || unattended_pacing::host_deleter_busy_this_pass()
                 {
                     session_scan_complete = false;
                     break;

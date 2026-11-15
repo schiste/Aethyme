@@ -441,6 +441,13 @@ pub(crate) struct UnattendedPacer {
     judge_permit_waited: Duration,
     /// Why the last whole-checkout deletion gate refused, until taken.
     deletion_refusal: Option<DeletionGate>,
+    /// The host directory could not hold the slot this run: deletion runs
+    /// unserialised, as a missing directory always did.
+    host_slot_unavailable: bool,
+    /// Another worker kept the slot through a tree-removal batch's wait in
+    /// this pass: later batches refuse at once instead of waiting again,
+    /// until the pass ends ([`clear_host_deleter_busy`]).
+    host_busy_this_pass: bool,
     summary: UnattendedPacingSummary,
 }
 
@@ -525,6 +532,8 @@ impl UnattendedPacer {
             host_slot_slept: Duration::ZERO,
             judge_permit_waited: Duration::ZERO,
             deletion_refusal: None,
+            host_slot_unavailable: false,
+            host_busy_this_pass: false,
             summary: UnattendedPacingSummary {
                 unlinks_per_second_limit: rate.limit(),
                 ..UnattendedPacingSummary::default()
@@ -570,12 +579,58 @@ impl UnattendedPacer {
                     SlotTake::AfterWait
                 }
             }
-            super::HostDeleterSlot::Unavailable => SlotTake::Unserialised,
+            super::HostDeleterSlot::Unavailable => {
+                self.host_slot_unavailable = true;
+                SlotTake::Unserialised
+            }
             super::HostDeleterSlot::Busy => {
                 self.summary.host_slot_busy = self.summary.host_slot_busy.saturating_add(1);
                 SlotTake::Busy
             }
         }
+    }
+
+    /// Whether an unlink must hold the slot: a host directory serialises
+    /// deletion here and has not proved unusable this run.
+    fn slot_required(&self) -> bool {
+        self.host_directory.is_some() && !self.host_slot_unavailable
+    }
+
+    /// End a deletion: pay the partial batch it was in (with the slot still
+    /// held, so the limiter's sleep stays the machine's one deleter's), start
+    /// the next deletion on a fresh batch, and give the slot back unless a
+    /// lane pins it. Without a held slot nothing changes, as before.
+    fn end_deletion(&mut self) {
+        if self.host_slot.is_none() || self.host_slot_pins > 0 {
+            return;
+        }
+        self.settle_partial_batch(None);
+        self.release_host_slot();
+    }
+
+    /// Pay the current batch's share of the bucket for the entries it has
+    /// so far, and start the next unlink on a fresh batch.
+    fn settle_partial_batch(&mut self, deadline: Option<Instant>) {
+        if let Some(started) = self.batch_started.take() {
+            self.pay_entries(started, self.in_batch, deadline);
+        }
+        self.in_batch = 0;
+    }
+
+    /// Hand a slot held for [`HOST_DELETER_MAX_HOLD`] over: give it back and
+    /// leave it free for [`HOST_DELETER_HANDOFF`]. `true` when it did.
+    fn hand_over_if_held_too_long(&mut self, deadline: Option<Instant>) -> bool {
+        let held_too_long = self.host_slot_pins == 0
+            && self.host_slot.as_ref().is_some_and(|(_, since)| {
+                self.clock.now().saturating_duration_since(*since) >= HOST_DELETER_MAX_HOLD
+            });
+        if !held_too_long {
+            return false;
+        }
+        self.release_host_slot();
+        let pause = cap_to_deadline(HOST_DELETER_HANDOFF, self.clock.now(), deadline);
+        self.clock.sleep(pause);
+        true
     }
 
     /// Give the slot back, unless a lane pins it.
@@ -605,21 +660,19 @@ impl UnattendedPacer {
     /// waited out without it. A slot held for [`HOST_DELETER_MAX_HOLD`] is
     /// handed over first.
     fn enter_batch_deletion(&mut self, deadline: Option<Instant>) -> DeletionGate {
-        if self.host_slot_pins == 0
-            && self.host_slot.as_ref().is_some_and(|(_, since)| {
-                self.clock.now().saturating_duration_since(*since) >= HOST_DELETER_MAX_HOLD
-            })
-        {
-            self.release_host_slot();
-            let pause = cap_to_deadline(HOST_DELETER_HANDOFF, self.clock.now(), deadline);
-            self.clock.sleep(pause);
+        self.hand_over_if_held_too_long(deadline);
+        if self.host_busy_this_pass && self.host_slot.is_none() {
+            return DeletionGate::HostDeleterBusy;
         }
         loop {
             if self.checked_wait(deadline, LOAD_BATCH_WAIT) == PressureVerdict::MemoryBackoff {
                 return DeletionGate::MemoryBackoff;
             }
             match self.take_host_slot(deadline, HOST_DELETER_ACQUIRE_WAIT) {
-                SlotTake::Busy => return DeletionGate::HostDeleterBusy,
+                SlotTake::Busy => {
+                    self.host_busy_this_pass = true;
+                    return DeletionGate::HostDeleterBusy;
+                }
                 SlotTake::AfterWait if self.pressure.sample().memory_elevated == Some(true) => {
                     self.release_host_slot();
                 }
@@ -636,8 +689,10 @@ impl UnattendedPacer {
     fn enter_deletion_now(&mut self) -> DeletionGate {
         let gate = match self.take_host_slot(None, HOST_DELETER_ACQUIRE_WAIT) {
             SlotTake::Busy => DeletionGate::HostDeleterBusy,
-            SlotTake::Unserialised => DeletionGate::Proceed,
-            SlotTake::AlreadyHeld | SlotTake::AtOnce | SlotTake::AfterWait => {
+            SlotTake::Unserialised
+            | SlotTake::AlreadyHeld
+            | SlotTake::AtOnce
+            | SlotTake::AfterWait => {
                 if self.pressure.sample().memory_elevated == Some(true) {
                     self.summary.pressure_yields = self.summary.pressure_yields.saturating_add(1);
                     self.release_host_slot();
@@ -791,6 +846,12 @@ impl UnattendedPacer {
     /// [`Self::before_unlink`]; `take_slot` is false for a charge, which
     /// pays for a deletion already made and takes no slot.
     fn gate_unlink(&mut self, deadline: Option<Instant>, take_slot: bool) -> bool {
+        // No unattended unlink without the slot, whatever the batch counter
+        // says: one about to happen with no slot held starts a fresh batch
+        // through the full gate (pressure check, then the slot).
+        if take_slot && self.slot_required() && self.host_slot.is_none() && self.in_batch != 0 {
+            self.settle_partial_batch(deadline);
+        }
         if self.in_batch == 0 {
             if let Some(started) = self.batch_started.take() {
                 self.pay_batch(started, deadline);
@@ -799,9 +860,16 @@ impl UnattendedPacer {
                 if self.enter_batch_deletion(deadline) != DeletionGate::Proceed {
                     return false;
                 }
-            } else if self.checked_wait(deadline, LOAD_BATCH_WAIT) == PressureVerdict::MemoryBackoff
-            {
-                return false;
+            } else {
+                // A charge that has held the slot for the maximum hands it
+                // over like a tree removal, and pays the rest without it if
+                // another worker takes it: the deletion it pays for is over.
+                if self.hand_over_if_held_too_long(deadline) {
+                    let _ = self.take_host_slot(deadline, HOST_DELETER_ACQUIRE_WAIT);
+                }
+                if self.checked_wait(deadline, LOAD_BATCH_WAIT) == PressureVerdict::MemoryBackoff {
+                    return false;
+                }
             }
             self.batch_started = Some(self.clock.now());
         }
@@ -823,11 +891,17 @@ impl UnattendedPacer {
     /// Sleep off whatever the last full batch finished ahead of its share of
     /// the bucket, never past the caller's deadline.
     fn pay_batch(&mut self, started: Instant, deadline: Option<Instant>) {
+        self.pay_entries(started, self.batch_entries, deadline);
+    }
+
+    /// Sleep off whatever `entries` unlinks begun at `started` finished
+    /// ahead of their share of the bucket, never past the caller's deadline.
+    fn pay_entries(&mut self, started: Instant, entries: u32, deadline: Option<Instant>) {
         let Some(limit) = self.effective_limit() else {
             return;
         };
         let minimum = Duration::from_nanos(
-            u64::from(self.batch_entries).saturating_mul(1_000_000_000) / u64::from(limit.max(1)),
+            u64::from(entries).saturating_mul(1_000_000_000) / u64::from(limit.max(1)),
         );
         let now = self.clock.now();
         let Some(deficit) = minimum.checked_sub(now.saturating_duration_since(started)) else {
@@ -966,10 +1040,24 @@ fn with_active<T>(default: T, operation: impl FnOnce(&mut UnattendedPacer) -> T)
     })
 }
 
+/// [`with_active`] for a deletion gate: `no_pacer` when none is installed
+/// (foreground), but `refused` when the installed pacer is already borrowed,
+/// so a gate never lets a deletion through unserialised by accident.
+fn with_active_gate<T>(
+    no_pacer: T,
+    refused: T,
+    operation: impl FnOnce(&mut UnattendedPacer) -> T,
+) -> T {
+    ACTIVE.with(|active| match active.try_borrow_mut() {
+        Ok(mut active) => active.as_mut().map_or(no_pacer, operation),
+        Err(_) => refused,
+    })
+}
+
 /// Tree-removal hook before one unlink. Without an installed pacer (every
 /// foreground caller) this always permits the unlink immediately.
 pub(crate) fn before_unattended_unlink(deadline: Option<Instant>) -> bool {
-    with_active(true, |pacer| pacer.before_unlink(deadline))
+    with_active_gate(true, false, |pacer| pacer.before_unlink(deadline))
 }
 
 /// Tree-removal hook after one successful unlink.
@@ -1015,7 +1103,11 @@ pub(crate) fn unattended_pressure_check(deadline: Option<Instant>) -> PressureVe
 /// [`release_host_deleter_slot`], after the removal's charge. Without a
 /// pacer (every foreground caller) it always proceeds and holds nothing.
 pub(crate) fn enter_unattended_deletion() -> DeletionGate {
-    with_active(DeletionGate::Proceed, UnattendedPacer::enter_deletion_now)
+    with_active_gate(
+        DeletionGate::Proceed,
+        DeletionGate::HostDeleterBusy,
+        UnattendedPacer::enter_deletion_now,
+    )
 }
 
 /// Why the last [`enter_unattended_deletion`] refused, once; `None` when it
@@ -1027,7 +1119,27 @@ pub(crate) fn take_deletion_refusal() -> Option<DeletionGate> {
 /// Give the host deleter slot back, unless a lane pins it. A no-op when it
 /// is not held or no pacer is installed.
 pub(crate) fn release_host_deleter_slot() {
-    with_active((), UnattendedPacer::release_host_slot);
+    with_active((), UnattendedPacer::end_deletion);
+}
+
+/// Start a new pass for the sticky busy refusal of tree-removal batches.
+pub(crate) fn clear_host_deleter_busy() {
+    with_active((), |pacer| pacer.host_busy_this_pass = false);
+}
+
+/// Whether a tree removal found the slot with another worker in this pass.
+pub(crate) fn host_deleter_busy_this_pass() -> bool {
+    with_active(false, |pacer| pacer.host_busy_this_pass)
+}
+
+/// Releases the host deleter slot when dropped: a slice holds one so the
+/// slot never outlives it, whatever exit it takes.
+pub(crate) struct HostDeleterSlotRelease;
+
+impl Drop for HostDeleterSlotRelease {
+    fn drop(&mut self) {
+        release_host_deleter_slot();
+    }
 }
 
 /// Whether the installed pacer holds the host deleter slot.
@@ -1040,8 +1152,13 @@ pub(crate) fn host_deleter_slot_held() -> bool {
 /// `false` means another worker kept it and the unlink must wait for a
 /// later pass. Without a pacer it is always `true`.
 pub(crate) fn ensure_host_deleter_slot(deadline: Option<Instant>) -> bool {
-    with_active(true, |pacer| {
-        pacer.take_host_slot(deadline, HOST_DELETER_ACQUIRE_WAIT) != SlotTake::Busy
+    with_active_gate(true, false, |pacer| {
+        if pacer.host_busy_this_pass && pacer.host_slot.is_none() {
+            return false;
+        }
+        let busy = pacer.take_host_slot(deadline, HOST_DELETER_ACQUIRE_WAIT) == SlotTake::Busy;
+        pacer.host_busy_this_pass |= busy;
+        !busy
     })
 }
 
@@ -1079,7 +1196,7 @@ impl Drop for HostDeleterPin {
         if self.pinned {
             with_active((), |pacer| {
                 pacer.host_slot_pins = pacer.host_slot_pins.saturating_sub(1);
-                pacer.release_host_slot();
+                pacer.end_deletion();
             });
         }
     }
@@ -1091,7 +1208,7 @@ impl Drop for HostDeleterPin {
 /// `None` when another repository's worker kept it through the wait.
 /// Without a pacer it pins nothing and always succeeds.
 pub(crate) fn pin_host_deleter_slot() -> Option<HostDeleterPin> {
-    with_active(Some(HostDeleterPin { pinned: false }), |pacer| {
+    with_active_gate(Some(HostDeleterPin { pinned: false }), None, |pacer| {
         if pacer.take_host_slot(None, HOST_DELETER_PIN_WAIT) == SlotTake::Busy {
             return None;
         }
@@ -1110,7 +1227,7 @@ pub(crate) struct JudgingPermit {
 /// caller ends its slice with a short retry. Without a pacer, or with no
 /// host directory, judging is not bounded and a permit is always granted.
 pub(crate) fn take_judging_permit() -> Option<JudgingPermit> {
-    with_active(Some(JudgingPermit { _lock: None }), |pacer| {
+    with_active_gate(Some(JudgingPermit { _lock: None }), None, |pacer| {
         pacer
             .take_judging_permit()
             .ok()
@@ -1865,9 +1982,17 @@ mod tests {
         );
         assert!(!before_unattended_unlink(None));
         assert_eq!(clock.slept.get(), HOST_DELETER_ACQUIRE_WAIT);
+        // Sticky for the pass: later batches and root unlinks refuse at
+        // once instead of waiting again.
+        assert!(host_deleter_busy_this_pass());
+        assert!(!before_unattended_unlink(None));
+        assert!(!ensure_host_deleter_slot(None));
+        assert_eq!(clock.slept.get(), HOST_DELETER_ACQUIRE_WAIT);
         assert_eq!(enter_unattended_deletion(), DeletionGate::HostDeleterBusy);
         assert_eq!(take_deletion_refusal(), Some(DeletionGate::HostDeleterBusy));
         assert_eq!(take_deletion_refusal(), None);
+        clear_host_deleter_busy();
+        assert!(!host_deleter_busy_this_pass());
         assert!(!ensure_host_deleter_slot(None));
         assert!(pin_host_deleter_slot().is_none());
         let summary = current_summary(0).unwrap();
@@ -2042,7 +2167,9 @@ mod tests {
         release_host_deleter_slot();
         let summary = current_summary(0).unwrap();
         assert_eq!(summary.host_slot_acquisitions, 1);
-        assert_eq!(summary.host_slot_held_ms, 512, "{summary:?}");
+        // The charge's two batches, and the two entries of its partial batch
+        // settled before the slot went back.
+        assert_eq!(summary.host_slot_held_ms, 514, "{summary:?}");
         assert_eq!(summary.host_slot_deleting_ms, 0, "{summary:?}");
     }
 
@@ -2074,5 +2201,211 @@ mod tests {
         );
         // The deleter slot is a separate lock: judging never blocks it.
         assert!(contender_takes_slot(host.path()).is_some());
+    }
+    /// No unattended unlink happens without the slot, whatever the batch
+    /// counter says: a second tree removal right after one that stopped
+    /// mid-batch takes the slot, after a pressure sample, at its first
+    /// unlink, and so does one that follows a charge paid without a slot.
+    #[test]
+    fn every_tree_removal_takes_the_slot_at_its_first_unlink() {
+        let host = tempfile::tempdir().unwrap();
+        let clock = FakeClock::new();
+        let (pressure, reads) = scripted(vec![memory(false)]);
+        let _scope = install(
+            UnattendedPacer::new(UnlinkRate::Unlimited, Box::new(clock.clone()), pressure)
+                .with_host_directory(Some(host.path().to_path_buf())),
+        );
+        for removal in 0..2 {
+            let _removal = TreeRemovalSlotScope::enter();
+            let sampled_before = reads.get();
+            assert!(before_unattended_unlink(None), "removal {removal}");
+            assert!(host_deleter_slot_held(), "removal {removal}");
+            assert!(
+                contender_takes_slot(host.path()).is_none(),
+                "removal {removal}: nobody else deletes during its first unlink"
+            );
+            assert!(reads.get() > sampled_before, "pressure read first");
+            for _ in 1..100 {
+                assert!(before_unattended_unlink(None));
+            }
+        }
+        assert!(!host_deleter_slot_held());
+        // A charge paid with no slot leaves the counter mid-batch.
+        charge_bulk_unattended_removal(300, Duration::ZERO, None);
+        assert!(!host_deleter_slot_held());
+        let _removal = TreeRemovalSlotScope::enter();
+        let sampled_before = reads.get();
+        assert!(before_unattended_unlink(None));
+        assert!(host_deleter_slot_held());
+        assert!(contender_takes_slot(host.path()).is_none());
+        assert!(reads.get() > sampled_before);
+        assert_eq!(current_summary(0).unwrap().host_slot_acquisitions, 3);
+    }
+
+    /// Many small trees (50 entries, a fifth of a batch) each hold the slot
+    /// for every one of their unlinks.
+    #[test]
+    fn many_small_tree_removals_each_hold_the_slot() {
+        let host = tempfile::tempdir().unwrap();
+        let clock = FakeClock::new();
+        let _scope = install(
+            UnattendedPacer::new(UnlinkRate::Limited(1_000), Box::new(clock.clone()), calm())
+                .with_host_directory(Some(host.path().to_path_buf())),
+        );
+        for removal in 0..10 {
+            let _removal = TreeRemovalSlotScope::enter();
+            for unlink in 0..50 {
+                assert!(before_unattended_unlink(None));
+                if unlink == 0 || unlink == 49 {
+                    assert!(
+                        contender_takes_slot(host.path()).is_none(),
+                        "removal {removal} unlink {unlink}"
+                    );
+                }
+                after_unattended_unlink(0);
+            }
+        }
+        let summary = current_summary(0).unwrap();
+        assert_eq!(summary.host_slot_acquisitions, 10);
+        assert_eq!(summary.entries_removed, 500);
+        // Each removal's partial batch is paid before its slot goes back:
+        // 500 entries at 1,000 a second.
+        assert_eq!(summary.limiter_sleep_ms, 500, "{summary:?}");
+    }
+
+    /// A tree removal right after a checkout removal and its charge takes
+    /// the slot at its first unlink: the charge's partial batch was settled
+    /// when the slot went back.
+    #[test]
+    fn a_tree_removal_after_a_checkout_charge_takes_the_slot() {
+        let host = tempfile::tempdir().unwrap();
+        let clock = FakeClock::new();
+        let _scope = install(
+            UnattendedPacer::new(UnlinkRate::Limited(1_000), Box::new(clock.clone()), calm())
+                .with_host_directory(Some(host.path().to_path_buf())),
+        );
+        assert_eq!(enter_unattended_deletion(), DeletionGate::Proceed);
+        charge_bulk_unattended_removal(300, Duration::ZERO, None);
+        assert!(
+            host_deleter_slot_held(),
+            "the charge keeps its removal's slot"
+        );
+        release_host_deleter_slot();
+        assert!(!host_deleter_slot_held());
+        assert!(contender_takes_slot(host.path()).is_some());
+        let _removal = TreeRemovalSlotScope::enter();
+        assert!(before_unattended_unlink(None));
+        assert!(host_deleter_slot_held());
+        assert!(contender_takes_slot(host.path()).is_none());
+        assert_eq!(current_summary(0).unwrap().host_slot_acquisitions, 2);
+    }
+
+    /// A tree's witness and root are unlinked outside the batch gate; they
+    /// too wait for the slot, and a busy one leaves the tree in place for a
+    /// later pass.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_trees_witness_and_root_wait_for_the_slot() {
+        let host = tempfile::tempdir().unwrap();
+        let trees = tempfile::tempdir().unwrap();
+        let empty = trees.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let witnessed = trees.path().join("witnessed");
+        std::fs::create_dir(&witnessed).unwrap();
+        std::fs::write(
+            witnessed.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        let other = contender_takes_slot(host.path()).unwrap();
+        let clock = FakeClock::new();
+        let _scope = install(
+            UnattendedPacer::new(UnlinkRate::Unlimited, Box::new(clock.clone()), calm())
+                .with_host_directory(Some(host.path().to_path_buf())),
+        );
+        assert_eq!(
+            super::super::remove_condemned_tree(&empty, None, None).unwrap(),
+            super::super::TreeRemoval::Interrupted
+        );
+        assert!(empty.is_dir());
+        clear_host_deleter_busy();
+        assert_eq!(
+            super::super::remove_condemned_tree(&witnessed, Some("CACHEDIR.TAG"), None).unwrap(),
+            super::super::TreeRemoval::Interrupted
+        );
+        assert!(
+            witnessed.join("CACHEDIR.TAG").is_file(),
+            "the witness stays"
+        );
+        drop(other);
+        clear_host_deleter_busy();
+        for (tree, witness) in [(&empty, None), (&witnessed, Some("CACHEDIR.TAG"))] {
+            assert_eq!(
+                super::super::remove_condemned_tree(tree, witness, None).unwrap(),
+                super::super::TreeRemoval::Complete
+            );
+            assert!(!tree.exists());
+        }
+        assert!(
+            !host_deleter_slot_held(),
+            "given back when each removal returned"
+        );
+        assert!(contender_takes_slot(host.path()).is_some());
+    }
+
+    /// A gate whose pacer is already borrowed refuses: it never lets a
+    /// deletion through unserialised by accident.
+    #[test]
+    fn a_borrowed_pacer_refuses_deletion() {
+        let host = tempfile::tempdir().unwrap();
+        let _scope = install(
+            UnattendedPacer::new(UnlinkRate::Unlimited, Box::new(FakeClock::new()), calm())
+                .with_host_directory(Some(host.path().to_path_buf())),
+        );
+        with_active((), |_pacer| {
+            assert!(!before_unattended_unlink(None));
+            assert!(!ensure_host_deleter_slot(None));
+            assert_eq!(enter_unattended_deletion(), DeletionGate::HostDeleterBusy);
+            assert!(pin_host_deleter_slot().is_none());
+            assert!(take_judging_permit().is_none());
+        });
+        assert!(before_unattended_unlink(None));
+    }
+
+    /// The whole-checkout gate reads memory pressure even when no host
+    /// directory serialises deletion.
+    #[test]
+    fn the_checkout_gate_reads_memory_pressure_without_a_host_directory() {
+        let (pressure, reads) = scripted(vec![memory(true)]);
+        let _scope = install(UnattendedPacer::new(
+            UnlinkRate::Unlimited,
+            Box::new(FakeClock::new()),
+            pressure,
+        ));
+        assert_eq!(enter_unattended_deletion(), DeletionGate::MemoryBackoff);
+        assert_eq!(reads.get(), 1);
+    }
+
+    /// A charge that has held the slot for the maximum hands it over like a
+    /// tree removal: it leaves it free for a moment, then takes it again.
+    #[test]
+    fn a_long_charge_hands_the_slot_over() {
+        let host = tempfile::tempdir().unwrap();
+        let (clock, probe) = probing_clock(host.path());
+        let _scope = install(
+            UnattendedPacer::new(UnlinkRate::Limited(1_000), clock, calm())
+                .with_host_directory(Some(host.path().to_path_buf())),
+        );
+        assert_eq!(enter_unattended_deletion(), DeletionGate::Proceed);
+        // 25,600 entries at 1,000 a second: more than the maximum hold.
+        charge_bulk_unattended_removal(u64::from(PACING_BATCH_ENTRIES) * 100, Duration::ZERO, None);
+        let sleeps = probe.free_during_sleeps.borrow().clone();
+        assert!(sleeps.iter().any(|free| *free), "handed over once");
+        assert!(
+            sleeps.iter().filter(|free| **free).count() <= 2,
+            "free only during the hand-over: {sleeps:?}"
+        );
+        assert!(host_deleter_slot_held(), "taken again after the hand-over");
+        assert_eq!(current_summary(0).unwrap().host_slot_acquisitions, 2);
     }
 }
