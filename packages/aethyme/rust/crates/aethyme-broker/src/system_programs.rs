@@ -12,10 +12,28 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+/// Test seam: a `ps` stub for integration tests that observe how the broker
+/// calls it. Honoured only in a process started by the test harness, so an
+/// ordinary environment cannot redirect it.
+pub(crate) const TEST_PS_ENV: &str = "AETHYME_TEST_PS";
+
 /// `ps`: `/bin/ps` on macOS and most Linux systems, `/usr/bin/ps` on others.
 pub(crate) fn ps() -> &'static Path {
     static PS: OnceLock<PathBuf> = OnceLock::new();
-    PS.get_or_init(|| resolve("ps", &["/bin/ps", "/usr/bin/ps"]))
+    PS.get_or_init(|| {
+        test_override(TEST_PS_ENV).unwrap_or_else(|| resolve("ps", &["/bin/ps", "/usr/bin/ps"]))
+    })
+}
+
+fn test_override(name: &str) -> Option<PathBuf> {
+    let under_test = ["CARGO_MANIFEST_DIR", "CARGO_BIN_EXE_aethyme"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some());
+    under_test
+        .then(|| std::env::var_os(name))
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 /// `sysctl`: `/usr/sbin/sysctl` on macOS, `/sbin/sysctl` on Linux.

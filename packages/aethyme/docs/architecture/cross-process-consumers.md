@@ -225,8 +225,8 @@ binary instead of once per process.
 - **Telemetry.** Command metric spans: `git_program_resolve` and
   `git_probe_run` (timed), and the counters `git_probe_cache_hit`,
   `git_probe_cache_miss_{absent,expired,key_mismatch,invalid,disabled,unkeyable}`,
-  `git_probe_fresh_forced`, `git_probe_dirs_sweep` (timed) and
-  `git_probe_dirs_removed`.
+  `git_probe_fresh_forced`, `git_probe_cache_write_failed`,
+  `git_probe_dirs_sweep` (timed) and `git_probe_dirs_removed`.
 
 ## Unattended deletion is paced (2026-11-13)
 

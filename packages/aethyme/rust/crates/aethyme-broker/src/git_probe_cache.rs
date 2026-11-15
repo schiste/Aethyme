@@ -429,7 +429,7 @@ pub(crate) fn record_acceptance(location: &CacheLocation, key: &ProgramKey, now:
     });
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.accepted_at_ms));
     entries.truncate(MAX_ENTRIES);
-    let _ = write_cache(path, entries);
+    note_write(write_cache(path, entries));
 }
 
 /// Drop every acceptance recorded for `candidate`. Called whenever a probe of
@@ -450,7 +450,15 @@ pub(crate) fn forget(location: &CacheLocation, candidate: &Path) {
         .filter(|entry| entry.key.candidate != candidate)
         .collect();
     if entries.len() != before {
-        let _ = write_cache(path, entries);
+        note_write(write_cache(path, entries));
+    }
+}
+
+/// Writes are best effort -- a cache that cannot be written only costs the
+/// next process a probe -- but a failure is counted, not dropped.
+fn note_write(result: std::io::Result<()>) {
+    if result.is_err() {
+        crate::phase_telemetry::add("git_probe_cache_write_failed", Duration::ZERO);
     }
 }
 

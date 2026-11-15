@@ -264,6 +264,8 @@ exit 1
                 format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
             )
             .env("PRESSURE_PS_LOG", &log)
+            // `ps` is spawned by absolute path, not through PATH.
+            .env("AETHYME_TEST_PS", &ps)
             .output()
             .unwrap();
     assert!(
