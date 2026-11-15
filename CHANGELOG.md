@@ -4,6 +4,20 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.102] - 2026-11-15
+
+### Changed
+
+- Background checkout removal under sustained load (a load average above twice the core count) waits at least 30 seconds after each throttled removal, so workers no longer remove back to back while the repository is at its checkout limit. Without load nothing changes. Memory pressure is still a hard stop (#1690).
+
+### Fixed
+
+- A removal slice is recorded as blocked by load (`pressure_before_selection`) only when the load wait is what stopped its pass. A failed pass, or a budget spent on counting checkouts, keeps `failed` or `out_of_time_before_selection` and its escalating retry (#1690).
+
+### Added
+
+- The slice record and the worker's metrics row show the throttle gap and, per worker run, slices, removals and time spent deleting versus waiting: `throttle_gap_ms`, `run_slices`, `run_removed`, `run_elapsed_ms`, `run_deleting_ms`, `run_waiting_ms`, `run_deleting_pct`, `run_waiting_pct`; counter `artifact_worker_capacity_removal_slice` and timed phases `artifact_worker_capacity_removal_waiting` and `artifact_worker_capacity_removal_throttle_gap` (#1690).
+
 ## [0.8.101] - 2026-11-15
 
 ### Fixed
