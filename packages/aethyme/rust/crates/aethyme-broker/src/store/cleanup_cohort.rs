@@ -1477,17 +1477,23 @@ impl BrokerStore {
     /// first, most recently merged first; the rest most recently closed first.
     /// Returns `(canonical_path, first_session_id, merged)`. Candidate order
     /// only: every returned group still goes through every removal proof.
+    /// Closed-checkout groups with a merged pull request or a due cleanup
+    /// request: those none of whose closed sessions closed after
+    /// `in_grace_after_ms` (their closed-worktree grace has passed) first,
+    /// then merged ones, most recently merged and closed first.
     pub(crate) fn cleanup_cohort_priority_groups(
         &self,
         namespace: &str,
         now_ms: i64,
+        in_grace_after_ms: i64,
         limit: usize,
     ) -> Result<Vec<(String, i64, bool)>, BrokerError> {
         let mut stmt = self.conn.prepare(
             "SELECT g.canonical_path, g.first_session_id,
                     MAX(COALESCE(linked.merged_at, direct.merged_at) IS NOT NULL) AS merged,
                     MAX(COALESCE(linked.merged_at, direct.merged_at, 0)) AS merged_at,
-                    MAX(COALESCE(s.closed_at, 0)) AS closed_at
+                    MAX(COALESCE(s.closed_at, 0)) AS closed_at,
+                    MAX(COALESCE(s.closed_at, s.updated_at, 0)) > ?4 AS in_grace
              FROM cleanup_cohort_scan_groups g
              JOIN cleanup_cohort_scan_rows r
                ON r.namespace = g.namespace AND r.canonical_path = g.canonical_path
@@ -1506,11 +1512,17 @@ impl BrokerStore {
                AND (q.session_id IS NOT NULL OR linked.merged_at IS NOT NULL
                     OR direct.merged_at IS NOT NULL)
              GROUP BY g.canonical_path, g.first_session_id
-             ORDER BY merged DESC, merged_at DESC, closed_at DESC, g.first_session_id DESC
+             ORDER BY in_grace ASC, merged DESC, merged_at DESC, closed_at DESC,
+                      g.first_session_id DESC
              LIMIT ?3",
         )?;
         let rows = stmt.query_map(
-            params![namespace, now_ms, limit.clamp(1, 256) as i64],
+            params![
+                namespace,
+                now_ms,
+                limit.clamp(1, 256) as i64,
+                in_grace_after_ms
+            ],
             |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
         )?;
         rows.collect::<Result<Vec<_>, _>>()
