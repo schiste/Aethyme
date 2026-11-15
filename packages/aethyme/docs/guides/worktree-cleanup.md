@@ -123,7 +123,22 @@ the directory goes:
 
 1. **Sessions** -- every broker session that names the worktree is closed.
 2. **No use** -- no process has a file or working directory open in it, no
-   lease that still holds covers it, and no gate is running.
+   lease that still holds covers it, and no gate is running that could be
+   using it. A gate keeps the checkout (code `gate_running`) when one of the
+   checkout's own sessions runs it, when the gate's recorded checkout is this
+   one, inside it or contains it (a gate in the main checkout keeps only
+   checkouts nested inside the main checkout), or when nothing identifies
+   where it runs: a pidfile or owner lock written by an older binary, an
+   unreadable or malformed record, or an owner lock whose recorded holder
+   process is gone. A gate positively recorded in another session's checkout
+   no longer keeps it. `kept[].gate_keep` says which it was: `own_session`,
+   `path` or `unknown_owner`. A gate is attributed only to the checkout it
+   runs in: a gate command that works in a sibling checkout (by changing
+   into it, or by taking its path as an argument) does not keep that
+   checkout, and a checkout moved or remounted after its gate started is
+   matched by the path recorded at start. The artifact-use marker every gate
+   registers for its own checkout, and the open-file check, still guard
+   those cases.
 3. **Clean** -- no tracked, staged or untracked change, no stash made on its
    branch, no rebase, merge, cherry-pick, revert or bisect in progress, and no
    protected ignored content. Only recognized or configured output directories

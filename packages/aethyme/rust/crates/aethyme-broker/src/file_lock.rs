@@ -517,6 +517,12 @@ impl ExclusiveFileLock {
         self.file.write_all_at(holder.as_bytes(), 0)
     }
 
+    /// Empty the holder line, still under the lock, so the next holder never
+    /// appears to be this one before it records itself.
+    pub(crate) fn clear_holder(&self) -> io::Result<()> {
+        self.file.set_len(0)
+    }
+
     /// Lock `file` exclusively if nobody holds it; `None` when it is held.
     pub(crate) fn try_acquire(file: File) -> io::Result<Option<Self>> {
         match file.try_lock() {
