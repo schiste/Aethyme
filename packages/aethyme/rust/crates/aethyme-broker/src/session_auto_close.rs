@@ -661,6 +661,243 @@ mod lane_tests {
         assert!(refusal.contains("broker start --reuse"), "{refusal}");
     }
 
+    /// A script proof-3 listings run instead of Git: `status` runs `status`
+    /// (a shell fragment), anything else goes to the real Git.
+    fn status_script(dir: &Path, name: &str, status: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in\n  *\" status \"*) {status} ;;\n  *) exec git \"$@\" ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn merged_quiet_session(broker: &mut crate::Broker, label: &str) -> crate::Session {
+        let (session, _) = session(broker, label, true);
+        link_pull_request(broker, session.id, 31, Some(1));
+        quiet(broker, &session, 3);
+        session
+    }
+
+    fn close_merged(
+        broker: &mut crate::Broker,
+        session: &crate::Session,
+        table: &mut crate::session_holder::RecordedHolderProcessTable,
+        deadline: Option<std::time::Instant>,
+    ) -> crate::broker::AbandonedSessionCloseOutcome {
+        broker
+            .try_close_merged_pull_request_session(
+                session.id,
+                now_ms(),
+                2 * HOUR_MS,
+                table,
+                true,
+                deadline,
+            )
+            .unwrap()
+    }
+
+    fn declined_as(
+        reason: crate::broker::LandedSessionDecline,
+    ) -> crate::broker::AbandonedSessionCloseOutcome {
+        crate::broker::AbandonedSessionCloseOutcome::LandedDeclined(reason)
+    }
+
+    /// A cleanliness listing that never finishes is stopped at the session's
+    /// budget: the session is kept as `proof_timed_out` and its streak
+    /// starts. The listing blocks until released, so the outcome does not
+    /// depend on how fast the runner is.
+    #[test]
+    fn a_stopped_proof_listing_keeps_the_session_as_timed_out() {
+        let (owner, _storage, mut broker) = fixture("");
+        let session = merged_quiet_session(&mut broker, "listing never finishes");
+        let release = owner.path().join("release");
+        let script = status_script(
+            owner.path(),
+            "blocking.sh",
+            &format!(
+                "while [ ! -e '{}' ]; do sleep 0.05; done",
+                release.display()
+            ),
+        );
+        let _seam = crate::auto_cleanup::proof_git_seam_for_test(Some(script), None);
+        let _budget = crate::broker::landed_proof_session_budget_for_test(
+            Some(session.id),
+            Duration::from_millis(500),
+        );
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        let outcome = close_merged(
+            &mut broker,
+            &session,
+            &mut table,
+            Some(std::time::Instant::now() + Duration::from_secs(3_600)),
+        );
+        std::fs::write(&release, "").unwrap();
+
+        assert_eq!(
+            outcome,
+            declined_as(crate::broker::LandedSessionDecline::ProofTimedOut)
+        );
+        assert!(is_open(&broker, session.id));
+        assert_eq!(
+            broker
+                .landed_proof_timeout_streaks()
+                .get(&session.id)
+                .map(|(streak, _)| *streak),
+            Some(1)
+        );
+    }
+
+    /// A listing past its output limit is no verdict on the checkout: the
+    /// session is kept (`worktree_unavailable`), not judged clean.
+    #[test]
+    fn an_overlong_proof_listing_keeps_the_session() {
+        let (owner, _storage, mut broker) = fixture("");
+        let session = merged_quiet_session(&mut broker, "listing too long");
+        let script = status_script(
+            owner.path(),
+            "overlong.sh",
+            "i=0; while [ $i -lt 64 ]; do printf '!! build-%04d/\\0' $i; i=$((i+1)); done",
+        );
+        let _seam = crate::auto_cleanup::proof_git_seam_for_test(Some(script), Some(64));
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        let outcome = close_merged(&mut broker, &session, &mut table, None);
+
+        assert_eq!(
+            outcome,
+            declined_as(crate::broker::LandedSessionDecline::WorktreeUnavailable)
+        );
+        assert!(is_open(&broker, session.id));
+    }
+
+    /// The last look under the claims hitting a failed listing keeps the
+    /// session under its own name, not as work the agent did.
+    #[test]
+    fn a_failed_recheck_under_the_claims_keeps_the_session() {
+        let (owner, _storage, mut broker) = fixture("");
+        let session = merged_quiet_session(&mut broker, "re-check fails");
+        let failing = status_script(owner.path(), "failing.sh", "echo refused >&2; exit 1");
+        // Restores "no seam" at the end; the hook replaces it mid-close.
+        let _restore = crate::auto_cleanup::proof_git_seam_for_test(None, None);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        table.install_before_landed_close_for_test(Box::new(move || {
+            std::mem::forget(crate::auto_cleanup::proof_git_seam_for_test(
+                Some(failing.clone()),
+                None,
+            ));
+        }));
+        let outcome = close_merged(&mut broker, &session, &mut table, None);
+
+        assert_eq!(
+            outcome,
+            declined_as(crate::broker::LandedSessionDecline::WorktreeUnavailable)
+        );
+        assert!(is_open(&broker, session.id));
+    }
+
+    /// Each consecutive `proof_timed_out` doubles the session's budget, a
+    /// conclusive answer ends the streak, an inconclusive one leaves it, and
+    /// the session timing out longest is the one a pass grants its share to.
+    #[test]
+    fn timeout_streaks_double_the_budget_and_name_the_oldest() {
+        use crate::broker::LandedSessionDecline as Decline;
+        let base = Duration::from_secs(10);
+        assert_eq!(crate::broker::doubled_proof_budget(base, 0), base);
+        assert_eq!(
+            crate::broker::doubled_proof_budget(base, 3),
+            Duration::from_secs(80)
+        );
+        assert_eq!(
+            crate::broker::doubled_proof_budget(base, 100),
+            crate::broker::doubled_proof_budget(base, 16),
+            "the doubling is bounded; the pass deadline bounds it first"
+        );
+
+        let (_owner, _storage, mut broker) = fixture("");
+        let (first, _) = session(&mut broker, "first to time out", false);
+        let (second, _) = session(&mut broker, "second to time out", false);
+        let base_budget = broker.landed_proof_session_budget(first.id);
+        broker.record_landed_proof_outcome(first.id, Some(Decline::ProofTimedOut));
+        broker.record_landed_proof_outcome(second.id, Some(Decline::ProofTimedOut));
+        broker.record_landed_proof_outcome(first.id, Some(Decline::ProofTimedOut));
+        assert_eq!(
+            broker.landed_proof_session_budget(first.id),
+            base_budget * 4
+        );
+        assert_eq!(
+            broker.landed_proof_session_budget(second.id),
+            base_budget * 2
+        );
+        assert_eq!(
+            broker.oldest_timed_out_session(&[first.id, second.id]),
+            Some(first.id)
+        );
+        assert_eq!(
+            broker.oldest_timed_out_session(&[second.id]),
+            Some(second.id),
+            "only sessions the pass may judge are granted"
+        );
+
+        broker.record_landed_proof_outcome(first.id, Some(Decline::Busy));
+        assert_eq!(
+            broker.landed_proof_session_budget(first.id),
+            base_budget * 4,
+            "contention leaves the streak"
+        );
+        broker.record_landed_proof_outcome(first.id, Some(Decline::NotLanded));
+        assert_eq!(broker.landed_proof_session_budget(first.id), base_budget);
+        broker.record_landed_proof_outcome(second.id, None);
+        assert!(broker.landed_proof_timeout_streaks().is_empty());
+        {
+            let _grant = crate::broker::long_proof_grant(second.id);
+            assert_eq!(broker.landed_proof_session_budget(second.id), Duration::MAX);
+            assert_eq!(broker.landed_proof_session_budget(first.id), base_budget);
+        }
+        assert_eq!(broker.landed_proof_session_budget(second.id), base_budget);
+    }
+
+    /// A session whose proof always outlives its own budget is still closed:
+    /// the next pass grants the session timing out longest the rest of the
+    /// lane's share. The base budget is zero, so only the grant can prove it.
+    #[test]
+    fn the_oldest_timed_out_session_is_granted_the_share_and_closes() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let session = merged_quiet_session(&mut broker, "always slow");
+        let _budget = crate::broker::landed_proof_session_budget_for_test(None, Duration::ZERO);
+        let pass = || Some(std::time::Instant::now() + Duration::from_secs(3_600));
+
+        let first = broker
+            .retire_abandoned_sessions_for_recovery(pass())
+            .unwrap();
+        assert_eq!(
+            first.landed_sessions_declined.get("proof_timed_out"),
+            Some(&1),
+            "{first:#?}"
+        );
+        assert!(is_open(&broker, session.id));
+
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let second = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker
+                .retire_abandoned_sessions_for_recovery(pass())
+                .unwrap()
+        };
+        assert_eq!(second.merged_pull_request_sessions_closed, 1, "{second:#?}");
+        assert!(!is_open(&broker, session.id));
+        assert_eq!(
+            phase_count(&recorder, "landed_proof_long_budget_granted"),
+            1
+        );
+        assert!(
+            broker.landed_proof_timeout_streaks().is_empty(),
+            "the close ends the streak"
+        );
+    }
+
     /// A session whose proof runs past its own budget is kept as
     /// `proof_timed_out`, and the likely-landed queue goes on to the next
     /// session in the same pass instead of stopping there: one slow checkout

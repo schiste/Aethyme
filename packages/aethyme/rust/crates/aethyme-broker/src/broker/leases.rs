@@ -362,6 +362,24 @@ impl LandedSessionDecline {
         })
     }
 
+    /// Whether this decline answered the session's question, so a
+    /// `proof_timed_out` streak ends: anything but running out of time,
+    /// contention or evidence that could not be read.
+    pub(crate) const fn is_conclusive(self) -> bool {
+        !matches!(
+            self,
+            Self::ProofTimedOut
+                | Self::BudgetExhausted
+                | Self::Busy
+                | Self::HolderUnknown
+                | Self::LeaseUnknown
+                | Self::OperationUnknown
+                | Self::LandingUnknown
+                | Self::WorktreeUnavailable
+                | Self::PolicyUnavailable
+        )
+    }
+
     /// Whether the abandonment lane may still judge the session by its own
     /// rules after this decline. Contention and unknown or active process
     /// evidence apply to both lanes alike, so they are reported once instead
@@ -683,25 +701,60 @@ pub(crate) struct LandedProof {
 /// event of any kind, is legacy.
 const HOLDER_RECORDING_SHIPPED_MS: i64 = 1_791_158_400_000;
 
-/// The longest one session's landed proof may run inside a budgeted pass.
-/// Past it the session is declined `proof_timed_out` (kept) and the lane
-/// moves on: one checkout whose `git status` crawls on a loaded host used to
-/// hold the whole retirement share, and with it the host slot, for minutes.
-/// A worker pass is at most 30 seconds, so a pass still reaches several
-/// sessions; the ignored-path listing alone keeps its own 15-second bound.
+/// The base budget of one session's landed judgement inside a budgeted
+/// pass: the proof, a memoized re-proof and the re-checks under the claims
+/// share it. Past it the session is declined `proof_timed_out` (kept) and
+/// the lane moves on: one checkout whose `git status` crawls on a loaded
+/// host used to hold the whole retirement share, and with it the host slot,
+/// for minutes. Each consecutive `proof_timed_out` doubles that session's
+/// budget (up to what is left of the pass), and once per pass the oldest
+/// timed-out session gets the rest of the lane's share, so every session is
+/// eventually judged conclusively.
 pub(crate) const LANDED_PROOF_SESSION_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(10);
 
+/// Meta key of the consecutive `proof_timed_out` streaks: a JSON object
+/// from session id to `[streak, first timed out at (epoch ms)]`.
+pub(crate) const LANDED_PROOF_TIMEOUTS_KEY: &str = "landed_lane.proof_timeouts";
+/// Streaks remembered at most; the most recent first-timeouts go first.
+const LANDED_PROOF_TIMEOUTS_MAX: usize = 4_096;
+/// Doublings at most: the pass deadline caps the budget long before.
+const LANDED_PROOF_MAX_DOUBLINGS: u32 = 16;
+
+thread_local! {
+    /// The session this thread's lane granted the rest of its share to.
+    static LONG_PROOF_GRANT: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+/// While held, `session_id`'s landed judgements on this thread are bounded
+/// by the pass deadline only (the long-budget grant).
+pub(crate) struct LongProofGrant(Option<i64>);
+
+impl Drop for LongProofGrant {
+    fn drop(&mut self) {
+        LONG_PROOF_GRANT.with(|cell| cell.set(self.0));
+    }
+}
+
+/// Grant `session_id` the rest of the lane's share until the guard drops.
+pub(crate) fn long_proof_grant(session_id: i64) -> LongProofGrant {
+    crate::phase_telemetry::add(
+        "landed_proof_long_budget_granted",
+        std::time::Duration::ZERO,
+    );
+    LongProofGrant(LONG_PROOF_GRANT.with(|cell| cell.replace(Some(session_id))))
+}
+
 #[cfg(test)]
 thread_local! {
-    /// Test seam: the per-session proof budget, for one session id or (with
+    /// Test seam: the base per-session budget, for one session id or (with
     /// `None`) for every session, instead of [`LANDED_PROOF_SESSION_BUDGET`].
     static LANDED_PROOF_SESSION_BUDGET_FOR_TEST:
         std::cell::Cell<Option<(Option<i64>, std::time::Duration)>> =
         const { std::cell::Cell::new(None) };
 }
 
-/// Install a per-session proof budget for this test thread until the guard
+/// Install a base per-session budget for this test thread until the guard
 /// drops: for `session_id` only, or for every session with `None`.
 #[cfg(test)]
 pub(crate) fn landed_proof_session_budget_for_test(
@@ -724,18 +777,64 @@ impl Drop for LandedProofSessionBudgetRestore {
     }
 }
 
-/// The per-session proof budget for `session_id`.
+/// The base per-session budget for `session_id`.
 #[cfg(not(test))]
-fn landed_proof_session_budget(_session_id: i64) -> std::time::Duration {
+fn landed_proof_base_budget(_session_id: i64) -> std::time::Duration {
     LANDED_PROOF_SESSION_BUDGET
 }
 
-/// The per-session proof budget for `session_id`, or the test override.
+/// The base per-session budget for `session_id`, or the test override.
 #[cfg(test)]
-fn landed_proof_session_budget(session_id: i64) -> std::time::Duration {
+fn landed_proof_base_budget(session_id: i64) -> std::time::Duration {
     match LANDED_PROOF_SESSION_BUDGET_FOR_TEST.with(std::cell::Cell::get) {
         Some((only, budget)) if only.is_none_or(|only| only == session_id) => budget,
         _ => LANDED_PROOF_SESSION_BUDGET,
+    }
+}
+
+/// `base` doubled once per consecutive `proof_timed_out`.
+pub(crate) fn doubled_proof_budget(base: std::time::Duration, streak: u32) -> std::time::Duration {
+    base.saturating_mul(1_u32 << streak.min(LANDED_PROOF_MAX_DOUBLINGS))
+}
+
+/// The phase counter one timeout streak of `streak` adds.
+const fn proof_timeout_streak_counter(streak: u32) -> &'static str {
+    match streak {
+        0 | 1 => "landed_proof_timeout_streak_1",
+        2 => "landed_proof_timeout_streak_2",
+        3 | 4 => "landed_proof_timeout_streak_3_4",
+        _ => "landed_proof_timeout_streak_5_plus",
+    }
+}
+
+/// The session deadline of one judgement: the earlier of the pass deadline
+/// and `budget` from now; unbudgeted callers stay unbounded.
+fn session_deadline_within(
+    pass: Option<std::time::Instant>,
+    budget: std::time::Duration,
+) -> Option<std::time::Instant> {
+    pass.map(|pass| {
+        std::time::Instant::now()
+            .checked_add(budget)
+            .map_or(pass, |end| pass.min(end))
+    })
+}
+
+/// The decline of a listing that failed: the pass ran out
+/// (`budget_exhausted`), only this session's budget did (`proof_timed_out`),
+/// or neither (`otherwise`).
+fn stopped_listing_decline(
+    pass: Option<std::time::Instant>,
+    session: Option<std::time::Instant>,
+    otherwise: LandedSessionDecline,
+) -> LandedSessionDecline {
+    let now = std::time::Instant::now();
+    if pass.is_some_and(|pass| now >= pass) {
+        LandedSessionDecline::BudgetExhausted
+    } else if session.is_some_and(|session| now >= session) {
+        LandedSessionDecline::ProofTimedOut
+    } else {
+        otherwise
     }
 }
 
@@ -1460,7 +1559,7 @@ impl Broker {
         allow_process_snapshot: bool,
         deadline: Option<std::time::Instant>,
     ) -> Result<AbandonedSessionCloseOutcome, BrokerOpError> {
-        self.try_close_session_inner(
+        let outcome = self.try_close_session_inner(
             session_id,
             decision_now_ms,
             landed_after_ms,
@@ -1468,7 +1567,9 @@ impl Broker {
             allow_process_snapshot,
             deadline,
             SessionCloseLane::Landed,
-        )
+        )?;
+        self.record_landed_proof_outcome(session_id, LandedSessionDecline::from_outcome(outcome));
+        Ok(outcome)
     }
 
     /// The landed close for a spawned session whose every recorded pull
@@ -1485,7 +1586,7 @@ impl Broker {
         allow_process_snapshot: bool,
         deadline: Option<std::time::Instant>,
     ) -> Result<AbandonedSessionCloseOutcome, BrokerOpError> {
-        self.try_close_session_inner(
+        let outcome = self.try_close_session_inner(
             session_id,
             decision_now_ms,
             merged_after_ms,
@@ -1493,7 +1594,9 @@ impl Broker {
             allow_process_snapshot,
             deadline,
             SessionCloseLane::MergedPullRequest,
-        )
+        )?;
+        self.record_landed_proof_outcome(session_id, LandedSessionDecline::from_outcome(outcome));
+        Ok(outcome)
     }
 
     /// The early close for a session that never did any work, after
@@ -1712,30 +1815,128 @@ impl Broker {
     /// The content search runs only when a merged pull request, a
     /// representation or ancestry already suggests a landing, stops at
     /// `deadline` (`BudgetExhausted`), and is not repeated for a HEAD it
-    /// already found unlanded against the same default-branch tip.
+    /// already found unlanded against the same default-branch tip. The close
+    /// path computes its one session deadline itself; this entry point is
+    /// the proof alone, for tests.
+    #[cfg(test)]
     pub(crate) fn landed_session_decline(
         &self,
         session: &crate::Session,
         deadline: Option<std::time::Instant>,
     ) -> Result<LandedProof, LandedSessionDecline> {
-        self.landed_session_decline_with_memo(session, deadline, true)
+        let session_deadline =
+            session_deadline_within(deadline, self.landed_proof_session_budget(session.id));
+        self.landed_session_decline_with_memo(session, deadline, session_deadline, true)
+    }
+
+    /// The consecutive `proof_timed_out` streaks, by session id, as
+    /// `(streak, first timed out at)`. Unreadable state reads as none.
+    pub(crate) fn landed_proof_timeout_streaks(
+        &self,
+    ) -> std::collections::BTreeMap<i64, (u32, i64)> {
+        self.store_ref()
+            .meta_get(LANDED_PROOF_TIMEOUTS_KEY)
+            .ok()
+            .flatten()
+            .and_then(|value| {
+                serde_json::from_str::<std::collections::BTreeMap<i64, (u32, i64)>>(&value).ok()
+            })
+            .unwrap_or_default()
+    }
+
+    /// This session's budget for one landed judgement: the base budget
+    /// doubled once per consecutive `proof_timed_out`, or (a long-budget
+    /// grant) unbounded but for the pass deadline.
+    pub(crate) fn landed_proof_session_budget(&self, session_id: i64) -> std::time::Duration {
+        if LONG_PROOF_GRANT.with(std::cell::Cell::get) == Some(session_id) {
+            return std::time::Duration::MAX;
+        }
+        let streak = self
+            .landed_proof_timeout_streaks()
+            .get(&session_id)
+            .map_or(0, |(streak, _)| *streak);
+        let budget = doubled_proof_budget(landed_proof_base_budget(session_id), streak);
+        if streak > 0 {
+            crate::phase_telemetry::add("landed_proof_session_budget_doubled", budget);
+        }
+        budget
+    }
+
+    /// Record how one landed judgement of `session_id` ended: a
+    /// `proof_timed_out` extends its streak, any conclusive outcome (a close
+    /// included, `decline` `None`) ends it.
+    pub(crate) fn record_landed_proof_outcome(
+        &self,
+        session_id: i64,
+        decline: Option<LandedSessionDecline>,
+    ) {
+        let mut streaks = self.landed_proof_timeout_streaks();
+        let changed = match decline {
+            Some(LandedSessionDecline::ProofTimedOut) => {
+                let entry = streaks
+                    .entry(session_id)
+                    .or_insert((0, crate::clock::epoch_ms()));
+                entry.0 = entry.0.saturating_add(1);
+                crate::phase_telemetry::add(
+                    proof_timeout_streak_counter(entry.0),
+                    std::time::Duration::ZERO,
+                );
+                true
+            }
+            Some(reason) if !reason.is_conclusive() => false,
+            _ => {
+                let ended = streaks.remove(&session_id);
+                if ended.is_some() {
+                    crate::phase_telemetry::add(
+                        "landed_proof_timeout_streak_ended",
+                        std::time::Duration::ZERO,
+                    );
+                }
+                ended.is_some()
+            }
+        };
+        if !changed {
+            return;
+        }
+        while streaks.len() > LANDED_PROOF_TIMEOUTS_MAX {
+            let Some((&latest, _)) = streaks.iter().max_by_key(|(_, (_, first))| *first) else {
+                break;
+            };
+            streaks.remove(&latest);
+        }
+        crate::warn_unrecorded(
+            "remember landed-proof timeout streaks",
+            self.store_ref().meta_set(
+                LANDED_PROOF_TIMEOUTS_KEY,
+                &serde_json::to_string(&streaks).unwrap_or_default(),
+            ),
+        );
+    }
+
+    /// Of `candidates`, the session that has been timing out longest: the
+    /// one a pass grants the rest of its share to.
+    pub(crate) fn oldest_timed_out_session(&self, candidates: &[i64]) -> Option<i64> {
+        self.landed_proof_timeout_streaks()
+            .into_iter()
+            .filter(|(session_id, _)| candidates.contains(session_id))
+            .min_by_key(|(session_id, (_, first))| (*first, *session_id))
+            .map(|(session_id, _)| session_id)
     }
 
     /// [`Self::landed_session_decline`]; with `use_memo` false a remembered
     /// landing is not trusted and the search runs again, as it does under
-    /// the claims before a close that rested on one.
+    /// the claims before a close that rested on one. `session_deadline` is
+    /// the one session deadline of this judgement (the earlier of the pass
+    /// deadline and the session's budget); `deadline` the pass's own.
     fn landed_session_decline_with_memo(
         &self,
         session: &crate::Session,
         deadline: Option<std::time::Instant>,
+        session_deadline: Option<std::time::Instant>,
         use_memo: bool,
     ) -> Result<LandedProof, LandedSessionDecline> {
-        // A budgeted pass also bounds this one session: every Git child of
-        // the proof (the content search and the proof-3 listings alike)
-        // stops at the earlier of the pass deadline and the session budget.
-        let session_deadline = deadline.map(|pass| {
-            pass.min(std::time::Instant::now() + landed_proof_session_budget(session.id))
-        });
+        // Every Git child of the proof (the content search and the proof-3
+        // listings alike) stops at the session deadline.
         let _git_deadline = session_deadline.map(crate::git::limit_git_until);
         let out_of_budget =
             || session_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
@@ -1857,9 +2058,24 @@ impl Broker {
                 .map_err(|_| LandedSessionDecline::LandingUnknown)?;
             let landed = remembered.is_some() || {
                 let _span = crate::phase_telemetry::span("landed_landing_search");
+                // A Git call the deadline stopped inside the search can read
+                // as "not delivered" (an ancestry check that answers false
+                // on error): any timeout makes the search inconclusive.
+                let timeouts_before = crate::git::git_timeout_generation();
                 let delivery = self
                     .head_delivery(session, &checkout, &head, &queue)
                     .map_err(|_| unknown(LandedSessionDecline::LandingUnknown))?;
+                if crate::git::git_timeout_generation() != timeouts_before {
+                    crate::phase_telemetry::add(
+                        "landed_landing_search_timed_out",
+                        std::time::Duration::ZERO,
+                    );
+                    return Err(stopped_listing_decline(
+                        deadline,
+                        session_deadline,
+                        LandedSessionDecline::LandingUnknown,
+                    ));
+                }
                 // Only the fetched default branch counts here: a local
                 // integration commit is not a landing a pull-request
                 // repository recognises.
@@ -1928,7 +2144,12 @@ impl Broker {
                 );
                 Err(LandedSessionDecline::WorktreeUnclean)
             }
-            Err(_) => Err(unknown(LandedSessionDecline::WorktreeUnclean)),
+            // A listing that failed is no verdict on the checkout.
+            Err(_) => Err(stopped_listing_decline(
+                deadline,
+                session_deadline,
+                LandedSessionDecline::WorktreeUnavailable,
+            )),
         }
     }
 
@@ -1966,7 +2187,12 @@ impl Broker {
         &self,
         session: &crate::Session,
         proof: &LandedProof,
+        deadline: Option<std::time::Instant>,
+        session_deadline: Option<std::time::Instant>,
     ) -> Option<LandedSessionDecline> {
+        // Bounded by the judgement's one session deadline; a listing it
+        // stops is `proof_timed_out`, never a change in the checkout.
+        let _git_deadline = session_deadline.map(crate::git::limit_git_until);
         if let Err(reason) = self.landed_session_preconditions(session) {
             return Some(reason);
         }
@@ -1978,7 +2204,14 @@ impl Broker {
         }
         match self.repo_handle().upstream_default() {
             Some((_, tip)) if tip == proof.upstream_tip => {}
-            _ => return Some(LandedSessionDecline::UpstreamMoved),
+            Some(_) => return Some(LandedSessionDecline::UpstreamMoved),
+            None => {
+                return Some(stopped_listing_decline(
+                    deadline,
+                    session_deadline,
+                    LandedSessionDecline::UpstreamMoved,
+                ));
+            }
         }
         let Ok(policy) = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root()) else {
             return Some(LandedSessionDecline::PolicyUnavailable);
@@ -1990,7 +2223,12 @@ impl Broker {
             &policy,
         ) {
             Ok(None) => None,
-            Ok(Some(_)) | Err(_) => Some(LandedSessionDecline::WorktreeUnclean),
+            Ok(Some(_)) => Some(LandedSessionDecline::WorktreeUnclean),
+            Err(_) => Some(stopped_listing_decline(
+                deadline,
+                session_deadline,
+                LandedSessionDecline::WorktreeUnavailable,
+            )),
         }
     }
 
@@ -2015,6 +2253,14 @@ impl Broker {
             lane,
             SessionCloseLane::Landed | SessionCloseLane::MergedPullRequest
         );
+        // One session deadline for the whole landed judgement: the proof, a
+        // memoized re-proof before the claims and the re-checks under them
+        // share this session's budget.
+        let session_deadline = if require_landed {
+            session_deadline_within(deadline, self.landed_proof_session_budget(session_id))
+        } else {
+            deadline
+        };
         let merged_lane = lane == SessionCloseLane::MergedPullRequest;
         let no_work_lane = lane == SessionCloseLane::NoWork;
         if abandon_after_ms <= 0 {
@@ -2148,7 +2394,12 @@ impl Broker {
         // and the holder (one process table per pass) is asked first.
         let mut landed_proof = if require_landed && !merged_lane {
             let _span = crate::phase_telemetry::span("landed_proof");
-            match self.landed_session_decline(&candidate, deadline) {
+            match self.landed_session_decline_with_memo(
+                &candidate,
+                deadline,
+                session_deadline,
+                true,
+            ) {
                 Ok(proof) => Some(proof),
                 Err(reason) => {
                     return Ok(keep_with(
@@ -2355,7 +2606,12 @@ impl Broker {
                 std::time::Duration::ZERO,
             );
             let _span = crate::phase_telemetry::span("landed_proof");
-            match self.landed_session_decline(&candidate, deadline) {
+            match self.landed_session_decline_with_memo(
+                &candidate,
+                deadline,
+                session_deadline,
+                true,
+            ) {
                 Ok(proof) => landed_proof = Some(proof),
                 Err(reason) => {
                     return Ok(keep_with(
@@ -2412,7 +2668,12 @@ impl Broker {
         // checkout.
         if let Some(remembered) = landed_proof.as_ref().filter(|proof| proof.memoized) {
             let _span = crate::phase_telemetry::span("landed_reproof_before_claims");
-            match self.landed_session_decline_with_memo(&candidate, deadline, false) {
+            match self.landed_session_decline_with_memo(
+                &candidate,
+                deadline,
+                session_deadline,
+                false,
+            ) {
                 Ok(fresh) if fresh.head == remembered.head && !fresh.memoized => {
                     landed_proof = Some(fresh);
                 }
@@ -3117,7 +3378,9 @@ impl Broker {
                     AbandonedSessionCloseOutcome::Changed,
                 ));
             };
-            if let Some(reason) = self.landed_proof_still_holds(&current, proof) {
+            if let Some(reason) =
+                self.landed_proof_still_holds(&current, proof, deadline, session_deadline)
+            {
                 return Ok(keep_with(
                     process_table,
                     AbandonmentKeepReason::LandedDeclined,
@@ -3185,22 +3448,32 @@ impl Broker {
                     ),
                 ));
             };
-            match crate::auto_cleanup::uncommitted_reason(
-                worktree,
-                Some(current.branch.as_str()),
-                self.main_root(),
-                &policy,
-            ) {
-                Ok(None) => {}
-                Ok(Some(_)) | Err(_) => {
-                    return Ok(keep_with(
-                        process_table,
-                        AbandonmentKeepReason::LandedDeclined,
-                        AbandonedSessionCloseOutcome::LandedDeclined(
-                            LandedSessionDecline::MovedBeforeClose,
-                        ),
-                    ));
-                }
+            let last_look = {
+                let _git_deadline = session_deadline.map(crate::git::limit_git_until);
+                crate::auto_cleanup::uncommitted_reason(
+                    worktree,
+                    Some(current.branch.as_str()),
+                    self.main_root(),
+                    &policy,
+                )
+            };
+            let changed = match last_look {
+                Ok(None) => None,
+                Ok(Some(_)) => Some(LandedSessionDecline::MovedBeforeClose),
+                // A listing that failed or was stopped is no change by the
+                // agent: it keeps the session under its own name.
+                Err(_) => Some(stopped_listing_decline(
+                    deadline,
+                    session_deadline,
+                    LandedSessionDecline::WorktreeUnavailable,
+                )),
+            };
+            if let Some(reason) = changed {
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::LandedDeclined,
+                    AbandonedSessionCloseOutcome::LandedDeclined(reason),
+                ));
             }
         }
         // The no-work conditions are read last, under both claims.
