@@ -1035,6 +1035,7 @@ mod tests {
         base: String,
         stop: Arc<AtomicBool>,
         watcher: Option<std::thread::JoinHandle<()>>,
+        stats: Arc<imp::Stats>,
     }
 
     impl Fixture {
@@ -1058,6 +1059,7 @@ mod tests {
                 base: String::from_utf8(head.stdout).unwrap().trim().to_string(),
                 stop: Arc::new(AtomicBool::new(false)),
                 watcher: None,
+                stats: Arc::new(imp::Stats::default()),
                 _holder: holder,
             }
         }
@@ -1065,9 +1067,10 @@ mod tests {
         fn start_watcher(&mut self) {
             let directory = self.directory.clone();
             let stop = Arc::clone(&self.stop);
+            let stats = Arc::clone(&self.stats);
             self.stop.store(false, Ordering::Relaxed);
             self.watcher = Some(std::thread::spawn(move || {
-                imp::run(&directory, &stop).unwrap();
+                imp::run_with_stats(&directory, &stop, stats).unwrap();
             }));
         }
 
@@ -1224,5 +1227,352 @@ mod tests {
                 changed_files_in(&fixture.directory, &fixture.checkout, "HEAD").unwrap();
             assert_eq!(source, Source::Git);
         }
+    }
+
+    fn load(counter: &std::sync::atomic::AtomicU64) -> u64 {
+        counter.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn an_event_storm_writes_a_bounded_number_of_counters_and_still_asks_git() {
+        let mut fixture = Fixture::new();
+        fixture.start_watcher();
+        assert!(fixture.ask_until(Source::Reused).is_empty());
+        let stats = Arc::clone(&fixture.stats);
+        let published = || load(&stats.published_initial) + load(&stats.published_claimed);
+        let (published_before, rounds_before) = (published(), load(&stats.rounds));
+        let started = Instant::now();
+
+        // A build rewriting many files as fast as it can, with nobody asking.
+        let root = fixture.checkout.root().to_path_buf();
+        let mut writes = 0_u64;
+        while started.elapsed() < Duration::from_secs(1) && writes < 20_000 {
+            std::fs::write(
+                root.join(format!("storm-{}.txt", writes % 200)),
+                writes.to_string(),
+            )
+            .unwrap();
+            writes += 1;
+        }
+        let elapsed = started.elapsed();
+        let (published_during, rounds_during) = (
+            published() - published_before,
+            load(&stats.rounds) - rounds_before,
+        );
+        assert!(writes >= 1_000, "the storm wrote only {writes} files");
+        // One counter for the first change after the stored answer's claim;
+        // nobody claimed the new counter, so the rest of the storm is free.
+        assert!(
+            published_during <= 3,
+            "{published_during} counters written for {writes} file writes"
+        );
+        // Every round lasts at least COALESCE while events keep coming.
+        let ceiling = (elapsed.as_millis() / COALESCE.as_millis()) as u64 + 3;
+        assert!(
+            rounds_during <= ceiling,
+            "{rounds_during} rounds in {elapsed:?}, ceiling {ceiling}"
+        );
+
+        // The answer stored before the storm is never reused after it.
+        let (files, source) = fixture.ask();
+        assert_eq!(source, Source::Git, "published: {:?}", fixture.published());
+        assert_eq!(files.len(), 200, "{files:?}");
+        assert!(files.iter().all(|file| file.starts_with("storm-")));
+    }
+
+    /// A watcher core driven by hand, with no file-system watcher and no
+    /// thread, so every ordering of change, claim, answer and flush is exact.
+    struct Driven {
+        fixture: Fixture,
+        /// Held for its locks.
+        _started: Option<imp::Started>,
+        core: imp::Core,
+        key: String,
+        root: PathBuf,
+    }
+
+    impl Driven {
+        fn new() -> Self {
+            let fixture = Fixture::new();
+            let root = std::fs::canonicalize(fixture.checkout.root()).unwrap();
+            let key = imp::key_for(&root);
+            let (started, core) = Self::begin(&fixture.directory, &key, &root);
+            Self {
+                fixture,
+                _started: Some(started),
+                core,
+                key,
+                root,
+            }
+        }
+
+        /// Start a watcher epoch, watch the worktree and publish its first counter.
+        fn begin(directory: &Path, key: &str, root: &Path) -> (imp::Started, imp::Core) {
+            let started = imp::start(directory, &AtomicBool::new(false))
+                .unwrap()
+                .expect("no other watcher holds the lock");
+            let mut core = imp::Core::new(started.epoch.clone(), Arc::new(imp::Stats::default()));
+            core.watch(key.to_string(), root.to_path_buf());
+            core.flush(directory);
+            (started, core)
+        }
+
+        fn restart(&mut self) {
+            self._started = None;
+            let (started, core) = Self::begin(&self.fixture.directory, &self.key, &self.root);
+            self._started = Some(started);
+            self.core = core;
+        }
+
+        /// A file changes and the file system reports it.
+        fn change(&mut self, name: &str) {
+            let path = self.root.join(name);
+            std::fs::write(&path, "x\n").unwrap();
+            let event =
+                notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Any))
+                    .add_path(path);
+            self.core.record(Ok(event));
+        }
+
+        fn flush(&mut self) {
+            self.core.flush(&self.fixture.directory);
+        }
+
+        fn seen_path(&self) -> PathBuf {
+            self.fixture.directory.join(SEEN).join(&self.key)
+        }
+
+        fn seen(&self) -> String {
+            std::fs::read_to_string(self.seen_path()).unwrap()
+        }
+
+        /// The identity of `seen/<key>`: every write renames a new file over it.
+        fn seen_identity(&self) -> (u64, std::time::SystemTime) {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(self.seen_path()).unwrap();
+            (metadata.ino(), metadata.modified().unwrap())
+        }
+
+        fn observe(&self) -> imp::Observed {
+            imp::observe(&self.fixture.directory, &self.root, &self.fixture.base)
+                .expect("a live watcher with a published counter")
+        }
+
+        fn claim(&self, observed: &imp::Observed) {
+            assert!(imp::claim(&self.fixture.directory, observed));
+        }
+
+        fn git(&self) -> Vec<String> {
+            self.fixture
+                .checkout
+                .changed_files(&self.fixture.base)
+                .unwrap()
+        }
+
+        fn answer(&self, observed: &imp::Observed, files: &[String]) {
+            imp::write_answer(&self.fixture.directory, observed, files);
+        }
+    }
+
+    #[test]
+    fn a_change_after_a_claim_is_never_answered_from_the_old_answer() {
+        // Race (a), the dangerous order, and race (c): two commands observe
+        // the same counter and ask Git before a change; both store their
+        // answers only after the watcher acted on the change.
+        let mut driven = Driven::new();
+        let first = driven.observe();
+        driven.claim(&first);
+        let first_files = driven.git();
+        let claim_path = imp::claim_path(&driven.fixture.directory, &first);
+        let claim_identity = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&claim_path).unwrap().ino()
+        };
+        let second = driven.observe();
+        driven.claim(&second);
+        {
+            use std::os::unix::fs::MetadataExt;
+            let shared = std::fs::metadata(&claim_path).unwrap().ino();
+            assert_eq!(
+                shared, claim_identity,
+                "a second claim of one counter rewrote it"
+            );
+        }
+        let second_files = driven.git();
+        let before = driven.seen();
+        driven.change("new.txt");
+        driven.flush();
+        assert_ne!(
+            driven.seen(),
+            before,
+            "a claimed counter must move on a change"
+        );
+        driven.answer(&first, &first_files);
+        driven.answer(&second, &second_files);
+        let (files, source) = driven.fixture.ask();
+        assert_eq!(source, Source::Git);
+        assert_eq!(files, ["new.txt"]);
+    }
+
+    #[test]
+    fn an_answer_stored_before_the_flush_is_outdated_by_it() {
+        // Race (b): the answer lands after the event arrived but before the
+        // watcher acted on it.
+        let mut driven = Driven::new();
+        let observed = driven.observe();
+        driven.claim(&observed);
+        let files = driven.git();
+        driven.change("new.txt");
+        driven.answer(&observed, &files);
+        driven.flush();
+        let (files, source) = driven.fixture.ask();
+        assert_eq!(source, Source::Git);
+        assert_eq!(files, ["new.txt"]);
+    }
+
+    #[test]
+    fn a_claim_landing_before_the_flush_moves_the_counter() {
+        // Race (b), claim side: the claim lands between the event and the
+        // watcher's check, so the check must see it.
+        let mut driven = Driven::new();
+        let observed = driven.observe();
+        driven.change("new.txt");
+        driven.claim(&observed);
+        let before = driven.seen();
+        driven.flush();
+        assert_ne!(driven.seen(), before);
+        driven.answer(&observed, &driven.git());
+        assert_eq!(driven.fixture.ask().1, Source::Git);
+    }
+
+    #[test]
+    fn a_claim_after_a_skipped_change_stores_an_answer_that_includes_it() {
+        // Race (a), the order the skip relies on: the command observed the
+        // counter before the change but claims it only after the watcher
+        // decided to skip, so Git runs after the change and sees it.
+        let mut driven = Driven::new();
+        let observed = driven.observe();
+        let identity = driven.seen_identity();
+        driven.change("new.txt");
+        driven.flush();
+        assert_eq!(
+            driven.seen_identity(),
+            identity,
+            "an unclaimed counter was rewritten"
+        );
+        driven.claim(&observed);
+        let files = driven.git();
+        assert_eq!(files, ["new.txt"]);
+        driven.answer(&observed, &files);
+        assert_eq!(
+            driven.fixture.ask(),
+            (vec!["new.txt".to_string()], Source::Reused)
+        );
+    }
+
+    #[test]
+    fn a_late_claim_of_an_older_counter_does_not_hide_a_newer_claim() {
+        let mut driven = Driven::new();
+        // A slow command observes the first counter...
+        let slow = driven.observe();
+        let early = driven.observe();
+        driven.claim(&early);
+        driven.change("first.txt");
+        driven.flush();
+        // ...a fast command claims the second counter and asks Git...
+        let fast = driven.observe();
+        assert_ne!(fast.token(), slow.token());
+        driven.claim(&fast);
+        let fast_files = driven.git();
+        // ...and only then does the slow command claim its older counter.
+        driven.claim(&slow);
+        driven.change("second.txt");
+        driven.flush();
+        driven.answer(&fast, &fast_files);
+        let (files, source) = driven.fixture.ask();
+        assert_eq!(source, Source::Git);
+        assert_eq!(files, ["first.txt", "second.txt"]);
+        // The sweep removes the orphaned claim and keeps the current one.
+        let current = driven.observe();
+        driven.claim(&current);
+        driven.core.sweep_claims(&driven.fixture.directory);
+        assert!(!imp::claim_path(&driven.fixture.directory, &slow).exists());
+        assert!(imp::claim_path(&driven.fixture.directory, &current).exists());
+    }
+
+    #[test]
+    fn a_restarted_watcher_ignores_the_previous_epochs_claims_and_answers() {
+        // Race (d).
+        let mut driven = Driven::new();
+        let observed = driven.observe();
+        driven.claim(&observed);
+        driven.answer(&observed, &driven.git());
+        assert_eq!(driven.fixture.ask().1, Source::Reused);
+        driven.restart();
+        driven.change("new.txt");
+        driven.flush();
+        let (files, source) = driven.fixture.ask();
+        assert_eq!(source, Source::Git);
+        assert_eq!(files, ["new.txt"]);
+    }
+
+    #[test]
+    fn an_unchanged_or_unclaimed_counter_is_never_rewritten() {
+        let mut driven = Driven::new();
+        let identity = driven.seen_identity();
+        for _ in 0..3 {
+            driven.flush();
+        }
+        assert_eq!(
+            driven.seen_identity(),
+            identity,
+            "an unchanged counter was rewritten"
+        );
+        for name in ["one.txt", "two.txt", "three.txt"] {
+            driven.change(name);
+            driven.flush();
+        }
+        assert_eq!(
+            driven.seen_identity(),
+            identity,
+            "an unclaimed counter was rewritten"
+        );
+        let stats = &driven.core.stats;
+        assert_eq!(load(&stats.published_initial), 1);
+        assert_eq!(load(&stats.published_claimed), 0);
+        assert_eq!(load(&stats.skipped_unclaimed), 3);
+    }
+
+    #[test]
+    fn stale_temporaries_are_removed_at_startup() {
+        let fixture = Fixture::new();
+        let directory = &fixture.directory;
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        let mut stale = Vec::new();
+        for folder in [WANTED, ANSWERS, SEEN] {
+            std::fs::create_dir_all(directory.join(folder)).unwrap();
+            stale.push(directory.join(folder).join(".0123456789ab.4242.7"));
+        }
+        stale.push(directory.join(".epoch.4242.3"));
+        for path in &stale {
+            std::fs::write(path, "x").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        // A command may be mid-write right now: a fresh temporary stays.
+        let fresh = directory.join(ANSWERS).join(".0123456789ab.4243.0");
+        std::fs::write(&fresh, "x").unwrap();
+        let started = imp::start(directory, &AtomicBool::new(false))
+            .unwrap()
+            .expect("no other watcher holds the lock");
+        for path in &stale {
+            assert!(!path.exists(), "{} was left behind", path.display());
+        }
+        assert!(fresh.exists(), "a temporary being written was removed");
+        drop(started);
     }
 }
