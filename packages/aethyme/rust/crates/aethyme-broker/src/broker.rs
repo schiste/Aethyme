@@ -3465,6 +3465,8 @@ mod leases;
 mod missing_checkout;
 mod owners;
 mod remote_heads;
+#[cfg(test)]
+pub(crate) use leases::landed_proof_session_budget_for_test;
 pub(crate) use leases::{
     AbandonedSessionCloseOutcome, AbandonmentKeepReason, LandedProof, LandedSessionDecline,
     validate_session_commit_args,
