@@ -5237,7 +5237,9 @@ impl Broker {
 
     /// Start or resume one complete, bounded-by-deadline filesystem alias
     /// refresh. This is called once per maintenance pass; proof lookups only
-    /// consume the resulting lap and never rewind it.
+    /// consume the resulting lap and never rewind it. Production lanes use
+    /// the resume-only or paced variants; tests drive a full lap with it.
+    #[cfg(test)]
     pub(crate) fn refresh_cleanup_cohort_aliases(
         &mut self,
         deadline: Option<Instant>,
