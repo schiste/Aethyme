@@ -213,6 +213,16 @@ impl ProcessTable {
             // Both sources refused, or `ps` alone was refused: no retry in
             // this command will see the table.
             ProcessTableObservation::Failed if native_denied => ProcessTableObservation::Denied,
+            // The native refusal was not the caller's sandbox after all:
+            // `ps` listed the table. Counted apart so the native counter is
+            // not read as the number of refused commands.
+            observation @ ProcessTableObservation::Complete(_) if native_denied => {
+                crate::phase_telemetry::add(
+                    "holder_process_table_native_denied_ps_complete",
+                    Duration::ZERO,
+                );
+                observation
+            }
             observation => observation,
         }
     }
@@ -575,6 +585,56 @@ fn kinfo_listing_outcome(
     }
 }
 
+/// Fetch attempts one `KERN_PROC_ALL` listing makes at most.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+const KINFO_FETCH_ATTEMPTS: usize = 5;
+
+/// The two-call `KERN_PROC_ALL` pattern: `size_query` asks how many bytes
+/// the table needs, `fetch(capacity)` lists into room for `capacity`
+/// entries and returns the buffer and the bytes written. A table that grew
+/// between the calls (`ENOMEM`) is fetched again with twice the room. A
+/// fetch refused after the same sysctl answered the size query is not a
+/// settled refusal (a sandbox refusing the name refuses the size query
+/// too), so it is fetched once more, with twice the room, before it counts
+/// as `Denied` (`holder_process_table_native_denied_retried`). A refused
+/// size query is `Denied` at once; any other error, a short read or running
+/// out of attempts is `Failed`.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn list_kinfo_with_retries<T>(
+    element: usize,
+    mut size_query: impl FnMut() -> Result<usize, i32>,
+    mut fetch: impl FnMut(usize) -> Result<(Vec<T>, usize), i32>,
+) -> Result<Vec<T>, NativeListingFailure> {
+    let classify = |errno: i32| {
+        kinfo_listing_outcome(Err(errno), element)
+            .err()
+            .unwrap_or(NativeListingFailure::Failed)
+    };
+    let needed = size_query().map_err(classify)?;
+    let mut capacity = needed / element.max(1) + 64;
+    let mut refusal_retried = false;
+    for _ in 0..KINFO_FETCH_ATTEMPTS {
+        match fetch(capacity) {
+            Ok((mut buffer, size)) => {
+                let count = kinfo_listing_outcome(Ok(size), element)?;
+                buffer.truncate(count);
+                return Ok(buffer);
+            }
+            Err(libc::ENOMEM) => capacity = capacity.saturating_mul(2),
+            Err(libc::EPERM | libc::EACCES) if !refusal_retried => {
+                refusal_retried = true;
+                crate::phase_telemetry::add(
+                    "holder_process_table_native_denied_retried",
+                    Duration::ZERO,
+                );
+                capacity = capacity.saturating_mul(2);
+            }
+            Err(errno) => return Err(classify(errno)),
+        }
+    }
+    Err(NativeListingFailure::Failed)
+}
+
 /// The process table listed natively instead of by a `ps` child: a sandboxed
 /// caller may be refused the spawn, and each refusal used to leave a whole
 /// retirement pass judging every holder unknown.
@@ -745,30 +805,33 @@ mod native_process_table {
     }
 
     /// Every `kinfo_proc`, sized with the two-call pattern and listed again,
-    /// larger, when the table grew between the calls (`ENOMEM`).
+    /// larger, when the table grew between the calls (`ENOMEM`); see
+    /// [`super::list_kinfo_with_retries`] for the retry rules.
     fn list_all() -> Result<Vec<KinfoProc>, Failure> {
         let element = std::mem::size_of::<KinfoProc>();
         let mut name = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
-        let mut needed = 0usize;
-        // SAFETY: `name` holds three MIB entries; a null buffer asks only for
-        // the size, written to `needed`.
-        let result = unsafe {
-            libc::sysctl(
-                name.as_mut_ptr(),
-                3,
-                std::ptr::null_mut(),
-                &mut needed,
-                std::ptr::null_mut(),
-                0,
-            )
+        let size_query = || {
+            let mut name = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
+            let mut needed = 0usize;
+            // SAFETY: `name` holds three MIB entries; a null buffer asks only
+            // for the size, written to `needed`.
+            let result = unsafe {
+                libc::sysctl(
+                    name.as_mut_ptr(),
+                    3,
+                    std::ptr::null_mut(),
+                    &mut needed,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if result == 0 {
+                Ok(needed)
+            } else {
+                Err(errno())
+            }
         };
-        if result != 0 {
-            return Err(super::kinfo_listing_outcome(Err(errno()), element)
-                .err()
-                .unwrap_or(Failure::Failed));
-        }
-        let mut capacity = needed / element + 64;
-        for _ in 0..5 {
+        let fetch = |capacity: usize| {
             // SAFETY: `KinfoProc` is plain old data; zero is a valid value.
             let mut buffer: Vec<KinfoProc> = vec![unsafe { std::mem::zeroed() }; capacity];
             let mut size = capacity * element;
@@ -784,21 +847,13 @@ mod native_process_table {
                     0,
                 )
             };
-            if result != 0 {
-                let errno = errno();
-                if errno == libc::ENOMEM {
-                    capacity = capacity.saturating_mul(2);
-                    continue;
-                }
-                return Err(super::kinfo_listing_outcome(Err(errno), element)
-                    .err()
-                    .unwrap_or(Failure::Failed));
+            if result == 0 {
+                Ok((buffer, size))
+            } else {
+                Err(errno())
             }
-            let count = super::kinfo_listing_outcome(Ok(size), element)?;
-            buffer.truncate(count);
-            return Ok(buffer);
-        }
-        Err(Failure::Failed)
+        };
+        super::list_kinfo_with_retries(element, size_query, fetch)
     }
 
     fn errno() -> i32 {
@@ -2638,6 +2693,79 @@ mod tests {
             kinfo_listing_outcome(Err(libc::EIO), 648),
             Err(NativeListingFailure::Failed)
         ));
+    }
+
+    /// The two-call listing: a table that grew between the calls is fetched
+    /// again larger; a fetch refused after the size query answered is
+    /// fetched once more before it is a denial; a refused size query is a
+    /// denial at once.
+    #[cfg(unix)]
+    #[test]
+    fn a_kinfo_listing_retries_growth_and_one_refused_fetch() {
+        const ELEMENT: usize = 8;
+        // Answers each fetch from `script` in order, recording the capacity
+        // asked for; an `Ok(n)` lists `n` whole entries.
+        let run = |size: Result<usize, i32>, script: Vec<Result<usize, i32>>| {
+            let mut script = script.into_iter();
+            let mut capacities = Vec::new();
+            let recorder = crate::phase_telemetry::Recorder::default();
+            let outcome = {
+                let _installed = crate::phase_telemetry::install(recorder.clone());
+                list_kinfo_with_retries(
+                    ELEMENT,
+                    || size,
+                    |capacity| {
+                        capacities.push(capacity);
+                        match script.next().expect("no fetch past the script") {
+                            Ok(entries) => Ok((vec![0u8; capacity], entries * ELEMENT)),
+                            Err(errno) => Err(errno),
+                        }
+                    },
+                )
+                .map(|buffer| buffer.len())
+            };
+            let retried = recorder
+                .totals()
+                .1
+                .get("holder_process_table_native_denied_retried")
+                .copied()
+                .unwrap_or(0);
+            (outcome, capacities, retried)
+        };
+
+        let (outcome, capacities, retried) = run(Ok(10 * ELEMENT), vec![Ok(7)]);
+        assert_eq!(outcome.ok(), Some(7));
+        assert_eq!(capacities, vec![74]);
+        assert_eq!(retried, 0);
+
+        let (outcome, capacities, _) = run(Ok(10 * ELEMENT), vec![Err(libc::ENOMEM), Ok(80)]);
+        assert_eq!(outcome.ok(), Some(80), "a grown table is listed again");
+        assert_eq!(capacities, vec![74, 148]);
+
+        let (outcome, capacities, retried) = run(Ok(10 * ELEMENT), vec![Err(libc::EPERM), Ok(9)]);
+        assert_eq!(outcome.ok(), Some(9), "one refused fetch is retried");
+        assert_eq!(capacities, vec![74, 148]);
+        assert_eq!(retried, 1);
+
+        let (outcome, capacities, retried) =
+            run(Ok(10 * ELEMENT), vec![Err(libc::EPERM), Err(libc::EACCES)]);
+        assert!(matches!(outcome, Err(NativeListingFailure::Denied)));
+        assert_eq!(capacities.len(), 2, "a second refusal is final");
+        assert_eq!(retried, 1);
+
+        let (outcome, capacities, _) = run(Err(libc::EPERM), Vec::new());
+        assert!(matches!(outcome, Err(NativeListingFailure::Denied)));
+        assert!(capacities.is_empty(), "a refused size query lists nothing");
+
+        let (outcome, _, _) = run(Ok(10 * ELEMENT), vec![Err(libc::EIO)]);
+        assert!(matches!(outcome, Err(NativeListingFailure::Failed)));
+
+        let (outcome, capacities, _) = run(
+            Ok(10 * ELEMENT),
+            vec![Err(libc::ENOMEM); KINFO_FETCH_ATTEMPTS],
+        );
+        assert!(matches!(outcome, Err(NativeListingFailure::Failed)));
+        assert_eq!(capacities.len(), KINFO_FETCH_ATTEMPTS);
     }
 
     /// A native listing is complete only when every read succeeded or found
