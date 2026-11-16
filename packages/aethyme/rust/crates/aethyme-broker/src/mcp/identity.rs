@@ -308,7 +308,9 @@ pub fn content_digest(path: &Path) -> String {
     }
 }
 
-fn walk_tree_identity(root: &Path, limits: &Limits) -> Result<String, String> {
+/// Every file's relative path and content under `root` (skipping `.git` and
+/// `node_modules`), within `limits`.
+pub fn walk_tree_identity(root: &Path, limits: &Limits) -> Result<String, String> {
     let mut files: Vec<PathBuf> = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     let mut total: u64 = 0;

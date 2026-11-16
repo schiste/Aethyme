@@ -45,6 +45,10 @@ pub struct Event {
     /// The fallback command was run.
     #[serde(default)]
     pub fallback: bool,
+    /// Problems that did not stop the command (`key_secret_unavailable`,
+    /// `hub_fallback:<reason>`, ...).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 pub fn now_ms() -> u64 {
@@ -120,6 +124,8 @@ pub struct Counters {
     pub last_key: Option<String>,
     /// Connects where a repository entry of the same name was ignored.
     pub shadowed_repository_entries: u64,
+    /// Warnings per code.
+    pub warnings: BTreeMap<String, u64>,
 }
 
 /// Counters per entry name.
@@ -142,6 +148,9 @@ pub fn summarize(events: &[Event]) -> BTreeMap<String, Counters> {
         }
         if event.shadowed {
             counters.shadowed_repository_entries += 1;
+        }
+        for warning in &event.warnings {
+            *counters.warnings.entry(warning.clone()).or_default() += 1;
         }
         if let Some(reason) = &event.reason {
             *counters.failure_reasons.entry(reason.clone()).or_default() += 1;

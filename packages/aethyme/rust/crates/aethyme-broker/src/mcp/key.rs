@@ -44,6 +44,9 @@ pub struct Caller {
     pub env: Vec<(OsString, OsString)>,
     /// The per-host HMAC key for value-derived key parts.
     pub key_secret: Vec<u8>,
+    /// Why the per-host secret could not be used, when it could not: the key
+    /// then holds per-process random bytes and must never be shared.
+    pub key_secret_error: Option<String>,
     /// Where source identities are cached, if anywhere.
     pub identity_cache: Option<PathBuf>,
     pub limits: Limits,
@@ -54,11 +57,19 @@ impl Caller {
     pub fn current(from_worktree: bool) -> std::io::Result<Self> {
         let cwd = std::env::current_dir()?;
         let host = super::host_directory();
-        let key_secret = host
-            .as_deref()
-            .and_then(|directory| secret::load_or_create(directory).ok())
-            .or_else(|| secret::random_bytes().ok())
-            .unwrap_or_default();
+        let (key_secret, key_secret_error) = match host.as_deref() {
+            Some(directory) => match secret::load_or_create(directory) {
+                Ok(secret) => (secret, None),
+                Err(error) => (
+                    secret::random_bytes().unwrap_or_default(),
+                    Some(error.to_string()),
+                ),
+            },
+            None => (
+                secret::random_bytes().unwrap_or_default(),
+                Some("the host state directory cannot be resolved".to_string()),
+            ),
+        };
         Ok(Self {
             cwd,
             path_env: std::env::var_os("PATH"),
@@ -69,6 +80,7 @@ impl Caller {
             from_worktree,
             env: std::env::vars_os().collect(),
             key_secret,
+            key_secret_error,
             identity_cache: host.map(|directory| directory.join(identity::CACHE_DIRECTORY)),
             limits: DEFAULT_LIMITS,
         })
@@ -325,12 +337,13 @@ pub fn plan(
         (CopyKind::Worktree, Some(_)) if copy.worktree_source_identity.is_some() => {
             copy.worktree_source_identity.clone()
         }
-        (_, Some(path)) => {
-            match identity::tree_identity_cached(
-                path,
-                &caller.limits,
-                caller.identity_cache.as_deref(),
-            ) {
+        (kind, Some(path)) => {
+            // Only the stable copy's identity is cached, and only in direct
+            // mode: an unstaged edit changes none of the cache's markers.
+            let cache = (lenient && kind == CopyKind::Stable)
+                .then_some(caller.identity_cache.as_deref())
+                .flatten();
+            match identity::tree_identity_cached(path, &caller.limits, cache) {
                 Ok((identity, hit)) => {
                     cache_hits += u64::from(hit);
                     Some(identity)
@@ -395,7 +408,10 @@ pub fn plan(
         env_file_identity: env_file_identity.as_deref(),
         source_identity: source_identity.as_deref(),
         lockfile_identity: lockfile_identity.as_deref(),
-    });
+        environment: &environment,
+        source: source.as_deref(),
+    })
+    .map_err(|message| fail("entry_directory_identity_failed", message, &phases))?;
     phases.insert("key", elapsed_ms(phase));
     phases.insert("total", elapsed_ms(started));
     Ok(Plan {
@@ -529,12 +545,17 @@ pub fn choose_copy(
             Some(&stable_checkout),
         );
     };
-    let cache = caller.identity_cache.as_deref();
-    let identities =
-        identity::tree_identity_cached(source, &caller.limits, cache).and_then(|stable_identity| {
-            identity::tree_identity_cached(&worktree_source, &caller.limits, cache)
+    // The worktree side is never cached (an unstaged edit changes none of the
+    // cache's markers); the stable side only in direct mode.
+    let stable_cache = lenient
+        .then_some(caller.identity_cache.as_deref())
+        .flatten();
+    let identities = identity::tree_identity_cached(source, &caller.limits, stable_cache).and_then(
+        |stable_identity| {
+            identity::tree_identity_cached(&worktree_source, &caller.limits, None)
                 .map(|worktree_identity| (stable_identity, worktree_identity))
-        });
+        },
+    );
     let ((stable_identity, stable_hit), (worktree_identity, worktree_hit)) = match identities {
         Ok(identities) => identities,
         Err(message) if lenient => {
@@ -583,6 +604,9 @@ struct KeyInputs<'a> {
     env_file_identity: Option<&'a str>,
     source_identity: Option<&'a str>,
     lockfile_identity: Option<&'a str>,
+    /// Every variable the server receives.
+    environment: &'a [(OsString, OsString)],
+    source: Option<&'a Path>,
 }
 
 /// `<copy>/relative` for paths inside the chosen copy, else the path.
@@ -614,7 +638,22 @@ fn env_values_identity(entry: &Entry, caller: &Caller) -> String {
     secret::hmac_hex(&caller.key_secret, &message)
 }
 
-fn compute_key(inputs: &KeyInputs<'_>) -> String {
+/// HMAC of every variable the server receives, names and values, sorted.
+fn environment_identity(environment: &[(OsString, OsString)], secret: &[u8]) -> String {
+    let mut pairs: Vec<&(OsString, OsString)> = environment.iter().collect();
+    pairs.sort();
+    let mut message = b"environment-v1\0".to_vec();
+    for (name, value) in pairs {
+        message.extend_from_slice(name.as_encoded_bytes());
+        message.push(b'=');
+        message.extend_from_slice(value.as_encoded_bytes());
+        message.push(0);
+    }
+    secret::hmac_hex(secret, &message)
+}
+
+fn compute_key(inputs: &KeyInputs<'_>) -> Result<String, String> {
+    let shared = inputs.entry.mode == Mode::Shared;
     let copy_root = inputs.copy_root;
     let argv: Vec<String> = inputs
         .resolution
@@ -655,6 +694,35 @@ fn compute_key(inputs: &KeyInputs<'_>) -> String {
         .map(|identity| &identity.file.path)
         .filter(|path| inside(path))
         .map(|path| identity::content_digest(path));
+    // Shared servers also hash the build output directory holding the entry
+    // file when no source identity covers it (capped like the file walk).
+    let entry_directory = match (
+        shared,
+        inputs
+            .resolution
+            .identity
+            .as_ref()
+            .map(|identity| identity.file.path.as_path())
+            .filter(|path| inside(path)),
+    ) {
+        (true, Some(path)) if inputs.source.is_none_or(|source| !path.starts_with(source)) => {
+            match path.parent() {
+                Some(directory) => Some(identity::walk_tree_identity(
+                    directory,
+                    &inputs.caller.limits,
+                )?),
+                None => None,
+            }
+        }
+        _ => None,
+    };
+    // Shared servers depend on everything they receive (HOME, XDG_*, PATH
+    // select credentials and configuration); direct ones on env_allow.
+    let env_values = if shared {
+        environment_identity(inputs.environment, &inputs.caller.key_secret)
+    } else {
+        env_values_identity(inputs.entry, inputs.caller)
+    };
     let package = inputs
         .resolution
         .package
@@ -667,16 +735,17 @@ fn compute_key(inputs: &KeyInputs<'_>) -> String {
         "argv": argv,
         "executables": executables,
         "entry_script": entry_script,
+        "entry_directory": entry_directory,
         "package": package,
         "lockfiles": inputs.lockfile_identity,
         "cwd": normalized(&inputs.cwd.to_string_lossy(), copy_root),
         "env_inherit": inputs.entry.env_inherit,
         "env_file": inputs.env_file_identity,
-        "env_values": env_values_identity(inputs.entry, inputs.caller),
+        "env_values": env_values,
         "source": inputs.source_identity,
         "flavour": inputs.entry.flavour,
         "repository": inputs.entry.repository.as_ref().map(|anchor| &anchor.identity),
     });
     let bytes = serde_json::to_vec(&material).unwrap_or_default();
-    secret::hmac_hex(&inputs.caller.key_secret, &bytes)
+    Ok(secret::hmac_hex(&inputs.caller.key_secret, &bytes))
 }

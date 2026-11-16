@@ -806,7 +806,23 @@ pub fn parse_node_shim(text: &str, shim_dir: &Path) -> Option<ShimTarget> {
     if text.len() > 16 * 1024 {
         return None;
     }
-    let mut target = None;
+    // `"$basedir/<relative>" "$@"`: the script both exec lines run.
+    let script_of = |rest: &str| -> Option<String> {
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        let [script, "\"$@\""] = words.as_slice() else {
+            return None;
+        };
+        let relative = script
+            .strip_prefix("\"$basedir/")
+            .and_then(|value| value.strip_suffix('"'))?;
+        let safe = !relative.contains('$')
+            && !relative.contains('`')
+            && !relative.contains('\\')
+            && valid_shim_relative(relative);
+        safe.then(|| relative.to_string())
+    };
+    let mut node_target: Option<String> = None;
+    let mut local_target: Option<String> = None;
     let mut node_path = None;
     for (index, raw) in text.lines().enumerate() {
         let line = raw.trim();
@@ -822,7 +838,6 @@ pub fn parse_node_shim(text: &str, shim_dir: &Path) -> Option<ShimTarget> {
             || line.starts_with("if [ ")
             || line == "else"
             || line == "fi"
-            || line.starts_with("exec \"$basedir/node\"")
         {
             continue;
         }
@@ -837,24 +852,45 @@ pub fn parse_node_shim(text: &str, shim_dir: &Path) -> Option<ShimTarget> {
             }
             continue;
         }
-        if let Some(rest) = line.strip_prefix("exec node ") {
-            let words: Vec<&str> = rest.split_whitespace().collect();
-            let [script, "\"$@\""] = words.as_slice() else {
-                return None;
-            };
-            let relative = script
-                .strip_prefix("\"$basedir/")
-                .and_then(|value| value.strip_suffix('"'))?;
-            if relative.contains('$') || relative.contains('`') || target.is_some() {
+        if let Some(rest) = line.strip_prefix("exec \"$basedir/node\" ") {
+            if local_target.is_some() {
                 return None;
             }
-            target = Some(shim_dir.join(relative));
+            local_target = Some(script_of(rest)?);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("exec node ") {
+            if node_target.is_some() {
+                return None;
+            }
+            node_target = Some(script_of(rest)?);
             continue;
         }
         return None;
     }
-    let target = target?;
-    target.is_file().then_some(ShimTarget { target, node_path })
+    let relative = node_target?;
+    // Both branches must run the same script.
+    if local_target.is_some_and(|local| local != relative) {
+        return None;
+    }
+    let target = shim_dir.join(&relative);
+    // The script must stay inside the node_modules directory holding the shim.
+    let modules = shim_dir.parent()?.canonicalize().ok()?;
+    let resolved = target.canonicalize().ok()?;
+    (resolved.is_file() && resolved.starts_with(&modules))
+        .then_some(ShimTarget { target, node_path })
+}
+
+/// A shim's script path: exactly one leading `../` (out of `.bin` into
+/// `node_modules`), then plain components with no `..`.
+fn valid_shim_relative(relative: &str) -> bool {
+    let Some(rest) = relative.strip_prefix("../") else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest
+            .split('/')
+            .all(|part| !part.is_empty() && part != ".." && part != ".")
 }
 
 /// The argv that runs a resolved file, its identity and notes.

@@ -220,6 +220,17 @@ fn eligible_pinned_session_contract(
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    // The MCP hub masks its termination signals before any thread exists,
+    // so only its signal thread ever receives them.
+    if args.len() >= 3
+        && args[0] == "mcp"
+        && args[1] == "hub"
+        && args[2] == "serve"
+        && let Err(error) = aethyme_broker::mcp::hub::block_signals_for_hub_process()
+    {
+        eprintln!("aethyme mcp hub: {error}");
+        return ExitCode::from(6);
+    }
     aethyme_broker::cli::with_status_read_context(&args, || main_with_args(&args))
 }
 
