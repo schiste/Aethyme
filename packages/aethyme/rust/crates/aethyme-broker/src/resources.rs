@@ -1706,6 +1706,28 @@ impl HostResourceCoordinator {
         &self.path
     }
 
+    /// The state and generation of one lease, read without touching any
+    /// other state; `None` when no lease has that id.
+    pub(crate) fn lease_state(
+        &self,
+        lease_id: &str,
+    ) -> Result<Option<(HostLeaseState, u64)>, HostResourceError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT state, generation FROM resource_leases WHERE lease_id = ?1",
+                [lease_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        match row {
+            Some((state, generation)) => {
+                Ok(Some((HostLeaseState::parse(&state)?, generation as u64)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Explicitly advance the managed-storage floor on this already-open host
     /// database. Ordinary coordinator opens preserve the shared schema-v1
     /// floor so older repository worktrees remain usable until every writer is
