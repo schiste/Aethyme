@@ -287,7 +287,7 @@ mod macos {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{Listeners, lsof_owned_sockets, netstat_listeners, reconcile};
+    use super::{LISTING_EMPTY, Listeners, lsof_owned_sockets, netstat_listeners, reconcile};
 
     const NETSTAT: &str = "/usr/sbin/netstat";
     const LSOF: &str = "/usr/sbin/lsof";
