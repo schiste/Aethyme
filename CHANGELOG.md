@@ -4,6 +4,20 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.107] - 2026-11-16
+
+### Added
+
+- `submit prepare` settles an inconclusive shared-cache budget check by itself. The first check that cannot measure the store queues a full measurement, which the background cleanup worker runs at low priority and at most 10,000 entries a second, one per machine, without holding the cache lease. It pauses under memory pressure and never runs twice for the same request (#1696).
+- Because the measurement holds no lease, a store counts as over budget only when it is more than 5% over `max_bytes`, and it rotates only after two consecutive measurements of the same store agree. A measurement between the budget and that margin keeps the store (#1696).
+- A result is trusted for 1 to 24 hours depending on headroom and observed growth, so a healthy store is not walked every hour. Repeated failed measurements back off up to a day, and a completed rotation discards the old result (#1696).
+- The prepare report and `submit prepare status --json` (`shared_cache_background_measurement`) say when a decision came from a background measurement. The `preparation.shared-cache-budget-inconclusive` notice clears once a measurement settles the question, or says why it could not. New pacing field `scan_limiter_sleep_ms` and `preparation_cache_measurement_*` counters (#1696).
+
+### Known issues
+
+- A store that cannot be walked in 30 minutes stays inconclusive; the notice says so.
+- While a measurement runs it keeps directory handles open on the cache volume, so an external volume cannot be ejected until the walk ends (at most 30 minutes). Killing the worker is safe.
+
 ## [0.8.106] - 2026-11-16
 
 ### Added
