@@ -68,10 +68,12 @@ stderr; a missing entry exits 3, a failed resolution 6, and `--fallback` runs
 the given command instead. `aethyme mcp resolve <name> [--json]`
 (`aethyme.mcp-resolve/v1`), `aethyme mcp status [--json]`
 (`aethyme.mcp-status/v1`) and `aethyme mcp config print --agent codex|claude`
-are read-only operator surfaces; refusals under `--json` are
-`aethyme.mcp-error/v1`. Its inputs are `<host state>/mcp/services.toml` and
-`.aethyme/mcp.toml` (`schema = 1`); it writes only
-`<host state>/mcp/events.jsonl` and `<host state>/mcp/resolved/`. Nothing
+are read-only operator surfaces; `aethyme mcp trust [--repo <path>] [--json]`
+(`aethyme.mcp-trust/v1`) records host trust for a repository file; refusals
+under `--json` are `aethyme.mcp-error/v1`. Its inputs are
+`<host state>/mcp/services.toml` and `.aethyme/mcp.toml` (`schema = 1`); it
+writes only under `<host state>/mcp/` (`events.jsonl`, `resolved/`,
+`identity-cache/`, `key-secret`, `trusted-repositories.json`). Nothing
 installs it: the external consumers are agent configurations an owner edits
 by hand from `config print`, so renaming `connect` or its flags breaks those
 configurations (the fallback keeps the agent working only while `aethyme mcp
