@@ -350,8 +350,12 @@ fn legacy_shared_daemon_binding_is_unknown_not_a_live_task_or_a_dead_holder() {
     );
 }
 
+/// A legacy session that never recorded a holder has no process to observe,
+/// so age is its only evidence: past the abandonment window, with no
+/// unresolved operation and no preparation in progress, its explicit claim
+/// stops holding and the session closes, releasing the claim with it.
 #[test]
-fn abandonment_keeps_an_explicit_claim_with_unknown_holder_liveness() {
+fn abandonment_releases_a_legacy_unbound_sessions_explicit_claim_past_the_window() {
     let tmp = isolation::FixtureRepo::new();
     fixture(tmp.path());
     let mut broker = isolation::open(tmp.path());
@@ -367,7 +371,7 @@ fn abandonment_keeps_an_explicit_claim_with_unknown_holder_liveness() {
     broker.agents(now_ms() + 100 * HOUR_MS).unwrap();
 
     assert!(
-        !broker
+        broker
             .store()
             .session(session.id)
             .unwrap()
@@ -375,7 +379,7 @@ fn abandonment_keeps_an_explicit_claim_with_unknown_holder_liveness() {
             .is_closed()
     );
     assert!(
-        broker
+        !broker
             .store()
             .active_leases()
             .unwrap()
@@ -385,6 +389,6 @@ fn abandonment_keeps_an_explicit_claim_with_unknown_holder_liveness() {
     assert!(
         session_events(&mut broker, session.id)
             .iter()
-            .all(|event| event.kind != "session.abandoned")
+            .any(|event| event.kind == "session.abandoned")
     );
 }

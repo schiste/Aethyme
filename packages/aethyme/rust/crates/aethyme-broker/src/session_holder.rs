@@ -217,6 +217,7 @@ impl ProcessTable {
         }
     }
 
+    #[cfg(test)]
     fn snapshot_with_budget(
         command: &mut Command,
         timeout: Duration,
