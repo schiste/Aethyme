@@ -398,6 +398,9 @@ pub(crate) enum AbandonmentKeepReason {
     RecentActivity,
     /// The recorded holder could not be checked.
     HolderUnknown,
+    /// This command was refused the process listing (a sandboxed caller), so
+    /// no holder could be checked in it.
+    HolderProcessTableDenied,
     /// The recorded holder runs and this is still its session.
     HolderAliveCurrent,
     /// A live holder whose task lease expired could not be re-read.
@@ -474,6 +477,7 @@ impl AbandonmentKeepReason {
             Self::WorktreeActivityUnavailable => "worktree_activity_unavailable",
             Self::RecentActivity => "recent_activity",
             Self::HolderUnknown => "holder_unknown",
+            Self::HolderProcessTableDenied => "holder_process_table_denied",
             Self::HolderAliveCurrent => "holder_alive_current",
             Self::HolderRecordUnavailable => "holder_record_unavailable",
             Self::HolderSharedService => "holder_shared_service",
@@ -521,6 +525,9 @@ impl AbandonmentKeepReason {
             }
             Self::RecentActivity => "session_abandonment_kept_recent_activity",
             Self::HolderUnknown => "session_abandonment_kept_holder_unknown",
+            Self::HolderProcessTableDenied => {
+                "session_abandonment_kept_holder_process_table_denied"
+            }
             Self::HolderAliveCurrent => "session_abandonment_kept_holder_alive_current",
             Self::HolderRecordUnavailable => "session_abandonment_kept_holder_record_unavailable",
             Self::HolderSharedService => "session_abandonment_kept_holder_shared_service",
@@ -1167,6 +1174,40 @@ impl Broker {
     /// owner, and lease checks. The process snapshot is captured before the
     /// nonblocking lifecycle claim; its holder-event identity is then checked
     /// again under the claim and in the store transaction.
+    /// Whether the session still owns an unresolved coordinated operation or
+    /// guarded command, after settling guarded-exec receipts whose command
+    /// provably died with the previous boot.
+    ///
+    /// Only the live `exec` command moves a receipt on. The per-session
+    /// operation guard does not prove a receipt written after the boot dead:
+    /// the shared lock is close-on-exec so a detached child never pins it
+    /// (`file_lock::SessionOperationGuard`), so a command's children can
+    /// outlive the command that owns the receipt. A receipt last written
+    /// before the boot is the one case with proof: no process from before a
+    /// boot survives it. `outcome_unknown` receipts stay blocking whatever
+    /// their age: they mean "never retry blindly", not "still running".
+    pub(crate) fn session_operations_unresolved_since_boot(
+        &mut self,
+        session_id: i64,
+    ) -> Result<bool, crate::BrokerError> {
+        if let (Some(boot_ms), Some(cutoff_ms)) = (
+            crate::host_boot::boot_time_ms(),
+            crate::host_boot::pre_boot_cutoff_ms(),
+        ) {
+            let settled = self
+                .store()
+                .abandon_pre_boot_guarded_exec_receipts(session_id, cutoff_ms, boot_ms)?;
+            for _ in 0..settled {
+                crate::phase_telemetry::add(
+                    "guarded_exec_receipts_abandoned_pre_boot",
+                    std::time::Duration::ZERO,
+                );
+            }
+        }
+        self.store_ref()
+            .session_has_unresolved_operations(session_id)
+    }
+
     pub(crate) fn try_close_abandoned_session(
         &mut self,
         session_id: i64,
@@ -1937,6 +1978,18 @@ impl Broker {
             }
         }
         match holder.liveness {
+            // A command refused the process listing (sandboxed) is not
+            // evidence about any holder: it is counted as its own reason, and
+            // the pass took no further snapshot for it.
+            crate::session_holder::RecordedHolderLiveness::Unknown
+                if process_table.process_listing_denied() =>
+            {
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::HolderProcessTableDenied,
+                    AbandonedSessionCloseOutcome::HolderUnavailable,
+                ));
+            }
             crate::session_holder::RecordedHolderLiveness::Unknown => {
                 return Ok(keep_with(
                     process_table,
@@ -2154,10 +2207,7 @@ impl Broker {
                     AbandonedSessionCloseOutcome::OperationActive,
                 ));
             }
-            match self
-                .store_ref()
-                .session_has_unresolved_operations(session_id)
-            {
+            match self.session_operations_unresolved_since_boot(session_id) {
                 Ok(true) => {
                     return Ok(keep_with(
                         process_table,
@@ -2413,7 +2463,40 @@ impl Broker {
                     ));
                 }
             };
-            if liveness.iter().any(|lease| lease.liveness_evidence.holds) {
+            // A legacy session that never recorded a holder has no process to
+            // observe, so its claims would hold forever. Age is the only
+            // evidence it can have: past the abandonment window (judged
+            // above) and with no unresolved operation or preparation in
+            // progress, its claims stop holding. Every other basis keeps its
+            // own rule.
+            let legacy_unbound = holder.binding_event_id.is_none() && bound_holder.is_none();
+            let legacy_claims_released = legacy_unbound
+                && liveness.iter().any(|lease| {
+                    lease.liveness_evidence.holds
+                        && lease.liveness_evidence.basis == "no_recorded_holder"
+                })
+                && matches!(
+                    self.session_operations_unresolved_since_boot(session_id),
+                    Ok(false)
+                )
+                && matches!(
+                    self.preparation_status(session_id),
+                    Ok(status) if !matches!(
+                        status.state,
+                        crate::PreparationState::InProgress | crate::PreparationState::Invalid
+                    )
+                );
+            if legacy_claims_released {
+                crate::phase_telemetry::add(
+                    "legacy_unbound_claims_released",
+                    std::time::Duration::ZERO,
+                );
+            }
+            if liveness.iter().any(|lease| {
+                lease.liveness_evidence.holds
+                    && !(legacy_claims_released
+                        && lease.liveness_evidence.basis == "no_recorded_holder")
+            }) {
                 return Ok(keep_with(
                     process_table,
                     AbandonmentKeepReason::LeaseHeld,

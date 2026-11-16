@@ -336,6 +336,74 @@ impl super::BrokerStore {
         )
     }
 
+    /// Settle this session's receipts that are still `starting` or `running`
+    /// although their command last wrote before the host booted. Only the
+    /// live command moves a receipt on, and no process from before a boot
+    /// survives it, so such a receipt has no owner left. It becomes
+    /// `completed` with an `unknown` outcome, audit and cleanup, a
+    /// combination no live command writes, and a
+    /// `guarded_exec.receipt_abandoned` event records why. `outcome_unknown`
+    /// receipts are deliberately ambiguous and never settled here; neither is
+    /// any receipt written at or after `pre_boot_cutoff_ms`. Returns how many
+    /// receipts were settled.
+    pub(crate) fn abandon_pre_boot_guarded_exec_receipts(
+        &mut self,
+        session_id: i64,
+        pre_boot_cutoff_ms: i64,
+        boot_time_ms: i64,
+    ) -> Result<usize, BrokerError> {
+        let now = super::now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let orphaned = {
+            let mut stmt = tx.prepare(
+                "SELECT receipt_id, phase, updated_at_ms FROM guarded_exec_receipts
+                 WHERE session_id = ?1 AND phase IN ('starting', 'running')
+                   AND updated_at_ms < ?2
+                 ORDER BY created_at_ms, receipt_id",
+            )?;
+            let rows = stmt.query_map(params![session_id, pre_boot_cutoff_ms], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut settled = 0;
+        for (receipt_id, previous_phase, updated_at_ms) in orphaned {
+            let changed = tx.execute(
+                "UPDATE guarded_exec_receipts
+                 SET phase = 'completed', command_outcome = 'unknown', exit_code = NULL,
+                     ownership_audit = 'unknown', process_group_cleanup = 'unknown',
+                     updated_at_ms = max(updated_at_ms, ?1)
+                 WHERE session_id = ?2 AND receipt_id = ?3 AND phase = ?4
+                   AND updated_at_ms = ?5",
+                params![now, session_id, receipt_id, previous_phase, updated_at_ms],
+            )?;
+            if changed != 1 {
+                continue;
+            }
+            super::insert_event(
+                &tx,
+                now,
+                crate::events::GUARDED_EXEC_RECEIPT_ABANDONED,
+                Some(session_id),
+                Some(&crate::events::guarded_exec_receipt_abandoned_payload(
+                    &receipt_id,
+                    &previous_phase,
+                    updated_at_ms,
+                    boot_time_ms,
+                )),
+            )?;
+            settled += 1;
+        }
+        tx.commit()?;
+        Ok(settled)
+    }
+
     fn transition_guarded_exec_receipt(
         &mut self,
         sql: &str,
@@ -691,6 +759,87 @@ mod tests {
                 .guarded_exec_receipt(2, &receipt_id)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// Only a `starting`/`running` receipt last written before the boot
+    /// cutoff is settled, as `completed` with an unknown outcome and one
+    /// event; a post-boot running receipt and an `outcome_unknown` receipt of
+    /// any age still count as unresolved.
+    #[test]
+    fn only_pre_boot_starting_or_running_receipts_are_settled_as_abandoned() {
+        let mut store = store();
+        let starting = store.begin_guarded_exec_receipt(1).unwrap();
+        let running = store.begin_guarded_exec_receipt(1).unwrap();
+        store.mark_guarded_exec_running(1, &running).unwrap();
+        let ambiguous = store.begin_guarded_exec_receipt(1).unwrap();
+        store.mark_guarded_exec_running(1, &ambiguous).unwrap();
+        store
+            .mark_guarded_exec_outcome_unknown(1, &ambiguous, "unverified")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE guarded_exec_receipts SET created_at_ms = 1000, updated_at_ms = 1000
+                 WHERE session_id = 1",
+                [],
+            )
+            .unwrap();
+        let after_boot = store.begin_guarded_exec_receipt(1).unwrap();
+        store.mark_guarded_exec_running(1, &after_boot).unwrap();
+
+        let boot_ms = 1_000_000;
+        assert_eq!(
+            store
+                .abandon_pre_boot_guarded_exec_receipts(1, boot_ms - 60_000, boot_ms)
+                .unwrap(),
+            2
+        );
+        for settled in [&starting, &running] {
+            let receipt = store.guarded_exec_receipt(1, settled).unwrap().unwrap();
+            assert_eq!(receipt.phase, "completed");
+            assert_eq!(receipt.command_outcome, "unknown");
+            assert_eq!(receipt.process_group_cleanup, "unknown");
+        }
+        assert_eq!(
+            store
+                .guarded_exec_receipt(1, &ambiguous)
+                .unwrap()
+                .unwrap()
+                .phase,
+            "outcome_unknown"
+        );
+        assert_eq!(
+            store
+                .guarded_exec_receipt(1, &after_boot)
+                .unwrap()
+                .unwrap()
+                .phase,
+            "running"
+        );
+        let events: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = ?1 AND session_id = 1",
+                [crate::events::GUARDED_EXEC_RECEIPT_ABANDONED],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 2);
+        assert!(store.session_has_unresolved_operations(1).unwrap());
+
+        store
+            .complete_guarded_exec_command(1, &after_boot, "succeeded", Some(0), "verified")
+            .unwrap();
+        assert!(
+            store.session_has_unresolved_operations(1).unwrap(),
+            "an outcome_unknown receipt stays unresolved whatever its age"
+        );
+        assert_eq!(
+            store
+                .abandon_pre_boot_guarded_exec_receipts(1, boot_ms - 60_000, boot_ms)
+                .unwrap(),
+            0
         );
     }
 

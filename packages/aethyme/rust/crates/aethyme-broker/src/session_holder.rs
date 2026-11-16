@@ -133,7 +133,19 @@ pub enum Caller {
 struct ProcessRow {
     ppid: i64,
     started: String,
-    args: String,
+    /// The command line, as `ps -o args` prints it with whitespace runs
+    /// collapsed. A native listing reads it only when it is first needed.
+    args: std::sync::OnceLock<String>,
+    /// The short command name a native listing shows, `(name)` like `ps`,
+    /// when the command line itself cannot be read.
+    comm: String,
+}
+
+impl ProcessRow {
+    fn args(&self, pid: i64) -> &str {
+        self.args
+            .get_or_init(|| native_process_args(pid, &self.comm))
+    }
 }
 
 /// One snapshot of the process table: a single `ps` call, walked in memory.
@@ -142,17 +154,67 @@ pub struct ProcessTable {
     rows: HashMap<i64, ProcessRow>,
 }
 
+/// How one attempt to snapshot the process table ended.
+#[derive(Debug)]
+pub(crate) enum ProcessTableObservation {
+    Complete(ProcessTable),
+    /// The host refused to list processes to this caller (typically a
+    /// sandboxed command). Retrying within the same command cannot help.
+    Denied,
+    /// Timed out, truncated, or failed for another reason; a later retry may
+    /// succeed.
+    Failed,
+}
+
+impl ProcessTableObservation {
+    pub(crate) fn into_table(self) -> Option<ProcessTable> {
+        match self {
+            Self::Complete(table) => Some(table),
+            Self::Denied | Self::Failed => None,
+        }
+    }
+}
+
 impl ProcessTable {
     /// Snapshot the host's process table, or `None` when the complete
     /// observation is unavailable. Never parse a timed-out or truncated prefix.
     pub fn snapshot() -> Option<Self> {
+        Self::observe().into_table()
+    }
+
+    /// Snapshot the host's process table. On macOS the table is listed
+    /// natively, without spawning a child a sandboxed caller may be refused;
+    /// `ps` remains the fallback there and the only source elsewhere.
+    pub(crate) fn observe() -> ProcessTableObservation {
+        #[cfg(target_os = "macos")]
+        let native_denied = match native_process_table::snapshot() {
+            Ok(table) => {
+                crate::phase_telemetry::add("holder_process_table_native", Duration::ZERO);
+                return ProcessTableObservation::Complete(table);
+            }
+            Err(native_process_table::Failure::Denied) => {
+                crate::phase_telemetry::add("holder_process_table_native_denied", Duration::ZERO);
+                true
+            }
+            Err(native_process_table::Failure::Failed) => {
+                crate::phase_telemetry::add("holder_process_table_native_fallback", Duration::ZERO);
+                false
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let native_denied = false;
         let mut command = Command::new(crate::system_programs::ps());
         command.args(["-A", "-o", "pid=,ppid=,lstart=,args="]);
-        Self::snapshot_with_budget(
+        match Self::observe_with_budget(
             &mut command,
             PROCESS_TABLE_TIMEOUT,
             PROCESS_TABLE_STREAM_LIMIT,
-        )
+        ) {
+            // Both sources refused, or `ps` alone was refused: no retry in
+            // this command will see the table.
+            ProcessTableObservation::Failed if native_denied => ProcessTableObservation::Denied,
+            observation => observation,
+        }
     }
 
     fn snapshot_with_budget(
@@ -160,15 +222,33 @@ impl ProcessTable {
         timeout: Duration,
         stream_limit: usize,
     ) -> Option<Self> {
-        let crate::bounded_output::LimitedOutput::Completed(output) =
-            crate::bounded_output::output_limited(command, timeout, stream_limit).ok()?
-        else {
-            return None;
+        Self::observe_with_budget(command, timeout, stream_limit).into_table()
+    }
+
+    fn observe_with_budget(
+        command: &mut Command,
+        timeout: Duration,
+        stream_limit: usize,
+    ) -> ProcessTableObservation {
+        let output = match crate::bounded_output::output_limited(command, timeout, stream_limit) {
+            Ok(crate::bounded_output::LimitedOutput::Completed(output)) => output,
+            Ok(_) => return ProcessTableObservation::Failed,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return ProcessTableObservation::Denied;
+            }
+            Err(_) => return ProcessTableObservation::Failed,
         };
-        output
-            .status
-            .success()
-            .then(|| Self::parse(&String::from_utf8_lossy(&output.stdout)))
+        if output.status.success() {
+            return ProcessTableObservation::Complete(Self::parse(&String::from_utf8_lossy(
+                &output.stdout,
+            )));
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("Operation not permitted") || stderr.contains("Permission denied") {
+            ProcessTableObservation::Denied
+        } else {
+            ProcessTableObservation::Failed
+        }
     }
 
     /// Parse `ps -o pid=,ppid=,lstart=,args=` output. `lstart` is five
@@ -188,7 +268,8 @@ impl ProcessTable {
                 ProcessRow {
                     ppid,
                     started: fields[2..7].join(" "),
-                    args: fields[7..].join(" "),
+                    args: std::sync::OnceLock::from(fields[7..].join(" ")),
+                    comm: String::new(),
                 },
             );
         }
@@ -200,7 +281,7 @@ impl ProcessTable {
         self.rows.get(&pid).map(|row| AgentProcess {
             pid,
             started: row.started.clone(),
-            command: row.args.clone(),
+            command: row.args(pid).to_owned(),
         })
     }
 
@@ -216,7 +297,7 @@ impl ProcessTable {
         let mut pids: Vec<i64> = self
             .rows
             .iter()
-            .filter(|(_, row)| is_agent_runtime(&row.args))
+            .filter(|(pid, row)| is_agent_runtime(row.args(**pid)))
             .map(|(pid, _)| *pid)
             .collect();
         pids.sort_unstable();
@@ -236,7 +317,7 @@ impl ProcessTable {
         let mut found = false;
         for _ in 0..64 {
             let row = self.rows.get(&current)?;
-            if is_agent_runtime(&row.args) {
+            if is_agent_runtime(row.args(current)) {
                 found = true;
                 break;
             }
@@ -251,7 +332,7 @@ impl ProcessTable {
         for _ in 0..64 {
             let ppid = self.rows.get(&current)?.ppid;
             match self.rows.get(&ppid) {
-                Some(parent) if ppid != current && is_agent_runtime(&parent.args) => {
+                Some(parent) if ppid != current && is_agent_runtime(parent.args(ppid)) => {
                     current = ppid;
                 }
                 _ => break,
@@ -320,6 +401,343 @@ fn is_agent_runtime(args: &str) -> bool {
     }
     let first_name = first.rsplit('/').next().unwrap_or(first);
     first_name == "node" && words.next().is_some_and(is_agent)
+}
+
+const LSTART_WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const LSTART_MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Epoch milliseconds of a C-locale `ps -o lstart` start text
+/// (`Mon Oct 5 21:56:54 2026`), read as local time the way `ps` printed it.
+/// `None` for anything else, a localized text included: a start the broker
+/// cannot read exactly is never compared with a clock.
+pub(crate) fn lstart_epoch_ms(started: &str) -> Option<i64> {
+    let fields: Vec<&str> = started.split_whitespace().collect();
+    let [weekday, month, day, time, year] = fields.as_slice() else {
+        return None;
+    };
+    let weekday = LSTART_WEEKDAYS.iter().position(|name| name == weekday)?;
+    let month = LSTART_MONTHS.iter().position(|name| name == month)?;
+    let day = day
+        .parse::<i32>()
+        .ok()
+        .filter(|day| (1..=31).contains(day))?;
+    let year = year
+        .parse::<i32>()
+        .ok()
+        .filter(|year| (1970..=9999).contains(year))?;
+    let mut clock = time.split(':').map(|part| part.parse::<i32>().ok());
+    let (Some(Some(hour)), Some(Some(minute)), Some(Some(second)), None) =
+        (clock.next(), clock.next(), clock.next(), clock.next())
+    else {
+        return None;
+    };
+    if !(0..24).contains(&hour) || !(0..60).contains(&minute) || !(0..=60).contains(&second) {
+        return None;
+    }
+    local_epoch_seconds(year, month, day, hour, minute, second, weekday)?.checked_mul(1_000)
+}
+
+/// The epoch seconds of a local calendar time, or `None` when it does not
+/// name a real day (a normalized date, or the weekday disagrees).
+#[cfg(unix)]
+fn local_epoch_seconds(
+    year: i32,
+    month: usize,
+    day: i32,
+    hour: i32,
+    minute: i32,
+    second: i32,
+    weekday: usize,
+) -> Option<i64> {
+    // SAFETY: `libc::tm` is plain old data; an all-zero value (including a
+    // null `tm_zone` on platforms that have it) is a valid input to `mktime`.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = year - 1900;
+    tm.tm_mon = month as libc::c_int;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = minute;
+    tm.tm_sec = second;
+    tm.tm_isdst = -1;
+    // SAFETY: `tm` is a live, writable, initialized `libc::tm`; `mktime`
+    // reads and normalizes it in place.
+    let seconds = unsafe { libc::mktime(&mut tm) };
+    if seconds == -1 {
+        return None;
+    }
+    (tm.tm_mday == day && tm.tm_mon == month as libc::c_int && tm.tm_wday == weekday as libc::c_int)
+        .then_some(i64::from(seconds))
+}
+
+#[cfg(not(unix))]
+fn local_epoch_seconds(
+    _year: i32,
+    _month: usize,
+    _day: i32,
+    _hour: i32,
+    _minute: i32,
+    _second: i32,
+    _weekday: usize,
+) -> Option<i64> {
+    None
+}
+
+/// A process's command line, read natively for a row a native listing
+/// produced; `(name)` like `ps` when it cannot be read.
+#[cfg(target_os = "macos")]
+fn native_process_args(pid: i64, comm: &str) -> String {
+    native_process_table::args(pid).unwrap_or_else(|| format!("({comm})"))
+}
+
+/// Rows parsed from `ps` carry their command line; nothing else creates rows.
+#[cfg(not(target_os = "macos"))]
+fn native_process_args(_pid: i64, _comm: &str) -> String {
+    String::new()
+}
+
+/// The process table listed with libproc instead of a `ps` child: a sandboxed
+/// caller may be refused the spawn, and each refusal used to leave a whole
+/// retirement pass judging every holder unknown.
+#[cfg(target_os = "macos")]
+mod native_process_table {
+    use std::collections::HashMap;
+
+    pub(super) enum Failure {
+        /// The kernel refused the listing to this caller.
+        Denied,
+        Failed,
+    }
+
+    fn failure_from_errno() -> Failure {
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EPERM) | Some(libc::EACCES) => Failure::Denied,
+            _ => Failure::Failed,
+        }
+    }
+
+    pub(super) fn snapshot() -> Result<super::ProcessTable, Failure> {
+        let pids = list_pids()?;
+        let locale = StartTimeLocale::from_environment();
+        let mut rows = HashMap::with_capacity(pids.len());
+        for pid in pids {
+            // A process may exit between the listing and this read; it is
+            // simply not in the table, as it would not be in `ps` output.
+            let Some(info) = bsd_info(pid) else {
+                continue;
+            };
+            let Some(started) = locale.format(info.pbi_start_tvsec) else {
+                continue;
+            };
+            let comm = info
+                .pbi_comm
+                .iter()
+                .take_while(|byte| **byte != 0)
+                .map(|byte| *byte as u8 as char)
+                .collect::<String>();
+            rows.insert(
+                i64::from(pid),
+                super::ProcessRow {
+                    ppid: i64::from(info.pbi_ppid),
+                    started,
+                    args: std::sync::OnceLock::new(),
+                    comm,
+                },
+            );
+        }
+        // The caller must at least see itself; anything less is not a
+        // complete observation.
+        if !rows.contains_key(&i64::from(std::process::id())) {
+            return Err(Failure::Failed);
+        }
+        Ok(super::ProcessTable { rows })
+    }
+
+    fn list_pids() -> Result<Vec<libc::pid_t>, Failure> {
+        // SAFETY: a null buffer asks only for the current number of pids.
+        let estimate = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        if estimate <= 0 {
+            return Err(failure_from_errno());
+        }
+        let mut capacity = estimate as usize + 256;
+        for _ in 0..3 {
+            let mut pids: Vec<libc::pid_t> = vec![0; capacity];
+            let bytes = libc::c_int::try_from(capacity * std::mem::size_of::<libc::pid_t>())
+                .map_err(|_| Failure::Failed)?;
+            // SAFETY: `pids` owns `bytes` writable bytes of `pid_t` storage.
+            let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+            if count <= 0 {
+                return Err(failure_from_errno());
+            }
+            let count = count as usize;
+            if count < capacity {
+                pids.truncate(count);
+                return Ok(pids);
+            }
+            // A full buffer may have been truncated: list again, larger.
+            capacity = capacity.saturating_mul(2);
+        }
+        Err(Failure::Failed)
+    }
+
+    fn bsd_info(pid: libc::pid_t) -> Option<libc::proc_bsdinfo> {
+        let size = std::mem::size_of::<libc::proc_bsdinfo>();
+        // SAFETY: `proc_bsdinfo` is plain old data; zero is a valid value.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is writable storage of exactly `size` bytes.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size as libc::c_int,
+            )
+        };
+        (written > 0 && written as usize == size).then_some(info)
+    }
+
+    /// `ps` prints `lstart` with `strftime("%c")` under the caller's locale;
+    /// this formats the same start the same way so recorded holders match.
+    struct StartTimeLocale {
+        locale: libc::locale_t,
+    }
+
+    impl StartTimeLocale {
+        fn from_environment() -> Self {
+            // SAFETY: both names are NUL-terminated; a null base asks for a
+            // new locale object, which `Drop` frees.
+            let mut locale =
+                unsafe { libc::newlocale(libc::LC_ALL_MASK, c"".as_ptr(), std::ptr::null_mut()) };
+            if locale.is_null() {
+                // `ps` keeps the C locale when the environment names an
+                // unusable one.
+                // SAFETY: as above.
+                locale = unsafe {
+                    libc::newlocale(libc::LC_ALL_MASK, c"C".as_ptr(), std::ptr::null_mut())
+                };
+            }
+            Self { locale }
+        }
+
+        fn format(&self, start_seconds: u64) -> Option<String> {
+            if self.locale.is_null() {
+                return None;
+            }
+            let seconds = libc::time_t::try_from(start_seconds).ok()?;
+            // SAFETY: plain old data; `localtime_r` fills it before it is read.
+            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+            // SAFETY: both pointers reference live, correctly aligned values.
+            if unsafe { libc::localtime_r(&seconds, &mut tm) }.is_null() {
+                return None;
+            }
+            let mut buffer = [0 as libc::c_char; 128];
+            // SAFETY: the buffer, format and `tm` are live for the call, the
+            // format is NUL-terminated, and `self.locale` is a valid locale.
+            let written = unsafe {
+                libc::strftime_l(
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                    c"%c".as_ptr(),
+                    &tm,
+                    self.locale,
+                )
+            };
+            if written == 0 {
+                return None;
+            }
+            let bytes = buffer[..written]
+                .iter()
+                .map(|byte| *byte as u8)
+                .collect::<Vec<u8>>();
+            // `ProcessTable::parse` rejoins `ps` fields with single spaces.
+            Some(
+                String::from_utf8_lossy(&bytes)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        }
+    }
+
+    impl Drop for StartTimeLocale {
+        fn drop(&mut self) {
+            if !self.locale.is_null() {
+                // SAFETY: the locale came from `newlocale` and is freed once.
+                unsafe {
+                    libc::freelocale(self.locale);
+                }
+            }
+        }
+    }
+
+    /// The command line of `pid` from `KERN_PROCARGS2`, its argument words
+    /// joined by single spaces as `ProcessTable::parse` reads `ps` output.
+    pub(super) fn args(pid: i64) -> Option<String> {
+        let pid = libc::c_int::try_from(pid).ok()?;
+        let mut argmax: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        let mut name = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        // SAFETY: `name` holds two MIB entries, and `argmax`/`size` describe
+        // writable storage of the size `KERN_ARGMAX` returns.
+        let result = unsafe {
+            libc::sysctl(
+                name.as_mut_ptr(),
+                2,
+                (&mut argmax as *mut libc::c_int).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 || argmax <= 0 {
+            return None;
+        }
+        let mut buffer = vec![0u8; argmax as usize];
+        let mut size = buffer.len();
+        let mut name = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        // SAFETY: `name` holds three MIB entries and `buffer` owns `size`
+        // writable bytes; the kernel updates `size` to the bytes written.
+        let result = unsafe {
+            libc::sysctl(
+                name.as_mut_ptr(),
+                3,
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 {
+            return None;
+        }
+        parse_procargs2(buffer.get(..size)?)
+    }
+
+    /// `KERN_PROCARGS2`: a native-endian `argc`, the executable path, NUL
+    /// padding, then `argc` NUL-terminated arguments (then the environment,
+    /// which is never read).
+    pub(super) fn parse_procargs2(buffer: &[u8]) -> Option<String> {
+        let argc_bytes = buffer.get(..std::mem::size_of::<libc::c_int>())?;
+        let argc = libc::c_int::from_ne_bytes(argc_bytes.try_into().ok()?);
+        let argc = usize::try_from(argc).ok().filter(|argc| *argc > 0)?;
+        let rest = &buffer[std::mem::size_of::<libc::c_int>()..];
+        let path_end = rest.iter().position(|byte| *byte == 0)?;
+        let mut cursor = path_end;
+        while rest.get(cursor) == Some(&0) {
+            cursor += 1;
+        }
+        let mut words = Vec::new();
+        for argument in rest.get(cursor..)?.split(|byte| *byte == 0).take(argc) {
+            words.extend(
+                String::from_utf8_lossy(argument)
+                    .split_whitespace()
+                    .map(str::to_owned),
+            );
+        }
+        (!words.is_empty()).then(|| words.join(" "))
+    }
 }
 
 /// Identify the caller of this broker command.
@@ -432,6 +850,9 @@ pub(crate) struct RecordedHolderProcessTable {
     /// answering "unknown" for every later holder.
     snapshot_retries: usize,
     snapshot_failed_at: Option<Instant>,
+    /// The host refused this command the process listing (sandboxed); no
+    /// snapshot is retried for the rest of the pass.
+    process_listing_denied: bool,
     /// Why the last automatic close judged with this table kept its session
     /// (`AbandonmentKeepReason`); the table is the one per-pass context every
     /// exit of the close path can reach.
@@ -450,6 +871,9 @@ pub(crate) struct RecordedHolderProcessTable {
     /// The next process-table snapshot, instead of running `ps`.
     #[cfg(test)]
     next_process_table_for_test: Option<Option<ProcessTable>>,
+    /// The next process-table snapshot is refused, as in a sandbox.
+    #[cfg(test)]
+    next_process_table_denied_for_test: bool,
     /// Runs immediately before the landed lane's last HEAD and activity
     /// re-read, so a test can interleave an agent's commit there.
     #[cfg(test)]
@@ -522,18 +946,47 @@ impl RecordedHolderProcessTable {
     /// Take one process-table snapshot, remembering when one fails.
     fn take_process_table(&mut self) -> Option<ProcessTable> {
         #[cfg(test)]
+        if std::mem::take(&mut self.next_process_table_denied_for_test) {
+            return self.record_observation(ProcessTableObservation::Denied);
+        }
+        #[cfg(test)]
         if let Some(snapshot) = self.next_process_table_for_test.take() {
             if snapshot.is_none() {
                 self.snapshot_failed_at = Some(Instant::now());
             }
             return snapshot;
         }
-        let snapshot = ProcessTable::snapshot();
-        if snapshot.is_none() {
-            crate::phase_telemetry::add("holder_process_table_failed", Duration::ZERO);
-            self.snapshot_failed_at = Some(Instant::now());
+        self.record_observation(ProcessTable::observe())
+    }
+
+    /// Keep a complete observation; remember a failure for the retry
+    /// schedule, and a refusal for the rest of the pass.
+    fn record_observation(&mut self, observation: ProcessTableObservation) -> Option<ProcessTable> {
+        match observation {
+            ProcessTableObservation::Complete(table) => Some(table),
+            ProcessTableObservation::Denied => {
+                // A refusal is a property of this command, not of the host's
+                // load: retrying cannot help, and the holders it hides are
+                // not judged "unknown" one by one.
+                crate::phase_telemetry::add("holder_process_table_denied", Duration::ZERO);
+                self.process_listing_denied = true;
+                self.snapshot_retries = PROCESS_TABLE_MAX_RETRIES_PER_PASS;
+                self.snapshot_failed_at = Some(Instant::now());
+                None
+            }
+            ProcessTableObservation::Failed => {
+                crate::phase_telemetry::add("holder_process_table_failed", Duration::ZERO);
+                self.snapshot_failed_at = Some(Instant::now());
+                None
+            }
         }
-        snapshot
+    }
+
+    /// Whether this command was refused the process listing. Retirement
+    /// judgements in such a command are skipped, not counted holder by
+    /// holder as unknown.
+    pub(crate) fn process_listing_denied(&self) -> bool {
+        self.process_listing_denied
     }
 
     /// Whether a failed process-table snapshot may be taken again now: the
@@ -583,10 +1036,10 @@ impl RecordedHolderProcessTable {
         event_id: i64,
         allow_snapshot: bool,
     ) -> Option<&ProcessTable> {
-        if !allow_snapshot {
+        if !allow_snapshot || self.process_listing_denied {
             return None;
         }
-        let snapshot = ProcessTable::snapshot();
+        let snapshot = self.record_observation(ProcessTable::observe());
         self.install_refreshed_snapshot(session_id, event_id, snapshot)
     }
 
@@ -734,6 +1187,13 @@ impl RecordedHolderProcessTable {
     #[cfg(test)]
     pub(crate) fn queue_process_table_for_test(&mut self, snapshot: Option<ProcessTable>) {
         self.next_process_table_for_test = Some(snapshot);
+    }
+
+    /// Make the next process-table snapshot this table takes be refused, as
+    /// it is for a sandboxed caller.
+    #[cfg(test)]
+    pub(crate) fn queue_denied_process_table_for_test(&mut self) {
+        self.next_process_table_denied_for_test = true;
     }
 
     #[cfg(test)]
@@ -1891,5 +2351,57 @@ mod tests {
             RecordedHolderLiveness::Unknown,
             "malformed holder records do not become age-only cleanup authority"
         );
+    }
+
+    /// Only an exact C-locale `lstart` text is read as a clock time.
+    #[cfg(unix)]
+    #[test]
+    fn lstart_reads_only_an_exact_c_locale_start() {
+        let monday = lstart_epoch_ms("Mon Jan 1 00:00:00 2024").expect("a real local time");
+        assert_eq!(
+            lstart_epoch_ms("Mon Jan  1 00:00:01 2024"),
+            Some(monday + 1_000)
+        );
+        assert_eq!(lstart_epoch_ms("Tue Jan 1 00:00:00 2024"), None);
+        assert_eq!(lstart_epoch_ms("Thu Feb 30 00:00:00 2024"), None);
+        assert_eq!(lstart_epoch_ms("lun. 16 nov. 14:09:50 2026"), None);
+        assert_eq!(lstart_epoch_ms("Mon Jan 1 00:00 2024"), None);
+    }
+
+    /// A refused listing is remembered for the pass: no retry follows it.
+    #[test]
+    fn a_refused_process_listing_is_not_retried_in_the_same_pass() {
+        let mut table = RecordedHolderProcessTable::default();
+        table.queue_denied_process_table_for_test();
+        assert!(table.get_or_snapshot(1, 1, true).is_none());
+        assert!(table.process_listing_denied());
+        assert!(table.get_or_snapshot(1, 1, true).is_none());
+        assert!(table.refresh_for_binding(1, 1, true).is_none());
+        assert_eq!(table.snapshots_taken_for_test(), 1);
+    }
+
+    /// The native listing reports this process exactly as `ps` does, so a
+    /// holder recorded from either source matches the other.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_native_process_table_agrees_with_ps_for_this_process() {
+        let mut command = Command::new(crate::system_programs::ps());
+        command.args(["-A", "-o", "pid=,ppid=,lstart=,args="]);
+        let ps = ProcessTable::snapshot_with_budget(
+            &mut command,
+            PROCESS_TABLE_TIMEOUT,
+            PROCESS_TABLE_STREAM_LIMIT,
+        )
+        .expect("ps lists processes");
+        let Ok(native) = native_process_table::snapshot() else {
+            panic!("the native listing is available to tests");
+        };
+        let pid = i64::from(std::process::id());
+        let from_ps = ps.process(pid).expect("ps lists this process");
+        let from_native = native.process(pid).expect("libproc lists this process");
+        assert_eq!(from_native, from_ps);
+        assert_eq!(native.rows[&pid].ppid, ps.rows[&pid].ppid);
+        assert!(native.is_alive(&from_ps));
+        assert!(ps.is_alive(&from_native));
     }
 }

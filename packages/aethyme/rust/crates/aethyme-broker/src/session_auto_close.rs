@@ -1690,6 +1690,235 @@ mod lane_tests {
         assert!(worktree.exists(), "closing deletes nothing");
     }
 
+    /// How often the command's metrics counted `name`.
+    fn phase_count(recorder: &crate::phase_telemetry::Recorder, name: &str) -> u64 {
+        recorder.totals().1.get(name).copied().unwrap_or(0)
+    }
+
+    /// Insert a guarded-exec receipt left in `phase`, last written at `at_ms`.
+    fn left_receipt(
+        broker: &mut crate::Broker,
+        session_id: i64,
+        receipt_id: &str,
+        phase: &str,
+        at_ms: i64,
+    ) {
+        let cleanup = if phase == "outcome_unknown" {
+            "unverified"
+        } else {
+            "unknown"
+        };
+        broker
+            .store()
+            .connection()
+            .execute(
+                "INSERT INTO guarded_exec_receipts (receipt_id, session_id, phase, command_outcome, ownership_audit, process_group_cleanup, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, 'unknown', 'not_run', ?4, ?5, ?5)",
+                rusqlite::params![receipt_id, session_id, phase, cleanup, at_ms],
+            )
+            .unwrap();
+    }
+
+    /// A guarded command recorded running before the host booted died with
+    /// that boot: its receipt is settled as abandoned, with an event, and no
+    /// longer keeps the session. One written after the boot, and an
+    /// `outcome_unknown` one of any age, still keep theirs.
+    #[test]
+    fn only_a_pre_boot_running_receipt_stops_keeping_the_session() {
+        let (_owner, _storage, mut broker) = fixture("");
+        crate::host_boot::set_boot_time_ms_for_tests(Some(now_ms() - HOUR_MS));
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+
+        let (died, _) = merged_candidate(&mut broker, "command died with the boot");
+        left_receipt(
+            &mut broker,
+            died.id,
+            "0123456789abcdef0123456789abcdef",
+            "running",
+            1,
+        );
+        quiet(&mut broker, &died, 3);
+        let (running, _) = merged_candidate(&mut broker, "command running since the boot");
+        left_receipt(
+            &mut broker,
+            running.id,
+            "1123456789abcdef0123456789abcdef",
+            "running",
+            now_ms(),
+        );
+        quiet(&mut broker, &running, 3);
+        let (ambiguous, _) = merged_candidate(&mut broker, "outcome unknown before the boot");
+        left_receipt(
+            &mut broker,
+            ambiguous.id,
+            "2123456789abcdef0123456789abcdef",
+            "outcome_unknown",
+            1,
+        );
+        quiet(&mut broker, &ambiguous, 3);
+
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        let died_outcome = close_directly(&mut broker, &died, &mut table);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        let running_outcome = close_directly(&mut broker, &running, &mut table);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        let ambiguous_outcome = close_directly(&mut broker, &ambiguous, &mut table);
+        crate::host_boot::set_boot_time_ms_for_tests(None);
+
+        assert_eq!(
+            died_outcome,
+            crate::broker::AbandonedSessionCloseOutcome::Closed
+        );
+        assert!(!is_open(&broker, died.id));
+        let (phase, outcome): (String, String) = broker
+            .store_ref()
+            .connection()
+            .query_row(
+                "SELECT phase, command_outcome FROM guarded_exec_receipts WHERE receipt_id = ?1",
+                ["0123456789abcdef0123456789abcdef"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((phase.as_str(), outcome.as_str()), ("completed", "unknown"));
+        let abandoned: i64 = broker
+            .store_ref()
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = ?1 AND session_id = ?2",
+                rusqlite::params![crate::events::GUARDED_EXEC_RECEIPT_ABANDONED, died.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(abandoned, 1);
+        assert_eq!(
+            phase_count(&recorder, "guarded_exec_receipts_abandoned_pre_boot"),
+            1
+        );
+
+        for (session, outcome) in [(&running, running_outcome), (&ambiguous, ambiguous_outcome)] {
+            assert_eq!(
+                outcome,
+                crate::broker::AbandonedSessionCloseOutcome::OperationActive,
+                "{:?}",
+                session.task
+            );
+            assert!(is_open(&broker, session.id));
+        }
+    }
+
+    /// After a restart the broker first sees every holder gone only when a
+    /// command runs. A holder whose recorded start predates the boot has
+    /// been gone since the boot, so its stale grace does not start again.
+    #[test]
+    fn a_holder_started_before_the_boot_gets_no_fresh_grace() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (session, _) = session(&mut broker, "explicit claims, holder died at reboot", false);
+        broker
+            .store()
+            .claim_lease(session.id, "base.txt", None)
+            .unwrap();
+        // `quiet` binds a holder started on 1 January 2024.
+        quiet(&mut broker, &session, 80);
+        crate::host_boot::set_boot_time_ms_for_tests(Some(now_ms() - HOUR_MS));
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        let outcome = close_abandoned_directly(&mut broker, &session, &mut table);
+        crate::host_boot::set_boot_time_ms_for_tests(None);
+
+        assert_eq!(
+            outcome,
+            crate::broker::AbandonedSessionCloseOutcome::Closed,
+            "the grace ran from the boot an hour ago, not from this first sighting"
+        );
+        assert!(phase_count(&recorder, "holder_grace_anchored_to_boot") >= 1);
+    }
+
+    /// A legacy session that never recorded a holder releases its explicit
+    /// claims only past the abandonment window and with no unresolved
+    /// operation; inside the window, or with a command still unresolved, its
+    /// claims keep it.
+    #[test]
+    fn a_legacy_session_without_a_holder_releases_claims_only_when_old_and_idle() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        let claimed = |broker: &mut crate::Broker, label: &str, hours: u64| {
+            let (session, _) = session(broker, label, false);
+            broker
+                .store()
+                .claim_lease(session.id, "base.txt", None)
+                .unwrap();
+            age(broker, &session, hours);
+            session
+        };
+
+        let recent = claimed(&mut broker, "legacy, inside the window", 1);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_abandoned_directly(&mut broker, &recent, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::NotDue
+        );
+        assert!(is_open(&broker, recent.id));
+
+        let busy = claimed(&mut broker, "legacy, command still running", 80);
+        left_receipt(
+            &mut broker,
+            busy.id,
+            "3123456789abcdef0123456789abcdef",
+            "running",
+            now_ms(),
+        );
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_abandoned_directly(&mut broker, &busy, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::LeaseHeld
+        );
+        assert!(is_open(&broker, busy.id));
+        assert_eq!(phase_count(&recorder, "legacy_unbound_claims_released"), 0);
+
+        let old = claimed(&mut broker, "legacy, quiet for days", 80);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_abandoned_directly(&mut broker, &old, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::Closed,
+            "age is the only evidence a session without a holder can have"
+        );
+        assert!(!is_open(&broker, old.id));
+        assert_eq!(phase_count(&recorder, "legacy_unbound_claims_released"), 1);
+    }
+
+    /// A command refused the process listing (sandboxed) judges no holder:
+    /// the session is kept under its own reason, not as an unknown holder,
+    /// and the pass does not retry the listing.
+    #[test]
+    fn a_refused_process_listing_is_its_own_keep_reason() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (session, _) = session(&mut broker, "holder hidden by a sandbox", false);
+        quiet(&mut broker, &session, 80);
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        table.queue_denied_process_table_for_test();
+
+        assert_eq!(
+            close_abandoned_directly(&mut broker, &session, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::HolderUnavailable
+        );
+        assert_eq!(
+            table.keep_reason(),
+            Some(crate::broker::AbandonmentKeepReason::HolderProcessTableDenied)
+        );
+        assert!(table.process_listing_denied());
+        assert_eq!(phase_count(&recorder, "holder_process_table_denied"), 1);
+        assert_eq!(
+            phase_count(&recorder, "session_abandonment_kept_holder_unknown"),
+            0
+        );
+        assert!(is_open(&broker, session.id));
+    }
+
     /// An explicit lease whose holder runs keeps the session, even when the
     /// holder moved on and the checkout is clean, which alone would close it.
     #[test]
@@ -1825,6 +2054,7 @@ mod lane_tests {
             Reason::WorktreeActivityUnavailable,
             Reason::RecentActivity,
             Reason::HolderUnknown,
+            Reason::HolderProcessTableDenied,
             Reason::HolderAliveCurrent,
             Reason::HolderRecordUnavailable,
             Reason::HolderSharedService,
@@ -1867,6 +2097,7 @@ mod lane_tests {
                 | Reason::WorktreeActivityUnavailable
                 | Reason::RecentActivity
                 | Reason::HolderUnknown
+                | Reason::HolderProcessTableDenied
                 | Reason::HolderAliveCurrent
                 | Reason::HolderRecordUnavailable
                 | Reason::HolderSharedService

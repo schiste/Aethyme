@@ -117,6 +117,7 @@ mod graph_impact;
 mod graph_impact_envelope;
 mod graph_integrity;
 mod homebrew;
+mod host_boot;
 pub mod hooks;
 mod host_operations;
 mod host_state;

@@ -29,6 +29,10 @@ pub const SESSION_HOLDER_BOUND: &str = "session.holder_bound";
 /// The broker first saw a session's holder process gone (#360). Starts the
 /// lease stale-grace clock for that holder.
 pub const SESSION_HOLDER_GONE: &str = "session.holder_gone";
+/// A guarded-exec receipt left `starting` or `running` by a command whose last
+/// write predates the host boot was settled as abandoned: no process from
+/// before a boot survives it.
+pub const GUARDED_EXEC_RECEIPT_ABANDONED: &str = "guarded_exec.receipt_abandoned";
 pub const SESSION_INSTALL_RECORDED: &str = "session.install_recorded";
 pub const SESSION_FINISH_CLEANUP_STARTED: &str = "session.finish_cleanup_started";
 pub const SESSION_CHECKPOINT_REANCHORED: &str = "session.checkpoint_reanchored";
@@ -194,6 +198,24 @@ pub fn session_holder_gone_payload(holder: &crate::session_holder::AgentProcess)
         "pid": holder.pid,
         "started": holder.started,
         "command": holder.command,
+    })
+    .to_string()
+}
+
+/// `guarded_exec.receipt_abandoned`: which receipt, the phase it was left in,
+/// its last write and the boot time that proves its command gone.
+pub fn guarded_exec_receipt_abandoned_payload(
+    receipt_id: &str,
+    previous_phase: &str,
+    receipt_updated_at_ms: i64,
+    boot_time_ms: i64,
+) -> String {
+    json!({
+        "receipt_id": receipt_id,
+        "previous_phase": previous_phase,
+        "receipt_updated_at_ms": receipt_updated_at_ms,
+        "boot_time_ms": boot_time_ms,
+        "reason": "command_predates_boot",
     })
     .to_string()
 }
