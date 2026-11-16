@@ -15755,6 +15755,20 @@ mod tests {
         let (_temporary, _storage, mut broker, first) = compaction_index_fixture();
         run_compaction_index_pass(&mut broker);
         let before = cohort_index_state(&mut broker);
+        // The stored row no longer matches what the path resolves to, and
+        // the session is dirty: the drain rewrites that row and no other.
+        assert_eq!(
+            broker
+                .store()
+                .connection()
+                .execute(
+                    "UPDATE cleanup_cohort_scan_rows SET git_dir = '/stale/git-dir'
+                     WHERE session_id = ?1",
+                    [first],
+                )
+                .unwrap(),
+            1
+        );
         assert_eq!(
             broker
                 .store()
@@ -15992,7 +16006,7 @@ mod tests {
                 "INSERT INTO sessions (
                      worktree_path, branch, origin, status, cleanup_state, closed_at,
                      created_at, updated_at, last_activity_at
-                 ) VALUES (?1, 'agent/alias-registered', 'adopted', 'closed', 'closed', 1, 1, 1, 1)",
+                 ) VALUES (?1, 'agent/alias-registered', 'adopted', 'cleaned', 'closed', 1, 1, 1, 1)",
                 [alias.to_string_lossy()],
             )
             .unwrap();
