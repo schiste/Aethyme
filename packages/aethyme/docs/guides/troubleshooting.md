@@ -143,8 +143,12 @@ aethyme broker status --json
    `aethyme broker status --json` (or `auto_cleanup` in
    `aethyme broker gc plan --json`): `merged_pull_request_examined` and
    `merged_pull_request_closed` count the 2-hour path, and `declined` names
-   the reason each kept session stayed open. `holder_unbound` and
-   `holder_alive` mean the agent process could not be proved gone;
+   the reason each kept session stayed open. `holder_unbound` means no
+   agent process was recorded; `holder_alive_current` means the agent
+   process still runs and this is its latest session; `holder_alive_in_use`
+   means it moved on to another session but a process still works in this
+   checkout (the `landed_worktree_unclean_<kind>` counters in the worker
+   metrics say which content keeps a `worktree_unclean` session);
    `not_landed` means commits after the merge; `worktree_unclean` means
    uncommitted or unclassified ignored content; `operation_active` or
    `operation_unknown` means a gate, queue entry, operation, preparation or

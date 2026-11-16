@@ -92,6 +92,7 @@ impl PullRequestMerges {
 }
 
 /// The `session.abandoned` payload for a landed-lane close.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn landed_close_payload(
     close_reason: &str,
     idle_ms: i64,
@@ -100,8 +101,12 @@ pub(crate) fn landed_close_payload(
     retirement_basis: &str,
     proof: &crate::broker::LandedProof,
     pull_requests: &PullRequestMerges,
+    holder_evidence: &str,
+    moved_on_to: Option<i64>,
 ) -> String {
     json!({
+        "holder_evidence": holder_evidence,
+        "holder_moved_on_to_session": moved_on_to,
         "idle_ms": idle_ms,
         "abandon_after_ms": window_ms,
         "pid_alive": pid_alive,
@@ -124,6 +129,8 @@ pub(crate) fn abandonment_close_payload(
     pull_requests: Option<&PullRequestMerges>,
     head: Option<&str>,
     unlanded_commits: Option<bool>,
+    holder_evidence: &str,
+    moved_on_to: Option<i64>,
 ) -> String {
     let mut payload: Value =
         serde_json::from_str(base_payload).unwrap_or_else(|_| Value::Object(Default::default()));
@@ -139,12 +146,33 @@ pub(crate) fn abandonment_close_payload(
         fields.insert("head".into(), json!(head));
         fields.insert("unlanded_commits".into(), json!(unlanded_commits));
         fields.insert("checkout_deleted".into(), json!(false));
+        fields.insert("holder_evidence".into(), json!(holder_evidence));
+        fields.insert("holder_moved_on_to_session".into(), json!(moved_on_to));
     }
     payload.to_string()
 }
 
 /// Why the payload says the session was closed, in words.
 fn close_reason_text(payload: &Value) -> String {
+    let reason = close_reason_basis(payload);
+    match (
+        payload.get("holder_evidence").and_then(Value::as_str),
+        payload
+            .get("holder_moved_on_to_session")
+            .and_then(Value::as_i64),
+    ) {
+        (Some("moved_on"), Some(newer)) => format!(
+            "{reason}; its agent process was still running but had moved on to session \
+             {newer}, and nothing was using this checkout"
+        ),
+        (Some("lease_expired"), _) => {
+            format!("{reason}; its agent process was still running but its task lease had expired")
+        }
+        _ => reason,
+    }
+}
+
+fn close_reason_basis(payload: &Value) -> String {
     let idle_hours = payload
         .get("idle_ms")
         .and_then(Value::as_i64)
@@ -308,20 +336,34 @@ mod tests {
     #[test]
     fn an_abandonment_close_names_a_session_without_any_pull_request() {
         let base = crate::events::session_abandoned_payload(3 * 86_400_000, 259_200_000, None);
-        let none = abandonment_close_payload(&base, Some(&merges(&[])), Some("abc"), Some(true));
+        let none = abandonment_close_payload(
+            &base,
+            Some(&merges(&[])),
+            Some("abc"),
+            Some(true),
+            "moved_on",
+            Some(77),
+        );
         let value: Value = serde_json::from_str(&none).unwrap();
         assert_eq!(value["close_reason"], CLOSE_REASON_INACTIVE_NO_PULL_REQUEST);
         assert_eq!(value["unlanded_commits"], true);
         assert_eq!(value["checkout_deleted"], false);
         assert_eq!(value["idle_ms"], 3 * 86_400_000, "existing fields are kept");
-        let with_pr =
-            abandonment_close_payload(&base, Some(&merges(&[(4, None)])), Some("abc"), None);
+        let with_pr = abandonment_close_payload(
+            &base,
+            Some(&merges(&[(4, None)])),
+            Some("abc"),
+            None,
+            "gone",
+            None,
+        );
         let value: Value = serde_json::from_str(&with_pr).unwrap();
         assert_eq!(value["close_reason"], CLOSE_REASON_INACTIVE);
         let note = close_note(9, "/nonexistent/auto-close-fixture", &none);
         assert!(note.contains("no pull request was recorded"), "{note}");
         assert!(note.contains("3 days"), "{note}");
         assert!(note.contains("branch and checkout are kept"), "{note}");
+        assert!(note.contains("moved on to session 77"), "{note}");
         assert!(note.contains("has since been removed"), "{note}");
     }
 
@@ -1297,5 +1339,261 @@ mod lane_tests {
             true,
         );
         assert_eq!(first_failure.snapshots_taken_for_test(), 1, "one retry");
+    }
+
+    /// The agent process this test runs in, as a holder the synthetic process
+    /// table below reports alive.
+    fn live_holder() -> crate::session_holder::AgentProcess {
+        crate::session_holder::AgentProcess {
+            pid: i64::from(std::process::id()),
+            started: "Mon Jan 1 00:00:00 2024".into(),
+            command: "orchestrating-agent".into(),
+        }
+    }
+
+    /// Bind `holder` to `session`, push its activity `hours` back, and give
+    /// back a process table in which `holder` is alive.
+    fn held_by_live_holder(
+        broker: &mut crate::Broker,
+        session: &crate::Session,
+        holder: &crate::session_holder::AgentProcess,
+        hours: u64,
+    ) -> crate::session_holder::RecordedHolderProcessTable {
+        let event_id = bind_holder(broker, session, holder);
+        age(broker, session, hours);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        table.install_holder_process_table_for_test(
+            session.id,
+            event_id,
+            crate::session_holder::ProcessTable::parse(&format!(
+                "{} 1 {} {}\n",
+                holder.pid, holder.started, holder.command
+            )),
+        );
+        table
+    }
+
+    /// One orchestrating agent holds many sessions: once it was bound to a
+    /// newer session after this one's last activity, a live holder no longer
+    /// keeps this merged, landed, clean session.
+    #[test]
+    fn a_live_holder_that_moved_on_no_longer_keeps_a_merged_session() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let holder = live_holder();
+        let (old, worktree) = merged_candidate(&mut broker, "finished long ago");
+        let mut table = held_by_live_holder(&mut broker, &old, &holder, 3);
+        let (newer, _) = session(&mut broker, "the agent's next task", false);
+        bind_holder(&mut broker, &newer, &holder);
+
+        assert_eq!(
+            close_directly(&mut broker, &old, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::Closed
+        );
+        let payload = close_payload(&broker, old.id);
+        assert_eq!(payload["holder_evidence"], "moved_on");
+        assert_eq!(payload["holder_moved_on_to_session"], newer.id);
+        assert!(worktree.exists(), "closing deletes nothing");
+        let refusal = super::closed_session_refusal(broker.store_ref(), old.id);
+        assert!(
+            refusal.contains(&format!("moved on to session {}", newer.id)),
+            "{refusal}"
+        );
+    }
+
+    /// The holder's latest session is kept whatever its idle time, and a
+    /// moved-on holder still keeps a session something is working in.
+    #[test]
+    fn a_live_holder_keeps_its_latest_session_and_any_session_in_use() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let holder = live_holder();
+        let (latest, _) = merged_candidate(&mut broker, "the agent's latest session");
+        let mut table = held_by_live_holder(&mut broker, &latest, &holder, 30);
+        assert_eq!(
+            close_directly(&mut broker, &latest, &mut table),
+            declined(crate::broker::LandedSessionDecline::HolderAlive)
+        );
+        assert_eq!(
+            crate::broker::LandedSessionDecline::HolderAlive.code(),
+            "holder_alive_current"
+        );
+
+        let (in_use, in_use_tree) = merged_candidate(&mut broker, "a process still works here");
+        let mut table = held_by_live_holder(&mut broker, &in_use, &holder, 3);
+        let (newer, _) = session(&mut broker, "moved on", false);
+        bind_holder(&mut broker, &newer, &holder);
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(opened_in(&in_use_tree)));
+        assert_eq!(
+            close_directly(&mut broker, &in_use, &mut table),
+            declined(crate::broker::LandedSessionDecline::HolderAliveInUse)
+        );
+        assert!(is_open(&broker, latest.id));
+        assert!(is_open(&broker, in_use.id));
+    }
+
+    fn close_abandoned_directly(
+        broker: &mut crate::Broker,
+        session: &crate::Session,
+        table: &mut crate::session_holder::RecordedHolderProcessTable,
+    ) -> crate::broker::AbandonedSessionCloseOutcome {
+        broker
+            .try_close_abandoned_session(session.id, now_ms(), 72 * HOUR_MS, table, true, None)
+            .unwrap()
+    }
+
+    /// The abandonment window treats a moved-on live holder as gone only for
+    /// a clean checkout; unlanded commits do not keep a clean one, and they
+    /// survive every later removal pass with their branch.
+    #[test]
+    fn the_abandonment_window_closes_a_moved_on_session_only_when_clean() {
+        let (_owner, _storage, mut broker) = fixture("closed_worktree_grace_hours = 0\n");
+        let holder = live_holder();
+
+        let (dirty, dirty_tree) = session(&mut broker, "dirty, no pull request", false);
+        std::fs::write(dirty_tree.join("base.txt"), "edited, not committed\n").unwrap();
+        let mut dirty_table = held_by_live_holder(&mut broker, &dirty, &holder, 80);
+
+        let (clean, clean_tree) = session(&mut broker, "clean with unlanded commits", false);
+        let clean_head = crate::git::GitRepo::discover(&clean_tree)
+            .unwrap()
+            .head_commit()
+            .unwrap();
+        let mut clean_table = held_by_live_holder(&mut broker, &clean, &holder, 80);
+
+        let (newer, _) = session(&mut broker, "the agent's next task", false);
+        bind_holder(&mut broker, &newer, &holder);
+
+        assert_eq!(
+            close_abandoned_directly(&mut broker, &dirty, &mut dirty_table),
+            crate::broker::AbandonedSessionCloseOutcome::ActiveProcess
+        );
+        assert!(is_open(&broker, dirty.id));
+
+        assert_eq!(
+            close_abandoned_directly(&mut broker, &clean, &mut clean_table),
+            crate::broker::AbandonedSessionCloseOutcome::Closed
+        );
+        let payload = close_payload(&broker, clean.id);
+        assert_eq!(
+            payload["close_reason"],
+            super::CLOSE_REASON_INACTIVE_NO_PULL_REQUEST
+        );
+        assert_eq!(payload["holder_evidence"], "moved_on");
+        assert_eq!(payload["unlanded_commits"], true);
+        for _ in 0..3 {
+            broker.auto_cleanup_now(None).unwrap();
+            assert!(clean_tree.exists(), "unlanded work keeps its checkout");
+            assert_eq!(
+                broker
+                    .repo_handle()
+                    .resolve_ref(&format!("refs/heads/{}", clean.branch))
+                    .as_deref(),
+                Some(clean_head.as_str())
+            );
+        }
+    }
+
+    fn close_session_row(broker: &mut crate::Broker, session: &crate::Session) {
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE sessions SET status = 'cleaned', cleanup_state = 'closed', closed_at = 1 WHERE id = ?1",
+                [session.id],
+            )
+            .unwrap();
+    }
+
+    /// A closed session whose checkout is gone from a mounted pool root,
+    /// unregistered and unused, is recorded as cleaned without deleting
+    /// anything; every unproven case is kept with its reason.
+    #[test]
+    fn a_closed_session_whose_checkout_is_gone_is_finished_only_when_proven() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let root = broker.main_root().to_path_buf();
+
+        let (gone, gone_tree) = session(&mut broker, "checkout removed elsewhere", false);
+        close_session_row(&mut broker, &gone);
+        git(
+            &root,
+            &["worktree", "remove", "--force", gone_tree.to_str().unwrap()],
+        );
+
+        let (present, _) = session(&mut broker, "checkout still here", false);
+        close_session_row(&mut broker, &present);
+
+        let (registered, registered_tree) = session(&mut broker, "still registered", false);
+        close_session_row(&mut broker, &registered);
+        std::fs::remove_dir_all(&registered_tree).unwrap();
+
+        let (shared, shared_tree) = session(&mut broker, "path reused by an open session", false);
+        close_session_row(&mut broker, &shared);
+        git(
+            &root,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                shared_tree.to_str().unwrap(),
+            ],
+        );
+        let (reuser, _) = session(&mut broker, "open at the same path", false);
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE sessions SET worktree_path = ?1 WHERE id = ?2",
+                rusqlite::params![shared.worktree_path, reuser.id],
+            )
+            .unwrap();
+
+        let (unmounted, _) = session(&mut broker, "pool root not on disk", false);
+        close_session_row(&mut broker, &unmounted);
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE sessions SET worktree_path = '/nonexistent-auto-close-pool/checkout' WHERE id = ?1",
+                [unmounted.id],
+            )
+            .unwrap();
+
+        let summary = broker
+            .finish_closed_sessions_with_missing_checkout(None)
+            .unwrap();
+
+        assert_eq!(summary.finished, 1, "{summary:?}");
+        let finished = broker.store_ref().session(gone.id).unwrap();
+        assert_eq!(finished.cleanup_state, SessionCleanupState::Cleaned);
+        assert!(
+            broker
+                .repo_handle()
+                .resolve_ref(&format!("refs/heads/{}", gone.branch))
+                .is_some(),
+            "the session branch is kept"
+        );
+        assert_eq!(
+            summary.kept.get("checkout_present"),
+            Some(&1),
+            "{summary:?}"
+        );
+        assert_eq!(summary.kept.get("git_registered"), Some(&1), "{summary:?}");
+        assert_eq!(
+            summary.kept.get("open_session_at_path"),
+            Some(&1),
+            "{summary:?}"
+        );
+        assert_eq!(
+            summary.kept.get("pool_root_missing"),
+            Some(&1),
+            "{summary:?}"
+        );
+        for kept in [&present, &registered, &shared, &unmounted] {
+            assert_eq!(
+                broker.store_ref().session(kept.id).unwrap().cleanup_state,
+                SessionCleanupState::Closed,
+                "{:?}",
+                kept.task
+            );
+        }
     }
 }

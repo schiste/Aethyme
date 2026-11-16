@@ -1763,6 +1763,18 @@ pub struct AutoCleanupReport {
     /// that window first, closed or not.
     #[serde(default, skip_serializing_if = "is_zero_count")]
     pub abandonment_sessions_examined: usize,
+    /// Sessions this report closed, per holder evidence (`gone`,
+    /// `moved_on`, `lease_expired`, `unbound`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sessions_closed_by_holder_evidence: std::collections::BTreeMap<String, usize>,
+    /// Closed sessions whose missing checkout the lane judged, finished
+    /// (recorded as cleaned) and kept per reason, in this report.
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub missing_checkout_examined: usize,
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub missing_checkout_finished: usize,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub missing_checkout_kept: std::collections::BTreeMap<String, usize>,
     /// When the retirement counts above were evaluated, when they were
     /// carried from an earlier report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2159,6 +2171,10 @@ pub struct LandedSessionRetirementView {
     /// Sessions past the abandonment window asked that window first.
     #[serde(skip_serializing_if = "is_zero_count")]
     pub abandonment_examined: usize,
+    /// Sessions closed per holder evidence (`gone`, `moved_on`,
+    /// `lease_expired`, `unbound`).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub closed_by_holder_evidence: std::collections::BTreeMap<String, usize>,
     /// Kept sessions per reason; the reasons are `LandedSessionDecline` codes.
     pub declined: std::collections::BTreeMap<String, usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2211,6 +2227,13 @@ impl AutoCleanupReport {
         self.abandonment_sessions_examined = self
             .abandonment_sessions_examined
             .saturating_add(retirement.abandonment_examined);
+        for (evidence, count) in &retirement.closed_by_holder_evidence {
+            let entry = self
+                .sessions_closed_by_holder_evidence
+                .entry((*evidence).to_string())
+                .or_default();
+            *entry = entry.saturating_add(*count);
+        }
         for (reason, count) in &retirement.closed_by_reason {
             let entry = self
                 .sessions_closed_by_reason
@@ -2251,6 +2274,23 @@ impl AutoCleanupReport {
         self.abandonment_sessions_examined = self
             .abandonment_sessions_examined
             .saturating_add(later.abandonment_sessions_examined);
+        self.missing_checkout_examined = self
+            .missing_checkout_examined
+            .saturating_add(later.missing_checkout_examined);
+        self.missing_checkout_finished = self
+            .missing_checkout_finished
+            .saturating_add(later.missing_checkout_finished);
+        for (code, count) in &later.missing_checkout_kept {
+            let entry = self.missing_checkout_kept.entry(code.clone()).or_default();
+            *entry = entry.saturating_add(*count);
+        }
+        for (evidence, count) in &later.sessions_closed_by_holder_evidence {
+            let entry = self
+                .sessions_closed_by_holder_evidence
+                .entry(evidence.clone())
+                .or_default();
+            *entry = entry.saturating_add(*count);
+        }
         for (reason, count) in &later.sessions_closed_by_reason {
             let entry = self
                 .sessions_closed_by_reason
@@ -2272,6 +2312,8 @@ impl AutoCleanupReport {
         self.merged_pull_request_sessions_closed = previous.merged_pull_request_sessions_closed;
         self.sessions_closed_by_reason = previous.sessions_closed_by_reason.clone();
         self.abandonment_sessions_examined = previous.abandonment_sessions_examined;
+        self.sessions_closed_by_holder_evidence =
+            previous.sessions_closed_by_holder_evidence.clone();
         self.retirement_evaluated_at_ms = previous
             .retirement_evaluated_at_ms
             .or(Some(previous.evaluated_at_ms));
@@ -2288,6 +2330,7 @@ impl AutoCleanupReport {
             || !self.sessions_closed_by_reason.is_empty())
         .then(|| LandedSessionRetirementView {
             abandonment_examined: self.abandonment_sessions_examined,
+            closed_by_holder_evidence: self.sessions_closed_by_holder_evidence.clone(),
             evaluated_at_ms: self
                 .retirement_evaluated_at_ms
                 .unwrap_or(self.evaluated_at_ms),
@@ -2355,7 +2398,32 @@ struct SessionRetirementSummary {
     closed_by_reason: std::collections::BTreeMap<&'static str, usize>,
     /// Sessions the oldest-first lap asked the abandonment window first.
     abandonment_examined: usize,
+    /// Sessions closed, per holder evidence: `gone`, `moved_on`,
+    /// `lease_expired`, `unbound`.
+    closed_by_holder_evidence: std::collections::BTreeMap<&'static str, usize>,
     cursor: Option<SessionRetirementCursorPosition>,
+}
+
+impl Broker {
+    /// The holder evidence the close of `session_id` recorded in its latest
+    /// `session.abandoned` event.
+    fn closed_holder_evidence(&self, session_id: i64) -> &'static str {
+        let evidence = self
+            .store_ref()
+            .latest_session_abandoned_event(session_id)
+            .ok()
+            .flatten()
+            .and_then(|event| event.payload_json)
+            .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
+            .and_then(|payload| payload["holder_evidence"].as_str().map(str::to_string));
+        match evidence.as_deref() {
+            Some("gone") => "gone",
+            Some("moved_on") => "moved_on",
+            Some("lease_expired") => "lease_expired",
+            Some("unbound") => "unbound",
+            _ => "unknown",
+        }
+    }
 }
 
 /// The order of the likely-landed queue: sessions with a merged pull
@@ -2389,6 +2457,10 @@ fn merged_pull_request_lane(
 }
 
 impl SessionRetirementSummary {
+    fn record_holder_evidence(&mut self, evidence: &'static str) {
+        *self.closed_by_holder_evidence.entry(evidence).or_default() += 1;
+    }
+
     fn record_close(&mut self, reason: &'static str) {
         *self.closed_by_reason.entry(reason).or_default() += 1;
         crate::phase_telemetry::add(
@@ -6891,6 +6963,7 @@ impl Broker {
                         "abandoned"
                     };
                     summary.record_close(reason);
+                    summary.record_holder_evidence(self.closed_holder_evidence(session.id));
                 }
                 crate::broker::AbandonedSessionCloseOutcome::HolderUnavailable => {
                     summary.deferred += 1;
@@ -7226,6 +7299,7 @@ impl Broker {
                 None => {
                     summary.landed_closed += 1;
                     summary.retired += 1;
+                    summary.record_holder_evidence(self.closed_holder_evidence(session.id));
                     summary.record_close(if merged_lane {
                         crate::session_auto_close::CLOSE_REASON_MERGED_PULL_REQUEST
                     } else {
@@ -7276,6 +7350,18 @@ impl Broker {
         report.deferred = retirement.deferred;
         report.sessions_retired = retirement.retired;
         report.retirement_deferred_reasons = retirement.reasons;
+        // Closed sessions whose checkout is already gone are finished in the
+        // same worker, with what is left of the pass.
+        if !deadline_expired(deadline) {
+            let missing = self.finish_closed_sessions_with_missing_checkout(deadline)?;
+            report.missing_checkout_examined = missing.examined;
+            report.missing_checkout_finished = missing.finished;
+            report.missing_checkout_kept = missing
+                .kept
+                .into_iter()
+                .map(|(code, count)| (code.to_string(), count))
+                .collect();
+        }
         Ok(report)
     }
 

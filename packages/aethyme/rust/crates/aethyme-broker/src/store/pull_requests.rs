@@ -2243,6 +2243,39 @@ impl BrokerStore {
             .map_err(BrokerError::from)
     }
 
+    /// A different session the same holder process (`pid` and recorded start
+    /// time) was bound to after `after_event_id` and after `after_ts`: the
+    /// newest such session, or `None`. Reads only the event log.
+    pub(crate) fn newer_holder_binding_elsewhere(
+        &self,
+        session_id: i64,
+        after_event_id: i64,
+        after_ts: i64,
+        pid: i64,
+        started: &str,
+    ) -> Result<Option<i64>, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT session_id FROM events
+                 WHERE kind = ?1 AND id > ?2 AND ts > ?3
+                   AND session_id IS NOT NULL AND session_id <> ?4
+                   AND json_extract(payload_json, '$.pid') = ?5
+                   AND json_extract(payload_json, '$.started') = ?6
+                 ORDER BY id DESC LIMIT 1",
+                params![
+                    crate::events::SESSION_HOLDER_BOUND,
+                    after_event_id,
+                    after_ts,
+                    session_id,
+                    pid,
+                    started
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(BrokerError::from)
+    }
+
     /// Latest `session.holder_gone` event for one session.
     pub fn latest_session_holder_gone_event(
         &self,
