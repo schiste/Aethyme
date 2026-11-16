@@ -1911,8 +1911,12 @@ pub struct InFlightGuard {
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        if read_in_flight(&self.path).as_ref() == Some(&self.holder) {
-            let _ = std::fs::remove_file(&self.path);
+        // A marker left behind is harmless: it names this process, so the next
+        // plan treats it as stale once this process has exited.
+        if read_in_flight(&self.path).as_ref() == Some(&self.holder)
+            && let Err(error) = std::fs::remove_file(&self.path)
+        {
+            eprintln!("Warning: cannot remove the reclaim plan in-flight marker: {error}");
         }
     }
 }
