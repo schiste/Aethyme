@@ -7,10 +7,20 @@
 //! - Linux: `/proc/net/tcp` and `/proc/net/tcp6` list the listeners and
 //!   their socket inodes; `/proc/<pid>/fd` of the group's processes tells
 //!   which inodes are the group's.
-//! - macOS: `netstat -anv -p tcp` (C locale, 2 s deadline), which lists
-//!   every user's TCP sockets with the owning pid; each listener's pid is
-//!   mapped to its group with `getpgid`. Output whose pid column cannot be
-//!   found or read is unverifiable, never "nobody listens".
+//! - macOS: two counts that must agree. `netstat -an -p tcp` (C locale, 2 s
+//!   deadline) lists every user's TCP sockets; only its leading columns
+//!   (protocol, queues, local and foreign address, state), which come
+//!   before anything a process controls, are read, to count the listeners
+//!   on the port and their addresses. `lsof -a -g <group> -nP
+//!   -iTCP:<port> -sTCP:LISTEN -Fdn`, limited to the server's own process
+//!   group, gives the listening sockets the group owns (deduplicated by
+//!   socket, since forked workers share one). Ours only when both counts
+//!   are equal and every listener is on 127.0.0.1; fewer owned than
+//!   listening is `listener_not_ours`; anything unreadable or of an
+//!   unexpected shape is unverifiable. No pid or process name is ever read
+//!   from another user's socket entry, so a crafted process name cannot
+//!   claim a listener. A process name with a line break could add a fake
+//!   `LISTEN` line, which only raises the count: it fails closed.
 //! - Anywhere else, or when the tool is missing or too slow: unverifiable,
 //!   and the server is not used.
 
@@ -41,7 +51,7 @@ impl Listeners {
     }
 }
 
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 /// One listener: whether it is bound to IPv4 loopback and whether the group
 /// owns it.
 struct Listener {
@@ -49,7 +59,7 @@ struct Listener {
     ours: bool,
 }
 
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn judge(listeners: &[Listener]) -> Listeners {
     if listeners.is_empty() {
         Listeners::None
@@ -183,53 +193,83 @@ mod linux {
     }
 }
 
-/// `(bound to 127.0.0.1 over IPv4, pid)` of each TCP listener on `port` in
-/// `netstat -anv -p tcp` output. `None` when the output has no header with a
-/// `pid` (or `process:pid`) column or a listener's pid cannot be read: the
-/// full set of listeners is then unknown.
+/// For each TCP listener on `port` in `netstat -an -p tcp` output: whether
+/// it is bound to 127.0.0.1 over IPv4. Only the leading columns are read
+/// (`Proto Recv-Q Send-Q Local Foreign (state)`); `None` when any TCP line
+/// does not have that shape, so the count is never a guess.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn parse_netstat(text: &str, port: u16) -> Option<Vec<(bool, u32)>> {
+pub(crate) fn netstat_listeners(text: &str, port: u16) -> Option<Vec<bool>> {
     let suffix = format!(".{port}");
     let loopback = format!("127.0.0.1{suffix}");
-    let mut pid_column: Option<usize> = None;
     let mut found = Vec::new();
     for line in text.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let Some(first) = fields.first() else {
+        let mut fields = line.split_whitespace();
+        let Some(proto) = fields.next() else {
             continue;
         };
-        if *first == "Proto" {
-            // "Local Address" and "Foreign Address" are two words each.
-            let mut columns: Vec<&str> = Vec::new();
-            let mut index = 0;
-            while index < fields.len() {
-                let word = fields[index];
-                if matches!(word, "Local" | "Foreign") && fields.get(index + 1) == Some(&"Address")
-                {
-                    columns.push("address");
-                    index += 2;
-                } else {
-                    columns.push(word);
-                    index += 1;
-                }
-            }
-            pid_column = columns
-                .iter()
-                .position(|column| matches!(*column, "pid" | "process:pid"));
+        if !proto.starts_with("tcp") {
             continue;
         }
-        if !first.starts_with("tcp") {
-            continue;
+        if !matches!(proto, "tcp4" | "tcp6" | "tcp46") {
+            return None;
         }
-        let column = pid_column?;
-        // Proto Recv-Q Send-Q Local Foreign (state) ...
-        if fields.get(5) != Some(&"LISTEN") || !fields.get(3)?.ends_with(&suffix) {
-            continue;
+        let (Some(receive), Some(send), Some(local), Some(_foreign), Some(state)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            return None;
+        };
+        let counter = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+        if !counter(receive) || !counter(send) {
+            return None;
         }
-        let pid = fields.get(column)?.rsplit(':').next()?.parse().ok()?;
-        found.push((*first == "tcp4" && fields[3] == loopback, pid));
+        if state == "LISTEN" && local.ends_with(&suffix) {
+            found.push(proto == "tcp4" && local == loopback);
+        }
     }
-    pid_column.map(|_| found)
+    Some(found)
+}
+
+/// The group's own listening sockets on `port` from `lsof -a -g <group> -nP
+/// -iTCP:<port> -sTCP:LISTEN -Fdn` (fields `p`, `f`, `d`, `n`): whether each
+/// distinct socket (by its `d` kernel address) is bound to 127.0.0.1.
+/// `None` when a name comes without its socket address.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn lsof_owned_sockets(text: &str, port: u16) -> Option<Vec<bool>> {
+    let loopback = format!("127.0.0.1:{port}");
+    let mut sockets = std::collections::BTreeMap::new();
+    let mut device: Option<&str> = None;
+    for line in text.lines() {
+        match line.split_at_checked(1) {
+            Some(("p" | "f", _)) => device = None,
+            Some(("d", value)) => device = Some(value),
+            Some(("n", name)) => {
+                let socket = device.take()?;
+                sockets.insert(socket, name == loopback);
+            }
+            _ => {}
+        }
+    }
+    Some(sockets.into_values().collect())
+}
+
+/// Combine the host-wide listeners on the port with the ones the group owns.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn reconcile(all: &[bool], owned: &[bool]) -> Listeners {
+    if all.is_empty() {
+        Listeners::None
+    } else if owned.len() < all.len() {
+        Listeners::NotOurs
+    } else if owned.len() > all.len() {
+        Listeners::Unverifiable("listener_count_mismatch".into())
+    } else if all.iter().chain(owned).any(|loopback| !loopback) {
+        Listeners::NotLoopback
+    } else {
+        Listeners::Ours
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -239,27 +279,27 @@ mod macos {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{Listener, Listeners, judge, parse_netstat};
+    use super::{Listeners, lsof_owned_sockets, netstat_listeners, reconcile};
 
     const NETSTAT: &str = "/usr/sbin/netstat";
+    const LSOF: &str = "/usr/sbin/lsof";
     const TOOL_TIMEOUT: Duration = Duration::from_secs(2);
 
-    pub(super) fn check(port: u16, group: u32) -> Listeners {
-        let spawned = Command::new(NETSTAT)
-            .args(["-anv", "-p", "tcp"])
+    /// Run a tool under the C locale within [`TOOL_TIMEOUT`], reading its
+    /// output while it runs; its exit status and output.
+    fn run(program: &str, args: &[&str]) -> Result<(Option<i32>, String), String> {
+        let mut child = Command::new(program)
+            .args(args)
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .spawn();
-        let Ok(mut child) = spawned else {
-            return Listeners::Unverifiable("netstat_missing".into());
-        };
-        // Read while it runs: a busy host's table outgrows a pipe buffer.
+            .spawn()
+            .map_err(|_| format!("{program}_missing"))?;
         let Some(mut stdout) = child.stdout.take() else {
             let _killed = child.kill();
             let _reaped = child.wait();
-            return Listeners::Unverifiable("netstat_output".into());
+            return Err("tool_output".into());
         };
         let reader = thread::spawn(move || {
             let mut text = String::new();
@@ -274,31 +314,51 @@ mod macos {
                     let _killed = child.kill();
                     let _reaped = child.wait();
                     let _drained = reader.join();
-                    return Listeners::Unverifiable("netstat_timeout".into());
+                    return Err("tool_timeout".into());
                 }
             }
         };
-        let text = match reader.join() {
-            Ok(Ok(text)) if status.success() => text,
-            _ => return Listeners::Unverifiable("netstat_failed".into()),
+        match reader.join() {
+            Ok(Ok(text)) => Ok((status.code(), text)),
+            _ => Err("tool_output".into()),
+        }
+    }
+
+    pub(super) fn check(port: u16, group: u32) -> Listeners {
+        let all = match run(NETSTAT, &["-an", "-p", "tcp"]) {
+            Ok((Some(0), text)) => match netstat_listeners(&text, port) {
+                Some(all) => all,
+                None => return Listeners::Unverifiable("netstat_format".into()),
+            },
+            Ok(_) => return Listeners::Unverifiable("netstat_failed".into()),
+            Err(reason) => return Listeners::Unverifiable(reason),
         };
-        let Some(found) = parse_netstat(&text, port) else {
-            return Listeners::Unverifiable("netstat_format".into());
+        if all.is_empty() {
+            return Listeners::None;
+        }
+        let selector = format!("-iTCP:{port}");
+        let group_text = group.to_string();
+        let owned = match run(
+            LSOF,
+            &[
+                "-a",
+                "-g",
+                &group_text,
+                "-nP",
+                &selector,
+                "-sTCP:LISTEN",
+                "-Fdn",
+            ],
+        ) {
+            // lsof exits 1 when it selects nothing.
+            Ok((Some(0 | 1), text)) => match lsof_owned_sockets(&text, port) {
+                Some(owned) => owned,
+                None => return Listeners::Unverifiable("lsof_format".into()),
+            },
+            Ok(_) => return Listeners::Unverifiable("lsof_failed".into()),
+            Err(reason) => return Listeners::Unverifiable(reason),
         };
-        let listeners: Vec<Listener> = found
-            .into_iter()
-            .map(|(loopback, pid)| {
-                let pgid = libc::pid_t::try_from(pid)
-                    // SAFETY: getpgid takes no pointers; it only reads a group id.
-                    .map(|pid| unsafe { libc::getpgid(pid) })
-                    .unwrap_or(-1);
-                Listener {
-                    loopback,
-                    ours: u32::try_from(pgid).ok() == Some(group),
-                }
-            })
-            .collect();
-        judge(&listeners)
+        reconcile(&all, &owned)
     }
 }
 
@@ -343,39 +403,57 @@ mod tests {
     }
 
     #[test]
-    fn netstat_listeners_are_read_with_their_pid_in_either_layout() {
-        // Older layout: a `pid` column.
-        let older = "Active Internet connections (including servers)
-Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)      rhiwat  shiwat    pid   epid state  options           gencnt    flags   flags1 usscnt rtncnt fltrs
-tcp4       0      0  127.0.0.1.47300        *.*                    LISTEN       131072  131072   4242      0 0x0100 0x00000006 0x000000000001a2b3 0x00000000 0x00000800      0      0 000001
-tcp46      0      0  *.47300                *.*                    LISTEN       131072  131072   4343      0 0x0100 0x00000006 0x000000000001a2b4 0x00000000 0x00000800      0      0 000001
-tcp4       0      0  127.0.0.1.47300        127.0.0.1.50000        ESTABLISHED  408241  146988   4242      0 0x0102 0x00000008 0x000000000001a2b5 0x00000000 0x00000800      1      0 000001
-tcp4       0      0  127.0.0.1.147300       *.*                    LISTEN       131072  131072   4444      0 0x0100 0x00000006 0x000000000001a2b6 0x00000000 0x00000800      0      0 000001
-udp4       0      0  *.47300                *.*                                 786896    9216   4545      0 0x0000 0x00000000 0x000000000001a2b7 0x00000000 0x00000800      0      0 000001
+    fn netstat_counts_listeners_from_the_leading_columns_only() {
+        let table = "Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)      rhiwat  shiwat    pid   epid
+tcp4       0      0  127.0.0.1.47300        *.*                    LISTEN       131072  131072   4242      0
+tcp46      0      0  *.47300                *.*                    LISTEN       131072  131072   4343      0
+tcp4       0      0  127.0.0.1.47300        127.0.0.1.50000        ESTABLISHED  408241  146988   4242      0
+tcp4       0      0  127.0.0.1.147300       *.*                    LISTEN       131072  131072   4444      0
+udp4       0      0  *.47300                *.*                                 786896    9216   4545      0
 ";
+        assert_eq!(netstat_listeners(table, 47300), Some(vec![true, false]));
+        assert_eq!(netstat_listeners(table, 47301), Some(Vec::new()));
+        // Hostile trailing columns (a process name with spaces, colons and
+        // a `name:1234` shape) change nothing: only the leading columns count.
+        let hostile = "tcp4       0      0  127.0.0.1.47300        *.*                    LISTEN       0 0 131072 131072   evil name:1234 x:99 more:5150  00102
+tcp6       0      0  ::1.47300              *.*                    LISTEN       0 0 131072 131072   a b c:4242
+";
+        assert_eq!(netstat_listeners(hostile, 47300), Some(vec![true, false]));
+        // A line of an unexpected shape makes the count unknown.
+        let truncated = "tcp4       0      0  127.0.0.1.47300\n";
+        assert_eq!(netstat_listeners(truncated, 47300), None);
+        let not_counters = "tcp4  x  0  127.0.0.1.47300  *.*  LISTEN\n";
+        assert_eq!(netstat_listeners(not_counters, 47300), None);
+        let odd_protocol = "tcpX  0  0  127.0.0.1.47300  *.*  LISTEN\n";
+        assert_eq!(netstat_listeners(odd_protocol, 47300), None);
+        assert_eq!(netstat_listeners("", 47300), Some(Vec::new()));
+    }
+
+    #[test]
+    fn lsof_sockets_are_deduplicated_and_need_their_address() {
+        // Two workers of the group share one listening socket.
+        let shared =
+            "p4242\nf5\nd0x1a2b3c\nn127.0.0.1:47300\np4243\nf5\nd0x1a2b3c\nn127.0.0.1:47300\n";
+        assert_eq!(lsof_owned_sockets(shared, 47300), Some(vec![true]));
+        let two = "p4242\nf5\nd0x1\nn127.0.0.1:47300\nf6\nd0x2\nn*:47300\n";
+        assert_eq!(lsof_owned_sockets(two, 47300), Some(vec![true, false]));
+        assert_eq!(lsof_owned_sockets("", 47300), Some(Vec::new()));
+        let no_address = "p4242\nf5\nn127.0.0.1:47300\n";
+        assert_eq!(lsof_owned_sockets(no_address, 47300), None);
+    }
+
+    #[test]
+    fn listeners_are_ours_only_when_the_counts_agree() {
+        assert_eq!(reconcile(&[], &[]), Listeners::None);
+        assert_eq!(reconcile(&[true], &[true]), Listeners::Ours);
+        assert_eq!(reconcile(&[true, true], &[true]), Listeners::NotOurs);
+        assert_eq!(reconcile(&[true], &[]), Listeners::NotOurs);
         assert_eq!(
-            parse_netstat(older, 47300),
-            Some(vec![(true, 4242), (false, 4343)])
+            reconcile(&[true], &[true, true]),
+            Listeners::Unverifiable("listener_count_mismatch".into())
         );
-        // Newer layout: `process:pid`, with byte counters before it.
-        let newer = "Active Internet connections (including servers)
-Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)          rxbytes      txbytes  rhiwat  shiwat    process:pid    state  options           gencnt    flags   flags1 usscnt rtncnt fltrs
-tcp6       0      0  ::1.47300              *.*                    LISTEN                 0            0  131072  131072   example:5151  00102 00000006 000000000001b2c3 00000000 00000800      0      0 000001
-tcp4       0      0  127.0.0.1.47300        *.*                    LISTEN                 0            0  131072  131072   example:5150  00102 00000006 000000000001b2c4 00000000 00000800      0      0 000001
-";
-        assert_eq!(
-            parse_netstat(newer, 47300),
-            Some(vec![(false, 5151), (true, 5150)])
-        );
-        assert_eq!(parse_netstat(newer, 47301), Some(Vec::new()));
-        // No pid column, or an unreadable pid: the set is unknown.
-        let no_pid = "Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)
-tcp4       0      0  127.0.0.1.47300        *.*                    LISTEN
-";
-        assert_eq!(parse_netstat(no_pid, 47300), None);
-        let bad_pid = older.replace("   4242      0 0x0100", "   ????      0 0x0100");
-        assert_eq!(parse_netstat(&bad_pid, 47300), None);
-        assert_eq!(parse_netstat("", 47300), None);
+        assert_eq!(reconcile(&[false], &[false]), Listeners::NotLoopback);
     }
 
     #[cfg(target_os = "linux")]

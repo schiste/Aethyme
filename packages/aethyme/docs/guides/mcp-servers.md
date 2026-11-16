@@ -444,10 +444,12 @@ the same way:
   "something accepts connections" is never enough. A server listening on
   `0.0.0.0`, `::` or any other address is killed and its key marked
   unhealthy (`not_loopback`); a listener of another process on the port
-  gives `listener_not_ours`. Ownership is read from `/proc` on Linux and
-  from `netstat -anv -p tcp` on macOS (every user's sockets with their
-  pid); where the full set of listeners cannot be read the server is not
-  used (`listener_unverifiable`). One that does not listen within 30
+  gives `listener_not_ours`. Ownership is read from `/proc` on Linux. On
+  macOS two counts must agree: the listeners on the port among every
+  user's sockets (`netstat -an -p tcp`, reading only the leading address
+  columns, never a pid or process name) and the listening sockets the
+  server's own process group holds (`lsof` limited to that group). Where
+  either cannot be read the server is not used (`listener_unverifiable`). One that does not listen within 30
   seconds is killed and counts as a crash.
 - **Limits.** Only the leased port is checked, and only once, when the
   server becomes ready. Any other port the server opens (a debugging or
