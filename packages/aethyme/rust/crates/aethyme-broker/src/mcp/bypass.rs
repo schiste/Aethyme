@@ -53,6 +53,10 @@ pub struct Process {
     pub argv: Vec<String>,
     /// `None` when there is no marker or the environment is unreadable.
     pub marker: Option<Marker>,
+    /// Whether `argv` is the real argv. `false`: only `ps`'s command line
+    /// was available (the kernel refused the process's arguments), so the
+    /// process is counted `unreadable`, never `bypass`.
+    pub readable: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -66,6 +70,8 @@ pub struct EntryCount {
     pub via_connect: usize,
     /// Fallback commands `connect` ran.
     pub fallback: usize,
+    /// Processes that seem to match but whose argv could not be read.
+    pub unreadable: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -76,9 +82,18 @@ pub struct BypassReport {
     /// `proc`, `ps+procargs` or `ps`.
     pub source: &'static str,
     pub processes_scanned: usize,
+    /// Processes whose argv could not be read; non-zero makes the result
+    /// inconclusive.
+    pub unreadable: usize,
     pub entries: Vec<EntryCount>,
     pub phases_ms: BTreeMap<&'static str, u64>,
+    /// How to read the counts.
+    pub note: &'static str,
 }
+
+/// What `via_connect` covers.
+pub const NOTE: &str = "via_connect includes every descendant of a server connect or the shared \
+                        hub started; fallback counts the caller's own command run by connect";
 
 impl BypassReport {
     pub fn total(&self) -> usize {
@@ -91,8 +106,10 @@ impl BypassReport {
             reason: Some(reason),
             source: SOURCE,
             processes_scanned: 0,
+            unreadable: 0,
             entries: Vec::new(),
             phases_ms,
+            note: NOTE,
         }
     }
 }
@@ -130,6 +147,7 @@ pub fn parse_ps(text: &str) -> Vec<Process> {
                 ppid,
                 argv,
                 marker: None,
+                readable: true,
             })
         })
         .collect()
@@ -195,6 +213,10 @@ pub fn count(
         let Some(entry) = counts.get_mut(&found.name) else {
             continue;
         };
+        if !process.readable {
+            entry.unreadable += 1;
+            continue;
+        }
         let remembered_resolution = remembered.get(&found.name).map(String::as_str)
             == Some(process.argv.join(" ").as_str());
         match process.marker {
@@ -238,9 +260,10 @@ const SOURCE: &str = "ps";
 /// Every process from `/proc`: real argv, parent, and the marker when the
 /// environment is readable (this user's processes).
 #[cfg(target_os = "linux")]
-fn snapshot(_set: &MatchSet, deadline: Instant) -> Result<Vec<Process>, String> {
+fn snapshot(_set: &MatchSet, deadline: Instant) -> Result<(Vec<Process>, usize), String> {
     let entries = std::fs::read_dir("/proc").map_err(|error| format!("/proc: {error}"))?;
     let mut processes = Vec::new();
+    let mut unreadable = 0;
     for entry in entries.flatten() {
         if Instant::now() > deadline {
             return Err("the process table could not be read within the budget".into());
@@ -264,8 +287,14 @@ fn snapshot(_set: &MatchSet, deadline: Instant) -> Result<Vec<Process>, String> 
         else {
             continue;
         };
-        let Ok(cmdline) = std::fs::read(directory.join("cmdline")) else {
-            continue;
+        let cmdline = match std::fs::read(directory.join("cmdline")) {
+            Ok(cmdline) => cmdline,
+            // The process exited meanwhile.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
         };
         let argv: Vec<String> = cmdline
             .split(|byte| *byte == 0)
@@ -283,9 +312,10 @@ fn snapshot(_set: &MatchSet, deadline: Instant) -> Result<Vec<Process>, String> 
             ppid,
             argv,
             marker,
+            readable: true,
         });
     }
-    Ok(processes)
+    Ok((processes, unreadable))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -316,7 +346,7 @@ fn ps_snapshot(deadline: Instant) -> Result<Vec<Process>, String> {
 /// One `ps` listing; the candidates' real argv and marker from
 /// `KERN_PROCARGS2`.
 #[cfg(target_os = "macos")]
-fn snapshot(set: &MatchSet, deadline: Instant) -> Result<Vec<Process>, String> {
+fn snapshot(set: &MatchSet, deadline: Instant) -> Result<(Vec<Process>, usize), String> {
     let mut processes = ps_snapshot(deadline)?;
     for process in &mut processes {
         if Instant::now() > deadline {
@@ -325,17 +355,20 @@ fn snapshot(set: &MatchSet, deadline: Instant) -> Result<Vec<Process>, String> {
         if set.managed_match(&process.argv).is_none() {
             continue;
         }
-        if let Some((argv, marker)) = procargs::read(process.pid) {
-            process.argv = argv;
-            process.marker = marker;
+        match procargs::read(process.pid) {
+            Some((argv, marker)) => {
+                process.argv = argv;
+                process.marker = marker;
+            }
+            None => process.readable = false,
         }
     }
-    Ok(processes)
+    Ok((processes, 0))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn snapshot(_set: &MatchSet, deadline: Instant) -> Result<Vec<Process>, String> {
-    ps_snapshot(deadline)
+fn snapshot(_set: &MatchSet, deadline: Instant) -> Result<(Vec<Process>, usize), String> {
+    ps_snapshot(deadline).map(|processes| (processes, 0))
 }
 
 #[cfg(target_os = "macos")]
@@ -421,12 +454,14 @@ pub fn scan(set: &MatchSet, host: Option<&Path>, budget: Duration) -> BypassRepo
             reason: None,
             source: SOURCE,
             processes_scanned: 0,
+            unreadable: 0,
             entries: Vec::new(),
             phases_ms: phases,
+            note: NOTE,
         };
     }
-    let processes = match snapshot(set, started + budget) {
-        Ok(processes) => processes,
+    let (processes, unreadable_unmatched) = match snapshot(set, started + budget) {
+        Ok(snapshot) => snapshot,
         Err(reason) => {
             phases.insert("snapshot", elapsed_ms(started));
             return BypassReport::inconclusive(reason, phases);
@@ -441,13 +476,23 @@ pub fn scan(set: &MatchSet, host: Option<&Path>, budget: Duration) -> BypassRepo
     let entries = count(set, &processes, &remembered, i64::from(std::process::id()));
     phases.insert("match", elapsed_ms(phase));
     phases.insert("total", elapsed_ms(started));
+    let unreadable =
+        unreadable_unmatched + entries.iter().map(|entry| entry.unreadable).sum::<usize>();
     BypassReport {
-        state: "complete",
-        reason: None,
+        state: if unreadable == 0 {
+            "complete"
+        } else {
+            "inconclusive"
+        },
+        reason: (unreadable > 0).then(|| {
+            format!("{unreadable} process(es) could not be read; they are not counted as bypass")
+        }),
         source: SOURCE,
         processes_scanned: processes.len(),
+        unreadable,
         entries,
         phases_ms: phases,
+        note: NOTE,
     }
 }
 

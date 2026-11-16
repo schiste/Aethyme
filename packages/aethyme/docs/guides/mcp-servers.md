@@ -393,6 +393,7 @@ match_packages = ["example-devtools-mcp"]      # a version suffix is ignored
 match_executables = ["example-devtools-mcp"]   # program basenames
 repair = "auto"                                # or "report"
 args = "caller"                                # or "pinned"
+base_args = ["--isolated"]                     # caller mode: options every caller gets
 ```
 
 - `match_packages`: npm package names. `example-devtools-mcp`,
@@ -403,14 +404,22 @@ args = "caller"                                # or "pinned"
 - `repair`: whether `repair --apply --auto` (the session-start repair)
   rewrites matching entries (`auto`, the default) or only reports them.
 - `args`: which arguments the server gets.
-  - `caller` (the default): the entry's `argv` supplies the program
-    resolution and any base arguments, and the arguments the caller gave
-    after the package or program (in the agent's configuration, or of an
-    intercepted launcher call) follow them. They are part of the resolved
-    argv and therefore of the sharing key: two agents asking for different
-    flags get different servers. Keep base arguments in the entry to what
-    every caller needs; a caller's own copy of a base argument would appear
-    twice.
+  - `caller` (the default): the entry's `argv` ends at the package or
+    program and supplies only the program resolution; `base_args` holds the
+    options every caller needs (options only: a positional would be joined
+    with the caller's); the arguments the caller gave after the package or
+    program (in the agent's configuration, or of an intercepted launcher
+    call) follow, without any option `base_args` already holds. They are
+    part of the resolved argv and therefore of the sharing key: two agents
+    asking for different flags get different servers. Caller mode needs an
+    argv this build can append to: a top-level launcher (`npx`, `npm exec`,
+    `pnpm exec`, `pnpm dlx`, `pnpx`, `bunx`, `bun x`, `yarn dlx`) or a
+    program; `env ...`, `sh -c ...` and `node <script>` entries are refused
+    (`caller_args_unsupported_form`) and must use `pinned`, and an argv
+    with anything after the package or program is refused
+    (`caller_args_argv_arguments`). A caller pinning a version an entry
+    without a replaceable package spec (`pnpm exec`, a program) cannot take
+    is left alone.
   - `pinned`: the entry's `argv` only. A caller whose arguments differ from
     the entry's base arguments is not routed through `connect`:
     interception passes it through with a one-line note on stderr, and
@@ -422,7 +431,13 @@ args = "caller"                                # or "pinned"
 - Calls with `--help`, `-h` or `--version` after the package are never
   routed to a server (`interactive_arguments`), and neither is anything
   intercepted while standard input is a terminal: that is a person, not an
-  agent host.
+  agent host. A host that runs agent commands under a pseudo-terminal is
+  therefore not intercepted at all; repair (A) covers its configured
+  servers.
+- When `connect` cannot apply the caller's arguments (a malformed
+  `--caller-args`, an entry that takes none), it reports
+  `caller_arguments` and runs the fallback, like any other failure before
+  the server starts.
 
 The matcher recognises `npx [-y] X`, `npm exec X` (and `npm x`),
 `pnpm exec X`, `pnpm dlx X`, `pnpx X`, `bunx X`, `bun x X` and `yarn dlx X`
@@ -480,9 +495,14 @@ Git), reads the match file and tests the call:
   directory (in any spelling, symlinks included) and does not resolve to
   this binary or to any file named `aethyme*` (a stale shim directory of
   another build). Arguments, stdio and exit status are the real tool's and
-  nothing is printed; the environment gains only `AETHYME_MCP_SHIM_HOPS`.
-  A chain that would pass a fifth time stops with exit 127 and a message
-  naming `aethyme mcp intercept status`. With no real tool it exits 127 with
+  nothing is printed; the environment gains only `AETHYME_MCP_SHIM_HOPS`
+  (`<pid>:<n>`). Only an exec chain keeps a pid, so only a shim that execs
+  back into a shim in the same process counts: such a loop stops at the
+  fifth pass with exit 127 and a message naming
+  `aethyme mcp intercept status`. Nested calls (`npm run` starting `npx`)
+  are new processes and never count. A call whose caller arguments are not
+  the end of its command (`npm exec pkg a -- b`) is passed through with a
+  note (`arguments_not_suffix`). With no real tool it exits 127 with
   `<name>: command not found`. Empty and relative `PATH` entries are never
   searched (a shell would search the current directory for them).
 - match: it `exec`s
@@ -610,8 +630,11 @@ server it starts with `AETHYME_MCP_CONNECT`, inherited by its children; a
 descendant of `aethyme mcp connect` or of the shared hub; or the command
 line `connect` last exec'd), `fallback` (marked `AETHYME_MCP_FALLBACK`: the
 caller's own command, run because `connect` could not start the server) and
-`bypass` (everything else). Another user's processes have no readable
-environment and count by ancestry only. Only counts and the matched package
+`bypass` (everything else). `via_connect` includes every descendant of a
+server `connect` or the hub started. Another user's processes have no
+readable environment and count by ancestry only; a candidate whose argv the
+kernel refuses is counted `unreadable`, never `bypass`, and makes the result
+`inconclusive`. Only counts and the matched package
 or executable name are shown. When the table cannot be read
 in time the result is `inconclusive`, never "none". `aethyme mcp status
 --json` includes the managed list, interception state, a bypass scan and the

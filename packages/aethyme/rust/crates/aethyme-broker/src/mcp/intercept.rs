@@ -96,6 +96,9 @@ pub fn render_match_file(set: &MatchSet, shim_dir: &Path) -> Result<String, Stri
         if let Some(version) = &entry.version {
             text.push_str(&format!("version {version}\n"));
         }
+        if entry.replaceable {
+            text.push_str("replaceable\n");
+        }
         if !entry.base_args.is_empty() {
             let encoded = serde_json::to_string(&entry.base_args).map_err(|e| e.to_string())?;
             text.push_str(&format!("base_args {encoded}\n"));
@@ -147,10 +150,17 @@ pub fn parse_match_file(bytes: &[u8]) -> Result<MatchFile, &'static str> {
                     args: ArgsMode::parse(args).ok_or("match_file_entry")?,
                     version: None,
                     base_args: Vec::new(),
+                    replaceable: false,
                 });
             }
             "version" if simple(value) => {
                 set.entries.last_mut().ok_or("match_file_order")?.version = Some(value.to_string());
+            }
+            "replaceable" if value.is_empty() => {
+                set.entries
+                    .last_mut()
+                    .ok_or("match_file_order")?
+                    .replaceable = true;
             }
             "base_args" => {
                 set.entries.last_mut().ok_or("match_file_order")?.base_args =
@@ -223,7 +233,7 @@ pub fn shim_main() -> Option<u8> {
             std::env::var_os(DEPTH_ENV).as_deref(),
         ),
         depth: count(std::env::var_os(DEPTH_ENV).as_deref()),
-        hops: count(std::env::var_os(HOPS_ENV).as_deref()),
+        hops: chain_hops(std::env::var_os(HOPS_ENV).as_deref(), std::process::id()),
         interactive,
         started,
     }))
@@ -234,6 +244,25 @@ fn count(value: Option<&OsStr>) -> u32 {
         .and_then(OsStr::to_str)
         .and_then(|text| text.parse().ok())
         .unwrap_or(0)
+}
+
+/// The pass-throughs already made by this exec chain. The counter is
+/// `<pid>:<n>`: an exec keeps the pid, so a value naming this process comes
+/// from a shim that exec'd into this one (a loop candidate), and any other
+/// value was inherited from a parent process and starts a fresh chain. A
+/// nested call (`npm run` -> `npx`) is a new process and is never counted.
+pub fn chain_hops(value: Option<&OsStr>, pid: u32) -> u32 {
+    value
+        .and_then(OsStr::to_str)
+        .and_then(|text| text.split_once(':'))
+        .filter(|(owner, _)| owner.parse::<u32>().ok() == Some(pid))
+        .and_then(|(_, hops)| hops.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The counter value a pass-through hands to the real tool.
+pub fn next_hops(pid: u32, hops: u32) -> String {
+    format!("{pid}:{}", hops + 1)
 }
 
 /// Whether a shim must pass through without matching.
@@ -313,13 +342,18 @@ pub fn decide(input: &ShimInput<'_>) -> Decision {
         Route::Connect {
             caller_args,
             caller_package,
-        } if caller_args.len() <= input.args.len() => Decision::HandOff {
+        } if argv[1..].ends_with(&caller_args) => Decision::HandOff {
             entry: found.name,
             fallback: real.clone(),
             caller_args: caller_args.len(),
             caller_package,
         },
-        Route::Connect { .. } | Route::Decline("interactive_arguments") => pass(None),
+        Route::Connect { .. } => pass(Some(format!(
+            "aethyme mcp: {}: not started through connect (arguments_not_suffix: the caller's \
+             arguments are not the end of its command)",
+            found.name
+        ))),
+        Route::Decline("interactive_arguments") => pass(None),
         Route::Decline(reason) => pass(Some(format!(
             "aethyme mcp: {}: not started through connect ({reason}; see the managed entry's \
              `args` and version)",
@@ -447,7 +481,7 @@ fn pass_through(call: &ShimCall, real: &Path) -> u8 {
     let error = Command::new(real)
         .arg0(&call.argv0)
         .args(&call.rest)
-        .env(HOPS_ENV, (call.hops + 1).to_string())
+        .env(HOPS_ENV, next_hops(std::process::id(), call.hops))
         .exec();
     eprintln!("{}: {error}", call.name);
     126

@@ -23,7 +23,7 @@ pub const BYPASS_SCHEMA: &str = "aethyme.mcp-bypass/v1";
 /// Appended to `aethyme mcp --help`.
 pub const USAGE: &str = "
 Managed servers (host file only: managed = true, match_packages,
-match_executables, repair = auto|report, args = caller|pinned):
+match_executables, repair = auto|report, args = caller|pinned, base_args):
   aethyme mcp manage list [--json]
   aethyme mcp manage add <name> --package <pkg> [--package ...]
                          [--executable <name> ...] [--repair auto|report]
@@ -32,9 +32,10 @@ match_executables, repair = auto|report, args = caller|pinned):
       List, mark or unmark managed entries in <host state>/mcp/services.toml
       (edited in place, formatting kept). A new entry starts as
       `npx -y <first package>`. Refreshes the shims when interception is on.
-      args = caller (default): the caller's arguments follow the entry's
-      argv and are part of the key; pinned: entry arguments only, and a
-      caller with other arguments is left alone.
+      args = caller (default): argv ends at the package or program, then
+      base_args (options only), then the caller's arguments (an option
+      already in base_args is not repeated); part of the key. pinned: argv
+      only, and a caller with other arguments is left alone.
   aethyme mcp connect <name> --caller-args <n> [--caller-package <spec>]
                       --fallback -- <command...>
       The form interception and repair write: the last <n> words of the
@@ -60,8 +61,8 @@ match_executables, repair = auto|report, args = caller|pinned):
       tracked .mcp.json is only reported. Prints names, never values.
   aethyme mcp bypass [--json]
       Running processes that match a managed entry, counted per entry as
-      via_connect, fallback or bypass (1 s budget; inconclusive when the
-      process table cannot be read).
+      via_connect (descendants included), fallback or bypass (1 s budget;
+      inconclusive when the process table or a candidate cannot be read).
 ";
 
 fn json_requested(args: &[String]) -> bool {
@@ -946,7 +947,7 @@ fn print_bypass_text(report: &bypass::BypassReport, no_managed: bool) {
     for entry in &report.entries {
         if entry.via_connect > 0 || entry.fallback > 0 {
             println!(
-                "{}: {} via connect, {} connect fallback{}",
+                "{}: {} via connect (descendants included), {} connect fallback{}",
                 entry.name,
                 entry.via_connect,
                 entry.fallback,

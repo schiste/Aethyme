@@ -63,6 +63,7 @@ fn devtools_set() -> MatchSet {
                 args: ArgsMode::Caller,
                 version: None,
                 base_args: Vec::new(),
+                replaceable: true,
             },
             MatchEntry {
                 name: "example-reported".into(),
@@ -72,6 +73,7 @@ fn devtools_set() -> MatchSet {
                 args: ArgsMode::Caller,
                 version: None,
                 base_args: Vec::new(),
+                replaceable: true,
             },
         ],
     }
@@ -88,6 +90,15 @@ fn the_matcher_recognises_every_launcher_shape() {
         &[
             "npx",
             "--package=example-devtools-mcp",
+            "example-devtools-mcp",
+        ],
+        // Two -p, but the binary is listed in match_executables.
+        &[
+            "npx",
+            "-p",
+            "example-devtools-mcp",
+            "-p",
+            "x",
             "example-devtools-mcp",
         ],
         &["npm", "exec", "example-devtools-mcp", "--", "--x"],
@@ -187,13 +198,14 @@ fn the_matcher_never_guesses_or_matches_connect() {
             "typescript",
             "tsc",
         ],
+        // Two -p and a binary not listed in match_executables.
         &[
             "npx",
             "-p",
-            "example-devtools-mcp",
+            "example-reported-mcp",
             "-p",
             "x",
-            "example-devtools-mcp",
+            "example-reported-mcp",
         ],
         &["npx", "-p", "@example/devtools-mcp", "devtools-mcp"],
         &["pnpm", "exec", "devtools-mcp"],
@@ -1231,6 +1243,7 @@ fn bypass_separates_connect_fallback_and_bypass() {
             ppid,
             argv: strings(argv),
             marker,
+            readable: true,
         };
     let processes = vec![
         process(1, 1, &["init"], None),
@@ -1285,6 +1298,11 @@ fn bypass_separates_connect_fallback_and_bypass() {
         // This process.
         process(30, 1, &["npx", "example-devtools-mcp"], None),
         process(31, 1, &["unrelated", "--thing"], None),
+        // Another user's launcher whose real argv the kernel refused.
+        bypass::Process {
+            readable: false,
+            ..process(32, 1, &["npx", "example-devtools-mcp"], None)
+        },
     ];
     let counts = bypass::count(&devtools_set(), &processes, &Default::default(), 30);
     let devtools = counts
@@ -1295,6 +1313,7 @@ fn bypass_separates_connect_fallback_and_bypass() {
     assert_eq!(devtools.fallback, 1);
     assert_eq!(devtools.via_connect, 3);
     assert_eq!(devtools.matched["example-devtools-mcp"], 3);
+    assert_eq!(devtools.unreadable, 1);
     let mut remembered = std::collections::BTreeMap::new();
     remembered.insert(
         "example-devtools".to_string(),
@@ -1404,4 +1423,144 @@ fn symlinks_into_a_repository_are_refused_and_stale_temporaries_swept() {
     fixture.run(true, false);
     assert!(!stale.exists());
     assert!(fresh.exists());
+}
+
+fn host_toml(body: &str) -> (Vec<super::config::Entry>, Vec<super::config::ConfigError>) {
+    parse_and_validate(
+        &format!("schema = 1\n[[servers]]\nname = \"x\"\n{body}"),
+        Path::new("/host/mcp/services.toml"),
+        Scope::Host,
+        None,
+        &NoCheckouts,
+    )
+}
+
+#[test]
+fn caller_mode_needs_an_argv_it_can_append_to() {
+    let code = |body: &str| {
+        let (_, errors) = host_toml(body);
+        errors.first().map(|error| error.code)
+    };
+    let managed = "managed = true\nmatch_executables = [\"x\"]\n";
+    assert_eq!(
+        code(&format!(
+            "argv = [\"env\", \"A=1\", \"npm\", \"exec\", \"x\"]\n{managed}"
+        )),
+        Some("caller_args_unsupported_form")
+    );
+    assert_eq!(
+        code(&format!("argv = [\"sh\", \"-c\", \"npx x\"]\n{managed}")),
+        Some("caller_args_unsupported_form")
+    );
+    assert_eq!(
+        code(&format!(
+            "argv = [\"npx\", \"-y\", \"x\", \"--isolated\"]\n{managed}"
+        )),
+        Some("caller_args_argv_arguments")
+    );
+    assert_eq!(
+        code(&format!(
+            "argv = [\"npx\", \"x\"]\nbase_args = [\"/srv\"]\n{managed}"
+        )),
+        Some("base_args_positional")
+    );
+    assert_eq!(
+        code(&format!(
+            "argv = [\"npx\", \"x\"]\nargs = \"pinned\"\nbase_args = [\"--a\"]\n{managed}"
+        )),
+        Some("base_args_with_pinned")
+    );
+    // Accepted: pinned wrappers, and caller mode with options in base_args.
+    assert_eq!(
+        code(&format!(
+            "argv = [\"sh\", \"-c\", \"npx x --y\"]\nargs = \"pinned\"\n{managed}"
+        )),
+        None
+    );
+    let (entries, errors) = host_toml(&format!(
+        "argv = [\"npx\", \"-y\", \"x\"]\nbase_args = [\"--isolated\"]\n{managed}"
+    ));
+    assert!(errors.is_empty(), "{errors:?}");
+    // A caller option equal to a base option is not repeated.
+    let applied = caller::apply(
+        &entries[0],
+        &caller::CallerOptions {
+            args: strings(&["--isolated", "--port", "9"]),
+            package: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        applied.argv,
+        strings(&["npx", "-y", "x", "--isolated", "--port", "9"])
+    );
+    // Without caller options the base arguments still apply.
+    let base = caller::adjust(&entries[0], None).unwrap().unwrap();
+    assert_eq!(base.argv, strings(&["npx", "-y", "x", "--isolated"]));
+    // A pinned or unmanaged entry refuses caller arguments.
+    let (plain, _) = host_toml("argv = [\"npx\", \"x\"]\n");
+    assert!(
+        caller::apply(
+            &plain[0],
+            &caller::CallerOptions {
+                args: strings(&["--a"]),
+                package: None,
+            },
+        )
+        .is_err()
+    );
+    // A caller version the entry cannot take is left alone.
+    let mut set = devtools_set();
+    set.entries[0].replaceable = false;
+    let found = set
+        .managed_match(&strings(&["npx", "example-devtools-mcp@1.2.3"]))
+        .unwrap();
+    assert_eq!(set.route(&found), Route::Decline("version_differs"));
+}
+
+#[test]
+fn a_shim_passes_through_when_the_caller_arguments_are_not_its_tail() {
+    let (_dir, root, self_bin, shims, _real) = shim_fixture();
+    let real = root.join("real-npm");
+    write_executable(&real.join("npm"), "#!/bin/sh\n");
+    let file = intercept::MatchFile {
+        set: devtools_set(),
+        shim_dir: Some(shims.clone()),
+    };
+    let path = path_of(&[&shims, &real]);
+    let decision = decide(&ShimInput {
+        name: "npm",
+        args: &os_args(&["exec", "example-devtools-mcp", "a", "--", "b"]),
+        file: Some(&file),
+        guard: false,
+        interactive: false,
+        path_env: Some(path.as_os_str()),
+        self_exe: Some(self_bin.as_path()),
+    });
+    match decision {
+        Decision::PassThrough {
+            note: Some(note), ..
+        } => assert!(note.contains("arguments_not_suffix"), "{note}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn the_hop_counter_only_counts_an_exec_chain() {
+    let pid = 4242;
+    assert_eq!(intercept::chain_hops(None, pid), 0);
+    assert_eq!(
+        intercept::chain_hops(Some(std::ffi::OsStr::new("4242:3")), pid),
+        3
+    );
+    // Inherited from a parent process: a fresh chain.
+    assert_eq!(
+        intercept::chain_hops(Some(std::ffi::OsStr::new("17:3")), pid),
+        0
+    );
+    assert_eq!(
+        intercept::chain_hops(Some(std::ffi::OsStr::new("3")), pid),
+        0
+    );
+    assert_eq!(intercept::next_hops(pid, 3), "4242:4");
 }

@@ -109,6 +109,8 @@ pub struct ManagedSpec {
     pub match_executables: Vec<String>,
     pub repair: RepairMode,
     pub args: ArgsMode,
+    /// Options every caller gets before its own (`args = "caller"` only).
+    pub base_args: Vec<String>,
 }
 
 /// The managed fields of one raw entry, before validation.
@@ -118,6 +120,9 @@ pub struct RawSpec<'a> {
     pub match_executables: &'a [String],
     pub repair: Option<RepairMode>,
     pub args: Option<ArgsMode>,
+    pub base_args: &'a [String],
+    /// The entry's argv (already checked non-empty).
+    pub argv: &'a [String],
 }
 
 /// `(field, code, message)` of a refused managed specification.
@@ -149,7 +154,8 @@ pub fn validate_spec(raw: &RawSpec<'_>, scope: Scope) -> Result<Option<ManagedSp
     let any_field = !raw.match_packages.is_empty()
         || !raw.match_executables.is_empty()
         || raw.repair.is_some()
-        || raw.args.is_some();
+        || raw.args.is_some()
+        || !raw.base_args.is_empty();
     if scope == Scope::Repository && (raw.managed || any_field) {
         return Err((
             "managed",
@@ -167,8 +173,10 @@ pub fn validate_spec(raw: &RawSpec<'_>, scope: Scope) -> Result<Option<ManagedSp
                 "match_executables"
             } else if raw.repair.is_some() {
                 "repair"
-            } else {
+            } else if raw.args.is_some() {
                 "args"
+            } else {
+                "base_args"
             };
             return Err((
                 field,
@@ -224,12 +232,77 @@ pub fn validate_spec(raw: &RawSpec<'_>, scope: Scope) -> Result<Option<ManagedSp
             match_executables.push(name.clone());
         }
     }
+    let args = raw.args.unwrap_or_default();
+    match args {
+        ArgsMode::Caller => caller_shape(raw.argv, raw.base_args)?,
+        ArgsMode::Pinned if !raw.base_args.is_empty() => {
+            return Err((
+                "base_args",
+                "base_args_with_pinned",
+                "with args = \"pinned\" the entry's arguments belong in argv".into(),
+            ));
+        }
+        ArgsMode::Pinned => {}
+    }
     Ok(Some(ManagedSpec {
         match_packages,
         match_executables,
         repair: raw.repair.unwrap_or_default(),
-        args: raw.args.unwrap_or_default(),
+        args,
+        base_args: raw.base_args.to_vec(),
     }))
+}
+
+/// `args = "caller"` appends the caller's arguments to the argv, which is
+/// only correct for a top-level launcher (`npx`, `npm exec`, `pnpm exec`,
+/// `pnpm dlx`, `pnpx`, `bunx`, `bun x`, `yarn dlx`) or a program run
+/// directly, with nothing after the package or program: base options go in
+/// `base_args`, and positionals would end up mixed with the caller's.
+fn caller_shape(argv: &[String], base_args: &[String]) -> Result<(), SpecError> {
+    let refuse = |code: &'static str, message: String| Err(("args", code, message));
+    let program = argv.first().map(|program| basename(program)).unwrap_or("");
+    if matches!(
+        program,
+        "env" | "sh" | "bash" | "dash" | "zsh" | "node" | "nodejs" | "bun"
+    ) && launcher_start(argv).is_none()
+    {
+        return refuse(
+            "caller_args_unsupported_form",
+            format!(
+                "args = \"caller\" cannot append the caller's arguments to a `{program}` \
+                 wrapper; start the launcher or program directly, or use args = \"pinned\""
+            ),
+        );
+    }
+    let rest = match classify(argv, 0) {
+        Invocation::Launch { rest, .. } | Invocation::Direct { rest, .. } => rest,
+        Invocation::Connect | Invocation::Unknown => {
+            return refuse(
+                "caller_args_unsupported_form",
+                "args = \"caller\" needs an argv this build can read (a launcher form it \
+                 recognises, or a program); use args = \"pinned\""
+                    .into(),
+            );
+        }
+    };
+    if !rest.is_empty() {
+        return refuse(
+            "caller_args_argv_arguments",
+            "with args = \"caller\" argv ends at the package or program: list required \
+             options in base_args, or use args = \"pinned\""
+                .into(),
+        );
+    }
+    if base_args.iter().any(|arg| !arg.starts_with('-')) {
+        return Err((
+            "base_args",
+            "base_args_positional",
+            "base_args may hold options only (each starting with '-'); a positional would be \
+             joined with the caller's"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// One managed entry as the matcher sees it.
@@ -242,8 +315,11 @@ pub struct MatchEntry {
     pub args: ArgsMode,
     /// The package version the entry's argv pins (`latest` is no pin).
     pub version: Option<String>,
-    /// The entry's own arguments after its package or program.
+    /// The arguments every caller gets before its own: `base_args` in
+    /// caller mode, the argv after the package or program when pinned.
     pub base_args: Vec<String>,
+    /// Whether the argv has a package spec `--caller-package` can replace.
+    pub replaceable: bool,
 }
 
 impl MatchEntry {
@@ -321,7 +397,7 @@ impl MatchSet {
             .filter(|entry| entry.scope == Scope::Host)
             .filter_map(|entry| {
                 entry.managed.as_ref().map(|spec| {
-                    let (version, base_args) = MatchEntry::argv_facts(&entry.argv);
+                    let (version, argv_args) = MatchEntry::argv_facts(&entry.argv);
                     MatchEntry {
                         name: entry.name.clone(),
                         packages: spec.match_packages.clone(),
@@ -329,7 +405,11 @@ impl MatchSet {
                         repair: spec.repair,
                         args: spec.args,
                         version,
-                        base_args,
+                        base_args: match spec.args {
+                            ArgsMode::Caller => spec.base_args.clone(),
+                            ArgsMode::Pinned => argv_args,
+                        },
+                        replaceable: replaceable_spec(&entry.argv),
                     }
                 })
             })
@@ -382,6 +462,16 @@ impl MatchSet {
         let caller_version = found.caller_spec.as_deref().and_then(package_version);
         if let (Some(pinned), Some(asked)) = (&entry.version, &caller_version)
             && pinned != asked
+        {
+            return Route::Decline("version_differs");
+        }
+        // A caller pinning a version the entry cannot take (no package spec
+        // to replace) would silently get another version: leave it alone.
+        if entry.version.is_none()
+            && !entry.replaceable
+            && caller_version
+                .as_deref()
+                .is_some_and(|version| version != "latest")
         {
             return Route::Decline("version_differs");
         }
@@ -735,6 +825,22 @@ fn pnpm_exec(argv: &[String]) -> Invocation {
         },
         _ => Invocation::Unknown,
     }
+}
+
+/// Whether a top-level argv names a package spec `apply_caller` can replace.
+pub fn replaceable_spec(argv: &[String]) -> bool {
+    launcher_start(argv)
+        .and_then(|(_, start)| scan_launcher(argv, start))
+        .is_some_and(|scanned| scanned.packages.is_empty() && scanned.positional < argv.len())
+}
+
+/// The caller's arguments without options the base arguments already hold.
+pub fn without_base_options(caller_args: &[String], base_args: &[String]) -> Vec<String> {
+    caller_args
+        .iter()
+        .filter(|arg| !(arg.starts_with('-') && base_args.contains(arg)))
+        .cloned()
+        .collect()
 }
 
 /// An entry argv with the caller's arguments (and package spec) applied:

@@ -403,26 +403,23 @@ fn run_inner(args: &[String]) -> u8 {
     // The caller's arguments and package join the entry's argv before the
     // plan, so they are part of the resolved argv and of the key.
     let adjusted;
-    let entry = match super::caller::scan(args).and_then(|options| {
-        options
-            .map(|options| super::caller::apply(entry, &options))
-            .transpose()
-    }) {
-        Ok(Some(changed)) => {
-            adjusted = changed;
-            &adjusted
-        }
-        Ok(None) => entry,
-        Err(message) => {
-            return fail(
-                &parsed,
-                &recorder,
-                "caller_arguments",
-                &message,
-                exit_status::USAGE,
-            );
-        }
-    };
+    let entry =
+        match super::caller::scan(args).and_then(|options| super::caller::adjust(entry, options)) {
+            Ok(Some(changed)) => {
+                adjusted = changed;
+                &adjusted
+            }
+            Ok(None) => entry,
+            Err(message) => {
+                return fail(
+                    &parsed,
+                    &recorder,
+                    "caller_arguments",
+                    &message,
+                    exit_status::USAGE,
+                );
+            }
+        };
     let planned = match key::plan(entry, &caller, &checkouts) {
         // A shared server whose identity cannot be taken starts privately.
         Err(failure)

@@ -269,13 +269,15 @@ confirmation or `--yes --digest` matching the printed digest.
 Managed servers: host entries with `managed = true`, `match_packages`,
 `match_executables`, `repair = "auto"|"report"` and `args =
 "caller"|"pinned"` (host file only; a repository file is refused with
-`managed_in_repository`). With `args = "caller"` (default) the caller's
-arguments follow the entry's argv and are part of the key
+`managed_in_repository`). With `args = "caller"` (default) argv ends at the
+package or program (a top-level launcher or a program), `base_args` holds
+required options, and the caller's arguments follow (an option already in
+`base_args` is not repeated) and are part of the key
 (`connect --caller-args <n>`: the last `<n>` words of the fallback command,
 or the `<n>` words after `--` without `--fallback`; `--caller-package`
 replaces the entry's package spec); `pinned` leaves callers with other
 arguments alone. `--help`, `-h`, `--version` and a terminal on stdin are
-never handed off. `manage` lists,
+never handed off; a `caller_arguments` error in `connect` runs the fallback. `manage` lists,
 marks or unmarks them in the host file (formatting kept). `intercept
 install` creates shims named `npx`, `npm`, `pnpm`, `pnpx`, `bunx`, `yarn`
 and each managed executable, pointing at `aethyme`, plus

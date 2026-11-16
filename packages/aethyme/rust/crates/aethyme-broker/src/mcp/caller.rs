@@ -89,12 +89,49 @@ pub fn scan(args: &[String]) -> Result<Option<CallerOptions>, String> {
     }))
 }
 
-/// The entry with the caller's arguments and package applied.
+/// The entry with the caller's arguments and package applied: the entry's
+/// argv, its `base_args`, then the caller's arguments without options the
+/// base arguments already hold. Only a managed entry in `args = "caller"`
+/// mode takes caller arguments; any other entry refuses them (and
+/// `connect` runs the fallback).
 pub fn apply(entry: &Entry, options: &CallerOptions) -> Result<Entry, String> {
+    let base_args = match &entry.managed {
+        Some(spec) if spec.args == super::managed::ArgsMode::Caller => spec.base_args.clone(),
+        _ if options.args.is_empty() && options.package.is_none() => Vec::new(),
+        _ => {
+            return Err(format!(
+                "{} takes no caller arguments (it is not a managed entry with args = \"caller\")",
+                entry.name
+            ));
+        }
+    };
+    let caller_args = super::managed::without_base_options(&options.args, &base_args);
+    let mut tail = base_args;
+    tail.extend(caller_args);
     let mut adjusted = entry.clone();
-    adjusted.argv =
-        super::managed::apply_caller(&entry.argv, &options.args, options.package.as_deref())?;
+    adjusted.argv = super::managed::apply_caller(&entry.argv, &tail, options.package.as_deref())?;
     Ok(adjusted)
+}
+
+/// The entry `connect` plans: with the caller's options applied, and a
+/// caller-mode entry's `base_args` even when no caller options were given.
+/// `Ok(None)`: the entry as configured.
+pub fn adjust(entry: &Entry, options: Option<CallerOptions>) -> Result<Option<Entry>, String> {
+    let has_base = entry.managed.as_ref().is_some_and(|spec| {
+        spec.args == super::managed::ArgsMode::Caller && !spec.base_args.is_empty()
+    });
+    match options {
+        Some(options) => apply(entry, &options).map(Some),
+        None if has_base => apply(
+            entry,
+            &CallerOptions {
+                args: Vec::new(),
+                package: None,
+            },
+        )
+        .map(Some),
+        None => Ok(None),
+    }
 }
 
 /// The `connect` arguments that carry a route: `--caller-args`,

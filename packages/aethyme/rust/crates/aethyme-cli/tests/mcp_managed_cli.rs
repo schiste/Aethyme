@@ -331,7 +331,7 @@ fn a_corrupt_match_file_never_blocks_a_launcher() {
 fn a_direct_executable_shim_starts_the_managed_entry_through_connect() {
     let fixture = Fixture::new();
     fixture.services(
-        "[[servers]]\nname = \"example-devtools\"\nargv = [\"example-devtools-mcp\", \"--stdio\"]\n\
+        "[[servers]]\nname = \"example-devtools\"\nargv = [\"example-devtools-mcp\"]\nbase_args = [\"--stdio\"]\n\
          managed = true\nmatch_executables = [\"example-devtools-mcp\"]\n",
     );
     write_executable(
@@ -578,28 +578,54 @@ fn help_and_version_calls_are_never_handed_off() {
 }
 
 #[test]
-fn a_chain_of_shims_stops_at_the_hop_limit() {
+fn nested_launcher_calls_are_not_a_loop_but_an_exec_cycle_is() {
     let fixture = Fixture::new();
     fixture.managed_devtools();
     fixture.install_shims();
-    let output = fixture
-        .command_named("npx", &["other"])
-        .env("AETHYME_MCP_SHIM_HOPS", "4")
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(127));
+    // Five nested pass-throughs, each in a new process (`npm run` -> `npx`).
+    write_executable(
+        &fixture.real.join("npx"),
+        "#!/bin/sh\nn=${NEST:-0}\nif [ \"$n\" -lt 5 ]; then NEST=$((n+1)) npx nest; exit $?; fi\n\
+         echo \"DEPTH:$n\"\n",
+    );
+    let output = fixture.command_named("npx", &["start"]).output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "DEPTH:5\n");
+    // A real tool that execs the shim again keeps the pid: a loop.
+    write_executable(
+        &fixture.real.join("npx"),
+        &format!("#!/bin/sh\nexec {:?} \"$@\"\n", fixture.shims.join("npx")),
+    );
+    let output = fixture.command_named("npx", &["loop"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(127), "{}", stderr(&output));
     assert!(
         stderr(&output).contains("aethyme mcp intercept status"),
         "{}",
         stderr(&output)
     );
-    assert_eq!(stdout(&output), "");
-    // One hop below the limit still reaches the real tool, and the real
-    // tool sees the counter incremented.
-    let output = fixture
-        .command_named("npx", &["other"])
-        .env("AETHYME_MCP_SHIM_HOPS", "3")
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(7));
+}
+
+#[test]
+fn a_caller_arguments_error_in_connect_runs_the_fallback() {
+    let fixture = Fixture::new();
+    fixture.managed_devtools();
+    let real = fixture.real.join("npx");
+    let output = fixture.aethyme(&[
+        "mcp",
+        "connect",
+        "example-devtools",
+        "--caller-args",
+        "9",
+        "--fallback",
+        "--",
+        real.to_str().unwrap(),
+        "x",
+    ]);
+    assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "ARGS:x|\nGUARD:unset\n");
+    assert!(
+        stderr(&output).contains("--caller-args"),
+        "{}",
+        stderr(&output)
+    );
 }
