@@ -35,6 +35,7 @@ const TOP_LEVEL: &[&str] = &[
     "upgrade",
     "collab",
     "env",
+    "mcp",
     "certify",
     "init",
     "deploy",
