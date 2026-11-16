@@ -28,6 +28,12 @@ const RECLAIM_PLAN_FILENAME_SUFFIX: &str = ".json";
 const RECLAIM_SIZE_CACHE_FILENAME: &str = ".aethyme-reclaim-plan-sizes.json";
 /// Present while a whole-root plan is running, naming its process.
 const RECLAIM_IN_FLIGHT_FILENAME: &str = ".aethyme-reclaim-plan-in-flight.json";
+/// Prefix of the synced temporaries the files above are written through, and
+/// of a stale in-flight marker moved aside before it is removed. Every such
+/// name ends in `.json`, so whatever a killed process leaves behind still
+/// reads as broker bookkeeping; none is ever a valid snapshot digest.
+const RECLAIM_TEMPORARY_PREFIX: &str = ".aethyme-reclaim-plan-tmp-";
+const RECLAIM_STALE_MARKER_PREFIX: &str = ".aethyme-reclaim-plan-in-flight-stale-";
 const RECLAIM_SIZE_CACHE_SCHEMA_VERSION: u8 = 1;
 
 /// The part of a candidate that determines whether an apply would touch it.
@@ -151,7 +157,7 @@ pub fn restrict_to_review(
         .map(|mut candidate| {
             if candidate.reclaimable && !authorized.contains(&candidate.path) {
                 candidate.reclaimable = false;
-                candidate.reason = "not in the reviewed plan".into();
+                candidate.reason = NOT_REVIEWED_REASON.into();
                 not_reviewed.push(candidate.path.clone());
             }
             candidate
@@ -282,9 +288,7 @@ pub fn save_snapshot(
         decisions,
     };
     let bytes = serde_json::to_vec_pretty(&snapshot).map_err(io::Error::other)?;
-    crate::atomic_file::with_synced_temporary(&path, &bytes, |temporary| {
-        std::fs::rename(temporary, &path)
-    })
+    write_bookkeeping(&path, &bytes, |temporary| std::fs::rename(temporary, &path))
 }
 
 /// Load and verify the saved decision set for a confirmation the fresh scan no
@@ -751,6 +755,30 @@ pub struct ReclaimOutcome {
     pub not_reviewed: Vec<PathBuf>,
 }
 
+/// A fixed label for why a candidate is kept, for command metrics. Reasons
+/// are free text that can name paths and processes, which must never reach a
+/// metrics row; the label says which protection kept it.
+pub fn kept_reason_class(reason: &str) -> &'static str {
+    if reason.starts_with("session is still active") {
+        "active_session"
+    } else if reason == UNRECORDED_WORKTREE_REASON {
+        "unrecorded_worktree"
+    } else if reason == NOT_REVIEWED_REASON {
+        "not_reviewed"
+    } else if reason.starts_with("Git index changed")
+        || reason.starts_with("cannot read when this worktree's Git index")
+    {
+        "recent_work"
+    } else if reason.starts_with("process ") {
+        "open_file_use"
+    } else {
+        "other"
+    }
+}
+
+const UNRECORDED_WORKTREE_REASON: &str = "no session of this repository records this worktree";
+const NOT_REVIEWED_REASON: &str = "not in the reviewed plan";
+
 /// Directory size, following no symlinks.
 ///
 /// A symlink into someone else's tree must contribute nothing to a total that
@@ -850,9 +878,11 @@ pub struct Discovery {
 /// discovery budget is spent, and says so.
 ///
 /// The budget is checked between worktrees, so each listed worktree's
-/// candidates are complete; the walk inside one worktree is already bounded
-/// by its depth limit. Worktrees are walked in name order so a cut-off plan
-/// is reproducible.
+/// candidates are complete and a worktree is either listed whole or counted
+/// as not scanned. The walk inside one worktree is bounded by its depth limit
+/// but not by the budget, so the real bound is the budget plus the walk of
+/// the worktree in progress. Worktrees are walked in name order so a cut-off
+/// plan is reproducible.
 pub fn scan_root_within(
     root: &Path,
     active: &[PathBuf],
@@ -970,7 +1000,7 @@ pub fn protect_unrecorded_worktrees(candidates: &mut [ReclaimCandidate], recorde
                 .is_ok_and(|worktree| canonical.contains(&worktree));
         if !known {
             candidate.reclaimable = false;
-            candidate.reason = "no session of this repository records this worktree".into();
+            candidate.reason = UNRECORDED_WORKTREE_REASON.into();
         }
     }
 }
@@ -1651,15 +1681,24 @@ thread_local! {
 }
 
 /// How long a whole-root plan may spend finding candidates before it stops
-/// starting new worktrees and reports itself partial. Measured on the busiest
-/// repository (about 626 checkouts) an unbounded plan ran 8-16+ minutes.
+/// starting new worktrees and reports itself partial. The worktree in progress
+/// when the budget runs out is finished, so discovery can overrun by one
+/// worktree's walk (depth-limited, and never into a build directory). Measured
+/// on the busiest repository (about 626 checkouts) an unbounded plan ran
+/// 8-16+ minutes.
 pub const WHOLE_ROOT_DISCOVERY_BUDGET: Duration = Duration::from_secs(60);
 
-/// How long a whole-root plan may spend measuring candidate sizes in total.
-/// Sizes are what an operator reads, never what a confirmation authorizes, so
-/// a plan that lists every candidate and sizes the largest share it can is
-/// worth more than one that never returns.
+/// How long a whole-root plan may spend measuring candidate sizes in total,
+/// including any wait for another whole-root plan to finish: one deadline
+/// covers both. Sizes are what an operator reads, never what a confirmation
+/// authorizes, so a plan that lists every candidate and sizes the largest
+/// share it can is worth more than one that never returns.
 pub const WHOLE_ROOT_SIZING_BUDGET: Duration = Duration::from_secs(20);
+
+/// How often a plan that is measuring shares what it has measured so far, so
+/// a budgeted plan that finds it running reuses those sizes instead of
+/// waiting minutes for a `--full-scan` to finish.
+pub const SIZE_CHECKPOINT_INTERVAL_MS: i64 = 5_000;
 
 /// How old a measurement another whole-root plan saved may be and still be
 /// shown instead of walking that directory again. Long enough to cover
@@ -1712,18 +1751,32 @@ pub struct SizingReport {
     pub elapsed_ms: u64,
 }
 
-/// Size `candidates` in place, reclaimable ones first.
-///
-/// A candidate with a recent measurement in `recent` takes it. Otherwise it
-/// is walked only when `walk` is true and the budget is not spent; a walk the
-/// budget interrupts is discarded. Everything not sized is left `None` and
-/// counted, never shown as zero. Returns the report and the fresh
-/// measurements to share with the next plan.
+/// `measure_within_sharing` without sharing anything as it goes.
+#[cfg(test)]
 pub fn measure_within(
     candidates: &mut [ReclaimCandidate],
     recent: &BTreeMap<PathBuf, u64>,
     walk: bool,
     expired: &mut dyn FnMut() -> bool,
+) -> (SizingReport, Vec<(PathBuf, u64)>) {
+    measure_within_sharing(candidates, recent, walk, expired, &mut |_, _| {})
+}
+
+/// Size `candidates` in place, reclaimable ones first.
+///
+/// A candidate with a recent measurement in `recent` takes it. Otherwise it
+/// is walked only when `walk` is true and the budget is not spent; a walk the
+/// budget interrupts is discarded. Everything not sized is left `None` and
+/// counted, never shown as zero. Each fresh measurement goes to
+/// `on_measured` as soon as it is taken, so a long measuring run can share
+/// sizes before it ends (see [`SizeCheckpoints`]). Returns the report and
+/// the fresh measurements.
+pub fn measure_within_sharing(
+    candidates: &mut [ReclaimCandidate],
+    recent: &BTreeMap<PathBuf, u64>,
+    walk: bool,
+    expired: &mut dyn FnMut() -> bool,
+    on_measured: &mut dyn FnMut(&Path, u64),
 ) -> (SizingReport, Vec<(PathBuf, u64)>) {
     let mut report = SizingReport::default();
     let mut fresh = Vec::new();
@@ -1746,6 +1799,7 @@ pub fn measure_within(
             Some(bytes) => {
                 candidate.bytes = Some(bytes);
                 report.measured += 1;
+                on_measured(&candidate.path, bytes);
                 fresh.push((candidate.path.clone(), bytes));
             }
             None => {
@@ -1807,15 +1861,29 @@ pub fn recent_sizes(root: &Path, now_ms: i64, window_ms: i64) -> BTreeMap<PathBu
         .collect()
 }
 
-/// Share fresh measurements with the next whole-root plan of this root.
-/// Entries still inside the window are kept with their original time, so a
-/// reused size never looks younger than it is.
+/// `record_sizes_at` for measurements taken at `now_ms`.
+#[cfg(test)]
 pub fn record_sizes(
     root: &Path,
     now_ms: i64,
     window_ms: i64,
     measured: &[(PathBuf, u64)],
 ) -> io::Result<()> {
+    record_sizes_at(root, now_ms, window_ms, now_ms, measured)
+}
+
+/// Share fresh measurements with the next whole-root plan of this root.
+/// They are stamped with `measured_at_ms` (never later than `now_ms`), the
+/// time of the oldest of them, and entries already inside the window keep
+/// their original time, so a reused size never looks younger than it is.
+pub fn record_sizes_at(
+    root: &Path,
+    now_ms: i64,
+    window_ms: i64,
+    measured_at_ms: i64,
+    measured: &[(PathBuf, u64)],
+) -> io::Result<()> {
+    let measured_at_ms = measured_at_ms.min(now_ms);
     if measured.is_empty() {
         return Ok(());
     }
@@ -1835,7 +1903,7 @@ pub fn record_sizes(
             SizeCacheEntry {
                 path: candidate.clone(),
                 bytes: *bytes,
-                measured_at_ms: now_ms,
+                measured_at_ms,
             },
         );
     }
@@ -1845,9 +1913,91 @@ pub fn record_sizes(
         entries: entries.into_values().collect(),
     };
     let bytes = serde_json::to_vec(&cache).map_err(io::Error::other)?;
-    crate::atomic_file::with_synced_temporary(&path, &bytes, |temporary| {
-        std::fs::rename(temporary, &path)
-    })
+    write_bookkeeping(&path, &bytes, |temporary| std::fs::rename(temporary, &path))
+}
+
+/// Write a file of the reclaim plan's own in the worktree root through a
+/// synced temporary named like the rest of its bookkeeping
+/// (`.aethyme-reclaim-plan-tmp-XXXXXX.json`). A temporary that a killed
+/// process leaves behind then still reads as broker bookkeeping, so it never
+/// stops an otherwise empty root from reading as empty.
+fn write_bookkeeping<T>(
+    target: &Path,
+    bytes: &[u8],
+    publish: impl FnOnce(&Path) -> io::Result<T>,
+) -> io::Result<T> {
+    crate::atomic_file::with_synced_temporary_named(
+        target,
+        RECLAIM_TEMPORARY_PREFIX,
+        RECLAIM_PLAN_FILENAME_SUFFIX,
+        bytes,
+        publish,
+    )
+}
+
+/// Shares a measuring plan's sizes while it runs.
+///
+/// A `--full-scan` can measure for minutes. Recording its sizes only at the
+/// end left every budgeted plan started meanwhile with nothing to reuse, so
+/// fresh measurements are recorded at most every `interval_ms`, and the rest
+/// when the run finishes. Sizes authorize nothing; a failed write is kept
+/// for one warning and costs the next plan a walk, nothing more.
+#[derive(Debug)]
+pub struct SizeCheckpoints {
+    root: PathBuf,
+    window_ms: i64,
+    interval_ms: i64,
+    pending: Vec<(PathBuf, u64)>,
+    oldest_pending_ms: Option<i64>,
+    last_shared_ms: i64,
+    shares: usize,
+    failure: Option<io::Error>,
+}
+
+impl SizeCheckpoints {
+    pub fn new(root: &Path, window_ms: i64, interval_ms: i64, now_ms: i64) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            window_ms,
+            interval_ms,
+            pending: Vec::new(),
+            oldest_pending_ms: None,
+            last_shared_ms: now_ms,
+            shares: 0,
+            failure: None,
+        }
+    }
+
+    /// Note one fresh measurement taken at `now_ms`, and share everything
+    /// pending once `interval_ms` has passed since the last share.
+    pub fn measured(&mut self, path: &Path, bytes: u64, now_ms: i64) {
+        self.oldest_pending_ms.get_or_insert(now_ms);
+        self.pending.push((path.to_path_buf(), bytes));
+        if now_ms.saturating_sub(self.last_shared_ms) >= self.interval_ms {
+            self.share(now_ms);
+        }
+    }
+
+    /// Share what is still pending. Returns how many shares were attempted
+    /// and the first write failure, if any.
+    pub fn finish(mut self, now_ms: i64) -> (usize, Option<io::Error>) {
+        self.share(now_ms);
+        (self.shares, self.failure)
+    }
+
+    fn share(&mut self, now_ms: i64) {
+        self.last_shared_ms = now_ms;
+        let Some(measured_at) = self.oldest_pending_ms.take() else {
+            return;
+        };
+        let pending = std::mem::take(&mut self.pending);
+        self.shares += 1;
+        if let Err(error) =
+            record_sizes_at(&self.root, now_ms, self.window_ms, measured_at, &pending)
+        {
+            self.failure.get_or_insert(error);
+        }
+    }
 }
 
 /// The process running a whole-root plan, as its in-flight marker names it.
@@ -1940,9 +2090,10 @@ pub fn in_flight_holder(
 /// Publication is a hard link of a fully written file, so a reader never sees
 /// a half-written marker and two claimants cannot both win. A marker naming a
 /// process that is gone (or whose pid was reused, or that cannot be parsed)
-/// is stale: it is removed and the claim retried once. Two plans that both
-/// find the same stale marker can at worst both measure, which costs time and
-/// never correctness -- sizes authorize nothing.
+/// is stale: it is removed (see [`remove_stale_marker`]) and the claim
+/// retried once. Two plans that both find the same stale marker can at worst
+/// both measure, which costs time and never correctness -- sizes authorize
+/// nothing.
 pub fn claim_in_flight(
     root: &Path,
     me: InFlightPlan,
@@ -1950,8 +2101,14 @@ pub fn claim_in_flight(
 ) -> io::Result<InFlightClaim> {
     let path = root.join(RECLAIM_IN_FLIGHT_FILENAME);
     let bytes = serde_json::to_vec(&me).map_err(io::Error::other)?;
-    for _ in 0..2 {
-        if crate::atomic_file::write_synced_if_absent(&path, &bytes)? {
+    for attempt in 0..2_u8 {
+        let published = crate::atomic_file::write_synced_if_absent_named(
+            &path,
+            RECLAIM_TEMPORARY_PREFIX,
+            RECLAIM_PLAN_FILENAME_SUFFIX,
+            &bytes,
+        )?;
+        if published {
             return Ok(InFlightClaim::Claimed(InFlightGuard { path, holder: me }));
         }
         let observed = std::fs::read(&path).ok();
@@ -1961,26 +2118,62 @@ pub fn claim_in_flight(
         if let Some(holder) = holder.filter(alive) {
             return Ok(InFlightClaim::HeldBy(holder));
         }
-        // Stale. Remove it only if it is still the marker that was judged,
-        // and only if it is a regular file this code wrote.
+        // Stale, unless it is not a regular file this code wrote.
         match ensure_regular_snapshot(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         }
-        if std::fs::read(&path).ok() == observed {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-        }
+        let aside = root.join(format!(
+            "{RECLAIM_STALE_MARKER_PREFIX}{}-{}-{attempt}{RECLAIM_PLAN_FILENAME_SUFFIX}",
+            me.pid,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos())
+        ));
+        remove_stale_marker(&path, &aside, observed.as_deref())?;
     }
     match read_in_flight(&path) {
         Some(holder) => Ok(InFlightClaim::HeldBy(holder)),
         None => Err(io::Error::other(
             "the whole-root reclaim plan marker kept changing while it was claimed",
         )),
+    }
+}
+
+/// Remove the in-flight marker at `path` only if it still holds `judged`, the
+/// bytes that were found stale.
+///
+/// Reading and then unlinking `path` races: between the two, the stale marker
+/// can be replaced by a live plan's, and the unlink would remove that one. So
+/// the marker is first renamed to `aside`, a name only this attempt uses; a
+/// rename moves one directory entry atomically, so what lands at `aside` is
+/// exactly what is no longer at `path`. Only then are its bytes compared. If
+/// they are the stale bytes, `aside` is removed. If a live plan's marker was
+/// moved instead, it is linked back into place, unless yet another marker has
+/// appeared there meanwhile; either way no live plan's marker is ever
+/// deleted while it is published, and the worst case -- a holder whose marker
+/// lost its place -- costs only a duplicate measurement.
+fn remove_stale_marker(path: &Path, aside: &Path, judged: Option<&[u8]>) -> io::Result<()> {
+    match std::fs::rename(path, aside) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    let moved = std::fs::read(aside).ok();
+    if moved.as_deref() != judged {
+        match std::fs::hard_link(aside, path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            // Leave it aside: a bookkeeping-named file costs nothing, and
+            // deleting it would delete a live plan's marker.
+            Err(error) => return Err(error),
+        }
+    }
+    match std::fs::remove_file(aside) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -3117,5 +3310,126 @@ mod budget_tests {
         let finished = wait_for_in_flight(&root, &|_| true, &mut || false, &mut release);
         assert!(finished);
         assert!(guard.is_none());
+    }
+
+    /// A long measuring run shares its sizes as it goes, stamped no younger
+    /// than the oldest of them, so a budgeted plan started meanwhile can
+    /// reuse them.
+    #[test]
+    fn checkpoints_share_sizes_while_measuring_and_at_the_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let first = root.join("a/target");
+        let second = root.join("b/target");
+        let third = root.join("c/target");
+        let window = SIZE_REUSE_WINDOW_MS;
+        let mut checkpoints = SizeCheckpoints::new(root, window, 5_000, 10_000);
+
+        checkpoints.measured(&first, 1, 11_000);
+        assert!(recent_sizes(root, 11_000, window).is_empty(), "not yet due");
+        checkpoints.measured(&second, 2, 15_000);
+        assert_eq!(
+            recent_sizes(root, 15_000, window),
+            BTreeMap::from([(first.clone(), 1), (second.clone(), 2)])
+        );
+        assert!(
+            recent_sizes(root, 11_000 + window + 1, window).is_empty(),
+            "stamped with the oldest measurement's time, never younger"
+        );
+        checkpoints.measured(&third, 3, 16_000);
+        let (shares, failure) = checkpoints.finish(17_000);
+
+        assert_eq!(shares, 2);
+        assert!(failure.is_none());
+        assert_eq!(recent_sizes(root, 17_000, window).get(&third), Some(&3));
+    }
+
+    /// P2 judged marker A stale; before it acted, P1 replaced A with its own
+    /// live marker B. P2 must not delete B.
+    #[test]
+    fn removing_a_stale_marker_never_removes_a_live_one_that_replaced_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(RECLAIM_IN_FLIGHT_FILENAME);
+        let aside = tmp.path().join("in-flight-stale-test.json");
+        let stale = serde_json::to_vec(&holder(1)).unwrap();
+        let live = serde_json::to_vec(&holder(2)).unwrap();
+        std::fs::write(&path, &live).unwrap();
+
+        remove_stale_marker(&path, &aside, Some(stale.as_slice())).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), live, "the live marker stays");
+        assert!(!aside.exists());
+
+        std::fs::write(&path, &stale).unwrap();
+        remove_stale_marker(&path, &aside, Some(stale.as_slice())).unwrap();
+        assert!(!path.exists(), "the judged stale marker is removed");
+        assert!(!aside.exists());
+        remove_stale_marker(&path, &aside, Some(stale.as_slice())).unwrap();
+    }
+
+    /// Whatever a killed writer leaves behind in the root must still read as
+    /// the plan's own bookkeeping, and every write leaves nothing else.
+    #[test]
+    fn reclaim_bookkeeping_and_its_temporaries_share_one_name_pattern() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bookkeeping = |name: &str| {
+            name.starts_with(RECLAIM_PLAN_FILENAME_PREFIX)
+                && name.ends_with(RECLAIM_PLAN_FILENAME_SUFFIX)
+        };
+        let seen = write_bookkeeping(&root.join("target.json"), b"x", |path| {
+            Ok(path.file_name().unwrap().to_string_lossy().into_owned())
+        })
+        .unwrap();
+        assert!(bookkeeping(&seen), "{seen}");
+        assert!(RECLAIM_TEMPORARY_PREFIX.starts_with(RECLAIM_PLAN_FILENAME_PREFIX));
+        assert!(RECLAIM_STALE_MARKER_PREFIX.starts_with(RECLAIM_PLAN_FILENAME_PREFIX));
+
+        let candidates = vec![classify(&root.join("a/target"), &root.join("a"), 8, &[])];
+        let digest = plan_digest(root, None, &candidates);
+        save_snapshot(root, None, &digest, &candidates).unwrap();
+        record_sizes(
+            root,
+            1_000,
+            SIZE_REUSE_WINDOW_MS,
+            &[(root.join("a/target"), 8)],
+        )
+        .unwrap();
+        let _guard = claimed(claim_in_flight(root, holder(1), &|_| true).unwrap());
+        for entry in std::fs::read_dir(root).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(bookkeeping(&name), "{name}");
+        }
+    }
+
+    #[test]
+    fn kept_reasons_map_to_fixed_labels() {
+        let root = Path::new("/r");
+        let active = classify(
+            &root.join("a/target"),
+            &root.join("a"),
+            0,
+            &[root.join("a")],
+        );
+        assert_eq!(kept_reason_class(&active.reason), "active_session");
+        let mut unrecorded = vec![classify(&root.join("b/target"), &root.join("b"), 0, &[])];
+        protect_unrecorded_worktrees(&mut unrecorded, &[]);
+        assert_eq!(
+            kept_reason_class(&unrecorded[0].reason),
+            "unrecorded_worktree"
+        );
+        assert_eq!(kept_reason_class(NOT_REVIEWED_REASON), "not_reviewed");
+        assert_eq!(
+            kept_reason_class("Git index changed 3 min ago"),
+            "recent_work"
+        );
+        assert_eq!(
+            kept_reason_class("process 42 (\"cargo\") has \"/r/a/target\" open"),
+            "open_file_use"
+        );
+        assert_eq!(
+            kept_reason_class("Git tracks files under this directory"),
+            "other"
+        );
     }
 }

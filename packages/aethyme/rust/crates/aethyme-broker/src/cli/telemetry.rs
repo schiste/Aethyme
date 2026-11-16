@@ -325,23 +325,35 @@ fn with_spans(
     if millis.is_empty() {
         return fields;
     }
-    let phases = fields
-        .entry("phase_timings_ms")
-        .or_insert_with(|| serde_json::Value::Object(Default::default()));
-    if let Some(phases) = phases.as_object_mut() {
-        for (name, elapsed) in millis {
-            phases.entry(name).or_insert(elapsed.into());
-        }
+    let phases = object_field(&mut fields, "phase_timings_ms");
+    for (name, elapsed) in millis {
+        phases.entry(name).or_insert(elapsed.into());
     }
-    let named = fields
-        .entry("phase_counts")
-        .or_insert_with(|| serde_json::Value::Object(Default::default()));
-    if let Some(named) = named.as_object_mut() {
-        for (name, count) in counts {
-            named.entry(name).or_insert(count.into());
-        }
+    let named = object_field(&mut fields, "phase_counts");
+    for (name, count) in counts {
+        named.entry(name).or_insert(count.into());
     }
     fields
+}
+
+/// The object at `key`, created when absent. Every reader of these rows
+/// expects an object there, so a command that attached anything else is a
+/// bug: the value is replaced (and the spans recorded) rather than the spans
+/// being dropped without a trace.
+fn object_field<'a>(
+    fields: &'a mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
+    let value = fields
+        .entry(key)
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    if !value.is_object() {
+        *value = serde_json::Value::Object(Default::default());
+    }
+    match value {
+        serde_json::Value::Object(object) => object,
+        _ => unreachable!("replaced by an object above"),
+    }
 }
 
 /// Whether this invocation should contribute command-latency telemetry.
@@ -395,8 +407,11 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
         ),
         // A reclaim plan is an observation and writes no outcome event; it
         // records its timing line by attaching phase details once it has run,
-        // so a refused selector still leaves no telemetry behind.
-        Some("reclaim") => false,
+        // so a refused selector still leaves no telemetry behind. An apply
+        // removes directories, so like `gc apply` it writes an outcome event
+        // and a `reclaim.apply` row on every run, refusals included; once it
+        // has scanned, the row carries its phase timings and counts.
+        Some("reclaim") => args.get(1).map(String::as_str) == Some("apply"),
         Some("storage") => match args.get(1).map(String::as_str) {
             Some("apply") => true,
             Some("attribute") => args.iter().any(|arg| arg == "--apply"),
@@ -622,6 +637,38 @@ mod tests {
             "a refused selector attaches nothing and writes nothing"
         );
         assert!(command_metric_enabled(&plan, false, true));
+    }
+
+    /// Apply removes directories and used to leave neither a row nor an
+    /// outcome event: `reclaim` was excluded wholesale with the plan.
+    #[test]
+    fn a_reclaim_apply_records_its_metric_and_outcome() {
+        let digest = "a".repeat(64);
+        let apply = ["reclaim", "apply", "--confirm", digest.as_str()].map(str::to_string);
+        assert_eq!(
+            label(&format!("gc reclaim apply --confirm {digest}")).as_deref(),
+            Some("reclaim.apply")
+        );
+        assert!(command_records_metric(&apply));
+        assert!(command_records_outcome(&apply));
+        assert!(command_metric_enabled(&apply, false, false));
+    }
+
+    /// A command that attaches a malformed `phase_counts` must not make the
+    /// spans vanish without a trace.
+    #[test]
+    fn spans_survive_a_non_object_phase_field() {
+        let spans = crate::phase_telemetry::Recorder::default();
+        {
+            let _installed = crate::phase_telemetry::install(spans.clone());
+            crate::phase_telemetry::add("subprocess_git", std::time::Duration::from_millis(2));
+        }
+        let attached = serde_json::json!({"phase_timings_ms": 7, "phase_counts": [1, 2]});
+
+        let fields = with_spans(attached.as_object().unwrap().clone(), &spans);
+
+        assert_eq!(fields["phase_counts"]["subprocess_git"], 1);
+        assert_eq!(fields["phase_timings_ms"]["subprocess_git"], 2);
     }
 
     #[test]

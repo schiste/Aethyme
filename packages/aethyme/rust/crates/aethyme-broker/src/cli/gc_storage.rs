@@ -832,11 +832,14 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
     // A whole-root plan is what an agent reaches for when the disk is low.
     // On the busiest repository it walked every checkout and sized every
     // build tree serially for 8-16+ minutes, from scratch for each agent that
-    // asked. It now discovers and sizes within budgets, shares what it
-    // measured, and never sizes the root while another plan is doing so.
+    // asked. It now discovers and sizes within budgets and shares what it
+    // measures; a budgeted plan never sizes the root while another plan is
+    // doing so, and `--full-scan` lifts both budgets and never waits.
     // Apply is untouched: it never sizes and re-proves every path itself.
     let whole_root_plan = scope.is_none() && matches!(&action, ReclaimAction::Plan);
     let bounded = whole_root_plan && !parsed.full_scan;
+    let discovery_budget = bounded.then(reclaim_discovery_budget);
+    let sizing_budget = bounded.then(reclaim_sizing_budget);
     let in_flight = if whole_root_plan {
         let alive = |holder: &crate::reclaim::InFlightPlan| {
             crate::reclaim::in_flight_holder_alive(holder, now_ms())
@@ -875,8 +878,10 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
             } else {
                 sizing
             };
-            let budget = crate::reclaim::WHOLE_ROOT_DISCOVERY_BUDGET;
-            let deadline = whole_root_deadline(bounded, budget);
+            let deadline = discovery_budget.map_or_else(
+                crate::reclaim::Deadline::never,
+                crate::reclaim::Deadline::after,
+            );
             let (found, mut discovery) = crate::reclaim::scan_root_within(
                 &root,
                 &active,
@@ -884,7 +889,7 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
                 sizing,
                 &mut || deadline.passed(),
             );
-            discovery.budget_ms = whole_root_budget_ms(bounded, budget);
+            discovery.budget_ms = discovery_budget.map(duration_ms);
             discovery.elapsed_ms = elapsed_ms(discovery_started);
             (found, Some(discovery))
         }
@@ -924,11 +929,12 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
         crate::reclaim::RECENT_WORK_WINDOW_MS,
     );
     let protection_ms = elapsed_ms(protection_started);
-    let (sizing_report, in_flight_wait_ms) = if whole_root_plan {
-        let (report, wait_ms) = size_whole_root_plan(&root, &mut candidates, in_flight, bounded);
-        (Some(report), wait_ms)
+    let (sizing_report, sizing_phases) = if whole_root_plan {
+        let (report, phases) =
+            size_whole_root_plan(&root, &mut candidates, in_flight, sizing_budget);
+        (Some(report), phases)
     } else {
-        (None, 0)
+        (None, SizingPhases::default())
     };
     let session_flag = parsed
         .session
@@ -962,7 +968,7 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
                     sizing: sizing_report.as_ref(),
                     discovery_ms,
                     protection_ms,
-                    in_flight_wait_ms,
+                    sizing_phases,
                     full_scan: parsed.full_scan,
                     confirmable,
                 },
@@ -993,9 +999,17 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
                 };
                 out!("{}", serde_json::to_string_pretty(&view)?);
             } else {
+                // A partial plan's digest confirms nothing, and an agent that
+                // copied it into apply would wait out a full apply scan only
+                // to be refused. So it is not printed at all; `--json` still
+                // carries it beside `"confirmable": false`.
+                let title = if confirmable {
+                    format!("Reclaim plan {}", plan.digest)
+                } else {
+                    "Partial reclaim plan (no digest: it cannot be applied)".to_string()
+                };
                 out!(
-                    "Reclaim plan {}: {} reclaimable of {} found",
-                    plan.digest,
+                    "{title}: {} reclaimable of {} found",
                     gib(plan.reclaimable_bytes),
                     gib(plan.total_bytes)
                 );
@@ -1018,7 +1032,9 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
                     .iter()
                     .any(|candidate| candidate.reclaimable && candidate.bytes.is_none());
                 if !confirmable {
-                    out!("Not applicable: this plan does not cover the whole root.");
+                    out!(
+                        "Not applicable: this plan does not cover the whole root, so it has no digest to confirm; apply accepts only a complete plan's digest."
+                    );
                 } else if plan.reclaimable_bytes == 0 && !unmeasured_reclaimable {
                     out!("Nothing to reclaim.");
                 } else {
@@ -1035,9 +1051,25 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
             // verified saved review names the authorized paths, and each is
             // removed only if the fresh scan still finds it reclaimable; a
             // change anywhere else in the root no longer voids the review.
+            //
+            // Every apply that got this far leaves a `reclaim.apply` metric
+            // row, refusals included: it is the destructive half.
+            let review_started = std::time::Instant::now();
+            let mut metric = ReclaimApplyMetric {
+                session_scoped: scope.is_some(),
+                exact_match: confirm == plan.digest,
+                scan_ms: discovery_ms,
+                protection_ms,
+                review_ms: 0,
+                removal_ms: 0,
+                candidates_scanned: plan.candidates.len(),
+                reviewed_reclaimable: 0,
+                withdrawn: 0,
+            };
             let mut not_reviewed = Vec::new();
             let mut withdrawn = Vec::new();
             let plan = if confirm == plan.digest {
+                metric.reviewed_reclaimable = count_reclaimable(&plan.candidates);
                 plan
             } else {
                 match crate::reclaim::load_snapshot(&root, &confirm) {
@@ -1045,6 +1077,8 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
                     // says nothing about the other worktrees, and a
                     // whole-root review was not made about one session.
                     Ok(Some(reviewed)) if reviewed.scope != scope => {
+                        metric.review_ms = elapsed_ms(review_started);
+                        metric.record(&plan.candidates, None, Some("scope_mismatch"));
                         let describe = |scope: &Option<std::path::PathBuf>| match scope {
                             Some(worktree) => format!("worktree {}", worktree.display()),
                             None => "the whole worktree root".to_string(),
@@ -1056,12 +1090,18 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
                         )));
                     }
                     Ok(Some(reviewed)) => {
+                        metric.reviewed_reclaimable = reviewed
+                            .decisions
+                            .iter()
+                            .filter(|decision| decision.reclaimable)
+                            .count();
                         let narrowed = crate::reclaim::restrict_to_review(
                             &plan.candidates,
                             &reviewed.decisions,
                         );
                         not_reviewed = narrowed.not_reviewed;
                         withdrawn = narrowed.withdrawn;
+                        metric.withdrawn = withdrawn.len();
                         crate::ReclaimPlan {
                             digest: confirm.to_string(),
                             root: plan.root,
@@ -1074,12 +1114,20 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
                     // Without a verified review there is nothing to narrow
                     // to, so only an exact match authorizes deletion.
                     unreadable => {
-                        let detail = match unreadable {
-                            Err(error) => format!(
-                                "the saved review could not be read ({error}); no reviewed decision set can be established"
+                        metric.review_ms = elapsed_ms(review_started);
+                        let (refusal, detail) = match unreadable {
+                            Err(error) => (
+                                "review_unreadable",
+                                format!(
+                                    "the saved review could not be read ({error}); no reviewed decision set can be established"
+                                ),
                             ),
-                            _ => "the saved review is unavailable; no reviewed decision set can be established".into(),
+                            _ => (
+                                "review_unavailable",
+                                "the saved review is unavailable; no reviewed decision set can be established".into(),
+                            ),
                         };
+                        metric.record(&plan.candidates, None, Some(refusal));
                         return Err(UsageError::Message(format!(
                             "confirmation does not match the current plan; re-run `aethyme broker gc reclaim plan{session_flag}` and review it again (reviewed {}, current {}); {}",
                             confirm, plan.digest, detail
@@ -1087,17 +1135,29 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
                     }
                 }
             };
-            let apply_root = broker
-                .require_bound_repository_worktree_root("worktree cache reclamation apply")?;
+            metric.review_ms = elapsed_ms(review_started);
+            let apply_root = match broker
+                .require_bound_repository_worktree_root("worktree cache reclamation apply")
+            {
+                Ok(apply_root) => apply_root,
+                Err(error) => {
+                    metric.record(&plan.candidates, None, Some("root_unbound"));
+                    return Err(error.into());
+                }
+            };
             if apply_root != root {
+                metric.record(&plan.candidates, None, Some("root_changed"));
                 return Err(UsageError::Message(
                     "the bound worktree root changed while preparing this reclaim; re-run the plan and review it again".into(),
                 ));
             }
+            let removal_started = std::time::Instant::now();
             let mut outcome = crate::apply_reclaim(&plan);
+            metric.removal_ms = elapsed_ms(removal_started);
             withdrawn.append(&mut outcome.skipped);
             outcome.skipped = withdrawn;
             outcome.not_reviewed = not_reviewed;
+            metric.record(&plan.candidates, Some(&outcome), None);
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&outcome)?);
             } else {
@@ -1126,17 +1186,47 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
     Ok(())
 }
 
-/// A deadline `limit` from now for a budgeted whole-root plan, or none.
-fn whole_root_deadline(bounded: bool, limit: std::time::Duration) -> crate::reclaim::Deadline {
-    if bounded {
-        crate::reclaim::Deadline::after(limit)
-    } else {
-        crate::reclaim::Deadline::never()
-    }
+/// Shortens the whole-root discovery budget to this many milliseconds.
+const RECLAIM_DISCOVERY_BUDGET_VARIABLE: &str = "AETHYME_RECLAIM_PLAN_DISCOVERY_BUDGET_MS";
+/// Shortens the whole-root sizing budget to this many milliseconds.
+const RECLAIM_SIZING_BUDGET_VARIABLE: &str = "AETHYME_RECLAIM_PLAN_SIZING_BUDGET_MS";
+
+fn reclaim_discovery_budget() -> std::time::Duration {
+    whole_root_budget(
+        crate::reclaim::WHOLE_ROOT_DISCOVERY_BUDGET,
+        RECLAIM_DISCOVERY_BUDGET_VARIABLE,
+    )
 }
 
-fn whole_root_budget_ms(bounded: bool, limit: std::time::Duration) -> Option<u64> {
-    bounded.then(|| u64::try_from(limit.as_millis()).unwrap_or(u64::MAX))
+fn reclaim_sizing_budget() -> std::time::Duration {
+    whole_root_budget(
+        crate::reclaim::WHOLE_ROOT_SIZING_BUDGET,
+        RECLAIM_SIZING_BUDGET_VARIABLE,
+    )
+}
+
+/// A budgeted whole-root plan's budget: `default`, or shorter when
+/// `variable` names fewer milliseconds. It is how the end-to-end tests make a
+/// partial plan without a root large enough to exhaust 60 s, and an operator
+/// may use it to get a quicker look.
+fn whole_root_budget(default: std::time::Duration, variable: &str) -> std::time::Duration {
+    shortened_budget(default, std::env::var(variable).ok().as_deref())
+}
+
+/// `default`, or `value` milliseconds when that parses and is shorter. A
+/// value can only shorten a budget, never lengthen or lift it: a shorter
+/// discovery budget yields a partial plan, which is never confirmable, and a
+/// shorter sizing budget yields unmeasured sizes, which authorize nothing.
+/// `--full-scan` is the only way to lift a budget.
+fn shortened_budget(default: std::time::Duration, value: Option<&str>) -> std::time::Duration {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .map_or(default, |shorter| shorter.min(default))
+}
+
+fn duration_ms(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn elapsed_ms(started: std::time::Instant) -> u64 {
@@ -1147,34 +1237,46 @@ fn elapsed_ms(started: std::time::Instant) -> u64 {
 /// whether it has finished.
 const IN_FLIGHT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Size a whole-root plan's candidates within the sizing budget.
+/// Size a whole-root plan's candidates within `budget` (`None`: unbounded,
+/// for `--full-scan`).
 ///
 /// Sizes another whole-root plan measured in the last
-/// [`crate::reclaim::SIZE_REUSE_WINDOW_MS`] are reused. When another plan
-/// holds the in-flight marker this one waits for it, within the sizing
-/// budget, and walks only once it has finished -- two plans never size the
-/// same trees at once. Sizes never authorize a deletion, so reusing or
-/// skipping them leaves the plan's decisions and digest exactly as they were.
-/// Returns the report and how long the wait took.
+/// [`crate::reclaim::SIZE_REUSE_WINDOW_MS`] are reused, including those a
+/// still-running plan has shared so far. When another plan holds the
+/// in-flight marker, a budgeted plan waits for it within the same deadline
+/// that bounds its walk, and walks only once it has finished; an unbounded
+/// plan never waits. Fresh sizes are shared as they are measured. Sizes never
+/// authorize a deletion, so reusing or skipping them leaves the plan's
+/// decisions and digest exactly as they were. Returns the report and the
+/// wait time and share count.
 fn size_whole_root_plan(
     root: &Path,
     candidates: &mut [crate::ReclaimCandidate],
     claim: Option<crate::reclaim::InFlightClaim>,
-    bounded: bool,
-) -> (crate::reclaim::SizingReport, u64) {
+    budget: Option<std::time::Duration>,
+) -> (crate::reclaim::SizingReport, SizingPhases) {
     use crate::reclaim::{
-        Deadline, InFlightClaim, InFlightPlan, in_flight_holder_alive, measure_within,
-        recent_sizes, record_sizes, wait_for_in_flight,
+        Deadline, InFlightClaim, InFlightPlan, SizeCheckpoints, in_flight_holder_alive,
+        measure_within_sharing, recent_sizes, wait_for_in_flight,
     };
-    let budget = crate::reclaim::WHOLE_ROOT_SIZING_BUDGET;
     let window = crate::reclaim::SIZE_REUSE_WINDOW_MS;
     let alive = |holder: &InFlightPlan| in_flight_holder_alive(holder, now_ms());
+    // One deadline for the wait and the walk together, so a budgeted plan
+    // never spends more than its sizing budget on sizes, however it spends it.
+    let deadline = budget.map_or_else(Deadline::never, Deadline::after);
     let wait_started = std::time::Instant::now();
     let (walk, deferred_to, _guard) = match claim {
         Some(InFlightClaim::Claimed(guard)) => (true, None, Some(guard)),
+        // `--full-scan` promises sizes for everything, so it never defers:
+        // waiting for another plan could not measure what that plan skips.
+        // It walks alongside, which costs I/O and never correctness.
+        Some(InFlightClaim::HeldBy(_)) if budget.is_none() => (true, None, None),
+        // A budgeted plan waits within its budget. Whatever the holder has
+        // measured so far -- it shares sizes every few seconds -- is reused
+        // below either way, so a minutes-long `--full-scan` holder no longer
+        // leaves it with nothing.
         Some(InFlightClaim::HeldBy(holder)) => {
-            let wait = Deadline::after(budget);
-            let mut waited_out = || wait.passed();
+            let mut waited_out = || deadline.passed();
             let mut pause = || std::thread::sleep(IN_FLIGHT_POLL);
             let finished = wait_for_in_flight(root, &alive, &mut waited_out, &mut pause);
             (finished, (!finished).then_some(holder), None)
@@ -1184,15 +1286,132 @@ fn size_whole_root_plan(
     let wait_ms = elapsed_ms(wait_started);
     let started = std::time::Instant::now();
     let recent = recent_sizes(root, now_ms(), window);
-    let deadline = whole_root_deadline(bounded, budget);
-    let (mut report, fresh) = measure_within(candidates, &recent, walk, &mut || deadline.passed());
-    if let Err(error) = record_sizes(root, now_ms(), window, &fresh) {
+    let mut checkpoints = SizeCheckpoints::new(
+        root,
+        window,
+        crate::reclaim::SIZE_CHECKPOINT_INTERVAL_MS,
+        now_ms(),
+    );
+    let (mut report, _) = measure_within_sharing(
+        candidates,
+        &recent,
+        walk,
+        &mut || deadline.passed(),
+        &mut |path, bytes| checkpoints.measured(path, bytes, now_ms()),
+    );
+    let (size_shares, failure) = checkpoints.finish(now_ms());
+    if let Some(error) = failure {
         eprintln!("Warning: cannot save reclaim plan sizes for the next plan to reuse: {error}");
     }
-    report.budget_ms = whole_root_budget_ms(bounded, budget);
+    report.budget_ms = budget.map(duration_ms);
     report.deferred_to = deferred_to;
     report.elapsed_ms = elapsed_ms(started);
-    (report, wait_ms)
+    (
+        report,
+        SizingPhases {
+            in_flight_wait_ms: wait_ms,
+            size_shares,
+        },
+    )
+}
+
+/// Timings and counts of the sizing phase beyond its report.
+#[derive(Debug, Clone, Copy, Default)]
+struct SizingPhases {
+    in_flight_wait_ms: u64,
+    /// Writes of fresh sizes to the shared size cache.
+    size_shares: usize,
+}
+
+fn count_reclaimable(candidates: &[crate::ReclaimCandidate]) -> usize {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.reclaimable)
+        .count()
+}
+
+/// What one `reclaim apply` did, for its `reclaim.apply` metric row.
+struct ReclaimApplyMetric {
+    session_scoped: bool,
+    /// The fresh scan hashed to the confirmed digest, so no saved review was
+    /// needed.
+    exact_match: bool,
+    scan_ms: u64,
+    /// The protections every candidate is re-proved against.
+    protection_ms: u64,
+    /// Matching the digest and loading and verifying the saved review.
+    review_ms: u64,
+    removal_ms: u64,
+    candidates_scanned: usize,
+    /// Paths the confirmed review marked reclaimable.
+    reviewed_reclaimable: usize,
+    /// Reviewed paths no longer present or now kept.
+    withdrawn: usize,
+}
+
+impl ReclaimApplyMetric {
+    /// Attach the row. `candidates` is what apply was handed (the fresh scan,
+    /// narrowed to the review when one was used); `refused` names why apply
+    /// stopped before removing anything.
+    fn record(
+        &self,
+        candidates: &[crate::ReclaimCandidate],
+        outcome: Option<&crate::ReclaimOutcome>,
+        refused: Option<&str>,
+    ) {
+        super::telemetry::set_command_metric_details(self.details(candidates, outcome, refused));
+    }
+
+    fn details(
+        &self,
+        candidates: &[crate::ReclaimCandidate],
+        outcome: Option<&crate::ReclaimOutcome>,
+        refused: Option<&str>,
+    ) -> serde_json::Value {
+        let removed = outcome.map_or(0, |outcome| outcome.removed.len());
+        let skipped = outcome.map_or(0, |outcome| outcome.skipped.len());
+        let mut counts = serde_json::Map::new();
+        counts.insert("candidates".into(), self.candidates_scanned.into());
+        counts.insert("reviewed".into(), self.reviewed_reclaimable.into());
+        counts.insert("authorized".into(), count_reclaimable(candidates).into());
+        counts.insert("removed".into(), removed.into());
+        counts.insert("withdrawn".into(), self.withdrawn.into());
+        counts.insert(
+            "removal_failed".into(),
+            skipped.saturating_sub(self.withdrawn).into(),
+        );
+        counts.insert(
+            "not_reviewed".into(),
+            outcome
+                .map_or(0, |outcome| outcome.not_reviewed.len())
+                .into(),
+        );
+        // Kept candidates by which protection kept them; the reasons
+        // themselves can name paths and processes and stay out of the row.
+        let mut kept = std::collections::BTreeMap::<&str, usize>::new();
+        for candidate in candidates.iter().filter(|candidate| !candidate.reclaimable) {
+            let class = crate::reclaim::kept_reason_class(&candidate.reason);
+            *kept.entry(class).or_default() += 1;
+        }
+        for (class, count) in kept {
+            counts.insert(format!("kept_{class}"), count.into());
+        }
+        serde_json::json!({
+            "phase_timings_ms": {
+                "scan": self.scan_ms,
+                "protection": self.protection_ms,
+                "review": self.review_ms,
+                "removal": self.removal_ms,
+            },
+            "phase_counts": counts,
+            "reclaim_apply": {
+                "scope": if self.session_scoped { "session" } else { "root" },
+                "review": if self.exact_match { "exact" } else { "saved_review" },
+                "refused": refused,
+                "reclaimed_bytes": outcome.map_or(0, |outcome| outcome.reclaimed_bytes),
+            },
+        })
+    }
 }
 
 /// The `reclaim plan --json` document: the plan, plus how complete it is.
@@ -1214,7 +1433,7 @@ struct ReclaimPlanPhases<'a> {
     sizing: Option<&'a crate::reclaim::SizingReport>,
     discovery_ms: u64,
     protection_ms: u64,
-    in_flight_wait_ms: u64,
+    sizing_phases: SizingPhases,
     full_scan: bool,
     confirmable: bool,
 }
@@ -1244,7 +1463,7 @@ fn reclaim_plan_metric_details(
         "phase_timings_ms": {
             "discovery": phases.discovery_ms,
             "protection": phases.protection_ms,
-            "in_flight_wait": phases.in_flight_wait_ms,
+            "in_flight_wait": phases.sizing_phases.in_flight_wait_ms,
             "sizing": sizing.elapsed_ms,
         },
         "phase_counts": {
@@ -1254,6 +1473,7 @@ fn reclaim_plan_metric_details(
             "measured": measured,
             "reused": sizing.reused,
             "unmeasured": unmeasured,
+            "size_shares": phases.sizing_phases.size_shares,
         },
         "reclaim_plan": {
             "scope": if plan.scope.is_some() { "session" } else { "root" },
@@ -2522,6 +2742,136 @@ mod artifact_use_refusal_tests {
             cleaned.contains("Session 7 has already been cleaned"),
             "{cleaned}"
         );
+    }
+}
+
+#[cfg(test)]
+mod reclaim_plan_tests {
+    use super::*;
+    use crate::reclaim::{InFlightClaim, InFlightPlan, claim_in_flight, classify, record_sizes};
+    use std::time::Duration;
+
+    #[test]
+    fn a_budget_override_only_ever_shortens() {
+        let default = Duration::from_secs(60);
+        assert_eq!(shortened_budget(default, None), default);
+        assert_eq!(shortened_budget(default, Some("0")), Duration::ZERO);
+        assert_eq!(
+            shortened_budget(default, Some(" 1500 ")),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(shortened_budget(default, Some("600000")), default);
+        assert_eq!(shortened_budget(default, Some("-1")), default);
+        assert_eq!(shortened_budget(default, Some("soon")), default);
+    }
+
+    /// One reclaimable candidate holding a 32-byte file, and a marker naming
+    /// this live process as another whole-root plan in flight.
+    fn root_with_a_live_holder() -> (
+        tempfile::TempDir,
+        Vec<crate::ReclaimCandidate>,
+        InFlightPlan,
+        crate::reclaim::InFlightGuard,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("idle/target")).unwrap();
+        std::fs::write(root.join("idle/target/x"), [b'x'; 32]).unwrap();
+        let candidates = vec![classify(
+            &root.join("idle/target"),
+            &root.join("idle"),
+            0,
+            &[],
+        )];
+        let holder = InFlightPlan::current(now_ms());
+        let guard = match claim_in_flight(root, holder.clone(), &|_| true).unwrap() {
+            InFlightClaim::Claimed(guard) => guard,
+            InFlightClaim::HeldBy(other) => panic!("fresh root already held by {other:?}"),
+        };
+        (tmp, candidates, holder, guard)
+    }
+
+    /// `--full-scan` used to wait 20 s for a budgeted holder and then list
+    /// everything unmeasured. Unbounded, it must measure at once: with a
+    /// live holder and no deadline, any wait would never end.
+    #[test]
+    fn a_full_scan_never_defers_to_a_plan_in_flight() {
+        let (tmp, mut candidates, holder, _guard) = root_with_a_live_holder();
+
+        let (report, phases) = size_whole_root_plan(
+            tmp.path(),
+            &mut candidates,
+            Some(InFlightClaim::HeldBy(holder)),
+            None,
+        );
+
+        assert_eq!(report.deferred_to, None);
+        assert_eq!((report.measured, report.unmeasured), (1, 0));
+        assert_eq!(report.budget_ms, None);
+        assert_eq!(candidates[0].bytes, Some(32));
+        assert_eq!(phases.size_shares, 1, "a full scan shares what it measured");
+    }
+
+    /// A budgeted plan that finds a holder waits only within its one sizing
+    /// deadline, then reuses whatever the holder has shared so far.
+    #[test]
+    fn a_budgeted_plan_reuses_what_a_running_holder_has_shared() {
+        let (tmp, mut candidates, holder, _guard) = root_with_a_live_holder();
+        let shared = [(tmp.path().join("idle/target"), 7_u64)];
+        record_sizes(
+            tmp.path(),
+            now_ms(),
+            crate::reclaim::SIZE_REUSE_WINDOW_MS,
+            &shared,
+        )
+        .unwrap();
+
+        let (report, _) = size_whole_root_plan(
+            tmp.path(),
+            &mut candidates,
+            Some(InFlightClaim::HeldBy(holder.clone())),
+            Some(Duration::ZERO),
+        );
+
+        assert_eq!(report.deferred_to, Some(holder));
+        assert_eq!((report.reused, report.measured), (1, 0));
+        assert_eq!(candidates[0].bytes, Some(7));
+        assert_eq!(report.budget_ms, Some(0));
+    }
+
+    /// The `reclaim.apply` row counts kept candidates by protection, never
+    /// by their free-text reasons, which can name paths and processes.
+    #[test]
+    fn the_apply_metric_counts_kept_candidates_by_protection_only() {
+        let root = std::path::Path::new("/r");
+        let active = classify(
+            &root.join("a/target"),
+            &root.join("a"),
+            0,
+            &[root.join("a")],
+        );
+        let idle = classify(&root.join("b/target"), &root.join("b"), 0, &[]);
+        let metric = ReclaimApplyMetric {
+            session_scoped: false,
+            exact_match: false,
+            scan_ms: 1,
+            protection_ms: 2,
+            review_ms: 3,
+            removal_ms: 0,
+            candidates_scanned: 2,
+            reviewed_reclaimable: 1,
+            withdrawn: 0,
+        };
+
+        let row = metric.details(&[active, idle], None, Some("review_unavailable"));
+
+        assert_eq!(row["phase_counts"]["kept_active_session"], 1);
+        assert_eq!(row["phase_counts"]["authorized"], 1);
+        assert_eq!(row["phase_counts"]["removed"], 0);
+        assert_eq!(row["reclaim_apply"]["refused"], "review_unavailable");
+        assert_eq!(row["reclaim_apply"]["review"], "saved_review");
+        assert_eq!(row["phase_timings_ms"]["review"], 3);
+        assert!(!row.to_string().contains("/r/"), "{row}");
     }
 }
 

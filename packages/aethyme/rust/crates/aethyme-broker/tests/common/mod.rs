@@ -58,7 +58,11 @@ pub fn broker_cli(binary: &str, args: &[&str]) -> Command {
         .env_remove("AETHYME_BROKER_OPEN_HOST_OPERATION_DB")
         .env_remove("AETHYME_BROKER_OPEN_HOST_STATE_EXPLICIT")
         .env_remove("AETHYME_BROKER_OPEN_WORKTREE_ROOT")
-        .env_remove("AETHYME_BROKER_OPEN_COLLABORATION_ROOT");
+        .env_remove("AETHYME_BROKER_OPEN_COLLABORATION_ROOT")
+        // Whole-root reclaim plan budgets: a test that wants them shorter
+        // sets them itself.
+        .env_remove("AETHYME_RECLAIM_PLAN_DISCOVERY_BUDGET_MS")
+        .env_remove("AETHYME_RECLAIM_PLAN_SIZING_BUDGET_MS");
     command
 }
 

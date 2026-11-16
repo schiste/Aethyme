@@ -856,6 +856,12 @@ hash archive bundles during the bounded scan. If you only need regenerable
 build output, `aethyme broker gc reclaim plan --session <id>` provides the
 targeted review for one session; the whole-root form is budgeted and may list
 unmeasured sizes or stop as a partial, unappliable plan (see the CLI reference).
+Its discovery budget (60 s) stops it starting new worktrees and finishes the
+one in progress, so it can overrun by one worktree's walk; its sizing budget
+(20 s) covers any wait for another plan as well as the walk. A partial plan
+prints no digest. `aethyme broker gc reclaim plan --full-scan` lifts both
+budgets and measures everything even while another plan runs, sharing its
+sizes as it goes so budgeted plans started meanwhile can reuse them.
 
 An apply with an existing journal resumes that authorized journal directly;
 the planning flags only control the fresh-plan check when no journal exists.

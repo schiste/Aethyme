@@ -1895,26 +1895,39 @@ to requiring the exact current digest, so a failed write costs flexibility, not
 safety.
 
 Without `--session`, `broker gc reclaim plan` covers the whole root within two
-budgets. Discovery stops starting new worktrees after 60 seconds: such a plan
+budgets. Discovery stops starting new worktrees after 60 seconds; the worktree
+in progress is finished (each listed worktree is complete, never cut off
+mid-walk), so discovery can overrun by one worktree's walk. Such a plan
 reports `"confirmable": false` and `discovery.complete: false`, saves no review
-snapshot, prints no apply command, and its digest matches no complete scan, so
-apply refuses it. Sizing stops after 20 seconds in total, reclaimable
-candidates first: every candidate is still listed, and one not measured in
-budget has `"bytes": null` (shown as `unmeasured`), is counted in
+snapshot, and its digest matches no complete scan, so apply refuses it. Its
+human output prints neither an apply command nor the digest, and says why;
+`--json` still carries `digest` beside `"confirmable": false`. Sizing has 20
+seconds in total, covering any wait for another plan as well as the walk,
+reclaimable candidates first: every candidate is still listed, and one not
+measured in budget has `"bytes": null` (shown as `unmeasured`), is counted in
 `sizing.unmeasured`, and contributes nothing to `reclaimable_bytes` or
 `total_bytes`, which are then lower bounds. Sizes are not part of the digest,
 so an unmeasured candidate confirms exactly what a measured one would. A plan
 reuses sizes another whole-root plan of the same root measured in the last 90
-seconds (`sizing.reused`), and while one whole-root plan is running (a marker
-naming its pid and process start time, removed when it ends and ignored once
-that process is gone) another waits for it within its sizing budget and does
-not walk the same directories meanwhile (`sizing.deferred_to`). `--full-scan`
-lifts both budgets; `--session <id>` scans and sizes one worktree without
-budgets. Each plan records a `reclaim.plan` row in
-`.aethyme/logs/command-metrics.jsonl` with `phase_timings_ms` (`discovery`,
-`protection`, `in_flight_wait`, `sizing`), `phase_counts` (`worktrees_scanned`,
-`worktrees_not_scanned`, `candidates`, `measured`, `reused`, `unmeasured`) and a
-`reclaim_plan` object; a plan interrupted by a signal records no row.
+seconds (`sizing.reused`); a measuring plan shares its sizes every 5 seconds
+while it runs, not only when it ends. While one whole-root plan is running (a
+marker naming its pid and process start time, removed when it ends and
+ignored once that process is gone) another budgeted plan waits for it within
+its sizing budget, does not walk the same directories meanwhile
+(`sizing.deferred_to`), and reuses whatever the running plan has shared so far.
+`--full-scan` lifts both budgets and never defers: it measures every
+candidate even while another plan runs. `--session <id>` scans and sizes one
+worktree without budgets. For tests and a quicker look,
+`AETHYME_RECLAIM_PLAN_DISCOVERY_BUDGET_MS` and
+`AETHYME_RECLAIM_PLAN_SIZING_BUDGET_MS` shorten the two budgets; a value can
+only shorten one, never lengthen it, and `--full-scan` ignores them. Each plan
+records a `reclaim.plan` row in `.aethyme/logs/command-metrics.jsonl` with
+`phase_timings_ms` (`discovery`, `protection`, `in_flight_wait`, `sizing`),
+`phase_counts` (`worktrees_scanned`, `worktrees_not_scanned`, `candidates`,
+`measured`, `reused`, `unmeasured`, `size_shares`) and a `reclaim_plan` object;
+a plan interrupted by a signal records no row. Each `reclaim apply` records a
+`reclaim.apply` row and a `broker.command.*` outcome event, refusals included
+(see `docs/architecture/cross-process-consumers.md`).
 `broker gc reclaim apply --confirm <sha256>` re-scans and removes only
 reviewed paths that are still reclaimable. The digest binds the root and the
 sorted candidate paths plus their kept/reclaimable decisions; measured byte

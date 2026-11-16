@@ -1376,6 +1376,173 @@ fn a_missing_review_still_requires_the_exact_digest() {
     assert!(worktree.join("rust/target").exists());
 }
 
+/// `gc reclaim` run with whole-root plan budgets shortened (they can only be
+/// shortened) to `discovery_ms` / `sizing_ms` milliseconds.
+fn reclaim_with_budgets(
+    repo: &Path,
+    container: &Path,
+    args: &[&str],
+    discovery_ms: Option<&str>,
+    sizing_ms: Option<&str>,
+) -> Output {
+    const DISCOVERY: &str = "AETHYME_RECLAIM_PLAN_DISCOVERY_BUDGET_MS";
+    const SIZING: &str = "AETHYME_RECLAIM_PLAN_SIZING_BUDGET_MS";
+    age_worktree_indexes(repo);
+    let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = Vec::new();
+    if let Some(ms) = discovery_ms {
+        env.push((DISCOVERY.into(), ms.into()));
+    }
+    if let Some(ms) = sizing_ms {
+        env.push((SIZING.into(), ms.into()));
+    }
+    command_from_fixture_with_env(repo, repo, container, args, env)
+        .output()
+        .unwrap()
+}
+
+/// Review snapshots in `root`: `.aethyme-reclaim-plan-<64 hex>.json`.
+fn reclaim_snapshots(root: &Path) -> Vec<String> {
+    std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            name.strip_prefix(".aethyme-reclaim-plan-")
+                .and_then(|rest| rest.strip_suffix(".json"))
+                .is_some_and(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        })
+        .collect()
+}
+
+/// A whole-root plan whose discovery budget ran out lists part of the root.
+/// It must never be a review: not confirmable, no apply command and no
+/// digest in its human output, no snapshot saved, and apply with its digest
+/// refused with nothing removed. The first root has no candidates at all, so
+/// a partial plan lists exactly what a complete one would: only the partial
+/// digest salt keeps its digest from confirming the whole root.
+#[test]
+fn a_partial_reclaim_plan_authorizes_nothing_end_to_end() {
+    let (repo, container) = fixture("");
+    let started = run(
+        repo.path(),
+        container.path(),
+        &["start", "--task", "no build output", "--json"],
+    );
+    assert!(
+        started.status.success(),
+        "start: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let plan_args = ["gc", "reclaim", "plan", "--json"];
+    let partial_plan = |label: &str| {
+        let output =
+            reclaim_with_budgets(repo.path(), container.path(), &plan_args, Some("0"), None);
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("cannot save reclaim plan review snapshot"),
+            "a partial plan must not even try to save a review: {stderr}"
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let refused_apply = |digest: &str| {
+        let output = run(
+            repo.path(),
+            container.path(),
+            &["gc", "reclaim", "apply", "--confirm", digest],
+        );
+        assert!(
+            !output.status.success(),
+            "a partial plan's digest must not confirm anything: stdout={}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let message = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(message.contains("saved review is unavailable"), "{message}");
+    };
+
+    let empty = partial_plan("partial plan of a root without candidates");
+    assert_eq!(empty["confirmable"], false, "{empty}");
+    assert_eq!(empty["discovery"]["complete"], false, "{empty}");
+    assert_eq!(empty["discovery"]["worktrees_scanned"], 0, "{empty}");
+    assert!(
+        empty["candidates"].as_array().unwrap().is_empty(),
+        "{empty}"
+    );
+    let root = PathBuf::from(empty["root"].as_str().unwrap());
+    let digest = empty["digest"].as_str().unwrap().to_string();
+    assert!(reclaim_snapshots(&root).is_empty());
+    let human = reclaim_with_budgets(
+        repo.path(),
+        container.path(),
+        &["gc", "reclaim", "plan"],
+        Some("0"),
+        None,
+    );
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(human.status.success(), "{human_stdout}");
+    assert!(
+        human_stdout.contains("Partial reclaim plan"),
+        "{human_stdout}"
+    );
+    assert!(!human_stdout.contains("Apply with"), "{human_stdout}");
+    assert!(
+        !human_stdout.contains(&digest),
+        "a partial plan's digest is not printed: {human_stdout}"
+    );
+    refused_apply(&digest);
+    assert!(reclaim_snapshots(&root).is_empty());
+
+    // The same refusal with build output a complete review would authorize.
+    let (worktree, _) = closed_session_with_target(repo.path(), container.path(), "partial");
+    let target = worktree.join("rust/target");
+    let partial = partial_plan("partial plan of a root with candidates");
+    assert_eq!(partial["confirmable"], false, "{partial}");
+    let digest = partial["digest"].as_str().unwrap().to_string();
+    refused_apply(&digest);
+    assert!(target.join("artifact").exists(), "nothing may be removed");
+    assert!(reclaim_snapshots(&root).is_empty());
+    let metrics_path = repo.path().join(".aethyme/logs/command-metrics.jsonl");
+    let metrics = std::fs::read_to_string(&metrics_path).unwrap();
+    let refusals = metrics
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|row| row["command"] == "reclaim.apply")
+        .filter(|row| row["reclaim_apply"]["refused"] == "review_unavailable")
+        .count();
+    assert_eq!(refusals, 2, "every refused apply leaves a row: {metrics}");
+
+    // A spent sizing budget leaves sizes unmeasured, never the plan
+    // partial: it still lists everything and can be confirmed.
+    let unsized_plan =
+        reclaim_with_budgets(repo.path(), container.path(), &plan_args, None, Some("0"));
+    assert!(unsized_plan.status.success());
+    let unsized_plan: serde_json::Value = serde_json::from_slice(&unsized_plan.stdout).unwrap();
+    assert_eq!(unsized_plan["confirmable"], true, "{unsized_plan}");
+    let candidate = unsized_plan["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| {
+            candidate["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("rust/target"))
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("no rust/target candidate: {unsized_plan}"));
+    assert!(candidate["bytes"].is_null(), "{candidate}");
+    assert_eq!(
+        reclaim_snapshots(&root).len(),
+        1,
+        "a complete plan is a review"
+    );
+    assert_ne!(unsized_plan["digest"], partial["digest"]);
+}
+
 /// A review edited to name more paths no longer hashes to the confirmed
 /// digest, so it authorizes nothing.
 #[test]
