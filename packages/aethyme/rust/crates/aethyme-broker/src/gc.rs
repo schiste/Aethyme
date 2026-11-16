@@ -324,6 +324,12 @@ const ARTIFACT_WORKER_LOAD_BLOCKED_RETRY_MS: i64 = 60_000;
 /// removes about twice as fast as steady removal under the same load. A
 /// steady slice keeps its minute; without load nothing changes.
 const ARTIFACT_WORKER_LOAD_THROTTLE_GAP_MS: i64 = 30_000;
+/// The shortest wait before the next slice after one that stopped
+/// `memory_warning_throttled`: memory at the warning level allows one
+/// checkout removal per slice and then a long gap, four times the load gap.
+/// Critical memory pressure is the hard stop
+/// ([`ARTIFACT_WORKER_CAPACITY_REMOVAL_PRESSURE_RETRY_MS`]).
+const ARTIFACT_WORKER_MEMORY_WARNING_THROTTLE_GAP_MS: i64 = 120_000;
 /// When the cache lane is due, capacity slices leave it at least this much
 /// of every worker run: three 30-second cache passes.
 const ARTIFACT_WORKER_CACHE_LANE_MIN: Duration = Duration::from_secs(90);
@@ -387,6 +393,14 @@ pub(crate) enum CapacitySliceStop {
     /// the next slice runs at the normal cadence, no sooner than
     /// [`ARTIFACT_WORKER_LOAD_THROTTLE_GAP_MS`].
     LoadThrottled,
+    /// Memory pressure stayed at the warning level through a pre-pass
+    /// check's bounded wait: the slice made its throttled allowance of
+    /// removals ([`ARTIFACT_WORKER_LOAD_THROTTLED_REMOVALS`]) and stopped;
+    /// the next slice waits at least
+    /// [`ARTIFACT_WORKER_MEMORY_WARNING_THROTTLE_GAP_MS`], which a new
+    /// landing does not shorten. Only critical memory pressure is
+    /// `memory_backoff`.
+    MemoryWarningThrottled,
     /// The slice's deadline cut a pacer wait short; the rest is owed before
     /// the next slice.
     SliceDeadline,
@@ -415,11 +429,12 @@ pub(crate) enum CapacitySliceStop {
 
 impl CapacitySliceStop {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 13] = [
+    pub(crate) const ALL: [Self; 14] = [
         Self::Cap,
         Self::Budget,
         Self::MemoryBackoff,
         Self::LoadThrottled,
+        Self::MemoryWarningThrottled,
         Self::SliceDeadline,
         Self::YieldedToForeground,
         Self::NothingSelected,
@@ -437,6 +452,7 @@ impl CapacitySliceStop {
             Self::Budget => "budget",
             Self::MemoryBackoff => "memory_backoff",
             Self::LoadThrottled => "load_throttled",
+            Self::MemoryWarningThrottled => "memory_warning_throttled",
             Self::SliceDeadline => "slice_deadline",
             Self::YieldedToForeground => "yielded_to_foreground",
             Self::NothingSelected => "nothing_selected",
@@ -455,6 +471,9 @@ impl CapacitySliceStop {
             Self::Budget => "artifact_worker_capacity_removal_stop_budget",
             Self::MemoryBackoff => "artifact_worker_capacity_removal_stop_memory_backoff",
             Self::LoadThrottled => "artifact_worker_capacity_removal_stop_load_throttled",
+            Self::MemoryWarningThrottled => {
+                "artifact_worker_capacity_removal_stop_memory_warning_throttled"
+            }
             Self::SliceDeadline => "artifact_worker_capacity_removal_stop_slice_deadline",
             Self::YieldedToForeground => {
                 "artifact_worker_capacity_removal_stop_yielded_to_foreground"
@@ -499,6 +518,9 @@ fn capacity_stop_retry_ms(
         ),
         CapacitySliceStop::LoadThrottled => {
             at_least(lap_retry_ms, ARTIFACT_WORKER_LOAD_THROTTLE_GAP_MS)
+        }
+        CapacitySliceStop::MemoryWarningThrottled => {
+            at_least(lap_retry_ms, ARTIFACT_WORKER_MEMORY_WARNING_THROTTLE_GAP_MS)
         }
         CapacitySliceStop::SliceDeadline => at_least(
             lap_retry_ms,
@@ -1034,6 +1056,24 @@ const SESSION_RETIREMENT_WORKER_RUN_BUDGET: Duration = Duration::from_secs(120);
 // bounded even when every inspected session has an unresolved reason.
 const SESSION_RETIREMENT_WORKER_MAX_PASSES: usize = 16;
 const SESSION_RETIREMENT_WORKER_RETRY_MS: i64 = 10 * 60_000;
+/// How long a retirement pass waits for the GC lock before it gives up the
+/// rest of its tranche. A foreground command's inline pass holds the lock
+/// for a fraction of a second; giving up at once used to defer retirement
+/// for ten minutes whenever a run started next to one.
+const SESSION_RETIREMENT_GC_LOCK_WAIT: Duration = Duration::from_secs(5);
+const SESSION_RETIREMENT_GC_LOCK_POLL: Duration = Duration::from_millis(100);
+/// After a retirement pass that found the GC lock held through its wait.
+const SESSION_RETIREMENT_LOCK_BUSY_RETRY_MS: i64 = 60_000;
+
+/// The retirement share of a worker run with `remaining` of the run left:
+/// up to [`SESSION_RETIREMENT_WORKER_RUN_BUDGET`], and never less than
+/// [`SESSION_RETIREMENT_WORKER_RESERVE`], whatever the removal lane before it
+/// used, failed or overran.
+fn worker_retirement_run_budget(remaining: Duration) -> Duration {
+    remaining
+        .min(SESSION_RETIREMENT_WORKER_RUN_BUDGET)
+        .max(SESSION_RETIREMENT_WORKER_RESERVE)
+}
 /// A general foreground sweep reserves up to one cleanup-worker pass for
 /// whole-checkout work, while leaving at least half of the pass for caches.
 const AUTO_CHECKOUT_CLEANUP_FOREGROUND_RESERVE: Duration = AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET;
@@ -4659,6 +4699,10 @@ impl Broker {
             ),
             ("artifact_worker_pacer_load_wait", summary.load_pause_ms),
             (
+                "artifact_worker_pacer_memory_warning_wait",
+                summary.memory_warning_pause_ms,
+            ),
+            (
                 "artifact_worker_pacer_limiter_sleep",
                 summary.limiter_sleep_ms,
             ),
@@ -4677,6 +4721,10 @@ impl Broker {
             (
                 "artifact_worker_pacer_load_throttled",
                 summary.load_throttled,
+            ),
+            (
+                "artifact_worker_pacer_memory_warning_throttled",
+                summary.memory_warning_throttled,
             ),
             ("artifact_worker_host_slot_busy", summary.host_slot_busy),
             (
@@ -7305,6 +7353,32 @@ impl Broker {
         }
     }
 
+    /// The detached worker's own retirement request: queued (one CAS row
+    /// update, as a foreground pass queues it) when the abandonment window is
+    /// enabled, nothing is pending and the pause after the last completed
+    /// lap is over. Best effort: an unreadable policy or a busy state row
+    /// leaves the run's other lanes untouched. Counted as
+    /// `artifact_worker_retirement_requested` when this run queued it.
+    fn request_worker_session_retirement(&mut self) {
+        let Ok(policy) = load_retention_policy(self.main_root()) else {
+            return;
+        };
+        let pending_before = matches!(
+            self.session_retirement_request_state(),
+            Ok((requested, completed)) if requested > completed
+        );
+        match self.request_session_retirement_if_due(&policy, ArtifactSweepScope::Drain) {
+            Ok(Some(_)) if !pending_before => {
+                crate::phase_telemetry::add("artifact_worker_retirement_requested", Duration::ZERO);
+            }
+            Ok(_) => {}
+            Err(error) => crate::warn_unrecorded(
+                "queue the worker's session-retirement request",
+                Err::<(), _>(error),
+            ),
+        }
+    }
+
     fn request_session_retirement_if_due(
         &mut self,
         policy: &RetentionPolicy,
@@ -8357,7 +8431,7 @@ impl Broker {
             && crate::AutoCleanupPolicy::artifact_sweep_allowed(self.main_root());
         let checkout_cleanup_pending = self.auto_checkout_cleanup_recovery_requested()?;
         let session_retirement_state = self.session_retirement_recovery_state()?;
-        let session_retirement_pending = session_retirement_state.unwrap_or(false);
+        let mut session_retirement_pending = session_retirement_state.unwrap_or(false);
         let compact_pending = self.compact_checkout_work_pending()?;
         let removal_trigger = self.checkout_removal_trigger_due(now_ms())?;
         let capacity_removal_due = removal_trigger.is_some();
@@ -8372,6 +8446,14 @@ impl Broker {
                 self.write_artifact_sweep_worker_status("no_backlog")?;
             }
             return Ok(());
+        }
+        // Retirement gets its share of every worker run, not only of runs a
+        // foreground pass happened to leave a request for: a run started for
+        // any lane queues one itself (outside the ten-minute pause after a
+        // completed lap).
+        if !session_retirement_pending {
+            self.request_worker_session_retirement();
+            session_retirement_pending = self.session_retirement_recovery_requested()?;
         }
         let namespace = self.artifact_sweep_namespace()?.to_string();
         let now = now_ms();
@@ -8472,21 +8554,27 @@ impl Broker {
         if let Some(request_generation) = session_retirement_generation {
             let remaining =
                 ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
-            let run_budget = remaining.min(SESSION_RETIREMENT_WORKER_RUN_BUDGET);
-            let ran = self.with_host_deleter_pin(|broker| {
-                broker.run_session_retirement_recovery_worker_loop_isolated(
-                    request_generation,
-                    Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
-                    Some(run_budget),
-                )
-            })?;
-            if ran.is_none() {
-                self.defer_session_retirement_request_for(
-                    request_generation,
-                    "session_retirement_host_deleter_busy",
-                    ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS,
-                )?;
+            let run_budget = worker_retirement_run_budget(remaining);
+            crate::phase_telemetry::add("artifact_worker_retirement_share_budget", run_budget);
+            if remaining < SESSION_RETIREMENT_WORKER_RESERVE {
+                // Removal overran the run: retirement still gets its reserve.
+                crate::phase_telemetry::add(
+                    "artifact_worker_retirement_share_reserve_used",
+                    Duration::ZERO,
+                );
             }
+            // Closing a session deletes nothing (the missing-checkout lane
+            // only records rows), so retirement takes no host deleter slot:
+            // another repository's deleting worker no longer puts it off.
+            let started = Instant::now();
+            self.run_session_retirement_recovery_worker_loop_isolated(
+                request_generation,
+                Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
+                Some(run_budget),
+            )?;
+            crate::phase_telemetry::add("artifact_worker_retirement_share_used", started.elapsed());
+        } else {
+            crate::phase_telemetry::add("artifact_worker_retirement_not_due", Duration::ZERO);
         }
         let cache_lane_result = if artifact_due {
             (|| {
@@ -8673,20 +8761,16 @@ impl Broker {
                         "session_retirement_post_cache_reserve_unavailable",
                     )?;
                 } else {
-                    let ran = broker.with_host_deleter_pin(|broker| {
-                        broker.run_session_retirement_recovery_worker_loop_isolated(
-                            request_generation,
-                            Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
-                            Some(remaining.min(SESSION_RETIREMENT_WORKER_RUN_BUDGET)),
-                        )
-                    })?;
-                    if ran.is_none() {
-                        broker.defer_session_retirement_request_for(
-                            request_generation,
-                            "session_retirement_host_deleter_busy",
-                            ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS,
-                        )?;
-                    }
+                    let started = Instant::now();
+                    broker.run_session_retirement_recovery_worker_loop_isolated(
+                        request_generation,
+                        Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
+                        Some(remaining.min(SESSION_RETIREMENT_WORKER_RUN_BUDGET)),
+                    )?;
+                    crate::phase_telemetry::add(
+                        "artifact_worker_retirement_share_used",
+                        started.elapsed(),
+                    );
                 }
             }
             Ok(())
@@ -9149,6 +9233,9 @@ impl Broker {
         // A pre-pass check found load still elevated after its bounded wait:
         // the slice runs throttled, one removal at most.
         let mut throttled = false;
+        // A pre-pass check found memory at the warning level after its
+        // bounded wait: throttled as for load, with the longer gap.
+        let mut memory_warning_throttled = false;
         // The budget left when the slice last reached its pre-pass pressure
         // check; `None` when it never did.
         let mut remaining_at_check: Option<Duration> = None;
@@ -9168,7 +9255,11 @@ impl Broker {
                 break CapacitySliceStop::KeptOnlyLimit;
             }
             if throttled && removed_so_far >= ARTIFACT_WORKER_LOAD_THROTTLED_REMOVALS {
-                break CapacitySliceStop::LoadThrottled;
+                break if memory_warning_throttled {
+                    CapacitySliceStop::MemoryWarningThrottled
+                } else {
+                    CapacitySliceStop::LoadThrottled
+                };
             }
             // Leave the GC lock free long enough for a waiter's poll, and
             // after a pass that deleted, at least as long as it held the
@@ -9201,7 +9292,19 @@ impl Broker {
                 unattended_pacing::PressureVerdict::LoadThrottled => {
                     throttled = true;
                     if removed_so_far >= ARTIFACT_WORKER_LOAD_THROTTLED_REMOVALS {
-                        break CapacitySliceStop::LoadThrottled;
+                        break if memory_warning_throttled {
+                            CapacitySliceStop::MemoryWarningThrottled
+                        } else {
+                            CapacitySliceStop::LoadThrottled
+                        };
+                    }
+                }
+                // Warning-level memory slows removal, it does not stop it.
+                unattended_pacing::PressureVerdict::MemoryWarningThrottled => {
+                    throttled = true;
+                    memory_warning_throttled = true;
+                    if removed_so_far >= ARTIFACT_WORKER_LOAD_THROTTLED_REMOVALS {
+                        break CapacitySliceStop::MemoryWarningThrottled;
                     }
                 }
                 unattended_pacing::PressureVerdict::Clear => {}
@@ -9405,13 +9508,17 @@ impl Broker {
         // gates and removal charges together; and its share of the host
         // deleter slot.
         let pacing_after = unattended_pacing::current_summary(0);
-        let (memory_wait_ms, load_wait_ms) = match (&pacing_before, &pacing_after) {
-            (Some(before), Some(after)) => (
-                after.memory_pause_ms.saturating_sub(before.memory_pause_ms),
-                after.load_pause_ms.saturating_sub(before.load_pause_ms),
-            ),
-            _ => (0, 0),
-        };
+        let (memory_wait_ms, load_wait_ms, memory_warning_wait_ms) =
+            match (&pacing_before, &pacing_after) {
+                (Some(before), Some(after)) => (
+                    after.memory_pause_ms.saturating_sub(before.memory_pause_ms),
+                    after.load_pause_ms.saturating_sub(before.load_pause_ms),
+                    after
+                        .memory_warning_pause_ms
+                        .saturating_sub(before.memory_warning_pause_ms),
+                ),
+                _ => (0, 0, 0),
+            };
         let host_slot_busy = match (&pacing_before, &pacing_after) {
             (Some(before), Some(after)) => {
                 after.host_slot_busy.saturating_sub(before.host_slot_busy)
@@ -9434,8 +9541,11 @@ impl Broker {
                 _ => (0, 0, 0),
             };
         let pressure = SlicePressure {
-            memory: stop == CapacitySliceStop::MemoryBackoff || memory_wait_ms > 0,
-            load: throttled || load_wait_ms > 0,
+            memory: stop == CapacitySliceStop::MemoryBackoff
+                || memory_wait_ms > 0
+                || memory_warning_throttled
+                || memory_warning_wait_ms > 0,
+            load: (throttled && !memory_warning_throttled) || load_wait_ms > 0,
         };
         crate::phase_telemetry::add(
             "artifact_worker_capacity_removal_memory_wait",
@@ -9445,6 +9555,16 @@ impl Broker {
             "artifact_worker_capacity_removal_load_wait",
             Duration::from_millis(load_wait_ms),
         );
+        crate::phase_telemetry::add(
+            "artifact_worker_capacity_removal_memory_warning_wait",
+            Duration::from_millis(memory_warning_wait_ms),
+        );
+        if memory_warning_throttled {
+            crate::phase_telemetry::add(
+                "artifact_worker_capacity_removal_memory_warning_throttled",
+                Duration::ZERO,
+            );
+        }
         if throttled {
             crate::phase_telemetry::add(
                 "artifact_worker_capacity_removal_throttled",
@@ -9503,12 +9623,17 @@ impl Broker {
         let selection_ran = capacity_slice_selection_ran(passes, lock_contended);
         // A slice that pressure kept from running any pass judged nothing:
         // it is not an idle lap and not an out-of-time slice.
+        // A bounded memory-warning wait that left too little budget blocks
+        // like a load wait: a short retry, never the critical back-off.
         let blocked_by = capacity_slice_blocked_by_pressure(
             removed,
             selection_ran,
             stop,
             remaining_at_check,
-            pressure,
+            SlicePressure {
+                load: pressure.load || memory_warning_throttled || memory_warning_wait_ms > 0,
+                ..pressure
+            },
         );
         let mut idle_streak = 0u32;
         // Steady: whether the slice ended the lap (or moved nothing); only
@@ -9602,6 +9727,7 @@ impl Broker {
                     || matches!(
                         stop,
                         CapacitySliceStop::MemoryBackoff
+                            | CapacitySliceStop::MemoryWarningThrottled
                             | CapacitySliceStop::RemovalFailures
                             | CapacitySliceStop::Failed
                             | CapacitySliceStop::SliceDeadline
@@ -9619,7 +9745,10 @@ impl Broker {
         };
         // How much the load throttle lengthened the wait (a pressure slice
         // that removed would otherwise run again at once).
-        let throttle_gap_ms = if stop == CapacitySliceStop::LoadThrottled {
+        let throttle_gap_ms = if matches!(
+            stop,
+            CapacitySliceStop::LoadThrottled | CapacitySliceStop::MemoryWarningThrottled
+        ) {
             u64::try_from(
                 retry_ms
                     .unwrap_or(0)
@@ -9896,7 +10025,21 @@ impl Broker {
         deadline: Instant,
     ) -> Result<Option<(crate::AutoCleanupReport, GcLock)>, BrokerOpError> {
         let root = self.main_root().to_path_buf();
-        let Ok(_lock) = GcLock::acquire(&root) else {
+        let lock_started = Instant::now();
+        let lock_deadline = deadline.min(lock_started + SESSION_RETIREMENT_GC_LOCK_WAIT);
+        let lock = loop {
+            if let Ok(lock) = GcLock::acquire(&root) {
+                break Some(lock);
+            }
+            let now = Instant::now();
+            if now >= lock_deadline {
+                break None;
+            }
+            std::thread::sleep(SESSION_RETIREMENT_GC_LOCK_POLL.min(lock_deadline - now));
+        };
+        crate::phase_telemetry::add("session_retirement_gc_lock_wait", lock_started.elapsed());
+        let Some(_lock) = lock else {
+            crate::phase_telemetry::add("session_retirement_gc_lock_busy", Duration::ZERO);
             return Ok(None);
         };
         let (requested, completed) = self.session_retirement_request_state()?;
@@ -10004,9 +10147,10 @@ impl Broker {
                                 aggregate.retirement_deferred_reasons.push(reason);
                             }
                             self.record_auto_cleanup_report(&aggregate)?;
-                            self.defer_session_retirement_request(
+                            self.defer_session_retirement_request_for(
                                 request_generation,
                                 "session_retirement_lock_busy",
+                                SESSION_RETIREMENT_LOCK_BUSY_RETRY_MS,
                             )?;
                         }
                         return Ok(());
@@ -13567,6 +13711,23 @@ mod tests {
             capacity_stop_retry_ms(CapacitySliceStop::LoadThrottled, Some(60_000), 1, 0, zero),
             Some(60_000),
             "a throttled steady slice keeps the steady minute"
+        );
+        // Memory at the warning level throttles with the long gap, never
+        // the ten-minute critical back-off, and a removal does not clear it.
+        assert_eq!(ARTIFACT_WORKER_MEMORY_WARNING_THROTTLE_GAP_MS, 120_000);
+        assert_eq!(
+            capacity_stop_retry_ms(CapacitySliceStop::MemoryWarningThrottled, None, 1, 0, zero),
+            Some(ARTIFACT_WORKER_MEMORY_WARNING_THROTTLE_GAP_MS)
+        );
+        assert_eq!(
+            capacity_stop_retry_ms(
+                CapacitySliceStop::MemoryWarningThrottled,
+                Some(60_000),
+                1,
+                0,
+                zero
+            ),
+            Some(ARTIFACT_WORKER_MEMORY_WARNING_THROTTLE_GAP_MS)
         );
         assert_eq!(
             capacity_stop_retry_ms(CapacitySliceStop::Cap, None, 1, 0, zero),

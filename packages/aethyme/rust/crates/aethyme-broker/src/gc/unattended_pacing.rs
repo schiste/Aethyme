@@ -17,15 +17,23 @@
 //! * sleeps off the batch's share of the token bucket
 //!   (`[cleanup] unattended_unlinks_per_second`), unless the sweep is in
 //!   disk-pressure mode, where freeing space is the priority; and
-//! * reads cheap system signals. Memory pressure above normal is a hard
-//!   stop: the pacer pauses, bounded by the caller's deadline and a per-run
-//!   cap, and when that budget is spent it asks removal to stop resumably;
-//!   the reclaim request stays durable for the next run. Load far above the
-//!   core count (or Linux I/O pressure) is a throttle, never a stop: the
-//!   pacer waits a bounded time for it to clear ([`LOAD_BATCH_WAIT`] per
-//!   batch, [`LOAD_GATE_WAIT`] before a removal starts) and then proceeds,
-//!   so a machine whose normal state is a high load average still makes
-//!   progress, at a reduced rate.
+//! * reads cheap system signals. Critical memory pressure (macOS level 4,
+//!   Linux memory PSI at its limit) is a hard stop: the pacer pauses,
+//!   bounded by the caller's deadline and a per-run cap, and when that
+//!   budget is spent it asks removal to stop resumably; the reclaim request
+//!   stays durable for the next run. Memory pressure at the warning level
+//!   (macOS level 2, or a level that could not be read) is a throttle, as
+//!   load is: the pacer waits a bounded time for it to clear and then
+//!   proceeds ([`PressureVerdict::MemoryWarningThrottled`]), and the
+//!   worker's checkout removal makes at most one removal per slice with a
+//!   long gap after it. Load far above the core count (or Linux I/O
+//!   pressure) is a throttle, never a stop: the pacer waits a bounded time
+//!   for it to clear ([`LOAD_BATCH_WAIT`] per batch, [`LOAD_GATE_WAIT`]
+//!   before a removal starts) and then proceeds, so a machine whose normal
+//!   state is a high load average still makes progress, at a reduced rate.
+//!   A machine that sits at the warning level for hours (swap nearly full,
+//!   the level flickering between 1 and 2) used to stop every unattended
+//!   removal for ten minutes at a time and removed nothing.
 //!
 //! The pacer exists because unthrottled unattended deletion once filled
 //! file-backed memory and contributed to memory-pressure kills. Memory
@@ -214,7 +222,13 @@ impl PacingClock for SystemClock {
 /// limit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PressureSample {
+    /// Memory pressure at the hard-stop level: macOS critical (level 4),
+    /// Linux memory PSI at `PSI_MEMORY_SOME_AVG10_LIMIT`.
     pub(crate) memory_elevated: Option<bool>,
+    /// Memory pressure at the throttle level: macOS warning (level 2), or a
+    /// macOS level that could not be read or is unknown, which is never
+    /// taken as normal. Linux has no separate warning level here.
+    pub(crate) memory_warning: Option<bool>,
     pub(crate) load_elevated: Option<bool>,
 }
 
@@ -244,10 +258,44 @@ impl PressureSignal for SystemPressure {
     }
 }
 
-/// `kern.memorystatus_vm_pressure_level`: 1 normal, 2 warning, 4 critical.
+/// What one memory pressure reading allows unattended deletion to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn memory_pressure_level_elevated(level: i32) -> bool {
-    level > 1
+enum MemoryPressureLevel {
+    /// Delete at the rate limit.
+    Normal,
+    /// Throttle: a bounded wait, then proceed slowly.
+    Warning,
+    /// Hard stop: no deletion starts.
+    Critical,
+}
+
+/// `kern.memorystatus_vm_pressure_level`: 1 normal, 2 warning, 4 critical.
+/// Anything above warning is read as critical, and a value this table does
+/// not know (zero, negative) as warning: an unexpected reading never runs
+/// deletion at full speed, and never stops it without evidence of critical
+/// pressure.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn memory_pressure_level(level: i32) -> MemoryPressureLevel {
+    match level {
+        1 => MemoryPressureLevel::Normal,
+        level if level > 2 => MemoryPressureLevel::Critical,
+        _ => MemoryPressureLevel::Warning,
+    }
+}
+
+/// The sample fields of one macOS level read: `(memory_elevated,
+/// memory_warning)`. A failed read is a warning, as conservative as an
+/// unknown level: throttled, never full speed.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn memory_sample_from_level(level: Option<i32>) -> (Option<bool>, Option<bool>) {
+    match level.map(memory_pressure_level) {
+        None => (None, Some(true)),
+        Some(level) => (
+            Some(level == MemoryPressureLevel::Critical),
+            Some(level == MemoryPressureLevel::Warning),
+        ),
+    }
 }
 
 #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
@@ -274,7 +322,7 @@ fn parse_loadavg(text: &str) -> Option<f64> {
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::{PressureSample, load_far_above_cores, memory_pressure_level_elevated};
+    use super::{PressureSample, load_far_above_cores, memory_sample_from_level};
 
     pub(super) fn sample(cores: usize) -> PressureSample {
         let mut level: libc::c_int = 0;
@@ -294,8 +342,10 @@ mod platform {
         let mut load = [0f64; 1];
         // SAFETY: `load` has room for the one element requested.
         let loaded = unsafe { libc::getloadavg(load.as_mut_ptr(), 1) } == 1;
+        let (memory_elevated, memory_warning) = memory_sample_from_level(read.then_some(level));
         PressureSample {
-            memory_elevated: read.then(|| memory_pressure_level_elevated(level)),
+            memory_elevated,
+            memory_warning,
             load_elevated: loaded.then(|| load_far_above_cores(load[0], cores)),
         }
     }
@@ -322,6 +372,8 @@ mod platform {
         let load_elevated = load.map(|load| load_far_above_cores(load, cores));
         PressureSample {
             memory_elevated: memory.map(|avg10| avg10 >= PSI_MEMORY_SOME_AVG10_LIMIT),
+            // PSI has no separate warning level; its limit stays the stop.
+            memory_warning: None,
             load_elevated: match (io_elevated, load_elevated) {
                 (None, None) => None,
                 (io, load) => Some(io.unwrap_or(false) || load.unwrap_or(false)),
@@ -380,6 +432,16 @@ pub struct UnattendedPacingSummary {
     /// (or Linux I/O pressure) stayed elevated through its bounded wait.
     #[serde(default)]
     pub load_throttled: u64,
+    /// Milliseconds waited because memory pressure was at the warning level,
+    /// each wait bounded like a load wait; none of it spends the critical
+    /// pause budget. Omitted when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub memory_warning_pause_ms: u64,
+    /// Times a pressure check proceeded throttled because memory pressure
+    /// stayed at the warning level through its bounded wait. Omitted when
+    /// zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub memory_warning_throttled: u64,
     /// Milliseconds spent waiting for the host-wide single-deleter lock,
     /// summed over every deletion of the run (each waits at most
     /// [`HOST_DELETER_ACQUIRE_WAIT`]).
@@ -435,6 +497,7 @@ pub(crate) struct UnattendedPacer {
     installed_at: Instant,
     limiter_slept: Duration,
     memory_paused: Duration,
+    memory_warning_paused: Duration,
     load_paused: Duration,
     host_lock_waited: Duration,
     /// A whole-checkout charge is running: the disk-pressure lift does not
@@ -517,6 +580,10 @@ pub(crate) enum PressureVerdict {
     /// Load (or Linux I/O pressure) stayed elevated through the bounded
     /// wait: proceed, throttled.
     LoadThrottled,
+    /// Memory pressure stayed at the warning level through the bounded
+    /// wait: proceed, throttled harder than for load (the worker's checkout
+    /// removal makes one removal and waits a long gap).
+    MemoryWarningThrottled,
     /// Memory pressure outlasted the run's pause budget or the deadline: do
     /// not start (or stop resumably).
     MemoryBackoff,
@@ -540,6 +607,7 @@ impl UnattendedPacer {
             installed_at,
             limiter_slept: Duration::ZERO,
             memory_paused: Duration::ZERO,
+            memory_warning_paused: Duration::ZERO,
             load_paused: Duration::ZERO,
             host_lock_waited: Duration::ZERO,
             bulk_charge_active: false,
@@ -968,18 +1036,23 @@ impl UnattendedPacer {
         }
     }
 
-    /// Wait while a signal reports pressure. Memory pressure pauses until it
-    /// clears, or until the run's memory pause budget or the deadline is
-    /// spent ([`PressureVerdict::MemoryBackoff`]). Load (or Linux I/O
-    /// pressure) waits at most `load_wait` in this call, never past the
-    /// deadline, and then proceeds ([`PressureVerdict::LoadThrottled`]);
-    /// load waits never spend the memory pause budget. The host deleter
-    /// slot is given back before any of these waits, unless a lane pins it.
+    /// Wait while a signal reports pressure. Critical memory pressure pauses
+    /// until it clears, or until the run's memory pause budget or the
+    /// deadline is spent ([`PressureVerdict::MemoryBackoff`]). Memory
+    /// pressure at the warning level, and load (or Linux I/O pressure), wait
+    /// at most `load_wait` together in this call, never past the deadline,
+    /// and then proceed ([`PressureVerdict::MemoryWarningThrottled`] when
+    /// the last reading was a memory warning, otherwise
+    /// [`PressureVerdict::LoadThrottled`]); these waits never spend the
+    /// memory pause budget. The host deleter slot is given back before any
+    /// of these waits, unless a lane pins it.
     fn wait_out_pressure(
         &mut self,
         deadline: Option<Instant>,
         load_wait: Duration,
     ) -> PressureVerdict {
+        // One bounded throttle wait per call, shared by a memory warning and
+        // load, so a reading that flickers between them never waits longer.
         let mut load_waited = Duration::ZERO;
         loop {
             let sample = self.pressure.sample();
@@ -993,6 +1066,20 @@ impl UnattendedPacer {
                 self.release_host_slot();
                 self.sleep_noting_slot(step);
                 self.memory_paused += step;
+                continue;
+            }
+            if sample.memory_warning == Some(true) {
+                let left = load_wait.saturating_sub(load_waited);
+                let step = cap_to_deadline(PRESSURE_POLL.min(left), now, deadline);
+                if step.is_zero() {
+                    self.summary.memory_warning_throttled =
+                        self.summary.memory_warning_throttled.saturating_add(1);
+                    return PressureVerdict::MemoryWarningThrottled;
+                }
+                self.release_host_slot();
+                self.sleep_noting_slot(step);
+                self.memory_warning_paused += step;
+                load_waited += step;
                 continue;
             }
             if sample.load_elevated == Some(true) {
@@ -1039,6 +1126,7 @@ impl UnattendedPacer {
             limiter_sleep_ms: duration_ms(self.limiter_slept),
             scan_limiter_sleep_ms: duration_ms(self.scan_limiter_slept),
             memory_pause_ms: duration_ms(self.memory_paused),
+            memory_warning_pause_ms: duration_ms(self.memory_warning_paused),
             load_pause_ms: duration_ms(self.load_paused),
             host_lock_wait_ms: duration_ms(self.host_lock_waited),
             host_slot_held_ms: duration_ms(held),
@@ -1461,6 +1549,15 @@ mod tests {
     fn memory(elevated: bool) -> PressureSample {
         PressureSample {
             memory_elevated: Some(elevated),
+            memory_warning: None,
+            load_elevated: Some(false),
+        }
+    }
+
+    fn memory_warning() -> PressureSample {
+        PressureSample {
+            memory_elevated: Some(false),
+            memory_warning: Some(true),
             load_elevated: Some(false),
         }
     }
@@ -1709,6 +1806,7 @@ mod tests {
     fn memory_and_load_in_the_same_sample_is_a_memory_back_off() {
         let both = PressureSample {
             memory_elevated: Some(true),
+            memory_warning: None,
             load_elevated: Some(true),
         };
         let clock = FakeClock::new();
@@ -1741,6 +1839,7 @@ mod tests {
         Box::new(Scripted {
             samples: vec![PressureSample {
                 memory_elevated: Some(false),
+                memory_warning: None,
                 load_elevated: Some(true),
             }],
             reads: Rc::new(Cell::new(0)),
@@ -1787,6 +1886,7 @@ mod tests {
                 samples: vec![
                     PressureSample {
                         memory_elevated: Some(false),
+                        memory_warning: None,
                         load_elevated: Some(true),
                     },
                     memory(true),
@@ -1846,6 +1946,7 @@ mod tests {
         let clock = FakeClock::new();
         let load = PressureSample {
             memory_elevated: Some(false),
+            memory_warning: None,
             load_elevated: Some(true),
         };
         let mut pacer = UnattendedPacer::new(
@@ -1862,6 +1963,80 @@ mod tests {
         assert_eq!(summary.load_pause_ms, 2_000);
         assert_eq!(summary.load_throttled, 0);
         assert_eq!(summary.pressure_yields, 0);
+    }
+
+    /// Memory pressure at the warning level throttles like load and never
+    /// stops removal: the pre-removal check waits at most
+    /// [`LOAD_GATE_WAIT`] and proceeds, tree removal waits one bounded wait
+    /// per batch and goes on past the critical pause budget, and none of it
+    /// spends that budget or counts as a back-off.
+    #[test]
+    fn memory_warning_throttles_and_never_stops_removal() {
+        let clock = FakeClock::new();
+        let _scope = install(UnattendedPacer::new(
+            UnlinkRate::Limited(1_000),
+            Box::new(clock.clone()),
+            Box::new(Scripted {
+                samples: vec![memory_warning()],
+                reads: Rc::new(Cell::new(0)),
+            }),
+        ));
+        assert_eq!(
+            unattended_pressure_check(None),
+            PressureVerdict::MemoryWarningThrottled
+        );
+        assert_eq!(clock.slept.get(), LOAD_GATE_WAIT);
+        let batches = 150u32;
+        for _ in 0..(PACING_BATCH_ENTRIES * batches) {
+            assert!(before_unattended_unlink(None), "a warning never stops removal");
+            after_unattended_unlink(0);
+        }
+        // A whole-checkout charge is paid in full, throttled.
+        let charge = charge_bulk_unattended_removal(1_000, Duration::ZERO, None);
+        assert!(!charge.memory_backoff, "{charge:?}");
+        // The gate right before Git removes a checkout proceeds at warning.
+        assert_eq!(enter_unattended_deletion(), DeletionGate::Proceed);
+        let summary = current_summary(0).unwrap();
+        assert_eq!(summary.pressure_yields, 0);
+        assert_eq!(summary.memory_pause_ms, 0);
+        assert_eq!(summary.load_throttled, 0);
+        assert!(summary.memory_warning_throttled > u64::from(batches));
+        assert!(summary.memory_warning_pause_ms >= u64::from(batches) * 1_000);
+        assert_eq!(
+            summary.entries_removed,
+            u64::from(PACING_BATCH_ENTRIES * batches) + 1_000
+        );
+    }
+
+    /// Critical pressure after a warning is still the hard stop with its
+    /// whole pause budget, and a warning that clears mid-wait is clear.
+    #[test]
+    fn critical_memory_pressure_still_stops_after_a_warning() {
+        let clock = FakeClock::new();
+        let mut pacer = UnattendedPacer::new(
+            UnlinkRate::Unlimited,
+            Box::new(clock.clone()),
+            Box::new(Scripted {
+                samples: vec![memory_warning(), memory(true)],
+                reads: Rc::new(Cell::new(0)),
+            }),
+        );
+        assert_eq!(pacer.pressure_check(None), PressureVerdict::MemoryBackoff);
+        assert_eq!(clock.slept.get(), PRESSURE_POLL + MAX_PRESSURE_PAUSE_PER_RUN);
+        assert!(!pacer.before_unlink(None), "no unlink at critical pressure");
+
+        let clock = FakeClock::new();
+        let mut pacer = UnattendedPacer::new(
+            UnlinkRate::Unlimited,
+            Box::new(clock.clone()),
+            Box::new(Scripted {
+                samples: vec![memory_warning(), PressureSample::default()],
+                reads: Rc::new(Cell::new(0)),
+            }),
+        );
+        assert_eq!(pacer.pressure_check(None), PressureVerdict::Clear);
+        assert_eq!(pacer.summary(0).memory_warning_pause_ms, 1_000);
+        assert_eq!(pacer.summary(0).memory_warning_throttled, 0);
     }
 
     #[test]
@@ -1981,9 +2156,18 @@ mod tests {
         assert_eq!(parse_psi_some_avg10(psi), Some(12.5));
         assert_eq!(parse_psi_some_avg10("full avg10=1.00\n"), None);
         assert_eq!(parse_loadavg("3.25 2.00 1.00 2/300 999\n"), Some(3.25));
-        assert!(!memory_pressure_level_elevated(1));
-        assert!(memory_pressure_level_elevated(2));
-        assert!(memory_pressure_level_elevated(4));
+        assert_eq!(memory_pressure_level(1), MemoryPressureLevel::Normal);
+        assert_eq!(memory_pressure_level(2), MemoryPressureLevel::Warning);
+        assert_eq!(memory_pressure_level(4), MemoryPressureLevel::Critical);
+        // Unknown readings are never normal; only above warning is critical.
+        assert_eq!(memory_pressure_level(0), MemoryPressureLevel::Warning);
+        assert_eq!(memory_pressure_level(-1), MemoryPressureLevel::Warning);
+        assert_eq!(memory_pressure_level(3), MemoryPressureLevel::Critical);
+        assert_eq!(memory_sample_from_level(Some(1)), (Some(false), Some(false)));
+        assert_eq!(memory_sample_from_level(Some(2)), (Some(false), Some(true)));
+        assert_eq!(memory_sample_from_level(Some(4)), (Some(true), Some(false)));
+        // A failed sysctl read stays conservative: throttled, not a stop.
+        assert_eq!(memory_sample_from_level(None), (None, Some(true)));
         assert!(!load_far_above_cores(19.9, 10));
         assert!(load_far_above_cores(20.1, 10));
     }
@@ -2138,6 +2322,7 @@ mod tests {
         let (clock, probe) = probing_clock(host.path());
         let load = PressureSample {
             memory_elevated: Some(false),
+            memory_warning: None,
             load_elevated: Some(true),
         };
         // First batch clear; the second waits out memory, then load (its
@@ -2392,6 +2577,7 @@ mod tests {
         let clock = FakeClock::new();
         let load = PressureSample {
             memory_elevated: Some(false),
+            memory_warning: None,
             load_elevated: Some(true),
         };
         // The checkout gate clear, then load through the charge's first

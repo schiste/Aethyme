@@ -14425,6 +14425,7 @@ mod tests {
     fn memory_pressure(elevated: bool) -> crate::gc::unattended_pacing::PressureSample {
         crate::gc::unattended_pacing::PressureSample {
             memory_elevated: Some(elevated),
+            memory_warning: None,
             load_elevated: Some(false),
         }
     }
@@ -14547,6 +14548,7 @@ mod tests {
     fn load_pressure(elevated: bool) -> crate::gc::unattended_pacing::PressureSample {
         crate::gc::unattended_pacing::PressureSample {
             memory_elevated: Some(false),
+            memory_warning: None,
             load_elevated: Some(elevated),
         }
     }
@@ -14800,6 +14802,7 @@ mod tests {
     fn memory_and_load_pressure() -> crate::gc::unattended_pacing::PressureSample {
         crate::gc::unattended_pacing::PressureSample {
             memory_elevated: Some(true),
+            memory_warning: None,
             load_elevated: Some(true),
         }
     }

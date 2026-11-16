@@ -1705,6 +1705,7 @@ mod tests {
     fn calm() -> PressureSample {
         PressureSample {
             memory_elevated: Some(false),
+            memory_warning: None,
             load_elevated: Some(false),
         }
     }
@@ -1712,6 +1713,7 @@ mod tests {
     fn memory_pressure() -> PressureSample {
         PressureSample {
             memory_elevated: Some(true),
+            memory_warning: None,
             load_elevated: Some(false),
         }
     }
