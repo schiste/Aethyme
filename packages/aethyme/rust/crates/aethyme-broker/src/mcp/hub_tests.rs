@@ -255,8 +255,9 @@ impl Client {
     }
 }
 
-fn key(digit: char) -> String {
-    std::iter::repeat_n(digit, 64).collect()
+/// A distinct 64-character hex key per test letter.
+fn key(letter: char) -> String {
+    format!("{:02x}", u32::from(letter)).repeat(32)
 }
 
 fn read_log(path: &Path) -> String {
@@ -757,6 +758,10 @@ fn recorded_upstreams_are_stopped_only_when_pid_and_start_time_match() {
             break;
         }
         thread::sleep(Duration::from_millis(50));
+    }
+    if !exited {
+        matching.kill().unwrap();
+        matching.wait().unwrap();
     }
     assert!(exited, "the recorded group was not stopped");
     assert!(

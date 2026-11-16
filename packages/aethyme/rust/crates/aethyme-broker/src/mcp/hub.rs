@@ -279,6 +279,9 @@ struct UpstreamState {
     stopped: bool,
     lease: Option<Lease>,
     record: Option<PathBuf>,
+    /// The last generation whose process was reaped: its pid (and process
+    /// group id) may since belong to someone else.
+    reaped: u64,
 }
 
 struct Upstream {
@@ -463,6 +466,7 @@ pub(crate) fn write_record(
 /// groups signalled.
 pub fn reap_recorded_upstreams(directory: &Path) -> Vec<u32> {
     let mut stopped = Vec::new();
+    let mut matched: Vec<UpstreamRecord> = Vec::new();
     let Ok(entries) = fs::read_dir(directory.join(RECORDS_DIRECTORY)) else {
         return stopped;
     };
@@ -476,17 +480,21 @@ pub fn reap_recorded_upstreams(directory: &Path) -> Vec<u32> {
         {
             send_signal(record.process_group, libc::SIGTERM);
             stopped.push(record.process_group);
+            matched.push(record);
         }
         crate::warn_unrecorded("forget an MCP upstream record", fs::remove_file(&path));
     }
     if !stopped.is_empty() {
-        let groups = stopped.clone();
+        let survivors = matched.clone();
         let spawned = thread::Builder::new()
             .name("mcp-hub-reap".into())
             .spawn(move || {
                 thread::sleep(STOP_GRACE);
-                for group in groups {
-                    send_signal(group, libc::SIGKILL);
+                // Only a leader that is still the recorded process.
+                for record in survivors {
+                    if process_start(record.pid).as_deref() == Some(record.started.as_str()) {
+                        send_signal(record.process_group, libc::SIGKILL);
+                    }
                 }
             });
         crate::warn_unrecorded("schedule an MCP upstream kill", spawned);
@@ -1020,6 +1028,7 @@ fn new_upstream(hub: &Arc<Hub>, key: &str, spec: Spec) -> Arc<Upstream> {
             stopped: false,
             lease: None,
             record: None,
+            reaped: 0,
         }),
         ready: Condvar::new(),
     })
@@ -1811,6 +1820,7 @@ fn upstream_exited(
 ) {
     let (failed, uptime, lease, lost) = {
         let mut state = lock(&upstream.state);
+        state.reaped = state.reaped.max(generation);
         if state.generation != generation {
             return;
         }
@@ -1930,19 +1940,23 @@ fn stop_upstream(hub: &Arc<Hub>, upstream: &Arc<Upstream>, reason: &str) {
             .values()
             .filter_map(|handle| handle.stream.try_clone().ok())
             .collect();
-        (state.pid.take(), streams)
+        (state.pid.take().map(|pid| (pid, state.generation)), streams)
     };
     upstream.ready.notify_all();
     for stream in streams {
         let _closed = stream.shutdown(std::net::Shutdown::Both);
     }
-    if let Some(pid) = pid {
+    if let Some((pid, generation)) = pid {
         send_signal(pid, libc::SIGTERM);
+        let watched = Arc::clone(upstream);
         let spawned = thread::Builder::new()
             .name("mcp-hub-stop".into())
             .spawn(move || {
                 thread::sleep(STOP_GRACE);
-                send_signal(pid, libc::SIGKILL);
+                // Once reaped, the group id may belong to another process.
+                if lock(&watched.state).reaped < generation {
+                    send_signal(pid, libc::SIGKILL);
+                }
             });
         crate::warn_unrecorded("schedule an MCP upstream kill", spawned);
     }
