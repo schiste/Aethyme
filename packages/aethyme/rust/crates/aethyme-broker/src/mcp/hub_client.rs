@@ -223,6 +223,10 @@ pub fn attach(plan: &Plan, budget: Duration) -> Attach {
     if SocketAddr::from_pathname(&paths.socket).is_err() {
         return Attach::Private("socket_path_too_long".into());
     }
+    // Marks any hub (of any build) recorded, even if that hub has exited.
+    if let Some(reason) = super::hub::unhealthy_reason(&directory, &plan.key) {
+        return Attach::Private(format!("unhealthy:{reason}"));
+    }
     let mut environment = Vec::new();
     for (name, value) in &plan.environment.0 {
         match (name.to_str(), value.to_str()) {

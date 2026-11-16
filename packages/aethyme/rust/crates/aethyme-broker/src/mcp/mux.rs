@@ -66,6 +66,8 @@ struct Pending {
     client: ClientId,
     original_id: Value,
     progress: Option<u64>,
+    /// A first `resources/subscribe` for this URI: undone if it fails.
+    subscribes: Option<String>,
 }
 
 /// Counts of messages the router refused or dropped.
@@ -73,7 +75,18 @@ struct Pending {
 pub struct Dropped {
     pub server_requests: u64,
     pub log_messages: u64,
+    /// Server notifications outside the known list-changed set.
+    pub notifications: u64,
+    /// Re-subscriptions after a restart that the new process refused.
+    pub failed_resubscribes: u64,
 }
+
+/// Server notifications every client of a key may see.
+pub const BROADCAST_NOTIFICATIONS: &[&str] = &[
+    "notifications/tools/list_changed",
+    "notifications/prompts/list_changed",
+    "notifications/resources/list_changed",
+];
 
 #[derive(Debug, Default)]
 pub struct Router {
@@ -86,6 +99,8 @@ pub struct Router {
     subscriptions: BTreeMap<String, BTreeSet<ClientId>>,
     /// Client -> requested log level (answered locally, never forwarded).
     log_levels: HashMap<ClientId, Value>,
+    /// Hub id -> URI of a re-subscription sent after a restart.
+    resubscribes: HashMap<u64, String>,
     pub dropped: Dropped,
 }
 
@@ -136,7 +151,16 @@ impl Router {
     }
 
     /// Track a request bound for the upstream and rewrite its id and token.
-    fn forward(&mut self, client: ClientId, mut message: Value) -> Value {
+    fn forward(&mut self, client: ClientId, message: Value) -> Value {
+        self.forward_tracking(client, message, None)
+    }
+
+    fn forward_tracking(
+        &mut self,
+        client: ClientId,
+        mut message: Value,
+        subscribes: Option<String>,
+    ) -> Value {
         let original = message.get("id").cloned().unwrap_or(Value::Null);
         let hub_id = self.allocate();
         let mut progress = None;
@@ -156,6 +180,7 @@ impl Router {
                 client,
                 original_id: original,
                 progress,
+                subscribes,
             },
         );
         message["id"] = json!(hub_id);
@@ -190,11 +215,11 @@ impl Router {
                 let Some(uri) = uri else {
                     return Action::Upstream(self.forward(client, message));
                 };
-                let subscribers = self.subscriptions.entry(uri).or_default();
+                let subscribers = self.subscriptions.entry(uri.clone()).or_default();
                 let first = subscribers.is_empty();
                 subscribers.insert(client);
                 if first {
-                    Action::Upstream(self.forward(client, message))
+                    Action::Upstream(self.forward_tracking(client, message, Some(uri)))
                 } else {
                     Action::Reply(success(id))
                 }
@@ -259,10 +284,38 @@ impl Router {
                 let Some(hub_id) = message.get("id").and_then(Value::as_u64) else {
                     return Vec::new();
                 };
+                let failed = message.get("error").is_some();
+                // A re-subscription after a restart: nobody waits for it, but
+                // a refusal must reach that URI's subscribers.
+                if let Some(uri) = self.resubscribes.remove(&hub_id) {
+                    if !failed {
+                        return Vec::new();
+                    }
+                    self.dropped.failed_resubscribes += 1;
+                    let changed =
+                        json!({"jsonrpc": "2.0", "method": "notifications/resources/list_changed"});
+                    let routes: Vec<Route> = self
+                        .subscribers(&uri)
+                        .into_iter()
+                        .map(|client| Route::Client(client, changed.clone()))
+                        .collect();
+                    self.subscriptions.remove(&uri);
+                    return routes;
+                }
                 // Unknown or late (its client left): dropped.
                 let Some(pending) = self.settle(hub_id) else {
                     return Vec::new();
                 };
+                // A failed first subscribe leaves nobody subscribed.
+                if failed
+                    && let Some(uri) = &pending.subscribes
+                    && let Some(subscribers) = self.subscriptions.get_mut(uri)
+                {
+                    subscribers.remove(&pending.client);
+                    if subscribers.is_empty() {
+                        self.subscriptions.remove(uri);
+                    }
+                }
                 message["id"] = pending.original_id;
                 vec![Route::Client(pending.client, message)]
             }
@@ -304,7 +357,14 @@ impl Router {
                     }
                     // The hub sends no requests a client could see cancelled.
                     "notifications/cancelled" => Vec::new(),
-                    _ => vec![Route::Broadcast(message)],
+                    known if BROADCAST_NOTIFICATIONS.contains(&known) => {
+                        vec![Route::Broadcast(message)]
+                    }
+                    // Anything else may be session-scoped: not shared.
+                    _ => {
+                        self.dropped.notifications += 1;
+                        Vec::new()
+                    }
                 }
             }
             Kind::Request => {
@@ -368,14 +428,41 @@ impl Router {
         upstream
     }
 
+    /// After a restart, subscribe the new process to every URI clients still
+    /// follow. A refusal later sends those clients
+    /// `notifications/resources/list_changed` so they re-read.
+    pub fn resubscribe(&mut self) -> Vec<Value> {
+        let uris: Vec<String> = self.subscriptions.keys().cloned().collect();
+        uris.into_iter()
+            .map(|uri| {
+                let id = self.allocate();
+                self.resubscribes.insert(id, uri.clone());
+                json!({"jsonrpc": "2.0", "id": id, "method": "resources/subscribe",
+                       "params": {"uri": uri}})
+            })
+            .collect()
+    }
+
     /// The upstream died: every in-flight request fails with a retryable
-    /// error. Subscriptions are forgotten (a new process has none).
+    /// error. Subscriptions are kept, to be renewed by [`Router::resubscribe`]
+    /// once a new process is initialized.
     pub fn fail_all(&mut self, reason: &str) -> Vec<(ClientId, Value)> {
         let pending = std::mem::take(&mut self.pending);
         self.by_client.clear();
         self.per_client.clear();
         self.progress.clear();
-        self.subscriptions.clear();
+        self.resubscribes.clear();
+        // A first subscribe still in flight never took effect.
+        for pending in pending.values() {
+            if let Some(uri) = &pending.subscribes
+                && let Some(subscribers) = self.subscriptions.get_mut(uri)
+            {
+                subscribers.remove(&pending.client);
+                if subscribers.is_empty() {
+                    self.subscriptions.remove(uri);
+                }
+            }
+        }
         let mut failed: Vec<(u64, ClientId, Value)> = pending
             .into_iter()
             .map(|(id, pending)| {
@@ -622,6 +709,81 @@ mod tests {
                 2,
                 json!({"jsonrpc": "2.0", "id": 1, "result": {}})
             )]
+        );
+    }
+
+    #[test]
+    fn a_failed_first_subscribe_leaves_nobody_subscribed() {
+        let mut router = Router::new();
+        let sent = forwarded(router.client_request(
+            1,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "resources/subscribe", "params": {"uri": "file:///a"}}),
+        ));
+        router.upstream_message(json!({"jsonrpc": "2.0", "id": sent["id"],
+                                       "error": {"code": -32002, "message": "no"}}));
+        assert!(router.subscribers("file:///a").is_empty());
+        // The next client's subscribe reaches the upstream again.
+        forwarded(router.client_request(
+            2,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "resources/subscribe", "params": {"uri": "file:///a"}}),
+        ));
+    }
+
+    #[test]
+    fn subscriptions_survive_a_restart_and_a_refused_renewal_tells_their_clients() {
+        let mut router = Router::new();
+        for (client, uri) in [(1, "file:///a"), (2, "file:///a"), (2, "file:///b")] {
+            let action = router.client_request(
+                client,
+                json!({"jsonrpc": "2.0", "id": 9, "method": "resources/subscribe", "params": {"uri": uri}}),
+            );
+            if let Action::Upstream(sent) = action {
+                router.upstream_message(json!({"jsonrpc": "2.0", "id": sent["id"], "result": {}}));
+            }
+        }
+        router.fail_all("restart");
+        let renewals = router.resubscribe();
+        assert_eq!(renewals.len(), 2);
+        let ids: Vec<u64> = renewals
+            .iter()
+            .map(|renewal| renewal["id"].as_u64().unwrap())
+            .collect();
+        // file:///a accepted, file:///b refused.
+        assert!(
+            router
+                .upstream_message(json!({"jsonrpc": "2.0", "id": ids[0], "result": {}}))
+                .is_empty()
+        );
+        let routes = router.upstream_message(
+            json!({"jsonrpc": "2.0", "id": ids[1], "error": {"code": -32002, "message": "gone"}}),
+        );
+        assert_eq!(
+            routes,
+            vec![Route::Client(
+                2,
+                json!({"jsonrpc": "2.0", "method": "notifications/resources/list_changed"})
+            )]
+        );
+        assert_eq!(router.dropped.failed_resubscribes, 1);
+        assert_eq!(router.subscribers("file:///a"), vec![1, 2]);
+        assert!(router.subscribers("file:///b").is_empty());
+    }
+
+    #[test]
+    fn unknown_server_notifications_are_not_shared() {
+        let mut router = Router::new();
+        assert!(
+            router
+                .upstream_message(
+                    json!({"jsonrpc": "2.0", "method": "notifications/custom/state", "params": {}})
+                )
+                .is_empty()
+        );
+        assert_eq!(router.dropped.notifications, 1);
+        let prompts = json!({"jsonrpc": "2.0", "method": "notifications/prompts/list_changed"});
+        assert_eq!(
+            router.upstream_message(prompts.clone()),
+            vec![Route::Broadcast(prompts)]
         );
     }
 

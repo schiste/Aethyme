@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use super::hub::{
-    HubConfig, HubPaths, UpstreamRecord, build_identity, process_start, reap_recorded_upstreams,
-    serve, write_record,
+    HubConfig, HubPaths, UNHEALTHY_FILE, UpstreamRecord, build_identity, process_start,
+    reap_recorded_upstreams, serve, unhealthy_reason, write_record,
 };
 use super::jsonrpc::{self, read_message};
 use super::mux::{INVALID_REQUEST, METHOD_NOT_FOUND};
@@ -36,6 +36,8 @@ while IFS= read -r line; do
   method=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
   case "$method" in
     initialize)
+      if [ -n "$FAKE_HANG_REINIT" ] && [ -e "$log.initialized" ]; then continue; fi
+      touch "$log.initialized"
       if [ -z "$FAKE_HANG_INIT" ]; then
         reply "$id" '{"capabilities":{"resources":{"subscribe":true},"tools":{"listChanged":true}},"protocolVersion":"2025-06-18","serverInfo":{"name":"fake","version":"1"}}'
       fi
@@ -549,6 +551,8 @@ fn an_initialize_that_never_answers_marks_the_key_unhealthy() {
     let hub = TestHub::start(|config| {
         config.init_timeout = Duration::from_millis(500);
         config.idle_timeout = Duration::from_secs(5);
+        // The hub must outlive the refusal for the second attach.
+        config.empty_grace = Duration::from_secs(60);
     });
     let log = hub.log("hang");
     let (_, hello, answer) =
@@ -561,6 +565,11 @@ fn an_initialize_that_never_answers_marks_the_key_unhealthy() {
     let (_, hello, _) = Client::attach(&hub, &key('h'), &log, &[], PROTOCOL);
     assert_eq!(hello["ok"], false);
     assert_eq!(hello["reason"], "unhealthy");
+    // Persisted for the next hub and for `connect`.
+    assert_eq!(
+        unhealthy_reason(&hub.paths.directory, &key('h')).as_deref(),
+        Some("initialize_timeout")
+    );
 }
 
 #[test]
@@ -680,17 +689,34 @@ fn a_client_over_its_byte_bound_is_disconnected_and_others_keep_working() {
 #[test]
 fn connections_are_capped_and_another_build_is_refused() {
     let hub = TestHub::start(|config| config.max_connections = 2);
-    // Let the start-up probe's connection close first.
-    thread::sleep(Duration::from_millis(300));
     let log = hub.log("cap");
-    let (_first, hello, _) = Client::attach(&hub, &key('6'), &log, &[], PROTOCOL);
-    assert_eq!(hello["ok"], true);
-    let (_second, hello, _) = Client::attach(&hub, &key('6'), &log, &[], PROTOCOL);
-    assert_eq!(hello["ok"], true);
-    let mut extra = Client::connect(&hub);
-    extra.send(&hub.hello(&key('6'), &log, &[]));
-    let refused = extra.recv().unwrap();
-    assert_eq!(refused["reason"], "too_many_connections");
+    // Attach until refused: never more than the cap, and the refusal says why
+    // (a lingering start-up probe may take a slot, so count what got in).
+    let mut accepted = Vec::new();
+    let mut refusal = None;
+    for _ in 0..4 {
+        let mut client = Client::connect(&hub);
+        client.send(&hub.hello(&key('6'), &log, &[]));
+        let reply = client.recv().unwrap();
+        if reply["ok"] == true {
+            client.send(&json!({
+                "jsonrpc": "2.0", "id": "init", "method": "initialize",
+                "params": {"protocolVersion": PROTOCOL, "capabilities": {},
+                           "clientInfo": {"name": "test", "version": "1"}}
+            }));
+            assert!(client.recv().is_some());
+            accepted.push(client);
+        } else {
+            refusal = Some(reply);
+            break;
+        }
+    }
+    assert!(
+        !accepted.is_empty() && accepted.len() <= 2,
+        "{}",
+        accepted.len()
+    );
+    assert_eq!(refusal.unwrap()["reason"], "too_many_connections");
 
     let other = TestHub::start(|_| {});
     let mut client = Client::connect(&other);
@@ -715,8 +741,36 @@ fn events_are_recorded_without_bodies() {
     assert!(!events.contains("tools/call"), "{events}");
 }
 
+fn record_for(
+    child: &std::process::Child,
+    started: String,
+    owner_pid: u32,
+    owner_started: String,
+) -> UpstreamRecord {
+    UpstreamRecord {
+        pid: child.id(),
+        process_group: child.id(),
+        session: 0,
+        started,
+        owner_pid,
+        owner_started,
+        build: "test".into(),
+    }
+}
+
+fn wait_exit(child: &mut std::process::Child, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 #[test]
-fn recorded_upstreams_are_stopped_only_when_pid_and_start_time_match() {
+fn recorded_upstreams_are_stopped_only_when_their_owner_hub_is_dead() {
     let dir = tempfile::tempdir().unwrap();
     let spawn_sleeper = || {
         std::process::Command::new("sleep")
@@ -725,56 +779,173 @@ fn recorded_upstreams_are_stopped_only_when_pid_and_start_time_match() {
             .spawn()
             .unwrap()
     };
-    let mut matching = spawn_sleeper();
-    let mut different = spawn_sleeper();
-    let started = process_start(matching.id()).unwrap();
+    // A dead owner: a process that has exited and been reaped.
+    let mut gone = std::process::Command::new("true").spawn().unwrap();
+    gone.wait().unwrap();
+    let dead_owner = gone.id();
+    // A live owner: this test process (another hub, of any build).
+    let live_owner = std::process::id();
+    let live_started = process_start(live_owner).unwrap();
+
+    let mut orphaned = spawn_sleeper();
+    let mut owned_by_live = spawn_sleeper();
+    let mut reused_pid = spawn_sleeper();
+    let started = |child: &std::process::Child| process_start(child.id()).unwrap();
     write_record(
         dir.path(),
-        "matching",
-        &UpstreamRecord {
-            pid: matching.id(),
-            process_group: matching.id(),
-            started,
-        },
+        "orphaned",
+        &record_for(&orphaned, started(&orphaned), dead_owner, "long ago".into()),
     )
     .unwrap();
     write_record(
         dir.path(),
-        "different",
-        &UpstreamRecord {
-            pid: different.id(),
-            process_group: different.id(),
-            started: "not its start time".into(),
-        },
+        "owned",
+        &record_for(
+            &owned_by_live,
+            started(&owned_by_live),
+            live_owner,
+            live_started,
+        ),
     )
     .unwrap();
-    let stopped = reap_recorded_upstreams(dir.path());
-    assert_eq!(stopped, vec![matching.id()]);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut exited = false;
-    while Instant::now() < deadline {
-        if matching.try_wait().unwrap().is_some() {
-            exited = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
+    write_record(
+        dir.path(),
+        "reused",
+        &record_for(
+            &reused_pid,
+            "not its start time".into(),
+            dead_owner,
+            "long ago".into(),
+        ),
+    )
+    .unwrap();
+
+    let report = reap_recorded_upstreams(dir.path());
+    assert_eq!(report.stopped, vec![orphaned.id()]);
+    assert_eq!(report.owner_alive, 1);
+    assert_eq!(report.leader_gone, 1, "a pid alone is not enough");
+    let stopped = wait_exit(&mut orphaned, Duration::from_secs(10));
+    if !stopped {
+        orphaned.kill().unwrap();
     }
-    if !exited {
-        matching.kill().unwrap();
-    }
-    matching.wait().unwrap();
-    assert!(exited, "the recorded group was not stopped");
+    orphaned.wait().unwrap();
+    assert!(stopped, "the dead owner's group was not stopped");
     assert!(
-        different.try_wait().unwrap().is_none(),
-        "a pid alone must not be enough"
+        owned_by_live.try_wait().unwrap().is_none(),
+        "a live hub's upstream was touched"
     );
-    different.kill().unwrap();
-    different.wait().unwrap();
-    // Every record is forgotten either way.
+    assert!(reused_pid.try_wait().unwrap().is_none());
+    for child in [&mut owned_by_live, &mut reused_pid] {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    // The live owner's record stays; the others are forgotten.
+    let left: Vec<String> = std::fs::read_dir(dir.path().join("upstreams"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, vec!["owned.json".to_string()]);
+}
+
+#[test]
+fn a_persisted_unhealthy_mark_is_honoured_by_a_new_hub() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let hub_dir = root.join("hub");
+    std::fs::create_dir(&hub_dir).unwrap();
+    std::fs::set_permissions(&hub_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let until = super::telemetry::now_ms() + 60_000;
+    let mut marks = serde_json::Map::new();
+    marks.insert(key('j'), json!({"until_ms": until, "reason": "crashes"}));
+    std::fs::write(
+        hub_dir.join(UNHEALTHY_FILE),
+        Value::Object(marks).to_string(),
+    )
+    .unwrap();
     assert_eq!(
-        std::fs::read_dir(dir.path().join("upstreams"))
-            .unwrap()
-            .count(),
-        0
+        unhealthy_reason(&hub_dir, &key('j')).as_deref(),
+        Some("crashes")
     );
+    assert!(unhealthy_reason(&hub_dir, &key('k')).is_none());
+    let paths = HubPaths::new(&hub_dir);
+    let config = test_config(paths.clone(), root.clone());
+    thread::spawn(move || serve(config));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stream = loop {
+        if let Ok(stream) = UnixStream::connect(&paths.socket) {
+            break stream;
+        }
+        assert!(Instant::now() < deadline, "the hub did not start");
+        thread::sleep(Duration::from_millis(20));
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let mut client = Client {
+        reader: BufReader::new(stream.try_clone().unwrap()),
+        stream,
+    };
+    client.send(&json!({
+        "hub": 1, "op": "attach", "build": build_identity(), "key": key('j'),
+        "name": "fake", "argv": ["/bin/true"], "cwd": root, "env": []
+    }));
+    let reply = client.recv().unwrap();
+    assert_eq!(reply["ok"], false);
+    assert_eq!(reply["reason"], "unhealthy");
+}
+
+#[test]
+fn subscriptions_are_renewed_after_a_restart() {
+    let hub = TestHub::start(|config| config.idle_timeout = Duration::from_secs(10));
+    let log = hub.log("renew");
+    let (mut client, _, _) = Client::attach(&hub, &key('l'), &log, &[], PROTOCOL);
+    client.request(json!(1), "resources/subscribe", json!({"uri": "file:///a"}));
+    assert_eq!(client.recv().unwrap()["id"], 1);
+    client.call(json!(2), "crash");
+    assert_eq!(client.recv().unwrap()["error"]["code"], jsonrpc::RETRYABLE);
+    assert_eq!(
+        client.recv().unwrap()["method"],
+        "notifications/tools/list_changed"
+    );
+    assert!(wait_for(
+        || read_log(&log).matches("resources/subscribe").count() == 2,
+        Duration::from_secs(10)
+    ));
+    client.call(json!(3), "touch");
+    let updated = client.recv().unwrap();
+    assert_eq!(updated["method"], "notifications/resources/updated");
+    assert_eq!(client.recv().unwrap()["id"], 3);
+}
+
+#[test]
+fn a_restart_that_cannot_initialize_counts_as_a_crash() {
+    let hub = TestHub::start(|config| {
+        config.idle_timeout = Duration::from_secs(10);
+        config.empty_grace = Duration::from_secs(60);
+        config.init_timeout = Duration::from_millis(400);
+        config.initial_backoff = Duration::from_millis(50);
+        config.max_backoff = Duration::from_millis(50);
+    });
+    let log = hub.log("reinit");
+    let (mut client, _, _) = Client::attach(
+        &hub,
+        &key('m'),
+        &log,
+        &[("FAKE_HANG_REINIT", "1")],
+        PROTOCOL,
+    );
+    client.call(json!(1), "crash");
+    assert_eq!(client.recv().unwrap()["error"]["code"], jsonrpc::RETRYABLE);
+    // Every restart hangs in initialize: each counts as a crash, and the
+    // fifth within the window makes the key unhealthy.
+    assert!(
+        wait_for(
+            || unhealthy_reason(&hub.paths.directory, &key('m')).is_some(),
+            Duration::from_secs(30)
+        ),
+        "{}",
+        read_log(&log)
+    );
+    assert!(read_log(&log).matches("started ").count() >= 5);
 }
