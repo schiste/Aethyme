@@ -21,6 +21,27 @@ pub(crate) fn with_synced_temporary<T, F>(target: &Path, bytes: &[u8], publish: 
 where
     F: FnOnce(&Path) -> io::Result<T>,
 {
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let prefix = format!(".{file_name}-");
+    with_synced_temporary_named(target, &prefix, "", bytes, publish)
+}
+
+/// [`with_synced_temporary`] with a temporary named `<prefix>XXXXXX<suffix>`,
+/// for a directory whose readers recognise a writer's files by name, so that
+/// a temporary an interrupted process leaves behind is recognised as well.
+pub(crate) fn with_synced_temporary_named<T, F>(
+    target: &Path,
+    prefix: &str,
+    suffix: &str,
+    bytes: &[u8],
+    publish: F,
+) -> io::Result<T>
+where
+    F: FnOnce(&Path) -> io::Result<T>,
+{
     let parent = target.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -29,13 +50,9 @@ where
     })?;
     fs::create_dir_all(parent)?;
 
-    let file_name = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("file");
-    let prefix = format!(".{file_name}-");
     let mut temporary = tempfile::Builder::new()
-        .prefix(&prefix)
+        .prefix(prefix)
+        .suffix(suffix)
         .tempfile_in(parent)?;
     crate::host_state::protect_host_state_path(temporary.path(), false)?;
     temporary.write_all(bytes)?;
@@ -51,22 +68,69 @@ where
 /// platforms retain no-replace publication without a directory durability claim.
 pub(crate) fn write_synced_if_absent(target: &Path, bytes: &[u8]) -> io::Result<bool> {
     let published = with_synced_temporary(target, bytes, |temporary| {
-        match fs::hard_link(temporary, target) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-            Err(error) => Err(error),
-        }
+        hard_link_if_absent(temporary, target)
     })?;
+    sync_published_parent(target, published)?;
+    Ok(published)
+}
+
+/// [`write_synced_if_absent`] through a temporary named as in
+/// [`with_synced_temporary_named`].
+pub(crate) fn write_synced_if_absent_named(
+    target: &Path,
+    prefix: &str,
+    suffix: &str,
+    bytes: &[u8],
+) -> io::Result<bool> {
+    let published = with_synced_temporary_named(target, prefix, suffix, bytes, |temporary| {
+        hard_link_if_absent(temporary, target)
+    })?;
+    sync_published_parent(target, published)?;
+    Ok(published)
+}
+
+fn hard_link_if_absent(temporary: &Path, target: &Path) -> io::Result<bool> {
+    match fs::hard_link(temporary, target) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn sync_published_parent(target: &Path, published: bool) -> io::Result<()> {
     #[cfg(unix)]
     if published {
         fs::File::open(target.parent().expect("temporary creation checked parent"))?.sync_all()?;
     }
-    Ok(published)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{with_synced_temporary, write_synced_if_absent};
+    use super::{
+        with_synced_temporary, with_synced_temporary_named, write_synced_if_absent,
+        write_synced_if_absent_named,
+    };
+
+    /// A temporary a killed writer leaves behind must carry the name its
+    /// directory's readers recognise.
+    #[test]
+    fn a_named_temporary_carries_the_prefix_and_suffix() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("plan.json");
+        let seen = with_synced_temporary_named(&target, ".writer-tmp-", ".json", b"x", |path| {
+            Ok(path.file_name().unwrap().to_string_lossy().into_owned())
+        })
+        .unwrap();
+        assert!(seen.starts_with(".writer-tmp-") && seen.ends_with(".json"), "{seen}");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+
+        assert!(write_synced_if_absent_named(&target, ".writer-tmp-", ".json", b"one").unwrap());
+        assert!(!write_synced_if_absent_named(&target, ".writer-tmp-", ".json", b"two").unwrap());
+        assert_eq!(std::fs::read(&target).unwrap(), b"one");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn a_failed_publication_leaves_no_temporary_file() {
