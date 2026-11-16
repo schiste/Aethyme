@@ -1,6 +1,6 @@
 # CLI Reference
 
-Last Updated: 2026-11-14
+Last Updated: 2026-11-15
 
 ## Install
 
@@ -732,7 +732,16 @@ cache, it also reports `current_operation` (what it is doing: `operation`,
 while it waits, `waiting_on` (the holder's `session_id`, `holder_pid` and the
 holder's own `current_operation`). Both are read from small activity records
 the running preparation rewrites every 15 seconds, are absent when nothing is
-running or the record is older than 90 seconds, and never decide anything. See
+running or the record is older than 90 seconds, and never decide anything. When
+the repository shares a preparation cache and a background measurement of it
+was ever queued, `shared_cache_background_measurement` reports the pending
+`request` (with `attempts`, `retry_after_ms`, `consecutive_failures`,
+`last_interruption` and, while a worker walks, `running_since_ms` and
+`running_pid`), the last completed `result` (with `outcome`, `bytes`,
+`entries`, `complete`, `skipped_entries`, `concurrent_activity`,
+`over_budget_confirmed`, `trusted_for_ms`, `trust_reason`, `completed_at_ms`
+and `used_at_ms`), `result_fresh`, whether the next budget check can decide
+from it, and `running`. See
 "Prepare Dependencies For Isolated Worktrees" in
 [host resource coordination](../guides/host-resource-coordination.md). A
 running `prepare` prints the same progress on stderr, and the `Now:` line of

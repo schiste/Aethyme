@@ -1731,6 +1731,96 @@ repository that does not set `max_concurrent` above 1 now measures its store
 at most once an hour, as a sharing one already did, instead of on every
 preparation; recovery of an unfinished rotation still runs every time.
 
+Since 2026-11-15 an inconclusive budget check queues a background measurement
+of the store, additively. Two records live in the repository's broker metadata
+(the `meta` table, never under `.aethyme/`); neither carries a path. The cache
+root is named by `cache_root_key` (the 12-hex digest also used in the
+budget-check stamp key) and identities are 32-hex digests of the volume-aware
+directory identity (device, inode, filesystem identifier).
+
+- `preparation.shared_cache_measurement.request`: JSON or `null`. Schema
+  `aethyme.preparation-cache-measurement-request/v1` with `schema`,
+  `repository`, `cache_root_key`, nullable `root_identity`, `budget_bytes`,
+  `reason` (`inconclusive_time_limit`, `inconclusive_entry_limit`, `refresh`
+  or `confirm_over_budget`), `queued_at_ms`, `times_queued`, `attempts`,
+  `consecutive_failures`, and, when present, `retry_after_ms`,
+  `failure_store_identity`, `running_since_ms` and `running_pid` (set while a
+  worker walks; a marker whose pid is gone or older than the 30-minute walk
+  deadline plus 10 minutes is stale and taken over), and `last_interruption`
+  (`reason`: `memory_pressure`, `deadline`, `root_changed`,
+  `rotation_pending`, `root_unavailable` or `scan_refused`; optional
+  `detail`, never a path; `at_ms`, `attempt`, `entries`, `bytes`,
+  `duration_ms`, `pacer_memory_pause_ms`, `pacer_load_pause_ms`). Written by
+  `submit prepare` (queue, coalesced by compare-and-set; a coalesce keeps a
+  running marker and attempt) and by the `gc __continue-artifacts` worker
+  (running marker, back-off, clear). The worker's final write applies only
+  while `attempts` and `running_since_ms` still match its own walk. A
+  `root_changed` interruption drops the request; repeated `deadline` or
+  `scan_refused` walks of one store back off from 10 minutes, doubling, up to
+  24 hours.
+- `preparation.shared_cache_measurement.result`: JSON or `null`, the last
+  completed measurement. Schema `aethyme.preparation-cache-measurement/v1`
+  with `schema`, `repository`, `cache_root_key`, nullable `root_identity`,
+  nullable `store_identity` (null when the store was absent), `budget_bytes`,
+  `outcome` (`within_budget`: complete and at or under the budget;
+  `over_budget`: more than 5% over it; `within_margin`: between the two,
+  decides nothing), `complete` (false when the walk stopped once over the
+  margin; `bytes` is then a lower bound), `bytes`, `entries`,
+  `skipped_entries`, `concurrent_activity`, `over_budget_walks`,
+  `over_budget_confirmed` (two consecutive over-budget walks of the same
+  store), `started_at_ms`, `completed_at_ms`, `duration_ms`,
+  `entries_per_second`, `bytes_per_second`, `pacer_memory_pause_ms`,
+  `pacer_load_pause_ms`, `pacer_scan_limiter_sleep_ms`, `attempt`,
+  `trusted_for_ms`, `trust_reason` (`growth_rate`, `not_growing`,
+  `at_most_half_of_budget`, `at_most_80_percent_of_budget`,
+  `above_80_percent_of_budget` or `not_within_budget`), `times_used` and,
+  once a budget check decided from it, `used_at_ms`. Interrupted walks never
+  replace it, but reset `over_budget_walks`. A completed rotation sets both
+  records to `null`.
+
+Readers ignore unknown fields and treat a malformed record as absent. A
+budget check uses a result only when its `repository`, `cache_root_key` and
+`root_identity` match the current root, it is younger than `trusted_for_ms`
+(at least an hour), it decides the current budget (within budget, or
+confirmed over budget plus the margin), and, checked under the lease after
+rotation recovery, its `store_identity` matches the store. The worker takes
+the host-wide advisory lock `<host state>/run/preparation-cache-measurement.lock`
+(content-free) for the walk; a busy lock defers the request by a minute, and
+a missing host state directory skips the walk for 10 minutes. The worker is
+admitted on broker open while a request is due (not running, not backing
+off), and `submit prepare` starts it after releasing the cache lease when it
+queued one. The walk is paced at 10,000 entries a second; the worker's
+`last_unattended_pacing` summary, persisted after the walk, gains
+`scan_limiter_sleep_ms` (omitted when zero).
+
+The budget inventory `outcome` gains `within_budget_background` and
+`over_budget_background` (the decision came from a measurement; no walk ran
+under the lease), with counters `shared_cache_inventory_within_budget_background`
+and `shared_cache_inventory_over_budget_background`. The prepare report and
+the metric's `preparation` object add `shared_cache_background_measurement`
+(omitted otherwise) with `decided_by` (`outcome`, `bytes`, `entries`,
+`complete`, `completed_at_ms`, `age_ms`) and `queued` (the queue reason).
+`submit prepare status --json` adds `shared_cache_background_measurement`
+(omitted when the repository shares no cache or nothing was ever queued):
+`request`, `result` (the records above), `result_fresh` and `running`. The
+`preparation.shared-cache-budget-inconclusive` advice keeps its threshold; its
+`evidence` gains one line with what the background measurement last did, and
+it clears when a measurement settles the question (within budget, or a
+confirmed over budget). Metrics add, in `phase_counts`,
+`preparation_cache_measurement_queued`, `_coalesced`, `_started`,
+`_restarted`, `_took_over_stale`, `_already_running`,
+`_completed_within_budget`, `_completed_over_budget`,
+`_completed_over_budget_unconfirmed`, `_completed_within_margin`,
+`_concurrent_activity`, `_host_busy`, `_host_lock_unavailable`,
+`_ignored_root_changed`, `_ignored_store_changed` and
+`_interrupted_<reason>`, and in `phase_timings_ms` the span
+`preparation_cache_measurement_lane`, the durations
+`preparation_cache_measurement_walk`,
+`preparation_cache_measurement_pacer_memory_pause`,
+`preparation_cache_measurement_pacer_load_wait` and
+`preparation_cache_measurement_scan_limiter_sleep`, and
+`artifact_worker_pacer_scan_limiter_sleep`.
+
 Successful `broker push` command metrics add `push_preflight`, `push_git`,
 `push_pr_and_watch`, `push_default_branch`, `push_overlap`, and
 `push_finalization` to `phase_timings_ms`. These are wall-clock milliseconds

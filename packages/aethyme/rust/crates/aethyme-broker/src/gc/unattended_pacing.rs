@@ -363,6 +363,10 @@ pub struct UnattendedPacingSummary {
     pub removal_rate_per_second: u64,
     /// Milliseconds the token bucket slept.
     pub limiter_sleep_ms: u64,
+    /// Milliseconds the scan rate limit of the shared preparation cache
+    /// measurement slept; omitted when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub scan_limiter_sleep_ms: u64,
     /// Milliseconds paused because memory pressure was above normal.
     pub memory_pause_ms: u64,
     /// Milliseconds waited because load (or Linux I/O pressure) was far
@@ -415,6 +419,10 @@ pub struct UnattendedPacingSummary {
     pub rate_lifted_for_disk_pressure: bool,
 }
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 /// Token bucket plus pressure back-off for one worker run.
 pub(crate) struct UnattendedPacer {
     rate: UnlinkRate,
@@ -432,6 +440,9 @@ pub(crate) struct UnattendedPacer {
     /// A whole-checkout charge is running: the disk-pressure lift does not
     /// apply to it, so checkout removal is always paced.
     bulk_charge_active: bool,
+    /// When the current batch of a read-only scan began.
+    scan_batch_started: Option<Instant>,
+    scan_limiter_slept: Duration,
     /// Where the host-wide single-deleter and judging locks live; `None`
     /// (foreground, tests that do not opt in, no host state directory)
     /// deletes unserialised, as a missing directory always did.
@@ -532,6 +543,8 @@ impl UnattendedPacer {
             load_paused: Duration::ZERO,
             host_lock_waited: Duration::ZERO,
             bulk_charge_active: false,
+            scan_batch_started: None,
+            scan_limiter_slept: Duration::ZERO,
             host_directory: None,
             host_slot: None,
             host_slot_pins: 0,
@@ -935,6 +948,26 @@ impl UnattendedPacer {
         }
     }
 
+    /// Sleep off what the last scan batch finished ahead of the scan rate,
+    /// never past the deadline.
+    fn pay_scan_batch(&mut self, entries: u64, per_second: u32, deadline: Option<Instant>) {
+        let Some(started) = self.scan_batch_started.take() else {
+            return;
+        };
+        let minimum = Duration::from_nanos(
+            entries.saturating_mul(1_000_000_000) / u64::from(per_second.max(1)),
+        );
+        let now = self.clock.now();
+        let Some(deficit) = minimum.checked_sub(now.saturating_duration_since(started)) else {
+            return;
+        };
+        let sleep = cap_to_deadline(deficit, now, deadline);
+        if !sleep.is_zero() {
+            self.clock.sleep(sleep);
+            self.scan_limiter_slept += sleep;
+        }
+    }
+
     /// Wait while a signal reports pressure. Memory pressure pauses until it
     /// clears, or until the run's memory pause budget or the deadline is
     /// spent ([`PressureVerdict::MemoryBackoff`]). Load (or Linux I/O
@@ -1004,6 +1037,7 @@ impl UnattendedPacer {
             elapsed_ms,
             removal_rate_per_second,
             limiter_sleep_ms: duration_ms(self.limiter_slept),
+            scan_limiter_sleep_ms: duration_ms(self.scan_limiter_slept),
             memory_pause_ms: duration_ms(self.memory_paused),
             load_pause_ms: duration_ms(self.load_paused),
             host_lock_wait_ms: duration_ms(self.host_lock_waited),
@@ -1112,6 +1146,27 @@ pub(crate) fn charge_bulk_unattended_removal(
 pub(crate) fn unattended_pressure_check(deadline: Option<Instant>) -> PressureVerdict {
     with_active(PressureVerdict::Clear, |pacer| {
         pacer.pressure_check(deadline)
+    })
+}
+
+/// Before one batch of a read-only background walk (the shared preparation
+/// cache measurement): on the installed pacer, sleep off what the previous
+/// batch of `batch_entries` finished ahead of `entries_per_second` (the scan
+/// rate limit, which bounds how fast the walk pulls entries into the kernel's
+/// vnode and inode caches), then wait out memory pressure and wait at most
+/// [`LOAD_BATCH_WAIT`] for elevated load to clear, never past `deadline`. A
+/// [`PressureVerdict::MemoryBackoff`] asks the walk to stop. Without a pacer
+/// (a foreground caller) it is always `Clear` and never sleeps.
+pub(crate) fn before_unattended_scan_batch(
+    deadline: Option<Instant>,
+    batch_entries: u64,
+    entries_per_second: u32,
+) -> PressureVerdict {
+    with_active(PressureVerdict::Clear, |pacer| {
+        pacer.pay_scan_batch(batch_entries, entries_per_second, deadline);
+        let verdict = pacer.checked_wait(deadline, LOAD_BATCH_WAIT);
+        pacer.scan_batch_started = Some(pacer.clock.now());
+        verdict
     })
 }
 

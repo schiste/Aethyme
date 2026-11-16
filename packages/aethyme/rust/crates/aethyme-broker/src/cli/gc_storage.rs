@@ -1781,7 +1781,7 @@ fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageErr
         // that handoff, but do not queue another worker behind an active one.
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    let Some(_worker_lock) = worker_lock else {
+    let Some(worker_lock) = worker_lock else {
         return Err(UsageError::Message(
             "automatic artifact continuation worker is already active".into(),
         ));
@@ -1792,7 +1792,10 @@ fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageErr
     // Every unlink this process makes is unattended: pace it.
     let _pacing = crate::gc::install_unattended_deletion_pacing(&repository_root, priority);
     let mut broker = Broker::open(&repository_root)?;
-    broker.run_artifact_sweep_recovery_worker()?;
+    // The read-only cache measurement may walk for minutes: the worker
+    // releases this repository's lock before it, so the next deletion run
+    // can start.
+    broker.run_artifact_sweep_recovery_worker(move || drop(worker_lock))?;
     Ok(())
 }
 
