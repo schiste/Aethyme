@@ -737,6 +737,9 @@ pub(super) fn render_gc_apply(report: &crate::GcApplyReport) {
     for entry in &report.environment_caches_reclaimed {
         out!("  environment cache entry evicted: {entry}");
     }
+    for skipped in &report.files_skipped {
+        out!("  skipped file: {}: {}", skipped.path, skipped.reason);
+    }
     for failure in &report.failures {
         out!("  retained: {failure}");
     }

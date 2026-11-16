@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-11-15
+Last Updated: 2026-11-16
 
 When code outside the `packages/aethyme/` Rust source tree invokes an
 Aethyme command, it crosses a process boundary. Static
@@ -902,6 +902,63 @@ staging files. The archive has a 32-file / 64 MiB admission limit, is never
 pruned automatically, and cannot be forgotten while its exact bytes are needed
 for active-journal crash recovery. Neither command accepts an arbitrary archive
 path or grants deletion authority.
+
+### Metrics-log trim, drifted files and resume backoff
+
+These changes let a confirmed journal finish when the files it reviewed have
+changed since review:
+
+- **Append lock.** Writers of `.aethyme/logs/command-metrics.jsonl` take a
+  shared `flock` on `.aethyme/run/command-metrics.lock` around each append. The
+  GC trim takes it exclusively from its read until after its atomic rename.
+  Once every writer takes the lock, no row can be lost. A writer waits at most
+  two seconds and then appends unlocked, which is how older binaries always
+  append. The trim narrows the risk from unlocked writers in two ways. An
+  append it sees before the rename makes it retry, up to three attempts. After
+  the rename it watches the replaced inode for 250 ms, still holding the lock,
+  and copies what lands there into the new file: whole lines while it watches,
+  and any trailing bytes without a newline, as written, when the period ends.
+  An unlocked writer that opened the file before the rename and writes after
+  that period still loses its row. When every attempt sees an append, or the
+  lock cannot be opened or taken, the trim is skipped, nothing is removed and
+  the journal continues. Each trim first removes `.command-metrics.jsonl-XXXXXX`
+  temporaries (regular files with exactly that name pattern, in the log's
+  directory) that an interrupted trim left.
+- **Digest.** A plan digest binds the command-metrics rewrite as `path`,
+  `action` and the rule `trim: "rows_older_than_age_cutoff"`. The cutoff is
+  bound through `age_anchor_ms` and `policy.command_metrics_days`. The
+  candidate's `before_sha256`, `after_sha256` and byte counts stay in the plan
+  JSON as reporting only. Gate-log candidates are bound exactly as before. The
+  digest of a plan that contains a metrics rewrite therefore differs from the
+  one an earlier binary printed, so review that plan again after upgrading.
+- **Apply.** Apply trims whatever the log holds when it runs and no longer
+  compares the metrics hashes. That includes schema 4 journals written by
+  earlier binaries, which resume instead of failing with "reviewed artifact
+  drifted". A gate log whose hash no longer matches is retained, never
+  deleted, and recorded in the journal's additive `files_skipped` array
+  (`path`, `reason`). The `gc apply` JSON report gains the same field, omitted
+  when empty. Older binaries ignore the journal field and drop it when they
+  rewrite the journal.
+- **Resume backoff.** When open-time resume fails in a way the next open
+  would repeat (an invalid or unsupported journal, a confirmation mismatch),
+  broker meta key `gc_journal_resume_failure` records
+  `{journal_sha256, failed_at_ms}`. Open-time resume skips that exact journal
+  for 15 minutes; changed journal bytes are retried at once. The returned error
+  names `gc apply --confirm <digest>` and `gc abandon --confirm <digest>`. A
+  held GC lock, a busy database or an I/O error arms nothing and is retried on
+  the next open, as before. An explicit `gc apply` never reads the record; it
+  clears it when the journal completes, and the first writable open without a
+  journal clears it after `gc abandon` (which opens a read-only snapshot).
+  Read-only snapshot opens never reach the resume path.
+- **Counters.** These appear in the command's `phase_counts`:
+  `gc_metrics_trim_retried`, `gc_metrics_trim_tail_recovered`,
+  `gc_metrics_trim_skipped_concurrent_append`,
+  `gc_metrics_trim_lock_unavailable`,
+  `gc_metrics_trim_stale_temporary_removed`, `gc_file_skipped_drifted`,
+  `gc_journal_resume_failed`, `gc_journal_resume_backoff_armed` and
+  `gc_journal_resume_backoff_skipped`.
+- **Abandon.** `gc abandon` accepts schema 2, 3 and 4 journals, as it already
+  did; only its help text said otherwise.
 
 ### Spawned-worktree instance witnesses (#995)
 

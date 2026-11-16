@@ -1,6 +1,6 @@
 # Automatic checkout maintenance
 
-Last Updated: 2026-11-14
+Last Updated: 2026-11-16
 
 A session becoming closed and its checkout being removed are separate steps.
 Idle-session retirement makes a checkout eligible for later inspection; it does
@@ -153,7 +153,12 @@ cleanup is independent of `auto_remove`.
 Inspect `.aethyme/gc-journal.json` before the first normal open: startup can
 resume a previously confirmed plan independently of these automatic-maintenance
 holds. Resolve any pending journal through the reviewed GC recovery workflow
-before proceeding. A shared router/engine update affects multiple enrolled
+before proceeding. A startup resume that fails because the journal itself is
+invalid warns once, naming `gc apply --confirm <digest>` and
+`gc abandon --confirm <digest>`, and retries that journal only after 15 minutes
+or once the journal changes. A busy GC lock is retried on the next open. A reviewed gate
+log that changed is retained and skipped, not deleted, and does not block the
+rest of the journal. A shared router/engine update affects multiple enrolled
 repositories; apply the holds and verify the drain for every affected database.
 Raise the compatibility floor, verify that old clients with open database
 connections have exited, then restore the reviewed retention and cleanup

@@ -328,6 +328,49 @@ fn locked_runtime_file_is_retained_and_resumable() {
 }
 
 #[test]
+fn metrics_rows_appended_after_review_keep_the_digest_and_survive_apply() {
+    use std::io::Write;
+
+    let (tmp, mut broker, _delivered_id, _worktree) = fixture();
+    let metrics = tmp.path().join(".aethyme/logs/command-metrics.jsonl");
+    std::fs::create_dir_all(metrics.parent().unwrap()).unwrap();
+    let old = "{\"ts\":1,\"command\":\"old\"}\n";
+    let new = "{\"ts\":9999999999999,\"command\":\"new\"}\n";
+    std::fs::write(&metrics, format!("{old}malformed\n{new}")).unwrap();
+    let plan = broker.gc_plan().unwrap();
+    assert!(
+        plan.files
+            .iter()
+            .any(|file| file.path.ends_with("command-metrics.jsonl"))
+    );
+
+    // Every broker command appends a row between review and apply, and a row
+    // may already be older than the cutoff when it lands.
+    let after = "{\"ts\":9999999999998,\"command\":\"after\"}\n";
+    let stale = "{\"ts\":2,\"command\":\"stale\"}\n";
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&metrics)
+        .unwrap();
+    log.write_all(format!("{after}{stale}").as_bytes()).unwrap();
+    assert_eq!(
+        broker.gc_plan().unwrap().digest,
+        plan.digest,
+        "the digest binds the trim rule, not the bytes the plan saw"
+    );
+
+    let report = broker.gc_apply(&plan.digest).unwrap();
+
+    assert!(report.complete, "{report:?}");
+    assert!(report.files_skipped.is_empty(), "{report:?}");
+    assert_eq!(
+        std::fs::read_to_string(&metrics).unwrap(),
+        format!("malformed\n{new}{after}")
+    );
+    assert!(!tmp.path().join(".aethyme/gc-journal.json").exists());
+}
+
+#[test]
 fn ephemeral_repositories_never_anchor_worktrees_in_durable_host_state() {
     const CHILD_ENV: &str = "AETHYME_TEST_DEFAULT_EPHEMERAL_PLACEMENT";
     const HOME_MARKER: &str = ".aethyme-test-ephemeral-placement-home";

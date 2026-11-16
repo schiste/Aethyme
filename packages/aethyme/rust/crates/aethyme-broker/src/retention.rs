@@ -580,6 +580,9 @@ pub enum GcFileAction {
     Rewrite,
 }
 
+/// The only file a GC plan ever rewrites rather than deletes.
+pub(crate) const COMMAND_METRICS_LOG: &str = ".aethyme/logs/command-metrics.jsonl";
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct GcFileCandidate {
     pub path: String,
@@ -1226,6 +1229,11 @@ pub struct GcApplyReport {
     pub deadline_reached: bool,
     pub rows_removed: usize,
     pub files_completed: Vec<String>,
+    /// Reviewed files retained instead of acted on, such as a gate log whose
+    /// content changed after review. Each was dropped from the journal so it
+    /// cannot pin the steps after it; none was deleted or rewritten.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files_skipped: Vec<GcSkippedFile>,
     pub sessions_cleaned: Vec<i64>,
     pub artifacts_reclaimed: Vec<String>,
     pub orphans_removed: Vec<String>,
@@ -1241,6 +1249,13 @@ pub struct GcApplyReport {
     pub reclaimed_bytes: u64,
     pub failures: Vec<String>,
     pub recovery_action: Option<String>,
+}
+
+/// One reviewed file an apply retained, and why.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcSkippedFile {
+    pub path: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1318,7 +1333,7 @@ impl GcPlan {
             age_anchor_ms: Option<i64>,
             policy: &'a RetentionPolicy,
             rows: &'a [GcRowCandidate],
-            files: &'a [GcFileCandidate],
+            files: Vec<AuthorizedFile<'a>>,
             worktrees: &'a [GcWorktreeCandidate],
             artifacts: &'a [GcArtifactCandidate],
             orphans: &'a [GcOrphanCandidate],
@@ -1341,7 +1356,7 @@ impl GcPlan {
             age_anchor_ms: self.age_anchor_ms,
             policy: &self.policy,
             rows: &self.rows,
-            files: &self.files,
+            files: self.files.iter().map(AuthorizedFile::from).collect(),
             worktrees: &self.worktrees,
             artifacts: &self.artifacts,
             orphans: &self.orphans,
@@ -1359,6 +1374,39 @@ impl GcPlan {
         };
         self.digest = format!("{:x}", Sha256::digest(bytes));
         Ok(())
+    }
+}
+
+/// What a plan digest binds for one file candidate.
+///
+/// A gate log is deleted only while it still has the reviewed hash, so the
+/// digest binds the whole candidate. The command metrics log is append-only,
+/// and its rewrite is reviewed as "drop rows older than the cutoff": the
+/// cutoff is bound by `age_anchor_ms` and `policy.command_metrics_days`, and
+/// the hashes and sizes the plan saw are reporting only. Binding them would
+/// make every plan unconfirmable, because each command appends a row.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum AuthorizedFile<'a> {
+    Exact(&'a GcFileCandidate),
+    MetricsTrim {
+        path: &'a str,
+        action: GcFileAction,
+        trim: &'static str,
+    },
+}
+
+impl<'a> From<&'a GcFileCandidate> for AuthorizedFile<'a> {
+    fn from(candidate: &'a GcFileCandidate) -> Self {
+        if candidate.action == GcFileAction::Rewrite && candidate.path == COMMAND_METRICS_LOG {
+            Self::MetricsTrim {
+                path: &candidate.path,
+                action: candidate.action,
+                trim: "rows_older_than_age_cutoff",
+            }
+        } else {
+            Self::Exact(candidate)
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 # CLI Reference
 
-Last Updated: 2026-11-15
+Last Updated: 2026-11-16
 
 ## Install
 
@@ -2353,16 +2353,58 @@ aethyme broker gc apply --confirm <sha256>
 ```
 
 Application uses an exclusive stale-owner-aware lock, transactional row
-batches, exact before-hash checks for files, and provenance-safe worktree/ref
-cleanup. Progress is journaled atomically in `.aethyme/gc-journal.json`.
-Subsequent broker startup may spend only the configured monotonic time budget
-resuming that already-confirmed journal; startup never authorizes a fresh plan.
-If a file changed or remains locked, it is retained and the exact recovery
-command remains available. Event IDs and operation cursors are not reused.
+batches, exact before-hash checks for gate logs, and provenance-safe
+worktree/ref cleanup. Progress is journaled atomically in
+`.aethyme/gc-journal.json`. Subsequent broker startup may spend only the
+configured monotonic time budget resuming that already-confirmed journal;
+startup never authorizes a fresh plan. Event IDs and operation cursors are not
+reused.
+
+A gate log whose content changed after review is never deleted. It is
+retained, listed under `files_skipped` (JSON) or `skipped file:` (human) with
+its path and reason, and dropped from the journal, so the remaining steps still
+run and the journal completes. No later step depends on a gate log: the rows
+naming it were removed earlier in the same run. A file that cannot be read or
+removed (for example, a read-only directory) still stops the run there, and the
+journal resumes it once the environment is fixed.
+
+The `command-metrics.jsonl` rewrite is reviewed as "drop rows older than the
+plan's cutoff", not as the exact bytes the plan saw: every broker command
+appends a row, so those bytes are stale within seconds. The plan digest binds
+the cutoff through `age_anchor_ms` and `command_metrics_days`; the file's
+hashes and sizes in the plan are reporting only, and appending rows between
+`gc plan` and `gc apply` does not change the digest. Apply re-reads the log and
+drops only rows older than the cutoff, keeping newer rows and malformed or
+timestamp-free lines byte for byte. Metric writers take a shared lock in
+`.aethyme/run/command-metrics.lock` around each append, and the trim holds it
+exclusively from its read until after its atomic rename. Once every writer
+takes that lock, no row can be lost. A writer that does not (an older binary,
+or one that waited 2 s and gave up) is narrowed but not excluded: an append
+seen before the rename restarts the attempt, and the replaced file is watched
+for 250 ms after the rename, with anything that lands there copied into the new
+file (whole lines first; trailing bytes without a newline are copied as written
+when the period ends). A row such a writer writes later still, through a file it
+opened before the rename, is lost. If every attempt sees an append, or the lock
+cannot be opened or taken, the trim is skipped for this run and listed under
+`files_skipped`, removing nothing; it never stops the journal. Each trim first
+removes temporaries an interrupted trim left beside the log. Journals written
+by earlier binaries resume the same way: their whole-file metrics hashes are no
+longer compared.
+
+If an open-time resume fails in a way the next open would repeat (an invalid or
+unsupported journal, or a confirmation mismatch), the warning names
+`gc apply --confirm <digest>` and `gc abandon --confirm <digest>`, and the
+failure is remembered in broker meta with the journal bytes' hash. Open-time
+resume then leaves that exact journal alone for 15 minutes, or until the
+journal changes, so one bad journal costs one warning rather than one per
+command. A failure that may clear by itself (a held GC lock, a busy database,
+I/O) is reported as before and retried on the next open. An explicit `gc apply`
+always runs. The record is cleared when the journal completes and on the first
+writable open after `gc abandon` removes it.
 
 Journal schema 3 includes the reviewed row-content fingerprint; schema 2
 journals cannot resume in this version. `gc abandon --confirm <pending-digest>`
-archives the exact schema 2 or 3 pending journal under
+archives the exact schema 2, 3 or 4 pending journal under
 `.aethyme/gc-journal-archives/` and clears only the active journal. It does not
 resume cleanup or remove retained rows, files, worktrees, or artifacts. The
 command uses a read-only broker snapshot so startup maintenance cannot resume

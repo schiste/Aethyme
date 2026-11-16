@@ -910,8 +910,8 @@ Usage:
       Pass the same --include-active-gate-cache and --full-scan options used
       for the plan. An existing journal resumes without a fresh plan scan.
   aethyme broker gc abandon --confirm <pending-digest> [--json]
-      Archive a schema 2 or 3 pending journal without resuming or removing
-      retained data. Requires a fresh plan review before later apply.
+      Archive a pending journal (schema 2, 3 or 4) without resuming or
+      removing retained data. Requires a fresh plan review before later apply.
   aethyme broker gc forget-abandoned --confirm <archived-plan-digest> [--json]
       Forget the matching archive or its private interrupted staging files;
       retained project data is not removed. Archives are bounded to 32 files

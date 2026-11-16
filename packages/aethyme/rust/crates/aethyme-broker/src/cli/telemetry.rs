@@ -303,14 +303,13 @@ pub(super) fn record_command_metric(
         .map(|fields| format!(",{fields}"))
         .unwrap_or_default();
     let line = metric_line(ts, &label, duration_ms, exit, output_bytes, &extra_fields);
-    use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("command-metrics.jsonl"))
-    {
-        let _ = file.write_all(line.as_bytes());
-    }
+    // Under the shared append lock, so a GC trim replacing this log can never
+    // drop the row with the inode it replaces.
+    crate::gc::metrics_trim::append_command_metric_line(
+        &main_root,
+        &dir.join("command-metrics.jsonl"),
+        line.as_bytes(),
+    );
 }
 
 /// Fold the spans recorded anywhere during the command into its metric
