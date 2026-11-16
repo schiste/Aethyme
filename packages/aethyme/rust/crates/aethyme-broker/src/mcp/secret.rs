@@ -16,17 +16,17 @@ pub const SECRET_FILE: &str = "key-secret";
 const SECRET_BYTES: usize = 32;
 
 /// The host's key secret, created when missing.
+///
+/// Creation writes a complete temporary file and hard-links it into place,
+/// which never overwrites: a racing process that loses reads the winner's
+/// secret, and a crash leaves either no secret or a whole one. A short or
+/// unreadable secret is an error the caller must report, never replaced
+/// silently.
 pub fn load_or_create(directory: &Path) -> std::io::Result<Vec<u8>> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let path = directory.join(SECRET_FILE);
-    match std::fs::read(&path) {
-        Ok(bytes) if bytes.len() >= SECRET_BYTES => return Ok(bytes),
-        Ok(_) => {
-            return Err(std::io::Error::other(format!(
-                "{} is shorter than {SECRET_BYTES} bytes; remove it to create a new one",
-                path.display()
-            )));
-        }
+    match read_valid(&path) {
+        Ok(secret) => return Ok(secret),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
@@ -35,21 +35,36 @@ pub fn load_or_create(directory: &Path) -> std::io::Result<Vec<u8>> {
         .mode(0o700)
         .create(directory)?;
     let secret = random_bytes()?;
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            file.write_all(&secret)?;
-            file.sync_all()?;
-            Ok(secret)
-        }
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".key-secret-")
+        .tempfile_in(directory)?;
+    temporary
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    temporary.write_all(&secret)?;
+    temporary.as_file().sync_all()?;
+    match std::fs::hard_link(temporary.path(), &path) {
+        Ok(()) => Ok(secret),
         // Another process created it first: use theirs.
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => std::fs::read(&path),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_valid(&path),
         Err(error) => Err(error),
     }
+    // `temporary` is removed when dropped; the link keeps the secret.
+}
+
+fn read_valid(path: &Path) -> std::io::Result<Vec<u8>> {
+    let bytes = std::fs::read(path)?;
+    if bytes.len() != SECRET_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} holds {} bytes, not {SECRET_BYTES}; remove it to create a new one",
+                path.display(),
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Random bytes from the operating system.

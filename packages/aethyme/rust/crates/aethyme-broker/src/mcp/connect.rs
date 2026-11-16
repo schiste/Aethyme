@@ -209,6 +209,7 @@ struct Recorder {
     phases: std::collections::BTreeMap<String, u64>,
     started: Instant,
     shadowed: bool,
+    warnings: Vec<String>,
 }
 
 impl Recorder {
@@ -218,6 +219,7 @@ impl Recorder {
             phases: Default::default(),
             started: Instant::now(),
             shadowed: false,
+            warnings: Vec::new(),
         }
     }
 
@@ -241,6 +243,7 @@ impl Recorder {
             phases_ms: phases,
             shadowed: self.shadowed,
             fallback,
+            warnings: self.warnings.clone(),
         };
         crate::warn_unrecorded(
             "record the MCP connect event",
@@ -306,6 +309,14 @@ fn run_inner(args: &[String]) -> u8 {
             );
         }
     };
+    if let Some(error) = &caller.key_secret_error {
+        eprintln!(
+            "aethyme mcp: {}: the per-host key secret is unusable ({error}); this key is \
+             private to this process and nothing will be shared",
+            parsed.name
+        );
+        recorder.warnings.push("key_secret_unavailable".into());
+    }
     let checkouts = GitCheckouts;
     let phase = Instant::now();
     // Only the requested entry is validated.
