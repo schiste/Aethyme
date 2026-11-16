@@ -372,7 +372,13 @@ pub fn indent_unit(source: &str) -> &str {
 
 /// `items` as a JSON array: on one line, or one item per line at
 /// `indent + unit` with the closing bracket at `indent`.
-pub fn render_string_array(items: &[String], multiline: bool, indent: &str, unit: &str) -> String {
+pub fn render_string_array(
+    items: &[String],
+    multiline: bool,
+    indent: &str,
+    unit: &str,
+    newline: &str,
+) -> String {
     if items.is_empty() {
         return "[]".into();
     }
@@ -382,5 +388,8 @@ pub fn render_string_array(items: &[String], multiline: bool, indent: &str, unit
     }
     let inner = format!("{indent}{unit}");
     let body: Vec<String> = quoted.iter().map(|item| format!("{inner}{item}")).collect();
-    format!("[\n{}\n{indent}]", body.join(",\n"))
+    format!(
+        "[{newline}{}{newline}{indent}]",
+        body.join(&format!(",{newline}"))
+    )
 }

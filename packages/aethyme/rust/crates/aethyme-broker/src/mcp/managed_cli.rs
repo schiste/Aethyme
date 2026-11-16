@@ -11,7 +11,7 @@ use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
 use super::bypass;
 use super::config::{self, Loaded, Scope};
 use super::intercept;
-use super::managed::{MatchSet, RepairMode};
+use super::managed::{ArgsMode, MatchSet, RepairMode};
 use super::repair;
 use crate::exit_status;
 
@@ -23,32 +23,44 @@ pub const BYPASS_SCHEMA: &str = "aethyme.mcp-bypass/v1";
 /// Appended to `aethyme mcp --help`.
 pub const USAGE: &str = "
 Managed servers (host file only: managed = true, match_packages,
-match_executables, repair = auto|report):
+match_executables, repair = auto|report, args = caller|pinned):
   aethyme mcp manage list [--json]
   aethyme mcp manage add <name> --package <pkg> [--package ...]
-                         [--executable <name> ...] [--repair auto|report] [--json]
+                         [--executable <name> ...] [--repair auto|report]
+                         [--args caller|pinned] [--json]
   aethyme mcp manage remove <name> [--json]
       List, mark or unmark managed entries in <host state>/mcp/services.toml
       (edited in place, formatting kept). A new entry starts as
       `npx -y <first package>`. Refreshes the shims when interception is on.
+      args = caller (default): the caller's arguments follow the entry's
+      argv and are part of the key; pinned: entry arguments only, and a
+      caller with other arguments is left alone.
+  aethyme mcp connect <name> --caller-args <n> [--caller-package <spec>]
+                      --fallback -- <command...>
+      The form interception and repair write: the last <n> words of the
+      fallback command are the caller's arguments (without --fallback, the
+      <n> words after `--`); --caller-package replaces the entry's package
+      spec with the caller's pinned version.
   aethyme mcp intercept install [--dir <path>] [--json]
   aethyme mcp intercept uninstall [--json]
   aethyme mcp intercept status [--json]
       Shims named after npx, npm, pnpm, pnpx, bunx, yarn and each managed
-      executable, pointing at aethyme: a matching call becomes `aethyme mcp
-      connect <name> --fallback -- <real launcher> <args>`, anything else
-      runs the real tool untouched. Prints the PATH line to add for agent
-      hosts; never edits a shell profile.
+      executable, pointing at aethyme: a matching call from an agent host
+      becomes `aethyme mcp connect <name> --caller-args <n> --fallback --
+      <real launcher> <args>`; anything else (and --help, -h, --version, a
+      terminal on stdin) runs the real tool untouched. Prints the PATH line
+      to add for agent hosts; never edits a shell profile.
   aethyme mcp repair [--check|--apply] [--auto] [--agent codex|claude]
                      [--codex-config <path>] [--claude-config <path>] [--json]
       Find agent configuration entries (Codex config.toml, ~/.claude.json,
       a repository's .mcp.json) that start a managed server without
-      connect; --apply rewrites only those (backup, compare-and-swap,
-      formatting kept); --auto only entries with repair = \"auto\". A
+      connect, or whose aethyme path is gone; --apply rewrites only those
+      to the absolute aethyme (backup, compare-and-swap, formatting kept).
+      --auto: only repair = \"auto\" entries, only the Codex TOML file. A
       tracked .mcp.json is only reported. Prints names, never values.
   aethyme mcp bypass [--json]
-      Running processes that match a managed entry but did not start
-      through connect, counted per entry (1 s budget; inconclusive when the
+      Running processes that match a managed entry, counted per entry as
+      via_connect, fallback or bypass (1 s budget; inconclusive when the
       process table cannot be read).
 ";
 
@@ -193,6 +205,7 @@ fn entries_json(set: &MatchSet) -> Vec<Value> {
                 "match_packages": entry.packages,
                 "match_executables": entry.executables,
                 "repair": entry.repair,
+                "args": entry.args,
             })
         })
         .collect()
@@ -341,7 +354,12 @@ fn refresh_interception(host: &Path) -> (MatchSet, Value) {
 
 fn manage_add(args: &[String]) -> u8 {
     let started = Instant::now();
-    let parsed = match parse(args, &[], &["--package", "--executable", "--repair"], 1) {
+    let parsed = match parse(
+        args,
+        &[],
+        &["--package", "--executable", "--repair", "--args"],
+        1,
+    ) {
         Ok(parsed) => parsed,
         Err(message) => {
             return report_error(json_requested(args), "usage", &message, exit_status::USAGE);
@@ -365,6 +383,18 @@ fn manage_add(args: &[String]) -> u8 {
             exit_status::USAGE,
         );
     }
+    let args_mode = match parsed.one("--args").as_deref().map(ArgsMode::parse) {
+        None => None,
+        Some(Some(mode)) => Some(mode),
+        Some(None) => {
+            return report_error(
+                parsed.json,
+                "usage",
+                "--args takes caller or pinned",
+                exit_status::USAGE,
+            );
+        }
+    };
     let repair = match parsed.one("--repair").as_deref().map(RepairMode::parse) {
         None => None,
         Some(Some(mode)) => Some(mode),
@@ -414,6 +444,9 @@ fn manage_add(args: &[String]) -> u8 {
         }
         if let Some(mode) = repair {
             table.insert("repair", value(mode.as_str()));
+        }
+        if let Some(mode) = args_mode {
+            table.insert("args", value(mode.as_str()));
         }
         Ok(())
     });
@@ -753,6 +786,17 @@ pub fn run_repair(args: &[String]) -> u8 {
         auto: parsed.flag("--auto"),
         deadline: None,
         backup_dir: host.join(repair::BACKUP_DIRECTORY),
+        aethyme: match intercept::aethyme_target() {
+            Ok(path) => path,
+            Err(message) => {
+                return report_error(
+                    parsed.json,
+                    "aethyme_not_found",
+                    &message,
+                    exit_status::ENVIRONMENT,
+                );
+            }
+        },
     };
     let report = repair::run(&set, &targets, &locations, &options);
     repair::record(&host, &report, elapsed_ms(started));
@@ -844,6 +888,19 @@ fn print_repair_text(report: &repair::Report, no_managed: bool) {
             "Run `aethyme mcp repair --apply` to rewrite them (takes effect at the next agent start)."
         );
     }
+    let json_touched = report.files.iter().any(|file| {
+        file.kind != repair::TargetKind::CodexToml
+            && file
+                .findings
+                .iter()
+                .any(|finding| matches!(finding.state, "would_repair" | "repaired"))
+    });
+    if json_touched {
+        println!(
+            "Run `aethyme mcp repair --apply` for the JSON configurations while no agent host is \
+             running: a running host can save its in-memory copy over the change."
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -887,6 +944,15 @@ fn print_bypass_text(report: &bypass::BypassReport, no_managed: bool) {
         println!("bypass: none among {} processes", report.processes_scanned);
     }
     for entry in &report.entries {
+        if entry.via_connect > 0 || entry.fallback > 0 {
+            println!(
+                "{}: {} via connect, {} connect fallback{}",
+                entry.name,
+                entry.via_connect,
+                entry.fallback,
+                if entry.fallback == 1 { "" } else { "s" }
+            );
+        }
         if entry.processes == 0 {
             continue;
         }

@@ -59,9 +59,9 @@ pub mod managed_cli;
 pub mod repair;
 
 #[cfg(test)]
-mod managed_tests;
-#[cfg(test)]
 mod hub_tests;
+#[cfg(test)]
+mod managed_tests;
 #[cfg(test)]
 mod tests;
 

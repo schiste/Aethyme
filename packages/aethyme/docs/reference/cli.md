@@ -228,7 +228,8 @@ aethyme mcp trust [--repo <path>] [--yes --digest <sha256>] [--json]
 aethyme mcp status [--json]
 aethyme mcp config print --agent codex|claude [--name <name>]
 aethyme mcp manage list [--json]
-aethyme mcp manage add <name> --package <pkg> [--package ...] [--executable <name> ...] [--repair auto|report] [--json]
+aethyme mcp manage add <name> --package <pkg> [--package ...] [--executable <name> ...] [--repair auto|report] [--args caller|pinned] [--json]
+aethyme mcp connect <name> --caller-args <n> [--caller-package <spec>] (--fallback -- <command...> | -- <n arguments>)
 aethyme mcp manage remove <name> [--json]
 aethyme mcp intercept install [--dir <path>] [--json]
 aethyme mcp intercept status [--json]
@@ -266,26 +267,35 @@ the hub cannot serve within 2 seconds. `trust` records only after a typed
 confirmation or `--yes --digest` matching the printed digest.
 
 Managed servers: host entries with `managed = true`, `match_packages`,
-`match_executables` and `repair = "auto"|"report"` (host file only; a
-repository file is refused with `managed_in_repository`). `manage` lists,
+`match_executables`, `repair = "auto"|"report"` and `args =
+"caller"|"pinned"` (host file only; a repository file is refused with
+`managed_in_repository`). With `args = "caller"` (default) the caller's
+arguments follow the entry's argv and are part of the key
+(`connect --caller-args <n>`: the last `<n>` words of the fallback command,
+or the `<n>` words after `--` without `--fallback`; `--caller-package`
+replaces the entry's package spec); `pinned` leaves callers with other
+arguments alone. `--help`, `-h`, `--version` and a terminal on stdin are
+never handed off. `manage` lists,
 marks or unmarks them in the host file (formatting kept). `intercept
 install` creates shims named `npx`, `npm`, `pnpm`, `pnpx`, `bunx`, `yarn`
 and each managed executable, pointing at `aethyme`, plus
 `<host state>/mcp/intercept.match`, and prints the `PATH` line to add; a
-matching call becomes `aethyme mcp connect <name> --fallback -- <real
-launcher> <args>` and anything else runs the real tool untouched (exit 127
-when there is none). `intercept status` reports completeness, staleness and
+matching call becomes `aethyme mcp connect <name> --caller-args <n>
+--fallback -- <real launcher> <args>` and anything else runs the real tool
+untouched (exit 127 when there is none, or after four pass-throughs in one
+chain). `intercept status` reports completeness, staleness and
 `PATH` order; `uninstall` removes what `install` created. `repair` scans the
 Codex `config.toml`, `~/.claude.json` and a repository's `.mcp.json` for
-entries starting a managed server without `connect`; `--apply` rewrites only
-those (backup, compare-and-swap, formatting kept; a tracked `.mcp.json` is
-only reported), `--auto` only `repair = "auto"` entries; it prints server
+entries starting a managed server without `connect` (or whose absolute
+`aethyme` is gone); `--apply` rewrites only those to the absolute `aethyme`
+(backup, compare-and-swap, formatting kept; a tracked `.mcp.json` is only
+reported), `--auto` only `repair = "auto"` entries of the Codex TOML file; it prints server
 names and program basenames, never values. `bypass` counts running processes
-that match a managed entry but did not start through `connect` (1 s budget;
+that match a managed entry as `via_connect`, `fallback` or bypass (1 s budget;
 `inconclusive` when the process table cannot be read). `status --json` adds
 a `managed` section. `<host state>/mcp/settings.toml` `[mcp]
 repair_on_session_start = true` makes `aethyme hook SessionStart` run
-`repair --apply --auto` within 2 s (off by default).
+`repair --apply --auto` on the Codex TOML file within 2 s (off by default).
 
 `--json` objects carry `schema`: `aethyme.mcp-resolve/v1`,
 `aethyme.mcp-status/v1`, `aethyme.mcp-trust/v1`, `aethyme.mcp-manage/v1`,

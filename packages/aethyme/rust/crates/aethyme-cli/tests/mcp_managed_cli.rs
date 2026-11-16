@@ -345,7 +345,8 @@ fn a_direct_executable_shim_starts_the_managed_entry_through_connect() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(stdout(&output), "SERVER:--stdio GUARD:unset\n");
+    // The entry's argv, then the caller's arguments.
+    assert_eq!(stdout(&output), "SERVER:--stdio --flag GUARD:unset\n");
     assert!(
         stderr(&output).contains("aethyme mcp: using stable copy"),
         "{}",
@@ -421,11 +422,20 @@ fn repair_checks_applies_with_backups_and_never_prints_values() {
     assert!(!stdout(&applied).contains(SECRET));
     assert!(!fixture.events().contains(SECRET));
     let codex_text = std::fs::read_to_string(&codex).unwrap();
-    assert!(codex_text.contains("command = \"aethyme\""), "{codex_text}");
+    let written: toml_edit::DocumentMut = codex_text.parse().unwrap();
+    assert_same_binary(
+        written["mcp_servers"]["devtools"]["command"]
+            .as_str()
+            .unwrap(),
+    );
     assert!(codex_text.contains(&format!("TOKEN = \"{SECRET}\"")));
     let claude_value: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&claude).unwrap()).unwrap();
-    assert_eq!(claude_value["mcpServers"]["devtools"]["command"], "aethyme");
+    assert_same_binary(
+        claude_value["mcpServers"]["devtools"]["command"]
+            .as_str()
+            .unwrap(),
+    );
     assert_eq!(
         claude_value["mcpServers"]["devtools"]["env"]["TOKEN"],
         SECRET
@@ -439,6 +449,15 @@ fn repair_checks_applies_with_backups_and_never_prints_values() {
     let again = fixture.aethyme(&["mcp", "repair", "--apply", "--auto"]);
     assert!(again.status.success(), "{}", stderr(&again));
     assert_eq!(stdout(&again), "");
+}
+
+/// A repaired entry runs this very `aethyme`, by absolute path.
+fn assert_same_binary(command: &str) {
+    assert!(Path::new(command).is_absolute(), "{command}");
+    assert_eq!(
+        Path::new(command).canonicalize().unwrap(),
+        aethyme_bin().canonicalize().unwrap()
+    );
 }
 
 fn session_start(fixture: &Fixture) -> Output {
@@ -462,12 +481,14 @@ fn session_start(fixture: &Fixture) -> Output {
 fn the_session_start_hook_repairs_only_when_the_owner_turned_it_on() {
     let fixture = Fixture::new();
     fixture.managed_devtools();
-    let (_, claude) = agent_configs(&fixture);
+    let (codex, claude) = agent_configs(&fixture);
     let before = std::fs::read_to_string(&claude).unwrap();
+    let codex_before = std::fs::read_to_string(&codex).unwrap();
     let off = session_start(&fixture);
     assert!(off.status.success());
     assert!(!stdout(&off).contains("repaired"), "{}", stdout(&off));
     assert_eq!(std::fs::read_to_string(&claude).unwrap(), before);
+    assert_eq!(std::fs::read_to_string(&codex).unwrap(), codex_before);
 
     std::fs::write(
         fixture.state.join("mcp/settings.toml"),
@@ -477,15 +498,18 @@ fn the_session_start_hook_repairs_only_when_the_owner_turned_it_on() {
     let on = session_start(&fixture);
     assert!(on.status.success());
     assert!(
-        stdout(&on).contains("repaired 2 managed MCP server entries"),
+        stdout(&on).contains("repaired 1 managed MCP server entry"),
         "{}",
         stdout(&on)
     );
+    // Only the TOML file: the JSON user configuration is left to an
+    // explicit `repair --apply`.
     assert!(
-        std::fs::read_to_string(&claude)
+        std::fs::read_to_string(&codex)
             .unwrap()
-            .contains("\"aethyme\"")
+            .contains("\"connect\"")
     );
+    assert_eq!(std::fs::read_to_string(&claude).unwrap(), before);
     let quiet = session_start(&fixture);
     assert!(!stdout(&quiet).contains("repaired"), "{}", stdout(&quiet));
 }
@@ -505,4 +529,77 @@ fn bypass_reports_counts_or_inconclusive_never_values() {
     } else {
         assert!(value["report"]["reason"].is_string());
     }
+}
+
+#[test]
+fn a_pinned_entry_leaves_a_caller_with_other_arguments_alone() {
+    let fixture = Fixture::new();
+    fixture.services(
+        "[[servers]]\nname = \"example-devtools\"\n\
+         argv = [\"npx\", \"-y\", \"example-devtools-mcp\", \"--headless\"]\nmanaged = true\n\
+         args = \"pinned\"\nmatch_packages = [\"example-devtools-mcp\"]\n",
+    );
+    fixture.install_shims();
+    let output = fixture
+        .command_named("npx", &["-y", "example-devtools-mcp", "--port", "9"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(
+        stdout(&output),
+        "ARGS:-y|example-devtools-mcp|--port|9|\nGUARD:unset\n"
+    );
+    assert!(
+        stderr(&output).contains("arguments_differ"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!fixture.events().contains("\"outcome\":\"handoff\""));
+}
+
+#[test]
+fn help_and_version_calls_are_never_handed_off() {
+    let fixture = Fixture::new();
+    fixture.managed_devtools();
+    fixture.install_shims();
+    for flag in ["--help", "--version"] {
+        let output = fixture
+            .command_named("npx", &["example-devtools-mcp", flag])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(
+            stdout(&output),
+            format!("ARGS:example-devtools-mcp|{flag}|\nGUARD:unset\n")
+        );
+        assert_eq!(stderr(&output), "");
+    }
+    assert!(!fixture.events().contains("handoff"));
+}
+
+#[test]
+fn a_chain_of_shims_stops_at_the_hop_limit() {
+    let fixture = Fixture::new();
+    fixture.managed_devtools();
+    fixture.install_shims();
+    let output = fixture
+        .command_named("npx", &["other"])
+        .env("AETHYME_MCP_SHIM_HOPS", "4")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(127));
+    assert!(
+        stderr(&output).contains("aethyme mcp intercept status"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(stdout(&output), "");
+    // One hop below the limit still reaches the real tool, and the real
+    // tool sees the counter incremented.
+    let output = fixture
+        .command_named("npx", &["other"])
+        .env("AETHYME_MCP_SHIM_HOPS", "3")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7));
 }

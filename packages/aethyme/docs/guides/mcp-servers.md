@@ -392,6 +392,7 @@ managed = true
 match_packages = ["example-devtools-mcp"]      # a version suffix is ignored
 match_executables = ["example-devtools-mcp"]   # program basenames
 repair = "auto"                                # or "report"
+args = "caller"                                # or "pinned"
 ```
 
 - `match_packages`: npm package names. `example-devtools-mcp`,
@@ -401,14 +402,34 @@ repair = "auto"                                # or "report"
   configuration names them by absolute path.
 - `repair`: whether `repair --apply --auto` (the session-start repair)
   rewrites matching entries (`auto`, the default) or only reports them.
-- The entry's own `argv`, `cwd` and environment decide how the server
-  starts. The arguments in the agent's configuration, or of an
-  intercepted launcher call, are only used by the fallback. Give the entry
-  the arguments every agent should get.
+- `args`: which arguments the server gets.
+  - `caller` (the default): the entry's `argv` supplies the program
+    resolution and any base arguments, and the arguments the caller gave
+    after the package or program (in the agent's configuration, or of an
+    intercepted launcher call) follow them. They are part of the resolved
+    argv and therefore of the sharing key: two agents asking for different
+    flags get different servers. Keep base arguments in the entry to what
+    every caller needs; a caller's own copy of a base argument would appear
+    twice.
+  - `pinned`: the entry's `argv` only. A caller whose arguments differ from
+    the entry's base arguments is not routed through `connect`:
+    interception passes it through with a one-line note on stderr, and
+    repair reports it as `arguments_differ` without rewriting it.
+- Versions: a caller pinning a version (`example-devtools-mcp@1.2.3`) the
+  entry does not pin gets that version, keyed separately; when the entry
+  pins a version, a caller asking for another one is left alone
+  (`version_differs`).
+- Calls with `--help`, `-h` or `--version` after the package are never
+  routed to a server (`interactive_arguments`), and neither is anything
+  intercepted while standard input is a terminal: that is a person, not an
+  agent host.
 
 The matcher recognises `npx [-y] X`, `npm exec X` (and `npm x`),
 `pnpm exec X`, `pnpm dlx X`, `pnpx X`, `bunx X`, `bun x X` and `yarn dlx X`
-(with `--package`/`-p` too), the same behind `env [NAME=VALUE ...]` or a
+(with `--package`/`-p`: then the named binary must be listed in
+`match_executables`, or equal the package's own unscoped name with that
+package the only `-p`; a scoped package's last segment is never taken for
+its binary), the same behind `env [NAME=VALUE ...]` or a
 `node <launcher script>` interpreter, `sh -c "<one simple command>"` when
 the string has no shell syntax at all (no operators, redirections,
 expansions, globs or assignments), and a program whose basename is in
@@ -418,7 +439,7 @@ guessed.
 
 ```text
 aethyme mcp manage list [--json]
-aethyme mcp manage add <name> --package <pkg> [--package ...] [--executable <name> ...] [--repair auto|report] [--json]
+aethyme mcp manage add <name> --package <pkg> [--package ...] [--executable <name> ...] [--repair auto|report] [--args caller|pinned] [--json]
 aethyme mcp manage remove <name> [--json]
 ```
 
@@ -454,17 +475,36 @@ The binary is multi-call: invoked under a shim name it decides from
 `argv[0]` before anything else (no database, configuration discovery or
 Git), reads the match file and tests the call:
 
-- no match: it `exec`s the real tool, the first `PATH` entry for that name
-  that is not the shim directory (in any spelling, symlinks included) and
-  does not resolve to `aethyme`. Arguments, environment, stdio, exit status
-  and signals are the real tool's; nothing is printed. With no real tool it
-  exits 127 with `<name>: command not found`.
+- no match (or a call it declines, see `args` above): it `exec`s the real
+  tool, the first absolute `PATH` entry for that name that is not the shim
+  directory (in any spelling, symlinks included) and does not resolve to
+  this binary or to any file named `aethyme*` (a stale shim directory of
+  another build). Arguments, stdio and exit status are the real tool's and
+  nothing is printed; the environment gains only `AETHYME_MCP_SHIM_HOPS`.
+  A chain that would pass a fifth time stops with exit 127 and a message
+  naming `aethyme mcp intercept status`. With no real tool it exits 127 with
+  `<name>: command not found`. Empty and relative `PATH` entries are never
+  searched (a shell would search the current directory for them).
 - match: it `exec`s
-  `aethyme mcp connect <name> --fallback -- <real launcher's absolute path> <original arguments...>`
-  with `AETHYME_MCP_SHIM_GUARD=1`, `AETHYME_MCP_SHIM_DEPTH` incremented and
-  the shim directory removed from `PATH`. A shim that sees the guard (or a
+  `aethyme mcp connect <name> --caller-args <n> [--caller-package <spec>] --fallback -- <real launcher's absolute path> <original arguments...>`
+  (the last `<n>` original arguments are the caller's) with
+  `AETHYME_MCP_SHIM_GUARD=1`, `AETHYME_MCP_SHIM_DEPTH` incremented and the
+  shim directory removed from `PATH`. A shim that sees the guard (or a
   depth of 2) always passes through, and the fallback names the real tool
-  by absolute path, so nothing re-enters a shim.
+  by absolute path, so nothing re-enters a shim. The guard is inherited by
+  everything the fallback starts, and a server `connect` starts gets a
+  `PATH` without the shim directory, so interception is off under a
+  managed server's process tree.
+
+Signals: Rust starts every program with SIGPIPE ignored and restores the
+default disposition in the program it `exec`s, so the real tool starts with
+the default SIGPIPE disposition even when its parent had deliberately
+ignored it. Everything else about signals is the real tool's.
+
+The match file is found through the host state directory
+(`AETHYME_HOST_STATE_DIR`, `XDG_STATE_HOME`, `HOME`). An agent host whose
+environment names a different host state directory has no match file there,
+so its shims pass every call through.
 
 An unreadable or corrupt match file never blocks a launcher: calls pass
 through and the error is counted. Only hand-offs and errors are recorded
@@ -489,16 +529,27 @@ It scans the Codex configuration (`$CODEX_HOME/config.toml`, else
 `~/.codex/config.toml`), the Claude user configuration (`~/.claude.json`:
 its `mcpServers` and every project's `mcpServers`) and, run inside a
 repository, that repository's `.mcp.json`, for stdio entries whose command
-matches a managed entry and is not already `aethyme mcp connect`. `--check`
-(the default) lists them; `--apply` rewrites only those entries to
+matches a managed entry and is not already `aethyme mcp connect`, and for
+`connect` entries whose absolute `aethyme` no longer exists
+(`stale_aethyme_path`). `--check` (the default) lists them; `--apply`
+rewrites only those entries to
 
 ```text
-aethyme mcp connect <name> --fallback -- <original command and args>
+<absolute aethyme> mcp connect <name> [--caller-args <n> [--caller-package <spec>]] --fallback -- <original command and args>
 ```
 
-keeping the entry's `env` map and every other key untouched. `--auto`
-writes only entries whose managed entry says `repair = "auto"`. Changes
-take effect when the agent next starts.
+keeping the entry's `env` map and every other key untouched. The command is
+the stable install path of `aethyme` (the one on `PATH` when it is this
+binary), so a configuration does not depend on the agent host's `PATH`. An
+entry whose caller arguments are not the tail of its command (a `sh -c`
+string) is reported (`arguments_not_suffix`). `--auto` writes only the
+Codex TOML file, and there only entries whose managed entry says
+`repair = "auto"`; the JSON files are reported (`explicit_apply_only`).
+Changes take effect when the agent next starts.
+
+Run `--apply` for `~/.claude.json` while no agent host is running: the host
+rewrites that file from its in-memory copy, and a host that saves after the
+repair puts the old entry back (the next `repair` finds it again).
 
 These files hold credentials, so:
 
@@ -515,19 +566,27 @@ These files hold credentials, so:
   newest five per file kept;
 - writes are compare-and-swap: size, modification time and SHA-256 are
   recorded at read, the new content is written to a temporary file in the
-  same directory with the original's mode, and the original is checked
-  unchanged right before the rename; a change discards the attempt, and
-  after three attempts the file is reported `contended` with nothing
-  written;
+  same directory with the original's mode (created 0600, removed on every
+  path that does not rename it, and any older than a minute is swept at
+  the next run), and the original is checked unchanged right before the
+  rename; a change discards the attempt, the next one waits 20 to 80 ms
+  (jittered), and after three attempts the file is reported `contended`
+  with nothing written. A write landing between the last check and the
+  rename is not seen: that window is a few microseconds, and is the reason
+  the frequently rewritten JSON file is never repaired automatically;
 - a symlinked configuration is followed only to a target inside `HOME`
-  (otherwise `refused_symlink`);
+  (otherwise `refused_symlink`) and outside any Git checkout (otherwise
+  `refused_symlink_into_repository`: the repair would be an uncommitted
+  change in a dotfiles repository);
 - a repository's tracked `.mcp.json` is never written: its matches are
   reported (`tracked_repository_file`), because changing it is a commit you
   make.
 
 **Session-start repair.** With `repair_on_session_start` on, the session
 start hook Aethyme already installs (`aethyme hook SessionStart`) runs
-`repair --apply --auto` in-process within a 2 second budget. It is silent
+`repair --apply --auto` in-process on the Codex TOML file only, within a 2
+second budget: the managed list is read first, no repository or Git is
+consulted, and a file is not started with less than 600 ms left. It is silent
 when nothing changed and adds one line to the session context when it
 repaired something. It is off by default; turn it on in
 `<host state>/mcp/settings.toml`:
@@ -543,12 +602,17 @@ repair_on_session_start = true
 aethyme mcp bypass [--json]
 ```
 
-takes one process-table snapshot (1 second budget) and counts, per managed
-entry, running processes whose command line matches it but which did not
-start through `connect` (a server `connect` started carries its remembered
-resolved argv, not a launcher). A launcher run as `connect`'s fallback
-counts too: that server did not get the resolved start. Only counts and the
-matched package or executable name are shown. When the table cannot be read
+takes one process-table snapshot (1 second budget; Linux reads `/proc`,
+macOS one `ps` listing plus the candidates' real argv and environment from
+the kernel, elsewhere `ps`) and counts, per managed entry, the running
+processes whose argv matches it, as `via_connect` (`connect` marks the
+server it starts with `AETHYME_MCP_CONNECT`, inherited by its children; a
+descendant of `aethyme mcp connect` or of the shared hub; or the command
+line `connect` last exec'd), `fallback` (marked `AETHYME_MCP_FALLBACK`: the
+caller's own command, run because `connect` could not start the server) and
+`bypass` (everything else). Another user's processes have no readable
+environment and count by ancestry only. Only counts and the matched package
+or executable name are shown. When the table cannot be read
 in time the result is `inconclusive`, never "none". `aethyme mcp status
 --json` includes the managed list, interception state, a bypass scan and the
 session-start switch under `managed`.
@@ -561,6 +625,8 @@ session-start switch under `managed`.
 - B does not see a configuration that calls a server binary by absolute
   path, or a launcher by absolute path (`/usr/local/bin/npx ...`): A
   repairs those entries.
+- B does not see processes started under a managed server or a fallback
+  (the guard and the stripped `PATH` turn it off there).
 - A covers the configuration files it knows; it cannot rewrite servers a
   plugin bundles, and a tracked `.mcp.json` needs your commit.
 - Neither changes how a server already running was started; restart the
@@ -596,13 +662,14 @@ Agents are configured with
 
 ```text
 $ aethyme mcp manage add example-devtools --package example-devtools-mcp
-$ $EDITOR "<host state>/mcp/services.toml"   # argv = ["npx", "-y", "example-devtools-mcp", "--headless"]
 $ aethyme mcp intercept install
 $ aethyme mcp repair --apply
 ```
 
 An agent whose configuration was repaired now runs
-`aethyme mcp connect example-devtools --fallback -- npx -y example-devtools-mcp@latest --headless`.
+`<absolute aethyme> mcp connect example-devtools --caller-args 1 --fallback -- npx -y example-devtools-mcp@latest --headless`:
+`connect` starts the entry's `npx -y example-devtools-mcp` resolution with
+`--headless` appended.
 One whose configuration was not (a plugin-bundled server, say) still
 spawns `npx -y example-devtools-mcp@latest --headless`; started with the
 shim directory first in `PATH`, that `npx` is the shim, which hands the

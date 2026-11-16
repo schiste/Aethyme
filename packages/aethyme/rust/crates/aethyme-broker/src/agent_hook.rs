@@ -190,7 +190,7 @@ fn decide(
     // turned `mcp.repair_on_session_start` on (off by default: one absent
     // settings file read). Bounded to 2 s, silent on a no-op.
     if event == HookEvent::SessionStart
-        && let Some(notice) = crate::mcp::repair::session_start_notice(&cwd)
+        && let Some(notice) = crate::mcp::repair::session_start_notice()
     {
         installation_notice.push(notice);
     }

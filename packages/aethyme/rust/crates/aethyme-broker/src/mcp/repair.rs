@@ -45,7 +45,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::json_span::{self, Edit, Node};
-use super::managed::{ManagedMatch, MatchSet, RepairMode};
+use super::managed::{ManagedMatch, MatchSet, RepairMode, Route};
+use super::resolve::is_executable_file;
 use super::telemetry::{self, Event};
 
 /// Attempts before a write is reported `contended`.
@@ -210,7 +211,11 @@ pub struct Finding {
     pub matched_kind: &'static str,
     pub matched: String,
     pub repair: RepairMode,
-    /// `would_repair`, `repaired`, `report_only`, `contended`, `skipped`.
+    /// `would_repair`, `repaired`, `report_only`, `contended`. `reason`
+    /// says why an entry is only reported (`tracked_repository_file`,
+    /// `repair_report`, `explicit_apply_only`, `interactive_arguments`,
+    /// `arguments_differ`, `version_differs`, `arguments_not_suffix`) or
+    /// that a connect entry's `aethyme` path is gone (`stale_aethyme_path`).
     pub state: &'static str,
     pub reason: Option<&'static str>,
     #[serde(skip)]
@@ -223,6 +228,8 @@ struct Location {
     project: Option<String>,
     server: String,
     argv: Vec<String>,
+    /// The `args` a repair writes (after the absolute `aethyme` command).
+    new_args: Vec<String>,
 }
 
 /// What happened to one file.
@@ -265,7 +272,17 @@ pub struct Options {
     pub deadline: Option<Instant>,
     /// Backups go here (`<host state>/mcp/repair-backups`).
     pub backup_dir: PathBuf,
+    /// The absolute `aethyme` a repaired entry runs (the stable install
+    /// path, see [`super::intercept::aethyme_target`]).
+    pub aethyme: PathBuf,
 }
+
+/// The most one file can take (three attempts with their backoff and
+/// I/O); a file is not started with less than this left of a deadline.
+pub const WORST_CASE_PER_FILE: Duration = Duration::from_millis(600);
+/// Temporary files of an interrupted repair older than this are removed.
+const STALE_TEMPORARY: Duration = Duration::from_secs(60);
+const TEMPORARY_PREFIX: &str = ".aethyme-repair-";
 
 fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -290,7 +307,7 @@ pub fn run_with_hook(
     for target in targets {
         if options
             .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
+            .is_some_and(|deadline| Instant::now() + WORST_CASE_PER_FILE > deadline)
         {
             files.push(empty_report(target, "budget_exhausted", None));
             continue;
@@ -374,10 +391,46 @@ fn real_path(path: &Path, home: Option<&Path>) -> Result<PathBuf, &'static str> 
     let home = home
         .and_then(|home| home.canonicalize().ok())
         .ok_or("refused_symlink")?;
-    if target.starts_with(&home) && target.is_file() {
-        Ok(target)
-    } else {
-        Err("refused_symlink")
+    if !target.starts_with(&home) || !target.is_file() {
+        return Err("refused_symlink");
+    }
+    // A target inside a Git checkout (dotfiles repositories) would turn a
+    // repair into an uncommitted change there.
+    if target
+        .ancestors()
+        .skip(1)
+        .any(|directory| directory.join(".git").exists())
+    {
+        return Err("refused_symlink_into_repository");
+    }
+    Ok(target)
+}
+
+/// Remove temporary files an interrupted repair left beside `real`.
+fn sweep_temporaries(real: &Path) {
+    let Some(directory) = real.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(TEMPORARY_PREFIX))
+            && entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > STALE_TEMPORARY);
+        if stale {
+            crate::warn_unrecorded(
+                "remove a stale repair temporary file",
+                std::fs::remove_file(entry.path()),
+            );
+        }
     }
 }
 
@@ -440,6 +493,7 @@ fn toml_servers(text: &str) -> Result<Vec<Server>, String> {
                 project: None,
                 server: name.to_string(),
                 argv,
+                new_args: Vec::new(),
             },
             scope: "user".into(),
         });
@@ -457,7 +511,15 @@ fn json_document(text: &str) -> Result<Node, String> {
 
 /// The stdio server entries of an `mcpServers` object.
 fn json_server_entries(map: &Node, project: Option<&str>, scope: &str, out: &mut Vec<Server>) {
-    for member in map.members() {
+    let members = map.members();
+    for (index, member) in members.iter().enumerate() {
+        // JSON readers keep the last of duplicate keys; so does repair.
+        if members[index + 1..]
+            .iter()
+            .any(|later| later.key == member.key)
+        {
+            continue;
+        }
         let server = &member.value;
         if server
             .get("type")
@@ -491,6 +553,7 @@ fn json_server_entries(map: &Node, project: Option<&str>, scope: &str, out: &mut
                 project: project.map(str::to_string),
                 server: member.key.clone(),
                 argv,
+                new_args: Vec::new(),
             },
             scope: scope.to_string(),
         });
@@ -520,19 +583,6 @@ fn json_servers(kind: TargetKind, text: &str) -> Result<Vec<Server>, String> {
     Ok(found)
 }
 
-/// `aethyme mcp connect <entry> --fallback -- <argv...>` as `args`.
-pub fn connect_args(entry: &str, argv: &[String]) -> Vec<String> {
-    let mut args = vec![
-        "mcp".to_string(),
-        "connect".to_string(),
-        entry.to_string(),
-        "--fallback".to_string(),
-        "--".to_string(),
-    ];
-    args.extend(argv.iter().cloned());
-    args
-}
-
 fn program_basename(argv: &[String]) -> String {
     argv.first()
         .map(|program| program.rsplit('/').next().unwrap_or(program).to_string())
@@ -545,11 +595,17 @@ fn is_connect(argv: &[String]) -> bool {
         && argv.get(2).map(String::as_str) == Some("connect")
 }
 
-/// The rewritten text, editing only the given entries.
-fn rewrite(kind: TargetKind, text: &str, changes: &[(Location, String)]) -> Result<String, String> {
+/// The rewritten text: each change's `command` becomes `aethyme` and its
+/// `args` the change's arguments; nothing else is touched.
+fn rewrite(
+    kind: TargetKind,
+    text: &str,
+    changes: &[Location],
+    aethyme: &str,
+) -> Result<String, String> {
     match kind {
-        TargetKind::CodexToml => rewrite_toml(text, changes),
-        TargetKind::ClaudeUser | TargetKind::ProjectJson => rewrite_json(text, changes),
+        TargetKind::CodexToml => rewrite_toml(text, changes, aethyme),
+        TargetKind::ClaudeUser | TargetKind::ProjectJson => rewrite_json(text, changes, aethyme),
     }
 }
 
@@ -566,20 +622,20 @@ fn set_toml_value(table: &mut dyn toml_edit::TableLike, key: &str, new: toml_edi
     }
 }
 
-fn rewrite_toml(text: &str, changes: &[(Location, String)]) -> Result<String, String> {
+fn rewrite_toml(text: &str, changes: &[Location], aethyme: &str) -> Result<String, String> {
     let mut document: toml_edit::DocumentMut =
         text.parse().map_err(|error| toml_line(text, &error))?;
-    for (location, entry) in changes {
+    for location in changes {
         let server = document
             .get_mut("mcp_servers")
             .and_then(toml_edit::Item::as_table_like_mut)
             .and_then(|servers| servers.get_mut(&location.server))
             .and_then(toml_edit::Item::as_table_like_mut)
             .ok_or("a server entry disappeared")?;
-        set_toml_value(server, "command", toml_edit::Value::from("aethyme"));
+        set_toml_value(server, "command", toml_edit::Value::from(aethyme));
         let mut args = toml_edit::Array::new();
-        for word in connect_args(entry, &location.argv) {
-            args.push(word);
+        for word in &location.new_args {
+            args.push(word.as_str());
         }
         set_toml_value(server, "args", toml_edit::Value::Array(args));
     }
@@ -599,18 +655,20 @@ fn find_json_server<'a>(root: &'a Node, location: &Location) -> Option<&'a Node>
     map.value.get(&location.server).map(|member| &member.value)
 }
 
-fn rewrite_json(text: &str, changes: &[(Location, String)]) -> Result<String, String> {
+fn rewrite_json(text: &str, changes: &[Location], aethyme: &str) -> Result<String, String> {
     let root = json_document(text)?;
     let unit = json_span::indent_unit(text).to_string();
+    // A file written with CRLF line ends keeps them.
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let mut edits = Vec::new();
-    for (location, entry) in changes {
+    for location in changes {
         let server = find_json_server(&root, location).ok_or("a server entry disappeared")?;
         let command = server.get("command").ok_or("a server entry changed")?;
-        let args = connect_args(entry, &location.argv);
+        let args = &location.new_args;
         edits.push(Edit {
             start: command.value.start,
             end: command.value.end,
-            text: json_span::quote("aethyme"),
+            text: json_span::quote(aethyme),
         });
         let object_multiline = text[server.start..command.key_start].contains('\n');
         match server.get("args") {
@@ -620,14 +678,15 @@ fn rewrite_json(text: &str, changes: &[(Location, String)]) -> Result<String, St
                 edits.push(Edit {
                     start: existing.value.start,
                     end: existing.value.end,
-                    text: json_span::render_string_array(&args, multiline, indent, &unit),
+                    text: json_span::render_string_array(args, multiline, indent, &unit, newline),
                 });
             }
             None => {
                 let indent = json_span::line_indent(text, command.key_start);
-                let array = json_span::render_string_array(&args, object_multiline, indent, &unit);
+                let array =
+                    json_span::render_string_array(args, object_multiline, indent, &unit, newline);
                 let inserted = if object_multiline {
-                    format!(",\n{indent}\"args\": {array}")
+                    format!(",{newline}{indent}\"args\": {array}")
                 } else {
                     format!(", \"args\": {array}")
                 };
@@ -653,30 +712,88 @@ fn plan(
     let mut findings = Vec::new();
     let mut already_managed = 0;
     for server in &servers {
-        if is_connect(&server.location.argv) {
-            already_managed += 1;
+        let argv = &server.location.argv;
+        if is_connect(argv) {
+            let program = Path::new(&argv[0]);
+            if program.is_absolute() && !is_executable_file(program) {
+                // A connect entry whose aethyme moved: point it at the
+                // current one, arguments unchanged.
+                let mut location = server.location.clone();
+                location.new_args = argv[1..].to_vec();
+                let (state, reason) = writable_state(target, options);
+                findings.push(Finding {
+                    agent: target.kind.agent(),
+                    file: target.path.clone(),
+                    scope: server.scope.clone(),
+                    server: server.location.server.clone(),
+                    entry: argv.get(3).cloned().unwrap_or_default(),
+                    program: "aethyme".into(),
+                    matched_kind: "connect",
+                    matched: String::new(),
+                    repair: RepairMode::Auto,
+                    state,
+                    reason: reason.or(Some("stale_aethyme_path")),
+                    location,
+                });
+            } else {
+                already_managed += 1;
+            }
             continue;
         }
-        let Some(found) = set.managed_match(&server.location.argv) else {
+        let Some(found) = set.managed_match(argv) else {
             continue;
         };
-        let (state, reason) = finding_state(target, &found, options);
+        let mut location = server.location.clone();
+        let (state, reason) = match set.route(&found) {
+            Route::Decline(reason) => ("report_only", Some(reason)),
+            Route::Connect { caller_args, .. } if !argv.ends_with(&caller_args) => {
+                // The fallback must end with the caller's arguments; a
+                // `sh -c` string does not.
+                ("report_only", Some("arguments_not_suffix"))
+            }
+            Route::Connect {
+                caller_args,
+                caller_package,
+            } => {
+                location.new_args = super::caller::connect_args(
+                    &found.name,
+                    &caller_args,
+                    caller_package.as_deref(),
+                    argv,
+                );
+                finding_state(target, &found, options)
+            }
+        };
         findings.push(Finding {
             agent: target.kind.agent(),
             file: target.path.clone(),
             scope: server.scope.clone(),
             server: server.location.server.clone(),
             entry: found.name.clone(),
-            program: program_basename(&server.location.argv),
+            program: program_basename(argv),
             matched_kind: found.kind,
             matched: found.matched.clone(),
             repair: found.repair,
             state,
             reason,
-            location: server.location.clone(),
+            location,
         });
     }
     Ok((findings, servers.len(), already_managed))
+}
+
+/// Whether this file may be written in this run at all.
+fn writable_state(target: &Target, options: &Options) -> (&'static str, Option<&'static str>) {
+    if !target.writable {
+        return ("report_only", target.not_writable_reason);
+    }
+    // Automatic repair touches only the user-level TOML configuration; the
+    // JSON files are rewritten often by their own applications and are
+    // repaired only by an explicit `repair --apply`.
+    if options.auto && target.kind != TargetKind::CodexToml {
+        return ("report_only", Some("explicit_apply_only"));
+    }
+    ("would_repair", None)
 }
 
 fn finding_state(
@@ -684,8 +801,9 @@ fn finding_state(
     found: &ManagedMatch,
     options: &Options,
 ) -> (&'static str, Option<&'static str>) {
-    if !target.writable {
-        return ("report_only", target.not_writable_reason);
+    let (state, reason) = writable_state(target, options);
+    if state != "would_repair" {
+        return (state, reason);
     }
     if options.auto && found.repair == RepairMode::Report {
         return ("report_only", Some("repair_report"));
@@ -705,9 +823,15 @@ fn process(
         Ok(real) => real,
         Err(state) => return empty_report(target, state, None),
     };
+    if options.apply {
+        sweep_temporaries(&real);
+    }
     let mut report = empty_report(target, "scanned", None);
     let mut backup_written: Option<PathBuf> = None;
     for attempt in 1..=ATTEMPTS {
+        if attempt > 1 {
+            backoff(attempt);
+        }
         report.attempts = attempt;
         let phase = Instant::now();
         let (bytes, before, mode) = match fingerprint(&real) {
@@ -741,17 +865,22 @@ fn process(
         report.already_managed = already_managed;
         report.findings = findings;
         report.phases_ms = phases.clone();
-        let changes: Vec<(Location, String)> = report
+        let changes: Vec<Location> = report
             .findings
             .iter()
             .filter(|finding| finding.state == "would_repair")
-            .map(|finding| (finding.location.clone(), finding.entry.clone()))
+            .map(|finding| finding.location.clone())
             .collect();
         if !options.apply || changes.is_empty() {
             return report;
         }
         let phase = Instant::now();
-        let new_text = match rewrite(target.kind, &text, &changes) {
+        let new_text = match rewrite(
+            target.kind,
+            &text,
+            &changes,
+            &options.aethyme.to_string_lossy(),
+        ) {
             Ok(new_text) => new_text,
             Err(detail) => {
                 report.state = "parse_error";
@@ -761,7 +890,7 @@ fn process(
         };
         // The result must parse and every changed entry must now be a connect.
         let verified = servers_of(target.kind, &new_text).is_ok_and(|after| {
-            changes.iter().all(|(location, _)| {
+            changes.iter().all(|location| {
                 after.iter().any(|server| {
                     server.location.server == location.server
                         && server.location.project == location.project
@@ -820,6 +949,18 @@ fn process(
     report
 }
 
+/// Wait 20 to 80 ms (jittered) before attempt `attempt`, so a retry does not
+/// land in step with the application that rewrote the file.
+fn backoff(attempt: usize) {
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::from(elapsed.subsec_nanos()) % 60)
+        .unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(
+        20 * u64::try_from(attempt - 1).unwrap_or(1) + jitter,
+    ));
+}
+
 /// Write `bytes` beside `real` and rename it over `real` when the file is
 /// still as `before` describes. `Ok(false)`: it changed; nothing written.
 fn swap(
@@ -832,8 +973,9 @@ fn swap(
     let directory = real
         .parent()
         .ok_or_else(|| std::io::Error::other("the configuration has no parent directory"))?;
+    // Created 0600; removed when dropped on every path that does not persist.
     let mut temporary = tempfile::Builder::new()
-        .prefix(".aethyme-repair-")
+        .prefix(TEMPORARY_PREFIX)
         .tempfile_in(directory)?;
     temporary.write_all(bytes)?;
     temporary.as_file().sync_all()?;
@@ -981,22 +1123,27 @@ pub fn host_match_set(host_file: Option<PathBuf>) -> MatchSet {
     ))
 }
 
-/// The session-start hook's repair: `--apply --auto` within
-/// [`SESSION_START_BUDGET`], only when the owner turned
-/// `mcp.repair_on_session_start` on. `None` on a no-op (the hook stays
-/// silent); one line when something was repaired.
-pub fn session_start_notice(cwd: &Path) -> Option<String> {
+/// The session-start hook's repair: `--apply --auto` on the user-level
+/// Codex TOML configuration only, within [`SESSION_START_BUDGET`] (the
+/// managed list, the target and every file start inside it), and only when
+/// the owner turned `mcp.repair_on_session_start` on. The JSON files are
+/// left to an explicit `repair --apply`: their applications rewrite them
+/// from memory. `None` on a no-op (the hook stays silent); one line when
+/// something was repaired.
+pub fn session_start_notice() -> Option<String> {
     let started = Instant::now();
+    let deadline = started + SESSION_START_BUDGET;
     let host = super::host_directory()?;
     if !repair_on_session_start(&host).unwrap_or(false) {
         return None;
     }
     let set = host_match_set(Some(host.join("services.toml")));
-    if set.is_empty() {
+    if set.is_empty() || Instant::now() + WORST_CASE_PER_FILE > deadline {
         return None;
     }
-    let locations = Locations::discover(Some(cwd), None, None);
-    let targets = locations.targets(None);
+    // No repository discovery and no Git: only the TOML file is a target.
+    let locations = Locations::discover(None, None, None);
+    let targets = locations.targets(Some("codex"));
     let report = run(
         &set,
         &targets,
@@ -1004,8 +1151,9 @@ pub fn session_start_notice(cwd: &Path) -> Option<String> {
         &Options {
             apply: true,
             auto: true,
-            deadline: Some(started + SESSION_START_BUDGET),
+            deadline: Some(deadline),
             backup_dir: host.join(BACKUP_DIRECTORY),
+            aethyme: super::intercept::aethyme_target().ok()?,
         },
     );
     record(&host, &report, elapsed_ms(started));

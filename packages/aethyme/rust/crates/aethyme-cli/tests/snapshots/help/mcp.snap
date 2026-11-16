@@ -52,31 +52,43 @@ Usage:
       it for a while. A client that cannot share starts a private server.
 
 Managed servers (host file only: managed = true, match_packages,
-match_executables, repair = auto|report):
+match_executables, repair = auto|report, args = caller|pinned):
   aethyme mcp manage list [--json]
   aethyme mcp manage add <name> --package <pkg> [--package ...]
-                         [--executable <name> ...] [--repair auto|report] [--json]
+                         [--executable <name> ...] [--repair auto|report]
+                         [--args caller|pinned] [--json]
   aethyme mcp manage remove <name> [--json]
       List, mark or unmark managed entries in <host state>/mcp/services.toml
       (edited in place, formatting kept). A new entry starts as
       `npx -y <first package>`. Refreshes the shims when interception is on.
+      args = caller (default): the caller's arguments follow the entry's
+      argv and are part of the key; pinned: entry arguments only, and a
+      caller with other arguments is left alone.
+  aethyme mcp connect <name> --caller-args <n> [--caller-package <spec>]
+                      --fallback -- <command...>
+      The form interception and repair write: the last <n> words of the
+      fallback command are the caller's arguments (without --fallback, the
+      <n> words after `--`); --caller-package replaces the entry's package
+      spec with the caller's pinned version.
   aethyme mcp intercept install [--dir <path>] [--json]
   aethyme mcp intercept uninstall [--json]
   aethyme mcp intercept status [--json]
       Shims named after npx, npm, pnpm, pnpx, bunx, yarn and each managed
-      executable, pointing at aethyme: a matching call becomes `aethyme mcp
-      connect <name> --fallback -- <real launcher> <args>`, anything else
-      runs the real tool untouched. Prints the PATH line to add for agent
-      hosts; never edits a shell profile.
+      executable, pointing at aethyme: a matching call from an agent host
+      becomes `aethyme mcp connect <name> --caller-args <n> --fallback --
+      <real launcher> <args>`; anything else (and --help, -h, --version, a
+      terminal on stdin) runs the real tool untouched. Prints the PATH line
+      to add for agent hosts; never edits a shell profile.
   aethyme mcp repair [--check|--apply] [--auto] [--agent codex|claude]
                      [--codex-config <path>] [--claude-config <path>] [--json]
       Find agent configuration entries (Codex config.toml, ~/.claude.json,
       a repository's .mcp.json) that start a managed server without
-      connect; --apply rewrites only those (backup, compare-and-swap,
-      formatting kept); --auto only entries with repair = "auto". A
+      connect, or whose aethyme path is gone; --apply rewrites only those
+      to the absolute aethyme (backup, compare-and-swap, formatting kept).
+      --auto: only repair = "auto" entries, only the Codex TOML file. A
       tracked .mcp.json is only reported. Prints names, never values.
   aethyme mcp bypass [--json]
-      Running processes that match a managed entry but did not start
-      through connect, counted per entry (1 s budget; inconclusive when the
+      Running processes that match a managed entry, counted per entry as
+      via_connect, fallback or bypass (1 s budget; inconclusive when the
       process table cannot be read).
 --- stderr

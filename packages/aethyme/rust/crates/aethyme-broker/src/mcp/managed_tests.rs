@@ -9,11 +9,15 @@ use std::path::{Path, PathBuf};
 
 use super::checkouts::{Checkout, Checkouts};
 use super::config::{Scope, parse_and_validate};
-use super::intercept::{self, Decision, decide, find_real_tool, parse_match_file, strip_path};
+use super::intercept::{
+    self, Decision, ShimInput, decide, find_real_tool, parse_match_file, strip_path,
+};
 use super::json_span;
-use super::managed::{MatchEntry, MatchSet, RepairMode, simple_command};
+use super::managed::{
+    ArgsMode, MatchEntry, MatchSet, RepairMode, Route, apply_caller, simple_command,
+};
 use super::repair::{self, Locations, Options, Target, TargetKind};
-use super::{bypass, telemetry};
+use super::{bypass, caller, telemetry};
 
 const SECRET: &str = "sk-test-SECRET-value-0123";
 
@@ -56,12 +60,18 @@ fn devtools_set() -> MatchSet {
                 packages: strings(&["example-devtools-mcp", "@example/devtools-mcp"]),
                 executables: strings(&["example-devtools-mcp"]),
                 repair: RepairMode::Auto,
+                args: ArgsMode::Caller,
+                version: None,
+                base_args: Vec::new(),
             },
             MatchEntry {
                 name: "example-reported".into(),
                 packages: strings(&["example-reported-mcp"]),
                 executables: Vec::new(),
                 repair: RepairMode::Report,
+                args: ArgsMode::Caller,
+                version: None,
+                base_args: Vec::new(),
             },
         ],
     }
@@ -75,7 +85,11 @@ fn the_matcher_recognises_every_launcher_shape() {
         &["npx", "example-devtools-mcp"],
         &["/usr/local/bin/npx", "--yes", "@example/devtools-mcp@2.1.0"],
         &["npx", "-p", "example-devtools-mcp", "example-devtools-mcp"],
-        &["npx", "--package=example-devtools-mcp", "run-it"],
+        &[
+            "npx",
+            "--package=example-devtools-mcp",
+            "example-devtools-mcp",
+        ],
         &["npm", "exec", "example-devtools-mcp", "--", "--x"],
         &["npm", "x", "-y", "example-devtools-mcp"],
         &["pnpm", "exec", "example-devtools-mcp", "--stdio"],
@@ -163,6 +177,26 @@ fn the_matcher_never_guesses_or_matches_connect() {
         &["bash", "-c", "npx example-devtools-mcp", "extra"],
         &["env", "-S", "npx example-devtools-mcp"],
         &["node", "server.js", "example-devtools-mcp"],
+        // A named binary is matched by name only.
+        &["npx", "--package=example-devtools-mcp", "run-it"],
+        &[
+            "npx",
+            "-p",
+            "example-devtools-mcp",
+            "-p",
+            "typescript",
+            "tsc",
+        ],
+        &[
+            "npx",
+            "-p",
+            "example-devtools-mcp",
+            "-p",
+            "x",
+            "example-devtools-mcp",
+        ],
+        &["npx", "-p", "@example/devtools-mcp", "devtools-mcp"],
+        &["pnpm", "exec", "devtools-mcp"],
         &[],
     ];
     for argv in not_matching {
@@ -245,7 +279,10 @@ fn only_the_host_file_can_mark_an_entry_managed() {
 
 #[test]
 fn the_match_file_round_trips_and_corruption_is_detected() {
-    let set = devtools_set();
+    let mut set = devtools_set();
+    set.entries[0].args = ArgsMode::Pinned;
+    set.entries[0].version = Some("1.2.3".into());
+    set.entries[0].base_args = strings(&["--a b", "x"]);
     let text = intercept::render_match_file(&set, Path::new("/state/mcp/shims dir")).unwrap();
     let parsed = parse_match_file(text.as_bytes()).unwrap();
     assert_eq!(parsed.set, set);
@@ -264,6 +301,10 @@ fn the_match_file_round_trips_and_corruption_is_detected() {
     );
     assert!(parse_match_file(format!("{text}package x\n").as_bytes()).is_err());
     assert!(parse_match_file(&[0xff, 0xfe]).is_err());
+    // A match file from the first release (no args, version or base_args).
+    let old = "aethyme-mcp-intercept 1\nshim_dir /s\nentry e auto\npackage p\nend\n";
+    let parsed = parse_match_file(old.as_bytes()).unwrap();
+    assert_eq!(parsed.set.entries[0].args, ArgsMode::Caller);
 }
 
 /// A shim directory with `npx` pointing at a stand-in for the aethyme
@@ -285,6 +326,36 @@ fn path_of<P: AsRef<Path>>(dirs: &[P]) -> OsString {
     std::env::join_paths(owned).unwrap()
 }
 
+fn os_args(words: &[&str]) -> Vec<OsString> {
+    words.iter().map(OsString::from).collect()
+}
+
+fn shim_decision(
+    file: Option<&intercept::MatchFile>,
+    words: &[&str],
+    guard: bool,
+    interactive: bool,
+    path: &OsString,
+    self_bin: &Path,
+) -> Decision {
+    decide(&ShimInput {
+        name: "npx",
+        args: &os_args(words),
+        file,
+        guard,
+        interactive,
+        path_env: Some(path.as_os_str()),
+        self_exe: Some(self_bin),
+    })
+}
+
+fn pass(real: &Path) -> Decision {
+    Decision::PassThrough {
+        real: real.join("npx"),
+        note: None,
+    }
+}
+
 #[test]
 fn a_shim_passes_through_hands_off_and_honours_the_guard() {
     let (_dir, _root, self_bin, shims, real) = shim_fixture();
@@ -293,58 +364,71 @@ fn a_shim_passes_through_hands_off_and_honours_the_guard() {
         shim_dir: Some(shims.clone()),
     };
     let path = path_of(&[&shims, &real]);
-    let args = |words: &[&str]| -> Vec<OsString> { words.iter().map(OsString::from).collect() };
-    let pass = decide(
-        "npx",
-        &args(&["-y", "other-mcp"]),
-        Some(&file),
-        false,
-        Some(path.as_os_str()),
-        Some(self_bin.as_path()),
-    );
-    assert_eq!(pass, Decision::PassThrough(real.join("npx")));
-    let handoff = decide(
-        "npx",
-        &args(&["-y", "example-devtools-mcp@latest", "--flag"]),
-        Some(&file),
-        false,
-        Some(path.as_os_str()),
-        Some(self_bin.as_path()),
-    );
+    let decision = |words: &[&str], guard: bool, interactive: bool| {
+        shim_decision(Some(&file), words, guard, interactive, &path, &self_bin)
+    };
+    assert_eq!(decision(&["-y", "other-mcp"], false, false), pass(&real));
+    // The caller's arguments travel: the last one is the caller's.
     assert_eq!(
-        handoff,
+        decision(
+            &["-y", "example-devtools-mcp@latest", "--flag"],
+            false,
+            false
+        ),
         Decision::HandOff {
             entry: "example-devtools".into(),
             fallback: Some(real.join("npx")),
+            caller_args: 1,
+            caller_package: None,
         }
     );
-    let guarded = decide(
-        "npx",
-        &args(&["-y", "example-devtools-mcp"]),
-        Some(&file),
-        true,
-        Some(path.as_os_str()),
-        Some(self_bin.as_path()),
+    // A caller pinning a version the entry does not: keyed separately.
+    assert_eq!(
+        decision(&["example-devtools-mcp@1.2.3"], false, false),
+        Decision::HandOff {
+            entry: "example-devtools".into(),
+            fallback: Some(real.join("npx")),
+            caller_args: 0,
+            caller_package: Some("example-devtools-mcp@1.2.3".into()),
+        }
     );
-    assert_eq!(guarded, Decision::PassThrough(real.join("npx")));
-    let no_file = decide(
-        "npx",
-        &args(&["-y", "example-devtools-mcp"]),
-        None,
-        false,
-        Some(path.as_os_str()),
-        Some(self_bin.as_path()),
+    // The guard, a person at a terminal, and --help/--version: untouched.
+    assert_eq!(
+        decision(&["-y", "example-devtools-mcp"], true, false),
+        pass(&real)
     );
-    assert_eq!(no_file, Decision::PassThrough(real.join("npx")));
-    let missing = decide(
-        "npx",
-        &args(&["-y", "other"]),
-        Some(&file),
-        false,
-        Some(path_of(&[&shims]).as_os_str()),
-        Some(self_bin.as_path()),
+    assert_eq!(
+        decision(&["-y", "example-devtools-mcp"], false, true),
+        pass(&real)
     );
-    assert_eq!(missing, Decision::NotFound);
+    for help in ["--help", "-h", "--version"] {
+        assert_eq!(
+            decision(&["-y", "example-devtools-mcp", help], false, false),
+            pass(&real)
+        );
+    }
+    assert_eq!(
+        shim_decision(
+            None,
+            &["-y", "example-devtools-mcp"],
+            false,
+            false,
+            &path,
+            &self_bin
+        ),
+        pass(&real)
+    );
+    assert_eq!(
+        shim_decision(
+            Some(&file),
+            &["-y", "other"],
+            false,
+            false,
+            &path_of(&[&shims]),
+            &self_bin
+        ),
+        Decision::NotFound
+    );
     assert!(intercept::guard_active(
         Some(std::ffi::OsStr::new("1")),
         None
@@ -357,6 +441,148 @@ fn a_shim_passes_through_hands_off_and_honours_the_guard() {
         None,
         Some(std::ffi::OsStr::new("1"))
     ));
+}
+
+#[test]
+fn pinned_entries_and_pinned_versions_leave_other_callers_alone() {
+    let (_dir, _root, self_bin, shims, real) = shim_fixture();
+    let mut set = devtools_set();
+    set.entries[0].args = ArgsMode::Pinned;
+    set.entries[0].base_args = strings(&["--headless"]);
+    let file = intercept::MatchFile {
+        set: set.clone(),
+        shim_dir: Some(shims.clone()),
+    };
+    let path = path_of(&[&shims, &real]);
+    let same = shim_decision(
+        Some(&file),
+        &["-y", "example-devtools-mcp", "--headless"],
+        false,
+        false,
+        &path,
+        &self_bin,
+    );
+    assert_eq!(
+        same,
+        Decision::HandOff {
+            entry: "example-devtools".into(),
+            fallback: Some(real.join("npx")),
+            caller_args: 0,
+            caller_package: None,
+        }
+    );
+    match shim_decision(
+        Some(&file),
+        &["-y", "example-devtools-mcp", "--port", "9"],
+        false,
+        false,
+        &path,
+        &self_bin,
+    ) {
+        Decision::PassThrough {
+            note: Some(note), ..
+        } => assert!(note.contains("arguments_differ"), "{note}"),
+        other => panic!("{other:?}"),
+    }
+    set.entries[0].args = ArgsMode::Caller;
+    set.entries[0].version = Some("2.0.0".into());
+    let found = set
+        .managed_match(&strings(&["npx", "example-devtools-mcp@1.0.0"]))
+        .unwrap();
+    assert_eq!(set.route(&found), Route::Decline("version_differs"));
+    let found = set
+        .managed_match(&strings(&["npx", "example-devtools-mcp@2.0.0", "--x"]))
+        .unwrap();
+    assert_eq!(
+        set.route(&found),
+        Route::Connect {
+            caller_args: strings(&["--x"]),
+            caller_package: None,
+        }
+    );
+}
+
+#[test]
+fn caller_arguments_join_the_entry_argv_and_connect_reads_them() {
+    assert_eq!(
+        apply_caller(
+            &strings(&["npx", "-y", "example-devtools-mcp"]),
+            &strings(&["--a", "b"]),
+            None
+        )
+        .unwrap(),
+        strings(&["npx", "-y", "example-devtools-mcp", "--a", "b"])
+    );
+    assert_eq!(
+        apply_caller(
+            &strings(&["npm", "exec", "example-devtools-mcp"]),
+            &strings(&["--a"]),
+            Some("example-devtools-mcp@1.2.3")
+        )
+        .unwrap(),
+        strings(&["npm", "exec", "example-devtools-mcp@1.2.3", "--", "--a"])
+    );
+    assert!(apply_caller(&strings(&["/opt/server"]), &[], Some("x@1")).is_err());
+    assert_eq!(
+        MatchEntry::argv_facts(&strings(&[
+            "npx",
+            "-y",
+            "example-devtools-mcp@2.0.0",
+            "--headless"
+        ])),
+        (Some("2.0.0".to_string()), strings(&["--headless"]))
+    );
+    assert_eq!(
+        MatchEntry::argv_facts(&strings(&["npx", "example-devtools-mcp@latest"])),
+        (None, Vec::new())
+    );
+
+    let parsed = caller::scan(&strings(&[
+        "example-devtools",
+        "--caller-args",
+        "2",
+        "--caller-package",
+        "example-devtools-mcp@1.2.3",
+        "--fallback",
+        "--",
+        "/usr/bin/npx",
+        "example-devtools-mcp@1.2.3",
+        "--a",
+        "b",
+    ]))
+    .unwrap()
+    .unwrap();
+    assert_eq!(parsed.args, strings(&["--a", "b"]));
+    assert_eq!(
+        parsed.package.as_deref(),
+        Some("example-devtools-mcp@1.2.3")
+    );
+    let bare = caller::scan(&strings(&["x", "--caller-args", "1", "--", "--z"]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(bare.args, strings(&["--z"]));
+    assert!(caller::scan(&strings(&["x", "--caller-args", "2", "--", "--z"])).is_err());
+    assert!(
+        caller::scan(&strings(&[
+            "x",
+            "--caller-args",
+            "1",
+            "--fallback",
+            "--",
+            "npx"
+        ]))
+        .is_err()
+    );
+    assert_eq!(
+        caller::scan(&strings(&["x", "--fallback", "--", "npx"])).unwrap(),
+        None
+    );
+    // connect accepts both forms and the old ones.
+    assert!(
+        super::connect::parse_args(&strings(&["x", "--caller-args", "1", "--", "--z"])).is_ok()
+    );
+    assert!(super::connect::parse_args(&strings(&["x", "--fallback", "--", "npx"])).is_ok());
+    assert!(super::connect::parse_args(&strings(&["x", "--", "npx"])).is_err());
 }
 
 #[test]
@@ -375,7 +601,6 @@ fn the_real_tool_is_found_past_every_spelling_of_the_shim_directory() {
         ),
         Some(real.join("npx"))
     );
-    // Even without the shim directory: anything resolving to this binary.
     assert_eq!(
         find_real_tool(
             "npx",
@@ -385,8 +610,31 @@ fn the_real_tool_is_found_past_every_spelling_of_the_shim_directory() {
         ),
         Some(real.join("npx"))
     );
+    // A stale shim directory of another build (a file named aethyme*) is
+    // skipped too, even when this binary is unknown.
+    let other = root.join("old/aethyme-0.8.0");
+    write_executable(&other, "#!/bin/sh\n");
+    let stale = root.join("stale-shims");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::os::unix::fs::symlink(&other, stale.join("npx")).unwrap();
+    let path_with_stale = path_of(&[&stale, &shims, &real]);
     assert_eq!(
-        find_real_tool("npx", Some(path.as_os_str()), None, None),
+        find_real_tool("npx", Some(path_with_stale.as_os_str()), None, None),
+        Some(real.join("npx"))
+    );
+    // Empty and relative entries are never searched.
+    let relative = OsString::from(format!(":rel:{}", real.display()));
+    assert_eq!(
+        find_real_tool(
+            "npx",
+            Some(relative.as_os_str()),
+            Some(self_bin.as_path()),
+            None
+        ),
+        Some(real.join("npx"))
+    );
+    assert_eq!(
+        find_real_tool("npx", Some(OsString::from("").as_os_str()), None, None),
         None
     );
     let stripped = strip_path(Some(path.as_os_str()), Some(shims.as_path())).unwrap();
@@ -518,6 +766,7 @@ fn claude_json() -> String {
 struct RepairFixture {
     _dir: tempfile::TempDir,
     root: PathBuf,
+    aethyme: PathBuf,
     codex: PathBuf,
     claude: PathBuf,
     backups: PathBuf,
@@ -531,7 +780,10 @@ impl RepairFixture {
         write(&codex, CODEX);
         write(&claude, &claude_json());
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let aethyme = root.join("bin/aethyme");
+        write_executable(&aethyme, "#!/bin/sh\n");
         Self {
+            aethyme,
             backups: root.join("state/mcp/repair-backups"),
             _dir: dir,
             root,
@@ -555,6 +807,7 @@ impl RepairFixture {
             auto,
             deadline: None,
             backup_dir: self.backups.clone(),
+            aethyme: self.aethyme.clone(),
         }
     }
 
@@ -630,7 +883,10 @@ fn apply_rewrites_only_managed_entries_and_keeps_everything_else() {
     assert!(codex.ends_with(env_onwards), "{codex}");
     let parsed: toml::Table = toml::from_str(&codex).unwrap();
     let devtools = &parsed["mcp_servers"]["devtools"];
-    assert_eq!(devtools["command"].as_str(), Some("aethyme"));
+    assert_eq!(
+        devtools["command"].as_str(),
+        Some(fixture.aethyme.to_str().unwrap())
+    );
     let args: Vec<&str> = devtools["args"]
         .as_array()
         .unwrap()
@@ -643,6 +899,8 @@ fn apply_rewrites_only_managed_entries_and_keeps_everything_else() {
             "mcp",
             "connect",
             "example-devtools",
+            "--caller-args",
+            "1",
             "--fallback",
             "--",
             "npx",
@@ -671,7 +929,8 @@ fn apply_rewrites_only_managed_entries_and_keeps_everything_else() {
         );
     }
     let value: serde_json::Value = serde_json::from_str(&claude).unwrap();
-    assert_eq!(value["mcpServers"]["devtools"]["command"], "aethyme");
+    let aethyme = fixture.aethyme.to_str().unwrap();
+    assert_eq!(value["mcpServers"]["devtools"]["command"], aethyme);
     assert_eq!(
         value["mcpServers"]["devtools"]["args"][2],
         "example-devtools"
@@ -679,7 +938,7 @@ fn apply_rewrites_only_managed_entries_and_keeps_everything_else() {
     assert_eq!(value["mcpServers"]["devtools"]["env"]["API_TOKEN"], SECRET);
     assert_eq!(value["mcpServers"]["remote"]["type"], "http");
     let local = &value["projects"]["/work/private-project"]["mcpServers"]["local-devtools"];
-    assert_eq!(local["command"], "aethyme");
+    assert_eq!(local["command"], aethyme);
     assert_eq!(local["args"][5], "/opt/tools/example-devtools-mcp");
     let mode = std::fs::metadata(&fixture.claude)
         .unwrap()
@@ -717,23 +976,42 @@ fn apply_rewrites_only_managed_entries_and_keeps_everything_else() {
 }
 
 #[test]
-fn auto_repairs_only_auto_entries() {
+fn auto_repairs_only_auto_entries_in_the_toml_file() {
     let fixture = RepairFixture::new();
+    write(
+        &fixture.codex,
+        &format!(
+            "{CODEX}\n[mcp_servers.reported]\ncommand = \"npx\"\nargs = [\"example-reported-mcp\"]\n"
+        ),
+    );
     let report = fixture.run(true, true);
-    let reported: Vec<_> = report
-        .files
-        .iter()
-        .flat_map(|file| &file.findings)
-        .filter(|finding| finding.server == "reported")
-        .collect();
-    assert_eq!(reported[0].state, "report_only");
-    assert_eq!(reported[0].reason, Some("repair_report"));
-    assert_eq!(report.repaired, 3);
-    let value: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&fixture.claude).unwrap()).unwrap();
+    let state_of = |server: &str, kind: TargetKind| {
+        report
+            .files
+            .iter()
+            .filter(|file| file.kind == kind)
+            .flat_map(|file| &file.findings)
+            .find(|finding| finding.server == server)
+            .map(|finding| (finding.state, finding.reason))
+            .unwrap()
+    };
     assert_eq!(
-        value["projects"]["/work/private-project"]["mcpServers"]["reported"]["command"],
-        "npx"
+        state_of("devtools", TargetKind::CodexToml),
+        ("repaired", None)
+    );
+    assert_eq!(
+        state_of("reported", TargetKind::CodexToml),
+        ("report_only", Some("repair_report"))
+    );
+    // The JSON user configuration is never written automatically.
+    assert_eq!(
+        state_of("devtools", TargetKind::ClaudeUser),
+        ("report_only", Some("explicit_apply_only"))
+    );
+    assert_eq!(report.repaired, 1);
+    assert_eq!(
+        std::fs::read_to_string(&fixture.claude).unwrap(),
+        claude_json()
     );
 }
 
@@ -863,7 +1141,7 @@ fn unparsable_symlinked_and_tracked_files_are_not_written() {
     assert!(
         std::fs::read_to_string(&inside)
             .unwrap()
-            .contains("\"aethyme\"")
+            .contains(fixture.aethyme.to_str().unwrap())
     );
 
     // A tracked repository .mcp.json is only reported.
@@ -921,8 +1199,11 @@ fn a_single_line_server_object_gains_args_on_its_line() {
     fixture.run(true, false);
     assert_eq!(
         std::fs::read_to_string(&fixture.claude).unwrap(),
-        "{\"mcpServers\": {\"d\": {\"command\": \"aethyme\", \"args\": [\"mcp\", \"connect\", \
-         \"example-devtools\", \"--fallback\", \"--\", \"example-devtools-mcp\"], \"env\": {}}}}"
+        format!(
+            "{{\"mcpServers\": {{\"d\": {{\"command\": \"{}\", \"args\": [\"mcp\", \"connect\", \
+             \"example-devtools\", \"--fallback\", \"--\", \"example-devtools-mcp\"], \"env\": {{}}}}}}}}",
+            fixture.aethyme.display()
+        )
     );
 }
 
@@ -943,35 +1224,184 @@ fn the_session_start_switch_is_off_unless_set() {
 }
 
 #[test]
-fn bypass_counts_launchers_but_not_connect_started_servers() {
-    let rows = bypass::parse_ps(
-        "  10 npm exec example-devtools-mcp@latest\n\
-         11 node /x/npm/bin/npx-cli.js -y example-devtools-mcp\n\
-         12 /opt/node /srv/devtools/index.js --stdio\n\
-         13 aethyme mcp connect example-devtools --fallback -- npx example-devtools-mcp\n\
-         14 npx -y example-devtools-mcp\n\
-         15 unrelated --thing\n",
-    );
-    assert_eq!(rows.len(), 6);
-    let mut remembered = std::collections::BTreeMap::new();
-    remembered.insert(
-        "example-devtools".to_string(),
-        "/opt/node /srv/devtools/index.js --stdio".to_string(),
-    );
-    let counts = bypass::count(&devtools_set(), &rows, &remembered, 14);
+fn bypass_separates_connect_fallback_and_bypass() {
+    let process =
+        |pid: i64, ppid: i64, argv: &[&str], marker: Option<bypass::Marker>| bypass::Process {
+            pid,
+            ppid,
+            argv: strings(argv),
+            marker,
+        };
+    let processes = vec![
+        process(1, 1, &["init"], None),
+        // A launcher started by an agent host: bypass.
+        process(10, 1, &["npm", "exec", "example-devtools-mcp@latest"], None),
+        process(
+            11,
+            1,
+            &[
+                "node",
+                "/x/npm/bin/npx-cli.js",
+                "-y",
+                "example-devtools-mcp",
+            ],
+            None,
+        ),
+        // A fallback connect ran.
+        process(
+            12,
+            1,
+            &["npx", "-y", "example-devtools-mcp"],
+            Some(bypass::Marker::Fallback),
+        ),
+        // A server connect started, and a child of it.
+        process(
+            13,
+            1,
+            &["/opt/tools/example-devtools-mcp"],
+            Some(bypass::Marker::Connect),
+        ),
+        process(
+            14,
+            13,
+            &["/opt/tools/example-devtools-mcp", "--child"],
+            None,
+        ),
+        // An upstream of the shared hub (no marker: the hub clears the env).
+        process(
+            20,
+            1,
+            &["/usr/bin/aethyme", "mcp", "hub", "serve", "/s"],
+            None,
+        ),
+        process(
+            21,
+            20,
+            &["/opt/tools/example-devtools-mcp", "--stdio"],
+            None,
+        ),
+        // A path with a space survives because argv is not split.
+        process(22, 1, &["/opt/my tools/example-devtools-mcp"], None),
+        // This process.
+        process(30, 1, &["npx", "example-devtools-mcp"], None),
+        process(31, 1, &["unrelated", "--thing"], None),
+    ];
+    let counts = bypass::count(&devtools_set(), &processes, &Default::default(), 30);
     let devtools = counts
         .iter()
         .find(|entry| entry.name == "example-devtools")
         .unwrap();
-    assert_eq!(devtools.processes, 2);
-    assert_eq!(devtools.matched["example-devtools-mcp"], 2);
-    assert_eq!(devtools.via_connect, 0);
-    let mut exact = remembered.clone();
-    exact.insert(
+    assert_eq!(devtools.processes, 3, "{devtools:?}");
+    assert_eq!(devtools.fallback, 1);
+    assert_eq!(devtools.via_connect, 3);
+    assert_eq!(devtools.matched["example-devtools-mcp"], 3);
+    let mut remembered = std::collections::BTreeMap::new();
+    remembered.insert(
         "example-devtools".to_string(),
         "npm exec example-devtools-mcp@latest".to_string(),
     );
-    let counts = bypass::count(&devtools_set(), &rows, &exact, 0);
-    assert_eq!(counts[0].via_connect, 1);
+    let counts = bypass::count(&devtools_set(), &processes, &remembered, 30);
+    assert_eq!(counts[0].via_connect, 4);
     assert_eq!(counts[0].processes, 2);
+    assert_eq!(
+        bypass::marker_in(b"A=1\0AETHYME_MCP_FALLBACK=x\0"),
+        Some(bypass::Marker::Fallback)
+    );
+    assert_eq!(
+        bypass::marker_in(b"AETHYME_MCP_FALLBACK=x\0AETHYME_MCP_CONNECT=y\0"),
+        Some(bypass::Marker::Connect)
+    );
+    assert_eq!(bypass::marker_in(b"AETHYME_MCP_CONNECTED=1\0"), None);
+    let rows = bypass::parse_ps("  10   1 npm exec example-devtools-mcp\n bad\n");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].ppid, 1);
+}
+
+#[test]
+fn a_moved_aethyme_is_flagged_and_repointed() {
+    let fixture = RepairFixture::new();
+    write(
+        &fixture.claude,
+        "{\n  \"mcpServers\": {\n    \"d\": {\n      \"command\": \"/gone/bin/aethyme\",\n      \
+         \"args\": [\"mcp\", \"connect\", \"example-devtools\"]\n    }\n  }\n}\n",
+    );
+    let checked = fixture.run(false, false);
+    let finding = checked
+        .files
+        .iter()
+        .flat_map(|file| &file.findings)
+        .find(|finding| finding.server == "d")
+        .unwrap();
+    assert_eq!(finding.reason, Some("stale_aethyme_path"));
+    assert_eq!(finding.state, "would_repair");
+    fixture.run(true, false);
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&fixture.claude).unwrap()).unwrap();
+    assert_eq!(
+        value["mcpServers"]["d"]["command"],
+        fixture.aethyme.to_str().unwrap()
+    );
+    assert_eq!(
+        value["mcpServers"]["d"]["args"],
+        serde_json::json!(["mcp", "connect", "example-devtools"])
+    );
+}
+
+#[test]
+fn crlf_files_keep_crlf_and_the_last_duplicate_key_is_edited() {
+    let fixture = RepairFixture::new();
+    let text = "{\r\n  \"mcpServers\": {\r\n    \"d\": {\"command\": \"other\"},\r\n    \"d\": {\r\n      \
+                \"command\": \"npx\",\r\n      \"args\": [\r\n        \"example-devtools-mcp\"\r\n      ]\r\n    \
+                }\r\n  }\r\n}\r\n";
+    write(&fixture.claude, text);
+    let report = fixture.run(true, false);
+    let claude = report
+        .files
+        .iter()
+        .find(|file| file.kind == TargetKind::ClaudeUser)
+        .unwrap();
+    assert_eq!(claude.findings.len(), 1, "{claude:?}");
+    assert_eq!(claude.state, "repaired");
+    let after = std::fs::read_to_string(&fixture.claude).unwrap();
+    assert!(after.starts_with("{\r\n  \"mcpServers\": {\r\n    \"d\": {\"command\": \"other\"},"));
+    assert!(!after.replace("\r\n", "").contains('\n'), "{after:?}");
+    let value: serde_json::Value = serde_json::from_str(&after).unwrap();
+    assert_eq!(value["mcpServers"]["d"]["args"][1], "connect");
+}
+
+#[test]
+fn symlinks_into_a_repository_are_refused_and_stale_temporaries_swept() {
+    let fixture = RepairFixture::new();
+    let repo = fixture.root.join("home/dotfiles");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    write(&repo.join("claude.json"), &claude_json());
+    std::fs::remove_file(&fixture.claude).unwrap();
+    std::os::unix::fs::symlink(repo.join("claude.json"), &fixture.claude).unwrap();
+    let report = fixture.run(true, false);
+    assert!(
+        report
+            .files
+            .iter()
+            .any(|file| file.state == "refused_symlink_into_repository")
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("claude.json")).unwrap(),
+        claude_json()
+    );
+
+    let directory = fixture.codex.parent().unwrap();
+    let stale = directory.join(".aethyme-repair-left");
+    let fresh = directory.join(".aethyme-repair-new");
+    write(&stale, "x");
+    write(&fresh, "x");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    std::fs::File::options()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    fixture.run(true, false);
+    assert!(!stale.exists());
+    assert!(fresh.exists());
 }
