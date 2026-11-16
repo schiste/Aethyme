@@ -1789,6 +1789,38 @@ impl HostResourceCoordinator {
         &self.path
     }
 
+    /// The state and generation of one lease, and whether its recorded
+    /// holder process is provably gone (`false` when no holder pid was
+    /// recorded or the pid answers), read without touching any other state;
+    /// `None` when no lease has that id.
+    pub(crate) fn lease_state(
+        &self,
+        lease_id: &str,
+    ) -> Result<Option<(HostLeaseState, u64, bool)>, HostResourceError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT state, generation, holder_pid FROM resource_leases WHERE lease_id = ?1",
+                [lease_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match row {
+            Some((state, generation, holder_pid)) => Ok(Some((
+                HostLeaseState::parse(&state)?,
+                generation as u64,
+                holder_pid.is_some_and(holder_process_is_gone),
+            ))),
+            None => Ok(None),
+        }
+    }
+
     /// Explicitly advance the managed-storage floor on this already-open host
     /// database. Ordinary coordinator opens preserve the shared schema-v1
     /// floor so older repository worktrees remain usable until every writer is

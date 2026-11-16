@@ -2543,3 +2543,17 @@ for minutes, so `status` and `agents` recorded `holder_process_table_failed`.
 A detached worker that finds another worker holding the repository's worker
 lock now exits successfully (`artifact_worker_already_active`), and takes the
 lock before the fresh Git probe rather than after it.
+
+### Sessions no dead owner keeps open; no-work sessions close after four hours
+
+Introduced 2026-11-16. Changes consumers may see:
+
+- `[retention] session_no_work_abandoned_after_hours` (default `4`, `0` disables, at most `8760`, never longer than `session_abandoned_after_hours`; `session_abandoned_after_hours = 0` disables it too). It appears in the retention policy of `gc plan --json`. A spawned session (adopted ones keep the full window) whose HEAD is symbolically its own branch, whose branch is still its `diff_base`, whose checkout is clean, whose recorded holder is gone past the lease stale grace and which holds no explicit claim, unresolved operation, preparation in progress, merge-queue entry or unmerged pull request closes after that window. Its `session.abandoned` payload carries `close_reason` `inactive_no_work`.
+- Schema v63 (compatible, floor stays 60): nullable `guarded_exec_receipts.boot_id`, the boot identifier (`kern.bootsessionuuid` on macOS, `/proc/sys/kernel/random/boot_id` on Linux) of the boot a receipt was written in. A `starting`/`running` receipt is dead when its boot id differs from the current one; a receipt without one (an older writer's) only when its last write predates the boot time by 10 minutes. Dead receipts stop counting as unresolved; they are settled only once their session closes.
+- New event kind `guarded_exec.receipt_abandoned` (payload `receipt_id`, `previous_phase`, `receipt_updated_at_ms`, `receipt_boot_id`, `boot_id`, `boot_time_ms`, `reason` = `boot_id_changed` or `written_before_boot`). The receipt it names moves to phase `completed` with `command_outcome`, `ownership_audit` and `process_group_cleanup` all `unknown`, a combination no live command writes. If its command still reports an outcome, the row is kept and a `guarded_exec.receipt_late_outcome` event (`receipt_id`, `command_outcome`, `exit_code`, `process_group_cleanup`) records it.
+- `broker submit prepare status --json` may report `state` `interrupted`: the record still says in progress but its host lease, at the recorded generation, is released and the lease's recorded holder process is gone. It may be retried like `failed`.
+- A session created before holder recording shipped (before 2026-10-05) with no holder event of any kind stops holding explicit claims past the abandonment window when nothing is unresolved and no process uses its checkout; any other session without a holder record keeps them.
+- New abandonment keep reasons `holder_process_table_denied` and `no_work_*` (`adopted`, `session_commits`, `worktree_dirty`, `holder_unbound`, `holder_alive`, `holder_gone_recently`, `explicit_claim`, `merge_queue`, `pull_request_open`, `pull_request_unknown`).
+- New phase counters: `guarded_exec_receipts_abandoned_pre_boot`, `holder_grace_anchored_to_boot`, `legacy_unbound_claims_released`, `preparation_judged_interrupted`, `holder_process_table_native`, `holder_process_table_native_fallback`, `holder_process_table_native_denied`, `holder_process_table_denied`, `session_closed_no_work`, `session_no_work_kept_<reason>`.
+
+Covered by `schema.rs`, `retention.rs`, `session_auto_close.rs`, `store/guarded_exec.rs`, `preparation.rs`, `lease_liveness.rs` and `session_holder.rs` tests.

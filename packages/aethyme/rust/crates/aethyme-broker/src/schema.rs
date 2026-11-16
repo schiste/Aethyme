@@ -34,7 +34,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 62;
+pub const SCHEMA_VERSION: i64 = 63;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -111,6 +111,10 @@ pub const SCHEMA_VERSION: i64 = 62;
 ///   changes, so the floor stays v60.
 /// - v62: one index for per-session event lookups. Older binaries maintain it
 ///   on write without naming it, so the floor stays v60.
+/// - v63: a nullable `boot_id` on guarded-exec receipts. Older writers name
+///   their columns and leave it NULL; a NULL boot id falls back to the
+///   conservative timestamp rule, and older readers ignore the column, so the
+///   floor stays v60.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 60;
 
 /// Migration that introduced profile-bound gate-cache reads and writes.
@@ -2124,6 +2128,12 @@ const MIGRATION_V62: &str = "
 CREATE INDEX IF NOT EXISTS events_by_session_kind ON events (session_id, kind, id);
 ";
 
+/// The boot a guarded-exec receipt was written in. A receipt whose boot id
+/// differs from the current one has no live owner; NULL means unrecorded.
+const MIGRATION_V63: &str = "
+ALTER TABLE guarded_exec_receipts ADD COLUMN boot_id TEXT;
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -2187,6 +2197,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V60,
     MIGRATION_V61,
     MIGRATION_V62,
+    MIGRATION_V63,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
@@ -2195,6 +2206,7 @@ const MIGRATIONS: &[&str] = &[
 const COLUMN_ONLY_MIGRATIONS: &[(i64, &[(&str, &str)])] = &[
     (49, &[("coordinated_operations", "agent_provenance_json")]),
     (52, &[("gate_results", "execution_profile_hash")]),
+    (63, &[("guarded_exec_receipts", "boot_id")]),
 ];
 
 /// Migrations whose tables the repair pass re-creates, with `IF NOT EXISTS`,
@@ -4464,6 +4476,35 @@ mod tests {
                 .unwrap();
             assert!(plan.contains("events_by_session_kind"), "{query}: {plan}");
         }
+    }
+
+    #[test]
+    fn v63_adds_a_nullable_receipt_boot_id_and_keeps_the_floor() {
+        let conn = migrated_through(62);
+        set_meta(&conn, "min_compatible_schema", 60);
+        conn.execute_batch(
+            "INSERT INTO sessions (id, worktree_path, branch, origin, status,
+                 created_at, updated_at, last_activity_at)
+             VALUES (1, '/w', 'agent/w', 'adopted', 'active', 1, 1, 1);
+             INSERT INTO guarded_exec_receipts (receipt_id, session_id, phase,
+                 command_outcome, ownership_audit, process_group_cleanup,
+                 created_at_ms, updated_at_ms)
+             VALUES ('0123456789abcdef0123456789abcdef', 1, 'running',
+                 'unknown', 'not_run', 'unknown', 1, 1);",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 60);
+        assert!(schema_is_compatible_with(&conn, 63, 60).unwrap());
+        let boot_id: Option<String> = conn
+            .query_row("SELECT boot_id FROM guarded_exec_receipts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(boot_id, None, "an older writer's receipt keeps NULL");
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]
