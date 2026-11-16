@@ -90,6 +90,10 @@ pub const GUARD_UNTRACKED_ARTIFACT: &str = "guard.untracked_artifact";
 // gate.<status> kinds derive from GateStatus::as_str (pass/fail/cancelled/error).
 pub const GATE_CACHED: &str = "gate.cached";
 pub const GATE_CACHE_BYPASSED: &str = "gate.cache_bypassed";
+/// A cacheable gate was looked up and no verdict was reused. Together with
+/// `gate.cached` this makes the hit rate `hits / (hits + misses)`; bypassed
+/// runs never perform a lookup and are in neither term.
+pub const GATE_CACHE_MISSED: &str = "gate.cache_missed";
 /// A human approved a repository's gate/prepare policy with `broker trust`.
 pub const GATE_POLICY_TRUSTED: &str = "gate.policy_trusted";
 /// A repository with gate history was trusted with its current policy the
@@ -927,6 +931,33 @@ pub fn gate_cached_payload(
 
 pub fn gate_cache_bypassed_payload(gate: &str, tree: &str) -> String {
     json!({ "gate": gate, "tree": tree }).to_string()
+}
+
+/// Why a cacheable gate ran instead of reusing a verdict. A closed set: the
+/// payload carries the gate name and tree hash like its sibling events, and
+/// nothing that identifies a path, session, branch or task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateCacheMissReason {
+    /// The indexed lookup returned no reusable row. This covers both "no
+    /// verdict stored for this tree, definition and profile" and "a stored
+    /// verdict that is not reusable" (cleared, or a failure other than a test
+    /// failure); telling those apart would need a second query.
+    NoReusableVerdict,
+    /// The execution profile could not be fully captured, so no lookup ran.
+    ProfileIncomplete,
+}
+
+impl GateCacheMissReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoReusableVerdict => "no_reusable_verdict",
+            Self::ProfileIncomplete => "profile_incomplete",
+        }
+    }
+}
+
+pub fn gate_cache_missed_payload(gate: &str, tree: &str, reason: GateCacheMissReason) -> String {
+    json!({ "gate": gate, "tree": tree, "reason": reason.as_str() }).to_string()
 }
 
 pub fn gate_policy_trust_payload(policy_sha256: &str, source: &str) -> String {

@@ -178,6 +178,7 @@ fn assemble(store: &BrokerStore) -> InsightsInput {
             .map(Into::into)
             .collect(),
         gates_cached: 0,
+        gates_cache_misses: 0,
         gates_cached_saved_ms: 0,
         pull_requests,
         overlaps_warned: folded.overlaps_warned,
