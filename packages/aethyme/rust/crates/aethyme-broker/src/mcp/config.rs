@@ -81,6 +81,7 @@ struct RawEntry {
     #[serde(default)]
     match_executables: Vec<String>,
     repair: Option<super::managed::RepairMode>,
+    args: Option<super::managed::ArgsMode>,
 }
 
 /// Whether agents may share one server (`shared`, through the hub once it
@@ -595,6 +596,7 @@ fn validate_entry(
             match_packages: &raw.match_packages,
             match_executables: &raw.match_executables,
             repair: raw.repair,
+            args: raw.args,
         },
         scope,
     )

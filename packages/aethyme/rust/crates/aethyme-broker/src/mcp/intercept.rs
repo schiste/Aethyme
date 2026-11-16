@@ -36,7 +36,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use super::managed::{LAUNCHERS, MatchEntry, MatchSet, RepairMode};
+use super::managed::{ArgsMode, LAUNCHERS, MatchEntry, MatchSet, RepairMode, Route};
 use super::resolve::{is_executable_file, search_path};
 use super::telemetry::{self, Event};
 
@@ -52,6 +52,11 @@ pub const GUARD_ENV: &str = "AETHYME_MCP_SHIM_GUARD";
 pub const DEPTH_ENV: &str = "AETHYME_MCP_SHIM_DEPTH";
 /// A shim never hands off at this depth or deeper.
 pub const MAX_DEPTH: u32 = 2;
+
+/// Pass-throughs in one chain: a shim that would be the fifth gives up.
+pub const HOPS_ENV: &str = "AETHYME_MCP_SHIM_HOPS";
+/// The cap on [`HOPS_ENV`].
+pub const MAX_HOPS: u32 = 4;
 
 const MATCH_HEADER: &str = "aethyme-mcp-intercept 1";
 
@@ -74,7 +79,7 @@ impl MatchFile {
 }
 
 /// The match file's text. Line-based so the shim parses it without a TOML
-/// or JSON parser; `end` makes a truncated file detectably corrupt.
+/// parser; `end` makes a truncated file detectably corrupt.
 pub fn render_match_file(set: &MatchSet, shim_dir: &Path) -> Result<String, String> {
     let dir = shim_dir.to_str().ok_or("the shim directory is not UTF-8")?;
     if dir.contains('\n') || dir.contains('\r') {
@@ -82,7 +87,19 @@ pub fn render_match_file(set: &MatchSet, shim_dir: &Path) -> Result<String, Stri
     }
     let mut text = format!("{MATCH_HEADER}\nshim_dir {dir}\n");
     for entry in &set.entries {
-        text.push_str(&format!("entry {} {}\n", entry.name, entry.repair.as_str()));
+        text.push_str(&format!(
+            "entry {} {} {}\n",
+            entry.name,
+            entry.repair.as_str(),
+            entry.args.as_str()
+        ));
+        if let Some(version) = &entry.version {
+            text.push_str(&format!("version {version}\n"));
+        }
+        if !entry.base_args.is_empty() {
+            let encoded = serde_json::to_string(&entry.base_args).map_err(|e| e.to_string())?;
+            text.push_str(&format!("base_args {encoded}\n"));
+        }
         for package in &entry.packages {
             text.push_str(&format!("package {package}\n"));
         }
@@ -113,7 +130,12 @@ pub fn parse_match_file(bytes: &[u8]) -> Result<MatchFile, &'static str> {
         match key {
             "shim_dir" if !value.is_empty() => shim_dir = Some(PathBuf::from(value)),
             "entry" => {
-                let (name, repair) = value.split_once(' ').ok_or("match_file_entry")?;
+                let words: Vec<&str> = value.split(' ').collect();
+                let (name, repair, args) = match words.as_slice() {
+                    [name, repair] => (*name, *repair, "caller"),
+                    [name, repair, args] => (*name, *repair, *args),
+                    _ => return Err("match_file_entry"),
+                };
                 if !simple(name) {
                     return Err("match_file_entry");
                 }
@@ -122,7 +144,17 @@ pub fn parse_match_file(bytes: &[u8]) -> Result<MatchFile, &'static str> {
                     packages: Vec::new(),
                     executables: Vec::new(),
                     repair: RepairMode::parse(repair).ok_or("match_file_entry")?,
+                    args: ArgsMode::parse(args).ok_or("match_file_entry")?,
+                    version: None,
+                    base_args: Vec::new(),
                 });
+            }
+            "version" if simple(value) => {
+                set.entries.last_mut().ok_or("match_file_order")?.version = Some(value.to_string());
+            }
+            "base_args" => {
+                set.entries.last_mut().ok_or("match_file_order")?.base_args =
+                    serde_json::from_str(value).map_err(|_| "match_file_line")?;
             }
             "package" if simple(value) => set
                 .entries
@@ -174,6 +206,8 @@ pub fn shim_main() -> Option<u8> {
         return None;
     }
     let rest: Vec<OsString> = args.collect();
+    // SAFETY: isatty only inspects file descriptor 0.
+    let interactive = unsafe { libc::isatty(0) } == 1;
     Some(run_shim(&ShimCall {
         name,
         argv0,
@@ -188,12 +222,14 @@ pub fn shim_main() -> Option<u8> {
             std::env::var_os(GUARD_ENV).as_deref(),
             std::env::var_os(DEPTH_ENV).as_deref(),
         ),
-        depth: depth(std::env::var_os(DEPTH_ENV).as_deref()),
+        depth: count(std::env::var_os(DEPTH_ENV).as_deref()),
+        hops: count(std::env::var_os(HOPS_ENV).as_deref()),
+        interactive,
         started,
     }))
 }
 
-fn depth(value: Option<&OsStr>) -> u32 {
+fn count(value: Option<&OsStr>) -> u32 {
     value
         .and_then(OsStr::to_str)
         .and_then(|text| text.parse().ok())
@@ -202,7 +238,7 @@ fn depth(value: Option<&OsStr>) -> u32 {
 
 /// Whether a shim must pass through without matching.
 pub fn guard_active(guard: Option<&OsStr>, depth_value: Option<&OsStr>) -> bool {
-    guard.is_some() || depth(depth_value) >= MAX_DEPTH
+    guard.is_some() || count(depth_value) >= MAX_DEPTH
 }
 
 struct ShimCall {
@@ -215,48 +251,80 @@ struct ShimCall {
     self_exe: Option<PathBuf>,
     guard: bool,
     depth: u32,
+    hops: u32,
+    interactive: bool,
     started: Instant,
 }
 
 /// What a shim decided, without doing it (tests drive [`decide`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
-    /// Exec the real tool.
-    PassThrough(PathBuf),
+    /// Exec the real tool; with a one-line note on stderr first when a
+    /// managed call was deliberately not routed.
+    PassThrough { real: PathBuf, note: Option<String> },
     /// No real tool: exit 127.
     NotFound,
-    /// Hand off to `connect` for this entry, with this fallback launcher.
+    /// Hand off to `connect`: the last `caller_args` arguments are the
+    /// caller's, and `caller_package` replaces the entry's package spec.
     HandOff {
         entry: String,
         fallback: Option<PathBuf>,
+        caller_args: usize,
+        caller_package: Option<String>,
     },
 }
 
-/// Decide for one call: `matched` is the managed entry the argv starts.
-pub fn decide(
-    name: &str,
-    args: &[OsString],
-    file: Option<&MatchFile>,
-    guard: bool,
-    path_env: Option<&OsStr>,
-    self_exe: Option<&Path>,
-) -> Decision {
-    let shim_dir = file.and_then(|file| file.shim_dir.as_deref());
-    let real = find_real_tool(name, path_env, self_exe, shim_dir);
-    if !guard
-        && let Some(file) = file
-        && let Some(argv) = utf8_argv(name, args)
-        && let Some(found) = file.set.managed_match(&argv)
-        && self_exe.is_some()
-    {
-        return Decision::HandOff {
-            entry: found.name,
-            fallback: real,
-        };
-    }
-    match real {
-        Some(path) => Decision::PassThrough(path),
+/// What a shim sees of its call.
+pub struct ShimInput<'a> {
+    pub name: &'a str,
+    pub args: &'a [OsString],
+    pub file: Option<&'a MatchFile>,
+    pub guard: bool,
+    /// Standard input is a terminal: a person, not an agent host.
+    pub interactive: bool,
+    pub path_env: Option<&'a OsStr>,
+    pub self_exe: Option<&'a Path>,
+}
+
+/// Decide for one call.
+pub fn decide(input: &ShimInput<'_>) -> Decision {
+    let shim_dir = input.file.and_then(|file| file.shim_dir.as_deref());
+    let real = find_real_tool(input.name, input.path_env, input.self_exe, shim_dir);
+    let pass = |note: Option<String>| match &real {
+        Some(path) => Decision::PassThrough {
+            real: path.clone(),
+            note,
+        },
         None => Decision::NotFound,
+    };
+    if input.guard || input.interactive || input.self_exe.is_none() {
+        return pass(None);
+    }
+    let Some(file) = input.file else {
+        return pass(None);
+    };
+    let Some(argv) = utf8_argv(input.name, input.args) else {
+        return pass(None);
+    };
+    let Some(found) = file.set.managed_match(&argv) else {
+        return pass(None);
+    };
+    match file.set.route(&found) {
+        Route::Connect {
+            caller_args,
+            caller_package,
+        } if caller_args.len() <= input.args.len() => Decision::HandOff {
+            entry: found.name,
+            fallback: real.clone(),
+            caller_args: caller_args.len(),
+            caller_package,
+        },
+        Route::Connect { .. } | Route::Decline("interactive_arguments") => pass(None),
+        Route::Decline(reason) => pass(Some(format!(
+            "aethyme mcp: {}: not started through connect ({reason}; see the managed entry's \
+             `args` and version)",
+            found.name
+        ))),
     }
 }
 
@@ -269,6 +337,15 @@ fn utf8_argv(name: &str, args: &[OsString]) -> Option<Vec<String>> {
 }
 
 fn run_shim(call: &ShimCall) -> u8 {
+    if call.hops >= MAX_HOPS {
+        eprintln!(
+            "{}: aethyme launcher shims passed this call on {} times without reaching the real \
+             tool; check `aethyme mcp intercept status` (a stale shim directory on PATH?)",
+            call.name, call.hops
+        );
+        record(call, "intercept", "hop_limit", None);
+        return 127;
+    }
     let file = match &call.compiled {
         Some(Ok(file)) => Some(file),
         Some(Err(code)) => {
@@ -280,21 +357,33 @@ fn run_shim(call: &ShimCall) -> u8 {
         }
         None => None,
     };
-    let decision = decide(
-        &call.name,
-        &call.rest,
+    let decision = decide(&ShimInput {
+        name: &call.name,
+        args: &call.rest,
         file,
-        call.guard,
-        call.path_env.as_deref(),
-        call.self_exe.as_deref(),
-    );
+        guard: call.guard,
+        interactive: call.interactive,
+        path_env: call.path_env.as_deref(),
+        self_exe: call.self_exe.as_deref(),
+    });
     match decision {
-        Decision::PassThrough(real) => pass_through(&call.name, &call.argv0, &call.rest, &real),
+        Decision::PassThrough { real, note } => {
+            if let Some(note) = note {
+                eprintln!("{note}");
+                record(call, "intercept", "declined", None);
+            }
+            pass_through(call, &real)
+        }
         Decision::NotFound => {
             eprintln!("{}: command not found", call.name);
             127
         }
-        Decision::HandOff { entry, fallback } => {
+        Decision::HandOff {
+            entry,
+            fallback,
+            caller_args,
+            caller_package,
+        } => {
             let Some(self_exe) = &call.self_exe else {
                 return 127;
             };
@@ -302,11 +391,25 @@ fn run_shim(call: &ShimCall) -> u8 {
             command
                 .arg0("aethyme")
                 .args(["mcp", "connect", entry.as_str()]);
-            if let Some(real) = &fallback {
-                command
-                    .args(["--fallback", "--"])
-                    .arg(real)
-                    .args(&call.rest);
+            if caller_args > 0 {
+                command.arg("--caller-args").arg(caller_args.to_string());
+            }
+            if let Some(package) = &caller_package {
+                command.arg("--caller-package").arg(package);
+            }
+            match &fallback {
+                Some(real) => {
+                    command
+                        .args(["--fallback", "--"])
+                        .arg(real)
+                        .args(&call.rest);
+                }
+                None if caller_args > 0 => {
+                    command
+                        .arg("--")
+                        .args(&call.rest[call.rest.len() - caller_args..]);
+                }
+                None => {}
             }
             command
                 .env(GUARD_ENV, "1")
@@ -329,16 +432,24 @@ fn run_shim(call: &ShimCall) -> u8 {
             record(call, &entry, "handoff_failed", Some("exec_failed"));
             eprintln!("aethyme mcp: {entry}: could not hand off to connect: {error}");
             match fallback {
-                Some(real) => pass_through(&call.name, &call.argv0, &call.rest, &real),
+                Some(real) => pass_through(call, &real),
                 None => 127,
             }
         }
     }
 }
 
-fn pass_through(name: &str, argv0: &OsStr, rest: &[OsString], real: &Path) -> u8 {
-    let error = Command::new(real).arg0(argv0).args(rest).exec();
-    eprintln!("{name}: {error}");
+/// Exec the real tool. Arguments, environment (plus the hop counter),
+/// stdio and exit status are the real tool's. Rust starts every program
+/// with SIGPIPE ignored and `Command` restores the default disposition in
+/// the new image, so a parent's deliberately ignored SIGPIPE is not kept.
+fn pass_through(call: &ShimCall, real: &Path) -> u8 {
+    let error = Command::new(real)
+        .arg0(&call.argv0)
+        .args(&call.rest)
+        .env(HOPS_ENV, (call.hops + 1).to_string())
+        .exec();
+    eprintln!("{}: {error}", call.name);
     126
 }
 
@@ -377,10 +488,13 @@ fn canonical(path: &Path) -> Option<PathBuf> {
     path.canonicalize().ok()
 }
 
-/// The real tool for `name`: the first `PATH` entry holding an executable
-/// of that name that is not the shim directory (compared canonically, so a
-/// second spelling or a symlink to it is skipped too) and does not resolve
-/// to this binary. The returned path is the `PATH` spelling, absolute.
+/// The real tool for `name`: the first absolute `PATH` entry holding an
+/// executable of that name that is not the shim directory (compared
+/// canonically, so a second spelling or a symlink to it is skipped too)
+/// and does not resolve to this binary or to any file named `aethyme*` (a
+/// stale shim directory of another build). Empty and relative `PATH`
+/// entries are skipped, unlike a shell, which would search the current
+/// directory. The returned path is the `PATH` spelling.
 pub fn find_real_tool(
     name: &str,
     path_env: Option<&OsStr>,
@@ -389,10 +503,6 @@ pub fn find_real_tool(
 ) -> Option<PathBuf> {
     let path_env = path_env?;
     let shim_dir = shim_dir.and_then(canonical);
-    // Without knowing itself or its directory the shim could find itself.
-    if self_exe.is_none() && shim_dir.is_none() {
-        return None;
-    }
     for dir in std::env::split_paths(path_env) {
         if !dir.is_absolute() {
             continue;
@@ -407,7 +517,12 @@ pub fn find_real_tool(
         let Some(resolved) = canonical(&candidate) else {
             continue;
         };
-        if self_exe.is_some_and(|exe| exe == resolved) {
+        if self_exe.is_some_and(|exe| exe == resolved)
+            || resolved
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|file| file.starts_with("aethyme"))
+        {
             continue;
         }
         return Some(candidate);

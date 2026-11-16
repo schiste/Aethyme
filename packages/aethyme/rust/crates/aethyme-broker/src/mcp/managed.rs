@@ -70,6 +70,36 @@ impl RepairMode {
     }
 }
 
+/// Which arguments a managed server gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArgsMode {
+    /// The entry's argv (program resolution and base arguments) followed by
+    /// the caller's arguments; they are part of the sharing key.
+    #[default]
+    Caller,
+    /// The entry's argv only. A caller whose arguments differ is not routed
+    /// through `connect`.
+    Pinned,
+}
+
+impl ArgsMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ArgsMode::Caller => "caller",
+            ArgsMode::Pinned => "pinned",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "caller" => Some(ArgsMode::Caller),
+            "pinned" => Some(ArgsMode::Pinned),
+            _ => None,
+        }
+    }
+}
+
 /// A validated managed specification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ManagedSpec {
@@ -78,6 +108,7 @@ pub struct ManagedSpec {
     /// Program basenames.
     pub match_executables: Vec<String>,
     pub repair: RepairMode,
+    pub args: ArgsMode,
 }
 
 /// The managed fields of one raw entry, before validation.
@@ -86,6 +117,7 @@ pub struct RawSpec<'a> {
     pub match_packages: &'a [String],
     pub match_executables: &'a [String],
     pub repair: Option<RepairMode>,
+    pub args: Option<ArgsMode>,
 }
 
 /// `(field, code, message)` of a refused managed specification.
@@ -97,9 +129,9 @@ pub fn package_name(word: &str) -> Option<String> {
     parse_spec(word).map(|spec| spec.name)
 }
 
-/// The basename of a package's default binary (`@scope/name` -> `name`).
-fn package_bin(name: &str) -> &str {
-    name.rsplit('/').next().unwrap_or(name)
+/// The version a package spec asks for (`latest` included).
+pub fn package_version(word: &str) -> Option<String> {
+    parse_spec(word).and_then(|spec| spec.version)
 }
 
 fn valid_executable(name: &str) -> bool {
@@ -114,8 +146,10 @@ fn valid_executable(name: &str) -> bool {
 
 /// Validate the managed fields. `Ok(None)`: the entry is not managed.
 pub fn validate_spec(raw: &RawSpec<'_>, scope: Scope) -> Result<Option<ManagedSpec>, SpecError> {
-    let any_field =
-        !raw.match_packages.is_empty() || !raw.match_executables.is_empty() || raw.repair.is_some();
+    let any_field = !raw.match_packages.is_empty()
+        || !raw.match_executables.is_empty()
+        || raw.repair.is_some()
+        || raw.args.is_some();
     if scope == Scope::Repository && (raw.managed || any_field) {
         return Err((
             "managed",
@@ -131,8 +165,10 @@ pub fn validate_spec(raw: &RawSpec<'_>, scope: Scope) -> Result<Option<ManagedSp
                 "match_packages"
             } else if !raw.match_executables.is_empty() {
                 "match_executables"
-            } else {
+            } else if raw.repair.is_some() {
                 "repair"
+            } else {
+                "args"
             };
             return Err((
                 field,
@@ -192,6 +228,7 @@ pub fn validate_spec(raw: &RawSpec<'_>, scope: Scope) -> Result<Option<ManagedSp
         match_packages,
         match_executables,
         repair: raw.repair.unwrap_or_default(),
+        args: raw.args.unwrap_or_default(),
     }))
 }
 
@@ -202,6 +239,33 @@ pub struct MatchEntry {
     pub packages: Vec<String>,
     pub executables: Vec<String>,
     pub repair: RepairMode,
+    pub args: ArgsMode,
+    /// The package version the entry's argv pins (`latest` is no pin).
+    pub version: Option<String>,
+    /// The entry's own arguments after its package or program.
+    pub base_args: Vec<String>,
+}
+
+impl MatchEntry {
+    /// The pinned version and base arguments an entry argv declares.
+    pub fn argv_facts(argv: &[String]) -> (Option<String>, Vec<String>) {
+        match classify(argv, 0) {
+            Invocation::Launch {
+                packages,
+                bin: None,
+                rest,
+                ..
+            } => (
+                packages
+                    .first()
+                    .and_then(|spec| package_version(spec))
+                    .filter(|version| version != "latest"),
+                rest,
+            ),
+            Invocation::Launch { rest, .. } | Invocation::Direct { rest, .. } => (None, rest),
+            Invocation::Connect | Invocation::Unknown => (None, Vec::new()),
+        }
+    }
 }
 
 /// Every managed entry: what the matcher, the shims and repair read.
@@ -222,6 +286,30 @@ pub struct ManagedMatch {
     /// The launcher form, when one was recognised.
     pub launcher: Option<&'static str>,
     pub repair: RepairMode,
+    /// The caller's arguments after the package or program (never printed).
+    #[serde(skip)]
+    pub caller_args: Vec<String>,
+    /// The caller's package spec as written, when a package matched.
+    #[serde(skip)]
+    pub caller_spec: Option<String>,
+}
+
+/// Arguments that mean a person is asking the program something: such a
+/// call is never routed to a server.
+pub const INTERACTIVE_ARGUMENTS: &[&str] = &["--help", "-h", "--version"];
+
+/// What to do with a match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// Start through `connect` with these caller arguments and, when the
+    /// caller pins a version the entry does not, that package spec.
+    Connect {
+        caller_args: Vec<String>,
+        caller_package: Option<String>,
+    },
+    /// Leave the call alone, for this reason (`interactive_arguments`,
+    /// `arguments_differ`, `version_differs`).
+    Decline(&'static str),
 }
 
 impl MatchSet {
@@ -232,11 +320,17 @@ impl MatchSet {
             .iter()
             .filter(|entry| entry.scope == Scope::Host)
             .filter_map(|entry| {
-                entry.managed.as_ref().map(|spec| MatchEntry {
-                    name: entry.name.clone(),
-                    packages: spec.match_packages.clone(),
-                    executables: spec.match_executables.clone(),
-                    repair: spec.repair,
+                entry.managed.as_ref().map(|spec| {
+                    let (version, base_args) = MatchEntry::argv_facts(&entry.argv);
+                    MatchEntry {
+                        name: entry.name.clone(),
+                        packages: spec.match_packages.clone(),
+                        executables: spec.match_executables.clone(),
+                        repair: spec.repair,
+                        args: spec.args,
+                        version,
+                        base_args,
+                    }
                 })
             })
             .collect();
@@ -273,49 +367,145 @@ impl MatchSet {
         self.match_invocation(&invocation)
     }
 
+    /// Whether and how a match is started through `connect`.
+    pub fn route(&self, found: &ManagedMatch) -> Route {
+        if found
+            .caller_args
+            .iter()
+            .any(|arg| INTERACTIVE_ARGUMENTS.contains(&arg.as_str()))
+        {
+            return Route::Decline("interactive_arguments");
+        }
+        let Some(entry) = self.find(&found.name) else {
+            return Route::Decline("unknown_entry");
+        };
+        let caller_version = found.caller_spec.as_deref().and_then(package_version);
+        if let (Some(pinned), Some(asked)) = (&entry.version, &caller_version)
+            && pinned != asked
+        {
+            return Route::Decline("version_differs");
+        }
+        match entry.args {
+            ArgsMode::Pinned if found.caller_args == entry.base_args => Route::Connect {
+                caller_args: Vec::new(),
+                caller_package: None,
+            },
+            ArgsMode::Pinned => Route::Decline("arguments_differ"),
+            ArgsMode::Caller => Route::Connect {
+                caller_args: found.caller_args.clone(),
+                caller_package: if entry.version.is_none()
+                    && caller_version
+                        .as_deref()
+                        .is_some_and(|version| version != "latest")
+                {
+                    found.caller_spec.clone()
+                } else {
+                    None
+                },
+            },
+        }
+    }
+
     fn match_invocation(&self, invocation: &Invocation) -> Option<ManagedMatch> {
         let found = |entry: &MatchEntry,
                      kind: &'static str,
                      matched: &str,
-                     launcher: Option<&'static str>| ManagedMatch {
+                     launcher: Option<&'static str>,
+                     rest: &[String],
+                     spec: Option<&String>| ManagedMatch {
             name: entry.name.clone(),
             kind,
             matched: matched.to_string(),
             launcher,
             repair: entry.repair,
+            caller_args: rest.to_vec(),
+            caller_spec: spec.cloned(),
         };
         match invocation {
             Invocation::Connect | Invocation::Unknown => None,
-            Invocation::Direct(program) => self
+            Invocation::Direct { program, rest } => self
                 .entries
                 .iter()
                 .find(|entry| entry.executables.iter().any(|name| name == program))
-                .map(|entry| found(entry, "executable", program.as_str(), None)),
+                .map(|entry| {
+                    found(
+                        entry,
+                        "executable",
+                        program.as_str(),
+                        None,
+                        rest.as_slice(),
+                        None,
+                    )
+                }),
             Invocation::Launch {
                 launcher,
                 packages,
-                bin,
+                bin: None,
+                rest,
             } => {
-                for word in packages {
-                    let Some(name) = package_name(word) else {
-                        continue;
-                    };
-                    if let Some(entry) = self
-                        .entries
-                        .iter()
-                        .find(|entry| entry.packages.contains(&name))
-                    {
-                        return Some(found(entry, "package", &name, Some(*launcher)));
-                    }
-                }
-                let bin = bin.as_deref()?;
+                let spec = packages.first()?;
+                let name = package_name(spec)?;
                 self.entries
                     .iter()
-                    .find(|entry| {
-                        entry.executables.iter().any(|name| name == bin)
-                            || entry.packages.iter().any(|name| package_bin(name) == bin)
+                    .find(|entry| entry.packages.contains(&name))
+                    .map(|entry| {
+                        found(
+                            entry,
+                            "package",
+                            &name,
+                            Some(*launcher),
+                            rest.as_slice(),
+                            Some(spec),
+                        )
                     })
-                    .map(|entry| found(entry, "executable", bin, Some(*launcher)))
+            }
+            Invocation::Launch {
+                launcher,
+                packages,
+                bin: Some(bin),
+                rest,
+            } => {
+                // A named binary matches only by name: one listed in
+                // match_executables, or one equal to the unscoped package
+                // name when that package is the only one the call installs
+                // (`npx -p P P`, `pnpm exec P`). A scoped package's last
+                // segment is never taken for its binary.
+                if let Some(entry) = self
+                    .entries
+                    .iter()
+                    .find(|entry| entry.executables.iter().any(|name| name == bin))
+                {
+                    return Some(found(
+                        entry,
+                        "executable",
+                        bin.as_str(),
+                        Some(*launcher),
+                        rest.as_slice(),
+                        None,
+                    ));
+                }
+                if packages.len() > 1 || bin.starts_with('@') {
+                    return None;
+                }
+                if let Some(spec) = packages.first() {
+                    let name = package_name(spec)?;
+                    if &name != bin {
+                        return None;
+                    }
+                }
+                self.entries
+                    .iter()
+                    .find(|entry| entry.packages.contains(bin))
+                    .map(|entry| {
+                        found(
+                            entry,
+                            "package",
+                            bin.as_str(),
+                            Some(*launcher),
+                            rest.as_slice(),
+                            packages.first(),
+                        )
+                    })
             }
         }
     }
@@ -326,14 +516,16 @@ impl MatchSet {
 enum Invocation {
     /// `aethyme mcp connect ...`: already managed.
     Connect,
-    /// A program, by basename.
-    Direct(String),
-    /// A launcher: the package specs it installs or runs, and the binary
-    /// it runs when that is named separately (`pnpm exec X`, `npx -p P X`).
+    /// A program, by basename, and its arguments.
+    Direct { program: String, rest: Vec<String> },
+    /// A launcher: the package specs it installs or runs, the binary it
+    /// runs when that is named separately (`pnpm exec X`, `npx -p P X`),
+    /// and the arguments after the package or binary.
     Launch {
         launcher: &'static str,
         packages: Vec<String>,
         bin: Option<String>,
+        rest: Vec<String>,
     },
     /// A form that cannot be read unambiguously.
     Unknown,
@@ -353,6 +545,29 @@ fn launcher_script(script: &str) -> Option<&'static str> {
         "pnpx" | "pnpx.cjs" | "pnpx.js" => Some("pnpx"),
         "yarn" | "yarn.js" | "yarn.cjs" => Some("yarn"),
         "bunx" => Some("bunx"),
+        _ => None,
+    }
+}
+
+fn direct(program: &str, argv: &[String]) -> Invocation {
+    Invocation::Direct {
+        program: program.to_string(),
+        rest: argv[1..].to_vec(),
+    }
+}
+
+/// Where the launcher form of a top-level argv starts reading: the
+/// launcher's name and the index of its first option.
+fn launcher_start(argv: &[String]) -> Option<(&'static str, usize)> {
+    let word = |index: usize| argv.get(index).map(String::as_str);
+    match basename(argv.first()?) {
+        "npx" => Some(("npx", 1)),
+        "npm" if matches!(word(1), Some("exec" | "x")) => Some(("npm exec", 2)),
+        "pnpm" if word(1) == Some("dlx") => Some(("pnpm dlx", 2)),
+        "pnpx" => Some(("pnpx", 1)),
+        "bunx" => Some(("bunx", 1)),
+        "bun" if word(1) == Some("x") => Some(("bun x", 2)),
+        "yarn" if word(1) == Some("dlx") => Some(("yarn dlx", 2)),
         _ => None,
     }
 }
@@ -387,21 +602,11 @@ fn classify(argv: &[String], depth: u8) -> Invocation {
             inner.extend(argv[2..].iter().cloned());
             classify(&inner, depth + 1)
         }
-        "npx" => npx_like(argv, 1, "npx"),
-        "npm" => match word(1) {
-            Some("exec" | "x") => npx_like(argv, 2, "npm exec"),
-            _ => Invocation::Direct(program.to_string()),
+        "pnpm" if word(1) == Some("exec") => pnpm_exec(argv),
+        _ => match launcher_start(argv) {
+            Some((launcher, start)) => npx_like(argv, start, launcher),
+            None => direct(program, argv),
         },
-        "pnpm" => match word(1) {
-            Some("exec") => pnpm_exec(argv),
-            Some("dlx") => npx_like(argv, 2, "pnpm dlx"),
-            _ => Invocation::Direct(program.to_string()),
-        },
-        "pnpx" => npx_like(argv, 1, "pnpx"),
-        "bunx" => npx_like(argv, 1, "bunx"),
-        "bun" if word(1) == Some("x") => npx_like(argv, 2, "bun x"),
-        "yarn" if word(1) == Some("dlx") => npx_like(argv, 2, "yarn dlx"),
-        _ => Invocation::Direct(program.to_string()),
     }
 }
 
@@ -440,11 +645,18 @@ const FLAG_OPTIONS: &[&str] = &[
     "--bun",
 ];
 
-/// `npx`, `npm exec`, `pnpm dlx`, `pnpx`, `bunx`, `bun x`, `yarn dlx`:
-/// options, then a package spec (or, after `--package`, the binary).
-fn npx_like(argv: &[String], start: usize, launcher: &'static str) -> Invocation {
+/// A launcher's options read: `--package` values, the index of the first
+/// positional word, and whether a `--` came before it.
+struct Scanned {
+    packages: Vec<String>,
+    positional: usize,
+    separated: bool,
+}
+
+fn scan_launcher(argv: &[String], start: usize) -> Option<Scanned> {
     let mut packages = Vec::new();
     let mut index = start;
+    let mut separated = false;
     while let Some(word) = argv.get(index) {
         if let Some(value) = word.strip_prefix("--package=") {
             packages.push(value.to_string());
@@ -454,35 +666,56 @@ fn npx_like(argv: &[String], start: usize, launcher: &'static str) -> Invocation
         match word.as_str() {
             flag if FLAG_OPTIONS.contains(&flag) => index += 1,
             "-p" | "--package" => {
-                let Some(value) = argv.get(index + 1) else {
-                    return Invocation::Unknown;
-                };
-                packages.push(value.clone());
+                packages.push(argv.get(index + 1)?.clone());
                 index += 2;
             }
             "--" => {
                 index += 1;
+                separated = true;
                 break;
             }
-            option if option.starts_with('-') => return Invocation::Unknown,
+            option if option.starts_with('-') => return None,
             _ => break,
         }
     }
-    let positional = argv.get(index).cloned();
-    if packages.is_empty() {
-        match positional {
-            Some(spec) => Invocation::Launch {
-                launcher,
-                packages: vec![spec],
-                bin: None,
-            },
-            None => Invocation::Unknown,
+    Some(Scanned {
+        packages,
+        positional: index,
+        separated,
+    })
+}
+
+/// `npx`, `npm exec`, `pnpm dlx`, `pnpx`, `bunx`, `bun x`, `yarn dlx`:
+/// options, then a package spec (or, after `--package`, the binary).
+fn npx_like(argv: &[String], start: usize, launcher: &'static str) -> Invocation {
+    let Some(scanned) = scan_launcher(argv, start) else {
+        return Invocation::Unknown;
+    };
+    let Some(positional) = argv.get(scanned.positional).cloned() else {
+        return Invocation::Unknown;
+    };
+    let mut rest = argv[scanned.positional + 1..].to_vec();
+    // `npm exec` reads options after the package as its own until a `--`,
+    // which it consumes; the caller's arguments are what follows.
+    if launcher == "npm exec"
+        && !scanned.separated
+        && let Some(end) = rest.iter().position(|word| word == "--")
+    {
+        rest.remove(end);
+    }
+    if scanned.packages.is_empty() {
+        Invocation::Launch {
+            launcher,
+            packages: vec![positional],
+            bin: None,
+            rest,
         }
     } else {
         Invocation::Launch {
             launcher,
-            packages,
-            bin: positional,
+            packages: scanned.packages,
+            bin: Some(positional),
+            rest,
         }
     }
 }
@@ -498,9 +731,48 @@ fn pnpm_exec(argv: &[String]) -> Invocation {
             launcher: "pnpm exec",
             packages: Vec::new(),
             bin: Some(bin.clone()),
+            rest: argv[index + 1..].to_vec(),
         },
         _ => Invocation::Unknown,
     }
+}
+
+/// An entry argv with the caller's arguments (and package spec) applied:
+/// `caller_package` replaces the launcher's package spec (refused when the
+/// argv has none at its top level), and `caller_args` are appended, behind
+/// a `--` for `npm exec` when the argv has none.
+pub fn apply_caller(
+    argv: &[String],
+    caller_args: &[String],
+    caller_package: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut out = argv.to_vec();
+    let layout = launcher_start(argv)
+        .and_then(|(launcher, start)| scan_launcher(argv, start).map(|scan| (launcher, scan)));
+    if let Some(package) = caller_package {
+        match &layout {
+            Some((_, scanned)) if scanned.packages.is_empty() && scanned.positional < out.len() => {
+                out[scanned.positional] = package.to_string();
+            }
+            _ => {
+                return Err(
+                    "the entry's argv names no package spec to replace with the caller's version"
+                        .into(),
+                );
+            }
+        }
+    }
+    if let Some(("npm exec", scanned)) = &layout
+        && !caller_args.is_empty()
+        && !scanned.separated
+        && !out[scanned.positional.min(out.len())..]
+            .iter()
+            .any(|word| word == "--")
+    {
+        out.push("--".into());
+    }
+    out.extend(caller_args.iter().cloned());
+    Ok(out)
 }
 
 /// Split a `sh -c` string that is one simple command: words, single quotes

@@ -44,6 +44,7 @@ pub mod trust;
 // Managed servers: one matcher, config repair, launcher interception and
 // bypass detection (see [`managed`]).
 pub mod bypass;
+pub mod caller;
 pub mod intercept;
 pub mod json_span;
 pub mod managed;
