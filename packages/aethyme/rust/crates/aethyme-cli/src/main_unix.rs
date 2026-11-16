@@ -420,6 +420,9 @@ fn main_with_args(args: &[String]) -> ExitCode {
         // Declared runnable environments per worktree (#1208). Profiles,
         // validation and plans are read-only (#1209).
         "env" => ExitCode::from(aethyme_broker::environments::cli::run(&args[1..])),
+        // Opt-in MCP server launching: offline launcher resolution and an
+        // exec'ing connect (no extra process). Writes no agent configuration.
+        "mcp" => ExitCode::from(aethyme_broker::mcp::cli::run(&args[1..])),
         // Broker commands have been native Rust from birth (issue #31).
         "broker" if readiness_remediation::is_command(command.args) => {
             ExitCode::from(readiness_remediation::run(&command.args[1..]))
@@ -716,6 +719,14 @@ Environments (declared in .aethyme/environments.toml):
                               recorded environments, their phases, history
                               and component logs; host supervisor state
 
+MCP servers (opt-in; <host state>/mcp/services.toml, .aethyme/mcp.toml):
+  mcp resolve <name>          launcher chain (pnpm exec, npm exec, npx) to the
+                              installed executable; runs and downloads nothing
+  mcp connect <name>          become the server (exec: no extra process);
+                              --fallback -- <cmd> keeps an agent unblocked
+  mcp status|config print     entries, identities, chosen copy; the snippet to
+                              paste into an agent (printed, never written)
+
 Collaboration (opt-in, experimental; disabled unless [collaboration] enables it):
   collab status|enroll        policy, state root and captures; mint a project ID
   collab capture|gc|context|brief
@@ -783,6 +794,7 @@ fn answer_help(route: help::HelpRoute, args: &[String]) -> ExitCode {
                 "upgrade" => repository_upgrade::run(rest),
                 "collab" => aethyme_broker::collaboration_cli::run(rest),
                 "env" => aethyme_broker::environments::cli::run(rest),
+                "mcp" => aethyme_broker::mcp::cli::run(rest),
                 other => {
                     eprintln!("Error: no help route for {other}");
                     2
