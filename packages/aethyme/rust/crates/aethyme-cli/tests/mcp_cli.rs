@@ -594,22 +594,30 @@ done
 
 /// One agent session through `connect`: initialize, one call, then leave.
 fn hub_session(fixture: &Fixture) -> (String, String) {
+    session(fixture, "example-shared", "2025-06-18")
+}
+
+/// One agent session for `name`, initializing with `protocol`.
+fn session(fixture: &Fixture, name: &str, protocol: &str) -> (String, String) {
     use std::io::{BufRead, Write};
     let mut child = fixture
-        .command(&["mcp", "connect", "example-shared"])
+        .command(&["mcp", "connect", name])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    stdin
-        .write_all(
-            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}\n\
-              {\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n\
-              {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"pid\",\"arguments\":{}}}\n",
-        )
-        .unwrap();
+    let input = format!(
+        "{}\n{}\n{}\n",
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": protocol, "capabilities": {},
+                       "clientInfo": {"name": "t", "version": "1"}}}),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "pid", "arguments": {}}}),
+    );
+    stdin.write_all(input.as_bytes()).unwrap();
     let stdout = child.stdout.take().unwrap();
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -680,4 +688,66 @@ fn shared_connects_reach_one_upstream_through_the_hub() {
     // Stop this test's own hub; its upstream ends with its input.
     let killed = Command::new("kill").arg(&pids[0]).status().unwrap();
     assert!(killed.success());
+}
+
+fn shared_fixture(extra: &str) -> (Fixture, std::path::PathBuf) {
+    let fixture = Fixture::new();
+    let script = fixture.work.join("fake-server.sh");
+    write_executable(&script, HUB_FAKE_SERVER);
+    let log = fixture.work.join("fake.log");
+    std::fs::write(
+        fixture.work.join("server.env"),
+        format!("FAKE_LOG={}\n", log.display()),
+    )
+    .unwrap();
+    fixture.services(&format!(
+        "[[servers]]\nname = \"example-shared\"\nmode = \"shared\"\nargv = [{:?}]\ncwd = {:?}\nenv_file = \"server.env\"\n{extra}\n",
+        script.display().to_string(),
+        fixture.work.display().to_string(),
+    ));
+    (fixture, log)
+}
+
+fn hub_pids(fixture: &Fixture) -> Vec<String> {
+    std::fs::read_dir(fixture.state.join("mcp/hub"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|extension| extension == "pid"))
+                .map(|path| std::fs::read_to_string(path).unwrap().trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_client_the_hub_cannot_serve_gets_a_private_server_with_its_initialize_replayed() {
+    let (fixture, log) = shared_fixture("");
+    let (shared, _) = session(&fixture, "example-shared", "2025-06-18");
+    assert!(!shared.is_empty());
+    // Another protocol version: the hub refuses after the initialize was read.
+    let (private, stderr) = session(&fixture, "example-shared", "2024-11-05");
+    assert!(!private.is_empty(), "{stderr}");
+    assert_ne!(private, shared, "{stderr}");
+    assert!(stderr.contains("protocol_version"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .matches("started ")
+            .count(),
+        2
+    );
+    for pid in hub_pids(&fixture) {
+        Command::new("kill").arg(pid).status().unwrap();
+    }
+}
+
+#[test]
+fn an_entry_requiring_client_features_is_never_shared() {
+    let (fixture, _) = shared_fixture("require_client_features = true");
+    let (pid, stderr) = session(&fixture, "example-shared", "2025-06-18");
+    assert!(!pid.is_empty(), "{stderr}");
+    assert!(stderr.contains("require_client_features"), "{stderr}");
+    assert!(hub_pids(&fixture).is_empty(), "no hub may start");
 }
