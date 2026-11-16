@@ -1754,6 +1754,28 @@ fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageErr
             "cannot resolve automatic artifact continuation repository: {error}"
         ))
     })?;
+
+    // Hold the OS lock before anything slow (the fresh Git probe the first
+    // Git call runs takes seconds on a loaded machine) and before
+    // Broker::open. The parent drops it only after this process has been
+    // spawned, so no second detached worker can enter. Taken while the probe
+    // ran, the gap let a broker open in between launch a second worker, and
+    // whichever lost the lock exited 1 with nothing done.
+    let mut worker_lock = None;
+    for _ in 0..40 {
+        if let Some(lock) = crate::gc::try_artifact_sweep_worker_lock(&requested_root)? {
+            worker_lock = Some(lock);
+            break;
+        }
+        // The launcher still owns the lock while the child starts. Wait for
+        // that handoff, but do not queue another worker behind an active one.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let Some(worker_lock) = worker_lock else {
+        // Another worker serves this repository's backlog: nothing failed.
+        crate::phase_telemetry::add("artifact_worker_already_active", std::time::Duration::ZERO);
+        return Ok(());
+    };
     let discovered = crate::GitRepo::discover(&requested_root)?;
     let repository_root = std::fs::canonicalize(discovered.main_root()?)?;
     if repository_root != requested_root {
@@ -1768,24 +1790,6 @@ fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageErr
             "automatic artifact continuation runtime or repository is not eligible".into(),
         ));
     }
-
-    // Hold the OS lock before Broker::open. The parent drops it only after
-    // this process has been spawned, so no second detached worker can enter.
-    let mut worker_lock = None;
-    for _ in 0..40 {
-        if let Some(lock) = crate::gc::try_artifact_sweep_worker_lock(&repository_root)? {
-            worker_lock = Some(lock);
-            break;
-        }
-        // The launcher still owns the lock while the child starts. Wait for
-        // that handoff, but do not queue another worker behind an active one.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let Some(worker_lock) = worker_lock else {
-        return Err(UsageError::Message(
-            "automatic artifact continuation worker is already active".into(),
-        ));
-    };
     // Hold the singleton briefly before reading the backlog: `finish` calls
     // arriving in a burst find this worker alive and are served by this run.
     std::thread::sleep(crate::gc::ARTIFACT_WORKER_COALESCE_WINDOW);

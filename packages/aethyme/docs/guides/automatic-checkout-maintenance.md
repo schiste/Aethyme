@@ -249,8 +249,8 @@ malformed one); a gate in another session's checkout does not keep it.
 The detached cleanup worker deletes finished sessions' build output while
 nobody waits on it, so it runs as a background job: lowest CPU and disk I/O
 priority (macOS and Linux), a rate limit on unlinks, one deleter at a time
-across every repository on the machine, and a pause while memory pressure is
-above normal. Commands you wait on (`finish`, `finish cleanup <id>`,
+across every repository on the machine, a throttle while memory pressure
+is at the warning level and a stop while it is critical. Commands you wait on (`finish`, `finish cleanup <id>`,
 `gc apply`, `gc sweep`) keep full speed.
 
 The one-deleter rule is a host-wide slot the worker holds only while it
@@ -259,16 +259,25 @@ a run of file-deletion batches (handed over after 20 seconds). Judging,
 counting, lock gaps and pressure waits never hold it, and each deletion waits
 at most two seconds for it; if another repository's worker is still
 deleting, this one goes back to judging and retries shortly. Lanes that
-delete in ways the pacer cannot see batch by batch (session retirement,
-checkout archives, the requested checkout cleanup) hold it for their whole
-pass, waiting at most ten seconds. At most two repositories judge closed
+delete in ways the pacer cannot see batch by batch (checkout archives, the
+requested checkout cleanup) hold it for their whole pass, waiting at most ten
+seconds. Session retirement deletes nothing (closing a session and finishing
+a session whose checkout is gone only write rows), so it takes no slot. At most two repositories judge closed
 checkouts at the same time; a third waits up to five seconds and otherwise
 retries a minute later. The slot and the judging permits are released by
 the operating system if a worker dies.
 
-Memory pressure is a hard stop: no removal starts while it lasts, and when it
+Critical memory pressure (macOS level 4, or Linux memory pressure at its
+limit) is a hard stop: no removal starts while it lasts, and when it
 outlasts the worker's pause budget (120 seconds per run) the work stops and
-waits for a later run. A high load average is only a throttle, never a stop:
+waits for a later run. Memory pressure at the warning level (macOS level 2,
+or a level that cannot be read) is a throttle, like load: the worker waits
+at most a few seconds for it to clear, then goes on with one checkout
+removal per slice and at least 2 minutes before the next slice
+(`stop_reason` `memory_warning_throttled`, a wait no new landing shortens);
+file deletion waits up to 1 second per batch of 256 files. A machine that
+sat at the warning level for hours used to stop every removal for 10
+minutes at a time. A high load average is only a throttle, never a stop:
 on a busy machine it can stay far above the core count for days while memory
 is fine. While the one-minute load average is above twice the core count (or,
 on Linux, I/O pressure is high) the worker waits at most a few seconds for it
@@ -297,7 +306,8 @@ leaves its request durable, and the next broker open starts a worker again.
 `cleanup_retention.last_artifact_sweep.unattended_pacing`: entries and bytes
 removed, the removal rate, time slept by the limiter, time paused for memory
 and waited for load, how often work went on throttled under load
-(`load_throttled`), time waited for, held and spent deleting under the host
+(`load_throttled`), time waited and throttled at the warning memory level
+(`memory_warning_pause_ms`, `memory_warning_throttled`, omitted when zero), time waited for, held and spent deleting under the host
 deleter slot (`host_lock_wait_ms`, `host_slot_held_ms`,
 `host_slot_deleting_ms`, `host_slot_busy`), time waited for a judging permit
 (`judge_permit_wait_ms`, `judge_permit_busy`), requests coalesced into the
@@ -306,7 +316,10 @@ run, and whether priority lowering succeeded. The worker's
 (`artifact_worker_host_deleter_wait`, `artifact_worker_host_slot_held`,
 `artifact_worker_host_slot_deleting`, `artifact_worker_judge_permit_wait`,
 `artifact_worker_pacer_memory_pause`, `artifact_worker_pacer_load_wait`,
-`artifact_worker_pacer_limiter_sleep`); it is written when the run exits,
+`artifact_worker_pacer_memory_warning_wait`,
+`artifact_worker_pacer_limiter_sleep`, and the counts
+`artifact_worker_pacer_memory_warning_throttled` and
+`artifact_worker_capacity_removal_memory_warning_throttled`); it is written when the run exits,
 at most about five minutes after it started. See
 [cross-process consumers](../architecture/cross-process-consumers.md) for the
 field list.
@@ -375,3 +388,30 @@ One long-lived agent process often holds dozens of open sessions, starting one a
 ### Closed sessions whose checkout is gone
 
 The background worker also finishes closed spawned sessions whose checkout no longer exists, recording them as cleaned exactly as a completed cleanup does, without deleting anything (the session branch is kept). It does so only after the session's closed-checkout grace (`closed_worktree_grace_hours`), and only when the pool root that held the checkout is on disk with this repository's root marker, the pool root is on the volume the spawn witness recorded (when it recorded one), Git no longer registers the path (a prunable registration keeps it until Git prunes it), no open session uses the path, and no finish recovery or archive intent is pending. Each finish records `session.checkout_missing_finished` with the evidence; up to 32 sessions per pass.
+
+## Session retirement in the background worker
+
+Every worker run, whatever lane started it, queues a session-retirement
+request of its own when the abandonment window is enabled, nothing is
+pending and the 10-minute pause after the last completed lap is over
+(`artifact_worker_retirement_requested`; `artifact_worker_retirement_not_due`
+when no request was due). Retirement then gets up to 120 seconds of the run,
+and never less than 30 seconds even when checkout removal before it used,
+failed or overran the run (`artifact_worker_retirement_share_budget`,
+`artifact_worker_retirement_share_used`,
+`artifact_worker_retirement_share_reserve_used`). It no longer waits for the
+host deleter slot. A pass waits up to 5 seconds for the GC lock a
+foreground command's inline pass may hold (`session_retirement_gc_lock_wait`,
+`session_retirement_gc_lock_busy`) and, when it stays held, retries a minute
+later instead of ten. Between passes it stops only on critical memory
+pressure (`session_retirement_memory_backoff`); at the warning level it
+waits at most a few seconds and goes on. Which sessions may close is
+unchanged.
+
+A session past the abandonment window by its session row whose checkout Git
+metadata moved more recently is kept for `recent_activity`. Until that
+activity plus the window, every pass, foreground or background, skips it
+instead of judging it again (`retirement_not_due_memo_skips`,
+`retirement_not_due_memo_recorded`; meta key
+`auto_cleanup.session_retirement_not_due`). A skip only delays a close; the
+landed lane is still asked, and a changed window discards the memo.

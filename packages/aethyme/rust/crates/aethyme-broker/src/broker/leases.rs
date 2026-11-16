@@ -1712,6 +1712,11 @@ impl Broker {
             ),
             crate::AbandonmentVerdict::Abandoned { .. }
         ) {
+            process_table.note_not_due_before(
+                database_activity
+                    .max(candidate.created_at)
+                    .saturating_add(abandon_after_ms),
+            );
             return Ok(keep_with(
                 process_table,
                 AbandonmentKeepReason::RecentActivity,
@@ -2052,6 +2057,11 @@ impl Broker {
             observed_at,
             abandon_after_ms,
         ) else {
+            process_table.note_not_due_before(
+                activity_at
+                    .max(current.created_at)
+                    .saturating_add(abandon_after_ms),
+            );
             return Ok(keep_with(
                 process_table,
                 AbandonmentKeepReason::RecentActivity,

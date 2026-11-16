@@ -299,7 +299,10 @@ pub fn ensure_running(root: &Path, executable: &Path) -> io::Result<SupervisorSt
         .stdout(log.try_clone()?)
         .stderr(log);
     detach(&mut command);
-    let mut child = command.spawn()?;
+    // Under the process-wide spawn lock: this runs on a background thread of
+    // report commands, and a supervisor that inherited another spawn's pipe
+    // would hold it open for its whole linger.
+    let mut child = crate::bounded_output::spawn_serialized(&mut command)?;
     let child_pid = child.id() as i32;
     let deadline = Instant::now() + SPAWN_WAIT;
     loop {

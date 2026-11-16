@@ -1050,7 +1050,8 @@ const SESSION_RETIREMENT_WORKER_PASS_BUDGET: Duration = Duration::from_secs(30);
 /// observation. Two minutes per run covers roughly ten full proofs, or
 /// hundreds of cheap judgements, so about 280 open sessions are examined
 /// within an hour of worker runs. Each pass still yields to a waiting
-/// foreground GC command and stops on memory pressure.
+/// foreground GC command and stops on critical memory pressure (the
+/// warning level only slows it).
 const SESSION_RETIREMENT_WORKER_RUN_BUDGET: Duration = Duration::from_secs(120);
 // One pass can inspect up to 128 open sessions. Keep serialized report size
 // bounded even when every inspected session has an unresolved reason.
@@ -10112,8 +10113,9 @@ impl Broker {
                 return Ok(());
             }
             let remaining = remaining.map(|remaining| remaining.saturating_sub(waited));
-            // Memory pressure stops the run between passes, resumably; load
-            // only slows it (the pacer's bounded wait).
+            // Critical memory pressure stops the run between passes,
+            // resumably; a memory warning and load only slow it (the pacer's
+            // bounded wait).
             if passes > 0
                 && unattended_pacing::unattended_pressure_check(
                     remaining.map(|remaining| Instant::now() + remaining),
@@ -13664,6 +13666,26 @@ mod tests {
             },
         ] {
             assert!(!steady_slice_may_continue(&summary), "{summary:?}");
+        }
+    }
+
+    /// Retirement gets up to its run budget and never less than its reserve,
+    /// however much of the run checkout removal used or overran.
+    #[test]
+    fn retirement_keeps_its_share_whatever_removal_used() {
+        assert_eq!(
+            worker_retirement_run_budget(ARTIFACT_SWEEP_WORKER_MAX_DURATION),
+            SESSION_RETIREMENT_WORKER_RUN_BUDGET
+        );
+        assert_eq!(
+            worker_retirement_run_budget(Duration::from_secs(45)),
+            Duration::from_secs(45)
+        );
+        for overran in [Duration::ZERO, Duration::from_secs(3)] {
+            assert_eq!(
+                worker_retirement_run_budget(overran),
+                SESSION_RETIREMENT_WORKER_RESERVE
+            );
         }
     }
 

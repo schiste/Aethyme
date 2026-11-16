@@ -1592,6 +1592,49 @@ mod lane_tests {
             .collect()
     }
 
+    /// A session quiet for days by its row but whose checkout Git metadata
+    /// moved recently is kept for recent activity once; until that activity
+    /// plus the window, later passes skip it instead of judging it again on
+    /// every command, and it stays open.
+    #[test]
+    fn a_session_kept_for_recent_activity_is_not_judged_again_until_due() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (session, worktree) = session(&mut broker, "row quiet, checkout touched", false);
+        quiet(&mut broker, &session, 80);
+        let git_dir = crate::git::checked_worktree_git_dir(&worktree)
+            .unwrap()
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(git_dir.join("index"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now())
+            .unwrap();
+        let counters = |recorder: &crate::phase_telemetry::Recorder| {
+            let totals = recorder.totals().1;
+            let get = |name: &str| totals.get(name).copied().unwrap_or(0);
+            (
+                get("session_abandonment_kept_recent_activity"),
+                get("retirement_not_due_memo_recorded"),
+                get("retirement_not_due_memo_skips"),
+            )
+        };
+
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let installed = crate::phase_telemetry::install(recorder.clone());
+        broker.retire_abandoned_sessions_for_recovery(None).unwrap();
+        drop(installed);
+        assert_eq!(counters(&recorder), (1, 1, 0));
+        assert!(is_open(&broker, session.id));
+
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let installed = crate::phase_telemetry::install(recorder.clone());
+        broker.retire_abandoned_sessions_for_recovery(None).unwrap();
+        drop(installed);
+        assert_eq!(counters(&recorder), (0, 0, 1));
+        assert!(is_open(&broker, session.id));
+    }
+
     /// A gone holder's explicit leases hold the session only through the
     /// stale grace, which starts when the broker first sees the holder gone;
     /// past it the session closes and its leases are released with it.

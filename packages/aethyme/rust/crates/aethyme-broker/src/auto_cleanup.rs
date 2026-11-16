@@ -121,6 +121,79 @@ const LANDED_SEARCH_HOLD_LIMIT: Duration = Duration::from_secs(10);
 /// then moves on whatever the answer, so one session never holds every later
 /// session back for more than one pass.
 const SESSION_RETIREMENT_BUDGET_HOLD_KEY: &str = "auto_cleanup.session_retirement_budget_hold";
+/// Meta key of [`NotDueMemo`]: when each session the abandonment window kept
+/// for recent activity can first be due.
+const SESSION_RETIREMENT_NOT_DUE_KEY: &str = "auto_cleanup.session_retirement_not_due";
+/// Entries the not-due memo keeps at most (the nearest due times win).
+const SESSION_RETIREMENT_NOT_DUE_MAX: usize = 4096;
+
+/// When each open session the abandonment window kept for recent activity
+/// can first be due again: its newest activity (session row, checkout Git
+/// metadata) plus the window. Activity only moves later, so until that time
+/// the same judgement would keep it again; a pass skips it
+/// (`retirement_not_due_memo_skips`) instead of re-reading its checkout on
+/// every command. Skipping only delays a close: it never closes anything,
+/// and the landed lane is still asked. A changed window discards the memo.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct NotDueMemo {
+    window_ms: i64,
+    sessions: std::collections::BTreeMap<i64, i64>,
+}
+
+impl NotDueMemo {
+    fn load(broker: &Broker, window_ms: i64, now: i64) -> Self {
+        let mut memo = broker
+            .store_ref()
+            .meta_get(SESSION_RETIREMENT_NOT_DUE_KEY)
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<Self>(&raw).ok())
+            .filter(|memo| memo.window_ms == window_ms)
+            .unwrap_or_else(|| Self {
+                window_ms,
+                ..Self::default()
+            });
+        memo.sessions.retain(|_, due_at| *due_at > now);
+        memo
+    }
+
+    fn not_due(&self, session_id: i64, now: i64) -> bool {
+        self.sessions
+            .get(&session_id)
+            .is_some_and(|due_at| *due_at > now)
+    }
+
+    fn record(&mut self, broker: &Broker, session_id: i64, due_at: i64, now: i64) {
+        if due_at <= now || self.sessions.get(&session_id) == Some(&due_at) {
+            return;
+        }
+        self.sessions.insert(session_id, due_at);
+        while self.sessions.len() > SESSION_RETIREMENT_NOT_DUE_MAX {
+            let Some((&latest, _)) = self.sessions.iter().max_by_key(|(_, due_at)| **due_at) else {
+                break;
+            };
+            self.sessions.remove(&latest);
+        }
+        crate::phase_telemetry::add("retirement_not_due_memo_recorded", Duration::ZERO);
+        self.persist(broker);
+    }
+
+    fn forget(&mut self, broker: &Broker, session_id: i64) {
+        if self.sessions.remove(&session_id).is_some() {
+            self.persist(broker);
+        }
+    }
+
+    fn persist(&self, broker: &Broker) {
+        let value = serde_json::to_string(self).unwrap_or_default();
+        crate::warn_unrecorded(
+            "remember when retirement candidates are due",
+            broker
+                .store_ref()
+                .meta_set(SESSION_RETIREMENT_NOT_DUE_KEY, &value),
+        );
+    }
+}
 /// Bound discovery of ignored roots before whole-checkout cleanup considers
 /// their existing policy classifications.
 const IGNORED_PATH_LISTING_BUDGET: Duration = Duration::from_secs(15);
@@ -6908,6 +6981,7 @@ impl Broker {
             .collect::<Vec<_>>();
         let mut holder_process_table = crate::session_holder::RecordedHolderProcessTable::default();
         holder_process_table.prime(self.store_ref(), &retirement_candidates, deadline);
+        let mut not_due_memo = NotDueMemo::load(self, window_ms, retirement_now);
         let pass_started = Instant::now();
         let mut landed_judged_in_pass = 0_usize;
         let mut budget_hold = self.retirement_budget_hold();
@@ -6969,7 +7043,13 @@ impl Broker {
             // and worktree scans, so sessions days past the window stayed
             // open behind them. The landed lane is still asked when only it
             // could close the session: a live holder whose task lease expired.
-            let abandonment_tried = old_enough_for_abandonment;
+            // A session kept for recent activity is not judged again before
+            // its activity plus the window: the judgement would keep it.
+            let memo_skipped = old_enough_for_abandonment && not_due_memo.not_due(session.id, now);
+            if memo_skipped {
+                crate::phase_telemetry::add("retirement_not_due_memo_skips", Duration::ZERO);
+            }
+            let abandonment_tried = old_enough_for_abandonment && !memo_skipped;
             let mut outcome = if abandonment_tried {
                 let _span = crate::phase_telemetry::span("retirement_abandonment_first");
                 self.try_close_abandoned_session(
@@ -6994,6 +7074,12 @@ impl Broker {
                     },
                     Duration::ZERO,
                 );
+                match holder_process_table.not_due_before() {
+                    Some(due_at) if !closed => {
+                        not_due_memo.record(self, session.id, due_at, now);
+                    }
+                    _ => not_due_memo.forget(self, session.id),
+                }
                 if closed {
                     summary.abandonment_closed += 1;
                 } else {
@@ -7100,7 +7186,7 @@ impl Broker {
             let fall_through = landed_decline
                 .is_none_or(crate::broker::LandedSessionDecline::allows_abandonment_fallback)
                 && !matches!(outcome, crate::broker::AbandonedSessionCloseOutcome::Closed);
-            if fall_through && old_enough_for_abandonment && !abandonment_tried {
+            if fall_through && old_enough_for_abandonment && !abandonment_tried && !memo_skipped {
                 outcome = self.try_close_abandoned_session(
                     session.id,
                     now,

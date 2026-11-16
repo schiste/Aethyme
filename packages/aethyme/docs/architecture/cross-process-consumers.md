@@ -2366,3 +2366,40 @@ A session whose landed proof runs out of budget leaves the retirement cursor on 
 ### A live holder that moved on; finishing closed sessions with a missing checkout
 
 Introduced 2026-11-16. The landed decline code `holder_alive` is renamed `holder_alive_current` (counter `landed_sessions_declined_holder_alive_current`), and `holder_alive_in_use` is added. A live holder whose process (pid and recorded start) has a `session.holder_bound` event on a different session after this session's last activity has moved on: the merged-pull-request and landed lanes close the session when every other proof holds and the open-file observation (no holder exemption), gates, operations, preparation, artifact producers, merge queue and explicit leases show no use; the abandonment window does so only for a clean checkout. The `session.abandoned` payload gains `holder_evidence` (`gone`, `moved_on`, `lease_expired`, `unbound`) and `holder_moved_on_to_session`. `AutoCleanupReport` gains `sessions_closed_by_holder_evidence`, `missing_checkout_examined`, `missing_checkout_finished`, `missing_checkout_kept`; `landed_session_retirement` gains `closed_by_holder_evidence`. New counters: `holder_moved_on_candidates`, `holder_moved_on_dirty_kept`, `session_closed_holder_<evidence>`, `landed_worktree_unclean_<kind>` (`uncommitted_changes`, `unmarked_tracked_deletions`, `strict_tracked_deletions`, `ignored_content`, `ignored_content_unverified`, `operation_in_progress`, `stash`, `other`), `missing_checkout_examined`, `missing_checkout_finished`, span `missing_checkout_finish`. The retirement open-file observation is valid for ten seconds (it was two). New event `session.checkout_missing_finished` with `worktree_path`, `pool_root`, `volume_evidence` (`volume_uuid_matches` or `pool_root_marker`) and `deleted: false`; meta key `missing_checkout.after` holds the lane's cursor.
+
+### Memory warning throttles the worker; retirement gets its share
+
+Introduced 2026-11-16. The unattended pacer reads two memory levels. macOS
+`kern.memorystatus_vm_pressure_level` 4 (and anything above 2), or Linux
+memory PSI at its limit, stays the hard stop. Level 2, a level of 0 or below,
+or a failed read is the warning level: one bounded wait shared with load
+(1 second per deletion batch, 5 seconds before a removal), then the work
+proceeds (`PressureVerdict::MemoryWarningThrottled`). `UnattendedPacingSummary`
+gains `memory_warning_pause_ms` and `memory_warning_throttled` (omitted when
+zero); the run's metrics row gains `artifact_worker_pacer_memory_warning_wait`
+and `artifact_worker_pacer_memory_warning_throttled`. The checkout removal
+slice gains the stop `memory_warning_throttled` (one removal, then at least
+120 seconds, a hard steady retry) and the phases
+`artifact_worker_capacity_removal_memory_warning_wait` and
+`artifact_worker_capacity_removal_memory_warning_throttled`; its
+`pressure_seen` reads `memory` for a warning.
+
+The worker queues its own session-retirement request in every run that
+starts for any lane (`artifact_worker_retirement_requested`), runs the lane
+without pinning the host deleter slot, gives it at least the 30-second
+reserve (`artifact_worker_retirement_share_budget`, `_used`,
+`_reserve_used`; `artifact_worker_retirement_not_due` when none was due),
+and a pass waits up to 5 seconds for the GC lock before deferring for one
+minute (`session_retirement_gc_lock_wait`, `session_retirement_gc_lock_busy`).
+Retirement passes remember when a session kept for `recent_activity` can be
+due again (meta key `auto_cleanup.session_retirement_not_due`, counters
+`retirement_not_due_memo_recorded`, `retirement_not_due_memo_skips`).
+
+Bounded captures (`output_limited`, used by the process-table snapshot) and
+the environment supervisor launch spawn under one process-wide spawn lock
+(`process_spawn_lock_wait` when one waited): a supervisor launched from a
+report command's background thread could inherit the `ps` pipe and hold it
+for minutes, so `status` and `agents` recorded `holder_process_table_failed`.
+A detached worker that finds another worker holding the repository's worker
+lock now exits successfully (`artifact_worker_already_active`), and takes the
+lock before the fresh Git probe rather than after it.
