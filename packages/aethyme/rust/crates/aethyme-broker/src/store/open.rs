@@ -604,6 +604,44 @@ impl BrokerStore {
     /// The non-cleaned session registered for exactly this worktree
     /// path, if any — what `adopt` consults to give a useful answer
     /// instead of a bare constraint violation.
+    /// Closed spawned sessions whose checkout has not been recorded as removed,
+    /// after `after_id`, oldest first, at most `limit`.
+    pub(crate) fn closed_spawned_sessions_after(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<Session>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SESSION_SELECT} WHERE origin = 'spawned' AND cleanup_state = 'closed'
+               AND id > ?1 ORDER BY id LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(
+            params![after_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+            session_from_row,
+        )?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row??);
+        }
+        Ok(sessions)
+    }
+
+    /// Whether an open session other than `session_id` names `worktree_path`.
+    pub(crate) fn other_open_session_at_path(
+        &self,
+        session_id: i64,
+        worktree_path: &str,
+    ) -> Result<bool, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions
+                 WHERE worktree_path = ?1 AND id <> ?2 AND cleanup_state = 'open')",
+                params![worktree_path, session_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     /// The latest session recorded for `worktree_path`, whatever its state.
     pub(crate) fn latest_session_for_worktree_any_state(
         &self,

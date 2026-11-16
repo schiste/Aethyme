@@ -210,7 +210,10 @@ pub(crate) enum LandedSessionDecline {
     /// The broker-spawned process, or a holder whose identity could not be
     /// re-read, is still running.
     ProcessAlive,
-    /// The recorded holder runs and its task lease is current or absent.
+    /// The recorded holder runs, its task lease is current or absent, and it
+    /// has not moved on: this is its latest session, or it was bound
+    /// elsewhere only before this session's last activity
+    /// (`holder_alive_current`).
     HolderAlive,
     /// No holder was recorded, or it is a shared agent service, so its
     /// absence from this session cannot be proved.
@@ -261,6 +264,10 @@ pub(crate) enum LandedSessionDecline {
     /// spawned; an adopted checkout is someone's own and waits for the
     /// ordinary landed window.
     Adopted,
+    /// The live holder moved on to a newer session, but a process (the
+    /// holder, a child, anything) has its working directory or an open file
+    /// in this checkout.
+    HolderAliveInUse,
 }
 
 impl LandedSessionDecline {
@@ -269,7 +276,7 @@ impl LandedSessionDecline {
             Self::RecentActivity => "recent_activity",
             Self::Changed => "changed",
             Self::ProcessAlive => "process_alive",
-            Self::HolderAlive => "holder_alive",
+            Self::HolderAlive => "holder_alive_current",
             Self::HolderUnbound => "holder_unbound",
             Self::HolderUnknown => "holder_unknown",
             Self::LeaseHeld => "lease_held",
@@ -291,6 +298,7 @@ impl LandedSessionDecline {
             Self::UpstreamMoved => "upstream_moved",
             Self::BudgetExhausted => "budget_exhausted",
             Self::Adopted => "adopted",
+            Self::HolderAliveInUse => "holder_alive_in_use",
         }
     }
 
@@ -300,7 +308,7 @@ impl LandedSessionDecline {
             Self::RecentActivity => "landed_sessions_declined_recent_activity",
             Self::Changed => "landed_sessions_declined_changed",
             Self::ProcessAlive => "landed_sessions_declined_process_alive",
-            Self::HolderAlive => "landed_sessions_declined_holder_alive",
+            Self::HolderAlive => "landed_sessions_declined_holder_alive_current",
             Self::HolderUnbound => "landed_sessions_declined_holder_unbound",
             Self::HolderUnknown => "landed_sessions_declined_holder_unknown",
             Self::LeaseHeld => "landed_sessions_declined_lease_held",
@@ -322,6 +330,7 @@ impl LandedSessionDecline {
             Self::UpstreamMoved => "landed_sessions_declined_upstream_moved",
             Self::BudgetExhausted => "landed_sessions_declined_budget_exhausted",
             Self::Adopted => "landed_sessions_declined_adopted",
+            Self::HolderAliveInUse => "landed_sessions_declined_holder_alive_in_use",
         }
     }
 
@@ -395,6 +404,20 @@ enum SessionCloseLane {
     /// the last activity and the last merge, and no gate, queue entry,
     /// operation, preparation or artifact producer running.
     MergedPullRequest,
+}
+
+/// The phase counter one `worktree_unclean` landed decline adds, per kind.
+fn worktree_unclean_counter(code: &str) -> &'static str {
+    match code {
+        "uncommitted_changes" => "landed_worktree_unclean_uncommitted_changes",
+        "unmarked_tracked_deletions" => "landed_worktree_unclean_unmarked_tracked_deletions",
+        "strict_tracked_deletions" => "landed_worktree_unclean_strict_tracked_deletions",
+        "ignored_content" => "landed_worktree_unclean_ignored_content",
+        "ignored_content_unverified" => "landed_worktree_unclean_ignored_content_unverified",
+        "operation_in_progress" => "landed_worktree_unclean_operation_in_progress",
+        "stash" => "landed_worktree_unclean_stash",
+        _ => "landed_worktree_unclean_other",
+    }
 }
 
 /// Why the open-file observation keeps the session, or `None` when it shows
@@ -981,6 +1004,33 @@ impl Broker {
         )
     }
 
+    /// The newer session a live holder was bound to after `activity_at`, when
+    /// it has moved on from `session_id`; `None` when this is still its
+    /// latest session, the binding cannot be read, or it is a shared agent
+    /// service (whose binding names no single task). Database only.
+    fn holder_moved_on(
+        &self,
+        session_id: i64,
+        holder_event: &crate::Event,
+        activity_at: i64,
+    ) -> Result<Option<i64>, BrokerError> {
+        let Some(agent) = holder_event.payload_json.as_deref().and_then(|payload| {
+            serde_json::from_str::<crate::session_holder::AgentProcess>(payload).ok()
+        }) else {
+            return Ok(None);
+        };
+        if crate::session_holder::is_shared_agent_service(&agent.command) {
+            return Ok(None);
+        }
+        self.store_ref().newer_holder_binding_elsewhere(
+            session_id,
+            holder_event.id,
+            activity_at,
+            agent.pid,
+            &agent.started,
+        )
+    }
+
     /// A whitespace-free fingerprint of the session's recorded pull requests
     /// and their merge times, or `unknown` when they cannot be read.
     fn pull_request_fingerprint(&self, session_id: i64) -> String {
@@ -1251,7 +1301,15 @@ impl Broker {
                 evidence,
                 memoized,
             }),
-            Ok(Some(_)) => Err(LandedSessionDecline::WorktreeUnclean),
+            Ok(Some(reason)) => {
+                // Which kind of content keeps it: the next reading of the
+                // worker metrics can tell untracked work from ignored leftovers.
+                crate::phase_telemetry::add(
+                    worktree_unclean_counter(crate::auto_cleanup::kept_reason_code(&reason)),
+                    std::time::Duration::ZERO,
+                );
+                Err(LandedSessionDecline::WorktreeUnclean)
+            }
             Err(_) => Err(unknown(LandedSessionDecline::WorktreeUnclean)),
         }
     }
@@ -1460,11 +1518,58 @@ impl Broker {
         } else {
             None
         };
+        // A live holder protects a session only while there is evidence it
+        // uses that session. One orchestrating agent routinely holds dozens of
+        // open sessions; when it was bound to a different session after this
+        // one's last activity, it has moved on, and the running-work checks
+        // below (open files with no holder exemption, gates, operations,
+        // preparation, artifact producers, merge queue, leases) decide.
+        let moved_on_to = if holder.liveness == crate::session_holder::RecordedHolderLiveness::Alive
+            && live_task_holder.is_none()
+        {
+            match holder_event.as_ref() {
+                Some(event) => self.holder_moved_on(
+                    session_id,
+                    event,
+                    fs_activity.max(candidate.last_activity_at),
+                )?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        if moved_on_to.is_some() {
+            crate::phase_telemetry::add("holder_moved_on_candidates", std::time::Duration::ZERO);
+        }
+        // The abandonment window treats a moved-on holder as gone only for a
+        // clean checkout: the owner's "close stale sessions if clean".
+        if !require_landed && moved_on_to.is_some() {
+            let worktree = std::path::Path::new(&candidate.worktree_path);
+            let clean = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root())
+                .ok()
+                .and_then(|policy| {
+                    crate::auto_cleanup::uncommitted_reason(
+                        worktree,
+                        Some(candidate.branch.as_str()),
+                        self.main_root(),
+                        &policy,
+                    )
+                    .ok()
+                })
+                .is_some_and(|reason| reason.is_none());
+            if !clean {
+                crate::phase_telemetry::add(
+                    "holder_moved_on_dirty_kept",
+                    std::time::Duration::ZERO,
+                );
+                return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+            }
+        }
         if require_landed {
             match holder.liveness {
                 crate::session_holder::RecordedHolderLiveness::Gone => {}
                 crate::session_holder::RecordedHolderLiveness::Alive
-                    if live_task_holder.is_some() => {}
+                    if live_task_holder.is_some() || moved_on_to.is_some() => {}
                 crate::session_holder::RecordedHolderLiveness::Alive => {
                     return Ok(AbandonedSessionCloseOutcome::LandedDeclined(
                         LandedSessionDecline::HolderAlive,
@@ -1507,7 +1612,9 @@ impl Broker {
             crate::session_holder::RecordedHolderLiveness::Unknown => {
                 return Ok(AbandonedSessionCloseOutcome::HolderUnavailable);
             }
-            crate::session_holder::RecordedHolderLiveness::Alive if live_task_holder.is_none() => {
+            crate::session_holder::RecordedHolderLiveness::Alive
+                if live_task_holder.is_none() && moved_on_to.is_none() =>
+            {
                 return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
             }
             crate::session_holder::RecordedHolderLiveness::Gone
@@ -1618,7 +1725,7 @@ impl Broker {
         // authorize closure. Legacy gone/unbound sessions keep their existing
         // behavior and avoid a system-wide lsof scan.
         let mut _artifact_use_reclaimer = None;
-        if task_lease_binding_present || merged_lane {
+        if task_lease_binding_present || merged_lane || moved_on_to.is_some() {
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
             }
@@ -1646,7 +1753,7 @@ impl Broker {
             }
             // A submission still being simulated, gated or awaiting promotion
             // is work in flight for this session.
-            if merged_lane {
+            if merged_lane || moved_on_to.is_some() {
                 match self.store_ref().latest_merge_queue_for_session(session_id) {
                     Ok(Some(entry))
                         if matches!(
@@ -1721,12 +1828,23 @@ impl Broker {
         // The opt-in abandonment lane tolerates the live holder's own working
         // directory; the landed lane does not: an agent sitting in its
         // worktree is using it.
-        let exempt_holder = if require_landed {
+        let exempt_holder = if require_landed || moved_on_to.is_some() {
             None
         } else {
             live_task_holder.as_ref().map(|agent| agent.pid)
         };
-        let process_use_checked = task_lease_binding_present || merged_lane;
+        let process_use_checked =
+            task_lease_binding_present || merged_lane || moved_on_to.is_some();
+        // For a moved-on holder a process in the checkout is the holder (or
+        // anything) still using it.
+        let in_use = |outcome: AbandonedSessionCloseOutcome| match outcome {
+            AbandonedSessionCloseOutcome::OperationActive
+                if moved_on_to.is_some() && require_landed =>
+            {
+                AbandonedSessionCloseOutcome::LandedDeclined(LandedSessionDecline::HolderAliveInUse)
+            }
+            other => other,
+        };
         if process_use_checked
             && let Some(kept) = process_use_verdict(
                 process_table,
@@ -1737,7 +1855,7 @@ impl Broker {
                 require_landed,
             )
         {
-            return Ok(kept);
+            return Ok(in_use(kept));
         }
 
         let leases = self
@@ -1846,7 +1964,7 @@ impl Broker {
                 exempt_holder,
                 require_landed,
             ) {
-                return Ok(kept);
+                return Ok(in_use(kept));
             }
         }
 
@@ -1870,6 +1988,40 @@ impl Broker {
                 })
             {
                 return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+            }
+        }
+
+        // A moved-on holder is asked again under the claims: the same later
+        // binding elsewhere, after this session's current activity, and for
+        // the abandonment window a checkout that is still clean.
+        if moved_on_to.is_some() {
+            let still_moved_on = match current_holder_event.as_ref() {
+                Some(event) => self.holder_moved_on(
+                    session_id,
+                    event,
+                    claimed_fs_activity.max(current.last_activity_at),
+                )?,
+                None => None,
+            };
+            if still_moved_on.is_none() {
+                return Ok(AbandonedSessionCloseOutcome::Changed);
+            }
+            if !require_landed {
+                let clean = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root())
+                    .ok()
+                    .and_then(|policy| {
+                        crate::auto_cleanup::uncommitted_reason(
+                            std::path::Path::new(&current.worktree_path),
+                            Some(current.branch.as_str()),
+                            self.main_root(),
+                            &policy,
+                        )
+                        .ok()
+                    })
+                    .is_some_and(|reason| reason.is_none());
+                if !clean {
+                    return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+                }
             }
         }
 
@@ -1951,6 +2103,15 @@ impl Broker {
             }
         }
         let pid_alive = current.pid.map(crate::broker::session_pid_alive);
+        let holder_evidence = if live_task_holder.is_some() {
+            "lease_expired"
+        } else if moved_on_to.is_some() {
+            "moved_on"
+        } else if holder.liveness == crate::session_holder::RecordedHolderLiveness::Gone {
+            "gone"
+        } else {
+            "unbound"
+        };
         let abandoned_payload = match (landed_proof.as_ref(), merged_evidence.as_ref()) {
             (Some(proof), merged) => {
                 let merges = match merged {
@@ -1977,6 +2138,8 @@ impl Broker {
                     },
                     proof,
                     &merges,
+                    holder_evidence,
+                    moved_on_to,
                 )
             }
             (None, _) => {
@@ -2001,6 +2164,8 @@ impl Broker {
                     .as_ref(),
                     head.as_deref(),
                     unlanded_commits,
+                    holder_evidence,
+                    moved_on_to,
                 )
             }
         };
@@ -2018,6 +2183,15 @@ impl Broker {
                 cleanup_request.is_some_and(|request| request.compact_checkout),
             ) {
             Ok(true) => {
+                crate::phase_telemetry::add(
+                    match holder_evidence {
+                        "lease_expired" => "session_closed_holder_lease_expired",
+                        "moved_on" => "session_closed_holder_moved_on",
+                        "gone" => "session_closed_holder_gone",
+                        _ => "session_closed_holder_unbound",
+                    },
+                    std::time::Duration::ZERO,
+                );
                 // Tell the agent, should it return, why and how to continue.
                 // The close stands whether or not the note is written.
                 crate::warn_unrecorded(

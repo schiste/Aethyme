@@ -34,7 +34,13 @@ pub const AGENT_PID_ENV: &str = "AETHYME_AGENT_PID";
 pub(crate) const TASK_LEASE_VERSION: u32 = 1;
 pub(crate) const TASK_LEASE_DURATION_MS: i64 = 24 * 60 * 60 * 1_000;
 pub(crate) const TASK_LEASE_RENEWAL_INTERVAL_MS: i64 = 5 * 60 * 1_000;
-pub(crate) const TASK_CLOSE_PROCESS_USE_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(2);
+/// How long one open-file observation answers for every retirement candidate
+/// of a pass. It equals the re-take interval, so a pass is covered by one
+/// observation at a time (at most four per pass) instead of each of hundreds
+/// of candidates asking for a system-wide `lsof`. A close resting on an
+/// observation up to this old deletes nothing; checkout removal checks
+/// process use again before it removes anything.
+pub(crate) const TASK_CLOSE_PROCESS_USE_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(10);
 /// A pass takes another open-file observation for a later retirement
 /// candidate only while at least this much of its deadline remains.
 const PROCESS_USE_RESNAPSHOT_MIN_BUDGET: Duration = Duration::from_secs(3);

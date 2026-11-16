@@ -5425,7 +5425,7 @@ impl Broker {
     /// absent. Retirement callers pass the complete closed cohort; other
     /// callers settle only the row they just removed. Raw alias symlinks may
     /// remain dangling, and additional cohort branch refs are left intact.
-    fn mark_removed_checkout_sessions_cleaned(
+    pub(super) fn mark_removed_checkout_sessions_cleaned(
         &mut self,
         session_ids: &[i64],
         owner_id: i64,

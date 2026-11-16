@@ -3456,6 +3456,7 @@ mod cleanup;
 mod finish;
 mod gates;
 mod leases;
+mod missing_checkout;
 mod owners;
 mod remote_heads;
 pub(crate) use leases::{
