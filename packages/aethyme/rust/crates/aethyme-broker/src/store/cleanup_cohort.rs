@@ -354,21 +354,24 @@ impl BrokerStore {
         })
     }
 
-    /// Session ids of up to `limit` indexed rows whose path resolution
-    /// failed, oldest first. Marking them dirty re-resolves only those rows.
-    pub(crate) fn cleanup_cohort_unresolved_session_ids(
+    /// Up to `limit` indexed rows whose path resolution failed, oldest first,
+    /// each with whether its session row still exists. Marking a live one
+    /// dirty re-resolves only that row; see
+    /// [`Self::mark_orphaned_cleanup_cohort_rows_dirty`] for the others.
+    pub(crate) fn cleanup_cohort_unresolved_rows(
         &self,
         namespace: &str,
         limit: usize,
-    ) -> Result<Vec<i64>, BrokerError> {
+    ) -> Result<Vec<(i64, bool)>, BrokerError> {
         let mut stmt = self.conn.prepare(
-            "SELECT session_id FROM cleanup_cohort_scan_rows
-             WHERE namespace = ?1 AND resolution_error IS NOT NULL
-             ORDER BY session_id LIMIT ?2",
+            "SELECT r.session_id, EXISTS(SELECT 1 FROM sessions s WHERE s.id = r.session_id)
+             FROM cleanup_cohort_scan_rows r
+             WHERE r.namespace = ?1 AND r.resolution_error IS NOT NULL
+             ORDER BY r.session_id LIMIT ?2",
         )?;
         let rows = stmt.query_map(
             params![namespace, i64::try_from(limit).unwrap_or(i64::MAX)],
-            |row| row.get::<_, i64>(0),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
         )?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(BrokerError::from)
@@ -1213,7 +1216,8 @@ impl BrokerStore {
             return Ok(CleanupCohortPersistOutcome::Changed);
         }
 
-        let mut affected_paths = BTreeSet::<String>::new();
+        let mut removed_paths = BTreeSet::<String>::new();
+        let mut writes = Vec::new();
         let mut applied_items = 0i64;
         for item in items {
             let current_dirty_revision = tx
@@ -1237,12 +1241,18 @@ impl BrokerStore {
                     "dirty cleanup cohort row has a mismatched session id".into(),
                 ));
             }
-            if let Some(old_path) = remove_cleanup_cohort_row(&tx, namespace, item.session_id)? {
-                affected_paths.insert(old_path);
-            }
-            if let Some(row) = &item.row {
-                affected_paths.insert(row.canonical_path.clone());
-                insert_cleanup_cohort_row(&tx, namespace, row)?;
+            // A row that still resolves to what is stored writes nothing; a
+            // changed one writes only its differences, as a discovery page
+            // does. A session that is gone loses its row and ancestors.
+            match &item.row {
+                Some(row) => writes.push(replace_cleanup_cohort_row(&tx, namespace, row)?),
+                None => {
+                    if let Some(old_path) =
+                        remove_cleanup_cohort_row(&tx, namespace, item.session_id)?
+                    {
+                        removed_paths.insert(old_path);
+                    }
+                }
             }
             tx.execute(
                 "DELETE FROM cleanup_cohort_dirty_sessions
@@ -1250,12 +1260,7 @@ impl BrokerStore {
                 params![item.session_id, item.revision],
             )?;
         }
-        for path in &affected_paths {
-            clear_cleanup_cohort_group(&tx, namespace, path)?;
-        }
-        for path in &affected_paths {
-            recompute_cleanup_cohort_group(&tx, namespace, path)?;
-        }
+        sync_cleanup_cohort_groups(&tx, namespace, &removed_paths)?;
 
         let current_revision: i64 = tx.query_row(
             "SELECT revision FROM session_cleanup_revision WHERE id = 1",
@@ -1323,10 +1328,17 @@ impl BrokerStore {
         );
         for _ in 0..applied_items {
             crate::phase_telemetry::add(
-                "cleanup_cohort_dirty_rows_rewritten",
+                "cleanup_cohort_dirty_rows_applied",
                 std::time::Duration::ZERO,
             );
         }
+        for _ in &removed_paths {
+            crate::phase_telemetry::add(
+                "cleanup_cohort_dirty_rows_removed",
+                std::time::Duration::ZERO,
+            );
+        }
+        record_cleanup_cohort_row_writes(&writes);
         Ok(CleanupCohortPersistOutcome::Stored)
     }
 
@@ -1606,6 +1618,30 @@ impl BrokerStore {
         namespace: &str,
         session_ids: &[i64],
     ) -> Result<usize, BrokerError> {
+        self.mark_cleanup_cohort_rows_dirty_where(namespace, session_ids, true)
+    }
+
+    /// Queue indexed rows whose session row no longer exists, exactly as the
+    /// session delete trigger would have: a dirty marker with no session
+    /// makes the next dirty page remove the index row, its ancestors and its
+    /// group membership. A discovery lap walks only existing sessions, so it
+    /// would never remove such a row; without this it stays unresolved.
+    pub(crate) fn mark_orphaned_cleanup_cohort_rows_dirty(
+        &mut self,
+        namespace: &str,
+        session_ids: &[i64],
+    ) -> Result<usize, BrokerError> {
+        self.mark_cleanup_cohort_rows_dirty_where(namespace, session_ids, false)
+    }
+
+    /// Mark indexed rows dirty whose session row exists (`session_exists`)
+    /// or is gone, and that are not dirty already.
+    fn mark_cleanup_cohort_rows_dirty_where(
+        &mut self,
+        namespace: &str,
+        session_ids: &[i64],
+        session_exists: bool,
+    ) -> Result<usize, BrokerError> {
         if session_ids.is_empty() {
             return Ok(0);
         }
@@ -1617,13 +1653,13 @@ impl BrokerStore {
             let eligible = tx.query_row(
                 "SELECT EXISTS(
                      SELECT 1 FROM cleanup_cohort_scan_rows r
-                     JOIN sessions s ON s.id = r.session_id
                      WHERE r.namespace = ?1 AND r.session_id = ?2
-                 ) AND NOT EXISTS(
+                 ) AND EXISTS(SELECT 1 FROM sessions s WHERE s.id = ?2) = ?3
+                 AND NOT EXISTS(
                      SELECT 1 FROM cleanup_cohort_dirty_sessions d
                      WHERE d.session_id = ?2
                  )",
-                params![namespace, session_id],
+                params![namespace, session_id, session_exists],
                 |row| row.get::<_, bool>(0),
             )?;
             if eligible {
@@ -1819,6 +1855,7 @@ fn remove_cleanup_cohort_row(
     Ok(canonical_path)
 }
 
+#[cfg(test)]
 fn insert_cleanup_cohort_row(
     tx: &rusqlite::Transaction<'_>,
     namespace: &str,
@@ -1858,9 +1895,18 @@ fn insert_cleanup_cohort_row(
 /// Phase counters for one committed discovery page: rows rewritten versus
 /// left unchanged, ancestor and group rows written, and the commit itself.
 fn record_cleanup_cohort_page_writes(writes: &[CleanupCohortRowWrite]) {
+    crate::phase_telemetry::add(
+        "cleanup_cohort_scan_page_commits",
+        std::time::Duration::ZERO,
+    );
+    record_cleanup_cohort_row_writes(writes);
+}
+
+/// Per-row counters for rows a page or a dirty page resolved: rewritten
+/// versus unchanged, and the ancestor and group rows written.
+fn record_cleanup_cohort_row_writes(writes: &[CleanupCohortRowWrite]) {
     use crate::phase_telemetry::add;
     use std::time::Duration;
-    add("cleanup_cohort_scan_page_commits", Duration::ZERO);
     for write in writes {
         add(
             if write.wrote_anything() {
@@ -2016,8 +2062,23 @@ fn replace_cleanup_cohort_row(
         paths.insert(stored.canonical_path.clone());
     }
     paths.insert(row.canonical_path.clone());
+    write.group_rows_written = sync_cleanup_cohort_groups(tx, namespace, &paths)?;
+    Ok(write)
+}
+
+/// Bring the group row of each canonical path to its recomputed first
+/// closed session, writing only groups that differ. Every differing group is
+/// cleared before any is inserted, so a session moving between two of the
+/// paths never collides on the per-namespace first-session key. Returns the
+/// group rows written.
+fn sync_cleanup_cohort_groups(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    paths: &BTreeSet<String>,
+) -> Result<usize, BrokerError> {
+    let mut written = 0usize;
     let mut changed_groups = Vec::new();
-    for path in &paths {
+    for path in paths {
         let wanted_first: Option<i64> = tx.query_row(
             "SELECT MIN(session_id) FROM cleanup_cohort_scan_rows
              WHERE namespace = ?1 AND canonical_path = ?2 AND cleanup_state = 'closed'",
@@ -2039,7 +2100,7 @@ fn replace_cleanup_cohort_row(
     for (path, stored, _) in &changed_groups {
         if *stored {
             clear_cleanup_cohort_group(tx, namespace, path)?;
-            write.group_rows_written += 1;
+            written += 1;
         }
     }
     for (path, _, wanted_first) in &changed_groups {
@@ -2050,10 +2111,10 @@ fn replace_cleanup_cohort_row(
                  ) VALUES (?1, ?2, ?3)",
                 params![namespace, path, first_session_id],
             )?;
-            write.group_rows_written += 1;
+            written += 1;
         }
     }
-    Ok(write)
+    Ok(written)
 }
 
 fn clear_cleanup_cohort_group(
@@ -2069,6 +2130,7 @@ fn clear_cleanup_cohort_group(
     Ok(())
 }
 
+#[cfg(test)]
 fn recompute_cleanup_cohort_group(
     tx: &rusqlite::Transaction<'_>,
     namespace: &str,
@@ -2194,6 +2256,351 @@ mod tests {
     }
 
     /// A store with one session (id 1) and the scan row the index hangs off.
+    /// A store with `count` sessions (ids 1..=count) and the scan row.
+    fn store_with_indexed_sessions(count: usize) -> (tempfile::TempDir, BrokerStore, Vec<i64>) {
+        let (repository, mut store) = fixture_store();
+        let ids = (0..count)
+            .map(|index| insert_session(&mut store, &format!("diffed-{index}")))
+            .collect::<Vec<_>>();
+        store
+            .conn
+            .execute("DELETE FROM cleanup_cohort_dirty_sessions", [])
+            .unwrap();
+        store
+            .cleanup_cohort_scan_page(CLEANUP_COHORT_NAMESPACE, 16, 0)
+            .unwrap();
+        (repository, store, ids)
+    }
+
+    fn row(
+        session_id: i64,
+        raw_path: &str,
+        canonical_path: &str,
+        cleanup_state: &str,
+    ) -> CleanupCohortResolvedRow {
+        CleanupCohortResolvedRow {
+            session_id,
+            raw_path: raw_path.into(),
+            canonical_path: canonical_path.into(),
+            git_dir: None,
+            resolution_error: None,
+            cleanup_state: cleanup_state.into(),
+        }
+    }
+
+    /// Apply `initial` then `updates` through the diffed write, and require
+    /// the index to equal what inserting the final rows into an empty index
+    /// and recomputing every group (the old delete-and-reinsert) stores.
+    /// Returns the writes the updates made.
+    fn diff_matches_reinsertion(
+        count: usize,
+        initial: &[CleanupCohortResolvedRow],
+        updates: &[CleanupCohortResolvedRow],
+    ) -> Vec<(String, String, i64)> {
+        let (_repository, mut store, _) = store_with_indexed_sessions(count);
+        for row in initial {
+            replace(&mut store, row);
+        }
+        install_cohort_write_log_for_test(&store.conn);
+        for row in updates {
+            replace(&mut store, row);
+        }
+        let mut last = BTreeMap::new();
+        for row in initial.iter().chain(updates) {
+            last.insert(row.session_id, row.clone());
+        }
+        let (_expected_repository, mut expected, _) = store_with_indexed_sessions(count);
+        {
+            let tx = expected.conn.transaction().unwrap();
+            for row in last.values() {
+                insert_cleanup_cohort_row(&tx, CLEANUP_COHORT_NAMESPACE, row).unwrap();
+            }
+            let paths = last
+                .values()
+                .flat_map(|row| [row.canonical_path.clone()])
+                .chain(initial.iter().map(|row| row.canonical_path.clone()))
+                .collect::<BTreeSet<_>>();
+            for path in &paths {
+                recompute_cleanup_cohort_group(&tx, CLEANUP_COHORT_NAMESPACE, path).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        assert_eq!(index_snapshot(&store.conn), index_snapshot(&expected.conn));
+        cohort_writes_for_test(&store.conn)
+    }
+
+    fn group_writes(writes: &[(String, String, i64)]) -> Vec<(String, i64)> {
+        writes
+            .iter()
+            .filter(|(table, _, _)| table == "groups")
+            .map(|(_, op, first)| (op.clone(), *first))
+            .collect()
+    }
+
+    #[test]
+    fn the_first_of_two_sessions_leaving_a_shared_path_hands_the_group_on() {
+        let writes = diff_matches_reinsertion(
+            2,
+            &[
+                row(1, "/tmp/cohort/shared", "/tmp/cohort/shared", "closed"),
+                row(2, "/tmp/cohort/shared", "/tmp/cohort/shared", "closed"),
+            ],
+            &[row(1, "/tmp/cohort/moved", "/tmp/cohort/moved", "closed")],
+        );
+        assert_eq!(
+            group_writes(&writes),
+            vec![
+                ("delete".to_owned(), 1),
+                ("insert".to_owned(), 1),
+                ("insert".to_owned(), 2)
+            ],
+            "{writes:?}"
+        );
+    }
+
+    #[test]
+    fn a_session_reopening_on_its_path_leaves_its_group() {
+        let writes = diff_matches_reinsertion(
+            1,
+            &[row(
+                1,
+                "/tmp/cohort/reopened",
+                "/tmp/cohort/reopened",
+                "closed",
+            )],
+            &[row(
+                1,
+                "/tmp/cohort/reopened",
+                "/tmp/cohort/reopened",
+                "open",
+            )],
+        );
+        assert_eq!(
+            writes,
+            vec![
+                ("rows".to_owned(), "update".to_owned(), 1),
+                ("groups".to_owned(), "delete".to_owned(), 1)
+            ],
+            "only the state and the emptied group change"
+        );
+    }
+
+    #[test]
+    fn the_last_member_leaving_a_group_removes_it() {
+        let writes = diff_matches_reinsertion(
+            2,
+            &[
+                row(1, "/tmp/cohort/emptied", "/tmp/cohort/emptied", "closed"),
+                row(2, "/tmp/cohort/emptied", "/tmp/cohort/emptied", "closed"),
+            ],
+            &[
+                row(2, "/tmp/cohort/emptied", "/tmp/cohort/emptied", "open"),
+                row(1, "/tmp/cohort/emptied", "/tmp/cohort/emptied", "open"),
+            ],
+        );
+        // Session 2 leaving changes nothing (1 is still first); session 1
+        // leaving empties the group.
+        assert_eq!(
+            group_writes(&writes),
+            vec![("delete".to_owned(), 1)],
+            "{writes:?}"
+        );
+    }
+
+    #[test]
+    fn a_raw_path_only_change_rewrites_only_raw_ancestors() {
+        let writes = diff_matches_reinsertion(
+            1,
+            &[row(
+                1,
+                "/tmp/cohort/raw-one",
+                "/private/tmp/cohort/canonical",
+                "closed",
+            )],
+            &[row(
+                1,
+                "/tmp/cohort/raw-two",
+                "/private/tmp/cohort/canonical",
+                "closed",
+            )],
+        );
+        assert_eq!(
+            writes,
+            vec![
+                ("rows".to_owned(), "update".to_owned(), 1),
+                ("ancestors".to_owned(), "delete".to_owned(), 1),
+                ("ancestors".to_owned(), "insert".to_owned(), 1)
+            ],
+            "the group and the canonical ancestors are untouched"
+        );
+    }
+
+    #[test]
+    fn a_dirty_page_writes_only_what_changed() {
+        let (_repository, mut store, ids) = store_with_indexed_sessions(2);
+        let unchanged = row(
+            ids[0],
+            "/tmp/cohort/dirty-a",
+            "/tmp/cohort/dirty-a",
+            "closed",
+        );
+        let moved = row(
+            ids[1],
+            "/tmp/cohort/dirty-b",
+            "/tmp/cohort/dirty-b",
+            "closed",
+        );
+        replace(&mut store, &unchanged);
+        replace(&mut store, &moved);
+        // Complete the lap so the dirty page has a complete index to keep.
+        let state = store
+            .cleanup_cohort_scan_page(CLEANUP_COHORT_NAMESPACE, 16, 1)
+            .unwrap()
+            .state;
+        store
+            .persist_cleanup_cohort_scan_page(
+                CLEANUP_COHORT_NAMESPACE,
+                state.revision,
+                state.generation,
+                state.alias_refresh_generation,
+                state.after_session_id,
+                &[unchanged.clone(), moved.clone()],
+                true,
+                2,
+            )
+            .unwrap();
+        store
+            .mark_cleanup_cohort_rows_dirty(CLEANUP_COHORT_NAMESPACE, &ids)
+            .unwrap();
+        let page = store
+            .cleanup_cohort_scan_page(CLEANUP_COHORT_NAMESPACE, 16, 3)
+            .unwrap();
+        assert_eq!(page.dirty_sessions.len(), 2);
+        let moved_again = row(
+            ids[1],
+            "/tmp/cohort/dirty-c",
+            "/tmp/cohort/dirty-c",
+            "closed",
+        );
+        let items = page
+            .dirty_sessions
+            .iter()
+            .map(|dirty| CleanupCohortDirtyResolvedRow {
+                session_id: dirty.session_id,
+                revision: dirty.revision,
+                row: Some(if dirty.session_id == ids[0] {
+                    unchanged.clone()
+                } else {
+                    moved_again.clone()
+                }),
+            })
+            .collect::<Vec<_>>();
+
+        install_cohort_write_log_for_test(&store.conn);
+        store
+            .persist_cleanup_cohort_dirty_page(
+                CLEANUP_COHORT_NAMESPACE,
+                page.state.generation,
+                page.state.alias_refresh_generation,
+                &items,
+                4,
+            )
+            .unwrap();
+
+        let writes = cohort_writes_for_test(&store.conn);
+        assert!(
+            writes.iter().all(|(_, _, session)| *session == ids[1]),
+            "the unchanged dirty row writes nothing: {writes:?}"
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|(table, _, _)| table == "rows")
+                .count(),
+            1,
+            "{writes:?}"
+        );
+        assert!(
+            store
+                .cleanup_cohort_scan_state(CLEANUP_COHORT_NAMESPACE)
+                .unwrap()
+                .unwrap()
+                .complete
+        );
+    }
+
+    #[test]
+    fn a_dirty_page_removes_the_row_of_a_session_that_is_gone() {
+        let (_repository, mut store, ids) = store_with_indexed_sessions(2);
+        let kept = row(
+            ids[0],
+            "/tmp/cohort/gone-shared",
+            "/tmp/cohort/gone-shared",
+            "closed",
+        );
+        let gone = row(
+            ids[1],
+            "/tmp/cohort/gone-shared",
+            "/tmp/cohort/gone-shared",
+            "closed",
+        );
+        replace(&mut store, &kept);
+        replace(&mut store, &gone);
+        store.conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        store
+            .conn
+            .execute("DELETE FROM sessions WHERE id = ?1", [ids[1]])
+            .unwrap();
+        store
+            .conn
+            .execute("DELETE FROM cleanup_cohort_dirty_sessions", [])
+            .unwrap();
+        assert_eq!(
+            store
+                .mark_cleanup_cohort_rows_dirty(CLEANUP_COHORT_NAMESPACE, &[ids[1]])
+                .unwrap(),
+            0,
+            "a live-session mark cannot reach the orphan"
+        );
+        assert_eq!(
+            store
+                .mark_orphaned_cleanup_cohort_rows_dirty(CLEANUP_COHORT_NAMESPACE, &ids)
+                .unwrap(),
+            1,
+            "only the row whose session is gone"
+        );
+        let page = store
+            .cleanup_cohort_scan_page(CLEANUP_COHORT_NAMESPACE, 16, 5)
+            .unwrap();
+        let items = page
+            .dirty_sessions
+            .iter()
+            .map(|dirty| CleanupCohortDirtyResolvedRow {
+                session_id: dirty.session_id,
+                revision: dirty.revision,
+                row: None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(items.len(), 1);
+        store
+            .persist_cleanup_cohort_dirty_page(
+                CLEANUP_COHORT_NAMESPACE,
+                page.state.generation,
+                page.state.alias_refresh_generation,
+                &items,
+                6,
+            )
+            .unwrap();
+        let (rows, ancestors, groups) = index_snapshot(&store.conn);
+        assert_eq!(rows.len(), 1);
+        assert!(ancestors.iter().all(|(_, session)| *session == ids[0]));
+        assert_eq!(
+            groups,
+            vec![("/tmp/cohort/gone-shared".to_owned(), ids[0])],
+            "the group was already first-session 1 and is untouched"
+        );
+    }
+
     fn store_with_one_indexed_session() -> (tempfile::TempDir, BrokerStore, i64) {
         let (repository, mut store) = fixture_store();
         let id = insert_session(&mut store, "diffed");
