@@ -63,8 +63,10 @@ MCP servers (opt-in; <host state>/mcp/services.toml, .aethyme/mcp.toml):
                               installed executable; runs and downloads nothing
   mcp connect <name>          become the server (exec: no extra process);
                               --fallback -- <cmd> keeps an agent unblocked
-  mcp status|config print     entries, identities, chosen copy; the snippet to
-                              paste into an agent (printed, never written)
+  mcp trust|status|config print
+                              trust a repository's .aethyme/mcp.toml; entries,
+                              identities, chosen copy; the snippet to paste
+                              into an agent (printed, never written)
 
 Collaboration (opt-in, experimental; disabled unless [collaboration] enables it):
   collab status|enroll        policy, state root and captures; mint a project ID

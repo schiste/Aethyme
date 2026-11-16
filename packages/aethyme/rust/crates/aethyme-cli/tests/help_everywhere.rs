@@ -121,6 +121,7 @@ const COMMANDS: &[&str] = &[
     "mcp resolve",
     "mcp connect",
     "mcp status",
+    "mcp trust",
     "mcp config",
     "mcp config print",
     "certify",

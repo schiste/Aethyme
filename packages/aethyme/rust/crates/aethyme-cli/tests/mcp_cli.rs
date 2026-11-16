@@ -215,7 +215,7 @@ fn resolve_without_an_installed_copy_keeps_the_declared_argv_and_downloads_nothi
     assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
     let value = json(&output);
     assert_eq!(value["resolution"]["resolved"], false);
-    assert_eq!(value["resolution"]["reason"], "not_installed");
+    assert_eq!(value["resolution"]["reason"], "unpinned");
     assert_eq!(
         value["resolution"]["argv"],
         serde_json::json!(["npx", "-y", "example-devtools@latest"])
@@ -229,11 +229,11 @@ fn resolve_without_an_installed_copy_keeps_the_declared_argv_and_downloads_nothi
     let connect = fixture.run(&["mcp", "connect", "example-devtools"]);
     assert_eq!(connect.status.code(), Some(6));
     assert!(
-        stderr(&connect).contains("never installs or downloads"),
+        stderr(&connect).contains("not resolved: unpinned"),
         "{}",
         stderr(&connect)
     );
-    assert!(fixture.events().contains("\"reason\":\"not_installed\""));
+    assert!(fixture.events().contains("\"reason\":\"unpinned\""));
 }
 
 #[test]
@@ -320,4 +320,238 @@ fn status_reports_entries_refusals_counters_and_no_hub() {
     assert_eq!(entries[0]["counters"]["outcomes"]["resolved"], 1);
     assert_eq!(value["errors"][0]["code"], "relative_path");
     assert_eq!(value["errors"][0]["entry"], "relative");
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const PNPM_SHIM: &str = r#"#!/bin/sh
+basedir=$(dirname "$(echo "$0" | sed -e 's,\\,/,g')")
+
+case `uname` in
+    *CYGWIN*) basedir=`cygpath -w "$basedir"`;;
+esac
+
+if [ -z "$NODE_PATH" ]; then
+  export NODE_PATH="/example/node_modules/.pnpm/node_modules"
+else
+  export NODE_PATH="/example/node_modules/.pnpm/node_modules:$NODE_PATH"
+fi
+if [ -x "$basedir/node" ]; then
+  exec "$basedir/node"  "$basedir/../example-server/dist/cli.js" "$@"
+else
+  exec node  "$basedir/../example-server/dist/cli.js" "$@"
+fi
+"#;
+
+#[test]
+fn a_pnpm_shim_starts_with_node_from_the_callers_path_without_env_allow() {
+    let fixture = Fixture::new();
+    let bin = fixture.work.join("fake-bin");
+    let pid_file = fixture.work.join("pid");
+    // A stand-in for node in a directory only the caller's PATH names.
+    write_executable(
+        &bin.join("node"),
+        &format!(
+            "#!/bin/sh\necho \"$$\" > {}\necho \"node-ran $1 $2 NODE_PATH=$NODE_PATH\"\n",
+            pid_file.display()
+        ),
+    );
+    let target = fixture.work.join("node_modules/example-server/dist/cli.js");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, "console.log(1)\n").unwrap();
+    write_executable(
+        &fixture.work.join("node_modules/.bin/example-server"),
+        PNPM_SHIM,
+    );
+    fixture.services(&format!(
+        "[[servers]]\nname = \"example-server\"\nargv = [\"pnpm\", \"exec\", \"example-server\", \"--stdio\"]\ncwd = {:?}\n",
+        fixture.work.display().to_string()
+    ));
+    let child = fixture
+        .command(&["mcp", "connect", "example-server"])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env_remove("NODE_PATH")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let line = stdout(&output);
+    assert!(line.starts_with("node-ran "), "{line}");
+    assert!(
+        line.contains("example-server/dist/cli.js --stdio"),
+        "{line}"
+    );
+    assert!(
+        line.contains("NODE_PATH=/example/node_modules/.pnpm/node_modules"),
+        "{line}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&pid_file).unwrap().trim(),
+        pid.to_string()
+    );
+}
+
+#[test]
+fn a_failed_preflight_runs_the_fallback_while_it_still_can() {
+    let fixture = Fixture::new();
+    // A shim this build does not read; with env_inherit = "none" its `node`
+    // cannot be found, which must be caught before the exec.
+    write_executable(
+        &fixture.work.join("node_modules/.bin/example-server"),
+        "#!/bin/sh\nset -e\nexec node \"$0.js\" \"$@\"\n",
+    );
+    fixture.services(&format!(
+        "[[servers]]\nname = \"example-server\"\nargv = [\"pnpm\", \"exec\", \"example-server\"]\ncwd = {:?}\nenv_inherit = \"none\"\n",
+        fixture.work.display().to_string()
+    ));
+    let output = fixture.run(&[
+        "mcp",
+        "connect",
+        "example-server",
+        "--fallback",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo fallback-ran",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "fallback-ran\n");
+    assert!(
+        stderr(&output).contains("not on the server's PATH"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(fixture.events().contains("\"reason\":\"preflight_failed\""));
+}
+
+#[test]
+fn the_fallback_runs_after_a_usage_error_or_a_panic() {
+    let fixture = Fixture::new();
+    fixture.services("");
+    let usage = fixture.run(&[
+        "mcp",
+        "connect",
+        "example-server",
+        "--bogus",
+        "--fallback",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo fallback-ran",
+    ]);
+    assert!(usage.status.success(), "{}", stderr(&usage));
+    assert_eq!(stdout(&usage), "fallback-ran\n");
+    assert!(stderr(&usage).contains("unknown option --bogus"));
+
+    let panicked = fixture
+        .command(&[
+            "mcp",
+            "connect",
+            "example-server",
+            "--fallback",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo fallback-ran",
+        ])
+        .env("AETHYME_TEST_MCP_CONNECT_PANIC", "1")
+        .env("CARGO_MANIFEST_DIR", env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert!(panicked.status.success(), "{}", stderr(&panicked));
+    assert_eq!(stdout(&panicked), "fallback-ran\n");
+    assert!(
+        stderr(&panicked).contains("internal error"),
+        "{}",
+        stderr(&panicked)
+    );
+    let events = fixture.events();
+    assert!(events.contains("\"reason\":\"usage\""), "{events}");
+    assert!(events.contains("\"reason\":\"panic\""), "{events}");
+}
+
+#[test]
+fn repository_entries_need_trust_and_never_shadow_a_host_entry() {
+    let fixture = Fixture::new();
+    git(&fixture.work, &["init", "-q", "-b", "main"]);
+    write_executable(
+        &fixture.work.join("repository.sh"),
+        "#!/bin/sh\necho repository-ran\n",
+    );
+    write_executable(&fixture.work.join("host.sh"), "#!/bin/sh\necho host-ran\n");
+    let repository_file = fixture.work.join(".aethyme/mcp.toml");
+    std::fs::create_dir_all(repository_file.parent().unwrap()).unwrap();
+    let declared = "schema = 1
+[[servers]]
+name = \"repository-server\"
+argv = [\"./repository.sh\"]
+cwd = \".\"
+
+[[servers]]
+name = \"shared-name\"
+argv = [\"./repository.sh\"]
+cwd = \".\"
+";
+    std::fs::write(&repository_file, declared).unwrap();
+    fixture.services(&format!(
+        "[[servers]]\nname = \"shared-name\"\nargv = [{:?}]\n",
+        fixture.work.join("host.sh").display().to_string()
+    ));
+
+    let refused = fixture.run(&["mcp", "connect", "repository-server"]);
+    assert_eq!(refused.status.code(), Some(3), "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("aethyme mcp trust"),
+        "{}",
+        stderr(&refused)
+    );
+
+    // The host entry wins even before any trust, with a note.
+    let shared = fixture.run(&["mcp", "connect", "shared-name"]);
+    assert!(shared.status.success(), "{}", stderr(&shared));
+    assert_eq!(stdout(&shared), "host-ran\n");
+    assert!(stderr(&shared).contains("is ignored and the host entry is used"));
+
+    let trusted = fixture.run(&["mcp", "trust", "--json"]);
+    assert!(trusted.status.success(), "{}", stderr(&trusted));
+    let value = json(&trusted);
+    assert_eq!(value["schema"], "aethyme.mcp-trust/v1");
+    assert_eq!(value["entries"][0]["name"], "repository-server");
+    assert_eq!(
+        value["entries"][0]["argv"],
+        serde_json::json!(["./repository.sh"])
+    );
+
+    let ran = fixture.run(&["mcp", "connect", "repository-server"]);
+    assert!(ran.status.success(), "{}", stderr(&ran));
+    assert_eq!(stdout(&ran), "repository-ran\n");
+    let shared = fixture.run(&["mcp", "connect", "shared-name"]);
+    assert_eq!(stdout(&shared), "host-ran\n");
+
+    // Any change needs trust again.
+    std::fs::write(&repository_file, format!("{declared}# edited\n")).unwrap();
+    let edited = fixture.run(&["mcp", "connect", "repository-server"]);
+    assert_eq!(edited.status.code(), Some(3), "{}", stderr(&edited));
+
+    let status = json(&fixture.run(&["mcp", "status", "--json"]));
+    assert_eq!(status["shadowed"], serde_json::json!(["shared-name"]));
+    assert_eq!(status["repository_trust"]["trusted"], false);
 }
