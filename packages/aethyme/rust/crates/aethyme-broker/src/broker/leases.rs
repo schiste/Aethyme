@@ -362,21 +362,21 @@ impl LandedSessionDecline {
         })
     }
 
-    /// Whether this decline answered the session's question, so a
-    /// `proof_timed_out` streak ends: anything but running out of time,
-    /// contention or evidence that could not be read.
+    /// Whether the landed proof itself reached this answer, so a
+    /// `proof_timed_out` streak ends: the landing proof concluded (not
+    /// landed, no evidence or commits to search for) or the cleanliness
+    /// listing finished (unclean, or work since the proof). A cheap decline
+    /// decided before the proof ran (recent activity, a live process, a held
+    /// lease, a changed row, a moved default branch), contention, running out
+    /// of time and unreadable evidence leave the streak as it was.
     pub(crate) const fn is_conclusive(self) -> bool {
-        !matches!(
+        matches!(
             self,
-            Self::ProofTimedOut
-                | Self::BudgetExhausted
-                | Self::Busy
-                | Self::HolderUnknown
-                | Self::LeaseUnknown
-                | Self::OperationUnknown
-                | Self::LandingUnknown
-                | Self::WorktreeUnavailable
-                | Self::PolicyUnavailable
+            Self::NotLanded
+                | Self::NoLandingEvidence
+                | Self::NoSessionCommits
+                | Self::WorktreeUnclean
+                | Self::MovedBeforeClose
         )
     }
 
@@ -716,8 +716,15 @@ pub(crate) const LANDED_PROOF_SESSION_BUDGET: std::time::Duration =
 /// Meta key of the consecutive `proof_timed_out` streaks: a JSON object
 /// from session id to `[streak, first timed out at (epoch ms)]`.
 pub(crate) const LANDED_PROOF_TIMEOUTS_KEY: &str = "landed_lane.proof_timeouts";
-/// Streaks remembered at most; the most recent first-timeouts go first.
+/// Streaks remembered at most; the oldest first-timeouts go first.
 const LANDED_PROOF_TIMEOUTS_MAX: usize = 4_096;
+/// Meta key of the sessions that still timed out with a long-budget grant:
+/// a JSON array of session ids, shown by `broker status`.
+pub(crate) const LANDED_PROOF_UNPROVABLE_KEY: &str = "landed_lane.proof_unprovable";
+/// Meta key counting likely-landed passes that had a session to grant.
+const LANDED_PROOF_GRANT_PASSES_KEY: &str = "landed_lane.grant_passes";
+/// Every this many such passes the grant runs first instead of last.
+pub(crate) const LANDED_PROOF_GRANT_FIRST_EVERY: u64 = 4;
 /// Doublings at most: the pass deadline caps the budget long before.
 const LANDED_PROOF_MAX_DOUBLINGS: u32 = 16;
 
@@ -1824,8 +1831,7 @@ impl Broker {
         session: &crate::Session,
         deadline: Option<std::time::Instant>,
     ) -> Result<LandedProof, LandedSessionDecline> {
-        let session_deadline =
-            session_deadline_within(deadline, self.landed_proof_session_budget(session.id));
+        let session_deadline = self.landed_proof_session_deadline(session.id, deadline);
         self.landed_session_decline_with_memo(session, deadline, session_deadline, true)
     }
 
@@ -1895,14 +1901,26 @@ impl Broker {
                 ended.is_some()
             }
         };
-        if !changed {
-            return;
+        if decline.is_none_or(LandedSessionDecline::is_conclusive) {
+            self.forget_landed_proof_unprovable(&[session_id]);
         }
+        if changed {
+            self.store_landed_proof_timeout_streaks(streaks);
+        }
+    }
+
+    fn store_landed_proof_timeout_streaks(
+        &self,
+        mut streaks: std::collections::BTreeMap<i64, (u32, i64)>,
+    ) {
         while streaks.len() > LANDED_PROOF_TIMEOUTS_MAX {
-            let Some((&latest, _)) = streaks.iter().max_by_key(|(_, (_, first))| *first) else {
+            let Some((&oldest, _)) = streaks
+                .iter()
+                .min_by_key(|(session_id, (_, first))| (*first, **session_id))
+            else {
                 break;
             };
-            streaks.remove(&latest);
+            streaks.remove(&oldest);
         }
         crate::warn_unrecorded(
             "remember landed-proof timeout streaks",
@@ -1911,6 +1929,125 @@ impl Broker {
                 &serde_json::to_string(&streaks).unwrap_or_default(),
             ),
         );
+    }
+
+    /// Drop the streaks and unprovable marks of sessions that are no longer
+    /// open: once per likely-landed pass, bounded by the stored entries.
+    pub(crate) fn prune_landed_proof_timeouts(&self, open: &std::collections::BTreeSet<i64>) {
+        let mut streaks = self.landed_proof_timeout_streaks();
+        let before = streaks.len();
+        streaks.retain(|session_id, _| open.contains(session_id));
+        for _ in streaks.len()..before {
+            crate::phase_telemetry::add(
+                "landed_proof_timeout_streaks_pruned",
+                std::time::Duration::ZERO,
+            );
+        }
+        if streaks.len() != before {
+            self.store_landed_proof_timeout_streaks(streaks);
+        }
+        let gone = self
+            .landed_proof_unprovable_sessions()
+            .into_iter()
+            .filter(|session_id| !open.contains(session_id))
+            .collect::<Vec<_>>();
+        self.forget_landed_proof_unprovable(&gone);
+    }
+
+    /// The sessions that still timed out with a long-budget grant.
+    pub(crate) fn landed_proof_unprovable_sessions(&self) -> std::collections::BTreeSet<i64> {
+        self.store_ref()
+            .meta_get(LANDED_PROOF_UNPROVABLE_KEY)
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_str::<std::collections::BTreeSet<i64>>(&value).ok())
+            .unwrap_or_default()
+    }
+
+    fn store_landed_proof_unprovable(&self, sessions: &std::collections::BTreeSet<i64>) {
+        crate::warn_unrecorded(
+            "remember sessions the landed proof could not conclude",
+            self.store_ref().meta_set(
+                LANDED_PROOF_UNPROVABLE_KEY,
+                &serde_json::to_string(sessions).unwrap_or_default(),
+            ),
+        );
+    }
+
+    /// Record that `session_id` timed out even with a long-budget grant.
+    pub(crate) fn mark_landed_proof_unprovable(&self, session_id: i64) {
+        crate::phase_telemetry::add("landed_proof_unprovable", std::time::Duration::ZERO);
+        let mut sessions = self.landed_proof_unprovable_sessions();
+        if sessions.insert(session_id) {
+            while sessions.len() > LANDED_PROOF_TIMEOUTS_MAX {
+                sessions.pop_first();
+            }
+            self.store_landed_proof_unprovable(&sessions);
+        }
+    }
+
+    fn forget_landed_proof_unprovable(&self, session_ids: &[i64]) {
+        if session_ids.is_empty() {
+            return;
+        }
+        let mut sessions = self.landed_proof_unprovable_sessions();
+        let before = sessions.len();
+        for session_id in session_ids {
+            sessions.remove(session_id);
+        }
+        if sessions.len() != before {
+            self.store_landed_proof_unprovable(&sessions);
+        }
+    }
+
+    /// Whether this likely-landed pass, which has a session to grant, runs
+    /// the grant first: every [`LANDED_PROOF_GRANT_FIRST_EVERY`]th such pass.
+    /// Otherwise it runs last, after the normal queue.
+    pub(crate) fn landed_proof_grant_goes_first(&self) -> bool {
+        let passes = self
+            .store_ref()
+            .meta_get(LANDED_PROOF_GRANT_PASSES_KEY)
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+            .wrapping_add(1);
+        crate::warn_unrecorded(
+            "count landed-proof grant passes",
+            self.store_ref()
+                .meta_set(LANDED_PROOF_GRANT_PASSES_KEY, &passes.to_string()),
+        );
+        passes % LANDED_PROOF_GRANT_FIRST_EVERY == 0
+    }
+
+    /// The one session deadline of a landed judgement of `session_id` in a
+    /// pass ending at `pass`. A long-budget grant gets what is left of the
+    /// pass less a tenth (at most a second), so a proof that still runs out
+    /// is told apart from the pass running out (`proof_timed_out`, not
+    /// `budget_exhausted`). Otherwise the session's budget from now, a
+    /// doubled budget never more than half of what is left of the pass, so
+    /// one slow session cannot take a whole pass outside the grant.
+    pub(crate) fn landed_proof_session_deadline(
+        &self,
+        session_id: i64,
+        pass: Option<std::time::Instant>,
+    ) -> Option<std::time::Instant> {
+        let budget = self.landed_proof_session_budget(session_id);
+        if budget == std::time::Duration::MAX {
+            return pass.map(|pass| {
+                let remaining = pass.saturating_duration_since(std::time::Instant::now());
+                pass.checked_sub((remaining / 10).min(std::time::Duration::from_secs(1)))
+                    .unwrap_or(pass)
+            });
+        }
+        let doubled = budget > landed_proof_base_budget(session_id);
+        let budget = match pass {
+            Some(pass) if doubled => {
+                budget.min(pass.saturating_duration_since(std::time::Instant::now()) / 2)
+            }
+            _ => budget,
+        };
+        session_deadline_within(pass, budget)
     }
 
     /// Of `candidates`, the session that has been timing out longest: the
@@ -2257,7 +2394,7 @@ impl Broker {
         // memoized re-proof before the claims and the re-checks under them
         // share this session's budget.
         let session_deadline = if require_landed {
-            session_deadline_within(deadline, self.landed_proof_session_budget(session_id))
+            self.landed_proof_session_deadline(session_id, deadline)
         } else {
             deadline
         };

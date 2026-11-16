@@ -2648,7 +2648,7 @@ Introduced 2026-11-16. Changes consumers may see:
 
 Covered by `auto_cleanup.rs`, `broker/leases.rs`, `session_auto_close.rs` and `session_holder.rs` tests.
 
-### Every slow landed proof is eventually concluded
+### Slow landed proofs get growing budgets and a long grant
 
 Introduced 2026-11-16. Changes consumers may see:
 
@@ -2658,3 +2658,14 @@ Introduced 2026-11-16. Changes consumers may see:
 - A listing that failed or was stopped is no longer reported as `moved_before_close`, `worktree_unclean` or `upstream_moved`. It is `proof_timed_out` when the session's budget ran out, `budget_exhausted` when the pass did, and `worktree_unavailable` otherwise. A landing search in which any Git call timed out is inconclusive (counter `landed_landing_search_timed_out`) instead of `not_landed`.
 
 Covered by `auto_cleanup.rs`, `broker/leases.rs` and `session_auto_close.rs` tests.
+
+### Landed-proof grant pacing, streak hygiene and group cleanup
+
+Introduced 2026-11-17. This corrects the guarantee stated in the previous section. Changes consumers may see:
+
+- What is guaranteed: a session that keeps timing out is, on every fourth likely-landed pass that has such a session, judged first, with what is left of the lane's share less a tenth (at most a second). On other passes it is judged last (counter `landed_proof_long_budget_first` when first; meta key `landed_lane.grant_passes`). A session that still runs out of time when judged first is kept, counted (`landed_proof_unprovable`) and listed in meta key `landed_lane.proof_unprovable` (JSON array of session ids). `broker status --json` shows them in advice `cleanup.landed-proof-unprovable` (severity `notice`, session ids only, no checkout path). A doubled budget is capped at half of what is left of the pass.
+- A streak ends only when the landing proof concluded (`not_landed`, `no_landing_evidence`, `no_session_commits`), the cleanliness listing finished (`worktree_unclean`, `moved_before_close`) or the session closed. Cheap declines decided before the proof ran (`recent_activity`, `process_alive`, `changed`, `upstream_moved`, `lease_held`), contention, running out of time and unreadable evidence leave it. At the cap the oldest entry is evicted. Entries of sessions no longer open are pruned once per likely-landed pass (counter `landed_proof_timeout_streaks_pruned`).
+- An owned process group whose leader finished is reaped at once. It is signalled (TERM, 75 ms, KILL) only when members remain, counter `owned_group_members_after_exit`; before, every normal completion paid the 75 ms grace.
+- The streamed early-stop check reads each listing byte once. The merged cleanliness listing also runs with `core.untrackedCache=false`.
+
+Covered by `bounded_output.rs`, `auto_cleanup.rs` and `session_auto_close.rs` tests.

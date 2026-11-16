@@ -2984,6 +2984,35 @@ pub struct StatusAdvice {
     pub commands: Vec<String>,
 }
 
+/// The `status` row naming sessions whose landed proof timed out even with
+/// the rest of a pass's share: the background worker keeps them open and
+/// asks again, but a person may need to look. Session ids only; the
+/// checkout paths are omitted.
+fn push_landed_proof_unprovable_advice(
+    view: &mut StatusView,
+    sessions: &std::collections::BTreeSet<i64>,
+) {
+    let Some(&first) = sessions.first() else {
+        return;
+    };
+    view.advice.push(StatusAdvice {
+        id: "cleanup.landed-proof-unprovable",
+        severity: StatusAdviceSeverity::Notice,
+        reason: "the landed proof of these sessions ran out of time even with the rest of a retirement pass, so they stay open and are asked again",
+        summary: format!(
+            "{} session(s) could not be proved landed within a full pass",
+            sessions.len()
+        ),
+        session_id: Some(first),
+        queue_entry_id: None,
+        evidence: sessions
+            .iter()
+            .map(|session_id| format!("session {session_id}"))
+            .collect(),
+        commands: Vec::new(),
+    });
+}
+
 /// Work a verify-only repository's integration branch carries that the
 /// published branch lacks.
 ///
@@ -3470,7 +3499,9 @@ pub(crate) use leases::{
     long_proof_grant, validate_session_commit_args,
 };
 #[cfg(test)]
-pub(crate) use leases::{doubled_proof_budget, landed_proof_session_budget_for_test};
+pub(crate) use leases::{
+    LANDED_PROOF_TIMEOUTS_KEY, doubled_proof_budget, landed_proof_session_budget_for_test,
+};
 pub use owners::{CommitOwner, MAX_OWNER_COMMITS, OwnedCommit, OwnersReport};
 pub(crate) mod lifecycle;
 mod scope_capture;

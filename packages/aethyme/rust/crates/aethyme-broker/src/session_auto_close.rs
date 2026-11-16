@@ -841,12 +841,22 @@ mod lane_tests {
             "only sessions the pass may judge are granted"
         );
 
-        broker.record_landed_proof_outcome(first.id, Some(Decline::Busy));
-        assert_eq!(
-            broker.landed_proof_session_budget(first.id),
-            base_budget * 4,
-            "contention leaves the streak"
-        );
+        for cheap in [
+            Decline::Busy,
+            Decline::RecentActivity,
+            Decline::ProcessAlive,
+            Decline::Changed,
+            Decline::UpstreamMoved,
+            Decline::LeaseHeld,
+            Decline::BudgetExhausted,
+        ] {
+            broker.record_landed_proof_outcome(first.id, Some(cheap));
+            assert_eq!(
+                broker.landed_proof_session_budget(first.id),
+                base_budget * 4,
+                "{cheap:?}, decided before the proof ran, leaves the streak"
+            );
+        }
         broker.record_landed_proof_outcome(first.id, Some(Decline::NotLanded));
         assert_eq!(broker.landed_proof_session_budget(first.id), base_budget);
         broker.record_landed_proof_outcome(second.id, None);
@@ -857,6 +867,143 @@ mod lane_tests {
             assert_eq!(broker.landed_proof_session_budget(first.id), base_budget);
         }
         assert_eq!(broker.landed_proof_session_budget(second.id), base_budget);
+    }
+
+    /// The streaks stay bounded and current: ids of sessions no longer open
+    /// are pruned, the oldest entry goes at the cap, the grant runs first
+    /// every fourth pass, and a doubled budget never takes more than half of
+    /// what is left of the pass.
+    #[test]
+    fn timeout_streaks_are_pruned_capped_and_paced() {
+        use crate::broker::LandedSessionDecline as Decline;
+        let (_owner, _storage, mut broker) = fixture("");
+        let (open, _) = session(&mut broker, "still open", false);
+
+        // At the cap, the oldest first-timeout is evicted, not the newest.
+        let full = (0..4_096_i64)
+            .map(|index| ((1_000_000 + index).to_string(), (1_u32, 1_000 + index)))
+            .collect::<BTreeMap<_, _>>();
+        broker
+            .store_ref()
+            .meta_set(
+                crate::broker::LANDED_PROOF_TIMEOUTS_KEY,
+                &serde_json::to_string(&full).unwrap(),
+            )
+            .unwrap();
+        broker.record_landed_proof_outcome(open.id, Some(Decline::ProofTimedOut));
+        let streaks = broker.landed_proof_timeout_streaks();
+        assert_eq!(streaks.len(), 4_096);
+        assert!(!streaks.contains_key(&1_000_000), "the oldest went");
+        assert!(streaks.contains_key(&1_004_095));
+        assert!(streaks.contains_key(&open.id), "the newest stayed");
+
+        // Sessions no longer open are pruned with their unprovable marks.
+        broker.mark_landed_proof_unprovable(1_000_001);
+        broker.mark_landed_proof_unprovable(open.id);
+        broker.prune_landed_proof_timeouts(&std::collections::BTreeSet::from([open.id]));
+        assert_eq!(
+            broker
+                .landed_proof_timeout_streaks()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![open.id]
+        );
+        assert_eq!(
+            broker.landed_proof_unprovable_sessions(),
+            std::collections::BTreeSet::from([open.id])
+        );
+        broker.record_landed_proof_outcome(open.id, None);
+        assert!(
+            broker.landed_proof_unprovable_sessions().is_empty(),
+            "a close forgets the mark"
+        );
+
+        // The grant runs first on every fourth pass that has one.
+        let cadence = (0..8)
+            .map(|_| broker.landed_proof_grant_goes_first())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cadence,
+            vec![false, false, false, true, false, false, false, true]
+        );
+
+        // A doubled budget is capped at half of what is left of the pass.
+        for _ in 0..3 {
+            broker.record_landed_proof_outcome(open.id, Some(Decline::ProofTimedOut));
+        }
+        let pass = std::time::Instant::now() + Duration::from_secs(20);
+        let deadline = broker
+            .landed_proof_session_deadline(open.id, Some(pass))
+            .unwrap();
+        assert!(
+            deadline <= std::time::Instant::now() + Duration::from_secs(10),
+            "80 s doubled, capped at half of the 20 s left"
+        );
+        assert_eq!(broker.landed_proof_session_deadline(open.id, None), None);
+    }
+
+    /// A session that runs out of time even when the grant runs first, with
+    /// the whole share, is counted and shown in `broker status` by its
+    /// session id only. Its listing blocks until released, so the outcome
+    /// does not depend on how fast the runner is.
+    #[test]
+    fn a_session_unprovable_under_the_grant_is_reported() {
+        let (owner, _storage, mut broker) = fixture("");
+        let session = merged_quiet_session(&mut broker, "never provable");
+        let worktree = session.worktree_path.clone();
+        broker.record_landed_proof_outcome(
+            session.id,
+            Some(crate::broker::LandedSessionDecline::ProofTimedOut),
+        );
+        // The next pass with a grant is the fourth: the grant goes first.
+        broker
+            .store_ref()
+            .meta_set("landed_lane.grant_passes", "3")
+            .unwrap();
+        let release = owner.path().join("release");
+        let script = status_script(
+            owner.path(),
+            "blocking.sh",
+            &format!(
+                "while [ ! -e '{}' ]; do sleep 0.05; done",
+                release.display()
+            ),
+        );
+        let seam = crate::auto_cleanup::proof_git_seam_for_test(Some(script), None);
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let report = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker
+                .retire_abandoned_sessions_for_recovery(Some(
+                    // The likely-landed queue gets half: well past the
+                    // process-table margin, so the holder is checked and the
+                    // proof itself is what runs out.
+                    std::time::Instant::now() + Duration::from_secs(10),
+                ))
+                .unwrap()
+        };
+        std::fs::write(&release, "").unwrap();
+        drop(seam);
+
+        assert!(is_open(&broker, session.id), "{report:#?}");
+        assert_eq!(phase_count(&recorder, "landed_proof_long_budget_first"), 1);
+        assert_eq!(phase_count(&recorder, "landed_proof_unprovable"), 1);
+        assert!(
+            broker
+                .landed_proof_unprovable_sessions()
+                .contains(&session.id)
+        );
+        let view = broker.status(now_ms()).unwrap();
+        let advice = view
+            .advice
+            .iter()
+            .find(|advice| advice.id == "cleanup.landed-proof-unprovable")
+            .expect("the unprovable session is shown");
+        assert_eq!(advice.session_id, Some(session.id));
+        assert_eq!(advice.evidence, vec![format!("session {}", session.id)]);
+        let shown = serde_json::to_string(advice).unwrap();
+        assert!(!shown.contains(&worktree), "no checkout path: {shown}");
     }
 
     /// A session whose proof always outlives its own budget is still closed:
