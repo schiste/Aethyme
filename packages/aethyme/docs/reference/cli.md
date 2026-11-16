@@ -227,6 +227,14 @@ aethyme mcp connect <name> [--from-worktree] [--fallback-cwd <dir>] [--fallback 
 aethyme mcp trust [--repo <path>] [--json]
 aethyme mcp status [--json]
 aethyme mcp config print --agent codex|claude [--name <name>]
+aethyme mcp manage list [--json]
+aethyme mcp manage add <name> --package <pkg> [--package ...] [--executable <name> ...] [--repair auto|report] [--json]
+aethyme mcp manage remove <name> [--json]
+aethyme mcp intercept install [--dir <path>] [--json]
+aethyme mcp intercept status [--json]
+aethyme mcp intercept uninstall [--json]
+aethyme mcp repair [--check|--apply] [--auto] [--agent codex|claude] [--codex-config <path>] [--claude-config <path>] [--json]
+aethyme mcp bypass [--json]
 ```
 
 Opt-in. Entries are declared in `<host state>/mcp/services.toml` and, per
@@ -251,9 +259,32 @@ that command instead. `status` lists entries, refusals and counters from
 `<host state>/mcp/events.jsonl`; `config print` prints an agent configuration
 snippet and writes nothing.
 
+Managed servers: host entries with `managed = true`, `match_packages`,
+`match_executables` and `repair = "auto"|"report"` (host file only; a
+repository file is refused with `managed_in_repository`). `manage` lists,
+marks or unmarks them in the host file (formatting kept). `intercept
+install` creates shims named `npx`, `npm`, `pnpm`, `pnpx`, `bunx`, `yarn`
+and each managed executable, pointing at `aethyme`, plus
+`<host state>/mcp/intercept.match`, and prints the `PATH` line to add; a
+matching call becomes `aethyme mcp connect <name> --fallback -- <real
+launcher> <args>` and anything else runs the real tool untouched (exit 127
+when there is none). `intercept status` reports completeness, staleness and
+`PATH` order; `uninstall` removes what `install` created. `repair` scans the
+Codex `config.toml`, `~/.claude.json` and a repository's `.mcp.json` for
+entries starting a managed server without `connect`; `--apply` rewrites only
+those (backup, compare-and-swap, formatting kept; a tracked `.mcp.json` is
+only reported), `--auto` only `repair = "auto"` entries; it prints server
+names and program basenames, never values. `bypass` counts running processes
+that match a managed entry but did not start through `connect` (1 s budget;
+`inconclusive` when the process table cannot be read). `status --json` adds
+a `managed` section. `<host state>/mcp/settings.toml` `[mcp]
+repair_on_session_start = true` makes `aethyme hook SessionStart` run
+`repair --apply --auto` within 2 s (off by default).
+
 `--json` objects carry `schema`: `aethyme.mcp-resolve/v1`,
-`aethyme.mcp-status/v1`, `aethyme.mcp-trust/v1`, or `aethyme.mcp-error/v1`
-(`code`, `message`). See
+`aethyme.mcp-status/v1`, `aethyme.mcp-trust/v1`, `aethyme.mcp-manage/v1`,
+`aethyme.mcp-intercept/v1`, `aethyme.mcp-repair/v1`,
+`aethyme.mcp-bypass/v1`, or `aethyme.mcp-error/v1` (`code`, `message`). See
 the [MCP servers guide](../guides/mcp-servers.md).
 
 ## Broker Commands

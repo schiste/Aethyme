@@ -79,6 +79,22 @@ by hand from `config print`, so renaming `connect` or its flags breaks those
 configurations (the fallback keeps the agent working only while `aethyme mcp
 connect` itself still parses). See [the guide](../guides/mcp-servers.md).
 
+Managed servers add two more external consumers. `aethyme mcp intercept
+install` creates symlinks named after launchers (`npx`, `npm`, `pnpm`,
+`pnpx`, `bunx`, `yarn`) and managed executables that point at the `aethyme`
+binary: the binary dispatches on `argv[0]`'s basename before anything else,
+and reads `<host state>/mcp/intercept.match` (a line-based file it writes
+itself, header `aethyme-mcp-intercept 1`); the environment variables
+`AETHYME_MCP_SHIM_GUARD` and `AETHYME_MCP_SHIM_DEPTH` are part of that
+contract. `aethyme mcp repair --apply` writes agent configurations (the
+Codex `config.toml`, `~/.claude.json`, an untracked `.mcp.json`) so their
+entries run `aethyme mcp connect <name> --fallback -- ...`, which makes
+`connect`'s spelling a consumer contract there too. The manage, intercept,
+repair and bypass commands emit `aethyme.mcp-manage/v1`,
+`aethyme.mcp-intercept/v1`, `aethyme.mcp-repair/v1` and
+`aethyme.mcp-bypass/v1`; `aethyme hook SessionStart` reads
+`<host state>/mcp/settings.toml` (`[mcp] repair_on_session_start`).
+
 The `service::jobs::JobStore` library adds a separate explicitly opened
 SQLite job file (application ID `0x41534a31`, schema 1), durable idempotency keys,
 atomic deduplication and fenced job state transitions. It has no CLI or socket
