@@ -209,7 +209,10 @@ pub fn compare_and_remember(
             identity: identity.clone(),
             at_ms: now_ms(),
         };
-        let _ = write_remembered(&path, &remembered);
+        crate::warn_unrecorded(
+            "remember the MCP resolution",
+            write_remembered(&path, &remembered),
+        );
     }
     change
 }

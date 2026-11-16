@@ -180,7 +180,10 @@ impl Recorder {
             key: plan.map(|plan| plan.key_short.clone()),
             phases_ms: phases,
         };
-        let _ = telemetry::append(&directory, &event);
+        crate::warn_unrecorded(
+            "record the MCP connect event",
+            telemetry::append(&directory, &event),
+        );
     }
 }
 

@@ -295,18 +295,21 @@ fn record_resolve(
         .unwrap_or_default();
     phases.insert("config_load".into(), config_ms);
     phases.insert("command_total".into(), elapsed_ms(started));
-    let _ = telemetry::append(
-        &directory,
-        &Event {
-            at_ms: telemetry::now_ms(),
-            command: "resolve".into(),
-            name: name.to_string(),
-            outcome: outcome.into(),
-            reason: reason.map(str::to_string),
-            copy: plan.map(|plan| plan.copy.kind.as_str().to_string()),
-            key: plan.map(|plan| plan.key_short.clone()),
-            phases_ms: phases,
-        },
+    crate::warn_unrecorded(
+        "record the MCP resolve event",
+        telemetry::append(
+            &directory,
+            &Event {
+                at_ms: telemetry::now_ms(),
+                command: "resolve".into(),
+                name: name.to_string(),
+                outcome: outcome.into(),
+                reason: reason.map(str::to_string),
+                copy: plan.map(|plan| plan.copy.kind.as_str().to_string()),
+                key: plan.map(|plan| plan.key_short.clone()),
+                phases_ms: phases,
+            },
+        ),
     );
 }
 
