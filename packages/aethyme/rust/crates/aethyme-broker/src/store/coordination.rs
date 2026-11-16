@@ -368,7 +368,11 @@ impl BrokerStore {
 
     /// Whether this session still owns a durable operation without a settled
     /// outcome. These journals survive a broker crash while a coordinated
-    /// `git`/`gh` write or guarded command may still be running.
+    /// `git`/`gh` write or guarded command may still be running. Retirement
+    /// uses `session_has_unresolved_operations_since_boot`, which also
+    /// discounts receipts of an earlier boot; this unfiltered form remains
+    /// for tests.
+    #[cfg(test)]
     pub(crate) fn session_has_unresolved_operations(
         &self,
         session_id: i64,
