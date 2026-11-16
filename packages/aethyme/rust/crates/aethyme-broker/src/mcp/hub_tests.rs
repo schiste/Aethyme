@@ -1028,3 +1028,178 @@ fn a_mark_from_a_clock_that_went_backwards_is_capped() {
     // A mark written ten hours ahead lasts no longer than a fresh one.
     assert_eq!(unhealthy_left(now + 36_000_000, now), Some(UNHEALTHY_FOR));
 }
+
+/// Not a test of its own: the fake streamable-HTTP server that HTTP hub
+/// tests start by running this test binary with `--exact` on this name.
+#[test]
+fn fake_http_server_process() {
+    aethyme_testkit::mcp_http::run_from_env();
+}
+
+/// Collects what an HTTP bridge writes.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    fn messages(&self) -> Vec<Value> {
+        String::from_utf8_lossy(&self.0.lock().unwrap())
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+}
+
+impl TestHub {
+    fn http_hello(&self, key: &str, argv: Vec<String>) -> Value {
+        json!({
+            "hub": 1,
+            "op": "attach",
+            "build": build_identity(),
+            "key": key,
+            "name": "fake-http",
+            "argv": argv,
+            "cwd": self.root,
+            "env": [["PATH", "/usr/bin:/bin"], [aethyme_testkit::mcp_http::FAKE_SERVER_ENV, "1"]],
+            "transport": "http",
+            "path": "/mcp",
+        })
+    }
+}
+
+fn fake_http_argv() -> Vec<String> {
+    vec![
+        std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        "mcp::hub_tests::fake_http_server_process".into(),
+        "--exact".into(),
+        "--nocapture".into(),
+        "--test-threads=1".into(),
+    ]
+}
+
+/// Attach over HTTP: the hello reply, then the ready or fallback line.
+fn http_attach(hub: &TestHub, key: &str, argv: Vec<String>) -> (Client, Value, Option<Value>) {
+    let mut client = Client::connect(hub);
+    client
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    client.send(&hub.http_hello(key, argv));
+    let hello = client.recv().expect("hello reply");
+    let control = (hello["ok"] == true).then(|| client.recv()).flatten();
+    (client, hello, control)
+}
+
+/// One agent session bridged to `url`: initialize, then two calls (an SSE
+/// reply and a JSON one). Returns everything written back.
+fn http_session(url: &str) -> Vec<Value> {
+    let input = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": PROTOCOL, "capabilities": {},
+                       "clientInfo": {"name": "t", "version": "1"}}}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "whoami", "arguments": {}}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "plain", "arguments": {}}}),
+    ]
+    .iter()
+    .map(|message| format!("{message}\n"))
+    .collect::<String>();
+    let captured = Captured::default();
+    let output: super::http::Output =
+        std::sync::Arc::new(std::sync::Mutex::new(Box::new(captured.clone())));
+    let code = super::http::bridge(url, std::io::Cursor::new(input.into_bytes()), output);
+    assert_eq!(code, 0, "{:?}", captured.messages());
+    captured.messages()
+}
+
+fn reply_for(messages: &[Value], id: u64) -> Value {
+    messages
+        .iter()
+        .find(|message| message["id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("no reply {id} in {messages:?}"))
+}
+
+#[test]
+fn http_clients_share_one_upstream_with_a_session_each() {
+    let hub = TestHub::start(|config| config.idle_timeout = Duration::from_secs(30));
+    let (_first, hello, ready) = http_attach(&hub, &key('p'), fake_http_argv());
+    assert_eq!(hello["ok"], true, "{hello}");
+    let ready = ready.expect("a ready line");
+    assert_eq!(ready["aethyme_hub"], "ready", "{ready}");
+    let url = ready["url"].as_str().unwrap().to_string();
+    assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+    assert!(url.ends_with("/mcp"), "{url}");
+    let (_second, _, again) = http_attach(&hub, &key('p'), fake_http_argv());
+    assert_eq!(again.unwrap()["url"], url.as_str(), "one upstream per key");
+
+    let one = http_session(&url);
+    let two = http_session(&url);
+    assert_eq!(
+        reply_for(&one, 1)["result"]["serverInfo"]["name"],
+        "fake-http"
+    );
+    assert!(
+        one.iter()
+            .any(|message| message["method"] == "notifications/progress"),
+        "SSE notifications reach the client: {one:?}"
+    );
+    let (whoami_one, whoami_two) = (reply_for(&one, 2), reply_for(&two, 2));
+    assert_eq!(whoami_one["result"]["text"], whoami_two["result"]["text"]);
+    assert_ne!(
+        whoami_one["result"]["session"], whoami_two["result"]["session"],
+        "each client is its own HTTP session"
+    );
+    // A JSON reply carries the same session as the SSE one.
+    assert_eq!(
+        reply_for(&one, 3)["result"]["session"],
+        whoami_one["result"]["session"]
+    );
+
+    let status = hub.status();
+    let upstreams = status["upstreams"].as_array().unwrap();
+    assert_eq!(upstreams.len(), 1, "{status}");
+    assert_eq!(upstreams[0]["clients"], 2, "{status}");
+    assert_eq!(upstreams[0]["init"], "ready", "{status}");
+    assert!(upstreams[0]["port"].is_u64(), "{status}");
+    assert!(
+        status["counters"][&key('p')[..12]]["last_listen_ms"].is_u64(),
+        "{status}"
+    );
+}
+
+#[test]
+fn an_http_server_that_never_listens_falls_back_with_a_reason() {
+    let hub = TestHub::start(|config| config.init_timeout = Duration::from_millis(800));
+    let (_client, hello, control) =
+        http_attach(&hub, &key('q'), vec!["/bin/sleep".into(), "60".into()]);
+    assert_eq!(hello["ok"], true, "{hello}");
+    let control = control.expect("a fallback line");
+    assert_eq!(control["aethyme_hub"], "fallback", "{control}");
+    assert_eq!(control["reason"], "listen_timeout", "{control}");
+}
+
+#[test]
+fn an_http_attach_without_a_path_is_refused() {
+    let hub = TestHub::start(|_| {});
+    let mut hello = hub.http_hello(&key('r'), fake_http_argv());
+    hello["path"] = json!("no-slash");
+    let mut client = Client::connect(&hub);
+    client.send(&hello);
+    assert_eq!(client.recv().unwrap()["reason"], "invalid_attach");
+}

@@ -1631,3 +1631,46 @@ fn shared_keys_cover_the_build_output_directory_of_the_entry() {
         "entry_directory_identity_failed"
     );
 }
+
+#[test]
+fn require_argv_and_http_path_are_enforced() {
+    let path = Path::new("/host/mcp/services.toml");
+    let text = "schema = 1
+[[servers]]
+name = \"isolated\"
+transport = \"http\"
+argv = [\"/bin/example-server\", \"--isolated\", \"--port={port}\"]
+require_argv = [\"--isolated\"]
+[[servers]]
+name = \"flag-dropped\"
+transport = \"http\"
+argv = [\"/bin/example-server\", \"--port={port}\"]
+require_argv = [\"--isolated\"]
+[[servers]]
+name = \"stdio-with-path\"
+argv = [\"/bin/example-server\"]
+http_path = \"/mcp\"
+[[servers]]
+name = \"bad-path\"
+transport = \"http\"
+argv = [\"/bin/example-server\"]
+http_path = \"mcp path\"
+";
+    let (entries, errors) = parse_and_validate(text, path, Scope::Host, None, &NoCheckouts);
+    let codes: Vec<&str> = errors.iter().map(|error| error.code).collect();
+    assert_eq!(
+        codes,
+        vec![
+            "missing_required_argument",
+            "http_path_without_http",
+            "invalid_http_path"
+        ]
+    );
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].require_argv, vec!["--isolated".to_string()]);
+    assert_eq!(
+        entries[0].http_path.as_deref(),
+        Some("/mcp"),
+        "the default path"
+    );
+}

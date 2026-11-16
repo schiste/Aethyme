@@ -751,3 +751,52 @@ fn an_entry_requiring_client_features_is_never_shared() {
     assert!(stderr.contains("require_client_features"), "{stderr}");
     assert!(hub_pids(&fixture).is_empty(), "no hub may start");
 }
+
+/// Not a test of its own: the fake streamable-HTTP server the HTTP cases
+/// start by running this test binary with `--exact` on this name.
+#[test]
+fn fake_http_server_process() {
+    aethyme_testkit::mcp_http::run_from_env();
+}
+
+fn http_fixture(mode: &str) -> Fixture {
+    let fixture = Fixture::new();
+    let exe = std::env::current_exe().unwrap();
+    std::fs::write(
+        fixture.work.join("server.env"),
+        format!("{}=1\n", aethyme_testkit::mcp_http::FAKE_SERVER_ENV),
+    )
+    .unwrap();
+    fixture.services(&format!(
+        "[[servers]]\nname = \"example-http\"\nmode = {mode:?}\ntransport = \"http\"\nargv = [{:?}, \"mcp_cli::fake_http_server_process\", \"--exact\", \"--nocapture\"]\nrequire_argv = [\"--exact\"]\ncwd = {:?}\nenv_file = \"server.env\"\n",
+        exe.display().to_string(),
+        fixture.work.display().to_string(),
+    ));
+    fixture
+}
+
+#[test]
+fn shared_http_connects_reach_one_server_through_the_hub() {
+    let fixture = http_fixture("shared");
+    let (first, first_stderr) = session(&fixture, "example-http", "2025-06-18");
+    let (second, second_stderr) = session(&fixture, "example-http", "2025-06-18");
+    assert!(!first.is_empty(), "{first_stderr}");
+    assert_eq!(first, second, "{second_stderr}");
+    assert!(!first_stderr.contains("not used"), "{first_stderr}");
+    let status = json(&fixture.run(&["mcp", "status", "--json"]));
+    assert_eq!(status["hub"]["state"], "running", "{status}");
+    for pid in hub_pids(&fixture) {
+        Command::new("kill").arg(pid).status().unwrap();
+    }
+}
+
+#[test]
+fn direct_http_connects_each_bridge_a_private_server() {
+    let fixture = http_fixture("direct");
+    let (first, first_stderr) = session(&fixture, "example-http", "2025-06-18");
+    let (second, _) = session(&fixture, "example-http", "2025-06-18");
+    assert!(!first.is_empty(), "{first_stderr}");
+    assert!(!second.is_empty());
+    assert_ne!(first, second, "a direct server is never shared");
+    assert!(hub_pids(&fixture).is_empty(), "no hub may start");
+}

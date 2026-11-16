@@ -17,7 +17,16 @@
 //! flavour = "staging"
 //! allow_cached = false         # unpinned npx/npm exec may use npm's cache
 //! require_client_features = false # true: never shared (roots, sampling, elicitation)
+//! require_argv = ["--stdio"]   # elements argv must contain (e.g. an isolation flag)
+//! http_path = "/mcp"           # transport = "http" only: where the server answers
 //! ```
+//!
+//! A `transport = "http"` server is started with `{port}` in `argv` replaced
+//! by a loopback port, also exported as `AETHYME_MCP_PORT`, and must answer
+//! streamable HTTP on `127.0.0.1:<port><http_path>`. Shared, it must keep
+//! one MCP session per HTTP client: the owner lists the server's isolation
+//! flag (for example `--isolated`) in `argv` and in `require_argv`, so an
+//! edit that drops it is refused rather than silently shared.
 //!
 //! Every path must name a stable copy. An entry whose `cwd`, `source`,
 //! `env_file` or path-like `argv` element (absolute, relative with a `/`, or
@@ -76,6 +85,9 @@ struct RawEntry {
     allow_cached: bool,
     #[serde(default)]
     require_client_features: bool,
+    #[serde(default)]
+    require_argv: Vec<String>,
+    http_path: Option<String>,
 }
 
 /// Whether agents may share one server (`shared`, through the hub once it
@@ -153,6 +165,10 @@ pub struct Entry {
     /// The server needs client features (roots, sampling, elicitation) the
     /// shared hub never offers: always start it privately.
     pub require_client_features: bool,
+    /// Elements `argv` must contain; validation refuses the entry otherwise.
+    pub require_argv: Vec<String>,
+    /// Where an HTTP server answers (`transport = "http"` only).
+    pub http_path: Option<String>,
     pub repository: Option<RepositoryAnchor>,
     pub config_path: PathBuf,
     /// Host entries are trusted; repository entries once the host trusted
@@ -533,6 +549,46 @@ fn validate_entry(
             "argv needs at least the program".into(),
         ));
     }
+    if let Some(missing) = raw
+        .require_argv
+        .iter()
+        .find(|required| !raw.argv.contains(required))
+    {
+        return Err(refuse(
+            "argv",
+            "missing_required_argument",
+            format!(
+                "argv must contain {missing:?} (listed in require_argv); it was removed or \
+                 changed, so the server would no longer run as its owner requires"
+            ),
+        ));
+    }
+    let http_path = match (raw.transport, raw.http_path.as_deref()) {
+        (Transport::Stdio, Some(_)) => {
+            return Err(refuse(
+                "http_path",
+                "http_path_without_http",
+                "http_path applies only to transport = \"http\"".into(),
+            ));
+        }
+        (Transport::Stdio, None) => None,
+        (Transport::Http, path) => {
+            let path = path.unwrap_or(super::http::DEFAULT_PATH);
+            let path_ok = path.starts_with('/')
+                && path.len() <= 256
+                && path.chars().all(|c| c.is_ascii_graphic());
+            if !path_ok {
+                return Err(refuse(
+                    "http_path",
+                    "invalid_http_path",
+                    "use an absolute URL path of printable characters without spaces, e.g. \
+                     \"/mcp\""
+                        .into(),
+                ));
+            }
+            Some(path.to_string())
+        }
+    };
     let base = match (scope, anchor) {
         (Scope::Repository, Some(anchor)) => Some(anchor.main_root.as_path()),
         _ => None,
@@ -656,6 +712,8 @@ fn validate_entry(
         flavour,
         allow_cached: raw.allow_cached,
         require_client_features: raw.require_client_features,
+        require_argv: raw.require_argv,
+        http_path,
         repository: match scope {
             Scope::Repository => anchor.cloned(),
             Scope::Host => None,

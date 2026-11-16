@@ -39,6 +39,7 @@ pub mod connect;
 pub mod envfile;
 pub mod hub;
 pub mod hub_client;
+pub mod http;
 pub mod identity;
 pub mod jsonrpc;
 pub mod key;
