@@ -4,6 +4,38 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.111] - 2026-11-16
+
+### Fixed
+
+- The background worker no longer rebuilds its checkout-alias index on every compaction pass. On the busiest repository the index had been rewound 29,500 times and committed 9.7 million pages for 7,323 rows, and macOS reported 2.1 GB of database writes in 12 minutes. A complete index is now reused; only changed or unresolved rows are re-resolved, a full re-verification lap runs at most every 6 hours, and a row is written only where it differs. Removal still re-audits aliases from the filesystem under the session's lifecycle claim (#1717, #1719).
+- The index scan is paced by the unattended pacer (load, memory warning, critical memory), runs before the worker takes the host deleter slot and the repository GC lock, has its own 30-second budget, and never rewinds a lap that a foreground command completed meanwhile. Unresolved rows are retried at most once every 30 minutes, in rotation (#1717, #1719).
+- The worktree watcher no longer rewrites a counter file on every small batch of file events (34 GB of writes in 51 minutes on the busiest machine). A command now claims the counter it observed before asking Git, and the watcher publishes a new counter only when the current one has been claimed. Events are coalesced for 50 ms, so the watcher runs at most 20 rounds a second with one write per worktree per round, and an unchanged counter is never rewritten (#1720).
+- Sessions are no longer kept open by a guarded command receipt left `starting` or `running` by a process from before the last boot. Receipts record a boot identifier; one from an earlier boot (or, for older receipts, last written more than 10 minutes before boot) stops blocking and is settled after the session closes. A late writer's real outcome is kept as a `guarded_exec.receipt_late_outcome` event (#1718).
+- A preparation record whose host lease is released and whose preparer process is gone reports `interrupted` instead of staying `in_progress` forever (#1718).
+- After a restart, a holder whose process started before boot is treated as gone since boot instead of getting a fresh stale grace when it is first seen gone (#1718).
+- Sessions created before holder recording existed stop holding explicit claims once past the abandonment window, when nothing is unresolved and no process uses the checkout (#1718).
+- On macOS the process table is read natively from the kernel instead of by spawning `ps`, with `ps` as the fallback. A refused or partial listing is reported as denied or failed for the whole pass, never as "holder gone" (#1718).
+
+### Changed
+
+- Upgrade note: the worktree watch directory moves from `worktree-watch-v1` to `worktree-watch-v2`. A supervisor started by an older version keeps its old watcher until it exits; restart long-lived `aethyme env supervise` processes after upgrading (#1720).
+- The background worker's heavy lanes (checkout removal, compaction, requested checkout cleanup) wait until 10 minutes after boot. Nothing is dropped: the lane is retried when the hold ends. `AETHYME_ARTIFACT_WORKER_POST_BOOT_HOLD_MS` can shorten, never lengthen, the hold (#1717).
+- Schema 63 adds the nullable column `guarded_exec_receipts.boot_id`. It is a compatible column-only migration; the schema floor is unchanged (#1718).
+
+### Added
+
+- `session_no_work_abandoned_after_hours` (default 4, `0` disables, capped at `session_abandoned_after_hours`): a spawned session closes after that many hours of inactivity when its branch still equals its base, the checkout is clean, its recorded holder is gone, and it has no unresolved receipt, running preparation, explicit claim, merge-queue entry or open pull request. Adopted sessions and sessions with no recorded holder keep the full window. Close reason `inactive_no_work`; counters `session_closed_no_work` and `session_no_work_kept_*` (#1718).
+- Preparation state `interrupted`; events `guarded_exec.receipt_abandoned` and `guarded_exec.receipt_late_outcome`; keep reason `holder_process_table_denied` (#1718).
+- Counters for index reuse, walk reasons, rows resolved, rows rewritten versus unchanged, ancestor and group rows written, page commits, pacer waits, unresolved-row retries, catch-up skips and post-boot holds (`auto_compact_cohort_index_*`, `cleanup_cohort_*`, `artifact_worker_post_boot_hold`) (#1717, #1719).
+- The worktree watcher writes `status.json` in its watch directory at most once a minute: events received and coalesced, counters published and skipped, review cycles and watched worktrees (#1720).
+
+### Known issues
+
+- The old `worktree-watch-v1` directory is not removed automatically, and an unreadable claims directory is not distinguished in the watcher's stats (#1720).
+- The 6-hour re-verification interval counts from when compaction first saw a lap, so a lap completed by a foreground command can be about 12 hours old before the next one. The post-boot hold does not cover the session retirement lane, and removal triggered by a full disk also waits out the hold (#1719).
+- If a session closes and the write that settles its dead receipts fails, those receipts stay `running` until reconciled (#1718).
+
 ## [0.8.110] - 2026-11-16
 
 ### Fixed
