@@ -116,6 +116,11 @@ const SESSION_RETIREMENT_PAGE_SIZE: usize = 128;
 /// A landed proof that alone exhausts a pass this long is passed over for the
 /// rest of the lap instead of holding the retirement cursor.
 const LANDED_SEARCH_HOLD_LIMIT: Duration = Duration::from_secs(10);
+/// Meta key naming the session a pass left the retirement cursor on because
+/// its landed proof ran out of budget. The next pass judges it once more and
+/// then moves on whatever the answer, so one session never holds every later
+/// session back for more than one pass.
+const SESSION_RETIREMENT_BUDGET_HOLD_KEY: &str = "auto_cleanup.session_retirement_budget_hold";
 /// Bound discovery of ignored roots before whole-checkout cleanup considers
 /// their existing policy classifications.
 const IGNORED_PATH_LISTING_BUDGET: Duration = Duration::from_secs(15);
@@ -1763,6 +1768,17 @@ pub struct AutoCleanupReport {
     /// that window first, closed or not.
     #[serde(default, skip_serializing_if = "is_zero_count")]
     pub abandonment_sessions_examined: usize,
+    /// Of those, the sessions the abandonment window closed.
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub abandonment_sessions_closed: usize,
+    /// Of those, the sessions it kept, per `AbandonmentKeepReason` code.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub abandonment_sessions_kept: std::collections::BTreeMap<String, usize>,
+    /// Where the retirement cursor stood when the first pass of this report
+    /// began, so a reader can tell whether the lap moved
+    /// (`retirement_cursor` is where it ended).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement_cursor_start: Option<SessionRetirementCursorPosition>,
     /// Sessions this report closed, per holder evidence (`gone`,
     /// `moved_on`, `lease_expired`, `unbound`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -2171,6 +2187,10 @@ pub struct LandedSessionRetirementView {
     /// Sessions past the abandonment window asked that window first.
     #[serde(skip_serializing_if = "is_zero_count")]
     pub abandonment_examined: usize,
+    /// What the abandonment window did with them: closed, and kept per
+    /// reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abandonment: Option<AbandonmentRetirementView>,
     /// Sessions closed per holder evidence (`gone`, `moved_on`,
     /// `lease_expired`, `unbound`).
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -2179,6 +2199,21 @@ pub struct LandedSessionRetirementView {
     pub declined: std::collections::BTreeMap<String, usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<SessionRetirementCursorPosition>,
+    /// Where the cursor stood when the reported passes began; equal to
+    /// `cursor` when the lap did not move.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_start: Option<SessionRetirementCursorPosition>,
+}
+
+/// What the abandonment window (`session_abandoned_after_hours`) did with the
+/// sessions past it: how many it judged and closed, and why it kept the rest.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AbandonmentRetirementView {
+    pub examined: usize,
+    pub closed: usize,
+    /// Kept sessions per `AbandonmentKeepReason` code (`lease_held`,
+    /// `holder_alive_current`, `open_files_in_checkout`, ...).
+    pub kept: std::collections::BTreeMap<String, usize>,
 }
 
 impl AutoCleanupReport {
@@ -2227,6 +2262,19 @@ impl AutoCleanupReport {
         self.abandonment_sessions_examined = self
             .abandonment_sessions_examined
             .saturating_add(retirement.abandonment_examined);
+        self.abandonment_sessions_closed = self
+            .abandonment_sessions_closed
+            .saturating_add(retirement.abandonment_closed);
+        for (reason, count) in &retirement.abandonment_kept {
+            let entry = self
+                .abandonment_sessions_kept
+                .entry((*reason).to_string())
+                .or_default();
+            *entry = entry.saturating_add(*count);
+        }
+        if self.retirement_cursor_start.is_none() {
+            self.retirement_cursor_start = retirement.cursor_start;
+        }
         for (evidence, count) in &retirement.closed_by_holder_evidence {
             let entry = self
                 .sessions_closed_by_holder_evidence
@@ -2274,6 +2322,19 @@ impl AutoCleanupReport {
         self.abandonment_sessions_examined = self
             .abandonment_sessions_examined
             .saturating_add(later.abandonment_sessions_examined);
+        self.abandonment_sessions_closed = self
+            .abandonment_sessions_closed
+            .saturating_add(later.abandonment_sessions_closed);
+        for (reason, count) in &later.abandonment_sessions_kept {
+            let entry = self
+                .abandonment_sessions_kept
+                .entry(reason.clone())
+                .or_default();
+            *entry = entry.saturating_add(*count);
+        }
+        if self.retirement_cursor_start.is_none() {
+            self.retirement_cursor_start = later.retirement_cursor_start;
+        }
         self.missing_checkout_examined = self
             .missing_checkout_examined
             .saturating_add(later.missing_checkout_examined);
@@ -2312,6 +2373,9 @@ impl AutoCleanupReport {
         self.merged_pull_request_sessions_closed = previous.merged_pull_request_sessions_closed;
         self.sessions_closed_by_reason = previous.sessions_closed_by_reason.clone();
         self.abandonment_sessions_examined = previous.abandonment_sessions_examined;
+        self.abandonment_sessions_closed = previous.abandonment_sessions_closed;
+        self.abandonment_sessions_kept = previous.abandonment_sessions_kept.clone();
+        self.retirement_cursor_start = previous.retirement_cursor_start;
         self.sessions_closed_by_holder_evidence =
             previous.sessions_closed_by_holder_evidence.clone();
         self.retirement_evaluated_at_ms = previous
@@ -2330,6 +2394,14 @@ impl AutoCleanupReport {
             || !self.sessions_closed_by_reason.is_empty())
         .then(|| LandedSessionRetirementView {
             abandonment_examined: self.abandonment_sessions_examined,
+            abandonment: (self.abandonment_sessions_examined > 0).then(|| {
+                AbandonmentRetirementView {
+                    examined: self.abandonment_sessions_examined,
+                    closed: self.abandonment_sessions_closed,
+                    kept: self.abandonment_sessions_kept.clone(),
+                }
+            }),
+            cursor_start: self.retirement_cursor_start,
             closed_by_holder_evidence: self.sessions_closed_by_holder_evidence.clone(),
             evaluated_at_ms: self
                 .retirement_evaluated_at_ms
@@ -2398,6 +2470,12 @@ struct SessionRetirementSummary {
     closed_by_reason: std::collections::BTreeMap<&'static str, usize>,
     /// Sessions the oldest-first lap asked the abandonment window first.
     abandonment_examined: usize,
+    /// Of those, the sessions it closed, and the ones it kept per
+    /// `AbandonmentKeepReason` code.
+    abandonment_closed: usize,
+    abandonment_kept: std::collections::BTreeMap<&'static str, usize>,
+    /// The cursor as this pass read it, before any lap restart.
+    cursor_start: Option<SessionRetirementCursorPosition>,
     /// Sessions closed, per holder evidence: `gone`, `moved_on`,
     /// `lease_expired`, `unbound`.
     closed_by_holder_evidence: std::collections::BTreeMap<&'static str, usize>,
@@ -3863,6 +3941,10 @@ type RemovalCohortHook = Box<dyn FnMut(&Path)>;
 thread_local! {
     /// Test seam: the retirement lane consumes its whole deadline.
     static RETIREMENT_EXHAUSTS_ITS_SHARE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Test seam: every landed proof of the oldest-first lap runs out of
+    /// budget, as one does when the likely-landed queue spent the pass.
+    pub(crate) static LAP_LANDED_PROOF_EXHAUSTS_BUDGET: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     /// Test seam: selection consumes its whole deadline after selecting.
     static SELECTION_EXHAUSTS_ITS_SHARE: std::cell::Cell<bool> =
@@ -6623,7 +6705,48 @@ impl Broker {
     /// Retire a bounded keyset page of sessions whose existing abandonment
     /// window has elapsed. This runs only in the mutating maintenance path;
     /// cleanup planning and read-only session snapshots remain unchanged.
+    /// Each pass reports whether it moved the cursor
+    /// (`retirement_cursor_advanced` or `retirement_cursor_unmoved`).
     fn retire_abandoned_sessions(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<SessionRetirementSummary, BrokerOpError> {
+        let summary = self.retire_abandoned_session_page(deadline)?;
+        if let (Some(start), Some(end)) = (summary.cursor_start, summary.cursor) {
+            crate::phase_telemetry::add(
+                if start == end {
+                    "retirement_cursor_unmoved"
+                } else {
+                    "retirement_cursor_advanced"
+                },
+                Duration::ZERO,
+            );
+        }
+        Ok(summary)
+    }
+
+    /// The session a previous pass left the retirement cursor on because its
+    /// landed proof ran out of budget, if any.
+    fn retirement_budget_hold(&self) -> Option<i64> {
+        self.store_ref()
+            .meta_get(SESSION_RETIREMENT_BUDGET_HOLD_KEY)
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|session_id| *session_id > 0)
+    }
+
+    fn set_retirement_budget_hold(&self, session_id: Option<i64>) {
+        crate::warn_unrecorded(
+            "remember the retirement budget hold",
+            self.store_ref().meta_set(
+                SESSION_RETIREMENT_BUDGET_HOLD_KEY,
+                &session_id.unwrap_or(0).to_string(),
+            ),
+        );
+    }
+
+    fn retire_abandoned_session_page(
         &mut self,
         deadline: Option<Instant>,
     ) -> Result<SessionRetirementSummary, BrokerOpError> {
@@ -6680,6 +6803,10 @@ impl Broker {
         }
 
         let (mut cursor, mut expected_raw) = self.session_retirement_cursor()?;
+        summary.cursor_start = Some(SessionRetirementCursorPosition {
+            after_session_id: cursor.after_session_id,
+            high_water_session_id: cursor.high_water_session_id,
+        });
         let current_high_water = self.store().open_session_max_id()?;
         if deadline_expired(deadline) {
             summary.deferred = 1;
@@ -6783,6 +6910,7 @@ impl Broker {
         holder_process_table.prime(self.store_ref(), &retirement_candidates, deadline);
         let pass_started = Instant::now();
         let mut landed_judged_in_pass = 0_usize;
+        let mut budget_hold = self.retirement_budget_hold();
         for session in sessions {
             if deadline_expired(deadline) {
                 summary.deferred += 1;
@@ -6857,14 +6985,26 @@ impl Broker {
             };
             if abandonment_tried {
                 summary.abandonment_examined += 1;
+                let closed = matches!(outcome, crate::broker::AbandonedSessionCloseOutcome::Closed);
                 crate::phase_telemetry::add(
-                    if matches!(outcome, crate::broker::AbandonedSessionCloseOutcome::Closed) {
+                    if closed {
                         "retirement_abandonment_first_closed"
                     } else {
                         "retirement_abandonment_first_kept"
                     },
                     Duration::ZERO,
                 );
+                if closed {
+                    summary.abandonment_closed += 1;
+                } else {
+                    // The close path counted `session_abandonment_kept_<reason>`
+                    // already; the summary carries the same breakdown to
+                    // `broker status`.
+                    let reason = holder_process_table
+                        .keep_reason()
+                        .unwrap_or(crate::broker::AbandonmentKeepReason::Unrecorded);
+                    *summary.abandonment_kept.entry(reason.code()).or_default() += 1;
+                }
             }
             let idle_enough_for_landed = idle_enough_for_landed
                 && matches!(
@@ -6892,14 +7032,25 @@ impl Broker {
                 summary.landed_examined += 1;
                 crate::phase_telemetry::add("landed_sessions_examined", Duration::ZERO);
                 let started = Instant::now();
-                outcome = self.try_close_landed_session(
-                    session.id,
-                    now,
-                    landed_window_ms,
-                    &mut holder_process_table,
-                    allow_snapshot,
-                    deadline,
-                )?;
+                #[cfg(test)]
+                let forced_budget_exhausted =
+                    LAP_LANDED_PROOF_EXHAUSTS_BUDGET.with(std::cell::Cell::get);
+                #[cfg(not(test))]
+                let forced_budget_exhausted = false;
+                outcome = if forced_budget_exhausted {
+                    crate::broker::AbandonedSessionCloseOutcome::LandedDeclined(
+                        crate::broker::LandedSessionDecline::BudgetExhausted,
+                    )
+                } else {
+                    self.try_close_landed_session(
+                        session.id,
+                        now,
+                        landed_window_ms,
+                        &mut holder_process_table,
+                        allow_snapshot,
+                        deadline,
+                    )?
+                };
                 let elapsed = started.elapsed();
                 crate::phase_telemetry::add("landed_session_retirement", elapsed);
                 summary.landed_elapsed_ms = summary
@@ -6917,9 +7068,23 @@ impl Broker {
                 // not hold every later session back.
                 let held_alone_too_long = landed_judged_in_pass == 1
                     && pass_started.elapsed() >= LANDED_SEARCH_HOLD_LIMIT;
-                if landed_decline == Some(crate::broker::LandedSessionDecline::BudgetExhausted)
-                    && !held_alone_too_long
-                {
+                // A pass whose landed lap starts with little budget left (the
+                // likely-landed queue spent the rest) never holds one session
+                // for the hold limit, so that test alone pinned the cursor on
+                // it pass after pass. The cursor is left on a session for one
+                // pass only: the next pass judges it once more and moves on.
+                let budget_exhausted =
+                    landed_decline == Some(crate::broker::LandedSessionDecline::BudgetExhausted);
+                let held_last_pass = budget_hold == Some(session.id);
+                if budget_exhausted && (held_alone_too_long || held_last_pass) {
+                    crate::phase_telemetry::add(
+                        "retirement_cursor_budget_hold_released",
+                        Duration::ZERO,
+                    );
+                }
+                if budget_exhausted && !held_alone_too_long && !held_last_pass {
+                    self.set_retirement_budget_hold(Some(session.id));
+                    crate::phase_telemetry::add("retirement_cursor_budget_held", Duration::ZERO);
                     let reason = crate::broker::LandedSessionDecline::BudgetExhausted;
                     *summary.landed_declined.entry(reason.code()).or_default() += 1;
                     crate::phase_telemetry::add(reason.telemetry_name(), Duration::ZERO);
@@ -7056,6 +7221,10 @@ impl Broker {
                 return Ok(summary);
             }
             summary.record_cursor(&cursor);
+            if budget_hold.is_some_and(|held| held <= session.id) {
+                self.set_retirement_budget_hold(None);
+                budget_hold = None;
+            }
         }
 
         if deadline_expired(deadline) {

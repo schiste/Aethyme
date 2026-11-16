@@ -48,6 +48,12 @@ const PROCESS_USE_RESNAPSHOT_MIN_BUDGET: Duration = Duration::from_secs(3);
 const PROCESS_USE_RESNAPSHOT_MIN_INTERVAL: Duration = Duration::from_secs(10);
 /// At most this many open-file observations per pass.
 const PROCESS_USE_MAX_SNAPSHOTS_PER_PASS: usize = 4;
+/// A failed process-table snapshot is retried at once, then again only after
+/// this interval: a `ps` that timed out once on a loaded host usually answers
+/// a few seconds later, and one failure must not leave a whole pass unknown.
+pub(crate) const PROCESS_TABLE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// At most this many process-table retries per pass.
+pub(crate) const PROCESS_TABLE_MAX_RETRIES_PER_PASS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -421,8 +427,15 @@ pub(crate) struct RecordedHolderProcessTable {
     observed_event_ids: HashMap<i64, i64>,
     snapshot: Option<Option<ProcessTable>>,
     /// A failed process-table snapshot (`ps` timed out or failed) is retried
-    /// once per pass instead of answering "unknown" for every later holder.
-    snapshot_retried: bool,
+    /// at once, then after [`PROCESS_TABLE_RETRY_INTERVAL`], at most
+    /// [`PROCESS_TABLE_MAX_RETRIES_PER_PASS`] times per pass, instead of
+    /// answering "unknown" for every later holder.
+    snapshot_retries: usize,
+    snapshot_failed_at: Option<Instant>,
+    /// Why the last automatic close judged with this table kept its session
+    /// (`AbandonmentKeepReason`); the table is the one per-pass context every
+    /// exit of the close path can reach.
+    keep_reason: std::cell::Cell<Option<crate::broker::AbandonmentKeepReason>>,
     process_use_snapshot: Option<(Instant, crate::reclaim::OpenFileSnapshot)>,
     /// Open-file observations this pass took, when the last one started, and
     /// whether the last request was refused by the per-pass throttle.
@@ -431,6 +444,9 @@ pub(crate) struct RecordedHolderProcessTable {
     process_use_throttled: bool,
     #[cfg(test)]
     snapshots_taken: usize,
+    /// The next process-table snapshot, instead of running `ps`.
+    #[cfg(test)]
+    next_process_table_for_test: Option<Option<ProcessTable>>,
     /// Runs immediately before the landed lane's last HEAD and activity
     /// re-read, so a test can interleave an agent's commit there.
     #[cfg(test)]
@@ -463,16 +479,16 @@ impl RecordedHolderProcessTable {
         event_id: i64,
         allow_snapshot: bool,
     ) -> Option<&ProcessTable> {
-        if matches!(self.snapshot, Some(None)) && allow_snapshot && !self.snapshot_retried {
+        if matches!(self.snapshot, Some(None)) && allow_snapshot && self.process_table_retry_due() {
             crate::phase_telemetry::add("holder_process_table_retried", Duration::ZERO);
-            self.snapshot_retried = true;
+            self.snapshot_retries += 1;
             self.snapshot = None;
         }
         if self.snapshot.is_none() {
             if !allow_snapshot {
                 return None;
             }
-            self.snapshot = Some(ProcessTable::snapshot());
+            self.snapshot = Some(self.take_process_table());
             #[cfg(test)]
             {
                 self.snapshots_taken += 1;
@@ -490,7 +506,7 @@ impl RecordedHolderProcessTable {
             if !allow_snapshot {
                 return None;
             }
-            self.snapshot = Some(ProcessTable::snapshot());
+            self.snapshot = Some(self.take_process_table());
             #[cfg(test)]
             {
                 self.snapshots_taken += 1;
@@ -498,6 +514,50 @@ impl RecordedHolderProcessTable {
             self.observed_event_ids.insert(session_id, event_id);
         }
         self.snapshot.as_ref().and_then(Option::as_ref)
+    }
+
+    /// Take one process-table snapshot, remembering when one fails.
+    fn take_process_table(&mut self) -> Option<ProcessTable> {
+        #[cfg(test)]
+        if let Some(snapshot) = self.next_process_table_for_test.take() {
+            if snapshot.is_none() {
+                self.snapshot_failed_at = Some(Instant::now());
+            }
+            return snapshot;
+        }
+        let snapshot = ProcessTable::snapshot();
+        if snapshot.is_none() {
+            crate::phase_telemetry::add("holder_process_table_failed", Duration::ZERO);
+            self.snapshot_failed_at = Some(Instant::now());
+        }
+        snapshot
+    }
+
+    /// Whether a failed process-table snapshot may be taken again now: the
+    /// first retry at once, later ones only once
+    /// [`PROCESS_TABLE_RETRY_INTERVAL`] has passed since the last failure,
+    /// and never more than [`PROCESS_TABLE_MAX_RETRIES_PER_PASS`] per pass.
+    fn process_table_retry_due(&self) -> bool {
+        self.snapshot_retries < PROCESS_TABLE_MAX_RETRIES_PER_PASS
+            && (self.snapshot_retries == 0
+                || self
+                    .snapshot_failed_at
+                    .is_none_or(|failed| failed.elapsed() >= PROCESS_TABLE_RETRY_INTERVAL))
+    }
+
+    /// Record why the close path keeps the session it is judging.
+    pub(crate) fn note_keep_reason(&self, reason: crate::broker::AbandonmentKeepReason) {
+        self.keep_reason.set(Some(reason));
+    }
+
+    /// Forget the last keep reason, before judging another session.
+    pub(crate) fn clear_keep_reason(&self) {
+        self.keep_reason.set(None);
+    }
+
+    /// Why the last session judged with this table was kept, if it was.
+    pub(crate) fn keep_reason(&self) -> Option<crate::broker::AbandonmentKeepReason> {
+        self.keep_reason.get()
     }
 
     /// A final abandonment decision must not reuse an earlier pass's process
@@ -642,7 +702,23 @@ impl RecordedHolderProcessTable {
     ) {
         self.observed_event_ids.insert(session_id, event_id);
         self.snapshot = Some(None);
-        self.snapshot_retried = retried;
+        self.snapshot_retries = usize::from(retried);
+        self.snapshot_failed_at = Some(Instant::now());
+    }
+
+    /// Pretend the last process-table failure happened `age` ago.
+    #[cfg(test)]
+    pub(crate) fn age_process_table_failure_for_test(&mut self, age: Duration) {
+        self.snapshot_failed_at = self
+            .snapshot_failed_at
+            .and_then(|failed| failed.checked_sub(age));
+    }
+
+    /// Make the next process-table snapshot this table takes answer
+    /// `snapshot` instead of running `ps`.
+    #[cfg(test)]
+    pub(crate) fn queue_process_table_for_test(&mut self, snapshot: Option<ProcessTable>) {
+        self.next_process_table_for_test = Some(snapshot);
     }
 
     #[cfg(test)]
@@ -1749,13 +1825,7 @@ mod tests {
             prefetched_event_ids: HashMap::from([(session.id, holder_event_id)]),
             observed_event_ids: HashMap::from([(session.id, holder_event_id)]),
             snapshot: Some(Some(table)),
-            snapshot_retried: false,
-            process_use_snapshot: None,
-            process_use_snapshots_taken: 0,
-            process_use_last_taken: None,
-            process_use_throttled: false,
-            snapshots_taken: 0,
-            before_landed_close: None,
+            ..RecordedHolderProcessTable::default()
         };
         assert_eq!(
             recorded_holder_liveness(broker.store(), session.id, &mut matching, true).liveness,
@@ -1765,13 +1835,7 @@ mod tests {
             prefetched_event_ids: HashMap::from([(session.id, holder_event_id)]),
             observed_event_ids: HashMap::from([(session.id, holder_event_id)]),
             snapshot: Some(Some(ProcessTable::parse(""))),
-            snapshot_retried: false,
-            process_use_snapshot: None,
-            process_use_snapshots_taken: 0,
-            process_use_last_taken: None,
-            process_use_throttled: false,
-            snapshots_taken: 0,
-            before_landed_close: None,
+            ..RecordedHolderProcessTable::default()
         };
         assert_eq!(
             recorded_holder_liveness(broker.store(), session.id, &mut missing, true).liveness,

@@ -388,6 +388,7 @@ mod tests {
 /// `origin`: the merged-pull-request window and the abandonment window.
 #[cfg(all(test, unix))]
 mod lane_tests {
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::Duration;
@@ -1303,8 +1304,8 @@ mod lane_tests {
         assert_eq!(ids, vec![30, 20, 40, 10]);
     }
 
-    /// A failed process-table snapshot is retried once per pass; after that
-    /// the holder stays unknown instead of a second retry.
+    /// A failed process-table snapshot is retried at once; a second retry
+    /// waits for the retry interval, so the holder stays unknown meanwhile.
     #[test]
     fn a_failed_process_table_is_retried_once_then_stays_unknown() {
         let (_owner, _storage, mut broker) = fixture("");
@@ -1339,6 +1340,78 @@ mod lane_tests {
             true,
         );
         assert_eq!(first_failure.snapshots_taken_for_test(), 1, "one retry");
+    }
+
+    /// One failed snapshot does not leave the rest of the pass unknown: after
+    /// the immediate retry, the process table is taken again once the retry
+    /// interval has passed, up to the per-pass limit.
+    #[test]
+    fn a_failed_process_table_is_retried_again_after_the_interval_within_a_pass() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (session, _) = session(&mut broker, "process table failed twice", false);
+        quiet(&mut broker, &session, 80);
+        let liveness = |table: &mut crate::session_holder::RecordedHolderProcessTable| {
+            crate::session_holder::recorded_holder_liveness(
+                broker.store_ref(),
+                session.id,
+                table,
+                true,
+            )
+            .liveness
+        };
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        table.queue_process_table_for_test(None);
+        assert_eq!(
+            liveness(&mut table),
+            crate::session_holder::RecordedHolderLiveness::Unknown
+        );
+        table.queue_process_table_for_test(None);
+        assert_eq!(
+            liveness(&mut table),
+            crate::session_holder::RecordedHolderLiveness::Unknown,
+            "the immediate retry failed too"
+        );
+        assert_eq!(table.snapshots_taken_for_test(), 2);
+        assert_eq!(
+            liveness(&mut table),
+            crate::session_holder::RecordedHolderLiveness::Unknown,
+            "the next retry waits for the interval"
+        );
+        assert_eq!(table.snapshots_taken_for_test(), 2);
+
+        table.age_process_table_failure_for_test(
+            crate::session_holder::PROCESS_TABLE_RETRY_INTERVAL,
+        );
+        assert_eq!(
+            liveness(&mut table),
+            crate::session_holder::RecordedHolderLiveness::Gone,
+            "a later retry within the same pass answers"
+        );
+        assert_eq!(table.snapshots_taken_for_test(), 3);
+
+        // The per-pass limit still bounds the retries.
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        for _ in 0..=crate::session_holder::PROCESS_TABLE_MAX_RETRIES_PER_PASS {
+            table.queue_process_table_for_test(None);
+            liveness(&mut table);
+            table.age_process_table_failure_for_test(
+                crate::session_holder::PROCESS_TABLE_RETRY_INTERVAL,
+            );
+        }
+        let taken = table.snapshots_taken_for_test();
+        assert_eq!(
+            taken,
+            1 + crate::session_holder::PROCESS_TABLE_MAX_RETRIES_PER_PASS
+        );
+        assert_eq!(
+            liveness(&mut table),
+            crate::session_holder::RecordedHolderLiveness::Unknown
+        );
+        assert_eq!(
+            table.snapshots_taken_for_test(),
+            taken,
+            "no retry past the limit"
+        );
     }
 
     /// The agent process this test runs in, as a holder the synthetic process
@@ -1490,6 +1563,411 @@ mod lane_tests {
                 Some(clean_head.as_str())
             );
         }
+    }
+
+    /// Age every `session.holder_gone` event of `session` by `minutes`, as if
+    /// the broker had first seen its holder gone that long ago.
+    fn age_gone_event(broker: &mut crate::Broker, session: &crate::Session, minutes: i64) {
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE events SET ts = ts - ?1 WHERE session_id = ?2 AND kind = ?3",
+                rusqlite::params![
+                    minutes * 60_000,
+                    session.id,
+                    crate::events::SESSION_HOLDER_GONE
+                ],
+            )
+            .unwrap();
+    }
+
+    /// The abandonment-window counters a command recorded, by name.
+    fn kept_counters(recorder: &crate::phase_telemetry::Recorder) -> BTreeMap<String, u64> {
+        recorder
+            .totals()
+            .1
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("session_abandonment_kept_"))
+            .collect()
+    }
+
+    /// A gone holder's explicit leases hold the session only through the
+    /// stale grace, which starts when the broker first sees the holder gone;
+    /// past it the session closes and its leases are released with it.
+    #[test]
+    fn a_gone_holders_explicit_leases_stop_holding_after_the_stale_grace() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (session, worktree) = session(&mut broker, "explicit claims, holder gone", false);
+        let lease = broker
+            .store()
+            .claim_lease(session.id, "base.txt", None)
+            .unwrap();
+        quiet(&mut broker, &session, 80);
+
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_abandoned_directly(&mut broker, &session, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::LeaseHeld,
+            "the first sighting starts the grace"
+        );
+        assert_eq!(
+            table.keep_reason(),
+            Some(crate::broker::AbandonmentKeepReason::LeaseHeld)
+        );
+        assert_eq!(
+            kept_counters(&recorder),
+            BTreeMap::from([("session_abandonment_kept_lease_held".to_string(), 1)])
+        );
+        assert!(is_open(&broker, session.id));
+
+        age_gone_event(&mut broker, &session, 20);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_abandoned_directly(&mut broker, &session, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::Closed
+        );
+        assert_eq!(table.keep_reason(), None);
+        assert_eq!(
+            close_payload(&broker, session.id)["holder_evidence"],
+            "gone"
+        );
+        let unreleased: i64 = broker
+            .store()
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM leases WHERE id = ?1 AND released_at IS NULL",
+                [lease.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unreleased, 0, "the close releases the explicit lease");
+        assert!(worktree.exists(), "closing deletes nothing");
+    }
+
+    /// An explicit lease whose holder runs keeps the session, even when the
+    /// holder moved on and the checkout is clean, which alone would close it.
+    #[test]
+    fn a_live_holders_explicit_lease_still_keeps_the_session() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let holder = live_holder();
+        let (claimed, _) = session(&mut broker, "explicit claim, holder alive", false);
+        broker
+            .store()
+            .claim_lease(claimed.id, "base.txt", None)
+            .unwrap();
+        let mut table = held_by_live_holder(&mut broker, &claimed, &holder, 80);
+        let (newer, _) = session(&mut broker, "the agent's next task", false);
+        bind_holder(&mut broker, &newer, &holder);
+
+        assert_eq!(
+            close_abandoned_directly(&mut broker, &claimed, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::LeaseHeld
+        );
+        assert_eq!(
+            table.keep_reason(),
+            Some(crate::broker::AbandonmentKeepReason::LeaseHeld)
+        );
+        assert!(is_open(&broker, claimed.id));
+    }
+
+    /// Each abandonment-window keep is counted under its own reason, and the
+    /// live-process keep is told apart by cause.
+    #[test]
+    fn every_abandonment_keep_is_counted_under_its_reason() {
+        use crate::broker::AbandonmentKeepReason as Reason;
+        let (_owner, _storage, mut broker) = fixture("");
+        let holder = live_holder();
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        // Counted as a delta: session setup may judge other sessions too.
+        let count = |reason: Reason| {
+            kept_counters(&recorder)
+                .get(reason.telemetry_name())
+                .copied()
+                .unwrap_or(0)
+        };
+        let kept = |broker: &mut crate::Broker,
+                    session: &crate::Session,
+                    table: &mut crate::session_holder::RecordedHolderProcessTable,
+                    reason: Reason| {
+            let before = count(reason);
+            assert_ne!(
+                close_abandoned_directly(broker, session, table),
+                crate::broker::AbandonedSessionCloseOutcome::Closed,
+                "{reason:?}"
+            );
+            assert_eq!(table.keep_reason(), Some(reason));
+            assert_eq!(count(reason), before + 1, "{reason:?}");
+        };
+
+        // Recent activity.
+        let (recent, _) = session(&mut broker, "worked an hour ago", false);
+        quiet(&mut broker, &recent, 1);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        kept(&mut broker, &recent, &mut table, Reason::RecentActivity);
+
+        // The holder runs and this is its latest session.
+        let (current, _) = session(&mut broker, "the holder's latest session", false);
+        let mut table = held_by_live_holder(&mut broker, &current, &holder, 80);
+        kept(
+            &mut broker,
+            &current,
+            &mut table,
+            Reason::HolderAliveCurrent,
+        );
+
+        // The holder could not be checked.
+        let (unknown, _) = session(&mut broker, "process table failed", false);
+        quiet(&mut broker, &unknown, 80);
+        let event_id = broker
+            .store_ref()
+            .latest_session_holder_event(unknown.id)
+            .unwrap()
+            .unwrap()
+            .id;
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        table.fail_process_table_for_test(unknown.id, event_id, true);
+        kept(&mut broker, &unknown, &mut table, Reason::HolderUnknown);
+
+        // The holder moved on: a dirty checkout, and a process in a clean one.
+        let (dirty, dirty_tree) = session(&mut broker, "moved on, dirty", false);
+        std::fs::write(dirty_tree.join("base.txt"), "edited, not committed\n").unwrap();
+        let mut dirty_table = held_by_live_holder(&mut broker, &dirty, &holder, 80);
+        let (in_use, in_use_tree) = session(&mut broker, "moved on, in use", false);
+        let mut in_use_table = held_by_live_holder(&mut broker, &in_use, &holder, 80);
+        let (newer, _) = session(&mut broker, "the agent's next task", false);
+        bind_holder(&mut broker, &newer, &holder);
+        kept(
+            &mut broker,
+            &dirty,
+            &mut dirty_table,
+            Reason::HolderMovedOnDirty,
+        );
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(opened_in(&in_use_tree)));
+        kept(
+            &mut broker,
+            &in_use,
+            &mut in_use_table,
+            Reason::OpenFilesInCheckout,
+        );
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+        ));
+
+        // The window is disabled.
+        let before = count(Reason::WindowDisabled);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            broker
+                .try_close_abandoned_session(recent.id, now_ms(), 0, &mut table, true, None)
+                .unwrap(),
+            crate::broker::AbandonedSessionCloseOutcome::NotDue
+        );
+        assert_eq!(table.keep_reason(), Some(Reason::WindowDisabled));
+        assert_eq!(count(Reason::WindowDisabled), before + 1);
+    }
+
+    /// Every keep reason has its own counter, named after its code.
+    #[test]
+    fn every_abandonment_keep_reason_names_its_counter_after_its_code() {
+        use crate::broker::AbandonmentKeepReason as Reason;
+        let every = [
+            Reason::WindowDisabled,
+            Reason::Changed,
+            Reason::SessionPidAlive,
+            Reason::FollowUpProtected,
+            Reason::WorktreeActivityUnavailable,
+            Reason::RecentActivity,
+            Reason::HolderUnknown,
+            Reason::HolderAliveCurrent,
+            Reason::HolderRecordUnavailable,
+            Reason::HolderSharedService,
+            Reason::HolderMovedOnDirty,
+            Reason::TaskLeaseCurrent,
+            Reason::OperationGuardBusy,
+            Reason::OperationGuardUnavailable,
+            Reason::LifecycleBusy,
+            Reason::DeadlineReached,
+            Reason::GateRunning,
+            Reason::GatesUnknown,
+            Reason::OperationUnresolved,
+            Reason::OperationsUnknown,
+            Reason::MergeQueueActive,
+            Reason::MergeQueueUnknown,
+            Reason::PreparationInProgress,
+            Reason::PreparationInvalid,
+            Reason::PreparationUnknown,
+            Reason::CheckoutNotDirectory,
+            Reason::ArtifactProducerActive,
+            Reason::ArtifactProtocolUnavailable,
+            Reason::LegacyArtifactMarkers,
+            Reason::OpenFilesInCheckout,
+            Reason::OpenFilesUnavailable,
+            Reason::OpenFilesThrottled,
+            Reason::LeaseHeld,
+            Reason::LeaseUnavailable,
+            Reason::DatabaseBusy,
+            Reason::PolicyUnavailable,
+            Reason::LandedDeclined,
+            Reason::Unrecorded,
+        ];
+        // A new reason must be added to `every` above.
+        for reason in every {
+            match reason {
+                Reason::WindowDisabled
+                | Reason::Changed
+                | Reason::SessionPidAlive
+                | Reason::FollowUpProtected
+                | Reason::WorktreeActivityUnavailable
+                | Reason::RecentActivity
+                | Reason::HolderUnknown
+                | Reason::HolderAliveCurrent
+                | Reason::HolderRecordUnavailable
+                | Reason::HolderSharedService
+                | Reason::HolderMovedOnDirty
+                | Reason::TaskLeaseCurrent
+                | Reason::OperationGuardBusy
+                | Reason::OperationGuardUnavailable
+                | Reason::LifecycleBusy
+                | Reason::DeadlineReached
+                | Reason::GateRunning
+                | Reason::GatesUnknown
+                | Reason::OperationUnresolved
+                | Reason::OperationsUnknown
+                | Reason::MergeQueueActive
+                | Reason::MergeQueueUnknown
+                | Reason::PreparationInProgress
+                | Reason::PreparationInvalid
+                | Reason::PreparationUnknown
+                | Reason::CheckoutNotDirectory
+                | Reason::ArtifactProducerActive
+                | Reason::ArtifactProtocolUnavailable
+                | Reason::LegacyArtifactMarkers
+                | Reason::OpenFilesInCheckout
+                | Reason::OpenFilesUnavailable
+                | Reason::OpenFilesThrottled
+                | Reason::LeaseHeld
+                | Reason::LeaseUnavailable
+                | Reason::DatabaseBusy
+                | Reason::PolicyUnavailable
+                | Reason::LandedDeclined
+                | Reason::Unrecorded => {}
+            }
+            assert_eq!(
+                reason.telemetry_name(),
+                format!("session_abandonment_kept_{}", reason.code())
+            );
+        }
+        let codes = every
+            .iter()
+            .map(|reason| reason.code())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(codes.len(), every.len(), "codes are distinct");
+    }
+
+    /// The retirement lap reports what the abandonment window did, kept
+    /// sessions per reason, and where the cursor started and ended, and
+    /// `broker status` shows the same breakdown.
+    #[test]
+    fn the_retirement_report_carries_the_abandonment_breakdown() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (claimed, _) = session(&mut broker, "explicit claims, holder gone", false);
+        broker
+            .store()
+            .claim_lease(claimed.id, "base.txt", None)
+            .unwrap();
+        quiet(&mut broker, &claimed, 80);
+        let (plain, _) = session(&mut broker, "no claims, holder gone", false);
+        quiet(&mut broker, &plain, 80);
+
+        let report = broker.retire_abandoned_sessions_for_recovery(None).unwrap();
+
+        assert!(is_open(&broker, claimed.id), "{report:#?}");
+        assert!(!is_open(&broker, plain.id), "{report:#?}");
+        assert_eq!(report.abandonment_sessions_examined, 2, "{report:#?}");
+        assert_eq!(report.abandonment_sessions_closed, 1, "{report:#?}");
+        assert_eq!(
+            report.abandonment_sessions_kept,
+            BTreeMap::from([("lease_held".to_string(), 1)]),
+            "{report:#?}"
+        );
+        assert_eq!(
+            report
+                .retirement_cursor_start
+                .map(|cursor| cursor.after_session_id),
+            Some(0),
+            "{report:#?}"
+        );
+        let view = report
+            .landed_session_retirement_view()
+            .expect("the abandonment window judged sessions");
+        let abandonment = view.abandonment.as_ref().expect("abandonment breakdown");
+        assert_eq!(abandonment.examined, 2);
+        assert_eq!(abandonment.closed, 1);
+        assert_eq!(abandonment.kept.get("lease_held"), Some(&1));
+        assert_eq!(view.cursor_start, report.retirement_cursor_start);
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["abandonment"]["kept"]["lease_held"], 1);
+
+        // Past the grace the next lap closes it.
+        age_gone_event(&mut broker, &claimed, 20);
+        let report = broker.retire_abandoned_sessions_for_recovery(None).unwrap();
+        assert!(!is_open(&broker, claimed.id), "{report:#?}");
+        assert_eq!(report.abandonment_sessions_closed, 1, "{report:#?}");
+    }
+
+    /// A session whose landed proof runs out of budget leaves the retirement
+    /// cursor on itself for one pass only. It used to stay there for as long
+    /// as no pass gave that one proof ten seconds, so every later session
+    /// waited behind it, pass after pass.
+    #[test]
+    fn a_budget_exhausted_session_holds_the_retirement_cursor_for_one_pass_only() {
+        let (_owner, _storage, mut broker) = fixture("");
+        // Past the landed window (24 h), short of the abandonment one (72 h),
+        // unlanded: only the oldest-first lap's landed proof judges them.
+        let (first, _) = session(&mut broker, "proof runs out of budget", false);
+        quiet(&mut broker, &first, 30);
+        let (second, _) = session(&mut broker, "waits behind it", false);
+        quiet(&mut broker, &second, 30);
+        crate::auto_cleanup::LAP_LANDED_PROOF_EXHAUSTS_BUDGET.with(|flag| flag.set(true));
+        let passes = (0..3)
+            .map(|_| broker.retire_abandoned_sessions_for_recovery(None))
+            .collect::<Vec<_>>();
+        crate::auto_cleanup::LAP_LANDED_PROOF_EXHAUSTS_BUDGET.with(|flag| flag.set(false));
+        let cursor_after = |report: &crate::AutoCleanupReport| {
+            report
+                .retirement_cursor
+                .map(|cursor| cursor.after_session_id)
+        };
+        let passes = passes.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+
+        assert_eq!(
+            cursor_after(&passes[0]),
+            Some(0),
+            "held on the first session"
+        );
+        assert_eq!(
+            cursor_after(&passes[1]),
+            Some(first.id),
+            "the next pass judges it once more and moves on: {:#?}",
+            passes[1]
+        );
+        assert_eq!(
+            passes[1]
+                .retirement_cursor_start
+                .map(|cursor| cursor.after_session_id),
+            Some(0)
+        );
+        assert!(
+            cursor_after(&passes[2]).is_some_and(|after| after >= second.id),
+            "and the session behind it does not wait either: {:#?}",
+            passes[2]
+        );
+        assert!(is_open(&broker, first.id));
+        assert!(is_open(&broker, second.id));
     }
 
     fn close_session_row(broker: &mut crate::Broker, session: &crate::Session) {

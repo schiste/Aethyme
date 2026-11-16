@@ -3460,7 +3460,8 @@ mod missing_checkout;
 mod owners;
 mod remote_heads;
 pub(crate) use leases::{
-    AbandonedSessionCloseOutcome, LandedProof, LandedSessionDecline, validate_session_commit_args,
+    AbandonedSessionCloseOutcome, AbandonmentKeepReason, LandedProof, LandedSessionDecline,
+    validate_session_commit_args,
 };
 pub use owners::{CommitOwner, MAX_OWNER_COMMITS, OwnedCommit, OwnersReport};
 pub(crate) mod lifecycle;

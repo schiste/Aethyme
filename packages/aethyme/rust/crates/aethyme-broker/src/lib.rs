@@ -281,9 +281,9 @@ pub use aethyme_graph_storage::{
 };
 pub use attribution::{Attribution, Identity};
 pub use auto_cleanup::{
-    AutoCleanupCheckTimings, AutoCleanupGateChecks, AutoCleanupLanes, AutoCleanupMemoHits,
-    AutoCleanupPlan, AutoCleanupPolicy, AutoCleanupReport, AutoKeptCheckout, AutoRemovedCheckout,
-    BUILT_IN_REGENERABLE, BlockedByIgnored, CapacityRemovalSlice, CheckTiming,
+    AbandonmentRetirementView, AutoCleanupCheckTimings, AutoCleanupGateChecks, AutoCleanupLanes,
+    AutoCleanupMemoHits, AutoCleanupPlan, AutoCleanupPolicy, AutoCleanupReport, AutoKeptCheckout,
+    AutoRemovedCheckout, BUILT_IN_REGENERABLE, BlockedByIgnored, CapacityRemovalSlice, CheckTiming,
     LandedSessionRetirementView, SessionRetirementCursorPosition, SessionRetirementDeferredReason,
     kept_reason_code,
 };

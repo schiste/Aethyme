@@ -41,6 +41,10 @@
     "retirement_cursor": {
       "after_session_id": "integer",
       "high_water_session_id": "integer"
+    },
+    "retirement_cursor_start": {
+      "after_session_id": "integer",
+      "high_water_session_id": "integer"
     }
   },
   "blocker_summary": [
