@@ -12786,7 +12786,8 @@ impl Broker {
             };
             match step {
                 GcFileStep::Completed { reclaimed_bytes } => {
-                    journal.reclaimed_bytes = journal.reclaimed_bytes.saturating_add(reclaimed_bytes);
+                    journal.reclaimed_bytes =
+                        journal.reclaimed_bytes.saturating_add(reclaimed_bytes);
                     journal.files_completed.push(candidate.path);
                 }
                 GcFileStep::Skipped { reason } => {

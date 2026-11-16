@@ -24,7 +24,9 @@ use std::time::{Duration, Instant};
 
 use crate::file_lock::open_command_metrics_lock;
 
-use super::{open_regular_file_nonblocking, retained_metric_bytes_until, same_regular_file_version};
+use super::{
+    open_regular_file_nonblocking, retained_metric_bytes_until, same_regular_file_version,
+};
 
 /// Whole attempts before an apply gives up on a log that keeps growing.
 pub(super) const TRIM_MAX_ATTEMPTS: u32 = 3;

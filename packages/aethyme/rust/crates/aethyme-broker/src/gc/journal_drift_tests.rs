@@ -250,10 +250,7 @@ fn a_failing_resume_backs_off_until_the_journal_changes_or_the_window_passes() {
         .broker
         .apply_confirmed_gc_journal_at(journal.clone(), 5000, start + 60_000)
         .unwrap();
-    assert!(
-        second.is_none(),
-        "the next open does not rerun the journal"
-    );
+    assert!(second.is_none(), "the next open does not rerun the journal");
     assert_eq!(
         std::fs::read(repository.journal_path()).unwrap(),
         journal_bytes
