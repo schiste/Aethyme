@@ -788,15 +788,6 @@ fn read_boot_proof() -> Result<BootProof, String> {
     })
 }
 
-/// The operating-system boot time in epoch milliseconds, from the same native
-/// source this recovery proves its lock age against.
-pub(crate) fn os_boot_time_ms() -> Option<i64> {
-    let (_, boot) = read_os_boot_time().ok()?;
-    boot.seconds
-        .checked_mul(1_000)?
-        .checked_add(i64::from(boot.nanoseconds / 1_000_000))
-}
-
 #[cfg(target_os = "macos")]
 fn read_os_boot_time() -> Result<(String, Timestamp), String> {
     let name = b"kern.boottime\0";
@@ -862,6 +853,15 @@ fn read_os_boot_time() -> Result<(String, Timestamp), String> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn read_os_boot_time() -> Result<(String, Timestamp), String> {
     Err("native boot-time proof is unsupported on this operating system".into())
+}
+
+/// The operating-system boot time in epoch milliseconds, from the same native
+/// source this recovery proves its lock age against.
+pub(crate) fn os_boot_time_ms() -> Option<i64> {
+    let (_, boot) = read_os_boot_time().ok()?;
+    boot.seconds
+        .checked_mul(1_000)?
+        .checked_add(i64::from(boot.nanoseconds / 1_000_000))
 }
 
 pub(crate) fn apply(cwd: &Path, confirmation: &str) -> GitMaintenanceLockApplyReport {
