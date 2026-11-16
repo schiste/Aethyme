@@ -986,6 +986,17 @@ const CLEANUP_COHORT_FULL_LAP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 
 const CLEANUP_COHORT_LAP_VERIFIED_KEY: &str = "gc.artifact_sweep.cleanup_cohort_lap_verified";
 /// Unresolved index rows one compaction pass marks dirty to re-resolve.
 const CLEANUP_COHORT_UNRESOLVED_RETRY_ROWS: usize = 32;
+/// Time the index catch-up leaves before a compaction pass's archive
+/// reserve for taking the host deleter pin (which waits up to ten seconds).
+const COMPACT_INDEX_CATCH_UP_PIN_MARGIN: Duration = Duration::from_secs(15);
+/// One unresolved index row is re-resolved at most this often.
+const CLEANUP_COHORT_UNRESOLVED_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// Unresolved index rows one pass reads to choose retries from.
+const CLEANUP_COHORT_UNRESOLVED_SCAN_ROWS: usize = 1_024;
+/// JSON map of session id to when the compaction lane last queued that
+/// unresolved index row for re-resolution.
+const CLEANUP_COHORT_UNRESOLVED_RETRIED_KEY: &str =
+    "gc.artifact_sweep.cleanup_cohort_unresolved_retried";
 
 fn cleanup_cohort_full_lap_interval_ms() -> i64 {
     i64::try_from(CLEANUP_COHORT_FULL_LAP_INTERVAL.as_millis()).unwrap_or(i64::MAX)
@@ -1035,6 +1046,25 @@ fn host_uptime() -> Option<Duration> {
 #[cfg(test)]
 fn host_uptime() -> Option<Duration> {
     POST_BOOT_UPTIME_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: let the worker lanes run in a test process, which has no
+    /// worker environment, an ephemeral temporary repository and no
+    /// installed runtime pair.
+    static WORKER_LANE_GATES_OPEN_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn worker_lane_gates_open_for_test() -> bool {
+    WORKER_LANE_GATES_OPEN_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn worker_lane_gates_open_for_test() -> bool {
+    false
 }
 
 /// What remains of the post-boot hold now, if any.
@@ -8205,13 +8235,11 @@ impl Broker {
         let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
         let current = self.store().cleanup_cohort_scan_state(namespace)?;
         let reason = match current {
-            Some(state) if state.complete && state.unresolved_rows > 0 => {
-                let unresolved = self.store().cleanup_cohort_unresolved_session_ids(
-                    namespace,
-                    CLEANUP_COHORT_UNRESOLVED_RETRY_ROWS,
-                )?;
-                self.store()
-                    .mark_cleanup_cohort_rows_dirty(namespace, &unresolved)?;
+            Some(state)
+                if state.complete
+                    && state.unresolved_rows > 0
+                    && self.retry_unresolved_cleanup_cohort_rows(now_ms())? > 0 =>
+            {
                 "auto_compact_cohort_index_walk_unresolved_rows"
             }
             Some(state) if state.complete => {
@@ -8254,6 +8282,75 @@ impl Broker {
         Ok(latest)
     }
 
+    /// Queue unresolved index rows for re-resolution, each at most once per
+    /// [`CLEANUP_COHORT_UNRESOLVED_RETRY_INTERVAL`] and at most
+    /// [`CLEANUP_COHORT_UNRESOLVED_RETRY_ROWS`] per pass, so a path that
+    /// stays unresolvable does not bump the cleanup revision (which makes
+    /// concurrent alias checks refuse) on every pass. A row whose session is
+    /// gone is queued for removal, as the session delete trigger would have
+    /// done; no discovery lap would ever remove it. Returns the rows queued;
+    /// `0` means there is nothing to walk.
+    fn retry_unresolved_cleanup_cohort_rows(&mut self, now: i64) -> Result<usize, BrokerOpError> {
+        let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
+        let unresolved = self
+            .store()
+            .cleanup_cohort_unresolved_rows(namespace, CLEANUP_COHORT_UNRESOLVED_SCAN_ROWS)?;
+        let recorded = self
+            .artifact_sweep_meta_get(CLEANUP_COHORT_UNRESOLVED_RETRIED_KEY)?
+            .and_then(|value| serde_json::from_str::<BTreeMap<i64, i64>>(&value).ok())
+            .unwrap_or_default();
+        // Forget rows that resolved or left the index since.
+        let mut retried: BTreeMap<i64, i64> = recorded
+            .iter()
+            .filter(|(id, _)| unresolved.iter().any(|(row, _)| row == *id))
+            .map(|(id, at)| (*id, *at))
+            .collect();
+        let interval =
+            i64::try_from(CLEANUP_COHORT_UNRESOLVED_RETRY_INTERVAL.as_millis()).unwrap_or(i64::MAX);
+        let mut live = Vec::new();
+        let mut orphaned = Vec::new();
+        for (session_id, session_exists) in &unresolved {
+            if !session_exists {
+                orphaned.push(*session_id);
+            } else if retried
+                .get(session_id)
+                .is_some_and(|at| now.saturating_sub(*at) < interval)
+            {
+                crate::phase_telemetry::add(
+                    "auto_compact_cohort_index_unresolved_retry_skipped",
+                    Duration::ZERO,
+                );
+            } else if live.len() < CLEANUP_COHORT_UNRESOLVED_RETRY_ROWS {
+                live.push(*session_id);
+            }
+        }
+        let marked = self
+            .store()
+            .mark_cleanup_cohort_rows_dirty(namespace, &live)?;
+        for session_id in &live {
+            retried.insert(*session_id, now);
+            crate::phase_telemetry::add(
+                "auto_compact_cohort_index_unresolved_retried",
+                Duration::ZERO,
+            );
+        }
+        let removed = self
+            .store()
+            .mark_orphaned_cleanup_cohort_rows_dirty(namespace, &orphaned)?;
+        for _ in 0..removed {
+            crate::phase_telemetry::add("auto_compact_cohort_index_orphaned_rows", Duration::ZERO);
+        }
+        if retried != recorded {
+            let value = serde_json::to_string(&retried).map_err(|error| {
+                BrokerOpError::InvalidStorageContext {
+                    reason: format!("cannot encode cohort index retry times: {error}").into(),
+                }
+            })?;
+            self.artifact_sweep_meta_set(CLEANUP_COHORT_UNRESOLVED_RETRIED_KEY, &value)?;
+        }
+        Ok(marked.saturating_add(removed))
+    }
+
     /// When the compaction lane first saw the complete lap
     /// `alias_refresh_generation`, recording `now` when it is a lap it has
     /// not seen. A lap another lane completed counts from when this lane
@@ -8281,13 +8378,50 @@ impl Broker {
         Ok(now)
     }
 
-    /// Run one detached compact-maintenance pass. The alias index is reused
-    /// when complete and otherwise caught up resumably
-    /// ([`Self::compaction_cleanup_cohort_index`]); the indexed inventory and
-    /// candidate cursor are then consumed within the same reserved pass. Each
-    /// attempt rebuilds its cohort and keeps the full archive reserve; the
-    /// batch and worker lifetime remain bounded independently.
+    /// Catch the cohort index up for a compaction pass that must end by
+    /// `deadline`, leaving that pass its archive reserve and the time to
+    /// take the host deleter pin. Called with neither the pin nor the GC
+    /// lock held, so its paced waits hold back no other deleter and no
+    /// foreground GC: the walk deletes nothing (the pin serializes deletions
+    /// across repositories), and every index write is its own SQLite
+    /// transaction that checks the cleanup revision, generation, alias lap
+    /// and cursor (or a dirty row's revision) it read, so a concurrent writer
+    /// makes it start over rather than corrupt the index. The pass then
+    /// re-reads the index state under the GC lock and defers unless it is
+    /// still complete.
+    fn compact_checkout_index_catch_up(&mut self, deadline: Instant) -> Result<(), BrokerOpError> {
+        if !load_retention_policy(self.main_root())?.compact_closed_worktrees {
+            return Ok(());
+        }
+        let catch_up_deadline = deadline
+            .checked_sub(
+                crate::auto_cleanup::AUTO_COMPACTION_MIN_BUDGET
+                    .saturating_add(COMPACT_INDEX_CATCH_UP_PIN_MARGIN),
+            )
+            .unwrap_or_else(Instant::now);
+        self.compaction_cleanup_cohort_index(catch_up_deadline)?;
+        Ok(())
+    }
+
+    /// One compact-maintenance pass without a host deleter pin: catch the
+    /// index up, then run [`Self::auto_compact_checkout_recovery_pass_indexed`].
+    #[cfg(test)]
     fn auto_compact_checkout_recovery_pass(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), BrokerOpError> {
+        self.compact_checkout_index_catch_up(deadline)?;
+        self.auto_compact_checkout_recovery_pass_indexed(deadline)
+    }
+
+    /// Run one detached compact-maintenance pass over the index
+    /// [`Self::compact_checkout_index_catch_up`] left. It never walks the
+    /// index: an index that is not complete under the GC lock defers the
+    /// pass. The indexed inventory and candidate cursor are consumed within
+    /// the same reserved pass. Each attempt rebuilds its cohort and keeps the
+    /// full archive reserve; the batch and worker lifetime remain bounded
+    /// independently.
+    fn auto_compact_checkout_recovery_pass_indexed(
         &mut self,
         deadline: Instant,
     ) -> Result<(), BrokerOpError> {
@@ -8322,11 +8456,13 @@ impl Broker {
         };
 
         // Leave the helper's minimum archive/removal reserve untouched while
-        // the index catches up and bounded stock pages run.
+        // bounded stock pages run.
         let refresh_deadline = deadline
             .checked_sub(crate::auto_cleanup::AUTO_COMPACTION_MIN_BUDGET)
             .unwrap_or(deadline);
-        let refreshed_index = self.compaction_cleanup_cohort_index(refresh_deadline)?;
+        let refreshed_index = self
+            .store()
+            .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)?;
         let Some(index_state) = refreshed_index.filter(|state| {
             state.complete && state.unresolved_rows == 0 && state.pending_dirty_rows == 0
         }) else {
@@ -8854,11 +8990,14 @@ impl Broker {
     }
 
     fn run_artifact_sweep_recovery_worker_lanes(&mut self) -> Result<(), BrokerOpError> {
-        if !matches!(std::env::var(ARTIFACT_SWEEP_WORKER_ENV).as_deref(), Ok("1")) {
+        let gates_open_for_test = worker_lane_gates_open_for_test();
+        if !gates_open_for_test
+            && !matches!(std::env::var(ARTIFACT_SWEEP_WORKER_ENV).as_deref(), Ok("1"))
+        {
             self.write_artifact_sweep_worker_status("refused_environment")?;
             return Ok(());
         }
-        if crate::host_state::path_is_ephemeral(self.main_root()) {
+        if !gates_open_for_test && crate::host_state::path_is_ephemeral(self.main_root()) {
             self.write_artifact_sweep_worker_status("refused_ephemeral_repository")?;
             return Ok(());
         }
@@ -8921,7 +9060,7 @@ impl Broker {
             self.write_artifact_sweep_worker_status("retry_deferred")?;
             return Ok(());
         }
-        if !artifact_worker_runtime_is_aligned() {
+        if !gates_open_for_test && !artifact_worker_runtime_is_aligned() {
             if steady_removal_due {
                 self.defer_steady_removal(ARTIFACT_WORKER_STEADY_IDLE_RETRY_MS)?;
             }
@@ -9131,9 +9270,15 @@ impl Broker {
                     let deadline = Instant::now() + pass_budget;
                     let _span =
                         crate::phase_telemetry::span("artifact_worker_compact_checkout_pass");
-                    let pass = broker.with_host_deleter_pin(|broker| {
-                        Ok(broker.auto_compact_checkout_recovery_pass(deadline))
-                    })?;
+                    // The index walk paces itself; it runs before the pin
+                    // and the GC lock so its waits block no one.
+                    let pass = match broker.compact_checkout_index_catch_up(deadline) {
+                        Err(error @ BrokerOpError::Store(_)) => return Err(error),
+                        Err(error) => Some(Err(error)),
+                        Ok(()) => broker.with_host_deleter_pin(|broker| {
+                            Ok(broker.auto_compact_checkout_recovery_pass_indexed(deadline))
+                        })?,
+                    };
                     match pass {
                         None => broker.defer_auto_compact_checkout_worker(
                             "compact_checkout_host_deleter_busy",
@@ -15783,6 +15928,366 @@ mod tests {
             ))
         });
         assert_eq!(artifact_worker_post_boot_hold_now(), None);
+    }
+
+    /// Set one indexed row's resolution error, as a failed lookup stores it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn set_cohort_resolution_error(broker: &mut Broker, session_id: i64, error: Option<&str>) {
+        assert_eq!(
+            broker
+                .store()
+                .connection()
+                .execute(
+                    "UPDATE cleanup_cohort_scan_rows SET resolution_error = ?2
+                     WHERE session_id = ?1",
+                    rusqlite::params![session_id, error],
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn cohort_resolution_error(broker: &mut Broker, session_id: i64) -> Option<Option<String>> {
+        broker
+            .store()
+            .connection()
+            .query_row(
+                "SELECT resolution_error FROM cleanup_cohort_scan_rows WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    /// The index never authorizes a removal on its own. A complete index the
+    /// compaction lane reuses still records another closed session at a
+    /// directory of its own; on disk that session's registered path is now a
+    /// symlink to the candidate's checkout. Removing the candidate would
+    /// delete what the other session's path names, so the alias re-audit
+    /// under the lifecycle claim must refuse and keep the checkout.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_reused_index_with_a_retargeted_alias_refuses_the_removal() {
+        let (_temporary, _storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (target, target_path, _) = closed_artifact_cache(&mut broker, "alias target");
+        std::fs::write(target_path.join("unique-commit.txt"), "alias target work").unwrap();
+        git(&target_path, &["add", "unique-commit.txt"]);
+        git(
+            &target_path,
+            &["commit", "-qm", "preserved alias target work"],
+        );
+        std::fs::write(target_path.join("recover-me.txt"), "alias target work").unwrap();
+
+        let parent = root.parent().unwrap().to_path_buf();
+        let elsewhere = parent.join("alias-elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let alias = parent.join("alias-registered-path");
+        std::os::unix::fs::symlink(&elsewhere, &alias).unwrap();
+        broker
+            .store()
+            .connection()
+            .execute(
+                "INSERT INTO sessions (
+                     worktree_path, branch, origin, status, cleanup_state, closed_at,
+                     created_at, updated_at, last_activity_at
+                 ) VALUES (?1, 'agent/alias-registered', 'adopted', 'closed', 'closed', 1, 1, 1, 1)",
+                [alias.to_string_lossy()],
+            )
+            .unwrap();
+        let indexed = broker
+            .refresh_cleanup_cohort_aliases(None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            indexed.complete && indexed.unresolved_rows == 0,
+            "{indexed:?}"
+        );
+
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[cleanup]\nauto_remove = true\nstrict = false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\ncompact_closed_worktrees = true\nclosed_worktree_grace_hours = 360\nauto_cleanup_worktrees_on_finish = false\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        broker
+            .store()
+            .request_closed_spawned_checkout_compactions(&[target], 360, now_ms())
+            .unwrap();
+        assert_eq!(
+            broker
+                .store()
+                .due_checkout_cleanup_compactions(now_ms(), 8)
+                .unwrap(),
+            vec![target]
+        );
+        // The lane saw this lap just now, so it reuses it as it is.
+        broker
+            .cleanup_cohort_lap_verified_at(indexed.alias_refresh_generation, now_ms())
+            .unwrap();
+
+        // SQLite does not see this: the stored index still says elsewhere.
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&target_path, &alias).unwrap();
+
+        broker
+            .auto_compact_checkout_recovery_pass(
+                Instant::now() + AUTO_COMPACT_CHECKOUT_WORKER_RESERVE,
+            )
+            .unwrap();
+
+        let status = broker
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
+            .unwrap();
+        assert!(
+            target_path.join("recover-me.txt").exists(),
+            "the checkout an alias names is kept: {status:?}"
+        );
+        let after = cohort_index_state(&mut broker);
+        assert_eq!(
+            after.alias_refresh_generation, indexed.alias_refresh_generation,
+            "the stale index was reused, not refreshed first"
+        );
+        assert!(
+            after.pending_dirty_rows >= 1,
+            "the alias re-audit found the retargeted path and marked it dirty: {after:?} {status:?}"
+        );
+        assert!(
+            broker
+                .store()
+                .next_pending_checkout_compaction_at()
+                .unwrap()
+                .is_some(),
+            "the compaction request is kept for a fresh pass"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_unresolved_row_is_retried_once_per_interval_without_a_full_lap() {
+        let (_temporary, _storage, mut broker, first) = compaction_index_fixture();
+        run_compaction_index_pass(&mut broker);
+        let initial = cohort_index_state(&mut broker);
+
+        // A stored lookup failure is re-resolved by itself on the next pass.
+        set_cohort_resolution_error(&mut broker, first, Some("transient lookup failure"));
+        run_compaction_index_pass(&mut broker);
+        assert_eq!(cohort_resolution_error(&mut broker, first), Some(None));
+        let retried = cohort_index_state(&mut broker);
+        assert!(retried.complete && retried.unresolved_rows == 0);
+        assert_eq!(
+            retried.alias_refresh_generation, initial.alias_refresh_generation,
+            "only the unresolved row is walked"
+        );
+
+        // The same row failing again within the interval is not retried:
+        // no dirty marker, no revision bump, no index write, no lap.
+        set_cohort_resolution_error(&mut broker, first, Some("still failing"));
+        let revisions = broker.store().cleanup_authority_revisions().unwrap();
+        crate::store::cleanup_cohort::install_cohort_write_log_for_test(
+            broker.store().connection(),
+        );
+        broker
+            .auto_compact_checkout_recovery_pass(
+                Instant::now() + AUTO_COMPACT_CHECKOUT_WORKER_RESERVE,
+            )
+            .unwrap();
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("compact_checkout_alias_index_incomplete")
+        );
+        assert_eq!(
+            cohort_resolution_error(&mut broker, first),
+            Some(Some("still failing".to_owned()))
+        );
+        assert_eq!(
+            broker.store().cleanup_authority_revisions().unwrap(),
+            revisions,
+            "a skipped retry leaves concurrent alias checks valid"
+        );
+        assert_eq!(
+            crate::store::cleanup_cohort::cohort_writes_for_test(broker.store().connection()),
+            Vec::new()
+        );
+        assert_eq!(
+            cohort_index_state(&mut broker).alias_refresh_generation,
+            initial.alias_refresh_generation
+        );
+
+        // Once the interval has passed it is retried again.
+        broker
+            .artifact_sweep_meta_set(
+                CLEANUP_COHORT_UNRESOLVED_RETRIED_KEY,
+                &format!("{{\"{first}\":0}}"),
+            )
+            .unwrap();
+        run_compaction_index_pass(&mut broker);
+        assert_eq!(cohort_resolution_error(&mut broker, first), Some(None));
+        assert_eq!(
+            cohort_index_state(&mut broker).alias_refresh_generation,
+            initial.alias_refresh_generation
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_unresolved_row_whose_session_is_gone_is_removed_without_a_full_lap() {
+        let (_temporary, _storage, mut broker, _first) = compaction_index_fixture();
+        run_compaction_index_pass(&mut broker);
+        let initial = cohort_index_state(&mut broker);
+        let orphan = 999_999i64;
+        broker
+            .store()
+            .connection()
+            .execute(
+                "INSERT INTO cleanup_cohort_scan_rows (
+                     namespace, session_id, raw_path, canonical_path, git_dir,
+                     resolution_error, cleanup_state
+                 ) VALUES (?1, ?2, '/tmp/aethyme-orphaned-row', '/tmp/aethyme-orphaned-row',
+                           NULL, 'session row was deleted', 'closed')",
+                rusqlite::params![
+                    crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+                    orphan
+                ],
+            )
+            .unwrap();
+        assert_eq!(cohort_index_state(&mut broker).unresolved_rows, 1);
+
+        run_compaction_index_pass(&mut broker);
+
+        assert_eq!(
+            cohort_resolution_error(&mut broker, orphan),
+            None,
+            "the orphaned row is removed, as the delete trigger would have done"
+        );
+        let after = cohort_index_state(&mut broker);
+        assert!(after.complete && after.unresolved_rows == 0 && after.pending_dirty_rows == 0);
+        assert_eq!(
+            after.alias_refresh_generation, initial.alias_refresh_generation,
+            "no full lap is rewound for it"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_critical_memory_stop_leaves_the_cohort_cursor_consistent() {
+        use crate::gc::unattended_pacing::{
+            self, FakeClock, PressureSample, Scripted, UnattendedPacer, UnlinkRate,
+        };
+        let (_temporary, _storage, mut broker, _first) = compaction_index_fixture();
+        let before = cohort_index_state(&mut broker);
+        let scope = unattended_pacing::install(UnattendedPacer::new(
+            UnlinkRate::Unlimited,
+            Box::new(FakeClock::new()),
+            Box::new(Scripted {
+                samples: vec![PressureSample {
+                    memory_elevated: Some(true),
+                    ..PressureSample::default()
+                }],
+                reads: Default::default(),
+            }),
+        ));
+
+        let stopped = broker
+            .refresh_cleanup_cohort_aliases_paced(Some(Instant::now() + Duration::from_secs(5)))
+            .unwrap();
+        drop(scope);
+
+        assert!(stopped.pressure_stopped);
+        let state = stopped.state.unwrap();
+        assert!(!state.complete);
+        assert_eq!(
+            state.alias_refresh_generation,
+            before.alias_refresh_generation + 1
+        );
+        assert_eq!(state.after_session_id, 0, "no page was taken");
+        assert!(state.after_session_id <= state.high_water_session_id);
+        assert_eq!(state, cohort_index_state(&mut broker), "what is stored");
+        assert!(
+            broker.store().connection().is_autocommit(),
+            "no transaction is left open"
+        );
+
+        // The stopped lap resumes; it is not rewound again.
+        let resumed = broker
+            .refresh_cleanup_cohort_aliases(None)
+            .unwrap()
+            .unwrap();
+        assert!(resumed.complete);
+        assert_eq!(
+            resumed.alias_refresh_generation,
+            state.alias_refresh_generation
+        );
+    }
+
+    /// The hold seen through the worker lanes: with compaction and steady
+    /// removal due one minute after boot, the run defers both (a retry at
+    /// the end of the hold), never enters the compaction pass, and removes
+    /// nothing.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_worker_lanes_hold_compaction_and_removal_after_boot() {
+        let (_temporary, _storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (session_id, worktree, _) = closed_artifact_cache(&mut broker, "held by the lanes");
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[cleanup]\nauto_remove = true\nstrict = false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\ncompact_closed_worktrees = true\nclosed_worktree_grace_hours = 0\nauto_cleanup_worktrees_on_finish = false\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        broker
+            .store()
+            .request_closed_spawned_checkout_compactions(&[session_id], 0, now_ms())
+            .unwrap();
+        assert!(broker.compact_checkout_work_due(now_ms()).unwrap());
+
+        WORKER_LANE_GATES_OPEN_FOR_TEST.with(|open| open.set(true));
+        POST_BOOT_UPTIME_FOR_TEST.with(|uptime| uptime.set(Some(Duration::from_secs(60))));
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let installed = crate::phase_telemetry::install(recorder.clone());
+        let started = now_ms();
+        let result = broker.run_artifact_sweep_recovery_worker_lanes();
+        drop(installed);
+        WORKER_LANE_GATES_OPEN_FOR_TEST.with(|open| open.set(false));
+        result.unwrap();
+
+        let counts = recorder.totals().1;
+        assert_eq!(
+            counts.get("artifact_worker_post_boot_hold"),
+            Some(&1),
+            "{counts:?}"
+        );
+        assert_eq!(
+            counts.get("artifact_worker_compact_checkout_pass"),
+            None,
+            "the compaction lane never ran: {counts:?}"
+        );
+        assert_eq!(counts.get("auto_compact_cohort_index"), None, "{counts:?}");
+        assert!(worktree.exists(), "nothing is removed during the hold");
+        assert!(broker.compact_checkout_work_pending().unwrap());
+        assert!(!broker.compact_checkout_work_due(now_ms()).unwrap());
+        let retry_at = broker
+            .store()
+            .next_pending_checkout_compaction_at()
+            .unwrap()
+            .unwrap();
+        let wait = retry_at - started;
+        assert!(
+            (8 * 60_000..=9 * 60_000 + 5_000).contains(&wait),
+            "due again when the nine minutes left of the hold end: {wait}"
+        );
     }
 
     #[test]
