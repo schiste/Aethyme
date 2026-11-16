@@ -1008,7 +1008,8 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
                     let size = candidate.bytes.map_or_else(|| "unmeasured".into(), gib);
                     out!("  {size:>10}  {}{kept}", candidate.path.display());
                 }
-                let notes = reclaim_plan_notes(discovery.as_ref(), sizing_report.as_ref(), now_ms());
+                let notes =
+                    reclaim_plan_notes(discovery.as_ref(), sizing_report.as_ref(), now_ms());
                 for line in notes {
                     out!("  {line}");
                 }
@@ -1229,8 +1230,7 @@ fn reclaim_plan_metric_details(
     let measured = if phases.sizing.is_some() {
         sizing.measured
     } else {
-        plan
-            .candidates
+        plan.candidates
             .iter()
             .filter(|candidate| candidate.bytes.is_some())
             .count()
