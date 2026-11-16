@@ -1282,10 +1282,10 @@ fn a_server_listening_beyond_loopback_is_killed_and_unhealthy() {
     assert_eq!(hello["ok"], true, "{hello}");
     let control = control.expect("a fallback line");
     assert_eq!(control["reason"], "not_loopback", "{control}");
-    assert_eq!(
-        unhealthy_reason(&hub.paths.directory, &key('u')).as_deref(),
-        Some("not_loopback")
-    );
+    assert!(wait_for(
+        || unhealthy_reason(&hub.paths.directory, &key('u')).as_deref() == Some("not_loopback"),
+        Duration::from_secs(10)
+    ));
     assert!(wait_for(
         || hub.status()["upstreams"][0]["pid"].is_null(),
         Duration::from_secs(10)

@@ -2281,12 +2281,13 @@ fn watch_listening(hub: &Arc<Hub>, upstream: &Arc<Upstream>, generation: u64, po
             // tell: never used, and not restarted into the same verdict.
             state.init = Init::Failed(reason.clone());
             drop(state);
-            upstream.ready.notify_all();
             eprintln!(
                 "aethyme mcp hub: {}: the HTTP upstream is not used ({reason})",
                 upstream.spec.name
             );
+            // Persisted before waiting clients learn of it.
             hub.mark_unhealthy(upstream, &reason);
+            upstream.ready.notify_all();
             hub.audit(upstream, "listener_refused", Some(&reason));
             stop_upstream(hub, upstream, &reason);
             return;
