@@ -853,7 +853,9 @@ path can take much longer because it measures candidate worktrees and caches
 and verifies recovery archives. In particular, the default plan defers the entire recovery
 archive inventory whenever its archive directory is nonempty; it does not
 hash archive bundles during the bounded scan. If you only need regenerable
-build output, `aethyme broker gc reclaim plan` provides the targeted review.
+build output, `aethyme broker gc reclaim plan --session <id>` provides the
+targeted review for one session; the whole-root form is budgeted and may list
+unmeasured sizes or stop as a partial, unappliable plan (see the CLI reference).
 
 An apply with an existing journal resumes that authorized journal directly;
 the planning flags only control the fresh-plan check when no journal exists.

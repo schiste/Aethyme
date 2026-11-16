@@ -1138,10 +1138,20 @@ fn gate_headroom_advice_fires_exactly_below_the_gate_threshold() {
     assert_eq!(
         starved.commands,
         vec![
-            "aethyme broker gc reclaim plan",
+            "aethyme broker gc reclaim plan --session <id>",
             "aethyme broker gc plan",
             "aethyme broker gc storage plan"
         ]
+    );
+    // The first command is the one agents run, so it must not be the
+    // whole-root walk; the evidence says what the whole-root form costs.
+    assert!(
+        starved
+            .evidence
+            .iter()
+            .any(|line| line.contains("without --session") && line.contains("budget")),
+        "{:?}",
+        starved.evidence
     );
 
     let at_threshold = super::gate_headroom_advice(

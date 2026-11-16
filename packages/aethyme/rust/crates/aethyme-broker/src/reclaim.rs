@@ -12,16 +12,23 @@
 //! real cost. So this reports candidates and only removes what an operator
 //! reviewed, following the same digest-bound plan/apply contract as `gc`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
 const RECLAIM_PLAN_SCHEMA_VERSION: u8 = 1;
 const RECLAIM_PLAN_FILENAME_PREFIX: &str = ".aethyme-reclaim-plan-";
 const RECLAIM_PLAN_FILENAME_SUFFIX: &str = ".json";
+/// Recent whole-root measurements, so a second plan reuses them instead of
+/// walking the same build trees again. Named like a review snapshot so root
+/// inventories treat it as broker bookkeeping; it is never a valid digest.
+const RECLAIM_SIZE_CACHE_FILENAME: &str = ".aethyme-reclaim-plan-sizes.json";
+/// Present while a whole-root plan is running, naming its process.
+const RECLAIM_IN_FLIGHT_FILENAME: &str = ".aethyme-reclaim-plan-in-flight.json";
+const RECLAIM_SIZE_CACHE_SCHEMA_VERSION: u8 = 1;
 
 /// The part of a candidate that determines whether an apply would touch it.
 /// Measured bytes deliberately do not belong here: a build may grow while the
@@ -50,9 +57,24 @@ pub fn decisions(candidates: &[ReclaimCandidate]) -> Vec<ReclaimDecision> {
 }
 
 fn decision_digest(root: &Path, scope: Option<&Path>, decisions: &[ReclaimDecision]) -> String {
+    decision_digest_of(root, scope, false, decisions)
+}
+
+fn decision_digest_of(
+    root: &Path,
+    scope: Option<&Path>,
+    partial: bool,
+    decisions: &[ReclaimDecision],
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"aethyme-reclaim-plan-v1\0");
     hasher.update(root.as_os_str().as_encoded_bytes());
+    // A plan whose discovery stopped early lists only part of the root. Its
+    // digest can never equal a complete scan's, so no confirmation of it
+    // reads as a review of the whole root.
+    if partial {
+        hasher.update(b"\0partial\0");
+    }
     // A whole-root plan hashes as it always has, so its saved reviews stay
     // valid; a one-worktree plan also commits to which worktree it covers.
     if let Some(scope) = scope {
@@ -82,6 +104,13 @@ fn decision_digest(root: &Path, scope: Option<&Path>, decisions: &[ReclaimDecisi
 /// plan was not reviewed as being about one session.
 pub fn plan_digest(root: &Path, scope: Option<&Path>, candidates: &[ReclaimCandidate]) -> String {
     decision_digest(root, scope, &decisions(candidates))
+}
+
+/// Digest for a whole-root plan whose discovery stopped before every worktree
+/// was walked. It is displayed for reference but never saved as a review, and
+/// it cannot match any complete scan, so apply refuses it.
+pub fn partial_plan_digest(root: &Path, candidates: &[ReclaimCandidate]) -> String {
+    decision_digest_of(root, None, true, &decisions(candidates))
 }
 
 /// A fresh scan narrowed to what a review authorized.
@@ -312,7 +341,10 @@ fn decisions_sorted(decisions: &[ReclaimDecision]) -> Vec<ReclaimDecision> {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ReclaimCandidate {
     pub path: PathBuf,
-    pub bytes: u64,
+    /// Measured size; `None` (JSON `null`) when it was not measured -- an
+    /// apply never measures, and a whole-root plan stops measuring when its
+    /// sizing budget runs out. Never authorization-bearing.
+    pub bytes: Option<u64>,
     /// The session worktree this belongs to.
     pub worktree: PathBuf,
     /// False when the session still needs it -- reported, never reclaimed.
@@ -360,7 +392,7 @@ pub fn classify(path: &Path, worktree: &Path, bytes: u64, active: &[PathBuf]) ->
     ReclaimCandidate {
         path: path.to_path_buf(),
         worktree: worktree.to_path_buf(),
-        bytes,
+        bytes: Some(bytes),
         reclaimable: !is_active,
         reason: if is_active {
             "session is still active; a build may be running against it".into()
@@ -370,12 +402,22 @@ pub fn classify(path: &Path, worktree: &Path, bytes: u64, active: &[PathBuf]) ->
     }
 }
 
-/// Total bytes the reclaimable candidates would free.
+/// Total measured bytes the reclaimable candidates would free. Unmeasured
+/// candidates contribute nothing, so with any of them this is a lower bound.
 pub fn reclaimable_bytes(candidates: &[ReclaimCandidate]) -> u64 {
     candidates
         .iter()
         .filter(|candidate| candidate.reclaimable)
-        .map(|candidate| candidate.bytes)
+        .filter_map(|candidate| candidate.bytes)
+        .sum()
+}
+
+/// Total measured bytes of every candidate; a lower bound when any candidate
+/// is unmeasured.
+pub fn measured_bytes(candidates: &[ReclaimCandidate]) -> u64 {
+    candidates
+        .iter()
+        .filter_map(|candidate| candidate.bytes)
         .sum()
 }
 
@@ -437,7 +479,7 @@ mod tests {
     fn an_inactive_sessions_artefacts_are_reclaimable() {
         let candidate = classify(&p("/w/done/target"), &p("/w/done"), 7 << 30, &[]);
         assert!(candidate.reclaimable);
-        assert_eq!(candidate.bytes, 7 << 30);
+        assert_eq!(candidate.bytes, Some(7 << 30));
     }
 
     /// Deleting a `target/` under a running build turns a disk problem into a
@@ -714,11 +756,28 @@ pub struct ReclaimOutcome {
 /// A symlink into someone else's tree must contribute nothing to a total that
 /// is about to justify a deletion.
 pub fn directory_bytes(path: &Path) -> u64 {
-    let mut total = 0;
+    directory_bytes_within(path, &mut || false).unwrap_or(0)
+}
+
+/// [`directory_bytes`], abandoned as soon as `expired` says the budget is
+/// spent. `None` means "not measured", never "empty": a partial count of a
+/// tree is not its size, so it is discarded rather than reported.
+///
+/// `expired` is consulted before each directory and each entry, so a single
+/// enormous `node_modules` cannot hold a plan past its budget. Tests pass a
+/// counting closure instead of a clock.
+pub fn directory_bytes_within(path: &Path, expired: &mut dyn FnMut() -> bool) -> Option<u64> {
+    if expired() {
+        return None;
+    }
+    let mut total: u64 = 0;
     let Ok(entries) = read_dir(path) else {
-        return 0;
+        return Some(0);
     };
     for entry in entries.flatten() {
+        if expired() {
+            return None;
+        }
         let Ok(kind) = entry.file_type() else {
             continue;
         };
@@ -726,12 +785,12 @@ pub fn directory_bytes(path: &Path) -> u64 {
             continue;
         }
         if kind.is_dir() {
-            total += directory_bytes(&entry.path());
+            total = total.saturating_add(directory_bytes_within(&entry.path(), expired)?);
         } else if let Ok(meta) = entry.metadata() {
-            total += meta.len();
+            total = total.saturating_add(meta.len());
         }
     }
-    total
+    Some(total)
 }
 
 /// Scan `root` for reclaimable artefacts, one level inside each worktree.
@@ -771,19 +830,61 @@ pub fn scan_root(
     extras: &[String],
     sizing: Sizing,
 ) -> Vec<ReclaimCandidate> {
+    scan_root_within(root, active, extras, sizing, &mut || false).0
+}
+
+/// How far a whole-root candidate discovery got.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Discovery {
+    /// Every worktree under the root was walked, so the candidate list is
+    /// the whole root's. A plan with `false` here cannot be applied.
+    pub complete: bool,
+    /// The discovery budget, or `None` when it was unbounded.
+    pub budget_ms: Option<u64>,
+    pub worktrees_scanned: usize,
+    pub worktrees_not_scanned: usize,
+    pub elapsed_ms: u64,
+}
+
+/// [`scan_root`] that stops starting new worktrees once `expired` says the
+/// discovery budget is spent, and says so.
+///
+/// The budget is checked between worktrees, so each listed worktree's
+/// candidates are complete; the walk inside one worktree is already bounded
+/// by its depth limit. Worktrees are walked in name order so a cut-off plan
+/// is reproducible.
+pub fn scan_root_within(
+    root: &Path,
+    active: &[PathBuf],
+    extras: &[String],
+    sizing: Sizing,
+    expired: &mut dyn FnMut() -> bool,
+) -> (Vec<ReclaimCandidate>, Discovery) {
     let mut found = Vec::new();
-    let Ok(worktrees) = std::fs::read_dir(root) else {
-        return found;
+    let mut discovery = Discovery {
+        complete: true,
+        ..Discovery::default()
     };
-    for worktree in worktrees.flatten() {
-        let base = worktree.path();
-        if !base.is_dir() {
-            continue;
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return (found, discovery);
+    };
+    let mut worktrees: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    worktrees.sort();
+    for worktree in &worktrees {
+        if expired() {
+            discovery.complete = false;
+            discovery.worktrees_not_scanned = worktrees.len() - discovery.worktrees_scanned;
+            break;
         }
-        found.extend(scan_worktree(&base, active, extras, sizing));
+        found.extend(scan_worktree(worktree, active, extras, sizing));
+        discovery.worktrees_scanned += 1;
     }
     found.sort_by_key(|candidate| std::cmp::Reverse(candidate.bytes));
-    found
+    (found, discovery)
 }
 
 /// Scan one worktree, and nothing else under its root.
@@ -1516,11 +1617,11 @@ impl Walk<'_> {
                 continue;
             }
             if is_artefact_directory_with_extras(name, self.extras) {
-                let bytes = match self.sizing {
-                    Sizing::Measure => directory_bytes(&path),
-                    Sizing::Skip => 0,
+                let mut candidate = classify(&path, self.worktree, 0, self.active);
+                candidate.bytes = match self.sizing {
+                    Sizing::Measure => Some(directory_bytes(&path)),
+                    Sizing::Skip => None,
                 };
-                let mut candidate = classify(&path, self.worktree, bytes, self.active);
                 if candidate.reclaimable
                     && let Some(reason) = git_protection(self.checkout, self.worktree, &path)
                 {
@@ -1547,6 +1648,356 @@ thread_local! {
     /// Directories this thread's scans opened, so a test can prove what a
     /// scan did not walk -- the filtered result alone cannot show that.
     static WALKED: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How long a whole-root plan may spend finding candidates before it stops
+/// starting new worktrees and reports itself partial. Measured on the busiest
+/// repository (about 626 checkouts) an unbounded plan ran 8-16+ minutes.
+pub const WHOLE_ROOT_DISCOVERY_BUDGET: Duration = Duration::from_secs(60);
+
+/// How long a whole-root plan may spend measuring candidate sizes in total.
+/// Sizes are what an operator reads, never what a confirmation authorizes, so
+/// a plan that lists every candidate and sizes the largest share it can is
+/// worth more than one that never returns.
+pub const WHOLE_ROOT_SIZING_BUDGET: Duration = Duration::from_secs(20);
+
+/// How old a measurement another whole-root plan saved may be and still be
+/// shown instead of walking that directory again. Long enough to cover
+/// several agents reacting to the same low-disk advice within a minute or
+/// so; short enough that a build growing by gigabytes is not hidden for long.
+/// Sizes never authorize anything, so a stale one costs accuracy, not safety.
+pub const SIZE_REUSE_WINDOW_MS: i64 = 90_000;
+
+/// A marker whose process start time cannot be read (an unsupported
+/// platform) is trusted as live only for this long after it was written.
+const IN_FLIGHT_UNVERIFIED_MAX_AGE_MS: i64 = 10 * 60_000;
+
+/// A point in time a budget runs out at, or none for an unbounded run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Deadline(Option<Instant>);
+
+impl Deadline {
+    /// `budget` from now; an unrepresentable instant is no deadline.
+    pub fn after(budget: Duration) -> Self {
+        Self(Instant::now().checked_add(budget))
+    }
+
+    pub fn never() -> Self {
+        Self(None)
+    }
+
+    pub fn passed(&self) -> bool {
+        self.0.is_some_and(|deadline| Instant::now() >= deadline)
+    }
+}
+
+/// What a whole-root plan measured, reused, and left unmeasured.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SizingReport {
+    /// The sizing budget, or `None` when `--full-scan` lifted it.
+    pub budget_ms: Option<u64>,
+    /// Candidates this plan walked and sized.
+    pub measured: usize,
+    /// Candidates sized from another whole-root plan's measurement at most
+    /// [`SIZE_REUSE_WINDOW_MS`] old.
+    pub reused: usize,
+    /// Candidates listed with `bytes: null`.
+    pub unmeasured: usize,
+    /// The budget ran out before every candidate was sized.
+    pub budget_exhausted: bool,
+    /// Another whole-root plan was measuring this root, so this one did not
+    /// walk the same directories at the same time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deferred_to: Option<InFlightPlan>,
+    pub elapsed_ms: u64,
+}
+
+/// Size `candidates` in place, reclaimable ones first.
+///
+/// A candidate with a recent measurement in `recent` takes it. Otherwise it
+/// is walked only when `walk` is true and the budget is not spent; a walk the
+/// budget interrupts is discarded. Everything not sized is left `None` and
+/// counted, never shown as zero. Returns the report and the fresh
+/// measurements to share with the next plan.
+pub fn measure_within(
+    candidates: &mut [ReclaimCandidate],
+    recent: &BTreeMap<PathBuf, u64>,
+    walk: bool,
+    expired: &mut dyn FnMut() -> bool,
+) -> (SizingReport, Vec<(PathBuf, u64)>) {
+    let mut report = SizingReport::default();
+    let mut fresh = Vec::new();
+    // Reclaimable first: they are what the totals an operator acts on count.
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_by_key(|&index| !candidates[index].reclaimable);
+    for index in order {
+        let candidate = &mut candidates[index];
+        if let Some(&bytes) = recent.get(&candidate.path) {
+            candidate.bytes = Some(bytes);
+            report.reused += 1;
+            continue;
+        }
+        if !walk || report.budget_exhausted {
+            candidate.bytes = None;
+            report.unmeasured += 1;
+            continue;
+        }
+        match directory_bytes_within(&candidate.path, expired) {
+            Some(bytes) => {
+                candidate.bytes = Some(bytes);
+                report.measured += 1;
+                fresh.push((candidate.path.clone(), bytes));
+            }
+            None => {
+                candidate.bytes = None;
+                report.unmeasured += 1;
+                report.budget_exhausted = true;
+            }
+        }
+    }
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.bytes));
+    (report, fresh)
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SizeCache {
+    schema_version: u8,
+    root: PathBuf,
+    entries: Vec<SizeCacheEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SizeCacheEntry {
+    path: PathBuf,
+    bytes: u64,
+    measured_at_ms: i64,
+}
+
+fn size_cache_entries(root: &Path, now_ms: i64, window_ms: i64) -> Vec<SizeCacheEntry> {
+    let path = root.join(RECLAIM_SIZE_CACHE_FILENAME);
+    if ensure_regular_snapshot(&path).is_err() {
+        return Vec::new();
+    }
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    let Ok(cache) = serde_json::from_slice::<SizeCache>(&bytes) else {
+        return Vec::new();
+    };
+    if cache.schema_version != RECLAIM_SIZE_CACHE_SCHEMA_VERSION || cache.root != root {
+        return Vec::new();
+    }
+    cache
+        .entries
+        .into_iter()
+        .filter(|entry| {
+            entry.measured_at_ms <= now_ms
+                && now_ms - entry.measured_at_ms <= window_ms
+                && is_within(root, &entry.path)
+        })
+        .collect()
+}
+
+/// Sizes another whole-root plan of this root measured within `window_ms`.
+/// Anything unreadable, foreign or old is simply not reused.
+pub fn recent_sizes(root: &Path, now_ms: i64, window_ms: i64) -> BTreeMap<PathBuf, u64> {
+    size_cache_entries(root, now_ms, window_ms)
+        .into_iter()
+        .map(|entry| (entry.path, entry.bytes))
+        .collect()
+}
+
+/// Share fresh measurements with the next whole-root plan of this root.
+/// Entries still inside the window are kept with their original time, so a
+/// reused size never looks younger than it is.
+pub fn record_sizes(
+    root: &Path,
+    now_ms: i64,
+    window_ms: i64,
+    measured: &[(PathBuf, u64)],
+) -> io::Result<()> {
+    if measured.is_empty() {
+        return Ok(());
+    }
+    let path = root.join(RECLAIM_SIZE_CACHE_FILENAME);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => ensure_regular_snapshot(&path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut entries = BTreeMap::new();
+    for entry in size_cache_entries(root, now_ms, window_ms) {
+        entries.insert(entry.path.clone(), entry);
+    }
+    for (candidate, bytes) in measured {
+        entries.insert(
+            candidate.clone(),
+            SizeCacheEntry {
+                path: candidate.clone(),
+                bytes: *bytes,
+                measured_at_ms: now_ms,
+            },
+        );
+    }
+    let cache = SizeCache {
+        schema_version: RECLAIM_SIZE_CACHE_SCHEMA_VERSION,
+        root: root.to_path_buf(),
+        entries: entries.into_values().collect(),
+    };
+    let bytes = serde_json::to_vec(&cache).map_err(io::Error::other)?;
+    crate::atomic_file::with_synced_temporary(&path, &bytes, |temporary| {
+        std::fs::rename(temporary, &path)
+    })
+}
+
+/// The process running a whole-root plan, as its in-flight marker names it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InFlightPlan {
+    pub pid: u32,
+    /// The process start time, which tells a reused pid from the holder.
+    #[serde(default)]
+    pub process_start: Option<u64>,
+    pub started_at_ms: i64,
+}
+
+impl InFlightPlan {
+    /// This process.
+    pub fn current(now_ms: i64) -> Self {
+        let pid = std::process::id();
+        Self {
+            pid,
+            process_start: i32::try_from(pid)
+                .ok()
+                .and_then(crate::gates::process_start_time),
+            started_at_ms: now_ms,
+        }
+    }
+}
+
+/// Whether the process a marker names is still the one that wrote it: the
+/// same pid with the same start time. Without a start time, a live pid is
+/// trusted only for [`IN_FLIGHT_UNVERIFIED_MAX_AGE_MS`]. A dead or reused pid
+/// makes the marker stale, so a plan killed mid-run never wedges the next.
+pub fn in_flight_holder_alive(holder: &InFlightPlan, now_ms: i64) -> bool {
+    match holder.process_start {
+        Some(start) => {
+            let live = i32::try_from(holder.pid)
+                .ok()
+                .and_then(crate::gates::process_start_time);
+            live == Some(start)
+        }
+        None => {
+            crate::blockers::process_alive(i64::from(holder.pid))
+                && now_ms.saturating_sub(holder.started_at_ms) < IN_FLIGHT_UNVERIFIED_MAX_AGE_MS
+        }
+    }
+}
+
+/// The outcome of claiming the whole-root plan marker.
+#[derive(Debug)]
+pub enum InFlightClaim {
+    /// This plan holds the marker until the guard drops.
+    Claimed(InFlightGuard),
+    /// Another live plan holds it.
+    HeldBy(InFlightPlan),
+}
+
+/// Removes the in-flight marker on drop, if it is still this plan's.
+#[derive(Debug)]
+pub struct InFlightGuard {
+    path: PathBuf,
+    holder: InFlightPlan,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if read_in_flight(&self.path).as_ref() == Some(&self.holder) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn read_in_flight(path: &Path) -> Option<InFlightPlan> {
+    ensure_regular_snapshot(path).ok()?;
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+/// The whole-root plan marker of `root`, if one names a live process.
+pub fn in_flight_holder(
+    root: &Path,
+    alive: &dyn Fn(&InFlightPlan) -> bool,
+) -> Option<InFlightPlan> {
+    let holder = read_in_flight(&root.join(RECLAIM_IN_FLIGHT_FILENAME))?;
+    alive(&holder).then_some(holder)
+}
+
+/// Claim the marker that says a whole-root plan of `root` is running.
+///
+/// Publication is a hard link of a fully written file, so a reader never sees
+/// a half-written marker and two claimants cannot both win. A marker naming a
+/// process that is gone (or whose pid was reused, or that cannot be parsed)
+/// is stale: it is removed and the claim retried once. Two plans that both
+/// find the same stale marker can at worst both measure, which costs time and
+/// never correctness -- sizes authorize nothing.
+pub fn claim_in_flight(
+    root: &Path,
+    me: InFlightPlan,
+    alive: &dyn Fn(&InFlightPlan) -> bool,
+) -> io::Result<InFlightClaim> {
+    let path = root.join(RECLAIM_IN_FLIGHT_FILENAME);
+    let bytes = serde_json::to_vec(&me).map_err(io::Error::other)?;
+    for _ in 0..2 {
+        if crate::atomic_file::write_synced_if_absent(&path, &bytes)? {
+            return Ok(InFlightClaim::Claimed(InFlightGuard { path, holder: me }));
+        }
+        let observed = std::fs::read(&path).ok();
+        let holder = observed
+            .as_deref()
+            .and_then(|observed| serde_json::from_slice::<InFlightPlan>(observed).ok());
+        if let Some(holder) = holder.filter(alive) {
+            return Ok(InFlightClaim::HeldBy(holder));
+        }
+        // Stale. Remove it only if it is still the marker that was judged,
+        // and only if it is a regular file this code wrote.
+        match ensure_regular_snapshot(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+        if std::fs::read(&path).ok() == observed {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    match read_in_flight(&path) {
+        Some(holder) => Ok(InFlightClaim::HeldBy(holder)),
+        None => Err(io::Error::other(
+            "the whole-root reclaim plan marker kept changing while it was claimed",
+        )),
+    }
+}
+
+/// Wait, within `expired`, for another plan's marker to go away. Returns
+/// whether it did. `pause` is called between checks; tests inject one that
+/// changes the world instead of sleeping.
+pub fn wait_for_in_flight(
+    root: &Path,
+    alive: &dyn Fn(&InFlightPlan) -> bool,
+    expired: &mut dyn FnMut() -> bool,
+    pause: &mut dyn FnMut(),
+) -> bool {
+    loop {
+        if in_flight_holder(root, alive).is_none() {
+            return true;
+        }
+        if expired() {
+            return false;
+        }
+        pause();
+    }
 }
 
 /// Remove the reviewed candidates, re-proving containment for each.
@@ -1651,7 +2102,7 @@ mod scan_tests {
         let found = scan(tmp.path(), &[]);
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].path.ends_with("target"));
-        assert_eq!(found[0].bytes, 2048);
+        assert_eq!(found[0].bytes, Some(2048));
         assert!(found[0].reclaimable);
     }
 
@@ -1685,7 +2136,7 @@ mod scan_tests {
         let found = scan_with_extra_directories(tmp.path(), &[], &[".aeptus-cache".into()]);
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].path.ends_with(".aeptus-cache"));
-        assert_eq!(found[0].bytes, 16);
+        assert_eq!(found[0].bytes, Some(16));
     }
 
     #[test]
@@ -1723,7 +2174,7 @@ mod scan_tests {
 
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].path, mine.join("target"));
-        assert_eq!(found[0].bytes, 8);
+        assert_eq!(found[0].bytes, Some(8));
         let walked = WALKED.with(|walked| walked.borrow().clone());
         assert!(walked.iter().any(|path| path.starts_with(&mine)));
         let strays: Vec<_> = walked
@@ -1745,7 +2196,7 @@ mod scan_tests {
         let unsized_scan = scan_worktree(&wt, &[], &[], Sizing::Skip);
 
         assert_eq!(decisions(&unsized_scan), decisions(&sized));
-        assert_eq!(unsized_scan[0].bytes, 0);
+        assert_eq!(unsized_scan[0].bytes, None);
         let walked = WALKED.with(|walked| walked.borrow().clone());
         assert!(
             !walked
@@ -1770,7 +2221,7 @@ mod scan_tests {
             root: tmp.path().to_path_buf(),
             scope: None,
             reclaimable_bytes: reclaimable_bytes(&candidates),
-            total_bytes: candidates.iter().map(|c| c.bytes).sum(),
+            total_bytes: measured_bytes(&candidates),
             candidates,
         };
         let outcome = apply(&plan);
@@ -1845,7 +2296,7 @@ mod scan_tests {
         std::os::unix::fs::symlink(&real, wt.join("target/link")).unwrap();
         let found = scan(tmp.path(), &[]);
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].bytes, 0, "symlinked content is not counted");
+        assert_eq!(found[0].bytes, Some(0), "symlinked content is not counted");
     }
 
     /// Projects commit `dist/` and `build/`. A name match deleted tracked
@@ -2301,5 +2752,366 @@ mod scan_tests {
         let index = git_index_path(&linked).unwrap();
         assert!(index.exists(), "{}", index.display());
         assert_ne!(index, main.join(".git/index"));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    fn write(path: &Path, bytes: usize) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![b'x'; bytes]).unwrap();
+    }
+
+    /// One kept and one reclaimable candidate, each holding one file.
+    fn two_candidates(root: &Path) -> Vec<ReclaimCandidate> {
+        write(&root.join("kept/target/x"), 16);
+        write(&root.join("idle/target/x"), 32);
+        vec![
+            classify(
+                &root.join("kept/target"),
+                &root.join("kept"),
+                0,
+                &[root.join("kept")],
+            ),
+            classify(&root.join("idle/target"), &root.join("idle"), 0, &[]),
+        ]
+    }
+
+    fn measure(
+        candidates: &mut [ReclaimCandidate],
+        expired: &mut dyn FnMut() -> bool,
+    ) -> (SizingReport, Vec<(PathBuf, u64)>) {
+        measure_within(candidates, &BTreeMap::new(), true, expired)
+    }
+
+    fn holder(pid: u32) -> InFlightPlan {
+        InFlightPlan {
+            pid,
+            process_start: Some(u64::from(pid)),
+            started_at_ms: i64::from(pid),
+        }
+    }
+
+    fn claimed(claim: InFlightClaim) -> InFlightGuard {
+        match claim {
+            InFlightClaim::Claimed(guard) => guard,
+            InFlightClaim::HeldBy(holder) => panic!("expected a claim, found {holder:?}"),
+        }
+    }
+
+    #[test]
+    fn a_spent_budget_lists_every_candidate_as_unmeasured_not_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut candidates = two_candidates(tmp.path());
+
+        let (report, fresh) = measure(&mut candidates, &mut || true);
+
+        assert_eq!(candidates.len(), 2, "unmeasured candidates stay listed");
+        assert!(candidates.iter().all(|candidate| candidate.bytes.is_none()));
+        assert_eq!(report.unmeasured, 2);
+        assert_eq!(report.measured, 0);
+        assert!(report.budget_exhausted);
+        assert!(fresh.is_empty());
+        assert_eq!(reclaimable_bytes(&candidates), 0);
+        let json = serde_json::to_value(&candidates[0]).unwrap();
+        assert!(
+            json["bytes"].is_null(),
+            "unmeasured must not read as 0: {json}"
+        );
+    }
+
+    #[test]
+    fn sizing_stops_mid_way_after_measuring_reclaimable_candidates_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut candidates = two_candidates(tmp.path());
+        // One check before the reclaimable directory and one for its single
+        // file; the third check, before the kept directory, finds the budget
+        // spent.
+        let mut checks = 0;
+        let mut expired = || {
+            checks += 1;
+            checks > 2
+        };
+
+        let (report, fresh) = measure(&mut candidates, &mut expired);
+
+        let idle = candidates
+            .iter()
+            .find(|candidate| candidate.reclaimable)
+            .unwrap();
+        let kept = candidates
+            .iter()
+            .find(|candidate| !candidate.reclaimable)
+            .unwrap();
+        assert_eq!(idle.bytes, Some(32));
+        assert_eq!(kept.bytes, None);
+        assert_eq!((report.measured, report.unmeasured), (1, 1));
+        assert!(report.budget_exhausted);
+        assert_eq!(fresh, vec![(tmp.path().join("idle/target"), 32)]);
+        assert_eq!(candidates[0].path, idle.path, "measured sizes sort first");
+    }
+
+    #[test]
+    fn an_unbounded_budget_measures_every_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut candidates = two_candidates(tmp.path());
+
+        let (report, fresh) = measure(&mut candidates, &mut || false);
+
+        assert_eq!((report.measured, report.unmeasured), (2, 0));
+        assert!(!report.budget_exhausted);
+        assert_eq!(fresh.len(), 2);
+        assert_eq!(measured_bytes(&candidates), 48);
+    }
+
+    #[test]
+    fn a_recent_measurement_is_reused_without_walking_the_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut candidates = two_candidates(tmp.path());
+        let recent = BTreeMap::from([
+            (tmp.path().join("idle/target"), 7_u64),
+            (tmp.path().join("kept/target"), 9_u64),
+        ]);
+        WALKED.with(|walked| walked.borrow_mut().clear());
+
+        let (report, fresh) = measure_within(&mut candidates, &recent, true, &mut || false);
+
+        assert_eq!((report.reused, report.measured), (2, 0));
+        assert!(fresh.is_empty(), "a reused size is not re-recorded as new");
+        assert_eq!(measured_bytes(&candidates), 16);
+        assert!(WALKED.with(|walked| walked.borrow().is_empty()));
+    }
+
+    /// While another plan measures the root, this one walks nothing.
+    #[test]
+    fn a_deferring_plan_never_walks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut candidates = two_candidates(tmp.path());
+        WALKED.with(|walked| walked.borrow_mut().clear());
+
+        let (report, _) = measure_within(&mut candidates, &BTreeMap::new(), false, &mut || false);
+
+        assert_eq!(report.unmeasured, 2);
+        assert!(
+            !report.budget_exhausted,
+            "nothing ran out; nothing was tried"
+        );
+        assert!(WALKED.with(|walked| walked.borrow().is_empty()));
+    }
+
+    /// Sizes are not authorization-bearing: measuring nothing and measuring
+    /// everything confirm the same decision.
+    #[test]
+    fn unmeasured_candidates_leave_the_digest_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut unmeasured = two_candidates(tmp.path());
+        let mut measured = unmeasured.clone();
+        measure(&mut unmeasured, &mut || true);
+        measure(&mut measured, &mut || false);
+
+        assert_eq!(
+            plan_digest(tmp.path(), None, &unmeasured),
+            plan_digest(tmp.path(), None, &measured)
+        );
+    }
+
+    /// A review whose sizes were not measured still authorizes exactly the
+    /// paths it listed reclaimable, and nothing it did not list.
+    #[test]
+    fn an_unmeasured_review_authorizes_only_the_paths_it_listed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut reviewed = two_candidates(tmp.path());
+        measure(&mut reviewed, &mut || true);
+        let mut fresh = reviewed.clone();
+        write(&tmp.path().join("new/target/x"), 8);
+        fresh.push(classify(
+            &tmp.path().join("new/target"),
+            &tmp.path().join("new"),
+            8,
+            &[],
+        ));
+
+        let scope = restrict_to_review(&fresh, &decisions(&reviewed));
+
+        let authorized: Vec<_> = scope
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.reclaimable)
+            .map(|candidate| candidate.path.clone())
+            .collect();
+        assert_eq!(authorized, vec![tmp.path().join("idle/target")]);
+        assert_eq!(scope.not_reviewed, vec![tmp.path().join("new/target")]);
+    }
+
+    /// A cut-off candidate list is never a whole-root review: its digest
+    /// matches no complete scan, and it cannot be saved as one.
+    #[test]
+    fn a_partial_plan_digest_is_never_a_complete_review() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let candidates = vec![classify(&root.join("a/target"), &root.join("a"), 8, &[])];
+        let partial = partial_plan_digest(&root, &candidates);
+        let scoped = plan_digest(&root, Some(&root.join("a")), &candidates);
+
+        assert_ne!(partial, plan_digest(&root, None, &candidates));
+        assert_ne!(partial, scoped);
+        assert!(save_snapshot(&root, None, &partial, &candidates).is_err());
+        assert_eq!(load_snapshot(&root, &partial).unwrap(), None);
+    }
+
+    #[test]
+    fn discovery_that_runs_out_of_budget_says_it_is_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] {
+            write(&tmp.path().join(name).join("target/x"), 4);
+        }
+
+        let (none, spent) = scan_root_within(tmp.path(), &[], &[], Sizing::Skip, &mut || true);
+        assert!(none.is_empty());
+        assert!(!spent.complete);
+        assert_eq!(spent.worktrees_scanned, 0);
+        assert_eq!(spent.worktrees_not_scanned, 3);
+
+        let mut checks = 0;
+        let mut expired = || {
+            checks += 1;
+            checks > 1
+        };
+        let (one, partial) = scan_root_within(tmp.path(), &[], &[], Sizing::Skip, &mut expired);
+        assert_eq!(one.len(), 1, "{one:?}");
+        assert_eq!(one[0].path, tmp.path().join("a/target"), "name order");
+        assert!(!partial.complete);
+        assert_eq!(partial.worktrees_scanned, 1);
+        assert_eq!(partial.worktrees_not_scanned, 2);
+
+        let (all, complete) = scan_root_within(tmp.path(), &[], &[], Sizing::Skip, &mut || false);
+        assert_eq!(all.len(), 3);
+        assert!(complete.complete);
+        assert_eq!(complete.worktrees_not_scanned, 0);
+        assert!(all.iter().all(|candidate| candidate.bytes.is_none()));
+    }
+
+    #[test]
+    fn recorded_sizes_are_reused_only_inside_the_window_and_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let inside = root.join("a/target");
+        let outside = tmp.path().join("elsewhere/target");
+        let window = SIZE_REUSE_WINDOW_MS;
+        let measured = [(inside.clone(), 5), (outside, 6)];
+
+        record_sizes(&root, 1_000, window, &measured).unwrap();
+
+        assert_eq!(
+            recent_sizes(&root, 1_000 + window, window),
+            BTreeMap::from([(inside.clone(), 5)])
+        );
+        assert!(
+            recent_sizes(&root, 1_001 + window, window).is_empty(),
+            "too old"
+        );
+        assert!(
+            recent_sizes(&root, 999, window).is_empty(),
+            "from the future"
+        );
+        let moved = tmp.path().join("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        assert!(
+            recent_sizes(&moved, 1_000, window).is_empty(),
+            "another root's measurements are not this root's"
+        );
+    }
+
+    #[test]
+    fn rerecording_keeps_an_older_measurement_at_its_original_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let first = root.join("a/target");
+        let second = root.join("b/target");
+        let window = SIZE_REUSE_WINDOW_MS;
+        record_sizes(root, 1_000, window, &[(first.clone(), 5)]).unwrap();
+        record_sizes(root, 2_000, window, &[(second.clone(), 6)]).unwrap();
+
+        assert_eq!(
+            recent_sizes(root, 1_000 + window, window),
+            BTreeMap::from([(first, 5), (second.clone(), 6)])
+        );
+        assert_eq!(
+            recent_sizes(root, 2_000 + window, window),
+            BTreeMap::from([(second, 6)])
+        );
+    }
+
+    #[test]
+    fn a_live_in_flight_plan_is_reported_and_its_marker_removed_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let guard = claimed(claim_in_flight(root, holder(1), &|_| true).unwrap());
+
+        match claim_in_flight(root, holder(2), &|_| true).unwrap() {
+            InFlightClaim::HeldBy(found) => assert_eq!(found, holder(1)),
+            InFlightClaim::Claimed(_) => panic!("a live plan's marker must not be taken"),
+        }
+        assert_eq!(in_flight_holder(root, &|_| true), Some(holder(1)));
+
+        drop(guard);
+        assert_eq!(in_flight_holder(root, &|_| true), None);
+        assert!(matches!(
+            claim_in_flight(root, holder(2), &|_| true).unwrap(),
+            InFlightClaim::Claimed(_)
+        ));
+    }
+
+    /// A plan killed mid-run leaves its marker; the next plan heals it.
+    #[test]
+    fn a_stale_in_flight_marker_self_heals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let stale = claimed(claim_in_flight(root, holder(1), &|_| true).unwrap());
+        let alive = |plan: &InFlightPlan| plan.pid != 1;
+
+        let fresh = claimed(claim_in_flight(root, holder(2), &alive).unwrap());
+        // The dead plan's guard must not remove the marker that replaced it.
+        drop(stale);
+        assert_eq!(in_flight_holder(root, &alive), Some(holder(2)));
+        drop(fresh);
+
+        std::fs::write(root.join(RECLAIM_IN_FLIGHT_FILENAME), b"not json").unwrap();
+        assert!(matches!(
+            claim_in_flight(root, holder(3), &|_| true).unwrap(),
+            InFlightClaim::Claimed(_)
+        ));
+    }
+
+    #[test]
+    fn liveness_requires_the_same_process_start_time() {
+        let now = 1_000;
+        assert!(in_flight_holder_alive(&InFlightPlan::current(now), now));
+        let reused_pid = InFlightPlan {
+            process_start: Some(u64::MAX),
+            ..InFlightPlan::current(now)
+        };
+        assert!(!in_flight_holder_alive(&reused_pid, now));
+    }
+
+    #[test]
+    fn waiting_for_an_in_flight_plan_ends_when_it_finishes_or_the_budget_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let guard = claimed(claim_in_flight(&root, holder(1), &|_| true).unwrap());
+
+        let mut pauses = 0;
+        let finished = wait_for_in_flight(&root, &|_| true, &mut || true, &mut || pauses += 1);
+        assert!(!finished);
+        assert_eq!(pauses, 0, "a spent budget does not wait");
+
+        let mut guard = Some(guard);
+        let mut release = || drop(guard.take());
+        let finished = wait_for_in_flight(&root, &|_| true, &mut || false, &mut release);
+        assert!(finished);
+        assert!(guard.is_none());
     }
 }

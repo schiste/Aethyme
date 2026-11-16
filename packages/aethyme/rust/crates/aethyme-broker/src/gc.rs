@@ -2324,7 +2324,7 @@ fn declined_reason(path: &Path, extras: &[String]) -> &'static str {
         .and_then(|name| name.to_str())
         .is_some_and(|name| crate::artifact_catalog::is_reviewed_only(name, extras));
     if reviewed_only {
-        "build output name with no witness GC can check; review it with `aethyme broker gc reclaim plan`"
+        "build output name with no witness GC can check; review it with `aethyme broker gc reclaim plan --session <id>`"
     } else {
         "git-ignored directory is outside the regenerable artifact catalog"
     }
