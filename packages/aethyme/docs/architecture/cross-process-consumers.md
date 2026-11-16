@@ -2542,3 +2542,15 @@ for minutes, so `status` and `agents` recorded `holder_process_table_failed`.
 A detached worker that finds another worker holding the repository's worker
 lock now exits successfully (`artifact_worker_already_active`), and takes the
 lock before the fresh Git probe rather than after it.
+
+### Sessions no dead owner keeps open; no-work sessions close after four hours
+
+Introduced 2026-11-16. Changes consumers may see:
+
+- `[retention] session_no_work_abandoned_after_hours` (default `4`, `0` disables, at most `8760`, never longer than `session_abandoned_after_hours`; `session_abandoned_after_hours = 0` disables it too). It appears in the retention policy of `gc plan --json`. A session whose HEAD is still its `diff_base`, whose checkout is clean, whose recorded holder is gone past the lease stale grace and which holds no explicit claim, unresolved operation, preparation in progress, merge-queue entry or unmerged pull request closes after that window. Its `session.abandoned` payload carries `close_reason` `inactive_no_work`.
+- New event kind `guarded_exec.receipt_abandoned` (payload `receipt_id`, `previous_phase`, `receipt_updated_at_ms`, `boot_time_ms`, `reason` = `command_predates_boot`). The receipt it names moves to phase `completed` with `command_outcome`, `ownership_audit` and `process_group_cleanup` all `unknown`, a combination no live command writes.
+- `broker submit prepare status --json` may report `state` `interrupted`: the record still says in progress but its host lease, at the recorded generation, is released. It may be retried like `failed`.
+- New abandonment keep reasons `holder_process_table_denied` and `no_work_*` (`session_commits`, `worktree_dirty`, `holder_unbound`, `holder_alive`, `holder_gone_recently`, `explicit_claim`, `merge_queue`, `pull_request_open`, `pull_request_unknown`).
+- New phase counters: `guarded_exec_receipts_abandoned_pre_boot`, `holder_grace_anchored_to_boot`, `legacy_unbound_claims_released`, `preparation_judged_interrupted`, `holder_process_table_native`, `holder_process_table_native_fallback`, `holder_process_table_native_denied`, `holder_process_table_denied`, `session_closed_no_work`, `session_no_work_kept_<reason>`.
+
+No schema change. Covered by `session_auto_close.rs`, `store/guarded_exec.rs`, `preparation.rs`, `lease_liveness.rs` and `session_holder.rs` tests.
