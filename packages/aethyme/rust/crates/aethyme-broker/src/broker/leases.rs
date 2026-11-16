@@ -2017,7 +2017,7 @@ impl Broker {
             self.store_ref()
                 .meta_set(LANDED_PROOF_GRANT_PASSES_KEY, &passes.to_string()),
         );
-        passes % LANDED_PROOF_GRANT_FIRST_EVERY == 0
+        passes.is_multiple_of(LANDED_PROOF_GRANT_FIRST_EVERY)
     }
 
     /// The one session deadline of a landed judgement of `session_id` in a
