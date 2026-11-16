@@ -21,7 +21,8 @@ use std::time::Instant;
 
 use super::checkouts::GitCheckouts;
 use super::config::{self, Entry, Mode, Scope, Sources, Transport};
-use super::hub_client::{self, Attach};
+use super::http::Ended;
+use super::hub_client::{self, Attach, HttpAttach};
 use super::key::{self, Caller, CopyKind, Plan};
 use super::resolve::{is_executable_file, is_shell, read_shebang, search_path};
 use super::telemetry::{self, Event};
@@ -391,15 +392,6 @@ fn run_inner(args: &[String]) -> u8 {
             exit_status::REFUSED,
         );
     }
-    if entry.transport == Transport::Http {
-        return fail(
-            &parsed,
-            &recorder,
-            "unsupported_transport",
-            "transport = \"http\" needs the shared hub, which this build does not have",
-            exit_status::REFUSED,
-        );
-    }
     // The caller's arguments and package join the entry's argv before the
     // plan, so they are part of the resolved argv and of the key.
     let adjusted;
@@ -420,6 +412,13 @@ fn run_inner(args: &[String]) -> u8 {
                 );
             }
         };
+    // Caller arguments and `base_args` must not drop or negate a required
+    // element: checked on the final argv.
+    if let Some((code, message)) =
+        super::config::required_argv_problem(&entry.argv, &entry.require_argv)
+    {
+        return fail(&parsed, &recorder, code, &message, exit_status::REFUSED);
+    }
     let planned = match key::plan(entry, &caller, &checkouts) {
         // A shared server whose identity cannot be taken starts privately.
         Err(failure)
@@ -511,7 +510,14 @@ fn run_inner(args: &[String]) -> u8 {
             );
         }
     }
-    if plan.mode == Mode::Shared && plan.transport == Transport::Stdio {
+    // Validation guarantees both for an HTTP entry.
+    let http = match (&entry.http_path, &entry.http_auth) {
+        (Some(path), Some(auth)) if plan.transport == Transport::Http => {
+            Some((path.clone(), auth.clone()))
+        }
+        _ => None,
+    };
+    if plan.mode == Mode::Shared {
         let blocked = if entry.require_client_features {
             Some("require_client_features".to_string())
         } else if caller.key_secret_error.is_some() {
@@ -527,22 +533,39 @@ fn run_inner(args: &[String]) -> u8 {
                 // One `hub` event per attempt, written before the session
                 // starts (an agent may kill this process at the end).
                 recorder.record("hub", None, Some(&plan), false);
-                match hub_client::attach(&plan, hub_client::ATTACH_BUDGET) {
-                    Attach::Done(code) => return code,
-                    Attach::Private(reason) => Some(reason),
-                    Attach::Replay {
-                        reason,
-                        consumed,
-                        input,
-                    } => {
-                        eprintln!(
-                            "aethyme mcp: {}: the shared hub cannot serve this client ({reason}); \
+                if let Some((path, auth)) = &http {
+                    match hub_client::attach_http(&plan, path, auth, hub_client::ATTACH_BUDGET) {
+                        HttpAttach::Done(ended) => {
+                            if let Ended::SessionLost(reason) = &ended {
+                                recorder.record(
+                                    "error",
+                                    Some(format!("http_session_lost:{reason}").as_str()),
+                                    Some(&plan),
+                                    false,
+                                );
+                            }
+                            return ended.code();
+                        }
+                        HttpAttach::Private(reason) => Some(reason),
+                    }
+                } else {
+                    match hub_client::attach(&plan, hub_client::ATTACH_BUDGET) {
+                        Attach::Done(code) => return code,
+                        Attach::Private(reason) => Some(reason),
+                        Attach::Replay {
+                            reason,
+                            consumed,
+                            input,
+                        } => {
+                            eprintln!(
+                                "aethyme mcp: {}: the shared hub cannot serve this client ({reason}); \
                              running a private server",
-                            plan.name
-                        );
-                        recorder.warnings.push(format!("hub_fallback:{reason}"));
-                        recorder.record("exec", Some("hub_replay"), Some(&plan), false);
-                        return hub_client::replay_private(&plan, &consumed, input);
+                                plan.name
+                            );
+                            recorder.warnings.push(format!("hub_fallback:{reason}"));
+                            recorder.record("exec", Some("hub_replay"), Some(&plan), false);
+                            return hub_client::replay_private(&plan, &consumed, input);
+                        }
                     }
                 }
             }
@@ -555,6 +578,25 @@ fn run_inner(args: &[String]) -> u8 {
             );
             recorder.warnings.push(format!("hub_fallback:{reason}"));
         }
+    }
+    if let Some((path, auth)) = &http {
+        // An HTTP server cannot take over this process's stdio: it runs as a
+        // child on a free loopback port, bridged like a shared one.
+        recorder.record("exec", Some("http_private"), Some(&plan), false);
+        let code = super::http::run_private(&plan, path, auth);
+        // ENVIRONMENT or REFUSED: nothing was bridged, stdin is untouched.
+        return match &parsed.fallback {
+            Some(fallback) if code == exit_status::ENVIRONMENT || code == exit_status::REFUSED => {
+                recorder.record(
+                    "exec_failed",
+                    Some("http_private_failed"),
+                    Some(&plan),
+                    true,
+                );
+                exec_fallback(&parsed.name, fallback)
+            }
+            _ => code,
+        };
     }
     recorder.record("exec", None, Some(&plan), false);
     let mut command = server_command(&plan);

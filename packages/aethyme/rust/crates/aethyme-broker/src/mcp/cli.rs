@@ -516,6 +516,7 @@ fn run_status(args: &[String]) -> u8 {
                     "pid": hub.get("pid"),
                     "build": hub.get("build"),
                     "upstreams": hub.get("upstreams"),
+                    "http_unverifiable": hub.get("http_unverifiable"),
                 }),
                 None => json!({"state": "not_running"}),
             },
@@ -602,6 +603,13 @@ fn run_status(args: &[String]) -> u8 {
                 .map_or(0, Vec::len)
         ),
         None => println!("hub: not running (started by the first shared connect)"),
+    }
+    if let Some(reason) = hub
+        .as_ref()
+        .and_then(|hub| hub.get("http_unverifiable"))
+        .and_then(Value::as_str)
+    {
+        println!("hub: cannot verify HTTP servers here ({reason}); they run privately");
     }
     super::managed_cli::print_status_text(&loaded);
     exit_status::SUCCESS

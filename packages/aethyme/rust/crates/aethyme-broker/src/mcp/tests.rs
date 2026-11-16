@@ -10,7 +10,7 @@ use std::process::Command;
 
 use super::checkouts::{Checkout, Checkouts};
 use super::config::{
-    Entry, EnvInherit, RepositoryAnchor, Scope, Sources, load, parse_and_validate,
+    Entry, EnvInherit, HttpAuth, RepositoryAnchor, Scope, Sources, load, parse_and_validate,
 };
 use super::connect::{parse_args, scan_fallback};
 use super::envfile;
@@ -1630,4 +1630,131 @@ fn shared_keys_cover_the_build_output_directory_of_the_entry() {
         plan(&shared, &small, &checkouts).unwrap_err().code,
         "entry_directory_identity_failed"
     );
+}
+
+#[test]
+fn require_argv_http_path_and_http_auth_are_enforced() {
+    let path = Path::new("/host/mcp/services.toml");
+    let text = "schema = 1
+[[servers]]
+name = \"isolated\"
+transport = \"http\"
+argv = [\"/bin/example-server\", \"--isolated\", \"--port={port}\"]
+require_argv = [\"--isolated\"]
+http_auth = \"bearer_env:EXAMPLE_TOKEN\"
+[[servers]]
+name = \"flag-dropped\"
+transport = \"http\"
+argv = [\"/bin/example-server\", \"--port={port}\"]
+require_argv = [\"--isolated\"]
+http_auth = \"bearer_env:EXAMPLE_TOKEN\"
+[[servers]]
+name = \"flag-turned-off\"
+transport = \"http\"
+argv = [\"/bin/example-server\", \"--isolated\", \"--isolated=false\"]
+require_argv = [\"--isolated\"]
+http_auth = \"bearer_env:EXAMPLE_TOKEN\"
+[[servers]]
+name = \"flag-negated\"
+argv = [\"/bin/example-server\", \"--isolated\", \"--no-isolated\"]
+require_argv = [\"--isolated\"]
+[[servers]]
+name = \"stdio-with-path\"
+argv = [\"/bin/example-server\"]
+http_path = \"/mcp\"
+[[servers]]
+name = \"bad-path\"
+transport = \"http\"
+argv = [\"/bin/example-server\"]
+http_path = \"mcp path\"
+http_auth = \"bearer_env:EXAMPLE_TOKEN\"
+[[servers]]
+name = \"no-auth\"
+transport = \"http\"
+argv = [\"/bin/example-server\"]
+[[servers]]
+name = \"open\"
+transport = \"http\"
+argv = [\"/bin/example-server\"]
+http_auth = \"none\"
+[[servers]]
+name = \"open-accepted\"
+transport = \"http\"
+argv = [\"/bin/example-server\"]
+http_auth = \"none\"
+http_unauthenticated = true
+[[servers]]
+name = \"token-file\"
+transport = \"http\"
+argv = [\"/bin/example-server\"]
+http_auth = \"bearer_file:--token-file\"
+[[servers]]
+name = \"bad-auth\"
+transport = \"http\"
+argv = [\"/bin/example-server\"]
+http_auth = \"basic\"
+[[servers]]
+name = \"stdio-with-auth\"
+argv = [\"/bin/example-server\"]
+http_auth = \"none\"
+";
+    let (entries, errors) = parse_and_validate(text, path, Scope::Host, None, &NoCheckouts);
+    let codes: Vec<&str> = errors.iter().map(|error| error.code).collect();
+    assert_eq!(
+        codes,
+        vec![
+            "missing_required_argument",
+            "contradicted_required_argument",
+            "contradicted_required_argument",
+            "http_path_without_http",
+            "invalid_http_path",
+            "missing_http_auth",
+            "unauthenticated_http",
+            "invalid_http_auth",
+            "http_field_without_http",
+        ]
+    );
+    let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(names, vec!["isolated", "open-accepted", "token-file"]);
+    assert_eq!(entries[0].require_argv, vec!["--isolated".to_string()]);
+    assert_eq!(
+        entries[0].http_path.as_deref(),
+        Some("/mcp"),
+        "the default path"
+    );
+    assert_eq!(
+        entries[0].http_auth,
+        Some(HttpAuth::BearerEnv {
+            name: "EXAMPLE_TOKEN".into()
+        })
+    );
+    assert_eq!(entries[1].http_auth, Some(HttpAuth::None));
+    assert_eq!(
+        entries[2].http_auth,
+        Some(HttpAuth::BearerFile {
+            flag: "--token-file".into()
+        })
+    );
+}
+
+#[test]
+fn require_argv_is_checked_on_the_final_argv_too() {
+    let required = strings(&["--isolated"]);
+    // As `connect` sees it after caller arguments and `base_args`.
+    assert_eq!(
+        super::config::required_argv_problem(
+            &strings(&["server", "--isolated", "--port=1"]),
+            &required
+        ),
+        None
+    );
+    let (code, _) = super::config::required_argv_problem(
+        &strings(&["server", "--isolated", "--caller", "--isolated=off"]),
+        &required,
+    )
+    .unwrap();
+    assert_eq!(code, "contradicted_required_argument");
+    let (code, _) =
+        super::config::required_argv_problem(&strings(&["server", "--other"]), &required).unwrap();
+    assert_eq!(code, "missing_required_argument");
 }

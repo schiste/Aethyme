@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use super::hub::{
-    HubConfig, HubPaths, UNHEALTHY_FILE, UpstreamRecord, build_identity, process_start,
-    reap_recorded_upstreams, serve, unhealthy_reason, write_record,
+    HubConfig, HubPaths, UNHEALTHY_FILE, UNHEALTHY_FOR, UpstreamRecord, build_identity,
+    process_start, reap_recorded_upstreams, serve, unhealthy_left, unhealthy_reason, write_record,
 };
 use super::jsonrpc::{self, read_message};
 use super::mux::{INVALID_REQUEST, METHOD_NOT_FOUND};
@@ -96,6 +96,7 @@ fn test_config(paths: HubPaths, events: PathBuf) -> HubConfig {
         global_in_flight: 1024,
         register_leases: false,
         handle_signals: false,
+        http_port: None,
     }
 }
 
@@ -948,4 +949,574 @@ fn a_restart_that_cannot_initialize_counts_as_a_crash() {
         read_log(&log)
     );
     assert!(read_log(&log).matches("started ").count() >= 5);
+}
+
+#[test]
+fn a_leader_that_no_longer_leads_its_recorded_group_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut gone = std::process::Command::new("true").spawn().unwrap();
+    gone.wait().unwrap();
+    let dead_owner = gone.id();
+    // Not a group leader: it stays in the test's own group.
+    let mut member = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    // A leader whose record names some other group.
+    let mut leader = std::process::Command::new("sleep")
+        .arg("60")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let started = |child: &std::process::Child| process_start(child.id()).unwrap();
+    write_record(
+        dir.path(),
+        "member",
+        &record_for(&member, started(&member), dead_owner, "long ago".into()),
+    )
+    .unwrap();
+    let mut other_group = record_for(&leader, started(&leader), dead_owner, "long ago".into());
+    other_group.process_group = member.id();
+    write_record(dir.path(), "other", &other_group).unwrap();
+
+    let report = reap_recorded_upstreams(dir.path());
+    assert!(report.stopped.is_empty(), "{report:?}");
+    assert_eq!(report.group_mismatch, 2, "{report:?}");
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        member.try_wait().unwrap().is_none(),
+        "a non-leader was signalled"
+    );
+    assert!(
+        leader.try_wait().unwrap().is_none(),
+        "a mismatched group was signalled"
+    );
+    for child in [&mut member, &mut leader] {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+#[test]
+fn unreadable_records_are_deleted_only_when_old() {
+    let dir = tempfile::tempdir().unwrap();
+    let records = dir.path().join("upstreams");
+    std::fs::create_dir_all(&records).unwrap();
+    std::fs::write(records.join("old.json"), b"{\"pid\": 1}").unwrap();
+    std::fs::write(records.join("fresh.json"), b"not json").unwrap();
+    let old = std::time::SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(records.join("old.json"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let report = reap_recorded_upstreams(dir.path());
+    assert_eq!(report.stale_removed, 1, "{report:?}");
+    assert!(report.stopped.is_empty());
+    assert!(!records.join("old.json").exists());
+    assert!(records.join("fresh.json").exists());
+}
+
+#[test]
+fn a_mark_from_a_clock_that_went_backwards_is_capped() {
+    let now = 1_000_000;
+    assert_eq!(unhealthy_left(now, now), None);
+    assert_eq!(
+        unhealthy_left(now + 1_000, now),
+        Some(Duration::from_secs(1))
+    );
+    // A mark written ten hours ahead lasts no longer than a fresh one.
+    assert_eq!(unhealthy_left(now + 36_000_000, now), Some(UNHEALTHY_FOR));
+}
+
+/// Not a test of its own: the fake streamable-HTTP server that HTTP hub
+/// tests start by running this test binary with `--exact` on this name.
+#[test]
+fn fake_http_server_process() {
+    aethyme_testkit::mcp_http::run_from_env();
+}
+
+/// Collects what an HTTP bridge writes.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    fn messages(&self) -> Vec<Value> {
+        String::from_utf8_lossy(&self.0.lock().unwrap())
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    fn output(&self) -> super::http::Output {
+        std::sync::Arc::new(std::sync::Mutex::new(Box::new(self.clone())))
+    }
+}
+
+const TOKEN_ENV: &str = aethyme_testkit::mcp_http::TOKEN_ENV;
+
+impl TestHub {
+    fn http_hello(&self, key: &str, argv: Vec<String>, extra_env: &[(&str, &str)]) -> Value {
+        self.http_hello_with(
+            key,
+            argv,
+            extra_env,
+            json!({"kind": "bearer_env", "name": TOKEN_ENV}),
+        )
+    }
+
+    fn http_hello_with(
+        &self,
+        key: &str,
+        argv: Vec<String>,
+        extra_env: &[(&str, &str)],
+        auth: Value,
+    ) -> Value {
+        let mut env = vec![
+            json!(["PATH", "/usr/bin:/bin"]),
+            json!([aethyme_testkit::mcp_http::FAKE_SERVER_ENV, "1"]),
+        ];
+        env.extend(extra_env.iter().map(|(name, value)| json!([name, value])));
+        json!({
+            "hub": 1,
+            "op": "attach",
+            "build": build_identity(),
+            "key": key,
+            "name": "fake-http",
+            "argv": argv,
+            "cwd": self.root,
+            "env": env,
+            "transport": "http",
+            "path": "/mcp",
+            "auth": auth,
+        })
+    }
+}
+
+fn fake_http_argv() -> Vec<String> {
+    vec![
+        std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        "mcp::hub_tests::fake_http_server_process".into(),
+        "--exact".into(),
+        "--nocapture".into(),
+        "--test-threads=1".into(),
+    ]
+}
+
+/// Attach over HTTP: the hello reply, then the ready or fallback line.
+fn http_attach(
+    hub: &TestHub,
+    key: &str,
+    argv: Vec<String>,
+    extra_env: &[(&str, &str)],
+) -> (Client, Value, Option<Value>) {
+    http_attach_hello(hub, &hub.http_hello(key, argv, extra_env))
+}
+
+fn http_attach_hello(hub: &TestHub, hello: &Value) -> (Client, Value, Option<Value>) {
+    let mut client = Client::connect(hub);
+    client
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    client.send(hello);
+    let hello = client.recv().expect("hello reply");
+    let control = (hello["ok"] == true).then(|| client.recv()).flatten();
+    (client, hello, control)
+}
+
+fn line(message: &Value) -> String {
+    format!("{message}\n")
+}
+
+fn initialize_line() -> String {
+    line(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": PROTOCOL, "capabilities": {},
+                   "clientInfo": {"name": "t", "version": "1"}}}))
+}
+
+fn call_line(id: u64, tool: &str) -> String {
+    line(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": {"name": tool, "arguments": {}}}))
+}
+
+fn bridge_options(token: Option<&str>) -> super::http::BridgeOptions {
+    super::http::BridgeOptions::new(token.map(str::to_string))
+}
+
+/// One agent session bridged to `url`: initialize, then two calls (an SSE
+/// reply and a JSON one). Returns everything written back.
+fn http_session(url: &str, token: Option<&str>) -> Vec<Value> {
+    let input = [
+        initialize_line(),
+        line(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})),
+        call_line(2, "whoami"),
+        call_line(3, "plain"),
+    ]
+    .concat();
+    let captured = Captured::default();
+    let ended = super::http::bridge(
+        url,
+        std::io::Cursor::new(input.into_bytes()),
+        captured.output(),
+        bridge_options(token),
+    );
+    assert_eq!(ended, super::http::Ended::Done, "{:?}", captured.messages());
+    captured.messages()
+}
+
+fn reply_for(messages: &[Value], id: u64) -> Value {
+    messages
+        .iter()
+        .find(|message| message["id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("no reply {id} in {messages:?}"))
+}
+
+#[test]
+fn http_clients_share_one_upstream_with_a_session_each() {
+    let hub = TestHub::start(|config| config.idle_timeout = Duration::from_secs(30));
+    let (_first, hello, ready) = http_attach(&hub, &key('p'), fake_http_argv(), &[]);
+    assert_eq!(hello["ok"], true, "{hello}");
+    let ready = ready.expect("a ready line");
+    assert_eq!(ready["aethyme_hub"], "ready", "{ready}");
+    let url = ready["url"].as_str().unwrap().to_string();
+    let token = ready["token"].as_str().expect("a bearer token").to_string();
+    assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+    assert!(url.ends_with("/mcp"), "{url}");
+    let (_second, _, again) = http_attach(&hub, &key('p'), fake_http_argv(), &[]);
+    let again = again.unwrap();
+    assert_eq!(again["url"], url.as_str(), "one upstream per key");
+    assert_eq!(again["token"], token.as_str());
+
+    let one = http_session(&url, Some(&token));
+    let two = http_session(&url, Some(&token));
+    assert_eq!(
+        reply_for(&one, 1)["result"]["serverInfo"]["name"],
+        "fake-http"
+    );
+    assert!(
+        one.iter()
+            .any(|message| message["method"] == "notifications/progress"),
+        "SSE notifications reach the client: {one:?}"
+    );
+    let (whoami_one, whoami_two) = (reply_for(&one, 2), reply_for(&two, 2));
+    assert_eq!(whoami_one["result"]["text"], whoami_two["result"]["text"]);
+    assert_ne!(
+        whoami_one["result"]["session"], whoami_two["result"]["session"],
+        "each client is its own HTTP session"
+    );
+    assert_eq!(
+        reply_for(&one, 3)["result"]["session"],
+        whoami_one["result"]["session"]
+    );
+    // Without the token the server refuses the client.
+    let refused = http_session(&url, None);
+    assert!(
+        reply_for(&refused, 1)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("401"),
+        "{refused:?}"
+    );
+
+    let status = hub.status();
+    let upstreams = status["upstreams"].as_array().unwrap();
+    assert_eq!(upstreams.len(), 1, "{status}");
+    assert_eq!(upstreams[0]["clients"], 2, "{status}");
+    assert_eq!(upstreams[0]["init"], "ready", "{status}");
+    assert!(upstreams[0]["port"].is_u64(), "{status}");
+    assert!(
+        status["counters"][&key('p')[..12]]["last_listen_ms"].is_u64(),
+        "{status}"
+    );
+}
+
+#[test]
+fn an_upstream_restart_disconnects_its_http_clients() {
+    let hub = TestHub::start(|config| config.idle_timeout = Duration::from_secs(30));
+    let (mut client, _, ready) = http_attach(&hub, &key('s'), fake_http_argv(), &[]);
+    assert_eq!(ready.unwrap()["aethyme_hub"], "ready");
+    let status = hub.status();
+    let pid = status["upstreams"][0]["pid"].as_u64().unwrap();
+    std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .unwrap();
+    // The hub closes the connection: the session is gone.
+    assert!(client.recv().is_none(), "the hub kept the client attached");
+    assert!(wait_for(
+        || hub.status()["counters"][&key('s')[..12]]["http_sessions_ended"] == 1,
+        Duration::from_secs(10)
+    ));
+}
+
+#[test]
+fn an_http_server_that_never_listens_falls_back_with_a_reason() {
+    let hub = TestHub::start(|config| config.init_timeout = Duration::from_millis(800));
+    let (_client, hello, control) =
+        http_attach(&hub, &key('q'), vec!["/bin/sleep".into(), "60".into()], &[]);
+    assert_eq!(hello["ok"], true, "{hello}");
+    let control = control.expect("a fallback line");
+    assert_eq!(control["aethyme_hub"], "fallback", "{control}");
+    assert_eq!(control["reason"], "listen_timeout", "{control}");
+}
+
+#[test]
+fn a_port_someone_else_holds_is_never_used() {
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = squatter.local_addr().unwrap().port();
+    let hub = TestHub::start(|config| config.http_port = Some(port));
+    let (_client, hello, _) = http_attach(&hub, &key('t'), fake_http_argv(), &[]);
+    assert_eq!(hello["ok"], false, "{hello}");
+    assert_eq!(hello["reason"], "port_busy", "{hello}");
+    drop(squatter);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_server_listening_beyond_loopback_is_killed_and_unhealthy() {
+    let hub = TestHub::start(|config| config.idle_timeout = Duration::from_secs(30));
+    let (_client, hello, control) = http_attach(
+        &hub,
+        &key('u'),
+        fake_http_argv(),
+        &[(aethyme_testkit::mcp_http::BIND_ENV, "0.0.0.0")],
+    );
+    assert_eq!(hello["ok"], true, "{hello}");
+    let control = control.expect("a fallback line");
+    assert_eq!(control["reason"], "not_loopback", "{control}");
+    assert!(wait_for(
+        || unhealthy_reason(&hub.paths.directory, &key('u')).as_deref() == Some("not_loopback"),
+        Duration::from_secs(10)
+    ));
+    assert!(wait_for(
+        || hub.status()["upstreams"][0]["pid"].is_null(),
+        Duration::from_secs(10)
+    ));
+}
+
+#[test]
+fn an_http_attach_without_a_path_or_auth_is_refused() {
+    let hub = TestHub::start(|_| {});
+    for field in ["path", "auth"] {
+        let mut hello = hub.http_hello(&key('r'), fake_http_argv(), &[]);
+        if field == "path" {
+            hello["path"] = json!("no-slash");
+        } else {
+            hello.as_object_mut().unwrap().remove("auth");
+        }
+        let mut client = Client::connect(&hub);
+        client.send(&hello);
+        assert_eq!(
+            client.recv().unwrap()["reason"],
+            "invalid_attach",
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn a_lost_session_answers_waiting_requests_and_ends_the_bridge_at_once() {
+    let port = aethyme_testkit::mcp_http::spawn_in_process(Default::default());
+    let url = super::http::url(port, "/mcp");
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    let captured = Captured::default();
+    let output = captured.output();
+    let bridge = thread::spawn(move || {
+        super::http::bridge(
+            &url,
+            std::io::BufReader::new(reader),
+            output,
+            bridge_options(None),
+        )
+    });
+    writer
+        .write_all((initialize_line() + &call_line(2, "forget")).as_bytes())
+        .unwrap();
+    assert!(wait_for(
+        || captured.messages().iter().any(|message| message["id"] == 2),
+        Duration::from_secs(10)
+    ));
+    // The session is gone: the next request ends the bridge while the
+    // agent's input is still open.
+    writer.write_all(call_line(3, "whoami").as_bytes()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !bridge.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "the bridge waited for more input"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        bridge.join().unwrap(),
+        super::http::Ended::SessionLost("session_expired".into())
+    );
+    let reply = reply_for(&captured.messages(), 3);
+    assert_eq!(reply["error"]["data"]["retryable"], true, "{reply}");
+    drop(writer);
+}
+
+#[test]
+fn a_reply_that_stays_silent_fails_retryably() {
+    let port = aethyme_testkit::mcp_http::spawn_in_process(Default::default());
+    let input = [initialize_line(), call_line(2, "hang")].concat();
+    let captured = Captured::default();
+    let mut options = bridge_options(None);
+    options.idle_timeout = Duration::from_millis(500);
+    let started = Instant::now();
+    let ended = super::http::bridge(
+        &super::http::url(port, "/mcp"),
+        std::io::Cursor::new(input.into_bytes()),
+        captured.output(),
+        options,
+    );
+    assert_eq!(ended, super::http::Ended::Done);
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "no idle deadline"
+    );
+    let reply = reply_for(&captured.messages(), 2);
+    assert_eq!(reply["error"]["data"]["retryable"], true, "{reply}");
+}
+
+#[test]
+fn a_bearer_file_token_reaches_the_server_through_a_private_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let hub = TestHub::start(|config| config.idle_timeout = Duration::from_secs(30));
+    let hello = hub.http_hello_with(
+        &key('v'),
+        fake_http_argv(),
+        &[(aethyme_testkit::mcp_http::TOKEN_FILE_FLAG_ENV, "--skip")],
+        json!({"kind": "bearer_file", "flag": "--skip"}),
+    );
+    let (_client, _, ready) = http_attach_hello(&hub, &hello);
+    let ready = ready.expect("a ready line");
+    assert_eq!(ready["aethyme_hub"], "ready", "{ready}");
+    let token = ready["token"].as_str().unwrap();
+    let directory = hub
+        .paths
+        .directory
+        .join("tokens")
+        .join(std::process::id().to_string())
+        .join(&key('v')[..12]);
+    let file = directory.join("token");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), token);
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let session = http_session(ready["url"].as_str().unwrap(), Some(token));
+    assert!(
+        reply_for(&session, 2)["result"]["text"].is_string(),
+        "{session:?}"
+    );
+}
+
+#[test]
+fn a_server_that_ignores_its_token_is_refused_and_unhealthy() {
+    let hub = TestHub::start(|config| config.idle_timeout = Duration::from_secs(30));
+    // The token goes to a variable the fake server never reads.
+    let hello = hub.http_hello_with(
+        &key('w'),
+        fake_http_argv(),
+        &[],
+        json!({"kind": "bearer_env", "name": "UNREAD_TOKEN"}),
+    );
+    let (_client, hello_reply, control) = http_attach_hello(&hub, &hello);
+    assert_eq!(hello_reply["ok"], true, "{hello_reply}");
+    let control = control.expect("a fallback line");
+    assert_eq!(
+        control["reason"], "token_not_enforced:server_ignores_token",
+        "{control}"
+    );
+    assert!(wait_for(
+        || unhealthy_reason(&hub.paths.directory, &key('w')).is_some(),
+        Duration::from_secs(10)
+    ));
+}
+
+#[test]
+fn a_token_probe_that_is_not_401_or_403_refuses_without_an_unhealthy_mark() {
+    let hub = TestHub::start(|config| config.idle_timeout = Duration::from_secs(30));
+    for (letter, status) in [
+        ('x', "400 Bad Request"),
+        ('y', "404 Not Found"),
+        ('z', "500 Internal Server Error"),
+    ] {
+        let extra = [(
+            aethyme_testkit::mcp_http::UNAUTHENTICATED_STATUS_ENV,
+            status,
+        )];
+        let (_client, hello, control) = http_attach(&hub, &key(letter), fake_http_argv(), &extra);
+        assert_eq!(hello["ok"], true, "{status}: {hello}");
+        let control = control.expect("a fallback line");
+        assert_eq!(
+            control["reason"],
+            super::http::TOKEN_PROBE_INCONCLUSIVE,
+            "{status}: {control}"
+        );
+        // Nothing is proven wrong: no mark, nothing kept, and the hub says
+        // it cannot verify.
+        assert!(unhealthy_reason(&hub.paths.directory, &key(letter)).is_none());
+        let status_now = hub.status();
+        assert!(status_now["http_unverifiable"].is_string(), "{status_now}");
+        // A later attach tries again (and is refused the same way).
+        let (_again, hello_again, control_again) =
+            http_attach(&hub, &key(letter), fake_http_argv(), &extra);
+        assert_eq!(hello_again["ok"], true, "{hello_again}");
+        assert_eq!(
+            control_again.unwrap()["reason"],
+            super::http::TOKEN_PROBE_INCONCLUSIVE
+        );
+    }
+}
+
+#[test]
+fn token_directories_are_swept_only_for_hubs_proven_dead() {
+    let dir = tempfile::tempdir().unwrap();
+    let tokens = dir.path().join("tokens");
+    let mut gone = std::process::Command::new("true").spawn().unwrap();
+    gone.wait().unwrap();
+    let live = std::process::id();
+    let owner = |pid: u32, started: &str| json!({"pid": pid, "started": started}).to_string();
+    for (name, record) in [
+        ("dead", Some(owner(gone.id(), "long ago"))),
+        ("live", Some(owner(live, &process_start(live).unwrap()))),
+        ("reused", Some(owner(live, "not its start time"))),
+        ("unknown", None),
+    ] {
+        std::fs::create_dir_all(tokens.join(name).join("key")).unwrap();
+        if let Some(record) = record {
+            std::fs::write(tokens.join(name).join("owner.json"), record).unwrap();
+        }
+    }
+    super::hub::sweep_token_directories(dir.path());
+    let mut left: Vec<String> = std::fs::read_dir(&tokens)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, vec!["live".to_string(), "unknown".to_string()]);
 }
