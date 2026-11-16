@@ -1455,3 +1455,68 @@ fn a_server_that_ignores_its_token_is_refused_and_unhealthy() {
         Duration::from_secs(10)
     ));
 }
+
+#[test]
+fn a_token_probe_that_is_not_401_or_403_refuses_without_an_unhealthy_mark() {
+    let hub = TestHub::start(|config| config.idle_timeout = Duration::from_secs(30));
+    for (letter, status) in [
+        ('x', "400 Bad Request"),
+        ('y', "404 Not Found"),
+        ('z', "500 Internal Server Error"),
+    ] {
+        let extra = [(
+            aethyme_testkit::mcp_http::UNAUTHENTICATED_STATUS_ENV,
+            status,
+        )];
+        let (_client, hello, control) = http_attach(&hub, &key(letter), fake_http_argv(), &extra);
+        assert_eq!(hello["ok"], true, "{status}: {hello}");
+        let control = control.expect("a fallback line");
+        assert_eq!(
+            control["reason"],
+            super::http::TOKEN_PROBE_INCONCLUSIVE,
+            "{status}: {control}"
+        );
+        // Nothing is proven wrong: no mark, nothing kept, and the hub says
+        // it cannot verify.
+        assert!(unhealthy_reason(&hub.paths.directory, &key(letter)).is_none());
+        let status_now = hub.status();
+        assert!(status_now["http_unverifiable"].is_string(), "{status_now}");
+        // A later attach tries again (and is refused the same way).
+        let (_again, hello_again, control_again) =
+            http_attach(&hub, &key(letter), fake_http_argv(), &extra);
+        assert_eq!(hello_again["ok"], true, "{hello_again}");
+        assert_eq!(
+            control_again.unwrap()["reason"],
+            super::http::TOKEN_PROBE_INCONCLUSIVE
+        );
+    }
+}
+
+#[test]
+fn token_directories_are_swept_only_for_hubs_proven_dead() {
+    let dir = tempfile::tempdir().unwrap();
+    let tokens = dir.path().join("tokens");
+    let mut gone = std::process::Command::new("true").spawn().unwrap();
+    gone.wait().unwrap();
+    let live = std::process::id();
+    let owner = |pid: u32, started: &str| json!({"pid": pid, "started": started}).to_string();
+    for (name, record) in [
+        ("dead", Some(owner(gone.id(), "long ago"))),
+        ("live", Some(owner(live, &process_start(live).unwrap()))),
+        ("reused", Some(owner(live, "not its start time"))),
+        ("unknown", None),
+    ] {
+        std::fs::create_dir_all(tokens.join(name).join("key")).unwrap();
+        if let Some(record) = record {
+            std::fs::write(tokens.join(name).join("owner.json"), record).unwrap();
+        }
+    }
+    super::hub::sweep_token_directories(dir.path());
+    let mut left: Vec<String> = std::fs::read_dir(&tokens)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, vec!["live".to_string(), "unknown".to_string()]);
+}

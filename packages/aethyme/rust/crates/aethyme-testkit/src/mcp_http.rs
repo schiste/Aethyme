@@ -37,12 +37,17 @@ pub const BIND_ENV: &str = "AETHYME_TEST_FAKE_MCP_BIND";
 /// this flag (for `bearer_file` entries; `--skip` suits a libtest binary,
 /// which takes it with a value).
 pub const TOKEN_FILE_FLAG_ENV: &str = "AETHYME_TEST_FAKE_MCP_TOKEN_FILE_FLAG";
+/// The status line for a request without the token (default
+/// `401 Unauthorized`), e.g. `404 Not Found` for a server that does not
+/// clearly reject it.
+pub const UNAUTHENTICATED_STATUS_ENV: &str = "AETHYME_TEST_FAKE_MCP_UNAUTHENTICATED_STATUS";
 
 /// How the fake server runs.
 #[derive(Debug, Clone)]
 pub struct FakeOptions {
     pub bind: IpAddr,
     pub token: Option<String>,
+    pub unauthenticated_status: String,
 }
 
 impl Default for FakeOptions {
@@ -50,6 +55,7 @@ impl Default for FakeOptions {
         Self {
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             token: None,
+            unauthenticated_status: "401 Unauthorized".into(),
         }
     }
 }
@@ -72,6 +78,8 @@ pub fn run_from_env() {
         token: token_from_file()
             .or_else(|| std::env::var(TOKEN_ENV).ok())
             .filter(|token| !token.is_empty()),
+        unauthenticated_status: std::env::var(UNAUTHENTICATED_STATUS_ENV)
+            .unwrap_or_else(|_| "401 Unauthorized".into()),
     };
     let listener = TcpListener::bind((options.bind, port)).expect("bind the fake server");
     serve(listener, options);
@@ -169,7 +177,7 @@ fn handle(
     if let Some(token) = &options.token
         && authorization.as_deref() != Some(format!("Bearer {token}").as_str())
     {
-        return respond(&mut stream, "401 Unauthorized", &[], b"");
+        return respond(&mut stream, &options.unauthenticated_status, &[], b"");
     }
     let known = |id: &Option<String>| {
         id.as_ref()

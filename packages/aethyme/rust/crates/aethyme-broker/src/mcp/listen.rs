@@ -256,10 +256,18 @@ pub(crate) fn lsof_owned_sockets(text: &str, port: u16) -> Option<Vec<bool>> {
     Some(sockets.into_values().collect())
 }
 
+/// Why a listing is unverifiable when it shows nothing the group holds, or
+/// nothing at all.
+pub const LISTING_EMPTY: &str = "listener_listing_empty";
+
 /// Combine the host-wide listeners on the port with the ones the group owns.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn reconcile(all: &[bool], owned: &[bool]) -> Listeners {
-    if all.is_empty() {
+    if all.is_empty() && !owned.is_empty() {
+        // The group holds a listener the host-wide listing does not show: the
+        // listing is incomplete (a sandbox can make it print nothing).
+        Listeners::Unverifiable(LISTING_EMPTY.into())
+    } else if all.is_empty() {
         Listeners::None
     } else if owned.len() < all.len() {
         Listeners::NotOurs
@@ -325,7 +333,14 @@ mod macos {
     }
 
     pub(super) fn check(port: u16, group: u32) -> Listeners {
+        // Both always run: an empty listing must be told apart from a port
+        // nobody listens on.
         let all = match run(NETSTAT, &["-an", "-p", "tcp"]) {
+            // A host always has TCP sockets: an empty table is a listing the
+            // caller may not see (an agent sandbox prints nothing, exit 0).
+            Ok((Some(0), text)) if text.trim().is_empty() => {
+                return Listeners::Unverifiable(LISTING_EMPTY.into());
+            }
             Ok((Some(0), text)) => match netstat_listeners(&text, port) {
                 Some(all) => all,
                 None => return Listeners::Unverifiable("netstat_format".into()),
@@ -333,9 +348,6 @@ mod macos {
             Ok(_) => return Listeners::Unverifiable("netstat_failed".into()),
             Err(reason) => return Listeners::Unverifiable(reason),
         };
-        if all.is_empty() {
-            return Listeners::None;
-        }
         let selector = format!("-iTCP:{port}");
         let group_text = group.to_string();
         let owned = match run(
@@ -446,6 +458,10 @@ tcp6       0      0  ::1.47300              *.*                    LISTEN       
     #[test]
     fn listeners_are_ours_only_when_the_counts_agree() {
         assert_eq!(reconcile(&[], &[]), Listeners::None);
+        assert_eq!(
+            reconcile(&[], &[true]),
+            Listeners::Unverifiable(LISTING_EMPTY.into())
+        );
         assert_eq!(reconcile(&[true], &[true]), Listeners::Ours);
         assert_eq!(reconcile(&[true, true], &[true]), Listeners::NotOurs);
         assert_eq!(reconcile(&[true], &[]), Listeners::NotOurs);

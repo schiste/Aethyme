@@ -425,18 +425,24 @@ the same way:
   variable, or written to a `0600` file in a `0700` directory under the
   hub's state directory (a temporary one for a private server) whose path
   follows the flag (`<flag> <path>`). The file is removed when the server
-  stops, and a hub sweeps those of hubs that no longer run when it starts.
+  stops; a starting hub removes the token directories of hubs proven dead
+  (by recorded pid and start time, as for upstream records) and leaves any
+  whose owner runs or cannot be judged.
   There is deliberately no form that puts the token itself in argv: argv
   is readable by every local user with `ps`, the very users the token keeps
   out. The bridge sends it as `Authorization: Bearer <token>`.
   `http_auth = "none"` is refused unless the entry also sets
   `http_unauthenticated = true`: then any local process can drive the
   server.
-- **Token enforced.** Once the server listens, one `initialize` is sent
-  without the token (client `aethyme-mcp-hub`; any session it creates is
-  deleted). A server that answers it with a result ignores its token: it is
-  stopped, its key marked unhealthy (`token_not_enforced:server_ignores_token`),
-  and a private run refuses it the same way. Entries with
+- **Token enforced.** Once the server listens, one well-formed
+  `initialize` is sent without the token (same path, `Accept` and protocol
+  header as the bridge; client `aethyme-mcp-hub`; any session it creates is
+  deleted). Only `401` or `403` count as enforcing the token. A `2xx` with
+  a result means the server ignores its token: it is stopped and its key
+  marked unhealthy (`token_not_enforced:server_ignores_token`). Anything
+  else (another status, a `2xx` with an error or no result, no answer) is
+  `token_probe_inconclusive`: the server did not clearly reject an
+  unauthenticated request, so it is not used. Entries with
   `http_auth = "none"` skip the probe.
 - **Who listens.** Before the server starts, its port must be free (else
   `port_busy`). It counts as ready only when every TCP listener on the port
@@ -449,7 +455,16 @@ the same way:
   user's sockets (`netstat -an -p tcp`, reading only the leading address
   columns, never a pid or process name) and the listening sockets the
   server's own process group holds (`lsof` limited to that group). Where
-  either cannot be read the server is not used (`listener_unverifiable`). One that does not listen within 30
+  either cannot be read, or the listing is empty or misses a listener the
+  group holds (an agent sandbox can make `netstat` print nothing), the
+  server is not used (`listener_unverifiable:listener_listing_empty`).
+- **Unverifiable is not unhealthy.** `listener_unverifiable` and
+  `token_probe_inconclusive` stop that server and refuse the attach at
+  once, so `connect` takes its private path or `--fallback` without
+  waiting, but they leave no unhealthy mark and count as no crash: the
+  next attach tries again. `aethyme mcp status` shows when a hub cannot
+  verify (`http_unverifiable`), for example because the hub itself started
+  in a sandbox. One that does not listen within 30
   seconds is killed and counts as a crash.
 - **Limits.** Only the leased port is checked, and only once, when the
   server becomes ready. Any other port the server opens (a debugging or

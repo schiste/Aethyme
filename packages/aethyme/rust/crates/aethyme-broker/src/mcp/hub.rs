@@ -359,6 +359,10 @@ struct HubState {
     ever_attached: bool,
     last_activity: Instant,
     stopping: bool,
+    /// Why this hub last could not verify an HTTP upstream's listener or
+    /// token (for example a sandbox hiding the socket table); `None` once
+    /// one verified.
+    http_unverifiable: Option<String>,
 }
 
 /// Spawns every upstream from one long-lived thread, so Linux's
@@ -997,6 +1001,7 @@ pub fn serve(config: HubConfig) -> io::Result<()> {
             ever_attached: false,
             last_activity: Instant::now(),
             stopping: false,
+            http_unverifiable: None,
         }),
         wake: Condvar::new(),
         next_client: AtomicU64::new(1),
@@ -1236,6 +1241,7 @@ fn status(hub: &Arc<Hub>) -> Value {
         "build": build_identity(),
         "connections": hub.connections.load(Ordering::Acquire),
         "upstreams": upstreams,
+        "http_unverifiable": state.http_unverifiable,
         "unhealthy": unhealthy,
         "counters": counters,
     })
@@ -2285,7 +2291,28 @@ fn fresh_token_directory(hub: &Arc<Hub>, upstream: &Upstream) -> io::Result<Path
         .create(&directory)?;
     // `recursive` leaves an existing parent's mode alone; set ours.
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    // The owner, so a later hub removes these only once this one is dead.
+    let owner = hub_tokens(&hub.config.paths.directory).join(TOKEN_OWNER_FILE);
+    if !owner.exists() {
+        let record = TokenOwner {
+            pid: std::process::id(),
+            started: hub.started.clone(),
+        };
+        fs::write(
+            &owner,
+            serde_json::to_vec(&record).map_err(io::Error::other)?,
+        )?;
+    }
     Ok(directory)
+}
+
+const TOKEN_OWNER_FILE: &str = "owner.json";
+
+/// The hub that owns a `tokens/<pid>` directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TokenOwner {
+    pub pid: u32,
+    pub started: String,
 }
 
 fn remove_token_directory(hub: &Arc<Hub>, upstream: &Upstream) {
@@ -2298,23 +2325,27 @@ fn remove_token_directory(hub: &Arc<Hub>, upstream: &Upstream) {
     }
 }
 
-/// Remove token directories of hubs that no longer run (any build).
-fn sweep_token_directories(directory: &Path) {
+/// Remove the token directories of hubs proven dead (any build), by the
+/// same owner rule as upstream records: the recorded pid and start time.
+/// An owner that runs or cannot be judged keeps its directory; one without
+/// a readable owner record is removed only once older than a day.
+pub(crate) fn sweep_token_directories(directory: &Path) {
     let Ok(entries) = fs::read_dir(directory.join(TOKENS_DIRECTORY)) else {
         return;
     };
     for entry in entries.flatten() {
-        let alive = entry
-            .file_name()
-            .to_str()
-            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
-            .is_some_and(|pid| {
-                // SAFETY: kill with signal 0 only checks that the process
-                // exists; it takes no pointers.
-                let probed = unsafe { libc::kill(pid, 0) };
-                probed == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-            });
-        if !alive {
+        let owner = fs::read(entry.path().join(TOKEN_OWNER_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<TokenOwner>(&bytes).ok());
+        let dead = match owner {
+            Some(owner) => liveness(owner.pid, &owner.started) == Liveness::Dead,
+            None => fs::metadata(entry.path())
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > STALE_RECORD),
+        };
+        if dead {
             crate::warn_unrecorded(
                 "sweep an MCP token directory",
                 fs::remove_dir_all(entry.path()),
@@ -2339,18 +2370,53 @@ fn watch_listening(hub: &Arc<Hub>, upstream: &Arc<Upstream>, generation: u64, po
         // A server that answers without its token would let any local
         // process in: probed once, before anyone is told the URL.
         let mut refusal = verdict.reason();
+        // Unverifiable: nothing is proven wrong with the server, so no
+        // unhealthy mark and no crash; a later attach tries again.
+        let mut unproven = matches!(verdict, Listeners::Unverifiable(_));
         if verdict == Listeners::Ours
             && has_token
             && let Some(path) = &upstream.spec.http_path
         {
-            refusal = match http::token_enforced(port, path) {
-                Ok(true) => None,
-                Ok(false) => Some(http::TOKEN_NOT_ENFORCED.to_string()),
-                Err(reason) => Some(reason),
-            };
+            let probe = http::probe_token(port, path);
+            unproven = matches!(probe, http::Probe::Inconclusive(_));
+            if let http::Probe::Inconclusive(detail) = &probe {
+                eprintln!(
+                    "aethyme mcp hub: {}: the token probe was inconclusive ({detail}); the \
+                     server must answer a request without its token with 401 or 403",
+                    upstream.spec.name
+                );
+            }
+            refusal = probe.refusal();
         }
         let mut state = lock(&upstream.state);
         if state.generation != generation || state.stopped || state.reaped >= generation {
+            return;
+        }
+        if let Some(reason) = refusal.clone()
+            && unproven
+        {
+            state.init = Init::Failed(reason.clone());
+            drop(state);
+            eprintln!(
+                "aethyme mcp hub: {}: the HTTP upstream cannot be verified, so it is not used \
+                 ({reason})",
+                upstream.spec.name
+            );
+            {
+                let mut hub_state = lock(&hub.state);
+                hub_state.http_unverifiable = Some(reason.clone());
+                // Forgotten, so the next attach starts afresh.
+                if hub_state
+                    .upstreams
+                    .get(&upstream.key)
+                    .is_some_and(|known| Arc::ptr_eq(known, upstream))
+                {
+                    hub_state.upstreams.remove(&upstream.key);
+                }
+            }
+            hub.audit(upstream, "listener_unverified", Some(&reason));
+            stop_upstream(hub, upstream, &reason);
+            upstream.ready.notify_all();
             return;
         }
         if let Some(reason) = refusal {
@@ -2373,6 +2439,7 @@ fn watch_listening(hub: &Arc<Hub>, upstream: &Arc<Upstream>, generation: u64, po
         if verdict == Listeners::Ours {
             state.init = Init::Ready(json!({"port": port}));
             drop(state);
+            lock(&hub.state).http_unverifiable = None;
             upstream.ready.notify_all();
             hub.count(&upstream.key, |counters| {
                 counters.last_listen_ms =

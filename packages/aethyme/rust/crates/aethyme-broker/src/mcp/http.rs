@@ -148,45 +148,100 @@ pub fn deliver_token(
     }
 }
 
-/// Whether a server on `port` refuses an `initialize` sent without its
-/// token: `Ok(false)` when it answers with a JSON-RPC result anyway (the
-/// token is not enforced). Any session the probe created is deleted.
-pub fn token_enforced(port: u16, path: &str) -> Result<bool, String> {
-    let target = parse_url(&url(port, path)).ok_or("invalid_url")?;
+/// The refusal when a server neither clearly rejects nor clearly accepts
+/// a request without its token.
+pub const TOKEN_PROBE_INCONCLUSIVE: &str =
+    "token_probe_inconclusive:server_did_not_clearly_reject_an_unauthenticated_request";
+
+/// What one `initialize` sent without the token showed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probe {
+    /// 401 or 403: the token is required.
+    Enforced,
+    /// A 2xx carrying a JSON-RPC result: the token is ignored.
+    NotEnforced,
+    /// Anything else (other statuses, a 2xx with an error or nothing, a
+    /// failed or silent request); why.
+    Inconclusive(String),
+}
+
+impl Probe {
+    /// The refusal reason, when the server is not used.
+    pub fn refusal(&self) -> Option<String> {
+        match self {
+            Self::Enforced => None,
+            Self::NotEnforced => Some(TOKEN_NOT_ENFORCED.to_string()),
+            Self::Inconclusive(_) => Some(TOKEN_PROBE_INCONCLUSIVE.to_string()),
+        }
+    }
+}
+
+/// Judge a probe from its status and the JSON-RPC messages of its body
+/// (`None` when the body could not be read).
+pub fn probe_verdict(status: u16, replies: Option<&[Value]>) -> Probe {
+    match status {
+        401 | 403 => Probe::Enforced,
+        200..=299 => match replies {
+            Some(replies) if replies.iter().any(|reply| reply.get("result").is_some()) => {
+                Probe::NotEnforced
+            }
+            Some(replies) if replies.iter().any(|reply| reply.get("error").is_some()) => {
+                Probe::Inconclusive(format!("http_{status}_with_error"))
+            }
+            _ => Probe::Inconclusive(format!("http_{status}_without_result")),
+        },
+        status => Probe::Inconclusive(format!("http_{status}")),
+    }
+}
+
+/// Send one well-formed `initialize` without the token, as the bridge would
+/// send it otherwise (same path, `Accept` and protocol header), and judge
+/// the answer. Any session it created is deleted.
+pub fn probe_token(port: u16, path: &str) -> Probe {
+    let Some(target) = parse_url(&url(port, path)) else {
+        return Probe::Inconclusive("invalid_url".into());
+    };
     let probe = serde_json::json!({
         "jsonrpc": "2.0", "id": "aethyme-token-probe", "method": "initialize",
-        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+        "params": {"protocolVersion": PROBE_PROTOCOL, "capabilities": {},
                    "clientInfo": {"name": "aethyme-mcp-hub", "version": "1"}},
     });
     let body = serde_json::to_vec(&probe).unwrap_or_default();
     let headers = [
         ("Accept", "application/json, text/event-stream".to_string()),
         ("Content-Type", "application/json".to_string()),
+        ("MCP-Protocol-Version", PROBE_PROTOCOL.to_string()),
     ];
-    let mut response = request(
+    let mut response = match request(
         &target,
         "POST",
         &headers,
         Some(&body),
         Some(Duration::from_secs(10)),
-    )
-    .map_err(|error| format!("token_probe_failed:{:?}", error.kind()))?;
-    if !(200..300).contains(&response.status) {
-        return Ok(true);
-    }
+    ) {
+        Ok(response) => response,
+        Err(error) => return Probe::Inconclusive(format!("request_failed:{:?}", error.kind())),
+    };
     let session = response.header("mcp-session-id").map(str::to_string);
-    let event_stream = response
+    let replies: Option<Vec<Value>> = if !(200..300).contains(&response.status) {
+        Some(Vec::new())
+    } else if response
         .header("content-type")
-        .is_some_and(|value| value.starts_with("text/event-stream"));
-    let mut answered = false;
-    if event_stream {
-        let _read = sse_messages(&mut response.body, |message| {
-            answered |= message.get("result").is_some();
-        });
-    } else if let Ok(bytes) = read_body(&mut response.body) {
-        answered = serde_json::from_slice::<Value>(&bytes)
-            .is_ok_and(|reply| reply.get("result").is_some());
-    }
+        .is_some_and(|value| value.starts_with("text/event-stream"))
+    {
+        let mut messages = Vec::new();
+        sse_messages(&mut response.body, |message| messages.push(message))
+            .ok()
+            .map(|()| messages)
+    } else {
+        read_body(&mut response.body)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .map(|reply| match reply {
+                Value::Array(replies) => replies,
+                reply => vec![reply],
+            })
+    };
     if let Some(id) = session {
         let _deleted = request(
             &target,
@@ -196,8 +251,11 @@ pub fn token_enforced(port: u16, path: &str) -> Result<bool, String> {
             Some(Duration::from_secs(5)),
         );
     }
-    Ok(!answered)
+    probe_verdict(response.status, replies.as_deref())
 }
+
+/// The protocol version the probe declares.
+const PROBE_PROTOCOL: &str = "2025-06-18";
 
 /// Wait until every listener on `port` is `group`'s own, on loopback.
 /// `Err(reason)` when the server exits, listens elsewhere, someone else
@@ -854,10 +912,9 @@ pub fn run_private(plan: &Plan, path: &str, auth: &HttpAuth) -> u8 {
     let started = Instant::now();
     let mut ready = wait_owned(port, child.id(), &mut child, LISTEN_TIMEOUT);
     if ready.is_ok() && token.is_some() {
-        ready = match token_enforced(port, path) {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(TOKEN_NOT_ENFORCED.to_string()),
-            Err(reason) => Err(reason),
+        ready = match probe_token(port, path).refusal() {
+            None => Ok(()),
+            Some(reason) => Err(reason),
         };
     }
     let code = match ready {
@@ -963,6 +1020,36 @@ mod tests {
             (Vec::new(), Some(("TOKEN".to_string(), "t".to_string())))
         );
         assert_eq!(new_token().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn only_401_and_403_prove_the_token_is_enforced() {
+        let result = [json!({"jsonrpc": "2.0", "id": 1, "result": {}})];
+        let error = [json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32001}})];
+        assert_eq!(probe_verdict(401, Some(&[])), Probe::Enforced);
+        assert_eq!(probe_verdict(403, None), Probe::Enforced);
+        assert_eq!(probe_verdict(200, Some(&result)), Probe::NotEnforced);
+        assert_eq!(probe_verdict(202, Some(&result)), Probe::NotEnforced);
+        for (status, replies) in [
+            (200, Some(&error[..])),
+            (200, Some(&[][..])),
+            (200, None),
+            (400, Some(&[][..])),
+            (404, Some(&[][..])),
+            (406, Some(&[][..])),
+            (500, Some(&[][..])),
+        ] {
+            let verdict = probe_verdict(status, replies);
+            assert!(
+                matches!(verdict, Probe::Inconclusive(_)),
+                "{status}: {verdict:?}"
+            );
+            assert_eq!(verdict.refusal().as_deref(), Some(TOKEN_PROBE_INCONCLUSIVE));
+        }
+        assert_eq!(
+            Probe::NotEnforced.refusal().as_deref(),
+            Some(TOKEN_NOT_ENFORCED)
+        );
     }
 
     #[test]
