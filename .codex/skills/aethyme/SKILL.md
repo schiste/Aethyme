@@ -30,6 +30,25 @@ repository's `[promote]` config in `.aethyme/config.toml` makes them refusals. A
 accepted claim with warnings permits work in your own session. Inspect overlaps,
 reconcile before merging, and resolve refusals; never edit another session's tree.
 
+## Git Fetch Efficiency
+
+Avoid routine fetches. `broker start` refreshes the session baseline, and
+`broker push` can reuse a successful default-branch fetch for 60 seconds or
+skip it when its remote check proves the branch has not moved. Do not fetch
+that same default branch just before push unless the task needs a fresh ref.
+
+When a fetch is needed, ask for the smallest transfer that can do the job:
+reuse local refs, combine needed refs into one fetch with exact refspecs, and
+prefer `--filter=blob:none` when the checkout is configured for partial clone
+and the server supports filtering. Use `--depth=1` only in an isolated,
+disposable clone when the task needs the tip but no ancestry. Never shallow
+fetch a shared Aethyme checkout. Request full history, blobs, or tags only
+when the task needs them, and state which operation requires the extra data.
+
+Brokered plain `git fetch` defaults to `--quiet --no-tags`; those defaults
+reduce output and implicit tag transfer, but do not limit refs or history.
+Explicit output or tag options keep their requested behavior.
+
 ## Default Contract
 
 Explore is a navigation aid, not an authority: every result is verified against
