@@ -69,7 +69,7 @@ use crate::service::transport;
 
 const CRASH_WINDOW: Duration = Duration::from_secs(300);
 const CRASHES_UNHEALTHY: usize = 5;
-const UNHEALTHY_FOR: Duration = Duration::from_secs(600);
+pub(crate) const UNHEALTHY_FOR: Duration = Duration::from_secs(600);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
 const STOP_GRACE: Duration = Duration::from_secs(5);
@@ -438,17 +438,41 @@ fn send_signal(process_group: u32, signal: libc::c_int) {
     let _signalled = unsafe { libc::killpg(group, signal) };
 }
 
+const PS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `ps -o <column>= -p <pid>` under the C locale (so dates compare across
+/// processes), within [`PS_TIMEOUT`]; `None` when it fails or takes longer.
+fn ps_column(column: &str, pid: u32) -> Option<String> {
+    let mut child = Command::new(crate::system_programs::ps())
+        .args(["-o", &format!("{column}="), "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + PS_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _killed = child.kill();
+                let _reaped = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut text = String::new();
+    std::io::Read::read_to_string(child.stdout.as_mut()?, &mut text).ok()?;
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
 /// A process's start time as `ps` prints it, to tell a recorded upstream
 /// from an unrelated process that later got the same pid.
 pub(crate) fn process_start(pid: u32) -> Option<String> {
-    let output = Command::new(crate::system_programs::ps())
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!text.is_empty()).then_some(text)
+    ps_column("lstart", pid)
 }
 
 /// An upstream as recorded on disk, so its group can be stopped after the
@@ -523,6 +547,24 @@ pub struct ReapReport {
     /// Dead owner and dead leader: members cannot be proven, so nothing is
     /// signalled; the record is forgotten.
     pub leader_gone: usize,
+    /// The leader is alive but no longer leads the recorded group: left.
+    pub group_mismatch: usize,
+    /// Unreadable or older-format records past [`STALE_RECORD`]: deleted,
+    /// never acted on.
+    pub stale_removed: usize,
+}
+
+/// Records nobody can read are deleted once this old.
+const STALE_RECORD: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Whether `pid` still leads `process_group`.
+fn leads_group(pid: u32, process_group: u32) -> bool {
+    let Ok(target) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: getpgid takes no pointers; it only reads the process's group.
+    let group = unsafe { libc::getpgid(target) };
+    pid == process_group && u32::try_from(group).ok() == Some(process_group)
 }
 
 /// Stop the process groups that hubs which are now dead recorded, when each
@@ -540,6 +582,18 @@ pub fn reap_recorded_upstreams(directory: &Path) -> ReapReport {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<UpstreamRecord>(&bytes).ok())
         else {
+            let stale = fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > STALE_RECORD);
+            if stale {
+                report.stale_removed += 1;
+                crate::warn_unrecorded(
+                    "forget a stale MCP upstream record",
+                    fs::remove_file(&path),
+                );
+            }
             continue;
         };
         match liveness(record.owner_pid, &record.owner_started) {
@@ -554,6 +608,11 @@ pub fn reap_recorded_upstreams(directory: &Path) -> ReapReport {
             Liveness::Dead => {}
         }
         if liveness(record.pid, &record.started) == Liveness::Alive {
+            if !leads_group(record.pid, record.process_group) {
+                report.group_mismatch += 1;
+                crate::warn_unrecorded("forget an MCP upstream record", fs::remove_file(&path));
+                continue;
+            }
             send_signal(record.process_group, libc::SIGTERM);
             report.stopped.push(record.process_group);
             matched.push(record);
@@ -569,7 +628,9 @@ pub fn reap_recorded_upstreams(directory: &Path) -> ReapReport {
                 thread::sleep(STOP_GRACE);
                 // Only a leader that is still the recorded process.
                 for record in matched {
-                    if liveness(record.pid, &record.started) == Liveness::Alive {
+                    if liveness(record.pid, &record.started) == Liveness::Alive
+                        && leads_group(record.pid, record.process_group)
+                    {
                         send_signal(record.process_group, libc::SIGKILL);
                     }
                 }
@@ -592,7 +653,18 @@ fn read_unhealthy(directory: &Path) -> BTreeMap<String, UnhealthyMark> {
         .unwrap_or_default()
 }
 
+/// Serializes read-modify-write of the unhealthy marks across hubs.
+const UNHEALTHY_LOCK: &str = "unhealthy.lock";
+
+/// Time left on a mark, never more than [`UNHEALTHY_FOR`] (a clock that went
+/// backwards must not extend it).
+pub(crate) fn unhealthy_left(until_ms: u64, now_ms: u64) -> Option<Duration> {
+    (until_ms > now_ms).then(|| Duration::from_millis(until_ms - now_ms).min(UNHEALTHY_FOR))
+}
+
 fn persist_unhealthy(directory: &Path, key: &str, until_ms: u64, reason: &str) -> io::Result<()> {
+    let lock_file = transport::private_coordination_file(&directory.join(UNHEALTHY_LOCK))?;
+    let _held = ExclusiveFileLock::acquire(lock_file)?;
     let now = telemetry::now_ms();
     let mut marks = read_unhealthy(directory);
     marks.retain(|_, mark| mark.until_ms > now);
@@ -616,7 +688,7 @@ pub fn unhealthy_reason(directory: &Path, key: &str) -> Option<String> {
     let now = telemetry::now_ms();
     read_unhealthy(directory)
         .remove(key)
-        .filter(|mark| mark.until_ms > now)
+        .filter(|mark| unhealthy_left(mark.until_ms, now).is_some())
         .map(|mark| mark.reason)
 }
 
@@ -855,10 +927,9 @@ pub fn serve(config: HubConfig) -> io::Result<()> {
                 let now = Instant::now();
                 read_unhealthy(&paths.directory)
                     .into_iter()
-                    .filter(|(_, mark)| mark.until_ms > now_ms)
-                    .map(|(key, mark)| {
-                        let left = Duration::from_millis(mark.until_ms - now_ms);
-                        (key, (now + left, mark.reason))
+                    .filter_map(|(key, mark)| {
+                        let left = unhealthy_left(mark.until_ms, now_ms)?;
+                        Some((key, (now + left, mark.reason)))
                     })
                     .collect()
             },
@@ -1113,13 +1184,7 @@ fn status(hub: &Arc<Hub>) -> Value {
 
 /// Resident set size in KiB, from `ps`.
 fn resident_kib(pid: u32) -> Option<u64> {
-    let output = Command::new(crate::system_programs::ps())
-        .args(["-o", "rss=", "-p", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+    ps_column("rss", pid)?.parse().ok()
 }
 
 fn spec_from_hello(hello: &Value) -> Option<(String, Spec)> {
@@ -1848,7 +1913,7 @@ fn restart_initialize_failed(
     generation: u64,
     reason: &str,
 ) {
-    let pid = {
+    {
         let mut state = lock(&upstream.state);
         if state.generation != generation
             || state.stopped
@@ -1865,13 +1930,16 @@ fn restart_initialize_failed(
             let error = jsonrpc::retryable_error(id, "the upstream server is restarting; retry");
             let _queued = reply_to(&state, client, &error);
         }
-        state.pid
+        // Signalled under the lock, and only while this generation is
+        // unreaped: afterwards its group id may belong to another process.
+        if state.reaped < generation
+            && let Some(pid) = state.pid
+        {
+            send_signal(pid, libc::SIGKILL);
+        }
     };
     upstream.ready.notify_all();
     hub.audit(upstream, "reinitialize_failed", Some(reason));
-    if let Some(pid) = pid {
-        send_signal(pid, libc::SIGKILL);
-    }
 }
 
 fn register_lease(

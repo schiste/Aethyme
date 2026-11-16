@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use super::hub::{
-    HubConfig, HubPaths, UNHEALTHY_FILE, UpstreamRecord, build_identity, process_start,
-    reap_recorded_upstreams, serve, unhealthy_reason, write_record,
+    HubConfig, HubPaths, UNHEALTHY_FILE, UNHEALTHY_FOR, UpstreamRecord, build_identity,
+    process_start, reap_recorded_upstreams, serve, unhealthy_left, unhealthy_reason, write_record,
 };
 use super::jsonrpc::{self, read_message};
 use super::mux::{INVALID_REQUEST, METHOD_NOT_FOUND};
@@ -948,4 +948,83 @@ fn a_restart_that_cannot_initialize_counts_as_a_crash() {
         read_log(&log)
     );
     assert!(read_log(&log).matches("started ").count() >= 5);
+}
+
+#[test]
+fn a_leader_that_no_longer_leads_its_recorded_group_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut gone = std::process::Command::new("true").spawn().unwrap();
+    gone.wait().unwrap();
+    let dead_owner = gone.id();
+    // Not a group leader: it stays in the test's own group.
+    let mut member = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    // A leader whose record names some other group.
+    let mut leader = std::process::Command::new("sleep")
+        .arg("60")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let started = |child: &std::process::Child| process_start(child.id()).unwrap();
+    write_record(
+        dir.path(),
+        "member",
+        &record_for(&member, started(&member), dead_owner, "long ago".into()),
+    )
+    .unwrap();
+    let mut other_group = record_for(&leader, started(&leader), dead_owner, "long ago".into());
+    other_group.process_group = member.id();
+    write_record(dir.path(), "other", &other_group).unwrap();
+
+    let report = reap_recorded_upstreams(dir.path());
+    assert!(report.stopped.is_empty(), "{report:?}");
+    assert_eq!(report.group_mismatch, 2, "{report:?}");
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        member.try_wait().unwrap().is_none(),
+        "a non-leader was signalled"
+    );
+    assert!(
+        leader.try_wait().unwrap().is_none(),
+        "a mismatched group was signalled"
+    );
+    for child in [&mut member, &mut leader] {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+#[test]
+fn unreadable_records_are_deleted_only_when_old() {
+    let dir = tempfile::tempdir().unwrap();
+    let records = dir.path().join("upstreams");
+    std::fs::create_dir_all(&records).unwrap();
+    std::fs::write(records.join("old.json"), b"{\"pid\": 1}").unwrap();
+    std::fs::write(records.join("fresh.json"), b"not json").unwrap();
+    let old = std::time::SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(records.join("old.json"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let report = reap_recorded_upstreams(dir.path());
+    assert_eq!(report.stale_removed, 1, "{report:?}");
+    assert!(report.stopped.is_empty());
+    assert!(!records.join("old.json").exists());
+    assert!(records.join("fresh.json").exists());
+}
+
+#[test]
+fn a_mark_from_a_clock_that_went_backwards_is_capped() {
+    let now = 1_000_000;
+    assert_eq!(unhealthy_left(now, now), None);
+    assert_eq!(
+        unhealthy_left(now + 1_000, now),
+        Some(Duration::from_secs(1))
+    );
+    // A mark written ten hours ahead lasts no longer than a fresh one.
+    assert_eq!(unhealthy_left(now + 36_000_000, now), Some(UNHEALTHY_FOR));
 }
