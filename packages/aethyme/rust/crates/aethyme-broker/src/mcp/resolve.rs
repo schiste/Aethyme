@@ -7,16 +7,19 @@
 //!
 //! The guarantees:
 //! - Nothing is run. The package manager is never executed; files are only
-//!   stat'ed and read (`package.json`, the first line of a script).
-//! - Nothing is downloaded. Only `node_modules` in the working directory and
-//!   its ancestors, and npm's own `_npx` cache directory, are searched. When
-//!   neither holds a matching copy the result says so and keeps the declared
-//!   argv.
+//!   stat'ed and read (`package.json`, a script's first line, a shim).
+//! - Nothing is downloaded. Only `node_modules` between the working directory
+//!   and its project root (the nearest repository root or directory holding
+//!   a lockfile or workspace file), and, for a pinned version or an entry
+//!   with `allow_cached`, npm's own `_npx` cache are searched. When nothing
+//!   matches, the result says so and keeps the declared argv.
+//! - Launchers it does not resolve (`yarn`, `bunx`, `bun x`, `pnpx`,
+//!   `pnpm dlx`, `env NAME=VALUE ...`) are reported unresolved, never
+//!   executed. Anything else is treated as the program it names.
 //! - A script's `#!/usr/bin/env <program>` line is resolved against the
-//!   caller's `PATH` now, so the server does not need `PATH` to start.
-//!
-//! `@latest` resolves to the newest installed copy; without the network it
-//! cannot be checked against the registry, and the result notes that.
+//!   caller's `PATH` now, and a pnpm-style `#!/bin/sh` shim is read to its
+//!   target and started as `<node> <target>`, so the server does not need
+//!   `PATH` to start.
 
 use std::ffi::OsStr;
 use std::io::Read;
@@ -94,6 +97,9 @@ pub struct Resolution {
     pub package: Option<PackageInfo>,
     pub notes: Vec<String>,
     pub identity: Option<ExecutableIdentity>,
+    /// `NODE_PATH` a parsed pnpm shim would have exported; applied the way
+    /// the shim does (prepended to the caller's value).
+    pub node_path: Option<String>,
 }
 
 /// What resolution reads from the caller.
@@ -105,6 +111,8 @@ pub struct ResolveInput<'a> {
     pub path_env: Option<&'a OsStr>,
     /// npm's cache directory (`$npm_config_cache`, else `~/.npm`).
     pub npm_cache: Option<&'a Path>,
+    /// Whether an unpinned request may use a copy from npm's cache.
+    pub allow_cached: bool,
 }
 
 struct Failure {
@@ -128,6 +136,34 @@ pub fn npm_cache_dir(npm_config_cache: Option<&OsStr>, home: Option<&OsStr>) -> 
             home.filter(|value| !value.is_empty())
                 .map(|home| PathBuf::from(home).join(".npm"))
         })
+}
+
+/// Files that mark a project root for the `node_modules` walk.
+pub const PROJECT_MARKERS: &[&str] = &[
+    "pnpm-workspace.yaml",
+    "pnpm-lock.yaml",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "bun.lock",
+    "bun.lockb",
+];
+
+/// The directories from `cwd` up to its project root, nearest first. Without
+/// a repository root or project marker above it, `cwd` alone.
+pub fn project_directories(cwd: &Path) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    for dir in cwd.ancestors() {
+        directories.push(dir.to_path_buf());
+        let root = dir.join(".git").exists()
+            || PROJECT_MARKERS
+                .iter()
+                .any(|marker| dir.join(marker).is_file());
+        if root {
+            return directories;
+        }
+    }
+    vec![cwd.to_path_buf()]
 }
 
 enum Launch {
@@ -156,10 +192,45 @@ impl PackageSpec {
     }
 }
 
+fn program_name(program: &str) -> &str {
+    Path::new(program)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default()
+}
+
 /// Resolve `input.argv`. Never fails: an unresolvable chain comes back with
 /// `resolved: false`, a reason, and the declared argv.
 pub fn resolve(input: &ResolveInput<'_>) -> Resolution {
     let declared = input.argv.to_vec();
+    // `env cmd ...` runs `cmd`: resolve that. Assignments and options are
+    // not interpreted.
+    if program_name(&input.argv[0]) == "env" && input.argv.len() > 1 {
+        let next = &input.argv[1];
+        if next.starts_with('-') || next.contains('=') {
+            return unresolved(
+                declared,
+                None,
+                failure(
+                    "unsupported_launcher_form",
+                    "`env` with options or NAME=VALUE assignments is not resolved; move the \
+                     variables to env_file",
+                ),
+            );
+        }
+        let mut inner = resolve(&ResolveInput {
+            argv: &input.argv[1..],
+            cwd: input.cwd,
+            path_env: input.path_env,
+            npm_cache: input.npm_cache,
+            allow_cached: input.allow_cached,
+        });
+        if !inner.resolved {
+            inner.argv = declared.clone();
+        }
+        inner.declared = declared;
+        return inner;
+    }
     let launch = match parse_launcher(input.argv) {
         Ok(launch) => launch,
         Err(failure) => return unresolved(declared, None, failure),
@@ -180,15 +251,16 @@ pub fn resolve(input: &ResolveInput<'_>) -> Resolution {
     match outcome {
         Ok(found) => Resolution {
             declared,
-            argv: found.argv,
+            argv: found.finalized.argv,
             launcher,
             method: found.method,
             resolved: true,
             reason: None,
             message: None,
             package: found.package,
-            notes: found.notes,
-            identity: Some(found.identity),
+            notes: found.finalized.notes,
+            identity: Some(found.finalized.identity),
+            node_path: found.finalized.node_path,
         },
         Err(failure) => unresolved(declared, launcher, failure),
     }
@@ -210,21 +282,24 @@ fn unresolved(
         package: None,
         notes: Vec::new(),
         identity: None,
+        node_path: None,
     }
 }
 
 fn parse_launcher(argv: &[String]) -> Result<Launch, Failure> {
-    let program = Path::new(&argv[0])
-        .file_name()
-        .and_then(OsStr::to_str)
-        .unwrap_or_default();
-    match program {
+    let unsupported = |what: &str| {
+        Err(failure(
+            "unsupported_launcher_form",
+            format!(
+                "{what} is a package-manager launcher this build does not resolve; it is never \
+                 run by resolution"
+            ),
+        ))
+    };
+    match program_name(&argv[0]) {
         "pnpm" => {
             if argv.get(1).map(String::as_str) != Some("exec") {
-                return Err(failure(
-                    "unsupported_launcher_form",
-                    "only `pnpm exec <bin> ...` is resolved",
-                ));
+                return unsupported("`pnpm` other than `pnpm exec`");
             }
             let mut index = 2;
             if argv.get(index).map(String::as_str) == Some("--") {
@@ -248,14 +323,17 @@ fn parse_launcher(argv: &[String]) -> Result<Launch, Failure> {
         }
         "npm" => {
             if argv.get(1).map(String::as_str) != Some("exec") {
-                return Err(failure(
-                    "unsupported_launcher_form",
-                    "only `npm exec <package> ...` is resolved",
-                ));
+                return unsupported("`npm` other than `npm exec`");
             }
             parse_npx_like(argv, 2, "npm exec")
         }
         "npx" => parse_npx_like(argv, 1, "npx"),
+        "yarn" => unsupported("`yarn`"),
+        "bunx" => unsupported("`bunx`"),
+        "pnpx" => unsupported("`pnpx`"),
+        "bun" if matches!(argv.get(1).map(String::as_str), Some("x" | "run")) => {
+            unsupported("`bun x` / `bun run`")
+        }
         _ => Ok(Launch::Direct),
     }
 }
@@ -351,11 +429,9 @@ fn parse_spec(word: &str) -> Option<PackageSpec> {
 }
 
 struct Found {
-    argv: Vec<String>,
+    finalized: Finalized,
     method: Method,
     package: Option<PackageInfo>,
-    notes: Vec<String>,
-    identity: ExecutableIdentity,
 }
 
 fn resolve_direct(input: &ResolveInput<'_>) -> Result<Found, Failure> {
@@ -375,13 +451,10 @@ fn resolve_direct(input: &ResolveInput<'_>) -> Result<Found, Failure> {
             )
         })?
     };
-    let (argv, identity, notes) = finalize(&path, &input.argv[1..], input.path_env)?;
     Ok(Found {
-        argv,
+        finalized: finalize(&path, &input.argv[1..], input.path_env)?,
         method: Method::Direct,
         package: None,
-        notes,
-        identity,
     })
 }
 
@@ -390,19 +463,16 @@ fn resolve_bin(input: &ResolveInput<'_>, bin: &str, rest: &[String]) -> Result<F
         failure(
             "not_installed",
             format!(
-                "no node_modules/.bin/{bin} in {} or its ancestors; the declared command is kept \
-                 (resolution never installs or downloads)",
+                "no node_modules/.bin/{bin} between {} and its project root; the declared \
+                 command is kept (resolution never installs or downloads)",
                 input.cwd.display()
             ),
         )
     })?;
-    let (argv, identity, notes) = finalize(&script, rest, input.path_env)?;
     Ok(Found {
-        argv,
+        finalized: finalize(&script, rest, input.path_env)?,
         method: Method::NodeModulesBin,
         package: None,
-        notes,
-        identity,
     })
 }
 
@@ -410,7 +480,8 @@ fn find_bin(cwd: &Path, bin: &str) -> Option<PathBuf> {
     if bin.contains('/') {
         return None;
     }
-    cwd.ancestors()
+    project_directories(cwd)
+        .into_iter()
         .map(|dir| dir.join("node_modules").join(".bin").join(bin))
         .find(|candidate| candidate.is_file())
 }
@@ -454,6 +525,10 @@ impl VersionWant {
                 .is_some_and(|version| requirement.matches(&version)),
         }
     }
+
+    fn pinned(&self) -> bool {
+        matches!(self, VersionWant::Req(_))
+    }
 }
 
 struct Manifest {
@@ -481,8 +556,8 @@ fn resolve_package(
     let want = version_want(spec.version.as_deref())?;
     let mut seen_versions: Vec<String> = Vec::new();
 
-    // node_modules in the working directory and its ancestors, nearest first.
-    for dir in input.cwd.ancestors() {
+    // node_modules up to the project root, nearest first.
+    for dir in project_directories(input.cwd) {
         let package_dir = dir.join("node_modules").join(&spec.name);
         let Some(manifest) = read_manifest(&package_dir) else {
             continue;
@@ -501,7 +576,37 @@ fn resolve_package(
         seen_versions.extend(manifest.version);
     }
 
-    // npm's npx cache: newest matching copy.
+    // A plain `.bin` link still serves an unversioned request.
+    if matches!(want, VersionWant::Any)
+        && let Some(script) = find_bin(input.cwd, spec.bin_name())
+    {
+        return Ok(Found {
+            finalized: finalize(&script, rest, input.path_env)?,
+            method: Method::NodeModulesBin,
+            package: None,
+        });
+    }
+
+    let requested = spec
+        .version
+        .as_deref()
+        .map(|version| format!("@{version}"))
+        .unwrap_or_default();
+
+    // npm's npx cache: only for a pinned version, or when the entry allows an
+    // arbitrary cached copy for an unpinned one.
+    if !want.pinned() && !input.allow_cached {
+        return Err(failure(
+            "unpinned",
+            format!(
+                "not resolved: unpinned. {}{requested} has no install under node_modules between \
+                 {} and its project root, and the entry neither pins a version nor sets \
+                 allow_cached = true, so no cached copy is used; the declared command is kept",
+                spec.name,
+                input.cwd.display()
+            ),
+        ));
+    }
     if let Some(cache) = input.npm_cache {
         let mut best: Option<(Option<semver::Version>, PathBuf, Manifest)> = None;
         if let Ok(entries) = std::fs::read_dir(cache.join("_npx")) {
@@ -539,20 +644,6 @@ fn resolve_package(
         }
     }
 
-    // A plain `.bin` link still serves an unversioned request.
-    if matches!(want, VersionWant::Any)
-        && let Some(script) = find_bin(input.cwd, spec.bin_name())
-    {
-        let (argv, identity, notes) = finalize(&script, rest, input.path_env)?;
-        return Ok(Found {
-            argv,
-            method: Method::NodeModulesBin,
-            package: None,
-            notes,
-            identity,
-        });
-    }
-
     let cache_text = input
         .npm_cache
         .map(|cache| format!(" or {}", cache.join("_npx").display()))
@@ -570,13 +661,10 @@ fn resolve_package(
     Err(failure(
         "not_installed",
         format!(
-            "no installed {}{} under node_modules in {} or its ancestors{cache_text}{versions_text}; \
-             the declared command is kept (resolution never installs or downloads)",
+            "no installed {}{requested} under node_modules between {} and its project \
+             root{cache_text}{versions_text}; the declared command is kept (resolution never \
+             installs or downloads)",
             spec.name,
-            spec.version
-                .as_deref()
-                .map(|version| format!("@{version}"))
-                .unwrap_or_default(),
             input.cwd.display(),
         ),
     ))
@@ -592,16 +680,16 @@ fn found_package(
     rest: &[String],
 ) -> Result<Found, Failure> {
     let script = package_bin(&package_dir, manifest.bin.as_ref(), spec.bin_name())?;
-    let (argv, identity, mut notes) = finalize(&script, rest, input.path_env)?;
+    let mut finalized = finalize(&script, rest, input.path_env)?;
     if matches!(want, VersionWant::Latest) {
-        notes.push(format!(
+        finalized.notes.push(format!(
             "@latest resolved to the installed {}; it is not checked against the registry \
              (resolution never uses the network)",
             manifest.version.as_deref().unwrap_or("copy")
         ));
     }
     Ok(Found {
-        argv,
+        finalized,
         method,
         package: Some(PackageInfo {
             name: spec.name.clone(),
@@ -609,8 +697,6 @@ fn found_package(
             version: manifest.version,
             directory: package_dir,
         }),
-        notes,
-        identity,
     })
 }
 
@@ -650,7 +736,22 @@ fn package_bin(
             ));
         }
     };
-    Ok(package_dir.join(relative))
+    let script = package_dir.join(&relative);
+    // The bin must stay inside its package, symlinks resolved.
+    let inside = match (package_dir.canonicalize(), script.canonicalize()) {
+        (Ok(package), Ok(target)) => target.starts_with(&package),
+        _ => false,
+    };
+    if !inside {
+        return Err(failure(
+            "bin_outside_package",
+            format!(
+                "{}: bin {relative:?} is missing or resolves outside the package",
+                package_dir.display()
+            ),
+        ));
+    }
+    Ok(script)
 }
 
 /// The first `PATH` entry holding an executable file called `name`.
@@ -662,13 +763,13 @@ pub fn search_path(name: &str, path_env: Option<&OsStr>) -> Option<PathBuf> {
         .find(|candidate| is_executable_file(candidate))
 }
 
-fn is_executable_file(path: &Path) -> bool {
+pub fn is_executable_file(path: &Path) -> bool {
     path.metadata()
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 /// The `#!` line of `path` without `#!`, when it has one.
-fn read_shebang(path: &Path) -> Option<String> {
+pub fn read_shebang(path: &Path) -> Option<String> {
     let mut buffer = [0u8; 256];
     let mut file = std::fs::File::open(path).ok()?;
     let read = file.read(&mut buffer).ok()?;
@@ -683,7 +784,87 @@ fn read_shebang(path: &Path) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-type Finalized = (Vec<String>, ExecutableIdentity, Vec<String>);
+/// Whether a `#!` interpreter is a POSIX shell.
+pub fn is_shell(interpreter: &str) -> bool {
+    matches!(
+        Path::new(interpreter).file_name().and_then(OsStr::to_str),
+        Some("sh" | "bash" | "dash")
+    )
+}
+
+/// What a pnpm-style shim runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShimTarget {
+    pub target: PathBuf,
+    pub node_path: Option<String>,
+}
+
+/// Read a package-manager shell shim (the shape pnpm writes into
+/// `node_modules/.bin`) to its target. `None` for anything that is not
+/// exactly that shape: such a shim is kept and run as it is.
+pub fn parse_node_shim(text: &str, shim_dir: &Path) -> Option<ShimTarget> {
+    if text.len() > 16 * 1024 {
+        return None;
+    }
+    let mut target = None;
+    let mut node_path = None;
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if index == 0 && line.starts_with("#!") {
+            continue;
+        }
+        if line.is_empty()
+            || line.starts_with('#')
+            || line.starts_with("basedir=")
+            || line.starts_with("case ")
+            || line == "esac"
+            || (line.starts_with('*') && line.ends_with(";;"))
+            || line.starts_with("if [ ")
+            || line == "else"
+            || line == "fi"
+            || line.starts_with("exec \"$basedir/node\"")
+        {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("export NODE_PATH=") {
+            let value = value.trim_matches('"');
+            if node_path.is_none() {
+                // The first form is the one used when the caller has none.
+                if value.contains('$') || value.contains('`') {
+                    return None;
+                }
+                node_path = Some(value.to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("exec node ") {
+            let words: Vec<&str> = rest.split_whitespace().collect();
+            let [script, "\"$@\""] = words.as_slice() else {
+                return None;
+            };
+            let relative = script
+                .strip_prefix("\"$basedir/")
+                .and_then(|value| value.strip_suffix('"'))?;
+            if relative.contains('$') || relative.contains('`') || target.is_some() {
+                return None;
+            }
+            target = Some(shim_dir.join(relative));
+            continue;
+        }
+        return None;
+    }
+    let target = target?;
+    target.is_file().then_some(ShimTarget { target, node_path })
+}
+
+/// The argv that runs a resolved file, its identity and notes.
+#[derive(Debug, Clone)]
+pub struct Finalized {
+    pub argv: Vec<String>,
+    pub identity: ExecutableIdentity,
+    pub notes: Vec<String>,
+    pub node_path: Option<String>,
+}
 
 /// The argv that runs `path` with `rest`, and its identity.
 fn finalize(path: &Path, rest: &[String], path_env: Option<&OsStr>) -> Result<Finalized, Failure> {
@@ -703,85 +884,135 @@ fn finalize(path: &Path, rest: &[String], path_env: Option<&OsStr>) -> Result<Fi
     let shown = path.to_string_lossy().into_owned();
     let mut notes = Vec::new();
     let shebang = read_shebang(&file.path);
-    let (argv, interpreter) = match &shebang {
-        Some(line) => {
-            let mut words = line.split_whitespace();
-            let interpreter = words.next().unwrap_or_default().to_string();
-            let mut extra: Vec<String> = words.map(str::to_string).collect();
-            if Path::new(&interpreter).file_name() == Some(OsStr::new("env")) {
-                if extra.first().map(String::as_str) == Some("-S") {
-                    extra.remove(0);
-                }
-                if extra.is_empty() {
-                    return Err(failure(
-                        "interpreter_not_found",
-                        format!("{}: `#!{line}` names no program", path.display()),
-                    ));
-                }
-                let program = extra.remove(0);
-                let program_path = search_path(&program, path_env).ok_or_else(|| {
-                    failure(
-                        "interpreter_not_found",
-                        format!(
-                            "{} starts with `#!{line}` and {program} is not on the caller's PATH",
-                            path.display()
-                        ),
-                    )
-                })?;
-                let identity = FileIdentity::of(&program_path).ok();
-                let mut argv = vec![program_path.to_string_lossy().into_owned()];
-                argv.extend(extra);
-                argv.push(shown);
-                argv.extend(rest.iter().cloned());
-                (argv, identity)
-            } else {
-                let identity = FileIdentity::of(Path::new(&interpreter)).ok();
-                if identity.is_none() {
-                    return Err(failure(
-                        "interpreter_not_found",
-                        format!(
-                            "{} starts with `#!{line}`, which does not exist",
-                            path.display()
-                        ),
-                    ));
-                }
-                if Path::new(&interpreter).file_name() == Some(OsStr::new("sh")) {
-                    notes.push(
-                        "a shell shim: it execs its target, so no extra process stays alive".into(),
-                    );
-                }
-                let argv = if executable {
-                    std::iter::once(shown).chain(rest.iter().cloned()).collect()
-                } else {
-                    let mut argv = vec![interpreter];
-                    argv.extend(extra);
-                    argv.push(shown);
-                    argv.extend(rest.iter().cloned());
-                    argv
-                };
-                (argv, identity)
-            }
-        }
-        None if executable => (
-            std::iter::once(shown).chain(rest.iter().cloned()).collect(),
-            None,
-        ),
-        None => {
+    let Some(line) = &shebang else {
+        if !executable {
             return Err(failure(
                 "not_executable",
                 format!("{} is neither executable nor a script", path.display()),
             ));
         }
+        return Ok(Finalized {
+            argv: std::iter::once(shown).chain(rest.iter().cloned()).collect(),
+            identity: ExecutableIdentity {
+                file,
+                shebang: None,
+                interpreter: None,
+            },
+            notes,
+            node_path: None,
+        });
     };
-    Ok((
+    let mut words = line.split_whitespace();
+    let interpreter = words.next().unwrap_or_default().to_string();
+    let mut extra: Vec<String> = words.map(str::to_string).collect();
+
+    if program_name(&interpreter) == "env" {
+        if extra.first().map(String::as_str) == Some("-S") {
+            extra.remove(0);
+        }
+        if extra.is_empty() {
+            return Err(failure(
+                "interpreter_not_found",
+                format!("{}: `#!{line}` names no program", path.display()),
+            ));
+        }
+        let program = extra.remove(0);
+        let program_path = search_path(&program, path_env).ok_or_else(|| {
+            failure(
+                "interpreter_not_found",
+                format!(
+                    "{} starts with `#!{line}` and {program} is not on the caller's PATH",
+                    path.display()
+                ),
+            )
+        })?;
+        let interpreter = FileIdentity::of(&program_path).ok();
+        let mut argv = vec![program_path.to_string_lossy().into_owned()];
+        argv.extend(extra);
+        argv.push(shown);
+        argv.extend(rest.iter().cloned());
+        return Ok(Finalized {
+            argv,
+            identity: ExecutableIdentity {
+                file,
+                shebang,
+                interpreter,
+            },
+            notes,
+            node_path: None,
+        });
+    }
+
+    let Ok(interpreter_identity) = FileIdentity::of(Path::new(&interpreter)) else {
+        return Err(failure(
+            "interpreter_not_found",
+            format!(
+                "{} starts with `#!{line}`, which does not exist",
+                path.display()
+            ),
+        ));
+    };
+
+    if is_shell(&interpreter)
+        && let Ok(text) = std::fs::read_to_string(&file.path)
+        && let Some(shim_dir) = path.parent()
+        && let Some(shim) = parse_node_shim(&text, shim_dir)
+    {
+        // The shim prefers a `node` beside it, as the shim itself does.
+        let local = shim_dir.join("node");
+        let node = if is_executable_file(&local) {
+            Some(local)
+        } else {
+            search_path("node", path_env)
+        };
+        if let Some(node) = node
+            && let (Ok(target), Ok(node_identity)) =
+                (FileIdentity::of(&shim.target), FileIdentity::of(&node))
+        {
+            notes.push(format!(
+                "package-manager shim {} read to its target; node starts it directly",
+                path.display()
+            ));
+            let mut argv = vec![
+                node.to_string_lossy().into_owned(),
+                shim.target.to_string_lossy().into_owned(),
+            ];
+            argv.extend(rest.iter().cloned());
+            return Ok(Finalized {
+                argv,
+                identity: ExecutableIdentity {
+                    file: target,
+                    shebang: Some("node".into()),
+                    interpreter: Some(node_identity),
+                },
+                notes,
+                node_path: shim.node_path,
+            });
+        }
+        notes.push("a shell shim whose node is not on the caller's PATH; it is kept".into());
+    } else if is_shell(&interpreter) {
+        notes.push("a shell shim kept as it is: it execs its target".into());
+    }
+
+    let argv = if executable {
+        std::iter::once(shown).chain(rest.iter().cloned()).collect()
+    } else {
+        let mut argv = vec![interpreter];
+        argv.extend(extra);
+        argv.push(shown);
+        argv.extend(rest.iter().cloned());
+        argv
+    };
+    Ok(Finalized {
         argv,
-        ExecutableIdentity {
+        identity: ExecutableIdentity {
             file,
             shebang,
-            interpreter,
+            interpreter: Some(interpreter_identity),
         },
         notes,
-    ))
+        node_path: None,
+    })
 }
 
 /// What differs between a remembered identity and the current one.

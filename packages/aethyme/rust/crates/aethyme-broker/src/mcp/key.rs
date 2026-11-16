@@ -3,30 +3,36 @@
 //! Agents test servers on branches. An entry names a stable copy (the main
 //! checkout, never a session worktree); a caller inside a broker session
 //! worktree of the same repository gets that worktree's copy instead when
-//! the worktree's `source` differs from the stable one, or when it asks with
-//! `--from-worktree`. Otherwise it gets the stable copy.
+//! the worktree's `source` or lockfiles differ from the stable ones, or when
+//! it asks with `--from-worktree`. Otherwise it gets the stable copy.
 //!
 //! The key hashes what makes two servers interchangeable: the resolved argv
 //! and working directory (paths inside the chosen copy are written relative
-//! to it, so two worktrees holding the same tree agree), the executable's
-//! identity when it lives outside the copy, the env file's content, the
-//! `source` tree's content, the allowed variable names, the flavour, mode,
-//! transport and, for repository entries, the repository. Sessions whose
-//! source trees are identical share a key; different branches get different
-//! keys, and so different servers once servers are shared.
+//! to it, so two worktrees holding the same tree agree); the identity of
+//! executables outside the copy; the content of the entry script inside it,
+//! the resolved package's name and version and the copy's lockfiles; the
+//! `source` tree's content; the flavour, mode and transport; for repository
+//! entries, the repository; and the values the server receives beyond the
+//! default inherited set (`env_allow` values and the env file), as an HMAC
+//! under the per-host secret so nothing printed or recorded reveals them.
+//! Sessions whose trees are identical share a key; different branches get
+//! different keys, and so different servers once servers are shared.
+//!
+//! In `mode = "direct"` a failed identity never blocks a start: the plan
+//! records the failure, marks the key incomplete and goes on.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use super::checkouts::{Checkout, Checkouts};
-use super::config::{Entry, Mode, Scope, Transport};
+use super::config::{Entry, EnvInherit, Mode, Scope, Transport, inherited_by_default};
+use super::identity::{self, DEFAULT_LIMITS, Limits};
 use super::resolve::{Resolution, ResolveInput, resolve};
+use super::secret;
 
 /// What `connect`, `resolve` and `status` read from the caller.
 pub struct Caller {
@@ -34,12 +40,25 @@ pub struct Caller {
     pub path_env: Option<OsString>,
     pub npm_cache: Option<PathBuf>,
     pub from_worktree: bool,
+    /// The caller's whole environment; the server gets a filtered copy.
+    pub env: Vec<(OsString, OsString)>,
+    /// The per-host HMAC key for value-derived key parts.
+    pub key_secret: Vec<u8>,
+    /// Where source identities are cached, if anywhere.
+    pub identity_cache: Option<PathBuf>,
+    pub limits: Limits,
 }
 
 impl Caller {
     /// The current process's working directory and environment.
     pub fn current(from_worktree: bool) -> std::io::Result<Self> {
         let cwd = std::env::current_dir()?;
+        let host = super::host_directory();
+        let key_secret = host
+            .as_deref()
+            .and_then(|directory| secret::load_or_create(directory).ok())
+            .or_else(|| secret::random_bytes().ok())
+            .unwrap_or_default();
         Ok(Self {
             cwd,
             path_env: std::env::var_os("PATH"),
@@ -48,7 +67,18 @@ impl Caller {
                 std::env::var_os("HOME").as_deref(),
             ),
             from_worktree,
+            env: std::env::vars_os().collect(),
+            key_secret,
+            identity_cache: host.map(|directory| directory.join(identity::CACHE_DIRECTORY)),
+            limits: DEFAULT_LIMITS,
         })
+    }
+
+    fn variable(&self, name: &str) -> Option<&OsString> {
+        self.env
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
     }
 }
 
@@ -79,6 +109,10 @@ pub struct CopyChoice {
     pub stable_root: Option<PathBuf>,
     pub stable_source_identity: Option<String>,
     pub worktree_source_identity: Option<String>,
+    /// Why the choice fell back to the stable copy, when it did.
+    pub note: Option<String>,
+    #[serde(skip)]
+    pub identity_cache_hits: u64,
 }
 
 impl CopyChoice {
@@ -88,6 +122,17 @@ impl CopyChoice {
             CopyKind::Stable => self.stable_root.as_deref(),
             CopyKind::Worktree => self.session_worktree.as_deref(),
         }
+    }
+}
+
+/// Environment for the server. `Debug` shows the count only: values may be
+/// credentials.
+#[derive(Clone, Default)]
+pub struct EnvValues(pub Vec<(OsString, OsString)>);
+
+impl std::fmt::Debug for EnvValues {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EnvValues({} variables, values redacted)", self.0.len())
     }
 }
 
@@ -103,31 +148,24 @@ pub struct Plan {
     /// The server's working directory (the caller's when the entry has none).
     pub cwd: PathBuf,
     pub env_file: Option<PathBuf>,
+    /// HMAC of the env file under the per-host secret.
     pub env_file_identity: Option<String>,
-    /// Variables the env file sets; values are never printed.
-    #[serde(skip)]
-    pub env_file_values: EnvValues,
+    pub env_inherit: EnvInherit,
     pub env_allow: Vec<String>,
+    /// Names the server receives; values are never printed.
+    pub environment_names: Vec<String>,
+    #[serde(skip)]
+    pub environment: EnvValues,
     pub source: Option<PathBuf>,
     pub source_identity: Option<String>,
+    pub lockfile_identity: Option<String>,
     pub resolution: Resolution,
     pub key: String,
     pub key_short: String,
+    /// False when an identity failed in direct mode and was left out.
+    pub key_complete: bool,
+    pub notes: Vec<String>,
     pub phases_ms: BTreeMap<&'static str, u64>,
-}
-
-/// Env-file assignments. `Debug` shows the count only: these are credentials.
-#[derive(Clone, Default)]
-pub struct EnvValues(pub Vec<(String, String)>);
-
-impl std::fmt::Debug for EnvValues {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "EnvValues({} assignments, values redacted)",
-            self.0.len()
-        )
-    }
 }
 
 /// A plan that could not be made.
@@ -142,15 +180,68 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Choose the copy, read the env file and source identity, resolve the argv
-/// and compute the key.
+/// The server's environment: the default inherited set (unless
+/// `env_inherit = "none"`), then `env_allow`, then the env file (which wins),
+/// then a parsed shim's `NODE_PATH`, prepended as the shim would.
+pub fn server_environment(
+    inherit: EnvInherit,
+    allow: &[String],
+    caller_env: &[(OsString, OsString)],
+    file: &[(String, String)],
+    node_path: Option<&str>,
+) -> Vec<(OsString, OsString)> {
+    fn set(environment: &mut Vec<(OsString, OsString)>, name: OsString, value: OsString) {
+        environment.retain(|(existing, _)| *existing != name);
+        environment.push((name, value));
+    }
+    let mut environment: Vec<(OsString, OsString)> = Vec::new();
+    if inherit == EnvInherit::Default {
+        for (name, value) in caller_env {
+            if name.to_str().is_some_and(inherited_by_default) {
+                set(&mut environment, name.clone(), value.clone());
+            }
+        }
+    }
+    for wanted in allow {
+        if let Some((name, value)) = caller_env.iter().find(|(name, _)| name == wanted.as_str()) {
+            set(&mut environment, name.clone(), value.clone());
+        }
+    }
+    for (name, value) in file {
+        set(
+            &mut environment,
+            OsString::from(name),
+            OsString::from(value),
+        );
+    }
+    if let Some(node_path) = node_path {
+        let existing = environment
+            .iter()
+            .find(|(name, _)| name == "NODE_PATH")
+            .map(|(_, value)| value.clone())
+            .filter(|value| !value.is_empty());
+        let mut value = OsString::from(node_path);
+        if let Some(existing) = existing {
+            value.push(":");
+            value.push(existing);
+        }
+        set(&mut environment, OsString::from("NODE_PATH"), value);
+    }
+    environment
+}
+
+/// Choose the copy, read the env file and identities, resolve the argv and
+/// compute the key.
 pub fn plan(
     entry: &Entry,
     caller: &Caller,
     checkouts: &dyn Checkouts,
 ) -> Result<Plan, Box<PlanFailure>> {
     let started = Instant::now();
+    let lenient = entry.mode == Mode::Direct;
     let mut phases: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut key_complete = true;
     let fail = |code: &'static str, message: String, phases: &BTreeMap<&'static str, u64>| {
         Box::new(PlanFailure {
             code,
@@ -160,9 +251,13 @@ pub fn plan(
     };
 
     let phase = Instant::now();
-    let copy = choose_copy(entry, caller, checkouts);
+    let copy = choose_copy(entry, caller, checkouts, lenient);
     phases.insert("copy_choice", elapsed_ms(phase));
     let copy = copy.map_err(|(code, message)| fail(code, message, &phases))?;
+    if let Some(note) = &copy.note {
+        notes.push(note.clone());
+        key_complete = false;
+    }
 
     let map = |path: &Path| -> PathBuf {
         match (copy.kind, &copy.stable_root, &copy.session_worktree) {
@@ -212,15 +307,17 @@ pub fn plan(
                     &phases,
                 )
             })?;
-            (Some(format!("{:x}", Sha256::digest(&bytes))), values)
+            let mut message = b"env-file-v1\0".to_vec();
+            message.extend_from_slice(&bytes);
+            (Some(secret::hmac_hex(&caller.key_secret, &message)), values)
         }
         None => (None, Vec::new()),
     };
-    let env_file_values = EnvValues(env_file_values);
     phases.insert("env_file", elapsed_ms(phase));
 
     let phase = Instant::now();
     let source = entry.source.as_deref().map(map);
+    let mut cache_hits = copy.identity_cache_hits;
     let source_identity = match (copy.kind, &source) {
         (CopyKind::Stable, Some(_)) if copy.stable_source_identity.is_some() => {
             copy.stable_source_identity.clone()
@@ -228,13 +325,30 @@ pub fn plan(
         (CopyKind::Worktree, Some(_)) if copy.worktree_source_identity.is_some() => {
             copy.worktree_source_identity.clone()
         }
-        (_, Some(path)) => Some(
-            tree_identity(path)
-                .map_err(|message| fail("source_identity_failed", message, &phases))?,
-        ),
+        (_, Some(path)) => {
+            match identity::tree_identity_cached(
+                path,
+                &caller.limits,
+                caller.identity_cache.as_deref(),
+            ) {
+                Ok((identity, hit)) => {
+                    cache_hits += u64::from(hit);
+                    Some(identity)
+                }
+                Err(message) if lenient => {
+                    notes.push(format!(
+                        "source identity left out of the key (direct mode continues): {message}"
+                    ));
+                    key_complete = false;
+                    None
+                }
+                Err(message) => return Err(fail("source_identity_failed", message, &phases)),
+            }
+        }
         (_, None) => None,
     };
     phases.insert("source_identity", elapsed_ms(phase));
+    phases.insert("source_identity_cache_hits", cache_hits);
 
     let phase = Instant::now();
     let declared: Vec<String> = entry
@@ -253,17 +367,36 @@ pub fn plan(
         cwd: &cwd,
         path_env: caller.path_env.as_deref(),
         npm_cache: caller.npm_cache.as_deref(),
+        allow_cached: entry.allow_cached,
     });
     phases.insert("resolve", elapsed_ms(phase));
 
+    let environment = server_environment(
+        entry.env_inherit,
+        &entry.env_allow,
+        &caller.env,
+        &env_file_values,
+        resolution.node_path.as_deref(),
+    );
+    let environment_names = environment
+        .iter()
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .collect();
+
+    let phase = Instant::now();
+    let copy_root = copy.copy_root().map(Path::to_path_buf);
+    let lockfile_identity = identity::lockfile_digest(copy_root.as_deref().unwrap_or(&cwd));
     let key = compute_key(&KeyInputs {
         entry,
-        copy_root: copy.copy_root(),
+        caller,
+        copy_root: copy_root.as_deref(),
         resolution: &resolution,
         cwd: &cwd,
         env_file_identity: env_file_identity.as_deref(),
         source_identity: source_identity.as_deref(),
+        lockfile_identity: lockfile_identity.as_deref(),
     });
+    phases.insert("key", elapsed_ms(phase));
     phases.insert("total", elapsed_ms(started));
     Ok(Plan {
         name: entry.name.clone(),
@@ -275,21 +408,32 @@ pub fn plan(
         cwd,
         env_file,
         env_file_identity,
-        env_file_values,
+        env_inherit: entry.env_inherit,
         env_allow: entry.env_allow.clone(),
+        environment_names,
+        environment: EnvValues(environment),
         source,
         source_identity,
+        lockfile_identity,
         resolution,
         key_short: key[..12].to_string(),
         key,
+        key_complete,
+        notes,
         phases_ms: phases,
     })
 }
 
 type ChoiceResult = Result<CopyChoice, (&'static str, String)>;
 
-/// Stable or worktree copy for this caller.
-pub fn choose_copy(entry: &Entry, caller: &Caller, checkouts: &dyn Checkouts) -> ChoiceResult {
+/// Stable or worktree copy for this caller. With `lenient` (direct mode), an
+/// identity failure falls back to the stable copy with a note.
+pub fn choose_copy(
+    entry: &Entry,
+    caller: &Caller,
+    checkouts: &dyn Checkouts,
+    lenient: bool,
+) -> ChoiceResult {
     let stable = |reason: &'static str,
                   session: Option<&Checkout>,
                   stable_root: Option<&Checkout>|
@@ -301,6 +445,8 @@ pub fn choose_copy(entry: &Entry, caller: &Caller, checkouts: &dyn Checkouts) ->
             stable_root: stable_root.map(|checkout| checkout.root.clone()),
             stable_source_identity: None,
             worktree_source_identity: None,
+            note: None,
+            identity_cache_hits: 0,
         })
     };
     let refuse_worktree = |message: String| -> ChoiceResult { Err(("no_worktree_copy", message)) };
@@ -350,6 +496,8 @@ pub fn choose_copy(entry: &Entry, caller: &Caller, checkouts: &dyn Checkouts) ->
             stable_root: Some(stable_checkout.root.clone()),
             stable_source_identity: stable_identity,
             worktree_source_identity: worktree_identity,
+            note: None,
+            identity_cache_hits: 0,
         };
     let anchor_copy = anchor.and_then(to_worktree);
     if caller.from_worktree {
@@ -365,7 +513,13 @@ pub fn choose_copy(entry: &Entry, caller: &Caller, checkouts: &dyn Checkouts) ->
             )),
         };
     }
+    // A dependency-only branch differs in its lockfiles, not its source.
+    let lockfiles_differ = identity::lockfile_digest(&stable_checkout.root)
+        != identity::lockfile_digest(&session.root);
     let Some(source) = entry.source.as_deref() else {
+        if lockfiles_differ {
+            return Ok(worktree_choice("lockfile_differs", None, None));
+        }
         return stable("no_source_declared", Some(&session), Some(&stable_checkout));
     };
     let Some(worktree_source) = to_worktree(source).filter(|path| path.exists()) else {
@@ -375,30 +529,60 @@ pub fn choose_copy(entry: &Entry, caller: &Caller, checkouts: &dyn Checkouts) ->
             Some(&stable_checkout),
         );
     };
-    let stable_identity =
-        tree_identity(source).map_err(|message| ("source_identity_failed", message))?;
-    let worktree_identity =
-        tree_identity(&worktree_source).map_err(|message| ("source_identity_failed", message))?;
-    if stable_identity == worktree_identity {
+    let cache = caller.identity_cache.as_deref();
+    let identities =
+        identity::tree_identity_cached(source, &caller.limits, cache).and_then(|stable_identity| {
+            identity::tree_identity_cached(&worktree_source, &caller.limits, cache)
+                .map(|worktree_identity| (stable_identity, worktree_identity))
+        });
+    let ((stable_identity, stable_hit), (worktree_identity, worktree_hit)) = match identities {
+        Ok(identities) => identities,
+        Err(message) if lenient => {
+            let mut choice = stable(
+                "source_identity_failed",
+                Some(&session),
+                Some(&stable_checkout),
+            )?;
+            choice.note = Some(format!(
+                "could not compare source trees, so the stable copy is used (direct mode \
+                 continues): {message}"
+            ));
+            return Ok(choice);
+        }
+        Err(message) => return Err(("source_identity_failed", message)),
+    };
+    let hits = u64::from(stable_hit) + u64::from(worktree_hit);
+    let mut choice = if stable_identity != worktree_identity {
+        worktree_choice(
+            "source_differs",
+            Some(stable_identity),
+            Some(worktree_identity),
+        )
+    } else if lockfiles_differ {
+        worktree_choice(
+            "lockfile_differs",
+            Some(stable_identity),
+            Some(worktree_identity),
+        )
+    } else {
         let mut choice = stable("source_identical", Some(&session), Some(&stable_checkout))?;
         choice.stable_source_identity = Some(stable_identity);
         choice.worktree_source_identity = Some(worktree_identity);
-        return Ok(choice);
-    }
-    Ok(worktree_choice(
-        "source_differs",
-        Some(stable_identity),
-        Some(worktree_identity),
-    ))
+        choice
+    };
+    choice.identity_cache_hits = hits;
+    Ok(choice)
 }
 
 struct KeyInputs<'a> {
     entry: &'a Entry,
+    caller: &'a Caller,
     copy_root: Option<&'a Path>,
     resolution: &'a Resolution,
     cwd: &'a Path,
     env_file_identity: Option<&'a str>,
     source_identity: Option<&'a str>,
+    lockfile_identity: Option<&'a str>,
 }
 
 /// `<copy>/relative` for paths inside the chosen copy, else the path.
@@ -407,6 +591,27 @@ fn normalized(path: &str, copy_root: Option<&Path>) -> String {
         Some(relative) => format!("<copy>/{}", relative.to_string_lossy()),
         None => path.to_string(),
     }
+}
+
+/// HMAC of the `env_allow` values the caller has, under the host secret.
+fn env_values_identity(entry: &Entry, caller: &Caller) -> String {
+    let mut names = entry.env_allow.clone();
+    names.sort();
+    names.dedup();
+    let mut message = b"env-values-v1\0".to_vec();
+    for name in &names {
+        message.extend_from_slice(name.as_bytes());
+        message.push(b'=');
+        match caller.variable(name) {
+            Some(value) => {
+                message.push(b'1');
+                message.extend_from_slice(value.as_encoded_bytes());
+            }
+            None => message.push(b'0'),
+        }
+        message.push(0);
+    }
+    secret::hmac_hex(&caller.key_secret, &message)
 }
 
 fn compute_key(inputs: &KeyInputs<'_>) -> String {
@@ -423,15 +628,15 @@ fn compute_key(inputs: &KeyInputs<'_>) -> String {
             }
         })
         .collect();
-    // Executables outside the copy are not covered by the source identity:
-    // an upgraded interpreter is a different server.
-    let outside = |path: &Path| copy_root.is_none_or(|root| !path.starts_with(root));
+    let inside = |path: &Path| copy_root.is_some_and(|root| path.starts_with(root));
+    // Executables outside the copy are not covered by any tree identity: an
+    // upgraded interpreter is a different server.
     let executables: Vec<serde_json::Value> = inputs
         .resolution
         .identity
         .iter()
         .flat_map(|identity| std::iter::once(&identity.file).chain(identity.interpreter.as_ref()))
-        .filter(|file| outside(&file.path))
+        .filter(|file| !inside(&file.path))
         .map(|file| {
             serde_json::json!({
                 "path": file.path,
@@ -441,177 +646,37 @@ fn compute_key(inputs: &KeyInputs<'_>) -> String {
             })
         })
         .collect();
-    let mut env_allow = inputs.entry.env_allow.clone();
-    env_allow.sort();
-    env_allow.dedup();
+    // The entry script inside the copy may be ignored build output that no
+    // source identity covers: hash its content.
+    let entry_script = inputs
+        .resolution
+        .identity
+        .as_ref()
+        .map(|identity| &identity.file.path)
+        .filter(|path| inside(path))
+        .map(|path| identity::content_digest(path));
+    let package = inputs
+        .resolution
+        .package
+        .as_ref()
+        .map(|package| serde_json::json!({"name": package.name, "version": package.version}));
     let material = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "mode": inputs.entry.mode,
         "transport": inputs.entry.transport,
         "argv": argv,
         "executables": executables,
+        "entry_script": entry_script,
+        "package": package,
+        "lockfiles": inputs.lockfile_identity,
         "cwd": normalized(&inputs.cwd.to_string_lossy(), copy_root),
+        "env_inherit": inputs.entry.env_inherit,
         "env_file": inputs.env_file_identity,
-        "env_allow": env_allow,
+        "env_values": env_values_identity(inputs.entry, inputs.caller),
         "source": inputs.source_identity,
         "flavour": inputs.entry.flavour,
         "repository": inputs.entry.repository.as_ref().map(|anchor| &anchor.identity),
     });
     let bytes = serde_json::to_vec(&material).unwrap_or_default();
-    format!("{:x}", Sha256::digest(&bytes))
-}
-
-/// Limits for hashing a source tree outside Git.
-const WALK_MAX_FILES: usize = 20_000;
-const WALK_MAX_BYTES: u64 = 256 * 1024 * 1024;
-
-/// Content identity of a file or directory tree.
-///
-/// Inside a Git checkout: the index entries under the path (blob ids, which
-/// are content addresses) plus the content of every changed or untracked,
-/// not ignored, file. Elsewhere: every file's relative path and content,
-/// skipping `.git` and `node_modules`, within fixed limits.
-pub fn tree_identity(path: &Path) -> Result<String, String> {
-    let metadata = path
-        .metadata()
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    if metadata.is_file() {
-        let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
-        let mut hasher = Sha256::new();
-        hasher.update(b"file-v1\0");
-        hasher.update(&bytes);
-        return Ok(format!("{:x}", hasher.finalize()));
-    }
-    let in_git = path.ancestors().any(|dir| dir.join(".git").exists());
-    if in_git && let Ok(repository) = crate::GitRepo::discover(path) {
-        return git_tree_identity(&repository, path);
-    }
-    walk_tree_identity(path)
-}
-
-fn git_tree_identity(repository: &crate::GitRepo, path: &Path) -> Result<String, String> {
-    let root = repository
-        .root()
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
-    let canonical = path.canonicalize().map_err(|error| error.to_string())?;
-    let relative = canonical
-        .strip_prefix(&root)
-        .map_err(|_| format!("{} is outside {}", canonical.display(), root.display()))?;
-    let pathspec = if relative.as_os_str().is_empty() {
-        ".".to_string()
-    } else {
-        relative.to_string_lossy().into_owned()
-    };
-    let index = repository
-        .index_entries_under(&pathspec)
-        .map_err(|error| error.to_string())?;
-    let status = repository
-        .status_entries_under(&pathspec)
-        .map_err(|error| error.to_string())?;
-    if index.is_empty() && status.is_empty() {
-        // Nothing tracked and nothing visible: an ignored directory (build
-        // output, a temporary directory inside a checkout). Git says nothing
-        // about its content, so hash the files.
-        return walk_tree_identity(path);
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(b"git-v1\0");
-    hasher.update(&index);
-    hasher.update(b"\0status\0");
-    let mut records = status
-        .split(|byte| *byte == 0)
-        .filter(|record| !record.is_empty());
-    while let Some(record) = records.next() {
-        if record.len() < 4 {
-            continue;
-        }
-        let (state, changed) = (&record[..2], &record[3..]);
-        hasher.update(state);
-        hasher.update(changed);
-        hasher.update(b"\0");
-        if matches!(state[0], b'R' | b'C')
-            && let Some(origin) = records.next()
-        {
-            hasher.update(origin);
-            hasher.update(b"\0");
-        }
-        let file = root.join(String::from_utf8_lossy(changed).as_ref());
-        hasher.update(content_digest(&file).as_bytes());
-        hasher.update(b"\0");
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-/// A file's content digest, a symlink's target, or a marker.
-fn content_digest(path: &Path) -> String {
-    match path.symlink_metadata() {
-        Ok(metadata) if metadata.file_type().is_symlink() => std::fs::read_link(path)
-            .map(|target| format!("link:{}", target.to_string_lossy()))
-            .unwrap_or_else(|_| "link:?".into()),
-        Ok(metadata) if metadata.is_file() => {
-            let mut hasher = Sha256::new();
-            match std::fs::File::open(path) {
-                Ok(mut file) => {
-                    let mut buffer = [0u8; 64 * 1024];
-                    loop {
-                        match file.read(&mut buffer) {
-                            Ok(0) => break,
-                            Ok(read) => hasher.update(&buffer[..read]),
-                            Err(_) => return "unreadable".into(),
-                        }
-                    }
-                    format!("{:x}", hasher.finalize())
-                }
-                Err(_) => "unreadable".into(),
-            }
-        }
-        Ok(_) => "dir".into(),
-        Err(_) => "absent".into(),
-    }
-}
-
-fn walk_tree_identity(root: &Path) -> Result<String, String> {
-    let mut files: Vec<PathBuf> = Vec::new();
-    let mut pending = vec![root.to_path_buf()];
-    let mut total: u64 = 0;
-    while let Some(dir) = pending.pop() {
-        let entries =
-            std::fs::read_dir(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if name == ".git" || name == "node_modules" {
-                continue;
-            }
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                pending.push(path);
-            } else {
-                total = total.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
-                files.push(path);
-            }
-            if files.len() > WALK_MAX_FILES || total > WALK_MAX_BYTES {
-                return Err(format!(
-                    "{} holds more than {WALK_MAX_FILES} files or {} MiB outside Git; declare a \
-                     narrower `source`",
-                    root.display(),
-                    WALK_MAX_BYTES / (1024 * 1024)
-                ));
-            }
-        }
-    }
-    files.sort();
-    let mut hasher = Sha256::new();
-    hasher.update(b"walk-v1\0");
-    for file in files {
-        let relative = file.strip_prefix(root).unwrap_or(&file);
-        hasher.update(relative.to_string_lossy().as_bytes());
-        hasher.update(b"\0");
-        hasher.update(content_digest(&file).as_bytes());
-        hasher.update(b"\0");
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+    secret::hmac_hex(&inputs.caller.key_secret, &bytes)
 }

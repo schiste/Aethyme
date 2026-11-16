@@ -17,6 +17,10 @@
 //!   downloading anything, plus the executable's identity.
 //! - [`key`]: which copy of a server a caller gets (stable, or its session
 //!   worktree's when that differs) and the key that names one server.
+//! - [`identity`]: content identities of source trees and lockfiles, capped
+//!   and cached.
+//! - [`secret`]: the per-host HMAC secret that keeps credentials out of keys.
+//! - [`trust`]: host trust for repository files.
 //! - [`envfile`]: `KEY=VALUE` files read without a shell.
 //! - [`telemetry`]: phase timings, outcomes and remembered resolutions under
 //!   `<host state>/mcp/`.
@@ -30,9 +34,12 @@ pub mod cli;
 pub mod config;
 pub mod connect;
 pub mod envfile;
+pub mod identity;
 pub mod key;
 pub mod resolve;
+pub mod secret;
 pub mod telemetry;
+pub mod trust;
 
 #[cfg(test)]
 mod tests;

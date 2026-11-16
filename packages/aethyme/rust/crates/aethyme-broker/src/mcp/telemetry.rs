@@ -39,6 +39,12 @@ pub struct Event {
     pub key: Option<String>,
     #[serde(default)]
     pub phases_ms: BTreeMap<String, u64>,
+    /// A repository entry of the same name was ignored for the host entry.
+    #[serde(default)]
+    pub shadowed: bool,
+    /// The fallback command was run.
+    #[serde(default)]
+    pub fallback: bool,
 }
 
 pub fn now_ms() -> u64 {
@@ -102,7 +108,8 @@ pub fn read_events(directory: &Path) -> Vec<Event> {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Counters {
     pub events: u64,
-    /// Per outcome: `exec`, `fallback`, `error`, `resolved`, `unresolved`.
+    /// Per outcome: `exec`, `exec_failed`, `fallback`, `error`, `resolved`,
+    /// `unresolved`.
     pub outcomes: BTreeMap<String, u64>,
     /// Failures (fallbacks, errors, unresolved) per reason code.
     pub failure_reasons: BTreeMap<String, u64>,
@@ -111,6 +118,8 @@ pub struct Counters {
     pub last_at_ms: Option<u64>,
     pub last_copy: Option<String>,
     pub last_key: Option<String>,
+    /// Connects where a repository entry of the same name was ignored.
+    pub shadowed_repository_entries: u64,
 }
 
 /// Counters per entry name.
@@ -121,6 +130,19 @@ pub fn summarize(events: &[Event]) -> BTreeMap<String, Counters> {
         let counters = summary.entry(event.name.clone()).or_default();
         counters.events += 1;
         *counters.outcomes.entry(event.outcome.clone()).or_default() += 1;
+        if event.outcome == "exec_failed" {
+            // Recorded after an `exec` event of the same attempt: undo it.
+            if let Some(execs) = counters.outcomes.get_mut("exec") {
+                *execs = execs.saturating_sub(1);
+            }
+            counters.events = counters.events.saturating_sub(1);
+            if event.fallback {
+                *counters.outcomes.entry("fallback".into()).or_default() += 1;
+            }
+        }
+        if event.shadowed {
+            counters.shadowed_repository_entries += 1;
+        }
         if let Some(reason) = &event.reason {
             *counters.failure_reasons.entry(reason.clone()).or_default() += 1;
         }

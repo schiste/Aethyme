@@ -20,16 +20,21 @@ pub const RESOLVE_SCHEMA: &str = "aethyme.mcp-resolve/v1";
 pub const STATUS_SCHEMA: &str = "aethyme.mcp-status/v1";
 pub const ERROR_SCHEMA: &str = "aethyme.mcp-error/v1";
 
+pub const TRUST_SCHEMA: &str = "aethyme.mcp-trust/v1";
+
 pub const USAGE: &str = "\
 aethyme mcp — start MCP servers without launcher chains (opt-in)
 
 Entries live in <host state>/mcp/services.toml and, per repository, in
 .aethyme/mcp.toml (schema = 1, one [[servers]] table each): name, mode
-(shared|direct), transport (stdio|http), argv, cwd, env_file, env_allow,
-source, flavour. Paths must name stable copies: an entry pointing into a
-broker session worktree is refused, because sessions are cleaned up.
-Nothing is written to any agent configuration; the owner pastes the
-snippet `config print` shows.
+(shared|direct), transport (stdio|http), argv, cwd, env_file, env_inherit
+(default|none), env_allow, source, flavour, allow_cached. Paths must name
+stable copies: an entry pointing into a broker session worktree is
+refused, because sessions are cleaned up. A host entry always wins over a
+repository entry of the same name; repository entries may only name paths
+inside their repository and run only after `aethyme mcp trust`. Nothing is
+written to any agent configuration; the owner pastes the snippet `config
+print` shows.
 
 Usage:
   aethyme mcp resolve <name> [--from-worktree] [--json]
@@ -43,17 +48,21 @@ Usage:
                       [--fallback -- <command...>]
       Replace this process with the resolved server (exec): stdio passes
       straight through and no extra process remains. Inside a broker session
-      worktree it uses that worktree's copy when its `source` differs from
-      the stable copy, or with --from-worktree; otherwise the stable copy.
-      It prints `aethyme mcp: using <stable|worktree> copy, key <short>` on
-      stderr. A missing entry or a failed resolution exits non-zero, unless
+      worktree it uses that worktree's copy when its `source` or lockfiles
+      differ from the stable copy, or with --from-worktree; otherwise the
+      stable copy. It prints `aethyme mcp: using <stable|worktree> copy, key
+      <short>` on stderr. Any failure before the exec exits non-zero, unless
       --fallback is given: then the fallback command runs instead (in
       --fallback-cwd when given), so an agent is never blocked.
+  aethyme mcp trust [--repo <path>] [--json]
+      Print what the repository's .aethyme/mcp.toml declares (each entry's
+      argv, cwd, env_file, env_allow) and trust that exact file on this host.
+      Any change to the file needs trust again.
   aethyme mcp status [--json]
       Every entry with its resolution, identity, chosen copy and key,
-      refused entries with the reason, and per-entry counters from
+      refused, shadowed and untrusted entries, and per-entry counters from
       <host state>/mcp/events.jsonl (outcomes, failure reasons, resolve
-      time). Writes nothing.
+      time). Writes nothing but the per-host key secret on first use.
   aethyme mcp config print --agent codex|claude [--name <name>]
       Print the configuration snippet for each entry (or one) in that
       agent's format: `aethyme mcp connect <name> --fallback -- <argv>`.
@@ -96,6 +105,7 @@ pub fn run(args: &[String]) -> u8 {
         "connect" => connect::run(rest),
         "resolve" => run_resolve(rest),
         "status" => run_status(rest),
+        "trust" => run_trust(rest),
         "config" => match rest.split_first() {
             Some((sub, tail)) if sub == "print" => run_config_print(tail),
             _ => report_error(
@@ -119,6 +129,7 @@ struct Options {
     from_worktree: bool,
     name: Option<String>,
     agent: Option<String>,
+    repo: Option<String>,
 }
 
 fn parse_options(args: &[String], allow: &[&str]) -> Result<Options, String> {
@@ -127,6 +138,7 @@ fn parse_options(args: &[String], allow: &[&str]) -> Result<Options, String> {
         from_worktree: false,
         name: None,
         agent: None,
+        repo: None,
     };
     let mut index = 0;
     while index < args.len() {
@@ -144,6 +156,9 @@ fn parse_options(args: &[String], allow: &[&str]) -> Result<Options, String> {
             "--agent" if allow.contains(&"--agent") => {
                 options.agent = Some(take_value(&mut index)?);
             }
+            "--repo" if allow.contains(&"--repo") => {
+                options.repo = Some(take_value(&mut index)?);
+            }
             option if option.starts_with('-') => return Err(format!("unknown option {option}")),
             value if allow.contains(&"<name>") && options.name.is_none() => {
                 options.name = Some(value.to_string());
@@ -155,8 +170,8 @@ fn parse_options(args: &[String], allow: &[&str]) -> Result<Options, String> {
     Ok(options)
 }
 
-fn load_for(caller: &Caller) -> Loaded {
-    config::load(&Sources::discover(&caller.cwd), &GitCheckouts)
+fn load_for(cwd: &std::path::Path, only: Option<&str>) -> Loaded {
+    config::load(&Sources::discover(cwd), &GitCheckouts, only)
 }
 
 fn run_resolve(args: &[String]) -> u8 {
@@ -187,7 +202,7 @@ fn run_resolve(args: &[String]) -> u8 {
         }
     };
     let phase = Instant::now();
-    let loaded = load_for(&caller);
+    let loaded = load_for(&caller.cwd, Some(name.as_str()));
     let config_ms = elapsed_ms(phase);
     let Some(entry) = loaded.find(&name) else {
         let errors: Vec<String> = loaded.errors_for(&name).map(ToString::to_string).collect();
@@ -308,6 +323,8 @@ fn record_resolve(
                 copy: plan.map(|plan| plan.copy.kind.as_str().to_string()),
                 key: plan.map(|plan| plan.key_short.clone()),
                 phases_ms: phases,
+                shadowed: false,
+                fallback: false,
             },
         ),
     );
@@ -410,7 +427,7 @@ fn run_status(args: &[String]) -> u8 {
         }
     };
     let phase = Instant::now();
-    let loaded = load_for(&caller);
+    let loaded = load_for(&caller.cwd, None);
     let config_ms = elapsed_ms(phase);
     let directory = super::host_directory();
     let counters = directory
@@ -435,6 +452,7 @@ fn run_status(args: &[String]) -> u8 {
                     "transport": entry.transport,
                     "flavour": entry.flavour,
                     "config_path": entry.config_path,
+                    "trusted": entry.trusted,
                     "plan": plan.as_ref().ok(),
                     "plan_error": plan.as_ref().err(),
                     "counters": counters.get(&entry.name),
@@ -446,6 +464,8 @@ fn run_status(args: &[String]) -> u8 {
             "schema": STATUS_SCHEMA,
             "files": loaded.files,
             "errors": loaded.errors,
+            "shadowed": loaded.shadowed,
+            "repository_trust": loaded.repository_trust,
             "entries": entries,
             "hub": {
                 "state": "not_available",
@@ -476,6 +496,12 @@ fn run_status(args: &[String]) -> u8 {
         println!("No MCP entries are configured.");
     }
     for (entry, plan) in &plans {
+        if !entry.trusted {
+            println!(
+                "{} (repository): untrusted; `connect` refuses it",
+                entry.name
+            );
+        }
         match plan {
             Ok(plan) => print_plan_text(entry, plan),
             Err(failure) => println!(
@@ -505,6 +531,17 @@ fn run_status(args: &[String]) -> u8 {
     }
     for error in &loaded.errors {
         println!("refused: {error}");
+    }
+    for name in &loaded.shadowed {
+        println!("ignored: the repository entry {name} (a host entry has the same name)");
+    }
+    if let Some(trust) = &loaded.repository_trust
+        && !trust.trusted
+    {
+        println!(
+            "untrusted: {} (run `aethyme mcp trust` after reviewing it)",
+            trust.path.display()
+        );
     }
     println!("hub: not available in this build; every connect runs its own server");
     exit_status::SUCCESS
@@ -579,8 +616,8 @@ fn run_config_print(args: &[String]) -> u8 {
             exit_status::USAGE,
         );
     };
-    let caller = match Caller::current(false) {
-        Ok(caller) => caller,
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
         Err(error) => {
             return report_error(
                 false,
@@ -590,21 +627,25 @@ fn run_config_print(args: &[String]) -> u8 {
             );
         }
     };
-    let loaded = load_for(&caller);
+    let loaded = load_for(&cwd, options.name.as_deref());
     let mut entries: Vec<&Entry> = Vec::new();
     for entry in &loaded.entries {
         let wanted = options
             .name
             .as_deref()
             .is_none_or(|name| name == entry.name);
-        // The repository entry shadows a host entry of the same name.
-        if wanted
-            && loaded
-                .find(&entry.name)
-                .is_some_and(|found| std::ptr::eq(found, entry))
-        {
-            entries.push(entry);
+        if !wanted {
+            continue;
         }
+        if !entry.trusted {
+            eprintln!(
+                "aethyme mcp: {}: skipped; the repository file is not trusted (`aethyme mcp \
+                 trust`)",
+                entry.name
+            );
+            continue;
+        }
+        entries.push(entry);
     }
     if entries.is_empty() {
         let message = match &options.name {
@@ -634,4 +675,137 @@ fn run_config_print(args: &[String]) -> u8 {
         }
         Err(message) => report_error(false, "usage", &message, exit_status::USAGE),
     }
+}
+
+fn run_trust(args: &[String]) -> u8 {
+    let options = match parse_options(args, &["--json", "--repo"]) {
+        Ok(options) => options,
+        Err(message) => {
+            return report_error(json_requested(args), "usage", &message, exit_status::USAGE);
+        }
+    };
+    let start = match &options.repo {
+        Some(path) => std::path::PathBuf::from(path),
+        None => match std::env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                return report_error(
+                    options.json,
+                    "caller_cwd_unavailable",
+                    &format!("the current directory is unavailable: {error}"),
+                    exit_status::ENVIRONMENT,
+                );
+            }
+        },
+    };
+    let Some((checkout, anchor)) = config::repository_anchor(&start) else {
+        return report_error(
+            options.json,
+            "not_a_repository",
+            &format!("{} is not inside a Git checkout", start.display()),
+            exit_status::REFUSED,
+        );
+    };
+    let path = checkout.join(config::REPOSITORY_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return report_error(
+                options.json,
+                "no_repository_file",
+                &format!("{}: {error}", path.display()),
+                exit_status::REFUSED,
+            );
+        }
+    };
+    let Ok(text) = String::from_utf8(bytes.clone()) else {
+        return report_error(
+            options.json,
+            "invalid_repository_file",
+            &format!("{} is not UTF-8", path.display()),
+            exit_status::REFUSED,
+        );
+    };
+    let Some(directory) = super::host_directory() else {
+        return report_error(
+            options.json,
+            "host_state_unavailable",
+            "the host state directory cannot be resolved, so trust cannot be recorded",
+            exit_status::ENVIRONMENT,
+        );
+    };
+    let (entries, errors) = config::parse_and_validate(
+        &text,
+        &path,
+        config::Scope::Repository,
+        Some(&anchor),
+        &GitCheckouts,
+    );
+    let sha256 = super::trust::file_digest(&bytes);
+    if let Err(error) = super::trust::record(&directory, &anchor.identity, &sha256, &path) {
+        return report_error(
+            options.json,
+            "trust_not_recorded",
+            &format!("could not record trust: {error}"),
+            exit_status::ENVIRONMENT,
+        );
+    }
+    let declared: Vec<Value> = entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "name": entry.name,
+                "argv": entry.argv,
+                "cwd": entry.cwd,
+                "env_file": entry.env_file,
+                "env_inherit": entry.env_inherit,
+                "env_allow": entry.env_allow,
+            })
+        })
+        .collect();
+    if options.json {
+        let value = json!({
+            "schema": TRUST_SCHEMA,
+            "path": path,
+            "repository": anchor.identity,
+            "sha256": sha256,
+            "entries": declared,
+            "errors": errors,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).unwrap_or_default()
+        );
+        return exit_status::SUCCESS;
+    }
+    println!(
+        "Trusted {} (sha256 {}) for repository {}:",
+        path.display(),
+        &sha256[..16],
+        anchor.identity
+    );
+    for entry in &entries {
+        println!("  {}", entry.name);
+        println!("    argv: {}", shell_words(&entry.argv));
+        if let Some(cwd) = &entry.cwd {
+            println!("    cwd: {}", cwd.display());
+        }
+        if let Some(env_file) = &entry.env_file {
+            println!("    env_file: {}", env_file.display());
+        }
+        println!(
+            "    env_inherit: {}; env_allow: {}",
+            serde_name(&entry.env_inherit),
+            if entry.env_allow.is_empty() {
+                "(none)".to_string()
+            } else {
+                entry.env_allow.join(", ")
+            }
+        );
+    }
+    for error in &errors {
+        println!("  refused (never runs): {error}");
+    }
+    println!("Any change to this file needs `aethyme mcp trust` again.");
+    exit_status::SUCCESS
 }
