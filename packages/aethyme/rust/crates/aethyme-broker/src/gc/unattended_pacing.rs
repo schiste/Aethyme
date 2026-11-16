@@ -1988,7 +1988,10 @@ mod tests {
         assert_eq!(clock.slept.get(), LOAD_GATE_WAIT);
         let batches = 150u32;
         for _ in 0..(PACING_BATCH_ENTRIES * batches) {
-            assert!(before_unattended_unlink(None), "a warning never stops removal");
+            assert!(
+                before_unattended_unlink(None),
+                "a warning never stops removal"
+            );
             after_unattended_unlink(0);
         }
         // A whole-checkout charge is paid in full, throttled.
@@ -2022,7 +2025,10 @@ mod tests {
             }),
         );
         assert_eq!(pacer.pressure_check(None), PressureVerdict::MemoryBackoff);
-        assert_eq!(clock.slept.get(), PRESSURE_POLL + MAX_PRESSURE_PAUSE_PER_RUN);
+        assert_eq!(
+            clock.slept.get(),
+            PRESSURE_POLL + MAX_PRESSURE_PAUSE_PER_RUN
+        );
         assert!(!pacer.before_unlink(None), "no unlink at critical pressure");
 
         let clock = FakeClock::new();
@@ -2163,7 +2169,10 @@ mod tests {
         assert_eq!(memory_pressure_level(0), MemoryPressureLevel::Warning);
         assert_eq!(memory_pressure_level(-1), MemoryPressureLevel::Warning);
         assert_eq!(memory_pressure_level(3), MemoryPressureLevel::Critical);
-        assert_eq!(memory_sample_from_level(Some(1)), (Some(false), Some(false)));
+        assert_eq!(
+            memory_sample_from_level(Some(1)),
+            (Some(false), Some(false))
+        );
         assert_eq!(memory_sample_from_level(Some(2)), (Some(false), Some(true)));
         assert_eq!(memory_sample_from_level(Some(4)), (Some(true), Some(false)));
         // A failed sysctl read stays conservative: throttled, not a stop.
