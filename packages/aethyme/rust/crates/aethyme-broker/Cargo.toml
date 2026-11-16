@@ -45,6 +45,9 @@ serde_json = { workspace = true }
 noyalib = { workspace = true }
 # .aethyme/config.toml ([leases] ignore, later [gates]/[promote]).
 toml = { workspace = true }
+# `aethyme mcp repair` and `mcp manage` edit TOML files in place, keeping
+# their formatting and key order.
+toml_edit = { workspace = true }
 # Gate trigger globs (gates.toml). Same matcher family ripgrep uses.
 globset = { workspace = true }
 notify = { workspace = true }

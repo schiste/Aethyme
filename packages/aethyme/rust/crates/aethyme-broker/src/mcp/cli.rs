@@ -93,7 +93,7 @@ fn report_error(json: bool, code: &str, message: &str, exit: u8) -> u8 {
 
 pub fn run(args: &[String]) -> u8 {
     let Some((command, rest)) = args.split_first() else {
-        print!("{USAGE}");
+        print!("{USAGE}{}", super::managed_cli::USAGE);
         return exit_status::USAGE;
     };
     // Help anywhere before `--` answers help and does nothing else, so the
@@ -104,7 +104,7 @@ pub fn run(args: &[String]) -> u8 {
             .take_while(|arg| *arg != "--")
             .any(|arg| arg == "-h" || arg == "--help")
     {
-        print!("{USAGE}");
+        print!("{USAGE}{}", super::managed_cli::USAGE);
         return exit_status::SUCCESS;
     }
     match command.as_str() {
@@ -113,6 +113,10 @@ pub fn run(args: &[String]) -> u8 {
         "status" => run_status(rest),
         "trust" => run_trust(rest),
         "hub" => run_hub(rest),
+        "manage" => super::managed_cli::run_manage(rest),
+        "intercept" => super::managed_cli::run_intercept(rest),
+        "repair" => super::managed_cli::run_repair(rest),
+        "bypass" => super::managed_cli::run_bypass(rest),
         "config" => match rest.split_first() {
             Some((sub, tail)) if sub == "print" => run_config_print(tail),
             _ => report_error(
@@ -516,6 +520,7 @@ fn run_status(args: &[String]) -> u8 {
                 None => json!({"state": "not_running"}),
             },
             "events_file": directory.as_ref().map(|directory| directory.join(telemetry::EVENTS_FILE)),
+            "managed": super::managed_cli::status_value(&loaded),
             "phases_ms": {
                 "config_load": config_ms,
                 "plans": plan_ms,
@@ -598,6 +603,7 @@ fn run_status(args: &[String]) -> u8 {
         ),
         None => println!("hub: not running (started by the first shared connect)"),
     }
+    super::managed_cli::print_status_text(&loaded);
     exit_status::SUCCESS
 }
 

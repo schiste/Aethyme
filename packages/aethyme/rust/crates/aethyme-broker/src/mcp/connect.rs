@@ -81,6 +81,7 @@ pub fn parse_args(args: &[String]) -> Result<ConnectArgs, String> {
     let mut name = None;
     let mut from_worktree = false;
     let mut fallback_requested = false;
+    let mut caller_requested = false;
     let mut index = 0;
     while index < args.len() {
         let word = args[index].as_str();
@@ -93,7 +94,18 @@ pub fn parse_args(args: &[String]) -> Result<ConnectArgs, String> {
                     return Err("--fallback-cwd needs a directory".into());
                 }
             }
+            // Caller arguments (see `super::caller`).
+            "--caller-args" | "--caller-package" => {
+                caller_requested = true;
+                index += 1;
+                if args.get(index).is_none() {
+                    return Err(format!("{word} needs a value"));
+                }
+            }
             "--" => {
+                if !fallback_requested && caller_requested {
+                    break;
+                }
                 if !fallback_requested {
                     return Err("`--` is only accepted after --fallback".into());
                 }
@@ -388,6 +400,26 @@ fn run_inner(args: &[String]) -> u8 {
             exit_status::REFUSED,
         );
     }
+    // The caller's arguments and package join the entry's argv before the
+    // plan, so they are part of the resolved argv and of the key.
+    let adjusted;
+    let entry =
+        match super::caller::scan(args).and_then(|options| super::caller::adjust(entry, options)) {
+            Ok(Some(changed)) => {
+                adjusted = changed;
+                &adjusted
+            }
+            Ok(None) => entry,
+            Err(message) => {
+                return fail(
+                    &parsed,
+                    &recorder,
+                    "caller_arguments",
+                    &message,
+                    exit_status::USAGE,
+                );
+            }
+        };
     let planned = match key::plan(entry, &caller, &checkouts) {
         // A shared server whose identity cannot be taken starts privately.
         Err(failure)
@@ -525,7 +557,9 @@ fn run_inner(args: &[String]) -> u8 {
         }
     }
     recorder.record("exec", None, Some(&plan), false);
-    let error = server_command(&plan).exec();
+    let mut command = server_command(&plan);
+    command.env(super::caller::CONNECT_MARKER, &parsed.name);
+    let error = command.exec();
     // Only reached when exec failed: one `exec_failed` event corrects the
     // `exec` above (status counts it once, as a failure).
     eprintln!(
@@ -559,7 +593,9 @@ fn fail(parsed: &ConnectArgs, recorder: &Recorder, reason: &str, message: &str, 
 fn exec_fallback(name: &str, fallback: &Fallback) -> u8 {
     eprintln!("aethyme mcp: {name}: running the fallback command");
     let mut command = Command::new(&fallback.command[0]);
-    command.args(&fallback.command[1..]);
+    command
+        .args(&fallback.command[1..])
+        .env(super::caller::FALLBACK_MARKER, name);
     if let Some(directory) = &fallback.cwd {
         command.current_dir(directory);
     }

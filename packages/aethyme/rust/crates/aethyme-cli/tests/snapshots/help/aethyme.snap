@@ -67,6 +67,10 @@ MCP servers (opt-in; <host state>/mcp/services.toml, .aethyme/mcp.toml):
                               trust a repository's .aethyme/mcp.toml; entries,
                               identities, chosen copy; the snippet to paste
                               into an agent (printed, never written)
+  mcp manage|intercept|repair|bypass
+                              managed servers: launcher shims that route
+                              matching calls through connect, agent config
+                              repair, and a count of servers that bypass it
 
 Collaboration (opt-in, experimental; disabled unless [collaboration] enables it):
   collab status|enroll        policy, state root and captures; mint a project ID
