@@ -4,6 +4,23 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.108] - 2026-11-16
+
+### Added
+
+- A running agent process no longer keeps a session it has moved on from. A live holder protects a session only while it is that holder's latest session, or a process has its working directory or an open file in the checkout, or work is running for it. When the same process was bound to a newer session after this one's last activity, a session whose every pull request merged (or whose work landed) closes after its window, and an idle session past the abandonment window closes when its checkout is clean. Nothing is deleted (#1704).
+- Each automatic close records `holder_evidence` (`gone`, `moved_on`, `lease_expired`, `unbound`) and, for `moved_on`, the newer session; the returning agent is told. `landed_session_retirement.closed_by_holder_evidence` in `broker status --json` (#1704).
+- Closed sessions whose checkout is already gone are recorded as cleaned (`session.checkout_missing_finished`) once the path is proven absent under a pool root that carries this repository's marker on a matching volume, unregistered in Git and unused. Nothing is deleted; sessions whose pool root is missing are kept (#1704).
+
+### Changed
+
+- The decline code `holder_alive` is now `holder_alive_current`; `holder_alive_in_use` is new. `worktree_unclean` declines are counted per kind in the worker metrics (#1704).
+- The open-file observation used before a close is valid for 10 seconds and shared across candidates (#1704).
+
+### Known issues
+
+- Subagents share their parent's process, so one subagent starting a session moves the holder on from a sibling's quiet session. That session is still protected by its idle window, the process-use check and the running-work checks, and can be continued with `broker start --reuse`.
+
 ## [0.8.107] - 2026-11-16
 
 ### Added
