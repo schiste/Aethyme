@@ -442,6 +442,8 @@ pub(crate) fn lstart_epoch_ms(started: &str) -> Option<i64> {
 /// The epoch seconds of a local calendar time, or `None` when it does not
 /// name a real day (a normalized date, or the weekday disagrees).
 #[cfg(unix)]
+// `time_t` is already `i64` on some targets only.
+#[allow(clippy::useless_conversion)]
 fn local_epoch_seconds(
     year: i32,
     month: usize,
