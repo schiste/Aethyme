@@ -1155,7 +1155,11 @@ impl Broker {
     }
 
     /// Whether an `in_progress` record's preparer provably stopped: the host
-    /// lease it names, at its recorded generation, is `released`.
+    /// lease it names, at its recorded generation, is `released` and the
+    /// lease's recorded holder process is gone. (The success path releases
+    /// the lease before it writes `current`; the holder check closes that
+    /// window. Writing `current` first would instead leave a `current` record
+    /// beside a lease whose release failed.)
     ///
     /// The preparer acquires that lease before it writes the record and holds
     /// it for the whole run (`resource_leases.holder_pid`). It releases it
@@ -5147,7 +5151,8 @@ fn route_preparation_command_failure(
 }
 
 /// Whether the host resource database at `path` holds `lease_id` at exactly
-/// `generation` in the `released` state. A missing database is never read as
+/// `generation` in the `released` state with its holder process provably
+/// gone. A missing database is never read as
 /// evidence: a read-only open of one is an empty in-memory registry.
 fn lease_released_in(path: &Path, lease_id: &str, generation: u64) -> bool {
     if !path.is_file() {
@@ -5156,9 +5161,13 @@ fn lease_released_in(path: &Path, lease_id: &str, generation: u64) -> bool {
     let Ok(coordinator) = HostResourceCoordinator::open_read_only(path) else {
         return false;
     };
+    // A succeeding preparer releases its lease a moment before it writes
+    // `current`; until its process is gone, a released lease is not proof
+    // that the run ended.
     matches!(
         coordinator.lease_state(lease_id),
-        Ok(Some((crate::HostLeaseState::Released, recorded))) if recorded == generation
+        Ok(Some((crate::HostLeaseState::Released, recorded, holder_gone)))
+            if recorded == generation && holder_gone
     )
 }
 
@@ -5915,19 +5924,20 @@ mod tests {
     }
 
     /// An `in_progress` record is judged interrupted only when its exact
-    /// lease is released. A live lease, a lease the host database does not
-    /// hold yet, another generation and a missing database all keep it in
-    /// progress.
+    /// lease is released and its holder process is gone. A live lease, the
+    /// success path's window (released, holder still running), a lease the
+    /// host database does not hold yet, another generation and a missing
+    /// database all keep it in progress.
     #[test]
     fn only_a_released_preparation_lease_marks_its_record_interrupted() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("r.db");
         let mut coordinator = HostResourceCoordinator::open(&path).unwrap();
-        let grant = coordinator
+        let live = coordinator
             .acquire(&cache_test_request(SharedCacheMode::Exclusive, 1))
             .unwrap();
-        let lease_id = grant.lease.lease_id.clone();
-        let generation = grant.lease.generation;
+        let lease_id = live.lease.lease_id.clone();
+        let generation = live.lease.generation;
 
         assert!(
             !lease_released_in(&path, &lease_id, generation),
@@ -5942,15 +5952,27 @@ mod tests {
             &lease_id,
             generation
         ));
-
         coordinator
-            .release(&lease_id, generation, &grant.ownership_token)
+            .release(&lease_id, generation, &live.ownership_token)
             .unwrap();
         assert!(
-            lease_released_in(&path, &lease_id, generation),
-            "a released lease means no preparer holds the run"
+            !lease_released_in(&path, &lease_id, generation),
+            "released by a preparer that still runs: it is about to write current"
         );
-        assert!(!lease_released_in(&path, &lease_id, generation + 1));
+
+        let dead = coordinator
+            .acquire(&request_from_a_dead_holder(SharedCacheMode::Exclusive))
+            .unwrap();
+        let dead_id = dead.lease.lease_id.clone();
+        let dead_generation = dead.lease.generation;
+        coordinator
+            .release(&dead_id, dead_generation, &dead.ownership_token)
+            .unwrap();
+        assert!(
+            lease_released_in(&path, &dead_id, dead_generation),
+            "released and its preparer gone: nobody holds the run"
+        );
+        assert!(!lease_released_in(&path, &dead_id, dead_generation + 1));
     }
 
     #[test]

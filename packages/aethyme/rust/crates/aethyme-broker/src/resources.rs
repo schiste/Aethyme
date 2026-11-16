@@ -1706,24 +1706,34 @@ impl HostResourceCoordinator {
         &self.path
     }
 
-    /// The state and generation of one lease, read without touching any
-    /// other state; `None` when no lease has that id.
+    /// The state and generation of one lease, and whether its recorded
+    /// holder process is provably gone (`false` when no holder pid was
+    /// recorded or the pid answers), read without touching any other state;
+    /// `None` when no lease has that id.
     pub(crate) fn lease_state(
         &self,
         lease_id: &str,
-    ) -> Result<Option<(HostLeaseState, u64)>, HostResourceError> {
+    ) -> Result<Option<(HostLeaseState, u64, bool)>, HostResourceError> {
         let row = self
             .conn
             .query_row(
-                "SELECT state, generation FROM resource_leases WHERE lease_id = ?1",
+                "SELECT state, generation, holder_pid FROM resource_leases WHERE lease_id = ?1",
                 [lease_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
             )
             .optional()?;
         match row {
-            Some((state, generation)) => {
-                Ok(Some((HostLeaseState::parse(&state)?, generation as u64)))
-            }
+            Some((state, generation, holder_pid)) => Ok(Some((
+                HostLeaseState::parse(&state)?,
+                generation as u64,
+                holder_pid.is_some_and(holder_process_is_gone),
+            ))),
             None => Ok(None),
         }
     }

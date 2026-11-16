@@ -500,18 +500,70 @@ fn native_process_args(_pid: i64, _comm: &str) -> String {
     String::new()
 }
 
+/// Why a native process listing is not a complete observation.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) enum NativeListingFailure {
+    /// The kernel refused the listing, or a read of a listed process, to
+    /// this caller.
+    Denied,
+    Failed,
+}
+
+/// One listed process as a native read returns it.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) struct NativeProcess {
+    ppid: i64,
+    started: String,
+    comm: String,
+}
+
+/// Build a process table from a native listing, refusing to call a partial
+/// one complete. A process that exited between the listing and its read
+/// (`ESRCH`) is simply absent, as it would be from `ps`. A refused read
+/// (`EPERM`/`EACCES`) means this caller cannot see other processes, which
+/// would make every live holder look gone: the listing is `Denied`. Any
+/// other error fails it. The table must hold the caller, its parent and
+/// pid 1, each of which provably exists.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn assemble_native_table(
+    pids: &[i64],
+    caller: i64,
+    caller_parent: i64,
+    mut read: impl FnMut(i64) -> Result<NativeProcess, i32>,
+) -> Result<ProcessTable, NativeListingFailure> {
+    let mut rows = HashMap::with_capacity(pids.len());
+    for &pid in pids {
+        match read(pid) {
+            Ok(process) => {
+                rows.insert(
+                    pid,
+                    ProcessRow {
+                        ppid: process.ppid,
+                        started: process.started,
+                        args: std::sync::OnceLock::new(),
+                        comm: process.comm,
+                    },
+                );
+            }
+            Err(libc::ESRCH) => {}
+            Err(libc::EPERM | libc::EACCES) => return Err(NativeListingFailure::Denied),
+            Err(_) => return Err(NativeListingFailure::Failed),
+        }
+    }
+    for required in [caller, caller_parent, 1] {
+        if !rows.contains_key(&required) {
+            return Err(NativeListingFailure::Failed);
+        }
+    }
+    Ok(ProcessTable { rows })
+}
+
 /// The process table listed with libproc instead of a `ps` child: a sandboxed
 /// caller may be refused the spawn, and each refusal used to leave a whole
 /// retirement pass judging every holder unknown.
 #[cfg(target_os = "macos")]
 mod native_process_table {
-    use std::collections::HashMap;
-
-    pub(super) enum Failure {
-        /// The kernel refused the listing to this caller.
-        Denied,
-        Failed,
-    }
+    pub(super) use super::NativeListingFailure as Failure;
 
     fn failure_from_errno() -> Failure {
         match std::io::Error::last_os_error().raw_os_error() {
@@ -521,40 +573,30 @@ mod native_process_table {
     }
 
     pub(super) fn snapshot() -> Result<super::ProcessTable, Failure> {
-        let pids = list_pids()?;
+        let pids = list_pids()?.into_iter().map(i64::from).collect::<Vec<_>>();
         let locale = StartTimeLocale::from_environment();
-        let mut rows = HashMap::with_capacity(pids.len());
-        for pid in pids {
-            // A process may exit between the listing and this read; it is
-            // simply not in the table, as it would not be in `ps` output.
-            let Some(info) = bsd_info(pid) else {
-                continue;
-            };
-            let Some(started) = locale.format(info.pbi_start_tvsec) else {
-                continue;
-            };
-            let comm = info
-                .pbi_comm
-                .iter()
-                .take_while(|byte| **byte != 0)
-                .map(|byte| *byte as u8 as char)
-                .collect::<String>();
-            rows.insert(
-                i64::from(pid),
-                super::ProcessRow {
+        super::assemble_native_table(
+            &pids,
+            i64::from(std::process::id()),
+            i64::from(std::os::unix::process::parent_id()),
+            |pid| {
+                let pid = libc::pid_t::try_from(pid).map_err(|_| libc::EINVAL)?;
+                let info = bsd_info(pid)?;
+                // A start that cannot be formatted is not a complete row.
+                let started = locale.format(info.pbi_start_tvsec).ok_or(libc::EINVAL)?;
+                let comm = info
+                    .pbi_comm
+                    .iter()
+                    .take_while(|byte| **byte != 0)
+                    .map(|byte| *byte as u8 as char)
+                    .collect::<String>();
+                Ok(super::NativeProcess {
                     ppid: i64::from(info.pbi_ppid),
                     started,
-                    args: std::sync::OnceLock::new(),
                     comm,
-                },
-            );
-        }
-        // The caller must at least see itself; anything less is not a
-        // complete observation.
-        if !rows.contains_key(&i64::from(std::process::id())) {
-            return Err(Failure::Failed);
-        }
-        Ok(super::ProcessTable { rows })
+                })
+            },
+        )
     }
 
     fn list_pids() -> Result<Vec<libc::pid_t>, Failure> {
@@ -584,7 +626,8 @@ mod native_process_table {
         Err(Failure::Failed)
     }
 
-    fn bsd_info(pid: libc::pid_t) -> Option<libc::proc_bsdinfo> {
+    /// One process's BSD info, or the errno that refused it.
+    fn bsd_info(pid: libc::pid_t) -> Result<libc::proc_bsdinfo, i32> {
         let size = std::mem::size_of::<libc::proc_bsdinfo>();
         // SAFETY: `proc_bsdinfo` is plain old data; zero is a valid value.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -598,7 +641,16 @@ mod native_process_table {
                 size as libc::c_int,
             )
         };
-        (written > 0 && written as usize == size).then_some(info)
+        if written > 0 && written as usize == size {
+            return Ok(info);
+        }
+        if written > 0 {
+            // A short read is a protocol mismatch, never a missing process.
+            return Err(libc::EIO);
+        }
+        Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO))
     }
 
     /// `ps` prints `lstart` with `strftime("%c")` under the caller's locale;
@@ -2406,5 +2458,50 @@ mod tests {
         assert_eq!(native.rows[&pid].ppid, ps.rows[&pid].ppid);
         assert!(native.is_alive(&from_ps));
         assert!(ps.is_alive(&from_native));
+    }
+
+    /// A native listing is complete only when every read succeeded or found
+    /// the process gone, and the caller, its parent and pid 1 are present.
+    #[cfg(unix)]
+    #[test]
+    fn a_native_listing_with_refused_or_failed_reads_is_never_complete() {
+        let row = |ppid: i64| NativeProcess {
+            ppid,
+            started: "Mon Jan 1 00:00:00 2024".into(),
+            comm: "fixture".into(),
+        };
+        let read_with = |errors: Vec<(i64, i32)>| {
+            move |pid: i64| match errors.iter().find(|(failing, _)| *failing == pid) {
+                Some((_, errno)) => Err(*errno),
+                None => Ok(row(1)),
+            }
+        };
+        let pids = [1, 50, 70, 90];
+
+        let table = assemble_native_table(&pids, 90, 50, read_with(vec![(70, libc::ESRCH)]))
+            .ok()
+            .expect("a process that exited is only absent");
+        assert!(table.process(70).is_none());
+        assert!(table.process(90).is_some());
+        assert!(matches!(
+            assemble_native_table(&pids, 90, 50, read_with(vec![(70, libc::EPERM)])),
+            Err(NativeListingFailure::Denied)
+        ));
+        assert!(matches!(
+            assemble_native_table(&pids, 90, 50, read_with(vec![(70, libc::EACCES)])),
+            Err(NativeListingFailure::Denied)
+        ));
+        assert!(matches!(
+            assemble_native_table(&pids, 90, 50, read_with(vec![(70, libc::EINVAL)])),
+            Err(NativeListingFailure::Failed)
+        ));
+        assert!(matches!(
+            assemble_native_table(&[50, 70, 90], 90, 50, read_with(Vec::new())),
+            Err(NativeListingFailure::Failed)
+        ));
+        assert!(matches!(
+            assemble_native_table(&pids, 90, 50, read_with(vec![(50, libc::ESRCH)])),
+            Err(NativeListingFailure::Failed)
+        ));
     }
 }

@@ -1773,7 +1773,47 @@ mod lane_tests {
             1,
         );
         quiet(&mut broker, &ambiguous, 3);
+        // A receipt naming another boot is dead whatever its timestamp.
+        crate::host_boot::set_boot_id_for_tests(Some("boot-now"));
+        let (other_boot, _) = merged_candidate(&mut broker, "receipt from another boot");
+        left_receipt(
+            &mut broker,
+            other_boot.id,
+            "5123456789abcdef0123456789abcdef",
+            "running",
+            now_ms(),
+        );
+        quiet(&mut broker, &other_boot, 3);
+        // A session kept for another reason keeps its dead receipt as it is.
+        let (queued, queued_tree) = merged_candidate(&mut broker, "dead receipt, queued");
+        left_receipt(
+            &mut broker,
+            queued.id,
+            "6123456789abcdef0123456789abcdef",
+            "running",
+            1,
+        );
+        let head = crate::git::GitRepo::discover(&queued_tree)
+            .unwrap()
+            .head_commit()
+            .unwrap();
+        broker
+            .store()
+            .connection()
+            .execute_batch(&format!(
+                "UPDATE guarded_exec_receipts SET boot_id = 'boot-before'
+                 WHERE receipt_id = '5123456789abcdef0123456789abcdef';
+                 INSERT INTO merge_queue (session_id, head_commit, base_commit, status, created_at, updated_at)
+                 VALUES ({}, '{head}', '{head}', 'submitted', 1, 1);",
+                queued.id
+            ))
+            .unwrap();
+        quiet(&mut broker, &queued, 3);
 
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        let other_boot_outcome = close_directly(&mut broker, &other_boot, &mut table);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        let queued_outcome = close_directly(&mut broker, &queued, &mut table);
         let mut table = crate::session_holder::RecordedHolderProcessTable::default();
         let died_outcome = close_directly(&mut broker, &died, &mut table);
         let mut table = crate::session_holder::RecordedHolderProcessTable::default();
@@ -1781,6 +1821,29 @@ mod lane_tests {
         let mut table = crate::session_holder::RecordedHolderProcessTable::default();
         let ambiguous_outcome = close_directly(&mut broker, &ambiguous, &mut table);
         crate::host_boot::set_boot_time_ms_for_tests(None);
+        crate::host_boot::set_boot_id_for_tests(None);
+
+        assert_eq!(
+            other_boot_outcome,
+            crate::broker::AbandonedSessionCloseOutcome::Closed
+        );
+        assert_eq!(
+            queued_outcome,
+            crate::broker::AbandonedSessionCloseOutcome::OperationActive
+        );
+        let queued_phase: String = broker
+            .store_ref()
+            .connection()
+            .query_row(
+                "SELECT phase FROM guarded_exec_receipts WHERE receipt_id = ?1",
+                ["6123456789abcdef0123456789abcdef"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            queued_phase, "running",
+            "a session that stays open keeps its receipts untouched"
+        );
 
         assert_eq!(
             died_outcome,
@@ -1809,7 +1872,7 @@ mod lane_tests {
         assert_eq!(abandoned, 1);
         assert_eq!(
             phase_count(&recorder, "guarded_exec_receipts_abandoned_pre_boot"),
-            1
+            2
         );
 
         for (session, outcome) in [(&running, running_outcome), (&ambiguous, ambiguous_outcome)] {
@@ -1852,26 +1915,40 @@ mod lane_tests {
         assert!(phase_count(&recorder, "holder_grace_anchored_to_boot") >= 1);
     }
 
-    /// A legacy session that never recorded a holder releases its explicit
-    /// claims only past the abandonment window and with no unresolved
-    /// operation; inside the window, or with a command still unresolved, its
-    /// claims keep it.
+    /// A legacy session (created before holders were recorded, with no
+    /// holder event) releases its explicit claims only past the abandonment
+    /// window and with no unresolved operation; inside the window, or with a
+    /// command still unresolved, its claims keep it. A session created since
+    /// then that merely has no holder record (an unidentified caller) keeps
+    /// its claims whatever its age.
     #[test]
     fn a_legacy_session_without_a_holder_releases_claims_only_when_old_and_idle() {
         let (_owner, _storage, mut broker) = fixture("");
         let recorder = crate::phase_telemetry::Recorder::default();
         let _installed = crate::phase_telemetry::install(recorder.clone());
-        let claimed = |broker: &mut crate::Broker, label: &str, hours: u64| {
+        // A day before holder recording shipped (2026-10-05T00:00:00Z).
+        let before_holder_recording = 1_791_158_400_000 - 24 * HOUR_MS;
+        let claimed = |broker: &mut crate::Broker, label: &str, hours: u64, legacy: bool| {
             let (session, _) = session(broker, label, false);
             broker
                 .store()
                 .claim_lease(session.id, "base.txt", None)
                 .unwrap();
             age(broker, &session, hours);
+            if legacy {
+                broker
+                    .store()
+                    .connection()
+                    .execute(
+                        "UPDATE sessions SET created_at = ?1 WHERE id = ?2",
+                        rusqlite::params![before_holder_recording, session.id],
+                    )
+                    .unwrap();
+            }
             session
         };
 
-        let recent = claimed(&mut broker, "legacy, inside the window", 1);
+        let recent = claimed(&mut broker, "legacy, inside the window", 1, true);
         let mut table = crate::session_holder::RecordedHolderProcessTable::default();
         assert_eq!(
             close_abandoned_directly(&mut broker, &recent, &mut table),
@@ -1879,7 +1956,16 @@ mod lane_tests {
         );
         assert!(is_open(&broker, recent.id));
 
-        let busy = claimed(&mut broker, "legacy, command still running", 80);
+        let unidentified = claimed(&mut broker, "no holder, created recently", 80, false);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_abandoned_directly(&mut broker, &unidentified, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::LeaseHeld,
+            "an unidentified caller's session is not legacy"
+        );
+        assert!(is_open(&broker, unidentified.id));
+
+        let busy = claimed(&mut broker, "legacy, command still running", 80, true);
         left_receipt(
             &mut broker,
             busy.id,
@@ -1895,15 +1981,51 @@ mod lane_tests {
         assert!(is_open(&broker, busy.id));
         assert_eq!(phase_count(&recorder, "legacy_unbound_claims_released"), 0);
 
-        let old = claimed(&mut broker, "legacy, quiet for days", 80);
+        let old = claimed(&mut broker, "legacy, quiet for days", 80, true);
         let mut table = crate::session_holder::RecordedHolderProcessTable::default();
         assert_eq!(
             close_abandoned_directly(&mut broker, &old, &mut table),
             crate::broker::AbandonedSessionCloseOutcome::Closed,
-            "age is the only evidence a session without a holder can have"
+            "age is the only evidence a legacy session can have"
         );
         assert!(!is_open(&broker, old.id));
         assert_eq!(phase_count(&recorder, "legacy_unbound_claims_released"), 1);
+    }
+
+    /// A legacy session whose checkout a process still uses keeps its claim.
+    #[test]
+    fn a_legacy_sessions_claim_is_kept_while_a_process_uses_its_checkout() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (session, worktree) = session(&mut broker, "legacy, editor open", false);
+        broker
+            .store()
+            .claim_lease(session.id, "base.txt", None)
+            .unwrap();
+        age(&mut broker, &session, 80);
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE sessions SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![1_791_158_400_000_i64 - 24 * HOUR_MS, session.id],
+            )
+            .unwrap();
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+                pid: std::process::id(),
+                command: "editor".into(),
+                descriptor: "cwd".into(),
+                file_type: Some("DIR".into()),
+                path: std::fs::canonicalize(&worktree).unwrap(),
+            }]),
+        ));
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        let outcome = close_abandoned_directly(&mut broker, &session, &mut table);
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+        ));
+        assert_ne!(outcome, crate::broker::AbandonedSessionCloseOutcome::Closed);
+        assert!(is_open(&broker, session.id));
     }
 
     /// A command refused the process listing (sandboxed) judges no holder:
@@ -2131,6 +2253,70 @@ mod lane_tests {
             &preparing,
             Default::default(),
             Reason::PreparationInProgress,
+        );
+
+        let (adopted, _) = no_work_session(&mut broker, "adopted session");
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE sessions SET origin = 'adopted' WHERE id = ?1",
+                [adopted.id],
+            )
+            .unwrap();
+        quiet(&mut broker, &adopted, 5);
+        judge(
+            &mut broker,
+            &adopted,
+            Default::default(),
+            Reason::NoWorkAdopted,
+        );
+
+        let (detached, detached_tree) = no_work_session(&mut broker, "detached HEAD");
+        git(&detached_tree, &["checkout", "-q", "--detach"]);
+        quiet(&mut broker, &detached, 5);
+        judge(
+            &mut broker,
+            &detached,
+            Default::default(),
+            Reason::NoWorkSessionCommits,
+        );
+
+        // The agent committed on the session branch, then switched to a new
+        // branch at the base: HEAD equals the base, the session branch does not.
+        let (ahead, ahead_tree) = session(&mut broker, "branch ahead, HEAD on base", false);
+        let base = ahead
+            .diff_base
+            .clone()
+            .expect("a spawned session records its base");
+        git(&ahead_tree, &["checkout", "-q", "-b", "scratch", &base]);
+        quiet(&mut broker, &ahead, 5);
+        judge(
+            &mut broker,
+            &ahead,
+            Default::default(),
+            Reason::NoWorkSessionCommits,
+        );
+
+        let (queued, queued_tree) = no_work_session(&mut broker, "merge-queue entry");
+        let head = crate::git::GitRepo::discover(&queued_tree)
+            .unwrap()
+            .head_commit()
+            .unwrap();
+        broker
+            .store()
+            .connection()
+            .execute(
+                "INSERT INTO merge_queue (session_id, head_commit, base_commit, status, created_at, updated_at) VALUES (?1, ?2, ?2, 'rejected', 1, 1)",
+                rusqlite::params![queued.id, head],
+            )
+            .unwrap();
+        quiet(&mut broker, &queued, 5);
+        judge(
+            &mut broker,
+            &queued,
+            Default::default(),
+            Reason::NoWorkMergeQueue,
         );
 
         // Unreadable pull-request state does not qualify: the table the
@@ -2373,6 +2559,7 @@ mod lane_tests {
             Reason::DatabaseBusy,
             Reason::PolicyUnavailable,
             Reason::LandedDeclined,
+            Reason::NoWorkAdopted,
             Reason::NoWorkSessionCommits,
             Reason::NoWorkWorktreeDirty,
             Reason::NoWorkHolderUnbound,
@@ -2425,6 +2612,7 @@ mod lane_tests {
                 | Reason::DatabaseBusy
                 | Reason::PolicyUnavailable
                 | Reason::LandedDeclined
+                | Reason::NoWorkAdopted
                 | Reason::NoWorkSessionCommits
                 | Reason::NoWorkWorktreeDirty
                 | Reason::NoWorkHolderUnbound

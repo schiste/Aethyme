@@ -1807,4 +1807,35 @@ mod tests {
             assert!(load_retention_policy(repo.path()).is_err(), "{text}");
         }
     }
+
+    /// The no-work window validates like the other session windows, is
+    /// disabled by zero (its own or the main window's) and never exceeds the
+    /// main window.
+    #[test]
+    fn the_no_work_window_is_validated_disabled_and_clamped() {
+        let policy = |no_work: u32, abandoned: u32| RetentionPolicy {
+            session_no_work_abandoned_after_hours: no_work,
+            session_abandoned_after_hours: abandoned,
+            ..RetentionPolicy::default()
+        };
+        assert_eq!(
+            RetentionPolicy::default().session_no_work_abandoned_after_hours,
+            4
+        );
+        assert!(policy(8_760, 72).validate().is_ok());
+        assert!(matches!(
+            policy(8_761, 72).validate(),
+            Err(RetentionConfigError::InvalidValue {
+                field: "session_no_work_abandoned_after_hours",
+                ..
+            })
+        ));
+        assert_eq!(policy(4, 72).no_work_abandonment_window_ms(), 4 * 3_600_000);
+        assert_eq!(policy(0, 72).no_work_abandonment_window_ms(), 0);
+        assert_eq!(policy(4, 0).no_work_abandonment_window_ms(), 0);
+        assert_eq!(
+            policy(100, 72).no_work_abandonment_window_ms(),
+            72 * 3_600_000
+        );
+    }
 }

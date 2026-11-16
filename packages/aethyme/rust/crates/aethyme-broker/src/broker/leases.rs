@@ -463,8 +463,11 @@ pub(crate) enum AbandonmentKeepReason {
     PolicyUnavailable,
     /// A landed-lane proof declined (never the abandonment window itself).
     LandedDeclined,
-    /// No-work lane: the branch has commits past its diff base, or that
-    /// could not be read.
+    /// No-work lane: an adopted session keeps the full window (its diff base
+    /// is the adopted HEAD, which can carry earlier work).
+    NoWorkAdopted,
+    /// No-work lane: HEAD is not the session branch, the branch has commits
+    /// past its diff base, or either could not be read.
     NoWorkSessionCommits,
     /// No-work lane: the checkout has uncommitted or untracked content, or
     /// its state could not be read.
@@ -529,6 +532,7 @@ impl AbandonmentKeepReason {
             Self::DatabaseBusy => "database_busy",
             Self::PolicyUnavailable => "policy_unavailable",
             Self::LandedDeclined => "landed_declined",
+            Self::NoWorkAdopted => "no_work_adopted",
             Self::NoWorkSessionCommits => "no_work_session_commits",
             Self::NoWorkWorktreeDirty => "no_work_worktree_dirty",
             Self::NoWorkHolderUnbound => "no_work_holder_unbound",
@@ -592,6 +596,7 @@ impl AbandonmentKeepReason {
             Self::DatabaseBusy => "session_abandonment_kept_database_busy",
             Self::PolicyUnavailable => "session_abandonment_kept_policy_unavailable",
             Self::LandedDeclined => "session_abandonment_kept_landed_declined",
+            Self::NoWorkAdopted => "session_abandonment_kept_no_work_adopted",
             Self::NoWorkSessionCommits => "session_abandonment_kept_no_work_session_commits",
             Self::NoWorkWorktreeDirty => "session_abandonment_kept_no_work_worktree_dirty",
             Self::NoWorkHolderUnbound => "session_abandonment_kept_no_work_holder_unbound",
@@ -614,6 +619,7 @@ impl AbandonmentKeepReason {
     /// lane relies on, one bucket for every other keep.
     pub(crate) const fn no_work_telemetry_name(self) -> &'static str {
         match self {
+            Self::NoWorkAdopted => "session_no_work_kept_adopted",
             Self::NoWorkSessionCommits => "session_no_work_kept_session_commits",
             Self::NoWorkWorktreeDirty => "session_no_work_kept_worktree_dirty",
             Self::NoWorkHolderUnbound => "session_no_work_kept_holder_unbound",
@@ -662,6 +668,12 @@ pub(crate) struct LandedProof {
     /// search; a close resting on it searches again under the claims.
     pub memoized: bool,
 }
+
+/// Sessions created before this instant (2026-10-05T00:00:00Z, a day before
+/// the 0.8.21 release that started recording holders, #542) were created by
+/// binaries that never recorded one. Only such a session, with no holder
+/// event of any kind, is legacy.
+const HOLDER_RECORDING_SHIPPED_MS: i64 = 1_791_158_400_000;
 
 /// Which window and which proofs an automatic close uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1294,37 +1306,52 @@ impl Broker {
     /// nonblocking lifecycle claim; its holder-event identity is then checked
     /// again under the claim and in the store transaction.
     /// Whether the session still owns an unresolved coordinated operation or
-    /// guarded command, after settling guarded-exec receipts whose command
-    /// provably died with the previous boot.
+    /// guarded command, not counting guarded-exec receipts whose command
+    /// provably died with an earlier boot. Read-only: such receipts are
+    /// settled only once the session actually closes
+    /// ([`Self::settle_dead_receipts_after_close`]).
     ///
     /// Only the live `exec` command moves a receipt on. The per-session
-    /// operation guard does not prove a receipt written after the boot dead:
+    /// operation guard does not prove a receipt of the current boot dead:
     /// the shared lock is close-on-exec so a detached child never pins it
     /// (`file_lock::SessionOperationGuard`), so a command's children can
-    /// outlive the command that owns the receipt. A receipt last written
-    /// before the boot is the one case with proof: no process from before a
-    /// boot survives it. `outcome_unknown` receipts stay blocking whatever
-    /// their age: they mean "never retry blindly", not "still running".
+    /// outlive the command that owns the receipt. A receipt that names
+    /// another boot is the proof; one written without a boot id by an older
+    /// version counts only when its last write predates the boot by
+    /// [`crate::host_boot::PRE_BOOT_MARGIN_MS`]. `outcome_unknown` receipts
+    /// stay blocking whatever their age: they mean "never retry blindly",
+    /// not "still running".
     pub(crate) fn session_operations_unresolved_since_boot(
-        &mut self,
+        &self,
         session_id: i64,
     ) -> Result<bool, crate::BrokerError> {
-        if let (Some(boot_ms), Some(cutoff_ms)) = (
-            crate::host_boot::boot_time_ms(),
-            crate::host_boot::pre_boot_cutoff_ms(),
-        ) {
-            let settled = self
-                .store()
-                .abandon_pre_boot_guarded_exec_receipts(session_id, cutoff_ms, boot_ms)?;
-            for _ in 0..settled {
-                crate::phase_telemetry::add(
-                    "guarded_exec_receipts_abandoned_pre_boot",
-                    std::time::Duration::ZERO,
-                );
-            }
-        }
         self.store_ref()
-            .session_has_unresolved_operations(session_id)
+            .session_has_unresolved_operations_since_boot(
+                session_id,
+                &crate::host_boot::BootEvidence::current(),
+            )
+    }
+
+    /// After a close, settle the session's receipts whose command died with
+    /// an earlier boot, so they stop reading as running.
+    fn settle_dead_receipts_after_close(&mut self, session_id: i64) {
+        match self.store().abandon_dead_guarded_exec_receipts(
+            session_id,
+            &crate::host_boot::BootEvidence::current(),
+        ) {
+            Ok(settled) => {
+                for _ in 0..settled {
+                    crate::phase_telemetry::add(
+                        "guarded_exec_receipts_abandoned_pre_boot",
+                        std::time::Duration::ZERO,
+                    );
+                }
+            }
+            Err(error) => crate::warn_unrecorded(
+                "settle guarded exec receipts of a closed session",
+                Err::<(), _>(error),
+            ),
+        }
     }
 
     pub(crate) fn try_close_abandoned_session(
@@ -1457,10 +1484,25 @@ impl Broker {
     /// for the session is unmerged (unreadable state does not qualify), and
     /// the session has no merge-queue entry. `None` when all hold.
     fn no_work_decline(&self, session: &crate::Session) -> Option<AbandonmentKeepReason> {
+        if session.origin != crate::SessionOrigin::Spawned {
+            return Some(AbandonmentKeepReason::NoWorkAdopted);
+        }
         let worktree = std::path::Path::new(&session.worktree_path);
-        let head = current_checkout_head(worktree);
-        match (head.as_deref(), session.diff_base.as_deref()) {
-            (Some(head), Some(base)) if head == base => {}
+        // HEAD must be the session branch itself, and that branch must still
+        // be its diff base: a detached HEAD or another branch at the base
+        // can hide commits on the session branch.
+        let Ok(checkout) = crate::git::GitRepo::discover(worktree) else {
+            return Some(AbandonmentKeepReason::NoWorkSessionCommits);
+        };
+        let branch_ref = format!("refs/heads/{}", session.branch);
+        if checkout.symbolic_ref("HEAD").as_deref() != Some(branch_ref.as_str()) {
+            return Some(AbandonmentKeepReason::NoWorkSessionCommits);
+        }
+        match (
+            checkout.resolve_ref(&branch_ref),
+            session.diff_base.as_deref(),
+        ) {
+            (Some(tip), Some(base)) if tip == base => {}
             _ => return Some(AbandonmentKeepReason::NoWorkSessionCommits),
         }
         let Ok(policy) = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root()) else {
@@ -1907,6 +1949,15 @@ impl Broker {
                 process_table,
                 AbandonmentKeepReason::SessionPidAlive,
                 AbandonedSessionCloseOutcome::ActiveProcess,
+            ));
+        }
+        // An adopted session keeps the full window: its diff base is the
+        // adopted HEAD, which can carry work done before the adoption.
+        if no_work_lane && candidate.origin != crate::SessionOrigin::Spawned {
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::NoWorkAdopted,
+                AbandonedSessionCloseOutcome::NotDue,
             ));
         }
         // Nothing makes `session_abandoned_after_hours` at least
@@ -2758,18 +2809,43 @@ impl Broker {
                     ));
                 }
             };
-            // A legacy session that never recorded a holder has no process to
-            // observe, so its claims would hold forever. Age is the only
-            // evidence it can have: past the abandonment window (judged
-            // above) and with no unresolved operation or preparation in
-            // progress, its claims stop holding. Every other basis keeps its
-            // own rule.
-            let legacy_unbound = holder.binding_event_id.is_none() && bound_holder.is_none();
-            let legacy_claims_released = legacy_unbound
+            // A legacy session, created before the broker recorded holders,
+            // has no process to observe, so its claims would hold forever.
+            // Age is the only evidence it can have: past the abandonment
+            // window (judged above), with no unresolved operation, no
+            // preparation in progress and no process using its checkout, its
+            // claims stop holding. A session merely without a holder record
+            // today (an unidentified caller: a person, an unrecognised agent,
+            // a sandboxed start) is not legacy and keeps its claims. Every
+            // other basis keeps its own rule.
+            let legacy_unbound = holder.binding_event_id.is_none()
+                && bound_holder.is_none()
+                && current.created_at < HOLDER_RECORDING_SHIPPED_MS
+                && matches!(
+                    self.store_ref()
+                        .latest_session_holder_gone_event(session_id),
+                    Ok(None)
+                );
+            let legacy_claims_release_candidate = legacy_unbound
                 && liveness.iter().any(|lease| {
                     lease.liveness_evidence.holds
                         && lease.liveness_evidence.basis == "no_recorded_holder"
-                })
+                });
+            if legacy_claims_release_candidate
+                && let Some(kept) = process_use_verdict(
+                    process_table,
+                    self.main_root(),
+                    std::path::Path::new(&current.worktree_path),
+                    deadline,
+                    None,
+                    false,
+                )
+            {
+                // A process in the checkout, or an observation that could not
+                // be made, keeps the claim.
+                return Ok(kept);
+            }
+            let legacy_claims_released = legacy_claims_release_candidate
                 && matches!(
                     self.session_operations_unresolved_since_boot(session_id),
                     Ok(false)
@@ -3124,6 +3200,7 @@ impl Broker {
                 cleanup_request.is_some_and(|request| request.compact_checkout),
             ) {
             Ok(true) => {
+                self.settle_dead_receipts_after_close(session_id);
                 crate::phase_telemetry::add(
                     match holder_evidence {
                         "lease_expired" => "session_closed_holder_lease_expired",
