@@ -68,6 +68,11 @@ Usage:
       Print the configuration snippet for each entry (or one) in that
       agent's format: `aethyme mcp connect <name> --fallback -- <argv>`.
       Prints only; never writes a file.
+  aethyme mcp hub serve <directory>
+      Internal: the shared hub for mode = shared stdio entries, started
+      by the first `connect` that needs it (never at boot). One upstream
+      server per key, multiplexed; it exits when nothing has used it for a
+      while. A client that cannot share starts a private server instead.
 ";
 
 fn json_requested(args: &[String]) -> bool {
@@ -107,6 +112,7 @@ pub fn run(args: &[String]) -> u8 {
         "resolve" => run_resolve(rest),
         "status" => run_status(rest),
         "trust" => run_trust(rest),
+        "hub" => run_hub(rest),
         "config" => match rest.split_first() {
             Some((sub, tail)) if sub == "print" => run_config_print(tail),
             _ => report_error(
@@ -451,6 +457,29 @@ fn run_status(args: &[String]) -> u8 {
         .map(|entry| (entry, key::plan(entry, &caller, &GitCheckouts)))
         .collect();
     let plan_ms = elapsed_ms(phase);
+    let phase = Instant::now();
+    let hub = super::hub_client::query_status();
+    let hub_ms = elapsed_ms(phase);
+    // The hub reports keys by their first 12 characters.
+    let hub_entry = |plan: &Result<key::Plan, Box<key::PlanFailure>>| -> Value {
+        let (Some(hub), Ok(plan)) = (&hub, plan) else {
+            return Value::Null;
+        };
+        let upstream = hub
+            .get("upstreams")
+            .and_then(Value::as_array)
+            .and_then(|upstreams| {
+                upstreams
+                    .iter()
+                    .find(|upstream| upstream.get("key_short") == Some(&json!(plan.key_short)))
+            })
+            .cloned();
+        json!({
+            "upstream": upstream,
+            "counters": hub.pointer(&format!("/counters/{}", plan.key_short)),
+            "unhealthy_seconds_left": hub.pointer(&format!("/unhealthy_seconds_left/{}", plan.key_short)),
+        })
+    };
     if options.json {
         let entries: Vec<Value> = plans
             .iter()
@@ -466,7 +495,7 @@ fn run_status(args: &[String]) -> u8 {
                     "plan": plan.as_ref().ok(),
                     "plan_error": plan.as_ref().err(),
                     "counters": counters.get(&entry.name),
-                    "hub": Value::Null,
+                    "hub": hub_entry(plan),
                 })
             })
             .collect();
@@ -477,14 +506,20 @@ fn run_status(args: &[String]) -> u8 {
             "shadowed": loaded.shadowed,
             "repository_trust": loaded.repository_trust,
             "entries": entries,
-            "hub": {
-                "state": "not_available",
-                "detail": "this build has no shared hub; every connect runs its own server",
+            "hub": match &hub {
+                Some(hub) => json!({
+                    "state": "running",
+                    "pid": hub.get("pid"),
+                    "build": hub.get("build"),
+                    "upstreams": hub.get("upstreams"),
+                }),
+                None => json!({"state": "not_running"}),
             },
             "events_file": directory.as_ref().map(|directory| directory.join(telemetry::EVENTS_FILE)),
             "phases_ms": {
                 "config_load": config_ms,
                 "plans": plan_ms,
+                "hub": hub_ms,
                 "total": elapsed_ms(started),
             },
         });
@@ -553,7 +588,16 @@ fn run_status(args: &[String]) -> u8 {
             trust.path.display()
         );
     }
-    println!("hub: not available in this build; every connect runs its own server");
+    match &hub {
+        Some(hub) => println!(
+            "hub: running (pid {}), {} upstream(s)",
+            hub.get("pid").and_then(Value::as_u64).unwrap_or(0),
+            hub.get("upstreams")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len)
+        ),
+        None => println!("hub: not running (started by the first shared connect)"),
+    }
     exit_status::SUCCESS
 }
 
@@ -890,4 +934,36 @@ fn confirm_on_terminal(sha256: &str) -> Result<&'static str, (&'static str, Stri
         return Err(("declined", "the confirmation was not given".to_string()));
     }
     Ok("terminal")
+}
+
+/// `aethyme mcp hub serve <directory>`: the hub process `connect` starts.
+fn run_hub(args: &[String]) -> u8 {
+    let [command, directory] = args else {
+        return report_error(
+            false,
+            "usage",
+            "use `aethyme mcp hub serve <directory>` (started by `connect`)",
+            exit_status::USAGE,
+        );
+    };
+    if command != "serve" {
+        return report_error(
+            false,
+            "usage",
+            "the only hub command is `serve`",
+            exit_status::USAGE,
+        );
+    }
+    let config = super::hub::HubConfig::production(std::path::Path::new(directory));
+    match super::hub::serve(config) {
+        Ok(()) => exit_status::SUCCESS,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!("aethyme mcp hub: {error}");
+            exit_status::REFUSED
+        }
+        Err(error) => {
+            eprintln!("aethyme mcp hub: {error}");
+            exit_status::ENVIRONMENT
+        }
+    }
 }

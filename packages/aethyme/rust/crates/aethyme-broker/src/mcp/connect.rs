@@ -20,7 +20,8 @@ use std::process::Command;
 use std::time::Instant;
 
 use super::checkouts::GitCheckouts;
-use super::config::{self, Entry, Scope, Sources, Transport};
+use super::config::{self, Entry, Mode, Scope, Sources, Transport};
+use super::hub_client::{self, Attach};
 use super::key::{self, Caller, CopyKind, Plan};
 use super::resolve::{is_executable_file, is_shell, read_shebang, search_path};
 use super::telemetry::{self, Event};
@@ -387,7 +388,29 @@ fn run_inner(args: &[String]) -> u8 {
             exit_status::REFUSED,
         );
     }
-    let plan = match key::plan(entry, &caller, &checkouts) {
+    let planned = match key::plan(entry, &caller, &checkouts) {
+        // A shared server whose identity cannot be taken starts privately.
+        Err(failure)
+            if entry.mode == Mode::Shared
+                && matches!(
+                    failure.code,
+                    "entry_directory_identity_failed" | "source_identity_failed"
+                ) =>
+        {
+            eprintln!(
+                "aethyme mcp: {}: {} ({}); starting a private server",
+                parsed.name, failure.message, failure.code
+            );
+            recorder
+                .warnings
+                .push(format!("hub_fallback:{}", failure.code));
+            let mut direct = entry.clone();
+            direct.mode = Mode::Direct;
+            key::plan(&direct, &caller, &checkouts)
+        }
+        other => other,
+    };
+    let plan = match planned {
         Ok(plan) => plan,
         Err(failure) => {
             recorder.phases.extend(
@@ -454,6 +477,49 @@ fn run_inner(args: &[String]) -> u8 {
                 plan.name,
                 change.changes.join(", ")
             );
+        }
+    }
+    if plan.mode == Mode::Shared && plan.transport == Transport::Stdio {
+        let blocked = if caller.key_secret_error.is_some() {
+            Some("key_secret_unavailable".to_string())
+        } else if !plan.key_complete {
+            Some("key_incomplete".to_string())
+        } else {
+            None
+        };
+        let fallback = match blocked {
+            Some(reason) => Some(reason),
+            None => {
+                // One `hub` event per attempt, written before the session
+                // starts (an agent may kill this process at the end).
+                recorder.record("hub", None, Some(&plan), false);
+                match hub_client::attach(&plan, hub_client::ATTACH_BUDGET) {
+                    Attach::Done(code) => return code,
+                    Attach::Private(reason) => Some(reason),
+                    Attach::Replay {
+                        reason,
+                        consumed,
+                        input,
+                    } => {
+                        eprintln!(
+                            "aethyme mcp: {}: the shared hub cannot serve this client ({reason}); \
+                             running a private server",
+                            plan.name
+                        );
+                        recorder.warnings.push(format!("hub_fallback:{reason}"));
+                        recorder.record("exec", Some("hub_replay"), Some(&plan), false);
+                        return hub_client::replay_private(&plan, &consumed, input);
+                    }
+                }
+            }
+        };
+        if let Some(reason) = fallback {
+            eprintln!(
+                "aethyme mcp: {}: the shared hub is not used ({reason}); starting a private \
+                 server",
+                plan.name
+            );
+            recorder.warnings.push(format!("hub_fallback:{reason}"));
         }
     }
     recorder.record("exec", None, Some(&plan), false);

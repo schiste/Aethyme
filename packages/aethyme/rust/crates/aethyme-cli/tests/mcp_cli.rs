@@ -577,3 +577,107 @@ cwd = \".\"
     assert_eq!(status["shadowed"], serde_json::json!(["shared-name"]));
     assert_eq!(status["repository_trust"]["trusted"], false);
 }
+
+const HUB_FAKE_SERVER: &str = r#"#!/bin/sh
+printf 'started %s\n' "$$" >> "$FAKE_LOG"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  method=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
+  case "$method" in
+    initialize)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"capabilities":{"tools":{}},"protocolVersion":"2025-06-18","serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
+    tools/call)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"text":"%s"}}\n' "$id" "$$" ;;
+  esac
+done
+"#;
+
+/// One agent session through `connect`: initialize, one call, then leave.
+fn hub_session(fixture: &Fixture) -> (String, String) {
+    use std::io::{BufRead, Write};
+    let mut child = fixture
+        .command(&["mcp", "connect", "example-shared"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}\n\
+              {\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n\
+              {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"pid\",\"arguments\":{}}}\n",
+        )
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut pid = String::new();
+    while let Ok(line) = receiver.recv_timeout(std::time::Duration::from_secs(30)) {
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if value["id"] == 2 {
+            pid = value["result"]["text"].as_str().unwrap().to_string();
+            break;
+        }
+    }
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    (pid, String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+#[test]
+fn shared_connects_reach_one_upstream_through_the_hub() {
+    let fixture = Fixture::new();
+    let script = fixture.work.join("fake-server.sh");
+    write_executable(&script, HUB_FAKE_SERVER);
+    let log = fixture.work.join("fake.log");
+    std::fs::write(
+        fixture.work.join("server.env"),
+        format!("FAKE_LOG={}\n", log.display()),
+    )
+    .unwrap();
+    fixture.services(&format!(
+        "[[servers]]\nname = \"example-shared\"\nmode = \"shared\"\nargv = [{:?}]\ncwd = {:?}\nenv_file = \"server.env\"\n",
+        script.display().to_string(),
+        fixture.work.display().to_string(),
+    ));
+    let (first, first_stderr) = hub_session(&fixture);
+    let (second, _) = hub_session(&fixture);
+    assert!(!first.is_empty(), "{first_stderr}");
+    assert_eq!(first, second, "both sessions must reach the same upstream");
+    assert_eq!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .matches("started ")
+            .count(),
+        1
+    );
+    assert!(first_stderr.contains("using stable copy"), "{first_stderr}");
+
+    let hub_dir = fixture.state.join("mcp/hub");
+    let pids: Vec<String> = std::fs::read_dir(&hub_dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "pid"))
+        .map(|path| std::fs::read_to_string(path).unwrap().trim().to_string())
+        .collect();
+    assert_eq!(pids.len(), 1, "one hub per build");
+    let status = json(&fixture.run(&["mcp", "status", "--json"]));
+    assert_eq!(status["hub"]["state"], "running");
+    assert_eq!(
+        status["entries"][0]["hub"]["upstream"]["pid"].to_string(),
+        first
+    );
+    // Stop this test's own hub; its upstream ends with its input.
+    let killed = Command::new("kill").arg(&pids[0]).status().unwrap();
+    assert!(killed.success());
+}
