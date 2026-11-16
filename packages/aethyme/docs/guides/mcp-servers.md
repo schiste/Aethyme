@@ -300,8 +300,13 @@ agent to the host's hub instead of starting its own server:
   arguments). Resource subscriptions are reference-counted: the upstream is
   subscribed on the first agent's `resources/subscribe` and unsubscribed on
   the last agent's `resources/unsubscribe` or disconnect, and
-  `notifications/resources/updated` reaches only that URI's subscribers.
-  `*/list_changed` notifications reach every agent of the key.
+  `notifications/resources/updated` reaches only that URI's subscribers; a
+  first subscribe the upstream refuses leaves nobody subscribed. After a
+  restart the hub subscribes the new process to every URI still followed; a
+  refused renewal sends those agents `notifications/resources/list_changed`
+  so they re-read. Only `tools`, `prompts` and `resources` `list_changed`
+  notifications reach every agent of the key; other server notifications may
+  be session-scoped and are dropped (and counted).
 - Request ids and progress tokens are rewritten to hub-unique numbers and
   mapped back per client, keeping their type; a client reusing an id still in
   flight gets an error for the second request, and a JSON-RPC batch gets an
@@ -316,17 +321,28 @@ agent to the host's hub instead of starting its own server:
   a client that cannot even receive that error is disconnected. It restarts
   with exponential backoff from 1 to 60 seconds and is initialized again;
   requests arriving meanwhile are held and sent once it is ready, after
-  `notifications/tools/list_changed`. Five crashes within five minutes, an
-  initialize that does not answer within 30 seconds, or an upstream that
-  cannot be registered as a host resource lease mark the key unhealthy for
-  ten minutes; its clients are disconnected and new ones start private
-  servers.
+  `notifications/tools/list_changed`. A restart's initialize has the same 30
+  second deadline; a timeout or an error reply fails the held requests
+  retryably and counts as a crash. It re-initializes with the protocol
+  version the first client asked for, or the one the upstream negotiated.
+  Five crashes within five minutes, an initialize that does not answer
+  within 30 seconds, or an upstream that cannot be registered as a host
+  resource lease mark the key unhealthy for ten minutes; its clients are
+  disconnected and new ones start private servers. Unhealthy marks are
+  persisted in `<host state>/mcp/hub/unhealthy.json`, honoured by the next
+  hub (of any build) and checked by `connect` before it attaches.
 - Each upstream runs in its own process group, registered as a host
-  resource lease held by the hub, and its pid, group and start time are
-  recorded under the hub directory. On SIGTERM, SIGINT or SIGHUP the hub
-  stops every upstream group before exiting; a hub that starts finds the
-  records an earlier one left and stops those groups only when pid and start
-  time both still match. On Linux upstreams also get a parent-death signal.
+  resource lease held by the hub, and its pid, group, session and start time
+  are recorded under the hub directory with the owning hub's pid, start time
+  and build. On SIGTERM, SIGINT or SIGHUP the hub stops every upstream group
+  before exiting (and never signals a group whose leader it already reaped).
+  A hub that starts reaps a record only when its owner hub is proven dead
+  (pid gone, or the pid now has another start time) and the group's leader
+  still has the recorded pid and start time; a record whose owner still runs
+  (an older build draining) or cannot be judged is left alone, and a group
+  whose leader is gone is left too (its members cannot be proven) and
+  counted. On Linux upstreams get a parent-death signal and refuse to start
+  if the hub is already gone.
 - An upstream stops ten minutes after its last client leaves; the hub exits
   a minute after it has no upstream (or a minute after starting, if nothing
   attaches). Nothing is pre-warmed, and the hub sleeps until its next
