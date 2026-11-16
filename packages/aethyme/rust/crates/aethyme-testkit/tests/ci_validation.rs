@@ -745,11 +745,7 @@ fn macos_tests_run_the_workspace_suite_per_release() {
     let oss = workflow("oss-ci.yml");
     assert_eq!(
         block(&macos, "on:"),
-        [
-            "  push:",
-            "    tags: [\"v*\"]",
-            "  workflow_dispatch:"
-        ]
+        ["  push:", "    tags: [\"v*\"]", "  workflow_dispatch:"]
     );
     assert_eq!(block(&macos, "permissions:"), ["  contents: read"]);
     assert!(macos.contains("  group: macos-tests-${{ github.ref }}\n  cancel-in-progress: true"));
