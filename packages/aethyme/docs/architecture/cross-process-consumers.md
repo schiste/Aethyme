@@ -58,6 +58,25 @@ The exact wire schema, permission rules and staged migration are documented in
 [broker-service.md](broker-service.md). Initial external consumers are manual
 operators; no installed hook, scheduled task or application is migrated yet.
 
+## Opt-in MCP server launching (`aethyme mcp`)
+
+`aethyme mcp connect <name> [--from-worktree] [--fallback-cwd <dir>]
+[--fallback -- <command...>]` is meant to be the command an agent's MCP
+configuration runs. It replaces its own process with the resolved server, so
+its stdout is the server's protocol stream and everything it says goes to
+stderr; a missing entry exits 3, a failed resolution 6, and `--fallback` runs
+the given command instead. `aethyme mcp resolve <name> [--json]`
+(`aethyme.mcp-resolve/v1`), `aethyme mcp status [--json]`
+(`aethyme.mcp-status/v1`) and `aethyme mcp config print --agent codex|claude`
+are read-only operator surfaces; refusals under `--json` are
+`aethyme.mcp-error/v1`. Its inputs are `<host state>/mcp/services.toml` and
+`.aethyme/mcp.toml` (`schema = 1`); it writes only
+`<host state>/mcp/events.jsonl` and `<host state>/mcp/resolved/`. Nothing
+installs it: the external consumers are agent configurations an owner edits
+by hand from `config print`, so renaming `connect` or its flags breaks those
+configurations (the fallback keeps the agent working only while `aethyme mcp
+connect` itself still parses). See [the guide](../guides/mcp-servers.md).
+
 The `service::jobs::JobStore` library adds a separate explicitly opened
 SQLite job file (application ID `0x41534a31`, schema 1), durable idempotency keys,
 atomic deduplication and fenced job state transitions. It has no CLI or socket
