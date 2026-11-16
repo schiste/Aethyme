@@ -4,6 +4,44 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.110] - 2026-11-16
+
+### Fixed
+
+- The background cleanup worker no longer stops for ten minutes whenever macOS memory pressure is at the warning level. Warning (or an unreadable level) now throttles like load: one checkout removal per slice, then a gap of at least two minutes per repository (`memory_warning_throttled`). Only critical pressure stops unattended deletion (#1711).
+- Session retirement runs in every background worker run. It no longer waits for the host deleter slot, keeps at least 30 seconds even when removal overruns the run, waits up to 5 seconds for the GC lock (never ahead of a waiting foreground command) and retries a held lock after one minute instead of ten (#1711).
+- `status`, `agents` and the other commands that reconcile agents no longer re-judge every live session on every call. Sessions inside the abandonment window, and sessions kept for recent activity until that activity plus the window (at most one window ahead), are skipped (`agents_view_abandonment_not_due`, `retirement_not_due_memo_skips`) (#1711).
+- `broker status` and `broker agents` no longer fail to read the process table and report holders as unknown. Long-lived spawns are serialized with bounded captures, and a capture's deadline no longer includes the wait for the spawn lock (#1711).
+- A detached worker that finds another worker running exits successfully instead of with exit 1, and takes its lock before probing Git (#1711).
+- `gc reclaim plan` without `--session` no longer runs for many minutes on a large worktree root. It stops finding candidates after 60 seconds plus the worktree in progress (the plan is then partial: `"confirmable": false`, no review snapshot, no digest in the human output, and apply refuses it) and gives sizing 20 seconds in total, reclaimable candidates first. Candidates not measured in time stay listed with `"bytes": null` and are counted in `sizing.unmeasured`; `--full-scan` lifts both budgets (#1708, #1713).
+- Whole-root reclaim plans share work: a plan reuses sizes measured in the last 90 seconds, measuring plans share their sizes every 5 seconds, and a budgeted plan started while another runs waits for it within its own budget. A marker left by a dead process is removed automatically, and never a live plan's marker (#1708, #1713).
+- The `host.disk-low` and `host.gate-headroom` advice suggests `aethyme broker gc reclaim plan --session <id>` first (#1708).
+- A confirmed GC journal no longer wedges on `.aethyme/logs/command-metrics.jsonl`. Apply drops only rows older than the reviewed cutoff from whatever the log holds now, keeping rows appended since the plan and malformed lines byte for byte. Journals written by earlier binaries resume the same way instead of failing with "reviewed artifact drifted" on every command (#1715).
+- A gate log whose content changed after review is retained, never deleted, and listed under `files_skipped`; the rest of the journal completes. A metrics trim that cannot take its lock or keeps seeing concurrent appends is skipped the same way (#1715).
+- An open-time GC resume that fails because the journal is invalid warns once, naming `gc apply --confirm` and `gc abandon --confirm`, and is retried only after 15 minutes or when the journal changes. A busy GC lock, a busy database or an I/O error is retried on the next open as before (#1715).
+- `gc abandon` help no longer says it accepts only schema 2 or 3 journals; it accepts schema 4 (#1715).
+
+### Changed
+
+- Upgrade note: the GC plan digest binds the metrics-log rewrite as "rows older than the age cutoff", not the file's hashes, so rows appended between `gc plan` and `gc apply` keep the digest. A plan containing that rewrite has a different digest from the one an earlier binary printed; review it again once (#1715).
+- Upgrade note: in `gc reclaim plan --json`, a candidate's `bytes` can be `null` for a whole-root plan, and `reclaimable_bytes` and `total_bytes` are then lower bounds (#1708).
+- Command-metric appends take a shared lock on `.aethyme/run/command-metrics.lock`; the GC trim takes it exclusively, watches the replaced file for 250 ms after its rename to copy rows from writers that do not take the lock, and removes temporaries an interrupted trim left. No row is lost once every running binary is 0.8.110 or later; an older binary writing during a trim has a narrow window in which one row can be lost (#1715).
+- `memory_backoff` now means critical memory pressure only, and sessions skipped as not due are no longer counted in `abandonment_examined` (#1711).
+- CI: merges to main run Linux only. The macOS suite runs on a release tag or on request, and the Windows smoke on request; the release workflow still builds every platform (#1714).
+
+### Added
+
+- `reclaim plan --json` gains `confirmable`, `discovery {complete, budget_ms, worktrees_scanned, worktrees_not_scanned, elapsed_ms}` and `sizing {budget_ms, measured, reused, unmeasured, budget_exhausted, deferred_to, elapsed_ms}`. Every plan records a `reclaim.plan` row and every apply a `reclaim.apply` row (refusals included) in `command-metrics.jsonl`, with phase timings and counts (#1708, #1713).
+- `AETHYME_RECLAIM_PLAN_DISCOVERY_BUDGET_MS` and `AETHYME_RECLAIM_PLAN_SIZING_BUDGET_MS` shorten, never lengthen, the whole-root plan budgets; `--full-scan` ignores them (#1713).
+- `files_skipped` (`path`, `reason`) in the `gc apply` report and journal; broker meta keys `gc_journal_resume_failure` and `auto_cleanup.session_retirement_not_due` (#1715, #1711).
+- Counters for the memory warning throttle, the worker's retirement share, retirement GC-lock waits and yields, not-due memo skips, agents-view skips, spawn-lock waits, the metrics trim (`gc_metrics_trim_*`), drifted file skips and journal resume backoff (#1711, #1715).
+
+### Known issues
+
+- An interrupted `gc reclaim plan` records no metrics row.
+- The two-minute gap at memory warning is per repository, so several repositories can each remove one checkout in the same two minutes.
+- A gate log skipped as drifted stays on disk after its rows are removed and is not collected later.
+
 ## [0.8.109] - 2026-11-16
 
 ### Fixed
