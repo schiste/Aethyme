@@ -30,6 +30,19 @@ pub(crate) const CLOSE_REASON_LANDED: &str = "landed";
 pub(crate) const CLOSE_REASON_INACTIVE_NO_PULL_REQUEST: &str = "inactive_no_pull_request";
 /// The abandonment window elapsed for a session with a pull request.
 pub(crate) const CLOSE_REASON_INACTIVE: &str = "inactive";
+/// Closed by `session_no_work_abandoned_after_hours`: the session never did
+/// any work (HEAD still its diff base, clean checkout) and its holder is gone.
+pub(crate) const CLOSE_REASON_INACTIVE_NO_WORK: &str = "inactive_no_work";
+
+/// `payload` with its `close_reason` replaced by `close_reason`.
+pub(crate) fn with_close_reason(payload: &str, close_reason: &str) -> String {
+    let mut value: Value =
+        serde_json::from_str(payload).unwrap_or_else(|_| Value::Object(Default::default()));
+    if let Value::Object(fields) = &mut value {
+        fields.insert("close_reason".into(), json!(close_reason));
+    }
+    value.to_string()
+}
 
 /// The pull requests recorded for one session, from
 /// `BrokerStore::session_pull_request_merges`.
@@ -218,6 +231,10 @@ fn close_reason_basis(payload: &Value) -> String {
             } else {
                 ""
             }
+        ),
+        Some(CLOSE_REASON_INACTIVE_NO_WORK) => format!(
+            "it never committed past its diff base, its checkout was clean, its agent was \
+             gone and it was inactive for {idle}"
         ),
         _ => format!("it was inactive for {idle} with no live agent"),
     }
@@ -1919,6 +1936,277 @@ mod lane_tests {
         assert!(is_open(&broker, session.id));
     }
 
+    /// A session started but never committed to: HEAD is its diff base.
+    fn no_work_session(broker: &mut crate::Broker, label: &str) -> (crate::Session, PathBuf) {
+        let session = broker.start_worktree(label, None).unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        (session, worktree)
+    }
+
+    fn close_no_work_directly(
+        broker: &mut crate::Broker,
+        session: &crate::Session,
+        table: &mut crate::session_holder::RecordedHolderProcessTable,
+    ) -> crate::broker::AbandonedSessionCloseOutcome {
+        broker
+            .try_close_no_work_session(session.id, now_ms(), 4 * HOUR_MS, table, true, None)
+            .unwrap()
+    }
+
+    /// A no-work session whose holder died with the previous boot (an hour
+    /// ago, so past the stale grace), quiet for five hours, closes by the
+    /// no-work window with its own close reason and counter; quiet for three
+    /// hours it is not due yet. Without the lane both stay open until 72 h.
+    #[test]
+    fn a_session_that_never_worked_closes_after_four_quiet_hours() {
+        let (_owner, _storage, mut broker) = fixture("");
+        crate::host_boot::set_boot_time_ms_for_tests(Some(now_ms() - HOUR_MS));
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+
+        let (recent, _) = no_work_session(&mut broker, "no work, three quiet hours");
+        quiet(&mut broker, &recent, 3);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        let recent_outcome = close_no_work_directly(&mut broker, &recent, &mut table);
+
+        let (idle, worktree) = no_work_session(&mut broker, "no work, five quiet hours");
+        quiet(&mut broker, &idle, 5);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        let idle_outcome = close_no_work_directly(&mut broker, &idle, &mut table);
+
+        let (by_status, _) = no_work_session(&mut broker, "no work, closed by a status read");
+        quiet(&mut broker, &by_status, 5);
+        broker.agents(now_ms()).unwrap();
+        crate::host_boot::set_boot_time_ms_for_tests(None);
+
+        assert_eq!(
+            recent_outcome,
+            crate::broker::AbandonedSessionCloseOutcome::NotDue
+        );
+        assert!(is_open(&broker, recent.id));
+        assert_eq!(
+            idle_outcome,
+            crate::broker::AbandonedSessionCloseOutcome::Closed
+        );
+        assert!(!is_open(&broker, idle.id));
+        assert_eq!(
+            close_payload(&broker, idle.id)["close_reason"],
+            super::CLOSE_REASON_INACTIVE_NO_WORK
+        );
+        assert!(worktree.exists(), "closing deletes nothing");
+        assert!(
+            !is_open(&broker, by_status.id),
+            "the foreground pass judges a no-work session at four hours"
+        );
+        assert_eq!(phase_count(&recorder, "session_closed_no_work"), 2);
+        assert_eq!(
+            phase_count(&recorder, "session_no_work_kept_recent_activity"),
+            1
+        );
+    }
+
+    /// At five quiet hours, each single failing condition keeps the session
+    /// and is counted under its own reason.
+    #[test]
+    fn a_session_failing_one_no_work_condition_is_kept() {
+        use crate::broker::AbandonmentKeepReason as Reason;
+        let (_owner, _storage, mut broker) = fixture("");
+        crate::host_boot::set_boot_time_ms_for_tests(Some(now_ms() - HOUR_MS));
+        let mut kept = Vec::new();
+        let mut judge = |broker: &mut crate::Broker,
+                         session: &crate::Session,
+                         mut table: crate::session_holder::RecordedHolderProcessTable,
+                         expected: Reason| {
+            let outcome = close_no_work_directly(broker, session, &mut table);
+            kept.push((
+                session.task.clone(),
+                outcome,
+                table.keep_reason(),
+                expected,
+                is_open(broker, session.id),
+            ));
+        };
+
+        let (committed, _) = session(&mut broker, "one commit ahead", false);
+        quiet(&mut broker, &committed, 5);
+        judge(
+            &mut broker,
+            &committed,
+            Default::default(),
+            Reason::NoWorkSessionCommits,
+        );
+
+        let (dirty, dirty_tree) = no_work_session(&mut broker, "untracked file");
+        std::fs::write(dirty_tree.join("draft.txt"), "draft\n").unwrap();
+        quiet(&mut broker, &dirty, 5);
+        judge(
+            &mut broker,
+            &dirty,
+            Default::default(),
+            Reason::NoWorkWorktreeDirty,
+        );
+
+        let (alive, _) = no_work_session(&mut broker, "holder still running");
+        let table = held_by_live_holder(&mut broker, &alive, &live_holder(), 5);
+        judge(&mut broker, &alive, table, Reason::NoWorkHolderAlive);
+
+        let (unbound, _) = no_work_session(&mut broker, "no holder ever recorded");
+        age(&mut broker, &unbound, 5);
+        judge(
+            &mut broker,
+            &unbound,
+            Default::default(),
+            Reason::NoWorkHolderUnbound,
+        );
+
+        let (open_pr, _) = no_work_session(&mut broker, "pull request open");
+        link_pull_request(&mut broker, open_pr.id, 21, None);
+        quiet(&mut broker, &open_pr, 5);
+        judge(
+            &mut broker,
+            &open_pr,
+            Default::default(),
+            Reason::NoWorkPullRequestOpen,
+        );
+
+        let (claimed, _) = no_work_session(&mut broker, "explicit claim");
+        broker
+            .store()
+            .claim_lease(claimed.id, "base.txt", None)
+            .unwrap();
+        quiet(&mut broker, &claimed, 5);
+        judge(
+            &mut broker,
+            &claimed,
+            Default::default(),
+            Reason::NoWorkExplicitClaim,
+        );
+
+        let (running, _) = no_work_session(&mut broker, "guarded command running");
+        left_receipt(
+            &mut broker,
+            running.id,
+            "4123456789abcdef0123456789abcdef",
+            "running",
+            now_ms(),
+        );
+        quiet(&mut broker, &running, 5);
+        judge(
+            &mut broker,
+            &running,
+            Default::default(),
+            Reason::OperationUnresolved,
+        );
+
+        let (preparing, preparing_tree) = no_work_session(&mut broker, "preparation running");
+        std::fs::create_dir_all(preparing_tree.join(".aethyme")).unwrap();
+        std::fs::write(
+            preparing_tree.join(".aethyme/prepare.toml"),
+            "schema_version = 1\n\n[[steps]]\nname = \"deps\"\ncommand = [\"sh\", \"-c\", \"true\"]\ninputs = []\noutputs = [\"out/\"]\nrequired_for_hooks = false\n",
+        )
+        .unwrap();
+        let preparation_dir = broker.main_root().join(".aethyme/run/preparation");
+        std::fs::create_dir_all(&preparation_dir).unwrap();
+        std::fs::write(
+            preparation_dir.join(format!("session-{}.json", preparing.id)),
+            serde_json::json!({
+                "schema_version": 1,
+                "session_id": preparing.id,
+                "state": "in_progress",
+                "digest": "fixture-digest",
+                "source_digest": "fixture-source",
+                "started_at": now_ms(),
+                "completed_at": null,
+                "failed_step": null,
+                "exit_code": null,
+                "host_lease_id": null,
+                "host_lease_generation": null,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        quiet(&mut broker, &preparing, 5);
+        judge(
+            &mut broker,
+            &preparing,
+            Default::default(),
+            Reason::PreparationInProgress,
+        );
+
+        // Unreadable pull-request state does not qualify: the table the
+        // links are read from is gone.
+        let (unknown_pr, _) = no_work_session(&mut broker, "pull request state unknown");
+        quiet(&mut broker, &unknown_pr, 5);
+        broker
+            .store()
+            .connection()
+            .execute_batch("DROP TABLE pull_request_milestones")
+            .unwrap();
+        judge(
+            &mut broker,
+            &unknown_pr,
+            Default::default(),
+            Reason::NoWorkPullRequestUnknown,
+        );
+        crate::host_boot::set_boot_time_ms_for_tests(None);
+
+        for (task, outcome, reason, expected, open) in kept {
+            assert_ne!(
+                outcome,
+                crate::broker::AbandonedSessionCloseOutcome::Closed,
+                "{task:?}"
+            );
+            assert_eq!(reason, Some(expected), "{task:?}");
+            assert!(open, "{task:?}");
+        }
+    }
+
+    /// A holder seen gone for the first time starts the stale grace: the
+    /// no-work lane waits for it, then closes.
+    #[test]
+    fn the_no_work_lane_waits_for_the_holders_stale_grace() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (session, _) = no_work_session(&mut broker, "holder just went away");
+        quiet(&mut broker, &session, 5);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_no_work_directly(&mut broker, &session, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::NotDue
+        );
+        assert_eq!(
+            table.keep_reason(),
+            Some(crate::broker::AbandonmentKeepReason::NoWorkHolderGoneRecently)
+        );
+        age_gone_event(&mut broker, &session, 20);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_no_work_directly(&mut broker, &session, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::Closed
+        );
+    }
+
+    /// `0` disables the no-work lane, and it never exceeds the main window.
+    #[test]
+    fn the_no_work_window_is_disabled_by_zero_and_clamped_to_the_main_window() {
+        let (_owner, _storage, broker) = fixture("");
+        assert_eq!(broker.no_work_window_ms(), 4 * HOUR_MS);
+        let (_owner, _storage, broker) = fixture("session_no_work_abandoned_after_hours = 0\n");
+        assert_eq!(broker.no_work_window_ms(), 0);
+        let (_owner, _storage, broker) = fixture("session_no_work_abandoned_after_hours = 100\n");
+        assert_eq!(broker.no_work_window_ms(), 72 * HOUR_MS);
+
+        let (_owner, _storage, mut broker) = fixture("session_no_work_abandoned_after_hours = 0\n");
+        crate::host_boot::set_boot_time_ms_for_tests(Some(now_ms() - HOUR_MS));
+        let (session, _) = no_work_session(&mut broker, "lane disabled");
+        quiet(&mut broker, &session, 5);
+        broker.agents(now_ms()).unwrap();
+        crate::host_boot::set_boot_time_ms_for_tests(None);
+        assert!(
+            is_open(&broker, session.id),
+            "a disabled lane closes nothing"
+        );
+    }
+
     /// An explicit lease whose holder runs keeps the session, even when the
     /// holder moved on and the checkout is clean, which alone would close it.
     #[test]
@@ -2085,6 +2373,15 @@ mod lane_tests {
             Reason::DatabaseBusy,
             Reason::PolicyUnavailable,
             Reason::LandedDeclined,
+            Reason::NoWorkSessionCommits,
+            Reason::NoWorkWorktreeDirty,
+            Reason::NoWorkHolderUnbound,
+            Reason::NoWorkHolderAlive,
+            Reason::NoWorkHolderGoneRecently,
+            Reason::NoWorkExplicitClaim,
+            Reason::NoWorkMergeQueue,
+            Reason::NoWorkPullRequestOpen,
+            Reason::NoWorkPullRequestUnknown,
             Reason::Unrecorded,
         ];
         // A new reason must be added to `every` above.
@@ -2128,6 +2425,15 @@ mod lane_tests {
                 | Reason::DatabaseBusy
                 | Reason::PolicyUnavailable
                 | Reason::LandedDeclined
+                | Reason::NoWorkSessionCommits
+                | Reason::NoWorkWorktreeDirty
+                | Reason::NoWorkHolderUnbound
+                | Reason::NoWorkHolderAlive
+                | Reason::NoWorkHolderGoneRecently
+                | Reason::NoWorkExplicitClaim
+                | Reason::NoWorkMergeQueue
+                | Reason::NoWorkPullRequestOpen
+                | Reason::NoWorkPullRequestUnknown
                 | Reason::Unrecorded => {}
             }
             assert_eq!(
