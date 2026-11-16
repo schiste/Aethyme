@@ -9,8 +9,9 @@
 //!
 //! The watcher never answers the question itself. Git stays the only source
 //! of the answer, so ignore rules, renames and staged changes keep Git's
-//! meaning. The watcher publishes one counter per worktree that moves whenever
-//! the file system reports any change under it. A command that scans a
+//! meaning. The watcher publishes one counter per worktree that moves when the
+//! file system reports a change under it that could outdate a stored answer
+//! (see the claim rule below). A command that scans a
 //! worktree stores Git's answer beside the counter it read *before* the scan;
 //! a later command reuses the answer only while the counter, the index file
 //! and the baseline commit are all the same and the watcher has been alive
@@ -23,12 +24,33 @@
 //!   or any mismatch means "unknown", and the command asks Git as before.
 //!   File events on an external volume do get dropped under bursts (8 of 5,000
 //!   in one probe on 2026-11-12), but the system flags the loss, and a flagged
-//!   loss moves every counter.
+//!   loss counts as a change to every worktree.
+//! - **No event filtering.** Every non-read event counts, including build
+//!   output and the Git directory: ignore rules (`.gitignore`, `info/exclude`,
+//!   `core.excludesFile`) decide what `ls-files --others --exclude-standard`
+//!   reports, and the watcher does not re-derive them. The claim rule makes
+//!   those events cheap instead.
 //! - **Bounded staleness, read-only commands only.** A counter is published up
-//!   to [`FLUSH_EVERY`] after the change, so a reused answer can be that much
-//!   older than a fresh one. Only commands that call
+//!   to [`COALESCE`] after the file system reports the change, so a reused
+//!   answer can be that much older than a fresh one. Only commands that call
 //!   [`allow_reuse_for_this_command`] reuse answers; anything that decides
 //!   whether work may land keeps asking Git.
+//! - **Publish only what a reader could act on.** A command that is about to
+//!   ask Git first writes a *claim*: the counter it observed. The watcher moves
+//!   a published counter only when a change arrives and a claim names that
+//!   counter. Without a claim no answer can be stored against the counter, and
+//!   a command that claims it later runs Git after the change, so its answer
+//!   already includes the change. A build writing thousands of files while
+//!   nobody asks therefore costs no writes at all (2026-11-16: the busiest
+//!   machine dirtied 34 GB in under an hour republishing counters).
+//! - **Bounded loop.** After the first event of a burst the watcher keeps
+//!   draining for [`COALESCE`] before it acts, so it runs at most
+//!   `1 / COALESCE` rounds a second and writes each counter at most once per
+//!   round.
+//! - **Status.** The watcher writes `status.json` in the watch directory at
+//!   most once every [`STATUS_EVERY`]: events received and coalesced, rounds,
+//!   reviews, counters written and skipped by reason, and the watched
+//!   worktrees.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,10 +75,28 @@ const WANTED: &str = "wanted";
 const SEEN: &str = "seen";
 #[cfg_attr(not(unix), allow(dead_code))]
 const ANSWERS: &str = "answers";
+/// `claims/<key>.<epoch>.<counter>`: an empty file saying a command observed
+/// that counter and is about to ask Git.
+#[cfg_attr(not(unix), allow(dead_code))]
+const CLAIMS: &str = "claims";
+#[cfg_attr(not(unix), allow(dead_code))]
+const STATUS: &str = "status.json";
 
-/// How often the watcher publishes counters that moved.
+/// How long the watcher waits for an event before it retries counters it
+/// could not write.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) const FLUSH_EVERY: Duration = Duration::from_millis(100);
+/// After the first event of a burst, how long the watcher keeps draining
+/// events before it acts. It bounds the watcher to `1 / COALESCE` rounds a
+/// second, and so every counter to that many writes a second.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) const COALESCE: Duration = Duration::from_millis(50);
+/// How often the watcher rewrites `status.json`.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) const STATUS_EVERY: Duration = Duration::from_secs(60);
+/// A temporary file this old was left by a process that died mid-write.
+#[cfg_attr(not(unix), allow(dead_code))]
+const STALE_TEMPORARY: Duration = Duration::from_secs(60);
 /// A stored answer older than this is asked again, whatever the counter says.
 #[cfg_attr(not(unix), allow(dead_code))]
 const ANSWER_MAX_AGE: Duration = Duration::from_secs(600);
@@ -127,11 +167,19 @@ pub(crate) fn changed_files_in(
         crate::phase_telemetry::add("changed_files_reused", Duration::ZERO);
         return Ok((files, Source::Reused));
     }
+    // The claim must land before Git runs: the watcher moves the counter on
+    // a later change only if it finds the claim, and a change it saw before
+    // the claim landed is one Git sees too. No claim, no stored answer.
+    let claimed = before
+        .as_ref()
+        .is_some_and(|observed| imp::claim(directory, observed));
     let files = {
         let _span = crate::phase_telemetry::span("changed_files_asked_git");
         checkout.changed_files(base)?
     };
-    if let Some(observed) = before {
+    if let Some(observed) = before
+        && claimed
+    {
         imp::write_answer(directory, &observed, &files);
     }
     Ok((files, Source::Git))
@@ -149,6 +197,9 @@ mod imp {
     pub(super) fn read_answer(_: &Path, _: &Observed) -> Option<Vec<String>> {
         None
     }
+    pub(super) fn claim(_: &Path, _: &Observed) -> bool {
+        false
+    }
     pub(super) fn write_answer(_: &Path, _: &Observed, _: &[String]) {}
     pub(super) fn request_supervisor() {}
 }
@@ -160,7 +211,7 @@ mod imp {
     use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::time::{Duration, Instant, SystemTime};
 
@@ -169,8 +220,8 @@ mod imp {
     use sha2::{Digest, Sha256};
 
     use super::{
-        ANSWER_MAX_AGE, ANSWERS, EPOCH, FLUSH_EVERY, LOCK, READY, SEEN, WANTED, WANTED_ACTIVE,
-        WANTED_KEEP, WANTED_REFRESH,
+        ANSWER_MAX_AGE, ANSWERS, CLAIMS, COALESCE, EPOCH, FLUSH_EVERY, LOCK, READY, SEEN,
+        STALE_TEMPORARY, STATUS, STATUS_EVERY, WANTED, WANTED_ACTIVE, WANTED_KEEP, WANTED_REFRESH,
     };
     use crate::environments::supervisor::{SupervisorWork, TickOutcome};
     use crate::file_lock::{ExclusiveFileLock, SharedFileLock, open_lock_file};
@@ -182,6 +233,13 @@ mod imp {
         token: String,
         base: String,
         index: IndexStamp,
+    }
+
+    #[cfg(test)]
+    impl Observed {
+        pub(crate) fn token(&self) -> &str {
+            &self.token
+        }
     }
 
     /// The identity of a worktree's index file. `git add`, `git rm --cached`
@@ -218,7 +276,7 @@ mod imp {
     }
 
     /// A stable file name for a canonical worktree path.
-    fn key_for(canonical: &Path) -> String {
+    pub(crate) fn key_for(canonical: &Path) -> String {
         let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
         digest[..12]
             .iter()
@@ -336,10 +394,52 @@ mod imp {
         same.then_some(answer.files)
     }
 
+    /// The claim file for one published counter of one worktree.
+    fn claim_name(key: &str, token: &str) -> String {
+        format!("{key}.{}", token.replace(':', "."))
+    }
+
+    pub(crate) fn claim_path(directory: &Path, observed: &Observed) -> PathBuf {
+        directory
+            .join(CLAIMS)
+            .join(claim_name(&observed.key, &observed.token))
+    }
+
+    /// Say "an answer may be stored against this counter" before asking Git.
+    /// The watcher moves a counter on a change only when the claim for it
+    /// exists; see [`Core::flush`]. False when the claim could not be made,
+    /// and the caller must then not store its answer.
+    ///
+    /// One file per counter, created and never rewritten: two commands that
+    /// observed the same counter share it, and a slow command claiming an
+    /// older counter cannot hide a newer command's claim. Whoever created the
+    /// file, it existed before this command asks Git.
+    pub(crate) fn claim(directory: &Path, observed: &Observed) -> bool {
+        let path = claim_path(directory, observed);
+        let create = || {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+        };
+        let created = create().or_else(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                fs::create_dir_all(directory.join(CLAIMS))?;
+                create()
+            } else {
+                Err(error)
+            }
+        });
+        match created {
+            Ok(_) => true,
+            Err(error) => error.kind() == io::ErrorKind::AlreadyExists,
+        }
+    }
+
     /// Store Git's answer beside what was observed *before* Git ran. A change
-    /// during the scan moves the counter past the stored one, so the answer is
-    /// then never reused.
-    pub(super) fn write_answer(directory: &Path, observed: &Observed, files: &[String]) {
+    /// during the scan moves the counter past the stored one (the command
+    /// claimed it first), so the answer is then never reused.
+    pub(crate) fn write_answer(directory: &Path, observed: &Observed, files: &[String]) {
         let answer = Answer {
             token: observed.token.clone(),
             base: observed.base.clone(),
@@ -395,10 +495,260 @@ mod imp {
         });
     }
 
+    /// `.<name>.<pid>.<sequence>`, as [`write_atomically`] names its files.
+    fn is_temporary(name: &str) -> bool {
+        let Some(rest) = name.strip_prefix('.') else {
+            return false;
+        };
+        let mut parts = rest.rsplitn(3, '.');
+        let numeric = |part: Option<&str>| {
+            part.is_some_and(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        };
+        numeric(parts.next())
+            && numeric(parts.next())
+            && parts.next().is_some_and(|n| !n.is_empty())
+    }
+
+    /// Remove temporaries a process left behind when it died between writing
+    /// and renaming. Commands write temporaries here too, so only old ones go.
+    fn remove_stale_temporaries(directory: &Path) {
+        for folder in [
+            directory.to_path_buf(),
+            directory.join(WANTED),
+            directory.join(ANSWERS),
+        ] {
+            let Ok(entries) = fs::read_dir(&folder) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if !name.to_str().is_some_and(is_temporary) {
+                    continue;
+                }
+                let old = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age >= STALE_TEMPORARY);
+                if old {
+                    hint(fs::remove_file(entry.path()));
+                }
+            }
+        }
+    }
+
+    /// What the watcher did since it started. Kept in memory and written to
+    /// `status.json` at most once every [`STATUS_EVERY`], so it adds no
+    /// write load of its own.
+    #[derive(Default)]
+    pub(crate) struct Stats {
+        pub(crate) events_received: AtomicU64,
+        /// Events that arrived while a round was already draining a burst.
+        pub(crate) events_coalesced: AtomicU64,
+        /// Reads, which never move a counter.
+        pub(crate) events_ignored: AtomicU64,
+        /// Errors, flagged losses and watch-set changes: every worktree changed.
+        pub(crate) rescans: AtomicU64,
+        pub(crate) rounds: AtomicU64,
+        pub(crate) reviews: AtomicU64,
+        /// A newly watched worktree's first counter.
+        pub(crate) published_initial: AtomicU64,
+        /// A change arrived and a command had claimed the published counter.
+        pub(crate) published_claimed: AtomicU64,
+        /// A change arrived and nobody had claimed the published counter.
+        pub(crate) skipped_unclaimed: AtomicU64,
+        pub(crate) publish_failures: AtomicU64,
+        pub(crate) watched: AtomicU64,
+    }
+
+    impl Stats {
+        fn bump(counter: &AtomicU64) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn to_json(&self, epoch: &str) -> serde_json::Value {
+            let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+            serde_json::json!({
+                "epoch": epoch,
+                "updated_at_ms": now_ms(),
+                "events_received": read(&self.events_received),
+                "events_coalesced": read(&self.events_coalesced),
+                "events_ignored": read(&self.events_ignored),
+                "rescans": read(&self.rescans),
+                "rounds": read(&self.rounds),
+                "reviews": read(&self.reviews),
+                "published_initial": read(&self.published_initial),
+                "published_claimed": read(&self.published_claimed),
+                "skipped_unclaimed": read(&self.skipped_unclaimed),
+                "publish_failures": read(&self.publish_failures),
+                "watched": read(&self.watched),
+            })
+        }
+    }
+
     struct Watched {
         path: PathBuf,
-        counter: u64,
-        unpublished: bool,
+        /// The counter on disk in `seen/<key>`, once one was written.
+        published: Option<u64>,
+        /// A change arrived since the watcher last decided about this worktree.
+        changed: bool,
+    }
+
+    /// Everything the watcher decides, without the file-system watcher, so
+    /// tests can drive each ordering of changes, claims and answers.
+    pub(crate) struct Core {
+        epoch: String,
+        /// The last counter handed out. Shared by every worktree, so a
+        /// counter is never published twice in one epoch, not even for a
+        /// worktree that was forgotten and requested again.
+        sequence: u64,
+        watching: HashMap<String, Watched>,
+        pub(crate) stats: Arc<Stats>,
+    }
+
+    impl Core {
+        pub(crate) fn new(epoch: String, stats: Arc<Stats>) -> Self {
+            Self {
+                epoch,
+                sequence: 0,
+                watching: HashMap::new(),
+                stats,
+            }
+        }
+
+        pub(crate) fn watch(&mut self, key: String, path: PathBuf) {
+            self.watching.insert(
+                key,
+                Watched {
+                    path,
+                    published: None,
+                    changed: false,
+                },
+            );
+            self.stats
+                .watched
+                .store(self.watching.len() as u64, Ordering::Relaxed);
+        }
+
+        fn forget(&mut self, key: &str) -> Option<PathBuf> {
+            let removed = self.watching.remove(key).map(|watched| watched.path);
+            self.stats
+                .watched
+                .store(self.watching.len() as u64, Ordering::Relaxed);
+            removed
+        }
+
+        pub(crate) fn change_all(&mut self) {
+            Stats::bump(&self.stats.rescans);
+            for watched in self.watching.values_mut() {
+                watched.changed = true;
+            }
+        }
+
+        pub(crate) fn record(&mut self, event: notify::Result<notify::Event>) {
+            Stats::bump(&self.stats.events_received);
+            let event = match event {
+                Ok(event) if !event.need_rescan() => event,
+                // An error or a flagged loss: nothing is known about any worktree.
+                _ => {
+                    self.change_all();
+                    return;
+                }
+            };
+            // Reads are reported on Linux (inotify opens and closes), and a lease
+            // scan itself reads the worktree: only changes move a counter.
+            if matches!(event.kind, notify::EventKind::Access(_)) {
+                Stats::bump(&self.stats.events_ignored);
+                return;
+            }
+            for path in &event.paths {
+                for watched in self.watching.values_mut() {
+                    if path.starts_with(&watched.path) {
+                        watched.changed = true;
+                    }
+                }
+            }
+        }
+
+        /// Publish what a reader could act on, and nothing else.
+        ///
+        /// - A worktree with no counter on disk gets its first one.
+        /// - A changed worktree gets a new counter only if the claim for the
+        ///   published one exists. Every stored answer was claimed first
+        ///   (see [`super::changed_files_in`]), so without that claim no
+        ///   stored answer names the published counter and none can be
+        ///   reused. A command that claims it after this check runs Git after
+        ///   the change arrived here, so its answer includes the change: the
+        ///   change is settled either way and the worktree is marked clean.
+        /// - A claim that cannot be read counts as a claim.
+        pub(crate) fn flush(&mut self, directory: &Path) {
+            for (key, watched) in &mut self.watching {
+                let publish = match watched.published {
+                    None => Some(&self.stats.published_initial),
+                    Some(_) if !watched.changed => None,
+                    Some(published) => {
+                        let name = claim_name(key, &format!("{}:{published}", self.epoch));
+                        let claimed = match fs::symlink_metadata(directory.join(CLAIMS).join(name))
+                        {
+                            Ok(_) => true,
+                            Err(error) => error.kind() != io::ErrorKind::NotFound,
+                        };
+                        if claimed {
+                            Some(&self.stats.published_claimed)
+                        } else {
+                            Stats::bump(&self.stats.skipped_unclaimed);
+                            watched.changed = false;
+                            None
+                        }
+                    }
+                };
+                let Some(reason) = publish else {
+                    continue;
+                };
+                let next = self.sequence + 1;
+                let line = format!("{}:{next}", self.epoch);
+                if write_atomically(&directory.join(SEEN).join(key), line.as_bytes()).is_ok() {
+                    self.sequence = next;
+                    // The superseded counter's claim can go: no answer
+                    // stored against that counter is reusable any more.
+                    if let Some(old) = watched.published {
+                        let old = claim_name(key, &format!("{}:{old}", self.epoch));
+                        hint(fs::remove_file(directory.join(CLAIMS).join(old)));
+                    }
+                    watched.published = Some(next);
+                    watched.changed = false;
+                    Stats::bump(reason);
+                } else {
+                    // Kept marked: retried on the next round.
+                    Stats::bump(&self.stats.publish_failures);
+                }
+            }
+        }
+
+        /// Remove claims that name no currently published counter: those of
+        /// forgotten worktrees, and those a slow command made for a counter
+        /// that was already superseded. The claim for a published counter is
+        /// never removed, so this can never hide a claim [`Core::flush`] needs.
+        pub(crate) fn sweep_claims(&self, directory: &Path) {
+            let Ok(entries) = fs::read_dir(directory.join(CLAIMS)) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                let key = name.split('.').next().unwrap_or_default();
+                let current = self
+                    .watching
+                    .get(key)
+                    .and_then(|watched| watched.published)
+                    .map(|published| claim_name(key, &format!("{}:{published}", self.epoch)));
+                if current.as_deref() != Some(name.as_str()) {
+                    hint(fs::remove_file(entry.path()));
+                }
+            }
+        }
     }
 
     /// The watcher as one unit of supervisor work. It owns a thread, because
@@ -481,17 +831,19 @@ mod imp {
             .collect()
     }
 
-    fn publish(directory: &Path, epoch: &str, key: &str, watched: &mut Watched) {
-        let line = format!("{epoch}:{}", watched.counter);
-        if write_atomically(&directory.join(SEEN).join(key), line.as_bytes()).is_ok() {
-            watched.unpublished = false;
-        }
+    /// What a running watcher holds. Commands trust the directory only while
+    /// `ready.lock` is held, and it is taken only after the new epoch is on
+    /// disk.
+    pub(crate) struct Started {
+        _lock: ExclusiveFileLock,
+        _ready: ExclusiveFileLock,
+        pub(crate) epoch: String,
     }
 
-    /// Watch until `stop` is set. Returns at once when another watcher holds
-    /// the lock.
-    pub(crate) fn run(directory: &Path, stop: &AtomicBool) -> io::Result<()> {
-        for name in [WANTED, SEEN, ANSWERS] {
+    /// Take the watcher's locks and start a new epoch. `None` when another
+    /// watcher holds the lock, or `stop` was set while waiting for it.
+    pub(crate) fn start(directory: &Path, stop: &AtomicBool) -> io::Result<Option<Started>> {
+        for name in [WANTED, SEEN, ANSWERS, CLAIMS] {
             fs::create_dir_all(directory.join(name))?;
         }
         crate::host_state::protect_host_state_path(directory, true)?;
@@ -504,13 +856,18 @@ mod imp {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let Some(_lock) = lock else {
-            return Ok(());
+        let Some(lock) = lock else {
+            return Ok(None);
         };
-        // A new epoch outdates every counter and answer of earlier watchers.
-        for entry in fs::read_dir(directory.join(SEEN))?.flatten() {
-            hint(fs::remove_file(entry.path()));
+        // A new epoch outdates every counter, claim and answer of earlier
+        // watchers. Counters and claims are removed outright; only this
+        // watcher writes counters, and a claim naming an old epoch is inert.
+        for folder in [SEEN, CLAIMS] {
+            for entry in fs::read_dir(directory.join(folder))?.flatten() {
+                hint(fs::remove_file(entry.path()));
+            }
         }
+        remove_stale_temporaries(directory);
         let epoch = format!("{}-{}", std::process::id(), now_ms());
         write_atomically(&directory.join(EPOCH), epoch.as_bytes())?;
         // Only now may a command trust what it reads here. Between taking
@@ -525,114 +882,124 @@ mod imp {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let Some(_ready) = ready else {
+        let Some(ready) = ready else {
+            return Ok(None);
+        };
+        Ok(Some(Started {
+            _lock: lock,
+            _ready: ready,
+            epoch,
+        }))
+    }
+
+    /// Watch until `stop` is set. Returns at once when another watcher holds
+    /// the lock.
+    pub(crate) fn run(directory: &Path, stop: &AtomicBool) -> io::Result<()> {
+        run_with_stats(directory, stop, Arc::new(Stats::default()))
+    }
+
+    /// [`run`], counting into `stats`.
+    pub(crate) fn run_with_stats(
+        directory: &Path,
+        stop: &AtomicBool,
+        stats: Arc<Stats>,
+    ) -> io::Result<()> {
+        let Some(started) = start(directory, stop)? else {
             return Ok(());
         };
-
         let (sender, events) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(move |event| {
             hint(sender.send(event));
         })
         .map_err(io::Error::other)?;
-        let mut watching: HashMap<String, Watched> = HashMap::new();
+        let mut core = Core::new(started.epoch.clone(), stats);
         let mut next_review = Instant::now();
+        let mut next_status = Instant::now();
 
         while !stop.load(Ordering::Relaxed) {
             if Instant::now() >= next_review {
                 next_review = Instant::now() + Duration::from_secs(1);
-                review(directory, &mut watcher, &mut watching);
+                review(directory, &mut watcher, &mut core);
             }
-            let mut received = match events.recv_timeout(FLUSH_EVERY) {
-                Ok(event) => Some(event),
-                Err(RecvTimeoutError::Timeout) => None,
+            match events.recv_timeout(FLUSH_EVERY) {
+                Ok(event) => {
+                    core.record(event);
+                    coalesce(&events, &mut core)?;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(io::Error::other("file watcher closed its channel"));
                 }
-            };
-            let mut drained = 0;
-            while let Some(event) = received.take() {
-                record(&mut watching, event);
-                drained += 1;
-                if drained < 4096 {
-                    received = events.try_recv().ok();
-                }
             }
-            for (key, watched) in &mut watching {
-                if watched.unpublished {
-                    publish(directory, &epoch, key, watched);
-                }
+            core.flush(directory);
+            Stats::bump(&core.stats.rounds);
+            if Instant::now() >= next_status {
+                next_status = Instant::now() + STATUS_EVERY;
+                core.sweep_claims(directory);
+                write_status(directory, &core);
             }
         }
         Ok(())
     }
 
+    type Events = mpsc::Receiver<notify::Result<notify::Event>>;
+
+    /// Keep taking events for [`COALESCE`] after the first one of a round.
+    /// A round therefore lasts at least that long while events keep coming,
+    /// however many are queued: the loop never spins.
+    fn coalesce(events: &Events, core: &mut Core) -> io::Result<()> {
+        let deadline = Instant::now() + COALESCE;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            match events.recv_timeout(remaining) {
+                Ok(event) => {
+                    Stats::bump(&core.stats.events_coalesced);
+                    core.record(event);
+                }
+                Err(RecvTimeoutError::Timeout) => return Ok(()),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::other("file watcher closed its channel"));
+                }
+            }
+        }
+    }
+
+    fn write_status(directory: &Path, core: &Core) {
+        if let Ok(bytes) = serde_json::to_vec_pretty(&core.stats.to_json(&core.epoch)) {
+            hint(write_atomically(&directory.join(STATUS), &bytes));
+        }
+    }
+
     /// Start watching newly requested worktrees and stop watching forgotten ones.
-    fn review(
-        directory: &Path,
-        watcher: &mut notify::RecommendedWatcher,
-        watching: &mut HashMap<String, Watched>,
-    ) {
+    fn review(directory: &Path, watcher: &mut notify::RecommendedWatcher, core: &mut Core) {
+        Stats::bump(&core.stats.reviews);
         let wanted = wanted(directory);
         let mut changed_watch_set = false;
         for (key, path, age) in &wanted {
             let keep = *age < WANTED_KEEP && path.is_dir();
-            if keep && !watching.contains_key(key) {
+            if keep && !core.watching.contains_key(key) {
                 if watcher.watch(path, RecursiveMode::Recursive).is_ok() {
-                    watching.insert(
-                        key.clone(),
-                        Watched {
-                            path: path.clone(),
-                            counter: 0,
-                            unpublished: true,
-                        },
-                    );
+                    core.watch(key.clone(), path.clone());
                     changed_watch_set = true;
                 }
             } else if !keep {
-                if let Some(watched) = watching.remove(key) {
-                    hint(watcher.unwatch(&watched.path));
+                if let Some(path) = core.forget(key) {
+                    hint(watcher.unwatch(&path));
                     changed_watch_set = true;
                 }
-                hint(fs::remove_file(directory.join(SEEN).join(key)));
-                hint(fs::remove_file(directory.join(ANSWERS).join(key)));
-                hint(fs::remove_file(directory.join(WANTED).join(key)));
+                // Its claims go with the next sweep.
+                for folder in [SEEN, ANSWERS, WANTED] {
+                    hint(fs::remove_file(directory.join(folder).join(key)));
+                }
             }
         }
         // Changing the watch set can restart the underlying event stream, and
         // events in that gap are lost: treat every worktree as changed.
         if changed_watch_set {
-            change_all(watching);
-        }
-    }
-
-    fn change_all(watching: &mut HashMap<String, Watched>) {
-        for watched in watching.values_mut() {
-            watched.counter += 1;
-            watched.unpublished = true;
-        }
-    }
-
-    fn record(watching: &mut HashMap<String, Watched>, event: notify::Result<notify::Event>) {
-        let event = match event {
-            Ok(event) if !event.need_rescan() => event,
-            // An error or a flagged loss: nothing is known about any worktree.
-            _ => {
-                change_all(watching);
-                return;
-            }
-        };
-        // Reads are reported on Linux (inotify opens and closes), and a lease
-        // scan itself reads the worktree: only changes move a counter.
-        if matches!(event.kind, notify::EventKind::Access(_)) {
-            return;
-        }
-        for path in &event.paths {
-            for watched in watching.values_mut() {
-                if path.starts_with(&watched.path) {
-                    watched.counter += 1;
-                    watched.unpublished = true;
-                }
-            }
+            core.change_all();
         }
     }
 }
