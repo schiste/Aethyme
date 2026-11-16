@@ -1,6 +1,6 @@
 # Read-only resource-pressure diagnostics
 
-Last Updated: 2026-10-25
+Last Updated: 2026-11-16
 
 `aethyme broker advanced resources pressure --json` explicitly diagnoses
 inactive recorded session owners. Routine status, successful resource admission
@@ -16,7 +16,8 @@ The report schema is `aethyme.resource-pressure/v1`. All fields are present.
 closed sessions retained for inspection. It is not a count of running agents;
 cleaned historical rows are excluded.
 `groups` contains at most 20 inactive-owner groups, ranked by known process-tree
-RSS descending and then oldest inactivity. `omitted_groups` counts groups
+physical footprint descending, then known process-tree RSS descending, and then
+oldest inactivity. `omitted_groups` counts groups
 outside the display. Each group includes at most eight
 `inactive_session_ids`, with `omitted_inactive_sessions` counting the rest.
 
@@ -29,7 +30,17 @@ recorded holder roots also stop attribution to an inactive ancestor.
 `agent_tree_rss_bytes` sums process RSS assigned to the nearest matching
 recorded holder. It is not private memory, available memory, or a promise of
 reclaimable bytes. Shared resident pages can occur in several RSS values.
-`swap_bytes` is always null: this sampler does not measure swap. Unrecorded,
+`agent_tree_footprint_bytes` sums each process's physical footprint over the
+same tree: the kernel ledger's count of the process's private memory whether
+resident, compressed or swapped out (macOS `ri_phys_footprint`, the figure
+Activity Monitor's Memory column shows). On a host that is paging, RSS falls as
+pages are compressed and this does not, so it is the figure to rank memory
+holders by: measured on 2026-11-16 on a 16 GB host, 27 agent trees held 40.6 GB
+of footprint of which 36.7 GB was compressed or swapped, about a tenth of it
+visible as RSS. It is null on a platform without that ledger, and null for a
+tree containing any process the kernel refuses to report; a process that exited
+after the sample counts as zero. It is not a promise of reclaimable bytes.
+`swap_bytes` is always null: this sampler does not measure swap separately. Unrecorded,
 unavailable or mismatched identity yields unknown memory, represented by null,
 not zero. No command text, environment or holder start time is emitted.
 
