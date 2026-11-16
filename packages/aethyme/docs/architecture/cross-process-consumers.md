@@ -79,6 +79,15 @@ by hand from `config print`, so renaming `connect` or its flags breaks those
 configurations (the fallback keeps the agent working only while `aethyme mcp
 connect` itself still parses). See [the guide](../guides/mcp-servers.md).
 
+`aethyme mcp hub serve <directory>` is the internal hub process; its only
+consumer is `aethyme mcp connect` of the same build, which starts it and
+speaks a line-delimited JSON attach protocol over a 0600 socket in
+`<host state>/mcp/hub/` (versioned `"hub": 1`, build identity checked).
+`aethyme mcp trust` now records only after a terminal confirmation or
+`--yes --digest <sha256>`; its JSON adds `trusted`, `approval` and `reason`.
+`status --json` adds `hub` (state, pid, upstreams) and per entry
+`hub.upstream`, `hub.counters`.
+
 Managed servers add two more external consumers. `aethyme mcp intercept
 install` creates symlinks named after launchers (`npx`, `npm`, `pnpm`,
 `pnpx`, `bunx`, `yarn`) and managed executables that point at the `aethyme`

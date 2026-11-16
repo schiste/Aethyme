@@ -940,6 +940,7 @@ pub fn record(host: &Path, report: &Report, command_ms: u64) {
                 phases_ms: phases,
                 shadowed: false,
                 fallback: false,
+                warnings: Vec::new(),
             },
         ),
     );

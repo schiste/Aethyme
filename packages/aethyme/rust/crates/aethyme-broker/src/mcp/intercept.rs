@@ -478,6 +478,7 @@ fn record(call: &ShimCall, name: &str, outcome: &str, reason: Option<&str>) {
             phases_ms: phases,
             shadowed: false,
             fallback: false,
+            warnings: Vec::new(),
         },
     ) {
         // Nothing more to do: a shim never prints on its own behalf.

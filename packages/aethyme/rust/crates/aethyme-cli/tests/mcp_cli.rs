@@ -293,7 +293,7 @@ fn config_print_only_prints_snippets_for_each_agent() {
 }
 
 #[test]
-fn status_reports_entries_refusals_counters_and_no_hub() {
+fn status_reports_entries_refusals_counters_and_a_stopped_hub() {
     let fixture = Fixture::new();
     let script = fixture.work.join("server.sh");
     write_executable(&script, "#!/bin/sh\n");
@@ -312,7 +312,7 @@ fn status_reports_entries_refusals_counters_and_no_hub() {
     assert!(output.status.success(), "{}", stderr(&output));
     let value = json(&output);
     assert_eq!(value["schema"], "aethyme.mcp-status/v1");
-    assert_eq!(value["hub"]["state"], "not_available");
+    assert_eq!(value["hub"]["state"], "not_running");
     let entries = value["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["name"], "example-server");
@@ -530,15 +530,37 @@ cwd = \".\"
     assert_eq!(stdout(&shared), "host-ran\n");
     assert!(stderr(&shared).contains("is ignored and the host entry is used"));
 
-    let trusted = fixture.run(&["mcp", "trust", "--json"]);
-    assert!(trusted.status.success(), "{}", stderr(&trusted));
-    let value = json(&trusted);
+    // Without a terminal, trust shows the entries and records nothing.
+    let shown = fixture.run(&["mcp", "trust", "--json"]);
+    assert_eq!(shown.status.code(), Some(3), "{}", stderr(&shown));
+    let value = json(&shown);
     assert_eq!(value["schema"], "aethyme.mcp-trust/v1");
+    assert_eq!(value["trusted"], false);
+    assert_eq!(value["reason"], "confirmation_required");
     assert_eq!(value["entries"][0]["name"], "repository-server");
     assert_eq!(
         value["entries"][0]["argv"],
         serde_json::json!(["./repository.sh"])
     );
+    let digest = value["sha256"].as_str().unwrap().to_string();
+    assert!(!fixture.state.join("mcp/trusted-repositories.json").exists());
+    let still_refused = fixture.run(&["mcp", "connect", "repository-server"]);
+    assert_eq!(still_refused.status.code(), Some(3));
+
+    let wrong = fixture.run(&["mcp", "trust", "--yes", "--digest", "0000", "--json"]);
+    assert_eq!(wrong.status.code(), Some(3));
+    assert_eq!(json(&wrong)["reason"], "digest_mismatch");
+    let missing = fixture.run(&["mcp", "trust", "--yes"]);
+    assert_eq!(missing.status.code(), Some(2));
+
+    let trusted = fixture.run(&["mcp", "trust", "--yes", "--digest", &digest, "--json"]);
+    assert!(trusted.status.success(), "{}", stderr(&trusted));
+    let value = json(&trusted);
+    assert_eq!(value["trusted"], true);
+    assert_eq!(value["approval"], "digest");
+    let record =
+        std::fs::read_to_string(fixture.state.join("mcp/trusted-repositories.json")).unwrap();
+    assert!(record.contains("\"approval\": \"digest\""), "{record}");
 
     let ran = fixture.run(&["mcp", "connect", "repository-server"]);
     assert!(ran.status.success(), "{}", stderr(&ran));
@@ -554,4 +576,178 @@ cwd = \".\"
     let status = json(&fixture.run(&["mcp", "status", "--json"]));
     assert_eq!(status["shadowed"], serde_json::json!(["shared-name"]));
     assert_eq!(status["repository_trust"]["trusted"], false);
+}
+
+const HUB_FAKE_SERVER: &str = r#"#!/bin/sh
+printf 'started %s\n' "$$" >> "$FAKE_LOG"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  method=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
+  case "$method" in
+    initialize)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"capabilities":{"tools":{}},"protocolVersion":"2025-06-18","serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
+    tools/call)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"text":"%s"}}\n' "$id" "$$" ;;
+  esac
+done
+"#;
+
+/// One agent session through `connect`: initialize, one call, then leave.
+fn hub_session(fixture: &Fixture) -> (String, String) {
+    session(fixture, "example-shared", "2025-06-18")
+}
+
+/// One agent session for `name`, initializing with `protocol`.
+fn session(fixture: &Fixture, name: &str, protocol: &str) -> (String, String) {
+    use std::io::{BufRead, Write};
+    let mut child = fixture
+        .command(&["mcp", "connect", name])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let input = format!(
+        "{}\n{}\n{}\n",
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": protocol, "capabilities": {},
+                       "clientInfo": {"name": "t", "version": "1"}}}),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "pid", "arguments": {}}}),
+    );
+    stdin.write_all(input.as_bytes()).unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut pid = String::new();
+    while let Ok(line) = receiver.recv_timeout(std::time::Duration::from_secs(30)) {
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if value["id"] == 2 {
+            pid = value["result"]["text"].as_str().unwrap().to_string();
+            break;
+        }
+    }
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    (pid, String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+#[test]
+fn shared_connects_reach_one_upstream_through_the_hub() {
+    let fixture = Fixture::new();
+    let script = fixture.work.join("fake-server.sh");
+    write_executable(&script, HUB_FAKE_SERVER);
+    let log = fixture.work.join("fake.log");
+    std::fs::write(
+        fixture.work.join("server.env"),
+        format!("FAKE_LOG={}\n", log.display()),
+    )
+    .unwrap();
+    fixture.services(&format!(
+        "[[servers]]\nname = \"example-shared\"\nmode = \"shared\"\nargv = [{:?}]\ncwd = {:?}\nenv_file = \"server.env\"\n",
+        script.display().to_string(),
+        fixture.work.display().to_string(),
+    ));
+    let (first, first_stderr) = hub_session(&fixture);
+    let (second, _) = hub_session(&fixture);
+    assert!(!first.is_empty(), "{first_stderr}");
+    assert_eq!(first, second, "both sessions must reach the same upstream");
+    assert_eq!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .matches("started ")
+            .count(),
+        1
+    );
+    assert!(first_stderr.contains("using stable copy"), "{first_stderr}");
+
+    let hub_dir = fixture.state.join("mcp/hub");
+    let pids: Vec<String> = std::fs::read_dir(&hub_dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "pid"))
+        .map(|path| std::fs::read_to_string(path).unwrap().trim().to_string())
+        .collect();
+    assert_eq!(pids.len(), 1, "one hub per build");
+    let status = json(&fixture.run(&["mcp", "status", "--json"]));
+    assert_eq!(status["hub"]["state"], "running");
+    assert_eq!(
+        status["entries"][0]["hub"]["upstream"]["pid"].to_string(),
+        first
+    );
+    // Stop this test's own hub; its upstream ends with its input.
+    let killed = Command::new("kill").arg(&pids[0]).status().unwrap();
+    assert!(killed.success());
+}
+
+fn shared_fixture(extra: &str) -> (Fixture, std::path::PathBuf) {
+    let fixture = Fixture::new();
+    let script = fixture.work.join("fake-server.sh");
+    write_executable(&script, HUB_FAKE_SERVER);
+    let log = fixture.work.join("fake.log");
+    std::fs::write(
+        fixture.work.join("server.env"),
+        format!("FAKE_LOG={}\n", log.display()),
+    )
+    .unwrap();
+    fixture.services(&format!(
+        "[[servers]]\nname = \"example-shared\"\nmode = \"shared\"\nargv = [{:?}]\ncwd = {:?}\nenv_file = \"server.env\"\n{extra}\n",
+        script.display().to_string(),
+        fixture.work.display().to_string(),
+    ));
+    (fixture, log)
+}
+
+fn hub_pids(fixture: &Fixture) -> Vec<String> {
+    std::fs::read_dir(fixture.state.join("mcp/hub"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|extension| extension == "pid"))
+                .map(|path| std::fs::read_to_string(path).unwrap().trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_client_the_hub_cannot_serve_gets_a_private_server_with_its_initialize_replayed() {
+    let (fixture, log) = shared_fixture("");
+    let (shared, _) = session(&fixture, "example-shared", "2025-06-18");
+    assert!(!shared.is_empty());
+    // Another protocol version: the hub refuses after the initialize was read.
+    let (private, stderr) = session(&fixture, "example-shared", "2024-11-05");
+    assert!(!private.is_empty(), "{stderr}");
+    assert_ne!(private, shared, "{stderr}");
+    assert!(stderr.contains("protocol_version"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .matches("started ")
+            .count(),
+        2
+    );
+    for pid in hub_pids(&fixture) {
+        Command::new("kill").arg(pid).status().unwrap();
+    }
+}
+
+#[test]
+fn an_entry_requiring_client_features_is_never_shared() {
+    let (fixture, _) = shared_fixture("require_client_features = true");
+    let (pid, stderr) = session(&fixture, "example-shared", "2025-06-18");
+    assert!(!pid.is_empty(), "{stderr}");
+    assert!(stderr.contains("require_client_features"), "{stderr}");
+    assert!(hub_pids(&fixture).is_empty(), "no hub may start");
 }

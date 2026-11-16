@@ -138,6 +138,7 @@ fn caller(cwd: &Path, path_env: Option<&Path>) -> Caller {
         from_worktree: false,
         env: Vec::new(),
         key_secret: SECRET.to_vec(),
+        key_secret_error: None,
         identity_cache: None,
         limits: DEFAULT_LIMITS,
     }
@@ -857,6 +858,7 @@ fn trust_records_digests_per_repository() {
         "repository-a",
         "aaaa",
         Path::new("/r/.aethyme/mcp.toml"),
+        "digest",
     )
     .unwrap();
     trust::record(
@@ -864,6 +866,7 @@ fn trust_records_digests_per_repository() {
         "repository-a",
         "bbbb",
         Path::new("/r/.aethyme/mcp.toml"),
+        "digest",
     )
     .unwrap();
     trust::record(
@@ -871,6 +874,7 @@ fn trust_records_digests_per_repository() {
         "repository-a",
         "aaaa",
         Path::new("/r/.aethyme/mcp.toml"),
+        "digest",
     )
     .unwrap();
     assert_eq!(
@@ -961,12 +965,22 @@ fn keys_follow_passed_values_without_revealing_them() {
         "different credentials, different server"
     );
     assert_eq!(first.key, with_token("one-secret-value").key);
-    // A default-inherited value (HOME) is not part of the key.
+    // A shared server depends on every inherited value too (HOME selects
+    // credential and configuration files).
     let mut other_home = caller(&root, None);
     other_home.env = os_pairs(&[("API_TOKEN", "one-secret-value"), ("HOME", "/elsewhere")]);
-    assert_eq!(
+    assert_ne!(
         plan(&entry, &other_home, &NoCheckouts).unwrap().key,
         first.key
+    );
+    // A direct one only on env_allow and the env file.
+    let mut direct = entry.clone();
+    direct.mode = super::config::Mode::Direct;
+    let mut home = caller(&root, None);
+    home.env = os_pairs(&[("API_TOKEN", "one-secret-value"), ("HOME", "/home/example")]);
+    assert_eq!(
+        plan(&direct, &home, &NoCheckouts).unwrap().key,
+        plan(&direct, &other_home, &NoCheckouts).unwrap().key
     );
 
     let shown = serde_json::to_string(&first).unwrap() + &format!("{first:?}");
@@ -1403,6 +1417,7 @@ fn telemetry_counts_outcomes_and_reasons_and_detects_changed_executables() {
         phases_ms: [("resolve".to_string(), resolve_ms)].into_iter().collect(),
         shadowed: false,
         fallback: false,
+        warnings: Vec::new(),
     };
     telemetry::append(&root, &event("exec", None, 2)).unwrap();
     telemetry::append(&root, &event("fallback", Some("not_installed"), 4)).unwrap();
@@ -1441,4 +1456,178 @@ fn telemetry_counts_outcomes_and_reasons_and_detects_changed_executables() {
     let changed = resolve(&input(&argv, &root)).identity.unwrap();
     let after = telemetry::compare_and_remember(&root, "host-example", &argv, &changed);
     assert_eq!(after.changes, vec!["content"]);
+}
+
+// ── re-review fixes ────────────────────────────────────────────────────────
+
+#[test]
+fn an_unstaged_worktree_edit_is_never_hidden_by_the_identity_cache() {
+    let (_dir, root) = canonical_tempdir();
+    let main = root.join("main");
+    std::fs::create_dir_all(&main).unwrap();
+    git(&main, &["init", "-q", "-b", "main"]);
+    write(&main.join("src/index.txt"), "one\n");
+    git(&main, &["add", "-A"]);
+    git(&main, &["commit", "-qm", "init"]);
+    let worktree = root.join("wt");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            worktree.to_str().unwrap(),
+            "-b",
+            "topic",
+        ],
+    );
+    let checkouts = FakeCheckouts {
+        stable: main.clone(),
+        worktrees: vec![worktree.clone()],
+        common: main.join(".git"),
+    };
+    let cache = root.join("cache");
+    let direct = host_entry(
+        &keyed_entry(&main, "").replace("mode = \"shared\"\n", ""),
+        &checkouts,
+    );
+    let mut inside = caller(&worktree, None);
+    inside.identity_cache = Some(cache.clone());
+    assert_eq!(
+        plan(&direct, &inside, &checkouts).unwrap().copy.reason,
+        "source_identical"
+    );
+    // Same size, no index or directory change: only content differs.
+    write(&worktree.join("src/index.txt"), "two\n");
+    let edited = plan(&direct, &inside, &checkouts).unwrap();
+    assert_eq!(edited.copy.kind, CopyKind::Worktree);
+    assert_eq!(edited.copy.reason, "source_differs");
+
+    // Shared mode never touches the cache.
+    let shared_cache = root.join("shared-cache");
+    let shared = host_entry(&keyed_entry(&main, ""), &checkouts);
+    let mut shared_caller = caller(&main, None);
+    shared_caller.identity_cache = Some(shared_cache.clone());
+    plan(&shared, &shared_caller, &checkouts).unwrap();
+    assert!(!shared_cache.exists());
+}
+
+#[test]
+fn a_short_key_secret_is_an_error_not_a_silent_replacement() {
+    let (_dir, root) = canonical_tempdir();
+    let directory = root.join("mcp");
+    write(&directory.join(secret::SECRET_FILE), "short");
+    let error = secret::load_or_create(&directory).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        std::fs::read(directory.join(secret::SECRET_FILE)).unwrap(),
+        b"short"
+    );
+    // A fresh directory gets exactly one whole secret and no leftovers.
+    let fresh = root.join("fresh");
+    let first = secret::load_or_create(&fresh).unwrap();
+    assert_eq!(secret::load_or_create(&fresh).unwrap(), first);
+    let names: Vec<String> = std::fs::read_dir(&fresh)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec![secret::SECRET_FILE.to_string()]);
+}
+
+#[test]
+fn shim_targets_stay_inside_node_modules_and_both_branches_must_agree() {
+    let (_dir, root) = canonical_tempdir();
+    let bin_dir = root.join("project/node_modules/.bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    write(&root.join("project/node_modules/pkg/cli.js"), "1\n");
+    write(&root.join("project/outside.js"), "1\n");
+    let shim = |local: &str, node: &str| {
+        format!(
+            "#!/bin/sh\nif [ -x \"$basedir/node\" ]; then\n  exec \"$basedir/node\"  \"$basedir/{local}\" \"$@\"\nelse\n  exec node  \"$basedir/{node}\" \"$@\"\nfi\n"
+        )
+    };
+    assert!(parse_node_shim(&shim("../pkg/cli.js", "../pkg/cli.js"), &bin_dir).is_some());
+    assert!(parse_node_shim(&shim("../../outside.js", "../../outside.js"), &bin_dir).is_none());
+    assert!(
+        parse_node_shim(
+            &shim("../pkg/../../outside.js", "../pkg/../../outside.js"),
+            &bin_dir
+        )
+        .is_none()
+    );
+    assert!(parse_node_shim(&shim("../pkg/cli.js", "../pkg/other.js"), &bin_dir).is_none());
+    // A symlink that leaves node_modules is refused too.
+    std::os::unix::fs::symlink(
+        root.join("project/outside.js"),
+        root.join("project/node_modules/pkg/link.js"),
+    )
+    .unwrap();
+    assert!(parse_node_shim(&shim("../pkg/link.js", "../pkg/link.js"), &bin_dir).is_none());
+}
+
+#[test]
+fn a_node_beside_the_shim_is_preferred_as_the_shim_does() {
+    let (_dir, root) = canonical_tempdir();
+    let project = root.join("project");
+    write(&project.join("pnpm-lock.yaml"), "\n");
+    write(&project.join("node_modules/pkg/cli.js"), "1\n");
+    let bin_dir = project.join("node_modules/.bin");
+    let local_node = bin_dir.join("node");
+    write_executable(&local_node, "#!/bin/sh\n");
+    let path_bin = root.join("bin");
+    write_executable(&path_bin.join("node"), "#!/bin/sh\n");
+    write_executable(
+        &bin_dir.join("example-server"),
+        "#!/bin/sh\nif [ -x \"$basedir/node\" ]; then\n  exec \"$basedir/node\"  \"$basedir/../pkg/cli.js\" \"$@\"\nelse\n  exec node  \"$basedir/../pkg/cli.js\" \"$@\"\nfi\n",
+    );
+    let argv = strings(&["pnpm", "exec", "example-server"]);
+    let resolution = resolve(&ResolveInput {
+        path_env: Some(path_bin.as_os_str()),
+        ..input(&argv, &project)
+    });
+    assert!(resolution.resolved, "{resolution:?}");
+    assert_eq!(resolution.argv[0], local_node.to_string_lossy());
+}
+
+#[test]
+fn shared_keys_cover_the_build_output_directory_of_the_entry() {
+    let (_dir, root) = canonical_tempdir();
+    let stable = root.join("project");
+    write(&stable.join("src/main.txt"), "main\n");
+    write_executable(&stable.join("dist/server.sh"), "#!/bin/sh\n");
+    write(&stable.join("dist/chunk.js"), "one\n");
+    let checkouts = FakeCheckouts {
+        stable: stable.clone(),
+        worktrees: Vec::new(),
+        common: stable.join(".git"),
+    };
+    let text = |mode: &str| {
+        format!(
+            "schema = 1\n[[servers]]\nname = \"s\"\nmode = \"{mode}\"\nargv = [\"./dist/server.sh\"]\ncwd = {:?}\nsource = {:?}\n",
+            stable.display().to_string(),
+            stable.join("src").display().to_string()
+        )
+    };
+    let shared = host_entry(&text("shared"), &checkouts);
+    let direct = host_entry(&text("direct"), &checkouts);
+    let key = |entry: &Entry| plan(entry, &caller(&stable, None), &checkouts).unwrap().key;
+    let (shared_before, direct_before) = (key(&shared), key(&direct));
+    write(&stable.join("dist/chunk.js"), "two\n");
+    assert_ne!(
+        key(&shared),
+        shared_before,
+        "a rebuilt chunk is another shared server"
+    );
+    assert_eq!(key(&direct), direct_before);
+    // Over the walk limits, a shared plan fails (and connect starts privately).
+    let mut small = caller(&stable, None);
+    small.limits = Limits {
+        max_files: 1,
+        max_bytes: 1024,
+    };
+    assert_eq!(
+        plan(&shared, &small, &checkouts).unwrap_err().code,
+        "entry_directory_identity_failed"
+    );
 }

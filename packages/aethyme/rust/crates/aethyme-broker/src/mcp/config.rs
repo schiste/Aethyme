@@ -16,6 +16,7 @@
 //! source = "/srv/example/src"  # its content identity is part of the key
 //! flavour = "staging"
 //! allow_cached = false         # unpinned npx/npm exec may use npm's cache
+//! require_client_features = false # true: never shared (roots, sampling, elicitation)
 //! ```
 //!
 //! Every path must name a stable copy. An entry whose `cwd`, `source`,
@@ -73,6 +74,8 @@ struct RawEntry {
     flavour: Option<String>,
     #[serde(default)]
     allow_cached: bool,
+    #[serde(default)]
+    require_client_features: bool,
     // Managed servers (see [`super::managed`]); host file only.
     #[serde(default)]
     managed: bool,
@@ -156,6 +159,9 @@ pub struct Entry {
     pub source: Option<PathBuf>,
     pub flavour: String,
     pub allow_cached: bool,
+    /// The server needs client features (roots, sampling, elicitation) the
+    /// shared hub never offers: always start it privately.
+    pub require_client_features: bool,
     pub repository: Option<RepositoryAnchor>,
     pub config_path: PathBuf,
     /// Host entries are trusted; repository entries once the host trusted
@@ -671,6 +677,7 @@ fn validate_entry(
         source,
         flavour,
         allow_cached: raw.allow_cached,
+        require_client_features: raw.require_client_features,
         repository: match scope {
             Scope::Repository => anchor.cloned(),
             Scope::Host => None,

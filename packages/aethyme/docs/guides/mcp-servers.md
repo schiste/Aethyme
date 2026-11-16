@@ -14,9 +14,9 @@ It is opt-in. Nothing is changed in any agent configuration: the owner
 declares entries, checks them with `aethyme mcp resolve`, and pastes the
 snippet `aethyme mcp config print` prints.
 
-This release launches one server per agent. A shared hub for
-`mode = "shared"` entries comes later; the configuration and keys described
-here are already the ones it will use.
+`mode = "direct"` entries get one server per agent. `mode = "shared"` stdio
+entries go through a shared hub: one server per key for the whole host,
+multiplexed between agents (see "Shared servers" below).
 
 ## Declaring entries
 
@@ -76,12 +76,19 @@ word, and an entry runs with the owner's environment and credentials:
   exact file:
 
   ```text
-  aethyme mcp trust [--repo <path>] [--json]
+  aethyme mcp trust [--repo <path>] [--yes --digest <sha256>] [--json]
   ```
 
   prints what the file declares (each entry's `argv`, `cwd`, `env_file`,
-  `env_inherit` and `env_allow`) and records the repository identity and the
-  SHA-256 of the file in `<host state>/mcp/trusted-repositories.json`. Any
+  `env_inherit` and `env_allow`) and its SHA-256 first, and records nothing
+  until the owner confirms: by typing `yes` on a terminal, or with
+  `--yes --digest <sha256>` matching the digest just printed (so a
+  non-interactive caller must have read the output; an agent that reads the
+  digest can still pass it, so this guards against blind approval, not
+  against a determined agent). It then records the
+  repository identity, the digest and how it was approved (`terminal` or
+  `digest`) in `<host state>/mcp/trusted-repositories.json`, under a lock so
+  concurrent runs lose nothing. Any
   change to the file, on any branch, is a different digest: `connect` refuses
   the entry (`untrusted_repository_entry`, exit 3, naming `aethyme mcp trust`)
   and runs `--fallback` when one was given.
@@ -205,23 +212,33 @@ entries under `source` (blob ids, through a literal pathspec) plus the content
 of every modified or untracked, not ignored, file; elsewhere, every file's
 path and content (skipping `.git` and `node_modules`). Both stop at 20,000
 files or 256 MiB, so a `source` inside a large outer repository fails fast.
-Git identities are cached for 15 seconds under
-`<host state>/mcp/identity-cache/`, keyed by the checkout's HEAD, its index
-file's size and mtime and the source directory's mtime (read without running
-Git); an edit that changes none of those within the 15 seconds is not seen.
+Only the stable copy's Git identity is cached, and only for direct entries:
+15 seconds under `<host state>/mcp/identity-cache/`, keyed by the checkout's
+HEAD, its index file's size and mtime and the source directory's mtime (read
+without running Git). The worktree side is never cached, because an unstaged
+edit changes none of those markers, and shared entries never use the cache.
 
 The key hashes what makes two servers interchangeable: the resolved argv and
 working directory, written relative to the chosen copy; the identity of
 executables outside that copy (an upgraded interpreter is another server);
-the content of the entry script inside it (ignored build output included),
-the resolved package's name and version, and the lockfiles at the copy root;
-the `source` identity; the flavour, mode, transport and `env_inherit`; for
-repository entries, the repository; and the values the server receives
-beyond the default set (the `env_allow` values and the env file). Those
+the content of the entry script inside it (ignored build output included)
+and, for shared entries, every file in the build output directory holding it
+when `source` does not cover it (capped like the file walk; over the cap the
+agent starts a private server); the resolved package's name and version, and
+the lockfiles at the copy root; the `source` identity; the flavour, mode,
+transport and `env_inherit`; for repository entries, the repository; and the
+values the server receives: for direct entries the `env_allow` values and
+the env file, for shared entries every variable passed to the server (names
+and values; `HOME`, `XDG_*`, `PATH` and `TMPDIR` select credential and
+configuration files). Those
 values, and the env file's identity shown by `resolve`, enter only as
 HMAC-SHA256 under a per-host secret (`<host state>/mcp/key-secret`, mode
-0600, created on first use), so nothing derived from a credential can be
-recovered from a key, `events.jsonl` or `--json`. Sessions whose trees are
+0600, created on first use as a complete temporary file hard-linked into
+place, so a crash never leaves a short secret and a racing process uses the
+winner's), so nothing derived from a credential can be recovered from a key,
+`events.jsonl` or `--json`. A short or unreadable secret is reported on
+stderr and counted (`key_secret_unavailable`); the key is then private to
+that process and a shared entry starts a private server. Sessions whose trees are
 identical share a key, and two branches get two keys. The shared hub will
 run one server per key.
 
@@ -238,6 +255,110 @@ appends one line with its phase timings (`config_load`, `copy_choice`,
 `key`, `total`); a failed exec appends one `exec_failed` line that corrects
 the `exec` before it. The file keeps the newest 2,000 lines once it passes
 1 MiB. Neither file holds environment values.
+
+## Shared servers
+
+For a `mode = "shared"`, `transport = "stdio"` entry, `connect` attaches the
+agent to the host's hub instead of starting its own server:
+
+- The hub (`aethyme mcp hub serve`, internal) is launched by the first
+  `connect` that needs it, never at boot, through `aethyme mcp hub launch`,
+  which starts it in its own session and exits at once, so the hub is never
+  a child of an agent's process. Its environment is reduced to `PATH`,
+  `HOME`, `USER`, `LOGNAME`, `TMPDIR`, the locale, `XDG_*` and the Aethyme
+  host-state variables. It follows the broker service's discipline: a
+  private 0700 directory `<host state>/mcp/hub/`, a 0600 socket, a permanent
+  singleton lock and a separate startup lock, its own executable by absolute
+  path. Socket and lock names carry the build identity: a hub from a newer
+  build takes new clients while an older one drains and exits, and a live
+  hub is never killed. Both ends check that the other is the same user
+  before anything (argv, environment) is exchanged; connections are capped
+  at 256, and the hub never logs request or response bodies.
+- `connect` stays as a thin stdio-to-socket bridge. If no hub answers within
+  2 seconds, the key is unhealthy, the build or the entry's argv, cwd or
+  environment differ from the upstream already running for that key
+  (`spec_mismatch`), the hub is full, the key could not be computed
+  completely, or the entry sets `require_client_features = true`, `connect`
+  execs a private server exactly as for a direct entry. Once the agent's
+  `initialize` has been read it cannot be given back, so a later refusal
+  (another protocol version, an initialize that never answers) runs the
+  private server as a child and replays that message; only then does a
+  `connect` process remain.
+- The hub initializes every upstream itself, with `capabilities: {}` and its
+  own `clientInfo` (`aethyme-mcp-hub`), whatever the first client declared,
+  and answers every client's `initialize` from the cached result (the
+  clients' `notifications/initialized` are swallowed). Roots, sampling and
+  elicitation are client capabilities the hub never offers: every
+  server-initiated request except `ping` is answered with method-not-found
+  and counted, and clients' `notifications/roots/list_changed` are dropped.
+  A client that declares those capabilities still attaches; it simply never
+  receives such requests. An entry whose server cannot work without them sets
+  `require_client_features = true` and always runs privately.
+- Per-session state never crosses agents. `logging/setLevel` is answered by
+  the hub and never forwarded, and the upstream's `notifications/message`
+  is dropped on shared keys (a log line may carry another agent's
+  arguments). Resource subscriptions are reference-counted: the upstream is
+  subscribed on the first agent's `resources/subscribe` and unsubscribed on
+  the last agent's `resources/unsubscribe` or disconnect, and
+  `notifications/resources/updated` reaches only that URI's subscribers; a
+  first subscribe the upstream refuses leaves nobody subscribed. After a
+  restart the hub subscribes the new process to every URI still followed; a
+  refused renewal sends those agents `notifications/resources/list_changed`
+  so they re-read. Only `tools`, `prompts` and `resources` `list_changed`
+  notifications reach every agent of the key; other server notifications may
+  be session-scoped and are dropped (and counted).
+- Request ids and progress tokens are rewritten to hub-unique numbers and
+  mapped back per client, keeping their type; a client reusing an id still in
+  flight gets an error for the second request, and a JSON-RPC batch gets an
+  error reply. `notifications/cancelled` is translated. A client that
+  disconnects has its requests cancelled upstream and their late replies
+  dropped. Each client has a bounded queue (256 messages, 64 MiB) and at
+  most 64 requests in flight; each upstream accepts at most 1024 in flight.
+  A request over either cap gets a retryable error; a client whose queue
+  overflows is disconnected; the upstream is never blocked.
+- When an upstream crashes, its in-flight requests fail with a retryable
+  JSON-RPC error (`-32000`, `data.retryable = true`); nothing is replayed, and
+  a client that cannot even receive that error is disconnected. It restarts
+  with exponential backoff from 1 to 60 seconds and is initialized again;
+  requests arriving meanwhile are held and sent once it is ready, after
+  `notifications/tools/list_changed`. A restart's initialize has the same 30
+  second deadline; a timeout or an error reply fails the held requests
+  retryably and counts as a crash. It re-initializes with the protocol
+  version the first client asked for, or the one the upstream negotiated.
+  Five crashes within five minutes, an initialize that does not answer
+  within 30 seconds, or an upstream that cannot be registered as a host
+  resource lease mark the key unhealthy for ten minutes; its clients are
+  disconnected and new ones start private servers. Unhealthy marks are
+  persisted in `<host state>/mcp/hub/unhealthy.json`, honoured by the next
+  hub (of any build) and checked by `connect` before it attaches.
+- Each upstream runs in its own process group, registered as a host
+  resource lease held by the hub, and its pid, group, session and start time
+  are recorded under the hub directory with the owning hub's pid, start time
+  and build. On SIGTERM, SIGINT or SIGHUP the hub stops every upstream group
+  before exiting (and never signals a group whose leader it already reaped).
+  A hub that starts reaps a record only when its owner hub is proven dead
+  (pid gone, or the pid now has another start time) and the group's leader
+  still has the recorded pid and start time; a record whose owner still runs
+  (an older build draining) or cannot be judged is left alone, and a group
+  whose leader is gone is left too (its members cannot be proven) and
+  counted. On Linux upstreams get a parent-death signal and refuse to start
+  if the hub is already gone.
+- An upstream stops ten minutes after its last client leaves; the hub exits
+  a minute after it has no upstream (or a minute after starting, if nothing
+  attaches). Nothing is pre-warmed, and the hub sleeps until its next
+  deadline instead of polling.
+- Upstreams receive the entry's environment (the env file included). Two
+  entries with different env files, flavours or sources have different keys
+  and never share.
+
+`aethyme mcp status --json` adds the hub: whether it runs, its pid, and per
+key the upstream (pid, clients, requests in flight) and counters (clients
+connected and disconnected, requests, errors, cancellations, crashes,
+restarts, queue overflows, refused server requests, dropped log messages,
+fallbacks by reason, and the upstream's resident memory, sampled at most once
+a minute). The hub records upstream starts,
+stops, crashes, unhealthy keys and overflows in `events.jsonl`, never message
+bodies.
 
 ## Managed servers
 

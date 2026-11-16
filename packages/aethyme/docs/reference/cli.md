@@ -224,7 +224,7 @@ for review, interruption, and rollback behavior.
 ```text
 aethyme mcp resolve <name> [--from-worktree] [--json]
 aethyme mcp connect <name> [--from-worktree] [--fallback-cwd <dir>] [--fallback -- <command...>]
-aethyme mcp trust [--repo <path>] [--json]
+aethyme mcp trust [--repo <path>] [--yes --digest <sha256>] [--json]
 aethyme mcp status [--json]
 aethyme mcp config print --agent codex|claude [--name <name>]
 aethyme mcp manage list [--json]
@@ -258,6 +258,12 @@ failed resolution 6, unless `--fallback -- <command...>` is given, which runs
 that command instead. `status` lists entries, refusals and counters from
 `<host state>/mcp/events.jsonl`; `config print` prints an agent configuration
 snippet and writes nothing.
+
+`mode = "shared"` stdio entries go through one shared hub per host and build
+(`aethyme mcp hub serve <directory>`, internal, started by `connect`, never at
+boot): one upstream per key, multiplexed, with a private fallback whenever
+the hub cannot serve within 2 seconds. `trust` records only after a typed
+confirmation or `--yes --digest` matching the printed digest.
 
 Managed servers: host entries with `managed = true`, `match_packages`,
 `match_executables` and `repair = "auto"|"report"` (host file only; a

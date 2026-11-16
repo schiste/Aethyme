@@ -24,6 +24,9 @@
 //! - [`envfile`]: `KEY=VALUE` files read without a shell.
 //! - [`telemetry`]: phase timings, outcomes and remembered resolutions under
 //!   `<host state>/mcp/`.
+//! - [`jsonrpc`], [`mux`], [`hub`] and [`hub_client`]: the shared hub for
+//!   `mode = "shared"` stdio servers: framing, multiplexing rules, the hub
+//!   process, and `connect`'s side of it.
 //! - [`connect`] and [`cli`]: the commands.
 //!
 //! Nothing here is automatic: an owner opts in by pasting the snippet `aethyme
@@ -34,8 +37,12 @@ pub mod cli;
 pub mod config;
 pub mod connect;
 pub mod envfile;
+pub mod hub;
+pub mod hub_client;
 pub mod identity;
+pub mod jsonrpc;
 pub mod key;
+pub mod mux;
 pub mod resolve;
 pub mod secret;
 pub mod telemetry;
@@ -53,6 +60,8 @@ pub mod repair;
 
 #[cfg(test)]
 mod managed_tests;
+#[cfg(test)]
+mod hub_tests;
 #[cfg(test)]
 mod tests;
 

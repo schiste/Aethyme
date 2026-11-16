@@ -31,10 +31,11 @@ Usage:
       <short>` on stderr. Any failure before the exec exits non-zero, unless
       --fallback is given: then the fallback command runs instead (in
       --fallback-cwd when given), so an agent is never blocked.
-  aethyme mcp trust [--repo <path>] [--json]
+  aethyme mcp trust [--repo <path>] [--yes --digest <sha256>] [--json]
       Print what the repository's .aethyme/mcp.toml declares (each entry's
-      argv, cwd, env_file, env_allow) and trust that exact file on this host.
-      Any change to the file needs trust again.
+      argv, cwd, env_file, env_allow) and its sha256, then trust that exact
+      file on this host after a typed confirmation on a terminal, or with
+      --yes --digest <the printed sha256>. Any change needs trust again.
   aethyme mcp status [--json]
       Every entry with its resolution, identity, chosen copy and key,
       refused, shadowed and untrusted entries, and per-entry counters from
@@ -44,6 +45,11 @@ Usage:
       Print the configuration snippet for each entry (or one) in that
       agent's format: `aethyme mcp connect <name> --fallback -- <argv>`.
       Prints only; never writes a file.
+  aethyme mcp hub serve|launch <directory>
+      Internal: the shared hub for mode = shared stdio entries, launched
+      detached by the first `connect` that needs it (never at boot). One
+      upstream server per key, multiplexed; it exits when nothing has used
+      it for a while. A client that cannot share starts a private server.
 
 Managed servers (host file only: managed = true, match_packages,
 match_executables, repair = auto|report):

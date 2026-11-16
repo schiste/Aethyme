@@ -221,6 +221,7 @@ pub fn record(host: &Path, report: &BypassReport) {
                 phases_ms: phases,
                 shadowed: false,
                 fallback: false,
+                warnings: Vec::new(),
             },
         ),
     );
