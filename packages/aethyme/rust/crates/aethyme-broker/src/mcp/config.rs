@@ -604,7 +604,7 @@ fn validate_entry(
         for (field, path) in &paths {
             if !path.starts_with(root) {
                 return Err(refuse(
-                    *field,
+                    field,
                     "outside_repository",
                     format!(
                         "{} is outside the repository {}; a repository entry may only name \
