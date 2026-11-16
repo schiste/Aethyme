@@ -293,7 +293,7 @@ fn config_print_only_prints_snippets_for_each_agent() {
 }
 
 #[test]
-fn status_reports_entries_refusals_counters_and_no_hub() {
+fn status_reports_entries_refusals_counters_and_a_stopped_hub() {
     let fixture = Fixture::new();
     let script = fixture.work.join("server.sh");
     write_executable(&script, "#!/bin/sh\n");
@@ -312,7 +312,7 @@ fn status_reports_entries_refusals_counters_and_no_hub() {
     assert!(output.status.success(), "{}", stderr(&output));
     let value = json(&output);
     assert_eq!(value["schema"], "aethyme.mcp-status/v1");
-    assert_eq!(value["hub"]["state"], "not_available");
+    assert_eq!(value["hub"]["state"], "not_running");
     let entries = value["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["name"], "example-server");
