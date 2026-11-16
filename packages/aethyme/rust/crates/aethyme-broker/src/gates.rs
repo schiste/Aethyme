@@ -5051,8 +5051,10 @@ fn wait_gate_child_with_signaler(
 }
 
 pub(crate) fn signal_owned_process_group(process_group: i32, signal: i32) -> std::io::Result<()> {
-    // SAFETY: callers invoke this only while the owned leader is unreaped, so
-    // its process-group ID has not been released for reuse.
+    // SAFETY: callers invoke this only while the owned leader is unreaped
+    // (running, or exited and observed with `WNOWAIT` but not yet waited
+    // for): its process, or its zombie, keeps the process-group ID reserved,
+    // so the signal cannot reach a group that reused the ID.
     let result = unsafe { libc::killpg(process_group, signal) };
     if result == 0 {
         Ok(())

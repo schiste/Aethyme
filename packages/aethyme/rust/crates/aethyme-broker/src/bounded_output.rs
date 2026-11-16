@@ -1168,15 +1168,32 @@ impl OwnedProbeChild {
         Err(error)
     }
 
-    /// After the leader exited (observed with `WNOWAIT`): reap it, and only
-    /// when the group still has members signal it and wait for it to go.
-    /// A group whose leader and members are all gone is done at once; this
-    /// used to pay the 75 ms TERM grace on every normal completion. A
-    /// remaining member keeps the group id reserved while it is signalled,
-    /// so the signal cannot reach a group that reused the id.
+    /// After the leader exited (observed with `WNOWAIT`, so it is still
+    /// unreaped): send the group one `SIGKILL` while the leader's zombie
+    /// still reserves the group id, so the signal can reach only this
+    /// group, then reap the leader. No TERM and no grace period: the
+    /// children of a listing need no cooperative shutdown, and a normal
+    /// completion pays no sleep. `ESRCH`/`EPERM` from that kill (nothing
+    /// left to signal, or only the zombie leader) are counted and never
+    /// retried after the reap. Only when the group is still present after
+    /// the reap (killed members not yet gone) does it wait, bounded, for
+    /// them to exit. The leader's exit status is returned unchanged.
     fn reap_exited_leader_and_settle_group(&mut self) -> io::Result<ExitStatus> {
         if self.reaped {
             return Err(io::Error::other("owned profile probe was already reaped"));
+        }
+        let mut kill_error = None;
+        if !self.ownership_uncertain {
+            match crate::gates::signal_owned_process_group(self.process_group, libc::SIGKILL) {
+                Ok(()) => {}
+                Err(error) if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::EPERM)) => {
+                    crate::phase_telemetry::add(
+                        "owned_group_kill_after_exit_refused",
+                        Duration::ZERO,
+                    );
+                }
+                Err(error) => kill_error = Some(error),
+            }
         }
         let status = match self.child.wait() {
             Ok(status) => {
@@ -1188,35 +1205,19 @@ impl OwnedProbeChild {
                 return Err(error);
             }
         };
+        // Probe only (signal zero): it never signals a group that reused
+        // the id after the reap.
         // SAFETY: signal zero only probes the process-group identifier.
-        let members_remain = if unsafe { libc::killpg(self.process_group, 0) } == 0 {
-            true
-        } else {
-            io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-        };
-        if !members_remain {
+        let absent = unsafe { libc::killpg(self.process_group, 0) } != 0
+            && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if absent && kill_error.is_none() {
             return Ok(status);
         }
         crate::phase_telemetry::add("owned_group_members_after_exit", Duration::ZERO);
-        let mut term_error = None;
-        let mut kill_error = None;
-        if let Err(error) =
-            crate::gates::signal_owned_process_group(self.process_group, libc::SIGTERM)
-            && error.raw_os_error() != Some(libc::ESRCH)
-        {
-            term_error = Some(error);
-        }
-        std::thread::sleep(Duration::from_millis(75));
-        if let Err(error) =
-            crate::gates::signal_owned_process_group(self.process_group, libc::SIGKILL)
-            && error.raw_os_error() != Some(libc::ESRCH)
-        {
-            kill_error = Some(error);
-        }
         validate_owned_probe_cleanup(
             self.reaped,
-            Ok(group_absent_within(self.process_group, OWNED_GROUP_SETTLE)),
-            term_error,
+            Ok(absent || group_absent_within(self.process_group, OWNED_GROUP_SETTLE)),
+            None,
             kill_error,
         )?;
         Ok(status)
@@ -1476,13 +1477,14 @@ mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
 
-    /// A group whose leader finished with no member left is done at once:
-    /// no TERM grace, no cleanup counted. A member left behind is stopped
-    /// and counted. The member blocks until released, so neither case
-    /// depends on how fast the runner is.
+    /// A group whose leader finished is settled without any grace period:
+    /// with no member left nothing waits and no cleanup is counted; a member
+    /// left behind is killed while the leader still reserves the group id,
+    /// and the call returns only once the group is proved gone. The member
+    /// blocks until released, so neither case depends on runner speed.
     #[cfg(unix)]
     #[test]
-    fn a_finished_group_is_signalled_only_when_members_remain() {
+    fn a_finished_group_is_killed_before_its_leader_is_reaped() {
         let recorder = crate::phase_telemetry::Recorder::default();
         let _installed = crate::phase_telemetry::install(recorder.clone());
         let mut alone = Command::new("/bin/sh");
@@ -1490,34 +1492,41 @@ mod tests {
         let output = output_limited_in_owned_group(&mut alone, Duration::from_secs(600), 64)
             .expect("a finished leader is reaped");
         assert!(matches!(output, LimitedOutput::Completed(ref out) if out.stdout == b"done"));
-        let cleanups = || {
-            recorder
+        assert!(
+            !recorder
                 .totals()
                 .1
-                .get("owned_group_members_after_exit")
-                .copied()
-                .unwrap_or(0)
-        };
-        assert_eq!(cleanups(), 0, "nothing left to signal");
+                .contains_key("owned_group_members_after_exit"),
+            "nothing was left to wait for"
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let release = dir.path().join("release");
+        let pid_file = dir.path().join("member.pid");
         let mut leaves_member = Command::new("/bin/sh");
         leaves_member.args([
             "-c",
             &format!(
-                "(while [ ! -e '{}' ]; do sleep 0.05; done) >/dev/null 2>&1 </dev/null & exit 0",
-                release.display()
+                "(while [ ! -e '{release}' ]; do sleep 0.05; done) >/dev/null 2>&1 </dev/null &\necho $! > '{pid}.tmp' && mv '{pid}.tmp' '{pid}'\nexit 7",
+                release = release.display(),
+                pid = pid_file.display(),
             ),
         ]);
         let result =
             output_limited_in_owned_group(&mut leaves_member, Duration::from_secs(600), 64);
+        let member: i32 = std::fs::read_to_string(&pid_file)
+            .expect("the leader recorded its member before exiting")
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal zero only checks that the process exists.
+        let member_gone = unsafe { libc::kill(member, 0) } != 0;
         std::fs::write(&release, "").unwrap();
-        assert!(
-            matches!(result, Ok(LimitedOutput::Completed(_))),
-            "the member was stopped and the group proved gone: {result:?}"
-        );
-        assert_eq!(cleanups(), 1, "the member left behind was counted");
+        let Ok(LimitedOutput::Completed(output)) = result else {
+            panic!("the member was killed and the group proved gone: {result:?}");
+        };
+        assert_eq!(output.status.code(), Some(7), "the leader's own status");
+        assert!(member_gone, "the member left behind was killed");
     }
 
     /// Overlapping spawns leak pipe ends into each other's children, so an

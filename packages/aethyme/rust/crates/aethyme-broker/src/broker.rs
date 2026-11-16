@@ -3005,12 +3005,32 @@ fn push_landed_proof_unprovable_advice(
         ),
         session_id: Some(first),
         queue_entry_id: None,
-        evidence: sessions
-            .iter()
-            .map(|session_id| format!("session {session_id}"))
-            .collect(),
+        evidence: unprovable_advice_evidence(sessions),
         commands: Vec::new(),
     });
+}
+
+/// Sessions the unprovable advice names at most; the total is given too.
+const UNPROVABLE_ADVICE_SESSIONS: usize = 20;
+
+/// The first [`UNPROVABLE_ADVICE_SESSIONS`] session ids, then the total when
+/// there are more.
+pub(crate) fn unprovable_advice_evidence(
+    sessions: &std::collections::BTreeSet<i64>,
+) -> Vec<String> {
+    let mut evidence = sessions
+        .iter()
+        .take(UNPROVABLE_ADVICE_SESSIONS)
+        .map(|session_id| format!("session {session_id}"))
+        .collect::<Vec<_>>();
+    if sessions.len() > UNPROVABLE_ADVICE_SESSIONS {
+        evidence.push(format!(
+            "{} more; {} in total",
+            sessions.len() - UNPROVABLE_ADVICE_SESSIONS,
+            sessions.len()
+        ));
+    }
+    evidence
 }
 
 /// Work a verify-only repository's integration branch carries that the

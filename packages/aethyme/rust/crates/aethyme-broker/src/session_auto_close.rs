@@ -943,6 +943,21 @@ mod lane_tests {
         assert_eq!(broker.landed_proof_session_deadline(open.id, None), None);
     }
 
+    /// The unprovable advice names at most 20 sessions and then the total.
+    #[test]
+    fn unprovable_advice_names_twenty_sessions_and_the_total() {
+        let few = (1..=3).collect::<std::collections::BTreeSet<i64>>();
+        assert_eq!(
+            crate::broker::unprovable_advice_evidence(&few),
+            vec!["session 1", "session 2", "session 3"]
+        );
+        let many = (1..=25).collect::<std::collections::BTreeSet<i64>>();
+        let evidence = crate::broker::unprovable_advice_evidence(&many);
+        assert_eq!(evidence.len(), 21);
+        assert_eq!(evidence[19], "session 20");
+        assert_eq!(evidence[20], "5 more; 25 in total");
+    }
+
     /// A session that runs out of time even when the grant runs first, with
     /// the whole share, is counted and shown in `broker status` by its
     /// session id only. Its listing blocks until released, so the outcome
