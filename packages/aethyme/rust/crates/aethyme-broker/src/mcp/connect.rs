@@ -480,7 +480,9 @@ fn run_inner(args: &[String]) -> u8 {
         }
     }
     if plan.mode == Mode::Shared && plan.transport == Transport::Stdio {
-        let blocked = if caller.key_secret_error.is_some() {
+        let blocked = if entry.require_client_features {
+            Some("require_client_features".to_string())
+        } else if caller.key_secret_error.is_some() {
             Some("key_secret_unavailable".to_string())
         } else if !plan.key_complete {
             Some("key_incomplete".to_string())

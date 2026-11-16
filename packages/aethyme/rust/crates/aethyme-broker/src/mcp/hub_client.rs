@@ -69,6 +69,62 @@ fn remaining(deadline: Instant) -> Duration {
         .max(Duration::from_millis(1))
 }
 
+/// The environment the hub gets: what it needs to find its state and run
+/// tools, not the agent's whole environment.
+pub fn hub_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    std::env::vars_os()
+        .filter(|(name, _)| {
+            name.to_str().is_some_and(|name| {
+                matches!(
+                    name,
+                    "PATH"
+                        | "HOME"
+                        | "USER"
+                        | "LOGNAME"
+                        | "TMPDIR"
+                        | "LANG"
+                        | "LC_ALL"
+                        | "AETHYME_HOST_STATE_DIR"
+                        | "AETHYME_HOST_CACHE_DIR"
+                ) || name.starts_with("XDG_")
+                    || name.starts_with("LC_")
+            })
+        })
+        .collect()
+}
+
+/// Runs in the hub between fork and exec: a new session, detached from the
+/// agent's terminal and process group.
+fn new_session() -> io::Result<()> {
+    // SAFETY: called in the forked child before exec; setsid is
+    // async-signal-safe and takes no pointers.
+    if unsafe { libc::setsid() } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `aethyme mcp hub launch <directory>`: start `hub serve` in its own
+/// session and return without waiting for it.
+pub fn launch(directory: &Path) -> io::Result<()> {
+    let paths = HubPaths::new(directory);
+    let executable = std::env::current_exe()?.canonicalize()?;
+    let log = transport::private_coordination_file(&paths.log)?;
+    let mut command = Command::new(executable);
+    command
+        .args(["mcp", "hub", "serve"])
+        .arg(directory)
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(log);
+    // SAFETY: `new_session` only calls setsid, which is async-signal-safe.
+    unsafe {
+        command.pre_exec(new_session);
+    }
+    command.spawn().map(drop)
+}
+
 /// Connect to this build's hub, starting it when nobody answers.
 fn connect_or_start(paths: &HubPaths, deadline: Instant) -> Result<UnixStream, String> {
     match UnixStream::connect(&paths.socket) {
@@ -106,26 +162,24 @@ fn connect_or_start(paths: &HubPaths, deadline: Instant) -> Result<UnixStream, S
     let executable = std::env::current_exe()
         .and_then(|path| path.canonicalize())
         .map_err(|_| "hub_executable_unknown".to_string())?;
-    let log = transport::private_coordination_file(&paths.log)
-        .map_err(|_| "hub_log_unusable".to_string())?;
-    let child = Command::new(&executable)
-        .args(["mcp", "hub", "serve"])
+    // `hub launch` starts the hub in its own session and exits at once, so
+    // the hub is never a child of this process (which may exec a server).
+    let mut launcher = Command::new(&executable);
+    launcher
+        .args(["mcp", "hub", "launch"])
         .arg(&paths.directory)
         .current_dir(&paths.directory)
+        .env_clear()
+        .envs(hub_environment())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(log)
-        .process_group(0)
-        .spawn()
+        .stderr(Stdio::null());
+    let launched = launcher
+        .status()
         .map_err(|_| "hub_spawn_failed".to_string())?;
-    // Reap the hub if it exits while this process still runs.
-    let mut child = child;
-    let spawned = thread::Builder::new()
-        .name("mcp-hub-reaper".into())
-        .spawn(move || {
-            let _reaped = child.wait();
-        });
-    crate::warn_unrecorded("watch the MCP hub process", spawned);
+    if !launched.success() {
+        return Err("hub_launch_failed".into());
+    }
     loop {
         match UnixStream::connect(&paths.socket) {
             Ok(stream) => return Ok(stream),
@@ -180,6 +234,10 @@ pub fn attach(plan: &Plan, budget: Duration) -> Attach {
         Ok(stream) => stream,
         Err(reason) => return Attach::Private(reason),
     };
+    // Argv and environment go only to a hub run by this user.
+    if super::hub::peer_uid(&stream).ok() != Some(transport::owner()) {
+        return Attach::Private("hub_peer_mismatch".into());
+    }
     let hello = json!({
         "hub": 1,
         "op": "attach",

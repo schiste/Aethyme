@@ -68,11 +68,11 @@ Usage:
       Print the configuration snippet for each entry (or one) in that
       agent's format: `aethyme mcp connect <name> --fallback -- <argv>`.
       Prints only; never writes a file.
-  aethyme mcp hub serve <directory>
-      Internal: the shared hub for mode = shared stdio entries, started
-      by the first `connect` that needs it (never at boot). One upstream
-      server per key, multiplexed; it exits when nothing has used it for a
-      while. A client that cannot share starts a private server instead.
+  aethyme mcp hub serve|launch <directory>
+      Internal: the shared hub for mode = shared stdio entries, launched
+      detached by the first `connect` that needs it (never at boot). One
+      upstream server per key, multiplexed; it exits when nothing has used
+      it for a while. A client that cannot share starts a private server.
 ";
 
 fn json_requested(args: &[String]) -> bool {
@@ -942,15 +942,24 @@ fn run_hub(args: &[String]) -> u8 {
         return report_error(
             false,
             "usage",
-            "use `aethyme mcp hub serve <directory>` (started by `connect`)",
+            "use `aethyme mcp hub serve|launch <directory>` (started by `connect`)",
             exit_status::USAGE,
         );
     };
+    if command == "launch" {
+        return match super::hub_client::launch(std::path::Path::new(directory)) {
+            Ok(()) => exit_status::SUCCESS,
+            Err(error) => {
+                eprintln!("aethyme mcp hub: {error}");
+                exit_status::ENVIRONMENT
+            }
+        };
+    }
     if command != "serve" {
         return report_error(
             false,
             "usage",
-            "the only hub command is `serve`",
+            "hub commands are `serve` and `launch`",
             exit_status::USAGE,
         );
     }
