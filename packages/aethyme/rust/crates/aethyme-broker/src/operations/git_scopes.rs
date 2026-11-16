@@ -9,6 +9,7 @@ use super::*;
 
 pub(super) const FETCH_FLAGS: &[&str] = &[
     "--atomic",
+    "--quiet",
     "--no-tags",
     "--no-write-fetch-head",
     "--no-recurse-submodules",
@@ -18,6 +19,48 @@ pub(super) const FETCH_FLAGS: &[&str] = &[
     "--no-prune-tags",
     "--refmap=",
 ];
+
+/// Keep brokered fetch output compact and avoid implicit tag transfers unless
+/// the caller selects an output or tag mode explicitly. Ref-limited fetches
+/// remain the caller's responsibility because the broker cannot infer which
+/// remote refs the task needs. Partial object filters and shallow depth limits
+/// are also task/repository-specific, so the broker does not inject them into
+/// shared worktrees.
+pub(super) fn apply_fetch_defaults(args: &mut Vec<String>) {
+    let Some(index) = super::git_subcommand_index(args) else {
+        return;
+    };
+    if args.get(index).map(String::as_str) != Some("fetch") {
+        return;
+    }
+
+    let options_end = args[index + 1..]
+        .iter()
+        .position(|arg| arg == "--")
+        .map(|relative| index + 1 + relative)
+        .unwrap_or(args.len());
+    let options = &args[index + 1..options_end];
+    let output_mode_explicit = options.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--quiet" | "-q" | "--verbose" | "-v" | "--progress" | "--no-progress"
+        )
+    });
+    let tag_mode_explicit = options
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--tags" | "--no-tags"));
+
+    let mut defaults = Vec::with_capacity(2);
+    if !output_mode_explicit {
+        defaults.push("--quiet".to_owned());
+    }
+    if !tag_mode_explicit {
+        defaults.push("--no-tags".to_owned());
+    }
+    if !defaults.is_empty() {
+        drop(args.splice(index + 1..index + 1, defaults));
+    }
+}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -47,9 +90,10 @@ fn ref_component(value: &str) -> bool {
 }
 
 /// The one fetch spelling with a closed ref footprint: exactly
-/// `refs/heads/<branch>` into `refs/remotes/<remote>/<branch>`, no tags, no
-/// FETCH_HEAD, no maintenance. It takes that tracking ref's lane instead of
-/// the repository-wide one when the repository's configuration proves it.
+/// `refs/heads/<branch>` into `refs/remotes/<remote>/<branch>`, quietly, with
+/// no tags, no FETCH_HEAD, and no maintenance. It takes that tracking ref's
+/// lane instead of the repository-wide one when the repository's
+/// configuration proves it.
 pub(crate) fn canonical_fetch_args(remote: &str, branch: &str) -> Option<Vec<String>> {
     if !ref_component(remote) || remote.contains('/') || !ref_component(branch) {
         return None;
@@ -1104,17 +1148,36 @@ pub(crate) const REPEATABLE_FETCH_AUTO_RESOLVED: &str =
 /// unknown state, and repeating it converges on whatever the remote holds, so
 /// an interrupted or failed attempt never needs anyone to inspect external
 /// state. Both spellings the broker issues qualify: the strict profile above
-/// and `fetch <remote> refs/heads/<b>:refs/remotes/<remote>/<b>`. Any other
-/// fetch (extra flags, globs, forced or several refspecs, leading global
-/// options, a URL remote) keeps the conservative unknown-outcome handling.
+/// and `fetch [--quiet] [--no-tags] <remote>
+/// refs/heads/<b>:refs/remotes/<remote>/<b>`. Any other fetch (extra flags,
+/// globs, forced or several refspecs, leading global options, a URL remote)
+/// keeps the conservative unknown-outcome handling.
 pub(crate) fn is_repeatable_tracking_fetch(args: &[String]) -> bool {
     if fetch_footprint(args).is_some() {
         return true;
     }
-    let [command, remote, refspec] = args else {
+    let [command, tail @ ..] = args else {
         return false;
     };
-    if command != "fetch" || !ref_component(remote) || remote.contains('/') {
+    if command != "fetch" {
+        return false;
+    }
+    let mut operands = tail;
+    while let Some(option) = operands.first().map(String::as_str) {
+        match option {
+            "--quiet" | "-q" | "--verbose" | "-v" | "--progress" | "--no-progress"
+            | "--no-tags" => operands = &operands[1..],
+            "--" => {
+                operands = &operands[1..];
+                break;
+            }
+            _ => break,
+        }
+    }
+    let [remote, refspec] = operands else {
+        return false;
+    };
+    if !ref_component(remote) || remote.contains('/') {
         return false;
     }
     let Some((source, destination)) = refspec.split_once(':') else {
