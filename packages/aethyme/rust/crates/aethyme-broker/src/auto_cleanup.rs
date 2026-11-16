@@ -9361,7 +9361,10 @@ mod tests {
     fn a_not_due_time_is_clamped_to_one_window() {
         let window = 72 * 3_600_000;
         assert_eq!(super::clamp_not_due(1_000 + 5, 1_000, window), 1_005);
-        assert_eq!(super::clamp_not_due(i64::MAX, 1_000, window), 1_000 + window);
+        assert_eq!(
+            super::clamp_not_due(i64::MAX, 1_000, window),
+            1_000 + window
+        );
         assert_eq!(super::clamp_not_due(5_000, 1_000, -1), 1_000);
     }
 

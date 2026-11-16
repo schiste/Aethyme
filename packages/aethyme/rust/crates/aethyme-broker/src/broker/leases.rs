@@ -1000,7 +1000,8 @@ impl Broker {
             // had (#176). Closing here does not delete anything -- it makes the
             // worktree a cleanup *candidate*, which `cleanup_item` then judges
             // on its own merits. Candidacy is granted; eligibility is earned.
-            let judge = due_by_row.contains(&session.id) && !not_due_memo.not_due(session.id, now_ms);
+            let judge =
+                due_by_row.contains(&session.id) && !not_due_memo.not_due(session.id, now_ms);
             if !derived_status.is_closed() && !judge {
                 crate::phase_telemetry::add(
                     "agents_view_abandonment_not_due",

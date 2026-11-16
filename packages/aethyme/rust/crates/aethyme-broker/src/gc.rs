@@ -16541,7 +16541,9 @@ mod tests {
             .run_worker_retirement_share(generation, Instant::now())
             .unwrap();
         drop(installed);
-        let busy = unattended_pacing::current_summary(0).unwrap().host_slot_busy;
+        let busy = unattended_pacing::current_summary(0)
+            .unwrap()
+            .host_slot_busy;
         drop(scope);
         drop(other);
         assert_eq!(
