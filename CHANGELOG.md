@@ -4,6 +4,37 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.112] - 2026-11-16
+
+### Fixed
+
+- The background worker no longer spends a whole run on one session. The "is this checkout clean" proof for a landed session ran `git status`, `rev-parse` and `stash list` with no deadline and no timing; on the busiest repository one proof took 5 to 6.5 minutes, the worker ran 3 times in 45 minutes instead of 17, and no checkout was removed. Those listings now stop at the active Git deadline, are timed as `subprocess_git`, and a stopped or failed listing always keeps the session (#1730).
+- Each session's proof gets a bounded budget inside a pass. A session that runs out is kept with the new decline `proof_timed_out` and the queue moves on; its budget doubles on each consecutive timeout, and each pass gives the session that has been timing out longest one long turn (#1730, #1731).
+- Where only "is anything unclean" matters, the proof stops `git status` at the first record that counts. The uncommitted, untracked and ignored listings are one `git status --ignored=matching` pass instead of two walks (#1731).
+- A stopped proof listing stops its whole process group, so submodule `git status` children are not left running (#1731).
+- A Git timeout while searching for a session's landing is inconclusive instead of "not delivered" (#1731).
+- On macOS a refused native process-table fetch is retried once before falling back to `ps`; refusals that `ps` then served are counted separately (#1730).
+- The worktree watcher's storm test no longer depends on runner speed (#1723).
+
+### Added
+
+- `aethyme mcp`: run MCP servers through Aethyme. `mcp connect <name>` resolves a launcher chain (`npx`, `npm exec`, `pnpm exec`) offline to the installed program and starts it in place, with `--fallback -- <original command>` so an agent is never left without its server. `mcp resolve`, `mcp status` and `mcp config print` (prints the agent config snippet; never writes one). Entries live in the host file `mcp/services.toml`; a repository's `.aethyme/mcp.toml` runs only after `aethyme mcp trust` and can never replace a host entry (#1724).
+- Shared servers: `mode = "shared"` stdio entries are served by one per-host hub, started on first use, that multiplexes agents onto one server per sharing key. The key covers the resolved program, working directory, every environment variable passed to the server, the env file, the server's source tree and build output, and the caller's arguments, so a session testing a different branch of a server gets its own. If the hub or a server does not answer within 2 seconds the agent gets a private server (#1728).
+- Managed servers: `aethyme mcp manage add|remove|list` marks servers that must go through Aethyme. `aethyme mcp intercept install` creates launcher wrappers that hand a managed server's launch to `mcp connect` and pass everything else straight to the real tool; `aethyme mcp repair` lists, and with `--apply` rewrites, agent config entries that bypass it; `aethyme mcp bypass` reports managed servers running outside Aethyme. Nothing is enabled by default (#1729).
+- Counters `proof_git_*`, `landed_proof_timeout_streak_*`, `landed_proof_session_budget_doubled`, `landed_proof_long_budget_granted`, `holder_process_table_native_denied_retried`, and per-key hub counters in `aethyme mcp status --json` (#1728, #1730, #1731).
+
+### Changed
+
+- Upgrade note: `aethyme mcp` is opt-in. Nothing reads or changes agent configuration, `PATH` or shell profiles until the owner runs `mcp intercept install` or `mcp repair --apply`, or sets `repair_on_session_start`.
+- Upgrade note: restart long-lived `aethyme env supervise` processes after upgrading from 0.8.110 or earlier so the worktree watcher fix from 0.8.111 takes effect.
+
+### Known issues
+
+- `aethyme mcp` has been validated on Linux CI only; the hub, the launcher wrappers and config repair have not yet run against a real macOS machine.
+- `transport = "http"` servers are not in this release.
+- Each proof listing waits a fixed 75 ms for its process group, about 450 ms per landed session; the timeout-streak record is pruned only when the retirement lane closes the session; a proof that needs longer than the lane's share still never concludes (#1731).
+- An agent host that runs commands under a pseudo-terminal is not intercepted by the launcher wrappers; config repair still applies to it (#1729).
+
 ## [0.8.111] - 2026-11-16
 
 ### Fixed
