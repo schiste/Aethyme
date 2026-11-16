@@ -3926,6 +3926,29 @@ impl GitRepo {
             .unwrap_or(common_dir))
     }
 
+    /// Index entries (mode, blob id, stage, path) under `pathspec`, NUL
+    /// separated, from `git ls-files -s -z`. Read-only; content-addressed, so
+    /// two checkouts holding the same files answer the same bytes.
+    pub(crate) fn index_entries_under(&self, pathspec: &str) -> Result<Vec<u8>, GitError> {
+        run_git_bytes(&self.root, &["ls-files", "-s", "-z", "--", pathspec])
+    }
+
+    /// Working-tree changes under `pathspec` (untracked files included), from
+    /// `git status --porcelain=v1 -z`. Read-only: optional locks are off.
+    pub(crate) fn status_entries_under(&self, pathspec: &str) -> Result<Vec<u8>, GitError> {
+        run_git_bytes(
+            &self.root,
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--",
+                pathspec,
+            ],
+        )
+    }
+
     pub fn current_branch(&self) -> Result<String, GitError> {
         run_git(&self.root, &["rev-parse", "--abbrev-ref", "HEAD"])
     }
