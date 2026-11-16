@@ -4,6 +4,22 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.109] - 2026-11-16
+
+### Fixed
+
+- The session-retirement lap no longer stays on one session forever. A session whose landing proof ran out of time held the cursor on every pass, so no later session was judged and sessions days past `[retention] session_abandoned_after_hours` stayed open. The hold now lasts one pass: the next pass judges that session once more and then moves on (meta key `auto_cleanup.session_retirement_budget_hold`) (#1706).
+- A failed process-table read no longer makes the rest of a pass answer `holder_unknown`. It is retried at once, then every 5 seconds, at most 3 times per pass (#1706).
+
+### Added
+
+- Every reason the inactivity lane keeps a session is counted as `session_abandonment_kept_<reason>`; the former `ActiveProcess` and `operation_unknown` outcomes are split by cause. `broker status --json` `landed_session_retirement` gains `abandonment {examined, closed, kept}` and `cursor_start`; the cleanup report gains `abandonment_sessions_closed`, `abandonment_sessions_kept` and `retirement_cursor_start` (#1706).
+- Counters `retirement_cursor_advanced`, `retirement_cursor_unmoved`, `retirement_cursor_budget_held`, `retirement_cursor_budget_hold_released` and `holder_process_table_failed` (#1706).
+
+### Changed
+
+- Documentation names `holder_alive_current` and `holder_alive_in_use` in place of the retired `holder_alive` (#1706).
+
 ## [0.8.108] - 2026-11-16
 
 ### Added
