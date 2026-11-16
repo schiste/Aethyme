@@ -661,6 +661,59 @@ mod lane_tests {
         assert!(refusal.contains("broker start --reuse"), "{refusal}");
     }
 
+    /// A session whose proof runs past its own budget is kept as
+    /// `proof_timed_out`, and the likely-landed queue goes on to the next
+    /// session in the same pass instead of stopping there: one slow checkout
+    /// no longer spends the whole retirement share. The slow session's
+    /// budget is zero, so nothing depends on how fast the runner is.
+    #[test]
+    fn a_proof_that_times_out_keeps_its_session_and_the_queue_moves_on() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (slow, slow_worktree) = session(&mut broker, "slow proof", true);
+        link_pull_request(&mut broker, slow.id, 21, Some(1));
+        quiet(&mut broker, &slow, 3);
+        let (next, _) = session(&mut broker, "next in the queue", true);
+        link_pull_request(&mut broker, next.id, 22, Some(1));
+        quiet(&mut broker, &next, 3);
+        assert!(slow.id < next.id, "the queue takes the slow session first");
+
+        let _budget =
+            crate::broker::landed_proof_session_budget_for_test(Some(slow.id), Duration::ZERO);
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let report = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker
+                .retire_abandoned_sessions_for_recovery(Some(
+                    std::time::Instant::now() + Duration::from_secs(3_600),
+                ))
+                .unwrap()
+        };
+
+        assert_eq!(
+            report.merged_pull_request_sessions_examined, 2,
+            "{report:#?}"
+        );
+        assert_eq!(report.merged_pull_request_sessions_closed, 1, "{report:#?}");
+        assert_eq!(
+            report.landed_sessions_declined.get("proof_timed_out"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert!(
+            !report
+                .landed_sessions_declined
+                .contains_key("budget_exhausted"),
+            "{report:#?}"
+        );
+        assert!(is_open(&broker, slow.id), "an inconclusive proof keeps");
+        assert!(slow_worktree.exists());
+        assert!(!is_open(&broker, next.id), "the next session still closed");
+        assert_eq!(
+            phase_count(&recorder, "landed_sessions_declined_proof_timed_out"),
+            1
+        );
+    }
+
     /// Every condition the merged-pull-request window cannot prove keeps the
     /// session open with its checkout.
     #[test]

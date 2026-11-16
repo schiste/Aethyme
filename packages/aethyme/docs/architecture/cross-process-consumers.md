@@ -606,7 +606,7 @@ Reason codes: `recent_activity`, `changed`, `process_alive`,
 `policy_unavailable`, `auto_remove_disabled`, `pinned`,
 `pull_request_unmerged`, `no_session_commits`, `no_landing_evidence`,
 `not_landed`, `landing_unknown`, `worktree_unclean`, `moved_before_close`,
-`upstream_moved`, `budget_exhausted`. An ignored tool cache keeps a session as
+`upstream_moved`, `budget_exhausted`, `proof_timed_out`. An ignored tool cache keeps a session as
 `worktree_unclean` until the repository names it in `[cleanup] regenerable`
 (a list of globs, relative to the worktree root, in `.aethyme/config.toml`).
 Fixtures that keep a
@@ -2608,3 +2608,13 @@ Introduced 2026-11-16. Changes consumers may see:
 - New phase counters: `guarded_exec_receipts_abandoned_pre_boot`, `holder_grace_anchored_to_boot`, `legacy_unbound_claims_released`, `preparation_judged_interrupted`, `holder_process_table_native`, `holder_process_table_native_fallback`, `holder_process_table_native_denied`, `holder_process_table_denied`, `session_closed_no_work`, `session_no_work_kept_<reason>`.
 
 Covered by `schema.rs`, `retention.rs`, `session_auto_close.rs`, `store/guarded_exec.rs`, `preparation.rs`, `lease_liveness.rs` and `session_holder.rs` tests.
+
+### One slow landed proof no longer holds the retirement share
+
+Introduced 2026-11-16. Changes consumers may see:
+
+- The cleanliness listings of the landed proof and of every automatic close (`git status`, `rev-parse --absolute-git-dir`, `stash list`, `ls-files --stage`) stop at the pass's Git deadline and are timed as `subprocess_git`; a stopped listing keeps the session. Without a deadline they stop after ten minutes. `git status` there runs with `core.fsmonitor=false`.
+- In a budgeted pass one session's landed proof may run for at most 10 seconds. Past that, while the pass still has time, the session is kept with the new landed decline code `proof_timed_out` (counter `landed_sessions_declined_proof_timed_out`) and the likely-landed queue and the retirement lap go on to the next session; `budget_exhausted` still means the pass ran out and stops the lane. `proof_timed_out` never falls through to the abandonment window and is not remembered: a later lap asks again.
+- New phase spans `landed_proof_checkout_read`, `landed_proof_worktree_clean`, `proof_uncommitted_check`, `proof_ignored_check`; new counters `landed_proof_worktree_clean_timed_out`, `proof_git_deadline_before_start`, `proof_git_stopped_at_deadline` (with the budget it had), `proof_git_output_limit`, `holder_process_table_native_denied_retried` (a native process listing refused after its size query was answered is fetched once more before it counts as denied) and `holder_process_table_native_denied_ps_complete` (the native listing was refused but `ps` listed the table).
+
+Covered by `auto_cleanup.rs`, `broker/leases.rs`, `session_auto_close.rs` and `session_holder.rs` tests.
