@@ -558,40 +558,185 @@ fn assemble_native_table(
     Ok(ProcessTable { rows })
 }
 
-/// The process table listed with libproc instead of a `ps` child: a sandboxed
+/// How a `KERN_PROC_ALL` read ended: the number of whole `element`-sized
+/// entries, or why the listing is not a complete observation. A refusal of
+/// the sysctl itself is `Denied`; any other error, an empty answer or a
+/// short (partial-entry) read is `Failed`.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn kinfo_listing_outcome(
+    read: Result<usize, i32>,
+    element: usize,
+) -> Result<usize, NativeListingFailure> {
+    match read {
+        Ok(bytes) if element > 0 && bytes > 0 && bytes % element == 0 => Ok(bytes / element),
+        Ok(_) => Err(NativeListingFailure::Failed),
+        Err(libc::EPERM | libc::EACCES) => Err(NativeListingFailure::Denied),
+        Err(_) => Err(NativeListingFailure::Failed),
+    }
+}
+
+/// The process table listed natively instead of by a `ps` child: a sandboxed
 /// caller may be refused the spawn, and each refusal used to leave a whole
 /// retirement pass judging every holder unknown.
 #[cfg(target_os = "macos")]
 mod native_process_table {
     pub(super) use super::NativeListingFailure as Failure;
 
-    fn failure_from_errno() -> Failure {
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::EPERM) | Some(libc::EACCES) => Failure::Denied,
-            _ => Failure::Failed,
-        }
+    /// `struct kinfo_proc` from `<sys/sysctl.h>` (LP64: x86_64 and arm64),
+    /// which `libc` does not expose. Only `p_starttime`, `p_pid`, `p_comm`
+    /// and `e_ppid` are read; every other field is mirrored so the compiler
+    /// lays the struct out exactly as the kernel does, and the size is
+    /// checked below.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    #[allow(dead_code)] // mirrored for layout; only a few fields are read
+    struct ExternProc {
+        p_starttime: libc::timeval,
+        p_vmspace: usize,
+        p_sigacts: usize,
+        p_flag: i32,
+        p_stat: i8,
+        p_pid: i32,
+        p_oppid: i32,
+        p_dupfd: i32,
+        user_stack: usize,
+        exit_thread: usize,
+        p_debugger: i32,
+        sigwait: i32,
+        p_estcpu: u32,
+        p_cpticks: i32,
+        p_pctcpu: u32,
+        p_wchan: usize,
+        p_wmesg: usize,
+        p_swtime: u32,
+        p_slptime: u32,
+        p_realtimer: [libc::timeval; 2],
+        p_rtime: libc::timeval,
+        p_uticks: u64,
+        p_sticks: u64,
+        p_iticks: u64,
+        p_traceflag: i32,
+        p_tracep: usize,
+        p_siglist: i32,
+        p_textvp: usize,
+        p_holdcnt: i32,
+        p_sigmask: u32,
+        p_sigignore: u32,
+        p_sigcatch: u32,
+        p_priority: u8,
+        p_usrpri: u8,
+        p_nice: i8,
+        p_comm: [u8; libc::MAXCOMLEN + 1],
+        p_pgrp: usize,
+        p_addr: usize,
+        p_xstat: u16,
+        p_acflag: u16,
+        p_ru: usize,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    #[allow(dead_code)] // mirrored for layout; only a few fields are read
+    struct Pcred {
+        pc_lock: [i8; 72],
+        pc_ucred: usize,
+        p_ruid: u32,
+        p_svuid: u32,
+        p_rgid: u32,
+        p_svgid: u32,
+        p_refcnt: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    #[allow(dead_code)] // mirrored for layout; only a few fields are read
+    struct Ucred {
+        cr_ref: i32,
+        cr_uid: u32,
+        cr_ngroups: i16,
+        cr_groups: [u32; 16],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    #[allow(dead_code)] // mirrored for layout; only a few fields are read
+    struct Vmspace {
+        dummy: i32,
+        dummy2: usize,
+        dummy3: [i32; 5],
+        dummy4: [usize; 3],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    #[allow(dead_code)] // mirrored for layout; only a few fields are read
+    struct Eproc {
+        e_paddr: usize,
+        e_sess: usize,
+        e_pcred: Pcred,
+        e_ucred: Ucred,
+        e_vm: Vmspace,
+        e_ppid: i32,
+        e_pgid: i32,
+        e_jobc: i16,
+        e_tdev: i32,
+        e_tpgid: i32,
+        e_tsess: usize,
+        e_wmesg: [u8; 8],
+        e_xsize: i32,
+        e_xrssize: i16,
+        e_xccount: i16,
+        e_xswrss: i16,
+        e_flag: i32,
+        e_login: [u8; 12],
+        e_spare: [i32; 4],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    #[allow(dead_code)] // mirrored for layout; only a few fields are read
+    struct KinfoProc {
+        kp_proc: ExternProc,
+        kp_eproc: Eproc,
+    }
+
+    // The kernel's `sizeof(struct kinfo_proc)` on LP64 macOS. A layout
+    // mistake fails the build here instead of misreading the table.
+    const _: () = assert!(std::mem::size_of::<KinfoProc>() == 648);
+    const _: () = assert!(std::mem::size_of::<ExternProc>() == 296);
+
+    /// The process table from `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_ALL)`,
+    /// the source `ps` reads: pid, parent and start time for every process,
+    /// with no same-user check. (`proc_pidinfo(PROC_PIDTBSDINFO)` refuses
+    /// other users' processes, pid 1 included, with `EPERM`, and
+    /// `PROC_PIDT_SHORTBSDINFO` carries no start time.)
     pub(super) fn snapshot() -> Result<super::ProcessTable, Failure> {
-        let pids = list_pids()?.into_iter().map(i64::from).collect::<Vec<_>>();
+        let processes = list_all()?;
         let locale = StartTimeLocale::from_environment();
+        let by_pid = processes
+            .iter()
+            .map(|process| (i64::from(process.kp_proc.p_pid), process))
+            .collect::<std::collections::HashMap<_, _>>();
+        let pids = by_pid.keys().copied().collect::<Vec<_>>();
         super::assemble_native_table(
             &pids,
             i64::from(std::process::id()),
             i64::from(std::os::unix::process::parent_id()),
             |pid| {
-                let pid = libc::pid_t::try_from(pid).map_err(|_| libc::EINVAL)?;
-                let info = bsd_info(pid)?;
+                let process = by_pid.get(&pid).ok_or(libc::ESRCH)?;
+                let start_seconds =
+                    u64::try_from(process.kp_proc.p_starttime.tv_sec).map_err(|_| libc::EINVAL)?;
                 // A start that cannot be formatted is not a complete row.
-                let started = locale.format(info.pbi_start_tvsec).ok_or(libc::EINVAL)?;
-                let comm = info
-                    .pbi_comm
+                let started = locale.format(start_seconds).ok_or(libc::EINVAL)?;
+                let comm = process
+                    .kp_proc
+                    .p_comm
                     .iter()
                     .take_while(|byte| **byte != 0)
-                    .map(|byte| *byte as u8 as char)
+                    .map(|byte| char::from(*byte))
                     .collect::<String>();
                 Ok(super::NativeProcess {
-                    ppid: i64::from(info.pbi_ppid),
+                    ppid: i64::from(process.kp_eproc.e_ppid),
                     started,
                     comm,
                 })
@@ -599,58 +744,67 @@ mod native_process_table {
         )
     }
 
-    fn list_pids() -> Result<Vec<libc::pid_t>, Failure> {
-        // SAFETY: a null buffer asks only for the current number of pids.
-        let estimate = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-        if estimate <= 0 {
-            return Err(failure_from_errno());
+    /// Every `kinfo_proc`, sized with the two-call pattern and listed again,
+    /// larger, when the table grew between the calls (`ENOMEM`).
+    fn list_all() -> Result<Vec<KinfoProc>, Failure> {
+        let element = std::mem::size_of::<KinfoProc>();
+        let mut name = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
+        let mut needed = 0usize;
+        // SAFETY: `name` holds three MIB entries; a null buffer asks only for
+        // the size, written to `needed`.
+        let result = unsafe {
+            libc::sysctl(
+                name.as_mut_ptr(),
+                3,
+                std::ptr::null_mut(),
+                &mut needed,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 {
+            return Err(super::kinfo_listing_outcome(Err(errno()), element)
+                .err()
+                .unwrap_or(Failure::Failed));
         }
-        let mut capacity = estimate as usize + 256;
-        for _ in 0..3 {
-            let mut pids: Vec<libc::pid_t> = vec![0; capacity];
-            let bytes = libc::c_int::try_from(capacity * std::mem::size_of::<libc::pid_t>())
-                .map_err(|_| Failure::Failed)?;
-            // SAFETY: `pids` owns `bytes` writable bytes of `pid_t` storage.
-            let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
-            if count <= 0 {
-                return Err(failure_from_errno());
+        let mut capacity = needed / element + 64;
+        for _ in 0..5 {
+            // SAFETY: `KinfoProc` is plain old data; zero is a valid value.
+            let mut buffer: Vec<KinfoProc> = vec![unsafe { std::mem::zeroed() }; capacity];
+            let mut size = capacity * element;
+            // SAFETY: `buffer` owns `size` writable bytes of `KinfoProc`
+            // storage; the kernel updates `size` to the bytes written.
+            let result = unsafe {
+                libc::sysctl(
+                    name.as_mut_ptr(),
+                    3,
+                    buffer.as_mut_ptr().cast(),
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if result != 0 {
+                let errno = errno();
+                if errno == libc::ENOMEM {
+                    capacity = capacity.saturating_mul(2);
+                    continue;
+                }
+                return Err(super::kinfo_listing_outcome(Err(errno), element)
+                    .err()
+                    .unwrap_or(Failure::Failed));
             }
-            let count = count as usize;
-            if count < capacity {
-                pids.truncate(count);
-                return Ok(pids);
-            }
-            // A full buffer may have been truncated: list again, larger.
-            capacity = capacity.saturating_mul(2);
+            let count = super::kinfo_listing_outcome(Ok(size), element)?;
+            buffer.truncate(count);
+            return Ok(buffer);
         }
         Err(Failure::Failed)
     }
 
-    /// One process's BSD info, or the errno that refused it.
-    fn bsd_info(pid: libc::pid_t) -> Result<libc::proc_bsdinfo, i32> {
-        let size = std::mem::size_of::<libc::proc_bsdinfo>();
-        // SAFETY: `proc_bsdinfo` is plain old data; zero is a valid value.
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` is writable storage of exactly `size` bytes.
-        let written = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                (&mut info as *mut libc::proc_bsdinfo).cast(),
-                size as libc::c_int,
-            )
-        };
-        if written > 0 && written as usize == size {
-            return Ok(info);
-        }
-        if written > 0 {
-            // A short read is a protocol mismatch, never a missing process.
-            return Err(libc::EIO);
-        }
-        Err(std::io::Error::last_os_error()
+    fn errno() -> i32 {
+        std::io::Error::last_os_error()
             .raw_os_error()
-            .unwrap_or(libc::EIO))
+            .unwrap_or(libc::EIO)
     }
 
     /// `ps` prints `lstart` with `strftime("%c")` under the caller's locale;
@@ -2435,8 +2589,9 @@ mod tests {
         assert_eq!(table.snapshots_taken_for_test(), 1);
     }
 
-    /// The native listing reports this process exactly as `ps` does, so a
-    /// holder recorded from either source matches the other.
+    /// The native listing reports this process and pid 1 (another user's
+    /// process) exactly as `ps` does, so a holder recorded from either
+    /// source matches the other.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_native_process_table_agrees_with_ps_for_this_process() {
@@ -2449,15 +2604,40 @@ mod tests {
         )
         .expect("ps lists processes");
         let Ok(native) = native_process_table::snapshot() else {
-            panic!("the native listing is available to tests");
+            panic!("the native listing is available to an ordinary user");
         };
-        let pid = i64::from(std::process::id());
-        let from_ps = ps.process(pid).expect("ps lists this process");
-        let from_native = native.process(pid).expect("libproc lists this process");
-        assert_eq!(from_native, from_ps);
-        assert_eq!(native.rows[&pid].ppid, ps.rows[&pid].ppid);
-        assert!(native.is_alive(&from_ps));
-        assert!(ps.is_alive(&from_native));
+        for pid in [i64::from(std::process::id()), 1] {
+            let from_ps = ps.process(pid).expect("ps lists the process");
+            let from_native = native.process(pid).expect("sysctl lists the process");
+            assert_eq!(from_native, from_ps, "pid {pid}");
+            assert_eq!(native.rows[&pid].ppid, ps.rows[&pid].ppid, "pid {pid}");
+            assert!(native.is_alive(&from_ps), "pid {pid}");
+            assert!(ps.is_alive(&from_native), "pid {pid}");
+        }
+    }
+
+    /// A `KERN_PROC_ALL` read is complete only with whole entries; a refused
+    /// sysctl is a denial, any other failure or a short read is not.
+    #[cfg(unix)]
+    #[test]
+    fn a_kinfo_listing_counts_only_whole_entries() {
+        assert_eq!(kinfo_listing_outcome(Ok(3 * 648), 648).ok(), Some(3));
+        assert!(matches!(
+            kinfo_listing_outcome(Ok(3 * 648 - 1), 648),
+            Err(NativeListingFailure::Failed)
+        ));
+        assert!(matches!(
+            kinfo_listing_outcome(Ok(0), 648),
+            Err(NativeListingFailure::Failed)
+        ));
+        assert!(matches!(
+            kinfo_listing_outcome(Err(libc::EPERM), 648),
+            Err(NativeListingFailure::Denied)
+        ));
+        assert!(matches!(
+            kinfo_listing_outcome(Err(libc::EIO), 648),
+            Err(NativeListingFailure::Failed)
+        ));
     }
 
     /// A native listing is complete only when every read succeeded or found
