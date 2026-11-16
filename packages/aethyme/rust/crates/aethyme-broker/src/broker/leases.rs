@@ -1815,7 +1815,10 @@ impl Broker {
     /// The content search runs only when a merged pull request, a
     /// representation or ancestry already suggests a landing, stops at
     /// `deadline` (`BudgetExhausted`), and is not repeated for a HEAD it
-    /// already found unlanded against the same default-branch tip.
+    /// already found unlanded against the same default-branch tip. The close
+    /// path computes its one session deadline itself; this entry point is
+    /// the proof alone, for tests.
+    #[cfg(test)]
     pub(crate) fn landed_session_decline(
         &self,
         session: &crate::Session,
