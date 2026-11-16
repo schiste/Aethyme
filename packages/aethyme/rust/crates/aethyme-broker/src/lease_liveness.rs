@@ -282,7 +282,38 @@ fn observe_holder_for_cleanup(
         return Ok((HolderObservation::Running, Some(holder.pid)));
     }
     let since = recorded_gone_since(store, session_id, &holder)?.unwrap_or(now_ms);
+    let since = gone_since_anchored_to_boot(&holder, since, crate::host_boot::boot_time_ms());
     Ok((HolderObservation::Gone { since }, Some(holder.pid)))
+}
+
+/// `lstart` has one-second resolution, and a local time in the repeated hour
+/// of a daylight-saving change reads up to an hour off.
+const LSTART_AMBIGUITY_MS: i64 = 60 * 60 * 1_000 + 1_000;
+
+/// When a gone holder can be said gone since. A holder whose recorded start
+/// provably predates the host boot died with the previous boot, however late
+/// the broker first noticed: its stale grace runs from the boot instead of
+/// restarting from the first command after a restart. A start the broker
+/// cannot read exactly (a localized text) or an unknown boot keeps `since`.
+fn gone_since_anchored_to_boot(
+    holder: &crate::session_holder::AgentProcess,
+    since: i64,
+    boot_ms: Option<i64>,
+) -> i64 {
+    let Some(boot_ms) = boot_ms.filter(|boot| *boot < since) else {
+        return since;
+    };
+    let Some(started_ms) = crate::session_holder::lstart_epoch_ms(&holder.started) else {
+        return since;
+    };
+    if started_ms.saturating_add(LSTART_AMBIGUITY_MS)
+        < boot_ms.saturating_sub(crate::host_boot::PRE_BOOT_MARGIN_MS)
+    {
+        crate::phase_telemetry::add("holder_grace_anchored_to_boot", std::time::Duration::ZERO);
+        boot_ms
+    } else {
+        since
+    }
 }
 
 /// When the broker first recorded this exact holder gone, if it has. A gone
@@ -1022,6 +1053,46 @@ mod tests {
         assert_eq!(
             LeaseLivenessPolicy::from_config_text("not toml ["),
             LeaseLivenessPolicy::default()
+        );
+    }
+
+    /// A holder whose recorded start predates the boot is gone since the
+    /// boot; an unknown boot, a holder started after it, and a start text the
+    /// broker cannot read exactly keep the first sighting.
+    #[cfg(unix)]
+    #[test]
+    fn a_holder_started_before_the_boot_is_gone_since_the_boot() {
+        let holder = crate::session_holder::AgentProcess {
+            pid: 1,
+            started: "Mon Jan 1 00:00:00 2024".into(),
+            command: "fixture-agent".into(),
+        };
+        let started = crate::session_holder::lstart_epoch_ms(&holder.started).unwrap();
+        let boot = started + 2 * LSTART_AMBIGUITY_MS + crate::host_boot::PRE_BOOT_MARGIN_MS;
+        let now = boot + 20 * MINUTE;
+        assert_eq!(gone_since_anchored_to_boot(&holder, now, Some(boot)), boot);
+        let (_, evidence) = classify(
+            false,
+            &HolderObservation::Gone { since: boot },
+            Some(1),
+            0,
+            now,
+            policy(),
+        );
+        assert!(!evidence.holds, "the grace ended 15 minutes after the boot");
+        assert_eq!(gone_since_anchored_to_boot(&holder, now, None), now);
+        assert_eq!(
+            gone_since_anchored_to_boot(&holder, now, Some(started)),
+            now,
+            "a holder started after the boot keeps its first sighting"
+        );
+        let localized = crate::session_holder::AgentProcess {
+            started: "lun. 1 janv. 00:00:00 2024".into(),
+            ..holder.clone()
+        };
+        assert_eq!(
+            gone_since_anchored_to_boot(&localized, now, Some(boot)),
+            now
         );
     }
 }

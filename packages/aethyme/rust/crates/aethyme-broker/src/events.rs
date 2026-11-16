@@ -29,6 +29,12 @@ pub const SESSION_HOLDER_BOUND: &str = "session.holder_bound";
 /// The broker first saw a session's holder process gone (#360). Starts the
 /// lease stale-grace clock for that holder.
 pub const SESSION_HOLDER_GONE: &str = "session.holder_gone";
+/// A guarded-exec receipt left `starting` or `running` by a command whose last
+/// write predates the host boot was settled as abandoned: no process from
+/// before a boot survives it.
+pub const GUARDED_EXEC_RECEIPT_ABANDONED: &str = "guarded_exec.receipt_abandoned";
+/// A settled-as-abandoned receipt's command reported its outcome late.
+pub const GUARDED_EXEC_RECEIPT_LATE_OUTCOME: &str = "guarded_exec.receipt_late_outcome";
 pub const SESSION_INSTALL_RECORDED: &str = "session.install_recorded";
 pub const SESSION_FINISH_CLEANUP_STARTED: &str = "session.finish_cleanup_started";
 pub const SESSION_CHECKPOINT_REANCHORED: &str = "session.checkpoint_reanchored";
@@ -194,6 +200,51 @@ pub fn session_holder_gone_payload(holder: &crate::session_holder::AgentProcess)
         "pid": holder.pid,
         "started": holder.started,
         "command": holder.command,
+    })
+    .to_string()
+}
+
+/// `guarded_exec.receipt_abandoned`: which receipt, the phase it was left in,
+/// its last write, and the boot evidence that proves its command gone:
+/// `reason` is `boot_id_changed` (the receipt names another boot) or
+/// `written_before_boot` (no boot id recorded, last write well before boot).
+pub(crate) fn guarded_exec_receipt_abandoned_payload(
+    receipt_id: &str,
+    previous_phase: &str,
+    receipt_updated_at_ms: i64,
+    receipt_boot_id: Option<&str>,
+    evidence: &crate::host_boot::BootEvidence,
+) -> String {
+    json!({
+        "receipt_id": receipt_id,
+        "previous_phase": previous_phase,
+        "receipt_updated_at_ms": receipt_updated_at_ms,
+        "receipt_boot_id": receipt_boot_id,
+        "boot_id": evidence.boot_id,
+        "boot_time_ms": evidence.boot_ms,
+        "reason": if receipt_boot_id.is_some() {
+            "boot_id_changed"
+        } else {
+            "written_before_boot"
+        },
+    })
+    .to_string()
+}
+
+/// `guarded_exec.receipt_late_outcome`: the command of a receipt already
+/// settled as abandoned reported its real outcome after all. The receipt
+/// keeps its settled state; this event keeps the outcome.
+pub fn guarded_exec_receipt_late_outcome_payload(
+    receipt_id: &str,
+    command_outcome: &str,
+    exit_code: Option<i32>,
+    process_group_cleanup: &str,
+) -> String {
+    json!({
+        "receipt_id": receipt_id,
+        "command_outcome": command_outcome,
+        "exit_code": exit_code,
+        "process_group_cleanup": process_group_cleanup,
     })
     .to_string()
 }

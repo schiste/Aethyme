@@ -130,6 +130,7 @@
     "session_abandoned_after_hours": "integer",
     "session_landed_after_hours": "integer",
     "session_merged_after_hours": "integer",
+    "session_no_work_abandoned_after_hours": "integer",
     "size_record_ttl_hours": "integer",
     "startup_budget_ms": "integer",
     "terminal_events_days": "integer",

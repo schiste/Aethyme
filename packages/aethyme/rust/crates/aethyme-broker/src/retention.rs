@@ -30,6 +30,7 @@ const RETENTION_POLICY_FIELDS: &[&str] = &[
     "session_abandoned_after_hours",
     "session_landed_after_hours",
     "session_merged_after_hours",
+    "session_no_work_abandoned_after_hours",
     "expire_abandoned_task_leases",
     "idle_session_artifact_hours",
     "artifact_sweep_budget_ms",
@@ -130,6 +131,16 @@ pub struct RetentionPolicy {
     /// operation, preparation or artifact producer of the session is running.
     /// Zero disables this earlier path.
     pub session_merged_after_hours: u32,
+    /// Hours of inactivity before a session that never did any work closes,
+    /// instead of `session_abandoned_after_hours`: its branch HEAD is still
+    /// its diff base, its checkout holds no uncommitted or untracked
+    /// non-ignored content, its recorded holder is gone past the lease stale
+    /// grace, and it holds no explicit claim, unresolved operation, running
+    /// preparation, merge-queue entry or open pull request. A session with no
+    /// recorded holder keeps the full window. Never longer than the main
+    /// window; `0` disables this earlier path, as does
+    /// `session_abandoned_after_hours = 0`.
+    pub session_no_work_abandoned_after_hours: u32,
     /// Opt in to guarded expiry of versioned task ownership after upgrading
     /// and draining older clients. Legacy or unknown holder evidence remains
     /// protected. This changes metadata eligibility, never deletion proofs.
@@ -205,6 +216,7 @@ impl Default for RetentionPolicy {
             session_abandoned_after_hours: 72,
             session_landed_after_hours: 24,
             session_merged_after_hours: 2,
+            session_no_work_abandoned_after_hours: 4,
             expire_abandoned_task_leases: false,
             idle_session_artifact_hours: 24,
             artifact_sweep_budget_ms: 5_000,
@@ -225,6 +237,19 @@ impl Default for RetentionPolicy {
 }
 
 impl RetentionPolicy {
+    /// The no-work window in milliseconds: never longer than the abandonment
+    /// window, and `0` (disabled) when either is zero.
+    pub(crate) fn no_work_abandonment_window_ms(&self) -> i64 {
+        if self.session_abandoned_after_hours == 0 {
+            return 0;
+        }
+        i64::from(
+            self.session_no_work_abandoned_after_hours
+                .min(self.session_abandoned_after_hours),
+        )
+        .saturating_mul(3_600_000)
+    }
+
     /// State-only close retains a checkout for inspection. Both reviewed GC
     /// and unattended removal must honor that same window; explicit cleanup
     /// remains an operator decision. Missing close times use the row update
@@ -318,6 +343,13 @@ impl RetentionPolicy {
             return Err(RetentionConfigError::InvalidValue {
                 field: "session_landed_after_hours",
                 value: self.session_landed_after_hours.to_string(),
+                constraint: "must be between 0 (disabled) and 8760 hours",
+            });
+        }
+        if self.session_no_work_abandoned_after_hours > 8_760 {
+            return Err(RetentionConfigError::InvalidValue {
+                field: "session_no_work_abandoned_after_hours",
+                value: self.session_no_work_abandoned_after_hours.to_string(),
                 constraint: "must be between 0 (disabled) and 8760 hours",
             });
         }
@@ -1774,5 +1806,36 @@ mod tests {
             std::fs::write(repo.path().join(BROKER_CONFIG_RELPATH), text).unwrap();
             assert!(load_retention_policy(repo.path()).is_err(), "{text}");
         }
+    }
+
+    /// The no-work window validates like the other session windows, is
+    /// disabled by zero (its own or the main window's) and never exceeds the
+    /// main window.
+    #[test]
+    fn the_no_work_window_is_validated_disabled_and_clamped() {
+        let policy = |no_work: u32, abandoned: u32| RetentionPolicy {
+            session_no_work_abandoned_after_hours: no_work,
+            session_abandoned_after_hours: abandoned,
+            ..RetentionPolicy::default()
+        };
+        assert_eq!(
+            RetentionPolicy::default().session_no_work_abandoned_after_hours,
+            4
+        );
+        assert!(policy(8_760, 72).validate().is_ok());
+        assert!(matches!(
+            policy(8_761, 72).validate(),
+            Err(RetentionConfigError::InvalidValue {
+                field: "session_no_work_abandoned_after_hours",
+                ..
+            })
+        ));
+        assert_eq!(policy(4, 72).no_work_abandonment_window_ms(), 4 * 3_600_000);
+        assert_eq!(policy(0, 72).no_work_abandonment_window_ms(), 0);
+        assert_eq!(policy(4, 0).no_work_abandonment_window_ms(), 0);
+        assert_eq!(
+            policy(100, 72).no_work_abandonment_window_ms(),
+            72 * 3_600_000
+        );
     }
 }

@@ -11,6 +11,16 @@ use crate::error::BrokerError;
 const MAX_RECEIPT_LIST_LIMIT: u32 = 100;
 const RETAIN_TERMINAL_RECEIPTS_PER_SESSION: i64 = 100;
 
+/// A receipt whose command provably died with an earlier boot, with
+/// `?2` the current boot id and `?3` the pre-boot cutoff (either may be NULL
+/// when unknown). Only `starting`/`running` receipts qualify: one that names
+/// a boot id is dead when that id differs from the current one; one written
+/// without a boot id (by an older version) is dead only when its last write
+/// predates the cutoff, which keeps a wide margin before the boot.
+const DEAD_RECEIPT_SQL: &str = "phase IN ('starting', 'running') AND (
+         (boot_id IS NOT NULL AND ?2 IS NOT NULL AND boot_id <> ?2)
+         OR (boot_id IS NULL AND ?3 IS NOT NULL AND updated_at_ms < ?3))";
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct GuardedExecReceipt {
     pub helper_observation: Option<HelperObservation>,
@@ -212,13 +222,14 @@ impl super::BrokerStore {
         let receipt_id = tx.query_row(
             "INSERT INTO guarded_exec_receipts (
                  receipt_id, session_id, phase, command_outcome, exit_code,
-                 ownership_audit, process_group_cleanup, created_at_ms, updated_at_ms
+                 ownership_audit, process_group_cleanup, created_at_ms, updated_at_ms,
+                 boot_id
              ) VALUES (
                  lower(hex(randomblob(16))), ?1, 'starting', 'unknown', NULL,
-                 'not_run', 'unknown', ?2, ?2
+                 'not_run', 'unknown', ?2, ?2, ?3
              )
              RETURNING receipt_id",
-            params![session_id, created_at],
+            params![session_id, created_at, crate::host_boot::boot_id()],
             |row| row.get(0),
         )?;
         tx.commit()?;
@@ -271,7 +282,7 @@ impl super::BrokerStore {
             process_group_cleanup,
             "verified" | "unverified" | "unknown"
         ));
-        self.transition_guarded_exec_receipt(
+        let changed = self.conn.execute(
             "UPDATE guarded_exec_receipts
              SET phase = 'completed', command_outcome = ?1, exit_code = ?2,
                  ownership_audit = 'unknown', process_group_cleanup = ?3,
@@ -287,6 +298,15 @@ impl super::BrokerStore {
                 receipt_id
             ],
         )?;
+        if changed != 1 {
+            return self.record_late_guarded_exec_outcome(
+                session_id,
+                receipt_id,
+                command_outcome,
+                exit_code,
+                process_group_cleanup,
+            );
+        }
         self.prune_terminal_guarded_exec_receipts(session_id)
     }
 
@@ -300,7 +320,7 @@ impl super::BrokerStore {
             process_group_cleanup,
             "verified" | "unverified" | "unknown"
         ));
-        self.transition_guarded_exec_receipt(
+        let changed = self.conn.execute(
             "UPDATE guarded_exec_receipts
              SET phase = 'outcome_unknown', command_outcome = 'unknown',
                  ownership_audit = 'unknown', process_group_cleanup = ?1,
@@ -314,6 +334,15 @@ impl super::BrokerStore {
                 receipt_id
             ],
         )?;
+        if changed != 1 {
+            return self.record_late_guarded_exec_outcome(
+                session_id,
+                receipt_id,
+                "outcome_unknown",
+                None,
+                process_group_cleanup,
+            );
+        }
         if process_group_cleanup == "verified" {
             self.prune_terminal_guarded_exec_receipts(session_id)?;
         }
@@ -334,6 +363,139 @@ impl super::BrokerStore {
                AND phase IN ('completed', 'outcome_unknown')",
             params![ownership_audit, super::now_ms(), session_id, receipt_id],
         )
+    }
+
+    /// Settle this session's receipts whose command provably died with an
+    /// earlier boot ([`DEAD_RECEIPT_SQL`]) as `completed` with an `unknown`
+    /// outcome, audit and cleanup, a combination no live command writes, and
+    /// record why in a `guarded_exec.receipt_abandoned` event. Callers run
+    /// this only once the session has closed, so a session that stays open
+    /// keeps its receipts untouched. `outcome_unknown` receipts are never
+    /// settled. Returns how many receipts were settled.
+    pub(crate) fn abandon_dead_guarded_exec_receipts(
+        &mut self,
+        session_id: i64,
+        evidence: &crate::host_boot::BootEvidence,
+    ) -> Result<usize, BrokerError> {
+        let now = super::now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let dead = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT receipt_id, phase, updated_at_ms, boot_id FROM guarded_exec_receipts
+                 WHERE session_id = ?1 AND {DEAD_RECEIPT_SQL}
+                 ORDER BY created_at_ms, receipt_id"
+            ))?;
+            let rows = stmt.query_map(
+                params![session_id, evidence.boot_id, evidence.cutoff_ms],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut settled = 0;
+        for (receipt_id, previous_phase, updated_at_ms, receipt_boot_id) in dead {
+            let changed = tx.execute(
+                "UPDATE guarded_exec_receipts
+                 SET phase = 'completed', command_outcome = 'unknown', exit_code = NULL,
+                     ownership_audit = 'unknown', process_group_cleanup = 'unknown',
+                     updated_at_ms = max(updated_at_ms, ?1)
+                 WHERE session_id = ?2 AND receipt_id = ?3 AND phase = ?4
+                   AND updated_at_ms = ?5",
+                params![now, session_id, receipt_id, previous_phase, updated_at_ms],
+            )?;
+            if changed != 1 {
+                continue;
+            }
+            super::insert_event(
+                &tx,
+                now,
+                crate::events::GUARDED_EXEC_RECEIPT_ABANDONED,
+                Some(session_id),
+                Some(&crate::events::guarded_exec_receipt_abandoned_payload(
+                    &receipt_id,
+                    &previous_phase,
+                    updated_at_ms,
+                    receipt_boot_id.as_deref(),
+                    evidence,
+                )),
+            )?;
+            settled += 1;
+        }
+        tx.commit()?;
+        Ok(settled)
+    }
+
+    /// Whether this session still owns an unresolved coordinated operation or
+    /// guarded command, not counting receipts whose command provably died
+    /// with an earlier boot. Read-only: nothing is settled here.
+    pub(crate) fn session_has_unresolved_operations_since_boot(
+        &self,
+        session_id: i64,
+        evidence: &crate::host_boot::BootEvidence,
+    ) -> Result<bool, BrokerError> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM coordinated_operations
+                        WHERE session_id = ?1 AND effect <> 'read'
+                          AND status IN ('prepared', 'running', 'outcome_unknown')
+                     ) OR EXISTS(
+                        SELECT 1 FROM guarded_exec_receipts
+                        WHERE session_id = ?1
+                          AND phase IN ('starting', 'running', 'outcome_unknown')
+                          AND NOT ({DEAD_RECEIPT_SQL})
+                     )"
+                ),
+                params![session_id, evidence.boot_id, evidence.cutoff_ms],
+                |row| row.get(0),
+            )
+            .map_err(BrokerError::from)
+    }
+
+    /// The command of a receipt that was settled as abandoned reports its
+    /// outcome after all: keep the settled row and record the outcome as a
+    /// `guarded_exec.receipt_late_outcome` event, so it is never lost. Any
+    /// other reason the transition matched no row stays an error.
+    fn record_late_guarded_exec_outcome(
+        &mut self,
+        session_id: i64,
+        receipt_id: &str,
+        command_outcome: &str,
+        exit_code: Option<i32>,
+        process_group_cleanup: &str,
+    ) -> Result<(), BrokerError> {
+        let abandoned: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guarded_exec_receipts
+                 WHERE session_id = ?1 AND receipt_id = ?2
+                   AND phase = 'completed' AND command_outcome = 'unknown')",
+            params![session_id, receipt_id],
+            |row| row.get(0),
+        )?;
+        if !abandoned {
+            return Err(rusqlite::Error::QueryReturnedNoRows.into());
+        }
+        super::insert_event(
+            &self.conn,
+            super::now_ms(),
+            crate::events::GUARDED_EXEC_RECEIPT_LATE_OUTCOME,
+            Some(session_id),
+            Some(&crate::events::guarded_exec_receipt_late_outcome_payload(
+                receipt_id,
+                command_outcome,
+                exit_code,
+                process_group_cleanup,
+            )),
+        )?;
+        Ok(())
     }
 
     fn transition_guarded_exec_receipt(
@@ -691,6 +853,182 @@ mod tests {
                 .guarded_exec_receipt(2, &receipt_id)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// The receipts a test session holds, by id, with their phase.
+    fn phase_of(store: &super::super::BrokerStore, receipt_id: &str) -> String {
+        store
+            .guarded_exec_receipt(1, receipt_id)
+            .unwrap()
+            .unwrap()
+            .phase
+    }
+
+    fn set_receipt(
+        store: &super::super::BrokerStore,
+        receipt_id: &str,
+        boot_id: Option<&str>,
+        at_ms: i64,
+    ) {
+        store
+            .conn
+            .execute(
+                "UPDATE guarded_exec_receipts
+                 SET boot_id = ?1, created_at_ms = ?2, updated_at_ms = ?2
+                 WHERE receipt_id = ?3",
+                params![boot_id, at_ms, receipt_id],
+            )
+            .unwrap();
+    }
+
+    /// A receipt is dead when it names another boot, or, written without a
+    /// boot id, when its last write predates the cutoff. The check is
+    /// read-only; settling marks exactly the dead receipts, with one event
+    /// each. A receipt of the current boot, one written after the cutoff
+    /// without a boot id, and an `outcome_unknown` receipt stay unresolved.
+    #[test]
+    fn dead_receipts_are_judged_by_boot_id_first_and_settled_only_on_request() {
+        let mut store = store();
+        let other_boot = store.begin_guarded_exec_receipt(1).unwrap();
+        store.mark_guarded_exec_running(1, &other_boot).unwrap();
+        let same_boot = store.begin_guarded_exec_receipt(1).unwrap();
+        store.mark_guarded_exec_running(1, &same_boot).unwrap();
+        let legacy_old = store.begin_guarded_exec_receipt(1).unwrap();
+        let legacy_recent = store.begin_guarded_exec_receipt(1).unwrap();
+        let ambiguous = store.begin_guarded_exec_receipt(1).unwrap();
+        store.mark_guarded_exec_running(1, &ambiguous).unwrap();
+        store
+            .mark_guarded_exec_outcome_unknown(1, &ambiguous, "unverified")
+            .unwrap();
+        let cutoff = 1_000_000;
+        set_receipt(&store, &other_boot, Some("boot-a"), cutoff + 5_000);
+        set_receipt(&store, &same_boot, Some("boot-b"), 1_000);
+        set_receipt(&store, &legacy_old, None, cutoff - 1);
+        set_receipt(&store, &legacy_recent, None, cutoff + 1);
+        set_receipt(&store, &ambiguous, Some("boot-a"), 1_000);
+        let evidence = crate::host_boot::BootEvidence {
+            boot_id: Some("boot-b".into()),
+            boot_ms: Some(cutoff + crate::host_boot::PRE_BOOT_MARGIN_MS),
+            cutoff_ms: Some(cutoff),
+        };
+
+        assert!(
+            store
+                .session_has_unresolved_operations_since_boot(1, &evidence)
+                .unwrap()
+        );
+        assert_eq!(
+            phase_of(&store, &other_boot),
+            "running",
+            "the check writes nothing"
+        );
+
+        assert_eq!(
+            store
+                .abandon_dead_guarded_exec_receipts(1, &evidence)
+                .unwrap(),
+            2
+        );
+        for settled in [&other_boot, &legacy_old] {
+            let receipt = store.guarded_exec_receipt(1, settled).unwrap().unwrap();
+            assert_eq!(receipt.phase, "completed");
+            assert_eq!(receipt.command_outcome, "unknown");
+        }
+        assert_eq!(phase_of(&store, &same_boot), "running");
+        assert_eq!(phase_of(&store, &legacy_recent), "starting");
+        assert_eq!(phase_of(&store, &ambiguous), "outcome_unknown");
+        let events: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = ?1 AND session_id = 1",
+                [crate::events::GUARDED_EXEC_RECEIPT_ABANDONED],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 2);
+
+        // Unknown boot evidence judges nothing dead.
+        assert_eq!(
+            store
+                .abandon_dead_guarded_exec_receipts(1, &crate::host_boot::BootEvidence::default())
+                .unwrap(),
+            0
+        );
+        store
+            .complete_guarded_exec_command(1, &same_boot, "succeeded", Some(0), "verified")
+            .unwrap();
+        store
+            .mark_guarded_exec_not_started(1, &legacy_recent)
+            .unwrap();
+        assert!(
+            store
+                .session_has_unresolved_operations_since_boot(1, &evidence)
+                .unwrap(),
+            "an outcome_unknown receipt stays unresolved whatever its boot"
+        );
+    }
+
+    /// A command whose receipt was settled as abandoned and that reports
+    /// its outcome after all loses nothing: the row keeps its settled state
+    /// and the outcome is recorded as an event.
+    #[test]
+    fn a_late_outcome_for_an_abandoned_receipt_is_recorded_not_lost() {
+        let mut store = store();
+        let finished = store.begin_guarded_exec_receipt(1).unwrap();
+        store.mark_guarded_exec_running(1, &finished).unwrap();
+        let unknown = store.begin_guarded_exec_receipt(1).unwrap();
+        store.mark_guarded_exec_running(1, &unknown).unwrap();
+        set_receipt(&store, &finished, Some("boot-a"), 1_000);
+        set_receipt(&store, &unknown, Some("boot-a"), 1_000);
+        let evidence = crate::host_boot::BootEvidence {
+            boot_id: Some("boot-b".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            store
+                .abandon_dead_guarded_exec_receipts(1, &evidence)
+                .unwrap(),
+            2
+        );
+
+        store
+            .complete_guarded_exec_command(1, &finished, "failed", Some(3), "verified")
+            .unwrap();
+        store
+            .mark_guarded_exec_outcome_unknown(1, &unknown, "unverified")
+            .unwrap();
+
+        assert_eq!(phase_of(&store, &finished), "completed");
+        let late: Vec<String> = {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT payload_json FROM events WHERE kind = ?1 ORDER BY id")
+                .unwrap();
+            stmt.query_map([crate::events::GUARDED_EXEC_RECEIPT_LATE_OUTCOME], |row| {
+                row.get(0)
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+        };
+        assert_eq!(late.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(&late[0]).unwrap();
+        assert_eq!(first["command_outcome"], "failed");
+        assert_eq!(first["exit_code"], 3);
+        let second: serde_json::Value = serde_json::from_str(&late[1]).unwrap();
+        assert_eq!(second["command_outcome"], "outcome_unknown");
+        assert!(
+            store
+                .complete_guarded_exec_command(
+                    1,
+                    "ffffffffffffffffffffffffffffffff",
+                    "failed",
+                    Some(1),
+                    "verified"
+                )
+                .is_err(),
+            "a receipt that was never settled still refuses a stray write"
         );
     }
 

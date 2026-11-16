@@ -7101,6 +7101,13 @@ impl Broker {
         } else {
             window_ms
         };
+        // The no-work lane judges sessions from its shorter window on.
+        let no_work_window_ms = policy.no_work_abandonment_window_ms();
+        let candidate_window_ms = if no_work_window_ms > 0 {
+            candidate_window_ms.min(no_work_window_ms)
+        } else {
+            candidate_window_ms
+        };
         let retirement_candidates = sessions
             .iter()
             .filter(|session| {
@@ -7336,6 +7343,38 @@ impl Broker {
                     deadline,
                 )?;
             }
+            // A session not yet past the full window may still close by the
+            // no-work window; the not-due memo never hides it from that lane.
+            let mut closed_no_work = false;
+            let old_enough_for_no_work = no_work_window_ms > 0
+                && crate::decide_abandonment(
+                    &crate::SessionActivity {
+                        session_id: session.id,
+                        last_activity_at: session.last_activity_at,
+                        created_at: session.created_at,
+                        agent_alive: None,
+                        closed: false,
+                    },
+                    now,
+                    no_work_window_ms,
+                )
+                .is_abandoned();
+            if fall_through && !old_enough_for_abandonment && old_enough_for_no_work {
+                let no_work = self.try_close_no_work_session(
+                    session.id,
+                    now,
+                    no_work_window_ms,
+                    &mut holder_process_table,
+                    allow_snapshot,
+                    deadline,
+                )?;
+                // A keep here is counted by the lane itself and leaves the
+                // pass's outcome for this session as it was.
+                if no_work == crate::broker::AbandonedSessionCloseOutcome::Closed {
+                    outcome = no_work;
+                    closed_no_work = true;
+                }
+            }
             if let Some(reason) = landed_decline
                 && !matches!(outcome, crate::broker::AbandonedSessionCloseOutcome::Closed)
             {
@@ -7348,7 +7387,9 @@ impl Broker {
                     // The cursor lane closes by the landed window or the
                     // abandonment window; merged-pull-request closes happen
                     // in the likely-landed queue.
-                    let reason = if landed_decline.is_none() && idle_enough_for_landed {
+                    let reason = if closed_no_work {
+                        crate::session_auto_close::CLOSE_REASON_INACTIVE_NO_WORK
+                    } else if landed_decline.is_none() && idle_enough_for_landed {
                         crate::session_auto_close::CLOSE_REASON_LANDED
                     } else {
                         "abandoned"
