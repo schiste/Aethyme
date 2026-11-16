@@ -32,7 +32,7 @@ schema = 1
 [[servers]]
 name = "example-server"
 mode = "shared"                 # "direct" (default): stateful, one per agent
-transport = "stdio"             # "http" is accepted but not served yet
+transport = "stdio"             # or "http" (see HTTP servers below)
 argv = ["pnpm", "exec", "example-server", "--stdio"]
 cwd = "/srv/example"            # host file: absolute paths only
 env_file = ".env.staging"       # relative to cwd
@@ -359,3 +359,48 @@ fallbacks by reason, and the upstream's resident memory, sampled at most once
 a minute). The hub records upstream starts,
 stops, crashes, unhealthy keys and overflows in `events.jsonl`, never message
 bodies.
+
+## HTTP servers
+
+An entry with `transport = "http"` names a server that speaks MCP's
+streamable HTTP transport instead of stdio:
+
+```toml
+[[servers]]
+name = "example-http"
+mode = "shared"
+transport = "http"
+argv = ["/srv/example/bin/example-server", "--http", "--port={port}", "--isolated"]
+require_argv = ["--isolated"]   # refused if an edit drops the flag
+http_path = "/mcp"              # the default
+cwd = "/srv/example"
+```
+
+- The server is started with every `{port}` in `argv` replaced by a loopback
+  port, which is also exported as `AETHYME_MCP_PORT`, and must answer on
+  `http://127.0.0.1:<port><http_path>`. `connect` bridges the agent's stdio
+  to that URL: each stdin message is POSTed, a JSON reply or every event of
+  an SSE reply goes to stdout, the `Mcp-Session-Id` and negotiated
+  `MCP-Protocol-Version` are sent with every later request, a `GET` stream
+  is opened for server-initiated messages when the server offers one, and
+  the session is ended with `DELETE` when the agent leaves. Only loopback
+  HTTP/1.1 is spoken.
+- Shared, the hub runs one server per key on a port leased from the host
+  resource registry (`tcp_port`, 47300-47799; the port is kept across
+  restarts) and tells each `connect` its URL. Every agent is its own HTTP
+  session, so nothing is multiplexed or renumbered, and the per-session
+  rules above (logging, subscriptions, client capabilities) are the
+  server's own. That is only safe when the server keeps sessions apart:
+  put its isolation flag in `argv` and list it in `require_argv`, so a
+  change that removes it is refused (`missing_required_argument`) instead
+  of silently shared. The server counts as ready once its port accepts
+  connections; one that does not listen within 30 seconds is killed and
+  counts as a crash. A crash ends the HTTP sessions, so each agent's
+  `connect` reports the session ended; when the hub stops the server, the
+  `connect` processes attached to it exit.
+- Direct, or whenever the hub is not used (the same reasons as for stdio),
+  `connect` runs the server as its own child on a free loopback port and
+  bridges to it; the server stops when the agent leaves. A server that never
+  listens runs `--fallback` when one is given.
+- `aethyme mcp status --json` shows each HTTP upstream's `port`, and the
+  counters add `last_listen_ms`.
