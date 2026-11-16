@@ -31,10 +31,11 @@ Usage:
       <short>` on stderr. Any failure before the exec exits non-zero, unless
       --fallback is given: then the fallback command runs instead (in
       --fallback-cwd when given), so an agent is never blocked.
-  aethyme mcp trust [--repo <path>] [--json]
+  aethyme mcp trust [--repo <path>] [--yes --digest <sha256>] [--json]
       Print what the repository's .aethyme/mcp.toml declares (each entry's
-      argv, cwd, env_file, env_allow) and trust that exact file on this host.
-      Any change to the file needs trust again.
+      argv, cwd, env_file, env_allow) and its sha256, then trust that exact
+      file on this host after a typed confirmation on a terminal, or with
+      --yes --digest <the printed sha256>. Any change needs trust again.
   aethyme mcp status [--json]
       Every entry with its resolution, identity, chosen copy and key,
       refused, shadowed and untrusted entries, and per-entry counters from

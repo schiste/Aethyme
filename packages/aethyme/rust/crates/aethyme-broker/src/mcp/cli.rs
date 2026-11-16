@@ -54,10 +54,11 @@ Usage:
       <short>` on stderr. Any failure before the exec exits non-zero, unless
       --fallback is given: then the fallback command runs instead (in
       --fallback-cwd when given), so an agent is never blocked.
-  aethyme mcp trust [--repo <path>] [--json]
+  aethyme mcp trust [--repo <path>] [--yes --digest <sha256>] [--json]
       Print what the repository's .aethyme/mcp.toml declares (each entry's
-      argv, cwd, env_file, env_allow) and trust that exact file on this host.
-      Any change to the file needs trust again.
+      argv, cwd, env_file, env_allow) and its sha256, then trust that exact
+      file on this host after a typed confirmation on a terminal, or with
+      --yes --digest <the printed sha256>. Any change needs trust again.
   aethyme mcp status [--json]
       Every entry with its resolution, identity, chosen copy and key,
       refused, shadowed and untrusted entries, and per-entry counters from
@@ -130,6 +131,8 @@ struct Options {
     name: Option<String>,
     agent: Option<String>,
     repo: Option<String>,
+    yes: bool,
+    digest: Option<String>,
 }
 
 fn parse_options(args: &[String], allow: &[&str]) -> Result<Options, String> {
@@ -139,6 +142,8 @@ fn parse_options(args: &[String], allow: &[&str]) -> Result<Options, String> {
         name: None,
         agent: None,
         repo: None,
+        yes: false,
+        digest: None,
     };
     let mut index = 0;
     while index < args.len() {
@@ -158,6 +163,10 @@ fn parse_options(args: &[String], allow: &[&str]) -> Result<Options, String> {
             }
             "--repo" if allow.contains(&"--repo") => {
                 options.repo = Some(take_value(&mut index)?);
+            }
+            "--yes" if allow.contains(&"--yes") => options.yes = true,
+            "--digest" if allow.contains(&"--digest") => {
+                options.digest = Some(take_value(&mut index)?);
             }
             option if option.starts_with('-') => return Err(format!("unknown option {option}")),
             value if allow.contains(&"<name>") && options.name.is_none() => {
@@ -325,6 +334,7 @@ fn record_resolve(
                 phases_ms: phases,
                 shadowed: false,
                 fallback: false,
+                warnings: Vec::new(),
             },
         ),
     );
@@ -678,12 +688,20 @@ fn run_config_print(args: &[String]) -> u8 {
 }
 
 fn run_trust(args: &[String]) -> u8 {
-    let options = match parse_options(args, &["--json", "--repo"]) {
+    let options = match parse_options(args, &["--json", "--repo", "--yes", "--digest"]) {
         Ok(options) => options,
         Err(message) => {
             return report_error(json_requested(args), "usage", &message, exit_status::USAGE);
         }
     };
+    if options.yes != options.digest.is_some() {
+        return report_error(
+            options.json,
+            "usage",
+            "--yes needs --digest <sha256> (the digest this command prints), and --digest needs --yes",
+            exit_status::USAGE,
+        );
+    }
     let start = match &options.repo {
         Some(path) => std::path::PathBuf::from(path),
         None => match std::env::current_dir() {
@@ -742,14 +760,8 @@ fn run_trust(args: &[String]) -> u8 {
         &GitCheckouts,
     );
     let sha256 = super::trust::file_digest(&bytes);
-    if let Err(error) = super::trust::record(&directory, &anchor.identity, &sha256, &path) {
-        return report_error(
-            options.json,
-            "trust_not_recorded",
-            &format!("could not record trust: {error}"),
-            exit_status::ENVIRONMENT,
-        );
-    }
+
+    // Show what would be trusted before anything is recorded.
     let declared: Vec<Value> = entries
         .iter()
         .map(|entry| {
@@ -763,49 +775,119 @@ fn run_trust(args: &[String]) -> u8 {
             })
         })
         .collect();
+    if !options.json {
+        println!(
+            "{} (sha256 {sha256}) for repository {} declares:",
+            path.display(),
+            anchor.identity
+        );
+        for entry in &entries {
+            println!("  {}", entry.name);
+            println!("    argv: {}", shell_words(&entry.argv));
+            if let Some(cwd) = &entry.cwd {
+                println!("    cwd: {}", cwd.display());
+            }
+            if let Some(env_file) = &entry.env_file {
+                println!("    env_file: {}", env_file.display());
+            }
+            println!(
+                "    env_inherit: {}; env_allow: {}",
+                serde_name(&entry.env_inherit),
+                if entry.env_allow.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    entry.env_allow.join(", ")
+                }
+            );
+        }
+        for error in &errors {
+            println!("  refused (never runs): {error}");
+        }
+    }
+
+    // Approval: an interactive confirmation, or --yes with the digest shown,
+    // so a non-interactive caller must have read this output.
+    let approval = match &options.digest {
+        Some(digest) if *digest == sha256 => Ok("digest"),
+        Some(_) => Err((
+            "digest_mismatch",
+            format!(
+                "--digest does not match the file's sha256 {sha256}; review the entries above \
+                 and pass the digest they were printed with"
+            ),
+        )),
+        None => confirm_on_terminal(&sha256),
+    };
+    let approval = match approval {
+        Ok(approval) => approval,
+        Err((code, message)) => {
+            if options.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "schema": TRUST_SCHEMA,
+                        "path": path,
+                        "repository": anchor.identity,
+                        "sha256": sha256,
+                        "trusted": false,
+                        "reason": code,
+                        "entries": declared,
+                        "errors": errors,
+                    }))
+                    .unwrap_or_default()
+                );
+            }
+            eprintln!("aethyme mcp: not trusted: {message}");
+            return exit_status::REFUSED;
+        }
+    };
+    if let Err(error) = super::trust::record(&directory, &anchor.identity, &sha256, &path, approval)
+    {
+        return report_error(
+            options.json,
+            "trust_not_recorded",
+            &format!("could not record trust: {error}"),
+            exit_status::ENVIRONMENT,
+        );
+    }
     if options.json {
-        let value = json!({
-            "schema": TRUST_SCHEMA,
-            "path": path,
-            "repository": anchor.identity,
-            "sha256": sha256,
-            "entries": declared,
-            "errors": errors,
-        });
         println!(
             "{}",
-            serde_json::to_string_pretty(&value).unwrap_or_default()
+            serde_json::to_string_pretty(&json!({
+                "schema": TRUST_SCHEMA,
+                "path": path,
+                "repository": anchor.identity,
+                "sha256": sha256,
+                "trusted": true,
+                "approval": approval,
+                "entries": declared,
+                "errors": errors,
+            }))
+            .unwrap_or_default()
         );
-        return exit_status::SUCCESS;
+    } else {
+        println!("Trusted ({approval}). Any change to this file needs `aethyme mcp trust` again.");
     }
-    println!(
-        "Trusted {} (sha256 {}) for repository {}:",
-        path.display(),
-        &sha256[..16],
-        anchor.identity
-    );
-    for entry in &entries {
-        println!("  {}", entry.name);
-        println!("    argv: {}", shell_words(&entry.argv));
-        if let Some(cwd) = &entry.cwd {
-            println!("    cwd: {}", cwd.display());
-        }
-        if let Some(env_file) = &entry.env_file {
-            println!("    env_file: {}", env_file.display());
-        }
-        println!(
-            "    env_inherit: {}; env_allow: {}",
-            serde_name(&entry.env_inherit),
-            if entry.env_allow.is_empty() {
-                "(none)".to_string()
-            } else {
-                entry.env_allow.join(", ")
-            }
-        );
-    }
-    for error in &errors {
-        println!("  refused (never runs): {error}");
-    }
-    println!("Any change to this file needs `aethyme mcp trust` again.");
     exit_status::SUCCESS
+}
+
+/// Ask on the terminal; refuse when there is none.
+fn confirm_on_terminal(sha256: &str) -> Result<&'static str, (&'static str, String)> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        return Err((
+            "confirmation_required",
+            format!(
+                "no terminal to confirm on; after reviewing the entries, run again with \
+                 --yes --digest {sha256}"
+            ),
+        ));
+    }
+    eprint!("Trust this file on this host? Type yes to confirm: ");
+    let _flushed = std::io::stderr().flush();
+    let mut answer = String::new();
+    if std::io::stdin().lock().read_line(&mut answer).is_err() || answer.trim() != "yes" {
+        return Err(("declined", "the confirmation was not given".to_string()));
+    }
+    Ok("terminal")
 }

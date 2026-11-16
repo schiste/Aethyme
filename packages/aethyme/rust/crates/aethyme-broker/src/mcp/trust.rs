@@ -30,6 +30,10 @@ pub struct TrustRecord {
     pub sha256: String,
     pub path: PathBuf,
     pub trusted_at_ms: u64,
+    /// How the owner approved: `terminal` (typed confirmation) or `digest`
+    /// (`--yes --digest` matching the printed digest).
+    #[serde(default)]
+    pub approval: String,
 }
 
 /// SHA-256 of a repository file's bytes (not secret: the file is in Git).
@@ -53,13 +57,24 @@ pub fn trusted_digests(directory: &Path, identity: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Trust `sha256` of `path` for `identity`.
-pub fn record(directory: &Path, identity: &str, sha256: &str, path: &Path) -> std::io::Result<()> {
+/// Lock file serializing trust updates, so concurrent runs lose nothing.
+pub const TRUST_LOCK: &str = "trusted-repositories.lock";
+
+/// Trust `sha256` of `path` for `identity`, recording how it was approved.
+pub fn record(
+    directory: &Path,
+    identity: &str,
+    sha256: &str,
+    path: &Path,
+    approval: &str,
+) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(directory)?;
+    let lock = crate::service::transport::private_coordination_file(&directory.join(TRUST_LOCK))?;
+    let _held = crate::file_lock::ExclusiveFileLock::acquire(lock)?;
     let mut file = read(directory);
     let records = file.repositories.entry(identity.to_string()).or_default();
     records.retain(|record| record.sha256 != sha256);
@@ -67,6 +82,7 @@ pub fn record(directory: &Path, identity: &str, sha256: &str, path: &Path) -> st
         sha256: sha256.to_string(),
         path: path.to_path_buf(),
         trusted_at_ms: super::telemetry::now_ms(),
+        approval: approval.to_string(),
     });
     let excess = records.len().saturating_sub(KEEP_PER_REPOSITORY);
     records.drain(..excess);

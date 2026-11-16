@@ -530,15 +530,37 @@ cwd = \".\"
     assert_eq!(stdout(&shared), "host-ran\n");
     assert!(stderr(&shared).contains("is ignored and the host entry is used"));
 
-    let trusted = fixture.run(&["mcp", "trust", "--json"]);
-    assert!(trusted.status.success(), "{}", stderr(&trusted));
-    let value = json(&trusted);
+    // Without a terminal, trust shows the entries and records nothing.
+    let shown = fixture.run(&["mcp", "trust", "--json"]);
+    assert_eq!(shown.status.code(), Some(3), "{}", stderr(&shown));
+    let value = json(&shown);
     assert_eq!(value["schema"], "aethyme.mcp-trust/v1");
+    assert_eq!(value["trusted"], false);
+    assert_eq!(value["reason"], "confirmation_required");
     assert_eq!(value["entries"][0]["name"], "repository-server");
     assert_eq!(
         value["entries"][0]["argv"],
         serde_json::json!(["./repository.sh"])
     );
+    let digest = value["sha256"].as_str().unwrap().to_string();
+    assert!(!fixture.state.join("mcp/trusted-repositories.json").exists());
+    let still_refused = fixture.run(&["mcp", "connect", "repository-server"]);
+    assert_eq!(still_refused.status.code(), Some(3));
+
+    let wrong = fixture.run(&["mcp", "trust", "--yes", "--digest", "0000", "--json"]);
+    assert_eq!(wrong.status.code(), Some(3));
+    assert_eq!(json(&wrong)["reason"], "digest_mismatch");
+    let missing = fixture.run(&["mcp", "trust", "--yes"]);
+    assert_eq!(missing.status.code(), Some(2));
+
+    let trusted = fixture.run(&["mcp", "trust", "--yes", "--digest", &digest, "--json"]);
+    assert!(trusted.status.success(), "{}", stderr(&trusted));
+    let value = json(&trusted);
+    assert_eq!(value["trusted"], true);
+    assert_eq!(value["approval"], "digest");
+    let record =
+        std::fs::read_to_string(fixture.state.join("mcp/trusted-repositories.json")).unwrap();
+    assert!(record.contains("\"approval\": \"digest\""), "{record}");
 
     let ran = fixture.run(&["mcp", "connect", "repository-server"]);
     assert!(ran.status.success(), "{}", stderr(&ran));
