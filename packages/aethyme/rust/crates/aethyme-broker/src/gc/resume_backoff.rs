@@ -10,6 +10,8 @@
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
+use crate::BrokerOpError;
+
 /// Broker meta key holding the last failed open-time resume.
 pub(super) const FAILURE_KEY: &str = "gc_journal_resume_failure";
 /// How long open-time resume leaves an unchanged failing journal alone.
@@ -36,6 +38,20 @@ pub(super) fn failure_record(fingerprint: &str, now_ms: i64) -> String {
         failed_at_ms: now_ms,
     })
     .expect("a resume failure record serializes")
+}
+
+/// Whether a resume failure will recur unchanged on the next open, so that
+/// retrying it on every command only repeats the warning. A held GC lock, a
+/// busy database, a spent budget or an I/O error may clear by itself and is
+/// retried on the next open instead.
+pub(super) fn is_deterministic(error: &BrokerOpError) -> bool {
+    matches!(
+        error,
+        BrokerOpError::InvalidGcJournal { .. }
+            | BrokerOpError::GcResumeConfirmationMismatch { .. }
+            | BrokerOpError::GcConfirmationMismatch { .. }
+            | BrokerOpError::GcConfirmationNotSha256
+    )
 }
 
 /// Whether open-time resume should skip the journal `fingerprint` at
@@ -72,5 +88,16 @@ mod tests {
         );
         assert!(!active(Some(""), "journal-a", 1_001));
         assert!(!active(None, "journal-a", 1_001));
+    }
+
+    #[test]
+    fn only_failures_that_recur_unchanged_arm_the_backoff() {
+        let invalid = BrokerOpError::InvalidGcJournal {
+            reason: "schema 2".into(),
+        };
+        let locked = BrokerOpError::GcLocked { pid: "1".into() };
+
+        assert!(is_deterministic(&invalid));
+        assert!(!is_deterministic(&locked));
     }
 }

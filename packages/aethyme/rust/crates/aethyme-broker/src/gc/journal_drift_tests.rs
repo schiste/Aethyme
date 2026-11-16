@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::{Broker, BrokerOpError, GcFileAction, GcFileCandidate, RetentionPolicy};
 
 use super::{
-    GcJournal, now_ms, resume_backoff, retained_metric_bytes, sha256, utc_day_floor_ms,
+    GcJournal, GcLock, now_ms, resume_backoff, retained_metric_bytes, sha256, utc_day_floor_ms,
     write_journal,
 };
 
@@ -274,4 +274,38 @@ fn a_failing_resume_backs_off_until_the_journal_changes_or_the_window_passes() {
             .is_err(),
         "a changed journal is retried at once"
     );
+}
+
+#[test]
+fn a_held_gc_lock_does_not_arm_the_backoff_and_the_next_open_resumes() {
+    let mut repository = Repository::new();
+    let journal = repository.publish_journal(Vec::new());
+    let start = 1_000_000;
+
+    let held = GcLock::acquire(&repository.root).unwrap();
+    let busy = repository
+        .broker
+        .apply_confirmed_gc_journal_at(journal.clone(), 5000, start)
+        .unwrap_err();
+    drop(held);
+
+    assert!(matches!(busy, BrokerOpError::GcLocked { .. }), "{busy}");
+    assert!(
+        !busy.to_string().contains("gc abandon"),
+        "a busy lock is not a reason to abandon the journal: {busy}"
+    );
+    let record = repository
+        .broker
+        .store()
+        .meta_get(resume_backoff::FAILURE_KEY)
+        .unwrap();
+    assert!(record.as_deref().is_none_or(str::is_empty), "{record:?}");
+
+    let report = repository
+        .broker
+        .apply_confirmed_gc_journal_at(journal, 5000, start + 60_000)
+        .unwrap()
+        .expect("the next open resumes the journal");
+    assert!(report.complete, "{report:?}");
+    assert!(!repository.journal_path().exists());
 }

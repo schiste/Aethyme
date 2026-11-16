@@ -153,9 +153,10 @@ cleanup is independent of `auto_remove`.
 Inspect `.aethyme/gc-journal.json` before the first normal open: startup can
 resume a previously confirmed plan independently of these automatic-maintenance
 holds. Resolve any pending journal through the reviewed GC recovery workflow
-before proceeding. A startup resume that fails warns once, naming
-`gc apply --confirm <digest>` and `gc abandon --confirm <digest>`. It retries
-that journal only after 15 minutes or once the journal changes. A reviewed gate
+before proceeding. A startup resume that fails because the journal itself is
+invalid warns once, naming `gc apply --confirm <digest>` and
+`gc abandon --confirm <digest>`, and retries that journal only after 15 minutes
+or once the journal changes. A busy GC lock is retried on the next open. A reviewed gate
 log that changed is retained and skipped, not deleted, and does not block the
 rest of the journal. A shared router/engine update affects multiple enrolled
 repositories; apply the holds and verify the drain for every affected database.

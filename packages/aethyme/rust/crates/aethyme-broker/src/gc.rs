@@ -2830,14 +2830,24 @@ fn trim_reviewed_metrics_log(
             };
         }
     };
-    let attempts = match &outcome {
-        MetricsTrim::Trimmed { attempts, .. }
-        | MetricsTrim::NothingExpired { attempts }
-        | MetricsTrim::SkippedConcurrentAppend { attempts } => *attempts,
-        MetricsTrim::Missing | MetricsTrim::Refused(_) => 1,
+    let (attempts, stale_temporaries) = match &outcome {
+        MetricsTrim::Trimmed {
+            attempts,
+            stale_temporaries_removed,
+            ..
+        }
+        | MetricsTrim::NothingExpired {
+            attempts,
+            stale_temporaries_removed,
+        } => (*attempts, *stale_temporaries_removed),
+        MetricsTrim::SkippedConcurrentAppend { attempts } => (*attempts, 0),
+        MetricsTrim::Missing | MetricsTrim::LockUnavailable(_) | MetricsTrim::Refused(_) => (1, 0),
     };
     for _ in 1..attempts {
         crate::phase_telemetry::add("gc_metrics_trim_retried", Duration::ZERO);
+    }
+    for _ in 0..stale_temporaries {
+        crate::phase_telemetry::add("gc_metrics_trim_stale_temporary_removed", Duration::ZERO);
     }
     match outcome {
         MetricsTrim::Trimmed {
@@ -2866,6 +2876,12 @@ fn trim_reviewed_metrics_log(
                     "rows were appended concurrently on each of {attempts} attempts; nothing was removed or lost, and the next GC plan proposes this trim again"
                 ),
             }
+        }
+        // Skipped, not stopped: a lock that cannot be taken here will not be
+        // takeable on the next run either, and must not pin the journal.
+        MetricsTrim::LockUnavailable(reason) => {
+            crate::phase_telemetry::add("gc_metrics_trim_lock_unavailable", Duration::ZERO);
+            GcFileStep::Skipped { reason }
         }
         MetricsTrim::Refused(reason) => {
             crate::phase_telemetry::add("gc_file_skipped_drifted", Duration::ZERO);
@@ -6973,8 +6989,20 @@ impl Broker {
                 let budget_ms = policy.startup_budget_ms;
                 self.apply_confirmed_gc_journal(journal, budget_ms)?
             }
-            None => None,
+            None => {
+                crate::warn_unrecorded(
+                    "clear the remembered GC journal resume failure",
+                    self.forget_gc_resume_failure(),
+                );
+                None
+            }
         };
+        // A pending journal that backoff skipped leaves its remaining
+        // candidates on disk while the sweep below runs. That is the state a
+        // budget-limited resume already leaves: the sweep takes the GC lock
+        // and re-proves every directory it removes, and each journal step
+        // re-proves its own candidate when it runs, treating one that is
+        // already gone as done.
         // The sweep only reclaims rebuildable caches, and this runs inside
         // broker open: its failure must not stop every command.
         crate::warn_unrecorded(
@@ -7005,10 +7033,26 @@ impl Broker {
         }
         let journal_path = self.main_root().join(".aethyme/gc-journal.json");
         let Some(journal) = load_journal(&journal_path)? else {
+            crate::warn_unrecorded(
+                "clear the remembered GC journal resume failure",
+                self.forget_gc_resume_failure(),
+            );
             return Ok(None);
         };
         let policy = load_retention_policy(self.main_root())?;
         self.apply_confirmed_gc_journal(journal, policy.startup_budget_ms)
+    }
+
+    /// Clear a remembered resume failure once it can no longer apply: the
+    /// journal finished, or `gc abandon` (which opens a read-only snapshot
+    /// and cannot write meta) archived it. One meta read per writable open
+    /// without a journal; a write only when a record is present.
+    fn forget_gc_resume_failure(&mut self) -> Result<(), BrokerOpError> {
+        let record = self.store().meta_get(resume_backoff::FAILURE_KEY)?;
+        if record.is_some_and(|value| !value.is_empty()) {
+            self.store().meta_set(resume_backoff::FAILURE_KEY, "")?;
+        }
+        Ok(())
     }
 
     fn apply_confirmed_gc_journal(
@@ -7020,10 +7064,12 @@ impl Broker {
     }
 
     /// Resume a confirmed journal at `now_ms`, unless its last open-time
-    /// resume failed on these exact journal bytes within the backoff window
-    /// (`None`). A failure is remembered and returned once, naming the
-    /// commands that finish or archive the journal; an unchanged failing
-    /// journal then costs nothing on the commands that follow.
+    /// resume failed deterministically on these exact journal bytes within
+    /// the backoff window (`None`). Such a failure is remembered and returned
+    /// once, naming the commands that finish or archive the journal; an
+    /// unchanged failing journal then costs nothing on the commands that
+    /// follow. A failure the next open may not repeat (a held GC lock, a busy
+    /// database, I/O) is returned unchanged and arms nothing, as before.
     fn apply_confirmed_gc_journal_at(
         &mut self,
         journal: GcJournal,
@@ -7051,6 +7097,10 @@ impl Broker {
             }
             Err(error) => {
                 crate::phase_telemetry::add("gc_journal_resume_failed", Duration::ZERO);
+                if !resume_backoff::is_deterministic(&error) {
+                    return Err(error);
+                }
+                crate::phase_telemetry::add("gc_journal_resume_backoff_armed", Duration::ZERO);
                 // Fingerprint the bytes left now: a partial run rewrites the
                 // journal before it fails.
                 if let Some(fingerprint) = resume_backoff::journal_fingerprint(&journal_path) {
@@ -13477,6 +13527,10 @@ impl Broker {
                 path: journal_path,
                 source,
             })?;
+            crate::warn_unrecorded(
+                "clear the remembered GC journal resume failure",
+                self.forget_gc_resume_failure(),
+            );
         }
         Ok(report)
     }
