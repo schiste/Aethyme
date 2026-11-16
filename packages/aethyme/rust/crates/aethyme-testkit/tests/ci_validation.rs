@@ -50,12 +50,18 @@ fn pull_requests_trigger_only_the_contract_check() {
     // Each workflow that left the pull-request lane can still be run by hand on
     // a branch, and on main. The tap's dispatch publishes, so its branch-free
     // rehearsal stays on push.
-    for name in ["oss-ci.yml", "windows-release.yml", "release-targets.yml"] {
+    for name in ["oss-ci.yml", "release-targets.yml"] {
         let text = workflow(name);
         let on = block(&text, "on:");
         assert!(on.contains(&"  workflow_dispatch:"), "{name}");
         assert!(on.contains(&"  push:"), "{name}");
     }
+    // Merges to main run Linux only. The Windows smoke runs on request; a
+    // release tag builds and smokes the Windows zip in release.yml.
+    assert_eq!(
+        block(&workflow("windows-release.yml"), "on:"),
+        ["  workflow_dispatch:"]
+    );
     let tap = workflow("homebrew-tap.yml");
     assert!(block(&tap, "on:").contains(&"  push:"));
     // A release calls the tap workflow from a tag push, so the event name cannot
@@ -723,11 +729,11 @@ fn macos_nightly_runs_the_whole_workspace_suite() {
     assert!(job.contains(&"        run: cargo build --locked --workspace --bins"));
 }
 
-/// Every commit on main also runs the workspace suite on macOS, with the
-/// commands of the Linux shards. It stays off pull requests (the per-PR macOS
-/// job blocked merges for 6-10 min of runner queue) and is no required check.
+/// Every release tag runs the workspace suite on macOS, with the commands of
+/// the Linux shards. It stays off pull requests and off merges to main (each
+/// merge queued a ~55 minute run nobody read) and is no required check.
 #[test]
-fn macos_tests_run_the_workspace_suite_on_main() {
+fn macos_tests_run_the_workspace_suite_per_release() {
     let run_lines = |text: &str, job: &str| -> Vec<String> {
         block(text, job)
             .iter()
@@ -741,12 +747,12 @@ fn macos_tests_run_the_workspace_suite_on_main() {
         block(&macos, "on:"),
         [
             "  push:",
-            "    branches: [\"main\"]",
+            "    tags: [\"v*\"]",
             "  workflow_dispatch:"
         ]
     );
     assert_eq!(block(&macos, "permissions:"), ["  contents: read"]);
-    assert!(macos.contains("  group: macos-tests-${{ github.sha }}\n  cancel-in-progress: false"));
+    assert!(macos.contains("  group: macos-tests-${{ github.ref }}\n  cancel-in-progress: true"));
     assert!(!macos.contains("github.event."));
 
     for job in [

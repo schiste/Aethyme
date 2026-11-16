@@ -1,26 +1,25 @@
 name: macOS tests
 
-# The Rust workspace suite on macOS, the primary user platform, for every
-# commit on main. Linux CI never saw macOS-only breakage; the nightly
-# (macos-nightly.yml) saw it a day late, on one runner, in ~53 minutes.
+# The Rust workspace suite on macOS, the primary user platform, once per
+# release (every `v*` tag) and on request (`workflow_dispatch` on any ref).
+#
+# Not on merges to main (since 2026-11-16): every merge queued a ~55 minute
+# macOS run, the queue backed up past an hour, and nothing read the verdict
+# before the next merge. Main runs Linux only; the other platforms run when a
+# release is cut. The nightly (macos-nightly.yml) still covers main daily.
 #
 # Not on pull requests: the per-pull-request macOS job removed on 2026-10-06
-# waited 6-10 min for a runner and blocked every merge on it. Here it runs
-# after the merge and blocks nothing.
+# waited 6-10 min for a runner and blocked every merge on it.
 #
-# Not a required check and not a release gate (yet): it has never been green,
-# and release verification reads only Aethyme Gates' full-suite record. Make
-# it one only after it has been reliably green.
+# Not a required check and not a release gate (yet): release verification
+# reads only Aethyme Gates' full-suite record.
 #
 # Shape: the commands and jobs of aethyme-gates.yml's cargo-test gate, on
 # macos-15. One job compiles the suite once into a nextest archive, six shard
 # jobs each run one hash partition of it, one job runs examples and doctests,
-# and `macos-tests` gives the one verdict. The nightly took 3187 s of test
-# time on one runner; six partitions bring each shard to roughly 9 min, so
-# the run takes about the build plus one shard (~25-35 min including the
-# macOS runner queue) instead of ~55 min. `macos_tests_run_the_workspace_suite_on_main`
-# in aethyme-testkit's ci_validation.rs keeps the commands equal to the
-# Linux shards'.
+# and `macos-tests` gives the one verdict.
+# `macos_tests_run_the_workspace_suite_per_release` in aethyme-testkit's
+# ci_validation.rs keeps the commands equal to the Linux shards'.
 #
 # The Linux jobs use GNU tools (`sha256sum`, `stat -c`, `tar --zstd`); these
 # use what macOS ships (`shasum -a 256`, `wc -c`, bsdtar). The archive itself
@@ -31,7 +30,7 @@ name: macOS tests
 
 on:
   push:
-    branches: ["main"]
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -42,13 +41,12 @@ permissions:
 env:
   CARGO_NET_RETRY: "10"
 
-# One group per commit: every commit on main gets a completed verdict.
-# Cancelling superseded runs left merge commits with no verdict at all
-# (aethyme-gates.yml, 2026-09-23), and a macOS break must be attributable to
-# the commit that introduced it.
+# One group per ref: a newer run on the same branch or tag replaces an older
+# one still queued or running, so a branch pushed several times does not hold
+# the macOS runners with superseded commits.
 concurrency:
-  group: macos-tests-${{ github.sha }}
-  cancel-in-progress: false
+  group: macos-tests-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   macos-tests-build:
