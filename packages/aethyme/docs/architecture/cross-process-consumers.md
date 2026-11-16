@@ -86,7 +86,13 @@ speaks a line-delimited JSON attach protocol over a 0600 socket in
 `aethyme mcp trust` now records only after a terminal confirmation or
 `--yes --digest <sha256>`; its JSON adds `trusted`, `approval` and `reason`.
 `status --json` adds `hub` (state, pid, upstreams) and per entry
-`hub.upstream`, `hub.counters`.
+`hub.upstream`, `hub.counters`. For `transport = "http"` entries the attach
+hello adds `"transport": "http"`, `"path"` and `"auth"`, and the hub answers
+with one `{"aethyme_hub": "ready", "url", "token"}` (or `fallback`) line; the server's port is
+a `tcp_port` lease (`repository = "aethyme-mcp-hub"`) in the host resource
+registry, and `status --json` adds `port` per upstream and
+`last_listen_ms` / `http_sessions_ended` per key. Entries gain
+`require_argv`, `http_path`, `http_auth` and `http_unauthenticated`.
 
 Managed servers add two more external consumers. `aethyme mcp intercept
 install` creates symlinks named after launchers (`npx`, `npm`, `pnpm`,

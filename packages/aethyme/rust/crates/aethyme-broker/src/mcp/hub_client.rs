@@ -14,11 +14,15 @@ use std::os::unix::net::{SocketAddr, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use super::config::HttpAuth;
+use super::http::{BridgeOptions, Ended};
 use super::hub::{HubPaths, build_identity};
 use super::jsonrpc::{self, read_message};
 use super::key::Plan;
@@ -213,36 +217,36 @@ pub fn query_status() -> Option<Value> {
     .ok()?
 }
 
-/// Attach this agent to the hub for `plan` and bridge until it leaves.
-pub fn attach(plan: &Plan, budget: Duration) -> Attach {
+/// Find or start the hub and send the attach hello (`http_path` for an
+/// HTTP server); the stream once the hub accepted, or why not.
+fn open_attach(
+    plan: &Plan,
+    budget: Duration,
+    http: Option<(&str, &HttpAuth)>,
+) -> Result<(UnixStream, BufReader<UnixStream>), String> {
     let deadline = Instant::now() + budget;
-    let Some(directory) = hub_directory() else {
-        return Attach::Private("hub_directory_unusable".into());
-    };
+    let directory = hub_directory().ok_or("hub_directory_unusable")?;
     let paths = HubPaths::new(&directory);
     if SocketAddr::from_pathname(&paths.socket).is_err() {
-        return Attach::Private("socket_path_too_long".into());
+        return Err("socket_path_too_long".into());
     }
     // Marks any hub (of any build) recorded, even if that hub has exited.
     if let Some(reason) = super::hub::unhealthy_reason(&directory, &plan.key) {
-        return Attach::Private(format!("unhealthy:{reason}"));
+        return Err(format!("unhealthy:{reason}"));
     }
     let mut environment = Vec::new();
     for (name, value) in &plan.environment.0 {
         match (name.to_str(), value.to_str()) {
             (Some(name), Some(value)) => environment.push(json!([name, value])),
-            _ => return Attach::Private("non_utf8_environment".into()),
+            _ => return Err("non_utf8_environment".into()),
         }
     }
-    let mut stream = match connect_or_start(&paths, deadline) {
-        Ok(stream) => stream,
-        Err(reason) => return Attach::Private(reason),
-    };
+    let mut stream = connect_or_start(&paths, deadline)?;
     // Argv and environment go only to a hub run by this user.
     if super::hub::peer_uid(&stream).ok() != Some(transport::owner()) {
-        return Attach::Private("hub_peer_mismatch".into());
+        return Err("hub_peer_mismatch".into());
     }
-    let hello = json!({
+    let mut hello = json!({
         "hub": 1,
         "op": "attach",
         "build": build_identity(),
@@ -252,10 +256,15 @@ pub fn attach(plan: &Plan, budget: Duration) -> Attach {
         "cwd": plan.cwd,
         "env": environment,
     });
-    let mut hub_reader = match stream.try_clone() {
-        Ok(read_half) => BufReader::new(read_half),
-        Err(_) => return Attach::Private("hub_socket_unusable".into()),
-    };
+    if let Some((path, auth)) = http {
+        hello["transport"] = json!("http");
+        hello["path"] = json!(path);
+        hello["auth"] = json!(auth);
+    }
+    let mut hub_reader = stream
+        .try_clone()
+        .map(BufReader::new)
+        .map_err(|_| "hub_socket_unusable")?;
     let accepted = stream
         .set_read_timeout(Some(remaining(deadline)))
         .and_then(|()| stream.write_all(&jsonrpc::encode(&hello)))
@@ -265,17 +274,104 @@ pub fn attach(plan: &Plan, budget: Duration) -> Attach {
         _ => None,
     };
     match reply {
-        Some(reply) if reply.get("ok") == Some(&Value::Bool(true)) => {}
-        Some(reply) => {
-            let reason = reply
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("refused")
-                .to_string();
-            return Attach::Private(reason);
-        }
-        None => return Attach::Private("hub_no_answer".into()),
+        Some(reply) if reply.get("ok") == Some(&Value::Bool(true)) => Ok((stream, hub_reader)),
+        Some(reply) => Err(reply
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("refused")
+            .to_string()),
+        None => Err("hub_no_answer".into()),
     }
+}
+
+/// How an HTTP attach ended.
+pub enum HttpAttach {
+    /// The agent's session ran against the shared server and is over.
+    Done(Ended),
+    /// Nothing was read from stdin: run the server privately.
+    Private(String),
+}
+
+/// Attach to the shared HTTP server for `plan` and bridge this process's
+/// stdio to it, as one HTTP session of its own. The hub connection stays
+/// open meanwhile (it keeps the server up); if the hub closes it, the
+/// server is gone and this process ends.
+pub fn attach_http(plan: &Plan, http_path: &str, auth: &HttpAuth, budget: Duration) -> HttpAttach {
+    let (stream, mut hub_reader) = match open_attach(plan, budget, Some((http_path, auth))) {
+        Ok(opened) => opened,
+        Err(reason) => return HttpAttach::Private(reason),
+    };
+    // The hub waits up to its own listen deadline before answering.
+    let answered = stream
+        .set_read_timeout(Some(INITIALIZE_BUDGET + Duration::from_secs(5)))
+        .and_then(|()| read_message(&mut hub_reader));
+    let control: Option<Value> = match answered {
+        Ok(Some(line)) => serde_json::from_slice(&line).ok(),
+        _ => None,
+    };
+    let Some(control) = control else {
+        return HttpAttach::Private("no_ready_answer".into());
+    };
+    if control.get("aethyme_hub").and_then(Value::as_str) != Some("ready") {
+        let reason = control
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("refused");
+        return HttpAttach::Private(reason.to_string());
+    }
+    let Some(url) = control
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|url| super::http::parse_url(url).is_some())
+        .map(str::to_string)
+    else {
+        return HttpAttach::Private("invalid_url".into());
+    };
+    let token = control
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if !matches!(auth, HttpAuth::None) && token.is_none() {
+        return HttpAttach::Private("token_missing".into());
+    }
+    if stream.set_read_timeout(None).is_err() {
+        return HttpAttach::Private("hub_socket_unusable".into());
+    }
+    let options = BridgeOptions::new(token);
+    // The hub closes this connection when the server stops or restarts:
+    // the session is then gone, and the bridge ends.
+    let stop = Arc::clone(&options.stop);
+    let watch = thread::Builder::new()
+        .name("mcp-connect-hub-watch".into())
+        .spawn(move || {
+            let _drained = io::copy(&mut hub_reader, &mut io::sink());
+            stop.store(true, Ordering::Release);
+        });
+    if watch.is_err() {
+        return HttpAttach::Private("hub_watch_unavailable".into());
+    }
+    let ended = super::http::bridge(
+        &url,
+        BufReader::new(io::stdin()),
+        super::http::stdout_output(),
+        options,
+    );
+    if let Ended::SessionLost(reason) = &ended {
+        eprintln!(
+            "aethyme mcp: {}: the shared HTTP session ended ({reason})",
+            plan.name
+        );
+    }
+    drop(stream);
+    HttpAttach::Done(ended)
+}
+
+/// Attach this agent to the hub for `plan` and bridge until it leaves.
+pub fn attach(plan: &Plan, budget: Duration) -> Attach {
+    let (mut stream, mut hub_reader) = match open_attach(plan, budget, None) {
+        Ok(opened) => opened,
+        Err(reason) => return Attach::Private(reason),
+    };
 
     // The agent's first message is its initialize.
     let mut input = BufReader::new(io::stdin());

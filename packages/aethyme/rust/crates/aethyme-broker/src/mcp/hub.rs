@@ -8,6 +8,9 @@
 //! - started lazily by `connect`, never at boot and never pre-warmed, fully
 //!   detached (its own session, never a child of an agent's process), with an
 //!   environment reduced to what it needs;
+//! - `transport = "http"` upstreams run on a leased loopback port; the hub
+//!   only starts, watches and stops them, and each client talks HTTP to the
+//!   server itself as its own session (see [`super::http`]);
 //! - socket and lock names carry the build identity, so a hub from a newer
 //!   build takes new clients while an older one drains and exits; a live hub
 //!   is never killed;
@@ -46,7 +49,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io::{self, BufReader, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -61,7 +64,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use super::config::HttpAuth;
+use super::http;
 use super::jsonrpc::{self, Kind, read_message};
+use super::listen::{self, Listeners};
 use super::mux::{Action, ClientId, HUB_INITIALIZE_ID, INVALID_REQUEST, Route, Router};
 use super::telemetry::{self, Event};
 use crate::file_lock::ExclusiveFileLock;
@@ -69,7 +75,7 @@ use crate::service::transport;
 
 const CRASH_WINDOW: Duration = Duration::from_secs(300);
 const CRASHES_UNHEALTHY: usize = 5;
-const UNHEALTHY_FOR: Duration = Duration::from_secs(600);
+pub(crate) const UNHEALTHY_FOR: Duration = Duration::from_secs(600);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
 const STOP_GRACE: Duration = Duration::from_secs(5);
@@ -78,6 +84,10 @@ const MEMORY_SAMPLE_EVERY: Duration = Duration::from_secs(60);
 /// Client requests held per upstream while it restarts.
 const HELD_LIMIT: usize = 1024;
 const RECORDS_DIRECTORY: &str = "upstreams";
+/// Loopback ports HTTP upstreams are allocated from (a `tcp_port` lease in
+/// the host resource registry).
+const HTTP_PORTS: (u16, u16) = (47300, 47799);
+const LISTEN_POLL: Duration = Duration::from_millis(100);
 /// Unhealthy keys, persisted so the next hub and `connect` honour them.
 pub const UNHEALTHY_FILE: &str = "unhealthy.json";
 
@@ -148,6 +158,8 @@ pub struct HubConfig {
     /// Handle SIGTERM, SIGINT and SIGHUP by stopping every upstream (only for
     /// a hub that owns its process).
     pub handle_signals: bool,
+    /// Tests: run HTTP upstreams on this port instead of a leased one.
+    pub http_port: Option<u16>,
 }
 
 impl HubConfig {
@@ -171,6 +183,7 @@ impl HubConfig {
             global_in_flight: 1024,
             register_leases: true,
             handle_signals: true,
+            http_port: None,
         }
     }
 }
@@ -235,6 +248,10 @@ pub struct KeyCounters {
     pub failed_resubscribes: u64,
     pub fallbacks: BTreeMap<String, u64>,
     pub memory_kib: Option<u64>,
+    /// HTTP upstreams: how long the last start took to listen.
+    pub last_listen_ms: Option<u64>,
+    /// HTTP clients disconnected because their upstream exited.
+    pub http_sessions_ended: u64,
     #[serde(skip)]
     memory_sampled: Option<Instant>,
 }
@@ -246,6 +263,11 @@ struct Spec {
     cwd: PathBuf,
     env: Vec<(String, String)>,
     digest: String,
+    /// `transport = "http"`: the path the server answers on. The hub only
+    /// runs such a server; each client talks HTTP to it directly.
+    http_path: Option<String>,
+    /// How an HTTP upstream authenticates its clients.
+    http_auth: Option<HttpAuth>,
 }
 
 enum Init {
@@ -255,9 +277,31 @@ enum Init {
     Failed(String),
 }
 
+/// What the hub delivers to a client: JSON-RPC lines for a stdio client;
+/// nothing for an HTTP client, which talks to its server directly.
+enum ClientKind {
+    Stdio(Outbox),
+    Http,
+}
+
 struct ClientHandle {
-    outbox: Outbox,
+    kind: ClientKind,
     stream: UnixStream,
+}
+
+impl ClientHandle {
+    /// Queue `bytes` for a stdio client; false when its queue is full. An
+    /// HTTP client is never sent anything, so there is nothing to refuse.
+    fn offer(&self, bytes: Vec<u8>) -> bool {
+        match &self.kind {
+            ClientKind::Stdio(outbox) => outbox.offer(bytes),
+            ClientKind::Http => true,
+        }
+    }
+
+    fn is_http(&self) -> bool {
+        matches!(self.kind, ClientKind::Http)
+    }
 }
 
 struct Lease {
@@ -290,6 +334,12 @@ struct UpstreamState {
     /// The last generation whose process was reaped: its pid (and process
     /// group id) may since belong to someone else.
     reaped: u64,
+    /// An HTTP upstream's port, kept across restarts so clients' URLs stay
+    /// valid, and its registry lease.
+    port: Option<u16>,
+    port_lease: Option<Lease>,
+    /// The bearer token of the running HTTP upstream (new for every start).
+    token: Option<String>,
 }
 
 struct Upstream {
@@ -309,6 +359,10 @@ struct HubState {
     ever_attached: bool,
     last_activity: Instant,
     stopping: bool,
+    /// Why this hub last could not verify an HTTP upstream's listener or
+    /// token (for example a sandbox hiding the socket table); `None` once
+    /// one verified.
+    http_unverifiable: Option<String>,
 }
 
 /// Spawns every upstream from one long-lived thread, so Linux's
@@ -438,17 +492,41 @@ fn send_signal(process_group: u32, signal: libc::c_int) {
     let _signalled = unsafe { libc::killpg(group, signal) };
 }
 
+const PS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `ps -o <column>= -p <pid>` under the C locale (so dates compare across
+/// processes), within [`PS_TIMEOUT`]; `None` when it fails or takes longer.
+fn ps_column(column: &str, pid: u32) -> Option<String> {
+    let mut child = Command::new(crate::system_programs::ps())
+        .args(["-o", &format!("{column}="), "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + PS_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _killed = child.kill();
+                let _reaped = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut text = String::new();
+    std::io::Read::read_to_string(child.stdout.as_mut()?, &mut text).ok()?;
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
 /// A process's start time as `ps` prints it, to tell a recorded upstream
 /// from an unrelated process that later got the same pid.
 pub(crate) fn process_start(pid: u32) -> Option<String> {
-    let output = Command::new(crate::system_programs::ps())
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!text.is_empty()).then_some(text)
+    ps_column("lstart", pid)
 }
 
 /// An upstream as recorded on disk, so its group can be stopped after the
@@ -470,7 +548,6 @@ pub(crate) fn write_record(
     name: &str,
     record: &UpstreamRecord,
 ) -> io::Result<PathBuf> {
-    use std::os::unix::fs::DirBuilderExt;
     let records = directory.join(RECORDS_DIRECTORY);
     fs::DirBuilder::new()
         .recursive(true)
@@ -523,6 +600,24 @@ pub struct ReapReport {
     /// Dead owner and dead leader: members cannot be proven, so nothing is
     /// signalled; the record is forgotten.
     pub leader_gone: usize,
+    /// The leader is alive but no longer leads the recorded group: left.
+    pub group_mismatch: usize,
+    /// Unreadable or older-format records past [`STALE_RECORD`]: deleted,
+    /// never acted on.
+    pub stale_removed: usize,
+}
+
+/// Records nobody can read are deleted once this old.
+const STALE_RECORD: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Whether `pid` still leads `process_group`.
+fn leads_group(pid: u32, process_group: u32) -> bool {
+    let Ok(target) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: getpgid takes no pointers; it only reads the process's group.
+    let group = unsafe { libc::getpgid(target) };
+    pid == process_group && u32::try_from(group).ok() == Some(process_group)
 }
 
 /// Stop the process groups that hubs which are now dead recorded, when each
@@ -540,6 +635,18 @@ pub fn reap_recorded_upstreams(directory: &Path) -> ReapReport {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<UpstreamRecord>(&bytes).ok())
         else {
+            let stale = fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > STALE_RECORD);
+            if stale {
+                report.stale_removed += 1;
+                crate::warn_unrecorded(
+                    "forget a stale MCP upstream record",
+                    fs::remove_file(&path),
+                );
+            }
             continue;
         };
         match liveness(record.owner_pid, &record.owner_started) {
@@ -554,6 +661,11 @@ pub fn reap_recorded_upstreams(directory: &Path) -> ReapReport {
             Liveness::Dead => {}
         }
         if liveness(record.pid, &record.started) == Liveness::Alive {
+            if !leads_group(record.pid, record.process_group) {
+                report.group_mismatch += 1;
+                crate::warn_unrecorded("forget an MCP upstream record", fs::remove_file(&path));
+                continue;
+            }
             send_signal(record.process_group, libc::SIGTERM);
             report.stopped.push(record.process_group);
             matched.push(record);
@@ -569,7 +681,9 @@ pub fn reap_recorded_upstreams(directory: &Path) -> ReapReport {
                 thread::sleep(STOP_GRACE);
                 // Only a leader that is still the recorded process.
                 for record in matched {
-                    if liveness(record.pid, &record.started) == Liveness::Alive {
+                    if liveness(record.pid, &record.started) == Liveness::Alive
+                        && leads_group(record.pid, record.process_group)
+                    {
                         send_signal(record.process_group, libc::SIGKILL);
                     }
                 }
@@ -592,7 +706,18 @@ fn read_unhealthy(directory: &Path) -> BTreeMap<String, UnhealthyMark> {
         .unwrap_or_default()
 }
 
+/// Serializes read-modify-write of the unhealthy marks across hubs.
+const UNHEALTHY_LOCK: &str = "unhealthy.lock";
+
+/// Time left on a mark, never more than [`UNHEALTHY_FOR`] (a clock that went
+/// backwards must not extend it).
+pub(crate) fn unhealthy_left(until_ms: u64, now_ms: u64) -> Option<Duration> {
+    (until_ms > now_ms).then(|| Duration::from_millis(until_ms - now_ms).min(UNHEALTHY_FOR))
+}
+
 fn persist_unhealthy(directory: &Path, key: &str, until_ms: u64, reason: &str) -> io::Result<()> {
+    let lock_file = transport::private_coordination_file(&directory.join(UNHEALTHY_LOCK))?;
+    let _held = ExclusiveFileLock::acquire(lock_file)?;
     let now = telemetry::now_ms();
     let mut marks = read_unhealthy(directory);
     marks.retain(|_, mark| mark.until_ms > now);
@@ -616,7 +741,7 @@ pub fn unhealthy_reason(directory: &Path, key: &str) -> Option<String> {
     let now = telemetry::now_ms();
     read_unhealthy(directory)
         .remove(key)
-        .filter(|mark| mark.until_ms > now)
+        .filter(|mark| unhealthy_left(mark.until_ms, now).is_some())
         .map(|mark| mark.reason)
 }
 
@@ -628,8 +753,16 @@ fn hello_reply(ok: bool, reason: Option<&str>) -> Vec<u8> {
     jsonrpc::encode(&reply)
 }
 
-fn spec_digest(argv: &[String], cwd: &Path, env: &[(String, String)]) -> String {
-    let material = json!({"argv": argv, "cwd": cwd, "env": env});
+fn spec_digest(
+    argv: &[String],
+    cwd: &Path,
+    env: &[(String, String)],
+    http_path: Option<&str>,
+    http_auth: Option<&HttpAuth>,
+) -> String {
+    let material = json!({
+        "argv": argv, "cwd": cwd, "env": env, "http_path": http_path, "http_auth": http_auth,
+    });
     format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&material).unwrap_or_default())
@@ -804,7 +937,8 @@ pub fn serve(config: HubConfig) -> io::Result<()> {
     } else {
         None
     };
-    // Upstreams dead hubs of any build left behind.
+    // Upstreams dead hubs of any build left behind, and their token files.
+    sweep_token_directories(&paths.directory);
     let reaped = reap_recorded_upstreams(&paths.directory);
     if reaped.leader_gone > 0 || reaped.owner_unknown > 0 {
         eprintln!(
@@ -855,10 +989,9 @@ pub fn serve(config: HubConfig) -> io::Result<()> {
                 let now = Instant::now();
                 read_unhealthy(&paths.directory)
                     .into_iter()
-                    .filter(|(_, mark)| mark.until_ms > now_ms)
-                    .map(|(key, mark)| {
-                        let left = Duration::from_millis(mark.until_ms - now_ms);
-                        (key, (now + left, mark.reason))
+                    .filter_map(|(key, mark)| {
+                        let left = unhealthy_left(mark.until_ms, now_ms)?;
+                        Some((key, (now + left, mark.reason)))
                     })
                     .collect()
             },
@@ -868,6 +1001,7 @@ pub fn serve(config: HubConfig) -> io::Result<()> {
             ever_attached: false,
             last_activity: Instant::now(),
             stopping: false,
+            http_unverifiable: None,
         }),
         wake: Condvar::new(),
         next_client: AtomicU64::new(1),
@@ -1080,6 +1214,7 @@ fn status(hub: &Arc<Hub>) -> Value {
             "held": upstream_state.held.len(),
             "init": init,
             "protocol": upstream_state.protocol,
+            "port": upstream_state.port,
             "idle_for_ms": upstream_state
                 .idle_since
                 .map(|since| u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)),
@@ -1106,6 +1241,7 @@ fn status(hub: &Arc<Hub>) -> Value {
         "build": build_identity(),
         "connections": hub.connections.load(Ordering::Acquire),
         "upstreams": upstreams,
+        "http_unverifiable": state.http_unverifiable,
         "unhealthy": unhealthy,
         "counters": counters,
     })
@@ -1113,13 +1249,7 @@ fn status(hub: &Arc<Hub>) -> Value {
 
 /// Resident set size in KiB, from `ps`.
 fn resident_kib(pid: u32) -> Option<u64> {
-    let output = Command::new(crate::system_programs::ps())
-        .args(["-o", "rss=", "-p", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+    ps_column("rss", pid)?.parse().ok()
 }
 
 fn spec_from_hello(hello: &Value) -> Option<(String, Spec)> {
@@ -1149,7 +1279,19 @@ fn spec_from_hello(hello: &Value) -> Option<(String, Spec)> {
         })
         .collect::<Option<_>>()?;
     let cwd = PathBuf::from(hello.get("cwd")?.as_str()?);
-    let digest = spec_digest(&argv, &cwd, &env);
+    let (http_path, http_auth) = match hello.get("transport").and_then(Value::as_str) {
+        None | Some("stdio") => (None, None),
+        Some("http") => {
+            let path = hello.get("path")?.as_str()?;
+            if !path.starts_with('/') || !path.chars().all(|c| c.is_ascii_graphic()) {
+                return None;
+            }
+            let auth: HttpAuth = serde_json::from_value(hello.get("auth")?.clone()).ok()?;
+            (Some(path.to_string()), Some(auth))
+        }
+        Some(_) => return None,
+    };
+    let digest = spec_digest(&argv, &cwd, &env, http_path.as_deref(), http_auth.as_ref());
     Some((
         key,
         Spec {
@@ -1158,6 +1300,8 @@ fn spec_from_hello(hello: &Value) -> Option<(String, Spec)> {
             cwd,
             env,
             digest,
+            http_path,
+            http_auth,
         },
     ))
 }
@@ -1188,6 +1332,9 @@ fn new_upstream(hub: &Arc<Hub>, key: &str, spec: Spec) -> Arc<Upstream> {
             lease: None,
             record: None,
             reaped: 0,
+            port: None,
+            port_lease: None,
+            token: None,
         }),
         ready: Condvar::new(),
     })
@@ -1269,7 +1416,12 @@ fn attach(
         refuse(&mut stream, &reason);
         return;
     }
-    let attached = attach_client(hub, &upstream, &mut stream, &mut reader);
+    let http = upstream.spec.http_path.is_some();
+    let attached = if http {
+        attach_http_client(hub, &upstream, &mut stream)
+    } else {
+        attach_client(hub, &upstream, &mut stream, &mut reader)
+    };
     if attached.is_none() {
         let mut upstream_state = lock(&upstream.state);
         if upstream_state.clients.is_empty() && !upstream_state.stopped {
@@ -1280,8 +1432,89 @@ fn attach(
     let Some(client) = attached else {
         return;
     };
-    serve_client(hub, &upstream, client, &mut reader);
+    if http {
+        // The client talks HTTP to the upstream; this connection only says
+        // it is still there. Anything it sends is ignored.
+        crate::warn_unrecorded(
+            "hold an MCP HTTP client connection",
+            io::copy(&mut reader, &mut io::sink()),
+        );
+    } else {
+        serve_client(hub, &upstream, client, &mut reader);
+    }
     client_gone(hub, &upstream, client, &stream);
+}
+
+/// Accept an HTTP client: once the upstream listens, send it the URL (one
+/// `{"aethyme_hub": "ready", "url"}` line) and register it, so the upstream
+/// stays up while it is connected. `None` after a fallback line.
+fn attach_http_client(
+    hub: &Arc<Hub>,
+    upstream: &Arc<Upstream>,
+    stream: &mut UnixStream,
+) -> Option<ClientId> {
+    stream.write_all(&hello_reply(true, None)).ok()?;
+    let path = upstream.spec.http_path.clone()?;
+    let deadline = Instant::now() + hub.config.init_timeout;
+    let id = hub.next_client.fetch_add(1, Ordering::Relaxed);
+    let registered: Result<(u16, Option<String>), String> = {
+        let mut state = lock(&upstream.state);
+        let outcome = loop {
+            // A failure's own reason wins over the stop that follows it.
+            if let Init::Failed(reason) = &state.init {
+                break Err(reason.clone());
+            }
+            if state.stopped {
+                break Err("upstream_stopped".to_string());
+            }
+            if matches!(state.init, Init::Ready(_)) {
+                break state
+                    .port
+                    .map(|port| (port, state.token.clone()))
+                    .ok_or_else(|| "upstream_without_port".into());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break Err("listen_timeout".to_string());
+            }
+            state = upstream
+                .ready
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        };
+        if outcome.is_ok() {
+            state.clients.insert(
+                id,
+                ClientHandle {
+                    kind: ClientKind::Http,
+                    stream: stream.try_clone().ok()?,
+                },
+            );
+            state.idle_since = None;
+        }
+        outcome
+    };
+    let control = match &registered {
+        Ok((port, token)) => {
+            json!({"aethyme_hub": "ready", "url": http::url(*port, &path), "token": token})
+        }
+        Err(reason) => {
+            hub.fallback(&upstream.key, &upstream.spec.name, reason);
+            json!({"aethyme_hub": "fallback", "reason": reason})
+        }
+    };
+    let sent = stream.write_all(&jsonrpc::encode(&control));
+    registered.ok()?;
+    hub.count(&upstream.key, |counters| {
+        counters.name = upstream.spec.name.clone();
+        counters.clients_connected += 1;
+    });
+    if sent.is_err() {
+        // client_gone runs once the caller sees the closed connection.
+        crate::warn_unrecorded("send an MCP hub ready line", sent);
+    }
+    Some(id)
 }
 
 /// Start a new upstream, outside the hub lock. On failure the key is marked
@@ -1290,13 +1523,17 @@ fn first_start(hub: &Arc<Hub>, upstream: &Arc<Upstream>) -> Result<(), String> {
     match start_process(hub, upstream) {
         Ok(()) => Ok(()),
         Err(reason) => {
-            {
+            let port_lease = {
                 let mut state = lock(&upstream.state);
                 state.starting = false;
                 state.stopped = true;
                 state.init = Init::Failed(reason.clone());
                 state.idle_since = Some(Instant::now());
-            }
+                state.port = None;
+                state.port_lease.take()
+            };
+            release_lease(port_lease);
+            remove_token_directory(hub, upstream);
             upstream.ready.notify_all();
             eprintln!(
                 "aethyme mcp hub: {}: could not start the upstream: {reason}",
@@ -1363,7 +1600,7 @@ fn attach_client(
         state.clients.insert(
             id,
             ClientHandle {
-                outbox: outbox.clone(),
+                kind: ClientKind::Stdio(outbox.clone()),
                 stream: stream.try_clone().ok()?,
             },
         );
@@ -1477,7 +1714,7 @@ fn reply_to(state: &UpstreamState, client: ClientId, reply: &Value) -> bool {
     state
         .clients
         .get(&client)
-        .is_some_and(|handle| handle.outbox.offer(jsonrpc::encode(reply)))
+        .is_some_and(|handle| handle.offer(jsonrpc::encode(reply)))
 }
 
 /// Answer a client directly; an overflow when its queue is full.
@@ -1676,21 +1913,11 @@ fn client_gone(hub: &Arc<Hub>, upstream: &Arc<Upstream>, client: ClientId, strea
 /// it. Called with no lock held. A key whose upstream cannot be registered
 /// as a host lease is not shared.
 fn start_process(hub: &Arc<Hub>, upstream: &Arc<Upstream>) -> Result<(), String> {
-    let spec = &upstream.spec;
-    let log_path = hub
-        .config
-        .paths
-        .directory
-        .join(format!("upstream-{}.log", upstream.key_short));
-    if fs::metadata(&log_path).is_ok_and(|metadata| metadata.len() > LOG_LIMIT) {
-        fs::remove_file(&log_path).map_err(|error| format!("upstream_log:{error}"))?;
+    if let Some(path) = &upstream.spec.http_path {
+        return start_http_process(hub, upstream, path);
     }
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&log_path)
-        .map_err(|error| format!("upstream_log:{error}"))?;
+    let spec = &upstream.spec;
+    let log = open_upstream_log(hub, upstream)?;
     let mut command = Command::new(&spec.argv[0]);
     command
         .args(&spec.argv[1..])
@@ -1726,29 +1953,7 @@ fn start_process(hub: &Arc<Hub>, upstream: &Arc<Upstream>) -> Result<(), String>
             return Err(reason);
         }
     };
-    let session = libc::pid_t::try_from(pid)
-        .ok()
-        // SAFETY: getsid takes no pointers; `pid` is this hub's own child.
-        .map(|child_pid| unsafe { libc::getsid(child_pid) })
-        .and_then(|session| u32::try_from(session).ok())
-        .unwrap_or(0);
-    let hub_pid = std::process::id();
-    let record = process_start(pid).and_then(|started| {
-        write_record(
-            &hub.config.paths.directory,
-            &format!("{hub_pid}-{}-{generation}", upstream.key_short),
-            &UpstreamRecord {
-                pid,
-                process_group: pid,
-                session,
-                started,
-                owner_pid: hub_pid,
-                owner_started: hub.started.clone(),
-                build: build_identity(),
-            },
-        )
-        .ok()
-    });
+    let record = record_upstream(hub, upstream, pid, generation);
     let (writer, receiver) =
         Outbox::new(hub.config.upstream_queue, hub.config.upstream_queue_bytes);
     let written = Arc::clone(&writer.bytes);
@@ -1839,6 +2044,425 @@ fn start_process(hub: &Arc<Hub>, upstream: &Arc<Upstream>) -> Result<(), String>
     Ok(())
 }
 
+/// The upstream's log (stderr, and stdout for HTTP servers), truncated past
+/// [`LOG_LIMIT`].
+fn open_upstream_log(hub: &Arc<Hub>, upstream: &Upstream) -> Result<fs::File, String> {
+    let log_path = hub
+        .config
+        .paths
+        .directory
+        .join(format!("upstream-{}.log", upstream.key_short));
+    if fs::metadata(&log_path).is_ok_and(|metadata| metadata.len() > LOG_LIMIT) {
+        fs::remove_file(&log_path).map_err(|error| format!("upstream_log:{error}"))?;
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&log_path)
+        .map_err(|error| format!("upstream_log:{error}"))
+}
+
+/// Record a started upstream so a later hub can stop it if this one dies.
+fn record_upstream(
+    hub: &Arc<Hub>,
+    upstream: &Upstream,
+    pid: u32,
+    generation: u64,
+) -> Option<PathBuf> {
+    let session = libc::pid_t::try_from(pid)
+        .ok()
+        // SAFETY: getsid takes no pointers; `pid` is this hub's own child.
+        .map(|child_pid| unsafe { libc::getsid(child_pid) })
+        .and_then(|session| u32::try_from(session).ok())
+        .unwrap_or(0);
+    let hub_pid = std::process::id();
+    process_start(pid).and_then(|started| {
+        write_record(
+            &hub.config.paths.directory,
+            &format!("{hub_pid}-{}-{generation}", upstream.key_short),
+            &UpstreamRecord {
+                pid,
+                process_group: pid,
+                session,
+                started,
+                owner_pid: hub_pid,
+                owner_started: hub.started.clone(),
+                build: build_identity(),
+            },
+        )
+        .ok()
+    })
+}
+
+/// A loopback port for an HTTP upstream: a `tcp_port` lease from the host
+/// resource registry (or, with leases off in tests, any free port).
+fn allocate_port(hub: &Arc<Hub>, upstream: &Upstream) -> Result<(u16, Option<Lease>), String> {
+    if !hub.config.register_leases {
+        return http::free_port()
+            .map(|port| (port, None))
+            .map_err(|error| format!("port_unavailable:{:?}", error.kind()));
+    }
+    let hub_pid = std::process::id();
+    let name = format!(
+        "mcp-http-{hub_pid}-{}-{}",
+        upstream.key_short,
+        telemetry::now_ms()
+    );
+    let request = crate::HostResourceRequest {
+        schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+        request_id: name.clone(),
+        repository: "aethyme-mcp-hub".into(),
+        worktree_fingerprint: format!("http-{}", upstream.key_short),
+        run_id: format!("mcp-hub-{hub_pid}"),
+        ttl_seconds: 86_400,
+        holder_pid: Some(hub_pid),
+        resources: vec![crate::HostResourceRequirement {
+            key: "port".into(),
+            resource: crate::HostResourceKind::TcpPort {
+                start: HTTP_PORTS.0,
+                end: HTTP_PORTS.1,
+            },
+        }],
+    };
+    let grant = crate::HostResourceCoordinator::open_default()
+        .and_then(|mut coordinator| coordinator.acquire(&request))
+        .map_err(|error| {
+            eprintln!(
+                "aethyme mcp hub: {}: no loopback port could be leased, so the server is not \
+                 shared: {error}",
+                upstream.spec.name
+            );
+            "port_unavailable".to_string()
+        })?;
+    let port = grant
+        .lease
+        .allocations
+        .iter()
+        .find(|allocation| allocation.kind == "tcp_port")
+        .and_then(|allocation| allocation.value.parse::<u16>().ok());
+    let lease = Lease {
+        lease_id: grant.lease.lease_id,
+        generation: grant.lease.generation,
+        token: grant.ownership_token,
+    };
+    match port {
+        Some(port) => Ok((port, Some(lease))),
+        None => {
+            release_lease(Some(lease));
+            Err("port_unavailable".into())
+        }
+    }
+}
+
+/// Start (or restart) an HTTP upstream on its port. It is ready once the
+/// port accepts connections (see [`watch_listening`]); its exit is handled
+/// like a stdio upstream's.
+fn start_http_process(hub: &Arc<Hub>, upstream: &Arc<Upstream>, path: &str) -> Result<(), String> {
+    let spec = &upstream.spec;
+    let log = open_upstream_log(hub, upstream)?;
+    let output = log
+        .try_clone()
+        .map_err(|error| format!("upstream_log:{error}"))?;
+    let known = lock(&upstream.state).port.or(hub.config.http_port);
+    let port = match known {
+        Some(port) => port,
+        None => {
+            let (port, lease) = allocate_port(hub, upstream)?;
+            let mut state = lock(&upstream.state);
+            state.port = Some(port);
+            state.port_lease = lease;
+            port
+        }
+    };
+    // Someone else on the port would receive the agents' traffic.
+    if !http::port_free(port) {
+        return Err("port_busy".into());
+    }
+    let auth = spec.http_auth.clone().unwrap_or(HttpAuth::None);
+    let token = match auth {
+        HttpAuth::None => None,
+        HttpAuth::BearerEnv { .. } | HttpAuth::BearerFile { .. } => Some(
+            http::new_token().map_err(|error| format!("token_unavailable:{:?}", error.kind()))?,
+        ),
+    };
+    let token_directory = fresh_token_directory(hub, upstream)
+        .map_err(|error| format!("token_directory:{:?}", error.kind()))?;
+    let (extra_argv, token_env) = http::deliver_token(&auth, token.as_deref(), &token_directory)
+        .map_err(|error| format!("token_file:{:?}", error.kind()))?;
+    let mut argv = http::with_port(&spec.argv, port);
+    argv.extend(extra_argv);
+    let mut command = Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .current_dir(&spec.cwd)
+        .env_clear()
+        .envs(spec.env.iter().map(|(name, value)| (name, value)))
+        .env(http::PORT_ENV, port.to_string())
+        .stdin(Stdio::null())
+        .stdout(output)
+        .stderr(log)
+        .process_group(0);
+    if let Some((name, value)) = token_env {
+        command.env(name, value);
+    }
+    let parent = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
+    // SAFETY: `upstream_child_setup` only calls async-signal-safe functions
+    // and touches no state shared with the parent.
+    unsafe {
+        command.pre_exec(move || upstream_child_setup(parent));
+    }
+    let mut child = hub
+        .spawner
+        .spawn(command)
+        .map_err(|error| format!("upstream_spawn_failed:{:?}", error.kind()))?;
+    let pid = child.id();
+    let generation = lock(&upstream.state).generation + 1;
+    let mut lease = match register_lease(hub, upstream, pid, generation) {
+        Ok(lease) => lease,
+        Err(reason) => {
+            send_signal(pid, libc::SIGKILL);
+            let _reaped = child.wait();
+            return Err(reason);
+        }
+    };
+    let record = record_upstream(hub, upstream, pid, generation);
+    let installed = {
+        let mut state = lock(&upstream.state);
+        if state.stopped {
+            false
+        } else {
+            state.pid = Some(pid);
+            state.generation = generation;
+            state.started_at = Some(Instant::now());
+            state.starting = false;
+            state.lease = lease.take();
+            state.record = record.clone();
+            state.init = Init::Pending;
+            state.token = token;
+            true
+        }
+    };
+    upstream.ready.notify_all();
+    if !installed {
+        send_signal(pid, libc::SIGKILL);
+        let _reaped = child.wait();
+        release_lease(lease.take());
+        if let Some(record) = record {
+            let _removed = fs::remove_file(record);
+        }
+        return Err("upstream_stopped".into());
+    }
+    let exit_hub = Arc::clone(hub);
+    let exit_upstream = Arc::clone(upstream);
+    thread::Builder::new()
+        .name("mcp-hub-http-upstream".into())
+        .spawn(move || {
+            let status = child.wait();
+            upstream_exited(&exit_hub, &exit_upstream, generation, status.ok());
+        })
+        .map_err(|error| format!("upstream_thread:{error}"))?;
+    let watch_hub = Arc::clone(hub);
+    let watch_upstream = Arc::clone(upstream);
+    let spawned = thread::Builder::new()
+        .name("mcp-hub-http-listen".into())
+        .spawn(move || watch_listening(&watch_hub, &watch_upstream, generation, port));
+    crate::warn_unrecorded("watch an MCP HTTP upstream start", spawned);
+    hub.audit(upstream, "upstream_started", Some(path));
+    Ok(())
+}
+
+const TOKENS_DIRECTORY: &str = "tokens";
+
+/// `<hub dir>/tokens/<hub pid>`: this hub's token files.
+fn hub_tokens(directory: &Path) -> PathBuf {
+    directory
+        .join(TOKENS_DIRECTORY)
+        .join(std::process::id().to_string())
+}
+
+/// An empty private (0700) directory for one upstream's token file.
+fn fresh_token_directory(hub: &Arc<Hub>, upstream: &Upstream) -> io::Result<PathBuf> {
+    let directory = hub_tokens(&hub.config.paths.directory).join(&upstream.key_short);
+    remove_token_directory(hub, upstream);
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&directory)?;
+    // `recursive` leaves an existing parent's mode alone; set ours.
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    // The owner, so a later hub removes these only once this one is dead.
+    let owner = hub_tokens(&hub.config.paths.directory).join(TOKEN_OWNER_FILE);
+    if !owner.exists() {
+        let record = TokenOwner {
+            pid: std::process::id(),
+            started: hub.started.clone(),
+        };
+        fs::write(
+            &owner,
+            serde_json::to_vec(&record).map_err(io::Error::other)?,
+        )?;
+    }
+    Ok(directory)
+}
+
+const TOKEN_OWNER_FILE: &str = "owner.json";
+
+/// The hub that owns a `tokens/<pid>` directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TokenOwner {
+    pub pid: u32,
+    pub started: String,
+}
+
+fn remove_token_directory(hub: &Arc<Hub>, upstream: &Upstream) {
+    let directory = hub_tokens(&hub.config.paths.directory).join(&upstream.key_short);
+    if directory.exists() {
+        crate::warn_unrecorded(
+            "remove an MCP token directory",
+            fs::remove_dir_all(&directory),
+        );
+    }
+}
+
+/// Remove the token directories of hubs proven dead (any build), by the
+/// same owner rule as upstream records: the recorded pid and start time.
+/// An owner that runs or cannot be judged keeps its directory; one without
+/// a readable owner record is removed only once older than a day.
+pub(crate) fn sweep_token_directories(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory.join(TOKENS_DIRECTORY)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let owner = fs::read(entry.path().join(TOKEN_OWNER_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<TokenOwner>(&bytes).ok());
+        let dead = match owner {
+            Some(owner) => liveness(owner.pid, &owner.started) == Liveness::Dead,
+            None => fs::metadata(entry.path())
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > STALE_RECORD),
+        };
+        if dead {
+            crate::warn_unrecorded(
+                "sweep an MCP token directory",
+                fs::remove_dir_all(entry.path()),
+            );
+        }
+    }
+}
+
+/// Mark an HTTP upstream ready once its port accepts connections. One that
+/// does not listen within the initialize deadline is killed, which counts
+/// as a crash.
+fn watch_listening(hub: &Arc<Hub>, upstream: &Arc<Upstream>, generation: u64, port: u16) {
+    let started = Instant::now();
+    let deadline = started + hub.config.init_timeout;
+    loop {
+        // The upstream leads its own group (process_group(0) at spawn).
+        let (group, has_token) = {
+            let state = lock(&upstream.state);
+            (state.pid, state.token.is_some())
+        };
+        let verdict = group.map_or(Listeners::None, |group| listen::check(port, group));
+        // A server that answers without its token would let any local
+        // process in: probed once, before anyone is told the URL.
+        let mut refusal = verdict.reason();
+        // Unverifiable: nothing is proven wrong with the server, so no
+        // unhealthy mark and no crash; a later attach tries again.
+        let mut unproven = matches!(verdict, Listeners::Unverifiable(_));
+        if verdict == Listeners::Ours
+            && has_token
+            && let Some(path) = &upstream.spec.http_path
+        {
+            let probe = http::probe_token(port, path);
+            unproven = matches!(probe, http::Probe::Inconclusive(_));
+            if let http::Probe::Inconclusive(detail) = &probe {
+                eprintln!(
+                    "aethyme mcp hub: {}: the token probe was inconclusive ({detail}); the \
+                     server must answer a request without its token with 401 or 403",
+                    upstream.spec.name
+                );
+            }
+            refusal = probe.refusal();
+        }
+        let mut state = lock(&upstream.state);
+        if state.generation != generation || state.stopped || state.reaped >= generation {
+            return;
+        }
+        if let Some(reason) = refusal.clone()
+            && unproven
+        {
+            state.init = Init::Failed(reason.clone());
+            drop(state);
+            eprintln!(
+                "aethyme mcp hub: {}: the HTTP upstream cannot be verified, so it is not used \
+                 ({reason})",
+                upstream.spec.name
+            );
+            {
+                let mut hub_state = lock(&hub.state);
+                hub_state.http_unverifiable = Some(reason.clone());
+                // Forgotten, so the next attach starts afresh.
+                if hub_state
+                    .upstreams
+                    .get(&upstream.key)
+                    .is_some_and(|known| Arc::ptr_eq(known, upstream))
+                {
+                    hub_state.upstreams.remove(&upstream.key);
+                }
+            }
+            hub.audit(upstream, "listener_unverified", Some(&reason));
+            stop_upstream(hub, upstream, &reason);
+            upstream.ready.notify_all();
+            return;
+        }
+        if let Some(reason) = refusal {
+            // Listening off loopback, someone else on the port, no way to
+            // tell, or the token ignored: never used, and not restarted into
+            // the same verdict.
+            state.init = Init::Failed(reason.clone());
+            drop(state);
+            eprintln!(
+                "aethyme mcp hub: {}: the HTTP upstream is not used ({reason})",
+                upstream.spec.name
+            );
+            // Persisted before waiting clients learn of it.
+            hub.mark_unhealthy(upstream, &reason);
+            upstream.ready.notify_all();
+            hub.audit(upstream, "listener_refused", Some(&reason));
+            stop_upstream(hub, upstream, &reason);
+            return;
+        }
+        if verdict == Listeners::Ours {
+            state.init = Init::Ready(json!({"port": port}));
+            drop(state);
+            lock(&hub.state).http_unverifiable = None;
+            upstream.ready.notify_all();
+            hub.count(&upstream.key, |counters| {
+                counters.last_listen_ms =
+                    Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+            });
+            return;
+        }
+        if Instant::now() >= deadline {
+            state.init = Init::Failed("listen_timeout".into());
+            // Unreaped: checked above, under this lock.
+            if let Some(pid) = state.pid {
+                send_signal(pid, libc::SIGKILL);
+            }
+            drop(state);
+            upstream.ready.notify_all();
+            hub.audit(upstream, "listen_timeout", None);
+            return;
+        }
+        drop(state);
+        thread::sleep(LISTEN_POLL);
+    }
+}
+
 /// A restarted upstream did not initialize (timeout or error reply): its
 /// held requests fail retryably and the process is killed, which counts as
 /// a crash toward the unhealthy rule (see [`upstream_exited`]).
@@ -1848,7 +2472,7 @@ fn restart_initialize_failed(
     generation: u64,
     reason: &str,
 ) {
-    let pid = {
+    {
         let mut state = lock(&upstream.state);
         if state.generation != generation
             || state.stopped
@@ -1865,13 +2489,16 @@ fn restart_initialize_failed(
             let error = jsonrpc::retryable_error(id, "the upstream server is restarting; retry");
             let _queued = reply_to(&state, client, &error);
         }
-        state.pid
+        // Signalled under the lock, and only while this generation is
+        // unreaped: afterwards its group id may belong to another process.
+        if state.reaped < generation
+            && let Some(pid) = state.pid
+        {
+            send_signal(pid, libc::SIGKILL);
+        }
     };
     upstream.ready.notify_all();
     hub.audit(upstream, "reinitialize_failed", Some(reason));
-    if let Some(pid) = pid {
-        send_signal(pid, libc::SIGKILL);
-    }
 }
 
 fn register_lease(
@@ -1975,7 +2602,7 @@ fn upstream_message(hub: &Arc<Hub>, upstream: &Arc<Upstream>, message: Value) {
         if announce {
             let changed = json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"});
             for (client, handle) in &state.clients {
-                if !handle.outbox.offer(jsonrpc::encode(&changed)) {
+                if !handle.offer(jsonrpc::encode(&changed)) {
                     overflowed.push(*client);
                 }
             }
@@ -2005,7 +2632,7 @@ fn upstream_message(hub: &Arc<Hub>, upstream: &Arc<Upstream>, message: Value) {
         match route {
             Route::Client(client, message) => {
                 if let Some(handle) = state.clients.get(&client)
-                    && !handle.outbox.offer(jsonrpc::encode(&message))
+                    && !handle.offer(jsonrpc::encode(&message))
                 {
                     overflowed.push(client);
                 }
@@ -2013,7 +2640,7 @@ fn upstream_message(hub: &Arc<Hub>, upstream: &Arc<Upstream>, message: Value) {
             Route::Broadcast(message) => {
                 let bytes = jsonrpc::encode(&message);
                 for (client, handle) in &state.clients {
-                    if !handle.outbox.offer(bytes.clone()) {
+                    if !handle.offer(bytes.clone()) {
                         overflowed.push(*client);
                     }
                 }
@@ -2074,7 +2701,7 @@ fn upstream_exited(
     generation: u64,
     status: Option<std::process::ExitStatus>,
 ) {
-    let (failed, uptime, lease, lost) = {
+    let (failed, uptime, lease, lost, http_ended) = {
         let mut state = lock(&upstream.state);
         state.reaped = state.reaped.max(generation);
         if state.generation != generation {
@@ -2098,11 +2725,19 @@ fn upstream_exited(
         let failed = state
             .router
             .fail_all("the upstream server exited; retry the request");
-        // A client that cannot even receive its error is disconnected.
-        let mut lost = Vec::new();
+        // A client that cannot even receive its error is disconnected, and
+        // so is every HTTP client: its session died with the server.
+        let mut lost: Vec<ClientId> = state
+            .clients
+            .iter()
+            .filter(|(_, handle)| handle.is_http())
+            .map(|(client, _)| *client)
+            .collect();
+        state.token = None;
+        let http_ended = lost.len();
         for (client, error) in &failed {
             if let Some(handle) = state.clients.get(client)
-                && !handle.outbox.offer(jsonrpc::encode(error))
+                && !handle.offer(jsonrpc::encode(error))
             {
                 lost.push(*client);
             }
@@ -2113,6 +2748,7 @@ fn upstream_exited(
             state.started_at.map(|at| at.elapsed()),
             lease,
             lost,
+            http_ended,
         )
     };
     release_lease(lease);
@@ -2136,6 +2772,7 @@ fn upstream_exited(
         let counters = state.counters.entry(upstream.key.clone()).or_default();
         counters.crashes += 1;
         counters.errors += failed as u64;
+        counters.http_sessions_ended += http_ended as u64;
         unhealthy
     };
     if unhealthy {
@@ -2180,7 +2817,7 @@ fn upstream_exited(
 /// its input closes, its process group gets SIGTERM and, after a grace
 /// period, SIGKILL.
 fn stop_upstream(hub: &Arc<Hub>, upstream: &Arc<Upstream>, reason: &str) {
-    let (pid, streams) = {
+    let (pid, streams, port_lease) = {
         let mut state = lock(&upstream.state);
         state.stopped = true;
         state.starting = false;
@@ -2196,8 +2833,15 @@ fn stop_upstream(hub: &Arc<Hub>, upstream: &Arc<Upstream>, reason: &str) {
             .values()
             .filter_map(|handle| handle.stream.try_clone().ok())
             .collect();
-        (state.pid.take().map(|pid| (pid, state.generation)), streams)
+        state.port = None;
+        (
+            state.pid.take().map(|pid| (pid, state.generation)),
+            streams,
+            state.port_lease.take(),
+        )
     };
+    release_lease(port_lease);
+    remove_token_directory(hub, upstream);
     upstream.ready.notify_all();
     for stream in streams {
         let _closed = stream.shutdown(std::net::Shutdown::Both);

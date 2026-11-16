@@ -43,6 +43,7 @@ pub mod composition_fixtures;
 pub mod filesystem;
 pub mod invoke;
 pub mod landing;
+pub mod mcp_http;
 pub mod paths;
 pub mod release_notes;
 pub mod repos;

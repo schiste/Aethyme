@@ -32,7 +32,7 @@ schema = 1
 [[servers]]
 name = "example-server"
 mode = "shared"                 # "direct" (default): stateful, one per agent
-transport = "stdio"             # "http" is accepted but not served yet
+transport = "stdio"             # or "http" (see HTTP servers below)
 argv = ["pnpm", "exec", "example-server", "--stdio"]
 cwd = "/srv/example"            # host file: absolute paths only
 env_file = ".env.staging"       # relative to cwd
@@ -359,6 +359,121 @@ fallbacks by reason, and the upstream's resident memory, sampled at most once
 a minute). The hub records upstream starts,
 stops, crashes, unhealthy keys and overflows in `events.jsonl`, never message
 bodies.
+
+## HTTP servers
+
+An entry with `transport = "http"` names a server that speaks MCP's
+streamable HTTP transport instead of stdio:
+
+```toml
+[[servers]]
+name = "example-http"
+mode = "shared"
+transport = "http"
+argv = ["/srv/example/bin/example-server", "--http", "--port={port}", "--isolated"]
+require_argv = ["--isolated"]          # refused if an edit drops or negates the flag
+http_auth = "bearer_env:EXAMPLE_TOKEN" # required; see Exposure below
+http_path = "/mcp"                     # the default
+cwd = "/srv/example"
+```
+
+- The server is started with every `{port}` in `argv` replaced by a loopback
+  port, which is also exported as `AETHYME_MCP_PORT`, and must answer on
+  `http://127.0.0.1:<port><http_path>`. `connect` bridges the agent's stdio
+  to that URL: each stdin message is POSTed, a JSON reply or every event of
+  an SSE reply goes to stdout, the `Mcp-Session-Id` and negotiated
+  `MCP-Protocol-Version` are sent with every later request, a `GET` stream
+  is opened for server-initiated messages when the server offers one, and
+  the session is ended with `DELETE` when the agent leaves. Only loopback
+  HTTP/1.1 is spoken. A reply silent for 5 minutes fails the request with a
+  retryable error; header lines, bodies and SSE events are bounded (32 MiB).
+- Shared, the hub runs one server per key on a port leased from the host
+  resource registry (`tcp_port`, 47300-47799; the port is kept across
+  restarts) and tells each `connect` its URL and token. Every agent is its
+  own HTTP session, so nothing is multiplexed or renumbered, and the
+  per-session rules above (logging, subscriptions, client capabilities)
+  are the server's own. That is only safe when the server keeps sessions
+  apart: put its isolation flag in `argv` and list it in `require_argv`.
+  `require_argv` is a presence check: each listed element must appear
+  exactly, and a later `--flag=false`, `--flag=0`, `--flag=no`,
+  `--flag=off` or `--no-flag` is refused (`contradicted_required_argument`);
+  it knows nothing else of the server's option syntax. It is checked when
+  the file is read and again by `connect` on the final argv, after caller
+  arguments and `base_args` are applied, so neither can drop or negate it.
+- When the server ends a session (404, or 401/403 once initialized), or the
+  hub disconnects it because the server exited or restarted, `connect`
+  answers every request still waiting with a retryable error and exits at
+  once, so the agent sees its server end and can start it again. The hub
+  counts these in `http_sessions_ended`.
+- Direct, or whenever the hub is not used (the same reasons as for stdio),
+  `connect` runs the server as its own child on a free loopback port, with
+  the same checks and token, and bridges to it; the server stops when the
+  agent leaves. A server that never listens or fails the checks runs
+  `--fallback` when one is given.
+- `aethyme mcp status --json` shows each HTTP upstream's `port`, and the
+  counters add `last_listen_ms` and `http_sessions_ended`.
+
+### Exposure
+
+A loopback port is reachable by every local user and process, not only by
+this user's agents. Shared and private HTTP entries are therefore guarded
+the same way:
+
+- **Authentication.** Every HTTP entry must state `http_auth`. With
+  `bearer_env:<NAME>` (preferred) or `bearer_file:<flag>`, a random token is
+  made for every start of the server and handed to it in that environment
+  variable, or written to a `0600` file in a `0700` directory under the
+  hub's state directory (a temporary one for a private server) whose path
+  follows the flag (`<flag> <path>`). The file is removed when the server
+  stops; a starting hub removes the token directories of hubs proven dead
+  (by recorded pid and start time, as for upstream records) and leaves any
+  whose owner runs or cannot be judged.
+  There is deliberately no form that puts the token itself in argv: argv
+  is readable by every local user with `ps`, the very users the token keeps
+  out. The bridge sends it as `Authorization: Bearer <token>`.
+  `http_auth = "none"` is refused unless the entry also sets
+  `http_unauthenticated = true`: then any local process can drive the
+  server.
+- **Token enforced.** Once the server listens, one well-formed
+  `initialize` is sent without the token (same path, `Accept` and protocol
+  header as the bridge; client `aethyme-mcp-hub`; any session it creates is
+  deleted). Only `401` or `403` count as enforcing the token. A `2xx` with
+  a result means the server ignores its token: it is stopped and its key
+  marked unhealthy (`token_not_enforced:server_ignores_token`). Anything
+  else (another status, a `2xx` with an error or no result, no answer) is
+  `token_probe_inconclusive`: the server did not clearly reject an
+  unauthenticated request, so it is not used. Entries with
+  `http_auth = "none"` skip the probe.
+- **Who listens.** Before the server starts, its port must be free (else
+  `port_busy`). It counts as ready only when every TCP listener on the port
+  belongs to the server's own process group and is bound to `127.0.0.1`;
+  "something accepts connections" is never enough. A server listening on
+  `0.0.0.0`, `::` or any other address is killed and its key marked
+  unhealthy (`not_loopback`); a listener of another process on the port
+  gives `listener_not_ours`. Ownership is read from `/proc` on Linux. On
+  macOS two counts must agree: the listeners on the port among every
+  user's sockets (`netstat -an -p tcp`, reading only the leading address
+  columns, never a pid or process name) and the listening sockets the
+  server's own process group holds (`lsof` limited to that group). Where
+  either cannot be read, or the listing is empty or misses a listener the
+  group holds (an agent sandbox can make `netstat` print nothing), the
+  server is not used (`listener_unverifiable:listener_listing_empty`).
+- **Unverifiable is not unhealthy.** `listener_unverifiable` and
+  `token_probe_inconclusive` stop that server and refuse the attach at
+  once, so `connect` takes its private path or `--fallback` without
+  waiting, but they leave no unhealthy mark and count as no crash: the
+  next attach tries again. `aethyme mcp status` shows when a hub cannot
+  verify (`http_unverifiable`), for example because the hub itself started
+  in a sandbox. One that does not listen within 30
+  seconds is killed and counts as a crash.
+- **Limits.** Only the leased port is checked, and only once, when the
+  server becomes ready. Any other port the server opens (a debugging or
+  metrics port, for example) is the server's own responsibility: prefer
+  servers that keep such ports on loopback, and list the flags that do so
+  in `require_argv` so they cannot be dropped.
+- **Origin.** The bridge never sends an `Origin` header. Servers should
+  reject requests that carry one (a browser page on a rebinding DNS name
+  could otherwise reach a loopback port); that check is the server's job.
 
 ## Managed servers
 
