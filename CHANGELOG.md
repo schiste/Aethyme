@@ -4,6 +4,30 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.113] - 2026-11-16
+
+### Added
+
+- `aethyme mcp`: `transport = "http"` servers. The hub runs one server per sharing key on a loopback port leased from the resources registry, and `mcp connect` bridges the agent's stdio to it over streamable HTTP, one HTTP session per agent. A server counts as ready only when every listener on its port belongs to the server's own process group and is bound to `127.0.0.1`; when that cannot be verified the agent gets a private server or its fallback at once (#1732).
+- Every HTTP entry must state `http_auth`: `bearer_env:<NAME>` or `bearer_file:<flag>` (a new random token per start, never on a command line), or `none` together with `http_unauthenticated = true`. After start the hub probes once without the token and refuses a server that answers anyway (`token_not_enforced`) or does not clearly reject the request (`token_probe_inconclusive`) (#1732).
+- `require_argv`: an entry can require flags on the final command line, checked after caller arguments and `base_args`; a later contradicting form of a required flag is refused. `http_path` sets the endpoint path (default `/mcp`) (#1732).
+- `cleanup.landed-proof-unprovable` advice in `broker status --json`: sessions whose cleanliness proof still times out under a long budget, by session id (first 20 and a total). Counters `landed_proof_unprovable`, `landed_proof_timeout_streaks_pruned`, `owned_group_members_after_exit`, `owned_group_kill_after_exit_refused` (#1733).
+
+### Fixed
+
+- A proof listing that finishes normally no longer waits a fixed 75 ms for its process group: the group is stopped once while the finished leader is still unreaped, then the leader is reaped. This removes about 450 ms per landed session (#1733).
+- The retirement lane gives its long proof budget first every fourth pass, caps a doubled budget at half of what is left of the pass, ends a timeout streak only on a conclusive answer, and prunes streak records of sessions that are no longer open (#1733).
+- The hub's stale-upstream cleanup signals a recorded process group only when the recorded leader still leads it; its process listings run with a fixed locale and a 2-second timeout; persisted unhealthy marks cannot be extended by a clock set backwards (#1732).
+
+### Changed
+
+- Upgrade note: `aethyme mcp` remains opt-in; nothing reads or changes agent configuration, `PATH` or shell profiles until the owner enables it.
+
+### Known issues
+
+- The HTTP listener ownership check on macOS (`netstat` and `lsof`) has been validated on Linux CI through its parsers only and has not yet run on a real macOS machine. Under a sandbox that hides the listener table the verdict is "cannot verify" and the server is not shared.
+- Only a server's leased port is checked, once at readiness. Other ports a server opens are its own responsibility; keep them on loopback with `require_argv`.
+
 ## [0.8.112] - 2026-11-16
 
 ### Fixed
