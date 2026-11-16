@@ -3898,9 +3898,54 @@ fn first_counting_record(listing: &str, strict: bool) -> Option<String> {
         .map(|(_, path)| path.to_string())
 }
 
-/// The early-stop test for a streamed status listing.
-fn holds_counting_record(stdout: &[u8], strict: bool) -> bool {
-    first_counting_record(&String::from_utf8_lossy(stdout), strict).is_some()
+/// The early-stop test for a streamed `status -z` listing, read
+/// incrementally: each call scans only the bytes after the last complete
+/// field it read, so a long listing costs one pass, not one per read.
+#[derive(Debug)]
+struct CountingRecordScan {
+    strict: bool,
+    /// Bytes of complete fields already read.
+    scanned: usize,
+    /// The next field is a rename's or copy's source, not a record.
+    skip_next: bool,
+}
+
+impl CountingRecordScan {
+    fn new(strict: bool) -> Self {
+        Self {
+            strict,
+            scanned: 0,
+            skip_next: false,
+        }
+    }
+
+    /// Whether `stdout` (the whole listing so far) holds a record that is
+    /// somebody's change; the same rule as [`status_record_counts`].
+    fn holds_counting_record(&mut self, stdout: &[u8]) -> bool {
+        while let Some(length) = stdout
+            .get(self.scanned..)
+            .and_then(|rest| rest.iter().position(|byte| *byte == 0))
+        {
+            let field = &stdout[self.scanned..self.scanned + length];
+            self.scanned += length + 1;
+            if std::mem::take(&mut self.skip_next) || field.len() < 4 {
+                continue;
+            }
+            let (code, path) = (&field[..2], &field[3..]);
+            if code.contains(&b'R') || code.contains(&b'C') {
+                self.skip_next = true;
+            }
+            if code == b"!!" {
+                continue;
+            }
+            let finder_metadata = code == b"??"
+                && path.rsplit(|byte| *byte == b'/').next() == Some(&b".DS_Store"[..]);
+            if self.strict || !finder_metadata {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// The keep reason of a listing ended at its first change.
@@ -3932,6 +3977,8 @@ pub(crate) fn unclean_reason(
             "--no-optional-locks",
             "-c",
             "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
             "status",
             "--porcelain=v1",
             "-z",
@@ -3939,7 +3986,10 @@ pub(crate) fn unclean_reason(
             "--ignored=matching",
             "--ignore-submodules=none",
         ],
-        &mut |stdout: &[u8]| holds_counting_record(stdout, strict),
+        &mut {
+            let mut scan = CountingRecordScan::new(strict);
+            move |stdout: &[u8]| scan.holds_counting_record(stdout)
+        },
     )? {
         ProofListing::Matched(listing) => return Ok(Some(first_change_reason(&listing, strict))),
         ProofListing::Complete(listing) => listing,
@@ -4177,8 +4227,9 @@ fn uncommitted_verdict(
     let status = match tracked_deletions {
         TrackedDeletions::Keep => {
             let strict = policy.strict;
+            let mut scan = CountingRecordScan::new(strict);
             match run_proof_git(worktree, &args, &mut |stdout: &[u8]| {
-                holds_counting_record(stdout, strict)
+                scan.holds_counting_record(stdout)
             })? {
                 ProofListing::Matched(listing) => {
                     return Ok((Some(first_change_reason(&listing, strict)), 0));
@@ -7928,9 +7979,17 @@ impl Broker {
             .flatten()
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
-        let mut likely = self
-            .store_ref()
-            .live_sessions()?
+        let live = self.store_ref().live_sessions()?;
+        // Streaks and unprovable marks of sessions no longer open go once per
+        // pass, bounded by the stored entries.
+        self.prune_landed_proof_timeouts(
+            &live
+                .iter()
+                .filter(|session| session.cleanup_state == SessionCleanupState::Open)
+                .map(|session| session.id)
+                .collect(),
+        );
+        let mut likely = live
             .into_iter()
             .filter(|session| {
                 if session.cleanup_state != SessionCleanupState::Open {
@@ -7977,10 +8036,22 @@ impl Broker {
         // The session that has been timing out longest is judged last, with
         // whatever is left of the lane's share: every session is eventually
         // judged conclusively, however slow its checkout.
+        // The session that has been timing out longest gets whatever is left
+        // of the lane's share: last, after the normal queue, and first every
+        // fourth such pass, so it is reached even when the queue alone would
+        // spend the share. A session that runs out of time even when it went
+        // first, with the whole share, is reported.
         let grant = self.oldest_timed_out_session(&ids);
+        let mut grant_first = false;
         if let Some(index) = grant.and_then(|grant| likely.iter().position(|s| s.id == grant)) {
             let granted = likely.remove(index);
-            likely.push(granted);
+            if self.landed_proof_grant_goes_first() {
+                crate::phase_telemetry::add("landed_proof_long_budget_first", Duration::ZERO);
+                grant_first = true;
+                likely.insert(0, granted);
+            } else {
+                likely.push(granted);
+            }
         }
         let mut process_table = crate::session_holder::RecordedHolderProcessTable::default();
         process_table.prime(self.store_ref(), &ids, deadline);
@@ -8087,6 +8158,12 @@ impl Broker {
                     .meta_set(LIKELY_LANDED_CURSOR_KEY, &session.id.to_string()),
             );
             let decline = crate::broker::LandedSessionDecline::from_outcome(outcome);
+            if grant_first
+                && grant == Some(session.id)
+                && decline == Some(crate::broker::LandedSessionDecline::ProofTimedOut)
+            {
+                self.mark_landed_proof_unprovable(session.id);
+            }
             decline_memo.record(self, session.id, key.as_deref(), decline);
             match decline {
                 None => {
@@ -10431,6 +10508,35 @@ mod tests {
         );
     }
 
+    /// The streamed early-stop check reads each byte once: a field cut off
+    /// mid-read is read when it completes, ignored entries and Finder
+    /// metadata never stop the listing, and a rename does.
+    #[test]
+    fn the_streamed_check_reads_each_field_once() {
+        let mut scan = super::CountingRecordScan::new(false);
+        let mut stdout = Vec::new();
+        for chunk in [&b"!! tar"[..], b"get/\0?? .DS_", b"Store\0!! a.log\0"] {
+            stdout.extend_from_slice(chunk);
+            assert!(!scan.holds_counting_record(&stdout), "{stdout:?}");
+        }
+        assert_eq!(
+            scan.scanned,
+            stdout.len(),
+            "every complete field was read exactly once"
+        );
+        let consumed = scan.scanned;
+        stdout.extend_from_slice(b"?? notes");
+        assert!(!scan.holds_counting_record(&stdout));
+        assert_eq!(scan.scanned, consumed, "an unterminated field waits");
+        stdout.extend_from_slice(b".txt\0");
+        assert!(scan.holds_counting_record(&stdout));
+
+        let mut strict = super::CountingRecordScan::new(true);
+        assert!(strict.holds_counting_record(b"?? .DS_Store\0"));
+        let mut renamed = super::CountingRecordScan::new(false);
+        assert!(renamed.holds_counting_record(b"R  new.txt\0old.txt\0"));
+    }
+
     /// A dirty checkout answers at its first record: the listing is stopped
     /// there instead of being waited for (the script never finishes on its
     /// own), and the reason says "at least 1".
@@ -10496,12 +10602,24 @@ mod tests {
             .trim()
             .parse()
             .unwrap();
-        let still_running = process_running(child);
+        // SAFETY: signal 0 only checks that the process exists.
+        let gone = unsafe { libc::kill(child, 0) } != 0;
+        let running_where_visible = std::path::Path::new("/proc/self/stat")
+            .exists()
+            .then(|| process_running(child));
         std::fs::write(&release, "").unwrap();
-        assert!(!still_running, "the listing's child outlived it");
         // Whether the group cleanup could prove the group gone or not, the
         // answer is never "clean".
         assert_ne!(reason, Ok(None));
+        if reason.is_ok() {
+            // An answer means the cleanup proved the group absent (`ESRCH`
+            // for the group): its member was killed and reaped.
+            assert!(gone, "the listing's child outlived it");
+        } else if let Some(running) = running_where_visible {
+            // An error may only mean a killed member still waited for its
+            // reaper; where `/proc` shows that, it must not be running.
+            assert!(!running, "the listing's child outlived it");
+        }
     }
 
     /// A listing stopped at its deadline and one past its output limit are
