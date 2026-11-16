@@ -61,6 +61,10 @@ struct Group {
     // Sum of process RSS, not private memory or reclaimable bytes. Shared pages
     // can appear in more than one process's RSS even within a single tree.
     agent_tree_rss_bytes: Option<u64>,
+    // Sum of each process's kernel-ledger physical footprint: its private
+    // memory whether resident, compressed or swapped out. On a host that is
+    // paging, RSS shrinks as pages are compressed while this does not.
+    agent_tree_footprint_bytes: Option<u64>,
     swap_bytes: Option<u64>,
     identity_observation: &'static str,
     recommendation: &'static str,
@@ -69,6 +73,45 @@ struct Group {
 struct MemorySnapshot {
     identities: ProcessTable,
     rows: BTreeMap<i64, (i64, u64)>,
+    // Physical footprint per pid. `None` when this platform has no such
+    // ledger; a pid absent from the map could not be read.
+    footprints: Option<BTreeMap<i64, u64>>,
+}
+
+/// One process's physical footprint in bytes. `Some(0)` for a process that
+/// exited after the table was sampled: it holds nothing now. `None` when the
+/// kernel refuses the read, which leaves that tree's total unknown.
+#[cfg(target_os = "macos")]
+fn physical_footprint(pid: i64) -> Option<u64> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: `rusage_info_v2` is plain old data, so all-zero is a valid value.
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a live, writable `rusage_info_v2`, the layout the
+    // kernel fills for `RUSAGE_INFO_V2`; the call writes nothing else.
+    let status = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V2,
+            std::ptr::from_mut(&mut info).cast::<libc::rusage_info_t>(),
+        )
+    };
+    if status == 0 {
+        return Some(info.ri_phys_footprint);
+    }
+    (std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)).then_some(0)
+}
+
+#[cfg(target_os = "macos")]
+fn physical_footprints(pids: impl Iterator<Item = i64>) -> Option<BTreeMap<i64, u64>> {
+    Some(
+        pids.filter_map(|pid| Some((pid, physical_footprint(pid)?)))
+            .collect(),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn physical_footprints(_pids: impl Iterator<Item = i64>) -> Option<BTreeMap<i64, u64>> {
+    None
 }
 
 impl MemorySnapshot {
@@ -99,6 +142,7 @@ impl MemorySnapshot {
         Some(Self {
             identities: ProcessTable::parse(&identities),
             rows,
+            footprints: None,
         })
     }
 
@@ -120,7 +164,37 @@ impl MemorySnapshot {
         if !output.status.success() {
             return None;
         }
-        Self::parse(std::str::from_utf8(&output.stdout).ok()?)
+        let mut snapshot = Self::parse(std::str::from_utf8(&output.stdout).ok()?)?;
+        snapshot.footprints = physical_footprints(snapshot.rows.keys().copied());
+        Some(snapshot)
+    }
+
+    /// Footprint total per root, or `None` for a root with any process whose
+    /// footprint is unknown. Call only after `totals` accepted the ancestry.
+    fn footprint_totals(&self, roots: &BTreeSet<i64>) -> BTreeMap<i64, Option<u64>> {
+        let mut totals: BTreeMap<i64, Option<u64>> = roots
+            .iter()
+            .map(|pid| (*pid, self.footprints.as_ref().map(|_| 0)))
+            .collect();
+        let Some(footprints) = self.footprints.as_ref() else {
+            return totals;
+        };
+        for &pid in self.rows.keys() {
+            let mut cursor = pid;
+            for _ in 0..=128 {
+                if let Some(total) = totals.get_mut(&cursor) {
+                    *total = total
+                        .zip(footprints.get(&pid).copied())
+                        .and_then(|(total, bytes)| total.checked_add(bytes));
+                    break;
+                }
+                let Some(&(parent, _)) = self.rows.get(&cursor) else {
+                    break;
+                };
+                cursor = parent;
+            }
+        }
+        totals
     }
 
     fn totals(&self, roots: &BTreeSet<i64>) -> Option<BTreeMap<i64, u64>> {
@@ -199,6 +273,9 @@ impl Report {
             })
             .collect();
         let totals = snapshot.and_then(|snapshot| snapshot.totals(&roots));
+        let footprints = snapshot
+            .filter(|_| totals.is_some())
+            .map(|snapshot| snapshot.footprint_totals(&roots));
         for owners in grouped.into_values() {
             let inactive: Vec<_> = owners.iter().filter(|owner| owner.inactive).collect();
             if inactive.is_empty() {
@@ -215,6 +292,10 @@ impl Report {
                 .as_ref()
                 .filter(|_| matched)
                 .and_then(|holder| totals.as_ref()?.get(&holder.pid).copied());
+            let footprint = holder
+                .as_ref()
+                .filter(|_| matched)
+                .and_then(|holder| footprints.as_ref()?.get(&holder.pid).copied().flatten());
             let active_owner_count = owners.len() - inactive.len();
             groups.push(Group {
                 holder_pid: holder.as_ref().map(|holder| holder.pid),
@@ -231,6 +312,7 @@ impl Report {
                     .max()
                     .unwrap_or(0),
                 agent_tree_rss_bytes: rss,
+                agent_tree_footprint_bytes: footprint,
                 swap_bytes: None,
                 identity_observation: if holder.is_none() {
                     "unrecorded"
@@ -249,8 +331,9 @@ impl Report {
             });
         }
         groups.sort_by(|a, b| {
-            b.agent_tree_rss_bytes
-                .cmp(&a.agent_tree_rss_bytes)
+            b.agent_tree_footprint_bytes
+                .cmp(&a.agent_tree_footprint_bytes)
+                .then_with(|| b.agent_tree_rss_bytes.cmp(&a.agent_tree_rss_bytes))
                 .then_with(|| b.oldest_idle_ms.cmp(&a.oldest_idle_ms))
                 .then_with(|| a.inactive_session_ids.cmp(&b.inactive_session_ids))
         });
@@ -376,6 +459,51 @@ mod tests {
         )
         .unwrap();
         assert!(cycle.totals(&BTreeSet::new()).is_none());
+    }
+    #[test]
+    fn footprint_is_summed_per_tree_ranks_first_and_is_unknown_when_any_process_is() {
+        let mut snapshot = snapshot();
+        let owners = |snapshot: &MemorySnapshot| {
+            vec![owner(1, 10, true, snapshot), owner(3, 12, true, snapshot)]
+        };
+        // No footprint ledger on this platform: RSS still ranks the groups.
+        let report = Report::from_snapshot(owners(&snapshot), Some(&snapshot));
+        assert!(
+            report
+                .groups
+                .iter()
+                .all(|group| group.agent_tree_footprint_bytes.is_none())
+        );
+        assert_eq!(report.groups[0].agent_tree_rss_bytes, Some(120 * 1024));
+
+        // The smaller-RSS tree holds more once compressed pages are counted.
+        snapshot.footprints = Some(BTreeMap::from([(10, 5), (11, 6), (12, 700), (13, 800)]));
+        let report = Report::from_snapshot(owners(&snapshot), Some(&snapshot));
+        assert_eq!(report.groups[0].inactive_session_ids, [3]);
+        assert_eq!(report.groups[0].agent_tree_footprint_bytes, Some(1500));
+        assert_eq!(report.groups[0].agent_tree_rss_bytes, Some(70 * 1024));
+        assert_eq!(report.groups[1].agent_tree_footprint_bytes, Some(11));
+
+        // One unreadable process leaves only its own tree unknown.
+        snapshot.footprints = Some(BTreeMap::from([(10, 5), (11, 6), (12, 700)]));
+        let report = Report::from_snapshot(owners(&snapshot), Some(&snapshot));
+        assert_eq!(report.groups[0].inactive_session_ids, [1]);
+        assert_eq!(report.groups[0].agent_tree_footprint_bytes, Some(11));
+        assert_eq!(report.groups[1].agent_tree_footprint_bytes, None);
+        assert_eq!(report.groups[1].agent_tree_rss_bytes, Some(70 * 1024));
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["groups"][0]["agent_tree_footprint_bytes"], 11);
+        assert_eq!(
+            json["groups"][1]["agent_tree_footprint_bytes"],
+            serde_json::Value::Null
+        );
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn this_process_has_a_footprint_and_a_missing_process_holds_nothing() {
+        assert!(physical_footprint(i64::from(std::process::id())).unwrap() > 0);
+        assert_eq!(physical_footprint(i64::from(i32::MAX)), Some(0));
     }
     #[test]
     fn omitted_groups_and_session_ids_are_explicit_and_no_commands_leak() {
