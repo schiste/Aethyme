@@ -115,6 +115,9 @@ pub const TOKEN_NOT_ENFORCED: &str = "token_not_enforced:server_ignores_token";
 /// The file a `bearer_file` token is written to, inside `directory`.
 pub const TOKEN_FILE: &str = "token";
 
+/// Extra argv elements and an extra environment variable for a server.
+pub type TokenDelivery = (Vec<String>, Option<(String, String)>);
+
 /// Hand `token` to a server per `auth`: extra argv elements (a flag and the
 /// path of a 0600 file written in `directory`, which must be a private 0700
 /// directory) and an extra environment variable. The token itself never
@@ -123,7 +126,7 @@ pub fn deliver_token(
     auth: &HttpAuth,
     token: Option<&str>,
     directory: &Path,
-) -> io::Result<(Vec<String>, Option<(String, String)>)> {
+) -> io::Result<TokenDelivery> {
     match (auth, token) {
         (HttpAuth::BearerFile { flag }, Some(token)) => {
             let path = directory.join(TOKEN_FILE);
