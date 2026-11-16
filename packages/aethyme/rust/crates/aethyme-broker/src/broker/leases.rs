@@ -375,6 +375,203 @@ impl LandedSessionDecline {
     }
 }
 
+/// Why one automatic close kept a session open: one reason per exit of the
+/// close path other than the close itself. The abandonment window counts it
+/// as `session_abandonment_kept_<code>` and `broker status` shows the counts
+/// under `landed_session_retirement.abandonment.kept`, so a reader can tell
+/// which check holds sessions that are far past the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum AbandonmentKeepReason {
+    /// `session_abandoned_after_hours` is zero.
+    WindowDisabled,
+    /// The session row, its holder binding or its status changed while it
+    /// was judged, or the close transaction found it changed.
+    Changed,
+    /// The broker-spawned process recorded on the session still runs.
+    SessionPidAlive,
+    /// A follow-up session the landed windows protect, while the abandonment
+    /// window is the shorter one.
+    FollowUpProtected,
+    /// The checkout's Git activity metadata could not be read.
+    WorktreeActivityUnavailable,
+    /// Session or checkout activity is newer than the window.
+    RecentActivity,
+    /// The recorded holder could not be checked.
+    HolderUnknown,
+    /// The recorded holder runs and this is still its session.
+    HolderAliveCurrent,
+    /// A live holder whose task lease expired could not be re-read.
+    HolderRecordUnavailable,
+    /// A live holder whose task lease expired is a shared agent service.
+    HolderSharedService,
+    /// The live holder moved on to a later session, but the checkout is not
+    /// clean.
+    HolderMovedOnDirty,
+    /// A live holder's task lease no longer reads as expired under the claims.
+    TaskLeaseCurrent,
+    /// An admitted session command holds the task operation guard.
+    OperationGuardBusy,
+    /// The task operation guard could not be tried.
+    OperationGuardUnavailable,
+    /// Another lifecycle operation holds the repository lifecycle claim.
+    LifecycleBusy,
+    /// The pass deadline ran out during the running-work checks.
+    DeadlineReached,
+    /// A gate runs for the session.
+    GateRunning,
+    /// The gate inventory could not be read or verified.
+    GatesUnknown,
+    /// A coordinated operation of the session is unresolved.
+    OperationUnresolved,
+    /// The coordinated-operation journal could not be read.
+    OperationsUnknown,
+    /// A submission is still being simulated, gated or promoted.
+    MergeQueueActive,
+    /// The merge queue could not be read.
+    MergeQueueUnknown,
+    /// Dependency preparation runs for the session.
+    PreparationInProgress,
+    /// The preparation configuration is invalid.
+    PreparationInvalid,
+    /// The preparation status could not be read.
+    PreparationUnknown,
+    /// The recorded checkout path is not a plain directory.
+    CheckoutNotDirectory,
+    /// An artifact producer uses the checkout, or its marker is contended.
+    ArtifactProducerActive,
+    /// The artifact-use protocol could not be read.
+    ArtifactProtocolUnavailable,
+    /// Artifact-use markers saved before a device renumber.
+    LegacyArtifactMarkers,
+    /// A process has its working directory or an open file in the checkout.
+    OpenFilesInCheckout,
+    /// The open-file observation failed or was incomplete.
+    OpenFilesUnavailable,
+    /// The pass may not take another open-file observation now.
+    OpenFilesThrottled,
+    /// An explicit lease still holds: its holder runs, or its stale grace has
+    /// not ended.
+    LeaseHeld,
+    /// Explicit-lease liveness could not be assessed.
+    LeaseUnavailable,
+    /// A concurrent SQLite writer prevented the close.
+    DatabaseBusy,
+    /// Retention or cleanup policy could not be read.
+    PolicyUnavailable,
+    /// A landed-lane proof declined (never the abandonment window itself).
+    LandedDeclined,
+    /// An exit that recorded no reason; a defect if it ever appears.
+    Unrecorded,
+}
+
+impl AbandonmentKeepReason {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::WindowDisabled => "window_disabled",
+            Self::Changed => "changed",
+            Self::SessionPidAlive => "session_pid_alive",
+            Self::FollowUpProtected => "follow_up_protected",
+            Self::WorktreeActivityUnavailable => "worktree_activity_unavailable",
+            Self::RecentActivity => "recent_activity",
+            Self::HolderUnknown => "holder_unknown",
+            Self::HolderAliveCurrent => "holder_alive_current",
+            Self::HolderRecordUnavailable => "holder_record_unavailable",
+            Self::HolderSharedService => "holder_shared_service",
+            Self::HolderMovedOnDirty => "holder_moved_on_dirty",
+            Self::TaskLeaseCurrent => "task_lease_current",
+            Self::OperationGuardBusy => "operation_guard_busy",
+            Self::OperationGuardUnavailable => "operation_guard_unavailable",
+            Self::LifecycleBusy => "lifecycle_busy",
+            Self::DeadlineReached => "deadline_reached",
+            Self::GateRunning => "gate_running",
+            Self::GatesUnknown => "gates_unknown",
+            Self::OperationUnresolved => "operation_unresolved",
+            Self::OperationsUnknown => "operations_unknown",
+            Self::MergeQueueActive => "merge_queue_active",
+            Self::MergeQueueUnknown => "merge_queue_unknown",
+            Self::PreparationInProgress => "preparation_in_progress",
+            Self::PreparationInvalid => "preparation_invalid",
+            Self::PreparationUnknown => "preparation_unknown",
+            Self::CheckoutNotDirectory => "checkout_not_directory",
+            Self::ArtifactProducerActive => "artifact_producer_active",
+            Self::ArtifactProtocolUnavailable => "artifact_protocol_unavailable",
+            Self::LegacyArtifactMarkers => "legacy_artifact_markers",
+            Self::OpenFilesInCheckout => "open_files_in_checkout",
+            Self::OpenFilesUnavailable => "open_files_unavailable",
+            Self::OpenFilesThrottled => "open_files_throttled",
+            Self::LeaseHeld => "lease_held",
+            Self::LeaseUnavailable => "lease_unavailable",
+            Self::DatabaseBusy => "database_busy",
+            Self::PolicyUnavailable => "policy_unavailable",
+            Self::LandedDeclined => "landed_declined",
+            Self::Unrecorded => "unrecorded",
+        }
+    }
+
+    /// The `phase_counts` name one abandonment-window keep adds to the
+    /// command's metrics.
+    pub(crate) const fn telemetry_name(self) -> &'static str {
+        match self {
+            Self::WindowDisabled => "session_abandonment_kept_window_disabled",
+            Self::Changed => "session_abandonment_kept_changed",
+            Self::SessionPidAlive => "session_abandonment_kept_session_pid_alive",
+            Self::FollowUpProtected => "session_abandonment_kept_follow_up_protected",
+            Self::WorktreeActivityUnavailable => {
+                "session_abandonment_kept_worktree_activity_unavailable"
+            }
+            Self::RecentActivity => "session_abandonment_kept_recent_activity",
+            Self::HolderUnknown => "session_abandonment_kept_holder_unknown",
+            Self::HolderAliveCurrent => "session_abandonment_kept_holder_alive_current",
+            Self::HolderRecordUnavailable => "session_abandonment_kept_holder_record_unavailable",
+            Self::HolderSharedService => "session_abandonment_kept_holder_shared_service",
+            Self::HolderMovedOnDirty => "session_abandonment_kept_holder_moved_on_dirty",
+            Self::TaskLeaseCurrent => "session_abandonment_kept_task_lease_current",
+            Self::OperationGuardBusy => "session_abandonment_kept_operation_guard_busy",
+            Self::OperationGuardUnavailable => {
+                "session_abandonment_kept_operation_guard_unavailable"
+            }
+            Self::LifecycleBusy => "session_abandonment_kept_lifecycle_busy",
+            Self::DeadlineReached => "session_abandonment_kept_deadline_reached",
+            Self::GateRunning => "session_abandonment_kept_gate_running",
+            Self::GatesUnknown => "session_abandonment_kept_gates_unknown",
+            Self::OperationUnresolved => "session_abandonment_kept_operation_unresolved",
+            Self::OperationsUnknown => "session_abandonment_kept_operations_unknown",
+            Self::MergeQueueActive => "session_abandonment_kept_merge_queue_active",
+            Self::MergeQueueUnknown => "session_abandonment_kept_merge_queue_unknown",
+            Self::PreparationInProgress => "session_abandonment_kept_preparation_in_progress",
+            Self::PreparationInvalid => "session_abandonment_kept_preparation_invalid",
+            Self::PreparationUnknown => "session_abandonment_kept_preparation_unknown",
+            Self::CheckoutNotDirectory => "session_abandonment_kept_checkout_not_directory",
+            Self::ArtifactProducerActive => "session_abandonment_kept_artifact_producer_active",
+            Self::ArtifactProtocolUnavailable => {
+                "session_abandonment_kept_artifact_protocol_unavailable"
+            }
+            Self::LegacyArtifactMarkers => "session_abandonment_kept_legacy_artifact_markers",
+            Self::OpenFilesInCheckout => "session_abandonment_kept_open_files_in_checkout",
+            Self::OpenFilesUnavailable => "session_abandonment_kept_open_files_unavailable",
+            Self::OpenFilesThrottled => "session_abandonment_kept_open_files_throttled",
+            Self::LeaseHeld => "session_abandonment_kept_lease_held",
+            Self::LeaseUnavailable => "session_abandonment_kept_lease_unavailable",
+            Self::DatabaseBusy => "session_abandonment_kept_database_busy",
+            Self::PolicyUnavailable => "session_abandonment_kept_policy_unavailable",
+            Self::LandedDeclined => "session_abandonment_kept_landed_declined",
+            Self::Unrecorded => "session_abandonment_kept_unrecorded",
+        }
+    }
+}
+
+/// Record why the close path keeps the session and return `outcome`. The
+/// reason rides on the pass's process table (one per pass) so the caller can
+/// count it without every outcome variant carrying a payload.
+fn keep_with(
+    process_table: &crate::session_holder::RecordedHolderProcessTable,
+    reason: AbandonmentKeepReason,
+    outcome: AbandonedSessionCloseOutcome,
+) -> AbandonedSessionCloseOutcome {
+    process_table.note_keep_reason(reason);
+    outcome
+}
+
 /// What a landed proof established, re-checked under the claims and again
 /// immediately before the close.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,25 +630,38 @@ fn process_use_verdict(
     require_landed: bool,
 ) -> Option<AbandonedSessionCloseOutcome> {
     let Some(open_files) = process_table.process_use_snapshot_for_retirement(root, deadline) else {
-        return Some(if require_landed && process_table.process_use_throttled() {
+        let throttled = process_table.process_use_throttled();
+        process_table.note_keep_reason(if throttled {
+            AbandonmentKeepReason::OpenFilesThrottled
+        } else {
+            AbandonmentKeepReason::OpenFilesUnavailable
+        });
+        return Some(if require_landed && throttled {
             AbandonedSessionCloseOutcome::LandedDeclined(LandedSessionDecline::BudgetExhausted)
         } else {
             AbandonedSessionCloseOutcome::OperationEvidenceUnavailable
         });
     };
-    match open_files {
+    let verdict = match open_files {
         crate::reclaim::OpenFileSnapshot::Complete(_) => {
             crate::reclaim::open_file_snapshot_blocker_for_session_worktree(
                 open_files,
                 worktree,
                 exempt_holder,
             )
-            .map(|_| AbandonedSessionCloseOutcome::OperationActive)
+            .map(|_| {
+                (
+                    AbandonmentKeepReason::OpenFilesInCheckout,
+                    AbandonedSessionCloseOutcome::OperationActive,
+                )
+            })
         }
-        crate::reclaim::OpenFileSnapshot::Incomplete { .. } => {
-            Some(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable)
-        }
-    }
+        crate::reclaim::OpenFileSnapshot::Incomplete { .. } => Some((
+            AbandonmentKeepReason::OpenFilesUnavailable,
+            AbandonedSessionCloseOutcome::OperationEvidenceUnavailable,
+        )),
+    };
+    verdict.map(|(reason, outcome)| keep_with(process_table, reason, outcome))
 }
 
 /// The checkout's HEAD commit, or `None` when it cannot be read.
@@ -948,7 +1158,8 @@ impl Broker {
         allow_process_snapshot: bool,
         deadline: Option<std::time::Instant>,
     ) -> Result<AbandonedSessionCloseOutcome, BrokerOpError> {
-        self.try_close_session_inner(
+        process_table.clear_keep_reason();
+        let outcome = self.try_close_session_inner(
             session_id,
             decision_now_ms,
             abandon_after_ms,
@@ -956,7 +1167,19 @@ impl Broker {
             allow_process_snapshot,
             deadline,
             SessionCloseLane::Abandonment,
-        )
+        )?;
+        if outcome == AbandonedSessionCloseOutcome::Closed {
+            process_table.clear_keep_reason();
+        } else {
+            // Every keep is counted per reason, so the metrics log says why
+            // sessions far past the window stay open.
+            let reason = process_table
+                .keep_reason()
+                .unwrap_or(AbandonmentKeepReason::Unrecorded);
+            process_table.note_keep_reason(reason);
+            crate::phase_telemetry::add(reason.telemetry_name(), std::time::Duration::ZERO);
+        }
+        Ok(outcome)
     }
 
     pub(crate) fn try_close_landed_session(
@@ -1390,22 +1613,38 @@ impl Broker {
         let require_landed = lane != SessionCloseLane::Abandonment;
         let merged_lane = lane == SessionCloseLane::MergedPullRequest;
         if abandon_after_ms <= 0 {
-            return Ok(AbandonedSessionCloseOutcome::NotDue);
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::WindowDisabled,
+                AbandonedSessionCloseOutcome::NotDue,
+            ));
         }
         let candidate = match self.store_ref().session(session_id) {
             Ok(session) => session,
             Err(BrokerError::SessionNotFound(_)) => {
-                return Ok(AbandonedSessionCloseOutcome::Changed);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::Changed,
+                    AbandonedSessionCloseOutcome::Changed,
+                ));
             }
             Err(error) => return Err(error.into()),
         };
         if candidate.cleanup_state != crate::SessionCleanupState::Open
             || candidate.status.is_closed()
         {
-            return Ok(AbandonedSessionCloseOutcome::Changed);
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::Changed,
+                AbandonedSessionCloseOutcome::Changed,
+            ));
         }
         if candidate.pid.is_some_and(crate::broker::session_pid_alive) {
-            return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::SessionPidAlive,
+                AbandonedSessionCloseOutcome::ActiveProcess,
+            ));
         }
         // Nothing makes `session_abandoned_after_hours` at least
         // `session_landed_after_hours`. When it is shorter, the abandonment
@@ -1422,7 +1661,13 @@ impl Broker {
                     .unwrap_or(true);
             match self.follow_up_protected(&candidate, follow_up_on_spawned_checkout) {
                 Ok(false) => {}
-                Ok(true) | Err(_) => return Ok(AbandonedSessionCloseOutcome::NotDue),
+                Ok(true) | Err(_) => {
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::FollowUpProtected,
+                        AbandonedSessionCloseOutcome::NotDue,
+                    ));
+                }
             }
         }
         // The merged-pull-request lane counts its window from the last merge
@@ -1430,7 +1675,13 @@ impl Broker {
         let merged_evidence = if merged_lane {
             match self.merged_pull_request_evidence(&candidate) {
                 Ok(evidence) => Some(evidence),
-                Err(reason) => return Ok(AbandonedSessionCloseOutcome::LandedDeclined(reason)),
+                Err(reason) => {
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::LandedDeclined,
+                        AbandonedSessionCloseOutcome::LandedDeclined(reason),
+                    ));
+                }
             }
         } else {
             None
@@ -1438,7 +1689,13 @@ impl Broker {
         let merged_at = merged_evidence.as_ref().map_or(0, |(_, at)| *at);
         let fs_activity = match checked_worktree_activity_ms(self.main_root(), &candidate) {
             Ok(activity) => activity.unwrap_or(0),
-            Err(_) => return Ok(AbandonedSessionCloseOutcome::WorktreeActivityUnavailable),
+            Err(_) => {
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::WorktreeActivityUnavailable,
+                    AbandonedSessionCloseOutcome::WorktreeActivityUnavailable,
+                ));
+            }
         };
         let database_activity = fs_activity.max(candidate.last_activity_at).max(merged_at);
         if !matches!(
@@ -1455,7 +1712,11 @@ impl Broker {
             ),
             crate::AbandonmentVerdict::Abandoned { .. }
         ) {
-            return Ok(AbandonedSessionCloseOutcome::NotDue);
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::RecentActivity,
+                AbandonedSessionCloseOutcome::NotDue,
+            ));
         }
         // The landing proof is asked before any holder, lease or process
         // evidence: most open sessions have not landed, and saying so costs
@@ -1467,7 +1728,13 @@ impl Broker {
             let _span = crate::phase_telemetry::span("landed_proof");
             match self.landed_session_decline(&candidate, deadline) {
                 Ok(proof) => Some(proof),
-                Err(reason) => return Ok(AbandonedSessionCloseOutcome::LandedDeclined(reason)),
+                Err(reason) => {
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::LandedDeclined,
+                        AbandonedSessionCloseOutcome::LandedDeclined(reason),
+                    ));
+                }
             }
         } else {
             None
@@ -1484,7 +1751,11 @@ impl Broker {
         };
         let holder_event = self.store_ref().latest_session_holder_event(session_id)?;
         if holder_event.as_ref().map(|event| event.id) != holder.binding_event_id {
-            return Ok(AbandonedSessionCloseOutcome::Changed);
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::Changed,
+                AbandonedSessionCloseOutcome::Changed,
+            ));
         }
         let task_lease_binding_present = holder_event
             .as_ref()
@@ -1509,10 +1780,18 @@ impl Broker {
         {
             let Some(agent) = crate::session_holder::recorded_holder(self.store_ref(), session_id)?
             else {
-                return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::HolderRecordUnavailable,
+                    AbandonedSessionCloseOutcome::ActiveProcess,
+                ));
             };
             if crate::session_holder::is_shared_agent_service(&agent.command) {
-                return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::HolderSharedService,
+                    AbandonedSessionCloseOutcome::ActiveProcess,
+                ));
             }
             Some(agent)
         } else {
@@ -1562,7 +1841,11 @@ impl Broker {
                     "holder_moved_on_dirty_kept",
                     std::time::Duration::ZERO,
                 );
-                return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::HolderMovedOnDirty,
+                    AbandonedSessionCloseOutcome::ActiveProcess,
+                ));
             }
         }
         if require_landed {
@@ -1571,13 +1854,21 @@ impl Broker {
                 crate::session_holder::RecordedHolderLiveness::Alive
                     if live_task_holder.is_some() || moved_on_to.is_some() => {}
                 crate::session_holder::RecordedHolderLiveness::Alive => {
-                    return Ok(AbandonedSessionCloseOutcome::LandedDeclined(
-                        LandedSessionDecline::HolderAlive,
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::LandedDeclined,
+                        AbandonedSessionCloseOutcome::LandedDeclined(
+                            LandedSessionDecline::HolderAlive,
+                        ),
                     ));
                 }
                 crate::session_holder::RecordedHolderLiveness::Unbound => {
-                    return Ok(AbandonedSessionCloseOutcome::LandedDeclined(
-                        LandedSessionDecline::HolderUnbound,
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::LandedDeclined,
+                        AbandonedSessionCloseOutcome::LandedDeclined(
+                            LandedSessionDecline::HolderUnbound,
+                        ),
                     ));
                 }
                 // No process table may be taken this late in the pass: that
@@ -1586,13 +1877,21 @@ impl Broker {
                 crate::session_holder::RecordedHolderLiveness::Unknown
                     if !allow_process_snapshot && holder.binding_event_id.is_some() =>
                 {
-                    return Ok(AbandonedSessionCloseOutcome::LandedDeclined(
-                        LandedSessionDecline::BudgetExhausted,
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::LandedDeclined,
+                        AbandonedSessionCloseOutcome::LandedDeclined(
+                            LandedSessionDecline::BudgetExhausted,
+                        ),
                     ));
                 }
                 crate::session_holder::RecordedHolderLiveness::Unknown => {
-                    return Ok(AbandonedSessionCloseOutcome::LandedDeclined(
-                        LandedSessionDecline::HolderUnknown,
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::LandedDeclined,
+                        AbandonedSessionCloseOutcome::LandedDeclined(
+                            LandedSessionDecline::HolderUnknown,
+                        ),
                     ));
                 }
             }
@@ -1605,17 +1904,31 @@ impl Broker {
             let _span = crate::phase_telemetry::span("landed_proof");
             match self.landed_session_decline(&candidate, deadline) {
                 Ok(proof) => landed_proof = Some(proof),
-                Err(reason) => return Ok(AbandonedSessionCloseOutcome::LandedDeclined(reason)),
+                Err(reason) => {
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::LandedDeclined,
+                        AbandonedSessionCloseOutcome::LandedDeclined(reason),
+                    ));
+                }
             }
         }
         match holder.liveness {
             crate::session_holder::RecordedHolderLiveness::Unknown => {
-                return Ok(AbandonedSessionCloseOutcome::HolderUnavailable);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::HolderUnknown,
+                    AbandonedSessionCloseOutcome::HolderUnavailable,
+                ));
             }
             crate::session_holder::RecordedHolderLiveness::Alive
                 if live_task_holder.is_none() && moved_on_to.is_none() =>
             {
-                return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::HolderAliveCurrent,
+                    AbandonedSessionCloseOutcome::ActiveProcess,
+                ));
             }
             crate::session_holder::RecordedHolderLiveness::Gone
             | crate::session_holder::RecordedHolderLiveness::Unbound => {}
@@ -1639,11 +1952,21 @@ impl Broker {
                     landed_proof = Some(fresh);
                 }
                 Ok(_) => {
-                    return Ok(AbandonedSessionCloseOutcome::LandedDeclined(
-                        LandedSessionDecline::MovedBeforeClose,
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::LandedDeclined,
+                        AbandonedSessionCloseOutcome::LandedDeclined(
+                            LandedSessionDecline::MovedBeforeClose,
+                        ),
                     ));
                 }
-                Err(reason) => return Ok(AbandonedSessionCloseOutcome::LandedDeclined(reason)),
+                Err(reason) => {
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::LandedDeclined,
+                        AbandonedSessionCloseOutcome::LandedDeclined(reason),
+                    ));
+                }
             }
         }
         // Both claims below are non-blocking: a busy one declines the session
@@ -1654,32 +1977,66 @@ impl Broker {
             crate::file_lock::SessionOperationLockMode::Exclusive,
         ) {
             Ok(Some(guard)) => guard,
-            Ok(None) => return Ok(AbandonedSessionCloseOutcome::OperationGuardBusy),
-            Err(_) => return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable),
+            Ok(None) => {
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::OperationGuardBusy,
+                    AbandonedSessionCloseOutcome::OperationGuardBusy,
+                ));
+            }
+            Err(_) => {
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::OperationGuardUnavailable,
+                    AbandonedSessionCloseOutcome::OperationEvidenceUnavailable,
+                ));
+            }
         };
         if candidate.pid.is_some_and(crate::broker::session_pid_alive) {
-            return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::SessionPidAlive,
+                AbandonedSessionCloseOutcome::ActiveProcess,
+            ));
         }
 
         // A maintenance pass must keep moving when another lifecycle operation
         // is active; status callers also leave the row open and retry later.
         let Some(_lifecycle_claim) = self.try_claim_worktree_lifecycle()? else {
-            return Ok(AbandonedSessionCloseOutcome::LifecycleBusy);
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::LifecycleBusy,
+                AbandonedSessionCloseOutcome::LifecycleBusy,
+            ));
         };
 
         let current = match self.store_ref().session(session_id) {
             Ok(session) => session,
             Err(BrokerError::SessionNotFound(_)) => {
-                return Ok(AbandonedSessionCloseOutcome::Changed);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::Changed,
+                    AbandonedSessionCloseOutcome::Changed,
+                ));
             }
             Err(error) => return Err(error.into()),
         };
         if current.cleanup_state != crate::SessionCleanupState::Open || current.status.is_closed() {
-            return Ok(AbandonedSessionCloseOutcome::Changed);
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::Changed,
+                AbandonedSessionCloseOutcome::Changed,
+            ));
         }
         let fs_activity = match checked_worktree_activity_ms(self.main_root(), &current) {
             Ok(activity) => activity.unwrap_or(0),
-            Err(_) => return Ok(AbandonedSessionCloseOutcome::WorktreeActivityUnavailable),
+            Err(_) => {
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::WorktreeActivityUnavailable,
+                    AbandonedSessionCloseOutcome::WorktreeActivityUnavailable,
+                ));
+            }
         };
         let claimed_fs_activity = fs_activity;
         let activity_at = fs_activity.max(current.last_activity_at).max(merged_at);
@@ -1695,17 +2052,29 @@ impl Broker {
             observed_at,
             abandon_after_ms,
         ) else {
-            return Ok(AbandonedSessionCloseOutcome::NotDue);
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::RecentActivity,
+                AbandonedSessionCloseOutcome::NotDue,
+            ));
         };
 
         // Recheck the spawned PID after taking the lifecycle claim. PID reuse
         // can only make this conservative: any occupant keeps the session open.
         if current.pid.is_some_and(crate::broker::session_pid_alive) {
-            return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::SessionPidAlive,
+                AbandonedSessionCloseOutcome::ActiveProcess,
+            ));
         }
         let current_holder_event = self.store_ref().latest_session_holder_event(session_id)?;
         if current_holder_event.as_ref().map(|event| event.id) != holder.binding_event_id {
-            return Ok(AbandonedSessionCloseOutcome::Changed);
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::Changed,
+                AbandonedSessionCloseOutcome::Changed,
+            ));
         }
         if live_task_holder.is_some()
             && !current_holder_event.as_ref().is_some_and(|event| {
@@ -1716,7 +2085,11 @@ impl Broker {
                 ) == Some(true)
             })
         {
-            return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::TaskLeaseCurrent,
+                AbandonedSessionCloseOutcome::ActiveProcess,
+            ));
         }
 
         // A versioned task binding can outlive its broker parent: inspect the
@@ -1727,7 +2100,11 @@ impl Broker {
         let mut _artifact_use_reclaimer = None;
         if task_lease_binding_present || merged_lane || moved_on_to.is_some() {
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::DeadlineReached,
+                    AbandonedSessionCloseOutcome::OperationEvidenceUnavailable,
+                ));
             }
             let gates = crate::gates::checked_running_session_gates_until(
                 self.main_root(),
@@ -1736,19 +2113,37 @@ impl Broker {
                 256,
             );
             let Some(gates) = gates else {
-                return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::GatesUnknown,
+                    AbandonedSessionCloseOutcome::OperationEvidenceUnavailable,
+                ));
             };
             if !gates.is_empty() {
-                return Ok(AbandonedSessionCloseOutcome::OperationActive);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::GateRunning,
+                    AbandonedSessionCloseOutcome::OperationActive,
+                ));
             }
             match self
                 .store_ref()
                 .session_has_unresolved_operations(session_id)
             {
-                Ok(true) => return Ok(AbandonedSessionCloseOutcome::OperationActive),
+                Ok(true) => {
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::OperationUnresolved,
+                        AbandonedSessionCloseOutcome::OperationActive,
+                    ));
+                }
                 Ok(false) => {}
                 Err(_) => {
-                    return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::OperationsUnknown,
+                        AbandonedSessionCloseOutcome::OperationEvidenceUnavailable,
+                    ));
                 }
             }
             // A submission still being simulated, gated or awaiting promotion
@@ -1763,30 +2158,56 @@ impl Broker {
                                 | crate::MergeStatus::Verified
                         ) =>
                     {
-                        return Ok(AbandonedSessionCloseOutcome::OperationActive);
+                        return Ok(keep_with(
+                            process_table,
+                            AbandonmentKeepReason::MergeQueueActive,
+                            AbandonedSessionCloseOutcome::OperationActive,
+                        ));
                     }
                     Ok(_) => {}
                     Err(_) => {
-                        return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+                        return Ok(keep_with(
+                            process_table,
+                            AbandonmentKeepReason::MergeQueueUnknown,
+                            AbandonedSessionCloseOutcome::OperationEvidenceUnavailable,
+                        ));
                     }
                 }
             }
             match self.preparation_status(session_id) {
                 Ok(status) if status.state == crate::PreparationState::InProgress => {
-                    return Ok(AbandonedSessionCloseOutcome::OperationActive);
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::PreparationInProgress,
+                        AbandonedSessionCloseOutcome::OperationActive,
+                    ));
                 }
                 Ok(status) if status.state == crate::PreparationState::Invalid => {
-                    return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::PreparationInvalid,
+                        AbandonedSessionCloseOutcome::OperationEvidenceUnavailable,
+                    ));
                 }
                 Ok(_) => {}
                 Err(_) => {
-                    return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::PreparationUnknown,
+                        AbandonedSessionCloseOutcome::OperationEvidenceUnavailable,
+                    ));
                 }
             }
             let worktree = std::path::Path::new(&current.worktree_path);
             match std::fs::symlink_metadata(worktree) {
                 Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-                _ => return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable),
+                _ => {
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::CheckoutNotDirectory,
+                        AbandonedSessionCloseOutcome::OperationEvidenceUnavailable,
+                    ));
+                }
             }
             match crate::file_lock::artifact_use::try_artifact_use_reclaimer(
                 self.main_root(),
@@ -1801,8 +2222,12 @@ impl Broker {
                         ..
                     },
                 )) if legacy_device_renumbered > 0 => {
-                    return Ok(AbandonedSessionCloseOutcome::LegacyArtifactMarkers(
-                        legacy_device_renumbered,
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::LegacyArtifactMarkers,
+                        AbandonedSessionCloseOutcome::LegacyArtifactMarkers(
+                            legacy_device_renumbered,
+                        ),
                     ));
                 }
                 Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(
@@ -1810,16 +2235,30 @@ impl Broker {
                     | crate::file_lock::artifact_use::ArtifactUseReclaimBlock::UnknownProducer {
                         ..
                     },
-                )) => return Ok(AbandonedSessionCloseOutcome::OperationActive),
+                )) => {
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::ArtifactProducerActive,
+                        AbandonedSessionCloseOutcome::OperationActive,
+                    ));
+                }
                 Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(
                     crate::file_lock::artifact_use::ArtifactUseReclaimBlock::ProtocolUnavailable,
                 ))
                 | Err(_) => {
-                    return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::ArtifactProtocolUnavailable,
+                        AbandonedSessionCloseOutcome::OperationEvidenceUnavailable,
+                    ));
                 }
             }
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::DeadlineReached,
+                    AbandonedSessionCloseOutcome::OperationEvidenceUnavailable,
+                ));
             }
         }
         // A live task holder is excused only after this open-file check. The
@@ -1898,7 +2337,11 @@ impl Broker {
                     crate::lease_liveness::GoneHolderWrite::Skipped
                     | crate::lease_liveness::GoneHolderWrite::Recorded => {}
                     crate::lease_liveness::GoneHolderWrite::DatabaseBusy => {
-                        return Ok(AbandonedSessionCloseOutcome::DatabaseBusy);
+                        return Ok(keep_with(
+                            process_table,
+                            AbandonmentKeepReason::DatabaseBusy,
+                            AbandonedSessionCloseOutcome::DatabaseBusy,
+                        ));
                     }
                 }
             }
@@ -1934,10 +2377,20 @@ impl Broker {
             };
             let liveness = match liveness_result {
                 Ok(liveness) => liveness,
-                Err(_) => return Ok(AbandonedSessionCloseOutcome::LeaseUnavailable),
+                Err(_) => {
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::LeaseUnavailable,
+                        AbandonedSessionCloseOutcome::LeaseUnavailable,
+                    ));
+                }
             };
             if liveness.iter().any(|lease| lease.liveness_evidence.holds) {
-                return Ok(AbandonedSessionCloseOutcome::LeaseHeld);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::LeaseHeld,
+                    AbandonedSessionCloseOutcome::LeaseHeld,
+                ));
             }
         }
         if self
@@ -1946,7 +2399,11 @@ impl Broker {
             .map(|event| event.id)
             != holder.binding_event_id
         {
-            return Ok(AbandonedSessionCloseOutcome::Changed);
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::Changed,
+                AbandonedSessionCloseOutcome::Changed,
+            ));
         }
         // The final look is real evidence: whatever observation it returns,
         // fresh or re-taken, is checked for processes in the checkout again.
@@ -1954,7 +2411,11 @@ impl Broker {
         // that showed new work there was never read.)
         if process_use_checked {
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::DeadlineReached,
+                    AbandonedSessionCloseOutcome::OperationEvidenceUnavailable,
+                ));
             }
             if let Some(kept) = process_use_verdict(
                 process_table,
@@ -1975,7 +2436,11 @@ impl Broker {
             let policy = match crate::load_retention_policy(&self.main_root) {
                 Ok(policy) => policy,
                 Err(_) => {
-                    return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::PolicyUnavailable,
+                        AbandonedSessionCloseOutcome::OperationEvidenceUnavailable,
+                    ));
                 }
             };
             if !(policy.expire_abandoned_task_leases || require_landed)
@@ -1987,7 +2452,11 @@ impl Broker {
                     ) == Some(true)
                 })
             {
-                return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::TaskLeaseCurrent,
+                    AbandonedSessionCloseOutcome::ActiveProcess,
+                ));
             }
         }
 
@@ -2004,7 +2473,11 @@ impl Broker {
                 None => None,
             };
             if still_moved_on.is_none() {
-                return Ok(AbandonedSessionCloseOutcome::Changed);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::Changed,
+                    AbandonedSessionCloseOutcome::Changed,
+                ));
             }
             if !require_landed {
                 let clean = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root())
@@ -2020,7 +2493,11 @@ impl Broker {
                     })
                     .is_some_and(|reason| reason.is_none());
                 if !clean {
-                    return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::HolderMovedOnDirty,
+                        AbandonedSessionCloseOutcome::ActiveProcess,
+                    ));
                 }
             }
         }
@@ -2029,7 +2506,11 @@ impl Broker {
         // guards are held. Unknown evidence preserves the session.
         if require_landed {
             let Ok(policy) = crate::load_retention_policy(self.main_root()) else {
-                return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::PolicyUnavailable,
+                    AbandonedSessionCloseOutcome::OperationEvidenceUnavailable,
+                ));
             };
             let configured_hours = if merged_lane {
                 policy.session_merged_after_hours
@@ -2041,18 +2522,34 @@ impl Broker {
                 || configured_ms <= 0
                 || idle_ms < configured_ms
             {
-                return Ok(AbandonedSessionCloseOutcome::Changed);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::Changed,
+                    AbandonedSessionCloseOutcome::Changed,
+                ));
             }
             let Some(proof) = landed_proof.as_ref() else {
-                return Ok(AbandonedSessionCloseOutcome::Changed);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::Changed,
+                    AbandonedSessionCloseOutcome::Changed,
+                ));
             };
             if let Some(reason) = self.landed_proof_still_holds(&current, proof) {
-                return Ok(AbandonedSessionCloseOutcome::LandedDeclined(reason));
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::LandedDeclined,
+                    AbandonedSessionCloseOutcome::LandedDeclined(reason),
+                ));
             }
             // A memoised proof was replaced by a fresh search before the
             // claims were taken (see above); a close never rests on the memo.
             if proof.memoized {
-                return Ok(AbandonedSessionCloseOutcome::Changed);
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::Changed,
+                    AbandonedSessionCloseOutcome::Changed,
+                ));
             }
             // Last look before the state transition: a commit or any index
             // write since the proof means the agent is still working here.
@@ -2066,8 +2563,12 @@ impl Broker {
             if head_now.as_deref() != Some(proof.head.as_str())
                 || activity_now != Some(claimed_fs_activity)
             {
-                return Ok(AbandonedSessionCloseOutcome::LandedDeclined(
-                    LandedSessionDecline::MovedBeforeClose,
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::LandedDeclined,
+                    AbandonedSessionCloseOutcome::LandedDeclined(
+                        LandedSessionDecline::MovedBeforeClose,
+                    ),
                 ));
             }
             // The pull requests are read again under the claims, last: a new pull
@@ -2075,17 +2576,31 @@ impl Broker {
             if let Some((merges, _)) = merged_evidence.as_ref() {
                 match self.merged_pull_request_evidence(&current) {
                     Ok((current_merges, _)) if current_merges == *merges => {}
-                    Ok(_) => return Ok(AbandonedSessionCloseOutcome::Changed),
+                    Ok(_) => {
+                        return Ok(keep_with(
+                            process_table,
+                            AbandonmentKeepReason::Changed,
+                            AbandonedSessionCloseOutcome::Changed,
+                        ));
+                    }
                     Err(reason) => {
-                        return Ok(AbandonedSessionCloseOutcome::LandedDeclined(reason));
+                        return Ok(keep_with(
+                            process_table,
+                            AbandonmentKeepReason::LandedDeclined,
+                            AbandonedSessionCloseOutcome::LandedDeclined(reason),
+                        ));
                     }
                 }
             }
             // A file written since the proof is work too: the shared
             // classifier looks once more, after every other check.
             let Ok(policy) = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root()) else {
-                return Ok(AbandonedSessionCloseOutcome::LandedDeclined(
-                    LandedSessionDecline::PolicyUnavailable,
+                return Ok(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::LandedDeclined,
+                    AbandonedSessionCloseOutcome::LandedDeclined(
+                        LandedSessionDecline::PolicyUnavailable,
+                    ),
                 ));
             };
             match crate::auto_cleanup::uncommitted_reason(
@@ -2096,8 +2611,12 @@ impl Broker {
             ) {
                 Ok(None) => {}
                 Ok(Some(_)) | Err(_) => {
-                    return Ok(AbandonedSessionCloseOutcome::LandedDeclined(
-                        LandedSessionDecline::MovedBeforeClose,
+                    return Ok(keep_with(
+                        process_table,
+                        AbandonmentKeepReason::LandedDeclined,
+                        AbandonedSessionCloseOutcome::LandedDeclined(
+                            LandedSessionDecline::MovedBeforeClose,
+                        ),
                     ));
                 }
             }
@@ -2211,10 +2730,16 @@ impl Broker {
                 );
                 Ok(AbandonedSessionCloseOutcome::Closed)
             }
-            Ok(false) => Ok(AbandonedSessionCloseOutcome::Changed),
-            Err(BrokerError::SessionRetirementDatabaseBusy) => {
-                Ok(AbandonedSessionCloseOutcome::DatabaseBusy)
-            }
+            Ok(false) => Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::Changed,
+                AbandonedSessionCloseOutcome::Changed,
+            )),
+            Err(BrokerError::SessionRetirementDatabaseBusy) => Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::DatabaseBusy,
+                AbandonedSessionCloseOutcome::DatabaseBusy,
+            )),
             Err(error) => Err(error.into()),
         }
     }
