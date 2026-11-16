@@ -725,15 +725,18 @@ impl Drop for LandedProofSessionBudgetRestore {
 }
 
 /// The per-session proof budget for `session_id`.
-fn landed_proof_session_budget(session_id: i64) -> std::time::Duration {
-    #[cfg(test)]
-    if let Some((only, budget)) = LANDED_PROOF_SESSION_BUDGET_FOR_TEST.with(std::cell::Cell::get)
-        && only.is_none_or(|only| only == session_id)
-    {
-        return budget;
-    }
-    let _ = session_id;
+#[cfg(not(test))]
+fn landed_proof_session_budget(_session_id: i64) -> std::time::Duration {
     LANDED_PROOF_SESSION_BUDGET
+}
+
+/// The per-session proof budget for `session_id`, or the test override.
+#[cfg(test)]
+fn landed_proof_session_budget(session_id: i64) -> std::time::Duration {
+    match LANDED_PROOF_SESSION_BUDGET_FOR_TEST.with(std::cell::Cell::get) {
+        Some((only, budget)) if only.is_none_or(|only| only == session_id) => budget,
+        _ => LANDED_PROOF_SESSION_BUDGET,
+    }
 }
 
 /// Which window and which proofs an automatic close uses.
