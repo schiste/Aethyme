@@ -115,6 +115,10 @@ as version stamps. Claim the paths it may change before running the broker guard
 then inspect the complete diff; preserve maintained guidance that the generator
 would remove and retain only the intended refresh.
 
+When invoking deploy through `aethyme broker advanced exec` from outside the
+session worktree, pass the session worktree path explicitly: caller-side `$PWD`
+expands before broker dispatch. Confirm the deploy output names that worktree.
+
 ## When Not To Use Aethyme
 
 - A simple file read, exact path lookup, or tiny grep already answers the task.
