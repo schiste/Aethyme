@@ -758,7 +758,9 @@ fn every_rust_gate_draws_its_cost_from_the_host_build_pool() {
             .resources
             .iter()
             .filter_map(|requirement| match &requirement.resource {
-                HostResourceKind::Capacity { pool, units, limit } => Some((pool, *units, *limit)),
+                HostResourceKind::Capacity {
+                    pool, units, limit, ..
+                } => Some((pool, *units, *limit)),
                 _ => None,
             })
             .collect();

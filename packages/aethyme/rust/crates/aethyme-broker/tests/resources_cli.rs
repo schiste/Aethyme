@@ -48,6 +48,7 @@ fn reap_reports_unproven_live_and_unverifiable_holders_without_releasing_allocat
                     pool: "diagnostics".into(),
                     units: 1,
                     limit: 4,
+                    pressure: None,
                 },
             },
             HostResourceRequirement {
@@ -310,6 +311,7 @@ fn final_capacity_refusal_reports_advice_without_dispatch_or_stdout_pollution() 
                 pool: "pressure-advice-fixture".into(),
                 units: 1,
                 limit: 1,
+                pressure: None,
             },
         }],
     };
@@ -1528,6 +1530,7 @@ fn reap_dry_run_projects_capacity_only_and_keeps_all_registry_rows_unchanged() {
                 pool: "preview".into(),
                 units: 1,
                 limit: 4,
+                pressure: None,
             },
         }];
         if named {

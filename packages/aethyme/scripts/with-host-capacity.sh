@@ -12,6 +12,9 @@
 # lifetime, renews the lease while it runs, and releases it when the command
 # exits. A build of the workspace costs 3 units (the cargo-test gate's cost),
 # so at most two run at once on the host; use --units 2 for a single crate.
+# The request follows host memory pressure: at warning the pool admits 3 units
+# (one workspace build), at critical 1, and an empty pool always admits one
+# command, so builds slow to one at a time under pressure and never stop.
 # --wait (default 30m) bounds the queueing; on expiry the command never starts
 # and the exit status is non-zero. The command's own exit status is returned.
 #
@@ -75,7 +78,7 @@ run_id="aethyme-build-${label}-$$-$(date +%s)-$(od -An -N4 -tx4 /dev/urandom | t
 request="$(mktemp "${TMPDIR:-/tmp}/aethyme-capacity.XXXXXX")"
 trap 'rm -f "$request"' EXIT
 cat >"$request" <<JSON
-{"schema_version":1,"request_id":"$run_id","repository":"aethyme","worktree_fingerprint":"$fingerprint","run_id":"$run_id","ttl_seconds":$ttl_seconds,"holder_pid":$$,"resources":[{"key":"host_build","kind":"capacity","pool":"$pool","units":$units,"limit":$limit}]}
+{"schema_version":1,"request_id":"$run_id","repository":"aethyme","worktree_fingerprint":"$fingerprint","run_id":"$run_id","ttl_seconds":$ttl_seconds,"holder_pid":$$,"resources":[{"key":"host_build","kind":"capacity","pool":"$pool","units":$units,"limit":$limit,"pressure":"memory"}]}
 JSON
 
 # Not exec: the shell stays as holder_pid and removes the request on exit.

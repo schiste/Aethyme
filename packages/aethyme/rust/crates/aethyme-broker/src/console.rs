@@ -402,6 +402,7 @@ pub fn console_request_with_options(
                     pool: format!("console:{repository}"),
                     units: 1,
                     limit: config.pool_limit,
+                    pressure: None,
                 },
             },
         ],
@@ -1058,7 +1059,9 @@ mod tests {
             .expect("slot")
             .resource
         {
-            HostResourceKind::Capacity { pool, units, limit } => {
+            HostResourceKind::Capacity {
+                pool, units, limit, ..
+            } => {
                 assert_eq!(pool, "console:repo-key");
                 assert_eq!((*units, *limit), (1, 3));
             }

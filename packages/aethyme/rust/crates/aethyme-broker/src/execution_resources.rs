@@ -254,6 +254,7 @@ fn request(
             pool: format!("{pool}:{key}"),
             units,
             limit,
+            pressure: None,
         },
     };
     Ok(HostResourceRequest {
@@ -273,6 +274,7 @@ fn request(
                     units: u32::try_from(envelope.memory.div_ceil(MIB))
                         .map_err(|_| ResourceError::Stale)?,
                     limit: policy.memory_mib,
+                    pressure: None,
                 },
             },
             HostResourceRequirement {
@@ -282,6 +284,7 @@ fn request(
                     units: u32::try_from(envelope.disk.div_ceil(MIB))
                         .map_err(|_| ResourceError::Stale)?,
                     limit: policy.disk_mib,
+                    pressure: None,
                 },
             },
             capacity(

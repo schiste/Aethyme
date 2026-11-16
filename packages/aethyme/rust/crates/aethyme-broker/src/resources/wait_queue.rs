@@ -348,7 +348,9 @@ pub(super) fn request_demands(request: &HostResourceRequest) -> Vec<WaiterDemand
     let mut keys = BTreeSet::<&str>::new();
     for requirement in &request.resources {
         match &requirement.resource {
-            HostResourceKind::Capacity { pool, units, limit } => {
+            HostResourceKind::Capacity {
+                pool, units, limit, ..
+            } => {
                 let entry = capacity.entry(pool.as_str()).or_insert((0, *limit));
                 entry.0 = entry.0.saturating_add(u64::from(*units));
             }
@@ -813,6 +815,7 @@ mod tests {
                 pool: "pool".into(),
                 units,
                 limit: 4,
+                pressure: None,
             },
         )
     }
@@ -1156,6 +1159,7 @@ mod tests {
                 pool: "pool".into(),
                 units,
                 limit,
+                pressure: None,
             },
         }
     }
