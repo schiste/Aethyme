@@ -168,6 +168,79 @@ Before this change the build output waited for the next periodic lap
 `cleanup.attempted` and `cleanup.artifact_bytes_reclaimed` keep their meaning.
 Readers of saved reports must treat a missing field as `false` / absent.
 
+## Whole-root reclaim plans are budgeted (0.8.110)
+
+`aethyme broker gc reclaim plan` without `--session` runs within a 60 s
+discovery budget and a 20 s sizing budget (`--full-scan` lifts both). Readers
+of `gc reclaim plan --json`, of the review snapshots, of the worktree root and
+of `command-metrics.jsonl` see these changes:
+
+- **`candidates[].bytes` may be `null`** in a whole-root plan: the candidate
+  was not measured in budget. It was always an integer before. A `null` size
+  contributes nothing to `reclaimable_bytes` or `total_bytes`, which are then
+  lower bounds. Sizes never enter the digest. `reclaim apply --json` output
+  is unchanged.
+- **`confirmable`** (bool, always present). `false` when discovery stopped
+  before every worktree was walked. Such a plan's `digest` is still present
+  but is salted so it matches no complete scan, no review snapshot is saved
+  for it, and apply refuses it. Its human output prints no digest and no apply
+  command.
+- **`discovery`** (whole-root plans only): `complete`, `budget_ms` (`null`
+  under `--full-scan`), `worktrees_scanned`, `worktrees_not_scanned`,
+  `elapsed_ms`. A listed worktree is always complete; the one in progress when
+  the budget runs out is finished, so `elapsed_ms` can exceed `budget_ms` by
+  one worktree's walk.
+- **`sizing`** (whole-root plans only): `budget_ms` (`null` under
+  `--full-scan`), `measured`, `reused`, `unmeasured`, `budget_exhausted`,
+  `elapsed_ms`, and `deferred_to` (`{pid, process_start, started_at_ms}`,
+  omitted unless this plan waited out its budget behind another whole-root
+  plan). The budget covers that wait and the walk together. A `--full-scan`
+  plan never defers.
+- **Two bookkeeping files in the worktree root**, both private to the broker
+  and written through synced temporaries:
+  - `.aethyme-reclaim-plan-sizes.json`: `{"schema_version": 1, "root",
+    "entries": [{"path", "bytes", "measured_at_ms"}]}`, sizes measured by
+    whole-root plans. An entry is reused for 90 s after it was measured. A
+    measuring plan rewrites the file every 5 s while it runs, stamping each
+    batch with its oldest measurement's time, and once more at its end.
+  - `.aethyme-reclaim-plan-in-flight.json`: `{"pid", "process_start",
+    "started_at_ms"}` while a whole-root plan runs. It is ignored once that
+    process is gone. A stale marker is first renamed to
+    `.aethyme-reclaim-plan-in-flight-stale-<pid>-<nanos>-<n>.json`, and only
+    removed if it still holds the bytes judged stale; a live plan's marker
+    moved by mistake is linked back.
+
+  Their temporaries are named `.aethyme-reclaim-plan-tmp-XXXXXX.json`. Every
+  one of these names matches the `.aethyme-reclaim-plan-*.json` pattern that
+  root inventories already treat as broker bookkeeping, so a leftover from a
+  killed process never stops an otherwise empty root from reading as empty.
+  None of them is a 64-hex review snapshot name.
+- **`reclaim.plan` metric row** (one per plan that ran): `phase_timings_ms`
+  (`discovery`, `protection`, `in_flight_wait`, `sizing`), `phase_counts`
+  (`worktrees_scanned`, `worktrees_not_scanned`, `candidates`, `measured`,
+  `reused`, `unmeasured`, `size_shares`) and `reclaim_plan` (`scope`,
+  `full_scan`, `discovery_complete`, `budget_exhausted`, `reused`,
+  `deferred_to_pid`, `confirmable`). A plan writes no outcome event.
+- **`reclaim.apply` metric row and outcome event** (new: apply used to record
+  neither). Every apply writes a `broker.command.succeeded` / `.failed` event
+  and a row, refusals included. Once it has scanned, the row carries
+  `phase_timings_ms` (`scan`, `protection`, `review`, `removal`),
+  `phase_counts` (`candidates`, `reviewed`, `authorized`, `removed`,
+  `withdrawn`, `removal_failed`, `not_reviewed`, and `kept_<class>` for each
+  protection that kept candidates: `active_session`, `unrecorded_worktree`,
+  `not_reviewed`, `recent_work`, `open_file_use`, `other`) and
+  `reclaim_apply` (`scope`, `review`: `exact` | `saved_review`, `refused`:
+  `null` | `scope_mismatch` | `review_unavailable` | `review_unreadable` |
+  `root_unbound` | `root_changed`, `reclaimed_bytes`). Kept reasons are
+  free text that can name paths and processes, so only these labels reach
+  the row.
+- **Spans and attached counts.** When a command attaches `phase_counts` or
+  `phase_timings_ms` that is not an object, the row's value is replaced by an
+  object holding the recorded spans instead of the spans being dropped.
+
+Readers must accept a `null` `bytes` and treat a missing `confirmable` (rows
+and documents from before 0.8.110) as `true`.
+
 ## Git wrapper probe verdict cache (2026-11-15)
 
 Before its first Git command every `aethyme` process proves that the `git` it
