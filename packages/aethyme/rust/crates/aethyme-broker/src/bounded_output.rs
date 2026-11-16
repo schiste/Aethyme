@@ -535,6 +535,63 @@ pub(crate) fn output_limited_in_owned_group_until(
     stop: &mut dyn FnMut() -> bool,
     partial: &mut PartialOutput,
 ) -> io::Result<Option<LimitedOutput>> {
+    Ok(
+        match owned_group_capture(
+            command,
+            budget,
+            max_stream_bytes,
+            stop,
+            &mut |_: &[u8]| false,
+            partial,
+        )? {
+            OwnedGroupEnd::Output(output) => Some(output),
+            OwnedGroupEnd::Stopped | OwnedGroupEnd::Matched(_) => None,
+        },
+    )
+}
+
+/// How an owned-group capture with an early-stop predicate ended.
+#[derive(Debug)]
+pub(crate) enum OwnedGroupEnd {
+    /// The child finished, hit the deadline or the output limit.
+    Output(LimitedOutput),
+    /// The caller's `stop` ended it.
+    Stopped,
+    /// `matched` accepted the stdout read so far (carried here); the whole
+    /// group was stopped without waiting for the rest.
+    Matched(Vec<u8>),
+}
+
+/// [`output_limited_in_owned_group`] that stops the whole group as soon as
+/// `matched` accepts the stdout printed so far, so a caller that needs only
+/// the first record of a long listing does not wait for the rest. The
+/// spawn-lock wait counts against `budget`.
+#[cfg(unix)]
+pub(crate) fn output_limited_in_owned_group_until_matched(
+    command: &mut Command,
+    budget: Duration,
+    max_stream_bytes: usize,
+    matched: &mut dyn FnMut(&[u8]) -> bool,
+) -> io::Result<OwnedGroupEnd> {
+    owned_group_capture(
+        command,
+        budget,
+        max_stream_bytes,
+        &mut || false,
+        matched,
+        &mut PartialOutput::default(),
+    )
+}
+
+#[cfg(unix)]
+fn owned_group_capture(
+    command: &mut Command,
+    budget: Duration,
+    max_stream_bytes: usize,
+    stop: &mut dyn FnMut() -> bool,
+    matched: &mut dyn FnMut(&[u8]) -> bool,
+    partial: &mut PartialOutput,
+) -> io::Result<OwnedGroupEnd> {
     let _span = crate::phase_telemetry::subprocess_span(command);
     let started = Instant::now();
     let deadline = started
@@ -544,7 +601,7 @@ pub(crate) fn output_limited_in_owned_group_until(
         .checked_add(1)
         .ok_or_else(|| io::Error::other("process output limit overflow"))?;
     if Instant::now() >= deadline {
-        return Ok(Some(LimitedOutput::Deadline));
+        return Ok(OwnedGroupEnd::Output(LimitedOutput::Deadline));
     }
 
     let child = spawn_in_owned_group(command)?;
@@ -572,7 +629,7 @@ pub(crate) fn output_limited_in_owned_group_until(
             partial.stdout = std::mem::take(&mut stdout);
             partial.stderr = std::mem::take(&mut stderr);
             child.terminate_and_reap()?;
-            return Ok(Some(LimitedOutput::Deadline));
+            return Ok(OwnedGroupEnd::Output(LimitedOutput::Deadline));
         }
         if last_stop_check.elapsed() >= Duration::from_secs(1) {
             last_stop_check = Instant::now();
@@ -580,18 +637,23 @@ pub(crate) fn output_limited_in_owned_group_until(
                 partial.stdout = std::mem::take(&mut stdout);
                 partial.stderr = std::mem::take(&mut stderr);
                 child.terminate_and_reap()?;
-                return Ok(None);
+                return Ok(OwnedGroupEnd::Stopped);
             }
         }
 
         if !stdout_closed {
+            let before = stdout.len();
             stdout_closed = matches!(
                 read_probe_stream(&mut stdout_reader, &mut stdout, max_stream_bytes, deadline)?,
                 ProbeStreamRead::Closed
             );
             if stdout.len() > max_stream_bytes {
                 child.terminate_and_reap()?;
-                return Ok(Some(LimitedOutput::OutputLimit));
+                return Ok(OwnedGroupEnd::Output(LimitedOutput::OutputLimit));
+            }
+            if stdout.len() > before && matched(&stdout) {
+                child.terminate_and_reap()?;
+                return Ok(OwnedGroupEnd::Matched(stdout));
             }
         }
         if !stderr_closed {
@@ -601,7 +663,7 @@ pub(crate) fn output_limited_in_owned_group_until(
             );
             if stderr.len() > max_stream_bytes {
                 child.terminate_and_reap()?;
-                return Ok(Some(LimitedOutput::OutputLimit));
+                return Ok(OwnedGroupEnd::Output(LimitedOutput::OutputLimit));
             }
         }
 
@@ -635,7 +697,7 @@ pub(crate) fn output_limited_in_owned_group_until(
                     );
                 }
                 if stdout.len() > max_stream_bytes || stderr.len() > max_stream_bytes {
-                    return Ok(Some(LimitedOutput::OutputLimit));
+                    return Ok(OwnedGroupEnd::Output(LimitedOutput::OutputLimit));
                 }
                 if stdout_closed && stderr_closed {
                     break;
@@ -647,7 +709,7 @@ pub(crate) fn output_limited_in_owned_group_until(
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            return Ok(Some(LimitedOutput::Completed(Output {
+            return Ok(OwnedGroupEnd::Output(LimitedOutput::Completed(Output {
                 status,
                 stdout,
                 stderr,
@@ -871,6 +933,19 @@ pub(crate) fn output_limited_in_owned_group(
     _budget: Duration,
     _max_stream_bytes: usize,
 ) -> io::Result<LimitedOutput> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "owned process-group probes are unavailable on this platform",
+    ))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn output_limited_in_owned_group_until_matched(
+    _command: &mut Command,
+    _budget: Duration,
+    _max_stream_bytes: usize,
+    _matched: &mut dyn FnMut(&[u8]) -> bool,
+) -> io::Result<OwnedGroupEnd> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "owned process-group probes are unavailable on this platform",

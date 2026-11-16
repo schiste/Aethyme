@@ -3683,84 +3683,356 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// The longest a proof-3 listing may run when no Git deadline is active
-/// (an unbudgeted caller such as `finish`).
-const PROOF_GIT_UNBUDGETED_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// The most output one proof-3 listing may print before it counts as failed.
 const PROOF_GIT_OUTPUT_LIMIT: usize = 256 * 1024 * 1024;
+/// Ignored entries one combined cleanliness listing may report before the
+/// checkout counts as unknown (the ignored-path listing's own cap).
+const PROOF_IGNORED_ENTRY_LIMIT: usize = 16_384;
+/// The longest ignored path one combined listing may report.
+const PROOF_IGNORED_PATH_BYTES: usize = 4_096;
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the script proof-3 listings run (with `/bin/sh`, so a
+    /// freshly written script is never executed directly) instead of Git.
+    static PROOF_GIT_PROGRAM_FOR_TEST: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+    /// Test seam: the output limit of a proof-3 listing.
+    static PROOF_GIT_OUTPUT_LIMIT_FOR_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Restores the previous proof-3 listing seams when dropped.
+#[cfg(test)]
+pub(crate) struct ProofGitSeam(Option<PathBuf>, Option<usize>);
+
+#[cfg(test)]
+impl Drop for ProofGitSeam {
+    fn drop(&mut self) {
+        PROOF_GIT_PROGRAM_FOR_TEST.with(|cell| cell.replace(self.0.take()));
+        PROOF_GIT_OUTPUT_LIMIT_FOR_TEST.with(|cell| cell.set(self.1));
+    }
+}
+
+/// Run this thread's proof-3 listings as `/bin/sh <script> <git args>`
+/// instead of Git and/or with `output_limit`, until the guard drops.
+#[cfg(test)]
+pub(crate) fn proof_git_seam_for_test(
+    script: Option<PathBuf>,
+    output_limit: Option<usize>,
+) -> ProofGitSeam {
+    ProofGitSeam(
+        PROOF_GIT_PROGRAM_FOR_TEST.with(|cell| cell.replace(script)),
+        PROOF_GIT_OUTPUT_LIMIT_FOR_TEST.with(|cell| cell.replace(output_limit)),
+    )
+}
+
+fn proof_git_command(dir: &Path, args: &[&str]) -> std::process::Command {
+    #[cfg(test)]
+    if let Some(script) = PROOF_GIT_PROGRAM_FOR_TEST.with(|cell| cell.borrow().clone()) {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg(script).args(args).current_dir(dir);
+        return command;
+    }
+    crate::git::readonly_listing_command(dir, args)
+}
+
+fn proof_git_output_limit() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = PROOF_GIT_OUTPUT_LIMIT_FOR_TEST.with(std::cell::Cell::get) {
+        return limit;
+    }
+    PROOF_GIT_OUTPUT_LIMIT
+}
+
+/// How long a proof-3 listing may run: until the thread's active Git
+/// deadline, never longer than the general Git limit
+/// (`AETHYME_GIT_TIMEOUT_SECS`, ten minutes by default); zero once the
+/// deadline has passed.
+fn proof_git_budget() -> Duration {
+    match crate::git::active_git_deadline() {
+        Some(deadline) if deadline <= Instant::now() => Duration::ZERO,
+        _ => crate::git::git_timeout(),
+    }
+}
+
+/// What one proof-3 listing printed.
+enum ProofListing {
+    /// The whole listing.
+    Complete(String),
+    /// The listing up to the record the caller was looking for; the process
+    /// group was stopped there.
+    Matched(String),
+}
+
+#[cfg(unix)]
+fn capture_proof_git(
+    command: &mut std::process::Command,
+    budget: Duration,
+    limit: usize,
+    matched: &mut dyn FnMut(&[u8]) -> bool,
+) -> std::io::Result<crate::bounded_output::OwnedGroupEnd> {
+    crate::bounded_output::output_limited_in_owned_group_until_matched(
+        command, budget, limit, matched,
+    )
+}
+
+#[cfg(not(unix))]
+fn capture_proof_git(
+    command: &mut std::process::Command,
+    budget: Duration,
+    limit: usize,
+    _matched: &mut dyn FnMut(&[u8]) -> bool,
+) -> std::io::Result<crate::bounded_output::OwnedGroupEnd> {
+    crate::bounded_output::output_limited(command, budget, limit)
+        .map(crate::bounded_output::OwnedGroupEnd::Output)
+}
 
 /// One proof-3 Git listing (`status`, `rev-parse`, `stash list`,
-/// `ls-files`). It stops at the thread's active Git deadline
-/// ([`crate::git::limit_git_until`]), is timed as `subprocess_git` like
-/// every other Git child, and fails rather than answers when stopped: every
-/// caller treats a failed listing as keep. These listings used to run as a
-/// plain `Command::output()`, so a `git status` on a loaded host ran past
-/// every lane deadline, untimed, sometimes with the lifecycle claim held.
-fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let timeout = match crate::git::active_git_deadline() {
-        Some(deadline) => deadline.saturating_duration_since(Instant::now()),
-        None => PROOF_GIT_UNBUDGETED_TIMEOUT,
-    };
-    if timeout.is_zero() {
+/// `ls-files`). It runs in a process group of its own, stops at the
+/// thread's active Git deadline ([`crate::git::limit_git_until`]; the
+/// spawn-lock wait counts against it), is timed as `subprocess_git`, and
+/// fails rather than answers when stopped: every caller treats a failed
+/// listing as keep. A stopped listing takes its whole group with it, so a
+/// submodule `git status` it started is not left running. `matched` may end
+/// it early, once the stdout printed so far holds what the caller needs.
+fn run_proof_git(
+    dir: &Path,
+    args: &[&str],
+    matched: &mut dyn FnMut(&[u8]) -> bool,
+) -> Result<ProofListing, String> {
+    use crate::bounded_output::{LimitedOutput, OwnedGroupEnd};
+    let budget = proof_git_budget();
+    if budget.is_zero() {
         crate::phase_telemetry::add("proof_git_deadline_before_start", Duration::ZERO);
         return Err(format!(
             "git {}: the time budget ran out before it started",
             args.join(" ")
         ));
     }
-    let mut command = std::process::Command::new("git");
-    command.args(args).current_dir(dir);
-    let output = match crate::bounded_output::output_limited(
-        &mut command,
-        timeout,
-        PROOF_GIT_OUTPUT_LIMIT,
-    ) {
-        Ok(crate::bounded_output::LimitedOutput::Completed(output)) => output,
-        Ok(crate::bounded_output::LimitedOutput::Deadline) => {
-            crate::phase_telemetry::add("proof_git_stopped_at_deadline", timeout);
-            return Err(format!(
+    let limit = proof_git_output_limit();
+    let mut command = proof_git_command(dir, args);
+    match capture_proof_git(&mut command, budget, limit, matched) {
+        Ok(OwnedGroupEnd::Output(LimitedOutput::Completed(output))) => {
+            if output.status.success() {
+                Ok(ProofListing::Complete(
+                    String::from_utf8_lossy(&output.stdout).into_owned(),
+                ))
+            } else {
+                Err(format!(
+                    "git {} failed: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ))
+            }
+        }
+        Ok(OwnedGroupEnd::Matched(stdout)) => {
+            crate::phase_telemetry::add("proof_git_stopped_at_first_record", Duration::ZERO);
+            Ok(ProofListing::Matched(
+                String::from_utf8_lossy(&stdout).into_owned(),
+            ))
+        }
+        Ok(OwnedGroupEnd::Output(LimitedOutput::Deadline) | OwnedGroupEnd::Stopped) => {
+            crate::phase_telemetry::add("proof_git_stopped_at_deadline", budget);
+            Err(format!(
                 "git {}: stopped at its time budget",
                 args.join(" ")
-            ));
+            ))
         }
-        Ok(crate::bounded_output::LimitedOutput::OutputLimit) => {
+        Ok(OwnedGroupEnd::Output(LimitedOutput::OutputLimit)) => {
             crate::phase_telemetry::add("proof_git_output_limit", Duration::ZERO);
-            return Err(format!(
-                "git {}: output exceeded {PROOF_GIT_OUTPUT_LIMIT} bytes",
+            Err(format!(
+                "git {}: output exceeded {limit} bytes",
                 args.join(" ")
-            ));
+            ))
         }
-        Err(error) => return Err(format!("git {}: {error}", args.join(" "))),
-    };
-    if !output.status.success() {
-        return Err(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        Err(error) => Err(format!("git {}: {error}", args.join(" "))),
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// [`run_proof_git`] for the whole listing.
+fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    match run_proof_git(dir, args, &mut |_: &[u8]| false)? {
+        ProofListing::Complete(listing) | ProofListing::Matched(listing) => Ok(listing),
+    }
+}
+
+/// The records of a `git status --porcelain=v1 -z` listing as
+/// `(status letters, path)`, complete fields only (a listing cut mid-record
+/// yields the records before the cut); a rename's or copy's source field is
+/// consumed with its record.
+fn status_records(listing: &str) -> Vec<(&str, &str)> {
+    let complete = match listing.rfind('\0') {
+        Some(end) => &listing[..end],
+        None => return Vec::new(),
+    };
+    let mut records = Vec::new();
+    let mut fields = complete.split('\0');
+    while let Some(field) = fields.next() {
+        if field.len() < 4 || !field.is_char_boundary(2) || !field.is_char_boundary(3) {
+            continue;
+        }
+        let (code, path) = (&field[..2], &field[3..]);
+        if code.contains('R') || code.contains('C') {
+            fields.next();
+        }
+        records.push((code, path));
+    }
+    records
+}
+
+/// Whether one status record is somebody's change: anything but an ignored
+/// entry, and (outside strict cleanup) Finder metadata.
+fn status_record_counts(code: &str, path: &str, strict: bool) -> bool {
+    if code == "!!" {
+        return false;
+    }
+    strict || !(code == "??" && path.rsplit('/').next() == Some(".DS_Store"))
+}
+
+/// The first record of a status listing that is somebody's change.
+fn first_counting_record(listing: &str, strict: bool) -> Option<String> {
+    status_records(listing)
+        .into_iter()
+        .find(|(code, path)| status_record_counts(code, path, strict))
+        .map(|(_, path)| path.to_string())
+}
+
+/// The early-stop test for a streamed status listing.
+fn holds_counting_record(stdout: &[u8], strict: bool) -> bool {
+    first_counting_record(&String::from_utf8_lossy(stdout), strict).is_some()
+}
+
+/// The keep reason of a listing ended at its first change.
+fn first_change_reason(listing: &str, strict: bool) -> String {
+    format!(
+        "at least 1 uncommitted or untracked path(s), first: {}",
+        first_counting_record(listing, strict).unwrap_or_default()
+    )
 }
 
 /// Proof 3: nothing in the checkout is somebody's unrecorded work.
 ///
 /// `Ok(None)` is clean; `Ok(Some(reason))` names what keeps it; `Err` is a
-/// listing that failed, which the caller also treats as keep.
+/// listing that failed, which the caller also treats as keep. One
+/// `git status --ignored=matching` pass answers both the uncommitted and the
+/// ignored question, so a clean checkout is walked once; it stops at the
+/// first change, so a dirty one answers as soon as Git prints it.
 pub(crate) fn unclean_reason(
     worktree: &Path,
     branch: Option<&str>,
     main_root: &Path,
     policy: &AutoCleanupPolicy,
 ) -> Result<Option<String>, String> {
-    if let Some(reason) = uncommitted_reason(worktree, branch, main_root, policy)? {
+    let _span = crate::phase_telemetry::span("proof_unclean_check");
+    let strict = policy.strict;
+    let listing = match run_proof_git(
+        worktree,
+        &[
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+            "--ignore-submodules=none",
+        ],
+        &mut |stdout: &[u8]| holds_counting_record(stdout, strict),
+    )? {
+        ProofListing::Matched(listing) => return Ok(Some(first_change_reason(&listing, strict))),
+        ProofListing::Complete(listing) => listing,
+    };
+    let records = status_records(&listing);
+    let changed = records
+        .iter()
+        .filter(|(code, path)| status_record_counts(code, path, strict))
+        .collect::<Vec<_>>();
+    if let Some((_, first)) = changed.first() {
+        return Ok(Some(format!(
+            "{} uncommitted or untracked path(s), first: {first}",
+            changed.len()
+        )));
+    }
+    if let Some(reason) = in_progress_or_stash_reason(worktree, branch, main_root)? {
         return Ok(Some(reason));
     }
-    ignored_content_reason(worktree, policy)
+    ignored_reason_from_status(worktree, &records, policy)
+}
+
+/// The ignored-content verdict ([`ignored_content_reason`]) over the `!!`
+/// records of a combined status listing: the same root check, budget,
+/// limits and per-entry classification.
+fn ignored_reason_from_status(
+    worktree: &Path,
+    records: &[(&str, &str)],
+    policy: &AutoCleanupPolicy,
+) -> Result<Option<String>, String> {
+    let _span = crate::phase_telemetry::span("proof_ignored_check");
+    let deadline = Instant::now() + IGNORED_PATH_LISTING_BUDGET;
+    crate::git::ignored_listing_preflight()?;
+    ensure_ignored_content_before(deadline)?;
+    let expected_root = worktree
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve cleanup checkout root: {error}"))?;
+    let repo = GitRepo::discover(worktree).map_err(|error| error.to_string())?;
+    let discovered_root = repo
+        .root()
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve discovered Git root: {error}"))?;
+    if discovered_root != expected_root {
+        return Err("Git resolved a different root than the cleanup checkout".into());
+    }
+    let ignored = records
+        .iter()
+        .filter(|(code, _)| *code == "!!")
+        .map(|(_, path)| *path)
+        .collect::<Vec<_>>();
+    if ignored.len() > PROOF_IGNORED_ENTRY_LIMIT {
+        return Err(format!(
+            "more than {PROOF_IGNORED_ENTRY_LIMIT} ignored paths; ignored content is unknown"
+        ));
+    }
+    let mut released_by_file_pattern = false;
+    for relative in ignored {
+        ensure_ignored_content_before(deadline)?;
+        if relative.len() > PROOF_IGNORED_PATH_BYTES {
+            return Err(format!(
+                "an ignored path longer than {PROOF_IGNORED_PATH_BYTES} bytes"
+            ));
+        }
+        // A classification error keeps the checkout, exactly as
+        // `ignored_content_blockers` reports it.
+        let verdict = classify_ignored_entry(worktree, relative, policy).and_then(
+            |(classification, rule)| {
+                match rule {
+                    IgnoredEntryRule::FilePattern => released_by_file_pattern = true,
+                    IgnoredEntryRule::ProtectedRefusal => crate::phase_telemetry::add(
+                        "cleanup_regenerable_protected_refused",
+                        Duration::ZERO,
+                    ),
+                    IgnoredEntryRule::Other => {}
+                }
+                ignored_verdict(relative, classification)
+            },
+        );
+        ensure_ignored_content_before(deadline)?;
+        if let Err(reason) = verdict {
+            return Ok(Some(format!(
+                "ignored content requires explicit cleanup: {reason}"
+            )));
+        }
+    }
+    if released_by_file_pattern {
+        crate::phase_telemetry::add("cleanup_checkout_released_by_file_pattern", Duration::ZERO);
+    }
+    Ok(None)
 }
 
 /// Proof 3 without the ignored-path listing: no uncommitted or untracked
 /// path, no merge, rebase or similar in progress, and no stash made on
-/// `branch`.
+/// `branch`. The status listing stops at the first change.
 pub(crate) fn uncommitted_reason(
     worktree: &Path,
     branch: Option<&str>,
@@ -3890,19 +4162,32 @@ fn uncommitted_verdict(
     // daemon for each of hundreds of checkouts; the answer is the same.
     // Timed through the in-progress markers and the stash listing below.
     let _span = crate::phase_telemetry::span("proof_uncommitted_check");
-    let status = git(
-        worktree,
-        &[
-            "--no-optional-locks",
-            "-c",
-            "core.fsmonitor=false",
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--ignore-submodules=none",
-        ],
-    )?;
+    let args = [
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=false",
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+    ];
+    // Keeping on any change needs only the first one: the listing stops
+    // there. Automatic removal reads the whole list (tracked deletions).
+    let status = match tracked_deletions {
+        TrackedDeletions::Keep => {
+            let strict = policy.strict;
+            match run_proof_git(worktree, &args, &mut |stdout: &[u8]| {
+                holds_counting_record(stdout, strict)
+            })? {
+                ProofListing::Matched(listing) => {
+                    return Ok((Some(first_change_reason(&listing, strict)), 0));
+                }
+                ProofListing::Complete(listing) => listing,
+            }
+        }
+        TrackedDeletions::Automatic { .. } => git(worktree, &args)?,
+    };
     let changed = status
         .split('\0')
         .filter(|entry| entry.len() > 3)
@@ -3953,6 +4238,19 @@ fn uncommitted_verdict(
         }
     }
 
+    Ok((
+        in_progress_or_stash_reason(worktree, branch, main_root)?,
+        interrupted_removal,
+    ))
+}
+
+/// A merge, rebase or similar in progress in the checkout, or a stash made
+/// on `branch`.
+fn in_progress_or_stash_reason(
+    worktree: &Path,
+    branch: Option<&str>,
+    main_root: &Path,
+) -> Result<Option<String>, String> {
     let git_dir = git(worktree, &["rev-parse", "--absolute-git-dir"])?;
     let git_dir = PathBuf::from(git_dir.trim());
     for (marker, what) in [
@@ -3964,7 +4262,7 @@ fn uncommitted_verdict(
         ("rebase-apply", "a rebase or am"),
     ] {
         if git_dir.join(marker).exists() {
-            return Ok((Some(format!("{what} is in progress")), 0));
+            return Ok(Some(format!("{what} is in progress")));
         }
     }
 
@@ -3975,14 +4273,14 @@ fn uncommitted_verdict(
             .lines()
             .find(|line| made_here.iter().any(|prefix| line.starts_with(prefix)))
         {
-            return Ok((
-                Some(format!("a stash was made on {branch}: {}", entry.trim())),
-                0,
-            ));
+            return Ok(Some(format!(
+                "a stash was made on {branch}: {}",
+                entry.trim()
+            )));
         }
     }
 
-    Ok((None, interrupted_removal))
+    Ok(None)
 }
 
 /// Shared ignored-content verdict for automatic and finish-time cleanup.
@@ -7676,6 +7974,14 @@ impl Broker {
             return Ok(judged);
         }
         let ids = likely.iter().map(|session| session.id).collect::<Vec<_>>();
+        // The session that has been timing out longest is judged last, with
+        // whatever is left of the lane's share: every session is eventually
+        // judged conclusively, however slow its checkout.
+        let grant = self.oldest_timed_out_session(&ids);
+        if let Some(index) = grant.and_then(|grant| likely.iter().position(|s| s.id == grant)) {
+            let granted = likely.remove(index);
+            likely.push(granted);
+        }
         let mut process_table = crate::session_holder::RecordedHolderProcessTable::default();
         process_table.prime(self.store_ref(), &ids, deadline);
         for session in likely {
@@ -7690,6 +7996,8 @@ impl Broker {
             {
                 continue;
             }
+            let _grant =
+                (grant == Some(session.id)).then(|| crate::broker::long_proof_grant(session.id));
             judged.insert(session.id);
             let allow_snapshot = match deadline {
                 Some(deadline) => {
@@ -10066,6 +10374,170 @@ mod tests {
             super::git(dir.path(), &["status", "--porcelain"]),
             Ok(String::new())
         );
+    }
+
+    /// A shell script a proof-3 listing runs instead of Git (see
+    /// [`super::proof_git_seam_for_test`]); `release` is a file whose
+    /// creation lets a blocked script finish.
+    #[cfg(unix)]
+    fn proof_git_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        path
+    }
+
+    /// Whether `pid` still runs (a zombie waiting for its reaper does not).
+    #[cfg(unix)]
+    fn process_running(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks that the process exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .is_none_or(|(_, rest)| !rest.trim_start().starts_with('Z')),
+            Err(_) => true,
+        }
+    }
+
+    /// The records of a `status -z` listing: a rename's source field is
+    /// consumed with it, ignored entries and Finder metadata do not count,
+    /// and a record cut off mid-listing is not read.
+    #[test]
+    fn status_records_read_whole_records_only() {
+        let listing = "R  new.txt\0old.txt\0!! target/\0?? .DS_Store\0 M src/lib.rs\0?? half";
+        assert_eq!(
+            super::status_records(listing),
+            vec![
+                ("R ", "new.txt"),
+                ("!!", "target/"),
+                ("??", ".DS_Store"),
+                (" M", "src/lib.rs"),
+            ]
+        );
+        assert_eq!(
+            super::first_counting_record("!! target/\0?? .DS_Store\0 M a.rs\0", false),
+            Some("a.rs".to_string())
+        );
+        assert_eq!(
+            super::first_counting_record("!! target/\0?? .DS_Store\0", true),
+            Some(".DS_Store".to_string())
+        );
+        assert_eq!(
+            super::first_counting_record("!! target/\0?? x.txt", false),
+            None,
+            "a record not yet terminated is not read"
+        );
+    }
+
+    /// A dirty checkout answers at its first record: the listing is stopped
+    /// there instead of being waited for (the script never finishes on its
+    /// own), and the reason says "at least 1".
+    #[cfg(unix)]
+    #[test]
+    fn a_dirty_listing_answers_at_its_first_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("release");
+        let script = proof_git_script(
+            dir.path(),
+            "dirty.sh",
+            &format!(
+                "case \" $* \" in *\" status \"*) printf '?? notes.txt\\0'; while [ ! -e '{}' ]; do sleep 0.05; done;; *) exit 0;; esac",
+                release.display()
+            ),
+        );
+        let _seam = super::proof_git_seam_for_test(Some(script), None);
+        let policy = AutoCleanupPolicy::default();
+        // The deadline only turns a regression into a failure, not a hang.
+        let (uncommitted, unclean) =
+            crate::git::with_git_deadline(std::time::Duration::from_secs(600), || {
+                (
+                    super::uncommitted_reason(dir.path(), None, dir.path(), &policy),
+                    super::unclean_reason(dir.path(), None, dir.path(), &policy),
+                )
+            });
+        std::fs::write(&release, "").unwrap();
+        for reason in [uncommitted, unclean] {
+            assert_eq!(
+                reason,
+                Ok(Some(
+                    "at least 1 uncommitted or untracked path(s), first: notes.txt".into()
+                ))
+            );
+        }
+    }
+
+    /// A stopped listing takes its whole process group with it: a child the
+    /// listing started (as a submodule `git status` would be) is not left
+    /// running.
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_listing_takes_its_process_group_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("release");
+        let pid_file = dir.path().join("child.pid");
+        let script = proof_git_script(
+            dir.path(),
+            "group.sh",
+            &format!(
+                "sh -c 'while [ ! -e \"{release}\" ]; do sleep 0.05; done' &\necho $! > '{pid}.tmp' && mv '{pid}.tmp' '{pid}'\nprintf '?? notes.txt\\0'\nwhile [ ! -e '{release}' ]; do sleep 0.05; done",
+                release = release.display(),
+                pid = pid_file.display(),
+            ),
+        );
+        let _seam = super::proof_git_seam_for_test(Some(script), None);
+        let policy = AutoCleanupPolicy::default();
+        let reason = crate::git::with_git_deadline(std::time::Duration::from_secs(600), || {
+            super::uncommitted_reason(dir.path(), None, dir.path(), &policy)
+        });
+        let child: i32 = std::fs::read_to_string(&pid_file)
+            .expect("the listing started its child before printing")
+            .trim()
+            .parse()
+            .unwrap();
+        let still_running = process_running(child);
+        std::fs::write(&release, "").unwrap();
+        assert!(!still_running, "the listing's child outlived it");
+        // Whether the group cleanup could prove the group gone or not, the
+        // answer is never "clean".
+        assert_ne!(reason, Ok(None));
+    }
+
+    /// A listing stopped at its deadline and one past its output limit are
+    /// errors, never "clean": every caller keeps on an error.
+    #[cfg(unix)]
+    #[test]
+    fn stopped_and_overlong_listings_are_no_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("release");
+        let blocking = proof_git_script(
+            dir.path(),
+            "blocking.sh",
+            &format!(
+                "while [ ! -e '{}' ]; do sleep 0.05; done",
+                release.display()
+            ),
+        );
+        let policy = AutoCleanupPolicy::default();
+        let stopped = {
+            let _seam = super::proof_git_seam_for_test(Some(blocking), None);
+            crate::git::with_git_deadline(std::time::Duration::from_millis(200), || {
+                super::unclean_reason(dir.path(), None, dir.path(), &policy)
+            })
+        };
+        std::fs::write(&release, "").unwrap();
+        let error = stopped.expect_err("a listing that never finished is no verdict");
+        assert!(error.contains("time budget"), "{error}");
+
+        let overlong = proof_git_script(
+            dir.path(),
+            "overlong.sh",
+            "i=0; while [ $i -lt 64 ]; do printf ' M file-%04d.txt\\0' $i; i=$((i+1)); done",
+        );
+        let _seam = super::proof_git_seam_for_test(Some(overlong), Some(64));
+        let error = super::git(dir.path(), &["status"]).expect_err("past the output limit");
+        assert!(error.contains("output exceeded"), "{error}");
     }
 
     #[cfg(unix)]

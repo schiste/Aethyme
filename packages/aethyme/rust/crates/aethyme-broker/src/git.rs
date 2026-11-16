@@ -8780,6 +8780,23 @@ fn ignored_paths_git_command(root: &Path, args: &[&str]) -> Command {
     command
 }
 
+/// A read-only cleanliness listing run in `root` with the resolved Git
+/// program, the inherited variables that redirect repository discovery
+/// removed and optional locks off: the command the ignored-path listing
+/// uses, for the cleanup proof's own listings.
+pub(crate) fn readonly_listing_command(root: &Path, args: &[&str]) -> Command {
+    ignored_paths_git_command(root, args)
+}
+
+/// Whether ignored paths may be read from a Git listing at all: no
+/// inherited routing override and a Git whose porcelain is not decorated.
+pub(crate) fn ignored_listing_preflight() -> Result<(), String> {
+    if std::env::vars_os().any(|(key, _)| unsafe_graph_git_environment_key(&key)) {
+        return Err("inherited Git routing overrides make ignored paths unknown".into());
+    }
+    require_trustworthy_porcelain().map_err(|error| error.to_string())
+}
+
 fn ensure_bounded_git_listing_before(deadline: Instant, args: &[&str]) -> Result<(), GitError> {
     if Instant::now() >= deadline {
         note_git_timeout();
