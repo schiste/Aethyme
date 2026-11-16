@@ -30,6 +30,11 @@
 # Arguments after -- are passed to nextest; package and target selectors must
 # appear before -- so the script can choose the right build path.
 #
+# A local run in a linked worktree with no target directory first clones one
+# from the seed an earlier session published for the same Cargo.lock, and a
+# passing local run publishes that seed when none exists yet
+# (rust-target-seed.sh; AETHYME_RUST_TARGET_SEED_DIR=off disables it).
+#
 # Local defaults use one Cargo build job, two nextest test workers, no retries,
 # fail-fast, and failure output at the end. Explicitly pass --full for the CI
 # profile, including CI retries and full-suite behavior. The local job count
@@ -321,6 +326,10 @@ else
         exit 2
     fi
     export CARGO_BUILD_JOBS="$local_build_jobs"
+    # A fresh worktree starts from the third-party artifacts an earlier
+    # session built for the same lockfile; see rust-target-seed.sh.
+    seed_local_target=1
+    "$(dirname "$rust")/scripts/rust-target-seed.sh" restore
     if [ "$coverage" = focused ]; then
         unset AETHYME_TESTKIT_PREBUILT_BINS
         selection=(-p "$package" --lib)
@@ -338,6 +347,9 @@ status=0
 test_command+=("${filter[@]+"${filter[@]}"}" "${extra[@]+"${extra[@]}"}")
 "${test_command[@]}" || status=$?
 elapsed=$(( $(date +%s) - started ))
+if [ "${seed_local_target:-0}" -eq 1 ] && [ "$status" -eq 0 ]; then
+    "$(dirname "$rust")/scripts/rust-target-seed.sh" publish
+fi
 
 if { [ "$coverage" = full ] || [ "$coverage" = from-archive ]; } && [ "$status" -eq 0 ]; then
     junit="$rust/target/nextest/ci/junit.xml"
