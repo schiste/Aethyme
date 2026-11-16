@@ -43,6 +43,7 @@ pub mod hub_client;
 pub mod identity;
 pub mod jsonrpc;
 pub mod key;
+pub mod listen;
 pub mod mux;
 pub mod resolve;
 pub mod secret;

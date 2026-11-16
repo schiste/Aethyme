@@ -21,6 +21,7 @@ use std::time::Instant;
 
 use super::checkouts::GitCheckouts;
 use super::config::{self, Entry, Mode, Scope, Sources, Transport};
+use super::http::Ended;
 use super::hub_client::{self, Attach, HttpAttach};
 use super::key::{self, Caller, CopyKind, Plan};
 use super::resolve::{is_executable_file, is_shell, read_shebang, search_path};
@@ -470,10 +471,13 @@ fn run_inner(args: &[String]) -> u8 {
             );
         }
     }
-    let http_path = entry
-        .http_path
-        .clone()
-        .filter(|_| plan.transport == Transport::Http);
+    // Validation guarantees both for an HTTP entry.
+    let http = match (&entry.http_path, &entry.http_auth) {
+        (Some(path), Some(auth)) if plan.transport == Transport::Http => {
+            Some((path.clone(), auth.clone()))
+        }
+        _ => None,
+    };
     if plan.mode == Mode::Shared {
         let blocked = if entry.require_client_features {
             Some("require_client_features".to_string())
@@ -490,9 +494,19 @@ fn run_inner(args: &[String]) -> u8 {
                 // One `hub` event per attempt, written before the session
                 // starts (an agent may kill this process at the end).
                 recorder.record("hub", None, Some(&plan), false);
-                if let Some(path) = &http_path {
-                    match hub_client::attach_http(&plan, path, hub_client::ATTACH_BUDGET) {
-                        HttpAttach::Done(code) => return code,
+                if let Some((path, auth)) = &http {
+                    match hub_client::attach_http(&plan, path, auth, hub_client::ATTACH_BUDGET) {
+                        HttpAttach::Done(ended) => {
+                            if let Ended::SessionLost(reason) = &ended {
+                                recorder.record(
+                                    "error",
+                                    Some(format!("http_session_lost:{reason}").as_str()),
+                                    Some(&plan),
+                                    false,
+                                );
+                            }
+                            return ended.code();
+                        }
                         HttpAttach::Private(reason) => Some(reason),
                     }
                 } else {
@@ -526,14 +540,14 @@ fn run_inner(args: &[String]) -> u8 {
             recorder.warnings.push(format!("hub_fallback:{reason}"));
         }
     }
-    if let Some(path) = &http_path {
+    if let Some((path, auth)) = &http {
         // An HTTP server cannot take over this process's stdio: it runs as a
         // child on a free loopback port, bridged like a shared one.
         recorder.record("exec", Some("http_private"), Some(&plan), false);
-        let code = super::http::run_private(&plan, path);
-        // ENVIRONMENT: the server never listened, so nothing was bridged.
+        let code = super::http::run_private(&plan, path, auth);
+        // ENVIRONMENT or REFUSED: nothing was bridged, stdin is untouched.
         return match &parsed.fallback {
-            Some(fallback) if code == exit_status::ENVIRONMENT => {
+            Some(fallback) if code == exit_status::ENVIRONMENT || code == exit_status::REFUSED => {
                 recorder.record(
                     "exec_failed",
                     Some("http_private_failed"),

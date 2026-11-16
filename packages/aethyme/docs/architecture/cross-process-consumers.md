@@ -87,10 +87,12 @@ speaks a line-delimited JSON attach protocol over a 0600 socket in
 `--yes --digest <sha256>`; its JSON adds `trusted`, `approval` and `reason`.
 `status --json` adds `hub` (state, pid, upstreams) and per entry
 `hub.upstream`, `hub.counters`. For `transport = "http"` entries the attach
-hello adds `"transport": "http"` and `"path"`, and the hub answers with one
-`{"aethyme_hub": "ready", "url"}` (or `fallback`) line; the server's port is
+hello adds `"transport": "http"`, `"path"` and `"auth"`, and the hub answers
+with one `{"aethyme_hub": "ready", "url", "token"}` (or `fallback`) line; the server's port is
 a `tcp_port` lease (`repository = "aethyme-mcp-hub"`) in the host resource
-registry, and `status --json` adds `port` per upstream.
+registry, and `status --json` adds `port` per upstream and
+`last_listen_ms` / `http_sessions_ended` per key. Entries gain
+`require_argv`, `http_path`, `http_auth` and `http_unauthenticated`.
 
 The `service::jobs::JobStore` library adds a separate explicitly opened
 SQLite job file (application ID `0x41534a31`, schema 1), durable idempotency keys,

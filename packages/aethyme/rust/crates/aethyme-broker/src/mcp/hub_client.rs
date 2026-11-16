@@ -14,11 +14,15 @@ use std::os::unix::net::{SocketAddr, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use super::config::HttpAuth;
+use super::http::{BridgeOptions, Ended};
 use super::hub::{HubPaths, build_identity};
 use super::jsonrpc::{self, read_message};
 use super::key::Plan;
@@ -218,7 +222,7 @@ pub fn query_status() -> Option<Value> {
 fn open_attach(
     plan: &Plan,
     budget: Duration,
-    http_path: Option<&str>,
+    http: Option<(&str, &HttpAuth)>,
 ) -> Result<(UnixStream, BufReader<UnixStream>), String> {
     let deadline = Instant::now() + budget;
     let directory = hub_directory().ok_or("hub_directory_unusable")?;
@@ -252,9 +256,10 @@ fn open_attach(
         "cwd": plan.cwd,
         "env": environment,
     });
-    if let Some(path) = http_path {
+    if let Some((path, auth)) = http {
         hello["transport"] = json!("http");
         hello["path"] = json!(path);
+        hello["auth"] = json!(auth);
     }
     let mut hub_reader = stream
         .try_clone()
@@ -282,7 +287,7 @@ fn open_attach(
 /// How an HTTP attach ended.
 pub enum HttpAttach {
     /// The agent's session ran against the shared server and is over.
-    Done(u8),
+    Done(Ended),
     /// Nothing was read from stdin: run the server privately.
     Private(String),
 }
@@ -291,13 +296,14 @@ pub enum HttpAttach {
 /// stdio to it, as one HTTP session of its own. The hub connection stays
 /// open meanwhile (it keeps the server up); if the hub closes it, the
 /// server is gone and this process ends.
-pub fn attach_http(plan: &Plan, http_path: &str, budget: Duration) -> HttpAttach {
-    let (stream, mut hub_reader) = match open_attach(plan, budget, Some(http_path)) {
+pub fn attach_http(plan: &Plan, http_path: &str, auth: &HttpAuth, budget: Duration) -> HttpAttach {
+    let (stream, mut hub_reader) = match open_attach(plan, budget, Some((http_path, auth))) {
         Ok(opened) => opened,
         Err(reason) => return HttpAttach::Private(reason),
     };
+    // The hub waits up to its own listen deadline before answering.
     let answered = stream
-        .set_read_timeout(Some(INITIALIZE_BUDGET))
+        .set_read_timeout(Some(INITIALIZE_BUDGET + Duration::from_secs(5)))
         .and_then(|()| read_message(&mut hub_reader));
     let control: Option<Value> = match answered {
         Ok(Some(line)) => serde_json::from_slice(&line).ok(),
@@ -306,43 +312,58 @@ pub fn attach_http(plan: &Plan, http_path: &str, budget: Duration) -> HttpAttach
     let Some(control) = control else {
         return HttpAttach::Private("no_ready_answer".into());
     };
-    let url = match control.get("aethyme_hub").and_then(Value::as_str) {
-        Some("ready") => control
-            .get("url")
+    if control.get("aethyme_hub").and_then(Value::as_str) != Some("ready") {
+        let reason = control
+            .get("reason")
             .and_then(Value::as_str)
-            .map(str::to_string),
-        _ => {
-            let reason = control
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("refused");
-            return HttpAttach::Private(reason.to_string());
-        }
-    };
-    let Some(url) = url.filter(|url| super::http::parse_url(url).is_some()) else {
+            .unwrap_or("refused");
+        return HttpAttach::Private(reason.to_string());
+    }
+    let Some(url) = control
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|url| super::http::parse_url(url).is_some())
+        .map(str::to_string)
+    else {
         return HttpAttach::Private("invalid_url".into());
     };
+    let token = control
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if !matches!(auth, HttpAuth::None) && token.is_none() {
+        return HttpAttach::Private("token_missing".into());
+    }
     if stream.set_read_timeout(None).is_err() {
         return HttpAttach::Private("hub_socket_unusable".into());
     }
-    let name = plan.name.clone();
+    let options = BridgeOptions::new(token);
+    // The hub closes this connection when the server stops or restarts:
+    // the session is then gone, and the bridge ends.
+    let stop = Arc::clone(&options.stop);
     let watch = thread::Builder::new()
         .name("mcp-connect-hub-watch".into())
         .spawn(move || {
             let _drained = io::copy(&mut hub_reader, &mut io::sink());
-            eprintln!("aethyme mcp: {name}: the shared server stopped; ending this session");
-            std::process::exit(i32::from(crate::exit_status::FAILED));
+            stop.store(true, Ordering::Release);
         });
     if watch.is_err() {
         return HttpAttach::Private("hub_watch_unavailable".into());
     }
-    let code = super::http::bridge(
+    let ended = super::http::bridge(
         &url,
         BufReader::new(io::stdin()),
         super::http::stdout_output(),
+        options,
     );
+    if let Ended::SessionLost(reason) = &ended {
+        eprintln!(
+            "aethyme mcp: {}: the shared HTTP session ended ({reason})",
+            plan.name
+        );
+    }
     drop(stream);
-    HttpAttach::Done(code)
+    HttpAttach::Done(ended)
 }
 
 /// Attach this agent to the hub for `plan` and bridge until it leaves.

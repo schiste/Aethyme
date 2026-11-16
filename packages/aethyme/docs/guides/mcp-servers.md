@@ -371,8 +371,9 @@ name = "example-http"
 mode = "shared"
 transport = "http"
 argv = ["/srv/example/bin/example-server", "--http", "--port={port}", "--isolated"]
-require_argv = ["--isolated"]   # refused if an edit drops the flag
-http_path = "/mcp"              # the default
+require_argv = ["--isolated"]          # refused if an edit drops or negates the flag
+http_auth = "bearer_env:EXAMPLE_TOKEN" # required; see Exposure below
+http_path = "/mcp"                     # the default
 cwd = "/srv/example"
 ```
 
@@ -384,23 +385,58 @@ cwd = "/srv/example"
   `MCP-Protocol-Version` are sent with every later request, a `GET` stream
   is opened for server-initiated messages when the server offers one, and
   the session is ended with `DELETE` when the agent leaves. Only loopback
-  HTTP/1.1 is spoken.
+  HTTP/1.1 is spoken. A reply silent for 5 minutes fails the request with a
+  retryable error; header lines, bodies and SSE events are bounded (32 MiB).
 - Shared, the hub runs one server per key on a port leased from the host
   resource registry (`tcp_port`, 47300-47799; the port is kept across
-  restarts) and tells each `connect` its URL. Every agent is its own HTTP
-  session, so nothing is multiplexed or renumbered, and the per-session
-  rules above (logging, subscriptions, client capabilities) are the
-  server's own. That is only safe when the server keeps sessions apart:
-  put its isolation flag in `argv` and list it in `require_argv`, so a
-  change that removes it is refused (`missing_required_argument`) instead
-  of silently shared. The server counts as ready once its port accepts
-  connections; one that does not listen within 30 seconds is killed and
-  counts as a crash. A crash ends the HTTP sessions, so each agent's
-  `connect` reports the session ended; when the hub stops the server, the
-  `connect` processes attached to it exit.
+  restarts) and tells each `connect` its URL and token. Every agent is its
+  own HTTP session, so nothing is multiplexed or renumbered, and the
+  per-session rules above (logging, subscriptions, client capabilities)
+  are the server's own. That is only safe when the server keeps sessions
+  apart: put its isolation flag in `argv` and list it in `require_argv`.
+  `require_argv` is a presence check: each listed element must appear
+  exactly, and a later `--flag=false`, `--flag=0`, `--flag=no`,
+  `--flag=off` or `--no-flag` is refused (`contradicted_required_argument`);
+  it knows nothing else of the server's option syntax.
+- When the server ends a session (404, or 401/403 once initialized), or the
+  hub disconnects it because the server exited or restarted, `connect`
+  answers every request still waiting with a retryable error and exits at
+  once, so the agent sees its server end and can start it again. The hub
+  counts these in `http_sessions_ended`.
 - Direct, or whenever the hub is not used (the same reasons as for stdio),
-  `connect` runs the server as its own child on a free loopback port and
-  bridges to it; the server stops when the agent leaves. A server that never
-  listens runs `--fallback` when one is given.
+  `connect` runs the server as its own child on a free loopback port, with
+  the same checks and token, and bridges to it; the server stops when the
+  agent leaves. A server that never listens or fails the checks runs
+  `--fallback` when one is given.
 - `aethyme mcp status --json` shows each HTTP upstream's `port`, and the
-  counters add `last_listen_ms`.
+  counters add `last_listen_ms` and `http_sessions_ended`.
+
+### Exposure
+
+A loopback port is reachable by every local user and process, not only by
+this user's agents. Shared and private HTTP entries are therefore guarded
+the same way:
+
+- **Authentication.** Every HTTP entry must state `http_auth`. With
+  `bearer_env:<NAME>` (preferred) or `bearer_arg:<flag>`, a random token is
+  made for every start of the server and handed to it in that environment
+  variable, or as the value after that flag (`<flag> <token>`; visible to
+  every local user in `ps`, so prefer the variable). The bridge sends it as
+  `Authorization: Bearer <token>`; the server must refuse requests without
+  it. `http_auth = "none"` is refused unless the entry also sets
+  `http_unauthenticated = true`: then any local process can drive the
+  server.
+- **Who listens.** Before the server starts, its port must be free (else
+  `port_busy`). It counts as ready only when every TCP listener on the port
+  belongs to the server's own process group and is bound to `127.0.0.1`;
+  "something accepts connections" is never enough. A server listening on
+  `0.0.0.0`, `::` or any other address is killed and its key marked
+  unhealthy (`not_loopback`); a listener of another process on the port
+  gives `listener_not_ours`. Ownership is read from `/proc` on Linux and
+  with `lsof` on macOS (which may not show another user's sockets); where it
+  cannot be determined the server is not used (`listener_unverifiable`).
+  One that does not listen within 30 seconds is killed and counts as a
+  crash.
+- **Origin.** The bridge never sends an `Origin` header. Servers should
+  reject requests that carry one (a browser page on a rebinding DNS name
+  could otherwise reach a loopback port); that check is the server's job.

@@ -233,7 +233,7 @@ Opt-in. Entries are declared in `<host state>/mcp/services.toml` and, per
 repository, `.aethyme/mcp.toml` (`schema = 1`, `[[servers]]` with `name`,
 `mode`, `transport`, `argv`, `cwd`, `env_file`, `env_allow`, `source`,
 `flavour`, `env_inherit`, `allow_cached`, `require_client_features`,
-`require_argv`, `http_path`). An entry whose paths lie inside a
+`require_argv`, `http_path`, `http_auth`, `http_unauthenticated`). An entry whose paths lie inside a
 broker session worktree is refused (`session_worktree_path`). A host entry
 always wins over a repository entry of the same name; repository entries may
 only name paths inside their repository and run only after `trust` recorded

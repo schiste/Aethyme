@@ -19,7 +19,15 @@
 //! require_client_features = false # true: never shared (roots, sampling, elicitation)
 //! require_argv = ["--stdio"]   # elements argv must contain (e.g. an isolation flag)
 //! http_path = "/mcp"           # transport = "http" only: where the server answers
+//! http_auth = "bearer_env:MCP_TOKEN" # http only, required: or "bearer_arg:--token", "none"
+//! http_unauthenticated = false # true is required with http_auth = "none"
 //! ```
+//!
+//! `require_argv` is a presence check: each listed element must appear in
+//! `argv` exactly, and a later contradicting form of a listed `--flag`
+//! (`--flag=false`, `--flag=0`, `--flag=no`, `--flag=off`, `--no-flag`) is
+//! refused. It does not understand the server's own option syntax beyond
+//! that.
 //!
 //! A `transport = "http"` server is started with `{port}` in `argv` replaced
 //! by a loopback port, also exported as `AETHYME_MCP_PORT`, and must answer
@@ -88,6 +96,60 @@ struct RawEntry {
     #[serde(default)]
     require_argv: Vec<String>,
     http_path: Option<String>,
+    http_auth: Option<String>,
+    #[serde(default)]
+    http_unauthenticated: bool,
+}
+
+/// How an HTTP server authenticates its clients. With a bearer mode a
+/// random token is made for every start and handed to the server through
+/// the named environment variable or as the value after the named flag
+/// (visible in `ps`); the bridge sends it as `Authorization: Bearer`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HttpAuth {
+    None,
+    BearerEnv { name: String },
+    BearerArg { flag: String },
+}
+
+impl HttpAuth {
+    fn parse(text: &str) -> Option<Self> {
+        if text == "none" {
+            return Some(Self::None);
+        }
+        if let Some(name) = text.strip_prefix("bearer_env:") {
+            return super::envfile::valid_name(name).then(|| Self::BearerEnv {
+                name: name.to_string(),
+            });
+        }
+        let flag = text.strip_prefix("bearer_arg:")?;
+        let flag_ok = flag.starts_with('-')
+            && flag.len() > 1
+            && flag.chars().all(|c| c.is_ascii_graphic() && c != '=');
+        flag_ok.then(|| Self::BearerArg {
+            flag: flag.to_string(),
+        })
+    }
+}
+
+/// A later element of `argv` that switches a required `--flag` back off.
+fn contradicts(required: &str, element: &str) -> bool {
+    let Some(name) = required.strip_prefix("--") else {
+        return false;
+    };
+    if element == format!("--no-{name}") {
+        return true;
+    }
+    element
+        .strip_prefix(required)
+        .and_then(|rest| rest.strip_prefix('='))
+        .is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "false" | "0" | "no" | "off"
+            )
+        })
 }
 
 /// Whether agents may share one server (`shared`, through the hub once it
@@ -169,6 +231,8 @@ pub struct Entry {
     pub require_argv: Vec<String>,
     /// Where an HTTP server answers (`transport = "http"` only).
     pub http_path: Option<String>,
+    /// How an HTTP server authenticates clients (`transport = "http"` only).
+    pub http_auth: Option<HttpAuth>,
     pub repository: Option<RepositoryAnchor>,
     pub config_path: PathBuf,
     /// Host entries are trusted; repository entries once the host trusted
@@ -563,6 +627,66 @@ fn validate_entry(
             ),
         ));
     }
+    for required in &raw.require_argv {
+        let position = raw.argv.iter().position(|element| element == required);
+        let contradicted = position.and_then(|position| {
+            raw.argv[position + 1..]
+                .iter()
+                .find(|element| contradicts(required, element))
+        });
+        if let Some(contradiction) = contradicted {
+            return Err(refuse(
+                "argv",
+                "contradicted_required_argument",
+                format!(
+                    "argv contains {required:?} (listed in require_argv) but later turns it off \
+                     with {contradiction:?}"
+                ),
+            ));
+        }
+    }
+    let http_auth = match (raw.transport, raw.http_auth.as_deref()) {
+        (Transport::Stdio, None) if !raw.http_unauthenticated => None,
+        (Transport::Stdio, _) => {
+            return Err(refuse(
+                "http_auth",
+                "http_field_without_http",
+                "http_auth and http_unauthenticated apply only to transport = \"http\"".into(),
+            ));
+        }
+        (Transport::Http, None) => {
+            return Err(refuse(
+                "http_auth",
+                "missing_http_auth",
+                "an HTTP entry must state http_auth: \"bearer_env:<NAME>\" (preferred), \
+                 \"bearer_arg:<flag>\" or \"none\""
+                    .into(),
+            ));
+        }
+        (Transport::Http, Some(text)) => match HttpAuth::parse(text) {
+            None => {
+                return Err(refuse(
+                    "http_auth",
+                    "invalid_http_auth",
+                    format!(
+                        "{text:?} is not \"bearer_env:<NAME>\", \"bearer_arg:<flag>\" or \
+                         \"none\""
+                    ),
+                ));
+            }
+            Some(HttpAuth::None) if !raw.http_unauthenticated => {
+                return Err(refuse(
+                    "http_auth",
+                    "unauthenticated_http",
+                    "with http_auth = \"none\" any local process can connect to the server's \
+                     loopback port and drive it; set http_unauthenticated = true to accept \
+                     that, or use a bearer token"
+                        .into(),
+                ));
+            }
+            Some(auth) => Some(auth),
+        },
+    };
     let http_path = match (raw.transport, raw.http_path.as_deref()) {
         (Transport::Stdio, Some(_)) => {
             return Err(refuse(
@@ -714,6 +838,7 @@ fn validate_entry(
         require_client_features: raw.require_client_features,
         require_argv: raw.require_argv,
         http_path,
+        http_auth,
         repository: match scope {
             Scope::Repository => anchor.cloned(),
             Scope::Host => None,

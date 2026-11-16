@@ -768,8 +768,9 @@ fn http_fixture(mode: &str) -> Fixture {
     )
     .unwrap();
     fixture.services(&format!(
-        "[[servers]]\nname = \"example-http\"\nmode = {mode:?}\ntransport = \"http\"\nargv = [{:?}, \"mcp_cli::fake_http_server_process\", \"--exact\", \"--nocapture\"]\nrequire_argv = [\"--exact\"]\ncwd = {:?}\nenv_file = \"server.env\"\n",
+        "[[servers]]\nname = \"example-http\"\nmode = {mode:?}\ntransport = \"http\"\nargv = [{:?}, \"mcp_cli::fake_http_server_process\", \"--exact\", \"--nocapture\"]\nrequire_argv = [\"--exact\"]\nhttp_auth = \"bearer_env:{}\"\ncwd = {:?}\nenv_file = \"server.env\"\n",
         exe.display().to_string(),
+        aethyme_testkit::mcp_http::TOKEN_ENV,
         fixture.work.display().to_string(),
     ));
     fixture

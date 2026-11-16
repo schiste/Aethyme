@@ -64,8 +64,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use super::config::HttpAuth;
 use super::http;
 use super::jsonrpc::{self, Kind, read_message};
+use super::listen::{self, Listeners};
 use super::mux::{Action, ClientId, HUB_INITIALIZE_ID, INVALID_REQUEST, Route, Router};
 use super::telemetry::{self, Event};
 use crate::file_lock::ExclusiveFileLock;
@@ -156,6 +158,8 @@ pub struct HubConfig {
     /// Handle SIGTERM, SIGINT and SIGHUP by stopping every upstream (only for
     /// a hub that owns its process).
     pub handle_signals: bool,
+    /// Tests: run HTTP upstreams on this port instead of a leased one.
+    pub http_port: Option<u16>,
 }
 
 impl HubConfig {
@@ -179,6 +183,7 @@ impl HubConfig {
             global_in_flight: 1024,
             register_leases: true,
             handle_signals: true,
+            http_port: None,
         }
     }
 }
@@ -245,6 +250,8 @@ pub struct KeyCounters {
     pub memory_kib: Option<u64>,
     /// HTTP upstreams: how long the last start took to listen.
     pub last_listen_ms: Option<u64>,
+    /// HTTP clients disconnected because their upstream exited.
+    pub http_sessions_ended: u64,
     #[serde(skip)]
     memory_sampled: Option<Instant>,
 }
@@ -259,6 +266,8 @@ struct Spec {
     /// `transport = "http"`: the path the server answers on. The hub only
     /// runs such a server; each client talks HTTP to it directly.
     http_path: Option<String>,
+    /// How an HTTP upstream authenticates its clients.
+    http_auth: Option<HttpAuth>,
 }
 
 enum Init {
@@ -268,9 +277,31 @@ enum Init {
     Failed(String),
 }
 
+/// What the hub delivers to a client: JSON-RPC lines for a stdio client;
+/// nothing for an HTTP client, which talks to its server directly.
+enum ClientKind {
+    Stdio(Outbox),
+    Http,
+}
+
 struct ClientHandle {
-    outbox: Outbox,
+    kind: ClientKind,
     stream: UnixStream,
+}
+
+impl ClientHandle {
+    /// Queue `bytes` for a stdio client; false when its queue is full. An
+    /// HTTP client is never sent anything, so there is nothing to refuse.
+    fn offer(&self, bytes: Vec<u8>) -> bool {
+        match &self.kind {
+            ClientKind::Stdio(outbox) => outbox.offer(bytes),
+            ClientKind::Http => true,
+        }
+    }
+
+    fn is_http(&self) -> bool {
+        matches!(self.kind, ClientKind::Http)
+    }
 }
 
 struct Lease {
@@ -307,6 +338,8 @@ struct UpstreamState {
     /// valid, and its registry lease.
     port: Option<u16>,
     port_lease: Option<Lease>,
+    /// The bearer token of the running HTTP upstream (new for every start).
+    token: Option<String>,
 }
 
 struct Upstream {
@@ -722,8 +755,11 @@ fn spec_digest(
     cwd: &Path,
     env: &[(String, String)],
     http_path: Option<&str>,
+    http_auth: Option<&HttpAuth>,
 ) -> String {
-    let material = json!({"argv": argv, "cwd": cwd, "env": env, "http_path": http_path});
+    let material = json!({
+        "argv": argv, "cwd": cwd, "env": env, "http_path": http_path, "http_auth": http_auth,
+    });
     format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&material).unwrap_or_default())
@@ -1237,18 +1273,19 @@ fn spec_from_hello(hello: &Value) -> Option<(String, Spec)> {
         })
         .collect::<Option<_>>()?;
     let cwd = PathBuf::from(hello.get("cwd")?.as_str()?);
-    let http_path = match hello.get("transport").and_then(Value::as_str) {
-        None | Some("stdio") => None,
+    let (http_path, http_auth) = match hello.get("transport").and_then(Value::as_str) {
+        None | Some("stdio") => (None, None),
         Some("http") => {
             let path = hello.get("path")?.as_str()?;
             if !path.starts_with('/') || !path.chars().all(|c| c.is_ascii_graphic()) {
                 return None;
             }
-            Some(path.to_string())
+            let auth: HttpAuth = serde_json::from_value(hello.get("auth")?.clone()).ok()?;
+            (Some(path.to_string()), Some(auth))
         }
         Some(_) => return None,
     };
-    let digest = spec_digest(&argv, &cwd, &env, http_path.as_deref());
+    let digest = spec_digest(&argv, &cwd, &env, http_path.as_deref(), http_auth.as_ref());
     Some((
         key,
         Spec {
@@ -1258,6 +1295,7 @@ fn spec_from_hello(hello: &Value) -> Option<(String, Spec)> {
             env,
             digest,
             http_path,
+            http_auth,
         },
     ))
 }
@@ -1290,6 +1328,7 @@ fn new_upstream(hub: &Arc<Hub>, key: &str, spec: Spec) -> Arc<Upstream> {
             reaped: 0,
             port: None,
             port_lease: None,
+            token: None,
         }),
         ready: Condvar::new(),
     })
@@ -1412,16 +1451,21 @@ fn attach_http_client(
     let path = upstream.spec.http_path.clone()?;
     let deadline = Instant::now() + hub.config.init_timeout;
     let id = hub.next_client.fetch_add(1, Ordering::Relaxed);
-    let registered: Result<u16, String> = {
+    let registered: Result<(u16, Option<String>), String> = {
         let mut state = lock(&upstream.state);
         let outcome = loop {
+            // A failure's own reason wins over the stop that follows it.
+            if let Init::Failed(reason) = &state.init {
+                break Err(reason.clone());
+            }
             if state.stopped {
                 break Err("upstream_stopped".to_string());
             }
-            match &state.init {
-                Init::Ready(_) => break state.port.ok_or_else(|| "upstream_without_port".into()),
-                Init::Failed(reason) => break Err(reason.clone()),
-                Init::NotStarted | Init::Pending => {}
+            if matches!(state.init, Init::Ready(_)) {
+                break state
+                    .port
+                    .map(|port| (port, state.token.clone()))
+                    .ok_or_else(|| "upstream_without_port".into());
             }
             let now = Instant::now();
             if now >= deadline {
@@ -1434,13 +1478,10 @@ fn attach_http_client(
                 .0;
         };
         if outcome.is_ok() {
-            // Nothing is ever queued to an HTTP client: its outbox has no
-            // receiver.
-            let (outbox, _no_receiver) = Outbox::new(1, 1);
             state.clients.insert(
                 id,
                 ClientHandle {
-                    outbox,
+                    kind: ClientKind::Http,
                     stream: stream.try_clone().ok()?,
                 },
             );
@@ -1449,7 +1490,9 @@ fn attach_http_client(
         outcome
     };
     let control = match &registered {
-        Ok(port) => json!({"aethyme_hub": "ready", "url": http::url(*port, &path)}),
+        Ok((port, token)) => {
+            json!({"aethyme_hub": "ready", "url": http::url(*port, &path), "token": token})
+        }
         Err(reason) => {
             hub.fallback(&upstream.key, &upstream.spec.name, reason);
             json!({"aethyme_hub": "fallback", "reason": reason})
@@ -1550,7 +1593,7 @@ fn attach_client(
         state.clients.insert(
             id,
             ClientHandle {
-                outbox: outbox.clone(),
+                kind: ClientKind::Stdio(outbox.clone()),
                 stream: stream.try_clone().ok()?,
             },
         );
@@ -1664,7 +1707,7 @@ fn reply_to(state: &UpstreamState, client: ClientId, reply: &Value) -> bool {
     state
         .clients
         .get(&client)
-        .is_some_and(|handle| handle.outbox.offer(jsonrpc::encode(reply)))
+        .is_some_and(|handle| handle.offer(jsonrpc::encode(reply)))
 }
 
 /// Answer a client directly; an overflow when its queue is full.
@@ -2114,7 +2157,7 @@ fn start_http_process(hub: &Arc<Hub>, upstream: &Arc<Upstream>, path: &str) -> R
     let output = log
         .try_clone()
         .map_err(|error| format!("upstream_log:{error}"))?;
-    let known = lock(&upstream.state).port;
+    let known = lock(&upstream.state).port.or(hub.config.http_port);
     let port = match known {
         Some(port) => port,
         None => {
@@ -2125,7 +2168,20 @@ fn start_http_process(hub: &Arc<Hub>, upstream: &Arc<Upstream>, path: &str) -> R
             port
         }
     };
-    let argv = http::with_port(&spec.argv, port);
+    // Someone else on the port would receive the agents' traffic.
+    if !http::port_free(port) {
+        return Err("port_busy".into());
+    }
+    let auth = spec.http_auth.clone().unwrap_or(HttpAuth::None);
+    let token = match auth {
+        HttpAuth::None => None,
+        HttpAuth::BearerEnv { .. } | HttpAuth::BearerArg { .. } => Some(
+            http::new_token().map_err(|error| format!("token_unavailable:{:?}", error.kind()))?,
+        ),
+    };
+    let (extra_argv, token_env) = http::token_delivery(&auth, token.as_deref());
+    let mut argv = http::with_port(&spec.argv, port);
+    argv.extend(extra_argv);
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
@@ -2137,6 +2193,9 @@ fn start_http_process(hub: &Arc<Hub>, upstream: &Arc<Upstream>, path: &str) -> R
         .stdout(output)
         .stderr(log)
         .process_group(0);
+    if let Some((name, value)) = token_env {
+        command.env(name, value);
+    }
     let parent = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
     // SAFETY: `upstream_child_setup` only calls async-signal-safe functions
     // and touches no state shared with the parent.
@@ -2170,6 +2229,7 @@ fn start_http_process(hub: &Arc<Hub>, upstream: &Arc<Upstream>, path: &str) -> R
             state.lease = lease.take();
             state.record = record.clone();
             state.init = Init::Pending;
+            state.token = token;
             true
         }
     };
@@ -2209,12 +2269,29 @@ fn watch_listening(hub: &Arc<Hub>, upstream: &Arc<Upstream>, generation: u64, po
     let started = Instant::now();
     let deadline = started + hub.config.init_timeout;
     loop {
-        let listening = http::port_open(port);
+        // The upstream leads its own group (process_group(0) at spawn).
+        let group = lock(&upstream.state).pid;
+        let verdict = group.map_or(Listeners::None, |group| listen::check(port, group));
         let mut state = lock(&upstream.state);
         if state.generation != generation || state.stopped || state.reaped >= generation {
             return;
         }
-        if listening {
+        if let Some(reason) = verdict.reason() {
+            // Listening off loopback, someone else on the port, or no way to
+            // tell: never used, and not restarted into the same verdict.
+            state.init = Init::Failed(reason.clone());
+            drop(state);
+            upstream.ready.notify_all();
+            eprintln!(
+                "aethyme mcp hub: {}: the HTTP upstream is not used ({reason})",
+                upstream.spec.name
+            );
+            hub.mark_unhealthy(upstream, &reason);
+            hub.audit(upstream, "listener_refused", Some(&reason));
+            stop_upstream(hub, upstream, &reason);
+            return;
+        }
+        if verdict == Listeners::Ours {
             state.init = Init::Ready(json!({"port": port}));
             drop(state);
             upstream.ready.notify_all();
@@ -2379,7 +2456,7 @@ fn upstream_message(hub: &Arc<Hub>, upstream: &Arc<Upstream>, message: Value) {
         if announce {
             let changed = json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"});
             for (client, handle) in &state.clients {
-                if !handle.outbox.offer(jsonrpc::encode(&changed)) {
+                if !handle.offer(jsonrpc::encode(&changed)) {
                     overflowed.push(*client);
                 }
             }
@@ -2409,7 +2486,7 @@ fn upstream_message(hub: &Arc<Hub>, upstream: &Arc<Upstream>, message: Value) {
         match route {
             Route::Client(client, message) => {
                 if let Some(handle) = state.clients.get(&client)
-                    && !handle.outbox.offer(jsonrpc::encode(&message))
+                    && !handle.offer(jsonrpc::encode(&message))
                 {
                     overflowed.push(client);
                 }
@@ -2417,7 +2494,7 @@ fn upstream_message(hub: &Arc<Hub>, upstream: &Arc<Upstream>, message: Value) {
             Route::Broadcast(message) => {
                 let bytes = jsonrpc::encode(&message);
                 for (client, handle) in &state.clients {
-                    if !handle.outbox.offer(bytes.clone()) {
+                    if !handle.offer(bytes.clone()) {
                         overflowed.push(*client);
                     }
                 }
@@ -2478,7 +2555,7 @@ fn upstream_exited(
     generation: u64,
     status: Option<std::process::ExitStatus>,
 ) {
-    let (failed, uptime, lease, lost) = {
+    let (failed, uptime, lease, lost, http_ended) = {
         let mut state = lock(&upstream.state);
         state.reaped = state.reaped.max(generation);
         if state.generation != generation {
@@ -2502,11 +2579,19 @@ fn upstream_exited(
         let failed = state
             .router
             .fail_all("the upstream server exited; retry the request");
-        // A client that cannot even receive its error is disconnected.
-        let mut lost = Vec::new();
+        // A client that cannot even receive its error is disconnected, and
+        // so is every HTTP client: its session died with the server.
+        let mut lost: Vec<ClientId> = state
+            .clients
+            .iter()
+            .filter(|(_, handle)| handle.is_http())
+            .map(|(client, _)| *client)
+            .collect();
+        state.token = None;
+        let http_ended = lost.len();
         for (client, error) in &failed {
             if let Some(handle) = state.clients.get(client)
-                && !handle.outbox.offer(jsonrpc::encode(error))
+                && !handle.offer(jsonrpc::encode(error))
             {
                 lost.push(*client);
             }
@@ -2517,6 +2602,7 @@ fn upstream_exited(
             state.started_at.map(|at| at.elapsed()),
             lease,
             lost,
+            http_ended,
         )
     };
     release_lease(lease);
@@ -2540,6 +2626,7 @@ fn upstream_exited(
         let counters = state.counters.entry(upstream.key.clone()).or_default();
         counters.crashes += 1;
         counters.errors += failed as u64;
+        counters.http_sessions_ended += http_ended as u64;
         unhealthy
     };
     if unhealthy {
