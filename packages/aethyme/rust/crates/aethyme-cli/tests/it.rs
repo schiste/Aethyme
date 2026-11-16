@@ -65,6 +65,8 @@ mod intents_cli;
 mod json_shape_snapshots;
 #[path = "local_workflow.rs"]
 mod local_workflow;
+#[path = "mcp_cli.rs"]
+mod mcp_cli;
 #[path = "operations_cli.rs"]
 mod operations_cli;
 #[path = "playground_hygiene.rs"]

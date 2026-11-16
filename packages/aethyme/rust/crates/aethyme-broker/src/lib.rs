@@ -145,6 +145,8 @@ pub mod local_target;
 pub mod local_wave;
 mod main_drift;
 pub mod managed_services;
+// Opt-in MCP server launching without launcher chains (`aethyme mcp`).
+pub mod mcp;
 mod measurement;
 mod merge;
 mod merge_chain;

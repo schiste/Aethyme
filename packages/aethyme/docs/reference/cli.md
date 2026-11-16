@@ -219,6 +219,43 @@ an enrolled repository whose marker is missing, incomplete, or newer than the
 binary. See the [repository upgrade guide](../guides/repository-upgrades.md)
 for review, interruption, and rollback behavior.
 
+## MCP Server Commands
+
+```text
+aethyme mcp resolve <name> [--from-worktree] [--json]
+aethyme mcp connect <name> [--from-worktree] [--fallback-cwd <dir>] [--fallback -- <command...>]
+aethyme mcp trust [--repo <path>] [--json]
+aethyme mcp status [--json]
+aethyme mcp config print --agent codex|claude [--name <name>]
+```
+
+Opt-in. Entries are declared in `<host state>/mcp/services.toml` and, per
+repository, `.aethyme/mcp.toml` (`schema = 1`, `[[servers]]` with `name`,
+`mode`, `transport`, `argv`, `cwd`, `env_file`, `env_allow`, `source`,
+`flavour`, `env_inherit`, `allow_cached`). An entry whose paths lie inside a
+broker session worktree is refused (`session_worktree_path`). A host entry
+always wins over a repository entry of the same name; repository entries may
+only name paths inside their repository and run only after `trust` recorded
+the exact file's digest.
+
+`resolve` turns a `pnpm exec`, `npm exec` or `npx` launcher chain into the
+installed executable's direct argv without running or downloading anything,
+and prints the executable's identity, the chosen copy and the key. It exits 6
+with `resolved: false` and the declared argv when no installed copy is found
+offline. `connect` replaces its own process with the resolved server (`exec`),
+so stdio passes straight through and no extra process remains; from a broker
+session worktree it uses that worktree's copy when its `source` differs from
+the stable copy, or with `--from-worktree`. A missing entry exits 3 and a
+failed resolution 6, unless `--fallback -- <command...>` is given, which runs
+that command instead. `status` lists entries, refusals and counters from
+`<host state>/mcp/events.jsonl`; `config print` prints an agent configuration
+snippet and writes nothing.
+
+`--json` objects carry `schema`: `aethyme.mcp-resolve/v1`,
+`aethyme.mcp-status/v1`, `aethyme.mcp-trust/v1`, or `aethyme.mcp-error/v1`
+(`code`, `message`). See
+the [MCP servers guide](../guides/mcp-servers.md).
+
 ## Broker Commands
 
 The broker is the stable product front door for multi-agent coordination:

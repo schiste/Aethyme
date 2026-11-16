@@ -1,0 +1,47 @@
+exit: 0
+--- stdout
+aethyme mcp — start MCP servers without launcher chains (opt-in)
+
+Entries live in <host state>/mcp/services.toml and, per repository, in
+.aethyme/mcp.toml (schema = 1, one [[servers]] table each): name, mode
+(shared|direct), transport (stdio|http), argv, cwd, env_file, env_inherit
+(default|none), env_allow, source, flavour, allow_cached. Paths must name
+stable copies: an entry pointing into a broker session worktree is
+refused, because sessions are cleaned up. A host entry always wins over a
+repository entry of the same name; repository entries may only name paths
+inside their repository and run only after `aethyme mcp trust`. Nothing is
+written to any agent configuration; the owner pastes the snippet `config
+print` shows.
+
+Usage:
+  aethyme mcp resolve <name> [--from-worktree] [--json]
+      Resolve the entry's launcher chain (pnpm exec, npm exec, npx) to the
+      installed executable and print the direct argv, the executable's
+      identity (path, size, mtime, script interpreter), the chosen copy and
+      the key. Runs nothing and never downloads: when no installed copy is
+      found offline it says so, keeps the declared argv and exits 6. A
+      changed executable since the last resolution is reported.
+  aethyme mcp connect <name> [--from-worktree] [--fallback-cwd <dir>]
+                      [--fallback -- <command...>]
+      Replace this process with the resolved server (exec): stdio passes
+      straight through and no extra process remains. Inside a broker session
+      worktree it uses that worktree's copy when its `source` or lockfiles
+      differ from the stable copy, or with --from-worktree; otherwise the
+      stable copy. It prints `aethyme mcp: using <stable|worktree> copy, key
+      <short>` on stderr. Any failure before the exec exits non-zero, unless
+      --fallback is given: then the fallback command runs instead (in
+      --fallback-cwd when given), so an agent is never blocked.
+  aethyme mcp trust [--repo <path>] [--json]
+      Print what the repository's .aethyme/mcp.toml declares (each entry's
+      argv, cwd, env_file, env_allow) and trust that exact file on this host.
+      Any change to the file needs trust again.
+  aethyme mcp status [--json]
+      Every entry with its resolution, identity, chosen copy and key,
+      refused, shadowed and untrusted entries, and per-entry counters from
+      <host state>/mcp/events.jsonl (outcomes, failure reasons, resolve
+      time). Writes nothing but the per-host key secret on first use.
+  aethyme mcp config print --agent codex|claude [--name <name>]
+      Print the configuration snippet for each entry (or one) in that
+      agent's format: `aethyme mcp connect <name> --fallback -- <argv>`.
+      Prints only; never writes a file.
+--- stderr
