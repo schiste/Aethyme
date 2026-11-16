@@ -620,7 +620,7 @@ pub use retention::{
     GcEnvironmentCacheInventory, GcFileAction, GcFileCandidate, GcGateCacheCandidate,
     GcGateCacheDisposition, GcGateCacheEntry, GcGateCacheInventory, GcHealth, GcOrphanCandidate,
     GcPlan, GcPublicationExposureExpiry, GcRecoveryArchiveCandidate, GcRowCandidate, GcRowKind,
-    GcWorktreeBlockerSummary, GcWorktreeCandidate, RETENTION_POLICY_SCHEMA_VERSION,
+    GcSkippedFile, GcWorktreeBlockerSummary, GcWorktreeCandidate, RETENTION_POLICY_SCHEMA_VERSION,
     RecoveryArchiveInventory, RetentionConfigError, RetentionConfigWarning, RetentionPolicy,
     RetentionPolicyLoadReport, load_retention_policy, load_retention_policy_report,
 };

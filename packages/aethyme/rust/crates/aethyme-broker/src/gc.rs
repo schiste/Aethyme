@@ -23,6 +23,10 @@ use crate::{
 };
 
 mod background_priority;
+#[cfg(test)]
+mod journal_drift_tests;
+pub(crate) mod metrics_trim;
+mod resume_backoff;
 mod tree_removal;
 pub(crate) mod unattended_pacing;
 pub use background_priority::BackgroundPriority;
@@ -2620,6 +2624,7 @@ fn retained_metric_bytes_until(
     Some((after, removed, malformed_lines))
 }
 
+#[cfg(test)]
 fn retained_metric_bytes(bytes: &[u8], cutoff: i64) -> Vec<u8> {
     retained_metric_bytes_until(bytes, cutoff, None)
         .expect("an unbounded metrics rewrite completes")
@@ -2643,7 +2648,7 @@ fn metrics_rewrite(
     blockers: &mut Vec<GcBlocker>,
     deadline: Option<Instant>,
 ) -> Result<MetricsRewrite, BrokerOpError> {
-    let relative = ".aethyme/logs/command-metrics.jsonl";
+    let relative = crate::retention::COMMAND_METRICS_LOG;
     let path = main_root.join(relative);
     if deadline_expired(deadline) {
         return Ok(MetricsRewrite::Deferred);
@@ -2748,6 +2753,127 @@ fn metrics_rewrite(
     })))
 }
 
+/// The outcome of one reviewed file step during apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GcFileStep {
+    /// Done, or already in the reviewed end state.
+    Completed { reclaimed_bytes: u64 },
+    /// Retained on purpose and dropped from the journal, with the reason the
+    /// apply report names. Nothing was deleted or rewritten.
+    Skipped { reason: String },
+    /// An I/O failure; the step stays first in the journal for a later run.
+    Stopped { failure: String },
+}
+
+/// Delete a reviewed gate log only while its content still has the reviewed
+/// hash. A changed file is retained and skipped, never deleted: deletion on a
+/// mismatched hash would remove bytes nobody reviewed.
+fn delete_reviewed_file(path: &Path, candidate: &GcFileCandidate) -> GcFileStep {
+    let (before, after) = (candidate.bytes_before, candidate.bytes_after);
+    let reclaimed_bytes = before.saturating_sub(after);
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return GcFileStep::Completed { reclaimed_bytes };
+        }
+        Err(error) => {
+            return GcFileStep::Stopped {
+                failure: format!("{}: {error}", candidate.path),
+            };
+        }
+    };
+    let observed = sha256(&bytes);
+    if observed != candidate.before_sha256 {
+        crate::phase_telemetry::add("gc_file_skipped_drifted", Duration::ZERO);
+        return GcFileStep::Skipped {
+            reason: format!(
+                "content changed since the plan was reviewed (expected sha256 {}, observed {observed}); it was retained, not deleted",
+                candidate.before_sha256
+            ),
+        };
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => GcFileStep::Completed { reclaimed_bytes },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            GcFileStep::Completed { reclaimed_bytes }
+        }
+        Err(error) => GcFileStep::Stopped {
+            failure: format!("{}: {error}", candidate.path),
+        },
+    }
+}
+
+/// Trim the command metrics log to the reviewed cutoff. The reviewed thing is
+/// "drop rows older than the cutoff", which the digest binds through the age
+/// anchor and `command_metrics_days`; the plan's hashes describe the bytes it
+/// saw and are not compared, because every command appends a row. Journals
+/// written before this rule carry the same candidate and resume the same way.
+fn trim_reviewed_metrics_log(
+    main_root: &Path,
+    path: &Path,
+    candidate: &GcFileCandidate,
+    cutoff: i64,
+) -> GcFileStep {
+    use metrics_trim::MetricsTrim;
+
+    if candidate.path != crate::retention::COMMAND_METRICS_LOG {
+        crate::phase_telemetry::add("gc_file_skipped_drifted", Duration::ZERO);
+        return GcFileStep::Skipped {
+            reason: "GC rewrites only the command metrics log; this rewrite was retained".into(),
+        };
+    }
+    let outcome = match metrics_trim::trim_expired_rows(main_root, path, cutoff) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return GcFileStep::Stopped {
+                failure: format!("{}: {error}", candidate.path),
+            };
+        }
+    };
+    let attempts = match &outcome {
+        MetricsTrim::Trimmed { attempts, .. }
+        | MetricsTrim::NothingExpired { attempts }
+        | MetricsTrim::SkippedConcurrentAppend { attempts } => *attempts,
+        MetricsTrim::Missing | MetricsTrim::Refused(_) => 1,
+    };
+    for _ in 1..attempts {
+        crate::phase_telemetry::add("gc_metrics_trim_retried", Duration::ZERO);
+    }
+    match outcome {
+        MetricsTrim::Trimmed {
+            bytes_before,
+            bytes_after,
+            recovered_tail_bytes,
+            ..
+        } => {
+            if recovered_tail_bytes > 0 {
+                crate::phase_telemetry::add("gc_metrics_trim_tail_recovered", Duration::ZERO);
+            }
+            GcFileStep::Completed {
+                reclaimed_bytes: bytes_before.saturating_sub(bytes_after),
+            }
+        }
+        MetricsTrim::NothingExpired { .. } | MetricsTrim::Missing => {
+            GcFileStep::Completed { reclaimed_bytes: 0 }
+        }
+        MetricsTrim::SkippedConcurrentAppend { attempts } => {
+            crate::phase_telemetry::add(
+                "gc_metrics_trim_skipped_concurrent_append",
+                Duration::ZERO,
+            );
+            GcFileStep::Skipped {
+                reason: format!(
+                    "rows were appended concurrently on each of {attempts} attempts; nothing was removed or lost, and the next GC plan proposes this trim again"
+                ),
+            }
+        }
+        MetricsTrim::Refused(reason) => {
+            crate::phase_telemetry::add("gc_file_skipped_drifted", Duration::ZERO);
+            GcFileStep::Skipped { reason }
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct GcJournal {
     schema_version: u32,
@@ -2790,6 +2916,9 @@ struct GcJournal {
     publication_exposures_expired: Vec<i64>,
     #[serde(default)]
     recovery_archives_removed: Vec<String>,
+    /// Reviewed files retained on purpose, each with its reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    files_skipped: Vec<crate::GcSkippedFile>,
     reclaimed_bytes: u64,
 }
 
@@ -2897,6 +3026,7 @@ impl From<GcPlan> for GcJournal {
             checkpoint_pins_released: Vec::new(),
             publication_exposures_expired: Vec::new(),
             recovery_archives_removed: Vec::new(),
+            files_skipped: Vec::new(),
             reclaimed_bytes: 0,
         }
     }
@@ -6840,7 +6970,8 @@ impl Broker {
         let journal_path = self.main_root().join(".aethyme/gc-journal.json");
         let resumed = match load_journal(&journal_path)? {
             Some(journal) => {
-                Some(self.apply_confirmed_gc_journal(journal, policy.startup_budget_ms)?)
+                let budget_ms = policy.startup_budget_ms;
+                self.apply_confirmed_gc_journal(journal, budget_ms)?
             }
             None => None,
         };
@@ -6878,15 +7009,64 @@ impl Broker {
         };
         let policy = load_retention_policy(self.main_root())?;
         self.apply_confirmed_gc_journal(journal, policy.startup_budget_ms)
-            .map(Some)
     }
 
     fn apply_confirmed_gc_journal(
         &mut self,
         journal: GcJournal,
         startup_budget_ms: u64,
-    ) -> Result<GcApplyReport, BrokerOpError> {
-        self.gc_apply_bounded(&journal.digest, Some(startup_budget_ms))
+    ) -> Result<Option<GcApplyReport>, BrokerOpError> {
+        self.apply_confirmed_gc_journal_at(journal, startup_budget_ms, now_ms())
+    }
+
+    /// Resume a confirmed journal at `now_ms`, unless its last open-time
+    /// resume failed on these exact journal bytes within the backoff window
+    /// (`None`). A failure is remembered and returned once, naming the
+    /// commands that finish or archive the journal; an unchanged failing
+    /// journal then costs nothing on the commands that follow.
+    fn apply_confirmed_gc_journal_at(
+        &mut self,
+        journal: GcJournal,
+        startup_budget_ms: u64,
+        now_ms: i64,
+    ) -> Result<Option<GcApplyReport>, BrokerOpError> {
+        let journal_path = self.main_root().join(".aethyme/gc-journal.json");
+        let record = self.store().meta_get(resume_backoff::FAILURE_KEY)?;
+        let record = record.filter(|value| !value.is_empty());
+        if let Some(fingerprint) = resume_backoff::journal_fingerprint(&journal_path)
+            && resume_backoff::active(record.as_deref(), &fingerprint, now_ms)
+        {
+            crate::phase_telemetry::add("gc_journal_resume_backoff_skipped", Duration::ZERO);
+            return Ok(None);
+        }
+        match self.gc_apply_bounded(&journal.digest, Some(startup_budget_ms)) {
+            Ok(report) => {
+                if record.is_some() {
+                    crate::warn_unrecorded(
+                        "clear the remembered GC journal resume failure",
+                        self.store().meta_set(resume_backoff::FAILURE_KEY, ""),
+                    );
+                }
+                Ok(Some(report))
+            }
+            Err(error) => {
+                crate::phase_telemetry::add("gc_journal_resume_failed", Duration::ZERO);
+                // Fingerprint the bytes left now: a partial run rewrites the
+                // journal before it fails.
+                if let Some(fingerprint) = resume_backoff::journal_fingerprint(&journal_path) {
+                    let value = resume_backoff::failure_record(&fingerprint, now_ms);
+                    crate::warn_unrecorded(
+                        "remember the failed GC journal resume",
+                        self.store().meta_set(resume_backoff::FAILURE_KEY, &value),
+                    );
+                }
+                Err(BrokerOpError::GcJournalResumeFailed {
+                    digest: journal.digest,
+                    reason: error.to_string(),
+                    retry_after_minutes: resume_backoff::RETRY_AFTER_MINUTES,
+                })
+            }
+        }
     }
 
     fn request_recovery_for_rotation_debt(&mut self) -> Result<(), BrokerOpError> {
@@ -12586,91 +12766,40 @@ impl Broker {
             write_journal(&journal_path, &journal)?;
         }
 
+        // Each file step stands alone: no later step reads a gate log or the
+        // metrics log, and the rows naming a gate log were removed above. A
+        // file whose content no longer matches the review is therefore
+        // retained and recorded, and the run carries on, rather than pinning
+        // every remaining step behind it. An I/O failure still stops here,
+        // so the journal resumes it once the environment is fixed.
         while !journal.remaining_files.is_empty() && !check_deadline(deadline) {
             let candidate = journal.remaining_files[0].clone();
             let path = runtime_path(&main_root, &candidate.path)?;
-            let current = match std::fs::read(&path) {
-                Ok(bytes) => Some(bytes),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    failures.push(format!("{}: {error}", candidate.path));
-                    break;
-                }
+            let step = match candidate.action {
+                GcFileAction::Delete => delete_reviewed_file(&path, &candidate),
+                GcFileAction::Rewrite => trim_reviewed_metrics_log(
+                    &main_root,
+                    &path,
+                    &candidate,
+                    cutoff(age_reference_ms, journal.policy.command_metrics_days),
+                ),
             };
-            let completed = match (candidate.action, current) {
-                (GcFileAction::Delete, None) => true,
-                (GcFileAction::Delete, Some(bytes)) => {
-                    let observed = sha256(&bytes);
-                    if observed != candidate.before_sha256 {
-                        return Err(BrokerOpError::GcArtifactDrift {
-                            path: candidate.path,
-                            expected: candidate.before_sha256,
-                            actual: observed,
-                        });
-                    }
-                    match std::fs::remove_file(&path) {
-                        Ok(()) => true,
-                        Err(error) => {
-                            failures.push(format!("{}: {error}", candidate.path));
-                            false
-                        }
-                    }
+            match step {
+                GcFileStep::Completed { reclaimed_bytes } => {
+                    journal.reclaimed_bytes = journal.reclaimed_bytes.saturating_add(reclaimed_bytes);
+                    journal.files_completed.push(candidate.path);
                 }
-                (GcFileAction::Rewrite, None) => {
-                    return Err(BrokerOpError::GcArtifactDrift {
+                GcFileStep::Skipped { reason } => {
+                    journal.files_skipped.push(crate::GcSkippedFile {
                         path: candidate.path,
-                        expected: candidate.before_sha256,
-                        actual: "missing".into(),
+                        reason,
                     });
                 }
-                (GcFileAction::Rewrite, Some(bytes)) => {
-                    let observed = sha256(&bytes);
-                    let expected_after = candidate.after_sha256.as_deref().ok_or_else(|| {
-                        BrokerOpError::InvalidGcJournal {
-                            reason: format!(
-                                "rewrite candidate {} has no after digest",
-                                candidate.path
-                            ),
-                        }
-                    })?;
-                    if observed == expected_after {
-                        true
-                    } else if observed == candidate.before_sha256 {
-                        let after = retained_metric_bytes(
-                            &bytes,
-                            cutoff(age_reference_ms, journal.policy.command_metrics_days),
-                        );
-                        let actual_after = sha256(&after);
-                        if actual_after != expected_after {
-                            return Err(BrokerOpError::GcArtifactDrift {
-                                path: candidate.path,
-                                expected: expected_after.to_owned(),
-                                actual: actual_after,
-                            });
-                        }
-                        match atomic_write(&path, &after) {
-                            Ok(()) => true,
-                            Err(error) => {
-                                failures.push(format!("{}: {error}", candidate.path));
-                                false
-                            }
-                        }
-                    } else {
-                        return Err(BrokerOpError::GcArtifactDrift {
-                            path: candidate.path,
-                            expected: candidate.before_sha256,
-                            actual: observed,
-                        });
-                    }
+                GcFileStep::Stopped { failure } => {
+                    failures.push(failure);
+                    break;
                 }
-            };
-            if !completed {
-                break;
             }
-            journal.reclaimed_bytes = journal
-                .reclaimed_bytes
-                .saturating_add(candidate.bytes_before.saturating_sub(candidate.bytes_after));
-            journal.files_completed.push(candidate.path);
             journal.remaining_files.remove(0);
             write_journal(&journal_path, &journal)?;
         }
@@ -13312,6 +13441,7 @@ impl Broker {
             deadline_reached,
             rows_removed: journal.rows_removed,
             files_completed: journal.files_completed.clone(),
+            files_skipped: journal.files_skipped.clone(),
             sessions_cleaned: journal.sessions_cleaned.clone(),
             artifacts_reclaimed: journal.artifacts_reclaimed.clone(),
             orphans_removed: journal.orphans_removed.clone(),
@@ -14024,6 +14154,7 @@ mod tests {
             checkpoint_pins_released: Vec::new(),
             publication_exposures_expired: Vec::new(),
             recovery_archives_removed: Vec::new(),
+            files_skipped: Vec::new(),
             reclaimed_bytes: 0,
         };
 

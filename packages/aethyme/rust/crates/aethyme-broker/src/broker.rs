@@ -334,11 +334,17 @@ pub enum BrokerOpError {
     AutoCleanupCursorChanged,
     #[error("GC recovery journal is invalid: {reason}")]
     InvalidGcJournal { reason: String },
-    #[error("GC reviewed artifact drifted at {path}: expected {expected}, observed {actual}")]
-    GcArtifactDrift {
-        path: String,
-        expected: String,
-        actual: String,
+    #[error(
+        "GC journal {digest} could not be resumed: {reason}. Open-time resume leaves this \
+         journal alone for {retry_after_minutes} minutes unless it changes. Finish it with \
+         `aethyme broker gc apply --confirm {digest}`, or archive it without removing \
+         anything with `aethyme broker gc abandon --confirm {digest}` and review a fresh \
+         `aethyme broker gc plan`"
+    )]
+    GcJournalResumeFailed {
+        digest: String,
+        reason: String,
+        retry_after_minutes: i64,
     },
     #[error(
         "repair paused during rebase for session {id} onto {base}: {message}\n\

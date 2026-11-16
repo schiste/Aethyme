@@ -280,6 +280,16 @@ fn repository_runtime_directory(main_root: &Path) -> io::Result<std::path::PathB
     Ok(canonical_run)
 }
 
+/// Open the lock that orders `command-metrics.jsonl` appends (shared) against
+/// the GC trim that replaces that log (exclusive). It lives in `.aethyme/run`,
+/// not beside the log, and is never unlinked, so every holder locks one inode.
+pub(crate) fn open_command_metrics_lock(main_root: &Path) -> io::Result<File> {
+    let path = repository_runtime_lock_path(main_root, "command-metrics.lock")?;
+    let file = open_lock_file_nofollow(&path)?;
+    verify_named_lock_file(&path, &file)?;
+    Ok(file)
+}
+
 /// Claim one complete CLI scheduling pass, including repository watches.
 /// The file remains persistent so a second inode cannot split ownership.
 pub(crate) fn acquire_pr_watch_tick_lock(main_root: &Path) -> io::Result<ExclusiveFileLock> {
