@@ -180,12 +180,20 @@ fn decide(
     // is computed before the broker is opened and survives an open that fails.
     // A broker that will not open is one of the things a mismatched router and
     // engine can produce, and that is the moment the notice is worth most.
-    let installation_notice = match event {
+    let mut installation_notice = match event {
         HookEvent::SessionStart => {
             crate::install_health::session_start_warnings_with_build(now_ms(), running_build_banner)
         }
         _ => Vec::new(),
     };
+    // Managed MCP servers: repair agent configuration entries when the owner
+    // turned `mcp.repair_on_session_start` on (off by default: one absent
+    // settings file read). Bounded to 2 s, silent on a no-op.
+    if event == HookEvent::SessionStart
+        && let Some(notice) = crate::mcp::repair::session_start_notice()
+    {
+        installation_notice.push(notice);
+    }
 
     // PreToolUse is the highest-frequency event that reaches the broker,
     // and it only reads. A snapshot keeps it off the write lock.

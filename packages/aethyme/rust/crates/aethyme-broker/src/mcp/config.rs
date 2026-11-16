@@ -99,6 +99,17 @@ struct RawEntry {
     http_auth: Option<String>,
     #[serde(default)]
     http_unauthenticated: bool,
+    // Managed servers (see [`super::managed`]); host file only.
+    #[serde(default)]
+    managed: bool,
+    #[serde(default)]
+    match_packages: Vec<String>,
+    #[serde(default)]
+    match_executables: Vec<String>,
+    repair: Option<super::managed::RepairMode>,
+    args: Option<super::managed::ArgsMode>,
+    #[serde(default)]
+    base_args: Vec<String>,
 }
 
 /// How an HTTP server authenticates its clients. With a bearer mode a
@@ -131,6 +142,41 @@ impl HttpAuth {
             flag: flag.to_string(),
         })
     }
+}
+
+/// Why `argv` does not satisfy `required` (`require_argv`): an element
+/// missing, or turned back off by a later element. `None` when it does.
+pub fn required_argv_problem(
+    argv: &[String],
+    required: &[String],
+) -> Option<(&'static str, String)> {
+    if let Some(missing) = required.iter().find(|element| !argv.contains(element)) {
+        return Some((
+            "missing_required_argument",
+            format!(
+                "argv must contain {missing:?} (listed in require_argv); it was removed or \
+                 changed, so the server would no longer run as its owner requires"
+            ),
+        ));
+    }
+    for element in required {
+        let position = argv.iter().position(|candidate| candidate == element);
+        let contradicted = position.and_then(|position| {
+            argv[position + 1..]
+                .iter()
+                .find(|later| contradicts(element, later))
+        });
+        if let Some(contradiction) = contradicted {
+            return Some((
+                "contradicted_required_argument",
+                format!(
+                    "argv contains {element:?} (listed in require_argv) but later turns it off \
+                     with {contradiction:?}"
+                ),
+            ));
+        }
+    }
+    None
 }
 
 /// A later element of `argv` that switches a required `--flag` back off.
@@ -238,6 +284,8 @@ pub struct Entry {
     /// Host entries are trusted; repository entries once the host trusted
     /// the exact file.
     pub trusted: bool,
+    /// Set when the host file marks the entry managed (see [`super::managed`]).
+    pub managed: Option<super::managed::ManagedSpec>,
 }
 
 /// One refused file or entry.
@@ -613,37 +661,10 @@ fn validate_entry(
             "argv needs at least the program".into(),
         ));
     }
-    if let Some(missing) = raw
-        .require_argv
-        .iter()
-        .find(|required| !raw.argv.contains(required))
-    {
-        return Err(refuse(
-            "argv",
-            "missing_required_argument",
-            format!(
-                "argv must contain {missing:?} (listed in require_argv); it was removed or \
-                 changed, so the server would no longer run as its owner requires"
-            ),
-        ));
-    }
-    for required in &raw.require_argv {
-        let position = raw.argv.iter().position(|element| element == required);
-        let contradicted = position.and_then(|position| {
-            raw.argv[position + 1..]
-                .iter()
-                .find(|element| contradicts(required, element))
-        });
-        if let Some(contradiction) = contradicted {
-            return Err(refuse(
-                "argv",
-                "contradicted_required_argument",
-                format!(
-                    "argv contains {required:?} (listed in require_argv) but later turns it off \
-                     with {contradiction:?}"
-                ),
-            ));
-        }
+    // The declared argv here; `connect` checks again once caller arguments
+    // and `base_args` are applied (see [`required_argv_problem`]).
+    if let Some((code, message)) = required_argv_problem(&raw.argv, &raw.require_argv) {
+        return Err(refuse("argv", code, message));
     }
     let http_auth = match (raw.transport, raw.http_auth.as_deref()) {
         (Transport::Stdio, None) if !raw.http_unauthenticated => None,
@@ -765,6 +786,19 @@ fn validate_entry(
             "use at most 64 printable characters".into(),
         ));
     }
+    let managed = super::managed::validate_spec(
+        &super::managed::RawSpec {
+            managed: raw.managed,
+            match_packages: &raw.match_packages,
+            match_executables: &raw.match_executables,
+            repair: raw.repair,
+            args: raw.args,
+            base_args: &raw.base_args,
+            argv: &raw.argv,
+        },
+        scope,
+    )
+    .map_err(|(field, code, message)| refuse(field, code, message))?;
     if let Some(path) = &source
         && !path.exists()
     {
@@ -845,5 +879,6 @@ fn validate_entry(
         },
         config_path: path.to_path_buf(),
         trusted: scope == Scope::Host,
+        managed,
     })
 }

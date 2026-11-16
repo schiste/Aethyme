@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::config::HttpAuth;
 use super::jsonrpc::{self, Kind, MAX_MESSAGE_BYTES, read_message};
@@ -155,8 +155,8 @@ fn too_large(what: &str) -> io::Error {
 }
 
 /// One line of at most [`MAX_LINE`] bytes.
-fn read_line_capped(reader: &mut impl BufRead, line: &mut String) -> io::Result<usize> {
-    let read = reader.by_ref().take(MAX_LINE as u64 + 1).read_line(line)?;
+fn read_line_capped(reader: &mut (impl BufRead + ?Sized), line: &mut String) -> io::Result<usize> {
+    let read = (&mut *reader).take(MAX_LINE as u64 + 1).read_line(line)?;
     if read > MAX_LINE {
         return Err(too_large("an HTTP line"));
     }
@@ -731,6 +731,7 @@ pub fn run_private(plan: &Plan, path: &str, auth: &HttpAuth) -> u8 {
         .env_clear()
         .envs(plan.environment.0.iter().cloned())
         .env(PORT_ENV, port.to_string())
+        .env(super::caller::CONNECT_MARKER, &plan.name)
         .stdin(Stdio::null())
         .stdout(stdout_to_stderr)
         .stderr(Stdio::inherit())
@@ -806,6 +807,8 @@ fn stop_child(child: &mut Child) {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]

@@ -50,8 +50,20 @@ pub mod secret;
 pub mod telemetry;
 pub mod trust;
 
+// Managed servers: one matcher, config repair, launcher interception and
+// bypass detection (see [`managed`]).
+pub mod bypass;
+pub mod caller;
+pub mod intercept;
+pub mod json_span;
+pub mod managed;
+pub mod managed_cli;
+pub mod repair;
+
 #[cfg(test)]
 mod hub_tests;
+#[cfg(test)]
+mod managed_tests;
 #[cfg(test)]
 mod tests;
 

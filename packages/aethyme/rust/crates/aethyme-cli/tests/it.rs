@@ -67,6 +67,8 @@ mod json_shape_snapshots;
 mod local_workflow;
 #[path = "mcp_cli.rs"]
 mod mcp_cli;
+#[path = "mcp_managed_cli.rs"]
+mod mcp_managed_cli;
 #[path = "operations_cli.rs"]
 mod operations_cli;
 #[path = "playground_hygiene.rs"]

@@ -1736,3 +1736,25 @@ http_auth = \"none\"
         })
     );
 }
+
+#[test]
+fn require_argv_is_checked_on_the_final_argv_too() {
+    let required = strings(&["--isolated"]);
+    // As `connect` sees it after caller arguments and `base_args`.
+    assert_eq!(
+        super::config::required_argv_problem(
+            &strings(&["server", "--isolated", "--port=1"]),
+            &required
+        ),
+        None
+    );
+    let (code, _) = super::config::required_argv_problem(
+        &strings(&["server", "--isolated", "--caller", "--isolated=off"]),
+        &required,
+    )
+    .unwrap();
+    assert_eq!(code, "contradicted_required_argument");
+    let (code, _) =
+        super::config::required_argv_problem(&strings(&["server", "--other"]), &required).unwrap();
+    assert_eq!(code, "missing_required_argument");
+}

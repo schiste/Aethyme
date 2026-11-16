@@ -94,6 +94,26 @@ registry, and `status --json` adds `port` per upstream and
 `last_listen_ms` / `http_sessions_ended` per key. Entries gain
 `require_argv`, `http_path`, `http_auth` and `http_unauthenticated`.
 
+Managed servers add two more external consumers. `aethyme mcp intercept
+install` creates symlinks named after launchers (`npx`, `npm`, `pnpm`,
+`pnpx`, `bunx`, `yarn`) and managed executables that point at the `aethyme`
+binary: the binary dispatches on `argv[0]`'s basename before anything else,
+and reads `<host state>/mcp/intercept.match` (a line-based file it writes
+itself, header `aethyme-mcp-intercept 1`); the environment variables
+`AETHYME_MCP_SHIM_GUARD`, `AETHYME_MCP_SHIM_DEPTH` and
+`AETHYME_MCP_SHIM_HOPS` are part of that contract, as are
+`AETHYME_MCP_CONNECT` and `AETHYME_MCP_FALLBACK`, which `connect` sets on
+what it starts and `bypass` reads. `aethyme mcp repair --apply` writes agent
+configurations (the Codex `config.toml`, `~/.claude.json`, an untracked
+`.mcp.json`) so their entries run `<absolute aethyme> mcp connect <name>
+[--caller-args <n> [--caller-package <spec>]] --fallback -- ...`, which
+makes `connect`'s spelling, including the caller-argument options, a
+consumer contract there too. The manage, intercept,
+repair and bypass commands emit `aethyme.mcp-manage/v1`,
+`aethyme.mcp-intercept/v1`, `aethyme.mcp-repair/v1` and
+`aethyme.mcp-bypass/v1`; `aethyme hook SessionStart` reads
+`<host state>/mcp/settings.toml` (`[mcp] repair_on_session_start`).
+
 The `service::jobs::JobStore` library adds a separate explicitly opened
 SQLite job file (application ID `0x41534a31`, schema 1), durable idempotency keys,
 atomic deduplication and fenced job state transitions. It has no CLI or socket
