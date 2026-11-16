@@ -185,10 +185,8 @@ fn copy_late_tail(replaced: &mut File, mut copied: u64, path: &Path) -> io::Resu
         }
         replaced.seek(SeekFrom::Start(copied))?;
         let mut tail = Vec::new();
-        replaced
-            .by_ref()
-            .take(length - copied)
-            .read_to_end(&mut tail)?;
+        let mut reader = Read::take(&mut *replaced, length - copied);
+        reader.read_to_end(&mut tail)?;
         let mut target = OpenOptions::new().append(true).open(path)?;
         target.write_all(&tail)?;
         copied = copied.saturating_add(tail.len() as u64);
