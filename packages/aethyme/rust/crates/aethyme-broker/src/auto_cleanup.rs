@@ -3683,13 +3683,55 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The longest a proof-3 listing may run when no Git deadline is active
+/// (an unbudgeted caller such as `finish`).
+const PROOF_GIT_UNBUDGETED_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// The most output one proof-3 listing may print before it counts as failed.
+const PROOF_GIT_OUTPUT_LIMIT: usize = 256 * 1024 * 1024;
+
+/// One proof-3 Git listing (`status`, `rev-parse`, `stash list`,
+/// `ls-files`). It stops at the thread's active Git deadline
+/// ([`crate::git::limit_git_until`]), is timed as `subprocess_git` like
+/// every other Git child, and fails rather than answers when stopped: every
+/// caller treats a failed listing as keep. These listings used to run as a
+/// plain `Command::output()`, so a `git status` on a loaded host ran past
+/// every lane deadline, untimed, sometimes with the lifecycle claim held.
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|error| format!("git {}: {error}", args.join(" ")))?;
+    let timeout = match crate::git::active_git_deadline() {
+        Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+        None => PROOF_GIT_UNBUDGETED_TIMEOUT,
+    };
+    if timeout.is_zero() {
+        crate::phase_telemetry::add("proof_git_deadline_before_start", Duration::ZERO);
+        return Err(format!(
+            "git {}: the time budget ran out before it started",
+            args.join(" ")
+        ));
+    }
+    let mut command = std::process::Command::new("git");
+    command.args(args).current_dir(dir);
+    let output = match crate::bounded_output::output_limited(
+        &mut command,
+        timeout,
+        PROOF_GIT_OUTPUT_LIMIT,
+    ) {
+        Ok(crate::bounded_output::LimitedOutput::Completed(output)) => output,
+        Ok(crate::bounded_output::LimitedOutput::Deadline) => {
+            crate::phase_telemetry::add("proof_git_stopped_at_deadline", timeout);
+            return Err(format!(
+                "git {}: stopped at its time budget",
+                args.join(" ")
+            ));
+        }
+        Ok(crate::bounded_output::LimitedOutput::OutputLimit) => {
+            crate::phase_telemetry::add("proof_git_output_limit", Duration::ZERO);
+            return Err(format!(
+                "git {}: output exceeded {PROOF_GIT_OUTPUT_LIMIT} bytes",
+                args.join(" ")
+            ));
+        }
+        Err(error) => return Err(format!("git {}: {error}", args.join(" "))),
+    };
     if !output.status.success() {
         return Err(format!(
             "git {} failed: {}",
@@ -3844,10 +3886,16 @@ fn uncommitted_verdict(
 ) -> Result<(Option<String>, usize), String> {
     // `--no-optional-locks`: asking must not refresh the index, whose
     // modification time is the worktree activity the idle windows read.
+    // `core.fsmonitor=false`: a background judge must not start a monitor
+    // daemon for each of hundreds of checkouts; the answer is the same.
+    // Timed through the in-progress markers and the stash listing below.
+    let _span = crate::phase_telemetry::span("proof_uncommitted_check");
     let status = git(
         worktree,
         &[
             "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
             "status",
             "--porcelain=v1",
             "-z",
@@ -3943,6 +3991,7 @@ pub(crate) fn ignored_content_reason(
     worktree: &Path,
     policy: &AutoCleanupPolicy,
 ) -> Result<Option<String>, String> {
+    let _span = crate::phase_telemetry::span("proof_ignored_check");
     Ok(ignored_content_blockers(worktree, policy, 1)?
         .into_iter()
         .next()
@@ -9957,6 +10006,65 @@ mod tests {
             output.status.success(),
             "git {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A proof-3 listing stops at the thread's Git deadline instead of
+    /// running past it (a spent deadline starts no Git at all, and the
+    /// cleanliness verdict is then an error, which every caller keeps), and
+    /// is timed as a Git child. Without a deadline it answers as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_proof_listing_stops_at_the_active_git_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q", "-b", "main"]);
+        let policy = AutoCleanupPolicy::default();
+
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let (spent_listing, spent_verdict) = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            crate::git::with_git_deadline(std::time::Duration::ZERO, || {
+                (
+                    super::git(dir.path(), &["status", "--porcelain"]),
+                    super::uncommitted_reason(dir.path(), None, dir.path(), &policy),
+                )
+            })
+        };
+        let error = spent_listing.expect_err("a spent deadline starts no listing");
+        assert!(error.contains("time budget"), "{error}");
+        assert!(
+            spent_verdict.is_err(),
+            "a stopped listing is no verdict: {spent_verdict:?}"
+        );
+        let (_, counts) = recorder.totals();
+        assert!(
+            counts
+                .get("proof_git_deadline_before_start")
+                .copied()
+                .unwrap_or(0)
+                >= 2,
+            "{counts:?}"
+        );
+        assert!(!counts.contains_key("subprocess_git"), "{counts:?}");
+
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let verdict = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            crate::git::with_git_deadline(std::time::Duration::from_secs(600), || {
+                super::uncommitted_reason(dir.path(), None, dir.path(), &policy)
+            })
+        };
+        assert_eq!(verdict, Ok(None), "an empty repository is clean");
+        let (_, counts) = recorder.totals();
+        assert!(counts.contains_key("subprocess_git"), "{counts:?}");
+        assert_eq!(
+            counts.get("proof_uncommitted_check"),
+            Some(&1),
+            "{counts:?}"
+        );
+        assert_eq!(
+            super::git(dir.path(), &["status", "--porcelain"]),
+            Ok(String::new())
         );
     }
 
