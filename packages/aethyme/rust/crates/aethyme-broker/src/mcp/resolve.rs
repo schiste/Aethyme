@@ -181,13 +181,13 @@ enum Launch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PackageSpec {
-    name: String,
-    version: Option<String>,
+pub(crate) struct PackageSpec {
+    pub(crate) name: String,
+    pub(crate) version: Option<String>,
 }
 
 impl PackageSpec {
-    fn bin_name(&self) -> &str {
+    pub(crate) fn bin_name(&self) -> &str {
         self.name.rsplit('/').next().unwrap_or(&self.name)
     }
 }
@@ -403,7 +403,7 @@ fn parse_npx_like(
     })
 }
 
-fn parse_spec(word: &str) -> Option<PackageSpec> {
+pub(crate) fn parse_spec(word: &str) -> Option<PackageSpec> {
     let (name, version) = match word.strip_prefix('@') {
         Some(rest) => match rest.split_once('@') {
             Some((name, version)) => (format!("@{name}"), Some(version.to_string())),

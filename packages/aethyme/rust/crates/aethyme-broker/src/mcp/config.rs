@@ -73,6 +73,14 @@ struct RawEntry {
     flavour: Option<String>,
     #[serde(default)]
     allow_cached: bool,
+    // Managed servers (see [`super::managed`]); host file only.
+    #[serde(default)]
+    managed: bool,
+    #[serde(default)]
+    match_packages: Vec<String>,
+    #[serde(default)]
+    match_executables: Vec<String>,
+    repair: Option<super::managed::RepairMode>,
 }
 
 /// Whether agents may share one server (`shared`, through the hub once it
@@ -152,6 +160,8 @@ pub struct Entry {
     /// Host entries are trusted; repository entries once the host trusted
     /// the exact file.
     pub trusted: bool,
+    /// Set when the host file marks the entry managed (see [`super::managed`]).
+    pub managed: Option<super::managed::ManagedSpec>,
 }
 
 /// One refused file or entry.
@@ -579,6 +589,16 @@ fn validate_entry(
             "use at most 64 printable characters".into(),
         ));
     }
+    let managed = super::managed::validate_spec(
+        &super::managed::RawSpec {
+            managed: raw.managed,
+            match_packages: &raw.match_packages,
+            match_executables: &raw.match_executables,
+            repair: raw.repair,
+        },
+        scope,
+    )
+    .map_err(|(field, code, message)| refuse(field, code, message))?;
     if let Some(path) = &source
         && !path.exists()
     {
@@ -655,5 +675,6 @@ fn validate_entry(
         },
         config_path: path.to_path_buf(),
         trusted: scope == Scope::Host,
+        managed,
     })
 }

@@ -219,6 +219,12 @@ fn eligible_pinned_session_contract(
 }
 
 fn main() -> ExitCode {
+    // Launcher interception: an `npx`/`npm`/... shim is a symlink to this
+    // binary. Decided from argv[0] before anything else is initialised;
+    // invoked as `aethyme` this returns at once.
+    if let Some(code) = aethyme_broker::mcp::intercept::shim_main() {
+        return ExitCode::from(code);
+    }
     let args: Vec<String> = env::args().skip(1).collect();
     aethyme_broker::cli::with_status_read_context(&args, || main_with_args(&args))
 }
@@ -728,6 +734,10 @@ MCP servers (opt-in; <host state>/mcp/services.toml, .aethyme/mcp.toml):
                               trust a repository's .aethyme/mcp.toml; entries,
                               identities, chosen copy; the snippet to paste
                               into an agent (printed, never written)
+  mcp manage|intercept|repair|bypass
+                              managed servers: launcher shims that route
+                              matching calls through connect, agent config
+                              repair, and a count of servers that bypass it
 
 Collaboration (opt-in, experimental; disabled unless [collaboration] enables it):
   collab status|enroll        policy, state root and captures; mint a project ID
