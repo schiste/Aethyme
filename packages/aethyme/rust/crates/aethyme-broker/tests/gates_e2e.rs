@@ -1549,7 +1549,7 @@ triggers = ["**/*.nomatch"]
 
     // The first run looked every cacheable gate up and reused nothing: one
     // miss record each, no hit, no bypass.
-    let count_events = |broker: &Broker, kind: &str| {
+    let count_events = |broker: &mut Broker, kind: &str| {
         broker
             .store()
             .events_after(0, i64::MAX)
@@ -1558,7 +1558,7 @@ triggers = ["**/*.nomatch"]
             .filter(|event| event.kind == kind)
             .collect::<Vec<_>>()
     };
-    let misses = count_events(&broker, "gate.cache_missed");
+    let misses = count_events(&mut broker, "gate.cache_missed");
     assert_eq!(misses.len(), 3, "{misses:?}");
     for miss in &misses {
         let payload: serde_json::Value =
@@ -1567,8 +1567,8 @@ triggers = ["**/*.nomatch"]
         assert_eq!(payload["tree"], tree_hash);
         assert_eq!(payload.as_object().unwrap().len(), 3, "{payload}");
     }
-    assert!(count_events(&broker, "gate.cached").is_empty());
-    assert!(count_events(&broker, "gate.cache_bypassed").is_empty());
+    assert!(count_events(&mut broker, "gate.cached").is_empty());
+    assert!(count_events(&mut broker, "gate.cache_bypassed").is_empty());
 
     // Same tree again: the tree-hash result cache answers, nothing runs.
     let outcomes = broker.run_all_gates(tmp.path()).unwrap();
@@ -1581,11 +1581,11 @@ triggers = ["**/*.nomatch"]
     assert_eq!(markers, markers_after, "cached rerun executed nothing");
 
     assert_eq!(
-        count_events(&broker, "gate.cache_missed").len(),
+        count_events(&mut broker, "gate.cache_missed").len(),
         3,
         "a cache hit records no miss"
     );
-    assert_eq!(count_events(&broker, "gate.cached").len(), 3);
+    assert_eq!(count_events(&mut broker, "gate.cached").len(), 3);
 
     let cached_before = broker
         .store()
@@ -1630,7 +1630,7 @@ triggers = ["**/*.nomatch"]
     }));
 
     assert_eq!(
-        count_events(&broker, "gate.cache_missed").len(),
+        count_events(&mut broker, "gate.cache_missed").len(),
         3,
         "an explicit bypass emits only gate.cache_bypassed"
     );
