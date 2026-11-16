@@ -154,6 +154,10 @@ fn assemble(
     cache_hits.retain(|event| event.ts >= since_ms);
     let (cached, cached_saved_ms) = cached_gate_totals(&cache_hits);
 
+    let mut cache_misses =
+        store.events_after_filtered(0, i64::MAX, Some(crate::events::GATE_CACHE_MISSED))?;
+    cache_misses.retain(|event| event.ts >= since_ms);
+
     let (succeeded, failed, outcome_unknown) = store.insight_operation_counts(since_ms)?;
 
     let input = InsightsInput {
@@ -166,6 +170,7 @@ fn assemble(
             .map(Into::into)
             .collect(),
         gates_cached: cached,
+        gates_cache_misses: cache_misses.len() as u64,
         gates_cached_saved_ms: cached_saved_ms,
         pull_requests,
         overlaps_warned: folded.overlaps_warned,
@@ -321,6 +326,11 @@ fn render(report: &InsightsReport) -> String {
         gates.runs,
         gates.cached,
         duration_ms(gates.cached_saved_ms)
+    ));
+    out.push_str(&format!(
+        "  cache misses {}, hit rate {}\n",
+        gates.cache_misses,
+        rate(gates.cache_hit_rate)
     ));
     out.push_str(&format!("  pass rate {}\n", rate(gates.pass_rate)));
     out.push_str(&format!("  execute  {}\n", duration(&gates.execute_ms)));

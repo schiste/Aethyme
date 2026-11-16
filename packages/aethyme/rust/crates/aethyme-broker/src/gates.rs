@@ -3577,15 +3577,21 @@ where
         // measurable (kill-criterion accounting). Gates that inspect
         // commit metadata must opt out: the tree can stay identical while
         // commit bodies change.
+        let mut cache_miss_reason = None;
         let cached_result = if cache_policy == CachePolicy::Use && gate.cache {
             if let Some(profile_digest) = profile.and_then(|profile| profile.digest()) {
-                store.cached_gate_result_for_execution_profile(
+                let found = store.cached_gate_result_for_execution_profile(
                     &gate.name,
                     &tree,
                     &gate.definition_hash,
                     profile_digest,
-                )?
+                )?;
+                if found.is_none() {
+                    cache_miss_reason = Some(crate::events::GateCacheMissReason::NoReusableVerdict);
+                }
+                found
             } else {
+                cache_miss_reason = Some(crate::events::GateCacheMissReason::ProfileIncomplete);
                 progress.report(&format!(
                     "gate {} cache unavailable: execution profile could not be captured ({})",
                     gate.name,
@@ -3720,6 +3726,24 @@ where
                 ),
             );
         }
+        // Measurement only: one record per cacheable lookup that reused
+        // nothing, so hits / (hits + misses) is computable. Like the bypass
+        // record it waits for storage admission, so a gate refused before it
+        // could run (and a refused database write) leaves no record, and a
+        // failed write never fails the gate.
+        if let Some(reason) = cache_miss_reason {
+            crate::warn_unrecorded(
+                "record the gate cache miss event",
+                store.append_event(
+                    crate::events::GATE_CACHE_MISSED,
+                    session_id,
+                    Some(&crate::events::gate_cache_missed_payload(
+                        &gate.name, &tree, reason,
+                    )),
+                ),
+            );
+        }
+
         // The selected volumes have been checked. Directory creation is best
         // effort as before; opening the owner lock, pidfile, or log reports an
         // actionable I/O error if a path became unavailable in the meantime.

@@ -24,6 +24,7 @@ mod common;
 /// any rename or removal is a break that requires a schema_version bump.
 const V1_KINDS: &[&str] = &[
     "broker.checkout.fast_forwarded",
+    "gate.cache_missed",
     "gate.cached",
     "gate.cancelled",
     "gate.error",
@@ -141,6 +142,7 @@ fn v1_kind_catalog_is_frozen() {
         events::LEASE_RELEASE_GRANTED.into(),
         events::LEASE_OVERLAP.into(),
         events::GATE_CACHED.into(),
+        events::GATE_CACHE_MISSED.into(),
         events::GRAPH_INTEGRITY_CHECKED.into(),
         events::MERGE_INTEGRATION_BRANCH_CREATED.into(),
         events::MERGE_INTEGRATION_REFRESHED.into(),
@@ -484,6 +486,15 @@ fn v1_constructor_payload_field_names_are_frozen() {
             "tree",
         ],
         "gate.cached",
+    );
+    assert_keys(
+        &events::gate_cache_missed_payload(
+            "g",
+            "t",
+            events::GateCacheMissReason::NoReusableVerdict,
+        ),
+        &["gate", "reason", "tree"],
+        "gate.cache_missed",
     );
     assert_keys(
         &events::merge_submitted_payload("h"),

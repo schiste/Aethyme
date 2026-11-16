@@ -143,6 +143,33 @@ fn insights_counts_gate_cache_hits_recorded_in_the_event_log() {
 }
 
 #[test]
+fn insights_reports_cache_misses_and_the_resulting_hit_rate() {
+    let fixture = fixture();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
+    for kind in [
+        "gate.cached",
+        "gate.cache_missed",
+        "gate.cache_missed",
+        "gate.cache_missed",
+    ] {
+        broker
+            .store()
+            .append_event(kind, None, Some(r#"{"gate":"test","saved_ms":10}"#))
+            .unwrap();
+    }
+    let output = run(
+        &broker,
+        fixture.path(),
+        &["advanced", "insights", "--days", "0", "--json"],
+    );
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["gates"]["cached"], 1);
+    assert_eq!(report["gates"]["cache_misses"], 3);
+    assert_eq!(report["gates"]["cache_hit_rate"], 0.25);
+}
+
+#[test]
 fn the_default_window_applies_to_gate_figures_as_well_as_the_funnel() {
     // The default report is the last 30 days. Gate, cache, coordination and
     // operation figures used to cover all history regardless, so the report put

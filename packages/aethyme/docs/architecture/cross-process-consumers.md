@@ -241,6 +241,34 @@ of `command-metrics.jsonl` see these changes:
 Readers must accept a `null` `bytes` and treat a missing `confirmable` (rows
 and documents from before 0.8.110) as `true`.
 
+## Gate cache miss events (2026-11-16)
+
+The gate runner recorded a verdict reuse (`gate.cached`) and a forced re-run
+(`gate.cache_bypassed`) but not an ordinary miss, so a hit rate could not be
+computed from the broker's own records. It now records one `gate.cache_missed`
+event per cacheable gate whose lookup reused nothing. Measurement only: cache
+keys, lookup and reuse are unchanged.
+
+- **Events (introduced).** `gate.cache_missed` with payload `{gate, tree,
+  reason}`. `gate` and `tree` are the same values as in `gate.cached` and
+  `gate.cache_bypassed`; no path, session id, branch or task text.
+  `reason` is one of `no_reusable_verdict` (the indexed lookup returned no
+  reusable row; "nothing stored for this tree" and "a stored row that is not
+  reusable" are not distinguished, which would need a second query) or
+  `profile_incomplete` (the execution profile could not be fully captured, so
+  no lookup ran). A gate with `cache = false` and a bypassed run
+  (`gate.cache_bypassed`: `--no-cache`, native gate jobs) make no lookup and
+  emit no miss. The write is best effort: a refused write is reported and never
+  fails the gate. Readers must tolerate new `reason` values.
+- **Hit rate.** `gate.cached / (gate.cached + gate.cache_missed)`. Dividing
+  hits by `gate.cache_bypassed` events is not a rate. History written before
+  this change has hits and no misses, so a window reaching back past it
+  overstates the rate.
+- **Report.** `aethyme broker advanced insights` (`--json`: `gates.cache_misses`,
+  `gates.cache_hit_rate`, null with no recorded miss; text: a `cache misses N,
+  hit rate P` line under Gates) reports both over the same window as
+  `gates.cached`.
+
 ## Git wrapper probe verdict cache (2026-11-15)
 
 Before its first Git command every `aethyme` process proves that the `git` it

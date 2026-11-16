@@ -369,6 +369,13 @@ pub struct GateSummary {
     pub runs: u64,
     pub passed: u64,
     pub cached: u64,
+    /// Cacheable lookups that reused no verdict (`gate.cache_missed`). Zero
+    /// for history recorded before misses were emitted.
+    pub cache_misses: u64,
+    /// `cached / (cached + cache_misses)`; `None` with no recorded miss.
+    /// Hits recorded before misses were emitted have no miss counterpart, so
+    /// a window reaching back before that overstates the rate.
+    pub cache_hit_rate: Option<f64>,
     /// `passed / runs` over *executed* runs only. A cache hit avoids the
     /// command entirely, so folding it into either side would move the rate
     /// for a reason that has nothing to do with whether the code passes.
@@ -622,6 +629,7 @@ pub struct InsightsInput {
     pub failure_times: BTreeMap<i64, BTreeMap<Outcome, i64>>,
     pub gates: Vec<GateObservation>,
     pub gates_cached: u64,
+    pub gates_cache_misses: u64,
     pub gates_cached_saved_ms: i64,
     pub pull_requests: Vec<PullRequestObservation>,
     pub overlaps_warned: u64,
@@ -877,6 +885,10 @@ pub fn report(query: InsightsQuery, input: &InsightsInput) -> InsightsReport {
         outcomes: accumulator.outcomes,
         gates: GateSummary {
             cached: input.gates_cached,
+            cache_misses: input.gates_cache_misses,
+            cache_hit_rate: (input.gates_cache_misses > 0).then(|| {
+                input.gates_cached as f64 / (input.gates_cached + input.gates_cache_misses) as f64
+            }),
             cached_saved_ms: input.gates_cached_saved_ms,
             ..gates
         },
@@ -974,6 +986,8 @@ fn gate_summary(observations: &[GateObservation]) -> GateSummary {
         runs,
         passed,
         cached: 0,
+        cache_misses: 0,
+        cache_hit_rate: None,
         pass_rate: (runs > 0).then(|| passed as f64 / runs as f64),
         execute_ms: DurationSummary::from_values(execute),
         wait_ms: DurationSummary::from_values(wait),
