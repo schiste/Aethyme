@@ -123,7 +123,10 @@ mod tests {
             Ok(path.file_name().unwrap().to_string_lossy().into_owned())
         })
         .unwrap();
-        assert!(seen.starts_with(".writer-tmp-") && seen.ends_with(".json"), "{seen}");
+        assert!(
+            seen.starts_with(".writer-tmp-") && seen.ends_with(".json"),
+            "{seen}"
+        );
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 
         assert!(write_synced_if_absent_named(&target, ".writer-tmp-", ".json", b"one").unwrap());

@@ -288,9 +288,7 @@ pub fn save_snapshot(
         decisions,
     };
     let bytes = serde_json::to_vec_pretty(&snapshot).map_err(io::Error::other)?;
-    write_bookkeeping(&path, &bytes, |temporary| {
-        std::fs::rename(temporary, &path)
-    })
+    write_bookkeeping(&path, &bytes, |temporary| std::fs::rename(temporary, &path))
 }
 
 /// Load and verify the saved decision set for a confirmation the fresh scan no
@@ -1753,13 +1751,8 @@ pub struct SizingReport {
     pub elapsed_ms: u64,
 }
 
-/// Size `candidates` in place, reclaimable ones first.
-///
-/// A candidate with a recent measurement in `recent` takes it. Otherwise it
-/// is walked only when `walk` is true and the budget is not spent; a walk the
-/// budget interrupts is discarded. Everything not sized is left `None` and
-/// counted, never shown as zero. Returns the report and the fresh
-/// measurements to share with the next plan.
+/// `measure_within_sharing` without sharing anything as it goes.
+#[cfg(test)]
 pub fn measure_within(
     candidates: &mut [ReclaimCandidate],
     recent: &BTreeMap<PathBuf, u64>,
@@ -1769,9 +1762,15 @@ pub fn measure_within(
     measure_within_sharing(candidates, recent, walk, expired, &mut |_, _| {})
 }
 
-/// [`measure_within`] that also hands each fresh measurement to
+/// Size `candidates` in place, reclaimable ones first.
+///
+/// A candidate with a recent measurement in `recent` takes it. Otherwise it
+/// is walked only when `walk` is true and the budget is not spent; a walk the
+/// budget interrupts is discarded. Everything not sized is left `None` and
+/// counted, never shown as zero. Each fresh measurement goes to
 /// `on_measured` as soon as it is taken, so a long measuring run can share
-/// sizes before it ends (see [`SizeCheckpoints`]).
+/// sizes before it ends (see [`SizeCheckpoints`]). Returns the report and
+/// the fresh measurements.
 pub fn measure_within_sharing(
     candidates: &mut [ReclaimCandidate],
     recent: &BTreeMap<PathBuf, u64>,
@@ -1862,9 +1861,8 @@ pub fn recent_sizes(root: &Path, now_ms: i64, window_ms: i64) -> BTreeMap<PathBu
         .collect()
 }
 
-/// Share fresh measurements with the next whole-root plan of this root.
-/// Entries still inside the window are kept with their original time, so a
-/// reused size never looks younger than it is.
+/// `record_sizes_at` for measurements taken at `now_ms`.
+#[cfg(test)]
 pub fn record_sizes(
     root: &Path,
     now_ms: i64,
@@ -1874,9 +1872,10 @@ pub fn record_sizes(
     record_sizes_at(root, now_ms, window_ms, now_ms, measured)
 }
 
-/// [`record_sizes`] for measurements taken no earlier than `measured_at_ms`.
-/// They are stamped with that time (never later than `now_ms`), so a size
-/// shared at a checkpoint never looks younger than it is.
+/// Share fresh measurements with the next whole-root plan of this root.
+/// They are stamped with `measured_at_ms` (never later than `now_ms`), the
+/// time of the oldest of them, and entries already inside the window keep
+/// their original time, so a reused size never looks younger than it is.
 pub fn record_sizes_at(
     root: &Path,
     now_ms: i64,
@@ -1914,9 +1913,7 @@ pub fn record_sizes_at(
         entries: entries.into_values().collect(),
     };
     let bytes = serde_json::to_vec(&cache).map_err(io::Error::other)?;
-    write_bookkeeping(&path, &bytes, |temporary| {
-        std::fs::rename(temporary, &path)
-    })
+    write_bookkeeping(&path, &bytes, |temporary| std::fs::rename(temporary, &path))
 }
 
 /// Write a file of the reclaim plan's own in the worktree root through a
@@ -3358,16 +3355,16 @@ mod budget_tests {
         let live = serde_json::to_vec(&holder(2)).unwrap();
         std::fs::write(&path, &live).unwrap();
 
-        remove_stale_marker(&path, &aside, Some(&stale)).unwrap();
+        remove_stale_marker(&path, &aside, Some(stale.as_slice())).unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), live, "the live marker stays");
         assert!(!aside.exists());
 
         std::fs::write(&path, &stale).unwrap();
-        remove_stale_marker(&path, &aside, Some(&stale)).unwrap();
+        remove_stale_marker(&path, &aside, Some(stale.as_slice())).unwrap();
         assert!(!path.exists(), "the judged stale marker is removed");
         assert!(!aside.exists());
-        remove_stale_marker(&path, &aside, Some(&stale)).unwrap();
+        remove_stale_marker(&path, &aside, Some(stale.as_slice())).unwrap();
     }
 
     /// Whatever a killed writer leaves behind in the root must still read as
@@ -3408,7 +3405,12 @@ mod budget_tests {
     #[test]
     fn kept_reasons_map_to_fixed_labels() {
         let root = Path::new("/r");
-        let active = classify(&root.join("a/target"), &root.join("a"), 0, &[root.join("a")]);
+        let active = classify(
+            &root.join("a/target"),
+            &root.join("a"),
+            0,
+            &[root.join("a")],
+        );
         assert_eq!(kept_reason_class(&active.reason), "active_session");
         let mut unrecorded = vec![classify(&root.join("b/target"), &root.join("b"), 0, &[])];
         protect_unrecorded_worktrees(&mut unrecorded, &[]);

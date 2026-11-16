@@ -1436,13 +1436,8 @@ fn a_partial_reclaim_plan_authorizes_nothing_end_to_end() {
     );
     let plan_args = ["gc", "reclaim", "plan", "--json"];
     let partial_plan = |label: &str| {
-        let output = reclaim_with_budgets(
-            repo.path(),
-            container.path(),
-            &plan_args,
-            Some("0"),
-            None,
-        );
+        let output =
+            reclaim_with_budgets(repo.path(), container.path(), &plan_args, Some("0"), None);
         assert!(
             output.status.success(),
             "{label}: {}",
@@ -1523,13 +1518,8 @@ fn a_partial_reclaim_plan_authorizes_nothing_end_to_end() {
 
     // A spent sizing budget leaves sizes unmeasured, never the plan
     // partial: it still lists everything and can be confirmed.
-    let unsized_plan = reclaim_with_budgets(
-        repo.path(),
-        container.path(),
-        &plan_args,
-        None,
-        Some("0"),
-    );
+    let unsized_plan =
+        reclaim_with_budgets(repo.path(), container.path(), &plan_args, None, Some("0"));
     assert!(unsized_plan.status.success());
     let unsized_plan: serde_json::Value = serde_json::from_slice(&unsized_plan.stdout).unwrap();
     assert_eq!(unsized_plan["confirmable"], true, "{unsized_plan}");

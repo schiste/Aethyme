@@ -2773,7 +2773,12 @@ mod reclaim_plan_tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join("idle/target")).unwrap();
         std::fs::write(root.join("idle/target/x"), [b'x'; 32]).unwrap();
-        let candidates = vec![classify(&root.join("idle/target"), &root.join("idle"), 0, &[])];
+        let candidates = vec![classify(
+            &root.join("idle/target"),
+            &root.join("idle"),
+            0,
+            &[],
+        )];
         let holder = InFlightPlan::current(now_ms());
         let guard = match claim_in_flight(root, holder.clone(), &|_| true).unwrap() {
             InFlightClaim::Claimed(guard) => guard,
@@ -2835,7 +2840,12 @@ mod reclaim_plan_tests {
     #[test]
     fn the_apply_metric_counts_kept_candidates_by_protection_only() {
         let root = std::path::Path::new("/r");
-        let active = classify(&root.join("a/target"), &root.join("a"), 0, &[root.join("a")]);
+        let active = classify(
+            &root.join("a/target"),
+            &root.join("a"),
+            0,
+            &[root.join("a")],
+        );
         let idle = classify(&root.join("b/target"), &root.join("b"), 0, &[]);
         let metric = ReclaimApplyMetric {
             session_scoped: false,
