@@ -715,7 +715,9 @@ fn a_profile_compiles_to_a_reservation_and_a_separate_capacity_request() {
     assert_eq!(capacity.resources.len(), 1);
     assert_eq!(capacity.resources[0].key, CAPACITY_KEY);
     match &capacity.resources[0].resource {
-        HostResourceKind::Capacity { pool, units, limit } => {
+        HostResourceKind::Capacity {
+            pool, units, limit, ..
+        } => {
             assert_eq!(pool, "env:repo-0123456789abcdef:envs");
             assert_eq!((*units, *limit), (3, 6));
         }

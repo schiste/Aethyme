@@ -143,6 +143,46 @@ The four generic resource kinds are:
 - `capacity`: consumes units from a named host-wide pool;
 - `exclusive_key`: permits one active owner of an exact named resource.
 
+### Let A Capacity Pool Follow Memory Pressure
+
+A fixed `limit` is the right number of concurrent heavy commands only while
+the host has memory to spare. Add `pressure = "memory"` to a `capacity`
+resource and admission follows the kernel's own reading (macOS
+`kern.memorystatus_vm_pressure_level`, Linux memory PSI) each time the bundle
+is planned:
+
+```toml
+[[gate.resources]]
+key = "heavy_slot"
+kind = "capacity"
+pool = "integration-tests"
+units = 1
+limit = 4
+pressure = "memory"
+```
+
+| Host memory pressure | Units the pool admits |
+|---|---|
+| normal | `limit` |
+| warning | half of `limit`, rounded up |
+| critical | 1 |
+
+A request is always admitted into a pool that nobody holds, whatever its
+size, so pressure reduces heavy work to one holder at a time and never stops
+it. A request the pressure keeps out is reported as ordinary
+`resource_contention` whose reason names the pressure level, so `--wait` and
+`resource_wait_seconds` retry it until a holder finishes or the pressure
+eases.
+
+The setting is read per request. The pool's declared `limit`, the stored
+lease and the `capacity_policy_mismatch` rule are unchanged, and holders
+already running are never interrupted. A request that omits `pressure` keeps
+the declared limit even when other callers of the same pool follow pressure.
+On macOS a level that cannot be read counts as warning; on a platform with no
+memory signal the declared limit applies. In request JSON the field is
+`"pressure":"memory"`; an Aethyme older than this field ignores it and applies
+the declared limit.
+
 Resource keys become normalized environment variables. The example above
 receives `AETHYME_RESOURCE_DOCKER_PROJECT`,
 `AETHYME_RESOURCE_POSTGRES_PORT`, `AETHYME_RESOURCE_DATABASE`, and

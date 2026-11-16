@@ -3042,6 +3042,7 @@ fn preparation_cache_users(repository: &str, units: u32) -> HostResourceRequirem
             pool: format!("aethyme-prepare-cache-users:{repository}"),
             units,
             limit: SHARED_CACHE_USER_UNITS,
+            pressure: None,
         },
     }
 }

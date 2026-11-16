@@ -1164,10 +1164,93 @@ pub enum HostResourceKind {
         pool: String,
         units: u32,
         limit: u32,
+        /// Opt-in: admit less of the pool while the host reports this kind
+        /// of pressure. Absent means the declared limit always applies, and
+        /// is not serialized, so existing request digests are unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pressure: Option<CapacityPressure>,
     },
     ExclusiveKey {
         name: String,
     },
+}
+
+/// The host signal a capacity requirement asks admission to follow.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityPressure {
+    /// Kernel memory pressure: macOS `kern.memorystatus_vm_pressure_level`,
+    /// Linux memory PSI.
+    Memory,
+}
+
+/// Host memory pressure as capacity admission reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemoryAdmission {
+    Normal,
+    Warning,
+    Critical,
+}
+
+impl MemoryAdmission {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Warning => "warning",
+            Self::Critical => "critical",
+        }
+    }
+
+    fn from_sample(sample: crate::gc::unattended_pacing::PressureSample) -> Self {
+        if sample.memory_elevated == Some(true) {
+            Self::Critical
+        } else if sample.memory_warning == Some(true) {
+            Self::Warning
+        } else {
+            Self::Normal
+        }
+    }
+}
+
+/// The units of a pressure-following pool that admission may fill at this
+/// pressure: the declared limit when normal, half of it (rounded up) at
+/// warning, one unit at critical. Never zero, and [`plan_allocations`] also
+/// admits any request into a pool nobody holds, so pressure slows work down
+/// to one holder at a time but cannot stop it.
+fn pressure_adjusted_limit(limit: u32, memory: MemoryAdmission) -> u32 {
+    match memory {
+        MemoryAdmission::Normal => limit,
+        MemoryAdmission::Warning => limit.div_ceil(2).max(1),
+        MemoryAdmission::Critical => 1,
+    }
+}
+
+thread_local! {
+    /// Test seam: a scripted reading instead of the host's.
+    static MEMORY_ADMISSION_OVERRIDE: std::cell::Cell<Option<MemoryAdmission>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Read host memory pressure once, only for a request that asked to follow
+/// it: every other request plans without the system call.
+fn memory_admission_for(request: &HostResourceRequest) -> MemoryAdmission {
+    let follows_memory = request.resources.iter().any(|requirement| {
+        matches!(
+            requirement.resource,
+            HostResourceKind::Capacity {
+                pressure: Some(CapacityPressure::Memory),
+                ..
+            }
+        )
+    });
+    if !follows_memory {
+        return MemoryAdmission::Normal;
+    }
+    if let Some(scripted) = MEMORY_ADMISSION_OVERRIDE.with(std::cell::Cell::get) {
+        return scripted;
+    }
+    use crate::gc::unattended_pacing::PressureSignal as _;
+    MemoryAdmission::from_sample(crate::gc::unattended_pacing::SystemPressure::new().sample())
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -2847,7 +2930,8 @@ impl HostResourceCoordinator {
         validate_request(request)?;
         let now = now_ms();
         let occupied = load_occupied(&self.conn)?;
-        let (mut proposed, mut conflicts) = plan_allocations(request, &occupied)?;
+        let (mut proposed, mut conflicts) =
+            plan_allocations(request, &occupied, memory_admission_for(request))?;
         let live = wait_queue::live_waiters(&self.conn, now)?;
         let (own, ahead) = wait_queue::split_queue(&live, &request.request_id);
         append_queue_conflicts(request, &occupied, &ahead, &mut conflicts);
@@ -3005,7 +3089,8 @@ impl HostResourceCoordinator {
             ));
         }
         let occupied = load_occupied(&tx)?;
-        let (allocations, mut conflicts) = plan_allocations(request, &occupied)?;
+        let (allocations, mut conflicts) =
+            plan_allocations(request, &occupied, memory_admission_for(request))?;
         append_queue_conflicts(request, &occupied, &ahead, &mut conflicts);
         if !conflicts.is_empty() {
             let code = aggregate_conflict_code(&conflicts).to_string();
@@ -5139,7 +5224,9 @@ fn validate_request(request: &HostResourceRequest) -> Result<(), HostResourceErr
                 ));
             }
             HostResourceKind::TcpPort { .. } => {}
-            HostResourceKind::Capacity { pool, units, limit } => {
+            HostResourceKind::Capacity {
+                pool, units, limit, ..
+            } => {
                 validate_identifier("capacity pool", pool)?;
                 if *units == 0 || *limit == 0 || units > limit {
                     return Err(HostResourceError::InvalidRequest(
@@ -5264,25 +5351,36 @@ fn load_occupied(conn: &Connection) -> Result<Vec<Occupied>, HostResourceError> 
 fn plan_allocations(
     request: &HostResourceRequest,
     occupied: &[Occupied],
+    memory: MemoryAdmission,
 ) -> Result<(Vec<HostResourceAllocation>, Vec<HostResourceConflict>), HostResourceError> {
     #[derive(Clone, Copy)]
     struct CapacityBundle {
         limit: u32,
         requested_units: u128,
         conflicting_limits: bool,
+        /// Any requirement of this bundle on the pool follows memory pressure.
+        follows_memory: bool,
     }
 
     let mut capacity_bundles = BTreeMap::<String, CapacityBundle>::new();
     for requirement in &request.resources {
-        if let HostResourceKind::Capacity { pool, units, limit } = &requirement.resource {
+        if let HostResourceKind::Capacity {
+            pool,
+            units,
+            limit,
+            pressure,
+        } = &requirement.resource
+        {
             let bundle = capacity_bundles
                 .entry(pool.clone())
                 .or_insert(CapacityBundle {
                     limit: *limit,
                     requested_units: 0,
                     conflicting_limits: false,
+                    follows_memory: false,
                 });
             bundle.conflicting_limits |= bundle.limit != *limit;
+            bundle.follows_memory |= *pressure == Some(CapacityPressure::Memory);
             bundle.requested_units = bundle.requested_units.saturating_add(u128::from(*units));
         }
     }
@@ -5335,7 +5433,9 @@ fn plan_allocations(
                     ));
                 }
             }
-            HostResourceKind::Capacity { pool, units, limit } => {
+            HostResourceKind::Capacity {
+                pool, units, limit, ..
+            } => {
                 if checked_capacity_pools.insert(pool.clone()) {
                     let bundle = capacity_bundles.get(pool).ok_or_else(|| {
                         HostResourceError::InvalidRequest("capacity pool summary is missing".into())
@@ -5404,6 +5504,32 @@ fn plan_allocations(
                                     bundle.requested_units, first.lease_id, first.generation
                                 ),
                                 Some(first.lease_id.clone()),
+                            ));
+                            rejected = true;
+                        } else if bundle.follows_memory
+                            && used > 0
+                            && used.saturating_add(bundle.requested_units)
+                                <= u128::from(bundle.limit)
+                            && used.saturating_add(bundle.requested_units)
+                                > u128::from(pressure_adjusted_limit(bundle.limit, memory))
+                        {
+                            // Fits the declared limit, not the one this
+                            // pressure allows. Ordinary contention: a holder
+                            // finishing or the pressure easing both make room,
+                            // and the wait loop re-plans on its bounded tick.
+                            let admitted = pressure_adjusted_limit(bundle.limit, memory);
+                            conflicts.push(conflict(
+                                "resource_contention",
+                                &requirement.key,
+                                "capacity",
+                                format!("{pool}:{}/{limit}", bundle.requested_units),
+                                &format!(
+                                    "host memory pressure is {}, so this pool admits {admitted}/{limit} units; {used} are allocated by {} live lease(s) and this bundle requests {} units",
+                                    memory.as_str(),
+                                    matching.len(),
+                                    bundle.requested_units
+                                ),
+                                matching.first().map(|o| o.lease_id.clone()),
                             ));
                             rejected = true;
                         } else if used.saturating_add(bundle.requested_units)
@@ -7852,6 +7978,7 @@ mod tests {
                 pool: "workers".into(),
                 units,
                 limit: 4,
+                pressure: None,
             },
         }]
     }
@@ -8019,6 +8146,7 @@ mod tests {
                         pool: "heavy".into(),
                         units: 1,
                         limit: 2,
+                        pressure: None,
                     },
                 }],
             )
@@ -8032,6 +8160,142 @@ mod tests {
         ));
     }
 
+    /// Script the host memory reading for the current thread until dropped.
+    struct ScriptedMemory;
+
+    impl ScriptedMemory {
+        fn set(level: MemoryAdmission) -> Self {
+            MEMORY_ADMISSION_OVERRIDE.with(|cell| cell.set(Some(level)));
+            Self
+        }
+    }
+
+    impl Drop for ScriptedMemory {
+        fn drop(&mut self) {
+            MEMORY_ADMISSION_OVERRIDE.with(|cell| cell.set(None));
+        }
+    }
+
+    fn pressure_capacity(
+        id: &str,
+        units: u32,
+        limit: u32,
+        pressure: Option<CapacityPressure>,
+    ) -> HostResourceRequest {
+        req(
+            id,
+            vec![HostResourceRequirement {
+                key: "slot".into(),
+                resource: HostResourceKind::Capacity {
+                    pool: "builds".into(),
+                    units,
+                    limit,
+                    pressure,
+                },
+            }],
+        )
+    }
+
+    #[test]
+    fn pressure_adjusted_limit_halves_at_warning_and_keeps_one_unit_at_critical() {
+        for (limit, warning) in [(1, 1), (2, 1), (3, 2), (6, 3), (7, 4), (u32::MAX, 1 << 31)] {
+            assert_eq!(
+                pressure_adjusted_limit(limit, MemoryAdmission::Normal),
+                limit
+            );
+            assert_eq!(
+                pressure_adjusted_limit(limit, MemoryAdmission::Warning),
+                warning
+            );
+            assert_eq!(pressure_adjusted_limit(limit, MemoryAdmission::Critical), 1);
+        }
+    }
+
+    #[test]
+    fn memory_pressure_shrinks_admission_of_a_pool_that_follows_it() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let memory = Some(CapacityPressure::Memory);
+        let _scripted = ScriptedMemory::set(MemoryAdmission::Warning);
+
+        // Limit 6 admits 3 units at warning: one 3-unit holder, no second.
+        let first = c.acquire(&pressure_capacity("one", 3, 6, memory)).unwrap();
+        let refused = c.acquire(&pressure_capacity("two", 3, 6, memory));
+        let Err(HostResourceError::Conflict { code, message, .. }) = refused else {
+            panic!("expected contention, got {refused:?}");
+        };
+        // Waitable, so `--wait` retries it, and the reason names the pressure.
+        assert_eq!(code, "resource_contention");
+        assert!(
+            message.contains("host memory pressure is warning"),
+            "{message}"
+        );
+        assert!(message.contains("admits 3/6 units"), "{message}");
+
+        // The same request is admitted once the pressure eases.
+        drop(_scripted);
+        let _scripted = ScriptedMemory::set(MemoryAdmission::Normal);
+        let second = c.acquire(&pressure_capacity("two", 3, 6, memory)).unwrap();
+        assert_eq!(second.lease.allocations[0].capacity_limit, Some(6));
+        assert_eq!(first.lease.allocations[0].capacity_limit, Some(6));
+    }
+
+    #[test]
+    fn critical_memory_pressure_still_admits_into_an_empty_pool() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let memory = Some(CapacityPressure::Memory);
+        let _scripted = ScriptedMemory::set(MemoryAdmission::Critical);
+
+        // Three units exceed the one unit critical pressure admits, but
+        // nobody holds the pool: refusing would stop all work, not slow it.
+        let only = c.acquire(&pressure_capacity("one", 3, 6, memory)).unwrap();
+        assert!(matches!(
+            c.acquire(&pressure_capacity("two", 1, 6, memory)),
+            Err(HostResourceError::Conflict { .. })
+        ));
+        c.release(
+            &only.lease.lease_id,
+            only.lease.generation,
+            &only.ownership_token,
+        )
+        .unwrap();
+        c.acquire(&pressure_capacity("two", 1, 6, memory)).unwrap();
+    }
+
+    #[test]
+    fn a_request_that_does_not_follow_pressure_keeps_the_declared_limit() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let _scripted = ScriptedMemory::set(MemoryAdmission::Critical);
+
+        c.acquire(&pressure_capacity("one", 3, 6, None)).unwrap();
+        c.acquire(&pressure_capacity("two", 3, 6, None)).unwrap();
+        assert!(matches!(
+            c.acquire(&pressure_capacity("three", 1, 6, None)),
+            Err(HostResourceError::Conflict { .. })
+        ));
+    }
+
+    #[test]
+    fn pressure_is_optional_in_the_request_and_absent_from_its_digest() {
+        let plain = pressure_capacity("one", 1, 2, None);
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("pressure"), "{json}");
+        let parsed: HostResourceRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, plain);
+
+        let following = pressure_capacity("one", 1, 2, Some(CapacityPressure::Memory));
+        let json = serde_json::to_string(&following).unwrap();
+        assert!(json.contains(r#""pressure":"memory""#), "{json}");
+        let parsed: HostResourceRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, following);
+        assert_ne!(
+            request_digest(&plain).unwrap(),
+            request_digest(&following).unwrap()
+        );
+    }
+
     #[test]
     fn same_pool_capacity_requirements_are_summed_for_bundle_admission() {
         let t = tempfile::tempdir().unwrap();
@@ -8042,6 +8306,7 @@ mod tests {
                 pool: "workers".into(),
                 units,
                 limit,
+                pressure: None,
             },
         };
 
@@ -8097,6 +8362,7 @@ mod tests {
                         pool: "workers".into(),
                         units: 1,
                         limit: 4,
+                        pressure: None,
                     },
                 },
                 HostResourceRequirement {
@@ -8105,6 +8371,7 @@ mod tests {
                         pool: "workers".into(),
                         units: 1,
                         limit: 5,
+                        pressure: None,
                     },
                 },
             ],
@@ -8150,6 +8417,7 @@ mod tests {
                         pool: "workers".into(),
                         units: u32::MAX,
                         limit: u32::MAX,
+                        pressure: None,
                     },
                 },
                 HostResourceRequirement {
@@ -8158,6 +8426,7 @@ mod tests {
                         pool: "workers".into(),
                         units: 1,
                         limit: u32::MAX,
+                        pressure: None,
                     },
                 },
             ],
@@ -9072,6 +9341,7 @@ mod tests {
                     pool: "host-work".into(),
                     units: 4,
                     limit: 4,
+                    pressure: None,
                 },
             }],
         )
@@ -9092,6 +9362,7 @@ mod tests {
                     pool: pool.into(),
                     units,
                     limit,
+                    pressure: None,
                 },
             }],
         );
@@ -9141,6 +9412,7 @@ mod tests {
                         pool: "prepush".into(),
                         units: 1,
                         limit: 3,
+                        pressure: None,
                     },
                 },
                 HostResourceRequirement {
@@ -9300,6 +9572,7 @@ mod tests {
                         pool: "workers".into(),
                         units: 1,
                         limit: 3,
+                        pressure: None,
                     },
                 },
             ],
@@ -9347,6 +9620,7 @@ mod tests {
                         pool: "host-work".into(),
                         units: 1,
                         limit: 4,
+                        pressure: None,
                     },
                 },
             ],
@@ -9569,6 +9843,7 @@ mod tests {
                         pool: "workers".into(),
                         units: 1,
                         limit: 5,
+                        pressure: None,
                     },
                 },
             ],

@@ -525,6 +525,7 @@ impl CompiledEnvironment {
                     pool: pool.lease_pool.clone(),
                     units: self.units,
                     limit: pool.limit,
+                    pressure: None,
                 },
             }],
         })

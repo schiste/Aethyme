@@ -426,6 +426,7 @@ fn hold_gate_resource(host: &Path, run_label: &str) -> Result<ContendedResource,
                 pool: FX10_RESOURCE_POOL.into(),
                 units: 1,
                 limit: 1,
+                pressure: None,
             },
         }],
     };
