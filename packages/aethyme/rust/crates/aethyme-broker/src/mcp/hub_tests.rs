@@ -761,8 +761,8 @@ fn recorded_upstreams_are_stopped_only_when_pid_and_start_time_match() {
     }
     if !exited {
         matching.kill().unwrap();
-        matching.wait().unwrap();
     }
+    matching.wait().unwrap();
     assert!(exited, "the recorded group was not stopped");
     assert!(
         different.try_wait().unwrap().is_none(),
