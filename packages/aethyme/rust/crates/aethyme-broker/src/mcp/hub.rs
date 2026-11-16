@@ -49,7 +49,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io::{self, BufReader, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -544,7 +544,6 @@ pub(crate) fn write_record(
     name: &str,
     record: &UpstreamRecord,
 ) -> io::Result<PathBuf> {
-    use std::os::unix::fs::DirBuilderExt;
     let records = directory.join(RECORDS_DIRECTORY);
     fs::DirBuilder::new()
         .recursive(true)
@@ -934,7 +933,8 @@ pub fn serve(config: HubConfig) -> io::Result<()> {
     } else {
         None
     };
-    // Upstreams dead hubs of any build left behind.
+    // Upstreams dead hubs of any build left behind, and their token files.
+    sweep_token_directories(&paths.directory);
     let reaped = reap_recorded_upstreams(&paths.directory);
     if reaped.leader_gone > 0 || reaped.owner_unknown > 0 {
         eprintln!(
@@ -1527,6 +1527,7 @@ fn first_start(hub: &Arc<Hub>, upstream: &Arc<Upstream>) -> Result<(), String> {
                 state.port_lease.take()
             };
             release_lease(port_lease);
+            remove_token_directory(hub, upstream);
             upstream.ready.notify_all();
             eprintln!(
                 "aethyme mcp hub: {}: could not start the upstream: {reason}",
@@ -2175,11 +2176,14 @@ fn start_http_process(hub: &Arc<Hub>, upstream: &Arc<Upstream>, path: &str) -> R
     let auth = spec.http_auth.clone().unwrap_or(HttpAuth::None);
     let token = match auth {
         HttpAuth::None => None,
-        HttpAuth::BearerEnv { .. } | HttpAuth::BearerArg { .. } => Some(
+        HttpAuth::BearerEnv { .. } | HttpAuth::BearerFile { .. } => Some(
             http::new_token().map_err(|error| format!("token_unavailable:{:?}", error.kind()))?,
         ),
     };
-    let (extra_argv, token_env) = http::token_delivery(&auth, token.as_deref());
+    let token_directory = fresh_token_directory(hub, upstream)
+        .map_err(|error| format!("token_directory:{:?}", error.kind()))?;
+    let (extra_argv, token_env) = http::deliver_token(&auth, token.as_deref(), &token_directory)
+        .map_err(|error| format!("token_file:{:?}", error.kind()))?;
     let mut argv = http::with_port(&spec.argv, port);
     argv.extend(extra_argv);
     let mut command = Command::new(&argv[0]);
@@ -2262,6 +2266,63 @@ fn start_http_process(hub: &Arc<Hub>, upstream: &Arc<Upstream>, path: &str) -> R
     Ok(())
 }
 
+const TOKENS_DIRECTORY: &str = "tokens";
+
+/// `<hub dir>/tokens/<hub pid>`: this hub's token files.
+fn hub_tokens(directory: &Path) -> PathBuf {
+    directory
+        .join(TOKENS_DIRECTORY)
+        .join(std::process::id().to_string())
+}
+
+/// An empty private (0700) directory for one upstream's token file.
+fn fresh_token_directory(hub: &Arc<Hub>, upstream: &Upstream) -> io::Result<PathBuf> {
+    let directory = hub_tokens(&hub.config.paths.directory).join(&upstream.key_short);
+    remove_token_directory(hub, upstream);
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&directory)?;
+    // `recursive` leaves an existing parent's mode alone; set ours.
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    Ok(directory)
+}
+
+fn remove_token_directory(hub: &Arc<Hub>, upstream: &Upstream) {
+    let directory = hub_tokens(&hub.config.paths.directory).join(&upstream.key_short);
+    if directory.exists() {
+        crate::warn_unrecorded(
+            "remove an MCP token directory",
+            fs::remove_dir_all(&directory),
+        );
+    }
+}
+
+/// Remove token directories of hubs that no longer run (any build).
+fn sweep_token_directories(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory.join(TOKENS_DIRECTORY)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let alive = entry
+            .file_name()
+            .to_str()
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+            .is_some_and(|pid| {
+                // SAFETY: kill with signal 0 only checks that the process
+                // exists; it takes no pointers.
+                let probed = unsafe { libc::kill(pid, 0) };
+                probed == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+            });
+        if !alive {
+            crate::warn_unrecorded(
+                "sweep an MCP token directory",
+                fs::remove_dir_all(entry.path()),
+            );
+        }
+    }
+}
+
 /// Mark an HTTP upstream ready once its port accepts connections. One that
 /// does not listen within the initialize deadline is killed, which counts
 /// as a crash.
@@ -2270,15 +2331,32 @@ fn watch_listening(hub: &Arc<Hub>, upstream: &Arc<Upstream>, generation: u64, po
     let deadline = started + hub.config.init_timeout;
     loop {
         // The upstream leads its own group (process_group(0) at spawn).
-        let group = lock(&upstream.state).pid;
+        let (group, has_token) = {
+            let state = lock(&upstream.state);
+            (state.pid, state.token.is_some())
+        };
         let verdict = group.map_or(Listeners::None, |group| listen::check(port, group));
+        // A server that answers without its token would let any local
+        // process in: probed once, before anyone is told the URL.
+        let mut refusal = verdict.reason();
+        if verdict == Listeners::Ours
+            && has_token
+            && let Some(path) = &upstream.spec.http_path
+        {
+            refusal = match http::token_enforced(port, path) {
+                Ok(true) => None,
+                Ok(false) => Some(http::TOKEN_NOT_ENFORCED.to_string()),
+                Err(reason) => Some(reason),
+            };
+        }
         let mut state = lock(&upstream.state);
         if state.generation != generation || state.stopped || state.reaped >= generation {
             return;
         }
-        if let Some(reason) = verdict.reason() {
-            // Listening off loopback, someone else on the port, or no way to
-            // tell: never used, and not restarted into the same verdict.
+        if let Some(reason) = refusal {
+            // Listening off loopback, someone else on the port, no way to
+            // tell, or the token ignored: never used, and not restarted into
+            // the same verdict.
             state.init = Init::Failed(reason.clone());
             drop(state);
             eprintln!(
@@ -2696,6 +2774,7 @@ fn stop_upstream(hub: &Arc<Hub>, upstream: &Arc<Upstream>, reason: &str) {
         )
     };
     release_lease(port_lease);
+    remove_token_directory(hub, upstream);
     upstream.ready.notify_all();
     for stream in streams {
         let _closed = stream.shutdown(std::net::Shutdown::Both);

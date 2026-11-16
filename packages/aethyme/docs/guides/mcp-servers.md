@@ -420,14 +420,24 @@ this user's agents. Shared and private HTTP entries are therefore guarded
 the same way:
 
 - **Authentication.** Every HTTP entry must state `http_auth`. With
-  `bearer_env:<NAME>` (preferred) or `bearer_arg:<flag>`, a random token is
+  `bearer_env:<NAME>` (preferred) or `bearer_file:<flag>`, a random token is
   made for every start of the server and handed to it in that environment
-  variable, or as the value after that flag (`<flag> <token>`; visible to
-  every local user in `ps`, so prefer the variable). The bridge sends it as
-  `Authorization: Bearer <token>`; the server must refuse requests without
-  it. `http_auth = "none"` is refused unless the entry also sets
+  variable, or written to a `0600` file in a `0700` directory under the
+  hub's state directory (a temporary one for a private server) whose path
+  follows the flag (`<flag> <path>`). The file is removed when the server
+  stops, and a hub sweeps those of hubs that no longer run when it starts.
+  There is deliberately no form that puts the token itself in argv: argv
+  is readable by every local user with `ps`, the very users the token keeps
+  out. The bridge sends it as `Authorization: Bearer <token>`.
+  `http_auth = "none"` is refused unless the entry also sets
   `http_unauthenticated = true`: then any local process can drive the
   server.
+- **Token enforced.** Once the server listens, one `initialize` is sent
+  without the token (client `aethyme-mcp-hub`; any session it creates is
+  deleted). A server that answers it with a result ignores its token: it is
+  stopped, its key marked unhealthy (`token_not_enforced:server_ignores_token`),
+  and a private run refuses it the same way. Entries with
+  `http_auth = "none"` skip the probe.
 - **Who listens.** Before the server starts, its port must be free (else
   `port_busy`). It counts as ready only when every TCP listener on the port
   belongs to the server's own process group and is bound to `127.0.0.1`;
@@ -435,10 +445,15 @@ the same way:
   `0.0.0.0`, `::` or any other address is killed and its key marked
   unhealthy (`not_loopback`); a listener of another process on the port
   gives `listener_not_ours`. Ownership is read from `/proc` on Linux and
-  with `lsof` on macOS (which may not show another user's sockets); where it
-  cannot be determined the server is not used (`listener_unverifiable`).
-  One that does not listen within 30 seconds is killed and counts as a
-  crash.
+  from `netstat -anv -p tcp` on macOS (every user's sockets with their
+  pid); where the full set of listeners cannot be read the server is not
+  used (`listener_unverifiable`). One that does not listen within 30
+  seconds is killed and counts as a crash.
+- **Limits.** Only the leased port is checked, and only once, when the
+  server becomes ready. Any other port the server opens (a debugging or
+  metrics port, for example) is the server's own responsibility: prefer
+  servers that keep such ports on loopback, and list the flags that do so
+  in `require_argv` so they cannot be dropped.
 - **Origin.** The bridge never sends an `Origin` header. Servers should
   reject requests that carry one (a browser page on a rebinding DNS name
   could otherwise reach a loopback port); that check is the server's job.

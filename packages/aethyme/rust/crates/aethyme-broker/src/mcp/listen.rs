@@ -7,11 +7,10 @@
 //! - Linux: `/proc/net/tcp` and `/proc/net/tcp6` list the listeners and
 //!   their socket inodes; `/proc/<pid>/fd` of the group's processes tells
 //!   which inodes are the group's.
-//! - macOS: `lsof -nP -iTCP:<port> -sTCP:LISTEN -Fpn` (C locale, 2 s
-//!   deadline), each listener's pid mapped to its group with `getpgid`.
-//!   `lsof` run by a normal user may not list another user's sockets, so a
-//!   squatter owned by another user could go unseen; the pre-spawn test
-//!   bind still catches a port that was already taken.
+//! - macOS: `netstat -anv -p tcp` (C locale, 2 s deadline), which lists
+//!   every user's TCP sockets with the owning pid; each listener's pid is
+//!   mapped to its group with `getpgid`. Output whose pid column cannot be
+//!   found or read is unverifiable, never "nobody listens".
 //! - Anywhere else, or when the tool is missing or too slow: unverifiable,
 //!   and the server is not used.
 
@@ -184,6 +183,55 @@ mod linux {
     }
 }
 
+/// `(bound to 127.0.0.1 over IPv4, pid)` of each TCP listener on `port` in
+/// `netstat -anv -p tcp` output. `None` when the output has no header with a
+/// `pid` (or `process:pid`) column or a listener's pid cannot be read: the
+/// full set of listeners is then unknown.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn parse_netstat(text: &str, port: u16) -> Option<Vec<(bool, u32)>> {
+    let suffix = format!(".{port}");
+    let loopback = format!("127.0.0.1{suffix}");
+    let mut pid_column: Option<usize> = None;
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(first) = fields.first() else {
+            continue;
+        };
+        if *first == "Proto" {
+            // "Local Address" and "Foreign Address" are two words each.
+            let mut columns: Vec<&str> = Vec::new();
+            let mut index = 0;
+            while index < fields.len() {
+                let word = fields[index];
+                if matches!(word, "Local" | "Foreign") && fields.get(index + 1) == Some(&"Address")
+                {
+                    columns.push("address");
+                    index += 2;
+                } else {
+                    columns.push(word);
+                    index += 1;
+                }
+            }
+            pid_column = columns
+                .iter()
+                .position(|column| matches!(*column, "pid" | "process:pid"));
+            continue;
+        }
+        if !first.starts_with("tcp") {
+            continue;
+        }
+        let column = pid_column?;
+        // Proto Recv-Q Send-Q Local Foreign (state) ...
+        if fields.get(5) != Some(&"LISTEN") || !fields.get(3)?.ends_with(&suffix) {
+            continue;
+        }
+        let pid = fields.get(column)?.rsplit(':').next()?.parse().ok()?;
+        found.push((*first == "tcp4" && fields[3] == loopback, pid));
+    }
+    pid_column.map(|_| found)
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use std::io::Read;
@@ -191,22 +239,32 @@ mod macos {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{Listener, Listeners, judge};
+    use super::{Listener, Listeners, judge, parse_netstat};
 
-    const LSOF: &str = "/usr/sbin/lsof";
+    const NETSTAT: &str = "/usr/sbin/netstat";
     const TOOL_TIMEOUT: Duration = Duration::from_secs(2);
 
     pub(super) fn check(port: u16, group: u32) -> Listeners {
-        let spawned = Command::new(LSOF)
-            .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpn"])
+        let spawned = Command::new(NETSTAT)
+            .args(["-anv", "-p", "tcp"])
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn();
         let Ok(mut child) = spawned else {
-            return Listeners::Unverifiable("lsof_missing".into());
+            return Listeners::Unverifiable("netstat_missing".into());
         };
+        // Read while it runs: a busy host's table outgrows a pipe buffer.
+        let Some(mut stdout) = child.stdout.take() else {
+            let _killed = child.kill();
+            let _reaped = child.wait();
+            return Listeners::Unverifiable("netstat_output".into());
+        };
+        let reader = thread::spawn(move || {
+            let mut text = String::new();
+            stdout.read_to_string(&mut text).map(|_| text)
+        });
         let deadline = Instant::now() + TOOL_TIMEOUT;
         let status = loop {
             match child.try_wait() {
@@ -215,42 +273,31 @@ mod macos {
                 _ => {
                     let _killed = child.kill();
                     let _reaped = child.wait();
-                    return Listeners::Unverifiable("lsof_timeout".into());
+                    let _drained = reader.join();
+                    return Listeners::Unverifiable("netstat_timeout".into());
                 }
             }
         };
-        let mut text = String::new();
-        if let Some(stdout) = child.stdout.as_mut()
-            && stdout.read_to_string(&mut text).is_err()
-        {
-            return Listeners::Unverifiable("lsof_output".into());
-        }
-        // lsof exits 1 when it finds nothing.
-        if text.trim().is_empty() {
-            return if status.success() || status.code() == Some(1) {
-                Listeners::None
-            } else {
-                Listeners::Unverifiable("lsof_failed".into())
-            };
-        }
-        let loopback = format!("127.0.0.1:{port}");
-        let mut listeners = Vec::new();
-        let mut owner: Option<i32> = None;
-        for line in text.lines() {
-            if let Some(pid) = line.strip_prefix('p') {
-                owner = pid.parse().ok();
-            } else if let Some(name) = line.strip_prefix('n') {
-                let Some(pid) = owner else {
-                    return Listeners::Unverifiable("lsof_output".into());
-                };
-                // SAFETY: getpgid takes no pointers; it only reads a group id.
-                let pgid = unsafe { libc::getpgid(pid) };
-                listeners.push(Listener {
-                    loopback: name == loopback,
+        let text = match reader.join() {
+            Ok(Ok(text)) if status.success() => text,
+            _ => return Listeners::Unverifiable("netstat_failed".into()),
+        };
+        let Some(found) = parse_netstat(&text, port) else {
+            return Listeners::Unverifiable("netstat_format".into());
+        };
+        let listeners: Vec<Listener> = found
+            .into_iter()
+            .map(|(loopback, pid)| {
+                let pgid = libc::pid_t::try_from(pid)
+                    // SAFETY: getpgid takes no pointers; it only reads a group id.
+                    .map(|pid| unsafe { libc::getpgid(pid) })
+                    .unwrap_or(-1);
+                Listener {
+                    loopback,
                     ours: u32::try_from(pgid).ok() == Some(group),
-                });
-            }
-        }
+                }
+            })
+            .collect();
         judge(&listeners)
     }
 }
@@ -293,6 +340,42 @@ mod tests {
             Listeners::NotOurs.reason().as_deref(),
             Some("listener_not_ours")
         );
+    }
+
+    #[test]
+    fn netstat_listeners_are_read_with_their_pid_in_either_layout() {
+        // Older layout: a `pid` column.
+        let older = "Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)      rhiwat  shiwat    pid   epid state  options           gencnt    flags   flags1 usscnt rtncnt fltrs
+tcp4       0      0  127.0.0.1.47300        *.*                    LISTEN       131072  131072   4242      0 0x0100 0x00000006 0x000000000001a2b3 0x00000000 0x00000800      0      0 000001
+tcp46      0      0  *.47300                *.*                    LISTEN       131072  131072   4343      0 0x0100 0x00000006 0x000000000001a2b4 0x00000000 0x00000800      0      0 000001
+tcp4       0      0  127.0.0.1.47300        127.0.0.1.50000        ESTABLISHED  408241  146988   4242      0 0x0102 0x00000008 0x000000000001a2b5 0x00000000 0x00000800      1      0 000001
+tcp4       0      0  127.0.0.1.147300       *.*                    LISTEN       131072  131072   4444      0 0x0100 0x00000006 0x000000000001a2b6 0x00000000 0x00000800      0      0 000001
+udp4       0      0  *.47300                *.*                                 786896    9216   4545      0 0x0000 0x00000000 0x000000000001a2b7 0x00000000 0x00000800      0      0 000001
+";
+        assert_eq!(
+            parse_netstat(older, 47300),
+            Some(vec![(true, 4242), (false, 4343)])
+        );
+        // Newer layout: `process:pid`, with byte counters before it.
+        let newer = "Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)          rxbytes      txbytes  rhiwat  shiwat    process:pid    state  options           gencnt    flags   flags1 usscnt rtncnt fltrs
+tcp6       0      0  ::1.47300              *.*                    LISTEN                 0            0  131072  131072   example:5151  00102 00000006 000000000001b2c3 00000000 00000800      0      0 000001
+tcp4       0      0  127.0.0.1.47300        *.*                    LISTEN                 0            0  131072  131072   example:5150  00102 00000006 000000000001b2c4 00000000 00000800      0      0 000001
+";
+        assert_eq!(
+            parse_netstat(newer, 47300),
+            Some(vec![(false, 5151), (true, 5150)])
+        );
+        assert_eq!(parse_netstat(newer, 47301), Some(Vec::new()));
+        // No pid column, or an unreadable pid: the set is unknown.
+        let no_pid = "Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)
+tcp4       0      0  127.0.0.1.47300        *.*                    LISTEN
+";
+        assert_eq!(parse_netstat(no_pid, 47300), None);
+        let bad_pid = older.replace("   4242      0 0x0100", "   ????      0 0x0100");
+        assert_eq!(parse_netstat(&bad_pid, 47300), None);
+        assert_eq!(parse_netstat("", 47300), None);
     }
 
     #[cfg(target_os = "linux")]

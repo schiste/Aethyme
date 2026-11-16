@@ -1684,10 +1684,10 @@ argv = [\"/bin/example-server\"]
 http_auth = \"none\"
 http_unauthenticated = true
 [[servers]]
-name = \"token-flag\"
+name = \"token-file\"
 transport = \"http\"
 argv = [\"/bin/example-server\"]
-http_auth = \"bearer_arg:--token\"
+http_auth = \"bearer_file:--token-file\"
 [[servers]]
 name = \"bad-auth\"
 transport = \"http\"
@@ -1715,7 +1715,7 @@ http_auth = \"none\"
         ]
     );
     let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-    assert_eq!(names, vec!["isolated", "open-accepted", "token-flag"]);
+    assert_eq!(names, vec!["isolated", "open-accepted", "token-file"]);
     assert_eq!(entries[0].require_argv, vec!["--isolated".to_string()]);
     assert_eq!(
         entries[0].http_path.as_deref(),
@@ -1731,8 +1731,8 @@ http_auth = \"none\"
     assert_eq!(entries[1].http_auth, Some(HttpAuth::None));
     assert_eq!(
         entries[2].http_auth,
-        Some(HttpAuth::BearerArg {
-            flag: "--token".into()
+        Some(HttpAuth::BearerFile {
+            flag: "--token-file".into()
         })
     );
 }

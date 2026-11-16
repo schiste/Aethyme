@@ -19,7 +19,7 @@
 //! require_client_features = false # true: never shared (roots, sampling, elicitation)
 //! require_argv = ["--stdio"]   # elements argv must contain (e.g. an isolation flag)
 //! http_path = "/mcp"           # transport = "http" only: where the server answers
-//! http_auth = "bearer_env:MCP_TOKEN" # http only, required: or "bearer_arg:--token", "none"
+//! http_auth = "bearer_env:MCP_TOKEN" # http only, required: or "bearer_file:--token-file", "none"
 //! http_unauthenticated = false # true is required with http_auth = "none"
 //! ```
 //!
@@ -114,14 +114,17 @@ struct RawEntry {
 
 /// How an HTTP server authenticates its clients. With a bearer mode a
 /// random token is made for every start and handed to the server through
-/// the named environment variable or as the value after the named flag
-/// (visible in `ps`); the bridge sends it as `Authorization: Bearer`.
+/// the named environment variable, or written to a private (0600) file
+/// whose path follows the named flag; the bridge sends it as
+/// `Authorization: Bearer`. There is deliberately no form that puts the
+/// token itself in argv: argv is readable by every local user (`ps`), the
+/// very users the token keeps out.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HttpAuth {
     None,
     BearerEnv { name: String },
-    BearerArg { flag: String },
+    BearerFile { flag: String },
 }
 
 impl HttpAuth {
@@ -134,11 +137,11 @@ impl HttpAuth {
                 name: name.to_string(),
             });
         }
-        let flag = text.strip_prefix("bearer_arg:")?;
+        let flag = text.strip_prefix("bearer_file:")?;
         let flag_ok = flag.starts_with('-')
             && flag.len() > 1
             && flag.chars().all(|c| c.is_ascii_graphic() && c != '=');
-        flag_ok.then(|| Self::BearerArg {
+        flag_ok.then(|| Self::BearerFile {
             flag: flag.to_string(),
         })
     }
@@ -680,7 +683,7 @@ fn validate_entry(
                 "http_auth",
                 "missing_http_auth",
                 "an HTTP entry must state http_auth: \"bearer_env:<NAME>\" (preferred), \
-                 \"bearer_arg:<flag>\" or \"none\""
+                 \"bearer_file:<flag>\" or \"none\""
                     .into(),
             ));
         }
@@ -690,7 +693,7 @@ fn validate_entry(
                     "http_auth",
                     "invalid_http_auth",
                     format!(
-                        "{text:?} is not \"bearer_env:<NAME>\", \"bearer_arg:<flag>\" or \
+                        "{text:?} is not \"bearer_env:<NAME>\", \"bearer_file:<flag>\" or \
                          \"none\""
                     ),
                 ));

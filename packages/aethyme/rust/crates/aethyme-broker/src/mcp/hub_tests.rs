@@ -1069,6 +1069,21 @@ const TOKEN_ENV: &str = aethyme_testkit::mcp_http::TOKEN_ENV;
 
 impl TestHub {
     fn http_hello(&self, key: &str, argv: Vec<String>, extra_env: &[(&str, &str)]) -> Value {
+        self.http_hello_with(
+            key,
+            argv,
+            extra_env,
+            json!({"kind": "bearer_env", "name": TOKEN_ENV}),
+        )
+    }
+
+    fn http_hello_with(
+        &self,
+        key: &str,
+        argv: Vec<String>,
+        extra_env: &[(&str, &str)],
+        auth: Value,
+    ) -> Value {
         let mut env = vec![
             json!(["PATH", "/usr/bin:/bin"]),
             json!([aethyme_testkit::mcp_http::FAKE_SERVER_ENV, "1"]),
@@ -1085,7 +1100,7 @@ impl TestHub {
             "env": env,
             "transport": "http",
             "path": "/mcp",
-            "auth": {"kind": "bearer_env", "name": TOKEN_ENV},
+            "auth": auth,
         })
     }
 }
@@ -1110,12 +1125,16 @@ fn http_attach(
     argv: Vec<String>,
     extra_env: &[(&str, &str)],
 ) -> (Client, Value, Option<Value>) {
+    http_attach_hello(hub, &hub.http_hello(key, argv, extra_env))
+}
+
+fn http_attach_hello(hub: &TestHub, hello: &Value) -> (Client, Value, Option<Value>) {
     let mut client = Client::connect(hub);
     client
         .stream
         .set_read_timeout(Some(Duration::from_secs(60)))
         .unwrap();
-    client.send(&hub.http_hello(key, argv, extra_env));
+    client.send(hello);
     let hello = client.recv().expect("hello reply");
     let control = (hello["ok"] == true).then(|| client.recv()).flatten();
     (client, hello, control)
@@ -1375,4 +1394,64 @@ fn a_reply_that_stays_silent_fails_retryably() {
     );
     let reply = reply_for(&captured.messages(), 2);
     assert_eq!(reply["error"]["data"]["retryable"], true, "{reply}");
+}
+
+#[test]
+fn a_bearer_file_token_reaches_the_server_through_a_private_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let hub = TestHub::start(|config| config.idle_timeout = Duration::from_secs(30));
+    let hello = hub.http_hello_with(
+        &key('v'),
+        fake_http_argv(),
+        &[(aethyme_testkit::mcp_http::TOKEN_FILE_FLAG_ENV, "--skip")],
+        json!({"kind": "bearer_file", "flag": "--skip"}),
+    );
+    let (_client, _, ready) = http_attach_hello(&hub, &hello);
+    let ready = ready.expect("a ready line");
+    assert_eq!(ready["aethyme_hub"], "ready", "{ready}");
+    let token = ready["token"].as_str().unwrap();
+    let directory = hub
+        .paths
+        .directory
+        .join("tokens")
+        .join(std::process::id().to_string())
+        .join(&key('v')[..12]);
+    let file = directory.join("token");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), token);
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let session = http_session(ready["url"].as_str().unwrap(), Some(token));
+    assert!(
+        reply_for(&session, 2)["result"]["text"].is_string(),
+        "{session:?}"
+    );
+}
+
+#[test]
+fn a_server_that_ignores_its_token_is_refused_and_unhealthy() {
+    let hub = TestHub::start(|config| config.idle_timeout = Duration::from_secs(30));
+    // The token goes to a variable the fake server never reads.
+    let hello = hub.http_hello_with(
+        &key('w'),
+        fake_http_argv(),
+        &[],
+        json!({"kind": "bearer_env", "name": "UNREAD_TOKEN"}),
+    );
+    let (_client, hello_reply, control) = http_attach_hello(&hub, &hello);
+    assert_eq!(hello_reply["ok"], true, "{hello_reply}");
+    let control = control.expect("a fallback line");
+    assert_eq!(
+        control["reason"], "token_not_enforced:server_ignores_token",
+        "{control}"
+    );
+    assert!(wait_for(
+        || unhealthy_reason(&hub.paths.directory, &key('w')).is_some(),
+        Duration::from_secs(10)
+    ));
 }

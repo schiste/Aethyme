@@ -24,7 +24,9 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, channel};
@@ -107,21 +109,91 @@ pub fn new_token() -> io::Result<String> {
         .collect())
 }
 
-/// What a server needs for `auth` and `token`: extra argv elements and an
-/// extra environment variable.
-pub fn token_delivery(
+/// The refusal for a server that answers without its token.
+pub const TOKEN_NOT_ENFORCED: &str = "token_not_enforced:server_ignores_token";
+
+/// The file a `bearer_file` token is written to, inside `directory`.
+pub const TOKEN_FILE: &str = "token";
+
+/// Hand `token` to a server per `auth`: extra argv elements (a flag and the
+/// path of a 0600 file written in `directory`, which must be a private 0700
+/// directory) and an extra environment variable. The token itself never
+/// goes into argv.
+pub fn deliver_token(
     auth: &HttpAuth,
     token: Option<&str>,
-) -> (Vec<String>, Option<(String, String)>) {
+    directory: &Path,
+) -> io::Result<(Vec<String>, Option<(String, String)>)> {
     match (auth, token) {
-        (HttpAuth::BearerArg { flag }, Some(token)) => {
-            (vec![flag.clone(), token.to_string()], None)
+        (HttpAuth::BearerFile { flag }, Some(token)) => {
+            let path = directory.join(TOKEN_FILE);
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)?;
+            file.write_all(token.as_bytes())?;
+            Ok((
+                vec![flag.clone(), path.to_string_lossy().into_owned()],
+                None,
+            ))
         }
         (HttpAuth::BearerEnv { name }, Some(token)) => {
-            (Vec::new(), Some((name.clone(), token.to_string())))
+            Ok((Vec::new(), Some((name.clone(), token.to_string()))))
         }
-        _ => (Vec::new(), None),
+        _ => Ok((Vec::new(), None)),
     }
+}
+
+/// Whether a server on `port` refuses an `initialize` sent without its
+/// token: `Ok(false)` when it answers with a JSON-RPC result anyway (the
+/// token is not enforced). Any session the probe created is deleted.
+pub fn token_enforced(port: u16, path: &str) -> Result<bool, String> {
+    let target = parse_url(&url(port, path)).ok_or("invalid_url")?;
+    let probe = serde_json::json!({
+        "jsonrpc": "2.0", "id": "aethyme-token-probe", "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                   "clientInfo": {"name": "aethyme-mcp-hub", "version": "1"}},
+    });
+    let body = serde_json::to_vec(&probe).unwrap_or_default();
+    let headers = [
+        ("Accept", "application/json, text/event-stream".to_string()),
+        ("Content-Type", "application/json".to_string()),
+    ];
+    let mut response = request(
+        &target,
+        "POST",
+        &headers,
+        Some(&body),
+        Some(Duration::from_secs(10)),
+    )
+    .map_err(|error| format!("token_probe_failed:{:?}", error.kind()))?;
+    if !(200..300).contains(&response.status) {
+        return Ok(true);
+    }
+    let session = response.header("mcp-session-id").map(str::to_string);
+    let event_stream = response
+        .header("content-type")
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+    let mut answered = false;
+    if event_stream {
+        let _read = sse_messages(&mut response.body, |message| {
+            answered |= message.get("result").is_some();
+        });
+    } else if let Ok(bytes) = read_body(&mut response.body) {
+        answered = serde_json::from_slice::<Value>(&bytes)
+            .is_ok_and(|reply| reply.get("result").is_some());
+    }
+    if let Some(id) = session {
+        let _deleted = request(
+            &target,
+            "DELETE",
+            &[("Mcp-Session-Id", id)],
+            None,
+            Some(Duration::from_secs(5)),
+        );
+    }
+    Ok(!answered)
 }
 
 /// Wait until every listener on `port` is `group`'s own, on loopback.
@@ -483,8 +555,11 @@ fn post(shared: &Shared, message: &Value) {
     let mut headers = shared.headers("application/json, text/event-stream");
     headers.push(("Content-Type", "application/json".to_string()));
     let body = serde_json::to_vec(message).unwrap_or_default();
+    // Only a request still waiting gets an error: never a second answer.
     let fail = |text: &str| {
-        if let Some(id) = &request_id {
+        if let Some(id) = &request_id
+            && lock(&shared.pending).remove(&id.to_string()).is_some()
+        {
             shared.emit(&jsonrpc::retryable_error(id.clone(), text));
         }
     };
@@ -708,7 +783,7 @@ pub fn run_private(plan: &Plan, path: &str, auth: &HttpAuth) -> u8 {
     };
     let token = match auth {
         HttpAuth::None => None,
-        HttpAuth::BearerEnv { .. } | HttpAuth::BearerArg { .. } => match new_token() {
+        HttpAuth::BearerEnv { .. } | HttpAuth::BearerFile { .. } => match new_token() {
             Ok(token) => Some(token),
             Err(error) => {
                 eprintln!("aethyme mcp: {}: no random token: {error}", plan.name);
@@ -716,7 +791,31 @@ pub fn run_private(plan: &Plan, path: &str, auth: &HttpAuth) -> u8 {
             }
         },
     };
-    let (extra_argv, token_env) = token_delivery(auth, token.as_deref());
+    // A private 0700 directory (removed on return) for a `bearer_file` token.
+    let token_directory = match tempfile::Builder::new()
+        .prefix("aethyme-mcp-token-")
+        .tempdir()
+    {
+        Ok(directory) => directory,
+        Err(error) => {
+            eprintln!(
+                "aethyme mcp: {}: no private token directory: {error}",
+                plan.name
+            );
+            return crate::exit_status::ENVIRONMENT;
+        }
+    };
+    let (extra_argv, token_env) =
+        match deliver_token(auth, token.as_deref(), token_directory.path()) {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                eprintln!(
+                    "aethyme mcp: {}: could not write the token: {error}",
+                    plan.name
+                );
+                return crate::exit_status::ENVIRONMENT;
+            }
+        };
     let mut argv = with_port(&plan.resolution.argv, port);
     argv.extend(extra_argv);
     let stdout_to_stderr = io::stderr()
@@ -750,7 +849,15 @@ pub fn run_private(plan: &Plan, path: &str, auth: &HttpAuth) -> u8 {
         }
     };
     let started = Instant::now();
-    let code = match wait_owned(port, child.id(), &mut child, LISTEN_TIMEOUT) {
+    let mut ready = wait_owned(port, child.id(), &mut child, LISTEN_TIMEOUT);
+    if ready.is_ok() && token.is_some() {
+        ready = match token_enforced(port, path) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(TOKEN_NOT_ENFORCED.to_string()),
+            Err(reason) => Err(reason),
+        };
+    }
+    let code = match ready {
         Ok(()) => {
             eprintln!(
                 "aethyme mcp: {}: private HTTP server listening after {} ms",
@@ -822,22 +929,34 @@ mod tests {
         assert_eq!(target.path, "/mcp");
         assert!(parse_url("http://example.invalid:80/mcp").is_none());
         assert!(parse_url("https://127.0.0.1:1/mcp").is_none());
+        let directory = tempfile::tempdir().unwrap();
+        let (argv, env) = deliver_token(
+            &HttpAuth::BearerFile {
+                flag: "--token-file".into(),
+            },
+            Some("secret-value"),
+            directory.path(),
+        )
+        .unwrap();
+        assert_eq!(env, None);
+        assert_eq!(argv[0], "--token-file");
+        assert!(!argv.iter().any(|element| element.contains("secret-value")));
+        let file = std::path::PathBuf::from(&argv[1]);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "secret-value");
+        use std::os::unix::fs::PermissionsExt;
         assert_eq!(
-            token_delivery(
-                &HttpAuth::BearerArg {
-                    flag: "--token".into()
-                },
-                Some("t")
-            ),
-            (vec!["--token".to_string(), "t".to_string()], None)
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
         );
         assert_eq!(
-            token_delivery(
+            deliver_token(
                 &HttpAuth::BearerEnv {
                     name: "TOKEN".into()
                 },
-                Some("t")
-            ),
+                Some("t"),
+                directory.path(),
+            )
+            .unwrap(),
             (Vec::new(), Some(("TOKEN".to_string(), "t".to_string())))
         );
         assert_eq!(new_token().unwrap().len(), 64);

@@ -33,6 +33,10 @@ pub const FAKE_SERVER_ENV: &str = "AETHYME_TEST_FAKE_MCP_HTTP";
 pub const TOKEN_ENV: &str = "AETHYME_TEST_FAKE_MCP_TOKEN";
 /// The address it binds (default `127.0.0.1`).
 pub const BIND_ENV: &str = "AETHYME_TEST_FAKE_MCP_BIND";
+/// When set, the token is read from the file named by the argument after
+/// this flag (for `bearer_file` entries; `--skip` suits a libtest binary,
+/// which takes it with a value).
+pub const TOKEN_FILE_FLAG_ENV: &str = "AETHYME_TEST_FAKE_MCP_TOKEN_FILE_FLAG";
 
 /// How the fake server runs.
 #[derive(Debug, Clone)]
@@ -65,12 +69,22 @@ pub fn run_from_env() {
             .ok()
             .and_then(|bind| bind.parse().ok())
             .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-        token: std::env::var(TOKEN_ENV)
-            .ok()
+        token: token_from_file()
+            .or_else(|| std::env::var(TOKEN_ENV).ok())
             .filter(|token| !token.is_empty()),
     };
     let listener = TcpListener::bind((options.bind, port)).expect("bind the fake server");
     serve(listener, options);
+}
+
+fn token_from_file() -> Option<String> {
+    let flag = std::env::var(TOKEN_FILE_FLAG_ENV).ok()?;
+    let args: Vec<String> = std::env::args().collect();
+    let path = args
+        .iter()
+        .position(|arg| *arg == flag)
+        .and_then(|index| args.get(index + 1))?;
+    std::fs::read_to_string(path).ok()
 }
 
 /// Start the fake server in this process on a free port; its port.
