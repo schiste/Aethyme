@@ -948,6 +948,15 @@ impl Broker {
             .map(|session| session.id)
             .collect::<Vec<_>>();
         holder_process_table.prime(self.store_ref(), &retirement_candidates, None);
+        // Only a session past the window by its row can be closed here (the
+        // close path keeps any session whose row or checkout activity is
+        // newer), and one the retirement memo knows is not due yet would be
+        // kept again: neither is judged. Reading the memo writes nothing.
+        let due_by_row = retirement_candidates
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let not_due_memo = crate::auto_cleanup::NotDueMemo::load(self, abandon_after_ms, now_ms);
         let enqueue_closed_checkout_cleanup = crate::load_retention_policy(&self.main_root)
             .is_ok_and(|policy| policy.auto_cleanup_worktrees_on_finish)
             && crate::AutoCleanupPolicy::load(&self.main_root)
@@ -991,7 +1000,16 @@ impl Broker {
             // had (#176). Closing here does not delete anything -- it makes the
             // worktree a cleanup *candidate*, which `cleanup_item` then judges
             // on its own merits. Candidacy is granted; eligibility is earned.
+            let judge =
+                due_by_row.contains(&session.id) && !not_due_memo.not_due(session.id, now_ms);
+            if !derived_status.is_closed() && !judge {
+                crate::phase_telemetry::add(
+                    "agents_view_abandonment_not_due",
+                    std::time::Duration::ZERO,
+                );
+            }
             let abandoned_now = !derived_status.is_closed()
+                && judge
                 && matches!(
                     self.try_close_abandoned_session(
                         session.id,
@@ -1712,6 +1730,11 @@ impl Broker {
             ),
             crate::AbandonmentVerdict::Abandoned { .. }
         ) {
+            process_table.note_not_due_before(
+                database_activity
+                    .max(candidate.created_at)
+                    .saturating_add(abandon_after_ms),
+            );
             return Ok(keep_with(
                 process_table,
                 AbandonmentKeepReason::RecentActivity,
@@ -2052,6 +2075,11 @@ impl Broker {
             observed_at,
             abandon_after_ms,
         ) else {
+            process_table.note_not_due_before(
+                activity_at
+                    .max(current.created_at)
+                    .saturating_add(abandon_after_ms),
+            );
             return Ok(keep_with(
                 process_table,
                 AbandonmentKeepReason::RecentActivity,

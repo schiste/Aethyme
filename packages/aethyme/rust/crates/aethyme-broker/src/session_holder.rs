@@ -436,6 +436,9 @@ pub(crate) struct RecordedHolderProcessTable {
     /// (`AbandonmentKeepReason`); the table is the one per-pass context every
     /// exit of the close path can reach.
     keep_reason: std::cell::Cell<Option<crate::broker::AbandonmentKeepReason>>,
+    /// When the last session kept for recent activity can first be due: its
+    /// newest activity plus the window it was judged against.
+    not_due_before_ms: std::cell::Cell<Option<i64>>,
     process_use_snapshot: Option<(Instant, crate::reclaim::OpenFileSnapshot)>,
     /// Open-file observations this pass took, when the last one started, and
     /// whether the last request was refused by the per-pass throttle.
@@ -553,6 +556,18 @@ impl RecordedHolderProcessTable {
     /// Forget the last keep reason, before judging another session.
     pub(crate) fn clear_keep_reason(&self) {
         self.keep_reason.set(None);
+        self.not_due_before_ms.set(None);
+    }
+
+    /// Record that the session being judged cannot be due before `at_ms`
+    /// (kept for recent activity).
+    pub(crate) fn note_not_due_before(&self, at_ms: i64) {
+        self.not_due_before_ms.set(Some(at_ms));
+    }
+
+    /// When the last session kept for recent activity can first be due.
+    pub(crate) fn not_due_before(&self) -> Option<i64> {
+        self.not_due_before_ms.get()
     }
 
     /// Why the last session judged with this table was kept, if it was.

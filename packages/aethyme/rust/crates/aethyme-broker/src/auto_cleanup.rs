@@ -121,6 +121,87 @@ const LANDED_SEARCH_HOLD_LIMIT: Duration = Duration::from_secs(10);
 /// then moves on whatever the answer, so one session never holds every later
 /// session back for more than one pass.
 const SESSION_RETIREMENT_BUDGET_HOLD_KEY: &str = "auto_cleanup.session_retirement_budget_hold";
+/// Meta key of [`NotDueMemo`]: when each session the abandonment window kept
+/// for recent activity can first be due.
+const SESSION_RETIREMENT_NOT_DUE_KEY: &str = "auto_cleanup.session_retirement_not_due";
+/// Entries the not-due memo keeps at most (the nearest due times win).
+const SESSION_RETIREMENT_NOT_DUE_MAX: usize = 4096;
+
+/// When each open session the abandonment window kept for recent activity
+/// can first be due again: its newest activity (session row, checkout Git
+/// metadata) plus the window. Activity only moves later, so until that time
+/// the same judgement would keep it again; a pass skips it
+/// (`retirement_not_due_memo_skips`) instead of re-reading its checkout on
+/// every command. Skipping only delays a close: it never closes anything,
+/// and the landed lane is still asked. A changed window discards the memo.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct NotDueMemo {
+    window_ms: i64,
+    sessions: std::collections::BTreeMap<i64, i64>,
+}
+
+/// A not-due time is at most one window away: Git metadata dated in the
+/// future (a skewed clock, a restored checkout) or one that later vanishes
+/// can delay a close by one window at most, never longer.
+fn clamp_not_due(due_at: i64, now: i64, window_ms: i64) -> i64 {
+    due_at.min(now.saturating_add(window_ms.max(0)))
+}
+
+impl NotDueMemo {
+    pub(crate) fn load(broker: &Broker, window_ms: i64, now: i64) -> Self {
+        let mut memo = broker
+            .store_ref()
+            .meta_get(SESSION_RETIREMENT_NOT_DUE_KEY)
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<Self>(&raw).ok())
+            .filter(|memo| memo.window_ms == window_ms)
+            .unwrap_or_else(|| Self {
+                window_ms,
+                ..Self::default()
+            });
+        memo.sessions.retain(|_, due_at| *due_at > now);
+        memo
+    }
+
+    pub(crate) fn not_due(&self, session_id: i64, now: i64) -> bool {
+        self.sessions
+            .get(&session_id)
+            .is_some_and(|due_at| *due_at > now)
+    }
+
+    fn record(&mut self, broker: &Broker, session_id: i64, due_at: i64, now: i64) {
+        let due_at = clamp_not_due(due_at, now, self.window_ms);
+        if due_at <= now || self.sessions.get(&session_id) == Some(&due_at) {
+            return;
+        }
+        self.sessions.insert(session_id, due_at);
+        while self.sessions.len() > SESSION_RETIREMENT_NOT_DUE_MAX {
+            let Some((&latest, _)) = self.sessions.iter().max_by_key(|(_, due_at)| **due_at) else {
+                break;
+            };
+            self.sessions.remove(&latest);
+        }
+        crate::phase_telemetry::add("retirement_not_due_memo_recorded", Duration::ZERO);
+        self.persist(broker);
+    }
+
+    fn forget(&mut self, broker: &Broker, session_id: i64) {
+        if self.sessions.remove(&session_id).is_some() {
+            self.persist(broker);
+        }
+    }
+
+    fn persist(&self, broker: &Broker) {
+        let value = serde_json::to_string(self).unwrap_or_default();
+        crate::warn_unrecorded(
+            "remember when retirement candidates are due",
+            broker
+                .store_ref()
+                .meta_set(SESSION_RETIREMENT_NOT_DUE_KEY, &value),
+        );
+    }
+}
 /// Bound discovery of ignored roots before whole-checkout cleanup considers
 /// their existing policy classifications.
 const IGNORED_PATH_LISTING_BUDGET: Duration = Duration::from_secs(15);
@@ -1976,12 +2057,15 @@ pub struct CapacityRemovalSlice {
     pub index_high_water_session_id: i64,
     /// Why the slice stopped: `cap` (made its allowance of removals),
     /// `budget` (too little time left for another pass), `memory_backoff`
-    /// (memory pressure outlasted the pacer's pause budget, before a pass or
+    /// (critical memory pressure outlasted the pacer's pause budget, before a pass or
     /// while paying for a removal; ten-minute retry), `load_throttled`
     /// (load stayed elevated through a pre-pass check's bounded wait, so
     /// the slice made one removal and stopped; the next slice runs at the
     /// normal cadence but no sooner than `throttle_gap_ms`; load is never a
-    /// back-off), `slice_deadline` (the slice
+    /// back-off), `memory_warning_throttled` (memory pressure stayed at the
+    /// warning level through the bounded wait: one removal, then at least
+    /// two minutes, a hard retry; only critical pressure is
+    /// `memory_backoff`), `slice_deadline` (the slice
     /// ended mid pacer wait; `pacer_unpaid_ms` is owed before the next
     /// slice), `yielded_to_foreground` (a foreground command waited for the
     /// GC lock), `nothing_selected` (a pass selected nothing and moved
@@ -6908,6 +6992,7 @@ impl Broker {
             .collect::<Vec<_>>();
         let mut holder_process_table = crate::session_holder::RecordedHolderProcessTable::default();
         holder_process_table.prime(self.store_ref(), &retirement_candidates, deadline);
+        let mut not_due_memo = NotDueMemo::load(self, window_ms, retirement_now);
         let pass_started = Instant::now();
         let mut landed_judged_in_pass = 0_usize;
         let mut budget_hold = self.retirement_budget_hold();
@@ -6969,7 +7054,13 @@ impl Broker {
             // and worktree scans, so sessions days past the window stayed
             // open behind them. The landed lane is still asked when only it
             // could close the session: a live holder whose task lease expired.
-            let abandonment_tried = old_enough_for_abandonment;
+            // A session kept for recent activity is not judged again before
+            // its activity plus the window: the judgement would keep it.
+            let memo_skipped = old_enough_for_abandonment && not_due_memo.not_due(session.id, now);
+            if memo_skipped {
+                crate::phase_telemetry::add("retirement_not_due_memo_skips", Duration::ZERO);
+            }
+            let abandonment_tried = old_enough_for_abandonment && !memo_skipped;
             let mut outcome = if abandonment_tried {
                 let _span = crate::phase_telemetry::span("retirement_abandonment_first");
                 self.try_close_abandoned_session(
@@ -6994,6 +7085,12 @@ impl Broker {
                     },
                     Duration::ZERO,
                 );
+                match holder_process_table.not_due_before() {
+                    Some(due_at) if !closed => {
+                        not_due_memo.record(self, session.id, due_at, now);
+                    }
+                    _ => not_due_memo.forget(self, session.id),
+                }
                 if closed {
                     summary.abandonment_closed += 1;
                 } else {
@@ -7100,7 +7197,7 @@ impl Broker {
             let fall_through = landed_decline
                 .is_none_or(crate::broker::LandedSessionDecline::allows_abandonment_fallback)
                 && !matches!(outcome, crate::broker::AbandonedSessionCloseOutcome::Closed);
-            if fall_through && old_enough_for_abandonment && !abandonment_tried {
+            if fall_through && old_enough_for_abandonment && !abandonment_tried && !memo_skipped {
                 outcome = self.try_close_abandoned_session(
                     session.id,
                     now,
@@ -9256,6 +9353,19 @@ mod tests {
         let path = root.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, "x").unwrap();
+    }
+
+    /// A not-due time is at most one window ahead, however far in the
+    /// future the checkout's Git metadata is dated.
+    #[test]
+    fn a_not_due_time_is_clamped_to_one_window() {
+        let window = 72 * 3_600_000;
+        assert_eq!(super::clamp_not_due(1_000 + 5, 1_000, window), 1_005);
+        assert_eq!(
+            super::clamp_not_due(i64::MAX, 1_000, window),
+            1_000 + window
+        );
+        assert_eq!(super::clamp_not_due(5_000, 1_000, -1), 1_000);
     }
 
     #[test]
@@ -14425,6 +14535,7 @@ mod tests {
     fn memory_pressure(elevated: bool) -> crate::gc::unattended_pacing::PressureSample {
         crate::gc::unattended_pacing::PressureSample {
             memory_elevated: Some(elevated),
+            memory_warning: None,
             load_elevated: Some(false),
         }
     }
@@ -14547,6 +14658,7 @@ mod tests {
     fn load_pressure(elevated: bool) -> crate::gc::unattended_pacing::PressureSample {
         crate::gc::unattended_pacing::PressureSample {
             memory_elevated: Some(false),
+            memory_warning: None,
             load_elevated: Some(elevated),
         }
     }
@@ -14665,6 +14777,57 @@ mod tests {
         assert!(
             !broker.capacity_removal_due(super::now_ms()).unwrap(),
             "the memory back-off is a hard retry"
+        );
+    }
+
+    /// Memory pressure at the warning level slows a steady slice and never
+    /// stops it: after a bounded wait it removes exactly one landed
+    /// checkout, stops `memory_warning_throttled`, and the next slice waits
+    /// the two-minute gap as a hard retry that the steady minute does not end.
+    #[cfg(unix)]
+    #[test]
+    fn a_memory_warning_allows_one_removal_then_a_hard_two_minute_gap() {
+        let (_owner, _storage, mut broker) =
+            landed_lane_fixture(Some("[worktrees]\nmax_checkouts = 0\n"));
+        let landed = (0..2)
+            .map(|index| {
+                let (session, worktree) =
+                    closed_landed_checkout(&mut broker, &format!("warning {index}"));
+                record_merged_pull_request(&mut broker, session.id, 440 + index);
+                worktree
+            })
+            .collect::<Vec<_>>();
+        let warning = crate::gc::unattended_pacing::PressureSample {
+            memory_elevated: Some(false),
+            memory_warning: Some(true),
+            load_elevated: Some(false),
+        };
+        let (scope, clock) = install_unlimited_scripted_pacer(vec![warning]);
+        let report = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("a memory warning never stops a steady slice");
+        drop(scope);
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert_eq!(landed.iter().filter(|path| path.exists()).count(), 1);
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(
+            slice.stop_reason.as_deref(),
+            Some("memory_warning_throttled"),
+            "{slice:#?}"
+        );
+        assert!(slice.throttled, "{slice:#?}");
+        assert_eq!(slice.pressure_seen.as_deref(), Some("memory"), "{slice:#?}");
+        assert_eq!(slice.memory_wait_ms, 0, "no critical pause: {slice:#?}");
+        assert_eq!(slice.retry_in_ms, Some(120_000), "{slice:#?}");
+        assert!(
+            clock.slept.get() < Duration::from_secs(10),
+            "bounded waits, not the slice: {slice:#?}"
+        );
+        broker.end_steady_removal_back_off_for_test();
+        assert!(
+            !broker.capacity_removal_due(super::now_ms()).unwrap(),
+            "the warning gap is a hard retry"
         );
     }
 
@@ -14800,6 +14963,7 @@ mod tests {
     fn memory_and_load_pressure() -> crate::gc::unattended_pacing::PressureSample {
         crate::gc::unattended_pacing::PressureSample {
             memory_elevated: Some(true),
+            memory_warning: None,
             load_elevated: Some(true),
         }
     }

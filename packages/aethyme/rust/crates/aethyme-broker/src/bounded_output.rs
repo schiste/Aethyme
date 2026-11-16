@@ -180,19 +180,18 @@ fn capture_with_stdin(
     max_stream_bytes: usize,
 ) -> io::Result<LimitedOutput> {
     let _span = crate::phase_telemetry::subprocess_span(command);
-    let deadline = checked_deadline(budget)?;
+    checked_deadline(budget)?;
     checked_stream_limit(max_stream_bytes)?;
-    if Instant::now() >= deadline {
+    if budget.is_zero() {
         return Ok(LimitedOutput::Deadline);
     }
 
-    let mut child = LimitedChild(
+    let mut child = LimitedChild(spawn_serialized(
         command
             .stdin(input)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?,
-    );
+            .stderr(Stdio::piped()),
+    )?);
     let mut stdout_reader = child
         .0
         .stdout
@@ -205,6 +204,9 @@ fn capture_with_stdin(
         .ok_or_else(|| io::Error::other("missing stderr"))?;
     set_probe_nonblocking(&stdout_reader)?;
     set_probe_nonblocking(&stderr_reader)?;
+    // The budget is the child's: a wait for the spawn lock is not charged
+    // to it, so a busy lock cannot time a `ps` snapshot out.
+    let deadline = checked_deadline(budget)?;
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -441,8 +443,41 @@ fn sleep_until_poll(deadline: Instant) {
 /// look as if a descendant kept their output open after their group was gone,
 /// and an unproven cleanup refuses the gate, so concurrent profile probes
 /// failed gate dispatch at random.
+///
+/// Every bounded capture ([`output_limited`], which the process-table
+/// snapshot uses) and the long-lived background spawns that may run on
+/// another thread meanwhile (the environment supervisor) spawn under it too:
+/// a supervisor started from a report command's background thread while
+/// `ps` was being spawned inherited `ps`'s output pipe and lived for
+/// minutes, so the snapshot never saw end-of-file, hit its two-second
+/// deadline and judged every holder unknown (`holder_process_table_failed`
+/// in `status` and `agents` only, the commands that start the supervisor).
 #[cfg(unix)]
 static OWNED_GROUP_SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Spawn `command` under the process-wide spawn lock ([`OWNED_GROUP_SPAWN`]
+/// on Unix), so no other spawn of this process can inherit its pipes.
+/// Counted as `process_spawn_lock_wait` when it had to wait.
+pub(crate) fn spawn_serialized(command: &mut Command) -> io::Result<Child> {
+    #[cfg(unix)]
+    {
+        let started = Instant::now();
+        // The guarded value is empty, so a panicking holder leaves nothing
+        // to repair.
+        let _spawning = OWNED_GROUP_SPAWN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let waited = started.elapsed();
+        if waited >= Duration::from_millis(1) {
+            crate::phase_telemetry::add("process_spawn_lock_wait", waited);
+        }
+        command.spawn()
+    }
+    #[cfg(not(unix))]
+    {
+        command.spawn()
+    }
+}
 
 #[cfg(unix)]
 fn spawn_in_owned_group(command: &mut Command) -> io::Result<Child> {

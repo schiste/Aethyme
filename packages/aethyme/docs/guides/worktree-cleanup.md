@@ -307,10 +307,13 @@ it started can run past it. After each
 removal the slice waits out what Git deleted at
 `[cleanup] unattended_unlinks_per_second` with no lock held, crediting only
 the time Git itself spent deleting; disk-pressure mode does not lift that
-rate. Before every pass it checks pressure. Memory pressure is waited out,
-and memory pressure that outlasts the pacer's pause budget stops the slice
+rate. Before every pass it checks pressure. Critical memory pressure is
+waited out, and when it outlasts the pacer's pause budget it stops the slice
 with nothing more removed and no further slice for 10 minutes
-(`memory_backoff`). Load is a throttle, never a stop: while the one-minute
+(`memory_backoff`). Memory pressure at the warning level is a throttle: the
+check waits at most 5 seconds, the pass runs, the slice removes at most one
+checkout (`memory_warning_throttled`) and the next slice comes no sooner
+than 2 minutes later, whatever lands. Load is a throttle, never a stop: while the one-minute
 load average is above twice the core count (or Linux I/O pressure is high)
 the check waits at most 5 seconds, then the pass runs anyway, the slice
 removes at most one checkout (`load_throttled`) and the next slice keeps the
@@ -360,7 +363,7 @@ holding the most checkouts with the line that would release each,
 (`memory`, `load` or `memory_and_load`) and `throttled` say which pressure the
 slice saw and whether it ran throttled; `stop_reason` says why the slice
 stopped (`cap`, `budget`, `memory_backoff`, `load_throttled`,
-`slice_deadline`, `yielded_to_foreground`, `nothing_selected`,
+`memory_warning_throttled`, `slice_deadline`, `yielded_to_foreground`, `nothing_selected`,
 `lap_complete`, `kept_only_limit`, `lock_busy`, `failed`,
 `removal_failures` or `host_deleter_busy`, when another repository's worker
 kept the host deleter slot through the two-second wait before a removal:

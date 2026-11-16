@@ -1872,6 +1872,7 @@ mod unix {
                 Box::new(Scripted {
                     samples: vec![PressureSample {
                         memory_elevated: Some(false),
+                        memory_warning: None,
                         load_elevated: Some(true),
                     }],
                     reads: Default::default(),
@@ -1911,6 +1912,7 @@ mod unix {
                 Box::new(Scripted {
                     samples: vec![PressureSample {
                         memory_elevated: Some(true),
+                        memory_warning: None,
                         load_elevated: None,
                     }],
                     reads: Default::default(),
