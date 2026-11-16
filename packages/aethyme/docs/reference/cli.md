@@ -1893,6 +1893,28 @@ digest-keyed host-state filename. A snapshot write failure is reported as a
 warning and does not suppress the plan. Without the snapshot, apply falls back
 to requiring the exact current digest, so a failed write costs flexibility, not
 safety.
+
+Without `--session`, `broker gc reclaim plan` covers the whole root within two
+budgets. Discovery stops starting new worktrees after 60 seconds: such a plan
+reports `"confirmable": false` and `discovery.complete: false`, saves no review
+snapshot, prints no apply command, and its digest matches no complete scan, so
+apply refuses it. Sizing stops after 20 seconds in total, reclaimable
+candidates first: every candidate is still listed, and one not measured in
+budget has `"bytes": null` (shown as `unmeasured`), is counted in
+`sizing.unmeasured`, and contributes nothing to `reclaimable_bytes` or
+`total_bytes`, which are then lower bounds. Sizes are not part of the digest,
+so an unmeasured candidate confirms exactly what a measured one would. A plan
+reuses sizes another whole-root plan of the same root measured in the last 90
+seconds (`sizing.reused`), and while one whole-root plan is running (a marker
+naming its pid and process start time, removed when it ends and ignored once
+that process is gone) another waits for it within its sizing budget and does
+not walk the same directories meanwhile (`sizing.deferred_to`). `--full-scan`
+lifts both budgets; `--session <id>` scans and sizes one worktree without
+budgets. Each plan records a `reclaim.plan` row in
+`.aethyme/logs/command-metrics.jsonl` with `phase_timings_ms` (`discovery`,
+`protection`, `in_flight_wait`, `sizing`), `phase_counts` (`worktrees_scanned`,
+`worktrees_not_scanned`, `candidates`, `measured`, `reused`, `unmeasured`) and a
+`reclaim_plan` object; a plan interrupted by a signal records no row.
 `broker gc reclaim apply --confirm <sha256>` re-scans and removes only
 reviewed paths that are still reclaimable. The digest binds the root and the
 sorted candidate paths plus their kept/reclaimable decisions; measured byte

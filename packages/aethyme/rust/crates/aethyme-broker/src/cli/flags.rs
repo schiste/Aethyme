@@ -233,7 +233,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
         &["--outcome", "--reason", "--session"],
     ),
     ("reclaim", &[]),
-    ("reclaim plan", &["--session"]),
+    ("reclaim plan", &["--session", "--full-scan"]),
     ("reclaim apply", &["--confirm", "--session"]),
     (
         "deliveries subscribe",

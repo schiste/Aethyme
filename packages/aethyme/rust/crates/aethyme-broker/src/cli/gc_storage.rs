@@ -413,7 +413,7 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool, full_scan: bool
             out!("  next: resolve the deferred checks and review a new plan");
         } else {
             out!(
-                "  next: use `aethyme broker gc reclaim plan` for build caches or repeat with `aethyme broker gc plan --full-scan` for an exhaustive inventory"
+                "  next: use `aethyme broker gc reclaim plan --session <id>` for one session's build caches or repeat with `aethyme broker gc plan --full-scan` for an exhaustive inventory"
             );
         }
     }
@@ -829,21 +829,68 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
     } else {
         crate::reclaim::Sizing::Measure
     };
-    let mut candidates = match &scope {
-        Some((_, false)) => Vec::new(),
-        Some((worktree, true)) => crate::reclaim::scan_worktree(
-            worktree,
-            &active,
-            &retention_policy.artefact_directories,
-            sizing,
-        ),
-        None => crate::reclaim::scan_root(
-            &root,
-            &active,
-            &retention_policy.artefact_directories,
-            sizing,
-        ),
+    // A whole-root plan is what an agent reaches for when the disk is low.
+    // On the busiest repository it walked every checkout and sized every
+    // build tree serially for 8-16+ minutes, from scratch for each agent that
+    // asked. It now discovers and sizes within budgets, shares what it
+    // measured, and never sizes the root while another plan is doing so.
+    // Apply is untouched: it never sizes and re-proves every path itself.
+    let whole_root_plan = scope.is_none() && matches!(&action, ReclaimAction::Plan);
+    let bounded = whole_root_plan && !parsed.full_scan;
+    let in_flight = if whole_root_plan {
+        let alive = |holder: &crate::reclaim::InFlightPlan| {
+            crate::reclaim::in_flight_holder_alive(holder, now_ms())
+        };
+        let me = crate::reclaim::InFlightPlan::current(now);
+        match crate::reclaim::claim_in_flight(&root, me, &alive) {
+            Ok(claim) => Some(claim),
+            Err(error) => {
+                eprintln!(
+                    "Warning: cannot mark this whole-root reclaim plan as in flight; \
+                     measuring without that coordination: {error}"
+                );
+                None
+            }
+        }
+    } else {
+        None
     };
+    let discovery_started = std::time::Instant::now();
+    let (mut candidates, discovery) = match &scope {
+        Some((_, false)) => (Vec::new(), None),
+        Some((worktree, true)) => (
+            crate::reclaim::scan_worktree(
+                worktree,
+                &active,
+                &retention_policy.artefact_directories,
+                sizing,
+            ),
+            None,
+        ),
+        None => {
+            // A whole-root plan sizes after the protections below, so its
+            // sizing budget goes first to what may actually be reclaimed.
+            let sizing = if whole_root_plan {
+                crate::reclaim::Sizing::Skip
+            } else {
+                sizing
+            };
+            let budget = crate::reclaim::WHOLE_ROOT_DISCOVERY_BUDGET;
+            let deadline = whole_root_deadline(bounded, budget);
+            let (found, mut discovery) = crate::reclaim::scan_root_within(
+                &root,
+                &active,
+                &retention_policy.artefact_directories,
+                sizing,
+                &mut || deadline.passed(),
+            );
+            discovery.budget_ms = whole_root_budget_ms(bounded, budget);
+            discovery.elapsed_ms = elapsed_ms(discovery_started);
+            (found, Some(discovery))
+        }
+    };
+    let discovery_ms = elapsed_ms(discovery_started);
+    let protection_started = std::time::Instant::now();
     // A worktree no session records has no owner who reviewed it, so its
     // artefacts are reported but kept rather than treated as abandoned.
     let recorded: Vec<std::path::PathBuf> = recorded_sessions
@@ -876,36 +923,75 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
         now,
         crate::reclaim::RECENT_WORK_WINDOW_MS,
     );
+    let protection_ms = elapsed_ms(protection_started);
+    let (sizing_report, in_flight_wait_ms) = if whole_root_plan {
+        let (report, wait_ms) = size_whole_root_plan(&root, &mut candidates, in_flight, bounded);
+        (Some(report), wait_ms)
+    } else {
+        (None, 0)
+    };
     let session_flag = parsed
         .session
         .map(|id| format!(" --session {id}"))
         .unwrap_or_default();
     let scope = scope.map(|(worktree, _)| worktree);
-    let digest = crate::reclaim::plan_digest(&root, scope.as_deref(), &candidates);
+    // A plan whose discovery stopped early lists only part of the root. It is
+    // shown, but it is not a review: its digest matches no complete scan and
+    // no snapshot is saved for it, so apply refuses it.
+    let confirmable = discovery.as_ref().is_none_or(|found| found.complete);
+    let digest = if confirmable {
+        crate::reclaim::plan_digest(&root, scope.as_deref(), &candidates)
+    } else {
+        crate::reclaim::partial_plan_digest(&root, &candidates)
+    };
     let plan = crate::ReclaimPlan {
         digest: digest.clone(),
         root: root.clone(),
         scope: scope.clone(),
         reclaimable_bytes: crate::reclaimable_bytes(&candidates),
-        total_bytes: candidates.iter().map(|c| c.bytes).sum(),
+        total_bytes: crate::reclaim::measured_bytes(&candidates),
         candidates,
     };
     let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0));
     match action {
         ReclaimAction::Plan => {
-            if let Err(error) = crate::reclaim::save_snapshot(
-                &root,
-                scope.as_deref(),
-                &plan.digest,
-                &plan.candidates,
-            ) {
+            let details = reclaim_plan_metric_details(
+                &plan,
+                ReclaimPlanPhases {
+                    discovery: discovery.as_ref(),
+                    sizing: sizing_report.as_ref(),
+                    discovery_ms,
+                    protection_ms,
+                    in_flight_wait_ms,
+                    full_scan: parsed.full_scan,
+                    confirmable,
+                },
+            );
+            super::telemetry::set_command_metric_details(details);
+            let snapshot = if confirmable {
+                crate::reclaim::save_snapshot(
+                    &root,
+                    scope.as_deref(),
+                    &plan.digest,
+                    &plan.candidates,
+                )
+            } else {
+                Ok(())
+            };
+            if let Err(error) = snapshot {
                 eprintln!(
                     "Warning: cannot save reclaim plan review snapshot; continuing with the \
                      digest-bound plan: {error}"
                 );
             }
             if parsed.json {
-                out!("{}", serde_json::to_string_pretty(&plan)?);
+                let view = ReclaimPlanView {
+                    plan: &plan,
+                    confirmable,
+                    discovery: discovery.as_ref(),
+                    sizing: sizing_report.as_ref(),
+                };
+                out!("{}", serde_json::to_string_pretty(&view)?);
             } else {
                 out!(
                     "Reclaim plan {}: {} reclaimable of {} found",
@@ -919,13 +1005,21 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
                     } else {
                         format!("  (kept: {})", candidate.reason)
                     };
-                    out!(
-                        "  {:>10}  {}{kept}",
-                        gib(candidate.bytes),
-                        candidate.path.display()
-                    );
+                    let size = candidate.bytes.map_or_else(|| "unmeasured".into(), gib);
+                    out!("  {size:>10}  {}{kept}", candidate.path.display());
                 }
-                if plan.reclaimable_bytes == 0 {
+                let notes =
+                    reclaim_plan_notes(discovery.as_ref(), sizing_report.as_ref(), now_ms());
+                for line in notes {
+                    out!("  {line}");
+                }
+                let unmeasured_reclaimable = plan
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.reclaimable && candidate.bytes.is_none());
+                if !confirmable {
+                    out!("Not applicable: this plan does not cover the whole root.");
+                } else if plan.reclaimable_bytes == 0 && !unmeasured_reclaimable {
                     out!("Nothing to reclaim.");
                 } else {
                     out!(
@@ -1030,6 +1124,201 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
         }
     }
     Ok(())
+}
+
+/// A deadline `limit` from now for a budgeted whole-root plan, or none.
+fn whole_root_deadline(bounded: bool, limit: std::time::Duration) -> crate::reclaim::Deadline {
+    if bounded {
+        crate::reclaim::Deadline::after(limit)
+    } else {
+        crate::reclaim::Deadline::never()
+    }
+}
+
+fn whole_root_budget_ms(bounded: bool, limit: std::time::Duration) -> Option<u64> {
+    bounded.then(|| u64::try_from(limit.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// How often a plan that found another whole-root plan in flight checks
+/// whether it has finished.
+const IN_FLIGHT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Size a whole-root plan's candidates within the sizing budget.
+///
+/// Sizes another whole-root plan measured in the last
+/// [`crate::reclaim::SIZE_REUSE_WINDOW_MS`] are reused. When another plan
+/// holds the in-flight marker this one waits for it, within the sizing
+/// budget, and walks only once it has finished -- two plans never size the
+/// same trees at once. Sizes never authorize a deletion, so reusing or
+/// skipping them leaves the plan's decisions and digest exactly as they were.
+/// Returns the report and how long the wait took.
+fn size_whole_root_plan(
+    root: &Path,
+    candidates: &mut [crate::ReclaimCandidate],
+    claim: Option<crate::reclaim::InFlightClaim>,
+    bounded: bool,
+) -> (crate::reclaim::SizingReport, u64) {
+    use crate::reclaim::{
+        Deadline, InFlightClaim, InFlightPlan, in_flight_holder_alive, measure_within,
+        recent_sizes, record_sizes, wait_for_in_flight,
+    };
+    let budget = crate::reclaim::WHOLE_ROOT_SIZING_BUDGET;
+    let window = crate::reclaim::SIZE_REUSE_WINDOW_MS;
+    let alive = |holder: &InFlightPlan| in_flight_holder_alive(holder, now_ms());
+    let wait_started = std::time::Instant::now();
+    let (walk, deferred_to, _guard) = match claim {
+        Some(InFlightClaim::Claimed(guard)) => (true, None, Some(guard)),
+        Some(InFlightClaim::HeldBy(holder)) => {
+            let wait = Deadline::after(budget);
+            let mut waited_out = || wait.passed();
+            let mut pause = || std::thread::sleep(IN_FLIGHT_POLL);
+            let finished = wait_for_in_flight(root, &alive, &mut waited_out, &mut pause);
+            (finished, (!finished).then_some(holder), None)
+        }
+        None => (true, None, None),
+    };
+    let wait_ms = elapsed_ms(wait_started);
+    let started = std::time::Instant::now();
+    let recent = recent_sizes(root, now_ms(), window);
+    let deadline = whole_root_deadline(bounded, budget);
+    let (mut report, fresh) = measure_within(candidates, &recent, walk, &mut || deadline.passed());
+    if let Err(error) = record_sizes(root, now_ms(), window, &fresh) {
+        eprintln!("Warning: cannot save reclaim plan sizes for the next plan to reuse: {error}");
+    }
+    report.budget_ms = whole_root_budget_ms(bounded, budget);
+    report.deferred_to = deferred_to;
+    report.elapsed_ms = elapsed_ms(started);
+    (report, wait_ms)
+}
+
+/// The `reclaim plan --json` document: the plan, plus how complete it is.
+#[derive(serde::Serialize)]
+struct ReclaimPlanView<'a> {
+    #[serde(flatten)]
+    plan: &'a crate::ReclaimPlan,
+    /// False when discovery stopped early: the digest then authorizes nothing.
+    confirmable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discovery: Option<&'a crate::reclaim::Discovery>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sizing: Option<&'a crate::reclaim::SizingReport>,
+}
+
+/// What a plan's metric row records beyond the plan itself.
+struct ReclaimPlanPhases<'a> {
+    discovery: Option<&'a crate::reclaim::Discovery>,
+    sizing: Option<&'a crate::reclaim::SizingReport>,
+    discovery_ms: u64,
+    protection_ms: u64,
+    in_flight_wait_ms: u64,
+    full_scan: bool,
+    confirmable: bool,
+}
+
+/// The command-metric fields of one `reclaim plan`, so a slow or cut-off
+/// plan leaves phase timings and counts in `command-metrics.jsonl`.
+fn reclaim_plan_metric_details(
+    plan: &crate::ReclaimPlan,
+    phases: ReclaimPlanPhases<'_>,
+) -> serde_json::Value {
+    let discovery = phases.discovery.cloned().unwrap_or_default();
+    let sizing = phases.sizing.cloned().unwrap_or_default();
+    let measured = if phases.sizing.is_some() {
+        sizing.measured
+    } else {
+        plan.candidates
+            .iter()
+            .filter(|candidate| candidate.bytes.is_some())
+            .count()
+    };
+    let unmeasured = plan
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.bytes.is_none())
+        .count();
+    serde_json::json!({
+        "phase_timings_ms": {
+            "discovery": phases.discovery_ms,
+            "protection": phases.protection_ms,
+            "in_flight_wait": phases.in_flight_wait_ms,
+            "sizing": sizing.elapsed_ms,
+        },
+        "phase_counts": {
+            "worktrees_scanned": discovery.worktrees_scanned,
+            "worktrees_not_scanned": discovery.worktrees_not_scanned,
+            "candidates": plan.candidates.len(),
+            "measured": measured,
+            "reused": sizing.reused,
+            "unmeasured": unmeasured,
+        },
+        "reclaim_plan": {
+            "scope": if plan.scope.is_some() { "session" } else { "root" },
+            "full_scan": phases.full_scan,
+            "discovery_complete": phases.discovery.is_none_or(|discovery| discovery.complete),
+            "budget_exhausted": sizing.budget_exhausted,
+            "reused": sizing.reused > 0,
+            "deferred_to_pid": sizing.deferred_to.as_ref().map(|holder| holder.pid),
+            "confirmable": phases.confirmable,
+        },
+    })
+}
+
+/// The lines that explain an incomplete whole-root plan and how to finish it.
+fn reclaim_plan_notes(
+    discovery: Option<&crate::reclaim::Discovery>,
+    sizing: Option<&crate::reclaim::SizingReport>,
+    now_ms: i64,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    let mut incomplete = false;
+    if let Some(sizing) = sizing {
+        if sizing.reused > 0 {
+            notes.push(format!(
+                "reused: {} size(s) another whole-root plan measured in the last {} s",
+                sizing.reused,
+                crate::reclaim::SIZE_REUSE_WINDOW_MS / 1000
+            ));
+        }
+        if sizing.unmeasured > 0 {
+            incomplete = true;
+            let why = match (&sizing.deferred_to, sizing.budget_exhausted) {
+                (Some(holder), _) => format!(
+                    "another whole-root plan (pid {}, started {} s ago) is still measuring this root; re-run when it finishes to reuse its sizes",
+                    holder.pid,
+                    now_ms.saturating_sub(holder.started_at_ms).max(0) / 1000
+                ),
+                (None, true) => format!(
+                    "the {} s sizing budget ran out",
+                    sizing.budget_ms.unwrap_or_default() / 1000
+                ),
+                (None, false) => "they were not measured".into(),
+            };
+            notes.push(format!(
+                "not measured: {} candidate(s), listed as unmeasured and not counted in the totals; {why}",
+                sizing.unmeasured
+            ));
+        }
+    }
+    if let Some(discovery) = discovery.filter(|discovery| !discovery.complete) {
+        incomplete = true;
+        notes.push(format!(
+            "partial: discovery stopped after its {} s budget with {} of {} worktree(s) scanned; this plan cannot be applied",
+            discovery.budget_ms.unwrap_or_default() / 1000,
+            discovery.worktrees_scanned,
+            discovery.worktrees_scanned + discovery.worktrees_not_scanned
+        ));
+    }
+    if incomplete {
+        notes.push(
+            "next: `aethyme broker gc reclaim plan --session <id>` for one session, or `aethyme broker gc reclaim plan --full-scan` for the whole root without budgets"
+                .into(),
+        );
+    }
+    notes
 }
 
 #[cfg(unix)]

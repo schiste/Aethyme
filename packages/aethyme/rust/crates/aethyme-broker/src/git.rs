@@ -14426,7 +14426,7 @@ exit $status
             scope: None,
             candidates: vec![crate::reclaim::ReclaimCandidate {
                 path: dir.clone(),
-                bytes: 4,
+                bytes: Some(4),
                 worktree: f.root.clone(),
                 reclaimable: true,
                 reason: "test".into(),

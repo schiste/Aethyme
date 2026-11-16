@@ -658,7 +658,10 @@ pub(super) fn lowest_headroom_with(
 ///
 /// Both bands name `gc reclaim plan`. `gc plan` and `gc sweep` touch only
 /// closed sessions; build output in an open session is reachable only through
-/// the reviewed `gc reclaim` lane.
+/// the reviewed `gc reclaim` lane. They name its session-scoped form: agents
+/// run the first command, and the whole-root form walked every checkout for
+/// 8-16+ minutes on the busiest repository, once per agent that read this.
+/// The whole-root form is still available and is now budgeted.
 ///
 /// Unknown headroom does not escalate, for the reason `refusal` fails open: a
 /// reading that could not be taken is not evidence of a full disk.
@@ -720,6 +723,10 @@ pub(super) fn gate_headroom_advice(
     };
     evidence.push("the volume is shared: other repositories and files on it count too".into());
     evidence.push("gc reclaim plan covers quiet open sessions' build output".into());
+    evidence.push(
+        "without --session, gc reclaim plan scans the whole root within a budget and lists unmeasured sizes"
+            .into(),
+    );
     Some(StatusAdvice {
         id: if starved {
             "host.gate-headroom"
@@ -741,7 +748,7 @@ pub(super) fn gate_headroom_advice(
         queue_entry_id: None,
         evidence,
         commands: vec![
-            "aethyme broker gc reclaim plan".into(),
+            "aethyme broker gc reclaim plan --session <id>".into(),
             "aethyme broker gc plan".into(),
             "aethyme broker gc storage plan".into(),
         ],

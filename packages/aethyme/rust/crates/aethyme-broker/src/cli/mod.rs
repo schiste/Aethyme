@@ -873,15 +873,18 @@ Usage:
   aethyme broker representation record --session <id> --confirm <sha256> [--json]
       Record the reviewed landing so the session can finish. Re-proves the scan
       and refuses if anything moved since it was reviewed.
-  aethyme broker reclaim plan [--session <id>] [--json]
+  aethyme broker reclaim plan [--session <id>] [--full-scan] [--json]
   aethyme broker reclaim apply --confirm <sha256> [--session <id>] [--json]
       Report regenerable build output (target, node_modules, .venv, build,
       dist) in session worktrees, and remove only what was reviewed. An active
       session's artefacts are listed but never removed. Apply removes each
       reviewed path that is still reclaimable and leaves anything new for a
-      later plan. --session scopes both to one session's worktree. Nothing
-      here is recreated for you: a reclaimed worktree pays a cold build next
-      time.
+      later plan. --session scopes both to one session's worktree. Without it,
+      plan stops finding candidates after 60s (a partial plan cannot be
+      applied) and sizing after 20s (the rest are listed unmeasured), and
+      reuses sizes another plan measured in the last 90s; --full-scan lifts
+      both budgets. Nothing here is recreated for you: a reclaimed worktree
+      pays a cold build next time.
   aethyme broker gc plan [--include-active-gate-cache] [--exclude-orphans] [--full-scan] [--json]
   aethyme broker gc plan --service-directory <directory> --request-key <key> --deadline-ms <utc-ms> [--include-active-gate-cache] [--full-scan] [--json]
       The explicit service form verifies this repository's owner, submits or

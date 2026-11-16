@@ -59,15 +59,18 @@ exit: 0
       requires a reviewed plan and service generation refresh.
   aethyme broker gc service uninstall --confirm <installed-plan-sha256> [--json]
       Remove exact installed service files only after successful deactivation.
-  aethyme broker gc reclaim plan [--session <id>] [--json]
+  aethyme broker gc reclaim plan [--session <id>] [--full-scan] [--json]
   aethyme broker gc reclaim apply --confirm <sha256> [--session <id>] [--json]
       Report regenerable build output (target, node_modules, .venv, build,
       dist) in session worktrees, and remove only what was reviewed. An active
       session's artefacts are listed but never removed. Apply removes each
       reviewed path that is still reclaimable and leaves anything new for a
-      later plan. --session scopes both to one session's worktree. Nothing
-      here is recreated for you: a reclaimed worktree pays a cold build next
-      time.
+      later plan. --session scopes both to one session's worktree. Without it,
+      plan stops finding candidates after 60s (a partial plan cannot be
+      applied) and sizing after 20s (the rest are listed unmeasured), and
+      reuses sizes another plan measured in the last 90s; --full-scan lifts
+      both budgets. Nothing here is recreated for you: a reclaimed worktree
+      pays a cold build next time.
   aethyme broker gc storage [--json]
   aethyme broker gc storage plan [--json]
   aethyme broker gc storage apply --confirm <sha256> [--json]

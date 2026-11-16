@@ -118,6 +118,9 @@ pub(super) const KNOWN_COMMAND_WORDS: &[&str] = &[
     "cleanup",
     "gc",
     "storage",
+    // `gc reclaim` resolves to `reclaim`. A plan attaches its phase timings
+    // and counts, which is what records it; see `command_records_metric`.
+    "reclaim",
     "certify",
     "readiness",
     "scaffold",
@@ -311,8 +314,9 @@ pub(super) fn record_command_metric(
 }
 
 /// Fold the spans recorded anywhere during the command into its metric
-/// fields. A phase the command named itself wins over a span of the same
-/// name; `phase_counts` says how many times each span ran.
+/// fields. A phase or count the command named itself wins over a span of the
+/// same name; `phase_counts` says how many times each span ran, beside any
+/// counts the command attached.
 fn with_spans(
     mut fields: serde_json::Map<String, serde_json::Value>,
     spans: &crate::phase_telemetry::Recorder,
@@ -329,15 +333,14 @@ fn with_spans(
             phases.entry(name).or_insert(elapsed.into());
         }
     }
-    fields.insert(
-        "phase_counts".into(),
-        serde_json::Value::Object(
-            counts
-                .into_iter()
-                .map(|(name, count)| (name, count.into()))
-                .collect(),
-        ),
-    );
+    let named = fields
+        .entry("phase_counts")
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    if let Some(named) = named.as_object_mut() {
+        for (name, count) in counts {
+            named.entry(name).or_insert(count.into());
+        }
+    }
     fields
 }
 
@@ -390,6 +393,10 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
             args.get(1).map(String::as_str),
             Some("apply" | "sweep" | "__continue-artifacts")
         ),
+        // A reclaim plan is an observation and writes no outcome event; it
+        // records its timing line by attaching phase details once it has run,
+        // so a refused selector still leaves no telemetry behind.
+        Some("reclaim") => false,
         Some("storage") => match args.get(1).map(String::as_str) {
             Some("apply") => true,
             Some("attribute") => args.iter().any(|arg| arg == "--apply"),
@@ -500,7 +507,7 @@ fn metric_line(
 mod tests {
     use super::{
         command_metric_enabled, command_records_metric, command_records_outcome, metric_line,
-        safe_command_surface,
+        safe_command_surface, with_spans,
     };
 
     #[test]
@@ -600,6 +607,43 @@ mod tests {
         assert!(!command_records_metric(&quick_test));
         assert!(!command_records_outcome(&quick_test));
         assert!(!command_metric_enabled(&quick_test, true, true));
+    }
+
+    /// A whole-root reclaim plan ran for minutes and left no row at all: its
+    /// label was unknown. It now records once it has run, and only then.
+    #[test]
+    fn a_reclaim_plan_records_its_metric_only_through_attached_details() {
+        let plan = ["reclaim", "plan", "--json"].map(str::to_string);
+        assert_eq!(label("gc reclaim plan").as_deref(), Some("reclaim.plan"));
+        assert!(!command_records_metric(&plan));
+        assert!(!command_records_outcome(&plan));
+        assert!(
+            !command_metric_enabled(&plan, false, false),
+            "a refused selector attaches nothing and writes nothing"
+        );
+        assert!(command_metric_enabled(&plan, false, true));
+    }
+
+    #[test]
+    fn spans_never_replace_counts_or_phases_the_command_attached() {
+        let spans = crate::phase_telemetry::Recorder::default();
+        {
+            let _installed = crate::phase_telemetry::install(spans.clone());
+            crate::phase_telemetry::add("subprocess_git", std::time::Duration::from_millis(2));
+            crate::phase_telemetry::add("measured", std::time::Duration::from_millis(9));
+        }
+        let attached = serde_json::json!({
+            "phase_timings_ms": {"measured": 1},
+            "phase_counts": {"measured": 40, "unmeasured": 3},
+        });
+
+        let fields = with_spans(attached.as_object().unwrap().clone(), &spans);
+
+        assert_eq!(fields["phase_counts"]["measured"], 40);
+        assert_eq!(fields["phase_counts"]["unmeasured"], 3);
+        assert_eq!(fields["phase_counts"]["subprocess_git"], 1);
+        assert_eq!(fields["phase_timings_ms"]["measured"], 1);
+        assert_eq!(fields["phase_timings_ms"]["subprocess_git"], 2);
     }
 
     #[test]
