@@ -832,8 +832,9 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
     // A whole-root plan is what an agent reaches for when the disk is low.
     // On the busiest repository it walked every checkout and sized every
     // build tree serially for 8-16+ minutes, from scratch for each agent that
-    // asked. It now discovers and sizes within budgets, shares what it
-    // measured, and never sizes the root while another plan is doing so.
+    // asked. It now discovers and sizes within budgets and shares what it
+    // measures; a budgeted plan never sizes the root while another plan is
+    // doing so, and `--full-scan` lifts both budgets and never waits.
     // Apply is untouched: it never sizes and re-proves every path itself.
     let whole_root_plan = scope.is_none() && matches!(&action, ReclaimAction::Plan);
     let bounded = whole_root_plan && !parsed.full_scan;
@@ -1236,15 +1237,18 @@ fn elapsed_ms(started: std::time::Instant) -> u64 {
 /// whether it has finished.
 const IN_FLIGHT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Size a whole-root plan's candidates within the sizing budget.
+/// Size a whole-root plan's candidates within `budget` (`None`: unbounded,
+/// for `--full-scan`).
 ///
 /// Sizes another whole-root plan measured in the last
-/// [`crate::reclaim::SIZE_REUSE_WINDOW_MS`] are reused. When another plan
-/// holds the in-flight marker this one waits for it, within the sizing
-/// budget, and walks only once it has finished -- two plans never size the
-/// same trees at once. Sizes never authorize a deletion, so reusing or
-/// skipping them leaves the plan's decisions and digest exactly as they were.
-/// Returns the report and how long the wait took.
+/// [`crate::reclaim::SIZE_REUSE_WINDOW_MS`] are reused, including those a
+/// still-running plan has shared so far. When another plan holds the
+/// in-flight marker, a budgeted plan waits for it within the same deadline
+/// that bounds its walk, and walks only once it has finished; an unbounded
+/// plan never waits. Fresh sizes are shared as they are measured. Sizes never
+/// authorize a deletion, so reusing or skipping them leaves the plan's
+/// decisions and digest exactly as they were. Returns the report and the
+/// wait time and share count.
 fn size_whole_root_plan(
     root: &Path,
     candidates: &mut [crate::ReclaimCandidate],
