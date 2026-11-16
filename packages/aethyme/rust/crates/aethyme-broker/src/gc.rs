@@ -975,6 +975,79 @@ const AUTO_COMPACT_CHECKOUT_RETRY_MS: i64 = 10 * 60_000;
 const AUTO_COMPACT_BACKFILL_RETRY_MS: i64 = 60_000;
 const AUTO_COMPACT_CHECKOUT_BATCH_SIZE: usize = 8;
 const AUTO_COMPACT_BACKFILL_PAGE_SIZE: usize = 32;
+/// The compaction lane reuses a complete cleanup cohort index and rewinds a
+/// full filesystem re-verification lap at most this often, so path changes
+/// SQLite does not see (a retargeted symlink, a remount) are still picked up.
+/// Removal never depends on this: it re-audits every alias under the
+/// lifecycle claim.
+const CLEANUP_COHORT_FULL_LAP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// `<alias_refresh_generation>:<ms>`: the complete lap the compaction lane
+/// last saw and when it first saw it.
+const CLEANUP_COHORT_LAP_VERIFIED_KEY: &str = "gc.artifact_sweep.cleanup_cohort_lap_verified";
+/// Unresolved index rows one compaction pass marks dirty to re-resolve.
+const CLEANUP_COHORT_UNRESOLVED_RETRY_ROWS: usize = 32;
+
+fn cleanup_cohort_full_lap_interval_ms() -> i64 {
+    i64::try_from(CLEANUP_COHORT_FULL_LAP_INTERVAL.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// The detached worker's heavy lanes are not due this soon after boot.
+const ARTIFACT_WORKER_POST_BOOT_HOLD: Duration = Duration::from_secs(10 * 60);
+/// Shortens [`ARTIFACT_WORKER_POST_BOOT_HOLD`] to this many milliseconds; it
+/// can never lengthen it. `0` turns the hold off.
+const ARTIFACT_WORKER_POST_BOOT_HOLD_ENV: &str = "AETHYME_ARTIFACT_WORKER_POST_BOOT_HOLD_MS";
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the host uptime the post-boot hold sees. Unset, tests see
+    /// no uptime and so no hold, whenever the test machine booted.
+    static POST_BOOT_UPTIME_FOR_TEST: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The post-boot hold: the default, or shorter when `value` (the
+/// environment override) names fewer milliseconds.
+fn artifact_worker_post_boot_hold(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .map_or(ARTIFACT_WORKER_POST_BOOT_HOLD, |hold| {
+            hold.min(ARTIFACT_WORKER_POST_BOOT_HOLD)
+        })
+}
+
+/// What is left of `hold` after `uptime`; `None` when the hold is over or
+/// the uptime is unknown (an unsupported platform skips the hold).
+fn post_boot_hold_remaining(uptime: Option<Duration>, hold: Duration) -> Option<Duration> {
+    hold.checked_sub(uptime?)
+        .filter(|remaining| !remaining.is_zero())
+}
+
+/// How long ago the host booted: `kern.boottime` on macOS, `btime` in
+/// `/proc/stat` on Linux, unknown elsewhere or when the clock is behind it.
+#[cfg(not(test))]
+fn host_uptime() -> Option<Duration> {
+    let boot = u64::try_from(crate::git_maintenance_lock::os_boot_unix_seconds()?).ok()?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    now.checked_sub(boot).map(Duration::from_secs)
+}
+
+#[cfg(test)]
+fn host_uptime() -> Option<Duration> {
+    POST_BOOT_UPTIME_FOR_TEST.with(std::cell::Cell::get)
+}
+
+/// What remains of the post-boot hold now, if any.
+fn artifact_worker_post_boot_hold_now() -> Option<Duration> {
+    post_boot_hold_remaining(
+        host_uptime(),
+        artifact_worker_post_boot_hold(
+            std::env::var(ARTIFACT_WORKER_POST_BOOT_HOLD_ENV)
+                .ok()
+                .as_deref(),
+        ),
+    )
+}
 
 fn artifact_worker_cache_lane_duration(
     checkout_cleanup_due: bool,
@@ -8106,11 +8179,114 @@ impl Broker {
         Ok((false, scheduled))
     }
 
-    /// Run one detached compact-maintenance pass. The alias index gets one
-    /// resumable full refresh; the indexed inventory and candidate cursor are
-    /// then consumed within the same reserved pass. Each attempt rebuilds its
-    /// cohort and keeps the full archive reserve; the batch and worker lifetime
-    /// remain bounded independently.
+    /// The cleanup cohort index the compaction lane works from.
+    ///
+    /// A complete index is reused as it is. Database changes reach it through
+    /// the session triggers' dirty rows, which are re-walked alone; rows whose
+    /// path did not resolve are marked dirty and re-walked alone. A full
+    /// filesystem re-verification lap is rewound at most once per
+    /// [`CLEANUP_COHORT_FULL_LAP_INTERVAL`], so a symlink or mount change
+    /// that leaves SQLite untouched is still seen eventually. This is safe
+    /// because the index never authorizes a removal on its own: every
+    /// checkout this lane removes goes through
+    /// `cleanup_after_recovery_archive_for_retirement`, which takes the
+    /// lifecycle claim and, before removing, re-resolves every indexed raw
+    /// path from the filesystem (`cleanup_cohort_filesystem_aliases_match`)
+    /// and refuses on any difference, unresolved row or pending dirty row.
+    /// A stale index can therefore only defer a removal.
+    ///
+    /// Each page is paced by the worker's unattended pacer; the walk stops at
+    /// `deadline` or for critical memory pressure and resumes next pass.
+    fn compaction_cleanup_cohort_index(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<Option<crate::store::cleanup_cohort::CleanupCohortScanState>, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("auto_compact_cohort_index");
+        let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
+        let current = self.store().cleanup_cohort_scan_state(namespace)?;
+        let reason = match current {
+            Some(state) if state.complete && state.unresolved_rows > 0 => {
+                let unresolved = self.store().cleanup_cohort_unresolved_session_ids(
+                    namespace,
+                    CLEANUP_COHORT_UNRESOLVED_RETRY_ROWS,
+                )?;
+                self.store()
+                    .mark_cleanup_cohort_rows_dirty(namespace, &unresolved)?;
+                "auto_compact_cohort_index_walk_unresolved_rows"
+            }
+            Some(state) if state.complete => {
+                let verified_at =
+                    self.cleanup_cohort_lap_verified_at(state.alias_refresh_generation, now_ms())?;
+                if now_ms().saturating_sub(verified_at) < cleanup_cohort_full_lap_interval_ms() {
+                    crate::phase_telemetry::add("auto_compact_cohort_index_reused", Duration::ZERO);
+                    return Ok(Some(state));
+                }
+                "auto_compact_cohort_index_walk_interval_elapsed"
+            }
+            Some(state) if state.pending_dirty_rows > 0 => {
+                "auto_compact_cohort_index_walk_dirty_rows"
+            }
+            _ => "auto_compact_cohort_index_walk_incomplete",
+        };
+        crate::phase_telemetry::add(reason, Duration::ZERO);
+        let mut latest = current;
+        let mut last_progress_sequence = None;
+        loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let progress = self.refresh_cleanup_cohort_aliases_paced(Some(deadline))?;
+            latest = progress.state;
+            let Some(state) = progress.state else {
+                break;
+            };
+            if state.complete
+                || progress.pressure_stopped
+                || last_progress_sequence == Some(state.progress_sequence)
+            {
+                break;
+            }
+            last_progress_sequence = Some(state.progress_sequence);
+        }
+        if let Some(state) = latest.filter(|state| state.complete) {
+            self.cleanup_cohort_lap_verified_at(state.alias_refresh_generation, now_ms())?;
+        }
+        Ok(latest)
+    }
+
+    /// When the compaction lane first saw the complete lap
+    /// `alias_refresh_generation`, recording `now` when it is a lap it has
+    /// not seen. A lap another lane completed counts from when this lane
+    /// first saw it.
+    fn cleanup_cohort_lap_verified_at(
+        &mut self,
+        alias_refresh_generation: i64,
+        now: i64,
+    ) -> Result<i64, BrokerOpError> {
+        let recorded = self
+            .artifact_sweep_meta_get(CLEANUP_COHORT_LAP_VERIFIED_KEY)?
+            .and_then(|value| {
+                let (generation, at) = value.split_once(':')?;
+                Some((generation.parse::<i64>().ok()?, at.parse::<i64>().ok()?))
+            });
+        if let Some((generation, at)) = recorded
+            && generation == alias_refresh_generation
+        {
+            return Ok(at);
+        }
+        self.artifact_sweep_meta_set(
+            CLEANUP_COHORT_LAP_VERIFIED_KEY,
+            &format!("{alias_refresh_generation}:{now}"),
+        )?;
+        Ok(now)
+    }
+
+    /// Run one detached compact-maintenance pass. The alias index is reused
+    /// when complete and otherwise caught up resumably
+    /// ([`Self::compaction_cleanup_cohort_index`]); the indexed inventory and
+    /// candidate cursor are then consumed within the same reserved pass. Each
+    /// attempt rebuilds its cohort and keeps the full archive reserve; the
+    /// batch and worker lifetime remain bounded independently.
     fn auto_compact_checkout_recovery_pass(
         &mut self,
         deadline: Instant,
@@ -8146,31 +8322,14 @@ impl Broker {
         };
 
         // Leave the helper's minimum archive/removal reserve untouched while
-        // the full alias lap and bounded stock pages run.
+        // the index catches up and bounded stock pages run.
         let refresh_deadline = deadline
             .checked_sub(crate::auto_cleanup::AUTO_COMPACTION_MIN_BUDGET)
             .unwrap_or(deadline);
-        let mut refreshed_index = None;
-        let mut last_progress_sequence = None;
-        loop {
-            if Instant::now() >= refresh_deadline {
-                break;
-            }
-            let Some(state) = self.refresh_cleanup_cohort_aliases(Some(refresh_deadline))? else {
-                break;
-            };
-            if state.complete {
-                refreshed_index = Some(state);
-                break;
-            }
-            if last_progress_sequence == Some(state.progress_sequence) {
-                break;
-            }
-            last_progress_sequence = Some(state.progress_sequence);
-        }
-        let Some(index_state) = refreshed_index
-            .filter(|state| state.unresolved_rows == 0 && state.pending_dirty_rows == 0)
-        else {
+        let refreshed_index = self.compaction_cleanup_cohort_index(refresh_deadline)?;
+        let Some(index_state) = refreshed_index.filter(|state| {
+            state.complete && state.unresolved_rows == 0 && state.pending_dirty_rows == 0
+        }) else {
             drop(gc_lock);
             return self.defer_auto_compact_checkout_worker(
                 "compact_checkout_alias_index_incomplete",
@@ -8783,6 +8942,28 @@ impl Broker {
             }
             return Ok(());
         }
+        // Right after boot the machine is busy starting everything else: the
+        // heavy lanes (checkout removal, compaction and its cohort-index
+        // walk, requested checkout cleanup) are not due yet. Their requests
+        // stay durable and become due when the hold ends.
+        let heavy_lanes_held = match artifact_worker_post_boot_hold_now() {
+            Some(remaining) if capacity_removal_due || compact_due || checkout_cleanup_due => {
+                self.hold_heavy_artifact_worker_lanes_after_boot(
+                    remaining,
+                    removal_trigger,
+                    compact_due,
+                    checkout_cleanup_due,
+                )?;
+                true
+            }
+            _ => false,
+        };
+        let capacity_removal_due = capacity_removal_due && !heavy_lanes_held;
+        let compact_due = compact_due && !heavy_lanes_held;
+        let checkout_cleanup_due = checkout_cleanup_due && !heavy_lanes_held;
+        if heavy_lanes_held && !(artifact_due || session_retirement_due) {
+            return Ok(());
+        }
         let coalesced = self.take_coalesced_artifact_worker_requests()?;
         unattended_pacing::record_requests_coalesced(coalesced);
         // One unattended deleter per machine: the pacer takes the host
@@ -8872,14 +9053,17 @@ impl Broker {
                         if cache_passes > 0 {
                             // Each pass releases the GC lock; leave it free
                             // long enough for a waiter, then let checkout
-                            // removal take its slice before more cache work.
+                            // removal take its slice before more cache work
+                            // (unless the post-boot hold put removal off).
                             let started = Instant::now();
                             std::thread::sleep(ARTIFACT_WORKER_GC_LOCK_YIELD);
-                            broker.run_capacity_removal_slice_isolated(
-                                worker_started,
-                                capacity_limits(),
-                                false,
-                            )?;
+                            if !heavy_lanes_held {
+                                broker.run_capacity_removal_slice_isolated(
+                                    worker_started,
+                                    capacity_limits(),
+                                    false,
+                                )?;
+                            }
                             let used = started.elapsed();
                             capacity_spent.set(capacity_spent.get().saturating_add(used));
                             remaining = remaining.map(|remaining| remaining.saturating_sub(used));
@@ -8926,7 +9110,7 @@ impl Broker {
             // Compact archives run only in this detached worker. A fresh
             // wake may have arrived during the cache lane, so recheck policy,
             // the backfill marker and per-session due times here.
-            let compact_pending = broker.compact_checkout_work_pending()?;
+            let compact_pending = !heavy_lanes_held && broker.compact_checkout_work_pending()?;
             let compact_due = compact_pending && broker.compact_checkout_work_due(now_ms())?;
             let cleanup_pending_before_compact = if compact_due {
                 broker.auto_checkout_cleanup_recovery_requested()?
@@ -8945,6 +9129,8 @@ impl Broker {
                     cleanup_due_before_compact,
                 ) {
                     let deadline = Instant::now() + pass_budget;
+                    let _span =
+                        crate::phase_telemetry::span("artifact_worker_compact_checkout_pass");
                     let pass = broker.with_host_deleter_pin(|broker| {
                         Ok(broker.auto_compact_checkout_recovery_pass(deadline))
                     })?;
@@ -8979,8 +9165,9 @@ impl Broker {
             // request in the outbox without a generation: queue it first.
             broker.reconcile_checkout_cleanup_outbox()?;
             let cleanup_pending = broker.auto_checkout_cleanup_recovery_requested()?;
-            let cleanup_due =
-                cleanup_pending && !broker.auto_checkout_cleanup_retry_pending(now_ms())?;
+            let cleanup_due = !heavy_lanes_held
+                && cleanup_pending
+                && !broker.auto_checkout_cleanup_retry_pending(now_ms())?;
             if cleanup_due {
                 let request_generation = broker
                     .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)?
@@ -9127,6 +9314,41 @@ impl Broker {
             ARTIFACT_WORKER_STEADY_REMOVAL_HARD_RETRY_AFTER_KEY,
             &now_ms().saturating_add(wait_ms).to_string(),
         )
+    }
+
+    /// Put the heavy lanes due in this run off until the post-boot hold
+    /// ends, `remaining` from now: each keeps its request and gets a retry
+    /// time, exactly as a lane deferred for a busy lock does. Nothing is
+    /// removed, skipped or completed.
+    fn hold_heavy_artifact_worker_lanes_after_boot(
+        &mut self,
+        remaining: Duration,
+        removal_trigger: Option<CheckoutRemovalTrigger>,
+        compact_due: bool,
+        checkout_cleanup_due: bool,
+    ) -> Result<(), BrokerOpError> {
+        crate::phase_telemetry::add("artifact_worker_post_boot_hold", remaining);
+        let wait_ms = i64::try_from(remaining.as_millis())
+            .unwrap_or(i64::MAX)
+            .max(1);
+        match removal_trigger {
+            Some(CheckoutRemovalTrigger::Steady) => self.defer_steady_removal(wait_ms)?,
+            Some(CheckoutRemovalTrigger::Pressure) => self.artifact_sweep_meta_set(
+                ARTIFACT_WORKER_CAPACITY_REMOVAL_RETRY_AFTER_KEY,
+                &now_ms().saturating_add(wait_ms).to_string(),
+            )?,
+            None => {}
+        }
+        if compact_due {
+            self.defer_auto_compact_checkout_worker("compact_checkout_post_boot_hold", wait_ms)?;
+        }
+        if checkout_cleanup_due {
+            self.defer_auto_checkout_cleanup_worker_for(
+                "checkout_cleanup_post_boot_hold",
+                wait_ms,
+            )?;
+        }
+        self.write_artifact_sweep_worker_status(&format!("post_boot_hold remaining_ms={wait_ms}"))
     }
 
     /// Whether the retry time stored under `key` is still ahead of `now`.
@@ -15309,6 +15531,258 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Two closed checkouts, a complete cohort index, and compaction on with
+    /// nothing due, so a pass does only its index work.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn compaction_index_fixture() -> (
+        tempfile::TempDir,
+        crate::test_storage::TestStorage,
+        Broker,
+        i64,
+    ) {
+        let (temporary, storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (first, _, _) = closed_artifact_cache(&mut broker, "cohort index first");
+        closed_artifact_cache(&mut broker, "cohort index second");
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\ncompact_closed_worktrees = true\nclosed_worktree_grace_hours = 360\nauto_cleanup_worktrees_on_finish = false\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        (temporary, storage, broker, first)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn cohort_index_state(
+        broker: &mut Broker,
+    ) -> crate::store::cleanup_cohort::CleanupCohortScanState {
+        broker
+            .store()
+            .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_compaction_index_pass(broker: &mut Broker) {
+        broker
+            .auto_compact_checkout_recovery_pass(
+                Instant::now() + AUTO_COMPACT_CHECKOUT_WORKER_RESERVE,
+            )
+            .unwrap();
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("compact_checkout_seeded=0 no_due_candidates"),
+            "the pass got past its index gate"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_second_compaction_pass_reuses_the_complete_cohort_index_without_writing() {
+        let (_temporary, _storage, mut broker, _first) = compaction_index_fixture();
+        run_compaction_index_pass(&mut broker);
+        let before = cohort_index_state(&mut broker);
+        assert!(before.complete);
+        crate::store::cleanup_cohort::install_cohort_write_log_for_test(
+            broker.store().connection(),
+        );
+
+        run_compaction_index_pass(&mut broker);
+
+        // Rewinding a complete lap on every pass bumped the alias generation
+        // and rewrote every session row, ancestor and group each time.
+        let after = cohort_index_state(&mut broker);
+        assert_eq!(after, before, "no lap is rewound and no page committed");
+        assert_eq!(
+            crate::store::cleanup_cohort::cohort_writes_for_test(broker.store().connection()),
+            Vec::new()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_dirty_session_rewrites_only_its_own_cohort_row() {
+        let (_temporary, _storage, mut broker, first) = compaction_index_fixture();
+        run_compaction_index_pass(&mut broker);
+        let before = cohort_index_state(&mut broker);
+        assert_eq!(
+            broker
+                .store()
+                .mark_cleanup_cohort_rows_dirty(
+                    crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+                    &[first],
+                )
+                .unwrap(),
+            1
+        );
+        crate::store::cleanup_cohort::install_cohort_write_log_for_test(
+            broker.store().connection(),
+        );
+
+        run_compaction_index_pass(&mut broker);
+
+        let after = cohort_index_state(&mut broker);
+        assert!(after.complete && after.pending_dirty_rows == 0);
+        assert_eq!(
+            after.alias_refresh_generation, before.alias_refresh_generation,
+            "a dirty row is drained in place, not by a new lap"
+        );
+        let writes =
+            crate::store::cleanup_cohort::cohort_writes_for_test(broker.store().connection());
+        assert!(
+            writes
+                .iter()
+                .any(|(table, _, session)| table == "rows" && *session == first),
+            "{writes:?}"
+        );
+        assert!(
+            writes.iter().all(|(_, _, session)| *session == first),
+            "only the dirty session's rows are written: {writes:?}"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_full_cohort_lap_is_still_rewound_once_its_interval_elapsed() {
+        let (_temporary, _storage, mut broker, _first) = compaction_index_fixture();
+        run_compaction_index_pass(&mut broker);
+        let before = cohort_index_state(&mut broker);
+        // The lap was first seen at the epoch: far more than the interval ago.
+        broker
+            .artifact_sweep_meta_set(
+                CLEANUP_COHORT_LAP_VERIFIED_KEY,
+                &format!("{}:0", before.alias_refresh_generation),
+            )
+            .unwrap();
+        crate::store::cleanup_cohort::install_cohort_write_log_for_test(
+            broker.store().connection(),
+        );
+
+        run_compaction_index_pass(&mut broker);
+
+        let after = cohort_index_state(&mut broker);
+        assert!(after.complete);
+        assert_eq!(
+            after.alias_refresh_generation,
+            before.alias_refresh_generation + 1,
+            "an elapsed interval re-verifies every registered path"
+        );
+        assert!(after.progress_sequence > before.progress_sequence);
+        // The re-verification resolved every row and found nothing changed.
+        assert_eq!(
+            crate::store::cleanup_cohort::cohort_writes_for_test(broker.store().connection()),
+            Vec::new()
+        );
+        let recorded = broker
+            .artifact_sweep_meta_get(CLEANUP_COHORT_LAP_VERIFIED_KEY)
+            .unwrap()
+            .unwrap();
+        assert!(
+            recorded.starts_with(&format!("{}:", after.alias_refresh_generation)),
+            "{recorded}"
+        );
+        assert_ne!(recorded, format!("{}:0", after.alias_refresh_generation));
+    }
+
+    #[test]
+    fn the_post_boot_hold_override_only_shortens_it() {
+        assert_eq!(
+            artifact_worker_post_boot_hold(None),
+            ARTIFACT_WORKER_POST_BOOT_HOLD
+        );
+        assert_eq!(
+            artifact_worker_post_boot_hold(Some("1500")),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(artifact_worker_post_boot_hold(Some("0")), Duration::ZERO);
+        assert_eq!(
+            artifact_worker_post_boot_hold(Some("86400000")),
+            ARTIFACT_WORKER_POST_BOOT_HOLD,
+            "the override never lengthens the hold"
+        );
+        assert_eq!(
+            artifact_worker_post_boot_hold(Some("soon")),
+            ARTIFACT_WORKER_POST_BOOT_HOLD
+        );
+        assert_eq!(
+            post_boot_hold_remaining(
+                Some(Duration::from_secs(60)),
+                ARTIFACT_WORKER_POST_BOOT_HOLD
+            ),
+            Some(ARTIFACT_WORKER_POST_BOOT_HOLD - Duration::from_secs(60))
+        );
+        assert_eq!(
+            post_boot_hold_remaining(
+                Some(ARTIFACT_WORKER_POST_BOOT_HOLD + Duration::from_secs(1)),
+                ARTIFACT_WORKER_POST_BOOT_HOLD
+            ),
+            None
+        );
+        assert_eq!(
+            post_boot_hold_remaining(
+                Some(Duration::from_secs(1)),
+                artifact_worker_post_boot_hold(Some("0"))
+            ),
+            None,
+            "a zero override turns the hold off"
+        );
+        assert_eq!(
+            post_boot_hold_remaining(None, ARTIFACT_WORKER_POST_BOOT_HOLD),
+            None,
+            "an unknown uptime skips the hold"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_post_boot_hold_defers_compaction_and_keeps_its_request() {
+        let (_temporary, _storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (session_id, worktree, _) = closed_artifact_cache(&mut broker, "post boot hold");
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\ncompact_closed_worktrees = true\nclosed_worktree_grace_hours = 0\nauto_cleanup_worktrees_on_finish = false\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        broker
+            .store()
+            .request_closed_spawned_checkout_compactions(&[session_id], 0, now_ms())
+            .unwrap();
+        assert!(broker.compact_checkout_work_due(now_ms()).unwrap());
+
+        POST_BOOT_UPTIME_FOR_TEST.with(|uptime| uptime.set(Some(Duration::from_secs(60))));
+        let remaining = artifact_worker_post_boot_hold_now().expect("one minute after boot");
+        assert!(remaining > Duration::from_secs(8 * 60), "{remaining:?}");
+        broker
+            .hold_heavy_artifact_worker_lanes_after_boot(remaining, None, true, false)
+            .unwrap();
+
+        assert!(
+            !broker.compact_checkout_work_due(now_ms()).unwrap(),
+            "compaction is not due until the hold ends"
+        );
+        assert!(
+            broker.compact_checkout_work_pending().unwrap(),
+            "the compaction request stays durable"
+        );
+        assert!(worktree.exists(), "nothing is removed during the hold");
+        assert!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
+                .unwrap()
+                .is_some_and(|status| status.starts_with("post_boot_hold")),
+        );
+
+        POST_BOOT_UPTIME_FOR_TEST.with(|uptime| {
+            uptime.set(Some(
+                ARTIFACT_WORKER_POST_BOOT_HOLD + Duration::from_secs(1),
+            ))
+        });
+        assert_eq!(artifact_worker_post_boot_hold_now(), None);
     }
 
     #[test]

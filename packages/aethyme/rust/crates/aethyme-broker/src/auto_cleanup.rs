@@ -101,6 +101,19 @@ pub(crate) const AUTO_CLEANUP_LAST_REPORT_KEY: &str = "auto_cleanup.last_report"
 const AUTO_CLEANUP_CURSOR_KEY: &str = "auto_cleanup.cursor";
 const AUTO_CLEANUP_CURSOR_VERSION: u32 = 3;
 const CLEANUP_COHORT_SCAN_PAGE_SIZE: usize = 16;
+/// Sessions per second a paced cohort-index lap resolves at most in the
+/// detached worker. Each one canonicalizes a checkout path and looks up its
+/// Git directory; a full lap over several thousand sessions then spreads
+/// over tens of seconds instead of one burst of filesystem and SQLite work.
+const CLEANUP_COHORT_SCAN_ROWS_PER_SECOND: u32 = 256;
+/// Where a paced cohort-index refresh stopped.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CleanupCohortScanProgress {
+    /// The index state after the last page, `None` when it has none.
+    pub(crate) state: Option<crate::store::cleanup_cohort::CleanupCohortScanState>,
+    /// The unattended pacer stopped the lap for critical memory pressure.
+    pub(crate) pressure_stopped: bool,
+}
 /// Paging under capacity pressure never selects more checkouts for removal
 /// in one pass than a single page could before (32 groups), so removal is
 /// no faster per pass than it was; it only stops spending passes on pages
@@ -5075,10 +5088,12 @@ impl Broker {
         }
         let expected_after = page.state.after_session_id;
         let mut resolved_rows = Vec::with_capacity(page.sessions.len());
+        let resolve_started = Instant::now();
         for session in &page.sessions {
             if deadline_expired(deadline) {
                 break;
             }
+            crate::phase_telemetry::add("cleanup_cohort_scan_rows_resolved", Duration::ZERO);
             let resolved = ResolvedWorktreePath::resolve(Path::new(&session.worktree_path));
             let mut errors = resolved.resolution_errors;
             let canonical_path = match resolved.canonical_or_raw.to_str() {
@@ -5104,6 +5119,7 @@ impl Broker {
                 cleanup_state: session.cleanup_state.as_str().to_owned(),
             });
         }
+        crate::phase_telemetry::add("cleanup_cohort_scan_resolve", resolve_started.elapsed());
         if resolved_rows.is_empty() {
             return Ok(self.store().cleanup_cohort_scan_state(
                 crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
@@ -5112,6 +5128,7 @@ impl Broker {
         let reached_high_water = resolved_rows
             .last()
             .is_some_and(|row| row.session_id >= page.state.high_water_session_id);
+        let _persist = crate::phase_telemetry::span("cleanup_cohort_scan_persist");
         let outcome = self.store().persist_cleanup_cohort_scan_page(
             crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
             page.state.revision,
@@ -5132,18 +5149,88 @@ impl Broker {
             .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)?)
     }
 
+    /// Advance discovery pages until the lap completes, the deadline passes,
+    /// or the page cap is reached. When `paced`, every page first goes
+    /// through the unattended pacer: in the detached worker it is held to
+    /// [`CLEANUP_COHORT_SCAN_ROWS_PER_SECOND`], waits a bounded time under
+    /// load or a memory warning, and stops resumably at critical memory
+    /// pressure. Foreground callers install no pacer and never wait.
     fn complete_cleanup_cohort_scan(
         &mut self,
         deadline: Option<Instant>,
-    ) -> Result<Option<crate::store::cleanup_cohort::CleanupCohortScanState>, BrokerOpError> {
+        paced: bool,
+    ) -> Result<CleanupCohortScanProgress, BrokerOpError> {
         let mut pages = 0usize;
+        let mut previous_page_rows = 0u64;
         loop {
+            if !paced {
+                let Some(state) = self.advance_cleanup_cohort_scan(deadline)? else {
+                    return Ok(CleanupCohortScanProgress {
+                        state: None,
+                        pressure_stopped: false,
+                    });
+                };
+                pages += 1;
+                if state.complete
+                    || deadline_expired(deadline)
+                    || pages >= cleanup_cohort_page_cap()
+                {
+                    return Ok(CleanupCohortScanProgress {
+                        state: Some(state),
+                        pressure_stopped: false,
+                    });
+                }
+                continue;
+            }
+            let pacer_started = Instant::now();
+            let verdict = crate::gc::unattended_pacing::before_unattended_scan_batch(
+                deadline,
+                previous_page_rows,
+                CLEANUP_COHORT_SCAN_ROWS_PER_SECOND,
+            );
+            crate::phase_telemetry::add("cleanup_cohort_scan_pacer_wait", pacer_started.elapsed());
+            match verdict {
+                crate::gc::unattended_pacing::PressureVerdict::Clear => {}
+                crate::gc::unattended_pacing::PressureVerdict::LoadThrottled => {
+                    crate::phase_telemetry::add(
+                        "cleanup_cohort_scan_load_throttled",
+                        Duration::ZERO,
+                    );
+                }
+                crate::gc::unattended_pacing::PressureVerdict::MemoryWarningThrottled => {
+                    crate::phase_telemetry::add(
+                        "cleanup_cohort_scan_memory_warning_throttled",
+                        Duration::ZERO,
+                    );
+                }
+                crate::gc::unattended_pacing::PressureVerdict::MemoryBackoff => {
+                    crate::phase_telemetry::add(
+                        "cleanup_cohort_scan_memory_backoff",
+                        Duration::ZERO,
+                    );
+                    return Ok(CleanupCohortScanProgress {
+                        state: self.store().cleanup_cohort_scan_state(
+                            crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+                        )?,
+                        pressure_stopped: true,
+                    });
+                }
+            }
             let Some(state) = self.advance_cleanup_cohort_scan(deadline)? else {
-                return Ok(None);
+                return Ok(CleanupCohortScanProgress {
+                    state: None,
+                    pressure_stopped: false,
+                });
             };
             pages += 1;
+            // The next page pays for this one as a full page: a short last
+            // page only makes the wait before a page that is not taken.
+            previous_page_rows = cleanup_cohort_scan_page_size() as u64;
             if state.complete || deadline_expired(deadline) || pages >= cleanup_cohort_page_cap() {
-                return Ok(Some(state));
+                return Ok(CleanupCohortScanProgress {
+                    state: Some(state),
+                    pressure_stopped: false,
+                });
             }
         }
     }
@@ -5159,7 +5246,22 @@ impl Broker {
             crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
             now_ms(),
         )?;
-        self.complete_cleanup_cohort_scan(deadline)
+        Ok(self.complete_cleanup_cohort_scan(deadline, false)?.state)
+    }
+
+    /// [`Self::refresh_cleanup_cohort_aliases`] with every page paced by the
+    /// installed unattended pacer (the compaction lane of the detached
+    /// worker), also saying whether the pacer stopped the lap for memory
+    /// pressure. Without an installed pacer it never waits.
+    pub(crate) fn refresh_cleanup_cohort_aliases_paced(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<CleanupCohortScanProgress, BrokerOpError> {
+        self.store().begin_cleanup_cohort_alias_refresh(
+            crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+            now_ms(),
+        )?;
+        self.complete_cleanup_cohort_scan(deadline, true)
     }
 
     /// Recheck every registered raw session path with filesystem-only
