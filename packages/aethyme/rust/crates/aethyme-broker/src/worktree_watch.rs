@@ -61,7 +61,11 @@ use crate::git::{GitError, GitRepo};
 /// Directory under the host state directory. The suffix is the on-disk
 /// protocol version: a different layout must use a different directory, so
 /// two binaries never read each other's files.
-const DIRECTORY: &str = "worktree-watch-v1";
+///
+/// v2 added claims: a v2 watcher skips a change when no claim names the
+/// published counter, and a v1 command stores answers without claiming, so a
+/// v1 command must never store answers where a v2 watcher publishes.
+const DIRECTORY: &str = "worktree-watch-v2";
 #[cfg_attr(not(unix), allow(dead_code))]
 const LOCK: &str = "watch.lock";
 /// Held by the watcher only once its epoch is published; see `run`.
