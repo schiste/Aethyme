@@ -353,7 +353,8 @@ fn record(call: &ShimCall, name: &str, outcome: &str, reason: Option<&str>) {
         "shim_us".to_string(),
         u64::try_from(call.started.elapsed().as_micros()).unwrap_or(u64::MAX),
     );
-    let _ = telemetry::append(
+    // Best effort, and silent: the shim's stderr belongs to the launcher.
+    if let Err(_unrecorded) = telemetry::append(
         directory,
         &Event {
             at_ms: telemetry::now_ms(),
@@ -367,7 +368,9 @@ fn record(call: &ShimCall, name: &str, outcome: &str, reason: Option<&str>) {
             shadowed: false,
             fallback: false,
         },
-    );
+    ) {
+        // Nothing more to do: a shim never prints on its own behalf.
+    }
 }
 
 fn canonical(path: &Path) -> Option<PathBuf> {

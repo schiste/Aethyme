@@ -206,19 +206,22 @@ pub fn record(host: &Path, report: &BypassReport) {
         .map(|(name, value)| ((*name).to_string(), *value))
         .collect();
     phases.insert("bypassing".into(), report.total() as u64);
-    let _ = telemetry::append(
-        host,
-        &Event {
-            at_ms: telemetry::now_ms(),
-            command: "bypass".into(),
-            name: "bypass".into(),
-            outcome: report.state.into(),
-            reason: None,
-            copy: None,
-            key: None,
-            phases_ms: phases,
-            shadowed: false,
-            fallback: false,
-        },
+    crate::warn_unrecorded(
+        "record the MCP bypass event",
+        telemetry::append(
+            host,
+            &Event {
+                at_ms: telemetry::now_ms(),
+                command: "bypass".into(),
+                name: "bypass".into(),
+                outcome: report.state.into(),
+                reason: None,
+                copy: None,
+                key: None,
+                phases_ms: phases,
+                shadowed: false,
+                fallback: false,
+            },
+        ),
     );
 }

@@ -383,18 +383,23 @@ fn manage_add(args: &[String]) -> u8 {
     };
     let mut created: Option<Vec<String>> = None;
     let result = edit_host_file(&host, &name, |document| {
-        let servers = servers_mut(document)?;
-        if find_server(servers, &name).is_none() {
+        if find_server(servers_mut(document)?, &name).is_none() {
             let mut table = Table::new();
+            // Comments at the end of the file stay where they were: above
+            // the appended table rather than after it.
+            let trailing = document.trailing().clone();
+            document.set_trailing("");
+            table.decor_mut().set_prefix(trailing);
             table.insert("name", value(name.as_str()));
             let argv = match packages.first() {
                 Some(package) => vec!["npx".to_string(), "-y".to_string(), package.clone()],
                 None => vec![executables[0].clone()],
             };
             table.insert("argv", string_array(&argv));
-            servers.push(table);
+            servers_mut(document)?.push(table);
             created = Some(argv);
         }
+        let servers = servers_mut(document)?;
         let table = find_server(servers, &name).ok_or("the entry could not be added")?;
         table.insert("managed", value(true));
         if packages.is_empty() {

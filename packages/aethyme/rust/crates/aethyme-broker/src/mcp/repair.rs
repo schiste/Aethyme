@@ -925,20 +925,23 @@ pub fn record(host: &Path, report: &Report, command_ms: u64) {
                 .or_default() += value;
         }
     }
-    let _ = telemetry::append(
-        host,
-        &Event {
-            at_ms: telemetry::now_ms(),
-            command: "repair".into(),
-            name: "repair".into(),
-            outcome: outcome.into(),
-            reason: None,
-            copy: None,
-            key: None,
-            phases_ms: phases,
-            shadowed: false,
-            fallback: false,
-        },
+    crate::warn_unrecorded(
+        "record the MCP repair event",
+        telemetry::append(
+            host,
+            &Event {
+                at_ms: telemetry::now_ms(),
+                command: "repair".into(),
+                name: "repair".into(),
+                outcome: outcome.into(),
+                reason: None,
+                copy: None,
+                key: None,
+                phases_ms: phases,
+                shadowed: false,
+                fallback: false,
+            },
+        ),
     );
 }
 
