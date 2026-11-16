@@ -788,6 +788,13 @@ fn read_boot_proof() -> Result<BootProof, String> {
     })
 }
 
+/// When the host booted, in whole Unix seconds, from the same native source
+/// as the boot proof; `None` where it cannot be read.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn os_boot_unix_seconds() -> Option<i64> {
+    read_os_boot_time().ok().map(|(_, boot)| boot.seconds)
+}
+
 #[cfg(target_os = "macos")]
 fn read_os_boot_time() -> Result<(String, Timestamp), String> {
     let name = b"kern.boottime\0";
