@@ -5253,15 +5253,38 @@ impl Broker {
     /// installed unattended pacer (the compaction lane of the detached
     /// worker), also saying whether the pacer stopped the lap for memory
     /// pressure. Without an installed pacer it never waits.
+    ///
+    /// Only `may_rewind` lets it start a new lap over a complete one; a
+    /// walker that chose to drain dirty rows or finish a lap from state it
+    /// read earlier passes `false`, so a lap another walker completed
+    /// meanwhile is kept.
     pub(crate) fn refresh_cleanup_cohort_aliases_paced(
         &mut self,
         deadline: Option<Instant>,
+        may_rewind: bool,
     ) -> Result<CleanupCohortScanProgress, BrokerOpError> {
-        self.store().begin_cleanup_cohort_alias_refresh(
+        let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
+        if may_rewind {
+            self.store()
+                .begin_cleanup_cohort_alias_refresh(namespace, now_ms())?;
+        } else {
+            self.store()
+                .resume_cleanup_cohort_alias_refresh(namespace, now_ms())?;
+        }
+        self.complete_cleanup_cohort_scan(deadline, true)
+    }
+
+    /// Resume an unfinished lap or drain dirty rows without ever starting a
+    /// new lap over a complete one (unpaced).
+    fn resume_cleanup_cohort_aliases(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<Option<crate::store::cleanup_cohort::CleanupCohortScanState>, BrokerOpError> {
+        self.store().resume_cleanup_cohort_alias_refresh(
             crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
             now_ms(),
         )?;
-        self.complete_cleanup_cohort_scan(deadline, true)
+        Ok(self.complete_cleanup_cohort_scan(deadline, false)?.state)
     }
 
     /// Recheck every registered raw session path with filesystem-only
@@ -6127,7 +6150,9 @@ impl Broker {
                 let _span = crate::phase_telemetry::span("auto_cleanup_cohort_index_refresh");
                 let mut last_progress = None;
                 loop {
-                    let Some(state) = self.refresh_cleanup_cohort_aliases(deadline)? else {
+                    // This lane only ever catches an index up: a lap another
+                    // walker completed since `existing` was read is kept.
+                    let Some(state) = self.resume_cleanup_cohort_aliases(deadline)? else {
                         *waiting_on = Some(InventoryWait::CohortIndex);
                         return Ok(None);
                     };

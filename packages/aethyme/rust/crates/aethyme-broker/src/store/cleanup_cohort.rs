@@ -211,6 +211,28 @@ impl BrokerStore {
         namespace: &str,
         now_ms: i64,
     ) -> Result<CleanupCohortScanState, BrokerError> {
+        self.start_cleanup_cohort_alias_refresh(namespace, now_ms, true)
+    }
+
+    /// [`Self::begin_cleanup_cohort_alias_refresh`] that never starts a new
+    /// lap: a stored lap that is complete with no dirty row is left exactly
+    /// as it is. A walker that chose to drain dirty rows or finish a lap
+    /// from state it read earlier uses this, so a lap another walker
+    /// completed meanwhile is not rewound under it.
+    pub(crate) fn resume_cleanup_cohort_alias_refresh(
+        &mut self,
+        namespace: &str,
+        now_ms: i64,
+    ) -> Result<CleanupCohortScanState, BrokerError> {
+        self.start_cleanup_cohort_alias_refresh(namespace, now_ms, false)
+    }
+
+    fn start_cleanup_cohort_alias_refresh(
+        &mut self,
+        namespace: &str,
+        now_ms: i64,
+        may_rewind: bool,
+    ) -> Result<CleanupCohortScanState, BrokerError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -249,7 +271,8 @@ impl BrokerStore {
                 },
             )
             .optional()?;
-        let rewound = matches!(prior, Some((.., complete, _)) if complete && dirty_count == 0);
+        let rewound =
+            may_rewind && matches!(prior, Some((.., complete, _)) if complete && dirty_count == 0);
         let state = match prior {
             Some((
                 scan_revision,
@@ -282,6 +305,27 @@ impl BrokerStore {
                     pending_dirty_rows: dirty_count,
                 }
             }
+            Some((
+                scan_revision,
+                generation,
+                alias_generation,
+                progress_sequence,
+                old_high_water,
+                after,
+                _,
+                progress_at_ms,
+            )) if !may_rewind => CleanupCohortScanState {
+                revision: scan_revision,
+                generation,
+                alias_refresh_generation: alias_generation,
+                progress_sequence,
+                high_water_session_id: old_high_water,
+                after_session_id: after,
+                complete: true,
+                progress_at_ms,
+                unresolved_rows: 0,
+                pending_dirty_rows: 0,
+            },
             Some((_, generation, alias_generation, progress_sequence, _, _, _, progress_at_ms)) => {
                 let next_alias_generation = alias_generation.saturating_add(1).max(1);
                 let complete = high_water == 0 && dirty_count == 0;
@@ -354,23 +398,29 @@ impl BrokerStore {
         })
     }
 
-    /// Up to `limit` indexed rows whose path resolution failed, oldest first,
-    /// each with whether its session row still exists. Marking a live one
-    /// dirty re-resolves only that row; see
-    /// [`Self::mark_orphaned_cleanup_cohort_rows_dirty`] for the others.
+    /// Up to `limit` indexed rows after `after_session_id` whose path
+    /// resolution failed, in session order, each with whether its session
+    /// row still exists. Marking a live one dirty re-resolves only that row;
+    /// see [`Self::mark_orphaned_cleanup_cohort_rows_dirty`] for the others.
     pub(crate) fn cleanup_cohort_unresolved_rows(
         &self,
         namespace: &str,
+        after_session_id: i64,
         limit: usize,
     ) -> Result<Vec<(i64, bool)>, BrokerError> {
         let mut stmt = self.conn.prepare(
             "SELECT r.session_id, EXISTS(SELECT 1 FROM sessions s WHERE s.id = r.session_id)
              FROM cleanup_cohort_scan_rows r
              WHERE r.namespace = ?1 AND r.resolution_error IS NOT NULL
+               AND r.session_id > ?3
              ORDER BY r.session_id LIMIT ?2",
         )?;
         let rows = stmt.query_map(
-            params![namespace, i64::try_from(limit).unwrap_or(i64::MAX)],
+            params![
+                namespace,
+                i64::try_from(limit).unwrap_or(i64::MAX),
+                after_session_id
+            ],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
         )?;
         rows.collect::<Result<Vec<_>, _>>()

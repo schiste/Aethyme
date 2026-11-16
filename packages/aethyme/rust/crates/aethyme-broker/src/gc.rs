@@ -986,9 +986,13 @@ const CLEANUP_COHORT_FULL_LAP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 
 const CLEANUP_COHORT_LAP_VERIFIED_KEY: &str = "gc.artifact_sweep.cleanup_cohort_lap_verified";
 /// Unresolved index rows one compaction pass marks dirty to re-resolve.
 const CLEANUP_COHORT_UNRESOLVED_RETRY_ROWS: usize = 32;
-/// Time the index catch-up leaves before a compaction pass's archive
-/// reserve for taking the host deleter pin (which waits up to ten seconds).
-const COMPACT_INDEX_CATCH_UP_PIN_MARGIN: Duration = Duration::from_secs(15);
+/// The compaction lane's cohort-index catch-up walks for at most this long,
+/// before (not out of) the compaction pass's own budget. It holds no lock
+/// and deletes nothing, and every page is paced.
+const COMPACT_INDEX_CATCH_UP_BUDGET: Duration = Duration::from_secs(30);
+/// Where the next window of unresolved index rows to consider starts.
+const CLEANUP_COHORT_UNRESOLVED_CURSOR_KEY: &str =
+    "gc.artifact_sweep.cleanup_cohort_unresolved_cursor";
 /// One unresolved index row is re-resolved at most this often.
 const CLEANUP_COHORT_UNRESOLVED_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Unresolved index rows one pass reads to choose retries from.
@@ -997,6 +1001,13 @@ const CLEANUP_COHORT_UNRESOLVED_SCAN_ROWS: usize = 1_024;
 /// unresolved index row for re-resolution.
 const CLEANUP_COHORT_UNRESOLVED_RETRIED_KEY: &str =
     "gc.artifact_sweep.cleanup_cohort_unresolved_retried";
+
+/// Whether `interval` ms have passed since `at`. A time in the future (the
+/// clock stepped back) counts as elapsed, so it never holds a retry or a
+/// re-verification off for longer than the interval.
+fn interval_elapsed(at: i64, now: i64, interval: i64) -> bool {
+    at > now || now.saturating_sub(at) >= interval
+}
 
 fn cleanup_cohort_full_lap_interval_ms() -> i64 {
     i64::try_from(CLEANUP_COHORT_FULL_LAP_INTERVAL.as_millis()).unwrap_or(i64::MAX)
@@ -1055,6 +1066,18 @@ thread_local! {
     /// installed runtime pair.
     static WORKER_LANE_GATES_OPEN_FOR_TEST: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+type CohortIndexReadHook = Box<dyn FnOnce(&mut Broker)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs once right after the compaction lane reads the
+    /// cohort index state, as another walker would between that read and
+    /// the walk.
+    static AFTER_COHORT_INDEX_READ_FOR_TEST: std::cell::RefCell<Option<CohortIndexReadHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -8234,36 +8257,64 @@ impl Broker {
         let _span = crate::phase_telemetry::span("auto_compact_cohort_index");
         let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
         let current = self.store().cleanup_cohort_scan_state(namespace)?;
-        let reason = match current {
+        #[cfg(test)]
+        if let Some(hook) = AFTER_COHORT_INDEX_READ_FOR_TEST.with(|hook| hook.borrow_mut().take()) {
+            hook(self);
+        }
+        let walk_time = Instant::now() < deadline;
+        let now = now_ms();
+        // Only an elapsed re-verification interval may start a new lap; every
+        // other reason catches the stored lap up and keeps it, even if a
+        // foreground walker completed it since `current` was read.
+        let (reason, may_rewind) = match current {
             Some(state)
-                if state.complete
+                if walk_time
+                    && state.complete
                     && state.unresolved_rows > 0
-                    && self.retry_unresolved_cleanup_cohort_rows(now_ms())? > 0 =>
+                    && self.retry_unresolved_cleanup_cohort_rows(now)? > 0 =>
             {
-                "auto_compact_cohort_index_walk_unresolved_rows"
+                ("auto_compact_cohort_index_walk_unresolved_rows", false)
             }
             Some(state) if state.complete => {
                 let verified_at =
-                    self.cleanup_cohort_lap_verified_at(state.alias_refresh_generation, now_ms())?;
-                if now_ms().saturating_sub(verified_at) < cleanup_cohort_full_lap_interval_ms() {
+                    self.cleanup_cohort_lap_verified_at(state.alias_refresh_generation, now)?;
+                let due = interval_elapsed(verified_at, now, cleanup_cohort_full_lap_interval_ms());
+                if !due || !walk_time {
+                    if !walk_time && (due || state.unresolved_rows > 0) {
+                        crate::phase_telemetry::add(
+                            "auto_compact_cohort_index_catch_up_skipped_no_time",
+                            Duration::ZERO,
+                        );
+                    }
                     crate::phase_telemetry::add("auto_compact_cohort_index_reused", Duration::ZERO);
                     return Ok(Some(state));
                 }
-                "auto_compact_cohort_index_walk_interval_elapsed"
+                ("auto_compact_cohort_index_walk_interval_elapsed", true)
             }
             Some(state) if state.pending_dirty_rows > 0 => {
-                "auto_compact_cohort_index_walk_dirty_rows"
+                ("auto_compact_cohort_index_walk_dirty_rows", false)
             }
-            _ => "auto_compact_cohort_index_walk_incomplete",
+            _ => ("auto_compact_cohort_index_walk_incomplete", false),
         };
+        if !walk_time {
+            crate::phase_telemetry::add(
+                "auto_compact_cohort_index_catch_up_skipped_no_time",
+                Duration::ZERO,
+            );
+            return Ok(current);
+        }
         crate::phase_telemetry::add(reason, Duration::ZERO);
         let mut latest = current;
         let mut last_progress_sequence = None;
+        let mut first = true;
         loop {
             if Instant::now() >= deadline {
                 break;
             }
-            let progress = self.refresh_cleanup_cohort_aliases_paced(Some(deadline))?;
+            // A rewind starts at most one lap; later calls resume it.
+            let progress =
+                self.refresh_cleanup_cohort_aliases_paced(Some(deadline), may_rewind && first)?;
+            first = false;
             latest = progress.state;
             let Some(state) = progress.state else {
                 break;
@@ -8288,40 +8339,61 @@ impl Broker {
     /// stays unresolvable does not bump the cleanup revision (which makes
     /// concurrent alias checks refuse) on every pass. A row whose session is
     /// gone is queued for removal, as the session delete trigger would have
-    /// done; no discovery lap would ever remove it. Returns the rows queued;
-    /// `0` means there is nothing to walk.
+    /// done; no discovery lap would ever remove it. Rows are read in a window
+    /// of [`CLEANUP_COHORT_UNRESOLVED_SCAN_ROWS`] that rotates from a stored
+    /// cursor, so every unresolved row is eventually considered however many
+    /// there are; only retries still inside their interval are remembered.
+    /// Returns the rows queued; `0` means there is nothing to walk.
     fn retry_unresolved_cleanup_cohort_rows(&mut self, now: i64) -> Result<usize, BrokerOpError> {
         let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
-        let unresolved = self
-            .store()
-            .cleanup_cohort_unresolved_rows(namespace, CLEANUP_COHORT_UNRESOLVED_SCAN_ROWS)?;
+        let cursor = self
+            .artifact_sweep_meta_get(CLEANUP_COHORT_UNRESOLVED_CURSOR_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let mut window = self.store().cleanup_cohort_unresolved_rows(
+            namespace,
+            cursor,
+            CLEANUP_COHORT_UNRESOLVED_SCAN_ROWS,
+        )?;
+        if window.len() < CLEANUP_COHORT_UNRESOLVED_SCAN_ROWS && cursor > 0 {
+            // Wrap around to the rows before the cursor.
+            let wrapped = self.store().cleanup_cohort_unresolved_rows(
+                namespace,
+                0,
+                CLEANUP_COHORT_UNRESOLVED_SCAN_ROWS - window.len(),
+            )?;
+            window.extend(wrapped.into_iter().filter(|(id, _)| *id <= cursor));
+        }
+        let interval =
+            i64::try_from(CLEANUP_COHORT_UNRESOLVED_RETRY_INTERVAL.as_millis()).unwrap_or(i64::MAX);
         let recorded = self
             .artifact_sweep_meta_get(CLEANUP_COHORT_UNRESOLVED_RETRIED_KEY)?
             .and_then(|value| serde_json::from_str::<BTreeMap<i64, i64>>(&value).ok())
             .unwrap_or_default();
-        // Forget rows that resolved or left the index since.
+        // A retry time only matters while its interval runs; one in the
+        // future (the clock stepped back) has expired.
         let mut retried: BTreeMap<i64, i64> = recorded
             .iter()
-            .filter(|(id, _)| unresolved.iter().any(|(row, _)| row == *id))
+            .filter(|(_, at)| !interval_elapsed(**at, now, interval))
             .map(|(id, at)| (*id, *at))
             .collect();
-        let interval =
-            i64::try_from(CLEANUP_COHORT_UNRESOLVED_RETRY_INTERVAL.as_millis()).unwrap_or(i64::MAX);
         let mut live = Vec::new();
         let mut orphaned = Vec::new();
-        for (session_id, session_exists) in &unresolved {
+        let mut next_cursor = window.last().map_or(0, |(id, _)| *id);
+        for (session_id, session_exists) in &window {
             if !session_exists {
                 orphaned.push(*session_id);
-            } else if retried
-                .get(session_id)
-                .is_some_and(|at| now.saturating_sub(*at) < interval)
-            {
+            } else if retried.contains_key(session_id) {
                 crate::phase_telemetry::add(
                     "auto_compact_cohort_index_unresolved_retry_skipped",
                     Duration::ZERO,
                 );
             } else if live.len() < CLEANUP_COHORT_UNRESOLVED_RETRY_ROWS {
                 live.push(*session_id);
+                if live.len() == CLEANUP_COHORT_UNRESOLVED_RETRY_ROWS {
+                    // Start the next window right after the last row queued.
+                    next_cursor = *session_id;
+                }
             }
         }
         let marked = self
@@ -8347,6 +8419,12 @@ impl Broker {
                 }
             })?;
             self.artifact_sweep_meta_set(CLEANUP_COHORT_UNRESOLVED_RETRIED_KEY, &value)?;
+        }
+        if next_cursor != cursor {
+            self.artifact_sweep_meta_set(
+                CLEANUP_COHORT_UNRESOLVED_CURSOR_KEY,
+                &next_cursor.to_string(),
+            )?;
         }
         Ok(marked.saturating_add(removed))
     }
@@ -8389,28 +8467,27 @@ impl Broker {
     /// makes it start over rather than corrupt the index. The pass then
     /// re-reads the index state under the GC lock and defers unless it is
     /// still complete.
-    fn compact_checkout_index_catch_up(&mut self, deadline: Instant) -> Result<(), BrokerOpError> {
+    ///
+    /// It has its own `budget` (at most [`COMPACT_INDEX_CATCH_UP_BUDGET`]),
+    /// taken before the pass's own budget rather than out of it.
+    fn compact_checkout_index_catch_up(&mut self, budget: Duration) -> Result<(), BrokerOpError> {
         if !load_retention_policy(self.main_root())?.compact_closed_worktrees {
             return Ok(());
         }
-        let catch_up_deadline = deadline
-            .checked_sub(
-                crate::auto_cleanup::AUTO_COMPACTION_MIN_BUDGET
-                    .saturating_add(COMPACT_INDEX_CATCH_UP_PIN_MARGIN),
-            )
-            .unwrap_or_else(Instant::now);
-        self.compaction_cleanup_cohort_index(catch_up_deadline)?;
+        let budget = budget.min(COMPACT_INDEX_CATCH_UP_BUDGET);
+        self.compaction_cleanup_cohort_index(Instant::now() + budget)?;
         Ok(())
     }
 
     /// One compact-maintenance pass without a host deleter pin: catch the
-    /// index up, then run [`Self::auto_compact_checkout_recovery_pass_indexed`].
+    /// index up within what is left before `deadline`, then run
+    /// [`Self::auto_compact_checkout_recovery_pass_indexed`].
     #[cfg(test)]
     fn auto_compact_checkout_recovery_pass(
         &mut self,
         deadline: Instant,
     ) -> Result<(), BrokerOpError> {
-        self.compact_checkout_index_catch_up(deadline)?;
+        self.compact_checkout_index_catch_up(deadline.saturating_duration_since(Instant::now()))?;
         self.auto_compact_checkout_recovery_pass_indexed(deadline)
     }
 
@@ -9259,47 +9336,61 @@ impl Broker {
             let cleanup_due_before_compact = cleanup_pending_before_compact
                 && !broker.auto_checkout_cleanup_retry_pending(now_ms())?;
             if compact_due {
-                let remaining =
-                    ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
-                let remaining_for_compact =
-                    remaining.saturating_sub(SESSION_RETIREMENT_WORKER_RESERVE);
-                if let Some(pass_budget) = compact_checkout_worker_pass_budget(
-                    remaining_for_compact,
-                    cleanup_due_before_compact,
+                let remaining_for_compact = || {
+                    ARTIFACT_SWEEP_WORKER_MAX_DURATION
+                        .saturating_sub(worker_started.elapsed())
+                        .saturating_sub(SESSION_RETIREMENT_WORKER_RESERVE)
+                };
+                let cleanup_reserve = if cleanup_due_before_compact {
+                    AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE
+                } else {
+                    Duration::ZERO
+                };
+                let _span = crate::phase_telemetry::span("artifact_worker_compact_checkout_pass");
+                // The index walk paces itself and holds no lock: it runs
+                // first, on its own budget within the worker's, before the
+                // pin and the GC lock, so its waits block no one and the
+                // pass keeps its full budget.
+                match broker.compact_checkout_index_catch_up(
+                    remaining_for_compact().saturating_sub(cleanup_reserve),
                 ) {
-                    let deadline = Instant::now() + pass_budget;
-                    let _span =
-                        crate::phase_telemetry::span("artifact_worker_compact_checkout_pass");
-                    // The index walk paces itself; it runs before the pin
-                    // and the GC lock so its waits block no one.
-                    let pass = match broker.compact_checkout_index_catch_up(deadline) {
-                        Err(error @ BrokerOpError::Store(_)) => return Err(error),
-                        Err(error) => Some(Err(error)),
-                        Ok(()) => broker.with_host_deleter_pin(|broker| {
-                            Ok(broker.auto_compact_checkout_recovery_pass_indexed(deadline))
-                        })?,
-                    };
-                    match pass {
-                        None => broker.defer_auto_compact_checkout_worker(
-                            "compact_checkout_host_deleter_busy",
-                            ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS,
-                        )?,
-                        Some(Err(error)) => {
-                            if matches!(error, BrokerOpError::Store(_)) {
-                                return Err(error);
+                    Err(error @ BrokerOpError::Store(_)) => return Err(error),
+                    Err(error) => broker.defer_auto_compact_checkout_worker(
+                        &format!("compact_checkout_index_failed: {error}"),
+                        AUTO_COMPACT_CHECKOUT_RETRY_MS,
+                    )?,
+                    Ok(()) => {
+                        if let Some(pass_budget) = compact_checkout_worker_pass_budget(
+                            remaining_for_compact(),
+                            cleanup_due_before_compact,
+                        ) {
+                            let deadline = Instant::now() + pass_budget;
+                            let pass = broker.with_host_deleter_pin(|broker| {
+                                Ok(broker.auto_compact_checkout_recovery_pass_indexed(deadline))
+                            })?;
+                            match pass {
+                                None => broker.defer_auto_compact_checkout_worker(
+                                    "compact_checkout_host_deleter_busy",
+                                    ARTIFACT_WORKER_CAPACITY_REMOVAL_LOCK_BUSY_RETRY_MS,
+                                )?,
+                                Some(Err(error)) => {
+                                    if matches!(error, BrokerOpError::Store(_)) {
+                                        return Err(error);
+                                    }
+                                    broker.defer_auto_compact_checkout_worker(
+                                        &format!("compact_checkout_pass_failed: {error}"),
+                                        AUTO_COMPACT_CHECKOUT_RETRY_MS,
+                                    )?;
+                                }
+                                Some(Ok(_)) => {}
                             }
+                        } else {
                             broker.defer_auto_compact_checkout_worker(
-                                &format!("compact_checkout_pass_failed: {error}"),
-                                AUTO_COMPACT_CHECKOUT_RETRY_MS,
+                                "compact_checkout_worker_reserve_unavailable",
+                                AUTO_COMPACT_BACKFILL_RETRY_MS,
                             )?;
                         }
-                        Some(Ok(_)) => {}
                     }
-                } else {
-                    broker.defer_auto_compact_checkout_worker(
-                        "compact_checkout_worker_reserve_unavailable",
-                        AUTO_COMPACT_BACKFILL_RETRY_MS,
-                    )?;
                 }
             }
 
@@ -16211,7 +16302,10 @@ mod tests {
         ));
 
         let stopped = broker
-            .refresh_cleanup_cohort_aliases_paced(Some(Instant::now() + Duration::from_secs(5)))
+            .refresh_cleanup_cohort_aliases_paced(
+                Some(Instant::now() + Duration::from_secs(5)),
+                true,
+            )
             .unwrap();
         drop(scope);
 
@@ -16240,6 +16334,216 @@ mod tests {
             resumed.alias_refresh_generation,
             state.alias_refresh_generation
         );
+    }
+
+    /// Make the stored row of `session_id` differ from what its path
+    /// resolves to and mark it dirty, so a drain must rewrite it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn stale_dirty_cohort_row(broker: &mut Broker, session_id: i64) {
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE cleanup_cohort_scan_rows SET git_dir = '/stale/git-dir'
+                 WHERE session_id = ?1",
+                [session_id],
+            )
+            .unwrap();
+        assert_eq!(
+            broker
+                .store()
+                .mark_cleanup_cohort_rows_dirty(
+                    crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+                    &[session_id],
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn indexed_session_ids(broker: &mut Broker) -> Vec<i64> {
+        broker
+            .store()
+            .connection()
+            .prepare("SELECT session_id FROM cleanup_cohort_scan_rows ORDER BY session_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<i64>, _>>()
+            .unwrap()
+    }
+
+    /// The catch-up chose to drain a dirty row from state it read; a
+    /// foreground walker drains it and completes the lap before the
+    /// catch-up walks. The catch-up must keep that lap, not rewind a new
+    /// one (which would make the foreground removal's alias re-audit refuse
+    /// and leave the index incomplete for a whole lap).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_lap_completed_after_the_catch_up_read_its_state_is_not_rewound() {
+        let (_temporary, _storage, mut broker, first) = compaction_index_fixture();
+        run_compaction_index_pass(&mut broker);
+        let before = cohort_index_state(&mut broker);
+        stale_dirty_cohort_row(&mut broker, first);
+        AFTER_COHORT_INDEX_READ_FOR_TEST.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|broker: &mut Broker| {
+                let foreground = broker
+                    .refresh_cleanup_cohort_aliases(None)
+                    .unwrap()
+                    .unwrap();
+                assert!(foreground.complete && foreground.pending_dirty_rows == 0);
+            }));
+        });
+
+        broker
+            .compact_checkout_index_catch_up(COMPACT_INDEX_CATCH_UP_BUDGET)
+            .unwrap();
+
+        assert!(AFTER_COHORT_INDEX_READ_FOR_TEST.with(|hook| hook.borrow().is_none()));
+        let after = cohort_index_state(&mut broker);
+        assert!(after.complete, "{after:?}");
+        assert_eq!(
+            after.alias_refresh_generation, before.alias_refresh_generation,
+            "the completed lap is kept"
+        );
+    }
+
+    /// The catch-up has its own budget: a compaction pass budget below the
+    /// old 75 s carve-out still drains the index and runs the pass.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_short_pass_budget_still_lets_the_index_catch_up() {
+        let (_temporary, _storage, mut broker, first) = compaction_index_fixture();
+        run_compaction_index_pass(&mut broker);
+        stale_dirty_cohort_row(&mut broker, first);
+
+        broker
+            .auto_compact_checkout_recovery_pass(Instant::now() + Duration::from_secs(65))
+            .unwrap();
+
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("compact_checkout_seeded=0 no_due_candidates")
+        );
+        let after = cohort_index_state(&mut broker);
+        assert!(after.complete && after.pending_dirty_rows == 0, "{after:?}");
+    }
+
+    /// With no walk time the unresolved retry is not taken: no dirty mark,
+    /// no revision bump, and the row's retry slot is still free next time.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn no_retry_slot_is_used_when_the_catch_up_has_no_time() {
+        let (_temporary, _storage, mut broker, first) = compaction_index_fixture();
+        run_compaction_index_pass(&mut broker);
+        set_cohort_resolution_error(&mut broker, first, Some("lookup failed"));
+        let revisions = broker.store().cleanup_authority_revisions().unwrap();
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let installed = crate::phase_telemetry::install(recorder.clone());
+
+        broker
+            .compact_checkout_index_catch_up(Duration::ZERO)
+            .unwrap();
+
+        drop(installed);
+        assert_eq!(
+            recorder
+                .totals()
+                .1
+                .get("auto_compact_cohort_index_catch_up_skipped_no_time"),
+            Some(&1)
+        );
+        assert_eq!(
+            broker.store().cleanup_authority_revisions().unwrap(),
+            revisions
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(CLEANUP_COHORT_UNRESOLVED_RETRIED_KEY)
+                .unwrap(),
+            None,
+            "no retry slot was taken"
+        );
+
+        broker
+            .compact_checkout_index_catch_up(COMPACT_INDEX_CATCH_UP_BUDGET)
+            .unwrap();
+        assert_eq!(cohort_resolution_error(&mut broker, first), Some(None));
+    }
+
+    /// A retry time or lap marker in the future (the clock stepped back)
+    /// counts as expired rather than holding work off until the clock
+    /// catches up.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn times_in_the_future_count_as_expired() {
+        let (_temporary, _storage, mut broker, first) = compaction_index_fixture();
+        run_compaction_index_pass(&mut broker);
+        let future = now_ms() + 60 * 60 * 1_000;
+
+        set_cohort_resolution_error(&mut broker, first, Some("lookup failed"));
+        broker
+            .artifact_sweep_meta_set(
+                CLEANUP_COHORT_UNRESOLVED_RETRIED_KEY,
+                &format!("{{\"{first}\":{future}}}"),
+            )
+            .unwrap();
+        run_compaction_index_pass(&mut broker);
+        assert_eq!(
+            cohort_resolution_error(&mut broker, first),
+            Some(None),
+            "a future retry time does not hold the retry off"
+        );
+
+        let before = cohort_index_state(&mut broker);
+        broker
+            .artifact_sweep_meta_set(
+                CLEANUP_COHORT_LAP_VERIFIED_KEY,
+                &format!("{}:{future}", before.alias_refresh_generation),
+            )
+            .unwrap();
+        run_compaction_index_pass(&mut broker);
+        assert_eq!(
+            cohort_index_state(&mut broker).alias_refresh_generation,
+            before.alias_refresh_generation + 1,
+            "a future lap marker does not hold re-verification off"
+        );
+        assert!(interval_elapsed(future, now_ms(), 1_000));
+        assert!(!interval_elapsed(now_ms(), now_ms(), 60_000));
+    }
+
+    /// Unresolved rows are read from a rotating cursor, so rows before it
+    /// are reached by wrapping around rather than never.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unresolved_rows_before_the_cursor_are_reached_by_wrapping() {
+        let (_temporary, _storage, mut broker, _first) = compaction_index_fixture();
+        run_compaction_index_pass(&mut broker);
+        let ids = indexed_session_ids(&mut broker);
+        assert!(ids.len() >= 2, "{ids:?}");
+        for id in &ids {
+            set_cohort_resolution_error(&mut broker, *id, Some("lookup failed"));
+        }
+        broker
+            .artifact_sweep_meta_set(
+                CLEANUP_COHORT_UNRESOLVED_CURSOR_KEY,
+                &ids.last().unwrap().to_string(),
+            )
+            .unwrap();
+
+        run_compaction_index_pass(&mut broker);
+
+        for id in &ids {
+            assert_eq!(
+                cohort_resolution_error(&mut broker, *id),
+                Some(None),
+                "{id}"
+            );
+        }
     }
 
     /// The hold seen through the worker lanes: with compaction and steady
