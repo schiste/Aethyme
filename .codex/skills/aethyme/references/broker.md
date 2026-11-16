@@ -98,7 +98,18 @@ the reviewed plan's full `--confirm <sha256>`. On an applied archive resolution,
 exit status zero can mean the archive succeeded while checkout removal failed. Check `worktree_removed` and
 `cleanup_error`, verify the checkout is absent, and retain the archive before
 reporting reclaimed storage. A partial removal needs inspection, not a blind
-retry or forced deletion.
+retry or forced deletion. The archive resolver cannot archive an ignored
+directory as a unit; preview can refuse with `ignored path ... is neither a
+regular file nor a symbolic link`. Inspect its exact contents. Add only paths
+verified to contain regenerable output to `[cleanup].regenerable`; otherwise
+keep the checkout.
+
+If cleanup refuses unresolved artifact-use markers, run
+`broker gc artifact-use reconcile plan <session-id>`. Confirm the recorded PID
+and process group are absent before applying that plan's digest; apply removes
+only markers re-proven quiescent. If the plan retains a marker because
+historical identity evidence is missing, confirm its producer is gone before
+removing that exact marker by hand. `--force` does not override this hold.
 
 At the checkout cap, an already-closed, retained checkout owned by your task
 can be reused without allocating or deleting a worktree. Verify that no live
