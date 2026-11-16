@@ -107,6 +107,15 @@ impl Broker {
         {
             return Err("not_closed_spawned");
         }
+        // A session closed within its closed-checkout grace is left to the
+        // ordinary lanes first, as its checkout would be.
+        match crate::load_retention_policy(self.main_root()) {
+            Ok(policy) if policy.closed_worktree_in_grace(session, crate::clock::epoch_ms()) => {
+                return Err("in_grace");
+            }
+            Ok(_) => {}
+            Err(_) => return Err("policy_unavailable"),
+        }
         let worktree = Path::new(&session.worktree_path);
         match std::fs::symlink_metadata(worktree) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
