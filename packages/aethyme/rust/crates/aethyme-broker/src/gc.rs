@@ -3524,6 +3524,27 @@ fn artifact_sweep_worker_lock_file(main_root: &Path) -> Result<std::fs::File, Br
 }
 
 /// Try to become the one process allowed to schedule or run continuation.
+/// The detached worker's singleton lock, after waiting out the launcher's
+/// handoff: `attempts` tries `poll` apart. `None` when another worker keeps
+/// it, counted as `artifact_worker_already_active`; that worker serves the
+/// backlog, so the caller exits successfully.
+pub(crate) fn take_artifact_sweep_worker_lock_after_handoff(
+    main_root: &Path,
+    attempts: usize,
+    poll: Duration,
+) -> Result<Option<crate::file_lock::ExclusiveFileLock>, BrokerOpError> {
+    for attempt in 0..attempts {
+        if let Some(lock) = try_artifact_sweep_worker_lock(main_root)? {
+            return Ok(Some(lock));
+        }
+        if attempt + 1 < attempts {
+            std::thread::sleep(poll);
+        }
+    }
+    crate::phase_telemetry::add("artifact_worker_already_active", Duration::ZERO);
+    Ok(None)
+}
+
 pub(crate) fn try_artifact_sweep_worker_lock(
     main_root: &Path,
 ) -> Result<Option<crate::file_lock::ExclusiveFileLock>, BrokerOpError> {
@@ -8296,7 +8317,9 @@ impl Broker {
             }
         };
         configure_artifact_worker_process_group(&mut command);
-        let _child = match command.spawn() {
+        // Under the process-wide spawn lock: the worker lives for minutes and
+        // must not inherit a pipe another thread is spawning a child with.
+        let _child = match crate::bounded_output::spawn_serialized(&mut command) {
             Ok(child) => child,
             Err(error) => {
                 if steady_removal_due {
@@ -8408,6 +8431,37 @@ impl Broker {
         let result = lane(self);
         drop(pin);
         result.map(Some)
+    }
+
+    /// The worker run's retirement share: up to
+    /// [`SESSION_RETIREMENT_WORKER_RUN_BUDGET`] and never less than the
+    /// reserve ([`worker_retirement_run_budget`]). Closing a session deletes
+    /// nothing (the missing-checkout lane only records rows), so the share
+    /// takes no host deleter slot: another repository's deleting worker no
+    /// longer puts it off.
+    fn run_worker_retirement_share(
+        &mut self,
+        request_generation: i64,
+        worker_started: Instant,
+    ) -> Result<(), BrokerOpError> {
+        let remaining = ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
+        let run_budget = worker_retirement_run_budget(remaining);
+        crate::phase_telemetry::add("artifact_worker_retirement_share_budget", run_budget);
+        if remaining < SESSION_RETIREMENT_WORKER_RESERVE {
+            // Removal overran the run: retirement still gets its reserve.
+            crate::phase_telemetry::add(
+                "artifact_worker_retirement_share_reserve_used",
+                Duration::ZERO,
+            );
+        }
+        let started = Instant::now();
+        self.run_session_retirement_recovery_worker_loop_isolated(
+            request_generation,
+            Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
+            Some(run_budget),
+        )?;
+        crate::phase_telemetry::add("artifact_worker_retirement_share_used", started.elapsed());
+        Ok(())
     }
 
     fn run_artifact_sweep_recovery_worker_lanes(&mut self) -> Result<(), BrokerOpError> {
@@ -8553,27 +8607,7 @@ impl Broker {
         let capacity_slice_used = capacity_slice_started.elapsed();
         capacity_spent.set(capacity_slice_used);
         if let Some(request_generation) = session_retirement_generation {
-            let remaining =
-                ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
-            let run_budget = worker_retirement_run_budget(remaining);
-            crate::phase_telemetry::add("artifact_worker_retirement_share_budget", run_budget);
-            if remaining < SESSION_RETIREMENT_WORKER_RESERVE {
-                // Removal overran the run: retirement still gets its reserve.
-                crate::phase_telemetry::add(
-                    "artifact_worker_retirement_share_reserve_used",
-                    Duration::ZERO,
-                );
-            }
-            // Closing a session deletes nothing (the missing-checkout lane
-            // only records rows), so retirement takes no host deleter slot:
-            // another repository's deleting worker no longer puts it off.
-            let started = Instant::now();
-            self.run_session_retirement_recovery_worker_loop_isolated(
-                request_generation,
-                Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
-                Some(run_budget),
-            )?;
-            crate::phase_telemetry::add("artifact_worker_retirement_share_used", started.elapsed());
+            self.run_worker_retirement_share(request_generation, worker_started)?;
         } else {
             crate::phase_telemetry::add("artifact_worker_retirement_not_due", Duration::ZERO);
         }
@@ -10020,15 +10054,29 @@ impl Broker {
         cleanup_lane(self)
     }
 
+    /// One retirement pass under the GC lock, which it waits for at most
+    /// [`SESSION_RETIREMENT_GC_LOCK_WAIT`]. `None` when it did not run;
+    /// `yielded` is then set when a foreground command announced it waits
+    /// for the lock: the pass never takes the lock ahead of such a waiter,
+    /// which would make it refuse after `GC_LOCK_FOREGROUND_WAIT`.
     fn session_retirement_recovery_pass(
         &mut self,
         request_generation: i64,
         deadline: Instant,
+        yielded: &mut bool,
     ) -> Result<Option<(crate::AutoCleanupReport, GcLock)>, BrokerOpError> {
         let root = self.main_root().to_path_buf();
         let lock_started = Instant::now();
         let lock_deadline = deadline.min(lock_started + SESSION_RETIREMENT_GC_LOCK_WAIT);
         let lock = loop {
+            if foreground_gc_lock_waiter(&root).is_some() {
+                crate::phase_telemetry::add(
+                    "session_retirement_gc_lock_yielded_to_foreground",
+                    Duration::ZERO,
+                );
+                *yielded = true;
+                break None;
+            }
             if let Ok(lock) = GcLock::acquire(&root) {
                 break Some(lock);
             }
@@ -10040,7 +10088,9 @@ impl Broker {
         };
         crate::phase_telemetry::add("session_retirement_gc_lock_wait", lock_started.elapsed());
         let Some(_lock) = lock else {
-            crate::phase_telemetry::add("session_retirement_gc_lock_busy", Duration::ZERO);
+            if !*yielded {
+                crate::phase_telemetry::add("session_retirement_gc_lock_busy", Duration::ZERO);
+            }
             return Ok(None);
         };
         let (requested, completed) = self.session_retirement_request_state()?;
@@ -10138,26 +10188,39 @@ impl Broker {
                 .map(|remaining| remaining.min(SESSION_RETIREMENT_WORKER_PASS_BUDGET))
                 .unwrap_or(SESSION_RETIREMENT_WORKER_PASS_BUDGET);
             let deadline = Instant::now() + pass_budget;
-            let (report, pass_lock) =
-                match self.session_retirement_recovery_pass(request_generation, deadline)? {
-                    Some(pass) => pass,
-                    None => {
-                        let (requested, completed) = self.session_retirement_request_state()?;
-                        if requested == request_generation && completed < request_generation {
-                            if let Some(reason) = continuation_reason.take() {
-                                aggregate.deferred = aggregate.deferred.saturating_add(1);
-                                aggregate.retirement_deferred_reasons.push(reason);
-                            }
-                            self.record_auto_cleanup_report(&aggregate)?;
+            let mut yielded = false;
+            let pass =
+                self.session_retirement_recovery_pass(request_generation, deadline, &mut yielded)?;
+            let (report, pass_lock) = match pass {
+                Some(pass) => pass,
+                None => {
+                    let (requested, completed) = self.session_retirement_request_state()?;
+                    if requested == request_generation && completed < request_generation {
+                        if let Some(reason) = continuation_reason.take() {
+                            aggregate.deferred = aggregate.deferred.saturating_add(1);
+                            aggregate.retirement_deferred_reasons.push(reason);
+                        }
+                        self.record_auto_cleanup_report(&aggregate)?;
+                        if yielded {
+                            // As the yield before the pass: the waiter is a
+                            // foreground command, the request waits for it.
+                            self.defer_session_retirement_request(
+                                request_generation,
+                                &format!(
+                                    "session_retirement_yielded_to_foreground passes={passes}"
+                                ),
+                            )?;
+                        } else {
                             self.defer_session_retirement_request_for(
                                 request_generation,
                                 "session_retirement_lock_busy",
                                 SESSION_RETIREMENT_LOCK_BUSY_RETRY_MS,
                             )?;
                         }
-                        return Ok(());
                     }
-                };
+                    return Ok(());
+                }
+            };
             aggregate.enabled = report.enabled;
             aggregate.config_error = report.config_error.clone();
             aggregate.evaluated_at_ms = report.evaluated_at_ms;
@@ -14430,6 +14493,32 @@ mod tests {
         assert_eq!(broker.take_coalesced_artifact_worker_requests().unwrap(), 0);
     }
 
+    /// A worker whose singleton another worker keeps through the handoff
+    /// wait gets no lock and says so, so it can exit successfully.
+    #[test]
+    fn a_second_worker_yields_to_the_active_one() {
+        let root = tempfile::tempdir().unwrap();
+        let (_storage, _broker) = pacing_fixture_broker(root.path());
+        let held = acquire_artifact_sweep_worker_lock(root.path()).unwrap();
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let installed = crate::phase_telemetry::install(recorder.clone());
+        let lock =
+            take_artifact_sweep_worker_lock_after_handoff(root.path(), 2, Duration::from_millis(1))
+                .unwrap();
+        drop(installed);
+        assert!(lock.is_none());
+        assert_eq!(
+            recorder.totals().1.get("artifact_worker_already_active"),
+            Some(&1)
+        );
+        drop(held);
+        assert!(
+            take_artifact_sweep_worker_lock_after_handoff(root.path(), 2, Duration::ZERO)
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[test]
     fn a_live_repository_worker_blocks_a_second_one() {
         let root = tempfile::tempdir().unwrap();
@@ -16323,6 +16412,186 @@ mod tests {
         let (requested, completed) = broker.session_retirement_request_state().unwrap();
         assert_eq!(requested, request_generation);
         assert!(completed < request_generation, "the request stays");
+    }
+
+    /// A repository with one open session past the abandonment window and a
+    /// queued retirement request, for the retirement lock tests.
+    #[cfg(unix)]
+    fn queued_retirement_fixture(
+        label: &str,
+    ) -> (
+        tempfile::TempDir,
+        crate::test_storage::TestStorage,
+        crate::Broker,
+        crate::Session,
+        i64,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().to_path_buf();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nsession_abandoned_after_hours = 72\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let stale = broker.start_worktree(label, None).unwrap();
+        age_open_session_for_retirement(&mut broker, stale.id, Path::new(&stale.worktree_path));
+        broker
+            .store()
+            .meta_set(
+                SESSION_RETIREMENT_STATE_KEY,
+                &serde_json::to_string(&SessionRetirementRequestState::default()).unwrap(),
+            )
+            .unwrap();
+        let policy = load_retention_policy(&root).unwrap();
+        let generation = broker
+            .request_session_retirement_if_due(&policy, ArtifactSweepScope::Inline)
+            .unwrap()
+            .expect("a retirement request is queued");
+        (temporary, storage, broker, stale, generation)
+    }
+
+    /// The retirement pass's GC-lock wait never takes the lock ahead of a
+    /// foreground command that announced it waits: with a waiter's notice
+    /// present the pass does not run, even once the lock is free, and says
+    /// it yielded.
+    #[cfg(unix)]
+    #[test]
+    fn a_retirement_pass_never_takes_the_lock_ahead_of_a_waiting_command() {
+        let (temporary, _storage, mut broker, stale, generation) =
+            queued_retirement_fixture("retirement behind a waiting command");
+        let root = temporary.path();
+        let held = GcLock::acquire(root).unwrap();
+        let mut waiter = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let waiters = gc_lock_waiters_dir(root, true).unwrap();
+        std::fs::write(waiters.join(waiter.id().to_string()), b"").unwrap();
+        drop(held);
+
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let installed = crate::phase_telemetry::install(recorder.clone());
+        let mut yielded = false;
+        let pass = broker.session_retirement_recovery_pass(
+            generation,
+            Instant::now() + Duration::from_secs(2),
+            &mut yielded,
+        );
+        drop(installed);
+        let _ = waiter.kill();
+        let _ = waiter.wait();
+        assert!(pass.unwrap().is_none(), "no retirement pass ran");
+        assert!(yielded);
+        let counts = recorder.totals().1;
+        assert_eq!(
+            counts.get("session_retirement_gc_lock_yielded_to_foreground"),
+            Some(&1)
+        );
+        assert_eq!(counts.get("session_retirement_gc_lock_busy"), None);
+        assert_ne!(
+            broker.store().session(stale.id).unwrap().cleanup_state,
+            crate::SessionCleanupState::Closed
+        );
+        let (requested, completed) = broker.session_retirement_request_state().unwrap();
+        assert_eq!(requested, generation);
+        assert!(completed < generation, "the request stays");
+    }
+
+    /// The worker's retirement share runs, and closes a session past the
+    /// window, while another repository's worker keeps the host deleter
+    /// slot: closing deletes nothing, so it does not wait for the slot.
+    #[cfg(unix)]
+    #[test]
+    fn retirement_runs_while_another_worker_holds_the_deleter_slot() {
+        let (_temporary, _storage, mut broker, stale, generation) =
+            queued_retirement_fixture("retirement beside a deleting worker");
+        let host = tempfile::tempdir().unwrap();
+        let other = match wait_for_host_deleter_slot(
+            Some(host.path()),
+            Duration::ZERO,
+            Duration::from_millis(1),
+            |_| unreachable!("a zero wait never sleeps"),
+        )
+        .0
+        {
+            HostDeleterSlot::Held(lock) => lock,
+            _ => panic!("another worker deletes"),
+        };
+        let scope = unattended_pacing::install(
+            unattended_pacing::UnattendedPacer::new(
+                unattended_pacing::UnlinkRate::Unlimited,
+                Box::new(unattended_pacing::FakeClock::new()),
+                Box::new(unattended_pacing::Scripted {
+                    samples: vec![unattended_pacing::PressureSample::default()],
+                    reads: Default::default(),
+                }),
+            )
+            .with_host_directory(Some(host.path().to_path_buf())),
+        );
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let installed = crate::phase_telemetry::install(recorder.clone());
+        broker
+            .run_worker_retirement_share(generation, Instant::now())
+            .unwrap();
+        drop(installed);
+        let busy = unattended_pacing::current_summary(0).unwrap().host_slot_busy;
+        drop(scope);
+        drop(other);
+        assert_eq!(
+            broker.store().session(stale.id).unwrap().cleanup_state,
+            crate::SessionCleanupState::Closed
+        );
+        assert_eq!(busy, 0, "the share never asked for the slot");
+        let counts = recorder.totals().1;
+        assert_eq!(counts.get("artifact_worker_host_slot_pin_busy"), None);
+        assert!(counts.contains_key("artifact_worker_retirement_share_used"));
+    }
+
+    /// A GC lock another process keeps through the pass's bounded wait
+    /// defers retirement for one minute, not ten.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_gc_lock_defers_retirement_for_one_minute() {
+        let (temporary, _storage, mut broker, stale, generation) =
+            queued_retirement_fixture("retirement behind a held lock");
+        let held = GcLock::acquire(temporary.path()).unwrap();
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let installed = crate::phase_telemetry::install(recorder.clone());
+        let before = now_ms();
+        broker
+            .run_session_retirement_recovery_worker_loop(
+                generation,
+                Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
+                Some(Duration::from_millis(400)),
+            )
+            .unwrap();
+        let after = now_ms();
+        drop(installed);
+        drop(held);
+        assert_eq!(
+            recorder.totals().1.get("session_retirement_gc_lock_busy"),
+            Some(&1)
+        );
+        assert_ne!(
+            broker.store().session(stale.id).unwrap().cleanup_state,
+            crate::SessionCleanupState::Closed
+        );
+        let (_, state) = broker.load_session_retirement_state().unwrap();
+        assert_eq!(state.requested_generation, generation);
+        assert!(state.completed_generation < generation);
+        assert!(
+            state.retry_after_ms >= before + SESSION_RETIREMENT_LOCK_BUSY_RETRY_MS
+                && state.retry_after_ms <= after + SESSION_RETIREMENT_LOCK_BUSY_RETRY_MS,
+            "{state:?}"
+        );
+        assert_eq!(SESSION_RETIREMENT_LOCK_BUSY_RETRY_MS, 60_000);
     }
 
     #[test]

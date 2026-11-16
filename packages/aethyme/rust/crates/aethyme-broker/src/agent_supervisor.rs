@@ -349,14 +349,17 @@ fn run(payload: &str) -> io::Result<u8> {
         return Ok(125);
     }
 
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(&launch.command)
-        .current_dir(&launch.worktree)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    // Under the process-wide spawn lock: the agent lives for the session,
+    // and must not inherit a pipe another thread is spawning a child with.
+    let mut child = crate::bounded_output::spawn_serialized(
+        Command::new("sh")
+            .arg("-c")
+            .arg(&launch.command)
+            .current_dir(&launch.worktree)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )?;
     // Keep the shell in the supervisor's process group so the broker owns one
     // exact group. This does not contain descendants that deliberately setsid.
     let stdout = child
@@ -610,11 +613,12 @@ fn start_cleanup_watcher() -> io::Result<std::process::Child> {
         ])
         .env("AETHYME_TEST_AGENT_CLEANUP_PARENT", parent.to_string());
     // Deliberately inherit the supervisor group, not process_group(0).
-    let mut child = process
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let mut child = crate::bounded_output::spawn_serialized(
+        process
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )?;
     let readiness = child
         .stdout
         .take()

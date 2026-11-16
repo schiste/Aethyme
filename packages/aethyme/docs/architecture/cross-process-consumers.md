@@ -2392,11 +2392,19 @@ reserve (`artifact_worker_retirement_share_budget`, `_used`,
 and a pass waits up to 5 seconds for the GC lock before deferring for one
 minute (`session_retirement_gc_lock_wait`, `session_retirement_gc_lock_busy`).
 Retirement passes remember when a session kept for `recent_activity` can be
-due again (meta key `auto_cleanup.session_retirement_not_due`, counters
-`retirement_not_due_memo_recorded`, `retirement_not_due_memo_skips`).
+due again, at most one window ahead (meta key
+`auto_cleanup.session_retirement_not_due`, counters
+`retirement_not_due_memo_recorded`, `retirement_not_due_memo_skips`). The
+agents view behind `status` and `agents` reads that memo without writing it
+and judges only sessions past the window by their row
+(`agents_view_abandonment_not_due` for the rest). A retirement pass's GC-lock
+wait yields to a foreground command that announced it waits
+(`session_retirement_gc_lock_yielded_to_foreground`).
 
-Bounded captures (`output_limited`, used by the process-table snapshot) and
-the environment supervisor launch spawn under one process-wide spawn lock
+Bounded captures (`output_limited`, used by the process-table snapshot; its
+deadline starts after the spawn), the environment supervisor launch, the
+detached worker launch, the agent supervisor's agent and cleanup-watcher
+spawns and the gated agent spawn run under one process-wide spawn lock
 (`process_spawn_lock_wait` when one waited): a supervisor launched from a
 report command's background thread could inherit the `ps` pipe and hold it
 for minutes, so `status` and `agents` recorded `holder_process_table_failed`.

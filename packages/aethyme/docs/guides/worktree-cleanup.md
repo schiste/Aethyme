@@ -363,7 +363,7 @@ holding the most checkouts with the line that would release each,
 (`memory`, `load` or `memory_and_load`) and `throttled` say which pressure the
 slice saw and whether it ran throttled; `stop_reason` says why the slice
 stopped (`cap`, `budget`, `memory_backoff`, `load_throttled`,
-`slice_deadline`, `yielded_to_foreground`, `nothing_selected`,
+`memory_warning_throttled`, `slice_deadline`, `yielded_to_foreground`, `nothing_selected`,
 `lap_complete`, `kept_only_limit`, `lock_busy`, `failed`,
 `removal_failures` or `host_deleter_busy`, when another repository's worker
 kept the host deleter slot through the two-second wait before a removal:

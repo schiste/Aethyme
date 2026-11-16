@@ -443,7 +443,7 @@ database alone kept), `check_timings` (`{count, ms}` per check kind:
 per pass), `groups_judged_per_min`, `outcome` (`removed`, `lock_busy`, `inventory_unavailable`, `lap_unfinished`,
 `out_of_time_before_selection`, `pressure_before_selection` or
 `nothing_removable`), `stop_reason` (`cap`, `budget`, `memory_backoff`,
-`load_throttled`, `slice_deadline`, `yielded_to_foreground`,
+`load_throttled`, `memory_warning_throttled`, `slice_deadline`, `yielded_to_foreground`,
 `nothing_selected`, `lap_complete`, `kept_only_limit`, `lock_busy`, `failed`,
 `removal_failures` or `host_deleter_busy`; older records may say
 `pacer_backoff`), the host deleter slot (`host_slot_wait_ms`,
@@ -467,8 +467,11 @@ summed over the slice's passes (`auto_cleanup.lanes.removal_gate_checks` per
 pass). A running gate keeps a closed checkout (`kept[].code` `gate_running`)
 only when one of its own sessions runs it, its recorded checkout overlaps it,
 or nothing identifies where it runs; `kept[].gate_keep` is `own_session`,
-`path` or `unknown_owner`. Memory pressure stops a slice (`memory_backoff`,
-10-minute retry); a load average above twice the core count only throttles it
+`path` or `unknown_owner`. Critical memory pressure stops a slice
+(`memory_backoff`, 10-minute retry); memory pressure at the warning level
+only throttles it to one removal after a wait of at most 5 seconds
+(`memory_warning_throttled`, at least 2 minutes before the next slice, a
+wait no landing shortens); a load average above twice the core count only throttles it
 to one removal after a wait of at most 5 seconds (`load_throttled`, normal
 cadence, at least 30 seconds before the next slice);
 "Checkout count keeps growing" in

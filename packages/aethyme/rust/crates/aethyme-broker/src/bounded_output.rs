@@ -180,9 +180,9 @@ fn capture_with_stdin(
     max_stream_bytes: usize,
 ) -> io::Result<LimitedOutput> {
     let _span = crate::phase_telemetry::subprocess_span(command);
-    let deadline = checked_deadline(budget)?;
+    checked_deadline(budget)?;
     checked_stream_limit(max_stream_bytes)?;
-    if Instant::now() >= deadline {
+    if budget.is_zero() {
         return Ok(LimitedOutput::Deadline);
     }
 
@@ -204,6 +204,9 @@ fn capture_with_stdin(
         .ok_or_else(|| io::Error::other("missing stderr"))?;
     set_probe_nonblocking(&stdout_reader)?;
     set_probe_nonblocking(&stderr_reader)?;
+    // The budget is the child's: a wait for the spawn lock is not charged
+    // to it, so a busy lock cannot time a `ps` snapshot out.
+    let deadline = checked_deadline(budget)?;
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();

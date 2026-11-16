@@ -10668,7 +10668,9 @@ pub(super) fn spawn_blocked_agent(
     if let Some(broker) = broker {
         broker.configure_storage_context_for_child(&mut process)?;
     }
-    let child = process.spawn().map_err(|source| BrokerOpError::Spawn {
+    // Under the process-wide spawn lock: the gated agent outlives this call.
+    let spawned = crate::bounded_output::spawn_serialized(&mut process);
+    let child = spawned.map_err(|source| BrokerOpError::Spawn {
         command: command.to_string(),
         source,
     })?;

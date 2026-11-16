@@ -319,8 +319,11 @@ run, and whether priority lowering succeeded. The worker's
 `artifact_worker_pacer_memory_warning_wait`,
 `artifact_worker_pacer_limiter_sleep`, and the counts
 `artifact_worker_pacer_memory_warning_throttled` and
-`artifact_worker_capacity_removal_memory_warning_throttled`); it is written when the run exits,
-at most about five minutes after it started. See
+`artifact_worker_capacity_removal_memory_warning_throttled`); it is written
+when the run exits: normally within about five minutes of its start, plus up
+to the 30-second retirement reserve when checkout removal overran the run,
+and longer when the read-only shared-cache measurement runs after the
+worker lock is released. See
 [cross-process consumers](../architecture/cross-process-consumers.md) for the
 field list.
 
@@ -410,8 +413,12 @@ unchanged.
 
 A session past the abandonment window by its session row whose checkout Git
 metadata moved more recently is kept for `recent_activity`. Until that
-activity plus the window, every pass, foreground or background, skips it
-instead of judging it again (`retirement_not_due_memo_skips`,
+activity plus the window (at most one window ahead, however the metadata is
+dated), every retirement pass, foreground or background, skips it instead of
+judging it again, and the `status`/`agents` view, which reads the memo but
+never writes it, does not judge it either; that view also no longer judges
+sessions whose row is still inside the window
+(`agents_view_abandonment_not_due`) (`retirement_not_due_memo_skips`,
 `retirement_not_due_memo_recorded`; meta key
 `auto_cleanup.session_retirement_not_due`). A skip only delays a close; the
 landed lane is still asked, and a changed window discards the memo.

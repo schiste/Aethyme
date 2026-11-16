@@ -135,13 +135,20 @@ const SESSION_RETIREMENT_NOT_DUE_MAX: usize = 4096;
 /// every command. Skipping only delays a close: it never closes anything,
 /// and the landed lane is still asked. A changed window discards the memo.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-struct NotDueMemo {
+pub(crate) struct NotDueMemo {
     window_ms: i64,
     sessions: std::collections::BTreeMap<i64, i64>,
 }
 
+/// A not-due time is at most one window away: Git metadata dated in the
+/// future (a skewed clock, a restored checkout) or one that later vanishes
+/// can delay a close by one window at most, never longer.
+fn clamp_not_due(due_at: i64, now: i64, window_ms: i64) -> i64 {
+    due_at.min(now.saturating_add(window_ms.max(0)))
+}
+
 impl NotDueMemo {
-    fn load(broker: &Broker, window_ms: i64, now: i64) -> Self {
+    pub(crate) fn load(broker: &Broker, window_ms: i64, now: i64) -> Self {
         let mut memo = broker
             .store_ref()
             .meta_get(SESSION_RETIREMENT_NOT_DUE_KEY)
@@ -157,13 +164,14 @@ impl NotDueMemo {
         memo
     }
 
-    fn not_due(&self, session_id: i64, now: i64) -> bool {
+    pub(crate) fn not_due(&self, session_id: i64, now: i64) -> bool {
         self.sessions
             .get(&session_id)
             .is_some_and(|due_at| *due_at > now)
     }
 
     fn record(&mut self, broker: &Broker, session_id: i64, due_at: i64, now: i64) {
+        let due_at = clamp_not_due(due_at, now, self.window_ms);
         if due_at <= now || self.sessions.get(&session_id) == Some(&due_at) {
             return;
         }
@@ -2049,12 +2057,15 @@ pub struct CapacityRemovalSlice {
     pub index_high_water_session_id: i64,
     /// Why the slice stopped: `cap` (made its allowance of removals),
     /// `budget` (too little time left for another pass), `memory_backoff`
-    /// (memory pressure outlasted the pacer's pause budget, before a pass or
+    /// (critical memory pressure outlasted the pacer's pause budget, before a pass or
     /// while paying for a removal; ten-minute retry), `load_throttled`
     /// (load stayed elevated through a pre-pass check's bounded wait, so
     /// the slice made one removal and stopped; the next slice runs at the
     /// normal cadence but no sooner than `throttle_gap_ms`; load is never a
-    /// back-off), `slice_deadline` (the slice
+    /// back-off), `memory_warning_throttled` (memory pressure stayed at the
+    /// warning level through the bounded wait: one removal, then at least
+    /// two minutes, a hard retry; only critical pressure is
+    /// `memory_backoff`), `slice_deadline` (the slice
     /// ended mid pacer wait; `pacer_unpaid_ms` is owed before the next
     /// slice), `yielded_to_foreground` (a foreground command waited for the
     /// GC lock), `nothing_selected` (a pass selected nothing and moved
@@ -9344,6 +9355,16 @@ mod tests {
         std::fs::write(path, "x").unwrap();
     }
 
+    /// A not-due time is at most one window ahead, however far in the
+    /// future the checkout's Git metadata is dated.
+    #[test]
+    fn a_not_due_time_is_clamped_to_one_window() {
+        let window = 72 * 3_600_000;
+        assert_eq!(super::clamp_not_due(1_000 + 5, 1_000, window), 1_005);
+        assert_eq!(super::clamp_not_due(i64::MAX, 1_000, window), 1_000 + window);
+        assert_eq!(super::clamp_not_due(5_000, 1_000, -1), 1_000);
+    }
+
     #[test]
     fn partial_live_path_index_is_discarded_when_deadline_expires_mid_scan() {
         let temporary = tempfile::tempdir().unwrap();
@@ -14753,6 +14774,57 @@ mod tests {
         assert!(
             !broker.capacity_removal_due(super::now_ms()).unwrap(),
             "the memory back-off is a hard retry"
+        );
+    }
+
+    /// Memory pressure at the warning level slows a steady slice and never
+    /// stops it: after a bounded wait it removes exactly one landed
+    /// checkout, stops `memory_warning_throttled`, and the next slice waits
+    /// the two-minute gap as a hard retry that the steady minute does not end.
+    #[cfg(unix)]
+    #[test]
+    fn a_memory_warning_allows_one_removal_then_a_hard_two_minute_gap() {
+        let (_owner, _storage, mut broker) =
+            landed_lane_fixture(Some("[worktrees]\nmax_checkouts = 0\n"));
+        let landed = (0..2)
+            .map(|index| {
+                let (session, worktree) =
+                    closed_landed_checkout(&mut broker, &format!("warning {index}"));
+                record_merged_pull_request(&mut broker, session.id, 440 + index);
+                worktree
+            })
+            .collect::<Vec<_>>();
+        let warning = crate::gc::unattended_pacing::PressureSample {
+            memory_elevated: Some(false),
+            memory_warning: Some(true),
+            load_elevated: Some(false),
+        };
+        let (scope, clock) = install_unlimited_scripted_pacer(vec![warning]);
+        let report = broker
+            .run_capacity_removal_slice(Instant::now())
+            .unwrap()
+            .expect("a memory warning never stops a steady slice");
+        drop(scope);
+        assert_eq!(report.removed.len(), 1, "{report:#?}");
+        assert_eq!(landed.iter().filter(|path| path.exists()).count(), 1);
+        let slice = broker.last_capacity_removal_slice().unwrap();
+        assert_eq!(
+            slice.stop_reason.as_deref(),
+            Some("memory_warning_throttled"),
+            "{slice:#?}"
+        );
+        assert!(slice.throttled, "{slice:#?}");
+        assert_eq!(slice.pressure_seen.as_deref(), Some("memory"), "{slice:#?}");
+        assert_eq!(slice.memory_wait_ms, 0, "no critical pause: {slice:#?}");
+        assert_eq!(slice.retry_in_ms, Some(120_000), "{slice:#?}");
+        assert!(
+            clock.slept.get() < Duration::from_secs(10),
+            "bounded waits, not the slice: {slice:#?}"
+        );
+        broker.end_steady_removal_back_off_for_test();
+        assert!(
+            !broker.capacity_removal_due(super::now_ms()).unwrap(),
+            "the warning gap is a hard retry"
         );
     }
 

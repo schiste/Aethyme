@@ -1761,19 +1761,15 @@ fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageErr
     // spawned, so no second detached worker can enter. Taken while the probe
     // ran, the gap let a broker open in between launch a second worker, and
     // whichever lost the lock exited 1 with nothing done.
-    let mut worker_lock = None;
-    for _ in 0..40 {
-        if let Some(lock) = crate::gc::try_artifact_sweep_worker_lock(&requested_root)? {
-            worker_lock = Some(lock);
-            break;
-        }
-        // The launcher still owns the lock while the child starts. Wait for
-        // that handoff, but do not queue another worker behind an active one.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let Some(worker_lock) = worker_lock else {
-        // Another worker serves this repository's backlog: nothing failed.
-        crate::phase_telemetry::add("artifact_worker_already_active", std::time::Duration::ZERO);
+    // The launcher still owns the lock while the child starts: wait for that
+    // handoff (40 tries, 50 ms apart), but never queue behind an active
+    // worker, which serves this repository's backlog: nothing failed.
+    let Some(worker_lock) = crate::gc::take_artifact_sweep_worker_lock_after_handoff(
+        &requested_root,
+        40,
+        std::time::Duration::from_millis(50),
+    )?
+    else {
         return Ok(());
     };
     let discovered = crate::GitRepo::discover(&requested_root)?;
