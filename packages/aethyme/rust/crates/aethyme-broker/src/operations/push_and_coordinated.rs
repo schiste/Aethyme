@@ -2998,6 +2998,9 @@ impl Broker {
         // out of what the lock may wait (#219).
         let admission = AdmissionDeadline::start(queue_wait);
         normalize_repeated_program_name(request.provider, &mut request.args);
+        if request.provider == OperationProvider::Git {
+            git_scopes::apply_fetch_defaults(&mut request.args);
+        }
         if request.args.is_empty() {
             return Err(BrokerOpError::InvalidCoordinatedOperation {
                 reason: format!(

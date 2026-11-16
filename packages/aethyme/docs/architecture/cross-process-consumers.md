@@ -318,8 +318,9 @@ directory, and the sweep cursor once per pass.
 ## Coordinated fetches never write-block (2026-11-12)
 
 A coordinated fetch of exactly one branch into its own remote-tracking ref
-(`fetch <remote> refs/heads/<b>:refs/remotes/<remote>/<b>`, or the strict
-`--atomic` profile) is journaled `failed` when it exits non-zero or times out,
+(`fetch --quiet --no-tags <remote>
+refs/heads/<b>:refs/remotes/<remote>/<b>`, or the strict `--atomic` profile)
+is journaled `failed` when it exits non-zero or times out,
 with `details.failure_class` `repeatable_fetch_failed` or
 `coordinated_operation_timeout` and `remote_outcome: not_applicable`. A crash
 mid-fetch is closed as `reconciled_failed` with
