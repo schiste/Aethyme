@@ -4,6 +4,35 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.120] - 2026-11-17
+
+### Fixed
+
+- Closed checkouts no longer pile up on a busy host. Each retirement run first moves the catalogued regenerable directories (`node_modules`, `target`, `.venv`, `.pnpm-store`) out of closed and cleaned checkouts into the pool's trash, oldest close first, at most 200 checkouts per run; `finish` strips its own checkout after its existing reclaim. A directory is stripped only when it is ignored, holds no tracked file, sits on the checkout's device with no symlink on the way, and carries its witness: a package-manager marker for `node_modules`, the store layout for `.pnpm-store`, `pyvenv.cfg` and only the usual top-level entries for `.venv`, a `CACHEDIR.TAG` with the standard signature for `target`. Anything else, and any directory with a nested repository, is kept with a recorded reason. `build` and `dist` are never stripped (#1764).
+- Leftover folders of sessions already recorded as cleaned are retired through the careful path, oldest first, in a second lap of each run (#1764).
+- A checkout is neither stripped nor retired when, under the lifecycle claim, another open or newer session uses its path, its holder is alive or unknown, the folder was created after the session closed, or a `start` holds a reservation on it (#1764).
+- The cleanup paths list worktrees once per run instead of once per checkout; a worktree lock is read fresh from Git's admin directory. Inspection timeouts are retried on the next run instead of being remembered as a keep (#1764).
+- `broker start` below the free-space reserve strips closed checkouts and drains the trash for up to 30 seconds before refusing, without holding the lifecycle claim through the drain (#1764).
+- A Git timeout names its source (per-call limit, the command's outer deadline, or not started), the subcommand, the directory, the limit and the elapsed time, and never says "killed" for a command that was not started. `finish` keeps its bounded-retry guidance for both wordings (#1766).
+- A transcript archive pass no longer takes one host-wide open-file listing per transcript (72% of a measured 3.4-hour pass). One shared observation, renewed every 30 seconds, decides what is compressed; originals are removed in batches of at most 200 copies or 60 seconds, each batch against one fresh observation taken after its last copy was verified, and only when the source is not open and its size, modification time and identity are unchanged. An incomplete observation removes nothing and discards the batch's copies. Verification paces the compressed bytes it reads; it still decodes and hashes the whole archive before any removal (#1769).
+
+### Added
+
+- Transcript counters `open_observation_refreshes`, `open_files_judged`, `removal_batches`, `removals_refused_open`, `removals_refused_unobserved` and `removals_refused_changed`, and phase `transcripts_remove` (#1769).
+
+- Storage ledger class `checkouts`, advice `storage.closed-checkouts-backlog`, and per-day counters `sessions_created`, `sessions_closed`, `checkouts_retired` and `cleaned_leftovers_retired`; the retirement report gains `cleaned_lap_complete` and `retired_cleaned_leftovers`. Checkout counts are written atomically, one file per repository (#1764).
+- Counters `git_timeout_per_call`, `git_timeout_outer_deadline` and `git_timeout_not_started` (#1766).
+
+### Changed
+
+- Upgrade note: after upgrading, closed checkouts lose their `node_modules`, `target`, `.venv` and `.pnpm-store`; reopening one with `broker start --reuse` needs `aethyme broker submit prepare` again. Stripped directories stay in the pool's trash until the deleter drains them.
+
+### Known issues
+
+- `git worktree add` in `start` and the directory removal in `finish` still run under the repository-wide lifecycle lock; `start --adopt` can hold it for minutes while comparing patches.
+- Stale open sessions are still not closed automatically; a fix is in review.
+- The structured form of a Git timeout is not yet carried in any `--json` output.
+
 ## [0.8.119] - 2026-11-17
 
 ### Changed
