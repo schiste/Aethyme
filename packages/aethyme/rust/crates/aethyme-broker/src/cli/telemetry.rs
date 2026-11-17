@@ -128,14 +128,22 @@ pub(super) const KNOWN_COMMAND_WORDS: &[&str] = &[
     "init",
 ];
 
+fn known_command_word(word: &str) -> bool {
+    KNOWN_COMMAND_WORDS.contains(&word)
+        || super::surface::PUBLIC_VERBS
+            .iter()
+            .chain(super::surface::ADVANCED_VERBS)
+            .any(|(name, _)| *name == word)
+}
+
 pub(super) fn safe_command_surface(args: &[String]) -> Option<String> {
     let first = args.first()?.as_str();
-    if !KNOWN_COMMAND_WORDS.contains(&first) {
+    if !known_command_word(first) {
         return None;
     }
     let mut words = vec![first];
     if let Some(second) = args.get(1).map(String::as_str)
-        && KNOWN_COMMAND_WORDS.contains(&second)
+        && known_command_word(second)
     {
         words.push(second);
     }
@@ -702,6 +710,20 @@ mod tests {
         assert_eq!(label("finish cleanup 3").as_deref(), Some("cleanup"));
         // The pre-six-verb spelling is the same command, so the same label.
         assert_eq!(label("close --session 3").as_deref(), Some("close"));
+    }
+
+    #[test]
+    fn resolved_public_and_advanced_verbs_have_command_labels() {
+        use super::super::surface::{ADVANCED_VERBS, PUBLIC_VERBS, public_forms};
+        for &(verb, _) in PUBLIC_VERBS {
+            assert!(label(verb).is_some(), "{verb}");
+        }
+        for &(verb, _) in ADVANCED_VERBS {
+            assert!(label(&format!("advanced {verb}")).is_some(), "{verb}");
+        }
+        for (verb, form) in public_forms() {
+            assert!(label(&format!("{verb} {form}")).is_some(), "{verb} {form}");
+        }
     }
 
     #[test]

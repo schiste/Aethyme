@@ -193,6 +193,9 @@ pub(super) fn collect(
     }
 
     report.completed_tasks = completed.len();
+    for task in &completed {
+        costs.entry(*task).or_default();
+    }
     let mut observed = costs.into_iter().collect::<Vec<_>>();
     observed.sort_unstable_by_key(|((id, started), _)| std::cmp::Reverse((*started, *id)));
     report.tasks_truncated = observed.len() > limit;
@@ -344,7 +347,13 @@ mod tests {
         assert_eq!(report.completed_task_totals.wall_ms, 9);
         assert_eq!(report.completed_task_totals.output_bytes, 13);
         assert_eq!(report.completed_task_totals.outcomes["outcome_unknown"], 1);
-        assert_eq!(report.tasks.len(), 2);
+        assert_eq!(report.tasks.len(), 4);
+        assert!(
+            report
+                .tasks
+                .iter()
+                .any(|row| { row.session_id == 2 && row.completed && row.costs.commands == 0 })
+        );
         assert!(
             report
                 .tasks
