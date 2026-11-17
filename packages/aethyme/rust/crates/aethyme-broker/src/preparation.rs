@@ -25,6 +25,8 @@ use crate::{
 pub(crate) mod cache_activity;
 #[path = "preparation_cache_measurement.rs"]
 pub(crate) mod cache_measurement;
+#[path = "preparation_install_cap.rs"]
+pub(crate) mod install_cap;
 #[path = "preparation_recovery_state.rs"]
 pub(crate) mod recovery_state;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -162,6 +164,18 @@ pub enum PreparationError {
     StorageUnavailable { path: PathBuf, reason: String },
     #[error("shared package-cache directory {path:?} is unsafe: {reason}")]
     SharedPackageCachePathInvalid { path: PathBuf, reason: String },
+    #[error(
+        "no host install slot for session {session_id}: {holders} of {limit} preparation install(s) are running and none finished within {waited_ms} ms ({reason}); {next_action}"
+    )]
+    InstallSlotUnavailable {
+        session_id: i64,
+        limit: u32,
+        holders: usize,
+        waited_ms: u64,
+        timed_out: bool,
+        reason: String,
+        next_action: String,
+    },
     #[error(transparent)]
     HostResource(#[from] crate::HostResourceError),
 }
@@ -824,6 +838,11 @@ pub struct PreparationReport {
     pub shared_cache_background_measurement:
         Option<cache_measurement::SharedCacheBackgroundMeasurementReport>,
     pub steps: Vec<PreparationStepResult>,
+    /// The host install slot the steps ran under: the host limit, where it
+    /// came from, the wait and the other installs running. Absent when no
+    /// step ran or the host resource database is unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_slot: Option<install_cap::InstallSlotReport>,
     pub next_action: String,
 }
 
@@ -838,6 +857,9 @@ impl PreparationReport {
             "shared_cache_mode": self.shared_cache_mode.map(|mode| mode.as_str()),
             "steps": self.steps,
         });
+        if let Some(slot) = &self.install_slot {
+            preparation["install_slot"] = serde_json::json!(slot);
+        }
         if let Some(rotation) = &self.shared_cache_rotation {
             preparation["shared_cache_rotation"] = serde_json::json!(rotation);
         }
@@ -1230,6 +1252,7 @@ impl Broker {
                 shared_cache_operations: Vec::new(),
                 shared_cache_background_measurement: None,
                 steps: Vec::new(),
+                install_slot: None,
                 next_action: "dependencies are already current".into(),
             });
         }
@@ -1635,6 +1658,57 @@ impl Broker {
             })?;
         }
 
+        // One of the host's install slots, in arrival order with every other
+        // repository's preparations, within what is left of the wait budget.
+        // Taken after the shared-cache lease: a slot holder never waits for a
+        // cache lease, so the two cannot deadlock.
+        let (mut install_slot, install_slot_report) =
+            match self.storage_context().host_resource_db_path.clone() {
+                Some(resource_db_path) => {
+                    let host_state = self.storage_context().host_state_dir.clone();
+                    match install_cap::acquire_install_slot(
+                        &resource_db_path,
+                        host_state.as_deref(),
+                        &repository_identity(self),
+                        session_id,
+                        &root,
+                        wait.saturating_sub(Duration::from_millis(shared_cache_wait_ms)),
+                    ) {
+                        Ok((slot, report)) => (Some(slot), Some(report)),
+                        Err(refusal) => {
+                            release_grant_best_effort(&mut coordinator, &mut grant);
+                            return Err(PreparationError::InstallSlotUnavailable {
+                                session_id,
+                                limit: refusal.limit,
+                                holders: refusal.holders,
+                                waited_ms: refusal.waited_ms,
+                                timed_out: refusal.timed_out,
+                                next_action: refusal.next_action(session_id),
+                                reason: refusal.reason,
+                            }
+                            .into());
+                        }
+                    }
+                }
+                None => (None, None),
+            };
+        // The slot wait may have been long: no install starts below the
+        // free-space reserve.
+        if let Err(error) = require_preparation_storage_with_cache_root(
+            &storage_root,
+            &storage_paths,
+            cache_root_binding.as_ref(),
+        ) {
+            let error = BrokerOpError::from(error);
+            let recovery_persisted = self.persist_storage_refusal(&error);
+            let lease_released = release_grant_best_effort(&mut coordinator, &mut grant);
+            drop(install_slot.take());
+            if recovery_persisted && lease_released {
+                self.start_storage_recovery_worker();
+            }
+            return Err(error);
+        }
+
         let started_at = now_ms();
         let mut record = PreparationRecord {
             schema_version: PREPARATION_SCHEMA_VERSION,
@@ -1722,6 +1796,9 @@ impl Broker {
                                             PREPARATION_LEASE_TTL_SECONDS,
                                         )
                                         .map_err(PreparationError::from)?;
+                                }
+                                if let Some(slot) = install_slot.as_mut() {
+                                    slot.renew().map_err(PreparationError::from)?;
                                 }
                                 Ok(())
                             },
@@ -1850,6 +1927,9 @@ impl Broker {
                 .into());
             }
         }
+        if let Some(slot) = install_slot.take() {
+            slot.release();
+        }
         release_grant(&mut coordinator, &mut grant)?;
         drop(lease_held_span);
         let shared_cache_operations = cache_activity_guard
@@ -1893,6 +1973,7 @@ impl Broker {
             shared_cache_operations,
             shared_cache_background_measurement,
             steps: results,
+            install_slot: install_slot_report,
             next_action: "continue work in the prepared session".into(),
         })
     }
@@ -8806,6 +8887,7 @@ mod tests {
                 },
             ),
             steps: Vec::new(),
+            install_slot: None,
             next_action: "continue".into(),
         };
         let details = report.metric_details();
