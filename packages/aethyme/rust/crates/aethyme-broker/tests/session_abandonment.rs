@@ -121,6 +121,9 @@ fn abandonment_grants_candidacy_but_never_eligibility() {
     // Uncommitted work. Abandoning the session must not put it at risk.
     std::fs::write(worktree.join("wip.txt"), "unsaved\n").unwrap();
 
+    // Uncommitted work closes only after a closing-soon note has stood a day:
+    // the first look leaves the note, the second (a day later) closes.
+    broker.agents(now_ms() + 200 * HOUR_MS).unwrap();
     broker.agents(now_ms() + 200 * HOUR_MS).unwrap();
     let plan = broker.cleanup_plan().unwrap();
     let item = plan
@@ -258,6 +261,8 @@ fn abandoning_an_adopted_session_releases_the_leases_it_was_holding() {
         "fixture must actually hold an implicit lease, or the assertion below is vacuous"
     );
 
+    // Its edit is uncommitted work: a closing-soon note first, then the close.
+    broker.agents(now_ms() + 200 * HOUR_MS).unwrap();
     broker.agents(now_ms() + 200 * HOUR_MS).unwrap();
     assert!(
         broker

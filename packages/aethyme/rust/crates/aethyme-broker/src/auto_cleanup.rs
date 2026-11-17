@@ -716,7 +716,7 @@ impl AutoCleanupPolicy {
                 }
                 // Read by the abandonment window's per-class gate; validated here.
                 key if crate::stale_session_policy::is_policy_key(key) => {
-                    crate::stale_session_policy::parse_hours(key, value)?;
+                    crate::stale_session_policy::validate_key(key, value)?;
                 }
                 other => return Err(format!("[cleanup] has no key {other:?}")),
             }

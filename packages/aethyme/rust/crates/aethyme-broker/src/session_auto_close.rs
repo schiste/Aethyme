@@ -437,7 +437,8 @@ mod lane_tests {
 
     /// `[cleanup]` per-class windows no longer than the abandonment window.
     const CLASS_WINDOWS_OFF: &str = "[cleanup]\nstale_landed_close_after_hours = 1\n\
-        stale_pushed_close_after_hours = 1\nstale_unpushed_close_after_hours = 1\n";
+        stale_pushed_close_after_hours = 1\nstale_unpushed_close_after_hours = 1\n\
+        stale_closing_notice_hours = 0\n";
 
     fn git(root: &Path, args: &[&str]) {
         let mut command = Command::new("git");
@@ -3331,12 +3332,70 @@ mod lane_tests {
         table
     }
 
+    /// Push every closing-soon note of `session` `hours` into the past, as if
+    /// it had been left that long ago.
+    fn age_closing_soon_notes(broker: &mut crate::Broker, session: &crate::Session, hours: i64) {
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE automation_notes SET created_at = created_at - ?1
+                 WHERE recipient_session_id = ?2 AND fingerprint = ?3",
+                rusqlite::params![
+                    hours * HOUR_MS,
+                    session.id,
+                    crate::stale_session_policy::CLOSING_SOON_NOTE_FINGERPRINT
+                ],
+            )
+            .unwrap();
+    }
+
+    fn closing_soon_notes(broker: &crate::Broker, session: &crate::Session) -> usize {
+        broker
+            .store_ref()
+            .automation_notes(session.id)
+            .unwrap()
+            .iter()
+            .filter(|note| {
+                note.fingerprint.as_deref()
+                    == Some(crate::stale_session_policy::CLOSING_SOON_NOTE_FINGERPRINT)
+            })
+            .count()
+    }
+
+    fn kept_not_due(broker: &mut crate::Broker, session: &crate::Session) {
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_abandoned_directly(broker, session, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::NotDue,
+            "{:?}",
+            session.task
+        );
+        assert_eq!(
+            table.keep_reason(),
+            Some(crate::broker::AbandonmentKeepReason::WorkClassNotDue)
+        );
+        assert!(is_open(broker, session.id));
+    }
+
+    fn closes_as(broker: &mut crate::Broker, session: &crate::Session, class: &str) {
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_abandoned_directly(broker, session, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::Closed,
+            "{class}"
+        );
+        assert_eq!(close_payload(broker, session.id)["work_class"], class);
+    }
+
     /// Past the abandonment window with its holder gone, a session waits for
-    /// the window of what closing would put at risk: unpushed work a week
-    /// (announced a day ahead), pushed but unmerged work three days (branch
-    /// left on the remote), work with nothing to lose closes at once.
+    /// the window of what closing would put at risk: unpushed work a week,
+    /// pushed but unmerged work three days (its branch left on the remote),
+    /// work with nothing to lose closes at once. Work closes only after a
+    /// closing-soon note has stood for a day, even when the window passed
+    /// long ago (the notice period is never skipped).
     #[test]
-    fn each_work_class_closes_after_its_own_window() {
+    fn each_work_class_closes_after_its_own_window_and_a_standing_note() {
         let (_owner, _storage, mut broker) = fixture("");
         shipped_class_windows(&broker);
         let (early, _) = session(&mut broker, "unpushed, three days idle", false);
@@ -3347,51 +3406,37 @@ mod lane_tests {
         push_branch(&broker, &pushed);
         quiet(&mut broker, &early, 80);
         quiet(&mut broker, &soon, 150);
-        quiet(&mut broker, &due, 170);
+        quiet(&mut broker, &due, 400);
         quiet(&mut broker, &pushed, 80);
         quiet(&mut broker, &nothing, 80);
 
-        for kept in [&early, &soon] {
-            let mut table = crate::session_holder::RecordedHolderProcessTable::default();
-            assert_eq!(
-                close_abandoned_directly(&mut broker, kept, &mut table),
-                crate::broker::AbandonedSessionCloseOutcome::NotDue
-            );
-            assert_eq!(
-                table.keep_reason(),
-                Some(crate::broker::AbandonmentKeepReason::WorkClassNotDue)
-            );
-            assert!(is_open(&broker, kept.id));
+        for kept in [&early, &soon, &due, &pushed] {
+            kept_not_due(&mut broker, kept);
         }
-        assert!(
-            broker
-                .store_ref()
-                .unread_automation_notes(early.id)
-                .unwrap()
-                .is_empty(),
-            "a session days from its close is not announced yet"
-        );
-        let notes = broker.store_ref().unread_automation_notes(soon.id).unwrap();
-        assert_eq!(notes.len(), 1, "{notes:?}");
         assert_eq!(
-            notes[0].fingerprint.as_deref(),
-            Some(crate::stale_session_policy::CLOSING_SOON_NOTE_FINGERPRINT)
+            closing_soon_notes(&broker, &early),
+            0,
+            "days from its close"
         );
-        assert!(notes[0].message.contains("closes it automatically"));
-
-        for (closed, class) in [
-            (&due, "unpushed"),
-            (&pushed, "pushed_unmerged"),
-            (&nothing, "landed"),
-        ] {
-            let mut table = crate::session_holder::RecordedHolderProcessTable::default();
-            assert_eq!(
-                close_abandoned_directly(&mut broker, closed, &mut table),
-                crate::broker::AbandonedSessionCloseOutcome::Closed,
-                "{class}"
-            );
-            assert_eq!(close_payload(&broker, closed.id)["work_class"], class);
+        for noted in [&soon, &due, &pushed] {
+            assert_eq!(closing_soon_notes(&broker, noted), 1, "{:?}", noted.task);
         }
+        let notes = broker.store_ref().unread_automation_notes(soon.id).unwrap();
+        assert!(notes[0].message.contains("closes it automatically"));
+        // A second look before the note has stood a day still keeps them.
+        kept_not_due(&mut broker, &due);
+        assert_eq!(
+            closing_soon_notes(&broker, &due),
+            1,
+            "one note, not one per look"
+        );
+        closes_as(&mut broker, &nothing, "landed");
+
+        for noted in [&due, &pushed] {
+            age_closing_soon_notes(&mut broker, noted, 25);
+        }
+        closes_as(&mut broker, &due, "unpushed");
+        closes_as(&mut broker, &pushed, "pushed_unmerged");
         assert!(
             broker
                 .repo_handle()
@@ -3419,9 +3464,56 @@ mod lane_tests {
         assert_eq!(closing.session_id, Some(soon.id));
     }
 
+    /// A closing-soon note that cannot be written keeps the session and does
+    /// not start the notice period; the next look writes it.
+    #[test]
+    fn a_failed_closing_soon_note_keeps_the_session_without_advancing() {
+        let (_owner, _storage, mut broker) = fixture("");
+        shipped_class_windows(&broker);
+        let (stale, _) = session(&mut broker, "unpushed, note write fails", false);
+        quiet(&mut broker, &stale, 400);
+        crate::stale_session_policy::fail_next_closing_soon_note_for_test();
+        kept_not_due(&mut broker, &stale);
+        assert_eq!(closing_soon_notes(&broker, &stale), 0);
+        kept_not_due(&mut broker, &stale);
+        assert_eq!(closing_soon_notes(&broker, &stale), 1);
+    }
+
+    /// The class reads the session branch as well as HEAD: a checkout
+    /// detached at its base, or every pull request merged with commits on
+    /// the branch after what merged, still holds unpushed work.
+    #[test]
+    fn the_branch_tip_is_classed_as_well_as_head() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (detached, detached_tree) = session(&mut broker, "detached at the base", false);
+        let base = detached.diff_base.clone().unwrap();
+        git(&detached_tree, &["checkout", "-q", "--detach", &base]);
+        assert_eq!(
+            broker.stale_work_class(&detached),
+            crate::stale_session_policy::StaleWorkClass::Unpushed
+        );
+
+        let (merged, merged_tree) = session(&mut broker, "merged, then more work", true);
+        link_pull_request(&mut broker, merged.id, 77, Some(1));
+        assert_eq!(
+            broker.stale_work_class(&merged),
+            crate::stale_session_policy::StaleWorkClass::Landed,
+            "what merged has landed"
+        );
+        std::fs::write(merged_tree.join("later.txt"), "after the merge\n").unwrap();
+        git(&merged_tree, &["add", "later.txt"]);
+        git(&merged_tree, &["commit", "-qm", "after the merge"]);
+        assert_eq!(
+            broker.stale_work_class(&merged),
+            crate::stale_session_policy::StaleWorkClass::Unpushed,
+            "a merged pull request does not cover later commits"
+        );
+    }
+
     /// A live holder bound to a newer session of this repository is no live
-    /// holder of the older one: its uncommitted work closes after the
-    /// unpushed window, through the archive path.
+    /// holder of the older one: its uncommitted work gets the closing-soon
+    /// note and then closes after the unpushed window, through the archive
+    /// path.
     #[test]
     fn a_holder_that_moved_on_counts_as_no_live_holder_for_the_work_class() {
         let (_owner, _storage, mut broker) = fixture("");
@@ -3429,10 +3521,16 @@ mod lane_tests {
         let holder = live_holder();
         let (old, tree) = session(&mut broker, "uncommitted, holder moved on", false);
         std::fs::write(tree.join("base.txt"), "edited, not committed\n").unwrap();
-        let mut table = held_by_live_holder(&mut broker, &old, &holder, 170);
+        let mut table = held_by_live_holder(&mut broker, &old, &holder, 400);
         let (newer, _) = session(&mut broker, "the agent's next task", false);
         bind_holder(&mut broker, &newer, &holder);
 
+        assert_eq!(
+            close_abandoned_directly(&mut broker, &old, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::NotDue
+        );
+        assert_eq!(closing_soon_notes(&broker, &old), 1);
+        age_closing_soon_notes(&mut broker, &old, 25);
         assert_eq!(
             close_abandoned_directly(&mut broker, &old, &mut table),
             crate::broker::AbandonedSessionCloseOutcome::Closed
@@ -3495,6 +3593,58 @@ mod lane_tests {
             Some(crate::broker::AbandonmentKeepReason::LeaseHeld)
         );
         assert!(is_open(&broker, old.id));
+    }
+
+    /// `session_abandoned_after_hours = 0` turns the no-work window off too
+    /// (`RetentionPolicy::no_work_abandonment_window_ms`), so a foreground
+    /// view finds nothing due and queues nothing; `stale_session_auto_close
+    /// = false` keeps what the windows would close.
+    #[test]
+    fn disabled_windows_close_nothing_and_count_nothing_due() {
+        let (_owner, _storage, mut broker) = fixture("");
+        std::fs::write(
+            broker.main_root().join(".aethyme/broker.toml"),
+            "[retention]\nsession_abandoned_after_hours = 0\n\
+             session_no_work_abandoned_after_hours = 4\n",
+        )
+        .unwrap();
+        let idle = broker
+            .start_worktree("never committed, idle", None)
+            .unwrap();
+        quiet(&mut broker, &idle, 80);
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        {
+            let _foreground = crate::file_lock::ForegroundCommand::enter();
+            broker.agents(now_ms()).unwrap();
+        }
+        broker.agents(now_ms()).unwrap();
+        assert!(is_open(&broker, idle.id));
+        assert_eq!(
+            phase_count(&recorder, "agents_view_abandonment_due_deferred"),
+            0
+        );
+
+        std::fs::write(
+            broker.main_root().join(".aethyme/broker.toml"),
+            "[retention]\nsession_abandoned_after_hours = 72\n",
+        )
+        .unwrap();
+        std::fs::write(
+            broker.main_root().join(".aethyme/config.toml"),
+            "[cleanup]\nstale_session_auto_close = false\n",
+        )
+        .unwrap();
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_abandoned_directly(&mut broker, &idle, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::NotDue
+        );
+        assert_eq!(
+            table.keep_reason(),
+            Some(crate::broker::AbandonmentKeepReason::WindowDisabled)
+        );
+        assert!(is_open(&broker, idle.id));
     }
 
     /// A foreground command never judges: the `agents` view leaves a due

@@ -1162,6 +1162,19 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static DENY_PROCESS_TABLES_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Every process listing on this thread is refused, as in a sandbox, until
+/// called again with `false`.
+#[cfg(test)]
+pub(crate) fn deny_process_tables_for_test(deny: bool) {
+    DENY_PROCESS_TABLES_FOR_TEST.with(|denied| denied.set(deny));
+}
+
 fn note_process_table_observation(complete: bool) {
     LAST_PROCESS_TABLE_OBSERVATION.with(|last| {
         if last.get() != Some(true) {
@@ -1286,6 +1299,10 @@ impl RecordedHolderProcessTable {
     /// Take one process-table snapshot, remembering when one fails.
     fn take_process_table(&mut self) -> Option<ProcessTable> {
         #[cfg(test)]
+        if DENY_PROCESS_TABLES_FOR_TEST.with(std::cell::Cell::get) {
+            return self.record_observation(ProcessTableObservation::Denied);
+        }
+        #[cfg(test)]
         if std::mem::take(&mut self.next_process_table_denied_for_test) {
             return self.record_observation(ProcessTableObservation::Denied);
         }
@@ -1323,6 +1340,31 @@ impl RecordedHolderProcessTable {
                 self.snapshot_failed_at = Some(Instant::now());
                 None
             }
+        }
+    }
+
+    /// Make sure this pass holds a complete process listing before a close:
+    /// `Ok` when it does; `Err(true)` when the listing was refused (a
+    /// sandboxed caller), `Err(false)` when it failed or may not be taken now.
+    /// A session needing no holder listing (`Unbound`) still gets one taken
+    /// here, so a refused pass is known and closes nothing.
+    pub(crate) fn require_complete_listing(&mut self, allow_snapshot: bool) -> Result<(), bool> {
+        if self.process_listing_denied {
+            return Err(true);
+        }
+        if matches!(self.snapshot, Some(Some(_))) {
+            return Ok(());
+        }
+        if allow_snapshot && (self.snapshot.is_none() || self.process_table_retry_due()) {
+            if self.snapshot.is_some() {
+                self.snapshot_retries += 1;
+            }
+            self.snapshot = Some(self.take_process_table());
+        }
+        match (&self.snapshot, self.process_listing_denied) {
+            (_, true) => Err(true),
+            (Some(Some(_)), false) => Ok(()),
+            _ => Err(false),
         }
     }
 

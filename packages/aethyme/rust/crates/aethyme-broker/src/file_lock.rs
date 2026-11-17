@@ -148,6 +148,12 @@ fn detached_background_worker() -> bool {
     DETACHED_BACKGROUND_WORKER.with(|depth| depth.get() > 0)
 }
 
+/// Whether this thread runs inside the detached background worker, where
+/// nobody waits on a short bounded retry.
+pub(crate) fn in_detached_background_worker() -> bool {
+    detached_background_worker()
+}
+
 thread_local! {
     /// Depth of [`ForegroundCommand`] scopes on this thread.
     static FOREGROUND_COMMAND: Cell<u32> = const { Cell::new(0) };

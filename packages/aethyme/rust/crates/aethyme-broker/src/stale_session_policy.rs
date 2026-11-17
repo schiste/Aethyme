@@ -16,11 +16,15 @@
 //!   (`stale_unpushed_close_after_hours`, default 168); the checkout is then
 //!   retired only through the recovery-archive path.
 //!
-//! Closing deletes nothing in any class. A session within
-//! `stale_closing_notice_hours` (default 24) of its close in the two
-//! classes that hold work gets a broker note and `sessions.closing-soon`.
-//! A live or unknown holder keeps every class open; that is decided by the
-//! close path before this policy is asked.
+//! The class is the more protective of what HEAD and the session branch's
+//! tip each show, so a detached or switched checkout cannot hide commits.
+//!
+//! Closing deletes nothing in any class. A session holding work (the last two
+//! classes) closes only after a closing-soon broker note has stood for
+//! `stale_closing_notice_hours` (default 24) with no activity since; a note
+//! that cannot be written keeps the session. A live or unknown holder keeps
+//! every class open; that is decided by the close path. `stale_session_auto_close
+//! = false` turns the abandonment and no-work windows off.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -33,8 +37,11 @@ pub(crate) const PUSHED_KEY: &str = "stale_pushed_close_after_hours";
 /// `[cleanup]` key: idle hours before a session with unpushed or
 /// uncommitted work closes.
 pub(crate) const UNPUSHED_KEY: &str = "stale_unpushed_close_after_hours";
-/// `[cleanup]` key: hours ahead of a close the note and advice appear.
+/// `[cleanup]` key: hours a closing-soon note stands before the close.
 pub(crate) const NOTICE_KEY: &str = "stale_closing_notice_hours";
+/// `[cleanup]` key: `false` keeps every session the abandonment and no-work
+/// windows would close.
+pub(crate) const AUTO_CLOSE_KEY: &str = "stale_session_auto_close";
 
 pub(crate) const DEFAULT_LANDED_HOURS: i64 = 24;
 pub(crate) const DEFAULT_PUSHED_HOURS: i64 = 72;
@@ -111,8 +118,9 @@ impl StaleWorkClass {
 pub(crate) struct WorkEvidence {
     /// Uncommitted, untracked or in-progress content in the checkout.
     pub dirty: Option<bool>,
-    /// At least one pull request is recorded and every one merged.
-    pub all_pull_requests_merged: bool,
+    /// Every recorded pull request merged and the tip is contained in a
+    /// merged pull request's recorded head.
+    pub merged_pull_request_contains_tip: bool,
     /// HEAD is an ancestor of the fetched default branch.
     pub head_landed: Option<bool>,
     /// HEAD is still the session's diff base.
@@ -127,7 +135,7 @@ pub(crate) fn classify(evidence: &WorkEvidence) -> StaleWorkClass {
     if evidence.dirty != Some(false) {
         return StaleWorkClass::Unpushed;
     }
-    if evidence.all_pull_requests_merged
+    if evidence.merged_pull_request_contains_tip
         || evidence.head_landed == Some(true)
         || evidence.no_commits == Some(true)
     {
@@ -146,6 +154,8 @@ pub(crate) struct StaleSessionPolicy {
     pub pushed_ms: i64,
     pub unpushed_ms: i64,
     pub notice_ms: i64,
+    /// `stale_session_auto_close`.
+    pub auto_close: bool,
 }
 
 impl Default for StaleSessionPolicy {
@@ -155,13 +165,28 @@ impl Default for StaleSessionPolicy {
             pushed_ms: DEFAULT_PUSHED_HOURS * HOUR_MS,
             unpushed_ms: DEFAULT_UNPUSHED_HOURS * HOUR_MS,
             notice_ms: DEFAULT_NOTICE_HOURS * HOUR_MS,
+            auto_close: true,
         }
     }
 }
 
 /// Whether `key` is one of this policy's `[cleanup]` keys.
 pub(crate) fn is_policy_key(key: &str) -> bool {
-    matches!(key, LANDED_KEY | PUSHED_KEY | UNPUSHED_KEY | NOTICE_KEY)
+    matches!(
+        key,
+        LANDED_KEY | PUSHED_KEY | UNPUSHED_KEY | NOTICE_KEY | AUTO_CLOSE_KEY
+    )
+}
+
+/// Validate one of this policy's `[cleanup]` values.
+pub(crate) fn validate_key(key: &str, value: &toml::Value) -> Result<(), String> {
+    if key == AUTO_CLOSE_KEY {
+        return value
+            .as_bool()
+            .map(|_| ())
+            .ok_or_else(|| format!("[cleanup] {key} must be true or false"));
+    }
+    parse_hours(key, value).map(|_| ())
 }
 
 /// The hours one key names, validated: a whole number of hours, at least one
@@ -177,19 +202,16 @@ pub(crate) fn parse_hours(key: &str, value: &toml::Value) -> Result<i64, String>
     }
 }
 
-/// When one class's window lets the session close, and whether it is close
-/// enough to say so.
+/// What one class's window and the closing-soon note allow now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StaleClassVerdict {
-    /// Idle past the class window.
+    /// The session may close.
     Due { due_at_ms: i64 },
-    /// Not yet. `revisit_at_ms` is when to judge it again: the start of the
-    /// notice period for a class that holds work, otherwise `due_at_ms`.
-    NotDue {
-        due_at_ms: i64,
-        revisit_at_ms: i64,
-        closing_soon: bool,
-    },
+    /// Not yet; judge it again at `revisit_at_ms`.
+    NotDue { due_at_ms: i64, revisit_at_ms: i64 },
+    /// It holds work, its notice period has begun and no note stands since
+    /// its last activity: leave one, and close no earlier than `due_at_ms`.
+    NeedsNotice { due_at_ms: i64 },
 }
 
 impl StaleSessionPolicy {
@@ -229,6 +251,11 @@ impl StaleSessionPolicy {
             if !is_policy_key(key) {
                 continue;
             }
+            validate_key(key, value)?;
+            if key == AUTO_CLOSE_KEY {
+                policy.auto_close = value.as_bool().unwrap_or(true);
+                continue;
+            }
             let ms = parse_hours(key, value)?.saturating_mul(HOUR_MS);
             match key.as_str() {
                 LANDED_KEY => policy.landed_ms = ms,
@@ -241,37 +268,55 @@ impl StaleSessionPolicy {
     }
 
     /// Judge a session of `class` whose newest activity is `activity_ms`.
+    /// `noted_at_ms` is when the latest closing-soon note was left; a note
+    /// older than the activity no longer counts. A session holding work
+    /// closes only once such a note has stood for the notice period, so a
+    /// worker that did not run, a sleeping host or a clock jump never skips
+    /// the notice.
     pub(crate) fn judge(
         &self,
         class: StaleWorkClass,
         activity_ms: i64,
         now_ms: i64,
+        noted_at_ms: Option<i64>,
     ) -> StaleClassVerdict {
-        let due_at_ms = activity_ms.saturating_add(self.window_ms(class));
-        if now_ms >= due_at_ms {
-            return StaleClassVerdict::Due { due_at_ms };
+        let window_due = activity_ms.saturating_add(self.window_ms(class));
+        if !class.holds_work() || self.notice_ms <= 0 {
+            return if now_ms >= window_due {
+                StaleClassVerdict::Due {
+                    due_at_ms: window_due,
+                }
+            } else {
+                StaleClassVerdict::NotDue {
+                    due_at_ms: window_due,
+                    revisit_at_ms: window_due,
+                }
+            };
         }
-        let notice_at_ms = if class.holds_work() && self.notice_ms > 0 {
-            Some(due_at_ms.saturating_sub(self.notice_ms))
-        } else {
-            None
-        };
-        match notice_at_ms {
-            Some(notice_at) if now_ms < notice_at => StaleClassVerdict::NotDue {
-                due_at_ms,
+        let notice_at = window_due.saturating_sub(self.notice_ms);
+        if now_ms < notice_at {
+            return StaleClassVerdict::NotDue {
+                due_at_ms: window_due,
                 revisit_at_ms: notice_at,
-                closing_soon: false,
+            };
+        }
+        match noted_at_ms.filter(|noted| *noted >= activity_ms) {
+            None => StaleClassVerdict::NeedsNotice {
+                due_at_ms: window_due.max(now_ms.saturating_add(self.notice_ms)),
             },
-            Some(_) => StaleClassVerdict::NotDue {
-                due_at_ms,
-                revisit_at_ms: due_at_ms,
-                closing_soon: true,
-            },
-            None => StaleClassVerdict::NotDue {
-                due_at_ms,
-                revisit_at_ms: due_at_ms,
-                closing_soon: false,
-            },
+            Some(noted) => {
+                let close_at = window_due.max(noted.saturating_add(self.notice_ms));
+                if now_ms >= close_at {
+                    StaleClassVerdict::Due {
+                        due_at_ms: close_at,
+                    }
+                } else {
+                    StaleClassVerdict::NotDue {
+                        due_at_ms: close_at,
+                        revisit_at_ms: close_at,
+                    }
+                }
+            }
         }
     }
 }
@@ -293,46 +338,71 @@ pub(crate) fn read_class_records(store: &crate::BrokerStore) -> BTreeMap<i64, Cl
         .unwrap_or_default()
 }
 
-/// Write `value` under `key` only if no other writer holds the database and
-/// the row still reads `expected`: a retirement pass never waits on another
-/// writer for bookkeeping, and a lost write is only a stale report.
-fn set_without_waiting(
+/// Compare-and-set attempts for stale-session bookkeeping: a few, a short
+/// pause apart, in the detached worker (nobody waits on it); one anywhere
+/// else, so a foreground command never waits on another writer.
+fn bookkeeping_attempts() -> usize {
+    if crate::file_lock::in_detached_background_worker() {
+        5
+    } else {
+        1
+    }
+}
+const BOOKKEEPING_RETRY_PAUSE: Duration = Duration::from_millis(50);
+
+/// Rewrite `key` with `update(current)` by compare-and-set, never waiting on
+/// another database writer and retrying only per [`bookkeeping_attempts`].
+/// `update` returns `None` when nothing needs writing. A write lost to a busy
+/// database only makes the status report one pass stale.
+fn update_without_waiting(
     store: &mut crate::BrokerStore,
     key: &str,
-    expected: Option<&str>,
-    value: &str,
+    update: impl Fn(Option<&str>) -> Option<String>,
 ) {
-    match store.meta_compare_and_set_for_session_retirement(key, expected, value) {
-        Ok(_) | Err(crate::BrokerError::SessionRetirementDatabaseBusy) => {}
-        Err(error) => {
-            crate::warn_unrecorded("record stale-session bookkeeping", Err::<(), _>(error))
+    let attempts = bookkeeping_attempts();
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            std::thread::sleep(BOOKKEEPING_RETRY_PAUSE);
+        }
+        let current = match store.meta_get_for_session_retirement(key) {
+            Ok(current) => current,
+            Err(crate::BrokerError::SessionRetirementDatabaseBusy) => continue,
+            Err(error) => {
+                crate::warn_unrecorded("read stale-session bookkeeping", Err::<(), _>(error));
+                return;
+            }
+        };
+        let Some(value) = update(current.as_deref()) else {
+            return;
+        };
+        match store.meta_compare_and_set_for_session_retirement(key, current.as_deref(), &value) {
+            Ok(true) => return,
+            Ok(false) | Err(crate::BrokerError::SessionRetirementDatabaseBusy) => {}
+            Err(error) => {
+                crate::warn_unrecorded("record stale-session bookkeeping", Err::<(), _>(error));
+                return;
+            }
         }
     }
+    crate::phase_telemetry::add("stale_bookkeeping_write_lost", Duration::ZERO);
 }
 
 /// Remember `record` for `session_id` (best effort, never waiting on another
 /// database writer), keeping the newest [`CLASSES_MAX`] sessions.
 pub(crate) fn remember_class(store: &mut crate::BrokerStore, session_id: i64, record: ClassRecord) {
-    let Ok(raw) = store.meta_get_for_session_retirement(CLASSES_META_KEY) else {
-        return;
-    };
-    let mut records = raw
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<BTreeMap<i64, ClassRecord>>(raw).ok())
-        .unwrap_or_default();
-    if records.get(&session_id) == Some(&record) {
-        return;
-    }
-    records.insert(session_id, record);
-    while records.len() > CLASSES_MAX {
-        records.pop_first();
-    }
-    set_without_waiting(
-        store,
-        CLASSES_META_KEY,
-        raw.as_deref(),
-        &serde_json::to_string(&records).unwrap_or_default(),
-    );
+    update_without_waiting(store, CLASSES_META_KEY, |raw| {
+        let mut records = raw
+            .and_then(|raw| serde_json::from_str::<BTreeMap<i64, ClassRecord>>(raw).ok())
+            .unwrap_or_default();
+        if records.get(&session_id) == Some(&record) {
+            return None;
+        }
+        records.insert(session_id, record);
+        while records.len() > CLASSES_MAX {
+            records.pop_first();
+        }
+        Some(serde_json::to_string(&records).unwrap_or_default())
+    });
 }
 
 /// Record what a retirement pass learned about the process table: a complete
@@ -348,10 +418,7 @@ pub(crate) fn record_process_table_observation(
         Some(false) => PROCESS_TABLE_DENIED_META_KEY,
         None => return,
     };
-    let Ok(expected) = store.meta_get_for_session_retirement(key) else {
-        return;
-    };
-    set_without_waiting(store, key, expected.as_deref(), &now_ms.to_string());
+    update_without_waiting(store, key, |_| Some(now_ms.to_string()));
 }
 
 thread_local! {
@@ -384,6 +451,51 @@ pub(crate) fn process_table_denied_since(store: &crate::BrokerStore, now_ms: i64
         .then_some(denied)
 }
 
+/// When the latest closing-soon note for `session_id` was left, and that
+/// note's id while it is unread; `None` when none was ever left.
+pub(crate) fn latest_closing_soon_note(
+    store: &crate::BrokerStore,
+    session_id: i64,
+) -> Result<Option<(i64, Option<i64>)>, crate::BrokerError> {
+    Ok(store
+        .automation_notes(session_id)?
+        .into_iter()
+        .find(|note| {
+            note.sender == crate::session_auto_close::NOTE_SENDER
+                && note.fingerprint.as_deref() == Some(CLOSING_SOON_NOTE_FINGERPRINT)
+        })
+        .map(|note| {
+            (
+                note.created_at,
+                note.acknowledged_at.is_none().then_some(note.id),
+            )
+        }))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_NOTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The next closing-soon note write fails, as a full disk or a locked
+/// database would make it.
+#[cfg(test)]
+pub(crate) fn fail_next_closing_soon_note_for_test() {
+    FAIL_NEXT_NOTE.with(|fail| fail.set(true));
+}
+
+/// Whether a test asked the next closing-soon note write to fail.
+pub(crate) fn closing_soon_note_write_fails_for_test() -> bool {
+    #[cfg(test)]
+    {
+        FAIL_NEXT_NOTE.with(std::cell::Cell::take)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// The closing-soon note left for one session.
 pub(crate) fn closing_soon_note(
     session_id: i64,
@@ -412,7 +524,7 @@ impl crate::Broker {
         let worktree = Path::new(&session.worktree_path);
         let checkout_exists = std::fs::symlink_metadata(worktree).is_ok();
         let repo = self.repo_handle();
-        let branch_ref = format!("refs/heads/{}", session.branch);
+        let branch_tip = repo.resolve_ref(&format!("refs/heads/{}", session.branch));
         // A checkout that is gone holds nothing beyond its branch.
         let (dirty, head) = if checkout_exists {
             let dirty = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root())
@@ -432,35 +544,51 @@ impl crate::Broker {
                 .and_then(|checkout| checkout.head_commit().ok());
             (dirty, head)
         } else {
-            (Some(false), repo.resolve_ref(&branch_ref))
+            (Some(false), branch_tip.clone())
         };
-        let all_pull_requests_merged =
+        let all_merged =
             crate::session_auto_close::PullRequestMerges::read(self.store_ref(), session.id)
                 .is_some_and(|merges| merges.all_merged());
+        let merged_heads = if all_merged {
+            self.store_ref()
+                .merged_pull_request_heads(session.id)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let upstream = repo.upstream_default();
-        let head_landed = match (head.as_deref(), upstream.as_ref()) {
-            (Some(head), Some((_, tip))) => repo.is_ancestor_checked(head, tip).ok(),
-            _ => None,
-        };
-        let no_commits = match (head.as_deref(), session.diff_base.as_deref()) {
-            (Some(head), Some(base)) => Some(head == base),
-            _ => None,
-        };
         let remote = upstream
             .as_ref()
             .and_then(|(name, _)| name.split_once('/').map(|(remote, _)| remote.to_string()))
             .unwrap_or_else(|| "origin".to_string());
-        let head_pushed = head.as_deref().and_then(|head| {
-            let tip = repo.resolve_ref(&format!("refs/remotes/{remote}/{}", session.branch))?;
-            repo.is_ancestor_checked(head, &tip).ok()
-        });
-        let class = classify(&WorkEvidence {
-            dirty,
-            all_pull_requests_merged,
-            head_landed,
-            no_commits,
-            head_pushed,
-        });
+        let remote_tip = repo.resolve_ref(&format!("refs/remotes/{remote}/{}", session.branch));
+        let contains = |ancestor: &str, descendant: &str| {
+            ancestor == descendant
+                || matches!(repo.is_ancestor_checked(ancestor, descendant), Ok(true))
+        };
+        // HEAD and the branch tip are classed apart and the more protective
+        // class wins: a detached HEAD at the base or a landed commit, or a
+        // checkout switched to another branch, cannot hide the branch's
+        // commits, nor the branch hide commits made on a detached HEAD.
+        let class_of = |tip: Option<&str>| -> StaleWorkClass {
+            let Some(tip) = tip else {
+                return StaleWorkClass::Unpushed;
+            };
+            classify(&WorkEvidence {
+                dirty,
+                merged_pull_request_contains_tip: merged_heads
+                    .iter()
+                    .any(|merged| contains(tip, merged.as_str())),
+                head_landed: upstream
+                    .as_ref()
+                    .and_then(|(_, upstream_tip)| repo.is_ancestor_checked(tip, upstream_tip).ok()),
+                no_commits: session.diff_base.as_deref().map(|base| tip == base),
+                head_pushed: remote_tip
+                    .as_deref()
+                    .map(|remote_tip| contains(tip, remote_tip)),
+            })
+        };
+        let class = class_of(head.as_deref()).max(class_of(branch_tip.as_deref()));
         crate::phase_telemetry::add(class.telemetry_name(), Duration::ZERO);
         crate::phase_telemetry::add("stale_work_classification", started.elapsed());
         class
@@ -513,7 +641,7 @@ mod tests {
     fn evidence() -> WorkEvidence {
         WorkEvidence {
             dirty: Some(false),
-            all_pull_requests_merged: false,
+            merged_pull_request_contains_tip: false,
             head_landed: Some(false),
             no_commits: Some(false),
             head_pushed: Some(false),
@@ -528,7 +656,7 @@ mod tests {
                 ..evidence()
             },
             WorkEvidence {
-                all_pull_requests_merged: true,
+                merged_pull_request_contains_tip: true,
                 ..evidence()
             },
             WorkEvidence {
@@ -561,7 +689,7 @@ mod tests {
             WorkEvidence {
                 dirty: Some(true),
                 head_landed: Some(true),
-                all_pull_requests_merged: true,
+                merged_pull_request_contains_tip: true,
                 ..evidence()
             },
             WorkEvidence {
@@ -594,51 +722,96 @@ mod tests {
     fn a_class_closes_only_past_its_window() {
         let policy = StaleSessionPolicy::default();
         let activity = 1_000 * HOUR_MS;
+        // Landed work needs no notice.
         assert_eq!(
             policy.judge(
-                StaleWorkClass::PushedUnmerged,
+                StaleWorkClass::Landed,
                 activity,
-                activity + 72 * HOUR_MS
+                activity + 24 * HOUR_MS,
+                None
             ),
             StaleClassVerdict::Due {
-                due_at_ms: activity + 72 * HOUR_MS
-            }
-        );
-        assert!(matches!(
-            policy.judge(StaleWorkClass::Unpushed, activity, activity + 100 * HOUR_MS),
-            StaleClassVerdict::NotDue { .. }
-        ));
-    }
-
-    #[test]
-    fn work_is_announced_a_notice_period_ahead_and_revisited_then() {
-        let policy = StaleSessionPolicy::default();
-        let activity = 1_000 * HOUR_MS;
-        let due = activity + 168 * HOUR_MS;
-        assert_eq!(
-            policy.judge(StaleWorkClass::Unpushed, activity, activity + 80 * HOUR_MS),
-            StaleClassVerdict::NotDue {
-                due_at_ms: due,
-                revisit_at_ms: due - 24 * HOUR_MS,
-                closing_soon: false,
+                due_at_ms: activity + 24 * HOUR_MS
             }
         );
         assert_eq!(
-            policy.judge(StaleWorkClass::Unpushed, activity, due - 2 * HOUR_MS),
-            StaleClassVerdict::NotDue {
-                due_at_ms: due,
-                revisit_at_ms: due,
-                closing_soon: true,
-            }
-        );
-        // Landed work is not announced: nothing is lost by its close.
-        assert_eq!(
-            policy.judge(StaleWorkClass::Landed, activity, activity + 23 * HOUR_MS),
+            policy.judge(
+                StaleWorkClass::Landed,
+                activity,
+                activity + 23 * HOUR_MS,
+                None
+            ),
             StaleClassVerdict::NotDue {
                 due_at_ms: activity + 24 * HOUR_MS,
                 revisit_at_ms: activity + 24 * HOUR_MS,
-                closing_soon: false,
             }
+        );
+        // Work is revisited when its notice period begins.
+        let due = activity + 168 * HOUR_MS;
+        assert_eq!(
+            policy.judge(
+                StaleWorkClass::Unpushed,
+                activity,
+                activity + 80 * HOUR_MS,
+                None
+            ),
+            StaleClassVerdict::NotDue {
+                due_at_ms: due,
+                revisit_at_ms: due - 24 * HOUR_MS,
+            }
+        );
+    }
+
+    #[test]
+    fn work_closes_only_after_a_note_has_stood_for_the_notice_period() {
+        let policy = StaleSessionPolicy::default();
+        let activity = 1_000 * HOUR_MS;
+        let due = activity + 72 * HOUR_MS;
+        let class = StaleWorkClass::PushedUnmerged;
+        // Inside the notice period with no note: leave one.
+        assert_eq!(
+            policy.judge(class, activity, due - 2 * HOUR_MS, None),
+            StaleClassVerdict::NeedsNotice { due_at_ms: due }
+        );
+        // Long past the window (the worker did not run, the host slept or
+        // the clock jumped) with no note: still a note first, and a full
+        // notice period from now.
+        let late = due + 100 * HOUR_MS;
+        assert_eq!(
+            policy.judge(class, activity, late, None),
+            StaleClassVerdict::NeedsNotice {
+                due_at_ms: late + 24 * HOUR_MS
+            }
+        );
+        // A note left late counts from when it was left.
+        assert_eq!(
+            policy.judge(class, activity, late + 23 * HOUR_MS, Some(late)),
+            StaleClassVerdict::NotDue {
+                due_at_ms: late + 24 * HOUR_MS,
+                revisit_at_ms: late + 24 * HOUR_MS,
+            }
+        );
+        assert_eq!(
+            policy.judge(class, activity, late + 24 * HOUR_MS, Some(late)),
+            StaleClassVerdict::Due {
+                due_at_ms: late + 24 * HOUR_MS
+            }
+        );
+        // A note older than the latest activity no longer counts.
+        assert_eq!(
+            policy.judge(class, activity, late, Some(activity - 1)),
+            StaleClassVerdict::NeedsNotice {
+                due_at_ms: late + 24 * HOUR_MS
+            }
+        );
+        // With the notice off, work closes at its window.
+        let silent = StaleSessionPolicy {
+            notice_ms: 0,
+            ..policy
+        };
+        assert_eq!(
+            silent.judge(class, activity, due, None),
+            StaleClassVerdict::Due { due_at_ms: due }
         );
     }
 
@@ -647,7 +820,7 @@ mod tests {
         let table: toml::Value = toml::from_str(
             "stale_landed_close_after_hours = 12\nstale_pushed_close_after_hours = 48\n\
              stale_unpushed_close_after_hours = 336\nstale_closing_notice_hours = 0\n\
-             auto_remove = true\n",
+             stale_session_auto_close = false\nauto_remove = true\n",
         )
         .unwrap();
         let policy = StaleSessionPolicy::from_cleanup_table(Some(&table)).unwrap();
@@ -655,6 +828,8 @@ mod tests {
         assert_eq!(policy.pushed_ms, 48 * HOUR_MS);
         assert_eq!(policy.unpushed_ms, 336 * HOUR_MS);
         assert_eq!(policy.notice_ms, 0);
+        assert!(!policy.auto_close);
+        assert!(StaleSessionPolicy::default().auto_close);
         assert_eq!(
             StaleSessionPolicy::from_cleanup_table(None).unwrap(),
             StaleSessionPolicy::default()
@@ -664,6 +839,7 @@ mod tests {
             "stale_unpushed_close_after_hours = 9000",
             "stale_landed_close_after_hours = \"a day\"",
             "stale_closing_notice_hours = -1",
+            "stale_session_auto_close = 1",
         ] {
             let table: toml::Value = toml::from_str(invalid).unwrap();
             assert!(
