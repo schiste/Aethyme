@@ -372,11 +372,11 @@ const PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after an ed
 
 Other agents may be working in sibling worktrees.
 
-For routine coordination, use `aethyme broker status --json` (compact).
-For session changes use `--session <id> --session-view --json`; reuse its
-revision with `--since-revision <token>`. Hooks deliver notes at tool boundaries.
-Session view omits global and peer state. Branch on `advice.categories[].severity`
-and `.commands`, `summary` and `drilldown` in focused status; deferred checks are unknown. Use
+Installed, trusted hooks deliver session and relevant peer and blocker changes
+at prompt and tool boundaries. To inspect the current session on demand, use
+`aethyme broker status --session <id> --session-view --json`. Reuse its revision
+with `--since-revision <token>` for changes only. Deferred checks are unknown.
+Use `aethyme broker status --json` for repository-wide advice and
 `aethyme broker status --full --json` only when exact session or lease-path evidence is
 needed. Check overlapping work before duplicating it. Overlaps with an active
 session's explicit lease are advisory. Accepted warnings permit work in your
@@ -410,11 +410,11 @@ const NON_PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after a
 
 Other agents may be working in sibling worktrees.
 
-For routine coordination, use `aethyme broker status --json` (compact).
-For session changes use `--session <id> --session-view --json`; reuse its
-revision with `--since-revision <token>`. Hooks deliver notes at tool boundaries.
-Session view omits global and peer state. Branch on `advice.categories[].severity`
-and `.commands`, `summary` and `drilldown` in focused status; deferred checks are unknown. Use
+Installed, trusted hooks deliver session and relevant peer and blocker changes
+at prompt and tool boundaries. To inspect the current session on demand, use
+`aethyme broker status --session <id> --session-view --json`. Reuse its revision
+with `--since-revision <token>` for changes only. Deferred checks are unknown.
+Use `aethyme broker status --json` for repository-wide advice and
 `aethyme broker status --full --json` only when exact session or lease-path evidence is
 needed. Check overlapping work before duplicating it. Overlaps with an active
 session's explicit lease are advisory. Accepted warnings permit work in your
@@ -1890,10 +1890,10 @@ mod tests {
                 "{tag}: missing the working-agreement pointer:\n{doc}"
             );
             for required in [
-                "For routine coordination, use `aethyme broker status --json` (compact).",
-                "revision with `--since-revision <token>`",
-                "Hooks deliver notes at tool boundaries.",
-                "Session view omits global and peer state.",
+                "Installed, trusted hooks deliver session and relevant peer and blocker changes",
+                "`aethyme broker status --session <id> --session-view --json`",
+                "with `--since-revision <token>` for changes only. Deferred checks are unknown.",
+                "Use `aethyme broker status --json` for repository-wide advice",
                 "`aethyme broker status --full --json` only when exact session or lease-path evidence is",
                 "session's explicit lease are advisory. Accepted warnings permit work in your",
                 "Resolve blockers and refusals.",
