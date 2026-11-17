@@ -343,6 +343,27 @@ budget only when proven landed in the default branch and past their manifest's
 creation time plus its minimum retention. An unlanded archive is never removed
 here, and no archive is removed by age.
 
+Recovery archives also expire by age, landed or not: an archive is
+removable once now reaches its manifest's `created_at_ms` plus the larger of
+`unlanded_archive_days` (default 30; 0 turns age expiry off) and the
+manifest's `minimum_archive_retention_ms`, and never sooner than seven days
+after the ledger first saw it, so an archive already past its age when this
+version first runs gets a week's notice. Age comes from the manifest only; an
+archive without `created_at_ms` is never removed by age. Removal is oldest
+first, paced, by the worker. `broker status` advice
+`storage.archives-expiring` lists the archives expiring within seven days
+(first 20 and the total) with the command that keeps one. `aethyme storage
+keep-archive <id> [--unkeep]` writes (or removes) `<archive>.aethyme-keep`
+beside the archive directory, which exempts it from age expiry; `aethyme
+storage archives [--json]` (`aethyme.storage-archives/v1`) lists archives with
+landed or not, created, expires and kept.
+
+The start-of-command check never runs from a temporary or self-update
+`payload` copy of the binary, nor for the staged payload's `broker
+quick-test` (the self-update also sets `AETHYME_STORAGE_LEDGER=0` for it), and
+the worker is started from the installed `aethyme` on `PATH` when there is
+one.
+
 Every broker command first runs an O(1) check (a statvfs per root and a read of
 the summary and worker lock, never a walk or `ps`). Over a budget or below the
 floor it starts the worker, at most once a minute and never while one runs.

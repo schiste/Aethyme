@@ -2117,8 +2117,11 @@ fn verify_payload(payload: &Path, version: &str) -> Result<(), String> {
         "aethyme-engine-cli",
         version,
     )?;
+    // A staged payload is verified, never put to work: no storage worker
+    // and no inline eviction from this temporary copy.
     let output = Command::new(payload.join("aethyme"))
         .args(["broker", "quick-test"])
+        .env(crate::storage_ledger::check::ENABLE_ENV, "0")
         .output()
         .map_err(|error| format!("run staged aethyme broker quick-test: {error}"))?;
     if !output.status.success() {
@@ -2139,6 +2142,7 @@ fn verify_public_pair(receipt: &InstallReceipt, version: &str) -> Result<(), Str
 fn verify_binary_version(path: &Path, name: &str, version: &str) -> Result<(), String> {
     let output = Command::new(path)
         .arg("--version")
+        .env(crate::storage_ledger::check::ENABLE_ENV, "0")
         .output()
         .map_err(|error| format!("run {} --version: {error}", path.display()))?;
     if !output.status.success() {

@@ -286,6 +286,7 @@ fn a_gate_that_takes_the_cache_after_selection_keeps_it() {
         bytes: 1,
         newest_ms: 0,
         reason: Reason::OverBudget,
+        expires_ms: None,
     };
     let leases = evict::leased_gate_caches(&registry).unwrap();
     assert_eq!(
@@ -712,6 +713,7 @@ fn links_recent_use_and_unknown_recency_keep_an_entry() {
         bytes: 1024,
         newest_ms,
         reason: Reason::OverBudget,
+        expires_ms: None,
     };
     let now = super::now_ms();
     let measured = now - 30 * DAY_MS + 1000;
@@ -747,6 +749,8 @@ fn links_recent_use_and_unknown_recency_keep_an_entry() {
             ctime_ms: 0,
             created_ms: None,
             min_retention_ms: None,
+            session_id: None,
+            kept: false,
         }],
         walk: None,
     };
@@ -889,6 +893,7 @@ fn an_interrupted_removal_leaves_its_remainder_for_the_sweep() {
         bytes: 1,
         newest_ms: 0,
         reason: Reason::OverBudget,
+        expires_ms: None,
     };
     let finished = evict::remove(&candidate, &mut || {}, Some(Instant::now())).unwrap();
     assert!(!finished, "the deadline stopped the deletion");
@@ -906,5 +911,218 @@ fn an_interrupted_removal_leaves_its_remainder_for_the_sweep() {
         super::read_names(cache)
             .iter()
             .all(|name| !name.starts_with(".aethyme-storage-evicting-"))
+    );
+}
+
+fn manifest_archive(
+    host_state: &Path,
+    id: &str,
+    created_days_ago: Option<u64>,
+    file_days_ago: u64,
+) -> PathBuf {
+    let path = host_state.join("recovery-archives/example-0123").join(id);
+    let mut manifest = serde_json::json!({
+        "session_id": 42,
+        "head": "0".repeat(40),
+        "staged_patch": {"bytes": 1},
+        "unstaged_patch": {"bytes": 0},
+        "untracked_files": [],
+        "ignored_files": [],
+    });
+    if let Some(days) = created_days_ago {
+        manifest["created_at_ms"] = serde_json::json!(super::now_ms() - days * DAY_MS);
+    }
+    file(&path.join("bundle.bin"), 8 * 1024);
+    fs::write(path.join("manifest.json"), manifest.to_string()).unwrap();
+    age(&path, file_days_ago);
+    path
+}
+
+fn archive_child(
+    created_days_ago: Option<u64>,
+    min_retention_days: Option<u64>,
+    kept: bool,
+) -> super::Child {
+    super::Child {
+        name: "example-0123/archive".into(),
+        bytes: 1,
+        newest_ms: 0,
+        ctime_ms: 0,
+        created_ms: created_days_ago.map(|days| super::now_ms() - days * DAY_MS),
+        min_retention_ms: min_retention_days.map(|days| days * DAY_MS),
+        session_id: Some(1),
+        kept,
+    }
+}
+
+#[test]
+fn archive_expiry_is_from_the_manifest_with_retention_notice_keep_and_off_switch() {
+    let budgets = Budgets::default();
+    let long_ago = Some(super::now_ms() - 365 * DAY_MS);
+    let created = |child: &super::Child| child.created_ms.unwrap();
+    // 30 days after creation once the notice week is over.
+    let child = archive_child(Some(40), None, false);
+    assert_eq!(
+        super::archive_expiry(&child, &budgets, long_ago),
+        Some(created(&child) + 30 * DAY_MS)
+    );
+    // A longer promised minimum retention wins.
+    let child = archive_child(Some(40), Some(60), false);
+    assert_eq!(
+        super::archive_expiry(&child, &budgets, long_ago),
+        Some(created(&child) + 60 * DAY_MS)
+    );
+    // First sight: never sooner than a week after the ledger saw it.
+    let child = archive_child(Some(100), None, false);
+    let first_seen = super::now_ms();
+    assert_eq!(
+        super::archive_expiry(&child, &budgets, Some(first_seen)),
+        Some(first_seen + 7 * DAY_MS)
+    );
+    // Kept, no creation time, or expiry off: never by age.
+    assert_eq!(
+        super::archive_expiry(&archive_child(Some(400), None, true), &budgets, long_ago),
+        None
+    );
+    assert_eq!(
+        super::archive_expiry(&archive_child(None, None, false), &budgets, long_ago),
+        None
+    );
+    let off = Budgets {
+        unlanded_archive_days: 0,
+        ..Budgets::default()
+    };
+    assert_eq!(
+        super::archive_expiry(&archive_child(Some(400), None, false), &off, long_ago),
+        None
+    );
+}
+
+#[test]
+fn unlanded_archives_expire_after_the_notice_week_unless_kept_or_undated() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path();
+    empty_registry(host_state);
+    // Unlanded (a staged patch), created 40 days ago, files touched today.
+    let old = manifest_archive(host_state, "old-unlanded", Some(40), 0);
+    // Created 5 days ago, files a year old: age comes from the manifest.
+    let young = manifest_archive(host_state, "young-unlanded", Some(5), 365);
+    let kept = manifest_archive(host_state, "kept-unlanded", Some(40), 0);
+    let undated = manifest_archive(host_state, "undated-unlanded", None, 365);
+    super::cli::keep_archive(host_state, "example-0123/kept-unlanded", true).unwrap();
+    let roots = || vec![root(host_state, RootKind::HostState)];
+
+    // First sight: nothing goes; the old one is announced.
+    let ledger = pass(host_state, roots(), Budgets::default());
+    assert!(ledger.last_pass.unwrap().evicted.is_empty());
+    assert!(old.exists());
+    let summary = Summary::load(host_state);
+    assert_eq!(summary.archives_expiring_total, 1, "{summary:?}");
+    assert_eq!(summary.archives_expiring[0].id, "example-0123/old-unlanded");
+    assert_eq!(summary.archives_expiring[0].session_id, Some(42));
+    let advice = super::cli::status_advice(host_state);
+    let expiring = advice
+        .iter()
+        .find(|row| row.id == "storage.archives-expiring")
+        .expect("advice");
+    assert_eq!(
+        expiring.commands[0],
+        "aethyme storage keep-archive example-0123/old-unlanded"
+    );
+
+    // A week after first sight it expires; kept, young and undated stay.
+    let mut ledger = super::Ledger::load(host_state);
+    for seen in ledger.archive_first_seen.values_mut() {
+        *seen -= 8 * DAY_MS;
+    }
+    ledger.save(host_state).unwrap();
+    let ledger = pass(host_state, roots(), Budgets::default());
+    let report = ledger.last_pass.unwrap();
+    assert_eq!(
+        report.evicted,
+        vec!["recovery_archives:recovery-archives/example-0123/old-unlanded".to_string()],
+        "{report:?}"
+    );
+    assert!(!old.exists());
+    assert!(young.exists() && kept.exists() && undated.exists());
+    assert_eq!(ledger.archive_telemetry.expired, 1);
+    assert_eq!(ledger.archive_telemetry.kept, 1);
+    // The keep marker sits beside the archive and is not an archive itself.
+    assert!(super::keep_marker(&kept).exists());
+    let archives = super::cli::archives_value(host_state);
+    assert_eq!(archives["archives"].as_array().unwrap().len(), 3);
+
+    // Unkept, it expires on the next pass (its notice week already ran).
+    super::cli::keep_archive(host_state, "example-0123/kept-unlanded", false).unwrap();
+    pass(host_state, roots(), Budgets::default());
+    assert!(!kept.exists());
+    assert!(
+        undated.exists(),
+        "an archive without a creation time is never removed by age"
+    );
+}
+
+#[test]
+fn keep_archive_refuses_anything_but_an_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path();
+    manifest_archive(host_state, "real", Some(1), 0);
+    for id in [
+        "../outside",
+        "example-0123",
+        "example-0123/missing",
+        "a/b/c",
+        "example-0123/real.aethyme-keep",
+    ] {
+        assert!(
+            super::cli::keep_archive(host_state, id, true).is_err(),
+            "{id}"
+        );
+    }
+    assert!(
+        super::cli::keep_archive(host_state, "recovery-archives/example-0123/real", true).is_ok()
+    );
+}
+
+#[test]
+fn a_temporary_or_payload_copy_never_starts_the_worker() {
+    let temp = std::env::temp_dir().join("payload-test/aethyme");
+    let payload = Path::new("/opt/stage/payload/aethyme");
+    let installed = Path::new("/opt/aethyme-installed/bin/aethyme");
+    assert!(check::ephemeral_executable(&temp));
+    assert!(check::ephemeral_executable(payload));
+    assert!(!check::ephemeral_executable(installed));
+    let words = |text: &str| text.split(' ').map(str::to_string).collect::<Vec<_>>();
+    assert!(
+        !check::start_check_allowed(&words("quick-test"), Some(installed)),
+        "self-update verification"
+    );
+    assert!(!check::start_check_allowed(
+        &words("status --json"),
+        Some(payload)
+    ));
+    assert!(!check::start_check_allowed(
+        &words("status --json"),
+        Some(&temp)
+    ));
+    assert!(!check::start_check_allowed(&words("status"), None));
+    assert!(check::start_check_allowed(
+        &words("status --json"),
+        Some(installed)
+    ));
+    // The worker binary is never a temporary copy.
+    assert_eq!(check::worker_executable(&temp, None), None);
+    assert_eq!(check::worker_executable(payload, None), None);
+    assert_eq!(
+        check::worker_executable(installed, None),
+        Some(installed.to_path_buf())
+    );
+    // An installed `aethyme` on PATH is preferred; one in a temporary
+    // directory is not.
+    let dir = tempfile::tempdir().unwrap();
+    file(&dir.path().join("aethyme"), 1);
+    assert_eq!(
+        check::worker_executable(installed, Some(dir.path().as_os_str())),
+        Some(installed.to_path_buf())
     );
 }

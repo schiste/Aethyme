@@ -52,6 +52,8 @@ pub struct Candidate {
     /// The most recent change the measurement saw (0 when unknown).
     pub newest_ms: u64,
     pub reason: Reason,
+    /// Recovery archives expiring by age: when they expire.
+    pub expires_ms: Option<u64>,
 }
 
 impl Candidate {
@@ -78,6 +80,7 @@ fn child_candidate(item: &Item, child: &Child, reason: Reason) -> Candidate {
         bytes: child.bytes,
         newest_ms: child.newest_ms.max(child.ctime_ms),
         reason,
+        expires_ms: None,
     }
 }
 
@@ -117,6 +120,7 @@ pub fn plan(
     aggressive: &BTreeSet<RootKind>,
 ) -> Vec<Candidate> {
     let mut expired = Vec::new();
+    let mut archives_expired = Vec::new();
     let mut over = Vec::new();
     let class_bytes = ledger.class_bytes();
     for item in ledger.items.iter().filter(|item| item.measured) {
@@ -133,6 +137,7 @@ pub fn plan(
                         bytes: item.bytes,
                         newest_ms: item.newest_ms,
                         reason: Reason::Expired,
+                        expires_ms: None,
                     });
                 }
             }
@@ -171,24 +176,36 @@ pub fn plan(
                 } else {
                     budgets.recovery_archives_bytes
                 };
-                if class_bytes.get(&item.class).copied().unwrap_or(0) > budget {
-                    // Oldest by manifest creation; one without it is kept.
-                    let mut children: Vec<(&Child, u64)> = item
-                        .children
-                        .iter()
-                        .filter_map(|child| child.created_ms.map(|created| (child, created)))
-                        .collect();
-                    children.sort_by_key(|(_, created)| *created);
-                    over.extend(
-                        children
-                            .into_iter()
-                            .map(|(child, _)| child_candidate(item, child, Reason::OverBudget)),
-                    );
+                let over_budget = class_bytes.get(&item.class).copied().unwrap_or(0) > budget;
+                // Oldest by manifest creation; one without it is kept.
+                let mut children: Vec<(&Child, u64)> = item
+                    .children
+                    .iter()
+                    .filter_map(|child| child.created_ms.map(|created| (child, created)))
+                    .collect();
+                children.sort_by_key(|(_, created)| *created);
+                for (child, created) in children {
+                    let first_seen = ledger.archive_first_seen.get(&child.name).copied();
+                    match super::archive_expiry(child, budgets, first_seen) {
+                        // An age rule: whatever the budget, landed or not.
+                        Some(expires) if now >= expires => {
+                            let mut candidate = child_candidate(item, child, Reason::Expired);
+                            candidate.newest_ms = created;
+                            candidate.expires_ms = Some(expires);
+                            archives_expired.push(candidate);
+                        }
+                        _ if over_budget => {
+                            over.push(child_candidate(item, child, Reason::OverBudget));
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
     }
     expired.sort_by_key(|candidate| candidate.newest_ms);
+    // Archives expire oldest first (they were sorted by creation).
+    expired.extend(archives_expired);
     expired.extend(over);
     expired
 }
@@ -455,14 +472,36 @@ pub fn refuse(
                 Some(_) => {}
             }
         }
+        Policy::RecoveryArchives if candidate.reason == Reason::Expired => {
+            // Re-read just before removal: the keep marker, and the age from
+            // the manifest only.
+            if super::keep_marker(&path).exists() {
+                return Some("kept by the owner's marker".into());
+            }
+            let meta = super::archive_meta(&path);
+            let Some(created) = meta.created_ms else {
+                return Some("its manifest has no creation time".into());
+            };
+            // The plan's expiry (configured age and notice) and, re-read
+            // from the manifest, its promised minimum retention.
+            let promised = created.saturating_add(
+                meta.min_retention_ms
+                    .unwrap_or(crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS),
+            );
+            let due = candidate.expires_ms.map(|expires| expires.max(promised));
+            if !due.is_some_and(|due| now >= due) {
+                return Some("not expired yet".into());
+            }
+        }
         Policy::RecoveryArchives => {
             if let Err(why) = archive_landed(&path) {
                 return Some(format!("unlanded: {why}"));
             }
-            let (created, retention) = super::archive_times(&path);
-            let retention =
-                retention.unwrap_or(crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS);
-            match created {
+            let meta = super::archive_meta(&path);
+            let retention = meta
+                .min_retention_ms
+                .unwrap_or(crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS);
+            match meta.created_ms {
                 Some(created) if now >= created.saturating_add(retention) => {}
                 _ => return Some("within its promised minimum retention".into()),
             }
