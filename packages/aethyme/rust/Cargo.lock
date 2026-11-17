@@ -19,7 +19,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aethyme-broker"
-version = "0.8.114"
+version = "0.8.115"
 dependencies = [
  "aethyme-config",
  "aethyme-contracts",
@@ -48,11 +48,12 @@ dependencies = [
  "toml",
  "toml_edit",
  "unicode-normalization",
+ "zstd",
 ]
 
 [[package]]
 name = "aethyme-cli"
-version = "0.8.114"
+version = "0.8.115"
 dependencies = [
  "aethyme-broker",
  "aethyme-engine",
@@ -72,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-config"
-version = "0.8.114"
+version = "0.8.115"
 dependencies = [
  "noyalib",
  "serde",
@@ -82,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-contracts"
-version = "0.8.114"
+version = "0.8.115"
 dependencies = [
  "data-encoding",
  "serde",
@@ -93,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-engine"
-version = "0.8.114"
+version = "0.8.115"
 dependencies = [
  "aethyme-graph-indexer",
  "aethyme-graph-schema",
@@ -114,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-enhance"
-version = "0.8.114"
+version = "0.8.115"
 dependencies = [
  "aethyme-config",
  "libc",
@@ -126,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-graph-indexer"
-version = "0.8.114"
+version = "0.8.115"
 dependencies = [
  "aethyme-graph-schema",
  "aethyme-graph-storage",
@@ -152,7 +153,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-graph-schema"
-version = "0.8.114"
+version = "0.8.115"
 dependencies = [
  "bincode",
  "blake3",
@@ -163,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-graph-storage"
-version = "0.8.114"
+version = "0.8.115"
 dependencies = [
  "aethyme-config",
  "aethyme-graph-schema",
@@ -179,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-producers"
-version = "0.8.114"
+version = "0.8.115"
 dependencies = [
  "aethyme-graph-schema",
  "aethyme-graph-storage",
@@ -189,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-quality"
-version = "0.8.114"
+version = "0.8.115"
 dependencies = [
  "libc",
  "regex",
@@ -447,6 +448,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aebf35691d1bfb0ac386a69bac2fde4dd276fb618cf8bf4f5318fe285e821bb2"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -1045,6 +1048,16 @@ name = "itoa"
 version = "1.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
+
+[[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom 0.4.2",
+ "libc",
+]
 
 [[package]]
 name = "jod-thread"
@@ -2795,3 +2808,31 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[package]]
+name = "zstd"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50adf04cf3ec914b0b9905c9dde90c80fe74bfd701e331fc80a39c512c525278"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "498d94ad68720c89b4fbe41b9090850651e68cb2dd9210ce7ffbff3a94653819"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.3+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f729a06d0257428fd9d997ac8db7e1407bd0262ab016b085b36bc52957c0052d"
+dependencies = [
+ "cc",
+ "pkg-config",
+]

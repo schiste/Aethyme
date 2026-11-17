@@ -277,6 +277,9 @@ const AUTO_CHECKOUT_CLEANUP_WORKER_MAX_PASSES: usize = 4096;
 /// lifetime as well as each individual pass, retaining the cursor/request for
 /// a later normal open when this deadline expires.
 const ARTIFACT_SWEEP_WORKER_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
+/// The share of one worker run the checkout retirement lane may use: the
+/// backlog sweep, then the trash drain.
+const CHECKOUT_RETIREMENT_WORKER_BUDGET: Duration = Duration::from_secs(180);
 const ARTIFACT_SWEEP_WORKER_RETRY_MS: i64 = 10 * 60_000;
 /// One cache pass of the detached worker holds the GC lock at most this
 /// long. Paced removal made a single pass run for minutes, and every other
@@ -7066,6 +7069,10 @@ impl Broker {
         exclude_orphans: bool,
     ) -> Result<GcApplyReport, BrokerOpError> {
         let planning_deadline = (!full_scan).then(|| Instant::now() + MANUAL_GC_PLAN_BUDGET);
+        // The explicit apply confirms checkout trash entries nothing else
+        // can (their mover's start time was unreadable), when they still
+        // match their recorded identity and no open session uses the path.
+        self.confirm_stale_pending_trash_rows();
         // The operator's `gc apply` waits for a holder; every other apply
         // (a broker open resuming a confirmed journal) fails fast.
         self.gc_apply_with_scope(
@@ -8800,12 +8807,15 @@ impl Broker {
         let steady_removal_due = removal_trigger == Some(CheckoutRemovalTrigger::Steady);
         // A queued shared preparation cache measurement (one metadata read).
         let measurement_due = self.shared_cache_measurement_due(now_ms());
+        // Closed checkouts to retire or trash to drain (one metadata read).
+        let checkout_retirement_due = self.checkout_retirement_due(now_ms());
         if !(artifact_pending
             || checkout_cleanup_pending
             || session_retirement_pending
             || compact_pending
             || capacity_removal_due
-            || measurement_due)
+            || measurement_due
+            || checkout_retirement_due)
         {
             return Ok(());
         }
@@ -8825,7 +8835,8 @@ impl Broker {
             || session_retirement_due
             || compact_due
             || capacity_removal_due
-            || measurement_due)
+            || measurement_due
+            || checkout_retirement_due)
         {
             return Ok(());
         }
@@ -9086,6 +9097,17 @@ impl Broker {
             self.write_artifact_sweep_worker_status(&format!(
                 "terminal_checkout_requests_reconciled={reconciled_terminal_rows}"
             ))?;
+        }
+        // Retiring closed checkouts and draining their trash needs no other
+        // lane to be due: it runs first in every worker run that finds it
+        // due, within its own budget, and never waits for memory pressure.
+        if self.checkout_retirement_due(now_ms()) && artifact_worker_post_boot_hold_now().is_none()
+        {
+            crate::warn_unrecorded(
+                "retire closed checkouts and drain their trash",
+                self.run_checkout_retirement(Instant::now() + CHECKOUT_RETIREMENT_WORKER_BUDGET)
+                    .map(|_| ()),
+            );
         }
         let artifact_pending = self.artifact_sweep_backlog_pending()?
             && crate::AutoCleanupPolicy::artifact_sweep_allowed(self.main_root());

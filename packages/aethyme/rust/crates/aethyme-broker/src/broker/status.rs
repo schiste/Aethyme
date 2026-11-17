@@ -49,6 +49,12 @@ impl Broker {
             .and_then(|report| report.capacity_removal.clone());
         push_auto_cleanup_advice(&mut view, auto_cleanup);
         push_landed_proof_unprovable_advice(&mut view, &self.landed_proof_unprovable_sessions());
+        push_checkout_retirement_advice(
+            &mut view,
+            &self.checkout_retirement_progress(),
+            &self.checkout_retirement_too_large(),
+            &self.checkout_retirement_in_progress(),
+        );
         self.push_checkout_capacity_advice(&mut view, deadline);
         self.push_shared_cache_inventory_advice(&mut view);
         push_environment_minimum_advice(&mut view, deadline);
@@ -534,6 +540,12 @@ impl Broker {
             .and_then(|report| report.capacity_removal.clone());
         push_auto_cleanup_advice(&mut view, auto_cleanup);
         push_landed_proof_unprovable_advice(&mut view, &self.landed_proof_unprovable_sessions());
+        push_checkout_retirement_advice(
+            &mut view,
+            &self.checkout_retirement_progress(),
+            &self.checkout_retirement_too_large(),
+            &self.checkout_retirement_in_progress(),
+        );
         self.push_checkout_capacity_advice(&mut view, deadline);
         self.push_shared_cache_inventory_advice(&mut view);
         push_environment_minimum_advice(&mut view, deadline);
@@ -955,6 +967,11 @@ impl Broker {
             crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
         ) {
             advice.insert(0, headroom_advice);
+        }
+        // Opt-in transcript archiving whose session links stayed unreadable
+        // for several passes (a no-op unless the host enabled it).
+        if let Some(transcripts_advice) = crate::transcripts::linkage_degraded_advice() {
+            advice.push(transcripts_advice);
         }
         if refresh && cleanup_retention.broker_owned_worktree_count > 0 {
             let count = cleanup_retention.broker_owned_worktree_count;

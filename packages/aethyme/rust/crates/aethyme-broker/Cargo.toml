@@ -71,6 +71,9 @@ tar = { workspace = true }
 # Release availability and downgrade decisions use semantic versions rather
 # than string ordering.
 semver = { workspace = true }
+# `aethyme transcripts` compresses closed agent transcripts to `.jsonl.zst`,
+# the one compressed form Codex unarchives and resumes natively.
+zstd = { workspace = true }
 
 # `tests/gate_policy.rs` asserts over the live `.aethyme/gates.toml`, so it
 # needs the monorepo root rather than this crate's. `repo_root()` discovers

@@ -4915,6 +4915,122 @@ impl Broker {
         self.cleanup_under_lifecycle_claim(&session, force, None)
     }
 
+    /// The broker-owned pool holding `worktree`, proved by the broker's own
+    /// records (the legacy root or a root whose marker names this
+    /// repository), when `session` was spawned by the broker. `None` for an
+    /// adopted checkout or anything outside a pool: those are never renamed
+    /// into a trash.
+    pub(crate) fn trash_pool_for(&self, session: &Session, worktree: &Path) -> Option<PathBuf> {
+        if session.origin != SessionOrigin::Spawned
+            || !self
+                .is_broker_owned_worktree_root_checked(session, worktree)
+                .unwrap_or(false)
+        {
+            return None;
+        }
+        worktree.parent().map(Path::to_path_buf)
+    }
+
+    /// Remove a checkout whose content the caller's proofs cover (every byte
+    /// in Git, in a verified archive, or catalogued regenerable output; or a
+    /// `force` discard) by moving it into its pool's trash, O(1), and
+    /// dropping its Git registration; the host deleter unlinks it later.
+    ///
+    /// Immediately before the rename, under the caller's claims: a merge,
+    /// rebase, cherry-pick, revert or bisect in progress, or unmerged index
+    /// entries, refuse (that state lives in the registration); a fresh
+    /// process-use observation must show nobody in the checkout; and commits
+    /// only the checkout's reflog still reaches are pinned under
+    /// `refs/aethyme/retired/<session>/` so removing the registration loses
+    /// none. Without `force`, Git's own refusal stays the last word for a
+    /// checkout that gained uncommitted or untracked content. A checkout
+    /// outside a broker-owned pool, an adopted one, or one the move refuses is
+    /// removed by Git as before, except inside the retirement lane, which
+    /// never removes synchronously: it keeps the checkout instead.
+    pub(crate) fn remove_checkout_through_trash(
+        &self,
+        session: &Session,
+        worktree: &Path,
+        force: bool,
+    ) -> Result<(), BrokerOpError> {
+        let in_lane = super::retire::in_retirement_lane();
+        let refuse = |reason: String| BrokerOpError::DirtyWorktree {
+            id: session.id,
+            reason,
+        };
+        if !force {
+            let clean = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root())
+                .ok()
+                .and_then(|policy| {
+                    crate::auto_cleanup::uncommitted_reason(
+                        worktree,
+                        None,
+                        self.main_root(),
+                        &policy,
+                    )
+                    .ok()
+                })
+                .is_some_and(|reason| reason.is_none());
+            if !clean {
+                crate::phase_telemetry::add(
+                    "checkout_trash_declined_unclean",
+                    std::time::Duration::ZERO,
+                );
+                if in_lane {
+                    return Err(refuse("the checkout changed since it was judged".into()));
+                }
+                self.repo.worktree_remove_registered(worktree, false)?;
+                return Ok(());
+            }
+        }
+        let Some(pool) = self.trash_pool_for(session, worktree) else {
+            crate::phase_telemetry::add("checkout_trash_outside_pool", std::time::Duration::ZERO);
+            if in_lane {
+                return Err(refuse(
+                    "the checkout is not inside a broker-owned pool".into(),
+                ));
+            }
+            self.repo.worktree_remove_registered(worktree, force)?;
+            return Ok(());
+        };
+        // An operation in progress, a process in the checkout, or reflog
+        // commits that cannot be pinned keep it: never a Git fallback.
+        self.prepare_checkout_for_trash(session, worktree)?;
+        let moved = self
+            .main_git_common_dir()
+            .map_err(|error| error.to_string())
+            .and_then(|common_dir| {
+                crate::checkout_trash::move_worktree_to_trash(
+                    &self.repo,
+                    &common_dir,
+                    &pool,
+                    worktree,
+                    session.id,
+                    &mut |trash_dir, entry, row| {
+                        self.record_checkout_trash_row(trash_dir, entry, row)
+                    },
+                )
+            });
+        match moved {
+            Ok(trashed) => {
+                self.note_checkout_trashed(&trashed);
+                Ok(())
+            }
+            Err(reason) => {
+                crate::phase_telemetry::add("checkout_trash_refused", std::time::Duration::ZERO);
+                if in_lane {
+                    return Err(refuse(reason));
+                }
+                crate::phase_telemetry::add(
+                    "checkout_trash_fell_back_to_git",
+                    std::time::Duration::ZERO,
+                );
+                self.repo.worktree_remove_registered(worktree, force)?;
+                Ok(())
+            }
+        }
+    }
+
     /// Remove a worktree only after an archive was written and verified.
     /// The exact reviewed plan, including protected ignored files and policy,
     /// is recomputed under the lifecycle claim immediately before removal.
@@ -5401,8 +5517,16 @@ impl Broker {
                     force,
                 )?);
             } else {
-                self.repo
-                    .worktree_remove_registered(&worktree_path, force)?;
+                // After a verified recovery archive the checkout goes into
+                // the trash in O(1) and the deleter unlinks it. A plain
+                // `finish`/cleanup keeps Git's removal in this slice; the
+                // retirement lane owns everything it leaves behind.
+                if archive_guard.is_some() {
+                    self.remove_checkout_through_trash(session, &worktree_path, force)?;
+                } else {
+                    self.repo
+                        .worktree_remove_registered(&worktree_path, force)?;
+                }
             }
         }
         require_worktree_path_absent(&worktree_path, session_id)?;

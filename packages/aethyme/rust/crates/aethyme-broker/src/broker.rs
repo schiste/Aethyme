@@ -2984,6 +2984,125 @@ pub struct StatusAdvice {
     pub commands: Vec<String>,
 }
 
+/// The `status` rows of checkout retirement, shown only when something needs
+/// a look: checkouts whose recovery archive would exceed the cap (by session
+/// id; paths omitted), and trash or kept checkouts that stopped shrinking.
+fn push_checkout_retirement_advice(
+    view: &mut StatusView,
+    progress: &retire::CheckoutRetirementProgress,
+    too_large: &std::collections::BTreeSet<i64>,
+    in_progress: &std::collections::BTreeSet<i64>,
+) {
+    if let Some(&first) = in_progress.first() {
+        view.advice.push(StatusAdvice {
+            id: "cleanup.retire-operation-in-progress",
+            severity: StatusAdviceSeverity::Notice,
+            reason: "a merge, rebase, cherry-pick, revert or bisect is in progress in these closed checkouts, or their index holds unmerged entries; that state is neither in Git nor archived, so they are kept",
+            summary: format!(
+                "{} closed checkout(s) are kept with an operation in progress",
+                in_progress.len()
+            ),
+            session_id: Some(first),
+            queue_entry_id: None,
+            evidence: unprovable_advice_evidence(in_progress),
+            commands: Vec::new(),
+        });
+    }
+    if progress.retired_pins > 0 {
+        view.advice.push(StatusAdvice {
+            id: "cleanup.retired-pins",
+            severity: StatusAdviceSeverity::Info,
+            reason: "commits only a retired checkout's reflog reached are pinned under refs/aethyme/retired/ until another ref holds them or their session has been cleaned for recovery_archive_days",
+            summary: format!(
+                "{} retired-commit pin(s) under refs/aethyme/retired/",
+                progress.retired_pins
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: Vec::new(),
+            commands: vec!["git for-each-ref refs/aethyme/retired/".into()],
+        });
+    }
+    if !progress.unrecognized_trash_entries.is_empty()
+        || !progress.stale_pending_trash_entries.is_empty()
+    {
+        let mut evidence = progress
+            .unrecognized_trash_entries
+            .iter()
+            .map(|name| format!("unrecorded: {name}"))
+            .collect::<Vec<_>>();
+        evidence.extend(progress.stale_pending_trash_entries.iter().map(|name| {
+            format!("unconfirmed for over a day (confirm with `aethyme broker gc apply`): {name}")
+        }));
+        view.advice.push(StatusAdvice {
+            id: "cleanup.trash-unrecognized",
+            severity: StatusAdviceSeverity::Notice,
+            reason: "the checkout trash holds entries the broker did not record, or recorded but could never confirm; both are left alone (names only)",
+            summary: format!(
+                "{} unrecorded and {} unconfirmed checkout trash entr(y/ies)",
+                progress.unrecognized_trash_entries.len(),
+                progress.stale_pending_trash_entries.len()
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence,
+            commands: Vec::new(),
+        });
+    }
+    if let Some(&first) = too_large.first() {
+        view.advice.push(StatusAdvice {
+            id: "cleanup.retire-archive-too-large",
+            severity: StatusAdviceSeverity::Notice,
+            reason: "these closed checkouts hold more uncommitted or untracked content than one recovery archive may carry, so they are kept until someone decides",
+            summary: format!(
+                "{} closed checkout(s) need a recovery archive larger than {} MiB",
+                too_large.len(),
+                retire::RETIRE_ARCHIVE_MAX_BYTES / (1024 * 1024)
+            ),
+            session_id: Some(first),
+            queue_entry_id: None,
+            evidence: unprovable_advice_evidence(too_large),
+            commands: vec![format!(
+                "aethyme broker finish cleanup resolve {first} --archive"
+            )],
+        });
+    }
+    if progress.stalled_runs >= retire::RETIRE_STALLED_RUNS
+        && (progress.trash_pending > 0 || progress.kept > 0)
+    {
+        let mut evidence = vec![
+            format!(
+                "{} retired checkout(s) still in the trash",
+                progress.trash_pending
+            ),
+            format!(
+                "{} closed checkout(s) kept by a precondition",
+                progress.kept
+            ),
+        ];
+        evidence.extend(
+            progress
+                .reported_trash_entries
+                .iter()
+                .take(20)
+                .map(|entry| format!("trash entry {entry} failed to delete 3 or more times")),
+        );
+        view.advice.push(StatusAdvice {
+            id: "cleanup.retirement-stalled",
+            severity: StatusAdviceSeverity::Warning,
+            reason: "closed checkouts are retired and their trash deleted in the background; neither shrank for several runs",
+            summary: format!(
+                "checkout retirement made no progress for {} run(s)",
+                progress.stalled_runs
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence,
+            commands: Vec::new(),
+        });
+    }
+}
+
 /// The `status` row naming sessions whose landed proof timed out even with
 /// the rest of a pass's share: the background worker keeps them open and
 /// asks again, but a person may need to look. Session ids only; the
@@ -3514,6 +3633,7 @@ mod leases;
 mod missing_checkout;
 mod owners;
 mod remote_heads;
+mod retire;
 pub(crate) use leases::{
     AbandonedSessionCloseOutcome, AbandonmentKeepReason, LandedProof, LandedSessionDecline,
     long_proof_grant, validate_session_commit_args,

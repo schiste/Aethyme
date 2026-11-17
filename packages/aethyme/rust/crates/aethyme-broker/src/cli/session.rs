@@ -1218,6 +1218,13 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     warn_stale_broker_binary(&broker);
     refuse_new_session_on_main_checkout(&mut broker, &path, parsed.allow_main_checkout)?;
+    // A checkout the broker retired after its session closed is recreated
+    // from the session branch, or refused with the archive holding its
+    // leftovers; reuse never fails on a missing path.
+    if mode == crate::AdoptMode::Reuse && !path.exists() {
+        let absolute = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+        broker.recreate_retired_checkout(&absolute)?;
+    }
     let previous_session = if mode == crate::AdoptMode::Reuse {
         let canonical_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         broker
