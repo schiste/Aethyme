@@ -1545,6 +1545,7 @@ impl Broker {
         )?;
         if outcome == AbandonedSessionCloseOutcome::Closed {
             process_table.clear_keep_reason();
+            self.retire_inline_after_close(session_id, deadline);
         } else {
             // Every keep is counted per reason, so the metrics log says why
             // sessions far past the window stay open.
@@ -1576,6 +1577,9 @@ impl Broker {
             SessionCloseLane::Landed,
         )?;
         self.record_landed_proof_outcome(session_id, LandedSessionDecline::from_outcome(outcome));
+        if outcome == AbandonedSessionCloseOutcome::Closed {
+            self.retire_inline_after_close(session_id, deadline);
+        }
         Ok(outcome)
     }
 
@@ -1603,6 +1607,9 @@ impl Broker {
             SessionCloseLane::MergedPullRequest,
         )?;
         self.record_landed_proof_outcome(session_id, LandedSessionDecline::from_outcome(outcome));
+        if outcome == AbandonedSessionCloseOutcome::Closed {
+            self.retire_inline_after_close(session_id, deadline);
+        }
         Ok(outcome)
     }
 
@@ -3711,6 +3718,9 @@ impl Broker {
             ) {
             Ok(true) => {
                 self.settle_dead_receipts_after_close(session_id);
+                // The checkout is retired by the worker's retirement lane:
+                // archived when needed, renamed into the trash, deleted.
+                self.request_checkout_retirement_run();
                 crate::phase_telemetry::add(
                     match holder_evidence {
                         "lease_expired" => "session_closed_holder_lease_expired",

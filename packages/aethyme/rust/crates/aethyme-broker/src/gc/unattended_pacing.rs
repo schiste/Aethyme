@@ -1166,6 +1166,42 @@ impl Drop for UnattendedPacingScope {
     }
 }
 
+/// Run `operation` with this thread's unattended pacer set aside, and put it
+/// back afterwards (also on unwind). The checkout trash deleter paces itself
+/// and must never wait on memory pressure: unlinking frees page cache.
+pub(crate) fn without_pacer<T>(operation: impl FnOnce() -> T) -> T {
+    struct Restore(Option<UnattendedPacer>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(pacer) = self.0.take() {
+                ACTIVE.with(|active| {
+                    if let Ok(mut active) = active.try_borrow_mut() {
+                        *active = Some(pacer);
+                    }
+                });
+            }
+        }
+    }
+    let _restore = Restore(ACTIVE.with(|active| {
+        active
+            .try_borrow_mut()
+            .ok()
+            .and_then(|mut active| active.take())
+    }));
+    operation()
+}
+
+/// Whether an unattended pacer is installed on this thread.
+#[cfg(test)]
+pub(crate) fn pacer_installed() -> bool {
+    ACTIVE.with(|active| {
+        active
+            .try_borrow()
+            .map(|active| active.is_some())
+            .unwrap_or(true)
+    })
+}
+
 /// Install `pacer` for unattended removal on the calling thread.
 pub(crate) fn install(pacer: UnattendedPacer) -> UnattendedPacingScope {
     ACTIVE.with(|active| *active.borrow_mut() = Some(pacer));

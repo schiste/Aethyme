@@ -35,6 +35,7 @@ mod broker;
 mod change_classification;
 mod chau7_mcp;
 mod chau7_tabs;
+mod checkout_trash;
 mod cleanup_audit;
 mod cleanup_batch;
 mod cleanup_resolve;

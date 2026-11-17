@@ -1715,6 +1715,10 @@ impl Broker {
             return Ok(None);
         }
         let session_id = expected_cohort.owner_session_id();
+        // The retirement lane's checkouts are never compacted by this lane.
+        if self.checkout_retirement_owns(session_id) {
+            return Ok(None);
+        }
         let worktree = expected_cohort.worktree();
         let started = Instant::now();
         if deadline.saturating_duration_since(started)

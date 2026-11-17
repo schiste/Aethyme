@@ -88,6 +88,38 @@ impl PinnedTreeRemoval {
         }
     }
 
+    /// Remove this pinned tree, calling `before_mutation` before every
+    /// unlink, and report the unlinks made and the logical regular-file
+    /// lengths observed for them. The pinned identity, mount and deadline
+    /// guards apply: no symlink is followed and no mount point is crossed.
+    pub(crate) fn remove_with_progress_and_observed_file_bytes_and_guard<M>(
+        self,
+        _keep_until_last: Option<&str>,
+        _deadline: Option<Instant>,
+        mut _before_mutation: M,
+    ) -> Result<(TreeRemoval, usize, u64), TreeRemovalError>
+    where
+        M: FnMut() -> io::Result<()>,
+    {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.0
+                .remove_with_progress_and_observed_file_bytes_and_guard(
+                    _keep_until_last,
+                    _deadline,
+                    &mut _before_mutation,
+                )
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _self = self;
+            Err(TreeRemovalError {
+                source: unsupported_platform(),
+                entries_reclaimed: 0,
+            })
+        }
+    }
+
     /// Identity of the directory opened by [`Self::open`].
     pub(crate) fn object_identity(&self) -> io::Result<TreeObjectIdentity> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]

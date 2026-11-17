@@ -49,6 +49,12 @@ impl Broker {
             .and_then(|report| report.capacity_removal.clone());
         push_auto_cleanup_advice(&mut view, auto_cleanup);
         push_landed_proof_unprovable_advice(&mut view, &self.landed_proof_unprovable_sessions());
+        push_checkout_retirement_advice(
+            &mut view,
+            &self.checkout_retirement_progress(),
+            &self.checkout_retirement_too_large(),
+            &self.checkout_retirement_in_progress(),
+        );
         self.push_checkout_capacity_advice(&mut view, deadline);
         self.push_shared_cache_inventory_advice(&mut view);
         push_environment_minimum_advice(&mut view, deadline);
@@ -534,6 +540,12 @@ impl Broker {
             .and_then(|report| report.capacity_removal.clone());
         push_auto_cleanup_advice(&mut view, auto_cleanup);
         push_landed_proof_unprovable_advice(&mut view, &self.landed_proof_unprovable_sessions());
+        push_checkout_retirement_advice(
+            &mut view,
+            &self.checkout_retirement_progress(),
+            &self.checkout_retirement_too_large(),
+            &self.checkout_retirement_in_progress(),
+        );
         self.push_checkout_capacity_advice(&mut view, deadline);
         self.push_shared_cache_inventory_advice(&mut view);
         push_environment_minimum_advice(&mut view, deadline);
