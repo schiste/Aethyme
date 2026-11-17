@@ -1842,7 +1842,14 @@ fn status_shows_linkage_degradation_and_broker_status_advises_after_three_passes
     let host = Host::new();
     let repository = Repository::new(&host, OTHER_UUID, "closed");
     fs::write(&repository.db, b"not a database at all").unwrap();
-    host.codex_transcript(UUID, &repository.root);
+    let source = host.codex_transcript(UUID, &repository.root);
+    // Old enough for `status`, which judges at the real current time.
+    fs::File::options()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(10 * 86_400))
+        .unwrap();
     let config = enabled(vec![Provider::Codex]);
     let mut open = probe(Vec::new());
     let index = || Index::open(&host.environment.host_dir).unwrap();
