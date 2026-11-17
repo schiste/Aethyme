@@ -205,7 +205,7 @@ pub(crate) fn session_block(
     let blockers: Vec<Value> = session_advice
         .iter()
         .filter(|item| item.severity == crate::StatusAdviceSeverity::Blocked)
-        .map(|item| json!({"id": item.id, "summary": item.summary, "commands": item.commands}))
+        .map(|item| json!({"id": item.id, "summary": item.summary}))
         .collect();
     let next_action = next_action(NextActionFacts {
         session_id,
@@ -219,6 +219,7 @@ pub(crate) fn session_block(
                 status.state,
                 crate::PreparationState::Required
                     | crate::PreparationState::Stale
+                    | crate::PreparationState::InProgress
                     | crate::PreparationState::Interrupted
                     | crate::PreparationState::Failed
                     | crate::PreparationState::Invalid
@@ -228,6 +229,15 @@ pub(crate) fn session_block(
         }),
         unpushed_commits: push.as_ref().ok().map(|state| state.unpushed_commits),
         pr_recorded: watch.is_some(),
+        push_enabled: crate::session_push::session_push_enabled(broker.repo_handle()),
+        inspect_worktree: format!(
+            "git -C '{}' status --short",
+            session.worktree_path.replace('\'', "'\\''")
+        ),
+        untouched_branch: push.as_ref().is_ok_and(|state| {
+            state.remote_oid.is_none()
+                && session.diff_base.as_deref() == Some(state.head_oid.as_str())
+        }),
     });
     json!({
         "id": session.id,
@@ -247,6 +257,125 @@ pub(crate) fn session_block(
     })
 }
 
+/// Routine advice is scoped to the current task; raw evidence is on demand.
+pub(crate) fn routine_session_block(
+    broker: &crate::Broker,
+    session_id: i64,
+    coordination: &crate::agent_hook::SessionCoordination,
+) -> Result<Value, crate::BrokerOpError> {
+    use crate::blockers::BlockerKind;
+
+    let advice = broker.session_status_advice(session_id, crate::clock::epoch_ms())?;
+    let mut block = session_block(broker, session_id, &advice);
+    for item in block["advice"].as_array_mut().into_iter().flatten() {
+        if let Some(item) = item.as_object_mut() {
+            item.remove("evidence");
+            item.remove("commands");
+        }
+    }
+    let Some(blockers) = block["blockers"].as_array_mut() else {
+        return Ok(block);
+    };
+    blockers.extend(coordination.actions.iter().take(10).map(|item| json!({
+        "id": item.id,
+        "summary": match item.kind {
+            BlockerKind::Operation => "A write from this session has an unknown outcome",
+            BlockerKind::ResourceLease => "A resource associated with this session needs recovery",
+            BlockerKind::Pidfile => "A gate ran from this session and left a stale pidfile",
+            BlockerKind::ActionRequired => "Read this worktree's .aethyme/broker-action-required.md",
+            _ => "A coordination record for this session needs inspection",
+        },
+    })));
+    if let Some(first) = coordination.actions.first()
+        && block["status"] != "cleaned"
+        && block["status"] != "closed"
+    {
+        block["next_action"] = json!({
+            "command": if first.kind == BlockerKind::ActionRequired {
+                let worktree = block["worktree"].as_str().unwrap_or_default().replace('\'', "'\\''");
+                format!("cat '{worktree}'/.aethyme/broker-action-required.md")
+            } else {
+                "aethyme broker unblock".to_string()
+            },
+            "reason": "inspect recovery evidence for this session",
+        });
+    }
+    block["waiting"] = json!({
+        "count": coordination.waiters.len(),
+        "records": coordination.waiters.iter().take(3).map(|waiter| json!({
+            "kind": waiter.kind, "resource": waiter.resource, "holder": waiter.holder,
+        })).collect::<Vec<_>>(),
+    });
+    if !coordination.waiters.is_empty()
+        && block["blockers"].as_array().is_some_and(Vec::is_empty)
+        && block["status"] != "closed"
+        && block["status"] != "cleaned"
+    {
+        let command = (coordination.waiters[0].kind == crate::waiters::WAIT_COORDINATED_WRITE_LOCK)
+            .then(|| format!("aethyme broker advanced operations list --session {session_id}"));
+        block["next_action"] = json!({
+            "command": command,
+            "instruction": "let the running command return before retrying",
+            "reason": "this session has a running wait",
+        });
+    }
+    Ok(block)
+}
+
+pub(crate) fn render_routine_session(block: &Value, show_worktree: bool) -> String {
+    use std::fmt::Write as _;
+    let mut text = format!(
+        "Aethyme session {} ({})",
+        block["id"],
+        block["status"].as_str().unwrap_or("unknown")
+    );
+    if show_worktree && let Some(worktree) = block["worktree"].as_str() {
+        write!(text, "\nWorktree: {worktree}").expect("writing to String is infallible");
+    }
+    if let Some(count) = block["unpushed_commits"].as_u64() {
+        write!(text, "\nUnpushed commits: {count}").expect("writing to String is infallible");
+    }
+    if let Some(number) = block["pr"]["number"].as_u64() {
+        let kind = if block["pr"]["draft"] == true {
+            "draft "
+        } else {
+            ""
+        };
+        let head = if block["pr"]["head_matches_local"] == true {
+            ""
+        } else {
+            " (recorded head differs or is unknown)"
+        };
+        write!(text, "\nPull request: {kind}#{number}{head}")
+            .expect("writing to String is infallible");
+    }
+    for blocker in block["blockers"].as_array().into_iter().flatten() {
+        if let Some(summary) = blocker["summary"].as_str() {
+            write!(text, "\nAction required: {summary}").expect("writing to String is infallible");
+        }
+    }
+    for waiter in block["waiting"]["records"].as_array().into_iter().flatten() {
+        write!(
+            text,
+            "\nWaiting: {} on {}",
+            waiter["kind"], waiter["resource"]
+        )
+        .expect("writing to String is infallible");
+        if let Some(holder) = waiter["holder"].as_str().filter(|text| !text.is_empty()) {
+            write!(text, " ({holder})").expect("writing to String is infallible");
+        }
+    }
+    if let (Some(command), Some(reason)) = (
+        block["next_action"]["command"]
+            .as_str()
+            .or_else(|| block["next_action"]["instruction"].as_str()),
+        block["next_action"]["reason"].as_str(),
+    ) {
+        write!(text, "\nNext: {command} ({reason})").expect("writing to String is infallible");
+    }
+    text
+}
+
 /// The facts the session block's `next_action` is decided from.
 pub(super) struct NextActionFacts {
     pub(super) session_id: i64,
@@ -255,6 +384,9 @@ pub(super) struct NextActionFacts {
     pub(super) preparation_command: Option<String>,
     pub(super) unpushed_commits: Option<u32>,
     pub(super) pr_recorded: bool,
+    pub(super) push_enabled: bool,
+    pub(super) inspect_worktree: String,
+    pub(super) untouched_branch: bool,
 }
 
 /// One exact command and why, in priority order: a closed session, a
@@ -270,6 +402,16 @@ pub(super) fn next_action(facts: NextActionFacts) -> Value {
         (command, "a blocker names this session")
     } else if let Some(command) = facts.preparation_command {
         (command, "the worktree's dependencies are not prepared")
+    } else if facts.untouched_branch && !facts.pr_recorded {
+        (
+            facts.inspect_worktree,
+            "inspect worktree changes before committing",
+        )
+    } else if !facts.push_enabled {
+        (
+            format!("aethyme broker submit --session {id}"),
+            "validate the committed session head under the repository's delivery policy",
+        )
     } else if facts.unpushed_commits.is_some_and(|count| count > 0) {
         if facts.pr_recorded {
             (
@@ -371,6 +513,9 @@ mod tests {
             preparation_command: None,
             unpushed_commits: Some(0),
             pr_recorded: true,
+            push_enabled: true,
+            inspect_worktree: "git -C /fixture status --short".into(),
+            untouched_branch: false,
         }
     }
 
@@ -423,6 +568,21 @@ mod tests {
             }),
             "aethyme broker push --session 7 --plan"
         );
+        assert_eq!(
+            command(NextActionFacts {
+                push_enabled: false,
+                ..facts()
+            }),
+            "aethyme broker submit --session 7"
+        );
         assert_eq!(command(facts()), "aethyme broker submit --session 7");
+        assert_eq!(
+            command(NextActionFacts {
+                pr_recorded: false,
+                untouched_branch: true,
+                ..facts()
+            }),
+            "git -C /fixture status --short"
+        );
     }
 }

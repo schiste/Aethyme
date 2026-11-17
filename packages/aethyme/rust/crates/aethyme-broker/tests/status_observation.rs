@@ -156,13 +156,10 @@ fn routine_status_keeps_abandoned_prepared_operation_visible_without_reaping_it(
         "routine status performed startup recovery"
     );
     assert_eq!(payload["coordinated_operations"]["count"], 1);
+    assert_eq!(payload["coordinated_operations"]["omitted_count"], 1);
     assert_eq!(
-        payload["coordinated_operations"]["records"][0]["id"],
-        row.id
-    );
-    assert_eq!(
-        payload["coordinated_operations"]["records"][0]["status"],
-        "prepared"
+        payload["coordinated_operations"]["records"],
+        serde_json::json!([])
     );
 }
 
