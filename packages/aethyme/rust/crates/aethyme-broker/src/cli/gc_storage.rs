@@ -1596,6 +1596,11 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     if action == "__continue-artifacts" {
         return run_artifact_sweep_continuation_worker(parsed);
     }
+    // A managed sweep tick is a detached worker: its starved background lanes
+    // may queue for the lifecycle lock (see `DetachedBackgroundWorker`).
+    #[cfg(target_os = "macos")]
+    let _detached_worker = (action == "sweep" && crate::gc_sweep_service::managed_tick_requested())
+        .then(crate::file_lock::DetachedBackgroundWorker::enter);
     if action == "artifact-use" {
         return run_gc_artifact_use_reconcile(parsed);
     }
@@ -1919,14 +1924,20 @@ fn run_gc_artifact_use_reconcile(parsed: Parsed) -> Result<(), UsageError> {
     };
 
     let mut broker = open_broker(true)?;
-    let _lifecycle_claim =
-        if action == "apply" {
-            Some(broker.try_claim_worktree_lifecycle()?.ok_or_else(|| {
-                UsageError::Message("worktree lifecycle is busy; retry later".into())
-            })?)
-        } else {
-            None
-        };
+    // An operator's explicit apply is foreground work: it does not yield to
+    // queued lifecycle waiters, it only refuses while the lock is held.
+    let _foreground = crate::file_lock::ForegroundLifecycleTryClaim::enter();
+    let _lifecycle_claim = if action == "apply" {
+        Some(
+            broker
+                .try_claim_worktree_lifecycle("artifact_use_reconcile")?
+                .ok_or_else(|| {
+                    UsageError::Message("worktree lifecycle is busy; retry later".into())
+                })?,
+        )
+    } else {
+        None
+    };
     let session = broker.store().session(session_id)?;
     let checkout_root = PathBuf::from(&session.worktree_path);
     let cohort = match broker.closed_artifact_checkout_cohort_for_session_readonly(
@@ -2255,6 +2266,9 @@ fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageErr
         parsed.positional.len(),
         artifact_worker_test_or_build_environment(),
     )?;
+    // Nobody waits on this process: its starved background lanes may queue
+    // for the lifecycle lock (see `DetachedBackgroundWorker`).
+    let _detached_worker = crate::file_lock::DetachedBackgroundWorker::enter();
     // Nobody waits on this process: drop to background CPU and I/O priority
     // before anything else runs, so every later child inherits it.
     let priority = crate::gc::lower_artifact_worker_priority();

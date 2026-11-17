@@ -22,9 +22,15 @@ struct Totals {
     count: u64,
 }
 
+#[derive(Default)]
+struct Accumulated {
+    totals: BTreeMap<&'static str, Totals>,
+    attachments: BTreeMap<&'static str, serde_json::Value>,
+}
+
 /// One command's accumulated spans, shared with its worker threads.
 #[derive(Clone, Default)]
-pub(crate) struct Recorder(Arc<Mutex<BTreeMap<&'static str, Totals>>>);
+pub(crate) struct Recorder(Arc<Mutex<Accumulated>>);
 
 thread_local! {
     static ACTIVE: std::cell::RefCell<Option<Recorder>> = const { std::cell::RefCell::new(None) };
@@ -73,11 +79,32 @@ pub(crate) fn span(name: &'static str) -> Span {
 pub(crate) fn add(name: &'static str, elapsed: Duration) {
     ACTIVE.with(|active| {
         if let Some(recorder) = active.borrow().as_ref()
-            && let Ok(mut totals) = recorder.0.lock()
+            && let Ok(mut accumulated) = recorder.0.lock()
         {
-            let entry = totals.entry(name).or_default();
+            let entry = accumulated.totals.entry(name).or_default();
             entry.micros = entry.micros.saturating_add(elapsed.as_micros() as u64);
             entry.count += 1;
+        }
+    });
+}
+
+/// Attach one structured field, `name`, to the command's metric line. For
+/// facts that are not durations, such as a lock's queue position or who held
+/// it. An object merges into an object already attached under that name (its
+/// keys win); anything else replaces it. Free when no command is recording.
+pub(crate) fn attach(name: &'static str, value: serde_json::Value) {
+    ACTIVE.with(|active| {
+        if let Some(recorder) = active.borrow().as_ref()
+            && let Ok(mut accumulated) = recorder.0.lock()
+        {
+            if let serde_json::Value::Object(fields) = &value
+                && let Some(serde_json::Value::Object(existing)) =
+                    accumulated.attachments.get_mut(name)
+            {
+                existing.extend(fields.clone());
+            } else {
+                accumulated.attachments.insert(name, value);
+            }
         }
     });
 }
@@ -98,9 +125,10 @@ pub(crate) fn subprocess_span(command: &std::process::Command) -> Span {
 impl Recorder {
     /// Milliseconds and occurrence counts per span, by name.
     pub(crate) fn totals(&self) -> (BTreeMap<String, u64>, BTreeMap<String, u64>) {
-        let Ok(totals) = self.0.lock() else {
+        let Ok(accumulated) = self.0.lock() else {
             return Default::default();
         };
+        let totals = &accumulated.totals;
         let millis = totals
             .iter()
             .map(|(name, total)| (name.to_string(), total.micros / 1000))
@@ -110,6 +138,18 @@ impl Recorder {
             .map(|(name, total)| (name.to_string(), total.count))
             .collect();
         (millis, counts)
+    }
+
+    /// The structured fields attached with [`attach`], by name.
+    pub(crate) fn attachments(&self) -> BTreeMap<String, serde_json::Value> {
+        let Ok(accumulated) = self.0.lock() else {
+            return BTreeMap::new();
+        };
+        accumulated
+            .attachments
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect()
     }
 }
 
@@ -139,6 +179,32 @@ mod tests {
         assert_eq!(counts.get("work"), Some(&2));
         assert_eq!(counts.get("scoped"), Some(&1));
         assert!(!counts.contains_key("ignored"));
+    }
+
+    #[test]
+    fn attachments_merge_by_name_and_only_while_installed() {
+        attach("ignored", serde_json::json!(1));
+        let recorder = Recorder::default();
+        {
+            let _installed = install(recorder.clone());
+            attach(
+                "lock",
+                serde_json::json!({"queue_position": 3, "wait_ms": 7}),
+            );
+            attach(
+                "lock",
+                serde_json::json!({"queue_position": 0, "held_ms": 2}),
+            );
+            attach("scalar", serde_json::json!(1));
+            attach("scalar", serde_json::json!(2));
+        }
+        let attachments = recorder.attachments();
+        assert_eq!(
+            attachments.get("lock"),
+            Some(&serde_json::json!({"queue_position": 0, "wait_ms": 7, "held_ms": 2}))
+        );
+        assert_eq!(attachments.get("scalar"), Some(&serde_json::json!(2)));
+        assert!(!attachments.contains_key("ignored"));
     }
 
     #[test]

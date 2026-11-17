@@ -1038,7 +1038,7 @@ impl Broker {
             // then move it away. The cleanup request's grace hours are
             // ignored on purpose: the work is in Git, so the directory gets
             // no grace.
-            let Some(_claim) = self.try_claim_worktree_lifecycle()? else {
+            let Some(_claim) = self.try_claim_worktree_lifecycle("retire")? else {
                 return Ok(Kept("lifecycle_busy"));
             };
             let current = self.store_ref().session(session_id)?;
@@ -1356,7 +1356,7 @@ impl Broker {
             id: session.id,
             reason,
         };
-        let Some(_claim) = self.try_claim_worktree_lifecycle()? else {
+        let Some(_claim) = self.try_claim_worktree_lifecycle("retire")? else {
             return Err(refuse(
                 "another checkout lifecycle operation is running; retry in a moment".into(),
             ));
@@ -2043,7 +2043,10 @@ mod tests {
         let (_owner, _storage, mut broker) = fixture();
         let (_session, path) = closed(&mut broker, "claimed", |_| {});
         assert_eq!(run(&mut broker).retired_clean, 1);
-        let held = broker.try_claim_worktree_lifecycle().unwrap().unwrap();
+        let held = broker
+            .try_claim_worktree_lifecycle("retire")
+            .unwrap()
+            .unwrap();
         let error = broker
             .recreate_retired_checkout(&path)
             .unwrap_err()
