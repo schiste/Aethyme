@@ -25,6 +25,10 @@ const CHECKOUT_CAPACITY_LOCK_WAIT: std::time::Duration = crate::gc::GC_LOCK_FORE
 /// The removal budget `broker start` spends at the checkout limit before it
 /// refuses.
 const CHECKOUT_CAPACITY_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+/// The least space one in-flight start is assumed to still need, when
+/// nothing better is measured: the storage admission of a concurrent start
+/// subtracts it per live reservation.
+const IN_FLIGHT_CHECKOUT_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
 /// How long `broker start` below the storage reserve spends stripping closed
 /// checkouts and deleting what that moved into the trash before refusing.
 const STORAGE_PRESSURE_STRIP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
@@ -80,7 +84,10 @@ struct CreatedSessionWorktree {
     worktree: GitRepo,
     worktree_placement: WorktreePlacement,
     selected_promote_branch: String,
-    _lifecycle_claim: crate::file_lock::ExclusiveFileLock,
+    /// The narrow claim on this checkout's path and branch. The repository
+    /// lifecycle lock is already released; the caller releases this once the
+    /// session row is committed or its rollback is done.
+    reservation: crate::start_reservation::StartReservation,
 }
 
 fn capture_spawned_worktree_instance_witness(
@@ -7544,8 +7551,11 @@ impl Broker {
             worktree,
             worktree_placement,
             selected_promote_branch,
-            _lifecycle_claim,
+            reservation,
         } = self.create_session_worktree(task, explicit_base, &planned_paths)?;
+        // Until this start's row and reports are done, inline nonblocking
+        // lifecycle claims stay "busy", as when start held the lock throughout.
+        let _decline_inline_claims = crate::file_lock::DeclineNonblockingLifecycleClaims::enter();
         let base = start_base.commit.clone();
         let base_observation = crate::broker::SessionBaseObservation::from_start_base(
             &start_base,
@@ -7608,6 +7618,8 @@ impl Broker {
                 return Err(error.into());
             }
         };
+        // The row now protects the checkout; the narrow claim is done.
+        reservation.release();
         self.store.set_session_foreign_files(session.id, &[])?;
         let planned_explicit_leases = self.planned_explicit_leases(session.id, &planned_paths)?;
         phase_timings_ms.insert(
@@ -7707,8 +7719,11 @@ impl Broker {
             worktree,
             worktree_placement,
             selected_promote_branch,
-            _lifecycle_claim,
+            reservation,
         } = self.create_session_worktree(task, explicit_base, &[])?;
+        // Until this start's row and reports are done, inline nonblocking
+        // lifecycle claims stay "busy", as when start held the lock throughout.
+        let _decline_inline_claims = crate::file_lock::DeclineNonblockingLifecycleClaims::enter();
         let agent_setup_started = std::time::Instant::now();
         let base = start_base.commit.clone();
         let base_observation = crate::broker::SessionBaseObservation::from_start_base(
@@ -7877,6 +7892,8 @@ impl Broker {
                 }
             }
         };
+        // The row now protects the checkout; the narrow claim is done.
+        reservation.release();
 
         if let Err(source) = agent.release() {
             let cleanup = match agent.abort() {
@@ -8007,10 +8024,23 @@ impl Broker {
         // writes the marker and build defaults, so it belongs under the same
         // claim as storage's empty-root removal; otherwise a confirmed sweep
         // could delete a root prepared before this final claim.
+        //
+        // The claim covers only repository-wide decisions: the checkout
+        // limit, root preparation, reaping dead start reservations, choosing
+        // the unique slug/branch/path and recording this start's reservation
+        // (see `crate::start_reservation` for the invariants). `git worktree
+        // add`, contract and witness capture and registration then run under
+        // the reservation alone.
         let mut lifecycle_claim =
             timed_start_phase(&mut phase_timings_ms, "lifecycle_lock_wait", || {
                 self.claim_worktree_lifecycle()
             })?;
+        let mut reserve_hold_started = std::time::Instant::now();
+        // Reap first, so a dead start's reservation counts against neither
+        // the checkout limit nor the free-space reserve below.
+        let reap = timed_start_phase(&mut phase_timings_ms, "start_reservation_reap", || {
+            self.reap_stale_start_reservations()
+        });
         let full = timed_start_phase(&mut phase_timings_ms, "checkout_count", || {
             self.worktree_checkout_limit()
         })?;
@@ -8048,6 +8078,7 @@ impl Broker {
                 "lifecycle_lock_wait_after_cleanup",
                 || self.claim_worktree_lifecycle(),
             )?;
+            reserve_hold_started = std::time::Instant::now();
             if let Some((count, maximum)) = self.worktree_checkout_limit()? {
                 let detail =
                     crate::auto_cleanup::checkout_capacity_refusal_detail(cleanup_report.as_ref());
@@ -8086,6 +8117,7 @@ impl Broker {
                 "lifecycle_lock_wait_after_strip",
                 || self.claim_worktree_lifecycle(),
             )?;
+            reserve_hold_started = std::time::Instant::now();
             placement =
                 timed_start_phase(&mut phase_timings_ms, "worktree_root_after_strip", || {
                     self.prepare_broker_worktree_root()
@@ -8103,36 +8135,81 @@ impl Broker {
                 ));
             }
         }
-        // Choose the unique branch and recheck the destination immediately
-        // before the checkout is allocated. The returned guard stays held
-        // until the caller registers the session or rolls the checkout back.
-        let slug = self.next_worktree_slug(task, &placement.root);
-        let worktree_path = placement.root.join(&slug);
-        self.refuse_nested_worktree_path(&worktree_path)?;
-        let branch = format!("agent/{slug}");
-        let (worktree, sparse_setup_fallback) =
-            match timed_start_phase(&mut phase_timings_ms, "git_worktree_add", || {
-                self.repo.worktree_add_with_sparse_paths(
-                    &worktree_path,
-                    &branch,
-                    &start_base.commit,
-                    &sparse_paths,
-                )
-            }) {
-                Ok(created) => created,
-                Err(error) => {
-                    let primary = BrokerOpError::Git(error);
-                    let recovery =
-                        inspect_partial_worktree_creation(&self.repo, &worktree_path, &branch);
-                    if recovery.is_empty() {
-                        return Err(primary);
-                    }
-                    return Err(BrokerOpError::StartAgentRollback {
-                        primary: Box::new(primary),
-                        recovery,
-                    });
+        // Choose the unique branch and destination and reserve both. Nothing
+        // after the reservation can fail while the wide claim is held, so the
+        // reserved (empty) destination never outlives its reservation without
+        // the rollback below.
+        let (slug, worktree_path, branch, reservation) =
+            timed_start_phase(&mut phase_timings_ms, "start_reservation", || {
+                self.reserve_session_checkout(task, &placement.root, &start_base.commit)
+            })?;
+        let reserve_held = reserve_hold_started.elapsed();
+        drop(lifecycle_claim);
+        phase_timings_ms.insert(
+            "lifecycle_lock_held_reserve".into(),
+            u64::try_from(reserve_held.as_millis()).unwrap_or(u64::MAX),
+        );
+
+        // Outside the wide claim. Two adds in one repository are safe
+        // concurrently: Git names each `worktrees/<id>` admin directory with
+        // an atomic mkdir (suffixing on collision) and marks it `locked`
+        // ("initializing") until the checkout is complete, so `git worktree
+        // prune` keeps it; `-b` creates a distinct loose ref under its own
+        // `<ref>.lock` and only reads packed-refs; the index, `index.lock` and
+        // HEAD belong to the new worktree's own admin directory. The slug
+        // reservation guarantees no other start uses this path or branch.
+        crate::start_reservation::run_before_add_hook(&worktree_path, &branch);
+        let add_started = std::time::Instant::now();
+        let added = timed_start_phase(&mut phase_timings_ms, "git_worktree_add", || {
+            self.repo.worktree_add_with_sparse_paths(
+                &worktree_path,
+                &branch,
+                &start_base.commit,
+                &sparse_paths,
+            )
+        });
+        let add_elapsed = add_started.elapsed();
+        let split = |rollback: Option<&str>| {
+            serde_json::json!({
+                "reserve_held_ms": u64::try_from(reserve_held.as_millis()).unwrap_or(u64::MAX),
+                "add_outside_lock_ms": u64::try_from(add_elapsed.as_millis()).unwrap_or(u64::MAX),
+                "reservations_reaped": reap.reaped,
+                "reaped_directories_removed": reap.removed_directories,
+                "reaped_branches_removed": reap.removed_branches,
+                "reaped_retained": reap.retained.len(),
+                "rollback": rollback,
+            })
+        };
+        let (worktree, sparse_setup_fallback) = match added {
+            Ok(created) => created,
+            Err(error) => {
+                let primary = BrokerOpError::Git(error);
+                let recovery = timed_start_phase(&mut phase_timings_ms, "start_rollback", || {
+                    self.rollback_reserved_session_checkout(
+                        &worktree_path,
+                        &branch,
+                        &start_base.commit,
+                        reservation,
+                    )
+                });
+                crate::phase_telemetry::attach(
+                    "start_lifecycle_split",
+                    split(Some(if recovery.is_empty() {
+                        "clean"
+                    } else {
+                        "retained"
+                    })),
+                );
+                if recovery.is_empty() {
+                    return Err(primary);
                 }
-            };
+                return Err(BrokerOpError::StartAgentRollback {
+                    primary: Box::new(primary),
+                    recovery,
+                });
+            }
+        };
+        crate::phase_telemetry::attach("start_lifecycle_split", split(None));
         if let Some(reason) = sparse_plan_fallback {
             eprintln!(
                 "warning: sparse checkout inputs were unavailable ({reason}); created a full checkout"
@@ -8157,8 +8234,148 @@ impl Broker {
             worktree,
             worktree_placement: placement,
             selected_promote_branch: selected_promote.branch,
-            _lifecycle_claim: lifecycle_claim,
+            reservation,
         })
+    }
+
+    /// Reap start reservations whose process died. Runs under the
+    /// repository lifecycle claim (`crate::start_reservation` invariant 3).
+    fn reap_stale_start_reservations(&self) -> crate::start_reservation::ReapReport {
+        let report = crate::start_reservation::reap_stale(
+            &self.main_root,
+            |branch| self.repo.resolve_ref(&format!("refs/heads/{branch}")),
+            |branch, base| {
+                self.repo
+                    .delete_branch_ref_checked(branch, base)
+                    .map_err(|error| error.to_string())
+            },
+        );
+        for _ in 0..report.reaped {
+            crate::phase_telemetry::add("start_reservation_reaped", std::time::Duration::ZERO);
+        }
+        for reason in &report.retained {
+            eprintln!("warning: {reason}");
+        }
+        report
+    }
+
+    /// Choose a unique slug and reserve its destination and branch. Runs under
+    /// the repository lifecycle claim.
+    fn reserve_session_checkout(
+        &self,
+        task: &str,
+        root: &Path,
+        base: &str,
+    ) -> Result<
+        (
+            String,
+            PathBuf,
+            String,
+            crate::start_reservation::StartReservation,
+        ),
+        BrokerOpError,
+    > {
+        // Slug selection skips existing paths, branches and reservations, so a
+        // `Taken` here means a directory appeared in between; try the next.
+        for _ in 0..8 {
+            let slug = self.next_worktree_slug(task, root);
+            let worktree_path = root.join(&slug);
+            refuse_nested_pool_destination(root, &worktree_path)?;
+            let branch = format!("agent/{slug}");
+            match crate::start_reservation::reserve(
+                &self.main_root,
+                &slug,
+                &worktree_path,
+                &branch,
+                base,
+            ) {
+                Ok(crate::start_reservation::Reserve::Reserved(reservation)) => {
+                    return Ok((slug, worktree_path, branch, reservation));
+                }
+                Ok(crate::start_reservation::Reserve::Taken) => continue,
+                Err(source) => {
+                    return Err(BrokerOpError::WorktreeRootUnavailable {
+                        path: worktree_path,
+                        reason: format!("cannot reserve the session checkout: {source}"),
+                    });
+                }
+            }
+        }
+        Err(BrokerOpError::WorktreeRootUnavailable {
+            path: root.to_path_buf(),
+            reason: "could not reserve a unique session checkout name".into(),
+        })
+    }
+
+    /// Undo a reserved checkout whose `git worktree add` failed, then release
+    /// the reservation. Takes the repository lifecycle claim (failure only),
+    /// so a start of an older binary, which holds the claim until its row is
+    /// committed, can never be mid-flight on this path: a row for the path
+    /// means it is not ours, and everything is retained.
+    fn rollback_reserved_session_checkout(
+        &self,
+        worktree_path: &Path,
+        branch: &str,
+        base: &str,
+        reservation: crate::start_reservation::StartReservation,
+    ) -> Vec<String> {
+        crate::phase_telemetry::add("start_reservation_rollback", std::time::Duration::ZERO);
+        let _claim = match self.claim_worktree_lifecycle() {
+            Ok(claim) => claim,
+            Err(error) => {
+                // Dropping the reservation leaves the leftovers to the next
+                // start's reaper, which removes only empty ones.
+                return vec![format!(
+                    "could not claim the lifecycle lock to roll back {}: {error}; the next start reaps what is safe to remove",
+                    worktree_path.display()
+                )];
+            }
+        };
+        let recovery = match self
+            .store
+            .session_for_worktree(&worktree_path.to_string_lossy())
+        {
+            Ok(Some(session)) => vec![format!(
+                "session {} owns {}; retained it and branch {branch}",
+                session.id,
+                worktree_path.display()
+            )],
+            Err(error) => vec![format!(
+                "could not check whether a session owns {}: {error}; retained it and branch {branch}",
+                worktree_path.display()
+            )],
+            Ok(None) if worktree_path.join(".git").exists() => {
+                // Git registered part of the checkout before failing.
+                rollback_unregistered_start(&self.repo, worktree_path, branch, base, None)
+            }
+            Ok(None) => {
+                let mut recovery = Vec::new();
+                match std::fs::remove_dir(worktree_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => recovery.push(format!(
+                        "could not remove reserved directory {}: {error}; retained it",
+                        worktree_path.display()
+                    )),
+                }
+                match self.repo.resolve_ref(&format!("refs/heads/{branch}")) {
+                    None => {}
+                    Some(tip) if tip == base => {
+                        if let Err(error) = self.repo.delete_branch_ref_checked(branch, base) {
+                            recovery.push(format!(
+                                "could not delete branch {branch} at its base {base}: {error}"
+                            ));
+                        }
+                    }
+                    Some(tip) => recovery.push(format!(
+                        "branch {branch} names {tip}, not the base {base}; retained it"
+                    )),
+                }
+                recovery
+            }
+        };
+        reservation.release();
+        recovery
     }
 
     pub fn worktree_root_plan(&self) -> Result<WorktreeRootPlan, BrokerOpError> {
@@ -10172,7 +10389,16 @@ impl Broker {
     }
 
     fn worktree_checkout_limit(&self) -> Result<Option<(usize, u32)>, BrokerOpError> {
-        let usage = self.worktree_checkout_usage()?;
+        // Every live start reservation is a checkout with no session row yet
+        // (its start releases it once the row is committed); count each so
+        // concurrent starts outside the lifecycle claim cannot overshoot the
+        // limit. A reservation whose `worktree add` already registered the
+        // checkout is counted twice until its row lands: conservative, and
+        // only for that short window.
+        let in_flight = crate::start_reservation::live_reserved_paths(&self.main_root).len();
+        let usage = self
+            .worktree_checkout_usage()?
+            .map(|(count, maximum)| (count + in_flight, maximum));
         if let Some((count, maximum)) = usage {
             // Passes too short to list checkouts read this to see pressure.
             self.record_checkout_usage(count, maximum);
@@ -10232,6 +10458,15 @@ impl Broker {
         placement: &WorktreePlacement,
     ) -> Result<(), BrokerOpError> {
         let configured_minimum = self.configured_worktree_minimum(placement.source)?;
+        // Starts holding reservations passed this check before their
+        // `worktree add`, which now runs outside the lifecycle claim; their
+        // checkouts will still consume space, so count them against it.
+        let in_flight = crate::start_reservation::live_reserved_paths(&self.main_root).len();
+        let in_flight_bytes = if in_flight == 0 {
+            0
+        } else {
+            (in_flight as u64).saturating_mul(self.estimated_checkout_bytes(&placement.root))
+        };
         preflight_worktree_root(
             &self.main_root,
             &placement.root,
@@ -10241,13 +10476,30 @@ impl Broker {
             crate::verification::removable_volume_unavailable_reason,
             |candidate| {
                 crate::disk_headroom::available_headroom_at_or_above_for(&self.main_root, candidate)
-                    .map(|headroom| headroom.bytes)
+                    .map(|headroom| headroom.bytes.saturating_sub(in_flight_bytes))
             },
         )
         .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
             path: placement.root.clone(),
             reason,
         })
+    }
+
+    /// Expected size of one new checkout under `root`: the median of the
+    /// recorded sizes of checkouts directly under it, never below
+    /// [`IN_FLIGHT_CHECKOUT_FLOOR_BYTES`].
+    fn estimated_checkout_bytes(&self, root: &Path) -> u64 {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let records = crate::measurement::load_size_records(&self.main_root);
+        let mut sizes = records
+            .records
+            .iter()
+            .filter(|(path, _)| Path::new(path).parent() == Some(root.as_path()))
+            .map(|(_, record)| record.bytes)
+            .collect::<Vec<_>>();
+        sizes.sort_unstable();
+        let median = sizes.get(sizes.len() / 2).copied().unwrap_or(0);
+        median.max(IN_FLIGHT_CHECKOUT_FLOOR_BYTES)
     }
 
     fn worktree_root_marker_exists_or_empty(&self, root: &Path) -> Result<bool, BrokerOpError> {
@@ -10551,6 +10803,29 @@ impl Broker {
         }
     }
 
+    /// Whether a session row records `path` (as given or under the
+    /// canonical root). An unreadable store counts as recorded.
+    fn session_row_records_path(&self, path: &Path) -> bool {
+        if crate::start_reservation::recorded_path_reuse_allowed() {
+            return false;
+        }
+        let given = path.to_string_lossy().into_owned();
+        let canonical = path
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .zip(path.file_name())
+            .map(|(parent, name)| parent.join(name).to_string_lossy().into_owned());
+        let mut candidates = vec![given.as_str()];
+        if let Some(canonical) = canonical.as_deref()
+            && canonical != given
+        {
+            candidates.push(canonical);
+        }
+        self.store
+            .any_session_records_worktree(&candidates)
+            .unwrap_or(true)
+    }
+
     pub(super) fn next_worktree_slug(&self, task: &str, worktree_root: &Path) -> String {
         let base = slugify(task);
         for attempt in 0..1000 {
@@ -10561,7 +10836,15 @@ impl Broker {
             };
             let branch = format!("refs/heads/agent/{slug}");
             let worktree_path = worktree_root.join(&slug);
-            if !worktree_path.exists() && self.repo.resolve_ref(&branch).is_none() {
+            // A reserved slug is taken even before its path or branch exists,
+            // and so is a path any session row records, cleaned ones included:
+            // lanes acting on that old row would otherwise reach the new
+            // checkout while `worktree add` runs outside the lifecycle claim.
+            if !worktree_path.exists()
+                && self.repo.resolve_ref(&branch).is_none()
+                && !crate::start_reservation::slug_is_reserved(&self.main_root, &slug)
+                && !self.session_row_records_path(&worktree_path)
+            {
                 return slug;
             }
         }
@@ -10956,32 +11239,33 @@ fn start_agent_setup_failure(
     }
 }
 
-fn inspect_partial_worktree_creation(
-    repo: &GitRepo,
-    worktree_path: &Path,
-    branch: &str,
-) -> Vec<String> {
-    let inventory = match repo.worktree_inventory() {
-        Ok(inventory) => inventory,
-        Err(error) => {
-            return vec![format!(
-                "worktree creation failed and its partial state could not be inspected: {error}; inspect path {} and branch {branch}",
-                worktree_path.display()
-            )];
-        }
+/// Refuse a start destination nested inside another checkout, without
+/// listing worktrees (`git worktree list` took 17 s over 857 registrations).
+/// The destination is a direct child of the broker's pool root, which root
+/// preparation already refused to place inside a registered worktree; walk
+/// up from the destination's parent to that root, inclusive, and refuse if
+/// any of them carries a `.git` file or directory.
+fn refuse_nested_pool_destination(
+    pool_root: &Path,
+    destination: &Path,
+) -> Result<(), BrokerOpError> {
+    let Some(mut current) = destination.parent() else {
+        return Ok(());
     };
-    let registered = inventory
-        .iter()
-        .any(|entry| same_path(&entry.path, worktree_path));
-    let branch_ref = format!("refs/heads/{branch}");
-    let branch_exists = repo.resolve_ref(&branch_ref).is_some();
-    if registered || worktree_path.exists() || branch_exists {
-        vec![format!(
-            "worktree creation left or may have left unregistered artifacts; retained path {} (registered={registered}, branch_ref_present={branch_exists}) and branch {branch}",
-            worktree_path.display()
-        )]
-    } else {
-        Vec::new()
+    loop {
+        if std::fs::symlink_metadata(current.join(".git")).is_ok() {
+            return Err(BrokerOpError::NestedWorktreePath {
+                path: destination.to_path_buf(),
+                owner: current.to_path_buf(),
+            });
+        }
+        if current == pool_root {
+            return Ok(());
+        }
+        match current.parent() {
+            Some(parent) if parent.starts_with(pool_root) => current = parent,
+            _ => return Ok(()),
+        }
     }
 }
 

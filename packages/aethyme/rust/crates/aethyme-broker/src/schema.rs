@@ -34,7 +34,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 64;
+pub const SCHEMA_VERSION: i64 = 65;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -120,6 +120,10 @@ pub const SCHEMA_VERSION: i64 = 64;
 ///   columns and leave it NULL; a NULL nonce only means a journal can never
 ///   auto-settle that row (it keeps the manual reconcile path), and older
 ///   readers ignore the column, so the floor stays v60.
+/// - v65: one index on `sessions (worktree_path)` covering cleaned rows too,
+///   so `broker start` can skip a checkout path any session ever recorded.
+///   Older binaries maintain it on write without naming it, so the floor
+///   stays v60.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 60;
 
 /// Migration that introduced profile-bound gate-cache reads and writes.
@@ -2145,6 +2149,13 @@ const MIGRATION_V64: &str = "
 ALTER TABLE coordinated_operations ADD COLUMN run_nonce TEXT;
 ";
 
+/// Every session row by checkout path, cleaned rows included: `broker start`
+/// never hands out a path a session row records, even a cleaned one, because
+/// lanes that act on that old row could otherwise touch the new checkout.
+const MIGRATION_V65: &str = "
+CREATE INDEX IF NOT EXISTS sessions_by_worktree_path ON sessions (worktree_path);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -2210,6 +2221,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V62,
     MIGRATION_V63,
     MIGRATION_V64,
+    MIGRATION_V65,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
@@ -2270,13 +2282,16 @@ const TRIGGER_MIGRATIONS: &[(i64, &str, &[&str])] = &[(
     ],
 )];
 
-const INDEX_REPAIRS: &[(i64, &str, &[&str])] = &[(
-    59,
-    "CREATE INDEX IF NOT EXISTS cleanup_cohort_scan_rows_unresolved
+const INDEX_REPAIRS: &[(i64, &str, &[&str])] = &[
+    (
+        59,
+        "CREATE INDEX IF NOT EXISTS cleanup_cohort_scan_rows_unresolved
      ON cleanup_cohort_scan_rows(namespace)
      WHERE resolution_error IS NOT NULL;",
-    &["cleanup_cohort_scan_rows_unresolved"],
-)];
+        &["cleanup_cohort_scan_rows_unresolved"],
+    ),
+    (65, MIGRATION_V65, &["sessions_by_worktree_path"]),
+];
 
 // v59 was published before alias refresh checkpoints gained their own
 // generation and progress sequence. CREATE TABLE IF NOT EXISTS cannot add
@@ -3135,7 +3150,7 @@ mod tests {
         set_meta(&conn, "min_compatible_schema", 58);
         let before: i64 = conn
             .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'automation_notes%' AND name <> 'events_by_session_kind'",
+                "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'automation_notes%' AND name <> 'events_by_session_kind' AND name <> 'sessions_by_worktree_path'",
                 [],
                 |row| row.get(0),
             )
@@ -3159,7 +3174,7 @@ mod tests {
         assert_eq!(MIGRATIONS[59], MIGRATION_V60);
         let after: i64 = conn
             .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'automation_notes%' AND name <> 'events_by_session_kind'",
+                "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'automation_notes%' AND name <> 'events_by_session_kind' AND name <> 'sessions_by_worktree_path'",
                 [],
                 |row| row.get(0),
             )
@@ -4558,6 +4573,27 @@ mod tests {
             })
             .unwrap();
         assert_eq!(nonce, None, "an older binary's run keeps NULL");
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v65_indexes_every_session_path_and_keeps_the_floor() {
+        let conn = migrated_through(64);
+        set_meta(&conn, "min_compatible_schema", 60);
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 60);
+        assert!(schema_is_compatible_with(&conn, 65, 60).unwrap());
+        assert_eq!(MIGRATIONS[64], MIGRATION_V65);
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT 1 FROM sessions WHERE worktree_path = '/w' LIMIT 1",
+                [],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("sessions_by_worktree_path"), "{plan}");
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 

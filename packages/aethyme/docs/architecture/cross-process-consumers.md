@@ -3059,17 +3059,84 @@ reports.
   `phase_timings_ms.lifecycle_lock_wait` takes precedence over the span of the
   same name on success.
 - **Shorter `start` hold.** The sparse-checkout plan is computed before the
-  claim. The claim is still held through lease and preparation reporting:
-  the lease-holder refresh there judges other sessions inline, and while
-  `start` holds the claim those judgements stay "busy" instead of closing
-  anything. `git worktree add`, contract and witness capture and registration
-  still run under it: storage's stray-checkout
-  review, GC orphan review, the worktree-registry orphan sweep and the
-  retirement lanes recognise a half-created checkout only by that exclusion,
-  so moving `worktree add` outside it needs a reservation every one of those
-  lanes honours first. Plain `finish`/`cleanup` still removes through
+  claim. Plain `finish`/`cleanup` still removes through
   `git worktree remove` under the claim; only verified-archive and retirement
-  removals rename into the trash.
+  removals rename into the trash. The `start` hold itself is now limited to
+  the reservation; see the next section.
+
+### `broker start` holds the lifecycle claim only for its reservation
+
+Introduced 2026-11-17. `broker start` (new checkouts, ordinary and detached)
+holds the repository lifecycle claim for the checkout limit, root preparation,
+storage admission, reaping dead start reservations, slug choice and recording
+its reservation, then releases it. `git worktree add`, the configured-root
+worktree lock, contract and witness capture, session registration and the
+lease and preparation reporting run outside the claim. Changes consumers may
+see:
+
+- **Reservation files.** `.aethyme/run/start-reservations/<slug>.lock`, a
+  JSON record (`pid`, `process_start`, `worktree_path`, `branch`, `base`,
+  `created_at_ms`) that the start holds an exclusive `flock` on from
+  reservation until its session row is committed or its rollback finished,
+  then unlinks. The destination is created as an empty directory under the
+  claim, after the file. A lock anyone can take means its start died; the next
+  start reaps it under the claim, removing only an empty destination and only
+  a branch that still names the recorded base while the destination has no
+  `.git`. Anything else is left (and named in a warning) for the existing
+  recovery lanes. A reader must tolerate the new directory; nothing else may
+  write or remove its files.
+- **Inline claims stay busy.** From the release of the claim until its row
+  and reports are done, nonblocking lifecycle claims made by the same
+  `start` (the lease-holder refresh's abandoned close, for one) answer busy
+  without touching the lock, as they did while `start` held it.
+- **Slug choice** treats a reserved slug as taken even before its path or
+  branch exists, and never hands out a path any session row records, cleaned
+  rows included (schema v65 adds the index `sessions_by_worktree_path`;
+  compatible, floor stays v60). Otherwise a lane acting on the old row could
+  reach the new checkout while `worktree add` runs.
+- **Checkout limit** counts every live reservation as a checkout (each has no
+  session row yet). One whose checkout Git already registered is counted
+  twice until its row lands.
+- **Free-space reserve.** Storage admission subtracts, per live reservation,
+  the median recorded size of checkouts under the pool root (at least
+  256 MiB) from the free space it compares with the reserve.
+- **Removal lanes refuse reserved checkouts.** Every checkout removal goes
+  through `GitRepo::worktree_remove`/`worktree_remove_registered` or
+  `checkout_trash::move_worktree_to_trash`; each refuses a path another
+  process's live reservation holds, with an error starting
+  `start_in_progress:` that the lane records as its reason (a start's own
+  rollback is allowed). Storage stray-directory apply refuses one too
+  (`a running broker start has reserved this checkout path`). The shared
+  helper is `start_reservation::path_is_reserved(main_root, path) -> bool`
+  (reservation file present and its lock held); lanes check it under the
+  lifecycle claim. The strip lanes' `reused_path_keep` (`start_reserved`)
+  calls the same helper; a held file whose record is not written yet matches
+  by its file stem, which is the destination folder's name. Git also marks a worktree `locked` ("initializing") while
+  `worktree add` runs, so `git worktree prune` keeps it.
+- **Nested-destination check** no longer runs `git worktree list` (17 s over
+  857 registrations on the busiest repository): it walks from the
+  destination's parent up to the pool root and refuses if any of them holds a
+  `.git` entry. Root preparation for a fresh binding keeps its listing-based
+  check.
+- **Failed `worktree add`** retakes the claim, keeps everything if a session
+  row owns the path, otherwise removes the empty destination and the branch
+  if it still names the base (or rolls back a partial registration through the
+  existing clean-checkout rollback), then releases the reservation. The
+  error's recovery list names anything retained.
+- **Mixed versions.** An older binary holds the claim for its whole start:
+  it sees the reserved directory and picks another slug, and its lanes are row
+  based as above, so the two cannot corrupt each other. A newer rollback holds
+  the claim, so an older start is never mid-flight on the same path.
+- **Telemetry.** New `phase_timings_ms` entries `start_reservation_reap`,
+  `start_reservation`, `lifecycle_lock_held_reserve` and, on failure,
+  `start_rollback`; counters `start_reservation_reaped` and
+  `start_reservation_rollback`; and a metric object `start_lifecycle_split`
+  with `reserve_held_ms`, `add_outside_lock_ms`, `reservations_reaped`,
+  `reaped_directories_removed`, `reaped_branches_removed`, `reaped_retained`
+  and `rollback` (`null`, `clean` or `retained`). Existing `lifecycle_lock`
+  fields are unchanged; its `held_ms` now covers the reservation only.
+
+Covered by `start_reservation.rs` and `broker/tests/start_reservation_lifecycle.rs` tests.
 
 ### Checkout retirement takes one process observation per run and archives abandoned operations
 

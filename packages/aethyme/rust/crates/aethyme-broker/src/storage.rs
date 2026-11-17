@@ -5239,6 +5239,14 @@ fn apply_candidate(
             if sources.ledger_claimed.contains_key(&path) {
                 return Err("session ledger claim appeared".into());
             }
+            // A start reserves its destination before `git worktree add`
+            // registers it, outside the lifecycle claim held here.
+            if crate::start_reservation::path_is_reserved(
+                &candidate.repository_root,
+                &candidate.path,
+            ) {
+                return Err("a running broker start has reserved this checkout path".into());
+            }
             if !is_real_directory(&candidate.path) {
                 return Err("stray directory disappeared or is no longer a real directory".into());
             }
@@ -10111,9 +10119,9 @@ mod tests {
         context.worktree_root_override = Some(root.clone());
         let layout = storage_layout_with_context(&owner_root, &context).unwrap();
 
-        // A start holds the lifecycle claim from final root preparation through
-        // worktree-add and session registration. Storage must wait, then see
-        // the new child and refuse to remove the root.
+        // A start holds the lifecycle claim from final root preparation until
+        // it has reserved (created) its destination. Storage must wait, then
+        // see the new child and refuse to remove the root.
         let start_claim = crate::file_lock::acquire_repository_lifecycle_lock(&owner_root).unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
