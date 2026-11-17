@@ -3034,6 +3034,28 @@ fn push_checkout_retirement_advice(
             commands: vec!["aethyme storage status".into(), "aethyme broker gc plan".into()],
         });
     }
+    if !progress.strip.venv_unexpected.is_empty() {
+        let names = progress
+            .strip
+            .venv_unexpected
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        view.advice.push(StatusAdvice {
+            id: "storage.venv-unexpected-content",
+            severity: StatusAdviceSeverity::Notice,
+            reason: "the strip keeps a virtual environment holding anything besides its layout and the files environment tools write; a marker file your own tooling writes there can be declared by exact name under [cleanup] venv_markers in .aethyme/config.toml",
+            summary: format!("virtual environments kept for unexpected top-level entries: {names}"),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: vec![
+                format!("names seen at a .venv top in the last 7 days: {names}"),
+                "declare only files your tooling writes; credentials files such as .env are never accepted".into(),
+            ],
+            commands: vec![],
+        });
+    }
     if let Some(&first) = in_progress.first() {
         view.advice.push(StatusAdvice {
             id: "cleanup.retire-operation-in-progress",

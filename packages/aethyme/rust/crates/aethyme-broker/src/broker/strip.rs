@@ -67,6 +67,22 @@ pub(crate) const STRIP_CHECKOUTS_PER_RUN: usize = 200;
 pub(crate) const CHECKOUT_STRIP_DONE_KEY: &str = "checkout_strip.done";
 /// Remembered handled sessions at most; the lowest ids go first.
 const STRIP_DONE_MAX: usize = 16_384;
+/// Meta key: checkouts whose directories were last kept only for a
+/// transient reason (`probe_failed`, `deadline`, `move_failed`), with when
+/// they may be looked at again (JSON: session id to [`StripBackoff`]).
+pub(crate) const CHECKOUT_STRIP_BACKOFF_KEY: &str = "checkout_strip.backoff";
+/// The first retry delay after a transient keep; it doubles per failure.
+const STRIP_BACKOFF_BASE_MS: i64 = 5 * 60_000;
+/// The longest retry delay.
+const STRIP_BACKOFF_MAX_MS: i64 = 4 * 3_600_000;
+/// Backed-off checkouts remembered at most; the earliest due go first.
+const STRIP_BACKOFF_ENTRIES_MAX: usize = 4_096;
+/// Names kept as a virtual environment's unexpected content, remembered for
+/// `broker status` at most, and for how long after they were last seen.
+const VENV_UNEXPECTED_NAMES_MAX: usize = 16;
+const VENV_UNEXPECTED_KEPT_MS: i64 = 7 * 86_400_000;
+/// Characters of one reported name, at most.
+const REPORTED_NAME_MAX: usize = 128;
 /// Closed or cleaned sessions read per strip pass, at most.
 const STRIP_CANDIDATES_MAX: usize = 100_000;
 /// Bytes at most read from one probe's output.
@@ -96,6 +112,27 @@ const POOL_LISTING_MAX: usize = 200_000;
 /// The longest the backlog count may take after the strip.
 const BACKLOG_BUDGET: Duration = Duration::from_secs(5);
 
+/// One checkout's retry backoff after transient keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StripBackoff {
+    /// The session's close time when it was kept: a checkout closed again
+    /// (it changed) starts afresh.
+    pub closed_at: i64,
+    /// Consecutive passes that kept it for a transient reason.
+    pub failures: u32,
+    /// Not looked at again before this (epoch ms).
+    pub until_ms: i64,
+}
+
+/// The retry delay after `failures` consecutive transient keeps: 5 minutes,
+/// doubling, at most 4 hours.
+pub(crate) fn strip_backoff_delay_ms(failures: u32) -> i64 {
+    let doublings = failures.saturating_sub(1).min(20);
+    STRIP_BACKOFF_BASE_MS
+        .saturating_mul(1_i64 << doublings)
+        .min(STRIP_BACKOFF_MAX_MS)
+}
+
 /// What one strip pass did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CheckoutStripReport {
@@ -103,6 +140,14 @@ pub(crate) struct CheckoutStripReport {
     pub folders_found: usize,
     /// Of those, skipped because an earlier pass handled the same close.
     pub skipped_remembered: usize,
+    /// Of those, skipped because a transient keep's backoff has not passed
+    /// (never counted toward the per-run cap).
+    pub skipped_backoff: usize,
+    /// Checkouts this pass kept only for a transient reason, now backed off.
+    pub backoff_set: usize,
+    /// Names that kept a virtual environment as `unexpected_content`
+    /// (bounded; names only, never content).
+    pub venv_unexpected: BTreeSet<String>,
     pub checkouts_examined: usize,
     /// Of those, checkouts that passed every precondition and were listed
     /// through Git; the per-run cap counts these, so checkouts refused
@@ -186,6 +231,11 @@ pub(crate) struct CheckoutStripProgress {
     /// Daily counters by UTC day number (epoch ms / 86,400,000).
     #[serde(default)]
     pub days: BTreeMap<i64, CheckoutStripDay>,
+    /// Names that kept a virtual environment as `unexpected_content`, with
+    /// when they were last seen (epoch ms), for 7 days; a name the
+    /// repository has since declared under `[cleanup] venv_markers` drops.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub venv_unexpected: BTreeMap<String, i64>,
 }
 
 /// A catalogued directory found in a checkout, not yet proved.
@@ -271,7 +321,9 @@ impl StripKind {
     /// `nested_repository` when a `.git` entry sits at its top (a nested
     /// repository or submodule is never regenerable). Reads only the
     /// directory's own top level (bounded) and at most one small file.
-    pub(crate) fn witness(self, path: &Path) -> Result<(), &'static str> {
+    /// `venv_markers` are the file names the repository declares under
+    /// `[cleanup] venv_markers` (see [`venv_unexpected_names`]).
+    pub(crate) fn witness(self, path: &Path, venv_markers: &[String]) -> Result<(), &'static str> {
         match std::fs::symlink_metadata(path.join(".git")) {
             Ok(_) => return Err("nested_repository"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -283,22 +335,7 @@ impl StripKind {
         let is_dir = |name: &str| {
             std::fs::symlink_metadata(path.join(name)).is_ok_and(|metadata| metadata.is_dir())
         };
-        let top_names = || -> Result<Vec<String>, &'static str> {
-            let mut names = Vec::new();
-            for entry in std::fs::read_dir(path).map_err(|_| "witness_missing")? {
-                let entry = entry.map_err(|_| "witness_missing")?;
-                names.push(
-                    entry
-                        .file_name()
-                        .into_string()
-                        .map_err(|_| "unexpected_content")?,
-                );
-                if names.len() > WITNESS_ENTRY_LIMIT {
-                    return Err("unexpected_content");
-                }
-            }
-            Ok(names)
-        };
+        let top_names = || top_names(path);
         match self {
             Self::NodeModules => {
                 if [".modules.yaml", ".package-lock.json", ".yarn-integrity"]
@@ -328,16 +365,7 @@ impl StripKind {
                 if !is_file("pyvenv.cfg") {
                     return Err("witness_missing");
                 }
-                // Besides the layout, a tool's marker file next to
-                // `pyvenv.cfg` (uv's `CACHEDIR.TAG` and `.lock`, a
-                // preparation script's `.env-check.json`): a hidden regular
-                // file, never a directory or a visible file someone put
-                // there.
-                if top_names()?.iter().all(|name| {
-                    VENV_LAYOUT.contains(&name.as_str())
-                        || ((name == "CACHEDIR.TAG" || name.starts_with('.'))
-                            && is_file(name.as_str()))
-                }) {
+                if venv_unexpected_names(path, venv_markers)?.is_empty() {
                     Ok(())
                 } else {
                     Err("unexpected_content")
@@ -355,6 +383,54 @@ impl StripKind {
             }
         }
     }
+}
+
+/// The top-level entry names of `path`, bounded. `Err` is the keep reason.
+fn top_names(path: &Path) -> Result<Vec<String>, &'static str> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(path).map_err(|_| "witness_missing")? {
+        let entry = entry.map_err(|_| "witness_missing")?;
+        names.push(
+            entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "unexpected_content")?,
+        );
+        if names.len() > WITNESS_ENTRY_LIMIT {
+            return Err("unexpected_content");
+        }
+    }
+    Ok(names)
+}
+
+/// Files Python environment tools themselves write at a virtual
+/// environment's top beside the layout (uv's cache tag and lock).
+const VENV_TOOL_MARKERS: &[&str] = &["CACHEDIR.TAG", ".lock"];
+
+/// The entries at the top of the virtual environment `path` that are
+/// neither its layout ([`VENV_LAYOUT`]) nor a regular file named by
+/// [`VENV_TOOL_MARKERS`] or by the repository's `[cleanup] venv_markers`
+/// (`declared`): what keeps it as `unexpected_content`. Fails closed: any
+/// other file, a dotfile such as `.env` included, or any other directory is
+/// someone's content, not the tool's output. Sorted.
+pub(crate) fn venv_unexpected_names(
+    path: &Path,
+    declared: &[String],
+) -> Result<Vec<String>, &'static str> {
+    let mut unexpected = top_names(path)?
+        .into_iter()
+        .filter(|name| {
+            let marker = VENV_TOOL_MARKERS.contains(&name.as_str())
+                || declared.iter().any(|declared| declared == name);
+            let accepted = VENV_LAYOUT.contains(&name.as_str())
+                || (marker
+                    && std::fs::symlink_metadata(path.join(name))
+                        .is_ok_and(|metadata| metadata.is_file()));
+            !accepted
+        })
+        .collect::<Vec<_>>();
+    unexpected.sort();
+    Ok(unexpected)
 }
 
 /// The first bytes of a `CACHEDIR.TAG` under the Cache Directory Tagging
@@ -474,7 +550,22 @@ pub(crate) fn regenerable_candidates(
 
 /// Run one read-only Git probe in `worktree` under `deadline`; returns its
 /// exit code and bounded stdout. Anything but a completed run is an error.
+#[cfg(test)]
+thread_local! {
+    /// Makes every strip probe fail, as a Git that cannot complete would.
+    static PROBES_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_probes_fail_for_tests(fail: bool) {
+    PROBES_FAIL.with(|cell| cell.set(fail));
+}
+
 fn git_probe(worktree: &Path, args: &[&str], deadline: Instant) -> Result<(i32, Vec<u8>), String> {
+    #[cfg(test)]
+    if PROBES_FAIL.with(std::cell::Cell::get) {
+        return Err(format!("git {}: failed for the test", args.join(" ")));
+    }
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(format!("git {}: out of time", args.join(" ")));
@@ -507,14 +598,18 @@ pub(crate) fn prove_strippable(
     candidate: &StripCandidate,
     deadline: Instant,
 ) -> Result<(), &'static str> {
-    prove_strippable_all(worktree, std::slice::from_ref(candidate), deadline)
+    prove_strippable_all(worktree, std::slice::from_ref(candidate), deadline, &[])
         .pop()
         .unwrap_or(Err("probe_failed"))
 }
 
 /// The on-disk half of the proof: every component a real directory (no
 /// symlink), on the checkout's device, and the tool's witness present.
-fn prove_on_disk(worktree: &Path, candidate: &StripCandidate) -> Result<(), &'static str> {
+fn prove_on_disk(
+    worktree: &Path,
+    candidate: &StripCandidate,
+    venv_markers: &[String],
+) -> Result<(), &'static str> {
     use std::os::unix::fs::MetadataExt;
     let checkout = std::fs::symlink_metadata(worktree).map_err(|_| "checkout_missing")?;
     if !checkout.is_dir() {
@@ -537,7 +632,7 @@ fn prove_on_disk(worktree: &Path, candidate: &StripCandidate) -> Result<(), &'st
             return Err("crosses_device");
         }
     }
-    candidate.kind.witness(&path)
+    candidate.kind.witness(&path, venv_markers)
 }
 
 /// Prove each of `candidates` may be stripped, cheaply and without
@@ -551,11 +646,12 @@ pub(crate) fn prove_strippable_all(
     worktree: &Path,
     candidates: &[StripCandidate],
     deadline: Instant,
+    venv_markers: &[String],
 ) -> Vec<Result<(), &'static str>> {
     let _span = crate::phase_telemetry::span("checkout_strip_prove");
     let mut verdicts = candidates
         .iter()
-        .map(|candidate| prove_on_disk(worktree, candidate))
+        .map(|candidate| prove_on_disk(worktree, candidate, venv_markers))
         .collect::<Vec<_>>();
     let pending = |verdicts: &[Result<(), &'static str>]| {
         verdicts
@@ -1024,13 +1120,26 @@ impl Broker {
         report.folder_listing_ms = elapsed_ms(listing_started);
         report.folders_found = judges.len();
         let done: BTreeMap<i64, i64> = self.meta_json(CHECKOUT_STRIP_DONE_KEY);
+        let backoff: BTreeMap<i64, StripBackoff> = self.meta_json(CHECKOUT_STRIP_BACKOFF_KEY);
+        let venv_markers = crate::auto_cleanup::venv_markers(self.main_root());
         let mut newly_done = BTreeMap::new();
+        let mut backoff_updates: BTreeMap<i64, Option<StripBackoff>> = BTreeMap::new();
         let mut holders = crate::session_holder::RecordedHolderProcessTable::default();
         for session in judges {
             let closed_at = session.closed_at.unwrap_or(0);
             if done.get(&session.id) == Some(&closed_at) {
                 report.skipped_remembered += 1;
                 crate::phase_telemetry::add("checkout_strip_skipped_remembered", Duration::ZERO);
+                continue;
+            }
+            // Backed off after transient keeps: not looked at, and not
+            // counted toward the cap, so it never starves newer checkouts.
+            let previous = backoff
+                .get(&session.id)
+                .filter(|entry| entry.closed_at == closed_at);
+            if previous.is_some_and(|entry| entry.until_ms > crate::clock::epoch_ms()) {
+                report.skipped_backoff += 1;
+                crate::phase_telemetry::add("checkout_strip_skipped_backoff", Duration::ZERO);
                 continue;
             }
             if report.checkouts_listed >= cap || Instant::now() >= deadline {
@@ -1048,7 +1157,14 @@ impl Broker {
             report.checkouts_examined += 1;
             crate::phase_telemetry::add("checkout_strip_examined", Duration::ZERO);
             let transient_before = transient_refusals(&report);
-            match self.strip_one_checkout(session, run, &mut holders, deadline, &mut report) {
+            match self.strip_one_checkout(
+                session,
+                run,
+                &mut holders,
+                deadline,
+                &venv_markers,
+                &mut report,
+            ) {
                 CheckoutStrip::Done(directories) => {
                     if directories > 0 {
                         report.checkouts_stripped += 1;
@@ -1059,9 +1175,30 @@ impl Broker {
                         );
                     }
                     // A directory kept only because a probe failed, time ran
-                    // out or a rename failed is asked again next pass.
+                    // out or a rename failed is asked again, after a backoff
+                    // that doubles per failure; a clean outcome resets it.
                     if transient_refusals(&report) == transient_before {
                         newly_done.insert(session.id, closed_at);
+                        if backoff.contains_key(&session.id) {
+                            backoff_updates.insert(session.id, None);
+                            crate::phase_telemetry::add(
+                                "checkout_strip_backoff_cleared",
+                                Duration::ZERO,
+                            );
+                        }
+                    } else {
+                        let failures = previous.map_or(0, |entry| entry.failures) + 1;
+                        backoff_updates.insert(
+                            session.id,
+                            Some(StripBackoff {
+                                closed_at,
+                                failures,
+                                until_ms: crate::clock::epoch_ms()
+                                    .saturating_add(strip_backoff_delay_ms(failures)),
+                            }),
+                        );
+                        report.backoff_set += 1;
+                        crate::phase_telemetry::add("checkout_strip_backoff_set", Duration::ZERO);
                     }
                 }
                 CheckoutStrip::Refused(code) => {
@@ -1096,6 +1233,34 @@ impl Broker {
                 ),
             );
         }
+        if !backoff_updates.is_empty() {
+            crate::warn_unrecorded(
+                "remember strip retry backoffs",
+                self.update_meta_json(
+                    CHECKOUT_STRIP_BACKOFF_KEY,
+                    |stored: &mut BTreeMap<i64, StripBackoff>| {
+                        for (id, update) in &backoff_updates {
+                            match update {
+                                Some(entry) => {
+                                    stored.insert(*id, *entry);
+                                }
+                                None => {
+                                    stored.remove(id);
+                                }
+                            }
+                        }
+                        while stored.len() > STRIP_BACKOFF_ENTRIES_MAX {
+                            let Some((&earliest, _)) =
+                                stored.iter().min_by_key(|(_, entry)| entry.until_ms)
+                            else {
+                                break;
+                            };
+                            stored.remove(&earliest);
+                        }
+                    },
+                ),
+            );
+        }
         if report.directories_stripped > 0 {
             crate::phase_telemetry::add("checkout_strip_checkouts_stripped", Duration::ZERO);
         }
@@ -1113,6 +1278,9 @@ impl Broker {
             serde_json::json!({
                 "folders_found": report.folders_found,
                 "skipped_remembered": report.skipped_remembered,
+                "skipped_backoff": report.skipped_backoff,
+                "backoff_set": report.backoff_set,
+                "venv_unexpected": report.venv_unexpected,
                 "checkouts_examined": report.checkouts_examined,
                 "checkouts_listed": report.checkouts_listed,
                 "candidates_found": report.candidates_found,
@@ -1151,7 +1319,15 @@ impl Broker {
         };
         let mut report = CheckoutStripReport::default();
         let mut holders = crate::session_holder::RecordedHolderProcessTable::default();
-        match self.strip_one_checkout(&session, &mut run, &mut holders, deadline, &mut report) {
+        let venv_markers = crate::auto_cleanup::venv_markers(self.main_root());
+        match self.strip_one_checkout(
+            &session,
+            &mut run,
+            &mut holders,
+            deadline,
+            &venv_markers,
+            &mut report,
+        ) {
             CheckoutStrip::Done(directories) => {
                 if directories > 0 {
                     crate::phase_telemetry::add(
@@ -1203,6 +1379,7 @@ impl Broker {
         run: &mut super::retire::RetireRun,
         holders: &mut crate::session_holder::RecordedHolderProcessTable,
         deadline: Instant,
+        venv_markers: &[String],
         report: &mut CheckoutStripReport,
     ) -> CheckoutStrip {
         use CheckoutStrip::Refused;
@@ -1330,12 +1507,27 @@ impl Broker {
             return Refused(code);
         }
         let prove_started = Instant::now();
-        let verdicts = prove_strippable_all(&worktree, &candidates, deadline);
+        let verdicts = prove_strippable_all(&worktree, &candidates, deadline, venv_markers);
         report.prove_ms = report.prove_ms.saturating_add(elapsed_ms(prove_started));
         let mut stripped = 0_usize;
         for (candidate, verdict) in candidates.iter().zip(verdicts) {
             if let Err(code) = verdict {
                 note_refusal(report, code);
+                // Name what kept an environment, so its owner can declare a
+                // marker their own tooling writes (names only).
+                if code == "unexpected_content" && candidate.kind == StripKind::Venv {
+                    for name in
+                        venv_unexpected_names(&worktree.join(&candidate.relative), venv_markers)
+                            .unwrap_or_default()
+                    {
+                        if report.venv_unexpected.len() >= VENV_UNEXPECTED_NAMES_MAX {
+                            break;
+                        }
+                        report
+                            .venv_unexpected
+                            .insert(name.chars().take(REPORTED_NAME_MAX).collect());
+                    }
+                }
                 continue;
             }
             if Instant::now() >= deadline {
@@ -1475,6 +1667,24 @@ impl Broker {
         while days.len() > STRIP_DAYS_KEPT {
             days.pop_first();
         }
+        let declared = crate::auto_cleanup::venv_markers(self.main_root());
+        let mut venv_unexpected = previous.venv_unexpected.clone();
+        for name in &strip.venv_unexpected {
+            venv_unexpected.insert(name.clone(), now_ms);
+        }
+        venv_unexpected.retain(|name, seen| {
+            now_ms.saturating_sub(*seen) < VENV_UNEXPECTED_KEPT_MS && !declared.contains(name)
+        });
+        while venv_unexpected.len() > VENV_UNEXPECTED_NAMES_MAX {
+            let Some(oldest) = venv_unexpected
+                .iter()
+                .min_by_key(|(_, seen)| **seen)
+                .map(|(name, _)| name.clone())
+            else {
+                break;
+            };
+            venv_unexpected.remove(&oldest);
+        }
         let backlog = if strip.backlog.observed_at_ms > 0 {
             strip.backlog.clone()
         } else {
@@ -1496,6 +1706,7 @@ impl Broker {
                 .bytes_freed_total
                 .saturating_add(report.trash.stripped_bytes),
             days,
+            venv_unexpected,
         }
     }
 
@@ -1651,7 +1862,7 @@ mod tests {
         // Discovery does not ask Git: it lists the name, and the proof
         // keeps it.
         let found = regenerable_candidates(&root, far()).unwrap();
-        let verdicts = prove_strippable_all(&root, &found, far());
+        let verdicts = prove_strippable_all(&root, &found, far(), &[]);
         for (candidate, verdict) in found.iter().zip(&verdicts) {
             if candidate.relative.ends_with("node_modules") {
                 assert_eq!(*verdict, Err("not_ignored"), "{candidate:?}");
@@ -1733,7 +1944,7 @@ mod tests {
             kind: StripKind::NodeModules,
         });
 
-        let verdicts = prove_strippable_all(&root, &candidates, far());
+        let verdicts = prove_strippable_all(&root, &candidates, far(), &[]);
 
         assert!(
             matches!(verdicts[0], Err("holds_tracked" | "not_ignored")),
@@ -1841,47 +2052,82 @@ mod tests {
         let modules = at("a/node_modules");
         std::fs::write(modules.join("index.js"), "x\n").unwrap();
         assert_eq!(
-            StripKind::NodeModules.witness(&modules),
+            StripKind::NodeModules.witness(&modules, &[]),
             Err("witness_missing")
         );
         std::fs::write(modules.join(".yarn-integrity"), "{}\n").unwrap();
-        assert_eq!(StripKind::NodeModules.witness(&modules), Ok(()));
+        assert_eq!(StripKind::NodeModules.witness(&modules, &[]), Ok(()));
         let pnpm = at("b/node_modules");
         std::fs::create_dir_all(pnpm.join(".pnpm")).unwrap();
-        assert_eq!(StripKind::NodeModules.witness(&pnpm), Ok(()));
+        assert_eq!(StripKind::NodeModules.witness(&pnpm, &[]), Ok(()));
         // A nested repository or submodule is never regenerable.
         std::fs::write(pnpm.join(".git"), "gitdir: elsewhere\n").unwrap();
         assert_eq!(
-            StripKind::NodeModules.witness(&pnpm),
+            StripKind::NodeModules.witness(&pnpm, &[]),
             Err("nested_repository")
         );
 
         let store = at(".pnpm-store");
         std::fs::create_dir_all(store.join("files")).unwrap();
-        assert_eq!(StripKind::PnpmStore.witness(&store), Err("witness_missing"));
+        assert_eq!(
+            StripKind::PnpmStore.witness(&store, &[]),
+            Err("witness_missing")
+        );
         std::fs::create_dir_all(store.join("v10")).unwrap();
-        assert_eq!(StripKind::PnpmStore.witness(&store), Ok(()));
+        assert_eq!(StripKind::PnpmStore.witness(&store, &[]), Ok(()));
 
         let venv = at(".venv");
         std::fs::create_dir_all(venv.join("lib")).unwrap();
-        assert_eq!(StripKind::Venv.witness(&venv), Err("witness_missing"));
+        assert_eq!(StripKind::Venv.witness(&venv, &[]), Err("witness_missing"));
         std::fs::write(venv.join("pyvenv.cfg"), "home = /usr\n").unwrap();
-        assert_eq!(StripKind::Venv.witness(&venv), Ok(()));
-        // A tool's hidden marker file or uv's cache tag is part of it.
-        std::fs::write(venv.join(".env-check.json"), "{}\n").unwrap();
+        assert_eq!(StripKind::Venv.witness(&venv, &[]), Ok(()));
+        // What environment tools write is part of it.
         std::fs::write(venv.join("CACHEDIR.TAG"), "Signature: x\n").unwrap();
-        assert_eq!(StripKind::Venv.witness(&venv), Ok(()));
-        // A hidden directory, or a visible file someone put there, is not.
+        std::fs::write(venv.join(".lock"), "").unwrap();
+        assert_eq!(StripKind::Venv.witness(&venv, &[]), Ok(()));
+        // Any other dotfile keeps it, unless the repository declared that
+        // exact name; `.env` keeps it whatever else is declared.
+        std::fs::write(venv.join(".env-check.json"), "{}\n").unwrap();
+        assert_eq!(
+            StripKind::Venv.witness(&venv, &[]),
+            Err("unexpected_content")
+        );
+        let declared = vec![".env-check.json".to_string(), ".other".to_string()];
+        assert_eq!(StripKind::Venv.witness(&venv, &declared), Ok(()));
+        std::fs::write(venv.join(".env"), "TOKEN=secret\n").unwrap();
+        assert_eq!(
+            StripKind::Venv.witness(&venv, &declared),
+            Err("unexpected_content")
+        );
+        assert_eq!(
+            venv_unexpected_names(&venv, &declared),
+            Ok(vec![".env".to_string()])
+        );
+        std::fs::remove_file(venv.join(".env")).unwrap();
+        // A declared name that is a directory, a hidden directory, or a
+        // visible file someone put there keeps it.
+        std::fs::create_dir_all(venv.join(".other")).unwrap();
+        assert_eq!(
+            StripKind::Venv.witness(&venv, &declared),
+            Err("unexpected_content")
+        );
+        std::fs::remove_dir_all(venv.join(".other")).unwrap();
         std::fs::create_dir_all(venv.join(".cache")).unwrap();
-        assert_eq!(StripKind::Venv.witness(&venv), Err("unexpected_content"));
+        assert_eq!(
+            StripKind::Venv.witness(&venv, &declared),
+            Err("unexpected_content")
+        );
         std::fs::remove_dir_all(venv.join(".cache")).unwrap();
         std::fs::write(venv.join("notes.txt"), "mine\n").unwrap();
-        assert_eq!(StripKind::Venv.witness(&venv), Err("unexpected_content"));
+        assert_eq!(
+            StripKind::Venv.witness(&venv, &declared),
+            Err("unexpected_content")
+        );
 
         let target = at("target");
         std::fs::write(target.join("CACHEDIR.TAG"), "not a cache tag\n").unwrap();
         assert_eq!(
-            StripKind::CargoTarget.witness(&target),
+            StripKind::CargoTarget.witness(&target, &[]),
             Err("witness_missing")
         );
         std::fs::write(
@@ -1889,8 +2135,11 @@ mod tests {
             "Signature: 8a477f597d28d172789f06886806bc55\n# cargo\n",
         )
         .unwrap();
-        assert_eq!(StripKind::CargoTarget.witness(&target), Ok(()));
+        assert_eq!(StripKind::CargoTarget.witness(&target, &[]), Ok(()));
         assert_eq!(StripKind::for_name("build"), None);
+        assert_eq!(strip_backoff_delay_ms(1), 5 * 60_000);
+        assert_eq!(strip_backoff_delay_ms(2), 10 * 60_000);
+        assert_eq!(strip_backoff_delay_ms(40), 4 * 3_600_000);
         assert_eq!(StripKind::for_name("dist"), None);
     }
 }
