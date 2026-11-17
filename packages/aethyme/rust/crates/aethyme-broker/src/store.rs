@@ -2815,6 +2815,19 @@ mod review_ledger_tests {
     }
 }
 
+/// What [`BrokerStore::settle_coordinated_operation`] found and did.
+#[derive(Debug, Clone)]
+pub(crate) enum OperationSettlement {
+    /// The row moved to the requested outcome; this is the row as committed.
+    Recorded(CoordinatedOperation),
+    /// The row had already left `running`/`outcome_unknown`; left untouched.
+    AlreadySettled(CoordinatedOperation),
+    /// A row with this id exists but belongs to another session or command.
+    Mismatch(CoordinatedOperation),
+    /// No row has this id.
+    Missing,
+}
+
 mod base_incidents;
 pub(crate) mod cleanup_cohort;
 mod coordination;

@@ -1224,6 +1224,21 @@ blocked.
    and broker operation IDs are separate identifiers; use the broker's reported
    operation ID for inspection and recovery.
 
+   A busy broker database never loses a finished command's outcome. Once the
+   `git`/`gh` child exits, the broker writes its result to an outcome journal
+   under `.aethyme/run/operation-outcomes/` before recording it, and retries
+   the record for up to a minute. If the database is still busy, the command
+   reports the child's real result plus a warning that operation `<id>`'s
+   record is pending; `operations show <id> --json` reports
+   `outcome_journal: pending`. Do not reconcile such an operation by hand and
+   do not retry the command: the next writable broker command, and every
+   coordinated write before its write-block check, records the journaled
+   outcome automatically. A journal that does not match its operation's id,
+   session and command is refused and reported, never applied. An operation
+   with no journal (its process died before the child's result was known)
+   still needs the inspection and reconciliation above. `broker status`
+   warns about a journal that has waited for more than ten minutes.
+
    Direct Git is limited to read-only inspection and operations confined to
    the isolated session worktree and session branch that cannot affect other
    sessions. Direct `gh` is limited to read-only inspection and local

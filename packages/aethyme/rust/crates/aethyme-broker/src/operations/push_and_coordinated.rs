@@ -2251,7 +2251,11 @@ impl Broker {
         let operation = self.store().coordinated_operation(operation_id)?.ok_or(
             crate::BrokerError::CoordinatedOperationNotFound(operation_id),
         )?;
-        Ok(OperationShowReport::from_operation(operation))
+        let mut report = OperationShowReport::from_operation(operation);
+        if outcome_journal::outcome_journal_pending(self.store().db_path(), operation_id) {
+            report.outcome_journal = "pending";
+        }
+        Ok(report)
     }
 
     pub fn run_coordinated_operation(
@@ -3880,6 +3884,17 @@ impl Broker {
             }
         }
         if effect != OperationEffect::Read {
+            // Before the write block is evaluated: an earlier operation whose
+            // child finished but whose record stayed pending on a busy
+            // database is settled from its journal here, so a journaled
+            // success never blocks this write. The earlier holder wrote its
+            // journal while it still held this lock, so it is on disk by now
+            // even if this broker's open-time replay ran too early to see it.
+            // Rows with no journal are untouched (outcome_journal invariant 3).
+            crate::warn_unrecorded(
+                "replay pending coordinated operation outcomes",
+                self.replay_operation_outcome_journals("write_block_check"),
+            );
             let unresolved = if request.provider == OperationProvider::Git {
                 // Every Git operation in this broker executes in a worktree of
                 // the same common directory. Unknown broad writes on another
@@ -4288,12 +4303,16 @@ impl Broker {
                     ref_determination,
                     &lanes,
                 );
-                let operation = self.store().transition_coordinated_operation(
-                    operation.id,
+                let recorded = self.record_coordinated_outcome(
+                    &operation,
                     status,
                     None,
-                    Some(&details.to_string()),
+                    &details.to_string(),
                 )?;
+                if let Some(pending) = &recorded.pending {
+                    eprintln!("warning: {}", pending.message(status));
+                }
+                let operation = recorded.operation;
                 if should_invalidate_open_pr_listing(
                     request.provider,
                     &request.args,
@@ -4357,12 +4376,16 @@ impl Broker {
                     ref_determination,
                     &lanes,
                 );
-                let operation = self.store().transition_coordinated_operation(
-                    operation.id,
+                let recorded = self.record_coordinated_outcome(
+                    &operation,
                     OperationStatus::Failed,
                     None,
-                    Some(&details.to_string()),
+                    &details.to_string(),
                 )?;
+                if let Some(pending) = &recorded.pending {
+                    eprintln!("warning: {}", pending.message(OperationStatus::Failed));
+                }
+                let operation = recorded.operation;
                 if let Some(guard) = &mut host_guard {
                     guard.finish(operation.status)?;
                 }
@@ -4655,12 +4678,14 @@ impl Broker {
             ref_determination,
             &lanes,
         );
-        let operation = self.store().transition_coordinated_operation(
-            operation.id,
-            status,
-            exit_code,
-            Some(&details.to_string()),
-        )?;
+        // The child's result is known from here on. It is journaled to disk
+        // before the database is asked, and a busy database is retried and
+        // then left to replay instead of losing the result (and write-
+        // blocking every session over a write that may have succeeded).
+        let recorded =
+            self.record_coordinated_outcome(&operation, status, exit_code, &details.to_string())?;
+        let outcome_record_pending = recorded.pending;
+        let operation = recorded.operation;
         if should_invalidate_open_pr_listing(request.provider, &request.args, operation.status) {
             self.invalidate_cached_open_pr_listing();
         }
@@ -4686,6 +4711,7 @@ impl Broker {
             post_merge_cleanup: None,
             representing_commit: None,
             created_pull_request: created_pull_request_number,
+            outcome_record_pending,
             remote_default_observation,
             pushed_refs: if output.status.success() {
                 match &push_planning {

@@ -580,6 +580,70 @@ printed), `remote_write_outcome_unknown`, and for a
 provider killed at its budget `remote_write_outcome_unknown_timeout` or
 `remote_write_failed_timeout`. Consumers must ignore names they do not know.
 
+## Coordinated operation outcome journal (2026-11-17)
+
+Once a coordinated `git`/`gh` child exits (or fails to spawn, or is killed
+at its budget), the broker writes the known result to
+`<broker db dir>/run/operation-outcomes/operation-<id>.json` before it
+touches the database: schema `aethyme.coordinated-operation-outcome/v1`,
+`operation_id`, `session_id`, `command_sha256` (SHA-256 of the row's exact
+`command_json`), `status` (`succeeded`, `failed` or `outcome_unknown`),
+`exit_code`, `details_json` (the details the row would carry, including any
+created URL, pushed refs or reconciliation evidence), `child_finished_at` and
+`writer_pid`. The file is a synced temporary renamed into place, followed by a
+sync of the directory. The row is then updated in one `IMMEDIATE`
+transaction that does nothing else (update plus its `operation.<status>`
+event), only while the row is still `running` or `outcome_unknown`, retried
+with exponential backoff (50 ms doubling to 2 s, each attempt waiting at most
+5 s for the lock) for up to 60 s. The journal is removed once the row holds
+the outcome.
+
+If the database stays busy past that budget, the command still reports the
+child's true result. `broker advanced git|gh --json` gains
+`outcome_record_pending` (`operation_id`, `journal_path`, `database_error`,
+`attempts`, `waited_ms`), stderr gains a `warning:` line naming the operation
+and saying it will be recorded automatically, and the exit code follows the
+child's outcome. `broker advanced operations show <id> --json` gains
+`outcome_journal: pending|none`.
+
+Replay: every writable broker open (every CLI command and the detached
+artifact worker; snapshot opens excluded), and every coordinated write before
+its write-block check, replays pending journals. A journal is applied only if
+its operation exists, its `session_id` and `command_sha256` match the row,
+and the row is `running` or `outcome_unknown`; the replayed row's details add
+`outcome_journal` (`replayed_by`: `broker_open` or `write_block_check`,
+`replayed_at`, `child_finished_at`, `writer_pid`, `status_before_replay`). A
+journal for a row already settled or reconciled is deleted. A journal that is
+unreadable, carries another schema, names a missing operation or does not
+match is renamed to `operation-<id>.json.refused`, reported on stderr, and
+never applied. A replay waits at most 1 s for the write lock and otherwise
+leaves the journal for the next opener. `broker status` adds one
+`operation.outcome-journal-unreplayed` warning per journal older than ten
+minutes.
+
+Invariant: success is never inferred without a journal. A `running` row with
+no journal (the process died before the child's result was known) keeps the
+previous path: `outcome_unknown`, a write block, and explicit reconciliation.
+
+Telemetry: phase counts `operation_outcome_journal_written`,
+`operation_outcome_journal_write_failed`, `operation_outcome_record_retry`,
+`operation_outcome_record_attempt_failed`, `operation_outcome_record_pending`,
+`operation_outcome_journal_replayed`, `operation_outcome_journal_discarded`,
+`operation_outcome_journal_still_pending`, `operation_outcome_journal_refused`;
+phases `operation_outcome_record_wait` (total wait) and
+`operation_outcome_journal_replay`; attachment `operation_outcome_record`
+(`outcome`, `attempts`, `retries`, `waited_ms`, `journal`).
+
+Every broker open also stopped writing `meta.min_compatible_schema` when the
+recorded floor is already at least the binary's: the unconditional upsert took
+the database write lock on every open, including each running operation's
+10-second heartbeat.
+
+Removing the journal, or recording before it is written, brings back the stranded `running` row that write-blocks every
+session after a write that succeeded. Applying a journal without the session
+and command-hash checks could settle an unrelated operation that reused an id
+in a restored database. Covered by `operations/outcome_journal/tests.rs`.
+
 ## Compact status by default, session block and push plan (2026-11-17)
 
 **Changed default.** `aethyme broker status --json` now prints the compact

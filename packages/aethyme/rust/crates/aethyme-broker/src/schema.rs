@@ -2547,6 +2547,19 @@ pub(crate) fn record_min_compatible_schema_floor(
     conn: &Connection,
     minimum: i64,
 ) -> Result<(), BrokerError> {
+    // Read first. The upsert takes the database write lock even when its
+    // `WHERE` makes it a no-op, and every open runs this -- including each
+    // running coordinated operation's 10-second heartbeat -- so on a busy
+    // repository an already-recorded floor cost a write-lock round trip per
+    // open and queued behind every other writer.
+    let recorded: Option<i64> = rusqlite::OptionalExtension::optional(conn.query_row(
+        "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'min_compatible_schema'",
+        [],
+        |row| row.get(0),
+    ))?;
+    if recorded.is_some_and(|recorded| recorded >= minimum) {
+        return Ok(());
+    }
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('min_compatible_schema', ?1)
          ON CONFLICT (key) DO UPDATE SET value = excluded.value

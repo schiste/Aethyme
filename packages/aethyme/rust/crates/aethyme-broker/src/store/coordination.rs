@@ -484,6 +484,145 @@ impl BrokerStore {
             .ok_or(BrokerError::CoordinatedOperationNotFound(id))
     }
 
+    /// Record the known final outcome of a coordinated operation whose child
+    /// process has exited.
+    ///
+    /// One `IMMEDIATE` transaction that does nothing else: it takes the write
+    /// lock up front (so it never fails a deferred read-to-write upgrade with
+    /// an instant `SQLITE_BUSY`), re-reads the row, checks it is the same
+    /// operation (`session_id` and the exact journaled `command_json`), and
+    /// only then moves a `running` or `outcome_unknown` row to `status` and
+    /// appends the matching `operation.<status>` event. A row that already
+    /// left those states -- settled by an earlier replay, or reconciled by an
+    /// operator -- is returned untouched. `busy_timeout` bounds how long this
+    /// one attempt waits for the write lock; the connection's usual timeout
+    /// is restored afterwards. Callers retry a busy error themselves.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn settle_coordinated_operation(
+        &mut self,
+        id: i64,
+        session_id: i64,
+        command_json: &str,
+        status: OperationStatus,
+        exit_code: Option<i64>,
+        details_json: &str,
+        busy_timeout: std::time::Duration,
+    ) -> Result<OperationSettlement, BrokerError> {
+        self.conn.busy_timeout(busy_timeout)?;
+        let settled = self.settle_coordinated_operation_once(
+            id,
+            session_id,
+            command_json,
+            status,
+            exit_code,
+            details_json,
+        );
+        let restored = self
+            .conn
+            .busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS));
+        let settled = settled?;
+        restored?;
+        Ok(settled)
+    }
+
+    fn settle_coordinated_operation_once(
+        &mut self,
+        id: i64,
+        session_id: i64,
+        command_json: &str,
+        status: OperationStatus,
+        exit_code: Option<i64>,
+        details_json: &str,
+    ) -> Result<OperationSettlement, BrokerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let read = |tx: &rusqlite::Transaction<'_>| {
+            tx.query_row(
+                "SELECT id, session_id, provider, repository, scope, effect,
+                        status, authorization_reason, command_json, pid,
+                        exit_code, details_json, created_at, updated_at, finished_at,
+                        host_operation_id, identity_provenance, agent_provenance_json
+                 FROM coordinated_operations WHERE id = ?1",
+                [id],
+                coordinated_operation_from_row,
+            )
+            .optional()
+        };
+        let Some(current) = read(&tx)?.transpose()? else {
+            return Ok(OperationSettlement::Missing);
+        };
+        if current.session_id != session_id || current.command_json != command_json {
+            return Ok(OperationSettlement::Mismatch(current));
+        }
+        if !matches!(
+            current.status,
+            OperationStatus::Running | OperationStatus::OutcomeUnknown
+        ) {
+            return Ok(OperationSettlement::AlreadySettled(current));
+        }
+        // As in `transition_coordinated_operation`: completion evidence of an
+        // exact fetch survives a transition whose new details lack it.
+        let mut details = serde_json::from_str::<serde_json::Value>(details_json)
+            .ok()
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(proof) = current
+            .details_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .and_then(|value| value.get("fetch_reconciliation").cloned())
+            && let Some(object) = details.as_object_mut()
+        {
+            object.entry("fetch_reconciliation").or_insert(proof);
+        }
+        let now = now_ms();
+        let finished_at = matches!(
+            status,
+            OperationStatus::Succeeded
+                | OperationStatus::Failed
+                | OperationStatus::OutcomeUnknown
+                | OperationStatus::ReconciledSucceeded
+                | OperationStatus::ReconciledFailed
+        )
+        .then_some(now);
+        tx.execute(
+            "UPDATE coordinated_operations
+             SET status = ?2, exit_code = ?3, details_json = ?4,
+                 updated_at = ?5, finished_at = ?6
+             WHERE id = ?1 AND status IN ('running', 'outcome_unknown')",
+            params![
+                id,
+                status.as_str(),
+                exit_code,
+                details.to_string(),
+                now,
+                finished_at,
+            ],
+        )?;
+        let payload = crate::events::operation_payload(
+            id,
+            current.provider,
+            &current.repository,
+            &current.scope,
+            current.effect,
+            status,
+            exit_code,
+        );
+        insert_event(
+            &tx,
+            now,
+            &format!("operation.{}", status.as_str()),
+            Some(current.session_id),
+            Some(&payload),
+        )?;
+        let recorded = read(&tx)?
+            .transpose()?
+            .ok_or(BrokerError::CoordinatedOperationNotFound(id))?;
+        tx.commit()?;
+        Ok(OperationSettlement::Recorded(recorded))
+    }
+
     /// Attach inspection evidence only to the exact operation observed before
     /// the remote read. Inspection must never overwrite a concurrent operator
     /// reconciliation or a newer inspection.
