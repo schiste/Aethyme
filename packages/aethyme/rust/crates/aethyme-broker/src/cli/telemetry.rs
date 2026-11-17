@@ -496,13 +496,25 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
         // of the things it reports on.
         Some(
             "certify" | "readiness" | "queue" | "metrics" | "insights" | "handoff" | "exec-status"
-            | "worktree-root" | "owners",
+            | "worktree-root" | "worktrees" | "owners",
         ) => false,
         Some("advisories") => matches!(args.get(1).map(String::as_str), Some("ack" | "suppress")),
         Some("exposures") => args.get(1).map(String::as_str) == Some("apply"),
         Some("report") => args.get(1).map(String::as_str) == Some("file"),
         Some("quality-report") => args.get(1).map(String::as_str) != Some("plan"),
         Some("issues" | "outcomes") => true,
+        // Read views stay side-effect free, and background watch polls stay
+        // quiet unless an operator opts into detailed measurement.
+        Some("watch") => match args.get(2).map(String::as_str) {
+            Some("start" | "pause" | "resume" | "stop" | "ack") => true,
+            Some("monitoring" | "service") => {
+                matches!(
+                    args.get(3).map(String::as_str),
+                    Some("activate" | "deactivate" | "install")
+                )
+            }
+            _ => false,
+        },
         Some("external-events") => matches!(
             args.get(1).map(String::as_str),
             Some("ingest" | "reconcile")
@@ -724,6 +736,28 @@ mod tests {
         }
         for (verb, form) in public_forms() {
             assert!(label(&format!("{verb} {form}")).is_some(), "{verb} {form}");
+        }
+    }
+
+    #[test]
+    fn newly_labelled_inspections_and_polls_stay_quiet_by_default() {
+        for invocation in [
+            &["worktrees", "--measure"][..],
+            &["watch", "pr", "list"],
+            &["watch", "pr", "monitoring", "status"],
+            &["watch", "pr", "service", "plan"],
+            &["watch", "pr", "poll"],
+            &["watch", "pr", "tick"],
+            &["watch", "repo", "events"],
+        ] {
+            let args: Vec<_> = invocation.iter().map(|word| (*word).to_owned()).collect();
+            assert!(safe_command_surface(&args).is_some(), "{invocation:?}");
+            assert!(
+                !command_metric_enabled(&args, false, false),
+                "{invocation:?}"
+            );
+            assert!(command_metric_enabled(&args, true, false), "{invocation:?}");
+            assert!(!command_records_outcome(&args), "{invocation:?}");
         }
     }
 
