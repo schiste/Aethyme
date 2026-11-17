@@ -7,6 +7,7 @@ use crate::types::{MergeQueueEntry, Session, SessionOrigin, SessionStatus};
 use crate::version::{BinaryBuild, VersionDriftReport, VersionDriftStatus};
 use std::path::{Path, PathBuf};
 
+mod start_reservation_lifecycle;
 mod storage_context_startup;
 
 #[test]

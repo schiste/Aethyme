@@ -104,7 +104,9 @@ gates run and leave staged changes untouched. See the
 
 For shared package-manager stores, add `shared_package_caches` to a
 `repository_shared` step. The supported names are `pnpm`, `npm`, `uv`, and
-`pip`; each creates a directory under the preparation digest's shared cache and
+`pip`; each creates a directory in the repository-wide package store (one per
+repository and platform, shared by every input set; `[shared_cache]
+package_store = "per_input"` keeps one per preparation digest instead) and
 exports its path as `AETHYME_PREPARE_PNPM_STORE_DIR`,
 `AETHYME_PREPARE_NPM_CACHE_DIR`, `AETHYME_PREPARE_UV_CACHE_DIR`, or
 `AETHYME_PREPARE_PIP_CACHE_DIR`. The command must explicitly use the variable

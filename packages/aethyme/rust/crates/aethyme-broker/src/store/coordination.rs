@@ -2097,6 +2097,18 @@ impl BrokerStore {
             .collect()
     }
 
+    /// Latest watch for one session, preferring one still being observed.
+    pub fn session_pull_request_watch(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<PullRequestWatch>, BrokerError> {
+        self.conn.query_row(
+            &(PULL_REQUEST_WATCH_SELECT.to_owned() +
+                " WHERE session_id = ?1 ORDER BY CASE WHEN status IN ('active', 'paused') THEN 0 ELSE 1 END, id DESC LIMIT 1"),
+            [session_id], pull_request_watch_from_row,
+        ).optional()?.transpose()
+    }
+
     pub fn update_pull_request_watch_status(
         &mut self,
         id: i64,

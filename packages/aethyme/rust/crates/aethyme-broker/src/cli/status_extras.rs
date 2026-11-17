@@ -36,7 +36,7 @@ fn evidence_cap_enabled() -> bool {
 /// Cap the evidence of every advice entry in `document["advice"]` (the full
 /// and `--summary` documents) and in `document["session"]["advice"]`.
 /// Returns how many entries were truncated.
-pub(super) fn cap_document_advice_evidence(document: &mut Value) -> usize {
+pub(crate) fn cap_document_advice_evidence(document: &mut Value) -> usize {
     if !evidence_cap_enabled() {
         return 0;
     }
@@ -125,7 +125,7 @@ fn truncate_text(text: &str, limit: usize) -> String {
 /// reaches the network: the pull request comes from the broker's own watch
 /// records, and mergeability and required checks, which it does not record,
 /// are reported unknown rather than fetched.
-pub(super) fn session_block(
+pub(crate) fn session_block(
     broker: &crate::Broker,
     session_id: i64,
     session_advice: &[crate::StatusAdvice],
@@ -157,23 +157,11 @@ pub(super) fn session_block(
             json!(error.to_string()),
         ),
     };
-    let watch = broker.pull_request_watches(true).ok().and_then(|watches| {
-        // Newest first; prefer a watch that is still observing.
-        let mine: Vec<_> = watches
-            .into_iter()
-            .filter(|watch| watch.session_id == session_id)
-            .collect();
-        let live = mine.iter().position(|watch| {
-            matches!(
-                watch.status,
-                crate::PullRequestWatchStatus::Active | crate::PullRequestWatchStatus::Paused
-            )
-        });
-        match live {
-            Some(index) => mine.into_iter().nth(index),
-            None => mine.into_iter().next(),
-        }
-    });
+    let watch = broker
+        .store_ref()
+        .session_pull_request_watch(session_id)
+        .ok()
+        .flatten();
     let (pr, pr_state) = match &watch {
         Some(watch) => (
             json!({

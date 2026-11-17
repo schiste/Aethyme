@@ -106,7 +106,7 @@
         "member_count": 12,
         "ci_mentions": 70,
         "executable_entrypoints": 1,
-        "source_files": 1078
+        "source_files": 1079
       }
     },
     {
@@ -540,7 +540,7 @@
       "member_count": 12,
       "ci_mentions": 70,
       "executable_entrypoints": 1,
-      "source_files": 1078
+      "source_files": 1079
     }
   },
   "commands": [
@@ -792,9 +792,9 @@
     ]
   },
   "freshness": {
-    "source_digest": "9c99b402f524982c0c4c93ed2d20268fdc59e62d3dee7d018953067b5eb000bf",
+    "source_digest": "7965cdadec7b5d43b642d7f95be9bed5fa9afe747dbad5a5c31fd3c7fb246ef2",
     "source_commit": null,
-    "source_file_count": 3986,
+    "source_file_count": 3987,
     "generator": "deterministic"
   },
   "notes": [

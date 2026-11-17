@@ -594,10 +594,11 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
             "--compact",
             "--full",
             "--session",
+            "--session-view",
             "--since-revision",
         ],
     ),
-    ("events", &["--since", "--kind", "--follow"]),
+    ("events", &["--since", "--kind", "--follow", "--session"]),
     ("events prune", &["--keep-days"]),
     ("metrics", &[]),
     (

@@ -36,6 +36,33 @@ consumer. This file exists so that doesn't happen again.
    `scripts/eval/verify-playground.sh` against any deployed
    playground; it asserts a subset of the contracts below.
 
+## Session coordination consumers
+
+`aethyme broker status --session <id> --json` supplies a session block in
+its full compact snapshot. With `--since-revision`, the
+`aethyme.broker-status-delta/v1` document includes `changed_sections.session`
+only when that block changes; an empty section map does not certify deferred
+checks. Older or differently scoped revision tokens reset to a full snapshot.
+
+`status --session <id> --session-view --json` returns the versioned
+`aethyme.broker-session-view/v1` snapshot. It reads session advice and pending
+lease release requests for the selected session, recorded peer lease and
+declared-scope overlaps, and a partial set of blocker observations. It skips
+the repository-wide status computation and marks deferred recovery checks
+as unknown. Its revision scope is separate from focused status, and unrelated
+repository counts do not cause deltas. Use focused or full status for broader
+checks and exact evidence.
+
+`aethyme broker advanced events --session <id> --since <event-id> --follow
+--json` emits NDJSON rows attributed to that session, in event-id order. It
+omits global and peer-attributed events, and cannot recover rows removed by
+retention. Clients persist the last consumed id and fetch focused or full
+status when they need current state or evidence. The installed, trusted hook
+plugin delivers changes to the session, relevant recorded peer overlaps and
+blocker observations at prompt and tool boundaries, alongside pending lease
+release requests. Session and blocker checks run at most once every 30 seconds
+during a continuing session. An idle agent receives updates on its next turn.
+
 ## Code-shape diagnostics
 
 `aethyme quality code-shape` is an opt-in CLI for source-shape diagnostics.
@@ -1443,10 +1470,65 @@ writes made by preparation commands.
 
 A `repository_shared` preparation step may opt into `shared_package_caches`
 with unique values `pnpm`, `npm`, `uv`, or `pip`. The broker exposes only the
-selected `AETHYME_PREPARE_*_DIR` paths, each beneath the existing canonical
-remote identity and preparation-digest directory. Steps selecting the same
-manager under one digest reuse that manager's directory. The pnpm alias keeps
-the existing `AETHYME_PREPARE_CACHE_DIR/pnpm-store` path. The command must
+selected `AETHYME_PREPARE_*_DIR` paths. By default each is beneath the
+repository-wide package store `<cache root>/<repository>/packages/<os>-<arch>/`,
+shared by every preparation digest: the store key is the captured cache root,
+canonical remote identity, OS, architecture and manager directory, and the
+manager's own layout version (pnpm `v10/`, uv and pip wheel tags) keeps
+incompatible content apart. Every digest directory links `pnpm-store`,
+`npm-cache`, `uv-cache` and `pip-cache` to that store with relative symlinks,
+so `AETHYME_PREPARE_CACHE_DIR/pnpm-store` reaches the shared store; an existing
+real directory there (the earlier layout) is left in place.
+`[shared_cache] package_store = "per_input"` keeps the earlier per-digest
+stores; the default is not serialized, so existing preparation digests and
+trusted policies are unchanged. The `packages` directory is never swept as a
+stale digest; only a whole-store rotation under the exclusive lease removes
+it, and a retired store containing it keeps a managed layout.
+
+Runtime keys: the preparation digest keys each `[[runtimes]]` entry on the
+SHA-256 of its probe's standard output, no longer on the executable's size
+and modification time (a one-time rekey: every checkout is stale once after
+upgrading). `submit prepare` runs each probe on exactly the resolved file (5 s
+limit, own process group, trusted policy, storage not under pressure) and
+caches verified outputs per executable and command in the checkout's Git
+directory (`aethyme-runtime-probes.json`), from which status reads and
+storage sweeps compute the same key without running anything. A failed,
+unstartable or timed-out probe is `unverified`: its key is the executable
+identity plus a per-run nonce, never shared, and the next preparation probes
+again. A permanently failing probe makes every preparation reinstall, the
+checkout never reports `current` (so `required_for_hooks` steps block hooks),
+and each run's digest directory is reclaimed by the next sweep; advice
+`prepare.runtime-probe-unverified` (metadata key
+`preparation.runtime_probe_unverified`) names the probe and its reason. Advice `prepare.runtime-probe-unstable` (broker metadata key
+`preparation.runtime_probe_unstable`) reports a probe whose output changed
+for an unchanged executable. `[shared_cache] max_bytes = 0` now means the
+8 GiB default rather than unbounded.
+
+Package-store reclamation: preparation-cache sweeps (`gc` and the storage
+recovery worker) rotate `<repository>/packages` under the repository's
+exclusive lease when its volume is under the free-space reserve or a bounded
+measurement finds it over the repository's `[shared_cache] max_bytes` (each
+preparation records it in `packages/.aethyme-store-cap`; 8 GiB when unset or
+zero), rename it to `packages-retired-*`, and remove
+retired stores without a lease. A preparation refused for storage tries the
+same rotation first. Telemetry phases: `package_store_rotated_pressure`,
+`package_store_rotated_over_cap`, `package_store_rotation_busy`,
+`package_store_retired_removal`, `runtime_probe`, `runtime_probe_unverified`.
+
+Mixed versions: binaries before this change compute different digests, so
+they never open a digest directory holding the new links; their unlink-based
+removal does not follow the links. They do report preparation-cache sweeps as
+incomplete while `packages` exists, and keep a retired whole-repository store
+that contains `packages` until a current binary reclaims it.
+
+Output contract (additive): the prepare report gains `package_store`,
+`cache_outcome` (`hit`, `miss_reason`) and per-step `volume_bytes_allocated`;
+the command metric's `preparation` object carries `package_store` and
+`cache_outcome`; `submit prepare status --json` gains `runtimes` and `package_store` from the
+session's last recorded preparation (store path, scope, key components,
+runtime identities, `same_volume`, `import_method`, free-space readings);
+`broker status` gains the warning `prepare.store-on-other-volume`, read from
+the broker metadata key `preparation.package_store_volume`. The command must
 explicitly route its manager to the alias; native package-manager variables
 remain caller-controlled. `CARGO_HOME` is deliberately unsupported because it
 also contains configuration, credentials, and executables. The broker does
@@ -1732,7 +1814,7 @@ This setting is a user-facing broker config contract. Changes to its accepted va
 | `[review.comments.<name>]` and rule `comment` writers, readers of `review plan --json` / `review run --json` (`rule_comments`), and anything that reads pull request comments carrying `<!-- aethyme:comment:<key> -->` (introduced 2026-10-07, #596) | A `[[review.trigger.rule]]` may carry `comment = { template, key, on_unmatch = "keep" \| "delete" }`; `[review.comments.<name>]` holds `body`, whose `{{variable}}` names are limited to `tier`, `risk`, `files_changed`, `lines_added`, `lines_deleted`, `churn`, `signals`, `reasons`, `rule`, `pr_number`, `head` (full 40-character SHA, added 2026-10-07), `head_short`, `base`. Load rejects an unknown variable, an unclosed `{{`, a missing template, an invalid or duplicate key. `review plan` and `review run` add `rule_comments[]` (`key`, `rule`, `decision` = `create`/`update`/`none`/`delete`/`suppressed`, optional `why`, optional `body`). `review run` creates with `pr comment`, edits with `api -X PATCH repos/<repo>/issues/comments/<id>` and deletes with `api -X DELETE …` (declared destructive), each through the coordinated lane with a reason naming the rule and key. A comment counts as the broker's only when its first line is the marker and its author is the `gh api user` login. | The marker is how a later tick finds its own comment: changing it orphans every comment already posted and doubles them. Adopting a marked comment by anyone else would let a rule overwrite or delete it. Interpolating text the pull request controls would let its author make the broker mention people or post links. |
 | `[review.trigger]` policy writers and every reader of the broker database (introduced 2026-09-13, #172) | A `[review.trigger.schedule.<type>]` table may declare `freshness = "head"` (the default, and what every dimension has always done) or `"head_and_base"`, which additionally invalidates a completed review when the base commit moves. Schema v36 adds a nullable `base_commit` to `review_requests` and to `pull_request_observations`; `review run` fills it from the provider's `baseRefOid`, falling back to the local ref. | A reader that assumes `review_requests.base_commit` is `NOT NULL` breaks on every row written before v36 -- and the null is load-bearing, not incidental: `head_and_base` reads an absent base as *unproven*, so it re-reviews rather than trusting a comparison nobody made. Backfilling the column from today's branch tip would assert exactly that comparison and silently pass stale reviews. Any process holding an older `aethyme` binary cannot open a v36 database until it is reinstalled. |
 | Every reader of `review_requests.state` in the broker database: adapters that close a review row, the PR projection, and any external dashboard over the ledger (introduced 2026-09-13, #172) | `state` gains a seventh value, `waived`: one dimension excused by a person at one head, written only by `aethyme broker advanced review waive` and carrying `waived by <who>: <reason>` in `detail`. Schema v37 rebuilds `review_requests` to widen the state CHECK, carrying v36's `base_commit` with it. `review state --state waived` is refused. | A reader that matches the six previous states exhaustively and treats the default as an error breaks on a waived row; one that treats the default as *settled* is correct, and one that treats it as *reviewed* is the defect this state exists to prevent -- `waived` must never be rendered, counted, or exported as `satisfied`. A waiver is scoped to (repository, pull request, review type, head commit) by the existing unique index, so it expires when the head moves; a reader that caches it per pull request reintroduces the standing exemption. Any process holding an older `aethyme` binary cannot open a v37 database until it is reinstalled. |
-| Operators and wrappers reading dependency preparation (introduced 2026-10-02; extended 2026-10-27) | `aethyme init --json` reports gain an additive `prepare` field (the phase-4 `prepare.draft` check; absent when `.aethyme/prepare.toml` already exists). `.aethyme/prepare.toml` accepts optional `[shared_cache] max_bytes` (omission supplies an 8 GiB logical-byte rotation threshold per repository; explicit `0` disables it; refused without a `repository_shared` step) and `root = "host" | "worktree_volume"` (absent means `host`; other values are refused). `worktree_volume` selects a repository-owned cache under the worktree placement filesystem and requires its ownership marker and matching filesystem identity. An explicit `AETHYME_PREPARATION_CACHE_ROOT` keeps precedence, but a cross-filesystem override is refused. Changing roots does not migrate or remove prior cache data. `aethyme broker submit prepare --json` now reports schema version 2. When rotation occurs, `shared_cache_rotation` includes `key`, `budget_bytes`, nullable `bytes_before`, `observed_bytes_lower_bound`, `bytes_after`, `removed`, `inventory_complete`, and typed `rotation_reason`. A complete over-budget inventory reports an exact number and `budget_exceeded`; a time- or entry-limited inventory reports `bytes_before: null`, `inventory_complete: false`, and `inventory_time_limit` or `inventory_entry_limit`. `inventory_complete` describes the size scan; `removed` reports whether rotation finished. | Configuration and preparation-state schemas remain version 1; the JSON report schema advances to 2 because `bytes_before` is nullable. Strict consumers must handle null and the two inventory-limit reasons before interpreting rotation data. Since 2026-11-14 an inventory that stops at its time or entry limit under budget no longer rotates (see the `submit prepare` metrics notes); an early stop over budget rotates with `budget_exceeded`; depth, filesystem, special-node and liveness failures still refuse. The cache-only pinned remover independently refuses special nodes and leaves durable recovery debt. Rotation is checked before preparation, covers all digest keys of that repository, and remains subject to existing writer leases, identity checks and durable recovery; it is not an in-flight write quota. Worktree-local steps acquire no shared budget. Adding `[shared_cache]` changes the trusted gate/prepare policy digest, so the next prepare needs `aethyme broker advanced trust` once, like any policy edit. Renaming `shared_cache.root`, `shared_cache.max_bytes` or `shared_cache_rotation` breaks configurations and wrappers that set or read them. |
+| Operators and wrappers reading dependency preparation (introduced 2026-10-02; extended 2026-10-27) | `aethyme init --json` reports gain an additive `prepare` field (the phase-4 `prepare.draft` check; absent when `.aethyme/prepare.toml` already exists). `.aethyme/prepare.toml` accepts optional `[shared_cache] max_bytes` (omission supplies an 8 GiB logical-byte rotation threshold per repository; explicit `0` disabled it until 2026-11-17 and now means the same 8 GiB default; refused without a `repository_shared` step) and `root = "host" | "worktree_volume"` (absent means `host`; other values are refused). `worktree_volume` selects a repository-owned cache under the worktree placement filesystem and requires its ownership marker and matching filesystem identity. An explicit `AETHYME_PREPARATION_CACHE_ROOT` keeps precedence, but a cross-filesystem override is refused. Changing roots does not migrate or remove prior cache data. `aethyme broker submit prepare --json` now reports schema version 2. When rotation occurs, `shared_cache_rotation` includes `key`, `budget_bytes`, nullable `bytes_before`, `observed_bytes_lower_bound`, `bytes_after`, `removed`, `inventory_complete`, and typed `rotation_reason`. A complete over-budget inventory reports an exact number and `budget_exceeded`; a time- or entry-limited inventory reports `bytes_before: null`, `inventory_complete: false`, and `inventory_time_limit` or `inventory_entry_limit`. `inventory_complete` describes the size scan; `removed` reports whether rotation finished. | Configuration and preparation-state schemas remain version 1; the JSON report schema advances to 2 because `bytes_before` is nullable. Strict consumers must handle null and the two inventory-limit reasons before interpreting rotation data. Since 2026-11-14 an inventory that stops at its time or entry limit under budget no longer rotates (see the `submit prepare` metrics notes); an early stop over budget rotates with `budget_exceeded`; depth, filesystem, special-node and liveness failures still refuse. The cache-only pinned remover independently refuses special nodes and leaves durable recovery debt. Rotation is checked before preparation, covers all digest keys of that repository, and remains subject to existing writer leases, identity checks and durable recovery; it is not an in-flight write quota. Worktree-local steps acquire no shared budget. Adding `[shared_cache]` changes the trusted gate/prepare policy digest, so the next prepare needs `aethyme broker advanced trust` once, like any policy edit. Renaming `shared_cache.root`, `shared_cache.max_bytes` or `shared_cache_rotation` breaks configurations and wrappers that set or read them. |
 | `aethyme collab project association propose/confirm/revoke` and every Local collaboration store reader/writer (experimental T03 association) | Proposal names the invoking and peer ProjectKeys, independently approved ProjectIds, exact committed descriptor RecordIds and anchor snapshots. Each explicit proposal carries a bounded, capability-gated nonce in its canonical record, so a new proposal for the same bindings gets a new exact RecordId. `propose --write` writes only `.aethyme/project-association.json`; `confirm --confirm <RecordId>` reloads both committed descriptors and both approved local bindings, then writes the canonical association object and one row to the invoking project’s schema-31 store. The peer store is read-only. `revoke` changes only the invoking store’s row; association rows and object roots are retained. A revoked RecordId is immutable; re-association requires a fresh proposal and exact confirmation. | A URL or matching tree never substitutes for either independent binding. Consumers must preserve the local and peer sides in order and reject stale descriptor IDs, changed anchors, equal ProjectIds, duplicate active pairs or revoked rows. Pre-schema-31 GC writers cannot see these canonical object roots and must refuse writes to the raised compatibility floor. Confirmation creates no cross-database transaction and grants no source, execution, acceptance or transitive association authority. |
 | Operators and generators writing managed dependency-preparation profiles (introduced 2026-10-17) | `.aethyme/prepare.toml` may opt into `[managed_storage.steps.<step>.output_growth_bytes]` with a positive integer byte bound for every exact declared output; `repository_shared` steps also need a positive `shared_cache_growth_bytes`. A missing profile keeps legacy configuration behavior. An otherwise valid, trusted request with an opt-in profile returns typed `ManagedStorageNotReady` before starting any command until reservation, root adoption and old-writer fencing are integrated. The minimal configuration is in `local-v3-storage-lifecycle.md`. | This is a fail-closed planning surface, not an active quota or reservation. CI pins exact positive bounds and the production `Broker::prepare_session` refusal with a command-created sentinel; a guard-removal mutation must fail that sentinel assertion. Do not tell operators that declared bytes currently cap writes. |
 | Operators and automation writing `integration reconcile` resolution files, and readers of its JSON plan (introduced 2026-10-07, #464) | Additive: schema-2 `unrecorded_resolutions[].disposition` accepts `tracked_elsewhere` with exactly one of `tracked_branch` (string) or `pull_request` (integer); both fields are forbidden for the other dispositions, and `upstream_commit` is forbidden for this one. The broker reads the branch head from the upstream remote with a bounded `git ls-remote` (and, for `pull_request`, the open PR's `headRefName`/`headRefOid` with the trusted `gh pr view`), requires that head to be fetched, and accepts the commit only when it is an ancestor of that head or a first-parent commit on it carries the same patch id. `plan.commits[].unrecorded_resolution.tracked_elsewhere` reports `remote`, `branch`, `remote_commit`, optional `pull_request`, `containment` (`ancestor` or `patch_id`) and `matching_commit`; such commits are not replayed. `resolution_template.field_contract.unrecorded_dispositions` lists the new rule, and template rows carry `tracked_branch`/`pull_request` only when set. | Accepting a branch the remote does not report, a closed pull request, or a raw-diff match would let reconcile drop work that exists nowhere else. A reader that treats every non-`preserve_and_replay` disposition as "content already upstream" must now also accept "content preserved on another ref". |
@@ -3077,17 +3159,84 @@ reports.
   `phase_timings_ms.lifecycle_lock_wait` takes precedence over the span of the
   same name on success.
 - **Shorter `start` hold.** The sparse-checkout plan is computed before the
-  claim. The claim is still held through lease and preparation reporting:
-  the lease-holder refresh there judges other sessions inline, and while
-  `start` holds the claim those judgements stay "busy" instead of closing
-  anything. `git worktree add`, contract and witness capture and registration
-  still run under it: storage's stray-checkout
-  review, GC orphan review, the worktree-registry orphan sweep and the
-  retirement lanes recognise a half-created checkout only by that exclusion,
-  so moving `worktree add` outside it needs a reservation every one of those
-  lanes honours first. Plain `finish`/`cleanup` still removes through
+  claim. Plain `finish`/`cleanup` still removes through
   `git worktree remove` under the claim; only verified-archive and retirement
-  removals rename into the trash.
+  removals rename into the trash. The `start` hold itself is now limited to
+  the reservation; see the next section.
+
+### `broker start` holds the lifecycle claim only for its reservation
+
+Introduced 2026-11-17. `broker start` (new checkouts, ordinary and detached)
+holds the repository lifecycle claim for the checkout limit, root preparation,
+storage admission, reaping dead start reservations, slug choice and recording
+its reservation, then releases it. `git worktree add`, the configured-root
+worktree lock, contract and witness capture, session registration and the
+lease and preparation reporting run outside the claim. Changes consumers may
+see:
+
+- **Reservation files.** `.aethyme/run/start-reservations/<slug>.lock`, a
+  JSON record (`pid`, `process_start`, `worktree_path`, `branch`, `base`,
+  `created_at_ms`) that the start holds an exclusive `flock` on from
+  reservation until its session row is committed or its rollback finished,
+  then unlinks. The destination is created as an empty directory under the
+  claim, after the file. A lock anyone can take means its start died; the next
+  start reaps it under the claim, removing only an empty destination and only
+  a branch that still names the recorded base while the destination has no
+  `.git`. Anything else is left (and named in a warning) for the existing
+  recovery lanes. A reader must tolerate the new directory; nothing else may
+  write or remove its files.
+- **Inline claims stay busy.** From the release of the claim until its row
+  and reports are done, nonblocking lifecycle claims made by the same
+  `start` (the lease-holder refresh's abandoned close, for one) answer busy
+  without touching the lock, as they did while `start` held it.
+- **Slug choice** treats a reserved slug as taken even before its path or
+  branch exists, and never hands out a path any session row records, cleaned
+  rows included (schema v65 adds the index `sessions_by_worktree_path`;
+  compatible, floor stays v60). Otherwise a lane acting on the old row could
+  reach the new checkout while `worktree add` runs.
+- **Checkout limit** counts every live reservation as a checkout (each has no
+  session row yet). One whose checkout Git already registered is counted
+  twice until its row lands.
+- **Free-space reserve.** Storage admission subtracts, per live reservation,
+  the median recorded size of checkouts under the pool root (at least
+  256 MiB) from the free space it compares with the reserve.
+- **Removal lanes refuse reserved checkouts.** Every checkout removal goes
+  through `GitRepo::worktree_remove`/`worktree_remove_registered` or
+  `checkout_trash::move_worktree_to_trash`; each refuses a path another
+  process's live reservation holds, with an error starting
+  `start_in_progress:` that the lane records as its reason (a start's own
+  rollback is allowed). Storage stray-directory apply refuses one too
+  (`a running broker start has reserved this checkout path`). The shared
+  helper is `start_reservation::path_is_reserved(main_root, path) -> bool`
+  (reservation file present and its lock held); lanes check it under the
+  lifecycle claim. The strip lanes' `reused_path_keep` (`start_reserved`)
+  calls the same helper; a held file whose record is not written yet matches
+  by its file stem, which is the destination folder's name. Git also marks a worktree `locked` ("initializing") while
+  `worktree add` runs, so `git worktree prune` keeps it.
+- **Nested-destination check** no longer runs `git worktree list` (17 s over
+  857 registrations on the busiest repository): it walks from the
+  destination's parent up to the pool root and refuses if any of them holds a
+  `.git` entry. Root preparation for a fresh binding keeps its listing-based
+  check.
+- **Failed `worktree add`** retakes the claim, keeps everything if a session
+  row owns the path, otherwise removes the empty destination and the branch
+  if it still names the base (or rolls back a partial registration through the
+  existing clean-checkout rollback), then releases the reservation. The
+  error's recovery list names anything retained.
+- **Mixed versions.** An older binary holds the claim for its whole start:
+  it sees the reserved directory and picks another slug, and its lanes are row
+  based as above, so the two cannot corrupt each other. A newer rollback holds
+  the claim, so an older start is never mid-flight on the same path.
+- **Telemetry.** New `phase_timings_ms` entries `start_reservation_reap`,
+  `start_reservation`, `lifecycle_lock_held_reserve` and, on failure,
+  `start_rollback`; counters `start_reservation_reaped` and
+  `start_reservation_rollback`; and a metric object `start_lifecycle_split`
+  with `reserve_held_ms`, `add_outside_lock_ms`, `reservations_reaped`,
+  `reaped_directories_removed`, `reaped_branches_removed`, `reaped_retained`
+  and `rollback` (`null`, `clean` or `retained`). Existing `lifecycle_lock`
+  fields are unchanged; its `held_ms` now covers the reservation only.
+
+Covered by `start_reservation.rs` and `broker/tests/start_reservation_lifecycle.rs` tests.
 
 ### Checkout retirement takes one process observation per run and archives abandoned operations
 

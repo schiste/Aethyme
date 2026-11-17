@@ -4064,18 +4064,14 @@ mod tests {
         let (_owner, _storage, mut broker) = fixture();
         let (session, worktree) = closed_with_dependencies(&mut broker, "reserved");
         let name = worktree.file_name().unwrap().to_str().unwrap().to_string();
-        let reservation = super::super::strip::start_reservation_path(broker.main_root(), &name);
-        std::fs::create_dir_all(reservation.parent().unwrap()).unwrap();
-        std::fs::write(&reservation, "").unwrap();
-        let held = crate::file_lock::ExclusiveFileLock::try_acquire(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&reservation)
-                .unwrap(),
-        )
-        .unwrap()
-        .expect("the test holds the reservation");
+        // A start in another process holding its real reservation.
+        let held = crate::start_reservation::hold_foreign_reservation(
+            broker.main_root(),
+            &name,
+            &worktree,
+            &format!("agent/{name}"),
+            "base",
+        );
         let current = broker.store_ref().session(session.id).unwrap();
         assert_eq!(
             broker.reused_path_keep(&current, &worktree, false),
