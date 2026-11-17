@@ -1553,7 +1553,15 @@ fn a_transcript_opened_after_the_shared_observation_is_kept() {
         },
         Duration::from_secs(3600),
     );
-    let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    let report = pass_at(
+        &host,
+        &config,
+        apply(),
+        &mut open,
+        &mut FakeAgents::none(),
+        &mut NoHooks,
+        later(),
+    );
     assert!(report.archived.is_empty(), "{report:?}");
     assert_eq!(report.skipped.get("open_by_process"), Some(&1));
     assert_eq!(report.removals_refused_open, 1, "{report:?}");
@@ -1590,7 +1598,15 @@ fn an_incomplete_batch_observation_removes_nothing() {
     let sources = codex_transcripts(&host, 3);
     let config = enabled(vec![Provider::Codex]);
     let mut open = OpenFiles::new(IncompleteAfterFirst { calls: 0 }, Duration::from_secs(3600));
-    let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    let report = pass_at(
+        &host,
+        &config,
+        apply(),
+        &mut open,
+        &mut FakeAgents::none(),
+        &mut NoHooks,
+        later(),
+    );
     assert!(report.archived.is_empty(), "{report:?}");
     assert_eq!(report.removals_refused_unobserved, 3, "{report:?}");
     assert_eq!(report.skipped.get("open_check_unavailable"), Some(&3));
