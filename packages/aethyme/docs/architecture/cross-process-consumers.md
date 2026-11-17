@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-11-16
+Last Updated: 2026-11-17
 
 When code outside the `packages/aethyme/` Rust source tree invokes an
 Aethyme command, it crosses a process boundary. Static
@@ -57,6 +57,23 @@ versions and request IDs are checked, and unavailable endpoints fail visibly.
 The exact wire schema, permission rules and staged migration are documented in
 [broker-service.md](broker-service.md). Initial external consumers are manual
 operators; no installed hook, scheduled task or application is migrated yet.
+
+## Opt-in transcript archiving (`aethyme transcripts`)
+
+`aethyme transcripts status|list|archive --dry-run|--apply|restore
+<session-id|path>|enable|disable [--json]` is a host-level operator surface.
+JSON output names its shape: `aethyme.transcripts-status/v1`,
+`aethyme.transcripts-list/v1`, `aethyme.transcripts-archive/v1`,
+`aethyme.transcripts-restore/v1`, `aethyme.transcripts-settings/v1`;
+refusals are `aethyme.transcripts-error/v1` with `code` and `message`. Its
+input is `<host state>/transcripts/settings.toml` (`[transcripts] archive`,
+off by default); `enable` and `disable` write only that file. It writes
+`<host state>/transcripts/` (`index.sqlite3`, `runs.jsonl`, `archive.lock`,
+`claude/`), Codex's `archived_sessions/*.jsonl.zst`, and reads broker
+databases read-only. The external consumers are Codex itself (`codex
+unarchive` and `codex resume` read the `.jsonl.zst` archives natively) and
+manual operators. The detached background worker runs the same pass when the
+host opted in. See [the guide](../guides/transcript-archiving.md).
 
 ## Opt-in MCP server launching (`aethyme mcp`)
 
