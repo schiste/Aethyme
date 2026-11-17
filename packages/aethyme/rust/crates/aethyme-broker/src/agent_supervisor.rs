@@ -1195,6 +1195,9 @@ mod tests {
             !crate::broker::session_pid_alive(group),
             "group should become reclaimable only after all members exit"
         );
+        // The checkout holds the writer's uncommitted output: the first look
+        // leaves the closing-soon note, a look after it has stood closes.
+        broker.agents(i64::MAX).unwrap();
         let views = broker.agents(i64::MAX).unwrap();
         let view = views
             .iter()

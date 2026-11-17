@@ -906,6 +906,26 @@ fn process_use_verdict(
             AbandonedSessionCloseOutcome::OperationEvidenceUnavailable
         });
     };
+    // The broker's own state under the primary checkout's `.aethyme/` (its
+    // database, locks and logs, open in every broker process) is not anyone
+    // using the checkout: without this, a session adopted on the primary
+    // checkout could never close.
+    let state_dir = root.join(".aethyme");
+    let without_broker_state;
+    let open_files = match open_files {
+        crate::reclaim::OpenFileSnapshot::Complete(uses)
+            if uses.iter().any(|open| open.path.starts_with(&state_dir)) =>
+        {
+            without_broker_state = crate::reclaim::OpenFileSnapshot::Complete(
+                uses.iter()
+                    .filter(|open| !open.path.starts_with(&state_dir))
+                    .cloned()
+                    .collect(),
+            );
+            &without_broker_state
+        }
+        other => other,
+    };
     let verdict = match open_files {
         crate::reclaim::OpenFileSnapshot::Complete(_) => {
             crate::reclaim::open_file_snapshot_blocker_for_session_worktree(

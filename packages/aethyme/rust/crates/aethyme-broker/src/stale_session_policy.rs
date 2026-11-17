@@ -768,10 +768,13 @@ mod tests {
         let activity = 1_000 * HOUR_MS;
         let due = activity + 72 * HOUR_MS;
         let class = StaleWorkClass::PushedUnmerged;
-        // Inside the notice period with no note: leave one.
+        // Inside the notice period with no note: leave one, which must then
+        // stand a full notice period.
         assert_eq!(
             policy.judge(class, activity, due - 2 * HOUR_MS, None),
-            StaleClassVerdict::NeedsNotice { due_at_ms: due }
+            StaleClassVerdict::NeedsNotice {
+                due_at_ms: due + 22 * HOUR_MS
+            }
         );
         // Long past the window (the worker did not run, the host slept or
         // the clock jumped) with no note: still a note first, and a full
