@@ -455,17 +455,25 @@ fn rename_noreplace(from_dir: RawFd, from: &str, to_dir: RawFd, to: &str) -> std
     let to = c_name(to)?;
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: both names are NUL-terminated; both descriptors are open.
-        checked(unsafe {
-            libc::renameat2(
+        // The raw syscall, not `libc::renameat2`: musl has no wrapper for it,
+        // so the wrapper fails to link in the static build.
+        // SAFETY: `SYS_renameat2` receives the Linux renameat2 ABI arguments;
+        // both names are NUL-terminated and both descriptors are open.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
                 from_dir,
                 from.as_ptr(),
                 to_dir,
                 to.as_ptr(),
                 libc::RENAME_NOREPLACE,
             )
-        })?;
-        Ok(())
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
     }
     #[cfg(target_os = "macos")]
     {
