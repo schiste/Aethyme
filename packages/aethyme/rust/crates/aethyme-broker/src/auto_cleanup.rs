@@ -9348,7 +9348,7 @@ impl Broker {
             self.record_auto_cleanup_report(&report)?;
             return Ok(report);
         };
-        let _lifecycle_claim = match self.try_claim_worktree_lifecycle() {
+        let _lifecycle_claim = match self.try_claim_worktree_lifecycle("auto_cleanup") {
             Ok(Some(claim)) => claim,
             Ok(None) => {
                 report.deferred = report.deferred.saturating_add(selected.len());

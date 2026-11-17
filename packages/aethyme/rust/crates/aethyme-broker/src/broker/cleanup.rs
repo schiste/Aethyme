@@ -1868,8 +1868,13 @@ impl Broker {
     /// Try to claim repository-wide checkout lifecycle mutation without
     /// waiting. Bounded maintenance uses this to skip a checkout rather than
     /// exceed its deadline while another creation, adoption, or removal runs.
+    ///
+    /// `lane` names the background lane asking (`retire`, `gc`, ...): its
+    /// yielding to queued waiters is bounded per lane, see
+    /// [`crate::file_lock::try_acquire_repository_lifecycle_lock`].
     pub(crate) fn try_claim_worktree_lifecycle(
         &self,
+        lane: &'static str,
     ) -> Result<Option<crate::file_lock::ExclusiveFileLock>, BrokerOpError> {
         self.store.require_live_schema_compatible()?;
         let main_root = self
@@ -1902,12 +1907,11 @@ impl Broker {
             }
             .into());
         }
-        let claim = crate::file_lock::try_acquire_repository_lifecycle_lock(&main_root).map_err(
-            |source| BrokerError::Io {
+        let claim = crate::file_lock::try_acquire_repository_lifecycle_lock(&main_root, lane)
+            .map_err(|source| BrokerError::Io {
                 path: main_root.join(".aethyme/run"),
                 source,
-            },
-        )?;
+            })?;
         if claim.is_some() {
             // The floor may have advanced while the nonblocking claim was
             // acquired. Keep it only if current committed markers permit us.

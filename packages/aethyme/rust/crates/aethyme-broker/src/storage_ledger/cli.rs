@@ -118,10 +118,14 @@ pub fn run(args: &[String]) -> u8 {
                 }
             }
         }
-        Some("worker") => match check::run_worker_pass() {
-            Ok(_) => crate::exit_status::SUCCESS,
-            Err(_) => crate::exit_status::FAILED,
-        },
+        Some("worker") => {
+            // The detached storage worker: nobody waits on it.
+            let _detached_worker = crate::file_lock::DetachedBackgroundWorker::enter();
+            match check::run_worker_pass() {
+                Ok(_) => crate::exit_status::SUCCESS,
+                Err(_) => crate::exit_status::FAILED,
+            }
+        }
         Some(other) => {
             eprintln!("Error: unknown storage command {other:?}\n\n{USAGE}");
             crate::exit_status::USAGE
