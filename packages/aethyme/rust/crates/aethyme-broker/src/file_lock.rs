@@ -182,6 +182,51 @@ fn detached_background_worker() -> bool {
     DETACHED_BACKGROUND_WORKER.with(|depth| depth.get() > 0)
 }
 
+/// Whether this thread runs inside the detached background worker, where
+/// nobody waits on a short bounded retry.
+pub(crate) fn in_detached_background_worker() -> bool {
+    detached_background_worker()
+}
+
+thread_local! {
+    /// Depth of [`ForegroundCommand`] scopes on this thread.
+    static FOREGROUND_COMMAND: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Marks this thread as running a broker CLI command someone waits on,
+/// entered where the CLI dispatches. Inside it the `agents` view does not
+/// judge stale sessions for retirement (holder, lease and process evidence,
+/// then a nonblocking lifecycle claim it lost on a busy repository): it
+/// counts the sessions that are due and queues the one shared detached
+/// worker, which judges them under the lifecycle queue rules. Worker
+/// processes are dispatched through the same entry, so a
+/// [`DetachedBackgroundWorker`] scope outranks this one. Library callers
+/// (tests, in-process tools) enter neither and judge inline as before.
+pub(crate) struct ForegroundCommand {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl ForegroundCommand {
+    pub(crate) fn enter() -> Self {
+        FOREGROUND_COMMAND.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Self {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for ForegroundCommand {
+    fn drop(&mut self) {
+        FOREGROUND_COMMAND.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Whether session retirement may be judged inline on this thread: always in
+/// a detached worker, never in a foreground CLI command.
+pub(crate) fn inline_session_retirement_allowed() -> bool {
+    detached_background_worker() || FOREGROUND_COMMAND.with(|depth| depth.get() == 0)
+}
+
 /// Which side of the queue a lifecycle claim came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleClaimKind {
@@ -2309,6 +2354,26 @@ mod tests {
         );
         assert_eq!(view.ahead, 0);
         drop(waiting);
+    }
+
+    #[test]
+    fn a_foreground_command_defers_session_retirement_to_the_detached_worker() {
+        assert!(inline_session_retirement_allowed(), "library callers judge");
+        let foreground = ForegroundCommand::enter();
+        assert!(
+            !inline_session_retirement_allowed(),
+            "a CLI command only records due sessions"
+        );
+        {
+            let _detached = DetachedBackgroundWorker::enter();
+            assert!(
+                inline_session_retirement_allowed(),
+                "the detached worker is dispatched through the CLI and judges"
+            );
+        }
+        assert!(!inline_session_retirement_allowed());
+        drop(foreground);
+        assert!(inline_session_retirement_allowed());
     }
 
     #[test]

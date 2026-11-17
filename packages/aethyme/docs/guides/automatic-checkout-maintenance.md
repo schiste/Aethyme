@@ -1,6 +1,6 @@
 # Automatic checkout maintenance
 
-Last Updated: 2026-11-16
+Last Updated: 2026-11-17
 
 A session becoming closed and its checkout being removed are separate steps.
 Idle-session retirement makes a checkout eligible for later inspection; it does
@@ -394,7 +394,7 @@ A spawned session that never did any work closes earlier, after `session_no_work
 
 ### A live agent that moved on
 
-One long-lived agent process often holds dozens of open sessions, starting one after another without finishing them. A running holder therefore keeps a session only while there is evidence it uses that session. The holder has moved on when the same process (pid and recorded start time) was bound to a different session after this session's last activity (`session.holder_bound` events; an agent turn only refreshes the session whose checkout it runs in). A moved-on holder no longer keeps a landed session (merged-pull-request or landed window): the session closes when nothing has its working directory or an open file in the checkout (with no exemption for the holder), no gate, operation, preparation, artifact producer, merge-queue entry or live explicit lease remains, and every other landed proof holds. The abandonment window treats a moved-on holder as gone only for a clean checkout (no uncommitted changes or unmarked tracked deletions). The holder's latest session is never moved on. Each close records `holder_evidence` (`gone`, `moved_on`, `lease_expired`, `unbound`) and, for `moved_on`, `holder_moved_on_to_session`. One open-file observation now answers every candidate for ten seconds (at most four per pass).
+One long-lived agent process often holds dozens of open sessions, starting one after another without finishing them. A running holder therefore keeps a session only while there is evidence it uses that session. The holder has moved on when the same process (pid and recorded start time) was bound to a different session after this session's last activity (`session.holder_bound` events; an agent turn only refreshes the session whose checkout it runs in). A moved-on holder no longer keeps a landed session (merged-pull-request or landed window): the session closes when nothing has its working directory or an open file in the checkout (with no exemption for the holder), no gate, operation, preparation, artifact producer, merge-queue entry or live explicit lease remains, and every other landed proof holds. The abandonment window treats a moved-on holder as no live holder of the older session; how long that session still waits is its work class (see "Stale sessions by work class"), so uncommitted work waits the unpushed window and is archived before its checkout is retired. The holder's latest session is never moved on. Each close records `holder_evidence` (`gone`, `moved_on`, `lease_expired`, `unbound`) and, for `moved_on`, `holder_moved_on_to_session`. One open-file observation now answers every candidate for ten seconds (at most four per pass).
 
 ### Closed sessions whose checkout is gone
 
@@ -430,3 +430,107 @@ sessions whose row is still inside the window
 `retirement_not_due_memo_recorded`; meta key
 `auto_cleanup.session_retirement_not_due`). A skip only delays a close; the
 landed lane is still asked, and a changed window discards the memo.
+
+## Stale sessions by work class
+
+Foreground commands no longer judge stale sessions. The `agents` view behind
+`status`, `exec`, `leases claim`, `start` and the other CLI commands counts
+the sessions that are due (`agents_view_abandonment_due_deferred`) and queues
+the shared detached worker (`agents_view_retirement_requested`); the worker
+judges them under the lifecycle queue rules. Judging inline meant a
+nonblocking lifecycle claim that a foreground command lost on every busy
+repository. Library callers (tests, in-process tools) still judge inline.
+
+Past the abandonment window, a session whose holder is gone waits for the
+window of what closing would put at risk. Configure the windows under
+`[cleanup]` in `.aethyme/config.toml`:
+
+```toml
+[cleanup]
+# false: the abandonment and no-work windows close nothing (the landed lanes,
+# which prove the work landed, still run). Like
+# `[retention] session_abandoned_after_hours = 0`, which turns both windows
+# off, but leaves that window's value in place.
+stale_session_auto_close = true
+# Every commit is on the fetched default branch, the session never committed
+# past its diff base, or every recorded pull request merged and the tip is
+# contained in a merged pull request's recorded head.
+stale_landed_close_after_hours = 24
+# The session branch's remote-tracking ref holds the tip, but nothing landed.
+# The close leaves the branch and the pull request alone.
+stale_pushed_close_after_hours = 72
+# Unpushed commits, uncommitted or untracked content, or unreadable evidence.
+# The checkout is retired only through the recovery-archive path.
+stale_unpushed_close_after_hours = 168
+# How long a closing-soon note must stand before a session holding work
+# closes. 0 turns the note off (work then closes at its window).
+stale_closing_notice_hours = 24
+```
+
+A session waits for both windows: the abandonment window first, then its
+class window, both counted from its newest activity. The class is read with
+local Git only (no fetch) for HEAD and for the session branch's tip, and the
+more protective of the two wins, so a checkout detached at its base or
+switched to another branch cannot hide the branch's commits. It is read once
+before any holder evidence and again under the claims, and the close records
+it as `work_class` in `session.abandoned`.
+
+A session holding work (pushed but unmerged, or unpushed) closes only after a
+closing-soon broker note (fingerprint `session-closing-soon`) has stood for
+the notice period, counted from when the note was left, never from when it
+could have been: a worker that did not run, a sleeping host or a clock jump
+does not skip it. The note is left only once the holder is known not to be
+live, under the claims. A note that cannot be written keeps the session and
+starts nothing (`stale_closing_soon_note_failed`). Activity after the note
+voids it: the unread note is acknowledged and a new one is needed. Landed work
+needs no note.
+
+A live or unknown holder keeps every class open. A holder that moved on to a
+newer session is not live, in the abandonment and no-work windows alike: the
+same process (pid and start time) was bound to another session of this
+repository after this session's last activity and after its own latest
+binding here, so a bind back makes it this session's holder again. Activity
+is the checkout's Git index and HEAD times plus broker activity; editing files
+without Git does not move it, so a moved-on holder's session (and an `Unbound`
+one: no holder recorded, or a shared agent service) closes only after the
+complete open-file and working-directory observation finds nothing in the
+checkout. A live explicit claim and a shared agent service still keep it, and
+so does a start reservation on the checkout's path (`start_reserved`: a
+running `broker start` is recreating it). The open-file observation ignores
+only the broker's own state files under the primary checkout's `.aethyme/`
+(the database and its siblings, lock files, `run/`, `logs/`, `locks/`), never
+a working directory, and nothing when the session's checkout is itself under
+`.aethyme/` (review checkouts live in `.aethyme/reviews/`).
+Closing deletes nothing: committed work stays on the branch, and
+`aethyme broker start --reuse` resumes the session from its checkout (or with
+its path once the checkout is retired).
+
+No session closes without a complete process listing in the same pass. A pass
+refused the listing (a worker started from a sandboxed caller inherits the
+sandbox) closes nothing, `Unbound` sessions included, and defers instead of
+keeping (`session_abandonment_deferred_process_table_denied`). The detached
+worker then stops its retirement lane with the request still pending
+(`session_retirement_stopped_process_table_denied`; retried after a minute),
+so the next worker started by a command that can list processes, or by the
+managed GC sweep, judges them. A worker cannot leave a sandbox it inherited.
+
+`broker status` reports `sessions.stale-backlog` (open sessions past the
+abandonment window, by class), `sessions.closing-soon`, and
+`sessions.process-table-denied` while every pass in the last day was refused
+the listing. Meta keys: `stale_sessions.classes`,
+`stale_sessions.process_table_observed_at`,
+`stale_sessions.process_table_denied_at`; the worker retries their writes a
+few times without waiting on another writer, a foreground command never.
+Counters: `stale_work_class_<class>`, `stale_work_classification` (time),
+`stale_closing_soon_noted`, `stale_bookkeeping_write_lost`.
+
+### Upgrade note
+
+For a repository that sets nothing: a stale session with unpushed or
+uncommitted work and a gone holder used to close at the abandonment window
+(72 h by default); it now waits 168 h idle plus a standing day-long note. A
+pushed but unmerged session waits 72 h plus the note. A dirty session whose
+holder moved on to a newer session was kept forever; it now closes after the
+unpushed window and the note, and its checkout is retired only after its
+uncommitted work is archived and verified. `stale_session_auto_close = false`
+restores keeping every idle session.

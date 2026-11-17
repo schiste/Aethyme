@@ -7779,6 +7779,30 @@ impl Broker {
         }
     }
 
+    /// A foreground `agents` view found stale sessions due for retirement and
+    /// left them to the shared detached worker: queue its request (one CAS
+    /// row update; nothing waits). Best effort, counted as
+    /// `agents_view_retirement_requested` when this call queued it.
+    pub(crate) fn request_session_retirement_for_due_sessions(&mut self) {
+        let Ok(policy) = load_retention_policy(self.main_root()) else {
+            return;
+        };
+        let pending_before = matches!(
+            self.session_retirement_request_state(),
+            Ok((requested, completed)) if requested > completed
+        );
+        match self.request_session_retirement_if_due(&policy, ArtifactSweepScope::Inline) {
+            Ok(Some(_)) if !pending_before => {
+                crate::phase_telemetry::add("agents_view_retirement_requested", Duration::ZERO);
+            }
+            Ok(_) => {}
+            Err(error) => crate::warn_unrecorded(
+                "queue a session-retirement request for due sessions",
+                Err::<(), _>(error),
+            ),
+        }
+    }
+
     fn request_session_retirement_if_due(
         &mut self,
         policy: &RetentionPolicy,
@@ -10949,6 +10973,27 @@ impl Broker {
                     return Ok(());
                 }
             };
+            if crate::stale_session_policy::last_pass_process_table_denied() {
+                // This worker inherited a sandboxed caller's sandbox and
+                // cannot list processes: another pass would only defer every
+                // session again. Stop the lane with the request pending (the
+                // refusal is recorded for `broker status`), so the next
+                // worker, started by a command that can list processes or by
+                // the managed sweep, judges them.
+                crate::phase_telemetry::add(
+                    "session_retirement_stopped_process_table_denied",
+                    Duration::ZERO,
+                );
+                aggregate.absorb_landed_report(&report);
+                self.record_auto_cleanup_report(&aggregate)?;
+                self.defer_session_retirement_request_for(
+                    request_generation,
+                    "session_retirement_process_table_denied",
+                    SESSION_RETIREMENT_LOCK_BUSY_RETRY_MS,
+                )?;
+                drop(pass_lock);
+                return Ok(());
+            }
             aggregate.enabled = report.enabled;
             aggregate.config_error = report.config_error.clone();
             aggregate.evaluated_at_ms = report.evaluated_at_ms;
@@ -17801,6 +17846,85 @@ mod tests {
                 .auto_checkout_cleanup_retry_pending(now_ms())
                 .unwrap(),
             "retirement leaves the physical-removal cooldown intact"
+        );
+    }
+
+    /// A worker refused the process listing (it inherited a sandboxed
+    /// caller's sandbox) closes nothing, an `Unbound` session included, and
+    /// stops its retirement lane with the request pending for a worker that
+    /// can see.
+    #[cfg(unix)]
+    #[test]
+    fn a_worker_refused_the_process_listing_closes_nothing_and_stops() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nsession_abandoned_after_hours = 72\n",
+        )
+        .unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        let stale = broker
+            .start_worktree("retirement under a refused listing", None)
+            .unwrap();
+        age_open_session_for_retirement(&mut broker, stale.id, Path::new(&stale.worktree_path));
+        let policy = load_retention_policy(root).unwrap();
+        let request_generation = broker
+            .request_session_retirement_if_due(&policy, ArtifactSweepScope::Inline)
+            .unwrap()
+            .expect("a retirement request is queued");
+
+        crate::session_holder::deny_process_tables_for_test(true);
+        let result = broker.run_session_retirement_recovery_worker_loop(
+            request_generation,
+            Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
+            Some(Duration::from_secs(5)),
+        );
+        crate::session_holder::deny_process_tables_for_test(false);
+        result.unwrap();
+
+        assert_eq!(
+            broker.store().session(stale.id).unwrap().cleanup_state,
+            crate::SessionCleanupState::Open,
+            "a pass that cannot list processes closes nothing"
+        );
+        let (requested, completed) = broker.session_retirement_request_state().unwrap();
+        assert_eq!(requested, request_generation);
+        assert!(completed < requested, "the request stays pending");
+        assert!(
+            crate::stale_session_policy::process_table_denied_since(broker.store_ref(), now_ms())
+                .is_some(),
+            "the refusal is recorded for broker status"
+        );
+
+        // A worker that can list processes then closes it.
+        broker
+            .store()
+            .meta_set(
+                SESSION_RETIREMENT_STATE_KEY,
+                &serde_json::to_string(&SessionRetirementRequestState::default()).unwrap(),
+            )
+            .unwrap();
+        let request_generation = broker
+            .request_session_retirement_if_due(&policy, ArtifactSweepScope::Inline)
+            .unwrap()
+            .expect("a fresh request is queued");
+        broker
+            .run_session_retirement_recovery_worker_loop(
+                request_generation,
+                Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
+                Some(Duration::from_secs(5)),
+            )
+            .unwrap();
+        assert_eq!(
+            broker.store().session(stale.id).unwrap().cleanup_state,
+            crate::SessionCleanupState::Closed
         );
     }
 
