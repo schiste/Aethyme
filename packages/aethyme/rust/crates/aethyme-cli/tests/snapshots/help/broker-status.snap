@@ -1,24 +1,16 @@
 exit: 0
 --- stdout
   aethyme broker status [--json] [--full] [--session <id>] [--session-view] [--since-revision <token>] [--summary] [--refresh]
-      Compact by default, as text and as --json: a versioned summary that
-      groups advice and marks omitted details and deferred checks; those
-      checks are unknown, not clean. Branch on
-      `advice.categories[].severity` and `.commands`, `summary` and
-      `drilldown`. Both JSON forms carry `form`. --full
-      returns the full document with per-session detail; use it only for
-      exact session or lease-path evidence. Session records there use
-      `agents[].id` for every --session flag. --compact is accepted and
-      changes nothing. Advice evidence over 8 KiB is truncated, with the
-      count and the command that prints the rest. The legacy
-      --summary --json shape is unchanged; --summary text remains brief.
-      --session focuses compact status on one session while preserving global
-      warnings, blockers and counts, including with --json, and adds a
-      `session` block: branch, head and remote oids, unpushed commits, the
-      locally recorded pull request (no network call), preparation, that
-      session's advice and the exact next command.
-      --session-view requires --session and --json and emits only session facts
-      and its lease requests. Global warnings and peer state are not inspected.
+      Compact by default. In a registered worktree, report the current
+      session, its next safe action, and recorded overlaps on its paths or
+      declared scopes. --session <id> selects a session from another checkout.
+      Elsewhere, summarize repository observations by count and category.
+      --compact selects the same default. --json identifies the schema and
+      sets form to compact. --session-view is accepted with --session and
+      --json as an explicit session view.
+      --full returns per-session evidence and detailed recovery instructions.
+      Advice evidence over 8 KiB is truncated with a drilldown command.
+      --summary --json retains its previous brief shape.
       --since-revision returns changed sections of compact JSON; invalid or
       differently scoped revisions return a fresh snapshot. Deferred checks
       remain unknown even when no sections changed.

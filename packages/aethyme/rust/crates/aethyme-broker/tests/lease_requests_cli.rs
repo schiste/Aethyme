@@ -492,6 +492,15 @@ fn compact_status_keeps_new_pending_request_after_resolved_lease_is_reclaimed() 
         .unwrap();
     let full = fx.json_as("0", &["status", "--full", "--json"]);
     let compact = fx.json_as("0", &["status", "--compact", "--json"]);
+    assert_eq!(
+        compact["lease_release_requests"]["records"],
+        serde_json::json!([])
+    );
+    assert_eq!(compact["lease_release_requests"]["count"], 1);
+    let compact = fx.json_as(
+        "0",
+        &["status", "--session", &holding.to_string(), "--json"],
+    );
     let pending: Vec<_> = full["lease_release_requests"]
         .as_array()
         .unwrap()

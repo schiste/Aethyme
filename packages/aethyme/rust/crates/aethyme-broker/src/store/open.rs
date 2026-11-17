@@ -1081,6 +1081,18 @@ impl BrokerStore {
         Ok(sessions)
     }
 
+    /// Recorded liveness only, without loading other sessions or worktrees.
+    pub(crate) fn recorded_stale_session_count(
+        &self,
+        except: Option<i64>,
+    ) -> Result<u64, BrokerError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE status = 'stale' AND id IS NOT ?1",
+            [except],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Highest open-session identity for bounded abandonment maintenance.
     /// The fixed high-water mark lets the caller finish a finite lap even as
     /// new sessions are inserted.
