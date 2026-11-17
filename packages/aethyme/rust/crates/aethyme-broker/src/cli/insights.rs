@@ -15,6 +15,8 @@
 //! gap that split the intervals, so the gap is on the first line of the text
 //! output and a field in the JSON.
 
+mod attribution;
+
 use crate::cli::{Parsed, UsageError};
 use crate::cli_output::out;
 use crate::insights::{
@@ -63,13 +65,26 @@ pub(super) fn run_insights(parsed: Parsed) -> Result<(), UsageError> {
         MAX_PULL_REQUEST_ROWS,
     )?;
 
-    let report = assemble(days, session_limit, pull_request_limit)?;
+    let (report, task_costs) = assemble(days, session_limit, pull_request_limit)?;
 
     if parsed.json {
-        out!("{}", serde_json::to_string_pretty(&report)?);
+        #[derive(serde::Serialize)]
+        struct Output<'a> {
+            #[serde(flatten)]
+            report: &'a InsightsReport,
+            task_attribution: &'a attribution::TaskCosts,
+        }
+        out!(
+            "{}",
+            serde_json::to_string_pretty(&Output {
+                report: &report,
+                task_attribution: &task_costs,
+            })?
+        );
         return Ok(());
     }
     out!("{}", render(&report).trim_end());
+    out!("{}", task_costs.render());
     Ok(())
 }
 
@@ -91,8 +106,9 @@ fn assemble(
     days: i64,
     session_limit: usize,
     pull_request_limit: usize,
-) -> Result<InsightsReport, UsageError> {
+) -> Result<(InsightsReport, attribution::TaskCosts), UsageError> {
     let mut broker = open_read_only()?;
+    let root = broker.main_root().to_path_buf();
     let store = broker.store();
     let now = crate::clock::epoch_ms();
 
@@ -181,7 +197,18 @@ fn assemble(
         operations_outcome_unknown: outcome_unknown,
     };
 
-    Ok(insights::report(query, &input))
+    let report = insights::report(query, &input);
+    for kind in [
+        crate::events::SESSION_REUSED,
+        "session.closed",
+        "session.cleaned",
+        crate::events::DUPLICATE_WORK_AVOIDED,
+    ] {
+        events.extend(store.events_after_filtered(0, i64::MAX, Some(kind))?);
+    }
+    events.sort_by_key(|event| (event.ts, event.id));
+    let costs = attribution::collect(&root, since_ms, session_limit, &input, &events);
+    Ok((report, costs))
 }
 
 fn open_read_only() -> Result<crate::Broker, UsageError> {

@@ -475,7 +475,18 @@ regenerable = [".gradle", "reports/quality-*.json"] # extra disposable output di
 keep = ["*-investigation"]     # worktrees never removed automatically
 unattended_unlinks_per_second = 1000 # background worker pace, also under load; 0 or "unlimited" = full speed
 abandoned_operation_after_hours = 24 # the default; a closed checkout's merge/rebase left in progress longer is archived, then retired
+venv_markers = [".env-check.json"] # exact file names your tooling writes at a .venv top (at most 16; never .env)
 ```
+
+The strip pass removes a closed checkout's `.venv` only when its top holds
+nothing but the environment layout, `pyvenv.cfg`, the files environment tools
+write (`CACHEDIR.TAG`, `.gitignore`, `.lock`) and the names declared in
+`venv_markers`. Anything else, a `.env` included, keeps the environment as
+`unexpected_content`, and `broker status` names what it saw (advice
+`storage.venv-unexpected-content`) so you can declare a marker your own
+tooling writes. Names must be exact file names: no path separator, no glob
+character, and never a credentials file (`.env`, `.env.*`, `.envrc`, `.netrc`,
+`.npmrc`, `.pypirc`).
 
 A `finish cleanup resolve` plan refuses a checkout holding an ignored
 directory nothing catalogues as regenerable. Pass

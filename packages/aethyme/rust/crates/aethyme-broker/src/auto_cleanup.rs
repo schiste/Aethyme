@@ -613,6 +613,82 @@ pub(crate) fn abandoned_operation_after_ms(main_root: &Path) -> i64 {
     hours.saturating_mul(3_600_000)
 }
 
+/// `[cleanup]` key: exact file names a repository's own tooling writes at
+/// the top of a Python virtual environment, which the strip pass then
+/// accepts beside `pyvenv.cfg` (it already accepts what environment tools
+/// write: `CACHEDIR.TAG`, `.gitignore`, `.lock`).
+pub(crate) const VENV_MARKERS_CONFIG_KEY: &str = "venv_markers";
+/// Names [`VENV_MARKERS_CONFIG_KEY`] may declare, at most.
+pub(crate) const MAX_VENV_MARKERS: usize = 16;
+/// Characters one declared marker name may have, at most.
+const MAX_VENV_MARKER_LEN: usize = 128;
+
+/// Parse [`VENV_MARKERS_CONFIG_KEY`]; absent is none. Each entry is one
+/// exact file name: no path separator, no glob character, not `.` or `..`,
+/// and never a name that holds credentials by convention (`.env`,
+/// `.env.<anything>`, `.envrc`, `.netrc`, `.npmrc`, `.pypirc`).
+pub(crate) fn parse_venv_markers(value: Option<&toml::Value>) -> Result<Vec<String>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let names = value
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .map(|item| item.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+        })
+        .ok_or_else(|| {
+            format!("[cleanup] {VENV_MARKERS_CONFIG_KEY} must be a list of file names")
+        })?;
+    if names.len() > MAX_VENV_MARKERS {
+        return Err(format!(
+            "[cleanup] {VENV_MARKERS_CONFIG_KEY} holds at most {MAX_VENV_MARKERS} names"
+        ));
+    }
+    for name in &names {
+        let credential = name == ".env"
+            || name.starts_with(".env.")
+            || matches!(name.as_str(), ".envrc" | ".netrc" | ".npmrc" | ".pypirc");
+        if name.is_empty()
+            || name.len() > MAX_VENV_MARKER_LEN
+            || name == "."
+            || name == ".."
+            || name.chars().any(|c| {
+                matches!(c, '/' | '\\' | '*' | '?' | '[' | ']' | '{' | '}') || c.is_control()
+            })
+            || credential
+        {
+            return Err(format!(
+                "[cleanup] {VENV_MARKERS_CONFIG_KEY} entry {name:?} must be one exact file name (no path separator, no glob character, at most {MAX_VENV_MARKER_LEN} characters, not a credentials file such as .env)"
+            ));
+        }
+    }
+    Ok(names)
+}
+
+/// [`VENV_MARKERS_CONFIG_KEY`] of the primary checkout's config. An
+/// unreadable or invalid value declares nothing (the cleanup policy loader
+/// reports it), so the strip keeps such environments.
+pub(crate) fn venv_markers(main_root: &Path) -> Vec<String> {
+    (|| -> Result<Vec<String>, String> {
+        let Some((path, text)) =
+            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
+                .map_err(|error| error.to_string())?
+        else {
+            return Ok(Vec::new());
+        };
+        let root: toml::Value = toml::from_str(&text)
+            .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+        parse_venv_markers(
+            root.get("cleanup")
+                .and_then(|cleanup| cleanup.get(VENV_MARKERS_CONFIG_KEY)),
+        )
+    })()
+    .unwrap_or_default()
+}
+
 /// `[cleanup]` in `.aethyme/config.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoCleanupPolicy {
@@ -713,6 +789,10 @@ impl AutoCleanupPolicy {
                 ABANDONED_OPERATION_CONFIG_KEY => {
                     // Read by the checkout retirement lane; validated here.
                     parse_abandoned_operation_after_hours(Some(value))?;
+                }
+                VENV_MARKERS_CONFIG_KEY => {
+                    // Read by the strip pass; validated here.
+                    parse_venv_markers(Some(value))?;
                 }
                 // Read by the abandonment window's per-class gate; validated here.
                 key if crate::stale_session_policy::is_policy_key(key) => {
@@ -19884,5 +19964,60 @@ mod fail_closed_removal_tests {
 
         assert!(result.is_err(), "a remaining path is not proof of removal");
         assert_eq!(std::fs::read(evidence).unwrap(), b"preserve replacement");
+    }
+
+    /// `[cleanup] venv_markers` takes exact file names only, a few of them,
+    /// never a credentials file, and the policy loader validates it.
+    #[test]
+    fn venv_markers_are_exact_safe_file_names() {
+        let parse = |text: &str| {
+            let value: toml::Value = toml::from_str(&format!("v = {text}")).unwrap();
+            super::parse_venv_markers(value.get("v"))
+        };
+        assert_eq!(
+            parse("[\".env-check.json\", \"MARKER\"]").unwrap(),
+            [".env-check.json", "MARKER"]
+        );
+        assert_eq!(
+            super::parse_venv_markers(None).unwrap(),
+            Vec::<String>::new()
+        );
+        for bad in [
+            "[\".env\"]",
+            "[\".env.local\"]",
+            "[\".envrc\"]",
+            "[\"a/b\"]",
+            "[\"*.json\"]",
+            "[\"..\"]",
+            "[\"\"]",
+            "\".marker\"",
+            "[1]",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        let many = format!(
+            "[{}]",
+            (0..=super::MAX_VENV_MARKERS)
+                .map(|index| format!("\".m{index}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(parse(&many).is_err());
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            root.path().join(".aethyme/config.toml"),
+            "[cleanup]\nvenv_markers = [\".env-check.json\"]\n",
+        )
+        .unwrap();
+        assert!(super::AutoCleanupPolicy::load(root.path()).is_ok());
+        assert_eq!(super::venv_markers(root.path()), [".env-check.json"]);
+        std::fs::write(
+            root.path().join(".aethyme/config.toml"),
+            "[cleanup]\nvenv_markers = [\".env\"]\n",
+        )
+        .unwrap();
+        assert!(super::AutoCleanupPolicy::load(root.path()).is_err());
+        assert!(super::venv_markers(root.path()).is_empty());
     }
 }

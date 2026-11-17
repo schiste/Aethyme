@@ -26,6 +26,7 @@ struct Totals {
 struct Accumulated {
     totals: BTreeMap<&'static str, Totals>,
     attachments: BTreeMap<&'static str, serde_json::Value>,
+    intervals: Vec<(Instant, Instant, bool)>,
 }
 
 /// One command's accumulated spans, shared with its worker threads.
@@ -63,7 +64,7 @@ pub(crate) struct Span {
 
 impl Drop for Span {
     fn drop(&mut self) {
-        add(self.name, self.started.elapsed());
+        record(self.name, self.started, Instant::now());
     }
 }
 
@@ -77,13 +78,37 @@ pub(crate) fn span(name: &'static str) -> Span {
 
 /// Add one occurrence of `name` lasting `elapsed`.
 pub(crate) fn add(name: &'static str, elapsed: Duration) {
+    let end = Instant::now();
+    record(name, end.checked_sub(elapsed).unwrap_or(end), end);
+}
+
+fn record(name: &'static str, start: Instant, end: Instant) {
     ACTIVE.with(|active| {
         if let Some(recorder) = active.borrow().as_ref()
             && let Ok(mut accumulated) = recorder.0.lock()
         {
             let entry = accumulated.totals.entry(name).or_default();
-            entry.micros = entry.micros.saturating_add(elapsed.as_micros() as u64);
+            entry.micros = entry
+                .micros
+                .saturating_add((end - start).as_micros() as u64);
             entry.count += 1;
+            if matches!(
+                name,
+                "subprocess_git" | "subprocess_other" | "review_on_push_child_wait"
+            ) {
+                accumulated.intervals.push((start, end, true));
+            } else if matches!(
+                name,
+                "lifecycle_lock_wait"
+                    | "lifecycle_lock_promoted_wait"
+                    | "process_spawn_lock_wait"
+                    | "repository_write_lock_wait"
+                    | "install_slot_wait"
+                    | "shared_cache_wait_exhausted"
+                    | "operation_outcome_record_wait"
+            ) {
+                accumulated.intervals.push((start, end, false));
+            }
         }
     });
 }
@@ -123,6 +148,51 @@ pub(crate) fn subprocess_span(command: &std::process::Command) -> Span {
 }
 
 impl Recorder {
+    /// Disjoint wall-clock attribution. Queue wait takes precedence over a
+    /// containing child span (which can also include the spawn-lock wait).
+    pub(crate) fn attribution(&self, started: Instant, ended: Instant) -> serde_json::Value {
+        let accumulated = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let endpoints = accumulated
+            .intervals
+            .iter()
+            .filter_map(|&(from, to, child)| {
+                let from = from.max(started);
+                let to = to.min(ended);
+                (from < to).then_some([(from, child, 1), (to, child, -1)])
+            })
+            .flatten();
+        let mut endpoints: Vec<_> = endpoints.collect();
+        endpoints.sort_unstable();
+        let mut child_count = 0;
+        let mut queue_count = 0;
+        let mut child = Duration::ZERO;
+        let mut queue = Duration::ZERO;
+        let mut previous = started;
+        for (at, is_child, change) in endpoints {
+            if queue_count > 0 {
+                queue += at - previous;
+            } else if child_count > 0 {
+                child += at - previous;
+            }
+            if is_child {
+                child_count += change;
+            } else {
+                queue_count += change;
+            }
+            previous = at;
+        }
+        let wall_ms = (ended - started).as_millis() as u64;
+        let child_ms = child.as_millis() as u64;
+        let queue_ms = queue.as_millis() as u64;
+        serde_json::json!({
+            "schema_version": 1,
+            "child_command_ms": child_ms,
+            "queue_wait_ms": queue_ms,
+            "broker_and_unattributed_ms": wall_ms - queue_ms - child_ms,
+            "retries": accumulated.totals.get("push_remote_tip_redecided").map_or(0, |span| span.count),
+        })
+    }
+
     /// Milliseconds and occurrence counts per span, by name.
     pub(crate) fn totals(&self) -> (BTreeMap<String, u64>, BTreeMap<String, u64>) {
         let Ok(accumulated) = self.0.lock() else {
@@ -179,6 +249,24 @@ mod tests {
         assert_eq!(counts.get("work"), Some(&2));
         assert_eq!(counts.get("scoped"), Some(&1));
         assert!(!counts.contains_key("ignored"));
+    }
+
+    #[test]
+    fn attribution_partitions_parallel_children_and_nested_queue_time() {
+        let recorder = Recorder::default();
+        let _installed = install(recorder.clone());
+        let start = Instant::now();
+        let ms = |value| start + Duration::from_millis(value);
+        record("subprocess_git", ms(1), ms(8));
+        record("subprocess_other", ms(3), ms(9));
+        record("process_spawn_lock_wait", ms(2), ms(4));
+        record("repository_write_lock_wait", ms(8), ms(12));
+        add("push_remote_tip_redecided", Duration::ZERO);
+        let costs = recorder.attribution(start, ms(10));
+        assert_eq!(costs["child_command_ms"], 5);
+        assert_eq!(costs["queue_wait_ms"], 4);
+        assert_eq!(costs["broker_and_unattributed_ms"], 1);
+        assert_eq!(costs["retries"], 1);
     }
 
     #[test]

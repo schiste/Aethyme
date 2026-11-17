@@ -1274,6 +1274,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
         agent_identity.as_deref(),
         context,
     )?;
+    telemetry::set_metric_session(report.session.id);
     bind_caller_as_holder(broker.store(), report.session.id);
     let tab_rename = crate::chau7_mcp::rename_session_tab_if_applicable(
         &report.session,
@@ -1580,6 +1581,7 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
     }
     // `start-agent` binds nothing: the agent it spawns is a different process
     // from its caller, and binds on its own first command.
+    telemetry::set_metric_session(report.session.id);
     bind_caller_as_holder(broker.store(), report.session.id);
     let tab_rename = crate::chau7_mcp::rename_session_tab_if_applicable(
         &report.session,
@@ -1703,6 +1705,7 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
     };
     phase_timings_ms.insert("broker_open".into(), open_ms);
     phase_timings_ms.insert("session_allocation".into(), allocation_ms);
+    telemetry::set_metric_session(report.session.id);
     let response_started = std::time::Instant::now();
     let tab_rename = crate::chau7_mcp::rename_session_tab(
         &report.session,
@@ -2186,10 +2189,16 @@ pub(super) fn run_close(parsed: Parsed) -> Result<(), UsageError> {
         .session
         .ok_or(UsageError::Message("close requires --session <id>".into()))?;
     let abandon_reason = abandon_reason(&parsed)?;
+    if parsed.duplicate_of.is_some() && abandon_reason.is_some() {
+        return Err(UsageError::Message(
+            "--duplicate-of cannot be combined with --abandon".into(),
+        ));
+    }
     let mut broker = open_broker(parsed.read_only_snapshot)?;
-    match abandon_reason {
-        Some(reason) => broker.close_abandoning_unpushed(session, reason)?,
-        None => broker.close(session)?,
+    match (abandon_reason, parsed.duplicate_of) {
+        (Some(reason), _) => broker.close_abandoning_unpushed(session, reason)?,
+        (_, Some(other)) => broker.close_duplicate_session(session, other)?,
+        _ => broker.close(session)?,
     }
     if parsed.json {
         out!("{}", serde_json::json!({ "closed": session }));

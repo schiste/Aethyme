@@ -81,11 +81,6 @@ fn record_failure() {
     });
 }
 
-/// Bytes this process has printed through out!.
-pub(crate) fn emitted() -> u64 {
-    EMITTED.load(Ordering::Relaxed)
-}
-
 pub(crate) fn exit_code_after_output(before: OutputSnapshot, code: u8) -> u8 {
     if code == crate::exit_status::SUCCESS && failed_since(before) {
         crate::exit_status::ENVIRONMENT
