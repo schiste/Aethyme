@@ -38,20 +38,23 @@ consumer. This file exists so that doesn't happen again.
 
 ## Session coordination consumers
 
-`aethyme broker status --session <id> --json` supplies a session block in
-its full compact snapshot. With `--since-revision`, the
-`aethyme.broker-status-delta/v1` document includes `changed_sections.session`
-only when that block changes; an empty section map does not certify deferred
-checks. Older or differently scoped revision tokens reset to a full snapshot.
+Routine `broker status --json` in a registered worktree and
+`broker status --session <id> --json` both return the
+`aethyme.broker-session-view/v2` document. The earlier `--session-view` spelling
+selects the same view and revision scope. Version 2 makes global recovery a
+count summary and omits per-observation evidence from default advice. `session.next_action` is the current
+session's next safe step. A running wait can supply an instruction with a null
+command. `session.blockers` reports its own recovery findings,
+`peer_state` scopes overlaps to its leases and declared scopes, and
+`global_state` counts other recorded coordination warnings by kind. A repository
+count can change without naming the record. Use `--full --json` for exact
+evidence and `broker unblock` for recovery inspection. The broker verifies
+exact resource conflicts when carrying out a requested operation.
 
-`status --session <id> --session-view --json` returns the versioned
-`aethyme.broker-session-view/v1` snapshot. It reads session advice and pending
-lease release requests for the selected session, recorded peer lease and
-declared-scope overlaps, and a partial set of blocker observations. It skips
-the repository-wide status computation and marks deferred recovery checks
-as unknown. Its revision scope is separate from focused status, and unrelated
-repository counts do not cause deltas. Use focused or full status for broader
-checks and exact evidence.
+With `--since-revision`, `aethyme.broker-status-delta/v1` carries section
+replacements for a valid revision of that same session. Old focused compact and v1 session-view
+tokens reset, as do tokens from other scopes. An empty section map leaves deferred checks
+unknown.
 
 `aethyme broker advanced events --session <id> --since <event-id> --follow
 --json` emits NDJSON rows attributed to that session, in event-id order. It
@@ -743,6 +746,52 @@ succeeded. Dropping any part of the run binding lets a stale journal settle
 another run that reuses the id after a database reset. Covered by
 `operations/outcome_journal/tests.rs` and the v64 schema test.
 
+## Stale sessions close from the background worker, by work class (2026-11-17)
+
+**Changed behaviour.** CLI commands (`status`, `agents`, `exec`, `leases
+claim`, `start`, `submit` ...) no longer close abandoned or no-work sessions
+inline: the `agents` view counts them (`agents_view_abandonment_due_deferred`)
+and queues the shared detached worker (`gc __continue-artifacts`), which
+judges them. A reader that expected one `broker status` to close an old
+session must now wait for the worker. Library callers of `Broker::agents`
+still judge inline. No session closes without a complete process listing in
+the same pass; `Unbound` sessions also need the complete open-file and
+working-directory observation.
+
+**New `[cleanup]` keys** (validated by the `[cleanup]` loader; an invalid
+value keeps sessions open): `stale_session_auto_close` (true),
+`stale_landed_close_after_hours` (24), `stale_pushed_close_after_hours` (72),
+`stale_unpushed_close_after_hours` (168), `stale_closing_notice_hours` (24).
+Past the abandonment window, a session with no live holder waits for its
+class window (the more protective of HEAD's and the branch tip's class), and
+a session holding work also for a closing-soon note left at least the notice
+period earlier with no activity since. A holder bound to a newer session of
+the repository (same pid and start time, no bind back) is no live holder, in
+the abandonment and no-work windows. The keep reason `holder_moved_on_dirty`
+(counter `session_abandonment_kept_holder_moved_on_dirty`) is removed; the new
+keep reasons are `work_class_not_due` and `start_reserved` (a held start
+reservation on the checkout's path).
+
+**New fields and records.** `session.abandoned` from the abandonment window
+gains `work_class` (`landed`, `pushed_unmerged`, `unpushed`). A closing-soon
+automation note (sender `automation:session-auto-close`, fingerprint
+`session-closing-soon`) gates every close of a session holding work. Status
+advice: `sessions.stale-backlog`, `sessions.closing-soon`,
+`sessions.process-table-denied`. Meta keys `stale_sessions.classes`,
+`stale_sessions.process_table_observed_at`,
+`stale_sessions.process_table_denied_at`.
+
+**Worker.** A retirement pass refused the process listing closes nothing and
+defers its sessions (they are no longer counted in
+`landed_session_retirement.abandonment.kept`), and the worker stops its
+retirement lane with the request pending
+(`session_retirement_stopped_process_table_denied`).
+
+Covered by `stale_session_policy` unit tests, the `session_auto_close` lane
+tests, the `gc` worker test, `file_lock` tests and
+`tests/session_abandonment.rs`. Upgrade note: the automatic checkout
+maintenance guide, "Stale sessions by work class".
+
 ## Compact status by default, session block and push plan (2026-11-17)
 
 **Changed default.** `aethyme broker status --json` now prints the compact
@@ -755,8 +804,8 @@ compact adds `hint`. `--compact` is still accepted and changes nothing; it,
 `--summary`, `--session` and `--since-revision` are refused beside `--full`.
 Compact JSON status is routine status: a read-only snapshot of broker state.
 It still appends its command-metrics row (see Telemetry below) but writes no
-outcome event and no broker-database row. Readers of the compact form branch on
-`advice.categories[].severity` and `.commands`, `summary` and `drilldown`. Every internal reader of the
+outcome event and no broker-database row. Readers of the repository compact form use category counts, `summary` and
+`drilldown`. See Session coordination consumers for the worktree-scoped default. Every internal reader of the
 full fields (tests, the JSON-shape snapshot, generated agent docs, the agent
 hook's advisory pointer, finish's recovery hint, the owners drilldown) now
 names `--full`. The ignored `local_compatibility` old-binary test still runs
@@ -2141,19 +2190,17 @@ help; only manual audit of every consumer can.
 
 `broker status --refresh` explicitly requests fresh lease derivation, dirty
 worktree inspection, Git conflict/history checks and cleanup eligibility.
-Routine `broker status` renders compact text by default; `broker status
---compact` selects that text explicitly. Compact output groups repeated advice,
-keeps each warning category visible, and marks omitted details and unknown or
-deferred checks instead of presenting them as absent. Use `broker status
---compact --json` for the versioned `aethyme.broker-status-compact/v1` shape.
-`broker status --compact --session <id> --json` adds a `focus` object with the session ID and count of unrelated session notices and informational observations omitted. Repository-wide counts, warnings, blockers, waiters and coordination records remain global; the full status remains available for omitted details. Unknown session IDs are rejected.
-`broker status --json` keeps the existing full JSON shape, and
-`broker status --summary --json` keeps the existing summary JSON shape.
-Routine `--summary` reports recorded observations instead. Consumers of the
-full and summary JSON shapes must check top-level `deferred_checks`,
-`leases_refreshed` and `leases_refreshed_at_ms` before interpreting zero counts
-as an absence of work. Compact JSON exposes the corresponding freshness values
-under `data_freshness`, including `deferred_checks_are_unknown`.
+Routine `broker status` and its alias `--compact` infer the current session
+from the worktree or accept `--session <id>`. Readers should dispatch on
+`schema`. Session selection gives `aethyme.broker-session-view/v2`; elsewhere
+`aethyme.broker-status-compact/v1` exposes repository counts and warning
+categories. In the repository form, count-bearing lists omit records and
+advice categories omit per-observation summaries and commands. In the session
+form, other-session and unscoped recovery records are counts, not actions.
+Use `--full --json` for the detailed JSON, and `--summary --json` for the
+legacy brief. Consumers of the full and brief documents use top-level
+`deferred_checks`, `leases_refreshed` and `leases_refreshed_at_ms`. Compact
+consumers use `data_freshness` to distinguish recorded and unknown findings.
 `--refresh` names in `deferred_checks` any check its inspection budget cut
 short, and lists the sessions it did not reach (#460).
 `integration_relation: not_checked` and empty ref heads in summary mean unknown,

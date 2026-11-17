@@ -242,15 +242,24 @@ fn the_holder_sees_the_request_and_an_ack_releases_the_path() {
             .any(|row| row["request_id"] == id && row["state"] == "pending"),
         "{status}"
     );
-    let human = fx.run_as("0", &["status"]);
+    let human = fx.run_as("0", &["status", "--session", &holding.to_string()]);
     assert!(human.status.success());
     let human = String::from_utf8_lossy(&human.stdout);
     assert!(
-        human.contains(&format!(
-            "session {asking} asked session {holding} to release {PATH}"
-        )),
-        "status must show the advisory release request and holder; got:\n{human}"
+        human.contains("1 pending lease release request(s) involving this session")
+            && human.contains(&format!(
+                "request {id} for {PATH:?} (session {asking} → session {holding})"
+            )),
+        "{human}"
     );
+    let unbound = fx.run_as("0", &["status"]);
+    assert!(unbound.status.success());
+    let unbound = String::from_utf8_lossy(&unbound.stdout);
+    assert!(
+        unbound.contains("1 pending lease release request(s)"),
+        "{unbound}"
+    );
+    assert!(!unbound.contains(PATH), "{unbound}");
 
     let acked = fx.json_as(
         &holder.pid(),
@@ -492,6 +501,15 @@ fn compact_status_keeps_new_pending_request_after_resolved_lease_is_reclaimed() 
         .unwrap();
     let full = fx.json_as("0", &["status", "--full", "--json"]);
     let compact = fx.json_as("0", &["status", "--compact", "--json"]);
+    assert_eq!(
+        compact["lease_release_requests"]["records"],
+        serde_json::json!([])
+    );
+    assert_eq!(compact["lease_release_requests"]["count"], 1);
+    let compact = fx.json_as(
+        "0",
+        &["status", "--session", &holding.to_string(), "--json"],
+    );
     let pending: Vec<_> = full["lease_release_requests"]
         .as_array()
         .unwrap()

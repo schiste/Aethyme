@@ -239,29 +239,20 @@ fn decide(
     let outcome = match event {
         HookEvent::SessionStart => {
             let start = on_session_start(&mut broker, &canonical, session.as_ref());
-            let peers = if matches!(start, HookOutcome::Deny(_)) {
-                None
-            } else {
-                session
-                    .as_ref()
-                    .and_then(|session| peer_view_update(&broker, session, true))
-            };
-            let own = if matches!(start, HookOutcome::Deny(_)) {
-                None
-            } else {
-                session
-                    .as_ref()
-                    .and_then(|session| own_view_update(&broker, session, true))
-            };
-            let global = if matches!(start, HookOutcome::Deny(_)) {
-                None
-            } else {
-                session
-                    .as_ref()
-                    .and_then(|session| global_view_update(&broker, session, true))
-            };
+            let scoped = session.as_ref().filter(|session| {
+                !session.status.is_closed() && !matches!(start, HookOutcome::Deny(_))
+            });
+            let own = scoped.map(|session| {
+                own_view_update(&broker, session, true).unwrap_or_else(|| {
+                    format!(
+                        "Aethyme session {}\nNext: aethyme broker status --session {}",
+                        session.id, session.id
+                    )
+                })
+            });
+            let peers = scoped.and_then(|session| peer_view_update(&broker, session));
             with_installation_notice(
-                append_context(append_context(append_context(start, own), peers), global),
+                append_context(append_context(start, own), peers),
                 &installation_notice,
             )
         }
@@ -374,220 +365,41 @@ fn touch(broker: &mut Broker, session: Option<&Session>) -> Result<(), crate::Br
     }
 }
 
-/// Register presence, tell every peer that the repository just became
-/// crowded, and hand the agent its current state plus the one command to run
-/// next.
-///
-/// The arrival note is the T1 transition (SOLO → COORDINATED), announced by
-/// the session that *causes* it, at the moment it causes it. No peer has to
-/// poll to discover the new arrival, and no extra state is needed to remember
-/// whether the announcement was already made — the note channel itself is the
-/// memory.
-///
-/// What the agent receives is state, not rules (recovery plan P4.7). The
-/// policy lives in the generated root guidance and the skill; restating it
-/// here billed it twice and still left the agent to work out which rule
-/// applied. A state line and a `Next:` command are what it acts on.
+/// Register activity for the current session or guide an unbound checkout.
 fn on_session_start(
     broker: &mut Broker,
     cwd: &std::path::Path,
     session: Option<&Session>,
 ) -> HookOutcome {
     let Some(session) = session else {
-        let live = broker.store().live_sessions().unwrap_or_default();
         let tab_session = host_tab_name().and_then(|tab| {
-            live.iter()
+            broker
+                .store()
+                .live_sessions()
+                .ok()?
+                .iter()
                 .find(|other| {
                     !other.status.is_closed() && other.tab_name.as_deref() == Some(tab.as_str())
                 })
                 .map(|other| (other.id, other.worktree_path.clone()))
         });
-        let facts = StartFacts {
-            checkout: cwd.display().to_string(),
-            tab_session,
-            peers: live
-                .iter()
-                .filter(|other| !other.status.is_closed())
-                .map(|other| (other.id, other.task.clone()))
-                .collect(),
-            ..StartFacts::default()
-        };
-        return HookOutcome::Context(render_start(&facts));
+        let information = session_coordination(broker, None).information;
+        let context = HookOutcome::Context(render_unbound_start(cwd, tab_session));
+        return append_context(context, render_repository_information(&information));
     };
     if session.status.is_closed() {
-        let facts = StartFacts {
-            checkout: cwd.display().to_string(),
-            session: Some(SessionFacts {
-                id: session.id,
-                worktree: session.worktree_path.clone(),
-                task: session.task.clone(),
-                closed: true,
-            }),
-            ..StartFacts::default()
-        };
-        return HookOutcome::Context(render_start(&facts));
+        return HookOutcome::Context(format!(
+            "Aethyme session {} is closed.\nNext: aethyme broker start --reuse --task \"<follow-up task>\" --short-name \"<short name>\"",
+            session.id
+        ));
     }
-
     if touch(broker, Some(session)).is_err() {
         return HookOutcome::Deny(format!(
             "Aethyme: session {} was closed before this turn began. Start or adopt a fresh session before editing.",
             session.id
         ));
     }
-
-    let peers = live_peers(broker, session.id);
-    if !peers.is_empty() {
-        let joined = format!(
-            "Aethyme: session {} joined this repository. You are no longer the only live \
-             session — claim paths before editing shared files (`aethyme broker advanced \
-             leases claim <path> --session <id>`) and integrate through `aethyme broker submit`.",
-            session.id
-        );
-        for peer in &peers {
-            // SessionStart fires again whenever the agent's TUI restarts on
-            // the same worktree. Announce a given pairing once, or a peer
-            // collects one identical note per restart.
-            if already_announced(broker, session.id, peer.id) {
-                continue;
-            }
-            crate::warn_unrecorded(
-                "record the arrival note for a peer session",
-                broker
-                    .store()
-                    .record_session_note(session.id, peer.id, &joined),
-            );
-        }
-    }
-
-    let blockers: Vec<crate::Blocker> = broker
-        .blockers()
-        .blockers
-        .into_iter()
-        .filter(|blocker| blocker.session_id.is_none_or(|owner| owner == session.id))
-        .collect();
-    let advisories = broker
-        .store()
-        .outstanding_advisories_for_session(session.id)
-        .map(|found| found.len())
-        .unwrap_or(0);
-    let facts = StartFacts {
-        checkout: cwd.display().to_string(),
-        session: Some(SessionFacts {
-            id: session.id,
-            worktree: session.worktree_path.clone(),
-            task: session.task.clone(),
-            closed: false,
-        }),
-        tab_session: None,
-        peers: peers
-            .iter()
-            .map(|peer| (peer.id, peer.task.clone()))
-            .collect(),
-        first_blocker: blockers.first().map(|blocker| blocker.clear.clone()),
-        blocker_count: blockers.len(),
-        advisories,
-        unintegrated_commits: unintegrated_commits(broker, session),
-        overlap: lease_overlap_summary(broker, session),
-    };
-    HookOutcome::Context(render_start(&facts))
-}
-
-/// "Sessions 209 (pr-1122) and 220 are changing 3 files you lease: a, b, c
-/// — you'll get details when you edit them." `None` when no live session
-/// overlaps this session's leases, which keeps the brief to its usual size.
-fn lease_overlap_summary(broker: &Broker, session: &Session) -> Option<String> {
-    let leases = broker.store_ref().active_leases().ok()?;
-    let mine: Vec<&str> = leases
-        .iter()
-        .filter(|lease| lease.session_id == session.id)
-        .map(|lease| lease.path.as_str())
-        .collect();
-    if mine.is_empty() {
-        return None;
-    }
-    let mut by_session: std::collections::BTreeMap<i64, std::collections::BTreeSet<String>> =
-        std::collections::BTreeMap::new();
-    for lease in leases.iter().filter(|lease| lease.session_id != session.id) {
-        for path in &mine {
-            if crate::leases::paths_overlap(&lease.path, path) {
-                by_session
-                    .entry(lease.session_id)
-                    .or_default()
-                    .insert(crate::overlap_diff::narrower(&lease.path, path));
-            }
-        }
-    }
-    let mut names = Vec::new();
-    let mut files = std::collections::BTreeSet::new();
-    let mut requests = Vec::new();
-    for (id, paths) in by_session {
-        let Ok(other) = broker.store_ref().session(id) else {
-            continue;
-        };
-        if !matches!(
-            other.status,
-            crate::SessionStatus::Active | crate::SessionStatus::Idle
-        ) {
-            continue;
-        }
-        names.push(match other.short_name.as_deref() {
-            Some(name) => format!("{id} ({name})"),
-            None => id.to_string(),
-        });
-        if requests.len() < crate::overlap_diff::max_holders() {
-            let explicit = leases
-                .iter()
-                .any(|lease| lease.session_id == id && lease.kind == crate::LeaseKind::Explicit);
-            requests.push(crate::overlap_diff::HolderRequest::new(
-                &other,
-                explicit,
-                paths.iter().cloned().collect(),
-            ));
-        }
-        files.extend(paths);
-    }
-    if names.is_empty() {
-        return None;
-    }
-    let who = match names.len() {
-        1 => format!("Session {}", names[0]),
-        _ => {
-            let last = names.pop().unwrap_or_default();
-            format!("Sessions {} and {last}", names.join(", "))
-        }
-    };
-    let verb = if who.starts_with("Sessions") {
-        "are"
-    } else {
-        "is"
-    };
-    let count = files.len();
-    let sample: Vec<&str> = files.iter().take(3).map(String::as_str).collect();
-    let more = count.saturating_sub(sample.len());
-    let more = if more > 0 {
-        format!(" (+{more} more)")
-    } else {
-        String::new()
-    };
-    let noun = if count == 1 { "file" } else { "files" };
-    let mut summary = format!(
-        "Overlap: {who} {verb} changing {count} {noun} you lease: {}{more}. You'll get details when you edit them.",
-        sample.join(", ")
-    );
-    if crate::overlap_diff::enabled(broker.main_root()) {
-        let mut seen = SeenState::load(broker.main_root(), session.id);
-        for mut report in crate::overlap_diff::read_all(
-            broker.main_root(),
-            requests,
-            crate::overlap_diff::HOOK_BUDGET,
-        ) {
-            crate::overlap_diff::mark_shown(&mut report, &mut seen);
-            summary.push('\n');
-            summary.push_str(&crate::overlap_diff::render(&report, "  "));
-        }
-        seen.save();
-    }
-    Some(summary)
+    HookOutcome::Silent
 }
 
 /// The host tab this agent runs in, when the host exports one — the same
@@ -601,189 +413,33 @@ fn host_tab_name() -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
-/// Commits in the session worktree that the integration branch does not hold
-/// yet. Two local `git` reads; zero on any failure, which only ever costs the
-/// agent a `submit` suggestion, never a wrong one.
-fn unintegrated_commits(broker: &Broker, session: &Session) -> usize {
-    let branch = crate::merge::PromoteConfig::load(&broker.main_root_path()).branch;
-    let Ok(worktree) = crate::GitRepo::discover(std::path::Path::new(&session.worktree_path))
-    else {
-        return 0;
-    };
-    let base = if worktree.resolve_ref(&branch).is_some() {
-        branch
-    } else if let Some(diff_base) = session.diff_base.clone() {
-        diff_base
-    } else {
-        return 0;
-    };
-    worktree
-        .commit_count_between(&base, "HEAD")
-        .map(|count| count as usize)
-        .unwrap_or(0)
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct SessionFacts {
-    id: i64,
-    worktree: String,
-    task: Option<String>,
-    closed: bool,
-}
-
-/// Everything the `SessionStart` brief reports, gathered once so the
-/// rendering — the part agents read — is a pure function under test.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct StartFacts {
-    checkout: String,
-    session: Option<SessionFacts>,
-    /// A live session registered for this agent's host tab, when the agent
-    /// is sitting in a checkout that is not that session's worktree.
-    tab_session: Option<(i64, String)>,
-    peers: Vec<(i64, Option<String>)>,
-    /// The clear command of the first blocker that is this session's (or the
-    /// whole repository's) to clear.
-    first_blocker: Option<String>,
-    blocker_count: usize,
-    advisories: usize,
-    unintegrated_commits: usize,
-    /// One line naming the live sessions changing files this session
-    /// leases, when there are any.
-    overlap: Option<String>,
-}
-
-/// Longest task text quoted in the brief. A task is a label here, not a
-/// specification; the full text is one `broker status` away.
-const TASK_PREVIEW_CHARS: usize = 60;
-
 fn preview(task: &str) -> String {
     let task = task.trim();
-    if task.chars().count() <= TASK_PREVIEW_CHARS {
+    if task.chars().count() <= 60 {
         return task.to_string();
     }
-    let cut: String = task.chars().take(TASK_PREVIEW_CHARS - 1).collect();
+    let cut: String = task.chars().take(59).collect();
     format!("{}…", cut.trim_end())
 }
 
-fn shell_quote(path: &str) -> String {
-    format!("'{}'", path.replace('\'', "'\\''"))
-}
-
-fn describe_peers(peers: &[(i64, Option<String>)], other: bool) -> String {
-    let other = if other { "other " } else { "" };
-    if peers.is_empty() {
-        return format!("no {other}live session");
-    }
-    let listed = peers
-        .iter()
-        .take(3)
-        .map(|(id, task)| match task.as_deref() {
-            Some(task) => format!("{id}: {}", preview(task)),
-            None => id.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    let more = peers.len().saturating_sub(3);
-    let suffix = if more > 0 {
-        format!("; +{more} more")
-    } else {
-        String::new()
-    };
-    let noun = if peers.len() == 1 {
-        "session"
-    } else {
-        "sessions"
-    };
-    format!("{} {other}live {noun} ({listed}{suffix})", peers.len())
-}
-
-/// The brief: at most five lines in the normal case, always ending in one
-/// `Next:` command.
-fn render_start(facts: &StartFacts) -> String {
-    let mut lines = Vec::new();
-    let Some(session) = &facts.session else {
-        lines.push(format!(
-            "Aethyme: this checkout ({}) is not a broker session; {}.",
-            facts.checkout,
-            describe_peers(&facts.peers, false)
-        ));
-        match &facts.tab_session {
-            Some((id, worktree)) => {
-                lines.push(format!(
-                    "Session {id} is registered for this tab in another worktree."
-                ));
-                lines.push(format!("Next: cd {}", shell_quote(worktree)));
-            }
-            None => {
-                lines.push(
-                    "Next: aethyme broker start --task \"<task>\" --short-name \"<short name>\" (then work only in the worktree it reports)"
-                        .to_string(),
-                );
-            }
+fn render_unbound_start(checkout: &std::path::Path, tab_session: Option<(i64, String)>) -> String {
+    let mut text = format!(
+        "Aethyme: this checkout ({}) has no broker session.",
+        checkout.display()
+    );
+    let next = match tab_session {
+        Some((id, worktree)) => {
+            text.push_str(&format!(
+                "\nSession {id} is registered for this tab in another worktree."
+            ));
+            format!("cd '{}'", worktree.replace('\'', "'\\''"))
         }
-        return lines.join("\n");
+        None => "aethyme broker start --task \"<task>\" --short-name \"<short name>\"".into(),
     };
-
-    let task = session
-        .task
-        .as_deref()
-        .map(|task| format!(": {}", preview(task)))
-        .unwrap_or_default();
-    if session.closed {
-        lines.push(format!(
-            "Aethyme: session {}{task} is finished; this worktree is no longer registered for new work.",
-            session.id
-        ));
-        lines.push("Next: aethyme broker start --reuse --task \"<follow-up task>\" --short-name \"<short name>\"".to_string());
-        return lines.join("\n");
-    }
-
-    lines.push(format!("Aethyme: session {}{task}", session.id));
-    lines.push(format!("Worktree: {}", session.worktree));
-    let blockers = match facts.blocker_count {
-        0 => "no blockers".to_string(),
-        1 => "1 blocker".to_string(),
-        n => format!("{n} blockers"),
-    };
-    let advisories = match facts.advisories {
-        0 => "no advisories".to_string(),
-        1 => "1 outstanding advisory".to_string(),
-        n => format!("{n} outstanding advisories"),
-    };
-    let commits = match facts.unintegrated_commits {
-        0 => "nothing committed to integrate".to_string(),
-        1 => "1 commit to integrate".to_string(),
-        n => format!("{n} commits to integrate"),
-    };
-    lines.push(format!(
-        "State: {}; {blockers}; {advisories}; {commits}.",
-        describe_peers(&facts.peers, true)
-    ));
-    if let Some(overlap) = &facts.overlap {
-        lines.push(overlap.clone());
-    }
-    let next = if let Some(clear) = &facts.first_blocker {
-        clear.clone()
-    } else if facts.unintegrated_commits > 0 {
-        format!("aethyme broker submit --session {}", session.id)
-    } else if facts.advisories > 0 {
-        "aethyme broker status --full --json (read the advisories before editing the named paths)"
-            .to_string()
-    } else {
-        format!(
-            "edit in this worktree and commit, then aethyme broker submit --session {}",
-            session.id
-        )
-    };
-    lines.push(format!("Next: {next}"));
-    lines.join("\n")
+    format!("{text}\nNext: {next}")
 }
 
-/// Deliver what changed since the last turn, and nothing else.
-///
-/// The note channel is drained and acknowledged here, which is what
-/// makes the SOLO claim safe to keep: an agent told it is alone will be
-/// told otherwise before its next prompt, so it never has to check.
+/// Deliver scoped coordination changes at turn boundaries.
 fn on_user_prompt_submit(broker: &mut Broker, session: Option<&Session>) -> HookOutcome {
     let Some(session) = session else {
         return HookOutcome::Silent;
@@ -796,8 +452,7 @@ fn on_user_prompt_submit(broker: &mut Broker, session: Option<&Session>) -> Hook
     }
     let notes = deliver_notes(broker, session);
     let notes = append_context(notes, own_view_update(broker, session, false));
-    let notes = append_context(notes, peer_view_update(broker, session, false));
-    append_context(notes, global_view_update(broker, session, false))
+    append_context(notes, peer_view_update(broker, session))
 }
 
 /// Stable, bounded observations of recorded peer ownership relevant to this session.
@@ -825,26 +480,74 @@ pub(crate) fn session_peer_view(
     }))
 }
 
-/// The session's own compact facts, with volatile watch timestamps omitted.
-fn own_session_view(broker: &Broker, session_id: i64) -> serde_json::Value {
-    let advice = match broker.session_status_advice(session_id, now_ms()) {
-        Ok(advice) => advice,
-        Err(error) => {
-            return serde_json::json!({"id": session_id, "status": "unknown", "error": error.to_string()});
-        }
-    };
-    let mut view = crate::cli::status_extras::session_block(broker, session_id, &advice);
-    if let Some(pr) = view
-        .pointer_mut("/pr")
-        .and_then(serde_json::Value::as_object_mut)
+pub(crate) struct SessionCoordination {
+    pub(crate) actions: Vec<crate::Blocker>,
+    pub(crate) waiters: Vec<crate::CurrentWaiter>,
+    pub(crate) information: serde_json::Value,
+}
+
+/// Only session-owned recovery goes in the action list. Unscoped observations
+/// remain informational here; the broker checks their exact target when an
+/// operation is attempted.
+pub(crate) fn session_coordination(
+    broker: &Broker,
+    session_id: Option<i64>,
+) -> SessionCoordination {
+    let report = broker.collect_blockers_with_recovery(false);
+    let (mut actions, other): (Vec<_>, Vec<_>) = report
+        .blockers
+        .into_iter()
+        .partition(|blocker| session_id.is_some() && blocker.session_id == session_id);
+    if let Some(session_id) = session_id
+        && let Ok(Some(notice)) = broker.session_action_required_blocker(session_id)
     {
-        pr.remove("observed_at_ms");
+        actions.insert(0, notice);
     }
-    view["advice_completeness"] =
-        serde_json::json!("partial; use focused status for full recorded advice");
-    let mut document = serde_json::json!({"session": view});
-    crate::cli::status_extras::cap_document_advice_evidence(&mut document);
-    document["session"].take()
+    let mut warnings_by_kind = std::collections::BTreeMap::new();
+    for warning in &other {
+        *warnings_by_kind.entry(warning.kind.as_str()).or_insert(0) += 1;
+    }
+    if broker
+        .collaboration_fence_state(crate::broker::FenceTrigger::Open)
+        .is_some()
+    {
+        warnings_by_kind.insert("collaboration_fence", 1);
+    }
+    let stale = broker
+        .store_ref()
+        .recorded_stale_session_count(session_id)
+        .ok();
+    let information = serde_json::json!({
+        "count": warnings_by_kind.values().sum::<usize>(),
+        "warnings_by_kind": warnings_by_kind,
+        "recorded_stale_sessions": stale,
+        "unavailable_source_count": report.unavailable.len(),
+        "recovery_checks": "not_inspected",
+    });
+    let waiters = session_id.map_or_else(Vec::new, |id| {
+        crate::waiters::current_session_waiters(broker.main_root(), now_ms(), id)
+            .into_iter()
+            .filter(|waiter| waiter.alive)
+            .collect()
+    });
+    SessionCoordination {
+        actions,
+        waiters,
+        information,
+    }
+}
+
+pub(crate) fn render_repository_information(view: &serde_json::Value) -> Option<String> {
+    let warnings = view["count"].as_u64().unwrap_or(0);
+    let unavailable = view["unavailable_source_count"].as_u64().unwrap_or(0);
+    let stale = view["recorded_stale_sessions"].as_u64();
+    if warnings == 0 && unavailable == 0 && stale == Some(0) {
+        return None;
+    }
+    let stale = stale.map_or_else(|| "unknown".to_string(), |count| count.to_string());
+    Some(format!(
+        "Repository information: {stale} recorded stale session(s), {warnings} other coordination warning(s), {unavailable} unavailable warning source(s)."
+    ))
 }
 
 fn own_view_update(broker: &Broker, session: &Session, force: bool) -> Option<String> {
@@ -852,92 +555,99 @@ fn own_view_update(broker: &Broker, session: &Session, force: bool) -> Option<St
     std::fs::create_dir_all(path.parent()?).ok()?;
     let file = crate::file_lock::open_lock_file(&path.with_extension("lock")).ok()?;
     let guard = crate::file_lock::ExclusiveFileLock::try_acquire(file).ok()??;
-    let previous: Option<serde_json::Value> = std::fs::read(&path)
+    let previous: serde_json::Value = std::fs::read(&path)
         .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
     let now = now_ms();
     if !force
-        && previous
-            .as_ref()
-            .and_then(|v| v["checked_at_ms"].as_i64())
+        && previous["checked_at_ms"]
+            .as_i64()
             .is_some_and(|at| now >= at && now - at < 30_000)
     {
         return None;
     }
-    let current = own_session_view(broker, session.id);
-    let record = serde_json::json!({"checked_at_ms": now, "view": current});
-    if !force && previous.as_ref().map(|v| &v["view"]) == Some(&current) {
+
+    let coordination = session_coordination(broker, Some(session.id));
+    let view =
+        crate::cli::status_extras::routine_session_block(broker, session.id, &coordination).ok()?;
+    let brief = crate::cli::status_extras::render_routine_session(&view, false);
+    let information = coordination.information;
+    let mut messages = Vec::new();
+    if force {
+        messages.push(crate::cli::status_extras::render_routine_session(
+            &view, true,
+        ));
+    } else if previous["brief"].as_str() != Some(&brief) {
+        messages.push(brief.clone());
+    }
+    let summary = render_repository_information(&information);
+    let previous_summary = (!previous["information"].is_null())
+        .then(|| render_repository_information(&previous["information"]))
+        .flatten();
+    if summary != previous_summary {
+        messages.push(summary.unwrap_or_else(|| {
+            "Repository information: no recorded stale sessions or other coordination warnings."
+                .into()
+        }));
+    }
+    let record =
+        serde_json::json!({"checked_at_ms": now, "brief": brief, "information": information});
+    if messages.is_empty() {
         save_hook_state(Some(&path), &record);
         return None;
     }
     PENDING_PEER_VIEWS.with(|pending| pending.borrow_mut().push((path, record, guard)));
-    Some(format!("Aethyme session view: {}", current))
+    Some(messages.join("\n"))
 }
 
-/// Recorded repository-wide blockers and blockers belonging to this session.
-/// Recovery-only sources remain explicitly uninspected.
-pub(crate) fn session_global_view(broker: &Broker, session_id: i64) -> serde_json::Value {
-    use sha2::{Digest, Sha256};
-    let report = broker.collect_blockers_with_recovery(false);
-    let blockers: Vec<_> = report
-        .blockers
-        .into_iter()
-        .filter(|blocker| {
-            blocker.kind != crate::blockers::BlockerKind::Pidfile
-                || blocker.session_id == Some(session_id)
-        })
-        .collect();
-    let all = serde_json::json!({"blockers": blockers, "unavailable": report.unavailable});
-    let digest = format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&all).expect("serializable blockers"))
+pub(crate) fn render_peer_information(view: &serde_json::Value, session_id: i64) -> Option<String> {
+    use std::fmt::Write as _;
+    let leases = view["lease_count"].as_u64().unwrap_or(0);
+    let scopes = view["scope_count"].as_u64().unwrap_or(0);
+    if leases == 0 && scopes == 0 {
+        return None;
+    }
+    let mut text = format!(
+        "Coordination: {leases} recorded path overlap(s), {scopes} matching declared scope(s)."
     );
-    let rows = all["blockers"].as_array().expect("blockers");
-    serde_json::json!({"count": rows.len(), "records": rows.iter().take(10).collect::<Vec<_>>(),
-        "unavailable": all["unavailable"], "digest": digest,
-        "recovery_checks": "not_inspected"})
-}
-
-/// Periodically refresh global sources, including external stores and process
-/// liveness that can change without an event in this repository's database.
-fn global_view_update(broker: &Broker, session: &Session, force: bool) -> Option<String> {
-    let path = hook_state_path(broker.main_root(), "hook-global-view", session.id)?;
-    std::fs::create_dir_all(path.parent()?).ok()?;
-    let file = crate::file_lock::open_lock_file(&path.with_extension("lock")).ok()?;
-    let guard = crate::file_lock::ExclusiveFileLock::try_acquire(file).ok()??;
-    let previous: Option<serde_json::Value> = std::fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-    let now = now_ms();
-    if !force
-        && previous
-            .as_ref()
-            .and_then(|v| v["checked_at_ms"].as_i64())
-            .is_some_and(|at| now >= at && now - at < 30_000)
+    for entry in view["leases"].as_array().into_iter().flatten().take(3) {
+        if entry[1] == entry[2] {
+            write!(text, "\n  session {} also leases {}.", entry[0], entry[2])
+                .expect("writing to String is infallible");
+        } else {
+            write!(
+                text,
+                "\n  session {} leases {}, overlapping your lease {}.",
+                entry[0], entry[2], entry[1]
+            )
+            .expect("writing to String is infallible");
+        }
+    }
+    for entry in view["scopes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(3usize.saturating_sub(leases.min(3) as usize))
     {
-        return None;
+        write!(
+            text,
+            "\n  session {} shares declared {} scope {}.",
+            entry[0], entry[1], entry[2]
+        )
+        .expect("writing to String is infallible");
     }
-    let current = session_global_view(broker, session.id);
-    let record = serde_json::json!({"checked_at_ms": now, "view": current});
-    let old = previous.as_ref().map(|v| &v["view"]);
-    let relevant = current["count"].as_u64().unwrap_or(0) > 0
-        || current["unavailable"]
-            .as_array()
-            .is_some_and(|a| !a.is_empty());
-    if old == Some(&current) && !(force && relevant) || old.is_none() && !relevant {
-        save_hook_state(Some(&path), &record);
-        return None;
-    }
-    PENDING_PEER_VIEWS.with(|pending| pending.borrow_mut().push((path, record, guard)));
-    Some(format!(
-        "Aethyme: recorded repository blocker observations changed: {}\n  Details: aethyme broker unblock",
-        current
-    ))
+    write!(
+        text,
+        "\nDetails: aethyme broker status --session {session_id} --json"
+    )
+    .expect("writing to String is infallible");
+    Some(text)
 }
 
 /// Emit recorded peer changes once at hook boundaries. The file lock prevents
 /// concurrent hooks from overwriting each other's observed revision.
-fn peer_view_update(broker: &Broker, session: &Session, force: bool) -> Option<String> {
+fn peer_view_update(broker: &Broker, session: &Session) -> Option<String> {
     let path = hook_state_path(broker.main_root(), "hook-peer-view", session.id)?;
     let parent = path.parent()?;
     std::fs::create_dir_all(parent).ok()?;
@@ -949,7 +659,7 @@ fn peer_view_update(broker: &Broker, session: &Session, force: bool) -> Option<S
     let current = session_peer_view(broker, session.id).ok()?;
     let has_relevance = current["lease_count"].as_u64().unwrap_or(0) > 0
         || current["scope_count"].as_u64().unwrap_or(0) > 0;
-    if previous.as_ref() == Some(&current) && !(force && has_relevance) {
+    if previous.as_ref() == Some(&current) {
         return None;
     }
     if previous.is_none() && !has_relevance {
@@ -957,10 +667,11 @@ fn peer_view_update(broker: &Broker, session: &Session, force: bool) -> Option<S
         return None;
     }
     PENDING_PEER_VIEWS.with(|pending| pending.borrow_mut().push((path, current.clone(), _guard)));
-    Some(format!(
-        "Aethyme: recorded task-relevant peer coordination changed: {}\n  Details: aethyme broker status --session {} --json",
-        current, session.id
-    ))
+    Some(
+        render_peer_information(&current, session.id).unwrap_or_else(|| {
+            "Coordination: no recorded path overlaps or matching declared scopes remain.".into()
+        }),
+    )
 }
 
 fn append_context(outcome: HookOutcome, addition: Option<String>) -> HookOutcome {
@@ -985,8 +696,7 @@ fn on_post_tool_use(cwd: &std::path::Path) -> HookOutcome {
         return HookOutcome::Silent;
     };
     let own = own_view_update(&snapshot, &session, false);
-    let peers = peer_view_update(&snapshot, &session, false);
-    let global = global_view_update(&snapshot, &session, false);
+    let peers = peer_view_update(&snapshot, &session);
     let store = snapshot.store_ref();
     let unread = !store
         .unread_session_notes(session.id)
@@ -997,24 +707,15 @@ fn on_post_tool_use(cwd: &std::path::Path) -> HookOutcome {
             .unwrap_or_default()
             .is_empty();
     if !unread {
-        return append_context(
-            append_context(append_context(HookOutcome::Silent, own), peers),
-            global,
-        );
+        return append_context(append_context(HookOutcome::Silent, own), peers);
     }
     drop(snapshot);
     let Some(mut broker) = Broker::open(cwd).ok() else {
-        return append_context(
-            append_context(append_context(HookOutcome::Silent, own), peers),
-            global,
-        );
+        return append_context(append_context(HookOutcome::Silent, own), peers);
     };
     append_context(
-        append_context(
-            append_context(deliver_notes(&mut broker, &session), own),
-            peers,
-        ),
-        global,
+        append_context(deliver_notes(&mut broker, &session), own),
+        peers,
     )
 }
 
@@ -1886,27 +1587,6 @@ fn repo_relative(
     Some(relative.to_string_lossy().replace('\\', "/"))
 }
 
-/// True when `sender` has already put a note in `recipient`'s queue,
-/// read or not. One announcement per pairing, for the life of the pair.
-fn already_announced(broker: &mut Broker, sender: i64, recipient: i64) -> bool {
-    broker
-        .store()
-        .session_notes(recipient)
-        .unwrap_or_default()
-        .iter()
-        .any(|note| note.sender_session_id == sender)
-}
-
-fn live_peers(broker: &mut Broker, self_id: i64) -> Vec<Session> {
-    broker
-        .store()
-        .live_sessions()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|other| other.id != self_id && !other.status.is_closed())
-        .collect()
-}
-
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1953,8 +1633,7 @@ mod tests {
         // Establish the same delivered baseline as SessionStart for both hosts.
         for session in [&holder, &other] {
             let _ = own_view_update(&broker, session, true);
-            let _ = peer_view_update(&broker, session, true);
-            let _ = global_view_update(&broker, session, true);
+            let _ = peer_view_update(&broker, session);
             acknowledge_peer_views();
         }
         broker.claim_lease(holder.id, "file.rs", None).unwrap();
@@ -1989,7 +1668,7 @@ mod tests {
         let HookOutcome::Context(text) = delivered else {
             panic!("expected request note")
         };
-        assert!(text.contains("recorded task-relevant peer coordination changed"));
+        assert!(text.contains("recorded path overlap"));
         acknowledge_peer_views();
         assert!(text.contains(&format!(
             "leases ack {} --session {}",
@@ -2033,8 +1712,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let _ = global_view_update(&broker, &holder, true);
-        acknowledge_peer_views();
         let repository = format!("local:{}", broker.main_root().display());
         let operation = broker
             .store()
@@ -2060,10 +1737,23 @@ mod tests {
                 None,
             )
             .unwrap();
-        let update = global_view_update(&broker, &holder, true).expect("new global blocker");
-        assert!(update.contains(&format!("op:{}", operation.id)));
+        let observed = session_coordination(&broker, Some(holder.id));
+        assert_eq!(observed.information["warnings_by_kind"]["operation"], 1);
+        assert!(observed.actions.is_empty());
+        assert!(
+            !observed
+                .information
+                .to_string()
+                .contains(&format!("op:{}", operation.id))
+        );
+        let update = own_view_update(&broker, &requester, true).expect("owned blocker");
+        assert!(
+            update.contains("Action required: A write from this session has an unknown outcome")
+        );
+        assert!(update.contains("Next: aethyme broker unblock"));
+        assert!(!update.contains("--outcome"));
         acknowledge_peer_views();
-        assert!(global_view_update(&broker, &holder, false).is_none());
+        assert!(own_view_update(&broker, &requester, false).is_none());
     }
 
     /// Through the hook's own path: opted in, a session changing a file this
@@ -2206,129 +1896,18 @@ mod tests {
         );
     }
 
-    fn open_session(id: i64) -> SessionFacts {
-        SessionFacts {
-            id,
-            worktree: "/wt/s7".into(),
-            task: Some("fix the parser".into()),
-            closed: false,
-        }
-    }
-
-    fn next_line(text: &str) -> &str {
-        text.lines()
-            .last()
-            .and_then(|line| line.strip_prefix("Next: "))
-            .unwrap_or_else(|| panic!("the brief must end in one Next: line: {text}"))
-    }
-
-    /// P4.7: the brief is state plus one command, never a paragraph of rules.
     #[test]
-    fn unregistered_checkout_is_told_to_start() {
-        let text = render_start(&StartFacts {
-            checkout: "/repo".into(),
-            peers: vec![(3, Some("other work".into()))],
-            ..StartFacts::default()
-        });
-        assert!(text.lines().count() <= 5, "{text}");
-        assert!(text.contains("not a broker session"), "{text}");
-        assert!(text.contains("1 live session (3: other work)"), "{text}");
+    fn unbound_start_names_only_the_registered_tab_session() {
+        let root = std::path::Path::new("/repo");
+        let text = render_unbound_start(root, None);
+        assert!(text.contains("has no broker session"), "{text}");
+        assert!(text.contains("Next: aethyme broker start --task"), "{text}");
+        let text = render_unbound_start(root, Some((7, "/wt/it's here".into())));
         assert!(
-            next_line(&text).starts_with("aethyme broker start --task \"<task>\" --short-name"),
+            text.contains("Session 7 is registered for this tab"),
             "{text}"
         );
-    }
-
-    #[test]
-    fn a_checkout_other_than_the_tab_session_is_told_to_cd() {
-        let text = render_start(&StartFacts {
-            checkout: "/repo".into(),
-            tab_session: Some((7, "/wt/it's here".into())),
-            ..StartFacts::default()
-        });
-        assert_eq!(next_line(&text), "cd '/wt/it'\\''s here'", "{text}");
-    }
-
-    #[test]
-    fn a_finished_session_is_told_to_reuse() {
-        let text = render_start(&StartFacts {
-            checkout: "/wt/s7".into(),
-            session: Some(SessionFacts {
-                closed: true,
-                ..open_session(7)
-            }),
-            ..StartFacts::default()
-        });
-        assert!(
-            next_line(&text).starts_with("aethyme broker start --reuse --task")
-                && next_line(&text).contains("--short-name"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn next_action_prefers_blocker_then_commits_then_advisories() {
-        let base = StartFacts {
-            checkout: "/wt/s7".into(),
-            session: Some(open_session(7)),
-            ..StartFacts::default()
-        };
-        let idle = render_start(&base);
-        assert_eq!(idle.lines().count(), 4, "{idle}");
-        assert!(idle.contains("Worktree: /wt/s7"), "{idle}");
-        assert!(
-            idle.contains("no other live session; no blockers; no advisories"),
-            "{idle}"
-        );
-        assert!(
-            next_line(&idle).ends_with("aethyme broker submit --session 7"),
-            "{idle}"
-        );
-
-        let advised = render_start(&StartFacts {
-            advisories: 2,
-            ..base.clone()
-        });
-        assert!(
-            next_line(&advised).starts_with("aethyme broker status --full --json"),
-            "{advised}"
-        );
-
-        let committed = render_start(&StartFacts {
-            advisories: 2,
-            unintegrated_commits: 3,
-            ..base.clone()
-        });
-        assert!(committed.contains("3 commits to integrate"), "{committed}");
-        assert_eq!(next_line(&committed), "aethyme broker submit --session 7");
-
-        let blocked = render_start(&StartFacts {
-            advisories: 2,
-            unintegrated_commits: 3,
-            blocker_count: 1,
-            first_blocker: Some("aethyme broker unblock op:4 --outcome succeeded".into()),
-            ..base
-        });
-        assert!(blocked.contains("1 blocker"), "{blocked}");
-        assert_eq!(
-            next_line(&blocked),
-            "aethyme broker unblock op:4 --outcome succeeded"
-        );
-        assert!(blocked.lines().count() <= 5, "{blocked}");
-    }
-
-    #[test]
-    fn long_task_text_is_previewed_not_dumped() {
-        let long = "x".repeat(200);
-        let text = render_start(&StartFacts {
-            checkout: "/wt/s7".into(),
-            session: Some(SessionFacts {
-                task: Some(long),
-                ..open_session(7)
-            }),
-            ..StartFacts::default()
-        });
-        assert!(text.lines().next().unwrap().chars().count() < 100, "{text}");
+        assert!(text.ends_with("Next: cd '/wt/it'\\''s here'"), "{text}");
     }
 
     /// Read-only tools cost nothing: no lease lookup happens at all.

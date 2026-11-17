@@ -1154,6 +1154,41 @@ pub(crate) fn trash_deleter_process_use_snapshot(
         .unwrap_or_else(|| crate::reclaim::OpenFileSnapshot::Complete(Vec::new()))
 }
 
+thread_local! {
+    /// What the process-table observations on this thread since the last
+    /// [`take_last_process_table_observation`] saw: `Some(true)` once any was
+    /// complete, `Some(false)` when every one was refused.
+    static LAST_PROCESS_TABLE_OBSERVATION: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static DENY_PROCESS_TABLES_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Every process listing on this thread is refused, as in a sandbox, until
+/// called again with `false`.
+#[cfg(test)]
+pub(crate) fn deny_process_tables_for_test(deny: bool) {
+    DENY_PROCESS_TABLES_FOR_TEST.with(|denied| denied.set(deny));
+}
+
+fn note_process_table_observation(complete: bool) {
+    LAST_PROCESS_TABLE_OBSERVATION.with(|last| {
+        if last.get() != Some(true) {
+            last.set(Some(complete));
+        }
+    });
+}
+
+/// Whether this thread listed processes since the last call (`Some(true)`),
+/// was refused every time (`Some(false)`), or did not try (`None`); resets.
+pub(crate) fn take_last_process_table_observation() -> Option<bool> {
+    LAST_PROCESS_TABLE_OBSERVATION.with(std::cell::Cell::take)
+}
+
 /// The process snapshot is valid only for the holder event it observed.
 /// Holder events are append-only identities, so a rebind forces a fresh
 /// snapshot instead of reusing a process table captured for another owner.
@@ -1264,6 +1299,10 @@ impl RecordedHolderProcessTable {
     /// Take one process-table snapshot, remembering when one fails.
     fn take_process_table(&mut self) -> Option<ProcessTable> {
         #[cfg(test)]
+        if DENY_PROCESS_TABLES_FOR_TEST.with(std::cell::Cell::get) {
+            return self.record_observation(ProcessTableObservation::Denied);
+        }
+        #[cfg(test)]
         if std::mem::take(&mut self.next_process_table_denied_for_test) {
             return self.record_observation(ProcessTableObservation::Denied);
         }
@@ -1281,8 +1320,12 @@ impl RecordedHolderProcessTable {
     /// schedule, and a refusal for the rest of the pass.
     fn record_observation(&mut self, observation: ProcessTableObservation) -> Option<ProcessTable> {
         match observation {
-            ProcessTableObservation::Complete(table) => Some(table),
+            ProcessTableObservation::Complete(table) => {
+                note_process_table_observation(true);
+                Some(table)
+            }
             ProcessTableObservation::Denied => {
+                note_process_table_observation(false);
                 // A refusal is a property of this command, not of the host's
                 // load: retrying cannot help, and the holders it hides are
                 // not judged "unknown" one by one.
@@ -1297,6 +1340,31 @@ impl RecordedHolderProcessTable {
                 self.snapshot_failed_at = Some(Instant::now());
                 None
             }
+        }
+    }
+
+    /// Make sure this pass holds a complete process listing before a close:
+    /// `Ok` when it does; `Err(true)` when the listing was refused (a
+    /// sandboxed caller), `Err(false)` when it failed or may not be taken now.
+    /// A session needing no holder listing (`Unbound`) still gets one taken
+    /// here, so a refused pass is known and closes nothing.
+    pub(crate) fn require_complete_listing(&mut self, allow_snapshot: bool) -> Result<(), bool> {
+        if self.process_listing_denied {
+            return Err(true);
+        }
+        if matches!(self.snapshot, Some(Some(_))) {
+            return Ok(());
+        }
+        if allow_snapshot && (self.snapshot.is_none() || self.process_table_retry_due()) {
+            if self.snapshot.is_some() {
+                self.snapshot_retries += 1;
+            }
+            self.snapshot = Some(self.take_process_table());
+        }
+        match (&self.snapshot, self.process_listing_denied) {
+            (_, true) => Err(true),
+            (Some(Some(_)), false) => Ok(()),
+            _ => Err(false),
         }
     }
 
@@ -1537,6 +1605,12 @@ impl RecordedHolderProcessTable {
         if let Some(hook) = self.before_landed_close.as_mut() {
             hook();
         }
+    }
+
+    /// A complete process listing for the pass, as if one had been taken.
+    #[cfg(test)]
+    pub(crate) fn install_process_table_for_test(&mut self, snapshot: ProcessTable) {
+        self.snapshot = Some(Some(snapshot));
     }
 
     #[cfg(test)]

@@ -87,51 +87,6 @@ pub(super) fn run_readiness(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
-/// The `--session` block as text: the same facts the JSON block carries.
-fn render_session_block(block: &serde_json::Value) {
-    let text = |value: &serde_json::Value| -> String {
-        match value {
-            serde_json::Value::Null => "unknown".into(),
-            serde_json::Value::String(text) => text.clone(),
-            other => other.to_string(),
-        }
-    };
-    out!(
-        "Session {}: {} on {}",
-        text(&block["id"]),
-        text(&block["status"]),
-        text(&block["branch"])
-    );
-    out!("  worktree: {}", text(&block["worktree"]));
-    out!(
-        "  head {} / remote {}; {} unpushed commit(s)",
-        text(&block["head_oid"]),
-        text(&block["remote_oid"]),
-        text(&block["unpushed_commits"])
-    );
-    if block["pr"].is_null() {
-        out!("  pull request: unknown (none recorded locally)");
-    } else {
-        out!(
-            "  pull request: #{} (draft: {}; head {}; mergeability and checks not recorded locally)",
-            text(&block["pr"]["number"]),
-            text(&block["pr"]["draft"]),
-            text(&block["pr"]["head_sha"])
-        );
-    }
-    out!("  preparation: {}", text(&block["preparation"]["state"]));
-    if let Some(blockers) = block["blockers"].as_array() {
-        for blocker in blockers {
-            out!("  blocker: {}", text(&blocker["summary"]));
-        }
-    }
-    out!(
-        "  next: {} ({})",
-        text(&block["next_action"]["command"]),
-        text(&block["next_action"]["reason"])
-    );
-}
-
 /// Which document `broker status` prints. Telemetry records it so a caller
 /// that keeps paying for the full form can be found.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -251,37 +206,87 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         open_broker(parsed.read_only_snapshot)?
     };
     let open_ms = opened.elapsed().as_millis() as u64;
-    if parsed.session_view {
-        let session_id = parsed.session.expect("validated session view");
-        let advice = broker.session_status_advice(session_id, now_ms())?;
-        let block = super::status_extras::session_block(&broker, session_id, &advice);
-        let requests: Vec<_> = broker.session_pending_lease_release_requests(session_id)?.into_iter()
+    let session_id = if form == StatusForm::Compact && parsed.session.is_none() {
+        let cwd = std::env::current_dir()
+            .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
+        let checkout = crate::GitRepo::discover(&cwd)
+            .map_err(|error| UsageError::Message(format!("cannot resolve checkout: {error}")))?;
+        broker
+            .store_ref()
+            .session_for_worktree(checkout.root().to_string_lossy().as_ref())?
+            .map(|session| session.id)
+    } else {
+        parsed.session
+    };
+    if let Some(session_id) = session_id {
+        let coordination = crate::agent_hook::session_coordination(&broker, Some(session_id));
+        let block =
+            super::status_extras::routine_session_block(&broker, session_id, &coordination)?;
+        let requests = broker.session_pending_lease_release_requests(session_id)?;
+        let count = requests.len();
+        let records: Vec<_> = requests.into_iter().take(10)
             .map(|request| serde_json::json!({
                 "request_id": request.request_id, "requester_session_id": request.requester_session_id,
                 "holder_session_id": request.holder_session_id, "path": request.path
             })).collect();
-        let count = requests.len();
         let peers = crate::agent_hook::session_peer_view(&broker, session_id)?;
-        let global = crate::agent_hook::session_global_view(&broker, session_id);
-        let mut value = serde_json::json!({
-            "schema": "aethyme.broker-session-view/v1",
-            "session": block,
-            "peer_state": peers,
-            "global_state": global,
-            "lease_release_requests": {"count": count, "omitted_count": count.saturating_sub(10), "records": requests.into_iter().take(10).collect::<Vec<_>>()},
-            "data_freshness": {"global_warnings": "recorded_partial", "peer_state": "recorded_only", "ownership_claims": "not_inspected", "session_advice": "partial", "deferred_checks_are_unknown": true},
-            "drilldown": {"focused_status": format!("aethyme broker status --session {session_id} --json"), "full_status": "aethyme broker status --full --json"}
-        });
-        super::status_extras::cap_document_advice_evidence(&mut value);
-        let mut value = super::status_revision::render_session(
-            value,
-            broker.main_root(),
-            Some(session_id),
-            parsed.status_revision.as_deref(),
-        )?;
-        value["form"] = serde_json::json!(StatusForm::Compact.as_str());
-        value["hint"] = serde_json::json!(super::status_extras::COMPACT_HINT);
-        out!("{}", serde_json::to_string_pretty(&value)?);
+        if parsed.json {
+            let snapshot = serde_json::json!({
+                "schema": "aethyme.broker-session-view/v2",
+                "session": block,
+                "peer_state": peers,
+                "global_state": coordination.information,
+                "lease_release_requests": {"count": count, "omitted_count": count.saturating_sub(records.len()), "records": records},
+                "data_freshness": {"global_warnings": "recorded_partial", "peer_state": "recorded_only", "ownership_claims": "not_inspected", "session_advice": "partial", "deferred_checks_are_unknown": true},
+                "drilldown": {"leases": format!("aethyme broker advanced leases --session {session_id} --json"), "recovery": "aethyme broker unblock", "full_status": "aethyme broker status --full --json"}
+            });
+            let mut value = super::status_revision::render_session(
+                snapshot,
+                broker.main_root(),
+                Some(session_id),
+                parsed.status_revision.as_deref(),
+            )?;
+            value["form"] = serde_json::json!(form.as_str());
+            value["hint"] = serde_json::json!(super::status_extras::COMPACT_HINT);
+            out!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            out!(
+                "{}",
+                super::status_extras::render_routine_session(&block, true)
+            );
+            if let Some(line) = crate::agent_hook::render_peer_information(&peers, session_id) {
+                out!("{line}");
+            }
+            if count > 0 {
+                out!(
+                    "Coordination: {count} pending lease release request(s) involving this session."
+                );
+                for request in records {
+                    out!(
+                        "  request {} for {} (session {} → session {})",
+                        request["request_id"],
+                        request["path"],
+                        request["requester_session_id"],
+                        request["holder_session_id"]
+                    );
+                }
+            }
+            if let Some(line) =
+                crate::agent_hook::render_repository_information(&coordination.information)
+            {
+                out!("{line}");
+            }
+            out!("Details: aethyme broker status --full --json");
+        }
+        record_status_metric(
+            &parsed,
+            form,
+            &std::collections::BTreeMap::from([
+                ("open".into(), open_ms),
+                ("command_total".into(), opened.elapsed().as_millis() as u64),
+            ]),
+            0,
+        );
         return Ok(());
     }
     if form == StatusForm::Compact {
@@ -291,99 +296,32 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             broker.status_brief(now_ms())?
         };
         let context_started = std::time::Instant::now();
-        let mut context = broker.routine_status_context(now_ms())?;
-        let mut omitted_unrelated_advice = 0;
-        let mut session_advice = Vec::new();
-        if let Some(session_id) = parsed.session {
-            broker.store_ref().session(session_id).map_err(|error| {
-                UsageError::Message(format!(
-                    "cannot focus status on session {session_id}: {error}"
-                ))
-            })?;
-            session_advice = brief
-                .advice
-                .iter()
-                .filter(|item| item.session_id == Some(session_id))
-                .cloned()
-                .collect();
-            let before = brief.advice.len();
-            brief.advice.retain(|item| {
-                item.session_id.is_none()
-                    || item.session_id == Some(session_id)
-                    || matches!(
-                        item.severity,
-                        crate::StatusAdviceSeverity::Blocked | crate::StatusAdviceSeverity::Warning
-                    )
-            });
-            omitted_unrelated_advice = before - brief.advice.len();
-            context.session_contexts.retain(|(id, _)| *id == session_id);
-            // Keep global counts and safety warnings, but reserve the bounded
-            // detail slots for the caller's own coordination first.
-            brief
-                .waiters
-                .sort_by_key(|waiter| waiter.session_id != Some(session_id));
-            context.lease_release_requests.sort_by_key(|request| {
-                request.requester_session_id != session_id
-                    && request.holder_session_id != session_id
-            });
-            context
-                .coordinated_operations
-                .sort_by_key(|operation| operation.session_id != session_id);
-        }
+        let context = broker.routine_status_context(now_ms())?;
         brief.phase_timings_ms.insert(
             "context_records".into(),
             context_started.elapsed().as_millis() as u64,
         );
-        let session_block = parsed.session.map(|session_id| {
-            let started = std::time::Instant::now();
-            let block = super::status_extras::session_block(&broker, session_id, &session_advice);
-            brief
-                .phase_timings_ms
-                .insert("session_block".into(), started.elapsed().as_millis() as u64);
-            block
-        });
         brief.phase_timings_ms.insert("open".into(), open_ms);
         brief
             .phase_timings_ms
             .insert("command_total".into(), opened.elapsed().as_millis() as u64);
         let phase_timings_ms = brief.phase_timings_ms.clone();
         let compact = super::status_compact::CompactStatus::from_brief(brief, context);
-        let mut evidence_truncated = 0;
         if parsed.json {
-            let mut value = serde_json::to_value(&compact)?;
-            if let Some(session_id) = parsed.session {
-                value["focus"] = serde_json::json!({
-                    "session_id": session_id,
-                    "unrelated_notice_and_info_omitted": omitted_unrelated_advice,
-                    "summary_and_blockers_are_global": true,
-                });
-            }
-            if let Some(block) = session_block {
-                value["session"] = block;
-            }
-            evidence_truncated = super::status_extras::cap_document_advice_evidence(&mut value);
+            let value = serde_json::to_value(&compact)?;
             let mut value = super::status_revision::render(
                 value,
                 broker.main_root(),
-                parsed.session,
+                None,
                 parsed.status_revision.as_deref(),
             )?;
-            // Outside the revision: always present, never a "changed section".
             value["form"] = serde_json::json!(StatusForm::Compact.as_str());
             value["hint"] = serde_json::json!(super::status_extras::COMPACT_HINT);
             out!("{}", serde_json::to_string_pretty(&value)?);
         } else {
-            if let Some(session_id) = parsed.session {
-                out!(
-                    "Focused on session {session_id}; summary and blockers remain global. {omitted_unrelated_advice} unrelated notices or informational observations omitted."
-                );
-                if let Some(block) = &session_block {
-                    render_session_block(block);
-                }
-            }
             out!("{}", compact.render_text().trim_end());
         }
-        record_status_metric(&parsed, form, &phase_timings_ms, evidence_truncated);
+        record_status_metric(&parsed, form, &phase_timings_ms, 0);
         return Ok(());
     }
     // The mandated first step of every session, so its cost is a tax

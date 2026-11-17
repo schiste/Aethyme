@@ -151,7 +151,7 @@ fn an_unregistered_checkout_is_told_to_start_a_session() {
     let fixture = Fixture::new();
     let context = fixture.session_start(&fixture.repo);
     assert!(brief(&context).lines().count() <= 5, "{context}");
-    assert!(context.contains("not a broker session"), "{context}");
+    assert!(context.contains("has no broker session"), "{context}");
     assert!(
         next(&context).starts_with("aethyme broker start --task"),
         "{context}"
@@ -172,17 +172,15 @@ fn a_session_worktree_gets_its_state_and_next_command() {
     let brief_text = brief(&context);
     assert!(brief_text.lines().count() <= 5, "{context}");
     assert!(
-        brief_text.starts_with(&format!("Aethyme: session {id}: brief fixture")),
+        brief_text.starts_with(&format!("Aethyme session {id} (active)")),
         "{context}"
     );
     assert!(brief_text.contains("Worktree: "), "{context}");
-    assert!(brief_text.contains("no blockers"), "{context}");
+    assert!(!brief_text.contains("Action required:"), "{context}");
     assert!(
-        next(&context).ends_with(&format!("aethyme broker submit --session {id}")),
-        "{context}"
-    );
-    assert!(
-        brief_text.contains("nothing committed to integrate"),
+        next(&context).starts_with("git -C ")
+            && next(&context)
+                .contains("status --short (inspect worktree changes before committing)"),
         "{context}"
     );
 
@@ -190,13 +188,9 @@ fn a_session_worktree_gets_its_state_and_next_command() {
     git(&worktree, &["add", "-A"]);
     git(&worktree, &["commit", "-qm", "work"]);
     let context = fixture.session_start(&worktree);
+    assert!(brief(&context).contains("Unpushed commits: "), "{context}");
     assert!(
-        brief(&context).contains("1 commit to integrate"),
-        "{context}"
-    );
-    assert_eq!(
-        next(&context),
-        format!("aethyme broker submit --session {id}"),
+        next(&context).starts_with(&format!("aethyme broker submit --session {id} (")),
         "{context}"
     );
 }

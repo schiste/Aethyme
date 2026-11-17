@@ -9,49 +9,26 @@ state.
 
 ## Status and doctor
 
-Routine default text and `broker status --json` (compact by default; `--compact`
-is accepted) use the compact recorded-observation view; `--full` prints the
-full document. Its schema is
-`aethyme.broker-status-compact/v1`; advice is grouped by `(id, severity)` with
-observation and duplicate counts, and every distinct category and its
-drilldown commands remain present. `omitted_details` names evidence and
-per-item identity fields the view leaves out. `data_freshness.deferred_checks`
-are explicitly unknown, not clean, and `leases_refreshed: false` means the
-counts reflect the last recorded refresh. Null summary fields are listed in
-`summary.unknown_fields`.
+In a registered worktree, routine status identifies the current session. Use
+`--session <id>` to select it explicitly from elsewhere. JSON uses
+`aethyme.broker-session-view/v2` for either selection. Its `session` block
+carries the next safe action, preparation and publication state, and
+session-owned recovery observations and live waits. When a wait needs no new
+command, the next action carries an instruction and a null command. `peer_state` includes recorded overlaps on
+the session's leased paths and declared scopes. Lease release request details
+are limited to requests involving the session. Repository information reports
+counts by warning kind, stale sessions as recorded, and unavailable sources.
+Other sessions' recovery commands and evidence appear in explicit drilldowns.
 
-Compact output also retains critical recorded coordination context:
-
-- `session_contexts` contains session IDs and repository/tab/provider labels.
-- `collaboration_fence` is present when active or pending, using the same
-  committed-config semantics as full status; it is absent otherwise.
-- `lease_release_requests` contains pending request IDs, requester/holder IDs
-  and paths. Resolved requests and request reasons require full status.
-- `coordinated_operations` reports total unresolved, holding-lock and waiting
-  counts, plus operation IDs, sessions, lock resources, scopes, states and
-  blocker IDs. Liveness detail requires full status.
-- `waiters.records` retains process/session, resource and holder observations.
-
-Each list retains at most ten rows. `count` describes the complete observed
-list, `omitted_count` names rows excluded by the limit, and `records` contains
-those displayed. Operation counts use `holding_lock_count` and `waiting_count`;
-only non-holder `prepared` operations count as waiting. `waiters.details_omitted`
-is true exactly when its row limit excluded observations. Empty lists have
-zero counts and empty records. These reads use broker records and existing
-fence/waiter helpers; they do not scan retained worktrees or Git history. Required fence checks may
-read committed config from Git.
-Per-list omission counts also appear in default text. Waiting counts describe
-recorded prepared rows, not verified process waits. An `outcome_unknown`
-operation requires reconciliation and is never described as queued.
-`phase_timings_ms.context_records` measures the additional metadata collection.
-The row caps bound output, not storage reads: pending lease requests use the
-existing filtered event-history replay. A required-but-unraised fence can use
-the existing committed-config lookup; an active fence uses its persisted record.
-
-The older `broker status --summary --json` shape remains available. Plain
-`broker status --json` still returns the full recorded view. Use that full
-shape for exact per-session, lease-path or evidence detail; use `--refresh
---json` for the explicit expensive audit.
+Outside a registered worktree, routine JSON uses
+`aethyme.broker-status-compact/v1`. Advice categories keep severity, count and
+omission fields. `session_contexts`, `lease_release_requests`,
+`coordinated_operations` and `waiters` expose counts with empty `records`.
+Deferred checks are unknown and `leases_refreshed: false` identifies recorded
+lease observations. In either scope, `--since-revision` returns only changed
+sections. Use `--full --json` for exact evidence, `broker unblock` for current
+recovery inspection, and `--refresh --json` for a fresh audit.
+`--summary --json` retains its brief shape.
 
 `broker status --refresh --json` lists omitted work in `deferred_checks` and
 the `status.inspection-budget` advisory. Sessions that were not reached by

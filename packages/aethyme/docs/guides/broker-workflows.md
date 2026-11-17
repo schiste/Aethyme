@@ -1522,21 +1522,20 @@ The new session ID may differ from the old one. Always use the ID printed by
 
 ### Routine status and explicit audits
 
-Default text and `aethyme broker status --json` (compact by default) use the recorded
-observation path without scanning each checkout. The compact JSON is versioned
-as `aethyme.broker-status-compact/v1`; it groups advice by id and severity,
-counts repeated observations and retains every category. Each category shows
-up to 10 distinct commands; `commands_omitted_count` is always present (zero
-when none are omitted). Use `aethyme broker status --full --json` to inspect omitted commands and
-per-observation evidence and identities. `deferred_checks` are unknown, not clean, and `leases_refreshed: false` means the lease counts
-come from the last recorded refresh. Null summary fields are listed in
-`summary.unknown_fields`.
+Run `aethyme broker status` from the session worktree for the current session,
+one next safe action, recorded overlaps on its paths or declared scopes, and
+its pending release requests. A recorded overlap is advisory. Reported
+repository warnings and recorded stale sessions are information. The broker
+checks exact resource conflicts when an operation is requested.
+`--session <id>` provides the same view from another checkout. Use `--json` for
+the `aethyme.broker-session-view/v2` snapshot or `--since-revision <token>`
+for the sections that changed.
 
-`aethyme broker status --summary --json` keeps its existing brief JSON shape.
-`aethyme broker status --json` keeps the full recorded status shape and its
-per-session details. Use it when you need exact session, lease-path or
-per-observation evidence; use `--refresh --json` when current Git, conflict and
-cleanup eligibility checks are required.
+Without a session, compact status shows repository counts and the command to
+start a session. Use `aethyme broker status --full --json` for exact session,
+lease-path and per-observation evidence, `aethyme broker unblock` for recovery
+details, and `--refresh --json` for a fresh conflict and cleanup audit.
+`--summary --json` keeps its brief shape. Deferred checks are unknown.
 
 The full JSON retention inventory checks ownership but limits work between
 sessions; an incomplete inventory reports `inventory_complete: false` and

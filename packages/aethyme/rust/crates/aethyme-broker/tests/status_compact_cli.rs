@@ -71,7 +71,11 @@ fn add_worktree(repo: &Path, worktree_root: &Path, name: &str) -> PathBuf {
 }
 
 fn run_status(repo: &Path, args: &[&str]) -> Output {
-    let mut command = common::broker_cli_for_fixture(CLI, args, repo);
+    let checkout = repo
+        .ancestors()
+        .find(|path| path.join(".git").exists())
+        .unwrap_or(repo);
+    let mut command = common::broker_cli_for_fixture(CLI, args, checkout);
     clear_git_selectors(&mut command);
     command
         .current_dir(repo)
@@ -167,10 +171,8 @@ fn compact_status_groups_repeated_warnings_and_marks_omitted_details() {
     assert_eq!(overlap["duplicate_count"], 2);
     assert_eq!(overlap["summary_variants_omitted"], true);
     assert_eq!(overlap["details_omitted"], true);
-    assert_eq!(
-        overlap["commands"],
-        serde_json::json!(["aethyme broker advanced leases --json"])
-    );
+    assert_eq!(overlap["commands"], serde_json::json!([]));
+    assert!(overlap["commands_omitted_count"].as_u64().unwrap() > 0);
     assert!(
         compact["omitted_details"]
             .as_array()
@@ -190,8 +192,8 @@ fn compact_status_groups_repeated_warnings_and_marks_omitted_details() {
     let text = String::from_utf8_lossy(&text.stdout);
     assert!(text.contains("Broker status (compact)"));
     assert!(text.contains("recorded lease-overlap observations"));
-    assert!(text.contains("lease.overlap-conflict"));
-    assert!(text.contains("count 3, 2 duplicates"));
+    assert!(text.contains("Repository information:"));
+    assert!(!text.contains("aethyme broker advanced leases --json"));
     assert!(text.contains("Deferred checks (unknown, not clean)"));
     assert!(text.contains("aethyme broker status --full --json"));
     assert!(text.contains("Dirty sessions and promoted conflicts: not checked."));
@@ -289,7 +291,7 @@ fn compact_json_is_additive_and_legacy_json_shapes_are_unchanged() {
 }
 
 #[test]
-fn compact_status_retains_bounded_waiter_resources() {
+fn unbound_compact_status_summarizes_waiters_without_resources() {
     let fixture = common::FixtureRepository::new();
     init_repo(fixture.path());
     let broker = common::open_fixture_repository_broker(&fixture).unwrap();
@@ -313,23 +315,14 @@ fn compact_status_retains_bounded_waiter_resources() {
     }
     let compact = json_status(fixture.path(), &["status", "--compact", "--json"]);
     assert_eq!(compact["waiters"]["count"], 12);
-    assert_eq!(compact["waiters"]["omitted_count"], 2);
+    assert_eq!(compact["waiters"]["omitted_count"], 12);
     assert_eq!(compact["waiters"]["details_omitted"], true);
-    let rows = compact["waiters"]["records"].as_array().unwrap();
-    assert_eq!(rows.len(), 10);
-    for (i, row) in rows.iter().enumerate() {
-        assert_eq!(row["resource"], format!("resource-{i}"));
-        assert_eq!(row["holder"], format!("session {}", 200 + i));
-    }
+    assert_eq!(compact["waiters"]["records"], serde_json::json!([]));
     let text = run_status(fixture.path(), &["status"]);
     assert!(text.status.success());
     let text = String::from_utf8(text.stdout).unwrap();
-    assert!(
-        text.contains("Waiters: 12 (2 additional rows omitted)."),
-        "{text}"
-    );
-    assert!(text.contains("resource-0: session 200"), "{text}");
-    assert!(!text.contains("resource-11"), "{text}");
+    assert!(text.contains("12 waiter(s)."), "{text}");
+    assert!(!text.contains("resource-0"), "{text}");
 }
 
 #[test]
@@ -373,7 +366,7 @@ fn summary_defers_gate_history_queries_to_full_inspection() {
 }
 
 #[test]
-fn session_focused_status_keeps_global_safety_information_and_checks_identity() {
+fn default_status_identifies_the_worktree_session_and_reports_only_its_conflicts() {
     let fixture = common::FixtureRepository::new();
     init_repo(fixture.path());
     let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
@@ -393,26 +386,17 @@ fn session_focused_status_keeps_global_safety_information_and_checks_identity() 
         fixture.path(),
         &["status", "--compact", "--session", &session_id, "--json"],
     );
-    assert_eq!(focused["focus"]["session_id"], session.id);
-    assert_eq!(focused["focus"]["summary_and_blockers_are_global"], true);
-    assert_eq!(
-        focused["summary"]["live_sessions"],
-        global["summary"]["live_sessions"]
-    );
-    let warnings = |value: &serde_json::Value| {
-        value["advice"]["categories"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|item| item["severity"] == "warning" || item["severity"] == "blocked")
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-    assert!(!warnings(&global).is_empty());
-    assert_eq!(warnings(&focused), warnings(&global));
-    let text = run_status(fixture.path(), &["status", "--session", &session_id]);
+    assert_eq!(focused["schema"], "aethyme.broker-session-view/v2");
+    assert_eq!(focused["peer_state"]["lease_count"], 1);
+    assert!(focused["global_state"].get("records").is_none());
+    assert!(focused.get("session_contexts").is_none());
+    assert_eq!(global["summary"]["live_sessions"], 2);
+    let text = run_status(&first.join("src"), &["status"]);
     assert!(text.status.success());
-    assert!(String::from_utf8_lossy(&text.stdout).contains("summary and blockers remain global"));
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("src/shared.txt"), "{text}");
+    assert!(text.contains("Next:"), "{text}");
+    assert_eq!(text.matches("Next:").count(), 1, "{text}");
     let unknown = run_status(
         fixture.path(),
         &["status", "--compact", "--json", "--session", "999999999"],
@@ -422,10 +406,9 @@ fn session_focused_status_keeps_global_safety_information_and_checks_identity() 
         fixture.path(),
         &["status", "--json", "--session", &session_id],
     );
-    assert_eq!(implicit["focus"]["session_id"], session.id);
-    assert_eq!(implicit["schema"], focused["schema"]);
-    assert_eq!(warnings(&implicit), warnings(&focused));
-
+    let bound = json_status(&first.join("src"), &["status", "--json"]);
+    assert_eq!(bound, focused);
+    assert_eq!(implicit, focused);
     // The session block: local facts only, the PR unknown when unrecorded.
     let block = &implicit["session"];
     assert_eq!(block["id"], session.id, "{block}");
@@ -447,7 +430,7 @@ fn session_focused_status_keeps_global_safety_information_and_checks_identity() 
     assert!(block["advice"].is_array() && block["blockers"].is_array());
     let next = block["next_action"]["command"].as_str().unwrap();
     assert!(
-        next.starts_with("aethyme broker ") && next.contains(&format!("--session {session_id}")),
+        !next.contains("broker push") && next.contains("status --short"),
         "{next}"
     );
     assert!(block["next_action"]["reason"].is_string());
@@ -455,10 +438,10 @@ fn session_focused_status_keeps_global_safety_information_and_checks_identity() 
     let text = run_status(fixture.path(), &["status", "--session", &session_id]);
     let text = String::from_utf8_lossy(&text.stdout);
     assert!(
-        text.contains(&format!("Session {session_id}: active on focused-first")),
+        text.contains(&format!("Aethyme session {session_id} (active)")),
         "{text}"
     );
-    assert!(text.contains("pull request: unknown"), "{text}");
+    assert!(text.contains("Next:"), "{text}");
 }
 
 #[test]
@@ -541,7 +524,7 @@ fn session_view_ignores_unrelated_sessions_and_resets_other_revision_scopes() {
         fixture.path(),
         &["status", "--session", &id, "--session-view", "--json"],
     );
-    assert_eq!(first["schema"], "aethyme.broker-session-view/v1");
+    assert_eq!(first["schema"], "aethyme.broker-session-view/v2");
     assert_eq!(
         first["data_freshness"]["global_warnings"],
         "recorded_partial"
@@ -567,18 +550,11 @@ fn session_view_ignores_unrelated_sessions_and_resets_other_revision_scopes() {
         same["changed_sections"].as_object().unwrap().is_empty(),
         "{same}"
     );
-    let full = json_status(
+    let unbound = json_status(
         fixture.path(),
-        &[
-            "status",
-            "--session",
-            &id,
-            "--since-revision",
-            revision,
-            "--json",
-        ],
+        &["status", "--since-revision", revision, "--json"],
     );
-    assert_eq!(full["revision_reset"], true);
+    assert_eq!(unbound["revision_reset"], true);
     let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
     broker
         .claim_lease(session.id, "src/shared.txt", None)
@@ -709,29 +685,94 @@ fn session_event_follower_drains_backlog_without_another_write() {
 }
 
 #[test]
-fn focused_status_prioritizes_the_callers_waiters_without_hiding_global_counts() {
+fn focused_status_reports_only_live_waits_owned_by_the_selected_session() {
     let fixture = common::FixtureRepository::new();
     init_repo(fixture.path());
     let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
-    let worktree = add_worktree(fixture.path(), &fixture.worktree_root(), "focused-waiter");
-    let session = broker.adopt(&worktree, Some("focused-waiter")).unwrap();
+    let root = fixture.worktree_root();
+    let first = add_worktree(fixture.path(), &root, "waiting-first");
+    let other = add_worktree(fixture.path(), &root, "waiting-other");
+    let session = broker.adopt(&first, None).unwrap();
+    let peer = broker.adopt(&other, None).unwrap();
+    broker
+        .store()
+        .set_session_status(peer.id, aethyme_broker::SessionStatus::Stale, None)
+        .unwrap();
     drop(broker);
     let waits = fixture.path().join(".aethyme/run/waits");
     std::fs::create_dir_all(&waits).unwrap();
-    for index in 0..12 {
-        let waiter = serde_json::json!({
-            "pid": std::process::id(),
-            "session_id": if index == 11 { session.id } else { 987654 },
-            "kind": "lease", "resource": format!("path-{index}"),
-            "holder": "fixture", "started_at_ms": if index == 11 { 2 } else { 1 }
-        });
-        std::fs::write(waits.join(format!("{index}.json")), waiter.to_string()).unwrap();
+    for (id, pid, resource) in [
+        (session.id, std::process::id(), "my-owned-ref"),
+        (peer.id, std::process::id(), "unrelated-ref"),
+        (session.id, i32::MAX as u32, "dead-waiter"),
+    ] {
+        let row = aethyme_broker::WaitRecord {
+            pid: i64::from(pid),
+            session_id: Some(id),
+            kind: "coordinated_write_lock".into(),
+            resource: resource.into(),
+            holder: "fixture holder".into(),
+            started_at_ms: 1,
+        };
+        std::fs::write(
+            waits.join(format!("{resource}.json")),
+            serde_json::to_vec(&row).unwrap(),
+        )
+        .unwrap();
     }
-    let id = session.id.to_string();
-    let status = json_status(fixture.path(), &["status", "--session", &id, "--json"]);
-    assert_eq!(status["waiters"]["count"], 12);
-    assert_eq!(status["waiters"]["omitted_count"], 2);
-    assert_eq!(status["waiters"]["records"][0]["session_id"], session.id);
+    let view = json_status(&first, &["status", "--json"]);
+    assert_eq!(view["global_state"]["recorded_stale_sessions"], 1);
+    assert_eq!(view["session"]["waiting"]["count"], 1, "{view}");
+    assert_eq!(
+        view["session"]["waiting"]["records"][0]["resource"],
+        "my-owned-ref"
+    );
+    assert!(!view.to_string().contains("unrelated-ref"));
+    assert!(!view.to_string().contains("dead-waiter"));
+    assert!(
+        view["session"]["next_action"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("running wait")
+    );
+}
+
+#[test]
+fn session_status_keeps_recovery_details_with_the_session_that_can_act() {
+    let fixture = common::FixtureRepository::new();
+    init_repo(fixture.path());
+    let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
+    let root = fixture.worktree_root();
+    let first = add_worktree(fixture.path(), &root, "recovery-first");
+    let other = add_worktree(fixture.path(), &root, "recovery-other");
+    let session = broker.adopt(&first, Some("focused")).unwrap();
+    let peer = broker.adopt(&other, Some("unrelated")).unwrap();
+    std::fs::create_dir_all(other.join(".aethyme")).unwrap();
+    std::fs::write(
+        other.join(".aethyme/broker-action-required.md"),
+        "private-conflict.txt",
+    )
+    .unwrap();
+    drop(broker);
+
+    let unbound = json_status(fixture.path(), &["status", "--json"]);
+    assert!(unbound.get("session").is_none());
+    let status = json_status(&first, &["status", "--json"]);
+    assert_eq!(status["session"]["id"], session.id);
+    assert_eq!(status["session"]["blockers"], serde_json::json!([]));
+    assert!(!status.to_string().contains("recovery-other"));
+
+    let owner = json_status(&other, &["status", "--json"]);
+    assert_eq!(
+        owner["session"]["blockers"][0]["id"],
+        format!("action:{}", peer.id)
+    );
+    let next = owner["session"]["next_action"]["command"].as_str().unwrap();
+    assert!(
+        next.starts_with("cat ") && next.ends_with("broker-action-required.md"),
+        "{next}"
+    );
+    assert!(!owner.to_string().contains("private-conflict.txt"));
 }
 
 #[test]

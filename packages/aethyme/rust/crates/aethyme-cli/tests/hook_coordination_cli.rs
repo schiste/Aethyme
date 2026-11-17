@@ -432,23 +432,32 @@ fn automation_notes_reach_the_agent_after_its_next_tool_call_once() {
 }
 
 #[test]
-fn session_start_names_live_sessions_changing_files_it_leases() {
+fn session_start_shows_relevant_paths_and_defers_diffs_to_the_edit() {
     let fixture = Fixture::new();
     let (other, other_tree) = fixture.start("Parser rework", "parser");
-    let (_me, my_tree) = fixture.start("Exporter", "exporter");
+    let (me, my_tree) = fixture.start("Exporter", "exporter");
     change_lines(&other_tree, "shared.txt", &[2]);
     change_lines(&my_tree, "shared.txt", &[9]);
     fixture.refresh();
 
     let brief = context(&fixture.hook(&my_tree, "SessionStart", &serde_json::json!({})));
     assert!(
-        brief.contains(&format!(
-            "Overlap: Session {other} (parser) is changing 1 file you lease: shared.txt."
-        )),
+        brief.contains(&format!("session {other} also leases \"shared.txt\".")),
         "{brief}"
     );
-    assert!(brief.contains("| +changed 2"), "{brief}");
-    assert!(brief.contains("not instructions"), "{brief}");
+    assert!(
+        brief.contains(&format!("aethyme broker status --session {me} --json")),
+        "{brief}"
+    );
+    assert!(!brief.contains("| +changed 2"), "{brief}");
+
+    let edit_context =
+        context(&fixture.hook(&my_tree, "PreToolUse", &edit(&my_tree.join("shared.txt"))));
+    assert!(
+        edit_context.contains(&format!("session {other} (parser)")),
+        "{edit_context}"
+    );
+    assert!(edit_context.contains("| +changed 2"), "{edit_context}");
 }
 
 /// Measured, not asserted against a budget: the hook runs on every edit, so

@@ -153,13 +153,11 @@ blocked.
    aethyme broker start --task "<your task>" --short-name "<short name>" --path <planned-path>
    ```
 
-   Routine status groups repeated advice categories, reports deferred checks
-   as unknown, and omits per-session evidence and lease paths. Branch on
-   `advice.categories[].severity` and `.commands`, `summary` and `drilldown`;
-   `status --session <id> --json` adds a `session` block with `next_action`. Use
-   `aethyme broker status --full --json` only when you need exact session, lease-path or
-   evidence detail before deciding what to edit. A deferred check is not a
-   clean result.
+   Routine status gives your worktree's session, its `next_action` and overlaps
+   involving its paths or declared scope. Use `--session <id>` from another
+   checkout. Outside a session, routine status shows repository counts.
+   Treat deferred checks as unknown. Use `aethyme broker status --full --json`
+   when you need exact session, lease-path or recovery evidence.
 
    If the execution tool reports the start command is still running, poll
    that same command to completion before retrying; a pending result does not

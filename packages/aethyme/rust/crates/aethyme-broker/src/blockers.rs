@@ -749,34 +749,44 @@ impl Broker {
         found
     }
 
+    pub(crate) fn session_action_required_blocker(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<Blocker>, BrokerOpError> {
+        Ok(Self::action_required_blocker(
+            &self.store_ref().session(session_id)?,
+        ))
+    }
+
     fn action_required_blockers(&self) -> Result<Vec<Blocker>, BrokerOpError> {
-        let mut found = Vec::new();
-        for session in self.store_ref().live_sessions()? {
-            if session.status.is_closed() {
-                continue;
-            }
-            let notice =
-                Path::new(&session.worktree_path).join(crate::merge::ACTION_REQUIRED_RELPATH);
-            if !notice.is_file() {
-                continue;
-            }
-            found.push(Blocker {
-                id: format!("action:{}", session.id),
-                kind: BlockerKind::ActionRequired,
-                scope: BlockerScope::Repo,
-                cause: format!(
-                    "session {}'s submission conflicted; {} names the files, the blocking \
-                     session, and the rebase steps",
-                    session.id,
-                    notice.display()
-                ),
-                session_id: Some(session.id),
-                clear: format!("aethyme broker submit --session {}", session.id),
-                safe_to_clear_automatically: false,
-                inspect: None,
-            });
+        Ok(self
+            .store_ref()
+            .live_sessions()?
+            .iter()
+            .filter_map(Self::action_required_blocker)
+            .collect())
+    }
+
+    fn action_required_blocker(session: &crate::Session) -> Option<Blocker> {
+        let notice = Path::new(&session.worktree_path).join(crate::merge::ACTION_REQUIRED_RELPATH);
+        if session.status.is_closed() || !notice.is_file() {
+            return None;
         }
-        Ok(found)
+        Some(Blocker {
+            id: format!("action:{}", session.id),
+            kind: BlockerKind::ActionRequired,
+            scope: BlockerScope::Repo,
+            cause: format!(
+                "session {}'s submission conflicted; {} names the files, the blocking \
+                 session, and the rebase steps",
+                session.id,
+                notice.display()
+            ),
+            session_id: Some(session.id),
+            clear: format!("aethyme broker submit --session {}", session.id),
+            safe_to_clear_automatically: false,
+            inspect: None,
+        })
     }
 
     // ── clearing ────────────────────────────────────────────────────
