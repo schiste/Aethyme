@@ -1,6 +1,7 @@
-//! `[transcripts]` in `<host state>/transcripts/settings.toml`: off unless the
-//! owner turns it on. `aethyme transcripts enable|disable` writes this file
-//! and nothing else.
+//! `[transcripts]` in `<host state>/transcripts/settings.toml`. Archiving is
+//! on by default (Codex and Claude Code) when the file is absent or omits
+//! `archive`; an explicit `archive = false` turns it off.
+//! `aethyme transcripts enable|disable` writes this file and nothing else.
 
 use std::fs;
 use std::io;
@@ -12,10 +13,11 @@ use super::providers::Provider;
 
 /// The settings file, under `<host state>/transcripts/`.
 pub const SETTINGS_FILE: &str = "settings.toml";
-pub const DEFAULT_ARCHIVE_AFTER_DAYS: u32 = 3;
+/// Days without activity before a Codex transcript qualifies.
+pub const DEFAULT_ARCHIVE_AFTER_INACTIVE_DAYS: u32 = 3;
 /// Claude Code keeps no transcript open while a session is idle, so its
 /// transcripts wait longer before they count as finished.
-pub const DEFAULT_ARCHIVE_AFTER_DAYS_CLAUDE: u32 = 14;
+pub const DEFAULT_ARCHIVE_AFTER_INACTIVE_DAYS_CLAUDE: u32 = 14;
 const MAX_ARCHIVE_AFTER_DAYS: i64 = 3650;
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -27,14 +29,38 @@ pub const MIN_BYTES_PER_SECOND: u64 = 4 * MIB;
 /// the space is needed now.
 pub const DEFAULT_FREE_SPACE_FLOOR_BYTES: u64 = 20 * GIB;
 
+/// Where `archive` came from: the built-in default (no settings file, or a
+/// file that omits `archive`) or an explicit `archive = true|false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnabledSource {
+    Default,
+    Settings,
+}
+
+impl EnabledSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            EnabledSource::Default => "default",
+            EnabledSource::Settings => "settings",
+        }
+    }
+}
+
 /// The host's transcript-archiving settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TranscriptsConfig {
     pub archive: bool,
-    /// Age before a Codex transcript qualifies.
-    pub archive_after_days: u32,
-    /// Age before a Claude Code transcript qualifies.
-    pub archive_after_days_claude: u32,
+    /// Whether `archive` is the default or set in the settings file.
+    pub enabled_source: EnabledSource,
+    /// Days without activity before a Codex transcript qualifies
+    /// (`archive_after_inactive_days`; the older `archive_after_days` is
+    /// still read).
+    pub archive_after_inactive_days: u32,
+    /// Days without activity before a Claude Code transcript qualifies
+    /// (`archive_after_inactive_days_claude`; the older
+    /// `archive_after_days_claude` is still read).
+    pub archive_after_inactive_days_claude: u32,
     pub providers: Vec<Provider>,
     /// Overrides `$CODEX_HOME` and `~/.codex`.
     pub codex_home: Option<PathBuf>,
@@ -50,10 +76,11 @@ pub struct TranscriptsConfig {
 impl Default for TranscriptsConfig {
     fn default() -> Self {
         Self {
-            archive: false,
-            archive_after_days: DEFAULT_ARCHIVE_AFTER_DAYS,
-            archive_after_days_claude: DEFAULT_ARCHIVE_AFTER_DAYS_CLAUDE,
-            providers: vec![Provider::Codex],
+            archive: true,
+            enabled_source: EnabledSource::Default,
+            archive_after_inactive_days: DEFAULT_ARCHIVE_AFTER_INACTIVE_DAYS,
+            archive_after_inactive_days_claude: DEFAULT_ARCHIVE_AFTER_INACTIVE_DAYS_CLAUDE,
+            providers: vec![Provider::Codex, Provider::Claude],
             codex_home: None,
             claude_home: None,
             repositories: Vec::new(),
@@ -94,15 +121,17 @@ fn days(key: &str, value: &toml::Value) -> Result<u32, String> {
 }
 
 impl TranscriptsConfig {
-    /// The age, in days, before `provider`'s transcripts qualify.
+    /// Days without activity before `provider`'s transcripts qualify.
     pub fn days_for(&self, provider: Provider) -> u32 {
         match provider {
-            Provider::Codex => self.archive_after_days,
-            Provider::Claude => self.archive_after_days_claude,
+            Provider::Codex => self.archive_after_inactive_days,
+            Provider::Claude => self.archive_after_inactive_days_claude,
         }
     }
 
-    /// Parse a settings file. A file without `[transcripts]` is the default.
+    /// Parse a settings file. A file without `[transcripts]` is the default
+    /// (enabled). The `archive_after_inactive_days*` names win over the
+    /// older `archive_after_days*` names whatever their order.
     pub fn parse(text: &str) -> Result<Self, String> {
         let table: toml::Table = toml::from_str(text)
             .map_err(|error| format!("settings are not valid TOML: {error}"))?;
@@ -113,16 +142,23 @@ impl TranscriptsConfig {
         let Some(section) = section.as_table() else {
             return Err("[transcripts] must be a table".into());
         };
+        let mut legacy_days = None;
+        let mut legacy_days_claude = None;
+        let mut inactive_days = None;
+        let mut inactive_days_claude = None;
         for (key, value) in section {
             match key.as_str() {
                 "archive" => {
                     config.archive = value
                         .as_bool()
                         .ok_or("transcripts.archive must be true or false")?;
+                    config.enabled_source = EnabledSource::Settings;
                 }
-                "archive_after_days" => config.archive_after_days = days(key, value)?,
-                "archive_after_days_claude" => {
-                    config.archive_after_days_claude = days(key, value)?;
+                "archive_after_days" => legacy_days = Some(days(key, value)?),
+                "archive_after_days_claude" => legacy_days_claude = Some(days(key, value)?),
+                "archive_after_inactive_days" => inactive_days = Some(days(key, value)?),
+                "archive_after_inactive_days_claude" => {
+                    inactive_days_claude = Some(days(key, value)?);
                 }
                 "providers" => {
                     let Some(items) = value.as_array() else {
@@ -157,10 +193,16 @@ impl TranscriptsConfig {
                 other => return Err(format!("unknown setting transcripts.{other}")),
             }
         }
+        if let Some(days) = inactive_days.or(legacy_days) {
+            config.archive_after_inactive_days = days;
+        }
+        if let Some(days) = inactive_days_claude.or(legacy_days_claude) {
+            config.archive_after_inactive_days_claude = days;
+        }
         Ok(config)
     }
 
-    /// The host's settings; the default (off) when the file does not exist.
+    /// The host's settings; the default (on) when the file does not exist.
     pub fn load(host_dir: &Path) -> Result<Self, String> {
         let path = host_dir.join(SETTINGS_FILE);
         match fs::read_to_string(&path) {
@@ -180,7 +222,9 @@ impl TranscriptsConfig {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SettingsChange {
     pub archive: bool,
-    pub archive_after_days: Option<u32>,
+    /// Written as `archive_after_inactive_days` (the older
+    /// `archive_after_days` key is then removed so one value remains).
+    pub archive_after_inactive_days: Option<u32>,
     pub providers: Option<Vec<Provider>>,
 }
 
@@ -209,8 +253,12 @@ pub(crate) fn write_settings(
         .as_table_mut()
         .ok_or("[transcripts] must be a table")?;
     section.insert("archive", toml_edit::value(change.archive));
-    if let Some(days) = change.archive_after_days {
-        section.insert("archive_after_days", toml_edit::value(i64::from(days)));
+    if let Some(days) = change.archive_after_inactive_days {
+        section.remove("archive_after_days");
+        section.insert(
+            "archive_after_inactive_days",
+            toml_edit::value(i64::from(days)),
+        );
     }
     if let Some(providers) = &change.providers {
         let mut array = toml_edit::Array::new();

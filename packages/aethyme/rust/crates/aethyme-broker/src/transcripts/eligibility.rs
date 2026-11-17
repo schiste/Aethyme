@@ -2,13 +2,16 @@
 //! caller gathered, so every rule is unit-tested without a file system.
 //!
 //! A transcript is archivable only when all of these hold:
-//! - it was last modified more than `archive_after_days` ago;
+//! - it has been inactive for more than `archive_after_inactive_days`: its
+//!   last activity is the newest of its modification time, the timestamp of
+//!   its last record (read from the file's tail) and the last activity of
+//!   every broker session linked to it;
 //! - when broker sessions are linked to it, every one is closed or cleaned
 //!   and its checkout directory no longer exists;
 //! - no process has it open (checked last, because it is the expensive
 //!   fact, and checked again by the archiver right before it acts).
 //!
-//! An unlinked transcript needs only the age and not-open conditions.
+//! An unlinked transcript needs only the inactivity and not-open conditions.
 //! Anything unreadable or ambiguous is a skip with a named reason.
 
 use serde::Serialize;
@@ -21,8 +24,14 @@ pub(crate) const DAY_MS: i64 = 86_400_000;
 pub enum SkipReason {
     /// The modification time could not be read.
     MtimeUnreadable,
-    /// Modified within the configured age.
+    /// Modified within the configured number of inactive days.
     TooRecent,
+    /// Its last record is timestamped within the configured inactive days
+    /// (the modification time alone was old enough).
+    RecentRecord,
+    /// A linked broker session was active within the configured inactive
+    /// days.
+    RecentSessionActivity,
     /// A linked broker database or session row could not be read.
     LinkageUnreadable,
     /// A linked broker session is still open.
@@ -70,6 +79,8 @@ impl SkipReason {
         match self {
             SkipReason::MtimeUnreadable => "mtime_unreadable",
             SkipReason::TooRecent => "too_recent",
+            SkipReason::RecentRecord => "recent_record",
+            SkipReason::RecentSessionActivity => "recent_session_activity",
             SkipReason::LinkageUnreadable => "linkage_unreadable",
             SkipReason::SessionOpen => "session_open",
             SkipReason::CheckoutPresent => "checkout_present",
@@ -106,6 +117,8 @@ pub(crate) struct LinkedSession {
     /// The session row's `cleanup_state` (`open`, `closed`, `cleaned`).
     pub cleanup_state: Option<String>,
     pub checkout: CheckoutState,
+    /// The session row's `last_activity_at`, in milliseconds.
+    pub last_activity_ms: Option<i64>,
 }
 
 /// What the broker databases say about a transcript.
@@ -129,29 +142,56 @@ pub(crate) enum OpenState {
 pub(crate) struct Facts<'a> {
     pub now_ms: i64,
     pub modified_ms: Option<i64>,
-    pub archive_after_days: u32,
+    /// The timestamp of the transcript's last record, when its tail named
+    /// one.
+    pub record_ms: Option<i64>,
+    pub inactive_days: u32,
     pub linkage: &'a Linkage,
 }
 
-/// The age rule alone, used to drop recent files before any linkage work.
+/// Whether `activity_ms` is more than `inactive_days` before `now_ms`. A
+/// time in the future counts as recent.
+pub(crate) fn inactive_long_enough(now_ms: i64, activity_ms: i64, inactive_days: u32) -> bool {
+    let threshold = i64::from(inactive_days).saturating_mul(DAY_MS);
+    now_ms.saturating_sub(activity_ms) > threshold
+}
+
+/// The modification-time rule alone, used to drop recent files before any
+/// tail read or linkage work: the last activity is never older than the
+/// modification time.
 pub(crate) fn judge_age(
     now_ms: i64,
     modified_ms: Option<i64>,
-    archive_after_days: u32,
+    inactive_days: u32,
 ) -> Result<(), SkipReason> {
     let Some(modified) = modified_ms else {
         return Err(SkipReason::MtimeUnreadable);
     };
-    let threshold = i64::from(archive_after_days).saturating_mul(DAY_MS);
-    if now_ms.saturating_sub(modified) <= threshold {
+    if !inactive_long_enough(now_ms, modified, inactive_days) {
         return Err(SkipReason::TooRecent);
     }
     Ok(())
 }
 
+/// The last-record rule: a record timestamped within the inactive days
+/// keeps the transcript.
+pub(crate) fn judge_record(
+    now_ms: i64,
+    record_ms: Option<i64>,
+    inactive_days: u32,
+) -> Result<(), SkipReason> {
+    match record_ms {
+        Some(record) if !inactive_long_enough(now_ms, record, inactive_days) => {
+            Err(SkipReason::RecentRecord)
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Every rule except "not open".
 pub(crate) fn judge_static(facts: &Facts<'_>) -> Result<(), SkipReason> {
-    judge_age(facts.now_ms, facts.modified_ms, facts.archive_after_days)?;
+    judge_age(facts.now_ms, facts.modified_ms, facts.inactive_days)?;
+    judge_record(facts.now_ms, facts.record_ms, facts.inactive_days)?;
     match facts.linkage {
         Linkage::Unlinked => Ok(()),
         Linkage::Unreadable => Err(SkipReason::LinkageUnreadable),
@@ -168,6 +208,14 @@ pub(crate) fn judge_static(facts: &Facts<'_>) -> Result<(), SkipReason> {
                     CheckoutState::Present => return Err(SkipReason::CheckoutPresent),
                     CheckoutState::Unknown => return Err(SkipReason::CheckoutUnknown),
                 }
+            }
+            let recent_session = sessions.iter().any(|session| {
+                session.last_activity_ms.is_some_and(|activity| {
+                    !inactive_long_enough(facts.now_ms, activity, facts.inactive_days)
+                })
+            });
+            if recent_session {
+                return Err(SkipReason::RecentSessionActivity);
             }
             Ok(())
         }

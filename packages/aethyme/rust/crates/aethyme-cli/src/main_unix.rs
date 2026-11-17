@@ -443,8 +443,8 @@ fn main_with_args(args: &[String]) -> ExitCode {
         // What Aethyme stores on this host, its budgets and the worker
         // that keeps it within them.
         "storage" => ExitCode::from(aethyme_broker::storage_ledger::cli::run(&args[1..])),
-        // Opt-in archiving of closed agent transcripts; off unless the host
-        // enabled it, and it writes only its own host settings.
+        // Archiving of closed agent transcripts: on by default, off when the
+        // host's settings say `archive = false`.
         "transcripts" => ExitCode::from(aethyme_broker::transcripts::cli::run(&args[1..])),
         // Broker commands have been native Rust from birth (issue #31).
         "broker" if readiness_remediation::is_command(command.args) => {
@@ -761,15 +761,16 @@ Storage (everything Aethyme keeps on this host):
                               and why not; reads the ledger only
   storage run                 one pass: measure, evict over budget or expired
 
-Agent transcripts (opt-in; <host state>/transcripts/settings.toml):
+Agent transcripts (on by default; <host state>/transcripts/settings.toml):
   transcripts status|list     archived and reclaimable bytes, eligible and
                               skipped transcripts with reasons
   transcripts archive --dry-run|--apply
-                              compress and move closed sessions' transcripts
+                              compress and move transcripts of closed
+                              sessions after N inactive days
                               (Codex: archived_sessions/*.jsonl.zst)
   transcripts restore <id|path>
                               decompress one back, verifying its hash
-  transcripts enable|disable  turn archiving on or off for this host
+  transcripts enable|disable  set archiving on or off explicitly for this host
 
 Collaboration (opt-in, experimental; disabled unless [collaboration] enables it):
   collab status|enroll        policy, state root and captures; mint a project ID

@@ -1861,8 +1861,8 @@ fn record(
             holder, why, previous,
         )),
     )?;
-    // Opt-in transcript archiving links this session to the holder's agent
-    // session; a no-op unless the host enabled it.
+    // Transcript archiving (on by default) links this session to the
+    // holder's agent session; a no-op when the host turned it off.
     crate::transcripts::note_holder_bound(store.db_path(), session_id, holder);
     Ok(())
 }

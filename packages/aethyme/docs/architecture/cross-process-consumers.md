@@ -58,22 +58,46 @@ The exact wire schema, permission rules and staged migration are documented in
 [broker-service.md](broker-service.md). Initial external consumers are manual
 operators; no installed hook, scheduled task or application is migrated yet.
 
-## Opt-in transcript archiving (`aethyme transcripts`)
+## Transcript archiving, on by default (`aethyme transcripts`)
 
 `aethyme transcripts status|list|archive --dry-run|--apply|restore
-<session-id|path>|enable|disable [--json]` is a host-level operator surface.
-JSON output names its shape: `aethyme.transcripts-status/v1`,
-`aethyme.transcripts-list/v1`, `aethyme.transcripts-archive/v1`,
-`aethyme.transcripts-restore/v1`, `aethyme.transcripts-settings/v1`;
-refusals are `aethyme.transcripts-error/v1` with `code` and `message`. Its
-input is `<host state>/transcripts/settings.toml` (`[transcripts] archive`,
-off by default); `enable` and `disable` write only that file. It writes
-`<host state>/transcripts/` (`index.sqlite3`, `runs.jsonl`, `archive.lock`,
-`claude/`), Codex's `archived_sessions/*.jsonl.zst`, and reads broker
-databases read-only. The external consumers are Codex itself (`codex
-unarchive` and `codex resume` read the `.jsonl.zst` archives natively) and
-manual operators. The detached background worker runs the same pass when the
-host opted in. See [the guide](../guides/transcript-archiving.md).
+<session-id|path>|enable [--after-inactive-days <n>]|disable [--json]` is a
+host-level operator surface. JSON output names its shape:
+`aethyme.transcripts-status/v1`, `aethyme.transcripts-list/v1`,
+`aethyme.transcripts-archive/v1`, `aethyme.transcripts-restore/v1`,
+`aethyme.transcripts-settings/v1`; refusals are
+`aethyme.transcripts-error/v1` with `code` and `message`. Its input is
+`<host state>/transcripts/settings.toml` (`[transcripts] archive`, **on by
+default** since 2026-11-17 when the file is absent or omits `archive`;
+`archive_after_inactive_days`, `archive_after_inactive_days_claude`, with
+the older `archive_after_days*` names still read and losing to the new
+ones); `enable` and `disable` write only that file (`--after-days` stays an
+alias of `--after-inactive-days`). Eligibility is inactivity: the newest of
+the file's mtime, its last record's `timestamp` (tail only) and its linked
+broker sessions' `last_activity_at` must be older than the setting.
+`status --json` gains `enabled_source` (`default`|`settings`, also under
+`config`) and `first_run` (`gate`, `noticed_at_ms`, `acknowledged_at_ms`,
+`acknowledged_by`, `automatic_archiving_from_ms`,
+`automatic_archiving_from`, `notice`, `commands`); `config` renames
+`archive_after_days*` to `archive_after_inactive_days*`. Archive reports gain
+`enabled_source`, `first_run_gate`, `record_tails_read` and the skip reasons
+`recent_record` and `recent_session_activity`. On a default-on host
+`aethyme broker status` shows the advice `transcripts.archiving-default-on`
+(severity notice; in every status form including compact, its summary
+names the start time) and records when in
+`<host state>/transcripts/first-run.json`; `broker start` text output
+prints the same notice while the wait runs;
+the background worker archives nothing until 24 hours later, unless
+`enable` or a manual `archive --apply` (recorded as `acknowledged_by`) skips
+the wait. It writes `<host state>/transcripts/` (`index.sqlite3`,
+`runs.jsonl`, `archive.lock`, `first-run.json`, `claude/`), Codex's
+`archived_sessions/*.jsonl.zst`, and reads broker databases read-only. The
+external consumers are Codex itself (`codex unarchive` and `codex resume`
+read the `.jsonl.zst` archives natively) and manual operators. A reader of
+`status --json` `config.archive_after_days` must read
+`config.archive_after_inactive_days`; a host that relied on the old
+off-by-default must write `archive = false` (`aethyme transcripts disable`).
+See [the guide](../guides/transcript-archiving.md).
 
 ## Opt-in MCP server launching (`aethyme mcp`)
 
