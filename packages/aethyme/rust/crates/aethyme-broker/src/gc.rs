@@ -9117,6 +9117,9 @@ impl Broker {
     }
 
     fn run_artifact_sweep_recovery_worker_lanes(&mut self) -> Result<(), BrokerOpError> {
+        // The worker's removal and retirement lanes share one worktree
+        // listing for the lookups that re-verify on disk.
+        let _inventory = crate::git::WorktreeInventoryRunScope::enter();
         let gates_open_for_test = worker_lane_gates_open_for_test();
         if !gates_open_for_test
             && !matches!(std::env::var(ARTIFACT_SWEEP_WORKER_ENV).as_deref(), Ok("1"))
