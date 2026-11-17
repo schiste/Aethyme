@@ -11,9 +11,15 @@
 //! progress, and only when no path the update changes is also changed locally
 //! (modified, staged, renamed, or an untracked file in the way). That overlap
 //! is computed first so a refusal can name the paths, but Git stays the
-//! arbiter: the update is a compare-and-swap of the branch ref followed by a
-//! two-tree `read-tree -m -u`, which refuses rather than overwrite any local
-//! change ([`GitRepo::fast_forward_checkout_preserving_local_changes`]).
+//! arbiter: the index and tree move first by a two-tree `read-tree -m -u`,
+//! which refuses rather than overwrite any local change, and the branch ref
+//! moves last by compare-and-swap
+//! ([`GitRepo::update_tree_preserving_local_changes`], then
+//! [`GitRepo::swap_branch_ref`]). Each step is journaled by a marker in the
+//! broker's run state ([`move_step`]); a later attempt that finds one finishes
+//! or drops the move only when the tree is provably at one end
+//! ([`resolve_marker`]), and otherwise holds with `main-checkout.interrupted`.
+//! Large jumps advance in steps of at most [`STEP_MAX_CHANGED_PATHS`] paths.
 //!
 //! Attempts run from two places: before the everyday commands run in the
 //! primary checkout (no fetch), and from the detached background worker on a
@@ -38,6 +44,8 @@ pub(crate) const REQUEST_META_KEY: &str = "main_checkout.sync_requested";
 const LIFECYCLE_LANE: &str = "main_checkout_sync";
 /// Status advice id.
 pub(crate) const ADVICE_ID: &str = "main-checkout.behind";
+/// Status advice id for an unresolved interrupted move.
+pub(crate) const INTERRUPTED_ADVICE_ID: &str = "main-checkout.interrupted";
 /// Blocking paths a record or advice names; the rest are counted.
 pub(crate) const BLOCKING_PATH_LIMIT: usize = 10;
 /// Longest wait between fetch attempts after repeated failures.
@@ -64,6 +72,8 @@ pub(crate) struct SyncConfig {
     pub(crate) behind_threshold_commits: u64,
     /// ...or behind at all and not synced for more than this many hours.
     pub(crate) behind_threshold_hours: u64,
+    /// Let a move run clean/smudge filters (Git LFS and the like).
+    pub(crate) allow_filters: bool,
 }
 
 impl Default for SyncConfig {
@@ -73,6 +83,7 @@ impl Default for SyncConfig {
             sync_interval_minutes: 15,
             behind_threshold_commits: 50,
             behind_threshold_hours: 24,
+            allow_filters: false,
         }
     }
 }
@@ -122,6 +133,12 @@ fn parse_config(table: Option<&toml::Value>) -> (SyncConfig, Option<String>) {
         match value.as_bool() {
             Some(flag) => config.auto_sync = flag,
             None => problems.push("auto_sync must be true or false"),
+        }
+    }
+    if let Some(value) = table.get("allow_filters") {
+        match value.as_bool() {
+            Some(flag) => config.allow_filters = flag,
+            None => problems.push("allow_filters must be true or false"),
         }
     }
     let mut integer = |key: &str, minimum: u64, slot: &mut u64, problem: &'static str| {
@@ -186,6 +203,14 @@ pub enum SyncReason {
     FetchFailed,
     /// `[main_checkout] auto_sync = false`.
     Disabled,
+    /// A move was interrupted and could not be proven finished or rolled
+    /// back (`main-checkout.interrupted`).
+    Interrupted,
+    /// Clean/smudge filters apply to paths the update changes.
+    FiltersConfigured,
+    /// `status` found unrelated local changes; it moves only a clean
+    /// checkout and leaves the rest to the background sync.
+    DeferredToBackground,
 }
 
 impl SyncReason {
@@ -203,6 +228,9 @@ impl SyncReason {
             Self::InspectionFailed => "inspection_failed",
             Self::FetchFailed => "fetch_failed",
             Self::Disabled => "disabled",
+            Self::Interrupted => "interrupted",
+            Self::FiltersConfigured => "filters_configured",
+            Self::DeferredToBackground => "deferred_to_background",
         }
     }
 
@@ -221,6 +249,9 @@ impl SyncReason {
             Self::InspectionFailed => "main_checkout_sync_held_inspection_failed",
             Self::FetchFailed => "main_checkout_sync_held_fetch_failed",
             Self::Disabled => "main_checkout_sync_held_disabled",
+            Self::Interrupted => "main_checkout_sync_held_interrupted",
+            Self::FiltersConfigured => "main_checkout_sync_held_filters_configured",
+            Self::DeferredToBackground => "main_checkout_sync_held_deferred_to_background",
         }
     }
 }
@@ -239,11 +270,13 @@ pub(crate) struct Hold {
 pub(crate) enum SyncOutcome {
     /// Already at its upstream.
     Current,
-    /// Fast-forwarded.
+    /// Fast-forwarded, to the upstream or (bounded steps) part of the way.
     Advanced {
         from: String,
         to: String,
         commits: u64,
+        /// Why it stopped short of the upstream, when it did for a reason.
+        remaining: Option<Hold>,
     },
     /// Left where it was.
     Held(Hold),
@@ -311,10 +344,64 @@ fn is_maintenance_hold_name(name: &str) -> bool {
         .is_some_and(|(release, suffix)| !release.is_empty() && !suffix.is_empty())
 }
 
-/// Attempt one fast-forward of the primary checkout at `main_root`.
-/// `allow_move = false` measures and records without moving (`auto_sync`
-/// off). Never fetches.
-pub(crate) fn attempt(checkout: &GitRepo, main_root: &Path, allow_move: bool) -> Attempt {
+/// How one attempt may act.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AttemptOptions {
+    /// Off (`auto_sync = false`): measure and record only.
+    pub(crate) allow_move: bool,
+    /// Move a checkout with unrelated local changes. Off for `status`, which
+    /// moves only a clean checkout, as it did before.
+    pub(crate) allow_dirty: bool,
+    /// `[main_checkout] allow_filters`.
+    pub(crate) allow_filters: bool,
+    /// Fast-forward steps this attempt may take.
+    pub(crate) max_steps: usize,
+    /// No further step starts after this.
+    pub(crate) deadline: Option<Instant>,
+    /// Changed paths one step may update.
+    pub(crate) step_max_paths: usize,
+}
+
+impl AttemptOptions {
+    /// Before a command: one bounded step, no fetch.
+    pub(crate) fn foreground(config: SyncConfig, allow_dirty: bool) -> Self {
+        Self {
+            allow_move: config.auto_sync,
+            allow_dirty,
+            allow_filters: config.allow_filters,
+            max_steps: 1,
+            deadline: None,
+            step_max_paths: STEP_MAX_CHANGED_PATHS,
+        }
+    }
+
+    /// The background worker: bounded steps until a time budget runs out.
+    pub(crate) fn worker(config: SyncConfig) -> Self {
+        Self {
+            allow_move: config.auto_sync,
+            allow_dirty: true,
+            allow_filters: config.allow_filters,
+            max_steps: WORKER_MAX_STEPS,
+            deadline: Some(Instant::now() + WORKER_STEP_BUDGET),
+            step_max_paths: STEP_MAX_CHANGED_PATHS,
+        }
+    }
+}
+
+/// Attempt to fast-forward the primary checkout at `main_root`. Never
+/// fetches.
+pub(crate) fn attempt(checkout: &GitRepo, main_root: &Path, options: AttemptOptions) -> Attempt {
+    attempt_with(checkout, main_root, options, &mut || true)
+}
+
+/// [`attempt`] with the test hook [`move_step`] runs between its tree and
+/// ref updates.
+pub(crate) fn attempt_with(
+    checkout: &GitRepo,
+    main_root: &Path,
+    options: AttemptOptions,
+    between: &mut dyn FnMut() -> bool,
+) -> Attempt {
     let mut observed = Observed::default();
     let root_text = main_root.to_string_lossy().into_owned();
     let quoted_root = crate::broker::shell_quote(&root_text);
@@ -386,6 +473,32 @@ pub(crate) fn attempt(checkout: &GitRepo, main_root: &Path, allow_move: bool) ->
                 "could not verify that no live broker session works in this checkout",
                 "aethyme broker status",
             );
+        }
+    }
+    // An interrupted move is resolved before anything else: never report
+    // Current and never start a move while one is unresolved.
+    match read_marker(main_root) {
+        Ok(None) => {}
+        Ok(Some(marker)) => match resolve_marker(checkout, main_root, &marker) {
+            Recovery::Cleared(kind) => {
+                crate::phase_telemetry::add(
+                    if kind == "finished" {
+                        "main_checkout_marker_finished"
+                    } else {
+                        "main_checkout_marker_rolled_back"
+                    },
+                    Duration::ZERO,
+                );
+            }
+            Recovery::Hold(reason, message) => {
+                crate::phase_telemetry::add("main_checkout_marker_unresolved", Duration::ZERO);
+                let command = interrupted_commands(main_root, Some(&marker)).remove(0);
+                return held(observed, reason, &message, &command);
+            }
+        },
+        Err(error) => {
+            let command = interrupted_commands(main_root, None).remove(2);
+            return held(observed, SyncReason::Interrupted, &error, &command);
         }
     }
     let Some((upstream_ref, upstream_commit)) = checkout.tracking_upstream() else {
@@ -467,7 +580,7 @@ pub(crate) fn attempt(checkout: &GitRepo, main_root: &Path, allow_move: bool) ->
         "git -C {quoted_root} merge --ff-only {}",
         crate::broker::shell_quote(&upstream_ref)
     );
-    if !allow_move {
+    if !options.allow_move {
         return held(
             observed,
             SyncReason::Disabled,
@@ -497,129 +610,229 @@ pub(crate) fn attempt(checkout: &GitRepo, main_root: &Path, allow_move: bool) ->
         }
         _ => {}
     }
-
-    let overlap_started = Instant::now();
-    let overlap = {
-        let _span = crate::phase_telemetry::span("main_checkout_overlap_check");
-        local_overlap(checkout, &head, &upstream_commit)
-    };
-    let overlap_elapsed = overlap_started.elapsed();
-    let overlap = match overlap {
-        Ok(overlap) => overlap,
-        Err(()) => {
-            let mut attempt = held(
-                observed,
-                SyncReason::InspectionFailed,
-                "could not list the update's paths or the local changes",
-                &status_command,
-            );
-            attempt.overlap_check = Some(overlap_elapsed);
-            return attempt;
-        }
-    };
-    observed.local_changes = Some(overlap.local_changes);
-    observed.broker_paths_ignored = Some(overlap.broker_paths_ignored);
-    if !overlap.paths.is_empty() {
-        let total = overlap.paths.len();
-        let named = overlap
-            .paths
-            .iter()
-            .take(BLOCKING_PATH_LIMIT)
-            .cloned()
-            .collect::<Vec<_>>();
-        let more = total.saturating_sub(named.len());
-        let message = format!(
-            "{total} locally changed path(s) would be changed by the update: {}{}",
-            named.join(", "),
-            if more > 0 {
-                format!(" (and {more} more)")
-            } else {
-                String::new()
-            }
-        );
-        return Attempt {
-            outcome: SyncOutcome::Held(Hold {
-                reason: SyncReason::LocalChangesOverlap,
-                message,
-                command: status_command,
-                paths: overlap.paths,
-            }),
+    // Local changes, read once: nothing in this attempt changes them.
+    let Ok(local) = local_changes(checkout) else {
+        return held(
             observed,
-            overlap_check: Some(overlap_elapsed),
-            fast_forward: None,
-        };
-    }
-
-    // Recheck the branch and refs immediately before the update; the ref
-    // compare-and-swap and Git's two-tree merge remain the final guards.
-    let still_same = checkout.current_branch().ok().as_deref() == Some(branch.as_str())
-        && checkout.head_commit().ok().as_deref() == Some(head.as_str())
-        && checkout
-            .tracking_upstream()
-            .is_some_and(|(current_ref, current_commit)| {
-                current_ref == upstream_ref && current_commit == upstream_commit
-            });
-    if !still_same {
-        let mut attempt = held(
-            observed,
-            SyncReason::ChangedDuringPreflight,
-            "the checkout changed during fast-forward preflight",
+            SyncReason::InspectionFailed,
+            "could not list the local changes",
             &status_command,
         );
-        attempt.overlap_check = Some(overlap_elapsed);
-        return attempt;
-    }
-    let forward_started = Instant::now();
-    let forwarded = {
-        let _span = crate::phase_telemetry::span("main_checkout_fast_forward");
-        checkout.fast_forward_checkout_preserving_local_changes(&branch, &head, &upstream_commit)
     };
-    let forward_elapsed = forward_started.elapsed();
-    if let Err(error) = forwarded {
-        let first_line = error.to_string().lines().next().unwrap_or("").to_string();
-        let mut attempt = held(
-            observed,
-            SyncReason::GitRefused,
-            &format!(
-                "Git refused to fast-forward without touching local changes (HEAD moved, a local change or untracked file is in the way, or the index was locked): {first_line}"
-            ),
-            &merge_command,
-        );
-        attempt.overlap_check = Some(overlap_elapsed);
-        attempt.fast_forward = Some(forward_elapsed);
-        return attempt;
+    observed.local_changes = Some(local.count);
+    observed.broker_paths_ignored = Some(local.broker_paths_ignored);
+
+    let mut current = head.clone();
+    let mut steps = 0usize;
+    let mut overlap_total = Duration::ZERO;
+    let mut forward_total = Duration::ZERO;
+    let mut stop: Option<Hold> = None;
+    let stop_with = |reason, message: String, command: &str, paths: Vec<String>| {
+        Some(Hold {
+            reason,
+            message,
+            command: command.to_string(),
+            paths,
+        })
+    };
+    while current != upstream_commit
+        && steps < options.max_steps
+        && options
+            .deadline
+            .is_none_or(|deadline| Instant::now() < deadline)
+    {
+        let planned_at = Instant::now();
+        let plan = {
+            let _span = crate::phase_telemetry::span("main_checkout_overlap_check");
+            plan_step(checkout, &current, &upstream_commit, options.step_max_paths)
+        };
+        let Ok((target, changes)) = plan else {
+            overlap_total += planned_at.elapsed();
+            stop = stop_with(
+                SyncReason::InspectionFailed,
+                "could not list the update's paths".into(),
+                &status_command,
+                Vec::new(),
+            );
+            break;
+        };
+        let paths = changes
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect::<Vec<_>>();
+        let mut blocking = overlapping_paths(&paths, &local.tracked, &local.untracked)
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        blocking.extend(ignored_collisions(main_root, &changes));
+        overlap_total += planned_at.elapsed();
+        if !blocking.is_empty() {
+            let blocking = blocking.into_iter().collect::<Vec<_>>();
+            stop = stop_with(
+                SyncReason::LocalChangesOverlap,
+                overlap_message(&blocking),
+                &status_command,
+                blocking,
+            );
+            break;
+        }
+        if !options.allow_filters {
+            match filters_apply(checkout, &paths) {
+                Ok(false) => {}
+                Ok(true) => {
+                    stop = stop_with(
+                        SyncReason::FiltersConfigured,
+                        "clean/smudge filters (for example Git LFS) apply to paths the update changes, and they can run programs or reach the network; set [main_checkout] allow_filters = true to allow them".into(),
+                        &merge_command,
+                        Vec::new(),
+                    );
+                    break;
+                }
+                Err(_) => {
+                    stop = stop_with(
+                        SyncReason::InspectionFailed,
+                        "could not check which filters apply to the update".into(),
+                        &status_command,
+                        Vec::new(),
+                    );
+                    break;
+                }
+            }
+        }
+        if !options.allow_dirty && local.count > 0 {
+            stop = stop_with(
+                SyncReason::DeferredToBackground,
+                format!(
+                    "{} local change(s): `status` moves only a clean checkout; the background sync or a mutating command will",
+                    local.count
+                ),
+                &status_command,
+                Vec::new(),
+            );
+            break;
+        }
+        let still_same = checkout.current_branch().ok().as_deref() == Some(branch.as_str())
+            && checkout.head_commit().ok().as_deref() == Some(current.as_str())
+            && checkout
+                .tracking_upstream()
+                .is_some_and(|(current_ref, current_commit)| {
+                    current_ref == upstream_ref && current_commit == upstream_commit
+                });
+        if !still_same {
+            stop = stop_with(
+                SyncReason::ChangedDuringPreflight,
+                "the checkout changed during fast-forward preflight".into(),
+                &status_command,
+                Vec::new(),
+            );
+            break;
+        }
+        let forward_started = Instant::now();
+        let result = {
+            let _span = crate::phase_telemetry::span("main_checkout_fast_forward");
+            move_step(checkout, main_root, &branch, &current, &target, between)
+        };
+        forward_total += forward_started.elapsed();
+        match result {
+            StepResult::Moved => {
+                crate::phase_telemetry::add("main_checkout_step", Duration::ZERO);
+                current = target;
+                steps += 1;
+            }
+            StepResult::Refused(message) => {
+                stop = stop_with(
+                    SyncReason::GitRefused,
+                    format!(
+                        "Git refused to fast-forward without touching local changes: {message}"
+                    ),
+                    &merge_command,
+                    Vec::new(),
+                );
+                break;
+            }
+            StepResult::Interrupted => {
+                stop = stop_with(
+                    SyncReason::Interrupted,
+                    "the move stopped between its tree update and its ref update".into(),
+                    &interrupted_commands(main_root, None)[0],
+                    Vec::new(),
+                );
+                break;
+            }
+            StepResult::Unresolved(message) => {
+                stop = stop_with(
+                    SyncReason::Interrupted,
+                    message,
+                    &interrupted_commands(main_root, None)[0],
+                    Vec::new(),
+                );
+                break;
+            }
+        }
     }
-    let commits = observed.behind.unwrap_or(0);
-    observed.head = Some(upstream_commit.clone());
-    observed.behind = Some(0);
+    let overlap_check = Some(overlap_total);
+    let fast_forward = (steps > 0 || forward_total > Duration::ZERO).then_some(forward_total);
+    observed.head = Some(current.clone());
+    observed.behind = checkout
+        .commit_count_between(&current, &upstream_commit)
+        .ok();
     observed.ahead = Some(0);
+    if steps > 0 {
+        let commits = checkout.commit_count_between(&head, &current).unwrap_or(0);
+        return Attempt {
+            outcome: SyncOutcome::Advanced {
+                from: head,
+                to: current,
+                commits,
+                remaining: stop,
+            },
+            observed,
+            overlap_check,
+            fast_forward,
+        };
+    }
+    let hold = stop.unwrap_or_else(|| Hold {
+        reason: SyncReason::InspectionFailed,
+        message: "no step fitted in this attempt's budget".into(),
+        command: status_command,
+        paths: Vec::new(),
+    });
     Attempt {
-        outcome: SyncOutcome::Advanced {
-            from: head,
-            to: upstream_commit,
-            commits,
-        },
+        outcome: SyncOutcome::Held(hold),
         observed,
-        overlap_check: Some(overlap_elapsed),
-        fast_forward: Some(forward_elapsed),
+        overlap_check,
+        fast_forward,
     }
 }
 
-struct Overlap {
-    /// Sorted, deduplicated local paths in the update's way.
-    paths: Vec<String>,
-    local_changes: u64,
+fn overlap_message(blocking: &[String]) -> String {
+    let total = blocking.len();
+    let named = blocking
+        .iter()
+        .take(BLOCKING_PATH_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>();
+    let more = total.saturating_sub(named.len());
+    format!(
+        "{total} locally changed path(s) would be changed by the update: {}{}",
+        named.join(", "),
+        if more > 0 {
+            format!(" (and {more} more)")
+        } else {
+            String::new()
+        }
+    )
+}
+
+/// The primary checkout's local changes, read once per attempt.
+struct LocalChanges {
+    tracked: Vec<String>,
+    untracked: Vec<String>,
+    /// Outside the broker's own files.
+    count: u64,
     broker_paths_ignored: u64,
 }
 
-/// Local paths the update from `from` to `to` would touch: a tracked path
-/// changed both locally and by the update, or an untracked path at, above or
-/// below a path the update writes. Compared case-insensitively, so a
-/// collision a case-insensitive filesystem would see is never missed.
-fn local_overlap(checkout: &GitRepo, from: &str, to: &str) -> Result<Overlap, ()> {
-    let changed = checkout
-        .changed_between_all_paths(from, to)
-        .map_err(|_| ())?;
+fn local_changes(checkout: &GitRepo) -> Result<LocalChanges, ()> {
     let tracked = checkout.locally_changed_tracked_paths().map_err(|_| ())?;
     let untracked = checkout.untracked_paths_readonly().map_err(|_| ())?;
     let broker_paths_ignored = tracked
@@ -627,11 +840,462 @@ fn local_overlap(checkout: &GitRepo, from: &str, to: &str) -> Result<Overlap, ()
         .chain(untracked.iter())
         .filter(|path| is_broker_owned_path(path))
         .count() as u64;
-    let local_changes = (tracked.len() + untracked.len()) as u64 - broker_paths_ignored;
-    Ok(Overlap {
-        paths: overlapping_paths(&changed, &tracked, &untracked),
-        local_changes,
+    let count = (tracked.len() + untracked.len()) as u64 - broker_paths_ignored;
+    Ok(LocalChanges {
+        tracked,
+        untracked,
+        count,
         broker_paths_ignored,
+    })
+}
+
+/// The next fast-forward target from `from` toward `to` whose change set
+/// has at most `max_paths` paths (at least one commit), and that change set.
+/// A jump that fits moves in one step; a larger one advances along `to`'s
+/// first-parent line, so each step's tree update stays bounded and is
+/// journaled on its own.
+fn plan_step(
+    checkout: &GitRepo,
+    from: &str,
+    to: &str,
+    max_paths: usize,
+) -> Result<(String, Vec<(u8, String)>), ()> {
+    let changed = |target: &str| {
+        checkout
+            .changed_between_with_status(from, target)
+            .map_err(|_| ())
+    };
+    let whole = changed(to)?;
+    if whole.len() <= max_paths {
+        return Ok((to.to_string(), whole));
+    }
+    let chain = checkout.fast_forward_steps(from, to).map_err(|_| ())?;
+    let Some(first) = chain.first() else {
+        return Ok((to.to_string(), whole));
+    };
+    let mut best = 0usize;
+    let mut best_changes = changed(first)?;
+    if best_changes.len() > max_paths {
+        return Ok((first.clone(), best_changes));
+    }
+    let (mut low, mut high) = (1usize, chain.len().saturating_sub(1));
+    while low <= high {
+        let middle = low + (high - low) / 2;
+        let candidate = changed(&chain[middle])?;
+        if candidate.len() <= max_paths {
+            best = middle;
+            best_changes = candidate;
+            low = middle + 1;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Ok((chain[best].clone(), best_changes))
+}
+
+/// Paths the update adds where something already exists on disk, or whose
+/// parent directory exists as a file that the update does not remove. This
+/// catches ignored files, which `ls-files --others --exclude-standard` does
+/// not list. `lstat` answers case-insensitively where the filesystem is.
+fn ignored_collisions(main_root: &Path, changes: &[(u8, String)]) -> Vec<String> {
+    let removed = changes
+        .iter()
+        .filter(|(status, _)| matches!(status, b'D' | b'T'))
+        .map(|(_, path)| path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut collisions = Vec::new();
+    for (status, path) in changes {
+        if *status != b'A' {
+            continue;
+        }
+        if main_root.join(path).symlink_metadata().is_ok() {
+            collisions.push(path.clone());
+        }
+        for parent in ancestors(path) {
+            if !removed.contains(parent)
+                && main_root
+                    .join(parent)
+                    .symlink_metadata()
+                    .is_ok_and(|metadata| !metadata.is_dir())
+            {
+                collisions.push(parent.to_string());
+            }
+        }
+    }
+    collisions
+}
+
+/// Whether a clean/smudge filter driver is configured and applies to one of
+/// `paths` (or the update changes a `.gitattributes` file).
+fn filters_apply(checkout: &GitRepo, paths: &[String]) -> Result<bool, crate::GitError> {
+    if !checkout.filter_drivers_configured()? {
+        return Ok(false);
+    }
+    if paths
+        .iter()
+        .any(|path| path == ".gitattributes" || path.ends_with("/.gitattributes"))
+    {
+        return Ok(true);
+    }
+    Ok(!checkout.paths_with_filter_attribute(paths)?.is_empty())
+}
+
+/// The journal of one in-flight move, written before the tree update and
+/// removed after the ref update. Its presence on a later attempt means the
+/// move was interrupted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct MoveMarker {
+    pub(crate) schema_version: u32,
+    pub(crate) branch: String,
+    pub(crate) from: String,
+    pub(crate) to: String,
+    pub(crate) started_at: i64,
+    pub(crate) pid: u32,
+}
+
+/// Run-state file holding the [`MoveMarker`].
+const MARKER_FILE: &str = "main-checkout-sync.json";
+/// A marker whose live process is younger than this belongs to a move in
+/// progress, not an interrupted one.
+const MARKER_LIVE_MS: i64 = 2 * 60 * 60 * 1000;
+/// Bound on each Git command of one move step, independent of the command's
+/// own inspection deadline.
+const MOVE_BUDGET: Duration = Duration::from_secs(30 * 60);
+/// Changed paths one step may update.
+pub(crate) const STEP_MAX_CHANGED_PATHS: usize = 2_000;
+/// The background worker starts no further step after this long.
+const WORKER_STEP_BUDGET: Duration = Duration::from_secs(10 * 60);
+/// Steps one background attempt may take.
+const WORKER_MAX_STEPS: usize = 64;
+
+pub(crate) fn marker_path(main_root: &Path) -> std::path::PathBuf {
+    main_root.join(".aethyme/run").join(MARKER_FILE)
+}
+
+pub(crate) fn read_marker(main_root: &Path) -> Result<Option<MoveMarker>, String> {
+    match std::fs::read_to_string(marker_path(main_root)) {
+        Ok(text) => serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|error| format!("unreadable move marker: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("unreadable move marker: {error}")),
+    }
+}
+
+/// Create the marker; `Ok(false)` when one already exists.
+fn write_marker_new(main_root: &Path, marker: &MoveMarker) -> std::io::Result<bool> {
+    use std::io::Write as _;
+    let directory = crate::file_lock::repository_run_directory(main_root)?;
+    let text = serde_json::to_vec(marker).map_err(std::io::Error::other)?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(directory.join(MARKER_FILE))
+    {
+        Ok(mut file) => {
+            file.write_all(&text)?;
+            file.sync_all()?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn clear_marker(main_root: &Path) {
+    std::fs::remove_file(marker_path(main_root)).ok();
+}
+
+/// What one journaled move step did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StepResult {
+    Moved,
+    /// Nothing changed; the marker is gone.
+    Refused(String),
+    /// Stopped between the tree and the ref update; the marker stays (the
+    /// test hook's model of a process killed there).
+    Interrupted,
+    /// The checkout could not be proven back at either end; the marker stays.
+    Unresolved(String),
+}
+
+fn first_line(error: &crate::GitError) -> String {
+    error
+        .to_string()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(300)
+        .collect()
+}
+
+/// Move the primary checkout one step, `from` to `to`, journaled: marker,
+/// tree and index first, branch ref last (compare-and-swap). If the swap
+/// loses (HEAD moved), the tree goes back by the same two-tree merge. Any
+/// state that cannot be proven to be one of the two ends keeps the marker.
+/// `between` runs after the tree update; returning false stops there, as a
+/// killed process would (tests).
+pub(crate) fn move_step(
+    checkout: &GitRepo,
+    main_root: &Path,
+    branch: &str,
+    from: &str,
+    to: &str,
+    between: &mut dyn FnMut() -> bool,
+) -> StepResult {
+    let marker = MoveMarker {
+        schema_version: 1,
+        branch: branch.to_string(),
+        from: from.to_string(),
+        to: to.to_string(),
+        started_at: crate::clock::epoch_ms(),
+        pid: std::process::id(),
+    };
+    match write_marker_new(main_root, &marker) {
+        Ok(true) => {}
+        Ok(false) => {
+            return StepResult::Refused("another main-checkout move holds its marker".into());
+        }
+        Err(error) => {
+            return StepResult::Refused(format!("could not write the move marker: {error}"));
+        }
+    }
+    if checkout.head_commit().ok().as_deref() != Some(from) {
+        clear_marker(main_root);
+        return StepResult::Refused("HEAD moved before the update".into());
+    }
+    if let Err(error) = checkout.update_tree_preserving_local_changes(from, to, MOVE_BUDGET) {
+        // Git refuses before writing; prove that before dropping the marker,
+        // since a killed or failed write could have stopped half way.
+        return match classify_tree(checkout, main_root, from, to) {
+            Ok(TreeState::AtFrom) => {
+                clear_marker(main_root);
+                StepResult::Refused(first_line(&error))
+            }
+            _ => StepResult::Unresolved(format!(
+                "the tree update failed part way and the checkout could not be proven unchanged: {}",
+                first_line(&error)
+            )),
+        };
+    }
+    if !between() {
+        return StepResult::Interrupted;
+    }
+    match checkout.swap_branch_ref(branch, from, to, MOVE_BUDGET) {
+        Ok(()) => {
+            clear_marker(main_root);
+            StepResult::Moved
+        }
+        Err(swap) => match checkout.update_tree_preserving_local_changes(to, from, MOVE_BUDGET) {
+            Ok(()) => {
+                clear_marker(main_root);
+                StepResult::Refused(format!(
+                    "HEAD moved during the update, so the tree was moved back: {}",
+                    first_line(&swap)
+                ))
+            }
+            Err(error) => StepResult::Unresolved(format!(
+                "HEAD moved during the update and the tree could not be moved back: {}",
+                first_line(&error)
+            )),
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeState {
+    /// Every path the move changes is at `to` in the index and on disk.
+    AtTo,
+    /// Every path the move changes is at `from` in the index and on disk.
+    AtFrom,
+    /// Neither.
+    Partial,
+}
+
+/// Where the index and working tree stand on the paths a `from`→`to` move
+/// changes. Paths the move does not change are local work either way.
+pub(crate) fn classify_tree(
+    checkout: &GitRepo,
+    main_root: &Path,
+    from: &str,
+    to: &str,
+) -> Result<TreeState, crate::GitError> {
+    let changes = checkout.changed_between_with_status(from, to)?;
+    let index_vs_to = checkout.index_paths_differing_from(to)?;
+    let index_vs_from = checkout.index_paths_differing_from(from)?;
+    let worktree = checkout.worktree_paths_differing_from_index()?;
+    let on_disk = |path: &str| main_root.join(path).symlink_metadata().is_ok();
+    let at_to = changes.iter().all(|(status, path)| {
+        !index_vs_to.contains(path)
+            && !worktree.contains(path)
+            && (*status != b'D' || !on_disk(path))
+    });
+    if at_to {
+        return Ok(TreeState::AtTo);
+    }
+    let at_from = changes.iter().all(|(status, path)| {
+        !index_vs_from.contains(path)
+            && !worktree.contains(path)
+            && (*status != b'A' || !on_disk(path))
+    });
+    Ok(if at_from {
+        TreeState::AtFrom
+    } else {
+        TreeState::Partial
+    })
+}
+
+/// What resolving a found marker did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Recovery {
+    /// The move was completed (`finished`) or the checkout proven untouched
+    /// (`rolled_back`); the marker is gone.
+    Cleared(&'static str),
+    /// Left as found; the marker stays.
+    Hold(SyncReason, String),
+}
+
+/// Resolve an interrupted move by the same non-destructive means: finish it
+/// (the tree is provably at `to`: swap the ref) or drop it (the tree is
+/// provably at `from`). Anything else stays as found.
+pub(crate) fn resolve_marker(
+    checkout: &GitRepo,
+    main_root: &Path,
+    marker: &MoveMarker,
+) -> Recovery {
+    if let Ok(Some(operation)) = checkout.in_progress_operation() {
+        return Recovery::Hold(SyncReason::OperationInProgress, operation.to_string());
+    }
+    let now = crate::clock::epoch_ms();
+    if marker.pid != std::process::id()
+        && crate::broker::pid_alive(i64::from(marker.pid))
+        && now.saturating_sub(marker.started_at) < MARKER_LIVE_MS
+    {
+        return Recovery::Hold(
+            SyncReason::OperationInProgress,
+            format!(
+                "another main-checkout move (pid {}) is in progress",
+                marker.pid
+            ),
+        );
+    }
+    let branch = checkout.current_branch().unwrap_or_default();
+    if branch != marker.branch {
+        return Recovery::Hold(
+            SyncReason::Interrupted,
+            format!(
+                "an interrupted move of {} was found while the checkout is on {branch}",
+                marker.branch
+            ),
+        );
+    }
+    let head = checkout.head_commit().unwrap_or_default();
+    if head == marker.to {
+        // The ref moves only after the tree, so the move completed.
+        clear_marker(main_root);
+        return Recovery::Cleared("finished");
+    }
+    if head != marker.from {
+        return Recovery::Hold(
+            SyncReason::Interrupted,
+            format!(
+                "an interrupted move from {} to {} was found with HEAD at {head}",
+                marker.from, marker.to
+            ),
+        );
+    }
+    match classify_tree(checkout, main_root, &marker.from, &marker.to) {
+        Ok(TreeState::AtTo) => {
+            match checkout.swap_branch_ref(&marker.branch, &marker.from, &marker.to, MOVE_BUDGET) {
+                Ok(()) => {
+                    clear_marker(main_root);
+                    Recovery::Cleared("finished")
+                }
+                Err(error) => Recovery::Hold(
+                    SyncReason::Interrupted,
+                    format!(
+                        "the interrupted move's tree is complete but its ref could not be moved: {}",
+                        first_line(&error)
+                    ),
+                ),
+            }
+        }
+        Ok(TreeState::AtFrom) => {
+            clear_marker(main_root);
+            Recovery::Cleared("rolled_back")
+        }
+        Ok(TreeState::Partial) => Recovery::Hold(
+            SyncReason::Interrupted,
+            format!(
+                "an interrupted move from {} to {} left some of its paths updated and others not",
+                marker.from, marker.to
+            ),
+        ),
+        Err(error) => Recovery::Hold(
+            SyncReason::InspectionFailed,
+            format!(
+                "could not inspect an interrupted move: {}",
+                first_line(&error)
+            ),
+        ),
+    }
+}
+
+/// The commands that show an interrupted move, most useful first.
+pub(crate) fn interrupted_commands(main_root: &Path, marker: Option<&MoveMarker>) -> Vec<String> {
+    let quoted_root = crate::broker::shell_quote(&main_root.to_string_lossy());
+    let quoted_marker = crate::broker::shell_quote(&marker_path(main_root).to_string_lossy());
+    let mut commands = vec![
+        format!("git -C {quoted_root} status --short --branch"),
+        format!("git -C {quoted_root} rev-parse HEAD"),
+        format!("cat {quoted_marker}"),
+    ];
+    if let Some(marker) = marker {
+        commands.push(format!(
+            "git -C {quoted_root} diff --stat {} {}",
+            marker.from, marker.to
+        ));
+        commands.push(format!(
+            "git -C {quoted_root} diff --cached --stat {}",
+            marker.to
+        ));
+    }
+    commands.push(format!(
+        "once the checkout is back at one end of the move (its paths matching that commit), remove the marker: rm {quoted_marker}"
+    ));
+    commands
+}
+
+/// `main-checkout.interrupted`: a move's marker is present and its process is
+/// gone. Reads one file.
+fn interrupted_advice(main_root: &Path) -> Option<crate::StatusAdvice> {
+    let (marker, detail) = match read_marker(main_root) {
+        Ok(None) => return None,
+        Ok(Some(marker)) => {
+            let live = marker.pid != std::process::id()
+                && crate::broker::pid_alive(i64::from(marker.pid))
+                && crate::clock::epoch_ms().saturating_sub(marker.started_at) < MARKER_LIVE_MS;
+            if live {
+                return None;
+            }
+            let detail = format!(
+                "move of {} from {} to {} started at {} by pid {}",
+                marker.branch, marker.from, marker.to, marker.started_at, marker.pid
+            );
+            (Some(marker), detail)
+        }
+        Err(error) => (None, error),
+    };
+    Some(crate::StatusAdvice {
+        id: INTERRUPTED_ADVICE_ID,
+        severity: crate::StatusAdviceSeverity::Blocked,
+        reason: "a main-checkout move was interrupted; no further move starts until it is resolved",
+        summary: "an interrupted main-checkout move could not be proven finished or rolled back; inspect the checkout before anything commits there".into(),
+        session_id: None,
+        queue_entry_id: None,
+        evidence: vec![detail, format!("marker: {}", marker_path(main_root).display())],
+        commands: interrupted_commands(main_root, marker.as_ref()),
     })
 }
 
@@ -780,22 +1444,39 @@ pub(crate) fn apply_attempt(
     state.trigger = Some(trigger.to_string());
     state.blocking_paths.clear();
     state.blocking_paths_omitted = 0;
-    match &attempt.outcome {
-        SyncOutcome::Current | SyncOutcome::Advanced { .. } => {
-            let result = if matches!(attempt.outcome, SyncOutcome::Current) {
-                "current"
-            } else {
-                "advanced"
-            };
-            state.last_result = Some(result.to_string());
-            state.last_sync_at = Some(now_ms);
+    let hold = match &attempt.outcome {
+        SyncOutcome::Held(hold) => {
+            state.last_result = Some("held".into());
+            Some(hold)
+        }
+        SyncOutcome::Advanced { remaining, .. } => {
+            state.last_result = Some("advanced".into());
+            remaining.as_ref()
+        }
+        SyncOutcome::Current => {
+            state.last_result = Some("current".into());
+            None
+        }
+        SyncOutcome::NoUpstream => {
+            state.last_result = Some("no_upstream".into());
+            None
+        }
+    };
+    if state.behind == Some(0) {
+        state.last_sync_at = Some(now_ms);
+    }
+    match hold {
+        None => {
             state.reason = None;
             state.detail = None;
             state.next_command = None;
-            state.behind_since = None;
+            if state.behind.unwrap_or(0) > 0 {
+                state.behind_since.get_or_insert(now_ms);
+            } else {
+                state.behind_since = None;
+            }
         }
-        SyncOutcome::Held(hold) => {
-            state.last_result = Some("held".into());
+        Some(hold) => {
             state.reason = Some(hold.reason);
             state.detail = Some(hold.message.clone());
             state.next_command = Some(hold.command.clone());
@@ -813,13 +1494,6 @@ pub(crate) fn apply_attempt(
                 state.behind_since = None;
             }
         }
-        SyncOutcome::NoUpstream => {
-            state.last_result = Some("no_upstream".into());
-            state.reason = None;
-            state.detail = None;
-            state.next_command = None;
-            state.behind_since = None;
-        }
     }
     state
 }
@@ -829,7 +1503,13 @@ fn record_attempt_telemetry(attempt: &Attempt, trigger: &str, extra: serde_json:
     crate::phase_telemetry::add("main_checkout_sync_attempt", Duration::ZERO);
     let (result, reason, commits) = match &attempt.outcome {
         SyncOutcome::Current => ("current", None, 0),
-        SyncOutcome::Advanced { commits, .. } => ("advanced", None, *commits),
+        SyncOutcome::Advanced {
+            commits, remaining, ..
+        } => (
+            "advanced",
+            remaining.as_ref().map(|hold| hold.reason),
+            *commits,
+        ),
         SyncOutcome::Held(hold) => ("held", Some(hold.reason), 0),
         SyncOutcome::NoUpstream => ("no_upstream", None, 0),
     };
@@ -842,6 +1522,11 @@ fn record_attempt_telemetry(attempt: &Attempt, trigger: &str, extra: serde_json:
         },
         Duration::ZERO,
     );
+    if result == "advanced"
+        && let Some(reason) = reason
+    {
+        crate::phase_telemetry::add(reason.counter(), Duration::ZERO);
+    }
     let mut details = serde_json::json!({
         "trigger": trigger,
         "result": result,
@@ -862,11 +1547,18 @@ fn record_attempt_telemetry(attempt: &Attempt, trigger: &str, extra: serde_json:
 }
 
 /// The attempt the everyday commands make before they run in the primary
-/// checkout: no fetch, no lock wait. Records the result when the broker
-/// database exists and returns the attempt for the caller to report.
+/// checkout: no fetch, no lock wait, at most one bounded step. `status` is
+/// read-only and moves only a clean checkout, as before; the mutating
+/// commands also move one with unrelated local changes. Records the result
+/// when the broker database exists and returns the attempt for the caller.
 pub(crate) fn foreground_attempt(checkout: &GitRepo, main_root: &Path, trigger: &str) -> Attempt {
     let (config, _) = load_config(main_root);
-    let attempt = attempt(checkout, main_root, config.auto_sync);
+    let allow_dirty = trigger != "broker.status";
+    let attempt = attempt(
+        checkout,
+        main_root,
+        AttemptOptions::foreground(config, allow_dirty),
+    );
     record_attempt_telemetry(&attempt, trigger, serde_json::json!({}));
     let database_exists = crate::broker_db_path(main_root).is_ok_and(|db| db.exists());
     if database_exists && let Ok(store) = crate::BrokerStore::open_in_repo(main_root) {
@@ -983,7 +1675,7 @@ pub(crate) fn run_timer_lane(
         let started = Instant::now();
         let fetched = {
             let _span = crate::phase_telemetry::span("main_checkout_fetch");
-            checkout.fetch_branch_into_tracking_ref(
+            checkout.fetch_default_branch_for_sync(
                 &default.remote,
                 &default.branch,
                 crate::git::git_timeout().min(FETCH_BUDGET_MAX),
@@ -1034,7 +1726,7 @@ pub(crate) fn run_timer_lane(
                 return report;
             }
         };
-    let attempt = attempt(&checkout, main_root, true);
+    let attempt = attempt(&checkout, main_root, AttemptOptions::worker(config));
     drop(lock);
     record_attempt_telemetry(
         &attempt,
@@ -1098,6 +1790,17 @@ fn human_age(ms: i64) -> String {
 /// by more than the configured threshold, or the timer lane's fetch has been
 /// failing that long. Read from the recorded state only (no Git).
 pub(crate) fn status_advice(
+    store: &crate::BrokerStore,
+    main_root: &Path,
+    now_ms: i64,
+) -> Vec<crate::StatusAdvice> {
+    interrupted_advice(main_root)
+        .into_iter()
+        .chain(behind_advice(store, main_root, now_ms))
+        .collect()
+}
+
+fn behind_advice(
     store: &crate::BrokerStore,
     main_root: &Path,
     now_ms: i64,

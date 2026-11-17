@@ -74,6 +74,7 @@ fn config_defaults_and_overrides() {
             sync_interval_minutes: 0,
             behind_threshold_commits: 5,
             behind_threshold_hours: 2,
+            allow_filters: false,
         }
     );
     assert_eq!(
@@ -267,6 +268,7 @@ fn a_held_attempt_records_reason_paths_and_keeps_the_last_sync_time() {
             from: "a".into(),
             to: "b".into(),
             commits: 7,
+            remaining: None,
         },
         observed: Observed {
             behind: Some(0),
@@ -528,4 +530,284 @@ fn completed_maintenance_holds_are_swept_after_a_day_and_nothing_else() {
         Some(&1),
         "{sweep:?}"
     );
+}
+
+/// An offline repository whose `base` files are committed at HEAD (`from`),
+/// with `origin/main` at `to`: one commit per `upstream` file on top.
+fn behind_repository(
+    base: &[(&str, &str)],
+    upstream: &[(&str, &str)],
+) -> (tempfile::TempDir, String, String) {
+    let tmp = offline_repository();
+    let root = tmp.path();
+    if !base.is_empty() {
+        for (path, body) in base {
+            std::fs::write(root.join(path), body).unwrap();
+            git(root, &["add", "-f", path]);
+        }
+        git(root, &["commit", "-qm", "base"]);
+    }
+    let from = git(root, &["rev-parse", "HEAD"]);
+    for (path, body) in upstream {
+        std::fs::write(root.join(path), body).unwrap();
+        git(root, &["add", "-f", path]);
+        git(root, &["commit", "-qm", &format!("upstream {path}")]);
+    }
+    let to = git(root, &["rev-parse", "HEAD"]);
+    git(root, &["update-ref", "refs/remotes/origin/main", &to]);
+    git(root, &["reset", "-q", "--hard", &from]);
+    (tmp, from, to)
+}
+
+fn dirty_options() -> AttemptOptions {
+    AttemptOptions::foreground(SyncConfig::default(), true)
+}
+
+fn head(root: &Path) -> String {
+    git(root, &["rev-parse", "HEAD"])
+}
+
+fn dead_marker(from: &str, to: &str) -> MoveMarker {
+    MoveMarker {
+        schema_version: 1,
+        branch: "main".into(),
+        from: from.into(),
+        to: to.into(),
+        started_at: 1,
+        pid: dead_pid(),
+    }
+}
+
+#[test]
+fn an_interruption_after_the_tree_update_is_finished_by_the_next_attempt() {
+    let (tmp, from, to) = behind_repository(&[], &[("up.txt", "up\n")]);
+    let root = tmp.path();
+    std::fs::write(root.join("README.md"), "local edit\n").unwrap();
+    let checkout = GitRepo::discover(root).unwrap();
+
+    let step = move_step(&checkout, root, "main", &from, &to, &mut || false);
+    assert_eq!(step, StepResult::Interrupted);
+    assert_eq!(head(root), from, "the ref moves last");
+    assert_eq!(std::fs::read(root.join("up.txt")).unwrap(), b"up\n");
+    assert!(
+        marker_path(root).exists(),
+        "the marker survives the interruption"
+    );
+    assert!(interrupted_advice(root).is_some());
+
+    let attempt = attempt(&checkout, root, dirty_options());
+    assert_eq!(attempt.outcome, SyncOutcome::Current, "{attempt:?}");
+    assert_eq!(head(root), to, "recovery finished the move");
+    assert!(!marker_path(root).exists());
+    assert!(interrupted_advice(root).is_none());
+    assert_eq!(
+        std::fs::read(root.join("README.md")).unwrap(),
+        b"local edit\n"
+    );
+    assert_eq!(git(root, &["diff", "--cached", "--name-only"]), "");
+    assert_eq!(git(root, &["status", "--porcelain"]), "M README.md");
+}
+
+#[test]
+fn a_marker_from_before_the_tree_update_is_dropped_and_the_move_retried() {
+    let (tmp, from, to) = behind_repository(&[], &[("up.txt", "up\n")]);
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+    assert!(write_marker_new(root, &dead_marker(&from, &to)).unwrap());
+    let checkout = GitRepo::discover(root).unwrap();
+
+    let attempt = attempt(&checkout, root, dirty_options());
+    assert!(
+        matches!(&attempt.outcome, SyncOutcome::Advanced { to: reached, remaining: None, .. } if *reached == to),
+        "{attempt:?}"
+    );
+    assert_eq!(head(root), to);
+    assert!(!marker_path(root).exists());
+}
+
+#[test]
+fn a_partly_written_move_is_held_with_its_marker_and_advice() {
+    let (tmp, from, to) = behind_repository(&[], &[("one.txt", "one\n"), ("two.txt", "two\n")]);
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+    assert!(write_marker_new(root, &dead_marker(&from, &to)).unwrap());
+    // A tree update cut off after writing one of its two files.
+    std::fs::write(root.join("one.txt"), "one\n").unwrap();
+    let checkout = GitRepo::discover(root).unwrap();
+    assert_eq!(
+        classify_tree(&checkout, root, &from, &to).unwrap(),
+        TreeState::Partial
+    );
+
+    let first = attempt(&checkout, root, dirty_options());
+    match &first.outcome {
+        SyncOutcome::Held(hold) => assert_eq!(hold.reason, SyncReason::Interrupted, "{hold:?}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(head(root), from);
+    assert!(
+        marker_path(root).exists(),
+        "an unproven state keeps the marker"
+    );
+    let advice = interrupted_advice(root).unwrap();
+    assert_eq!(advice.id, INTERRUPTED_ADVICE_ID);
+    assert!(advice.commands.iter().any(|c| c.contains("rev-parse HEAD")));
+    assert!(
+        advice
+            .commands
+            .iter()
+            .any(|c| c.contains(&format!("diff --stat {from} {to}")))
+    );
+    // Still held on the next attempt: never Current, never a new move.
+    let again = attempt(&checkout, root, dirty_options());
+    assert!(matches!(again.outcome, SyncOutcome::Held(_)), "{again:?}");
+}
+
+#[test]
+fn a_concurrent_commit_stops_the_move_and_the_tree_goes_back() {
+    let (tmp, from, to) = behind_repository(&[], &[("up.txt", "up\n")]);
+    let root = tmp.path();
+    std::fs::write(root.join("README.md"), "local edit\n").unwrap();
+    let checkout = GitRepo::discover(root).unwrap();
+
+    // Between the check and the move.
+    let tree = git(root, &["rev-parse", &format!("{from}^{{tree}}")]);
+    let early = git(root, &["commit-tree", &tree, "-p", &from, "-m", "early"]);
+    git(root, &["update-ref", "refs/heads/main", &early]);
+    let step = move_step(&checkout, root, "main", &from, &to, &mut || true);
+    assert!(matches!(step, StepResult::Refused(_)), "{step:?}");
+    assert_eq!(head(root), early);
+    assert!(!root.join("up.txt").exists());
+    assert!(!marker_path(root).exists());
+    git(root, &["update-ref", "refs/heads/main", &from]);
+
+    // Between the tree update and the ref swap.
+    let mut concurrent = String::new();
+    let step = move_step(&checkout, root, "main", &from, &to, &mut || {
+        concurrent = git(root, &["commit-tree", &tree, "-p", &from, "-m", "late"]);
+        git(root, &["update-ref", "refs/heads/main", &concurrent]);
+        true
+    });
+    assert!(matches!(step, StepResult::Refused(_)), "{step:?}");
+    assert_eq!(head(root), concurrent, "the other writer's ref is kept");
+    assert!(!root.join("up.txt").exists(), "the tree went back");
+    assert!(!marker_path(root).exists());
+    assert_eq!(
+        std::fs::read(root.join("README.md")).unwrap(),
+        b"local edit\n"
+    );
+    assert_eq!(git(root, &["status", "--porcelain"]), "M README.md");
+}
+
+#[test]
+fn a_large_jump_advances_in_bounded_steps() {
+    let (tmp, from, to) =
+        behind_repository(&[], &[("a.txt", "a\n"), ("b.txt", "b\n"), ("c.txt", "c\n")]);
+    let root = tmp.path();
+    let checkout = GitRepo::discover(root).unwrap();
+    let chain = checkout.fast_forward_steps(&from, &to).unwrap();
+    assert_eq!(chain.len(), 3);
+    let (target, changes) = plan_step(&checkout, &from, &to, 1).unwrap();
+    assert_eq!(target, chain[0]);
+    assert_eq!(changes, vec![(b'A', "a.txt".to_string())]);
+    let (target, _) = plan_step(&checkout, &from, &to, 2).unwrap();
+    assert_eq!(target, chain[1]);
+    assert_eq!(plan_step(&checkout, &from, &to, 3).unwrap().0, to);
+
+    let options = AttemptOptions {
+        step_max_paths: 1,
+        max_steps: 2,
+        ..dirty_options()
+    };
+    let first = attempt(&checkout, root, options);
+    assert!(
+        matches!(&first.outcome, SyncOutcome::Advanced { to: reached, commits: 2, .. } if *reached == chain[1]),
+        "{first:?}"
+    );
+    assert_eq!(first.observed.behind, Some(1));
+    let second = attempt(&checkout, root, options);
+    assert!(
+        matches!(&second.outcome, SyncOutcome::Advanced { to: reached, .. } if *reached == to),
+        "{second:?}"
+    );
+    assert!(!marker_path(root).exists());
+}
+
+#[test]
+fn filters_on_updated_paths_hold_the_move_unless_allowed() {
+    let (tmp, _from, to) = behind_repository(
+        &[(".gitattributes", "*.bin filter=demo\n")],
+        &[("data.bin", "payload\n")],
+    );
+    let root = tmp.path();
+    git(root, &["config", "filter.demo.smudge", "cat"]);
+    git(root, &["config", "filter.demo.clean", "cat"]);
+    let checkout = GitRepo::discover(root).unwrap();
+
+    let held = attempt(&checkout, root, dirty_options());
+    match &held.outcome {
+        SyncOutcome::Held(hold) => assert_eq!(hold.reason, SyncReason::FiltersConfigured),
+        other => panic!("{other:?}"),
+    }
+    assert!(!root.join("data.bin").exists());
+
+    let allowed = AttemptOptions {
+        allow_filters: true,
+        ..dirty_options()
+    };
+    let moved = attempt(&checkout, root, allowed);
+    assert!(
+        matches!(moved.outcome, SyncOutcome::Advanced { .. }),
+        "{moved:?}"
+    );
+    assert_eq!(head(root), to);
+}
+
+#[test]
+fn an_ignored_file_where_the_update_writes_holds_the_move() {
+    let (tmp, from, _to) = behind_repository(
+        &[(".gitignore", "/.aethyme/\n/broker.db*\n*.cache\n")],
+        &[("data.cache", "upstream\n")],
+    );
+    let root = tmp.path();
+    std::fs::write(root.join("data.cache"), "local ignored\n").unwrap();
+    let checkout = GitRepo::discover(root).unwrap();
+
+    let attempt = attempt(&checkout, root, dirty_options());
+    match &attempt.outcome {
+        SyncOutcome::Held(hold) => {
+            assert_eq!(hold.reason, SyncReason::LocalChangesOverlap);
+            assert_eq!(hold.paths, vec!["data.cache".to_string()]);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(head(root), from);
+    assert_eq!(
+        std::fs::read(root.join("data.cache")).unwrap(),
+        b"local ignored\n"
+    );
+}
+
+#[test]
+fn status_moves_only_a_clean_checkout() {
+    let (tmp, from, to) = behind_repository(&[], &[("up.txt", "up\n")]);
+    let root = tmp.path();
+    std::fs::write(root.join("notes.txt"), "local\n").unwrap();
+    let checkout = GitRepo::discover(root).unwrap();
+    let read_only = AttemptOptions::foreground(SyncConfig::default(), false);
+
+    let attempt_dirty = attempt(&checkout, root, read_only);
+    match &attempt_dirty.outcome {
+        SyncOutcome::Held(hold) => assert_eq!(hold.reason, SyncReason::DeferredToBackground),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(head(root), from);
+
+    std::fs::remove_file(root.join("notes.txt")).unwrap();
+    let attempt_clean = attempt(&checkout, root, read_only);
+    assert!(
+        matches!(attempt_clean.outcome, SyncOutcome::Advanced { .. }),
+        "{attempt_clean:?}"
+    );
+    assert_eq!(head(root), to);
 }

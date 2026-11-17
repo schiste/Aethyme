@@ -2258,6 +2258,40 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String, GitError> {
     crate::status_reads::git_identity(cwd, args, || run_git_inner(cwd, None, args))
 }
 
+/// Run Git within `budget` alone: unlike [`run_git`], an enclosing command
+/// deadline does not shorten it. For the primary-checkout move, which must
+/// not be cut off between its steps by a short inspection budget.
+fn run_git_own_bound(cwd: &Path, args: &[&str], budget: Duration) -> Result<String, GitError> {
+    let mut command = git_command();
+    command.args(args).current_dir(cwd);
+    let started = Instant::now();
+    let output = crate::bounded_output::output_within(&mut command, budget).map_err(|source| {
+        GitError::Spawn {
+            args: args.join(" "),
+            source,
+        }
+    })?;
+    let Some(output) = output else {
+        note_git_timeout();
+        return Err(GitError::timed_out_running(
+            args.join(" "),
+            Some(cwd),
+            started,
+            false,
+            budget,
+        ));
+    };
+    if !output.status.success() {
+        return Err(GitError::Git {
+            args: args.join(" "),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
+}
+
 fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
     let mut command = git_command();
     command
@@ -5360,40 +5394,59 @@ impl GitRepo {
         Ok(())
     }
 
-    /// Fast-forward the checked-out `branch` from exactly `from` to `to`
-    /// while unrelated local changes stay where they are.
+    /// Move the index and working tree from `from` to `to`, leaving every
+    /// unrelated local change where it is. The first half of a primary
+    /// checkout fast-forward; the branch ref moves only afterwards
+    /// ([`Self::swap_branch_ref`]), so an interruption between the two leaves
+    /// the tree ahead of HEAD, never HEAD ahead of the tree.
     ///
-    /// The same two steps as [`Self::fast_forward_checkout_from`]: a
-    /// compare-and-swap of the branch ref, then a two-tree `read-tree -m -u`.
-    /// The two-tree merge is Git's own branch-switch rule: a path whose
-    /// content is the same in `from` and `to` keeps its index entry and its
-    /// working file untouched, a path the update changes is replaced only when
-    /// its index entry and working file still match `from`, and an untracked
-    /// or ignored file the update would write over makes Git refuse. Git never
-    /// discards a local change here; it refuses, and the ref is swapped back.
-    /// No stash, no `reset`, no forced checkout, no submodule update.
+    /// A two-tree `read-tree -m -u` is Git's own branch-switch rule: a path
+    /// whose content is the same in `from` and `to` keeps its index entry and
+    /// working file untouched; a path the update changes is replaced only when
+    /// its index entry and working file still match `from`; an untracked or
+    /// ignored file the update would write over makes Git refuse. On refusal
+    /// nothing is written. No stash, reset, forced checkout or submodule update.
     ///
-    /// Repository hooks do not run: `read-tree` and `update-index` run none,
-    /// and `core.hooksPath` points at a path that cannot hold a hook for the
-    /// one that could (`reference-transaction`, run by `update-ref`).
-    pub(crate) fn fast_forward_checkout_preserving_local_changes(
+    /// Runs under its own `budget`, not an enclosing command deadline. No
+    /// repository hook runs: `read-tree` and `update-index` have none.
+    pub(crate) fn update_tree_preserving_local_changes(
         &self,
-        branch: &str,
         from: &str,
         to: &str,
+        budget: Duration,
     ) -> Result<(), GitError> {
         let hooks_off = format!("core.hooksPath={NO_HOOKS_PATH}");
         // Refresh only the stat data of entries whose content is unchanged,
         // so a file touched without being edited is not taken for a local
         // change. It never rewrites an entry whose content differs. Best
         // effort: `read-tree` stays the arbiter when this cannot run.
-        run_git(
+        run_git_own_bound(
             &self.root,
             &["-c", &hooks_off, "update-index", "-q", "--refresh"],
+            budget,
         )
         .ok();
+        run_git_own_bound(
+            &self.root,
+            &["-c", &hooks_off, "read-tree", "-m", "-u", from, to],
+            budget,
+        )?;
+        Ok(())
+    }
+
+    /// Compare-and-swap `refs/heads/<branch>` from exactly `from` to `to`,
+    /// with a reflog entry. `core.hooksPath` points where no hook can exist,
+    /// so `reference-transaction` does not run.
+    pub(crate) fn swap_branch_ref(
+        &self,
+        branch: &str,
+        from: &str,
+        to: &str,
+        budget: Duration,
+    ) -> Result<(), GitError> {
+        let hooks_off = format!("core.hooksPath={NO_HOOKS_PATH}");
         let reference = format!("refs/heads/{branch}");
-        run_git(
+        run_git_own_bound(
             &self.root,
             &[
                 "-c",
@@ -5405,25 +5458,204 @@ impl GitRepo {
                 to,
                 from,
             ],
+            budget,
         )?;
-        if let Err(error) = run_git(
-            &self.root,
-            &["-c", &hooks_off, "read-tree", "-m", "-u", from, to],
-        ) {
-            let restored = run_git(
-                &self.root,
-                &["-c", &hooks_off, "update-ref", &reference, from, to],
-            );
-            if let Err(restore) = restored {
-                return Err(GitError::Git {
-                    args: format!("read-tree -m -u {from} {to}"),
-                    stderr: format!(
-                        "{error}; restoring {reference} to {from} also failed: {restore}"
-                    ),
-                });
-            }
-            return Err(error);
+        Ok(())
+    }
+
+    /// `(status, path)` for every path that differs between two commits,
+    /// renames reported as a deletion and an addition (`A`, `D`, `M`, `T`).
+    pub(crate) fn changed_between_with_status(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<(u8, String)>, GitError> {
+        let args = [
+            "diff",
+            "--name-status",
+            "-z",
+            "--no-renames",
+            from,
+            to,
+            "--",
+        ];
+        let output = run_git_bytes(&self.root, &args)?;
+        let mut fields = output.split(|byte| *byte == 0).filter(|f| !f.is_empty());
+        let mut entries = Vec::new();
+        while let Some(status) = fields.next() {
+            let path = fields.next().ok_or_else(|| GitError::UntrustedOutput {
+                detail: "git diff --name-status -z ended without a path".into(),
+            })?;
+            let path = std::str::from_utf8(path).map_err(|_| GitError::UntrustedOutput {
+                detail: "git diff --name-status -z returned a non-UTF-8 path".into(),
+            })?;
+            entries.push((status.first().copied().unwrap_or(b'?'), path.to_string()));
         }
+        Ok(entries)
+    }
+
+    /// Paths whose index entry differs from `commit`.
+    pub(crate) fn index_paths_differing_from(
+        &self,
+        commit: &str,
+    ) -> Result<std::collections::BTreeSet<String>, GitError> {
+        Ok(parse_nul_paths(&run_git(
+            &self.root,
+            &[
+                "diff",
+                "--cached",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "--ignore-submodules=none",
+                commit,
+                "--",
+            ],
+        )?)
+        .into_iter()
+        .collect())
+    }
+
+    /// Tracked paths whose working file differs from its index entry.
+    pub(crate) fn worktree_paths_differing_from_index(
+        &self,
+    ) -> Result<std::collections::BTreeSet<String>, GitError> {
+        Ok(parse_nul_paths(&run_git(
+            &self.root,
+            &[
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "--ignore-submodules=none",
+                "--",
+            ],
+        )?)
+        .into_iter()
+        .collect())
+    }
+
+    /// Commits after `from` up to `to` along `to`'s first-parent line, oldest
+    /// first, each a descendant of `from` (so a fast-forward target).
+    pub(crate) fn fast_forward_steps(&self, from: &str, to: &str) -> Result<Vec<String>, GitError> {
+        let range = format!("{from}..{to}");
+        let listing = run_git(
+            &self.root,
+            &[
+                "rev-list",
+                "--reverse",
+                "--first-parent",
+                "--ancestry-path",
+                &range,
+            ],
+        )?;
+        Ok(listing
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Whether any clean/smudge filter driver (`filter.<name>.smudge` or
+    /// `filter.<name>.process`) is configured for this checkout.
+    pub(crate) fn filter_drivers_configured(&self) -> Result<bool, GitError> {
+        let args = ["config", "--get-regexp", r"^filter\..*\.(smudge|process)$"];
+        let mut command = git_command();
+        command
+            .args(args)
+            .current_dir(&self.root)
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        let output = run_git_process_output(command, &args, git_timeout())?;
+        match output.status.code() {
+            Some(0) => Ok(!output.stdout.is_empty()),
+            Some(1) => Ok(false),
+            _ => Err(GitError::Git {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }),
+        }
+    }
+
+    /// The `paths` that a `filter` attribute applies to.
+    pub(crate) fn paths_with_filter_attribute(
+        &self,
+        paths: &[String],
+    ) -> Result<Vec<String>, GitError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut input = Vec::new();
+        for path in paths {
+            input.extend_from_slice(path.as_bytes());
+            input.push(0);
+        }
+        let output = run_git_bytes_with_stdin(
+            &self.root,
+            &["check-attr", "-z", "--stdin", "filter"],
+            &input,
+        )?;
+        let fields = output
+            .split(|byte| *byte == 0)
+            .map(|field| String::from_utf8_lossy(field).into_owned())
+            .collect::<Vec<_>>();
+        Ok(fields
+            .chunks(3)
+            .filter(|triple| triple.len() == 3)
+            .filter(|triple| triple[2] != "unspecified" && triple[2] != "unset")
+            .map(|triple| triple[0].clone())
+            .collect())
+    }
+
+    /// Fetch exactly `refs/heads/<branch>` of `remote` into
+    /// `refs/remotes/<remote>/<branch>` for the background main-checkout
+    /// sync, and nothing else: an explicit non-forcing refspec, no tags, no
+    /// pruning, no submodules, no automatic gc, no hooks and no interactive
+    /// credential prompt. Refuses names that could be read as options or
+    /// refspec syntax.
+    pub(crate) fn fetch_default_branch_for_sync(
+        &self,
+        remote: &str,
+        branch: &str,
+        budget: Duration,
+    ) -> Result<(), GitError> {
+        let unsafe_name = |name: &str| {
+            name.is_empty()
+                || name.starts_with('-')
+                || name.starts_with('+')
+                || name
+                    .chars()
+                    .any(|c| c == ':' || c == '*' || c.is_whitespace() || c.is_control())
+        };
+        if unsafe_name(remote) || unsafe_name(branch) {
+            return Err(GitError::Git {
+                args: "fetch".into(),
+                stderr: format!("refusing to fetch remote {remote:?} branch {branch:?}"),
+            });
+        }
+        let _span = crate::phase_telemetry::span("git_fetch");
+        let hooks_off = format!("core.hooksPath={NO_HOOKS_PATH}");
+        let refspec = format!("refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+        let args = [
+            "-c",
+            hooks_off.as_str(),
+            "-c",
+            "credential.interactive=never",
+            "fetch",
+            "--no-tags",
+            "--no-prune",
+            "--no-recurse-submodules",
+            "--no-auto-gc",
+            "--quiet",
+            remote,
+            refspec.as_str(),
+        ];
+        let mut command = git_command();
+        command
+            .args(args)
+            .current_dir(&self.root)
+            .env("GIT_TERMINAL_PROMPT", "0");
+        run_git_command(command, &args, budget)?;
         Ok(())
     }
 

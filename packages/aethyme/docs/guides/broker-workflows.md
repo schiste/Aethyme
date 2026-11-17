@@ -1275,6 +1275,11 @@ fetches, so "upstream" is as fresh as the last fetch.
 
 ## Keep The Main Checkout Current
 
+Behaviour change: the broker now moves the primary checkout forward even when
+it has local changes, as long as they do not touch the incoming paths. Turn
+it off with `[main_checkout] auto_sync = false` (report only) or stop the
+background attempts with `sync_interval_minutes = 0`.
+
 The primary checkout is where people and agents look first, so the broker
 keeps it on the remote default branch. It moves it only by fast-forward, and
 only when that cannot touch anything local:
@@ -1284,32 +1289,45 @@ only when that cannot touch anything local:
   assume-unchanged or skip-worktree entries, and no live session working in
   it;
 - no path the update changes is also modified, staged or renamed locally,
-  and no untracked file sits at, above or below a path the update writes
-  (compared case-insensitively).
+  and no untracked or ignored file sits at, above or below a path the update
+  writes (compared case-insensitively);
+- no clean/smudge filter (Git LFS, for example) applies to a changed path,
+  since a filter can run programs and reach the network. Set
+  `allow_filters = true` to let it run.
 
 Unrelated local edits, staged work and untracked files stay exactly as they
-were: the update is Git's own two-tree merge (`read-tree -m -u` after a
-compare-and-swap of the branch ref), which refuses rather than overwrite a
-local change. No stash, reset or forced checkout runs, submodules are not
-updated, and repository hooks (`post-merge`, `post-checkout`,
-`reference-transaction`) do not run. The broker's own files under `.aethyme/`
-never count as local changes.
+were. Each step updates the index and tree first, with Git's own two-tree
+merge (`read-tree -m -u`), which refuses rather than overwrite a local
+change, and moves the branch last by compare-and-swap. No stash, reset or
+forced checkout runs, submodules are not updated, and repository hooks
+(`post-merge`, `post-checkout`, `reference-transaction`) do not run. The
+broker's own files under `.aethyme/` never count as local changes.
 
-Attempts run before `status`, `sync`, `push`, `submit`, `finish` and
-`start --adopt/--reuse` when run from the primary checkout (no fetch), and
-from the background worker every 15 minutes, which first fetches only the
-default branch. The worker also removes the broker's own leftovers there:
-staged `.gc.lock.<pid>.<nanos>` files older than an hour whose process is gone,
-and `.operator-*-maintenance-hold-*` directories whose manifest has been
-`complete` for a day. Anything it cannot prove stale is left and counted.
+Every step is journaled in `.aethyme/run/main-checkout-sync.json`. If a step
+is interrupted (killed, machine asleep), the next attempt finishes it when the
+tree is provably at the target, or drops it when the tree is provably
+untouched. Otherwise it leaves everything as found and `broker status` shows
+`main-checkout.interrupted` with the commands to inspect it; nothing moves
+until the checkout is back at one end and the marker is removed. Large jumps
+advance in steps of at most 2,000 changed paths.
+
+`status` is read-only: it moves the checkout only when it is clean, as it
+always did. `sync`, `push`, `submit`, `finish` and `start --adopt/--reuse`
+run from the primary checkout take one step (no fetch), and the background
+worker, every 15 minutes, fetches only the default branch and takes up to 64
+steps in ten minutes. The worker also removes the broker's own leftovers
+there: staged `.gc.lock.<pid>.<nanos>` files older than an hour whose process
+is gone, and `.operator-*-maintenance-hold-*` directories whose manifest has
+been `complete` for a day. Anything it cannot prove stale is left and counted.
 
 When the checkout cannot move, `broker status` shows `main-checkout.behind`
 once it is more than 50 commits or 24 hours behind, with the reason
 (`local_changes_overlap`, `not_on_default_branch`, `local_commits`,
-`operation_in_progress`, `fetch_failed`, `disabled`, ...), up to ten blocking
-paths and the commands to run; `broker start` prints a one-line reminder to
-read code in the session worktree; and `broker status --json` carries the
-record as `main_checkout`. Configure it in `.aethyme/config.toml`:
+`operation_in_progress`, `filters_configured`, `fetch_failed`, `disabled`,
+...), up to ten blocking paths and the commands to run; `broker start` prints
+a one-line reminder to read code in the session worktree; and
+`broker status --json` carries the record as `main_checkout`. Configure it in
+`.aethyme/config.toml`:
 
 ```toml
 [main_checkout]
@@ -1317,6 +1335,7 @@ auto_sync = true               # false: never move it, only report
 sync_interval_minutes = 15     # 0: no background attempts
 behind_threshold_commits = 50
 behind_threshold_hours = 24
+allow_filters = false          # true: let clean/smudge filters run
 ```
 
 ## Finish With A Durable Handoff

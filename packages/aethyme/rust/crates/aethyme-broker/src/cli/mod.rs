@@ -1379,14 +1379,14 @@ fn maybe_fast_forward_main_checkout(args: &[String], mode: &CompatibilityMode) {
             // A switched-off sync and a checkout parked on another branch are
             // deliberate states: recorded for `status`, not repeated here on
             // every command.
-            if !matches!(
-                hold.reason,
-                crate::SyncReason::Disabled | crate::SyncReason::NotOnDefaultBranch
-            ) {
-                report_main_checkout_unchanged(&hold.message, &hold.command);
-            }
+            report_main_checkout_hold(&hold);
         }
-        crate::main_checkout_sync::SyncOutcome::Advanced { from, to, commits } => {
+        crate::main_checkout_sync::SyncOutcome::Advanced {
+            from,
+            to,
+            commits,
+            remaining,
+        } => {
             let branch = observed.branch.unwrap_or_default();
             let upstream_ref = observed.upstream_ref.unwrap_or_default();
             let payload = crate::events::broker_checkout_fast_forwarded_payload(
@@ -1410,7 +1410,24 @@ fn maybe_fast_forward_main_checkout(args: &[String], mode: &CompatibilityMode) {
             if let Some(count) = observed.local_changes.filter(|count| *count > 0) {
                 eprintln!("  {commits} commit(s); {count} local change(s) left as they were.");
             }
+            if let Some(hold) = remaining {
+                report_main_checkout_hold(&hold);
+            }
         }
+    }
+}
+
+/// Print why the primary checkout was held, except for deliberate states
+/// (sync switched off, another branch checked out, `status` leaving a dirty
+/// checkout to the background sync), which `status` reports instead.
+fn report_main_checkout_hold(hold: &crate::main_checkout_sync::Hold) {
+    if !matches!(
+        hold.reason,
+        crate::SyncReason::Disabled
+            | crate::SyncReason::NotOnDefaultBranch
+            | crate::SyncReason::DeferredToBackground
+    ) {
+        report_main_checkout_unchanged(&hold.message, &hold.command);
     }
 }
 

@@ -528,8 +528,24 @@ fn unrelated_local_changes_ride_along_a_fast_forward_untouched() {
     let worktree_diff_before = git_output(&fixture.repo, &["diff"]);
     let staged_diff_before = git_output(&fixture.repo, &["diff", "--cached", "-M"]);
 
-    let output = fixture.run(&["status", "--full", "--json"], &fixture.remote);
-    let status = json(&output);
+    // `status` is read-only: it leaves a dirty checkout to the background
+    // sync, quietly.
+    let read_only = fixture.run(&["status", "--full", "--json"], &fixture.remote);
+    let status = json(&read_only);
+    let quiet = String::from_utf8_lossy(&read_only.stderr);
+    assert_eq!(git_output(&fixture.repo, &["rev-parse", "HEAD"]), before);
+    assert!(
+        !quiet.contains("left the main checkout unchanged"),
+        "{quiet}"
+    );
+    assert_eq!(
+        status["main_checkout"]["reason"], "deferred_to_background",
+        "{status:#}"
+    );
+
+    // A mutating command moves it. The command itself may refuse (no
+    // session here); the attempt runs before it.
+    let output = fixture.run(&["sync", "--json"], &fixture.remote);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert_ne!(before, upstream);
@@ -569,11 +585,12 @@ fn unrelated_local_changes_ride_along_a_fast_forward_untouched() {
         stderr.contains("local change(s) left as they were"),
         "{stderr}"
     );
-    assert_eq!(fixture.checkout_fast_forward_events().len(), 1);
-    assert_eq!(
-        status["main_checkout"]["last_result"], "advanced",
-        "{status:#}"
-    );
+    let events = fixture.checkout_fast_forward_events();
+    assert_eq!(events.len(), 1);
+    let payload: serde_json::Value =
+        serde_json::from_str(events[0].payload_json.as_deref().unwrap()).unwrap();
+    assert_eq!(payload["trigger"], "broker.sync");
+    let status = json(&fixture.run(&["status", "--full", "--json"], &fixture.remote));
     assert_eq!(status["main_checkout"]["behind"], 0, "{status:#}");
     assert_eq!(status["main_checkout"]["branch"], "main", "{status:#}");
     assert!(status["main_checkout"]["last_sync_at"].as_i64().is_some());
