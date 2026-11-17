@@ -2752,26 +2752,44 @@ reports.
 - **Queue.** A blocking claim (start, adopt, finish, cleanup, close, submit,
   gate admission, storage removal) creates a ticket under
   `.aethyme/run/lifecycle-lock-waiters/` named
-  `<enqueue epoch ns>.<pid>.<process start>.<sequence>` and tries the lock only
-  while no live ticket sorts before its own. It refreshes the ticket's mtime
-  every second while it waits and removes the ticket once it holds the lock, on
-  timeout, or on error. A ticket whose PID has exited, whose PID now has a
-  different process start time, or that is older than 15 minutes is removed by
-  the next waiter that scans; a live ticket not refreshed for 10 seconds is
-  passed over but kept. Anything else in the directory is ignored. The wait
-  stays bounded at 180 seconds (less under a command Git deadline, at most 10
+  `<deadline ns>.<enqueue ns>.<pid>.<process start>.<sequence>`, both times on
+  the host monotonic clock (`CLOCK_MONOTONIC`), where the deadline is the
+  enqueue time plus the caller's wait budget. Tickets are served earliest
+  deadline first, ties by enqueue time, PID and sequence (a total order), and a
+  waiter tries the lock only while no live ticket sorts before its own. So gate
+  admission (10 s budget) goes ahead of a `start` that still has minutes left,
+  and a newer arrival outranks a waiter only when its own deadline is earlier:
+  a waiter with `r` seconds left is never passed by an arrival whose budget is
+  `r` seconds or more. The head of the queue polls every 50 ms, others rescan
+  every 250 ms, and each waiter reuses a ticket's liveness verdict for 1 s.
+  While it waits, a waiter writes `heartbeat=<monotonic ns>` into its ticket
+  every 2 s and re-creates the ticket under the same name if it disappeared;
+  it removes the ticket once it holds the lock, on timeout, or on error. A
+  ticket whose PID has exited, whose PID now has a different process start
+  time, whose times lie ahead of the clock (written before a reboot), or that
+  was enqueued more than 15 minutes ago is removed by the next waiter that
+  scans. A live ticket whose heartbeat is more than 10 s old is passed over
+  but kept. File modification times are not consulted, so a wall-clock jump
+  ages nothing. Anything else in the directory is ignored. The wait stays
+  bounded at 180 seconds (less under a command Git deadline, at most 10
   seconds for gate admission).
-- **Foreground first.** A nonblocking claim (`try_claim_worktree_lifecycle`:
-  retirement, auto-cleanup, GC, missing-checkout repair, abandoned-session
-  close) returns "busy" while any live ticket exists, even when the lock itself
-  is free. `broker start` making room at the checkout limit and
-  `gc artifact-use reconcile apply` claim inside a foreground scope and do not
+- **Foreground first, background bounded.** A nonblocking claim
+  (`try_claim_worktree_lifecycle(lane)`, lanes `retire`, `auto_cleanup`, `gc`,
+  `missing_checkout`, `abandoned_close`, `artifact_use_reconcile`) returns
+  "busy" while any live ticket exists, even when the lock is free. Each lane
+  records its run of yields in `.aethyme/run/lifecycle-lock-yields/<lane>`
+  (`since_ns=<monotonic ns> count=<n>`). After 5 consecutive yields or 60 s of
+  yielding, the lane's next attempt takes a ticket itself and waits its turn
+  for at most 30 s (less under a command Git deadline). It then holds the claim
+  or reports busy, and its run of yields starts over. A direct acquisition also
+  clears the record. `broker start` making room at the checkout limit and
+  `gc artifact-use reconcile apply` claim inside a foreground scope and never
   yield. The background worker's capacity slice is not foreground.
 - **Compatibility.** Binaries older than this change keep no ticket and poll
   unordered, so they can take the lock out of turn; ordering degrades, mutual
   exclusion does not. A reader must tolerate the new directory.
 - **Holder record.** The lock file now reads
-  `pid=<pid> since_ms=<epoch ms> kind=<foreground|nonblocking> session=<id|-> operation=<first command words>`
+  `pid=<pid> since_ms=<epoch ms> kind=<foreground|nonblocking|promoted> session=<id|-> operation=<first command words>`
   (`operation=` stays last) and is emptied, still under the lock, when the claim
   is released. The session is taken only from a numeric `--session` argument.
   Readers of the older `pid=… since_ms=… operation=…` form keep working.
@@ -2790,7 +2808,12 @@ reports.
   summed phases and the last queued claim's object. A nonblocking claim adds
   to `lifecycle_lock_held` and counts `lifecycle_lock_nonblocking_acquired`
   (or `lifecycle_lock_yielded_to_waiter` when it yielded) but never writes the
-  object. `broker start`'s own
+  object. Background lanes write a separate object, `lifecycle_lock_background`:
+  `lane`, `outcome` (`yielded`, `promoted_acquired`, `promoted_timeout`,
+  `promoted_failed`), `consecutive_yields`, `yielding_for_ms` and, when
+  promoted, `promoted_wait_ms` and `queue_position_at_enqueue`, plus the timed
+  phase `lifecycle_lock_promoted_wait`. A waiter that had to re-create its
+  ticket counts `lifecycle_lock_ticket_recreated`. `broker start`'s own
   `phase_timings_ms.lifecycle_lock_wait` takes precedence over the span of the
   same name on success.
 - **Shorter `start` hold.** The sparse-checkout plan is computed before the

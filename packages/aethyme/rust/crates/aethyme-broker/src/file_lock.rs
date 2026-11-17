@@ -12,33 +12,54 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 /// How long a foreground lifecycle command waits for the claim. A start on
 /// Mockup (11,437 tracked files, load about 40) held it for 20-25 s, so a 10 s
 /// wait failed 102 starts in one day (2026-11-05), each leaving its agent to
 /// retry by hand. This covers about seven such holders queued ahead.
 const LIFECYCLE_LOCK_WAIT: Duration = Duration::from_secs(180);
+/// How often the waiter at the head of the queue tries the lock.
 const LIFECYCLE_LOCK_POLL: Duration = Duration::from_millis(50);
+/// How often a waiter with others ahead of it rescans the queue: it cannot
+/// take the lock before they do, so it need not look as often.
+const LIFECYCLE_QUEUED_POLL: Duration = Duration::from_millis(250);
 /// When a waiting command first says so, and how often after that.
 const LIFECYCLE_WAIT_NOTICE_AFTER: Duration = Duration::from_secs(5);
 const LIFECYCLE_WAIT_NOTICE_EVERY: Duration = Duration::from_secs(30);
 
-/// Directory, under `.aethyme/run`, where every foreground command waiting for
-/// the lifecycle lock keeps one ticket file for as long as it waits. The lock
+/// Directory, under `.aethyme/run`, where every command waiting for the
+/// lifecycle lock keeps one ticket file for as long as it waits. The lock
 /// itself stays the flock on `worktree-lifecycle.lock`; tickets only decide who
 /// may try it next, so a lost or unreadable ticket can cost fairness, never
 /// mutual exclusion.
 const LIFECYCLE_WAITERS_DIR: &str = "lifecycle-lock-waiters";
-/// How often a waiting command refreshes its ticket's modification time.
-const LIFECYCLE_TICKET_HEARTBEAT: Duration = Duration::from_secs(1);
-/// A ticket whose live process stopped refreshing it this long ago (stopped,
-/// hung, or swapped out) is passed over, so it cannot hold up the queue. It is
-/// not removed: the waiter takes its turn again once it refreshes.
+/// How often a waiting command writes a fresh heartbeat into its ticket (and
+/// re-creates the ticket if something removed it).
+const LIFECYCLE_TICKET_HEARTBEAT: Duration = Duration::from_secs(2);
+/// A ticket whose live process has not written a heartbeat for this long
+/// (stopped, hung, or swapped out) is passed over, so it cannot hold up the
+/// queue. It is not removed: the waiter takes its turn again once it beats.
 const LIFECYCLE_TICKET_STALL: Duration = Duration::from_secs(10);
-/// A ticket older than this is removed whatever its process: no command waits
-/// this long, so it was left by one that never cleaned up.
+/// A ticket enqueued longer ago than this is removed whatever its process: no
+/// command waits this long, so it was left by one that never cleaned up.
 const LIFECYCLE_TICKET_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+/// How long one waiter trusts a ticket's liveness verdict before checking the
+/// process again.
+const LIFECYCLE_LIVENESS_CACHE: Duration = Duration::from_secs(1);
+
+/// Directory, under `.aethyme/run`, where each background lane records since
+/// when, and how many times in a row, it has yielded to queued waiters.
+const LIFECYCLE_YIELDS_DIR: &str = "lifecycle-lock-yields";
+/// A background lane that has yielded continuously for this long queues
+/// instead of yielding again.
+const BACKGROUND_YIELD_LIMIT: Duration = Duration::from_secs(60);
+/// A background lane that has yielded this many times in a row queues on its
+/// next attempt instead of yielding again.
+const BACKGROUND_YIELD_COUNT: u32 = 5;
+/// How long a promoted background lane waits in the queue before it gives up
+/// for this pass (never past an active command Git deadline).
+const BACKGROUND_PROMOTED_WAIT: Duration = Duration::from_secs(30);
 
 /// Orders tickets one process creates within the same clock tick.
 static LIFECYCLE_TICKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -82,9 +103,12 @@ enum LifecycleClaimKind {
     /// A command that waits its turn in the queue (start, adopt, finish,
     /// cleanup, close, submit, gate admission, storage removal).
     Foreground,
-    /// A nonblocking claim; it yields to any queued foreground waiter unless
-    /// made inside a [`ForegroundLifecycleTryClaim`] scope.
+    /// A nonblocking claim; it yields to any queued waiter unless made
+    /// inside a [`ForegroundLifecycleTryClaim`] scope.
     Nonblocking,
+    /// A background lane that yielded too long and is now queued with a
+    /// bounded wait, so a busy queue cannot starve it.
+    Promoted,
 }
 
 impl LifecycleClaimKind {
@@ -92,6 +116,7 @@ impl LifecycleClaimKind {
         match self {
             Self::Foreground => "foreground",
             Self::Nonblocking => "nonblocking",
+            Self::Promoted => "promoted",
         }
     }
 }
@@ -247,26 +272,30 @@ fn describe_lifecycle_holder(path: &Path) -> String {
     format!("pid {pid} ({what}) has held it for {held_for} s and is running")
 }
 
-/// Make a nonblocking claim for a checkout lifecycle operation.
+/// Make a nonblocking claim for a checkout lifecycle operation on behalf of
+/// the background `lane` (a short lowercase name such as `retire`).
 ///
 /// Admission paths use this when queueing behind a remover could outlive the
 /// caller's bounded maintenance window. `None` means another lifecycle claim
 /// is active; path and inode changes remain errors.
 ///
-/// Foreground commands outrank it: while any live foreground waiter is queued
-/// it returns `None` without touching the lock, so background maintenance never
-/// takes the claim from under a waiting user. A [`ForegroundLifecycleTryClaim`]
-/// scope on this thread skips that check.
+/// Queued waiters outrank it: while any live ticket is queued it returns
+/// `None` without touching the lock. That yielding is bounded per lane: once
+/// the lane has yielded [`BACKGROUND_YIELD_COUNT`] times in a row, or for
+/// [`BACKGROUND_YIELD_LIMIT`], its next attempt takes a ticket and waits its
+/// turn for at most [`BACKGROUND_PROMOTED_WAIT`], so a queue that is never
+/// empty cannot starve retirement, cleanup or GC. A
+/// [`ForegroundLifecycleTryClaim`] scope on this thread skips the yielding.
 pub(crate) fn try_acquire_repository_lifecycle_lock(
     main_root: &Path,
+    lane: &'static str,
 ) -> io::Result<Option<ExclusiveFileLock>> {
     let path = repository_lifecycle_lock_path(main_root)?;
     if !foreground_try_claim_active()
         && let Some(directory) = existing_lifecycle_waiters_directory(main_root)
-        && scan_lifecycle_queue(&directory, None).live > 0
+        && scan_lifecycle_queue(&directory, None, None).live > 0
     {
-        crate::phase_telemetry::add("lifecycle_lock_yielded_to_waiter", Duration::ZERO);
-        return Ok(None);
+        return yield_or_promote_background_lane(main_root, lane);
     }
     let file = open_lock_file_nofollow(&path)?;
     let Some(mut lock) = ExclusiveFileLock::try_acquire(file)? else {
@@ -280,11 +309,164 @@ pub(crate) fn try_acquire_repository_lifecycle_lock(
     }
     verify_named_lock_file(&path, &lock.file)?;
     record_lifecycle_holder(&lock, LifecycleClaimKind::Nonblocking);
+    clear_background_yields(main_root, lane);
     // Counted, not attached: the `lifecycle_lock` object describes the
     // command's queued claims, which a maintenance claim must not overwrite.
     crate::phase_telemetry::add("lifecycle_lock_nonblocking_acquired", Duration::ZERO);
     lock.lifecycle_held_since = Some((Instant::now(), LifecycleClaimKind::Nonblocking));
     Ok(Some(lock))
+}
+
+/// A background lane's run of consecutive yields, as persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackgroundYields {
+    /// [`host_monotonic_ns`] when the run of yields began.
+    since_ns: u128,
+    count: u32,
+}
+
+fn background_yields_path(main_root: &Path, lane: &str, create: bool) -> Option<PathBuf> {
+    if lane.is_empty()
+        || !lane
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+    {
+        return None;
+    }
+    let directory = repository_runtime_directory(main_root)
+        .ok()?
+        .join(LIFECYCLE_YIELDS_DIR);
+    if create {
+        ensure_real_directory(&directory).ok()?;
+    } else if !std::fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.is_dir()) {
+        return None;
+    }
+    Some(directory.join(lane))
+}
+
+fn read_background_yields(path: &Path) -> Option<BackgroundYields> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    let field = |name: &str| {
+        text.split_whitespace()
+            .find_map(|word| word.strip_prefix(name))
+            .map(str::to_owned)
+    };
+    Some(BackgroundYields {
+        since_ns: field("since_ns=")?.parse().ok()?,
+        count: field("count=")?.parse().ok()?,
+    })
+}
+
+/// Best effort: a lost record only delays or advances one lane's promotion.
+fn write_background_yields(path: &Path, yields: BackgroundYields) {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.file_type().is_file()) {
+        return;
+    }
+    std::fs::write(
+        path,
+        format!("since_ns={} count={}\n", yields.since_ns, yields.count),
+    )
+    .ok();
+}
+
+fn clear_background_yields(main_root: &Path, lane: &str) {
+    if let Some(path) = background_yields_path(main_root, lane, false)
+        && std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file())
+    {
+        std::fs::remove_file(path).ok();
+    }
+}
+
+/// Whether a lane whose run of yields so far is `previous` should queue now
+/// rather than yield once more.
+fn background_lane_due_for_promotion(previous: Option<BackgroundYields>, now_ns: u128) -> bool {
+    previous.is_some_and(|previous| {
+        previous.count >= BACKGROUND_YIELD_COUNT
+            || now_ns.saturating_sub(previous.since_ns) >= BACKGROUND_YIELD_LIMIT.as_nanos()
+    })
+}
+
+/// A queued waiter exists: yield once more, or, when the lane has yielded long
+/// enough, queue for a bounded turn.
+fn yield_or_promote_background_lane(
+    main_root: &Path,
+    lane: &'static str,
+) -> io::Result<Option<ExclusiveFileLock>> {
+    let now_ns = host_monotonic_ns();
+    let record = background_yields_path(main_root, lane, true);
+    // A record from before a reboot (its start lies in the future) restarts.
+    let previous = record
+        .as_deref()
+        .and_then(read_background_yields)
+        .filter(|previous| previous.since_ns <= now_ns);
+    let yielding_for_ms = previous.map_or(0, |previous| {
+        u64::try_from(now_ns.saturating_sub(previous.since_ns) / 1_000_000).unwrap_or(u64::MAX)
+    });
+    if !background_lane_due_for_promotion(previous, now_ns) {
+        let yields = BackgroundYields {
+            since_ns: previous.map_or(now_ns, |previous| previous.since_ns),
+            count: previous.map_or(1, |previous| previous.count.saturating_add(1)),
+        };
+        if let Some(record) = &record {
+            write_background_yields(record, yields);
+        }
+        crate::phase_telemetry::add("lifecycle_lock_yielded_to_waiter", Duration::ZERO);
+        crate::phase_telemetry::attach(
+            "lifecycle_lock_background",
+            serde_json::json!({
+                "lane": lane,
+                "outcome": "yielded",
+                "consecutive_yields": yields.count,
+                "yielding_for_ms": yielding_for_ms,
+            }),
+        );
+        return Ok(None);
+    }
+    // Promoted: the run of yields ends here whatever the wait's outcome.
+    clear_background_yields(main_root, lane);
+    let wait = crate::git::active_git_deadline().map_or(BACKGROUND_PROMOTED_WAIT, |deadline| {
+        BACKGROUND_PROMOTED_WAIT.min(deadline.saturating_duration_since(Instant::now()))
+    });
+    let started = Instant::now();
+    let mut observation = LifecycleQueueObservation::default();
+    let result = acquire_lifecycle_lock_in_turn(
+        main_root,
+        wait,
+        started,
+        &mut observation,
+        LifecycleClaimKind::Promoted,
+    );
+    let waited = started.elapsed();
+    crate::phase_telemetry::add("lifecycle_lock_promoted_wait", waited);
+    crate::phase_telemetry::attach(
+        "lifecycle_lock_background",
+        serde_json::json!({
+            "lane": lane,
+            "outcome": match &result {
+                Ok(_) => "promoted_acquired",
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => "promoted_timeout",
+                Err(_) => "promoted_failed",
+            },
+            "consecutive_yields": previous.map_or(0, |previous| previous.count),
+            "yielding_for_ms": yielding_for_ms,
+            "promoted_wait_ms": u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+            "queue_position_at_enqueue": observation.position_at_enqueue,
+        }),
+    );
+    match result {
+        Ok(mut lock) => {
+            lock.lifecycle_held_since = Some((Instant::now(), LifecycleClaimKind::Promoted));
+            Ok(Some(lock))
+        }
+        // A turn that did not come within the bound is an ordinary busy
+        // answer: the lane retries on its next pass.
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn repository_lifecycle_lock_path(main_root: &Path) -> io::Result<std::path::PathBuf> {
@@ -522,12 +704,12 @@ pub(crate) fn try_acquire_session_commit_lock(
     Ok(lock)
 }
 
-/// What one blocking claim saw while it queued, for its telemetry and refusal.
+/// What one queued claim saw while it waited, for its telemetry and refusal.
 #[derive(Default)]
 struct LifecycleQueueObservation {
-    /// Live foreground waiters ahead of this one when it queued.
+    /// Live waiters ahead of this one when it queued.
     position_at_enqueue: usize,
-    /// Live foreground waiters, this one excluded, when it queued.
+    /// Live waiters, this one excluded, when it queued.
     length_at_enqueue: usize,
     /// The command holding the lock when this one first found it held.
     waited_behind: Option<String>,
@@ -536,13 +718,22 @@ struct LifecycleQueueObservation {
     ticketed: bool,
 }
 
-/// Wait for the lifecycle lock in ticket order: each waiter keeps a ticket
-/// (enqueue time, PID, process start time) under `.aethyme/run`, and only the
-/// one with no live ticket ahead tries the lock. A ticket whose process has
-/// exited, or whose PID now belongs to another process, is removed; one whose
-/// live process stopped refreshing it is passed over. Older binaries keep no
-/// ticket and may still take the lock out of turn; that costs order, never
-/// exclusion, which the flock alone provides.
+/// Wait for the lifecycle lock in ticket order. Each waiter keeps a ticket
+/// under `.aethyme/run` naming its deadline (enqueue time plus its wait budget),
+/// its enqueue time, PID, process start time and a sequence, all times on the
+/// host's monotonic clock. Tickets are served earliest deadline first, ties by
+/// enqueue time, then PID and sequence: a short-budget caller such as gate
+/// admission goes ahead of a `start` with three minutes to spare, and a newer
+/// arrival outranks a waiter only if its own deadline is earlier. So a waiter
+/// with `r` seconds left is never passed by an arrival whose budget is `r`
+/// seconds or more; with every caller's budget at least `b`, nothing that
+/// arrives in a waiter's last `b` seconds goes ahead of it.
+///
+/// Only the waiter with no live ticket ahead tries the lock. A ticket whose
+/// process has exited, or whose PID now belongs to another process, is
+/// removed; one whose live process stopped writing heartbeats is passed over.
+/// Older binaries keep no ticket and may still take the lock out of turn; that
+/// costs order, never exclusion, which the flock alone provides.
 ///
 /// Records the wait, the queue position and the holder it waited behind on
 /// every outcome, the timeout included, and the hold time when the guard drops.
@@ -552,7 +743,13 @@ pub(crate) fn acquire_repository_lifecycle_lock_with_wait(
 ) -> io::Result<ExclusiveFileLock> {
     let started = Instant::now();
     let mut observation = LifecycleQueueObservation::default();
-    let result = acquire_lifecycle_lock_in_turn(main_root, wait, started, &mut observation);
+    let result = acquire_lifecycle_lock_in_turn(
+        main_root,
+        wait,
+        started,
+        &mut observation,
+        LifecycleClaimKind::Foreground,
+    );
     let waited = started.elapsed();
     crate::phase_telemetry::add("lifecycle_lock_wait", waited);
     crate::phase_telemetry::attach(
@@ -577,19 +774,31 @@ pub(crate) fn acquire_repository_lifecycle_lock_with_wait(
     Ok(lock)
 }
 
+/// How long a waiter sleeps before looking again: the head tries the lock
+/// often, everyone behind it only rescans.
+fn lifecycle_poll_interval(ahead: usize) -> Duration {
+    if ahead == 0 {
+        LIFECYCLE_LOCK_POLL
+    } else {
+        LIFECYCLE_QUEUED_POLL
+    }
+}
+
 fn acquire_lifecycle_lock_in_turn(
     main_root: &Path,
     wait: Duration,
     started: Instant,
     observation: &mut LifecycleQueueObservation,
+    kind: LifecycleClaimKind,
 ) -> io::Result<ExclusiveFileLock> {
     let path = repository_lifecycle_lock_path(main_root)?;
     let deadline = started + wait;
     let mut next_notice = started + LIFECYCLE_WAIT_NOTICE_AFTER;
     // Best effort: a waiter that cannot keep a ticket still waits, unordered.
-    let mut ticket = LifecycleTicket::enqueue(main_root);
+    let mut ticket = LifecycleTicket::enqueue(main_root, wait);
+    let mut liveness = LifecycleLivenessCache::default();
     if let Some(ticket) = &ticket {
-        let view = scan_lifecycle_queue(&ticket.directory, Some(ticket.key));
+        let view = scan_lifecycle_queue(&ticket.directory, Some(ticket.key), Some(&mut liveness));
         observation.position_at_enqueue = view.ahead;
         observation.length_at_enqueue = view.live;
         observation.ticketed = true;
@@ -598,7 +807,7 @@ fn acquire_lifecycle_lock_in_turn(
         let ahead = match ticket.as_mut() {
             Some(ticket) => {
                 ticket.heartbeat();
-                scan_lifecycle_queue(&ticket.directory, Some(ticket.key)).ahead
+                scan_lifecycle_queue(&ticket.directory, Some(ticket.key), Some(&mut liveness)).ahead
             }
             None => 0,
         };
@@ -618,7 +827,7 @@ fn acquire_lifecycle_lock_in_turn(
                 // Leave the queue only once the lock is ours, so no background
                 // claim slips in between.
                 drop(ticket.take());
-                record_lifecycle_holder(&lock, LifecycleClaimKind::Foreground);
+                record_lifecycle_holder(&lock, kind);
                 return Ok(lock);
             }
         }
@@ -628,7 +837,7 @@ fn acquire_lifecycle_lock_in_turn(
         let now = Instant::now();
         if now >= deadline {
             let queued = ticket.as_ref().map_or(0, |ticket| {
-                scan_lifecycle_queue(&ticket.directory, Some(ticket.key)).live
+                scan_lifecycle_queue(&ticket.directory, Some(ticket.key), None).live
             });
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -641,7 +850,8 @@ fn acquire_lifecycle_lock_in_turn(
                 ),
             ));
         }
-        if now >= next_notice {
+        // Background lanes stay quiet; their telemetry says they waited.
+        if kind == LifecycleClaimKind::Foreground && now >= next_notice {
             eprintln!(
                 "waiting for the repository lifecycle lock: {}; {} ahead of this command in the queue; waited {} of at most {} s",
                 describe_lifecycle_holder(&path),
@@ -651,7 +861,7 @@ fn acquire_lifecycle_lock_in_turn(
             );
             next_notice = now + LIFECYCLE_WAIT_NOTICE_EVERY;
         }
-        thread::sleep(LIFECYCLE_LOCK_POLL.min(deadline.saturating_duration_since(now)));
+        thread::sleep(lifecycle_poll_interval(ahead).min(deadline.saturating_duration_since(now)));
     }
 }
 
@@ -672,16 +882,42 @@ fn describe_lifecycle_queue(
     )
 }
 
-/// Ordering key of one ticket: enqueue time, then PID, then the per-process
-/// sequence.
+/// The host's monotonic clock in nanoseconds (`CLOCK_MONOTONIC`): shared by
+/// every process on this host and unaffected by wall-clock changes, so ticket
+/// order and staleness survive the clock being set forward or back. It
+/// restarts at boot; tickets from before a reboot belong to dead processes.
+#[cfg(unix)]
+fn host_monotonic_ns() -> u128 {
+    // SAFETY: timespec is plain integers (and, on some targets, padding), for
+    // which all-zero bytes are a valid value.
+    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: `now` is a valid, writable timespec for the duration of the call.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
+        return 0;
+    }
+    u128::try_from(now.tv_sec).unwrap_or(0) * 1_000_000_000
+        + u128::try_from(now.tv_nsec).unwrap_or(0)
+}
+
+#[cfg(not(unix))]
+fn host_monotonic_ns() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos())
+}
+
+/// Ordering key of one ticket: earliest deadline first, then enqueue time,
+/// then PID, then the per-process sequence. A total order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct LifecycleTicketKey {
-    nanos: u128,
+    deadline_ns: u128,
+    enqueue_ns: u128,
     pid: u32,
     sequence: u64,
 }
 
-/// A ticket's file name, `<nanos>.<pid>.<process start>.<sequence>`.
+/// A ticket's file name,
+/// `<deadline ns>.<enqueue ns>.<pid>.<process start>.<sequence>`.
 struct LifecycleTicketName {
     key: LifecycleTicketKey,
     /// The process's start time as [`crate::gates::process_start_time`] gives
@@ -689,9 +925,17 @@ struct LifecycleTicketName {
     process_start: u64,
 }
 
+fn lifecycle_ticket_file_name(key: LifecycleTicketKey, process_start: u64) -> String {
+    format!(
+        "{}.{}.{}.{process_start}.{}",
+        key.deadline_ns, key.enqueue_ns, key.pid, key.sequence
+    )
+}
+
 fn parse_lifecycle_ticket_name(name: &str) -> Option<LifecycleTicketName> {
     let mut parts = name.split('.');
-    let nanos = parts.next()?.parse().ok()?;
+    let deadline_ns = parts.next()?.parse().ok()?;
+    let enqueue_ns = parts.next()?.parse().ok()?;
     let pid = parts.next()?.parse().ok()?;
     let process_start = parts.next()?.parse().ok()?;
     let sequence = parts.next()?.parse().ok()?;
@@ -700,12 +944,20 @@ fn parse_lifecycle_ticket_name(name: &str) -> Option<LifecycleTicketName> {
     }
     Some(LifecycleTicketName {
         key: LifecycleTicketKey {
-            nanos,
+            deadline_ns,
+            enqueue_ns,
             pid,
             sequence,
         },
         process_start,
     })
+}
+
+/// The heartbeat a ticket's contents carry, `heartbeat=<monotonic ns>`.
+fn lifecycle_ticket_heartbeat(text: &str) -> Option<u128> {
+    text.split_whitespace()
+        .find_map(|word| word.strip_prefix("heartbeat="))
+        .and_then(|value| value.parse().ok())
 }
 
 fn own_process_start() -> u64 {
@@ -718,25 +970,32 @@ fn own_process_start() -> u64 {
     })
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleTicketState {
     Live,
-    /// Its process lives but stopped refreshing the ticket.
+    /// Its process lives but stopped writing heartbeats.
     Stalled,
-    /// Its process is gone, or the PID now names another process.
+    /// Its process is gone, the PID now names another process, it predates
+    /// this boot, or it is older than any wait.
     Dead,
 }
 
+/// Judge one ticket against the host monotonic clock `now_ns`. `heartbeat_ns`
+/// is the last heartbeat its contents carry; without one the enqueue time
+/// stands in. File modification times are never consulted, so a wall-clock
+/// jump cannot age a live ticket.
 fn lifecycle_ticket_state(
     name: &LifecycleTicketName,
-    metadata: &std::fs::Metadata,
+    heartbeat_ns: Option<u128>,
+    now_ns: u128,
 ) -> LifecycleTicketState {
-    let age = metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.elapsed().ok())
-        .unwrap_or(Duration::ZERO);
-    if age > LIFECYCLE_TICKET_MAX_AGE {
+    let last_beat = heartbeat_ns.unwrap_or(name.key.enqueue_ns);
+    // Times ahead of this clock were written before the last boot.
+    let boot_slack = Duration::from_secs(1).as_nanos();
+    if name.key.enqueue_ns > now_ns.saturating_add(boot_slack)
+        || last_beat > now_ns.saturating_add(boot_slack)
+        || now_ns.saturating_sub(name.key.enqueue_ns) > LIFECYCLE_TICKET_MAX_AGE.as_nanos()
+    {
         return LifecycleTicketState::Dead;
     }
     if name.key.pid != std::process::id() {
@@ -752,10 +1011,29 @@ fn lifecycle_ticket_state(
             return LifecycleTicketState::Dead;
         }
     }
-    if age > LIFECYCLE_TICKET_STALL {
+    if now_ns.saturating_sub(last_beat) > LIFECYCLE_TICKET_STALL.as_nanos() {
         LifecycleTicketState::Stalled
     } else {
         LifecycleTicketState::Live
+    }
+}
+
+/// One waiter's recent liveness verdicts by ticket name, each trusted for
+/// [`LIFECYCLE_LIVENESS_CACHE`], so a waiter rescanning a long queue does not
+/// probe every process on every pass.
+#[derive(Default)]
+struct LifecycleLivenessCache {
+    verdicts: std::collections::HashMap<String, (LifecycleTicketState, Instant)>,
+}
+
+impl LifecycleLivenessCache {
+    fn cached(&self, name: &str, now: Instant) -> Option<LifecycleTicketState> {
+        self.verdicts
+            .get(name)
+            .filter(|(_, checked)| {
+                now.saturating_duration_since(*checked) < LIFECYCLE_LIVENESS_CACHE
+            })
+            .map(|(state, _)| *state)
     }
 }
 
@@ -769,39 +1047,74 @@ struct LifecycleQueueView {
 
 /// Count the live tickets in `directory` other than `own`, and those ahead of
 /// it, removing dead ones. Anything that is not a regular file with a ticket
-/// name is left alone and ignored.
-fn scan_lifecycle_queue(directory: &Path, own: Option<LifecycleTicketKey>) -> LifecycleQueueView {
+/// name is left alone and ignored. With a cache, a verdict younger than
+/// [`LIFECYCLE_LIVENESS_CACHE`] is reused instead of probing again.
+fn scan_lifecycle_queue(
+    directory: &Path,
+    own: Option<LifecycleTicketKey>,
+    mut cache: Option<&mut LifecycleLivenessCache>,
+) -> LifecycleQueueView {
     let mut view = LifecycleQueueView::default();
     let Ok(entries) = std::fs::read_dir(directory) else {
         return view;
     };
+    let checked_at = Instant::now();
+    let now_ns = host_monotonic_ns();
+    let mut seen = std::collections::HashSet::new();
     for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str().and_then(parse_lifecycle_ticket_name) else {
+        let Ok(file_name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(name) = parse_lifecycle_ticket_name(&file_name) else {
             continue;
         };
         if Some(name.key) == own {
             continue;
         }
-        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
-            continue;
+        let cached = cache
+            .as_deref()
+            .and_then(|cache| cache.cached(&file_name, checked_at));
+        let state = match cached {
+            Some(state) => state,
+            None => {
+                let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+                    continue;
+                };
+                if !metadata.file_type().is_file() {
+                    continue;
+                }
+                let heartbeat = std::fs::read_to_string(entry.path())
+                    .ok()
+                    .as_deref()
+                    .and_then(lifecycle_ticket_heartbeat);
+                let state = lifecycle_ticket_state(&name, heartbeat, now_ns);
+                if let Some(cache) = cache.as_deref_mut() {
+                    cache
+                        .verdicts
+                        .insert(file_name.clone(), (state, checked_at));
+                }
+                state
+            }
         };
-        if !metadata.file_type().is_file() {
-            continue;
-        }
-        match lifecycle_ticket_state(&name, &metadata) {
+        match state {
             LifecycleTicketState::Dead => {
                 // Best effort: another waiter may have removed it first.
                 std::fs::remove_file(entry.path()).ok();
             }
-            LifecycleTicketState::Stalled => {}
+            LifecycleTicketState::Stalled => {
+                seen.insert(file_name);
+            }
             LifecycleTicketState::Live => {
                 view.live += 1;
                 if own.is_some_and(|own| name.key < own) {
                     view.ahead += 1;
                 }
+                seen.insert(file_name);
             }
         }
+    }
+    if let Some(cache) = cache {
+        cache.verdicts.retain(|name, _| seen.contains(name));
     }
     view
 }
@@ -830,16 +1143,17 @@ struct LifecycleTicket {
     path: PathBuf,
     file: File,
     key: LifecycleTicketKey,
+    process_start: u64,
     refreshed: Instant,
 }
 
 impl LifecycleTicket {
-    fn enqueue(main_root: &Path) -> Option<Self> {
+    fn enqueue(main_root: &Path, wait: Duration) -> Option<Self> {
         let directory = lifecycle_waiters_directory(main_root).ok()?;
+        let enqueue_ns = host_monotonic_ns();
         let key = LifecycleTicketKey {
-            nanos: SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |since| since.as_nanos()),
+            deadline_ns: enqueue_ns.saturating_add(wait.as_nanos()),
+            enqueue_ns,
             pid: std::process::id(),
             sequence: LIFECYCLE_TICKET_SEQUENCE.fetch_add(1, Ordering::Relaxed),
         };
@@ -847,10 +1161,21 @@ impl LifecycleTicket {
     }
 
     fn create(directory: PathBuf, key: LifecycleTicketKey, process_start: u64) -> Option<Self> {
-        let path = directory.join(format!(
-            "{}.{}.{process_start}.{}",
-            key.nanos, key.pid, key.sequence
-        ));
+        let path = directory.join(lifecycle_ticket_file_name(key, process_start));
+        let file = Self::open_new(&path)?;
+        let ticket = Self {
+            directory,
+            path,
+            file,
+            key,
+            process_start,
+            refreshed: Instant::now(),
+        };
+        ticket.write_heartbeat();
+        Some(ticket)
+    }
+
+    fn open_new(path: &Path) -> Option<File> {
         let mut options = OpenOptions::new();
         // `create_new` refuses anything already at the name, a symlink included.
         options.write(true).create_new(true);
@@ -859,22 +1184,43 @@ impl LifecycleTicket {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = options.open(&path).ok()?;
-        Some(Self {
-            directory,
-            path,
-            file,
-            key,
-            refreshed: Instant::now(),
-        })
+        options.open(path).ok()
     }
 
-    /// Refresh the ticket's modification time, at most once a second, so other
-    /// waiters can tell a live waiter from a stopped one.
+    /// Fixed width, so a rewrite in place never leaves a longer tail behind.
+    fn write_heartbeat(&self) {
+        use std::os::unix::fs::FileExt;
+        self.file
+            .write_all_at(
+                format!("heartbeat={:039}\n", host_monotonic_ns()).as_bytes(),
+                0,
+            )
+            .ok();
+    }
+
+    /// At most every [`LIFECYCLE_TICKET_HEARTBEAT`]: write a fresh heartbeat so
+    /// other waiters can tell a live waiter from a stopped one, and put the
+    /// ticket back under its own name if something removed it (a waiter that
+    /// misjudged it, or a cleanup), so this waiter keeps its place.
     fn heartbeat(&mut self) {
-        if self.refreshed.elapsed() >= LIFECYCLE_TICKET_HEARTBEAT {
-            self.file.set_modified(SystemTime::now()).ok();
-            self.refreshed = Instant::now();
+        if self.refreshed.elapsed() < LIFECYCLE_TICKET_HEARTBEAT {
+            return;
+        }
+        self.refreshed = Instant::now();
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(_) => self.write_heartbeat(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let path = self
+                    .directory
+                    .join(lifecycle_ticket_file_name(self.key, self.process_start));
+                if let Some(file) = Self::open_new(&path) {
+                    self.file = file;
+                    self.path = path;
+                    self.write_heartbeat();
+                    crate::phase_telemetry::add("lifecycle_lock_ticket_recreated", Duration::ZERO);
+                }
+            }
+            Err(_) => {}
         }
     }
 }
@@ -1073,13 +1419,13 @@ mod tests {
         let repository = tempfile::tempdir().unwrap();
         let held = acquire_repository_lifecycle_lock(repository.path()).unwrap();
         assert!(
-            try_acquire_repository_lifecycle_lock(repository.path())
+            try_acquire_repository_lifecycle_lock(repository.path(), "test_lane")
                 .unwrap()
                 .is_none()
         );
         drop(held);
         assert!(
-            try_acquire_repository_lifecycle_lock(repository.path())
+            try_acquire_repository_lifecycle_lock(repository.path(), "test_lane")
                 .unwrap()
                 .is_some()
         );
@@ -1427,7 +1773,7 @@ mod tests {
         let pid = exited.id();
         exited.wait().unwrap();
         // Queued long before this command, by a process that has exited.
-        let dead = directory.join(format!("1.{pid}.0.0"));
+        let dead = directory.join(format!("1.1.{pid}.0.0"));
         std::fs::write(&dead, b"").unwrap();
         let started = Instant::now();
         let claim =
@@ -1454,15 +1800,18 @@ mod tests {
             return;
         };
         // The ticket names the PID with another start time: a reused PID.
-        let reused = directory.join(format!("1.{pid}.{}.0", start.wrapping_add(1)));
-        std::fs::write(&reused, b"").unwrap();
+        let now = host_monotonic_ns();
+        let reused = directory.join(format!("{now}.{now}.{pid}.{}.0", start.wrapping_add(1)));
+        std::fs::write(&reused, format!("heartbeat={now}")).unwrap();
         let view = scan_lifecycle_queue(
             &directory,
             Some(LifecycleTicketKey {
-                nanos: u128::MAX,
+                deadline_ns: u128::MAX,
+                enqueue_ns: u128::MAX,
                 pid: std::process::id(),
                 sequence: 0,
             }),
+            None,
         );
         assert_eq!(view, LifecycleQueueView::default());
         assert!(!reused.exists());
@@ -1481,10 +1830,11 @@ mod tests {
             .unwrap();
         let pid = live.id();
         let start = crate::gates::process_start_time(pid as i32).unwrap_or(0);
-        let stalled = directory.join(format!("1.{pid}.{start}.0"));
-        let file = std::fs::File::create(&stalled).unwrap();
-        file.set_modified(SystemTime::now() - Duration::from_secs(60))
-            .unwrap();
+        // Queued a minute ago and silent since; its process is still alive.
+        let now = host_monotonic_ns();
+        let then = now.saturating_sub(Duration::from_secs(60).as_nanos());
+        let stalled = directory.join(format!("{then}.{then}.{pid}.{start}.0"));
+        std::fs::write(&stalled, format!("heartbeat={then}")).unwrap();
         let claim =
             acquire_repository_lifecycle_lock_with_wait(&root, Duration::from_secs(5)).unwrap();
         assert!(stalled.exists(), "a live process's ticket is never removed");
@@ -1498,30 +1848,22 @@ mod tests {
         let repository = tempfile::tempdir().unwrap();
         let root = repository.path().canonicalize().unwrap();
         let directory = lifecycle_waiters_directory(&root).unwrap();
-        let ticket = LifecycleTicket::create(
-            directory,
-            LifecycleTicketKey {
-                nanos: 1,
-                pid: std::process::id(),
-                sequence: u64::MAX,
-            },
-            own_process_start(),
-        )
-        .unwrap();
+        let ticket =
+            LifecycleTicket::create(directory, far_deadline_key(), own_process_start()).unwrap();
         assert!(
-            try_acquire_repository_lifecycle_lock(&root)
+            try_acquire_repository_lifecycle_lock(&root, "test_lane")
                 .unwrap()
                 .is_none(),
             "background maintenance must not take the free lock from a queued waiter"
         );
         {
             let _foreground = ForegroundLifecycleTryClaim::enter();
-            let claim = try_acquire_repository_lifecycle_lock(&root).unwrap();
+            let claim = try_acquire_repository_lifecycle_lock(&root, "test_lane").unwrap();
             assert!(claim.is_some(), "a foreground try-claim does not yield");
         }
         drop(ticket);
         assert!(
-            try_acquire_repository_lifecycle_lock(&root)
+            try_acquire_repository_lifecycle_lock(&root, "test_lane")
                 .unwrap()
                 .is_some()
         );
@@ -1533,15 +1875,19 @@ mod tests {
         let root = repository.path().canonicalize().unwrap();
         let held = acquire_repository_lifecycle_lock(&root).unwrap();
         let queued_root = root.clone();
+        // Queued first with the earlier deadline, so it stays ahead of the
+        // claim below until it gives up after one second.
         let queued = thread::spawn(move || {
-            drop(acquire_repository_lifecycle_lock(&queued_root).unwrap());
+            let outcome =
+                acquire_repository_lifecycle_lock_with_wait(&queued_root, Duration::from_secs(1));
+            assert!(outcome.is_err(), "the lock stays held past its budget");
         });
         wait_for_tickets(&root, 1);
 
         let recorder = crate::phase_telemetry::Recorder::default();
         let error = {
             let _installed = crate::phase_telemetry::install(recorder.clone());
-            acquire_repository_lifecycle_lock_with_wait(&root, Duration::from_millis(200))
+            acquire_repository_lifecycle_lock_with_wait(&root, Duration::from_millis(1500))
                 .unwrap_err()
         };
         drop(held);
@@ -1550,7 +1896,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         let message = error.to_string();
         assert!(
-            message.contains("1 other command(s) are waiting for it, 1 of them ahead of this one")
+            message.contains("0 other command(s) are waiting for it, 0 of them ahead of this one")
                 && message.contains("(1 ahead when it queued)")
                 && message.contains(&format!("pid {} (", std::process::id()))
                 && message.contains("retry this command"),
@@ -1561,7 +1907,7 @@ mod tests {
         assert!(
             millis
                 .get("lifecycle_lock_wait")
-                .is_some_and(|ms| *ms >= 150)
+                .is_some_and(|ms| *ms >= 1400)
         );
         assert!(!counts.contains_key("lifecycle_lock_held"));
         let attached = &recorder.attachments()["lifecycle_lock"];
@@ -1570,7 +1916,7 @@ mod tests {
         assert_eq!(attached["queue_position_at_enqueue"], 1);
         assert_eq!(attached["queue_length_at_enqueue"], 1);
         assert_eq!(attached["queued"], true);
-        assert!(attached["wait_ms"].as_u64().is_some_and(|ms| ms >= 150));
+        assert!(attached["wait_ms"].as_u64().is_some_and(|ms| ms >= 1400));
         assert!(attached["waited_behind"].is_string());
         assert!(
             lifecycle_tickets(&root).is_empty(),
@@ -1628,23 +1974,260 @@ mod tests {
         drop(held);
     }
 
+    /// A live ticket for this process that sorts behind any claim made in
+    /// the next three minutes.
+    fn far_deadline_key() -> LifecycleTicketKey {
+        let now = host_monotonic_ns();
+        LifecycleTicketKey {
+            deadline_ns: now + Duration::from_secs(180).as_nanos(),
+            enqueue_ns: now,
+            pid: std::process::id(),
+            sequence: u64::MAX - LIFECYCLE_TICKET_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    #[test]
+    fn a_short_budget_waiter_is_served_before_an_earlier_long_one() {
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path().canonicalize().unwrap();
+        let held = acquire_repository_lifecycle_lock(&root).unwrap();
+        let (order_tx, order_rx) = std::sync::mpsc::channel();
+        let long_root = root.clone();
+        let long_tx = order_tx.clone();
+        // Queued first, with the full three-minute budget a start has.
+        let long = thread::spawn(move || {
+            let claim = acquire_repository_lifecycle_lock(&long_root).unwrap();
+            long_tx.send("long").unwrap();
+            drop(claim);
+        });
+        wait_for_tickets(&root, 1);
+        // Queued second, with the ten-second budget gate admission has.
+        let short_root = root.clone();
+        let short = thread::spawn(move || {
+            let claim =
+                acquire_repository_lifecycle_lock_with_wait(&short_root, Duration::from_secs(10))
+                    .unwrap();
+            order_tx.send("short").unwrap();
+            thread::sleep(Duration::from_millis(100));
+            drop(claim);
+        });
+        wait_for_tickets(&root, 2);
+        drop(held);
+        long.join().unwrap();
+        short.join().unwrap();
+        let order: Vec<_> = order_rx.try_iter().collect();
+        assert_eq!(order, ["short", "long"]);
+    }
+
+    #[test]
+    fn a_waiter_near_its_deadline_outranks_newer_arrivals_with_longer_budgets() {
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path().canonicalize().unwrap();
+        let directory = lifecycle_waiters_directory(&root).unwrap();
+        // A waiter with five seconds left.
+        let now = host_monotonic_ns();
+        let waiting = LifecycleTicket::create(
+            directory.clone(),
+            LifecycleTicketKey {
+                deadline_ns: now + Duration::from_secs(5).as_nanos(),
+                enqueue_ns: now.saturating_sub(Duration::from_secs(170).as_nanos()),
+                pid: std::process::id(),
+                sequence: 0,
+            },
+            own_process_start(),
+        )
+        .unwrap();
+        let arrival = |budget: Duration| {
+            let at = host_monotonic_ns();
+            LifecycleTicketKey {
+                deadline_ns: at + budget.as_nanos(),
+                enqueue_ns: at,
+                pid: std::process::id(),
+                sequence: u64::MAX,
+            }
+        };
+        // Any newer arrival whose budget is at least the time it has left
+        // queues behind it, however short that budget is.
+        for budget in [Duration::from_secs(5), Duration::from_secs(10)] {
+            let view = scan_lifecycle_queue(&directory, Some(arrival(budget)), None);
+            assert_eq!(view.ahead, 1, "{budget:?}");
+        }
+        // Only a budget shorter than its remaining time goes first.
+        let view =
+            scan_lifecycle_queue(&directory, Some(arrival(Duration::from_millis(100))), None);
+        assert_eq!(view.ahead, 0);
+        drop(waiting);
+    }
+
+    #[test]
+    fn a_background_lane_queues_after_five_consecutive_yields() {
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path().canonicalize().unwrap();
+        let directory = lifecycle_waiters_directory(&root).unwrap();
+        // A foreground waiter that never leaves: the queue is never empty.
+        let foreground =
+            LifecycleTicket::create(directory, far_deadline_key(), own_process_start()).unwrap();
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        for attempt in 1..=BACKGROUND_YIELD_COUNT {
+            assert!(
+                try_acquire_repository_lifecycle_lock(&root, "test_lane")
+                    .unwrap()
+                    .is_none(),
+                "attempt {attempt} yields"
+            );
+            assert_eq!(
+                recorder.attachments()["lifecycle_lock_background"]["consecutive_yields"],
+                attempt
+            );
+        }
+        let started = Instant::now();
+        let claim = try_acquire_repository_lifecycle_lock(&root, "test_lane").unwrap();
+        assert!(claim.is_some(), "the promoted lane takes its turn");
+        assert!(started.elapsed() < BACKGROUND_PROMOTED_WAIT);
+        let attached = &recorder.attachments()["lifecycle_lock_background"];
+        assert_eq!(attached["outcome"], "promoted_acquired");
+        assert_eq!(attached["consecutive_yields"], BACKGROUND_YIELD_COUNT);
+        let (_, counts) = recorder.totals();
+        assert_eq!(counts.get("lifecycle_lock_promoted_wait"), Some(&1));
+        assert_eq!(
+            counts.get("lifecycle_lock_yielded_to_waiter"),
+            Some(&u64::from(BACKGROUND_YIELD_COUNT))
+        );
+        drop(claim);
+        // The run of yields starts over after the promotion.
+        assert!(
+            try_acquire_repository_lifecycle_lock(&root, "test_lane")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            recorder.attachments()["lifecycle_lock_background"]["consecutive_yields"],
+            1
+        );
+        drop(foreground);
+    }
+
+    #[test]
+    fn a_background_lane_queues_after_a_minute_of_yielding() {
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path().canonicalize().unwrap();
+        let directory = lifecycle_waiters_directory(&root).unwrap();
+        let foreground =
+            LifecycleTicket::create(directory, far_deadline_key(), own_process_start()).unwrap();
+        let record = background_yields_path(&root, "test_lane", true).unwrap();
+        write_background_yields(
+            &record,
+            BackgroundYields {
+                since_ns: host_monotonic_ns()
+                    .saturating_sub((BACKGROUND_YIELD_LIMIT + Duration::from_secs(1)).as_nanos()),
+                count: 1,
+            },
+        );
+        let claim = try_acquire_repository_lifecycle_lock(&root, "test_lane").unwrap();
+        assert!(claim.is_some(), "a minute of yielding promotes the lane");
+        assert!(!record.exists(), "the promotion ends the run of yields");
+        drop(claim);
+        drop(foreground);
+    }
+
+    #[test]
+    fn a_waiter_puts_back_a_ticket_someone_removed() {
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path().canonicalize().unwrap();
+        let directory = lifecycle_waiters_directory(&root).unwrap();
+        let mut ticket =
+            LifecycleTicket::create(directory, far_deadline_key(), own_process_start()).unwrap();
+        let path = ticket.path.clone();
+        std::fs::remove_file(&path).unwrap();
+        ticket.refreshed = Instant::now() - LIFECYCLE_TICKET_HEARTBEAT;
+        ticket.heartbeat();
+        assert!(path.exists(), "the ticket is back under its own name");
+        let heartbeat = lifecycle_ticket_heartbeat(&std::fs::read_to_string(&path).unwrap());
+        assert!(heartbeat.is_some());
+        drop(ticket);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_ticket_with_an_old_modification_time_but_a_fresh_heartbeat_stays_live() {
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path().canonicalize().unwrap();
+        let directory = lifecycle_waiters_directory(&root).unwrap();
+        let ticket =
+            LifecycleTicket::create(directory.clone(), far_deadline_key(), own_process_start())
+                .unwrap();
+        // The wall clock jumped: the file now looks an hour old.
+        std::fs::File::options()
+            .write(true)
+            .open(&ticket.path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        let view = scan_lifecycle_queue(&directory, None, None);
+        assert_eq!(view.live, 1);
+        assert!(ticket.path.exists());
+        drop(ticket);
+    }
+
+    #[test]
+    fn a_waiter_reuses_a_liveness_verdict_for_a_second_and_then_rechecks() {
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path().canonicalize().unwrap();
+        let directory = lifecycle_waiters_directory(&root).unwrap();
+        let ticket =
+            LifecycleTicket::create(directory.clone(), far_deadline_key(), own_process_start())
+                .unwrap();
+        let mut cache = LifecycleLivenessCache::default();
+        assert_eq!(
+            scan_lifecycle_queue(&directory, None, Some(&mut cache)).live,
+            1
+        );
+        // The waiter falls silent; within the cache window the verdict holds.
+        let silent = host_monotonic_ns().saturating_sub(Duration::from_secs(60).as_nanos());
+        std::fs::write(&ticket.path, format!("heartbeat={silent:039}\n")).unwrap();
+        assert_eq!(
+            scan_lifecycle_queue(&directory, None, Some(&mut cache)).live,
+            1
+        );
+        // Once the verdict expires the ticket is judged again: stalled.
+        for (_, checked) in cache.verdicts.values_mut() {
+            *checked -= LIFECYCLE_LIVENESS_CACHE;
+        }
+        assert_eq!(
+            scan_lifecycle_queue(&directory, None, Some(&mut cache)).live,
+            0
+        );
+        assert!(ticket.path.exists(), "a stalled live waiter is not removed");
+        drop(ticket);
+    }
+
+    #[test]
+    fn only_the_head_of_the_queue_polls_quickly() {
+        assert_eq!(lifecycle_poll_interval(0), LIFECYCLE_LOCK_POLL);
+        assert_eq!(lifecycle_poll_interval(1), LIFECYCLE_QUEUED_POLL);
+        assert!(LIFECYCLE_QUEUED_POLL >= Duration::from_millis(250));
+    }
+
     #[test]
     fn ticket_names_parse_only_in_the_exact_shape() {
-        let parsed = parse_lifecycle_ticket_name("17.42.99.3").unwrap();
+        let parsed = parse_lifecycle_ticket_name("19.17.42.99.3").unwrap();
         assert_eq!(
             parsed.key,
             LifecycleTicketKey {
-                nanos: 17,
+                deadline_ns: 19,
+                enqueue_ns: 17,
                 pid: 42,
                 sequence: 3
             }
         );
         assert_eq!(parsed.process_start, 99);
+        assert_eq!(lifecycle_ticket_file_name(parsed.key, 99), "19.17.42.99.3");
         for invalid in [
-            "17.42.99",
-            "17.42.99.3.1",
-            "17.0.99.3",
-            "x.42.99.3",
+            "17.42.99.3",
+            "19.17.42.99.3.1",
+            "19.17.0.99.3",
+            "x.17.42.99.3",
             ".DS_Store",
         ] {
             assert!(parse_lifecycle_ticket_name(invalid).is_none(), "{invalid}");

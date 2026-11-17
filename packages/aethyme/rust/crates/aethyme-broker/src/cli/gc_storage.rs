@@ -1922,14 +1922,17 @@ fn run_gc_artifact_use_reconcile(parsed: Parsed) -> Result<(), UsageError> {
     // An operator's explicit apply is foreground work: it does not yield to
     // queued lifecycle waiters, it only refuses while the lock is held.
     let _foreground = crate::file_lock::ForegroundLifecycleTryClaim::enter();
-    let _lifecycle_claim =
-        if action == "apply" {
-            Some(broker.try_claim_worktree_lifecycle()?.ok_or_else(|| {
-                UsageError::Message("worktree lifecycle is busy; retry later".into())
-            })?)
-        } else {
-            None
-        };
+    let _lifecycle_claim = if action == "apply" {
+        Some(
+            broker
+                .try_claim_worktree_lifecycle("artifact_use_reconcile")?
+                .ok_or_else(|| {
+                    UsageError::Message("worktree lifecycle is busy; retry later".into())
+                })?,
+        )
+    } else {
+        None
+    };
     let session = broker.store().session(session_id)?;
     let checkout_root = PathBuf::from(&session.worktree_path);
     let cohort = match broker.closed_artifact_checkout_cohort_for_session_readonly(

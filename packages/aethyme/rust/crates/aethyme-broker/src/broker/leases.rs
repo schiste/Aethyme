@@ -2872,7 +2872,7 @@ impl Broker {
 
         // A maintenance pass must keep moving when another lifecycle operation
         // is active; status callers also leave the row open and retry later.
-        let Some(_lifecycle_claim) = self.try_claim_worktree_lifecycle()? else {
+        let Some(_lifecycle_claim) = self.try_claim_worktree_lifecycle("abandoned_close")? else {
             return Ok(keep_with(
                 process_table,
                 AbandonmentKeepReason::LifecycleBusy,

@@ -11591,7 +11591,7 @@ impl Broker {
             return Ok(ArtifactSweepRemovalProgress::no_work(false));
         };
         let owner_session_id = expected_cohort.owner_session_id();
-        let _lifecycle_claim = match self.try_claim_worktree_lifecycle() {
+        let _lifecycle_claim = match self.try_claim_worktree_lifecycle("gc") {
             Ok(Some(claim)) => claim,
             Ok(None) => {
                 for path in candidates {
@@ -12867,7 +12867,7 @@ impl Broker {
                     session_scan_complete = false;
                     continue;
                 }
-                let _lifecycle_claim = match self.try_claim_worktree_lifecycle() {
+                let _lifecycle_claim = match self.try_claim_worktree_lifecycle("gc") {
                     Ok(Some(claim)) => claim,
                     Ok(None) => {
                         blocked_interrupted_paths.push(BlockedInterruptedPath {
@@ -13732,7 +13732,7 @@ impl Broker {
             // where the artifact-use protocol is unavailable.
             #[cfg(unix)]
             let (_lifecycle_claim, _artifact_use_reclaimer) = {
-                let lifecycle_claim = match self.try_claim_worktree_lifecycle() {
+                let lifecycle_claim = match self.try_claim_worktree_lifecycle("gc") {
                     Ok(Some(claim)) => claim,
                     Ok(None) => {
                         failures.push(format!(

@@ -240,7 +240,8 @@ impl Broker {
         evidence: serde_json::Value,
         deadline: Option<std::time::Instant>,
     ) -> Result<(), Keep> {
-        let Ok(Some(_lifecycle_claim)) = self.try_claim_worktree_lifecycle() else {
+        let Ok(Some(_lifecycle_claim)) = self.try_claim_worktree_lifecycle("missing_checkout")
+        else {
             return Err("busy");
         };
         let current = self
