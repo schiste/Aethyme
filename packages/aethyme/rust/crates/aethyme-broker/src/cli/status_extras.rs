@@ -157,23 +157,11 @@ pub(super) fn session_block(
             json!(error.to_string()),
         ),
     };
-    let watch = broker.pull_request_watches(true).ok().and_then(|watches| {
-        // Newest first; prefer a watch that is still observing.
-        let mine: Vec<_> = watches
-            .into_iter()
-            .filter(|watch| watch.session_id == session_id)
-            .collect();
-        let live = mine.iter().position(|watch| {
-            matches!(
-                watch.status,
-                crate::PullRequestWatchStatus::Active | crate::PullRequestWatchStatus::Paused
-            )
-        });
-        match live {
-            Some(index) => mine.into_iter().nth(index),
-            None => mine.into_iter().next(),
-        }
-    });
+    let watch = broker
+        .store_ref()
+        .session_pull_request_watch(session_id)
+        .ok()
+        .flatten();
     let (pr, pr_state) = match &watch {
         Some(watch) => (
             json!({

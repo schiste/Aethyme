@@ -251,6 +251,36 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         open_broker(parsed.read_only_snapshot)?
     };
     let open_ms = opened.elapsed().as_millis() as u64;
+    if parsed.session_view {
+        let session_id = parsed.session.expect("validated session view");
+        let advice = broker.session_status_advice(session_id, now_ms())?;
+        let block = super::status_extras::session_block(&broker, session_id, &advice);
+        let requests: Vec<_> = broker.pending_lease_release_requests()?.into_iter()
+            .filter(|request| request.requester_session_id == session_id || request.holder_session_id == session_id)
+            .map(|request| serde_json::json!({
+                "request_id": request.request_id, "requester_session_id": request.requester_session_id,
+                "holder_session_id": request.holder_session_id, "path": request.path
+            })).collect();
+        let count = requests.len();
+        let mut value = serde_json::json!({
+            "schema": "aethyme.broker-session-view/v1",
+            "session": block,
+            "lease_release_requests": {"count": count, "omitted_count": count.saturating_sub(10), "records": requests.into_iter().take(10).collect::<Vec<_>>()},
+            "data_freshness": {"global_warnings": "not_inspected", "peer_state": "not_inspected", "ownership_claims": "not_inspected", "session_advice": "partial", "deferred_checks_are_unknown": true},
+            "drilldown": {"focused_status": format!("aethyme broker status --session {session_id} --json"), "full_status": "aethyme broker status --full --json"}
+        });
+        super::status_extras::cap_document_advice_evidence(&mut value);
+        let mut value = super::status_revision::render_session(
+            value,
+            broker.main_root(),
+            Some(session_id),
+            parsed.status_revision.as_deref(),
+        )?;
+        value["form"] = serde_json::json!(StatusForm::Compact.as_str());
+        value["hint"] = serde_json::json!(super::status_extras::COMPACT_HINT);
+        out!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
     if form == StatusForm::Compact {
         let mut brief = if parsed.read_only_snapshot {
             broker.status_brief_snapshot(now_ms())?
@@ -284,12 +314,6 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             });
             omitted_unrelated_advice = before - brief.advice.len();
             context.session_contexts.retain(|(id, _)| *id == session_id);
-            if parsed.session_view {
-                context.lease_release_requests.retain(|request| {
-                    request.requester_session_id == session_id
-                        || request.holder_session_id == session_id
-                });
-            }
             // Keep global counts and safety warnings, but reserve the bounded
             // detail slots for the caller's own coordination first.
             brief
@@ -335,28 +359,12 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                 value["session"] = block;
             }
             evidence_truncated = super::status_extras::cap_document_advice_evidence(&mut value);
-            let mut value = if parsed.session_view {
-                let session_value = serde_json::json!({
-                    "schema": "aethyme.broker-session-view/v1",
-                    "session": value["session"],
-                    "lease_release_requests": value["lease_release_requests"],
-                    "data_freshness": {"global_warnings": "not_inspected", "peer_state": "not_inspected", "deferred_checks_are_unknown": true},
-                    "drilldown": {"focused_status": format!("aethyme broker status --session {} --json", parsed.session.unwrap()), "full_status": "aethyme broker status --full --json"}
-                });
-                super::status_revision::render_session(
-                    session_value,
-                    broker.main_root(),
-                    parsed.session,
-                    parsed.status_revision.as_deref(),
-                )?
-            } else {
-                super::status_revision::render(
-                    value,
-                    broker.main_root(),
-                    parsed.session,
-                    parsed.status_revision.as_deref(),
-                )?
-            };
+            let mut value = super::status_revision::render(
+                value,
+                broker.main_root(),
+                parsed.session,
+                parsed.status_revision.as_deref(),
+            )?;
             // Outside the revision: always present, never a "changed section".
             value["form"] = serde_json::json!(StatusForm::Compact.as_str());
             value["hint"] = serde_json::json!(super::status_extras::COMPACT_HINT);

@@ -708,3 +708,32 @@ fn focused_status_prioritizes_the_callers_waiters_without_hiding_global_counts()
     assert_eq!(status["waiters"]["omitted_count"], 2);
     assert_eq!(status["waiters"]["records"][0]["session_id"], session.id);
 }
+
+#[test]
+fn session_view_does_not_load_unrelated_agent_records() {
+    let fixture = common::FixtureRepository::new();
+    init_repo(fixture.path());
+    let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
+    let first = add_worktree(fixture.path(), &fixture.worktree_root(), "focused-record");
+    let other = add_worktree(fixture.path(), &fixture.worktree_root(), "unrelated-record");
+    let session = broker.adopt(&first, Some("focused")).unwrap();
+    let peer = broker.adopt(&other, Some("unrelated")).unwrap();
+    drop(broker);
+    let db = rusqlite::Connection::open(aethyme_broker::broker_db_path(fixture.path()).unwrap())
+        .unwrap();
+    db.execute_batch("PRAGMA ignore_check_constraints = ON").unwrap();
+    db.execute(
+        "UPDATE sessions SET origin = 'unrecognized-origin' WHERE id = ?1",
+        [peer.id],
+    )
+    .unwrap();
+    drop(db);
+    let id = session.id.to_string();
+    let view = json_status(
+        fixture.path(),
+        &["status", "--session", &id, "--session-view", "--json"],
+    );
+    assert_eq!(view["session"]["id"], session.id);
+    assert_eq!(view["data_freshness"]["session_advice"], "partial");
+    assert_eq!(view["data_freshness"]["peer_state"], "not_inspected");
+}
