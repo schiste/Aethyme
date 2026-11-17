@@ -266,9 +266,22 @@ pub(crate) fn probe_import_method(
         PackageImportMethod::Copy
     };
     for path in [&cloned, &linked, &source] {
-        let _ = fs::remove_file(path);
+        remove_probe_file(path);
     }
     method
+}
+
+/// Remove one probe file. A file that was never created is fine; any other
+/// failure leaves a few bytes behind and is reported, never fatal.
+fn remove_probe_file(path: &Path) {
+    if let Err(error) = fs::remove_file(path)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "warning: aethyme could not remove import probe {}: {error}",
+            path.display()
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -311,7 +324,7 @@ fn clone_file(source: &Path, destination: &Path) -> io::Result<()> {
     } else {
         let error = io::Error::last_os_error();
         drop(destination_file);
-        let _ = fs::remove_file(destination);
+        remove_probe_file(destination);
         Err(error)
     }
 }
