@@ -11,10 +11,13 @@ const SECTIONS: &[&str] = &[
     "advice",
     "waiters",
     "session_contexts",
+    "peer_state",
+    "global_state",
     "collaboration_fence",
     "lease_release_requests",
     "coordinated_operations",
     "focus",
+    "session",
     "omitted_details",
     "drilldown",
 ];
@@ -27,12 +30,45 @@ fn digest(data: &[u8]) -> String {
 /// revision. A missing, malformed, or differently scoped token falls back to a
 /// full snapshot; it must never be interpreted as an unchanged observation.
 pub(super) fn render(
+    snapshot: Value,
+    root: &Path,
+    session: Option<i64>,
+    since: Option<&str>,
+) -> Result<Value, serde_json::Error> {
+    render_inner(snapshot, root, session, since, false)
+}
+
+pub(super) fn render_session(
     mut snapshot: Value,
     root: &Path,
     session: Option<i64>,
     since: Option<&str>,
 ) -> Result<Value, serde_json::Error> {
-    let scope = digest(format!("{}\0{:?}", root.display(), session).as_bytes());
+    // Polling a watch refreshes its observation time even when no PR facts
+    // change. Keep it out of both the projection and its revision; focused
+    // status retains the timestamp for callers needing freshness evidence.
+    if let Some(pr) = snapshot
+        .pointer_mut("/session/pr")
+        .and_then(Value::as_object_mut)
+    {
+        pr.remove("observed_at_ms");
+    }
+    render_inner(snapshot, root, session, since, true)
+}
+
+fn render_inner(
+    mut snapshot: Value,
+    root: &Path,
+    session: Option<i64>,
+    since: Option<&str>,
+    session_view: bool,
+) -> Result<Value, serde_json::Error> {
+    let scope_text = if session_view {
+        format!("{}\0{:?}\0session-view", root.display(), session)
+    } else {
+        format!("{}\0{:?}", root.display(), session)
+    };
+    let scope = digest(scope_text.as_bytes());
     let mut hashes = Vec::with_capacity(SECTIONS.len());
     for key in SECTIONS {
         hashes.push(digest(&serde_json::to_vec(
@@ -89,9 +125,34 @@ pub(super) fn render(
 
 #[cfg(test)]
 mod tests {
-    use super::render;
+    use super::{render, render_session};
     use serde_json::json;
     use std::path::Path;
+
+    #[test]
+    fn session_revision_ignores_watch_poll_time_but_detects_pr_changes() {
+        let snapshot =
+            |time, draft| json!({"session": {"pr": {"observed_at_ms": time, "draft": draft}}});
+        let first = render_session(snapshot(1, false), Path::new("/repo"), Some(7), None).unwrap();
+        assert!(first["session"]["pr"].get("observed_at_ms").is_none());
+        let revision = first["revision"].as_str().unwrap();
+        let same = render_session(
+            snapshot(2, false),
+            Path::new("/repo"),
+            Some(7),
+            Some(revision),
+        )
+        .unwrap();
+        assert!(same["changed_sections"].as_object().unwrap().is_empty());
+        let changed = render_session(
+            snapshot(3, true),
+            Path::new("/repo"),
+            Some(7),
+            Some(revision),
+        )
+        .unwrap();
+        assert_eq!(changed["changed_sections"]["session"]["pr"]["draft"], true);
+    }
 
     #[test]
     fn revision_reports_section_replacements_and_falls_back_across_scope() {

@@ -217,3 +217,63 @@ fn install_only_ever_runs_plugin_subcommands() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn plugin_hook_streams_capable_cli_and_keeps_legacy_failure_silent() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
+    std::fs::create_dir(&bin).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let stub = bin.join("aethyme");
+    std::fs::write(
+        &stub,
+        r##"#!/bin/sh
+if [ "$2" = "__stream_protocol_v1" ]; then
+  [ "$TEST_HOOK_MODE" = modern ] && printf 'aethyme-hook-stream-v1\n'
+  exit 0
+fi
+if [ "$1" = hook ]; then
+  printf '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"hello"}}'
+  [ "$TEST_HOOK_MODE" = legacy_failure ] && exit 1
+  exit 0
+fi
+exit 0
+"##,
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let script = plugin_dir().join("hooks/aethyme-hook.sh");
+    for (mode, expected) in [
+        ("modern", true),
+        ("legacy", true),
+        ("legacy_failure", false),
+    ] {
+        let output = Command::new("bash")
+            .arg(&script)
+            .arg("PostToolUse")
+            .current_dir(&repo)
+            .env("PATH", &path)
+            .env("TEST_HOOK_MODE", mode)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(!output.stdout.is_empty(), expected, "{mode}: {:?}", output);
+        if expected {
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["hookSpecificOutput"]["additionalContext"], "hello");
+        }
+    }
+}

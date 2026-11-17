@@ -46,9 +46,12 @@ Requires a **schema_version bump** (breaking — never do this silently):
 
 ```bash
 aethyme broker advanced events --json --since <last-id>        # replay / catch up
-aethyme broker advanced events --json --follow                 # live NDJSON, ~700ms poll
+aethyme broker advanced events --json --follow                 # live NDJSON, filesystem wakeups
+aethyme broker advanced events --json --session <id> --since <last-id> --follow  # session-owned events
 aethyme broker advanced events --json --kind merge.            # prefix filter
 ```
+
+`--session` selects rows whose `session_id` matches. Global events and events attributed to another session are excluded, even when they might be relevant. Use focused status and full status for current coordination and evidence; the event stream alone is not a safety decision. If events were pruned, a cursor still works but cannot recover deleted rows.
 
 One JSON object per line:
 
@@ -79,7 +82,7 @@ One JSON object per line:
 7. **Follow waits:** `--follow` waits for local filesystem notifications
    on the broker database directory, then reads rows after its current event
    id. Notifications can coalesce; the durable log and cursor remain
-   authoritative, so every wakeup is followed by a query.
+   authoritative, so every wakeup is followed by a query. A full page is drained immediately before waiting again.
 
 ## Event catalog
 

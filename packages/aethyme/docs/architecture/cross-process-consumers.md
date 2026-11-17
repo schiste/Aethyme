@@ -36,6 +36,33 @@ consumer. This file exists so that doesn't happen again.
    `scripts/eval/verify-playground.sh` against any deployed
    playground; it asserts a subset of the contracts below.
 
+## Session coordination consumers
+
+`aethyme broker status --session <id> --json` supplies a session block in
+its full compact snapshot. With `--since-revision`, the
+`aethyme.broker-status-delta/v1` document includes `changed_sections.session`
+only when that block changes; an empty section map does not certify deferred
+checks. Older or differently scoped revision tokens reset to a full snapshot.
+
+`status --session <id> --session-view --json` returns the versioned
+`aethyme.broker-session-view/v1` snapshot. It reads session advice and pending
+lease release requests for the selected session, recorded peer lease and
+declared-scope overlaps, and a partial set of blocker observations. It skips
+the repository-wide status computation and marks deferred recovery checks
+as unknown. Its revision scope is separate from focused status, and unrelated
+repository counts do not cause deltas. Use focused or full status for broader
+checks and exact evidence.
+
+`aethyme broker advanced events --session <id> --since <event-id> --follow
+--json` emits NDJSON rows attributed to that session, in event-id order. It
+omits global and peer-attributed events, and cannot recover rows removed by
+retention. Clients persist the last consumed id and fetch focused or full
+status when they need current state or evidence. The installed, trusted hook
+plugin delivers changes to the session, relevant recorded peer overlaps and
+blocker observations at prompt and tool boundaries, alongside pending lease
+release requests. Session and blocker checks run at most once every 30 seconds
+during a continuing session. An idle agent receives updates on its next turn.
+
 ## Code-shape diagnostics
 
 `aethyme quality code-shape` is an opt-in CLI for source-shape diagnostics.

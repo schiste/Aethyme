@@ -4467,6 +4467,26 @@ impl Broker {
         })
     }
 
+    /// Pending release requests involving one session.
+    pub(crate) fn session_pending_lease_release_requests(
+        &self,
+        session_id: i64,
+    ) -> Result<Vec<crate::lease_requests::LeaseReleaseRequest>, BrokerOpError> {
+        let leases = self
+            .store
+            .active_leases_for_release_session(session_id, now_ms())?;
+        let paths_by_holder = index_active_lease_paths_by_holder(
+            leases
+                .iter()
+                .map(|lease| (lease.session_id, lease.path.as_str())),
+        );
+        crate::lease_requests::pending_requests_for_session(
+            &self.store,
+            session_id,
+            |holder, path| holder_has_overlapping_active_lease(&paths_by_holder, holder, path),
+        )
+    }
+
     /// Ask every other session holding a lease on `path` to release it. One
     /// request per holder; an identical pending request is returned, not
     /// repeated. Requests against a holder already gone past its grace are
@@ -4512,12 +4532,10 @@ impl Broker {
                 ids.push(pending.request_id);
                 continue;
             }
-            ids.push(self.store.append_event(
-                crate::lease_requests::REQUESTED,
-                Some(requester),
-                Some(&crate::lease_requests::request_payload(
-                    &path, requester, holder, reason,
-                )),
+            ids.push(self.store.append_release_request_with_note(
+                requester,
+                holder,
+                &crate::lease_requests::request_payload(&path, requester, holder, reason),
             )?);
         }
         self.grant_stale_lease_requests()?;
