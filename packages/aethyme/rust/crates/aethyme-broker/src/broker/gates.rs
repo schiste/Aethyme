@@ -1011,6 +1011,7 @@ impl Broker {
         BrokerOpError,
     > {
         let timeout_generation_before = crate::git::git_timeout_generation();
+        let phase_started = std::time::Instant::now();
         let (result, deadline_expired) = crate::git::with_git_deadline(
             std::time::Duration::from_millis(GATES_AFFECTED_PHASE_BUDGET_MS),
             || {
@@ -1052,10 +1053,13 @@ impl Broker {
         );
 
         if deadline_expired || crate::git::git_timeout_generation() != timeout_generation_before {
-            return Err(GitError::TimedOut {
-                args: "gates affected input selection".into(),
-                seconds: GATES_AFFECTED_PHASE_BUDGET_MS.div_ceil(1_000),
-            }
+            return Err(GitError::timed_out_running(
+                "gates affected input selection",
+                None,
+                phase_started,
+                true,
+                std::time::Duration::from_millis(GATES_AFFECTED_PHASE_BUDGET_MS),
+            )
             .into());
         }
 

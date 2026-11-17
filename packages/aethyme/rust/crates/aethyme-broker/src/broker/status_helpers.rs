@@ -464,10 +464,11 @@ mod checkout_inspection_error_tests {
 
     #[test]
     fn a_git_timeout_is_an_unknown_checkout_not_a_clean_or_unreadable_one() {
-        let inspection = checkout_inspection_error(crate::GitError::TimedOut {
-            args: "status --porcelain".into(),
-            seconds: 7,
-        });
+        let inspection = checkout_inspection_error(crate::GitError::timed_out_before_start(
+            "status --porcelain",
+            None,
+            std::time::Duration::ZERO,
+        ));
 
         assert_eq!(inspection, CheckoutInspection::NotInspected);
     }
