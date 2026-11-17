@@ -529,6 +529,88 @@ fn focused_revision_only_returns_session_when_its_facts_change() {
 }
 
 #[test]
+fn session_view_ignores_unrelated_sessions_and_resets_other_revision_scopes() {
+    let fixture = common::FixtureRepository::new();
+    init_repo(fixture.path());
+    let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
+    let worktree = add_worktree(fixture.path(), &fixture.worktree_root(), "view-first");
+    let session = broker.adopt(&worktree, Some("view-first")).unwrap();
+    drop(broker);
+    let id = session.id.to_string();
+    let first = json_status(
+        fixture.path(),
+        &["status", "--session", &id, "--session-view", "--json"],
+    );
+    assert_eq!(first["schema"], "aethyme.broker-session-view/v1");
+    assert_eq!(first["data_freshness"]["global_warnings"], "not_inspected");
+    let revision = first["revision"].as_str().unwrap();
+    let other = add_worktree(fixture.path(), &fixture.worktree_root(), "view-other");
+    let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
+    broker.adopt(&other, Some("unrelated")).unwrap();
+    drop(broker);
+    let same = json_status(
+        fixture.path(),
+        &[
+            "status",
+            "--session",
+            &id,
+            "--session-view",
+            "--since-revision",
+            revision,
+            "--json",
+        ],
+    );
+    assert!(
+        same["changed_sections"].as_object().unwrap().is_empty(),
+        "{same}"
+    );
+    let full = json_status(
+        fixture.path(),
+        &[
+            "status",
+            "--session",
+            &id,
+            "--since-revision",
+            revision,
+            "--json",
+        ],
+    );
+    assert_eq!(full["revision_reset"], true);
+    std::fs::write(worktree.join("new-view.txt"), "changed").unwrap();
+    git(&worktree, &["add", "new-view.txt"]);
+    git(&worktree, &["commit", "-qm", "change session"]);
+    let changed = json_status(
+        fixture.path(),
+        &[
+            "status",
+            "--session",
+            &id,
+            "--session-view",
+            "--since-revision",
+            revision,
+            "--json",
+        ],
+    );
+    assert_ne!(
+        changed["changed_sections"]["session"]["head_oid"], first["session"]["head_oid"],
+        "{changed}"
+    );
+    assert!(
+        !run_status(fixture.path(), &["status", "--session-view", "--json"])
+            .status
+            .success()
+    );
+    assert!(
+        !run_status(
+            fixture.path(),
+            &["status", "--session", &id, "--session-view"]
+        )
+        .status
+        .success()
+    );
+}
+
+#[test]
 fn session_event_follower_drains_backlog_without_another_write() {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;

@@ -373,14 +373,16 @@ const PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after an ed
 Other agents may be working in sibling worktrees.
 
 For routine coordination, use `aethyme broker status --json` (compact).
-After starting a session, focus it with `--session <id>`; retain the JSON
-revision and use `--since-revision <token>` for later changes. Installed agent
-hooks deliver notes and edit-overlap warnings at tool boundaries. Hooks do not
+After starting a session, use `aethyme broker status --session <id> --session-view --json`;
+retain its revision and use `--since-revision <token>` for later changes. This
+session view does not inspect global warnings or peer state; use focused
+status when those matter. Installed agent hooks deliver notes and edit-overlap
+warnings at tool boundaries. Hooks do not
 cover every state change: check focused status when current state matters, and
 use `aethyme broker advanced events --session <id> --follow --json` for a
 session-owned event stream when a client can consume it. The stream excludes
-global and peer events. Branch on `advice.categories[].severity` and
-`.commands`, `summary` and `drilldown`; deferred checks are unknown, not clean. Use
+global and peer events. In focused status, branch on `advice.categories[].severity`
+and `.commands`, `summary` and `drilldown`; deferred checks are unknown, not clean. Use
 `aethyme broker status --full --json` only when exact session or lease-path evidence is
 needed. Check overlapping work before duplicating it. Overlaps with an active
 session's explicit lease are advisory. Accepted warnings permit work in your
@@ -415,14 +417,16 @@ const NON_PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after a
 Other agents may be working in sibling worktrees.
 
 For routine coordination, use `aethyme broker status --json` (compact).
-After starting a session, focus it with `--session <id>`; retain the JSON
-revision and use `--since-revision <token>` for later changes. Installed agent
-hooks deliver notes and edit-overlap warnings at tool boundaries. Hooks do not
+After starting a session, use `aethyme broker status --session <id> --session-view --json`;
+retain its revision and use `--since-revision <token>` for later changes. This
+session view does not inspect global warnings or peer state; use focused
+status when those matter. Installed agent hooks deliver notes and edit-overlap
+warnings at tool boundaries. Hooks do not
 cover every state change: check focused status when current state matters, and
 use `aethyme broker advanced events --session <id> --follow --json` for a
 session-owned event stream when a client can consume it. The stream excludes
-global and peer events. Branch on `advice.categories[].severity` and
-`.commands`, `summary` and `drilldown`; deferred checks are unknown, not clean. Use
+global and peer events. In focused status, branch on `advice.categories[].severity`
+and `.commands`, `summary` and `drilldown`; deferred checks are unknown, not clean. Use
 `aethyme broker status --full --json` only when exact session or lease-path evidence is
 needed. Check overlapping work before duplicating it. Overlaps with an active
 session's explicit lease are advisory. Accepted warnings permit work in your
@@ -1560,13 +1564,17 @@ mod tests {
             .first()
             .expect("at least one substantive commit policy")
             .required_sections;
-        assert!(substantive
-            .iter()
-            .all(|policy| policy.required_sections == required_sections));
-        assert!(COMMIT_POLICIES
-            .iter()
-            .filter(|policy| !policy.body_required)
-            .all(|policy| policy.required_sections.is_empty()));
+        assert!(
+            substantive
+                .iter()
+                .all(|policy| policy.required_sections == required_sections)
+        );
+        assert!(
+            COMMIT_POLICIES
+                .iter()
+                .filter(|policy| !policy.body_required)
+                .all(|policy| policy.required_sections.is_empty())
+        );
 
         let doc = render_agents_document(None).unwrap();
         assert!(doc.contains(&format!("Types: {}.", policy_list(&all))));

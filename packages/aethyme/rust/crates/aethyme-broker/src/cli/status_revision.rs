@@ -28,12 +28,36 @@ fn digest(data: &[u8]) -> String {
 /// revision. A missing, malformed, or differently scoped token falls back to a
 /// full snapshot; it must never be interpreted as an unchanged observation.
 pub(super) fn render(
-    mut snapshot: Value,
+    snapshot: Value,
     root: &Path,
     session: Option<i64>,
     since: Option<&str>,
 ) -> Result<Value, serde_json::Error> {
-    let scope = digest(format!("{}\0{:?}", root.display(), session).as_bytes());
+    render_inner(snapshot, root, session, since, false)
+}
+
+pub(super) fn render_session(
+    snapshot: Value,
+    root: &Path,
+    session: Option<i64>,
+    since: Option<&str>,
+) -> Result<Value, serde_json::Error> {
+    render_inner(snapshot, root, session, since, true)
+}
+
+fn render_inner(
+    mut snapshot: Value,
+    root: &Path,
+    session: Option<i64>,
+    since: Option<&str>,
+    session_view: bool,
+) -> Result<Value, serde_json::Error> {
+    let scope_text = if session_view {
+        format!("{}\0{:?}\0session-view", root.display(), session)
+    } else {
+        format!("{}\0{:?}", root.display(), session)
+    };
+    let scope = digest(scope_text.as_bytes());
     let mut hashes = Vec::with_capacity(SECTIONS.len());
     for key in SECTIONS {
         hashes.push(digest(&serde_json::to_vec(

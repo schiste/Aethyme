@@ -788,7 +788,7 @@ Usage:
       queue attestations and per-SHA unrecorded-commit dispositions. The
       template option atomically writes a no-clobber schema-v2 document with
       exact identifiers and deliberately invalid null operator judgments.
-  aethyme broker status [--json] [--full] [--session <id>] [--since-revision <token>] [--summary] [--refresh]
+  aethyme broker status [--json] [--full] [--session <id>] [--session-view] [--since-revision <token>] [--summary] [--refresh]
       Compact by default, as text and as --json: a versioned summary that
       groups advice and marks omitted details and deferred checks; those
       checks are unknown, not clean. Branch on
@@ -805,6 +805,8 @@ Usage:
       `session` block: branch, head and remote oids, unpushed commits, the
       locally recorded pull request (no network call), preparation, that
       session's advice and the exact next command.
+      --session-view requires --session and --json and emits only session facts
+      and its lease requests. Global warnings and peer state are not inspected.
       --since-revision returns changed sections of compact JSON; invalid or
       differently scoped revisions return a fresh snapshot. Deferred checks
       remain unknown even when no sections changed.
@@ -1601,6 +1603,7 @@ struct Parsed {
     /// `status --compact`: the default JSON form since compact became the
     /// default; still accepted, and refused only beside `--full`.
     compact: bool,
+    session_view: bool,
     /// `status --full`: the full `StatusView` document.
     full: bool,
     status_revision: Option<String>,
@@ -1789,6 +1792,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         read_only_compatibility: None,
         summary: false,
         compact: false,
+        session_view: false,
         full: false,
         status_revision: None,
         refresh: false,
@@ -1948,6 +1952,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--non-interactive" => parsed.non_interactive = true,
             "--summary" => parsed.summary = true,
             "--compact" => parsed.compact = true,
+            "--session-view" => parsed.session_view = true,
             "--full" => parsed.full = true,
             "--plan" => parsed.push_plan = true,
             "--since-revision" => {

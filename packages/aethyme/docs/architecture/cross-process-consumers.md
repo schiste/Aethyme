@@ -44,6 +44,14 @@ its full compact snapshot. With `--since-revision`, the
 only when that block changes; an empty section map does not certify deferred
 checks. Older or differently scoped revision tokens reset to a full snapshot.
 
+`status --session <id> --session-view --json` instead returns the versioned
+`aethyme.broker-session-view/v1` snapshot with the session and its lease-release
+requests. Its revision scope is separate from focused status, and unrelated
+repository counts do not cause deltas. Global warnings and peer state are
+explicitly `not_inspected`; use focused or full status when they matter. The
+projection currently shares the underlying status computation, so reduced output
+does not imply reduced computation.
+
 `aethyme broker advanced events --session <id> --since <event-id> --follow
 --json` emits NDJSON rows attributed to that session, in event-id order. It
 omits global and peer-attributed events, and cannot recover rows removed by
