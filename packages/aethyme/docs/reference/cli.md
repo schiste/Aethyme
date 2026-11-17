@@ -955,7 +955,24 @@ required_for_hooks = true
 ```
 
 Commands are argv arrays, not shell strings; Aethyme does not infer npm,
-pnpm, Yarn, Cargo, Python, or any other ecosystem. Every input and output is a
+pnpm, Yarn, Cargo, Python, or any other ecosystem.
+
+Each `[[runtimes]]` probe is a repository command. `submit prepare` runs every
+probe once per run, in the checkout, with the environment the steps inherit
+(the invoking process's, including its `PATH`), for at most 5 seconds each,
+and only when the policy is already trusted and storage is not under
+pressure. The prepared state is valid for the digest of each probe's exit
+status and standard output, so a runtime whose output changes behind an
+unchanged executable (a Python probe launched through Node) makes the
+checkout stale, while a reinstall of the same version does not. The
+preparation digest itself keys each runtime on its resolved canonical path
+only. Status reads and storage sweeps never run a probe: the recorded output
+stands while the runtime resolves to the same executable (path, size,
+modification time), and a changed executable sends the checkout back to
+`submit prepare`, which probes again and, when the output is unchanged,
+reports it current without running a step. `submit prepare status --json`
+lists the recorded `runtimes` (`executable`, `size`, `modified_ns`,
+`probe_sha256`, `probe_summary`, `probe_timed_out`). Every input and output is a
 validated repository-relative path. Outputs remain inside the worktree and a
 symlink at an output path is refused. Repositories should ignore local outputs
 in Git. `worktree_local` steps receive no shared cache. A

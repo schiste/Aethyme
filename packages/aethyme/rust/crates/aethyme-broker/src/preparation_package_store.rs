@@ -74,9 +74,15 @@ pub struct PackageStoreKey {
     pub arch: String,
 }
 
-/// One runtime the preparation declares, as the preparation digest saw it.
-/// The digest hashes the resolved executable's canonical path, size and
-/// modification time; it does not run the probe command.
+/// One runtime the preparation declares: the executable its probe resolves
+/// to (canonical path, size, modification time) and, once a preparation has
+/// run the probe, a digest of what it printed.
+///
+/// The prepared state is valid for a probe *output*, not for a binary: the
+/// executable identity only tells a status read, which never runs a probe,
+/// whether the recorded output can still stand. A probe that reaches another
+/// interpreter (a Python probe launched through Node) is judged by its output
+/// like any other.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RuntimeIdentity {
     pub name: String,
@@ -86,6 +92,142 @@ pub struct RuntimeIdentity {
     pub size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_ns: Option<u64>,
+    /// SHA-256 of the probe's exit status and standard output; absent when
+    /// the probe has not been run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_sha256: Option<String>,
+    /// The first non-empty line the probe printed, at most 120 characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_summary: Option<String>,
+    /// The probe did not finish within its time limit and was killed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub probe_timed_out: bool,
+}
+
+impl RuntimeIdentity {
+    /// Whether `other` resolves the same executable (path, size, mtime).
+    pub(crate) fn same_executable(&self, other: &Self) -> bool {
+        self.executable == other.executable
+            && self.size == other.size
+            && self.modified_ns == other.modified_ns
+    }
+}
+
+/// How long one runtime probe may run before it is killed.
+pub(crate) const RUNTIME_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// The most standard output read from one probe.
+const RUNTIME_PROBE_MAX_OUTPUT: u64 = 64 * 1024;
+
+/// What one probe run produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeProbeOutput {
+    pub(crate) sha256: String,
+    pub(crate) summary: Option<String>,
+    pub(crate) timed_out: bool,
+}
+
+/// Run one declared runtime probe in `root` with the broker's environment,
+/// which is the environment preparation steps inherit. Standard input is
+/// closed, standard error discarded, and the probe (with its process group
+/// on Unix) is killed after `timeout`. Returns `None` when it cannot start.
+pub(crate) fn run_runtime_probe(
+    root: &Path,
+    command: &[String],
+    timeout: std::time::Duration,
+) -> Option<RuntimeProbeOutput> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let (program, arguments) = command.split_first()?;
+    let mut builder = Command::new(program);
+    builder
+        .args(arguments)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        builder.process_group(0);
+    }
+    let mut child = builder.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        if (&mut stdout)
+            .take(RUNTIME_PROBE_MAX_OUTPUT)
+            .read_to_end(&mut output)
+            .is_err()
+        {
+            output.clear();
+        }
+        // The receiver is gone only when the probe timed out; nothing waits.
+        drop(sender.send(output));
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let mut timed_out = false;
+    let exit_code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                timed_out = true;
+                kill_probe(&mut child);
+                break None;
+            }
+        }
+    };
+    // A grandchild may hold the pipe open; never wait on it past the limit.
+    let output = receiver
+        .recv_timeout(
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .max(std::time::Duration::from_millis(100)),
+        )
+        .unwrap_or_default();
+    let mut hasher = Sha256::new();
+    if timed_out {
+        hasher.update(b"timed-out\n");
+    } else {
+        hasher.update(format!("exit:{exit_code:?}\n").as_bytes());
+        hasher.update(&output);
+    }
+    let summary = String::from_utf8_lossy(&output)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(120).collect::<String>());
+    Some(RuntimeProbeOutput {
+        sha256: format!("{:x}", hasher.finalize()),
+        summary,
+        timed_out,
+    })
+}
+
+fn kill_probe(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: kill(2) with a negative pid signals the probe's own
+            // process group, created for it by `process_group(0)`.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    if let Err(error) = child.kill()
+        && error.kind() != io::ErrorKind::InvalidInput
+    {
+        eprintln!("warning: aethyme could not stop a runtime probe: {error}");
+    }
+    if let Err(error) = child.wait() {
+        eprintln!("warning: aethyme could not reap a runtime probe: {error}");
+    }
 }
 
 /// What one preparation used for package storage, and what it cost the
@@ -472,6 +614,41 @@ mod tests {
         // clone. Copy would mean even hard links failed on one directory.
         assert_ne!(method, PackageImportMethod::Copy);
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_runtime_probe_is_judged_by_its_output_and_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let probe = |script: &str| {
+            run_runtime_probe(
+                root.path(),
+                &["sh".into(), "-c".into(), script.into()],
+                std::time::Duration::from_secs(5),
+            )
+            .unwrap()
+        };
+        let first = probe("echo v1.2.3");
+        assert_eq!(first.summary.as_deref(), Some("v1.2.3"));
+        assert!(!first.timed_out);
+        assert_eq!(probe("echo v1.2.3").sha256, first.sha256);
+        assert_ne!(probe("echo v1.2.4").sha256, first.sha256);
+        assert_ne!(probe("echo v1.2.3; exit 3").sha256, first.sha256);
+        let slow = run_runtime_probe(
+            root.path(),
+            &["sh".into(), "-c".into(), "sleep 30".into()],
+            std::time::Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(slow.timed_out);
+        assert!(
+            run_runtime_probe(
+                root.path(),
+                &["aethyme-no-such-probe-binary".into()],
+                RUNTIME_PROBE_TIMEOUT
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -1401,10 +1401,18 @@ trusted policies are unchanged. The `packages` directory is never swept as a
 stale digest; only a whole-store rotation under the exclusive lease removes
 it, and a retired store containing it keeps a managed layout.
 
+Runtime keys: the preparation digest keys each `[[runtimes]]` entry on its
+resolved canonical path, no longer on its size and modification time (a
+one-time rekey: every checkout is stale once after upgrading). `submit
+prepare` runs each probe (5 s limit, trusted policy, storage not under
+pressure) and the record keeps each probe's output digest and executable
+identity; a status read accepts the recorded output while the executable is
+unchanged and otherwise reports `stale` with `runtime changed: ...`.
+
 Output contract (additive): the prepare report gains `package_store`,
 `cache_outcome` (`hit`, `miss_reason`) and per-step `volume_bytes_allocated`;
 the command metric's `preparation` object carries `package_store` and
-`cache_outcome`; `submit prepare status --json` gains `package_store` from the
+`cache_outcome`; `submit prepare status --json` gains `runtimes` and `package_store` from the
 session's last recorded preparation (store path, scope, key components,
 runtime identities, `same_volume`, `import_method`, free-space readings);
 `broker status` gains the warning `prepare.store-on-other-volume`, read from

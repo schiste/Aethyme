@@ -806,6 +806,10 @@ pub struct PreparationStatus {
     /// keyed on, the import the volume supports and the free-space change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub package_store: Option<package_store::PackageStoreReport>,
+    /// The runtime identities and probe outputs this session's last recorded
+    /// preparation was keyed on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub runtimes: Vec<package_store::RuntimeIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -893,9 +897,8 @@ impl PreparationReport {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PreparationCacheOutcome {
     pub hit: bool,
-    /// On a miss: the preparation state before this run and why. A stale
-    /// checkout whose recorded runtimes differ from the resolved ones names
-    /// them.
+    /// On a miss: the preparation state before this run and why; a runtime
+    /// whose probe output or executable changed is named.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub miss_reason: Option<String>,
 }
@@ -908,27 +911,10 @@ impl PreparationCacheOutcome {
         }
     }
 
-    fn miss(
-        status: &PreparationStatus,
-        current_runtimes: &[package_store::RuntimeIdentity],
-    ) -> Self {
-        let mut reason = format!("{}: {}", status.state.as_str(), status.reason);
-        if status.state == PreparationState::Stale
-            && let Some(recorded) = status.package_store.as_ref()
-            && !recorded.runtimes.is_empty()
-        {
-            let changed = current_runtimes
-                .iter()
-                .filter(|runtime| !recorded.runtimes.contains(runtime))
-                .map(|runtime| runtime.name.as_str())
-                .collect::<Vec<_>>();
-            if !changed.is_empty() {
-                reason.push_str(&format!(" (runtimes changed: {})", changed.join(", ")));
-            }
-        }
+    fn miss(status: &PreparationStatus) -> Self {
         Self {
             hit: false,
-            miss_reason: Some(reason),
+            miss_reason: Some(format!("{}: {}", status.state.as_str(), status.reason)),
         }
     }
 }
@@ -948,6 +934,9 @@ struct PreparationRecord {
     host_lease_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     package_store: Option<package_store::PackageStoreReport>,
+    /// The runtime probes this preparation ran, with their executables.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    runtimes: Vec<package_store::RuntimeIdentity>,
 }
 
 impl Broker {
@@ -1124,6 +1113,7 @@ impl Broker {
                     waiting_on: None,
                     shared_cache_background_measurement: None,
                     package_store: None,
+                    runtimes: Vec::new(),
                 });
             }
             Ok(Some(config)) => config,
@@ -1131,14 +1121,18 @@ impl Broker {
                 return Ok(invalid_status(session_id, error.to_string()));
             }
         };
-        self.preparation_status_for_config(session_id, root, &config)
+        self.preparation_status_for_config(session_id, root, &config, None)
     }
 
+    /// `probed` carries runtime probes a preparation has just run; without
+    /// them (every status read) the recorded probe outputs stand while each
+    /// runtime still resolves to the executable they were taken from.
     fn preparation_status_for_config(
         &self,
         session_id: i64,
         root: &Path,
         config: &PreparationConfig,
+        probed: Option<&[package_store::RuntimeIdentity]>,
     ) -> Result<PreparationStatus, BrokerOpError> {
         let hook_required = config.steps.iter().any(|step| step.required_for_hooks);
         let source_digest = match preparation_source_digest(root, config, session_id) {
@@ -1150,6 +1144,10 @@ impl Broker {
         let package_store = record
             .as_ref()
             .and_then(|record| record.package_store.clone());
+        let recorded_runtimes = record
+            .as_ref()
+            .map(|record| record.runtimes.clone())
+            .unwrap_or_default();
         let (state, reason, recorded_digest, recorded_source_digest) = match record {
             None => (
                 PreparationState::Required,
@@ -1216,6 +1214,23 @@ impl Broker {
                 Some(record.source_digest),
             ),
         };
+        let (state, reason) = match (state, config.runtimes.is_empty()) {
+            (PreparationState::Current, false) => {
+                let observed;
+                let (current, from_probe) = match probed {
+                    Some(probed) => (probed, true),
+                    None => {
+                        observed = runtime_identities(root, config);
+                        (observed.as_slice(), false)
+                    }
+                };
+                match runtime_change(&recorded_runtimes, current, from_probe) {
+                    Some(change) => (PreparationState::Stale, change),
+                    None => (state, reason),
+                }
+            }
+            _ => (state, reason),
+        };
         let expected_digest = Some(hash_text(&source_digest));
         let current_operation = (state != PreparationState::Current)
             .then(|| self.preparation_cache_activity(session_id))
@@ -1248,6 +1263,7 @@ impl Broker {
                 .then(|| self.shared_cache_measurement_status())
                 .flatten(),
             package_store,
+            runtimes: recorded_runtimes,
         })
     }
 
@@ -1294,10 +1310,47 @@ impl Broker {
             path: PREPARATION_CONFIG_RELPATH.into(),
             reason: "repository declares no preparation steps".into(),
         })?;
+        // Run the declared runtime probes before judging the checkout, so a
+        // runtime whose output changed behind an unchanged executable (an
+        // interpreter reached through another one) is never reused. Probes are
+        // repository commands: they run only under an already trusted policy,
+        // read without recording anything; an untrusted policy is refused
+        // below as before.
+        let early_policy = match crate::gates::load_gates(&root) {
+            Ok(gates) => Some(gates),
+            Err(crate::gates::GateConfigError::Missing(_)) => Some(Vec::new()),
+            Err(_) => None,
+        }
+        .map(|gates| crate::broker::gate_trust::GatePolicy::from_parts(&gates, Some(&config)));
+        let early_probes = early_policy
+            .filter(|policy| {
+                crate::broker::gate_trust::assess_trusted_for_host_state(
+                    self.main_root(),
+                    self.storage_context().host_state_dir.as_deref(),
+                    policy,
+                    Some(self.store_ref()),
+                )
+                .is_ok()
+            })
+            // Under storage pressure nothing of the repository's runs, probes
+            // included; the refusal itself comes from the checks below.
+            .filter(|_| {
+                require_preparation_storage(
+                    self.main_root(),
+                    &[root.clone(), self.main_root().join(".aethyme")],
+                )
+                .is_ok()
+            })
+            .map(|_| run_runtime_probes(&root, &config));
         // Status and execution must use the same parsed configuration and
         // fingerprint. Hashing it once avoids re-reading every input on each
         // preparation, including when the checkout is already current.
-        let status = self.preparation_status_for_config(session_id, &root, &config)?;
+        let status = self.preparation_status_for_config(
+            session_id,
+            &root,
+            &config,
+            early_probes.as_deref(),
+        )?;
         let source_digest = match status.source_digest.as_ref() {
             Some(digest) => digest.clone(),
             // Preserve the original detailed error for invalid inputs.
@@ -1305,6 +1358,21 @@ impl Broker {
         };
         let digest = hash_text(&source_digest);
         if status.state == PreparationState::Current {
+            // The probes matched: record the executables they now come from,
+            // so later status reads accept them without probing (a reinstall
+            // of the same version).
+            if let Some(probes) = early_probes.as_ref() {
+                let state_path = record_path(self.main_root(), session_id);
+                if let Ok(Some(mut record)) = read_record(&state_path)
+                    && record.runtimes != *probes
+                {
+                    record.runtimes = probes.clone();
+                    crate::warn_unrecorded(
+                        "record the refreshed runtime probes",
+                        write_record(&state_path, &record),
+                    );
+                }
+            }
             return Ok(PreparationReport {
                 schema_version: PREPARATION_REPORT_SCHEMA_VERSION,
                 session_id,
@@ -1324,8 +1392,7 @@ impl Broker {
             });
         }
         ensure_preparation_retry_allowed(session_id, status.state)?;
-        let current_runtimes = runtime_identities(&root, &config);
-        let cache_outcome = PreparationCacheOutcome::miss(&status, &current_runtimes);
+        let cache_outcome = PreparationCacheOutcome::miss(&status);
         // Everything below runs the repository's own commands. The policy is
         // this worktree's: its gates and the preparation just loaded.
         let gates = match crate::gates::load_gates(&root) {
@@ -1335,6 +1402,10 @@ impl Broker {
         };
         let policy = crate::broker::gate_trust::GatePolicy::from_parts(&gates, Some(&config));
         self.require_trusted_policy(&policy, Some(session_id))?;
+        let probes = match early_probes {
+            Some(probes) => probes,
+            None => run_runtime_probes(&root, &config),
+        };
         if offline
             && let Some(step) = config
                 .steps
@@ -1736,7 +1807,7 @@ impl Broker {
                 cache_dir,
                 package_store_scope,
                 &repository_identity(self),
-                current_runtimes.clone(),
+                probes.clone(),
             )
         });
         let shared_store_root = package_store_report
@@ -1758,6 +1829,7 @@ impl Broker {
             host_lease_id: grant.as_ref().map(|grant| grant.lease.lease_id.clone()),
             host_lease_generation: grant.as_ref().map(|grant| grant.lease.generation),
             package_store: None,
+            runtimes: probes.clone(),
         };
         let state_path = record_path(self.main_root(), session_id);
         self.release_grant_after_error(
@@ -1988,6 +2060,7 @@ impl Broker {
         record.host_lease_id = None;
         record.host_lease_generation = None;
         record.package_store = package_store_report.clone();
+        record.runtimes = probes;
         self.release_grant_after_error(
             write_record(&state_path, &record),
             &mut coordinator,
@@ -2260,9 +2333,9 @@ fn prepare_package_store(
     }
 }
 
-/// The runtime identities the preparation digest keys on, resolved the same
-/// way: the declared probe's executable, canonicalized, with its size and
-/// modification time. The probe command itself is not run.
+/// Each declared runtime's executable, resolved as the preparation digest
+/// resolves it (canonical path) with its size and modification time. Cheap:
+/// no probe runs, so status reads can use it.
 fn runtime_identities(
     root: &Path,
     config: &PreparationConfig,
@@ -2285,9 +2358,82 @@ fn runtime_identities(
                     .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                     .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok()),
                 executable,
+                probe_sha256: None,
+                probe_summary: None,
+                probe_timed_out: false,
             }
         })
         .collect()
+}
+
+/// Resolve every declared runtime and run its probe (bounded by
+/// [`package_store::RUNTIME_PROBE_TIMEOUT`]) in the checkout, with the
+/// environment the preparation steps inherit.
+fn run_runtime_probes(
+    root: &Path,
+    config: &PreparationConfig,
+) -> Vec<package_store::RuntimeIdentity> {
+    let mut identities = runtime_identities(root, config);
+    for (identity, runtime) in identities.iter_mut().zip(&config.runtimes) {
+        let Some(output) = package_store::run_runtime_probe(
+            root,
+            &runtime.command,
+            package_store::RUNTIME_PROBE_TIMEOUT,
+        ) else {
+            continue;
+        };
+        if output.timed_out {
+            eprintln!(
+                "warning: aethyme runtime probe {:?} did not finish within {} s and was stopped",
+                runtime.name,
+                package_store::RUNTIME_PROBE_TIMEOUT.as_secs()
+            );
+        }
+        identity.probe_sha256 = Some(output.sha256);
+        identity.probe_summary = output.summary;
+        identity.probe_timed_out = output.timed_out;
+    }
+    identities
+}
+
+/// Why recorded runtime probes no longer stand for `current`, or `None`.
+/// With fresh probes (`from_probe`) the outputs are compared; otherwise a
+/// recorded output stands while its runtime resolves to the same executable.
+fn runtime_change(
+    recorded: &[package_store::RuntimeIdentity],
+    current: &[package_store::RuntimeIdentity],
+    from_probe: bool,
+) -> Option<String> {
+    let mut changed = Vec::new();
+    for runtime in current {
+        let Some(previous) = recorded
+            .iter()
+            .find(|previous| previous.name == runtime.name)
+        else {
+            changed.push(format!("{} (not probed yet)", runtime.name));
+            continue;
+        };
+        if from_probe {
+            if previous.probe_sha256 != runtime.probe_sha256 {
+                changed.push(format!(
+                    "{} (probe output now {:?})",
+                    runtime.name,
+                    runtime.probe_summary.as_deref().unwrap_or("")
+                ));
+            }
+        } else if previous.probe_sha256.is_none() || !previous.same_executable(runtime) {
+            changed.push(format!(
+                "{} (executable changed since its probe)",
+                runtime.name
+            ));
+        }
+    }
+    (!changed.is_empty()).then(|| {
+        format!(
+            "runtime changed: {}; prepare runs the probes again",
+            changed.join(", ")
+        )
+    })
 }
 
 fn ensure_shared_package_cache_directory(
@@ -2791,14 +2937,12 @@ fn preparation_source_digest_before(
                 session_id,
             });
         }
+        // The executable's size and modification time are not part of the
+        // key: a reinstall of the same version must not rekey, and a version
+        // change is caught by the recorded probe output (see
+        // `runtime_change`), which a preparation refreshes before judging.
         hasher.update(runtime.name.as_bytes());
         hasher.update(canonical.to_string_lossy().as_bytes());
-        hasher.update(metadata.len().to_le_bytes());
-        if let Ok(modified) = metadata.modified()
-            && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
-        {
-            hasher.update(duration.as_nanos().to_le_bytes());
-        }
         check_liveness_deadline(deadline)?;
     }
     check_liveness_deadline(deadline)?;
@@ -5613,6 +5757,7 @@ fn invalid_status(session_id: i64, reason: String) -> PreparationStatus {
         waiting_on: None,
         shared_cache_background_measurement: None,
         package_store: None,
+        runtimes: Vec::new(),
     }
 }
 
@@ -6458,6 +6603,7 @@ mod tests {
             host_lease_id: Some(grant.lease.lease_id.clone()),
             host_lease_generation: Some(grant.lease.generation),
             package_store: None,
+            runtimes: Vec::new(),
         }
     }
 
@@ -6853,41 +6999,60 @@ cache = "repository_shared"
     }
 
     #[test]
-    fn a_stale_miss_names_the_runtimes_that_changed() {
-        let runtime = |name: &str, size: u64| package_store::RuntimeIdentity {
+    fn runtime_changes_are_judged_by_probe_output_or_executable() {
+        let runtime = |name: &str, size: u64, probe: &str| package_store::RuntimeIdentity {
             name: name.into(),
             executable: Some(PathBuf::from(format!("/usr/bin/{name}"))),
             size: Some(size),
             modified_ns: Some(1),
+            probe_sha256: Some(probe.into()),
+            probe_summary: Some(format!("{name} {probe}")),
+            probe_timed_out: false,
         };
+        let recorded = vec![runtime("node", 1, "a"), runtime("python", 1, "b")];
+        // Fresh probes: an output change behind an unchanged executable (the
+        // interpreter-through-another-interpreter case) is a change.
+        let reason = runtime_change(
+            &recorded,
+            &[runtime("node", 1, "a"), runtime("python", 1, "c")],
+            true,
+        )
+        .unwrap();
+        assert!(reason.contains("python (probe output now"), "{reason}");
+        assert!(!reason.contains("node"), "{reason}");
+        // A reinstall of the same version changes the executable but not the
+        // output: no change once probed.
+        assert_eq!(
+            runtime_change(
+                &recorded,
+                &[runtime("node", 2, "a"), runtime("python", 1, "b")],
+                true
+            ),
+            None
+        );
+        // A status read cannot probe: a changed executable sends the
+        // checkout back to a preparation, which probes again.
+        let mut unprobed = runtime("node", 2, "a");
+        unprobed.probe_sha256 = None;
+        let reason = runtime_change(&recorded, &[unprobed], false).unwrap();
+        assert!(reason.contains("node (executable changed"), "{reason}");
+        let mut same = runtime("node", 1, "a");
+        same.probe_sha256 = None;
+        assert_eq!(runtime_change(&recorded, &[same], false), None);
+        let reason = runtime_change(&[], &[runtime("node", 1, "a")], false).unwrap();
+        assert!(reason.contains("not probed yet"), "{reason}");
+
         let mut status = invalid_status(1, "unused".into());
         status.state = PreparationState::Stale;
-        status.reason = "configuration, inputs, platform, or architecture changed".into();
-        status.package_store = Some(package_store::PackageStoreReport {
-            path: PathBuf::from("/cache/repository/packages/linux-x86_64"),
-            scope: package_store::PackageStoreScope::Repository,
-            key: package_store::PackageStoreKey {
-                repository: "repository".into(),
-                os: "linux".into(),
-                arch: "x86_64".into(),
-            },
-            runtimes: vec![runtime("node", 1), runtime("pnpm", 1)],
-            same_volume: Some(true),
-            import_method: package_store::PackageImportMethod::Clone,
-            compatibility_links: Vec::new(),
-            volume_free_bytes_before: None,
-            volume_free_bytes_after: None,
-            volume_bytes_allocated: None,
-        });
-        let outcome =
-            PreparationCacheOutcome::miss(&status, &[runtime("node", 2), runtime("pnpm", 1)]);
+        status.reason = reason;
+        let outcome = PreparationCacheOutcome::miss(&status);
         assert!(!outcome.hit);
-        let reason = outcome.miss_reason.unwrap();
-        assert!(reason.starts_with("stale: "), "{reason}");
-        assert!(reason.ends_with("(runtimes changed: node)"), "{reason}");
-        let unchanged =
-            PreparationCacheOutcome::miss(&status, &[runtime("node", 1), runtime("pnpm", 1)]);
-        assert!(!unchanged.miss_reason.unwrap().contains("runtimes changed"));
+        assert!(
+            outcome
+                .miss_reason
+                .unwrap()
+                .starts_with("stale: runtime changed")
+        );
         assert!(PreparationCacheOutcome::hit().hit);
     }
 
