@@ -1317,7 +1317,7 @@ fn the_worker_starts_only_from_an_install_of_this_build() {
     // `other` sits under the temporary directory too, so make a location
     // that is not: none qualifies without the build match.
     assert_eq!(
-        check::worker_executable(&staged, &[other.clone()], &never),
+        check::worker_executable(&staged, std::slice::from_ref(&other), &never),
         None
     );
     assert_eq!(
