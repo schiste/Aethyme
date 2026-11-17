@@ -373,7 +373,8 @@ const PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after an ed
 Other agents may be working in sibling worktrees.
 
 For routine coordination, use `aethyme broker status --json` (compact).
-It groups advice and reports deferred checks as unknown. Use
+Branch on `advice.categories[].severity` and `.commands`, `summary` and
+`drilldown`; deferred checks are unknown, not clean. Use
 `aethyme broker status --full --json` only when exact session or lease-path evidence is
 needed. Check overlapping work before duplicating it. Overlaps with an active
 session's explicit lease are advisory. Accepted warnings permit work in your
@@ -408,7 +409,8 @@ const NON_PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after a
 Other agents may be working in sibling worktrees.
 
 For routine coordination, use `aethyme broker status --json` (compact).
-It groups advice and reports deferred checks as unknown. Use
+Branch on `advice.categories[].severity` and `.commands`, `summary` and
+`drilldown`; deferred checks are unknown, not clean. Use
 `aethyme broker status --full --json` only when exact session or lease-path evidence is
 needed. Check overlapping work before duplicating it. Overlaps with an active
 session's explicit lease are advisory. Accepted warnings permit work in your
@@ -667,7 +669,9 @@ blocked.
    ```
 
    Routine status groups repeated advice categories, reports deferred checks
-   as unknown, and omits per-session evidence and lease paths. Use
+   as unknown, and omits per-session evidence and lease paths. Branch on
+   `advice.categories[].severity` and `.commands`, `summary` and `drilldown`;
+   `status --session <id> --json` adds a `session` block with `next_action`. Use
    `aethyme broker status --full --json` only when you need exact session, lease-path or
    evidence detail before deciding what to edit. A deferred check is not a
    clean result.

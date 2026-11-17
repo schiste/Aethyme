@@ -182,3 +182,53 @@ fn active_queue_excludes_terminal_entries() {
         all.len()
     );
 }
+
+/// Every status call writes its metric row, the compact default included, so
+/// a caller that polls status can be identified by form, focus and caller.
+#[test]
+fn default_compact_status_records_its_form_caller_and_section_timings() {
+    let repo = fixture();
+    let last_row = |repo: &Path| -> serde_json::Value {
+        let bytes = metrics(repo);
+        let text = String::from_utf8_lossy(&bytes);
+        serde_json::from_str(text.lines().last().expect("a metric row")).unwrap()
+    };
+
+    let before = metrics(repo.path()).len();
+    let output = run(repo.path(), None, &["status", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let printed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(printed["form"], "compact");
+    assert!(
+        metrics(repo.path()).len() > before,
+        "compact status wrote no row"
+    );
+    let row = last_row(repo.path());
+    assert_eq!(row["command"], "status", "{row}");
+    assert_eq!(row["exit"], 0);
+    assert_eq!(row["status_form"], "compact", "{row}");
+    assert_eq!(row["status_json"], true);
+    assert_eq!(row["status_session_flag"], false);
+    let recorded = row["output_bytes"].as_u64().unwrap();
+    let printed_bytes = output.stdout.len() as u64;
+    assert!(
+        recorded > 0 && recorded.abs_diff(printed_bytes) <= 1,
+        "{row}"
+    );
+    assert!(row["duration_ms"].as_i64().is_some(), "{row}");
+    assert!(row.get("caller_hint").is_some(), "{row}");
+    if let Some(caller) = row["caller_hint"].as_str() {
+        assert!(!caller.contains('/') && !caller.contains(' '), "{row}");
+    }
+    let phases = row["phase_timings_ms"]
+        .as_object()
+        .expect("section timings");
+    for section in ["open", "summary", "status_advice", "context_records"] {
+        assert!(phases.contains_key(section), "missing {section}: {row}");
+    }
+
+    let full = run(repo.path(), None, &["status", "--full", "--json"]);
+    assert!(full.status.success(), "{full:?}");
+    let row = last_row(repo.path());
+    assert_eq!(row["status_form"], "full", "{row}");
+}

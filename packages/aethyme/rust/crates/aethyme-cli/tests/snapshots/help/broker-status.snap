@@ -3,7 +3,9 @@ exit: 0
   aethyme broker status [--json] [--full] [--session <id>] [--since-revision <token>] [--summary] [--refresh]
       Compact by default, as text and as --json: a versioned summary that
       groups advice and marks omitted details and deferred checks; those
-      checks are unknown, not clean. Both JSON forms carry `form`. --full
+      checks are unknown, not clean. Branch on
+      `advice.categories[].severity` and `.commands`, `summary` and
+      `drilldown`. Both JSON forms carry `form`. --full
       returns the full document with per-session detail; use it only for
       exact session or lease-path evidence. Session records there use
       `agents[].id` for every --session flag. --compact is accepted and

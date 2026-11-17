@@ -154,7 +154,9 @@ blocked.
    ```
 
    Routine status groups repeated advice categories, reports deferred checks
-   as unknown, and omits per-session evidence and lease paths. Use
+   as unknown, and omits per-session evidence and lease paths. Branch on
+   `advice.categories[].severity` and `.commands`, `summary` and `drilldown`;
+   `status --session <id> --json` adds a `session` block with `next_action`. Use
    `aethyme broker status --full --json` only when you need exact session, lease-path or
    evidence detail before deciding what to edit. A deferred check is not a
    clean result.

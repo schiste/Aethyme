@@ -377,10 +377,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   the executed argv, exit status, stdout and stderr, and require a positive
   control that detects a known changed path before treating empty diff output
   as equality.
-- For routine broker status checks, prefer `aethyme broker status --summary
-  --json`; capture `status --full --json` only when its additional detail is needed.
+- For routine broker status checks, prefer `aethyme broker status
+  --json` (compact); capture `status --full --json` only when its additional detail is needed.
   Retain complete stdout and stderr before parsing exact session IDs and
-  structured advice fields such as severity and commands. Never infer absence
+  structured advice fields such as `advice.categories[].severity` and `.commands`. Never infer absence
   from truncated output or suppressed stderr.
 - When bounding subprocess output, audit every consumer for parsing or evidence
   use. Keep draining after the cap, expose an explicit truncation signal, and

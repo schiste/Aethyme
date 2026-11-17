@@ -590,8 +590,10 @@ needs the full document (`agents[]`, `leases`, `queue`, `blockers`,
 documents are unchanged; each now carries `form` (`"compact"` or `"full"`), and
 compact adds `hint`. `--compact` is still accepted and changes nothing; it,
 `--summary`, `--session` and `--since-revision` are refused beside `--full`.
-Compact JSON status is routine status: a read-only snapshot that writes no
-metric row unless `AETHYME_MEASURE_OUTPUT` is set. Every internal reader of the
+Compact JSON status is routine status: a read-only snapshot of broker state.
+It still appends its command-metrics row (see Telemetry below) but writes no
+outcome event and no broker-database row. Readers of the compact form branch on
+`advice.categories[].severity` and `.commands`, `summary` and `drilldown`. Every internal reader of the
 full fields (tests, the JSON-shape snapshot, generated agent docs, the agent
 hook's advisory pointer, finish's recovery hint, the owners drilldown) now
 names `--full`. The ignored `local_compatibility` old-binary test still runs
@@ -624,7 +626,9 @@ and prints `remote`, `destination_ref`, `proposed_sha`, `remote_sha_last_known`,
 `pre_push_remote_oid`, `pre_push_remote_observed` and `pushed_refs[]`
 (`destination_ref`, `proposed_sha`).
 
-**Telemetry.** Full status rows in `.aethyme/logs/command-metrics.jsonl` add
+**Telemetry.** Every status call, compact default included, appends a row to
+`.aethyme/logs/command-metrics.jsonl` (previously routine status wrote none
+unless `AETHYME_MEASURE_OUTPUT` was set). Status rows add
 `status_form`, `status_json`, `status_session_flag`,
 `status_evidence_truncated` and `caller_hint` (the parent process's executable
 name, at most 64 characters of `[A-Za-z0-9._+-]`; never arguments or paths).

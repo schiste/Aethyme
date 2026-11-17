@@ -162,19 +162,16 @@ impl StatusForm {
 }
 
 /// Attach the status form, `--session` presence, caller hint and section
-/// timings to this command's metric row. Routine status writes no row unless
-/// output measurement is opted in, and attaching details would force one, so
-/// they are attached only when a row is written anyway.
+/// timings to this command's metric row. Every status call writes that row,
+/// the compact default included, so a poller can be identified: the row is an
+/// append to `.aethyme/logs/command-metrics.jsonl`, never a broker-database
+/// write, so the read-only snapshot stays read-only.
 fn record_status_metric(
     parsed: &Parsed,
     form: StatusForm,
-    routine: bool,
     phase_timings_ms: &std::collections::BTreeMap<String, u64>,
     evidence_truncated: usize,
 ) {
-    if routine && !telemetry::output_measurement_opted_in() {
-        return;
-    }
     telemetry::set_command_metric_details(serde_json::json!({
         "status_form": form.as_str(),
         "status_json": parsed.json,
@@ -344,13 +341,7 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             }
             out!("{}", compact.render_text().trim_end());
         }
-        record_status_metric(
-            &parsed,
-            form,
-            routine,
-            &phase_timings_ms,
-            evidence_truncated,
-        );
+        record_status_metric(&parsed, form, &phase_timings_ms, evidence_truncated);
         return Ok(());
     }
     // The mandated first step of every session, so its cost is a tax
@@ -376,13 +367,7 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             render_waiters(&brief.waiters);
             render_status_advice(&brief.advice);
         }
-        record_status_metric(
-            &parsed,
-            form,
-            routine,
-            &brief.phase_timings_ms,
-            evidence_truncated,
-        );
+        record_status_metric(&parsed, form, &brief.phase_timings_ms, evidence_truncated);
         return Ok(());
     }
     let mut status = if parsed.read_only_snapshot {
@@ -401,16 +386,10 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         value["form"] = serde_json::json!(StatusForm::Full.as_str());
         let evidence_truncated = super::status_extras::cap_document_advice_evidence(&mut value);
         out!("{}", serde_json::to_string_pretty(&value)?);
-        record_status_metric(
-            &parsed,
-            form,
-            routine,
-            &status.phase_timings_ms,
-            evidence_truncated,
-        );
+        record_status_metric(&parsed, form, &status.phase_timings_ms, evidence_truncated);
         return Ok(());
     }
-    record_status_metric(&parsed, form, routine, &status.phase_timings_ms, 0);
+    record_status_metric(&parsed, form, &status.phase_timings_ms, 0);
     {
         out!(
             "Integration: {} @ {}",

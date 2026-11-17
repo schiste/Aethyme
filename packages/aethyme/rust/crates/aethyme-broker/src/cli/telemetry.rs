@@ -533,7 +533,14 @@ fn command_metric_enabled(args: &[String], opted_in: bool, has_details: bool) ->
     ) {
         return false;
     }
-    command_records_metric(args) || opted_in || has_details
+    // Every `status` call appends its row, routine compact status included:
+    // identifying who polls status, and in which form, is what the row is
+    // for. It is a log append, so routine status still writes no broker
+    // state and no outcome event (`command_records_outcome` stays false).
+    command_records_metric(args)
+        || opted_in
+        || has_details
+        || args.first().map(String::as_str) == Some("status")
 }
 
 /// `gates affected` opts into a timing line while preserving its read-only
@@ -695,6 +702,10 @@ mod tests {
     fn compact_status_is_routine_and_full_status_is_recorded() {
         let compact = ["status", "--json"].map(str::to_string);
         assert!(!command_records_metric(&compact));
+        assert!(!command_records_outcome(&compact));
+        assert!(command_metric_enabled(&compact, false, false));
+        let focused = ["status", "--session", "7", "--json"].map(str::to_string);
+        assert!(command_metric_enabled(&focused, false, false));
         let full = ["status", "--full", "--json"].map(str::to_string);
         assert!(command_records_metric(&full));
     }
