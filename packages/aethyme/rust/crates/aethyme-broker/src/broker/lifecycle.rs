@@ -7466,8 +7466,17 @@ impl Broker {
                                 .into(),
                     });
                 }
+                if let Some((head, unpushed_commits)) = self.unpushed_close_check(&session) {
+                    return Err(BrokerOpError::UnpushedSessionWork {
+                        session_id,
+                        branch: session.branch,
+                        head,
+                        unpushed_commits,
+                    });
+                }
                 let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
                 if checkout.root() != Path::new(&session.worktree_path)
+                    || checkout.main_root()? != self.main_root()
                     || checkout.current_branch()? != session.branch
                     || !checkout.uncommitted_summary()?.is_empty()
                     || session.diff_base.as_deref() != Some(checkout.head_commit()?.as_str())
