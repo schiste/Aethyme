@@ -71,7 +71,11 @@ fn add_worktree(repo: &Path, worktree_root: &Path, name: &str) -> PathBuf {
 }
 
 fn run_status(repo: &Path, args: &[&str]) -> Output {
-    let mut command = common::broker_cli_for_fixture(CLI, args, repo);
+    let checkout = repo
+        .ancestors()
+        .find(|path| path.join(".git").exists())
+        .unwrap_or(repo);
+    let mut command = common::broker_cli_for_fixture(CLI, args, checkout);
     clear_git_selectors(&mut command);
     command
         .current_dir(repo)
@@ -426,7 +430,7 @@ fn default_status_identifies_the_worktree_session_and_reports_only_its_conflicts
     assert!(block["advice"].is_array() && block["blockers"].is_array());
     let next = block["next_action"]["command"].as_str().unwrap();
     assert!(
-        next.starts_with("aethyme broker ") && next.contains(&format!("--session {session_id}")),
+        next.starts_with("git -C ") && next.ends_with("status --short"),
         "{next}"
     );
     assert!(block["next_action"]["reason"].is_string());

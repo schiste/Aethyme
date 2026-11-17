@@ -372,15 +372,15 @@ const PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after an ed
 
 Other agents may be working in sibling worktrees.
 
-Installed, trusted hooks deliver session and relevant peer and blocker changes
-at prompt and tool boundaries. To inspect the current session on demand, use
-`aethyme broker status --session <id> --session-view --json`. Reuse its revision
-with `--since-revision <token>` for changes only. Deferred checks are unknown.
-Use `aethyme broker status --json` for repository-wide advice and
-`aethyme broker status --full --json` only when exact session or lease-path evidence is
-needed. Check overlapping work before duplicating it. Overlaps with an active
-session's explicit lease are advisory. Accepted warnings permit work in your
-session; reconcile before merging. Resolve blockers and refusals.
+Installed, trusted hooks deliver current-session actions, relevant peer
+changes and changes to repository warning counts at prompt and tool boundaries.
+Use `aethyme broker status --json` in your worktree to inspect the session on
+demand. Add `--session <id>` from another checkout. Reuse its revision with
+`--since-revision <token>` for changes only. Treat deferred checks as unknown.
+Use `aethyme broker status --full --json` for exact session or lease-path
+evidence. Check overlapping work before duplicating it. Overlaps with an
+active session's explicit lease are advisory. Reconcile before merging and
+resolve blockers and refusals.
 
 1. `aethyme broker start --task "<task>"`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
@@ -410,15 +410,15 @@ const NON_PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after a
 
 Other agents may be working in sibling worktrees.
 
-Installed, trusted hooks deliver session and relevant peer and blocker changes
-at prompt and tool boundaries. To inspect the current session on demand, use
-`aethyme broker status --session <id> --session-view --json`. Reuse its revision
-with `--since-revision <token>` for changes only. Deferred checks are unknown.
-Use `aethyme broker status --json` for repository-wide advice and
-`aethyme broker status --full --json` only when exact session or lease-path evidence is
-needed. Check overlapping work before duplicating it. Overlaps with an active
-session's explicit lease are advisory. Accepted warnings permit work in your
-session; reconcile before merging. Resolve blockers and refusals.
+Installed, trusted hooks deliver current-session actions, relevant peer
+changes and changes to repository warning counts at prompt and tool boundaries.
+Use `aethyme broker status --json` in your worktree to inspect the session on
+demand. Add `--session <id>` from another checkout. Reuse its revision with
+`--since-revision <token>` for changes only. Treat deferred checks as unknown.
+Use `aethyme broker status --full --json` for exact session or lease-path
+evidence. Check overlapping work before duplicating it. Overlaps with an
+active session's explicit lease are advisory. Reconcile before merging and
+resolve blockers and refusals.
 
 1. `aethyme broker start --task "<task>" [--short-name "<label>"]`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
@@ -672,13 +672,11 @@ blocked.
    aethyme broker start --task "<your task>" --short-name "<short name>" --path <planned-path>
    ```
 
-   Routine status groups repeated advice categories, reports deferred checks
-   as unknown, and omits per-session evidence and lease paths. Branch on
-   `advice.categories[].severity` and `.commands`, `summary` and `drilldown`;
-   `status --session <id> --json` adds a `session` block with `next_action`. Use
-   `aethyme broker status --full --json` only when you need exact session, lease-path or
-   evidence detail before deciding what to edit. A deferred check is not a
-   clean result.
+   Routine status gives your worktree's session, its `next_action` and overlaps
+   involving its paths or declared scope. Use `--session <id>` from another
+   checkout. Outside a session, routine status shows repository counts.
+   Treat deferred checks as unknown. Use `aethyme broker status --full --json`
+   when you need exact session, lease-path or recovery evidence.
 
    If the execution tool reports the start command is still running, poll
    that same command to completion before retrying; a pending result does not
@@ -1572,13 +1570,17 @@ mod tests {
             .first()
             .expect("at least one substantive commit policy")
             .required_sections;
-        assert!(substantive
-            .iter()
-            .all(|policy| policy.required_sections == required_sections));
-        assert!(COMMIT_POLICIES
-            .iter()
-            .filter(|policy| !policy.body_required)
-            .all(|policy| policy.required_sections.is_empty()));
+        assert!(
+            substantive
+                .iter()
+                .all(|policy| policy.required_sections == required_sections)
+        );
+        assert!(
+            COMMIT_POLICIES
+                .iter()
+                .filter(|policy| !policy.body_required)
+                .all(|policy| policy.required_sections.is_empty())
+        );
 
         let doc = render_agents_document(None).unwrap();
         assert!(doc.contains(&format!("Types: {}.", policy_list(&all))));
@@ -1623,7 +1625,7 @@ mod tests {
         let doc = render_agents_document(Some(&repo)).unwrap();
         for needle in [
             "## Broker Coordination: before and after an edit",
-            "`aethyme broker status --session <id> --session-view --json`",
+            "`aethyme broker status --json`",
             "`aethyme broker status --json` for repository-wide advice",
             "`aethyme broker status --full --json` only when exact session or lease-path evidence is",
             "`aethyme broker start --task \"<task>\" [--short-name \"<label>\"]`",
@@ -1851,7 +1853,7 @@ mod tests {
         let doc = render_agents_document(Some(&repo)).unwrap();
         for needle in [
             "## Broker Coordination: before and after an edit",
-            "`aethyme broker status --session <id> --session-view --json`",
+            "`aethyme broker status --json`",
             "`aethyme broker status --json` for repository-wide advice",
             "`aethyme broker status --full --json` only when exact session or lease-path evidence is",
             "Commit early and small, and after each commit run\n   `aethyme broker push --session <id>`",
@@ -1893,7 +1895,7 @@ mod tests {
             );
             for required in [
                 "Installed, trusted hooks deliver session and relevant peer and blocker changes",
-                "`aethyme broker status --session <id> --session-view --json`",
+                "`aethyme broker status --json`",
                 "with `--since-revision <token>` for changes only. Deferred checks are unknown.",
                 "Use `aethyme broker status --json` for repository-wide advice",
                 "`aethyme broker status --full --json` only when exact session or lease-path evidence is",

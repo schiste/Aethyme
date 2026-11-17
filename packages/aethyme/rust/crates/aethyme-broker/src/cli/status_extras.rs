@@ -229,6 +229,11 @@ pub(crate) fn session_block(
         }),
         unpushed_commits: push.as_ref().ok().map(|state| state.unpushed_commits),
         pr_recorded: watch.is_some(),
+        push_enabled: crate::session_push::session_push_enabled(broker.repo_handle()),
+        inspect_worktree: format!(
+            "git -C '{}' status --short",
+            session.worktree_path.replace('\'', "'\\''")
+        ),
         untouched_branch: push.as_ref().is_ok_and(|state| {
             state.remote_oid.is_none()
                 && session.diff_base.as_deref() == Some(state.head_oid.as_str())
@@ -346,6 +351,8 @@ pub(super) struct NextActionFacts {
     pub(super) preparation_command: Option<String>,
     pub(super) unpushed_commits: Option<u32>,
     pub(super) pr_recorded: bool,
+    pub(super) push_enabled: bool,
+    pub(super) inspect_worktree: String,
     pub(super) untouched_branch: bool,
 }
 
@@ -364,8 +371,13 @@ pub(super) fn next_action(facts: NextActionFacts) -> Value {
         (command, "the worktree's dependencies are not prepared")
     } else if facts.untouched_branch && !facts.pr_recorded {
         (
-            format!("aethyme broker push --session {id} --plan"),
-            "review the unpublished branch before opening a pull request",
+            facts.inspect_worktree,
+            "inspect worktree changes before committing",
+        )
+    } else if !facts.push_enabled {
+        (
+            format!("aethyme broker submit --session {id}"),
+            "validate the committed session head under the repository's delivery policy",
         )
     } else if facts.unpushed_commits.is_some_and(|count| count > 0) {
         if facts.pr_recorded {
@@ -468,6 +480,8 @@ mod tests {
             preparation_command: None,
             unpushed_commits: Some(0),
             pr_recorded: true,
+            push_enabled: true,
+            inspect_worktree: "git -C /fixture status --short".into(),
             untouched_branch: false,
         }
     }
@@ -521,6 +535,13 @@ mod tests {
             }),
             "aethyme broker push --session 7 --plan"
         );
+        assert_eq!(
+            command(NextActionFacts {
+                push_enabled: false,
+                ..facts()
+            }),
+            "aethyme broker submit --session 7"
+        );
         assert_eq!(command(facts()), "aethyme broker submit --session 7");
         assert_eq!(
             command(NextActionFacts {
@@ -528,7 +549,7 @@ mod tests {
                 untouched_branch: true,
                 ..facts()
             }),
-            "aethyme broker push --session 7 --plan"
+            "git -C /fixture status --short"
         );
     }
 }

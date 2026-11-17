@@ -250,7 +250,7 @@ fn decide(
                     )
                 })
             });
-            let peers = scoped.and_then(|session| peer_view_update(&broker, session, true));
+            let peers = scoped.and_then(|session| peer_view_update(&broker, session));
             with_installation_notice(
                 append_context(append_context(start, own), peers),
                 &installation_notice,
@@ -365,20 +365,7 @@ fn touch(broker: &mut Broker, session: Option<&Session>) -> Result<(), crate::Br
     }
 }
 
-/// Register presence, tell every peer that the repository just became
-/// crowded, and hand the agent its current state plus the one command to run
-/// next.
-///
-/// The arrival note is the T1 transition (SOLO → COORDINATED), announced by
-/// the session that *causes* it, at the moment it causes it. No peer has to
-/// poll to discover the new arrival, and no extra state is needed to remember
-/// whether the announcement was already made — the note channel itself is the
-/// memory.
-///
-/// What the agent receives is state, not rules (recovery plan P4.7). The
-/// policy lives in the generated root guidance and the skill; restating it
-/// here billed it twice and still left the agent to work out which rule
-/// applied. A state line and a `Next:` command are what it acts on.
+/// Register activity for the current session or guide an unbound checkout.
 fn on_session_start(
     broker: &mut Broker,
     cwd: &std::path::Path,
@@ -465,7 +452,7 @@ fn on_user_prompt_submit(broker: &mut Broker, session: Option<&Session>) -> Hook
     }
     let notes = deliver_notes(broker, session);
     let notes = append_context(notes, own_view_update(broker, session, false));
-    append_context(notes, peer_view_update(broker, session, false))
+    append_context(notes, peer_view_update(broker, session))
 }
 
 /// Stable, bounded observations of recorded peer ownership relevant to this session.
@@ -519,12 +506,18 @@ pub(crate) fn session_coordination(
     for warning in &other {
         *warnings_by_kind.entry(warning.kind.as_str()).or_insert(0) += 1;
     }
+    if broker
+        .collaboration_fence_state(crate::broker::FenceTrigger::Open)
+        .is_some()
+    {
+        warnings_by_kind.insert("collaboration_fence", 1);
+    }
     let stale = broker
         .store_ref()
         .recorded_stale_session_count(session_id)
         .ok();
     let information = serde_json::json!({
-        "count": other.len(),
+        "count": warnings_by_kind.values().sum::<usize>(),
         "warnings_by_kind": warnings_by_kind,
         "recorded_stale_sessions": stale,
         "unavailable_source_count": report.unavailable.len(),
@@ -581,14 +574,15 @@ fn own_view_update(broker: &Broker, session: &Session, force: bool) -> Option<St
     } else if previous["brief"].as_str() != Some(&brief) {
         messages.push(brief.clone());
     }
-    if previous["information"] != information {
-        if let Some(summary) = render_repository_information(&information) {
-            messages.push(summary);
-        } else if render_repository_information(&previous["information"]).is_some()
-            && !previous["information"].is_null()
-        {
-            messages.push("Repository information: no recorded stale sessions or other coordination warnings.".into());
-        }
+    let summary = render_repository_information(&information);
+    let previous_summary = (!previous["information"].is_null())
+        .then(|| render_repository_information(&previous["information"]))
+        .flatten();
+    if summary != previous_summary {
+        messages.push(summary.unwrap_or_else(|| {
+            "Repository information: no recorded stale sessions or other coordination warnings."
+                .into()
+        }));
     }
     let record =
         serde_json::json!({"checked_at_ms": now, "brief": brief, "information": information});
@@ -617,6 +611,18 @@ pub(crate) fn render_peer_information(view: &serde_json::Value, session_id: i64)
             entry[0], entry[2], entry[1]
         );
     }
+    for entry in view["scopes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(3usize.saturating_sub(leases.min(3) as usize))
+    {
+        let _ = write!(
+            text,
+            "\n  session {} shares declared {} scope {}.",
+            entry[0], entry[1], entry[2]
+        );
+    }
     let _ = write!(
         text,
         "\nDetails: aethyme broker status --session {session_id} --json"
@@ -626,7 +632,7 @@ pub(crate) fn render_peer_information(view: &serde_json::Value, session_id: i64)
 
 /// Emit recorded peer changes once at hook boundaries. The file lock prevents
 /// concurrent hooks from overwriting each other's observed revision.
-fn peer_view_update(broker: &Broker, session: &Session, force: bool) -> Option<String> {
+fn peer_view_update(broker: &Broker, session: &Session) -> Option<String> {
     let path = hook_state_path(broker.main_root(), "hook-peer-view", session.id)?;
     let parent = path.parent()?;
     std::fs::create_dir_all(parent).ok()?;
@@ -638,7 +644,7 @@ fn peer_view_update(broker: &Broker, session: &Session, force: bool) -> Option<S
     let current = session_peer_view(broker, session.id).ok()?;
     let has_relevance = current["lease_count"].as_u64().unwrap_or(0) > 0
         || current["scope_count"].as_u64().unwrap_or(0) > 0;
-    if previous.as_ref() == Some(&current) && !(force && has_relevance) {
+    if previous.as_ref() == Some(&current) {
         return None;
     }
     if previous.is_none() && !has_relevance {
@@ -675,7 +681,7 @@ fn on_post_tool_use(cwd: &std::path::Path) -> HookOutcome {
         return HookOutcome::Silent;
     };
     let own = own_view_update(&snapshot, &session, false);
-    let peers = peer_view_update(&snapshot, &session, false);
+    let peers = peer_view_update(&snapshot, &session);
     let store = snapshot.store_ref();
     let unread = !store
         .unread_session_notes(session.id)
@@ -1612,7 +1618,7 @@ mod tests {
         // Establish the same delivered baseline as SessionStart for both hosts.
         for session in [&holder, &other] {
             let _ = own_view_update(&broker, session, true);
-            let _ = peer_view_update(&broker, session, true);
+            let _ = peer_view_update(&broker, session);
             acknowledge_peer_views();
         }
         broker.claim_lease(holder.id, "file.rs", None).unwrap();
