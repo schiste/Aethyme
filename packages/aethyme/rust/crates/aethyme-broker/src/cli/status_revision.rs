@@ -37,11 +37,20 @@ pub(super) fn render(
 }
 
 pub(super) fn render_session(
-    snapshot: Value,
+    mut snapshot: Value,
     root: &Path,
     session: Option<i64>,
     since: Option<&str>,
 ) -> Result<Value, serde_json::Error> {
+    // Polling a watch refreshes its observation time even when no PR facts
+    // change. Keep it out of both the projection and its revision; focused
+    // status retains the timestamp for callers needing freshness evidence.
+    if let Some(pr) = snapshot
+        .pointer_mut("/session/pr")
+        .and_then(Value::as_object_mut)
+    {
+        pr.remove("observed_at_ms");
+    }
     render_inner(snapshot, root, session, since, true)
 }
 
@@ -114,9 +123,34 @@ fn render_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::render;
+    use super::{render, render_session};
     use serde_json::json;
     use std::path::Path;
+
+    #[test]
+    fn session_revision_ignores_watch_poll_time_but_detects_pr_changes() {
+        let snapshot =
+            |time, draft| json!({"session": {"pr": {"observed_at_ms": time, "draft": draft}}});
+        let first = render_session(snapshot(1, false), Path::new("/repo"), Some(7), None).unwrap();
+        assert!(first["session"]["pr"].get("observed_at_ms").is_none());
+        let revision = first["revision"].as_str().unwrap();
+        let same = render_session(
+            snapshot(2, false),
+            Path::new("/repo"),
+            Some(7),
+            Some(revision),
+        )
+        .unwrap();
+        assert!(same["changed_sections"].as_object().unwrap().is_empty());
+        let changed = render_session(
+            snapshot(3, true),
+            Path::new("/repo"),
+            Some(7),
+            Some(revision),
+        )
+        .unwrap();
+        assert_eq!(changed["changed_sections"]["session"]["pr"]["draft"], true);
+    }
 
     #[test]
     fn revision_reports_section_replacements_and_falls_back_across_scope() {
