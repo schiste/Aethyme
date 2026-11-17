@@ -1662,7 +1662,11 @@ impl Broker {
         // repository's preparations, within what is left of the wait budget.
         // Taken after the shared-cache lease: a slot holder never waits for a
         // cache lease, so the two cannot deadlock.
-        let (mut install_slot, install_slot_report) =
+        let parent_slot = std::env::var(install_cap::PARENT_SLOT_ENV)
+            .ok()
+            .filter(|lease| !lease.is_empty());
+        let mut slot_renewal_failures = 0_u64;
+        let (mut install_slot, mut install_slot_report) =
             match self.storage_context().host_resource_db_path.clone() {
                 Some(resource_db_path) => {
                     let host_state = self.storage_context().host_state_dir.clone();
@@ -1673,6 +1677,8 @@ impl Broker {
                         session_id,
                         &root,
                         wait.saturating_sub(Duration::from_millis(shared_cache_wait_ms)),
+                        // Set when this preparation runs inside another's step.
+                        parent_slot.as_deref(),
                     ) {
                         Ok((slot, report)) => (Some(slot), Some(report)),
                         Err(refusal) => {
@@ -1762,8 +1768,18 @@ impl Broker {
             )
             .map_err(BrokerOpError::from)
             .and_then(|()| {
-                let environment = preparation_step_environment(cache_dir.as_deref(), step)
+                let mut environment = preparation_step_environment(cache_dir.as_deref(), step)
                     .map_err(BrokerOpError::from)?;
+                // A preparation started by this step runs under this slot,
+                // or under the parent slot this preparation itself reused.
+                if let Some(lease) = install_slot
+                    .as_ref()
+                    .and_then(install_cap::InstallSlot::lease_id)
+                    .map(str::to_owned)
+                    .or_else(|| parent_slot.clone())
+                {
+                    environment.push((install_cap::PARENT_SLOT_ENV.into(), lease));
+                }
                 let supervisor = match next_supervisor.take() {
                     Some(supervisor) => supervisor,
                     None => self.start_preparation_exec_supervisor()?,
@@ -1797,8 +1813,12 @@ impl Broker {
                                         )
                                         .map_err(PreparationError::from)?;
                                 }
-                                if let Some(slot) = install_slot.as_mut() {
-                                    slot.renew().map_err(PreparationError::from)?;
+                                // Never stops a running install; see
+                                // `InstallSlot::renew_best_effort`.
+                                if let Some(slot) = install_slot.as_mut()
+                                    && !slot.renew_best_effort()
+                                {
+                                    slot_renewal_failures += 1;
                                 }
                                 Ok(())
                             },
@@ -1929,6 +1949,9 @@ impl Broker {
         }
         if let Some(slot) = install_slot.take() {
             slot.release();
+        }
+        if let Some(report) = install_slot_report.as_mut() {
+            report.renewal_failures = slot_renewal_failures;
         }
         release_grant(&mut coordinator, &mut grant)?;
         drop(lease_held_span);

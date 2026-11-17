@@ -508,11 +508,27 @@ limit differs from an active holder's. Set it in `<host state>/preparation.toml`
 max_concurrent = 4   # 1 to 64
 ```
 
-Without it the default is half the CPU count or one install per 4 GiB of
-physical memory, whichever is smaller (at least 1). Free memory, which changes
-between requests, is followed through memory-pressure admission instead of
-the limit. An unreadable or out-of-range file keeps the default and prints a
-warning.
+A request always adopts the limit of the installs already holding the pool,
+so a configured value edited while installs run applies once they finish
+(the preparation prints a warning and reports `limit_source: active_pool`);
+with no holder, the configured value applies. Without it the default is half
+the CPU count or one install per 4 GiB of physical memory, whichever is
+smaller (at least 1). The default is persisted in
+`<host state>/preparation-install-limit.json` and reused: it is recomputed
+only while no install holds the pool and the host facts changed, and never
+from a caller that cannot see the physical memory size (a sandboxed caller
+reuses it). Free memory, which changes between requests, is followed through
+memory-pressure admission instead of the limit. An unreadable or
+out-of-range file counts as unset and prints a warning.
+
+A renewal of the slot that fails while steps run is reported, counted in
+`renewal_failures` and phase `install_slot_renewal_failed`, and otherwise
+ignored: a running install is never stopped for its slot, at the cost of
+possibly admitting one install too many later. A preparation started from
+inside a preparation step inherits `AETHYME_PREPARE_INSTALL_SLOT` (the
+parent's lease id) and, while that lease is active, runs under the parent's
+slot (`limit_source: parent_slot`) instead of waiting for one, which at limit
+1 would wait on itself.
 
 The wait shares `submit prepare --wait` with the shared-cache wait: what the
 cache wait left. A wait that ends with every slot busy fails with exit 6 and
