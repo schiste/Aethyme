@@ -1,6 +1,7 @@
 //! The routine worktree transition, using the same policy and journal as push.
 
 use super::{Parsed, UsageError, open_broker};
+use crate::cli_output::out;
 use crate::exit_status as exit;
 use crate::{Broker, BrokerOpError, GitRepo, PreparationState};
 use serde::Serialize;

@@ -2787,6 +2787,12 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
             code: crate::exit_status::USAGE,
         });
     }
+    if subcommand == "advance" && !parsed.positional.is_empty() {
+        return Err(UsageError::Exit {
+            message: "advance takes no positional arguments".into(),
+            code: crate::exit_status::USAGE,
+        });
+    }
     let exec_status_request = if subcommand == "exec-status" {
         Some(validated_exec_status_request(&parsed)?)
     } else {
