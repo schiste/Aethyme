@@ -4472,7 +4472,9 @@ impl Broker {
         &self,
         session_id: i64,
     ) -> Result<Vec<crate::lease_requests::LeaseReleaseRequest>, BrokerOpError> {
-        let leases = self.store.active_leases()?;
+        let leases = self
+            .store
+            .active_leases_for_release_session(session_id, now_ms())?;
         let paths_by_holder = index_active_lease_paths_by_holder(
             leases
                 .iter()

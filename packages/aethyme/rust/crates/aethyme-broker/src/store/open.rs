@@ -2147,6 +2147,36 @@ impl BrokerStore {
         Ok(leases)
     }
 
+    /// Live leases held by sessions named in this session's release requests.
+    pub(crate) fn active_leases_for_release_session(
+        &self,
+        session_id: i64,
+        now: i64,
+    ) -> Result<Vec<Lease>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{LEASE_SELECT} WHERE released_at IS NULL
+               AND (expires_at IS NULL OR expires_at > ?1)
+               AND session_id IN (SELECT id FROM sessions WHERE status IN ('active', 'idle', 'stale'))
+               AND session_id IN (
+                   SELECT CASE WHEN json_valid(payload_json)
+                       THEN json_extract(payload_json, '$.holder_session_id') END
+                   FROM events WHERE kind = ?2 AND CASE WHEN json_valid(payload_json)
+                       THEN json_extract(payload_json, '$.requester_session_id') = ?3
+                         OR json_extract(payload_json, '$.holder_session_id') = ?3
+                       ELSE 0 END
+               ) ORDER BY id"
+        ))?;
+        let rows = stmt.query_map(
+            rusqlite::params![now, crate::events::LEASE_RELEASE_REQUESTED, session_id],
+            lease_from_row,
+        )?;
+        let mut leases = Vec::new();
+        for row in rows {
+            leases.push(row??);
+        }
+        Ok(leases)
+    }
+
     /// Every lease row recorded for one session, regardless of session or
     /// lease state — introspection for tests and doctor-style audits.
     pub fn session_leases(&self, session_id: i64) -> Result<Vec<Lease>, BrokerError> {

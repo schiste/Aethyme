@@ -1711,6 +1711,20 @@ mod tests {
             .request_lease_release(requester.id, "file.rs", "need file")
             .unwrap();
         assert_eq!(requests.len(), 1);
+        for id in [holder.id, requester.id, other.id] {
+            let expected: Vec<_> = broker
+                .pending_lease_release_requests()
+                .unwrap()
+                .into_iter()
+                .filter(|request| {
+                    request.requester_session_id == id || request.holder_session_id == id
+                })
+                .collect();
+            assert_eq!(
+                broker.session_pending_lease_release_requests(id).unwrap(),
+                expected
+            );
+        }
         assert_eq!(
             requests[0].state,
             crate::lease_requests::RequestState::Pending
@@ -1742,6 +1756,12 @@ mod tests {
         broker
             .decline_lease_release(holder.id, requests[0].request_id, "still editing")
             .unwrap();
+        assert!(
+            broker
+                .session_pending_lease_release_requests(requester.id)
+                .unwrap()
+                .is_empty()
+        );
         let pending = broker
             .request_lease_release(requester.id, "file.rs", "need again")
             .unwrap();
