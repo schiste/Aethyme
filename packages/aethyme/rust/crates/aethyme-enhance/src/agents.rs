@@ -372,9 +372,11 @@ const PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after an ed
 
 Other agents may be working in sibling worktrees.
 
-For routine coordination, use `aethyme broker status --json` (compact).
-Branch on `advice.categories[].severity` and `.commands`, `summary` and
-`drilldown`; deferred checks are unknown, not clean. Use
+Installed, trusted hooks deliver session and relevant peer and blocker changes
+at prompt and tool boundaries. To inspect the current session on demand, use
+`aethyme broker status --session <id> --session-view --json`. Reuse its revision
+with `--since-revision <token>` for changes only. Deferred checks are unknown.
+Use `aethyme broker status --json` for repository-wide advice and
 `aethyme broker status --full --json` only when exact session or lease-path evidence is
 needed. Check overlapping work before duplicating it. Overlaps with an active
 session's explicit lease are advisory. Accepted warnings permit work in your
@@ -408,9 +410,11 @@ const NON_PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after a
 
 Other agents may be working in sibling worktrees.
 
-For routine coordination, use `aethyme broker status --json` (compact).
-Branch on `advice.categories[].severity` and `.commands`, `summary` and
-`drilldown`; deferred checks are unknown, not clean. Use
+Installed, trusted hooks deliver session and relevant peer and blocker changes
+at prompt and tool boundaries. To inspect the current session on demand, use
+`aethyme broker status --session <id> --session-view --json`. Reuse its revision
+with `--since-revision <token>` for changes only. Deferred checks are unknown.
+Use `aethyme broker status --json` for repository-wide advice and
 `aethyme broker status --full --json` only when exact session or lease-path evidence is
 needed. Check overlapping work before duplicating it. Overlaps with an active
 session's explicit lease are advisory. Accepted warnings permit work in your
@@ -1619,7 +1623,8 @@ mod tests {
         let doc = render_agents_document(Some(&repo)).unwrap();
         for needle in [
             "## Broker Coordination: before and after an edit",
-            "`aethyme broker status --json` (compact)",
+            "`aethyme broker status --session <id> --session-view --json`",
+            "`aethyme broker status --json` for repository-wide advice",
             "`aethyme broker status --full --json` only when exact session or lease-path evidence is",
             "`aethyme broker start --task \"<task>\" [--short-name \"<label>\"]`",
             "work only in the worktree it\n   reports",
@@ -1846,7 +1851,8 @@ mod tests {
         let doc = render_agents_document(Some(&repo)).unwrap();
         for needle in [
             "## Broker Coordination: before and after an edit",
-            "`aethyme broker status --json` (compact)",
+            "`aethyme broker status --session <id> --session-view --json`",
+            "`aethyme broker status --json` for repository-wide advice",
             "`aethyme broker status --full --json` only when exact session or lease-path evidence is",
             "Commit early and small, and after each commit run\n   `aethyme broker push --session <id>`",
             "open a draft PR with `aethyme broker push --session <id> --pr`",
@@ -1886,7 +1892,10 @@ mod tests {
                 "{tag}: missing the working-agreement pointer:\n{doc}"
             );
             for required in [
-                "For routine coordination, use `aethyme broker status --json` (compact).",
+                "Installed, trusted hooks deliver session and relevant peer and blocker changes",
+                "`aethyme broker status --session <id> --session-view --json`",
+                "with `--since-revision <token>` for changes only. Deferred checks are unknown.",
+                "Use `aethyme broker status --json` for repository-wide advice",
                 "`aethyme broker status --full --json` only when exact session or lease-path evidence is",
                 "session's explicit lease are advisory. Accepted warnings permit work in your",
                 "Resolve blockers and refusals.",

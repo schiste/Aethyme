@@ -96,7 +96,7 @@ codex plugin marketplace remove aethyme
 | `SessionStart` | Register the session; name the live sessions changing files it leases. |
 | `UserPromptSubmit` | Mark the session ACTIVE; deliver notes from other sessions. |
 | `PreToolUse` | Before an edit, say which other live session is changing the same file, where, whether Git would conflict, and how to reach it. Never blocks the edit and never claims a lease. Once per change. |
-| `PostToolUse` | Deliver a note from another session at the first turn boundary after a tool call. Read-only and silent unless a note is waiting. |
+| `PostToolUse` | Deliver notes and pending lease release requests at the first turn boundary after a tool call. Read-only and silent unless a note is waiting. |
 | `Stop` | Mark the session idle. |
 
 `PermissionRequest` stays unwired: nothing in the coordination model reads it,
@@ -204,3 +204,14 @@ event never breaks an older CLI either.
 It does not re-inject `AGENTS.md` or `CLAUDE.md`. Codex loads those natively,
 and injecting them again from a hook is pure duplication — measured at 142M
 tokens over 48 hours before it was removed.
+
+## Codex
+
+The plugin includes a Codex compatibility manifest and uses the same hook
+entry point as Claude. Install the plugin in Codex and review and trust its
+hooks when prompted; installation alone does not enable untrusted hooks.
+The hooks run at supported lifecycle and tool boundaries. Session and global
+observations are refreshed at most once every 30 seconds during a continuing
+session; peer lease and declared-scope observations are checked at tool and
+prompt boundaries. Recovery-only checks remain unknown in the compact view;
+use focused or full broker status for detailed evidence.

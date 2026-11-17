@@ -616,7 +616,11 @@ blocked.
 7. **If a file named `.aethyme/broker-action-required.md` appears in your
    worktree**, read it immediately: your submission conflicted. It names
    the conflicting files, the blocking session, and the exact rebase
-   steps. Resolve, commit, and resubmit.
+   steps. If the reported conflicts come from historical upstream merge commits,
+   inspect the session and default-branch ancestry and run `broker sync` when
+   the session is behind. Push any synchronization commit and resubmit before
+   rewriting a published branch; a refreshed baseline can eliminate replay-only
+   conflicts. If conflicts remain, follow the regenerated recovery handoff.
 
 8. **Treat broker advisories as delivered work context, not as blockers.**
    The broker surfaces outstanding session advisories after post-commit,

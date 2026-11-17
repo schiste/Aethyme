@@ -520,37 +520,6 @@ enum CheckoutStrip {
 /// born without reading as recreated (see `reused_path_keep`).
 const CREATION_SLACK_MS: i64 = 60_000;
 
-/// Where a `broker start` in progress holds its reservation for the
-/// checkout folder `name` (`.aethyme/run/start-reservations/<name>.lock`,
-/// held exclusively while the start creates the destination).
-pub(crate) fn start_reservation_path(main_root: &Path, name: &str) -> PathBuf {
-    main_root
-        .join(".aethyme/run/start-reservations")
-        .join(format!("{name}.lock"))
-}
-
-/// Whether a start holds the reservation for `worktree`'s folder: the
-/// reservation file exists and its lock cannot be taken. `Err` when that
-/// cannot be told (which keeps the folder). Correct whether or not starts
-/// write reservations: no file means no start is reserving it.
-pub(crate) fn start_reservation_held(main_root: &Path, worktree: &Path) -> Result<bool, String> {
-    let Some(name) = worktree.file_name().and_then(|name| name.to_str()) else {
-        return Err("the checkout folder has no usable name".into());
-    };
-    let path = start_reservation_path(main_root, name);
-    let file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(format!("cannot open {}: {error}", path.display())),
-    };
-    match crate::file_lock::ExclusiveFileLock::try_acquire(file) {
-        // Taken and released at once: nobody is starting there.
-        Ok(Some(_lock)) => Ok(false),
-        Ok(None) => Ok(true),
-        Err(error) => Err(format!("cannot test {}: {error}", path.display())),
-    }
-}
-
 /// When the checkout folder was created (epoch ms): the directory's birth
 /// time where the filesystem records one, otherwise the status-change time
 /// of its `.git` file (written once when Git creates the worktree; the
@@ -641,11 +610,10 @@ impl Broker {
             Some(_) => {}
             None => return Some("creation_time_unknown"),
         }
-        match start_reservation_held(self.main_root(), worktree) {
-            Ok(false) => None,
-            Ok(true) => Some("start_reserved"),
-            Err(_) => Some("start_reservation_unknown"),
-        }
+        // The one definition of a start's reservation, shared with start and
+        // every removal primitive.
+        crate::start_reservation::path_is_reserved(self.main_root(), worktree)
+            .then_some("start_reserved")
     }
 
     /// Strip catalogued regenerable directories from closed checkouts,

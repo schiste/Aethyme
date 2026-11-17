@@ -57,6 +57,9 @@ impl Broker {
         );
         self.push_checkout_capacity_advice(&mut view, deadline);
         self.push_shared_cache_inventory_advice(&mut view);
+        self.push_package_store_volume_advice(&mut view);
+        self.push_unstable_runtime_probe_advice(&mut view);
+        self.push_unverified_runtime_probe_advice(&mut view);
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
@@ -133,6 +136,41 @@ impl Broker {
             .phase_timings_ms
             .insert("total".into(), total_started.elapsed().as_millis() as u64);
         Ok(brief)
+    }
+
+    /// Advice derived from this session alone, without constructing global agent views.
+    pub(crate) fn session_status_advice(
+        &self,
+        session_id: i64,
+        now_ms: i64,
+    ) -> Result<Vec<StatusAdvice>, BrokerOpError> {
+        let session = self.store.session(session_id)?;
+        let agents = self.agent_views(vec![session], now_ms)?;
+        let agent = &agents[0];
+        let mut advice = Vec::new();
+        if let Some(entry) = self.store.latest_merge_queue_for_session(session_id)? {
+            match entry.status {
+                MergeStatus::Rejected => advice.push(rejected_submit_advice(agent, &entry)),
+                MergeStatus::Submitted if submission_was_deferred(&entry) => {
+                    advice.push(deferred_submit_advice(agent, &entry));
+                }
+                MergeStatus::Conflict => advice.push(conflict_submit_advice(agent, &entry)),
+                _ => {}
+            }
+        }
+        if let Ok(Some(graph)) = self.finish_last_graph_integrity(session_id)
+            && let Some(row) = graph_integrity_advice(agent, &graph)
+        {
+            advice.push(row);
+        }
+        advice.extend(stalled_submit_advice(
+            &crate::submit_progress::in_flight_for_sessions(
+                &self.main_root,
+                now_ms,
+                std::iter::once(session_id),
+            ),
+        ));
+        Ok(advice)
     }
 
     /// Read coordination records for compact presentation without inspecting
@@ -449,6 +487,84 @@ impl Broker {
         });
     }
 
+    /// Warn when the last preparation could not verify a runtime probe: that
+    /// checkout reinstalls on every preparation, never reports current, and a
+    /// `required_for_hooks` step then blocks its hooks. One metadata read.
+    fn push_unverified_runtime_probe_advice(&self, view: &mut StatusView) {
+        let Some(record) = self.unverified_runtime_probes() else {
+            return;
+        };
+        view.advice.push(StatusAdvice {
+            id: "prepare.runtime-probe-unverified",
+            severity: StatusAdviceSeverity::Warning,
+            reason: "a runtime probe that cannot start, fails or times out keys each preparation uniquely, so the checkout reinstalls every time, never reports current, and hooks requiring preparation refuse",
+            summary: format!(
+                "session {} could not verify runtime probe(s): {}; fix the probe command in .aethyme/prepare.toml or install the runtime",
+                record.session_id,
+                record
+                    .runtimes
+                    .iter()
+                    .map(|probe| format!("{} ({})", probe.name, probe.reason))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            session_id: Some(record.session_id),
+            queue_entry_id: None,
+            evidence: vec![format!("observed at (ms since epoch): {}", record.at_ms)],
+            commands: vec![format!(
+                "aethyme broker submit prepare status --session {} --json",
+                record.session_id
+            )],
+        });
+    }
+
+    /// Warn when a runtime probe printed different output for the same
+    /// executable on consecutive preparations: each preparation then rekeys.
+    /// One metadata read.
+    fn push_unstable_runtime_probe_advice(&self, view: &mut StatusView) {
+        let Some(record) = self.unstable_runtime_probes() else {
+            return;
+        };
+        view.advice.push(StatusAdvice {
+            id: "prepare.runtime-probe-unstable",
+            severity: StatusAdviceSeverity::Warning,
+            reason: "the prepared state is keyed on each runtime probe's output; a probe whose output changes while its executable does not makes every preparation reinstall",
+            summary: format!(
+                "runtime probe output changed for an unchanged executable: {}; make the probe print only the runtime's version",
+                record.runtimes.join(", ")
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: vec![format!("observed at (ms since epoch): {}", record.at_ms)],
+            commands: vec!["aethyme broker status --json".into()],
+        });
+    }
+
+    /// Warn when the last preparation's package store was on another volume
+    /// than its checkout: a package manager can then only copy every file,
+    /// so no two sessions share dependency bytes. One metadata read.
+    fn push_package_store_volume_advice(&self, view: &mut StatusView) {
+        let Some(record) = self.package_store_on_other_volume() else {
+            return;
+        };
+        view.advice.push(StatusAdvice {
+            id: "prepare.store-on-other-volume",
+            severity: StatusAdviceSeverity::Warning,
+            reason: "a package manager can clone or hard link from its store only within one volume; across volumes every preparation copies every dependency file",
+            summary: format!(
+                "the shared package store {} is on another volume than the session checkouts; dependencies are copied, not shared",
+                record.store.display()
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: vec![format!(
+                "observed by the preparation at (ms since epoch): {}",
+                record.at_ms
+            )],
+            commands: vec!["aethyme broker status --json".into()],
+        });
+    }
+
     fn push_checkout_capacity_advice(&self, view: &mut StatusView, deadline: std::time::Instant) {
         let advice = if std::time::Instant::now() >= deadline {
             None
@@ -560,6 +676,9 @@ impl Broker {
         );
         self.push_checkout_capacity_advice(&mut view, deadline);
         self.push_shared_cache_inventory_advice(&mut view);
+        self.push_package_store_volume_advice(&mut view);
+        self.push_unstable_runtime_probe_advice(&mut view);
+        self.push_unverified_runtime_probe_advice(&mut view);
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,

@@ -120,7 +120,7 @@ pub fn requests(
     store: &BrokerStore,
     holds: impl Fn(i64, &str) -> bool,
 ) -> Result<Vec<LeaseReleaseRequest>, crate::BrokerOpError> {
-    requests_impl(store, holds, false)
+    requests_impl(store, holds, false, None)
 }
 
 /// Only requests that can still be pending. Resolved requests and requests
@@ -129,15 +129,27 @@ pub(crate) fn pending_requests(
     store: &BrokerStore,
     holds: impl Fn(i64, &str) -> bool,
 ) -> Result<Vec<LeaseReleaseRequest>, crate::BrokerOpError> {
-    requests_impl(store, holds, true)
+    requests_impl(store, holds, true, None)
+}
+
+pub(crate) fn pending_requests_for_session(
+    store: &BrokerStore,
+    session_id: i64,
+    holds: impl Fn(i64, &str) -> bool,
+) -> Result<Vec<LeaseReleaseRequest>, crate::BrokerOpError> {
+    requests_impl(store, holds, true, Some(session_id))
 }
 
 fn requests_impl(
     store: &BrokerStore,
     holds: impl Fn(i64, &str) -> bool,
     pending_only: bool,
+    session_id: Option<i64>,
 ) -> Result<Vec<LeaseReleaseRequest>, crate::BrokerOpError> {
-    let events = store.lease_release_events()?;
+    let events = match session_id {
+        Some(id) => store.session_lease_release_events(id)?,
+        None => store.lease_release_events()?,
+    };
     let mut requests: Vec<LeaseReleaseRequest> = Vec::new();
     let mut request_ids = HashSet::<i64>::new();
     let mut outcome_resolutions = HashMap::<i64, RequestResolution>::new();
@@ -458,6 +470,46 @@ mod tests {
                 Some(&request_payload(path, 2, 1, "need it")),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn session_pending_requests_match_full_lifecycle_projection() {
+        let (_dir, mut store) = store();
+        let done = request(&mut store, "done.rs");
+        let mine = request(&mut store, "mine.rs");
+        let other = store
+            .append_event(
+                REQUESTED,
+                Some(3),
+                Some(&request_payload("other.rs", 3, 4, "other")),
+            )
+            .unwrap();
+        store
+            .append_event(
+                DECLINED,
+                Some(1),
+                Some(&outcome_payload(done, "done.rs", Some("busy"))),
+            )
+            .unwrap();
+        store
+            .append_event(REQUESTED, Some(5), Some("malformed"))
+            .unwrap();
+        let full = pending_requests(&store, |_, _| true).unwrap();
+        assert!(full.iter().any(|item| item.request_id == mine));
+        assert!(full.iter().any(|item| item.request_id == other));
+        for session_id in [1, 2, 3, 4, 5] {
+            let expected: Vec<_> = full
+                .iter()
+                .filter(|item| {
+                    item.requester_session_id == session_id || item.holder_session_id == session_id
+                })
+                .cloned()
+                .collect();
+            assert_eq!(
+                pending_requests_for_session(&store, session_id, |_, _| true).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]

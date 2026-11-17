@@ -23,7 +23,20 @@
 //! already know. That is the whole point: a turn boundary that produces
 //! no output cost nothing.
 
-use std::io::Read;
+use std::io::{Read, Write};
+
+thread_local! {
+    // A changed view is acknowledged only after its envelope reaches stdout.
+    static PENDING_PEER_VIEWS: std::cell::RefCell<Vec<(std::path::PathBuf, serde_json::Value, crate::file_lock::ExclusiveFileLock)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn acknowledge_peer_views() {
+    PENDING_PEER_VIEWS.with(|pending| {
+        for (path, value, _lock) in pending.borrow_mut().drain(..) {
+            save_hook_state(Some(&path), &value);
+        }
+    });
+}
 
 use crate::{Broker, Session};
 
@@ -113,6 +126,15 @@ pub fn run_with_build_banner(args: &[String], running_build_banner: &str) -> u8 
 }
 
 fn run_with_optional_build_banner(args: &[String], running_build_banner: Option<&str>) -> u8 {
+    // The compatibility shim probes before streaming. Older routers answer
+    // unknown hook events silently, so they retain the buffered fallback.
+    if args
+        .first()
+        .is_some_and(|arg| arg == "__stream_protocol_v1")
+    {
+        println!("aethyme-hook-stream-v1");
+        return 0;
+    }
     let Some(event) = args.first().map(String::as_str).and_then(HookEvent::parse) else {
         // Includes `--help` and every future event this binary predates.
         // An older CLI must stay silent in front of a newer plugin.
@@ -130,7 +152,14 @@ fn run_with_optional_build_banner(args: &[String], running_build_banner: Option<
     match decide(event, repo.as_deref(), &event_json, running_build_banner) {
         Some(outcome) => {
             if let Some(envelope) = outcome.envelope(event) {
-                println!("{envelope}");
+                let stdout = std::io::stdout();
+                let mut output = stdout.lock();
+                if writeln!(output, "{envelope}")
+                    .and_then(|_| output.flush())
+                    .is_ok()
+                {
+                    acknowledge_peer_views();
+                }
             }
             0
         }
@@ -208,10 +237,34 @@ fn decide(
     let session = current_session(&mut broker, &canonical);
 
     let outcome = match event {
-        HookEvent::SessionStart => with_installation_notice(
-            on_session_start(&mut broker, &canonical, session.as_ref()),
-            &installation_notice,
-        ),
+        HookEvent::SessionStart => {
+            let start = on_session_start(&mut broker, &canonical, session.as_ref());
+            let peers = if matches!(start, HookOutcome::Deny(_)) {
+                None
+            } else {
+                session
+                    .as_ref()
+                    .and_then(|session| peer_view_update(&broker, session, true))
+            };
+            let own = if matches!(start, HookOutcome::Deny(_)) {
+                None
+            } else {
+                session
+                    .as_ref()
+                    .and_then(|session| own_view_update(&broker, session, true))
+            };
+            let global = if matches!(start, HookOutcome::Deny(_)) {
+                None
+            } else {
+                session
+                    .as_ref()
+                    .and_then(|session| global_view_update(&broker, session, true))
+            };
+            with_installation_notice(
+                append_context(append_context(append_context(start, own), peers), global),
+                &installation_notice,
+            )
+        }
         HookEvent::UserPromptSubmit => on_user_prompt_submit(&mut broker, session.as_ref()),
         HookEvent::PreToolUse => on_pre_tool_use(&mut broker, session.as_ref(), event_json),
         HookEvent::Stop => {
@@ -741,7 +794,183 @@ fn on_user_prompt_submit(broker: &mut Broker, session: Option<&Session>) -> Hook
             session.id
         ));
     }
-    deliver_notes(broker, session)
+    let notes = deliver_notes(broker, session);
+    let notes = append_context(notes, own_view_update(broker, session, false));
+    let notes = append_context(notes, peer_view_update(broker, session, false));
+    append_context(notes, global_view_update(broker, session, false))
+}
+
+/// Stable, bounded observations of recorded peer ownership relevant to this session.
+pub(crate) fn session_peer_view(
+    broker: &Broker,
+    session_id: i64,
+) -> Result<serde_json::Value, crate::BrokerError> {
+    use sha2::{Digest, Sha256};
+    let leases = broker
+        .store_ref()
+        .session_peer_lease_overlaps(session_id, now_ms())?;
+    let scopes = broker.store_ref().session_peer_scopes(session_id)?;
+    let all = serde_json::json!({"leases": leases, "scopes": scopes});
+    let hash = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&all).expect("serializable peer records"))
+    );
+    let lease_rows = all["leases"].as_array().expect("lease records");
+    let scope_rows = all["scopes"].as_array().expect("scope records");
+    Ok(serde_json::json!({
+        "lease_count": lease_rows.len(), "scope_count": scope_rows.len(),
+        "leases": lease_rows.iter().take(10).collect::<Vec<_>>(),
+        "scopes": scope_rows.iter().take(10).collect::<Vec<_>>(),
+        "digest": hash, "source": "recorded",
+    }))
+}
+
+/// The session's own compact facts, with volatile watch timestamps omitted.
+fn own_session_view(broker: &Broker, session_id: i64) -> serde_json::Value {
+    let advice = match broker.session_status_advice(session_id, now_ms()) {
+        Ok(advice) => advice,
+        Err(error) => {
+            return serde_json::json!({"id": session_id, "status": "unknown", "error": error.to_string()});
+        }
+    };
+    let mut view = crate::cli::status_extras::session_block(broker, session_id, &advice);
+    if let Some(pr) = view
+        .pointer_mut("/pr")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        pr.remove("observed_at_ms");
+    }
+    view["advice_completeness"] =
+        serde_json::json!("partial; use focused status for full recorded advice");
+    let mut document = serde_json::json!({"session": view});
+    crate::cli::status_extras::cap_document_advice_evidence(&mut document);
+    document["session"].take()
+}
+
+fn own_view_update(broker: &Broker, session: &Session, force: bool) -> Option<String> {
+    let path = hook_state_path(broker.main_root(), "hook-own-view", session.id)?;
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    let file = crate::file_lock::open_lock_file(&path.with_extension("lock")).ok()?;
+    let guard = crate::file_lock::ExclusiveFileLock::try_acquire(file).ok()??;
+    let previous: Option<serde_json::Value> = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let now = now_ms();
+    if !force
+        && previous
+            .as_ref()
+            .and_then(|v| v["checked_at_ms"].as_i64())
+            .is_some_and(|at| now >= at && now - at < 30_000)
+    {
+        return None;
+    }
+    let current = own_session_view(broker, session.id);
+    let record = serde_json::json!({"checked_at_ms": now, "view": current});
+    if !force && previous.as_ref().map(|v| &v["view"]) == Some(&current) {
+        save_hook_state(Some(&path), &record);
+        return None;
+    }
+    PENDING_PEER_VIEWS.with(|pending| pending.borrow_mut().push((path, record, guard)));
+    Some(format!("Aethyme session view: {}", current))
+}
+
+/// Recorded repository-wide blockers and blockers belonging to this session.
+/// Recovery-only sources remain explicitly uninspected.
+pub(crate) fn session_global_view(broker: &Broker, session_id: i64) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    let report = broker.collect_blockers_with_recovery(false);
+    let blockers: Vec<_> = report
+        .blockers
+        .into_iter()
+        .filter(|blocker| {
+            blocker.kind != crate::blockers::BlockerKind::Pidfile
+                || blocker.session_id == Some(session_id)
+        })
+        .collect();
+    let all = serde_json::json!({"blockers": blockers, "unavailable": report.unavailable});
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&all).expect("serializable blockers"))
+    );
+    let rows = all["blockers"].as_array().expect("blockers");
+    serde_json::json!({"count": rows.len(), "records": rows.iter().take(10).collect::<Vec<_>>(),
+        "unavailable": all["unavailable"], "digest": digest,
+        "recovery_checks": "not_inspected"})
+}
+
+/// Periodically refresh global sources, including external stores and process
+/// liveness that can change without an event in this repository's database.
+fn global_view_update(broker: &Broker, session: &Session, force: bool) -> Option<String> {
+    let path = hook_state_path(broker.main_root(), "hook-global-view", session.id)?;
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    let file = crate::file_lock::open_lock_file(&path.with_extension("lock")).ok()?;
+    let guard = crate::file_lock::ExclusiveFileLock::try_acquire(file).ok()??;
+    let previous: Option<serde_json::Value> = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let now = now_ms();
+    if !force
+        && previous
+            .as_ref()
+            .and_then(|v| v["checked_at_ms"].as_i64())
+            .is_some_and(|at| now >= at && now - at < 30_000)
+    {
+        return None;
+    }
+    let current = session_global_view(broker, session.id);
+    let record = serde_json::json!({"checked_at_ms": now, "view": current});
+    let old = previous.as_ref().map(|v| &v["view"]);
+    let relevant = current["count"].as_u64().unwrap_or(0) > 0
+        || current["unavailable"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty());
+    if old == Some(&current) && !(force && relevant) || old.is_none() && !relevant {
+        save_hook_state(Some(&path), &record);
+        return None;
+    }
+    PENDING_PEER_VIEWS.with(|pending| pending.borrow_mut().push((path, record, guard)));
+    Some(format!(
+        "Aethyme: recorded repository blocker observations changed: {}\n  Details: aethyme broker unblock",
+        current
+    ))
+}
+
+/// Emit recorded peer changes once at hook boundaries. The file lock prevents
+/// concurrent hooks from overwriting each other's observed revision.
+fn peer_view_update(broker: &Broker, session: &Session, force: bool) -> Option<String> {
+    let path = hook_state_path(broker.main_root(), "hook-peer-view", session.id)?;
+    let parent = path.parent()?;
+    std::fs::create_dir_all(parent).ok()?;
+    let file = crate::file_lock::open_lock_file(&path.with_extension("lock")).ok()?;
+    let _guard = crate::file_lock::ExclusiveFileLock::try_acquire(file).ok()??;
+    let previous: Option<serde_json::Value> = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let current = session_peer_view(broker, session.id).ok()?;
+    let has_relevance = current["lease_count"].as_u64().unwrap_or(0) > 0
+        || current["scope_count"].as_u64().unwrap_or(0) > 0;
+    if previous.as_ref() == Some(&current) && !(force && has_relevance) {
+        return None;
+    }
+    if previous.is_none() && !has_relevance {
+        save_hook_state(Some(&path), &current);
+        return None;
+    }
+    PENDING_PEER_VIEWS.with(|pending| pending.borrow_mut().push((path, current.clone(), _guard)));
+    Some(format!(
+        "Aethyme: recorded task-relevant peer coordination changed: {}\n  Details: aethyme broker status --session {} --json",
+        current, session.id
+    ))
+}
+
+fn append_context(outcome: HookOutcome, addition: Option<String>) -> HookOutcome {
+    match (outcome, addition) {
+        (HookOutcome::Silent, Some(text)) => HookOutcome::Context(text),
+        (HookOutcome::Context(existing), Some(text)) => {
+            HookOutcome::Context(format!("{existing}\n{text}"))
+        }
+        (other, _) => other,
+    }
 }
 
 /// Hand a note from another session to this agent at the first turn
@@ -755,6 +984,9 @@ fn on_post_tool_use(cwd: &std::path::Path) -> HookOutcome {
     let Some(session) = current_session(&mut snapshot, &canonical) else {
         return HookOutcome::Silent;
     };
+    let own = own_view_update(&snapshot, &session, false);
+    let peers = peer_view_update(&snapshot, &session, false);
+    let global = global_view_update(&snapshot, &session, false);
     let store = snapshot.store_ref();
     let unread = !store
         .unread_session_notes(session.id)
@@ -765,13 +997,25 @@ fn on_post_tool_use(cwd: &std::path::Path) -> HookOutcome {
             .unwrap_or_default()
             .is_empty();
     if !unread {
-        return HookOutcome::Silent;
+        return append_context(
+            append_context(append_context(HookOutcome::Silent, own), peers),
+            global,
+        );
     }
     drop(snapshot);
     let Some(mut broker) = Broker::open(cwd).ok() else {
-        return HookOutcome::Silent;
+        return append_context(
+            append_context(append_context(HookOutcome::Silent, own), peers),
+            global,
+        );
     };
-    deliver_notes(&mut broker, &session)
+    append_context(
+        append_context(
+            append_context(deliver_notes(&mut broker, &session), own),
+            peers,
+        ),
+        global,
+    )
 }
 
 /// Render every unread note for `session`, each with the command that
@@ -791,6 +1035,31 @@ fn deliver_notes(broker: &mut Broker, session: &Session) -> HookOutcome {
     }
     let mut lines = Vec::with_capacity((unread.len() + automation.len()) * 2);
     for note in &automation {
+        if note.sender == "automation:lease-release" {
+            let request_id = note
+                .fingerprint
+                .as_deref()
+                .and_then(|value| value.strip_prefix("lease-release-request:"))
+                .and_then(|value| value.parse::<i64>().ok());
+            let Some(request_id) = request_id else {
+                continue;
+            };
+            match broker.lease_release_request(request_id) {
+                Ok(request)
+                    if request.holder_session_id == session.id
+                        && request.state == crate::lease_requests::RequestState::Pending => {}
+                Ok(_) => {
+                    crate::warn_unrecorded(
+                        "acknowledge a resolved release request note",
+                        broker.store().acknowledge_automation_note(note.id),
+                    );
+                    continue;
+                }
+                // An unavailable or pruned request cannot be safely presented
+                // as actionable; retain the note for later inspection.
+                Err(_) => continue,
+            }
+        }
         // An automation cannot be replied to; the note itself says what
         // failed and where it is tracked.
         lines.push(format!("Note from {}: {}", note.sender, note.message));
@@ -815,7 +1084,11 @@ fn deliver_notes(broker: &mut Broker, session: &Session) -> HookOutcome {
             broker.store().acknowledge_session_note(note.id),
         );
     }
-    HookOutcome::Context(lines.join("\n"))
+    if lines.is_empty() {
+        HookOutcome::Silent
+    } else {
+        HookOutcome::Context(lines.join("\n"))
+    }
 }
 
 /// Tell the agent, before it edits a file, that another live session is
@@ -1644,6 +1917,154 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_request_delivers_once_and_resolved_request_stays_silent() {
+        use crate::main_drift::tests::git;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("file.rs"), "base\n").unwrap();
+        git(&root, &["add", "file.rs"]);
+        git(&root, &["commit", "-qm", "base"]);
+        let worktree = |name: &str| {
+            let path = temp.path().join(name);
+            git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    name,
+                    path.to_str().unwrap(),
+                    "main",
+                ],
+            );
+            path
+        };
+        let mut broker = Broker::open(&root).unwrap();
+        let holder = broker.adopt(&worktree("holder"), Some("holder")).unwrap();
+        let requester = broker
+            .adopt(&worktree("requester"), Some("requester"))
+            .unwrap();
+        let other = broker.adopt(&worktree("other"), Some("other")).unwrap();
+        // Establish the same delivered baseline as SessionStart for both hosts.
+        for session in [&holder, &other] {
+            let _ = own_view_update(&broker, session, true);
+            let _ = peer_view_update(&broker, session, true);
+            let _ = global_view_update(&broker, session, true);
+            acknowledge_peer_views();
+        }
+        broker.claim_lease(holder.id, "file.rs", None).unwrap();
+        broker.claim_lease(requester.id, "file.rs", None).unwrap();
+        let requests = broker
+            .request_lease_release(requester.id, "file.rs", "need file")
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        for id in [holder.id, requester.id, other.id] {
+            let expected: Vec<_> = broker
+                .pending_lease_release_requests()
+                .unwrap()
+                .into_iter()
+                .filter(|request| {
+                    request.requester_session_id == id || request.holder_session_id == id
+                })
+                .collect();
+            assert_eq!(
+                broker.session_pending_lease_release_requests(id).unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            requests[0].state,
+            crate::lease_requests::RequestState::Pending
+        );
+        assert_eq!(
+            on_post_tool_use(std::path::Path::new(&other.worktree_path)),
+            HookOutcome::Silent
+        );
+        let delivered = on_post_tool_use(std::path::Path::new(&holder.worktree_path));
+        let HookOutcome::Context(text) = delivered else {
+            panic!("expected request note")
+        };
+        assert!(text.contains("recorded task-relevant peer coordination changed"));
+        acknowledge_peer_views();
+        assert!(text.contains(&format!(
+            "leases ack {} --session {}",
+            requests[0].request_id, holder.id
+        )));
+        assert_eq!(
+            on_post_tool_use(std::path::Path::new(&holder.worktree_path)),
+            HookOutcome::Silent
+        );
+        let repeated = broker
+            .request_lease_release(requester.id, "file.rs", "need file")
+            .unwrap();
+        assert_eq!(repeated[0].request_id, requests[0].request_id);
+        assert_eq!(
+            on_post_tool_use(std::path::Path::new(&holder.worktree_path)),
+            HookOutcome::Silent
+        );
+        broker
+            .decline_lease_release(holder.id, requests[0].request_id, "still editing")
+            .unwrap();
+        assert!(
+            broker
+                .session_pending_lease_release_requests(requester.id)
+                .unwrap()
+                .is_empty()
+        );
+        let pending = broker
+            .request_lease_release(requester.id, "file.rs", "need again")
+            .unwrap();
+        broker
+            .decline_lease_release(holder.id, pending[0].request_id, "still editing")
+            .unwrap();
+        assert_eq!(
+            on_post_tool_use(std::path::Path::new(&holder.worktree_path)),
+            HookOutcome::Silent
+        );
+        assert!(
+            broker
+                .store()
+                .unread_automation_notes(holder.id)
+                .unwrap()
+                .is_empty()
+        );
+        let _ = global_view_update(&broker, &holder, true);
+        acknowledge_peer_views();
+        let repository = format!("local:{}", broker.main_root().display());
+        let operation = broker
+            .store()
+            .create_coordinated_operation(&crate::NewCoordinatedOperation {
+                session_id: requester.id,
+                provider: crate::OperationProvider::Git,
+                repository,
+                scope: "repository".into(),
+                effect: crate::OperationEffect::Write,
+                authorization_reason: Some("test crash".into()),
+                command_json: r#"["git","push"]"#.into(),
+                pid: 999_999,
+                host_operation_id: None,
+                identity_provenance: crate::OperationIdentityProvenance::LocalRepository,
+            })
+            .unwrap();
+        broker
+            .store()
+            .transition_coordinated_operation(
+                operation.id,
+                crate::OperationStatus::OutcomeUnknown,
+                None,
+                None,
+            )
+            .unwrap();
+        let update = global_view_update(&broker, &holder, true).expect("new global blocker");
+        assert!(update.contains(&format!("op:{}", operation.id)));
+        acknowledge_peer_views();
+        assert!(global_view_update(&broker, &holder, false).is_none());
+    }
 
     /// Through the hook's own path: opted in, a session changing a file this
     /// edit depends on is named with its diff, once; not opted in, it is silent.

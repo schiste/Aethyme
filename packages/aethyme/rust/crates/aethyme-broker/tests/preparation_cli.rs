@@ -64,7 +64,7 @@ fn fixture() -> tempfile::TempDir {
 
 [[runtimes]]
 name = "shell"
-command = ["sh", "-c", "touch runtime-probe-must-not-run"]
+command = ["sh", "-c", "mkdir -p .aethyme/run && touch .aethyme/run/runtime-probe-ran && echo shell"]
 
 [[steps]]
 name = "npm-pnpm-yarn"
@@ -122,7 +122,7 @@ fn low_space_preparation_preserves_state_and_does_not_run_install() {
         "node_modules",
         "target",
         ".venv",
-        "runtime-probe-must-not-run",
+        ".aethyme/run/runtime-probe-ran",
     ] {
         assert!(
             !temp.path().join(path).exists(),
@@ -244,7 +244,8 @@ fn preparation_is_explicit_language_neutral_and_invalidates_on_input_change() {
     ));
     let session = adopted["id"].as_i64().unwrap().to_string();
     assert_eq!(adopted["preparation"]["state"], "required");
-    assert!(!temp.path().join("runtime-probe-must-not-run").exists());
+    // Status reads never run a runtime probe.
+    assert!(!temp.path().join(".aethyme/run/runtime-probe-ran").exists());
 
     for output in ["node_modules", "target", ".venv"] {
         assert!(!temp.path().join(output).exists(), "adopt ran preparation");
@@ -307,7 +308,12 @@ fn preparation_is_explicit_language_neutral_and_invalidates_on_input_change() {
     for step in prepared["steps"].as_array().unwrap() {
         assert!(step["duration_ms"].as_u64().is_some());
     }
-    assert!(!temp.path().join("runtime-probe-must-not-run").exists());
+    // A preparation runs the declared probe and keys on its output.
+    assert!(temp.path().join(".aethyme/run/runtime-probe-ran").exists());
+    assert_eq!(
+        prepared["package_store"]["runtimes"][0]["probe_summary"],
+        "shell"
+    );
     for output in ["node_modules", "target", ".venv"] {
         assert!(temp.path().join(output).is_dir());
     }

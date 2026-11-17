@@ -36,12 +36,21 @@ root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 # One call. If this CLI has no `hook` subcommand (or the event is one it does
 # not handle), it exits nonzero and we stay silent rather than leaking an
 # error message into the envelope slot.
-out="$(printf '%s' "$payload" | aethyme hook "$event" --repo "$root" 2>/dev/null)"
-status=$?
-
-if [[ $status -eq 0 && -n "$out" ]]; then
-    printf '%s' "$out"
-    exit 0
+# A capable CLI promises that only hook envelopes appear on stdout. Stream
+# directly so it can acknowledge only after the host pipe accepts the output.
+# Older CLIs do not know the probe and retain the buffered compatibility path.
+protocol="$(aethyme hook __stream_protocol_v1 </dev/null 2>/dev/null || true)"
+if [[ "$protocol" == "aethyme-hook-stream-v1" ]]; then
+    printf '%s' "$payload" | aethyme hook "$event" --repo "$root" 2>/dev/null
+    status=$?
+    [[ $status -eq 0 ]] && exit 0
+else
+    out="$(printf '%s' "$payload" | aethyme hook "$event" --repo "$root" 2>/dev/null)"
+    status=$?
+    if [[ $status -eq 0 && -n "$out" ]]; then
+        printf '%s' "$out"
+        exit 0
+    fi
 fi
 
 # Fallback: record that the surface fired so the broker can still see liveness,

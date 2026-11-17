@@ -113,6 +113,40 @@ fn foreground_try_claim_active() -> bool {
 }
 
 thread_local! {
+    /// Depth of [`DeclineNonblockingLifecycleClaims`] scopes on this thread.
+    static DECLINE_NONBLOCKING: Cell<u32> = const { Cell::new(0) };
+}
+
+/// While alive, nonblocking lifecycle claims made on this thread answer
+/// "busy" without touching the lock. `broker start` enters it after it has
+/// released the lifecycle lock but before its session row and reports are
+/// done: inline judgements made there (the lease-holder refresh's abandoned
+/// close, for one) used to find the lock held by `start` itself and stay
+/// "busy", and must keep doing so now that `start` no longer holds it.
+pub(crate) struct DeclineNonblockingLifecycleClaims {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl DeclineNonblockingLifecycleClaims {
+    pub(crate) fn enter() -> Self {
+        DECLINE_NONBLOCKING.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Self {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for DeclineNonblockingLifecycleClaims {
+    fn drop(&mut self) {
+        DECLINE_NONBLOCKING.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+fn nonblocking_claims_declined() -> bool {
+    DECLINE_NONBLOCKING.with(|depth| depth.get() > 0)
+}
+
+thread_local! {
     /// Depth of [`DetachedBackgroundWorker`] scopes on this thread.
     static DETACHED_BACKGROUND_WORKER: Cell<u32> = const { Cell::new(0) };
 }
@@ -345,6 +379,9 @@ pub(crate) fn try_acquire_repository_lifecycle_lock(
     main_root: &Path,
     lane: &'static str,
 ) -> io::Result<Option<ExclusiveFileLock>> {
+    if nonblocking_claims_declined() {
+        return Ok(None);
+    }
     let path = repository_lifecycle_lock_path(main_root)?;
     if !foreground_try_claim_active()
         && let Some(directory) = existing_lifecycle_waiters_directory(main_root)
