@@ -968,10 +968,15 @@ impl Broker {
         ) {
             advice.insert(0, headroom_advice);
         }
-        // Opt-in transcript archiving whose session links stayed unreadable
-        // for several passes (a no-op unless the host enabled it).
+        // Transcript archiving whose session links stayed unreadable for
+        // several passes (a no-op while the host has it turned off).
         if let Some(transcripts_advice) = crate::transcripts::linkage_degraded_advice() {
             advice.push(transcripts_advice);
+        }
+        // Archiving on by default: the one-line notice that starts the
+        // 24-hour first-run wait (shown only during that wait).
+        if let Some(notice) = crate::transcripts::default_on_advice() {
+            advice.push(notice);
         }
         if refresh && cleanup_retention.broker_owned_worktree_count > 0 {
             let count = cleanup_retention.broker_owned_worktree_count;

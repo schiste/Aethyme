@@ -184,7 +184,7 @@ pub mod session_guidance;
 pub mod session_holder;
 mod test_storage;
 mod text_redaction;
-/// Opt-in archiving of closed agent transcripts (`aethyme transcripts`).
+/// Archiving of closed agent transcripts, on by default (`aethyme transcripts`).
 pub mod transcripts;
 mod unpushed;
 pub mod worktree_location;

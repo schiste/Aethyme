@@ -1,15 +1,23 @@
-//! `aethyme transcripts`: opt-in archiving of closed agent transcripts.
+//! `aethyme transcripts`: archiving of closed agent transcripts, on by
+//! default.
 //!
 //! Agent transcripts grow without bound (tens of GiB on a busy host) and are
-//! almost never read once their session is over. When the owner turns this on
-//! (`[transcripts] archive = true` in `<host state>/transcripts/settings.toml`),
-//! a transcript that is older than `archive_after_days`, open in no process,
-//! and whose linked broker sessions are all closed with their checkouts gone,
-//! is compressed with zstd and moved: Codex transcripts into Codex's own
-//! `archived_sessions/` as `.jsonl.zst` (which Codex unarchives and resumes
-//! natively), Claude Code transcripts under Aethyme's host state (restored
-//! with `aethyme transcripts restore`). Nothing runs, and no directory is
-//! listed, while the setting is off.
+//! almost never read once their session is over. Unless the owner turned it
+//! off (`[transcripts] archive = false` in
+//! `<host state>/transcripts/settings.toml`, written by
+//! `aethyme transcripts disable`), a transcript that has been inactive for
+//! more than `archive_after_inactive_days` (its newest modification time,
+//! last record timestamp, and linked broker session activity are all that
+//! old), open in no process, and whose linked broker sessions are all closed
+//! with their checkouts gone, is compressed with zstd and moved: Codex
+//! transcripts into Codex's own `archived_sessions/` as `.jsonl.zst` (which
+//! Codex unarchives and resumes natively), Claude Code transcripts under
+//! Aethyme's host state (restored with `aethyme transcripts restore`).
+//! Nothing runs, and no directory is listed, while the setting is off.
+//!
+//! On a host that never set `archive` explicitly, the background worker
+//! waits 24 hours after `aethyme broker status` first shows the
+//! `transcripts.archiving-default-on` notice (`first_run.rs`).
 //!
 //! The lane runs from the existing detached background worker at low
 //! priority and a bounded byte rate, or on demand with
@@ -21,6 +29,7 @@ mod archive;
 pub mod cli;
 mod config;
 mod eligibility;
+mod first_run;
 mod index;
 mod linkage;
 mod open_files;
@@ -36,8 +45,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub use archive::Restored;
-pub use config::{SETTINGS_FILE, TranscriptsConfig};
+pub use config::{EnabledSource, SETTINGS_FILE, TranscriptsConfig};
 pub use eligibility::SkipReason;
+pub(crate) use first_run::default_on_advice;
+pub use first_run::{FirstRunState, FirstRunStatus, Gate};
 pub use index::ArchiveRow;
 pub(crate) use linkage::note_holder_bound;
 pub use providers::Provider;

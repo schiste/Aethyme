@@ -8,16 +8,46 @@ over. `aethyme transcripts` compresses and moves the transcripts of finished
 sessions, and puts any of them back on request. zstd at level 3 shrinks agent
 transcripts four to five times.
 
-It is opt-in and off by default. While it is off nothing runs: no agent
-directory is opened, listed or stat'ed, and only Aethyme's own settings file
-is read (once per process).
+It is on by default, for Codex and Claude Code, on every host that has not
+set `archive` in its settings: with no settings file, or a file without an
+`archive` line. An explicit `archive = false` (`aethyme transcripts
+disable`) turns it off. While it is off nothing runs: no agent directory is
+opened, listed or stat'ed, and only Aethyme's own settings file is read
+(once per process).
+
+### First run on a host that never chose
+
+Because the default moves the owner's files, the background worker archives
+nothing on such a host until 24 hours after `aethyme broker status` first
+shows this one-line notice (advice `transcripts.archiving-default-on`,
+severity notice): what will be archived, after how many inactive days, and
+how to change the days (`aethyme transcripts enable --after-inactive-days
+<n>`) or turn it off (`aethyme transcripts disable`). The time the notice
+was first shown is recorded in `<host state>/transcripts/first-run.json`;
+showing it again does not restart the wait, and the notice disappears once
+the wait is over. Either of these skips the wait:
+
+- `aethyme transcripts enable` (an explicit `archive = true`);
+- a manual `aethyme transcripts archive --apply` (recorded in
+  `first-run.json` as `acknowledged_by = "archive_apply"`).
+
+`aethyme transcripts status --json` reports `enabled`, `enabled_source`
+(`default` or `settings`) and `first_run` (`gate`: `open`,
+`notice_pending` or `waiting`; `noticed_at_ms`, `acknowledged_at_ms`,
+`acknowledged_by`, `automatic_archiving_from_ms`).
 
 ## What qualifies
 
 A transcript is archived only when all of these hold:
 
-- it was last modified more than `archive_after_days` ago (default 3), or
-  for Claude Code `archive_after_days_claude` (default 14);
+- it has been inactive for more than `archive_after_inactive_days`
+  (default 3), or for Claude Code `archive_after_inactive_days_claude`
+  (default 14). Its last activity is the newest of: the file's modification
+  time; the `timestamp` of the newest complete record in its last 64 KiB
+  (only the tail is read, and only once the modification time is old
+  enough); and the `last_activity_at` of every broker session linked to it.
+  Skips are counted as `too_recent`, `recent_record` and
+  `recent_session_activity`;
 - no process has it open, checked when archiving starts and again just
   before the original is removed (a running Codex keeps its transcript files
   open; a running Claude Code does not, which is why the age rule matters);
@@ -31,7 +61,7 @@ A transcript is archived only when all of these hold:
   without this an idle session's transcript would be split. If the process
   table cannot be read, every Claude transcript is skipped.
 
-A transcript linked to no broker session needs only the age and not-open
+A transcript linked to no broker session needs only the inactivity and not-open
 (and, for Claude, no-live-process) conditions, and only when every broker
 database and live-holder listing was read that pass: if any could not be
 read, unlinked transcripts are skipped as `linkage_unreadable`. Anything unreadable or ambiguous is skipped and counted with a
@@ -60,21 +90,25 @@ registry, and the repository a transcript's recorded `cwd` belongs to.
 Every archive is recorded in `<host state>/transcripts/index.sqlite3` with
 its original path and SHA-256.
 
-## Turning it on
+## Settings
 
 ```bash
 aethyme transcripts enable
-aethyme transcripts enable --after-days 5 --providers codex,claude
+aethyme transcripts enable --after-inactive-days 5 --providers codex,claude
 aethyme transcripts disable
 ```
 
-`enable` and `disable` write only `<host state>/transcripts/settings.toml`:
+`enable` and `disable` write only `<host state>/transcripts/settings.toml`
+(`--after-days` is an alias of `--after-inactive-days`; either writes
+`archive_after_inactive_days` and drops an older `archive_after_days`
+line):
 
 ```toml
 [transcripts]
-archive = true
-archive_after_days = 3
-providers = ["codex"]          # "claude" is allowed too
+archive = true                 # omitted: on by default (first-run wait applies)
+archive_after_inactive_days = 3
+archive_after_inactive_days_claude = 14
+providers = ["codex", "claude"] # the default
 # codex_home = "/absolute/path"     default: $CODEX_HOME, then ~/.codex
 # claude_home = "/absolute/path"    default: $CLAUDE_CONFIG_DIR, then ~/.claude
 # repositories = ["/absolute/repo"] extra broker databases to read
@@ -82,7 +116,11 @@ providers = ["codex"]          # "claude" is allowed too
 # free_space_floor_bytes = 21474836480
 ```
 
-Once enabled, the broker's detached background worker runs one archive pass
+The older names `archive_after_days` and `archive_after_days_claude` are
+still read; when both spellings are present the `archive_after_inactive_*`
+one wins.
+
+While it is on (and past the first-run wait), the broker's detached background worker runs one archive pass
 each time it runs: at background CPU and I/O priority, at most
 `bytes_per_second` (never slower than 4 MiB/s), largest transcripts first so
 space comes back early, for at most ten minutes per pass. When the archive
@@ -172,10 +210,16 @@ the next pass.
 
 ## Telemetry
 
-Each pass records phase timings (`transcripts_scan`, `transcripts_linkage`,
-`transcripts_judge`, `transcripts_open_check`, `transcripts_compress`,
-`transcripts_verify`, `transcripts_archive`, `transcripts_total`) into the
-background worker's command-metrics row, appends one line to
-`<host state>/transcripts/runs.jsonl`, and adds to lifetime counters
+Each pass records phase timings (`transcripts_scan`,
+`transcripts_inactivity` (the modification-time and tail-record tests),
+`transcripts_linkage` with its parts `transcripts_linkage_cwds`,
+`transcripts_linkage_databases`, `transcripts_linkage_backfill` and
+`transcripts_linkage_live_holders`, `transcripts_judge`,
+`transcripts_open_check`, `transcripts_compress`, `transcripts_verify`,
+`transcripts_archive`, `transcripts_total`) into the background worker's
+command-metrics row, appends one line to
+`<host state>/transcripts/runs.jsonl` (with `enabled_source`,
+`first_run_gate`, `record_tails_read`, eligible count and bytes, archived
+count, bytes in and out, skips by reason), and adds to lifetime counters
 (`examined`, `archived`, `bytes_in`, `bytes_out`, `resumed`,
 `verify_failures`, `restored`, `skipped_<reason>`) shown by `status --json`.
