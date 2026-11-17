@@ -1395,10 +1395,10 @@ mod tests {
         let (order_tx, order_rx) = std::sync::mpsc::channel();
         let mut waiters = Vec::new();
         for (index, label) in ["first", "second", "third"].into_iter().enumerate() {
-            let root = root.clone();
+            let waiter_root = root.clone();
             let order_tx = order_tx.clone();
             waiters.push(thread::spawn(move || {
-                let claim = acquire_repository_lifecycle_lock(&root).unwrap();
+                let claim = acquire_repository_lifecycle_lock(&waiter_root).unwrap();
                 order_tx.send(label).unwrap();
                 thread::sleep(Duration::from_millis(100));
                 drop(claim);
