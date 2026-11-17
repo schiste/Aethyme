@@ -992,8 +992,9 @@ impl Broker {
 
     /// Pin, as `refs/aethyme/retired/<session_id>/<commit>`, every commit
     /// only `worktree` itself refers to, so dropping its registration (its
-    /// HEAD reflog, its per-worktree refs, its bisect state) loses none: the
-    /// commits its HEAD reflog names (old and new ids), the commits its
+    /// HEAD reflog, its per-worktree refs, its bisect state) loses none: its
+    /// current `HEAD` and `ORIG_HEAD`, the commits its HEAD reflog names
+    /// (old and new ids; a missing reflog is recorded), the commits its
     /// per-worktree refs (`refs/bisect/*`, `refs/worktree/*`,
     /// `refs/rewritten/*`) point at, and those `BISECT_LOG`/`BISECT_START`
     /// name, each unless already reachable from the default branch, a
@@ -1008,9 +1009,42 @@ impl Broker {
             .map_err(|error| format!("cannot find the checkout's Git directory: {error}"))?
             .ok_or("the checkout has no linked Git directory")?;
         let mut candidates = std::collections::BTreeSet::new();
-        if let Ok(reflog) = std::fs::read_to_string(git_dir.join("logs/HEAD")) {
-            for line in reflog.lines() {
-                candidates.extend(line.split_whitespace().take(2).map(str::to_string));
+        match std::fs::read_to_string(git_dir.join("logs/HEAD")) {
+            Ok(reflog) => {
+                for line in reflog.lines() {
+                    candidates.extend(line.split_whitespace().take(2).map(str::to_string));
+                }
+            }
+            Err(error) => {
+                // No reflog (logAllRefUpdates off, expired, removed): HEAD
+                // and ORIG_HEAD below still count; say so instead of
+                // silently finding nothing.
+                crate::phase_telemetry::add(
+                    "checkout_trash_worktree_reflog_missing",
+                    std::time::Duration::ZERO,
+                );
+                crate::phase_telemetry::attach(
+                    "checkout_trash_worktree_reflog",
+                    serde_json::json!({
+                        "missing_session_id": session_id,
+                        "error": error.kind().to_string(),
+                    }),
+                );
+            }
+        }
+        // The worktree's current HEAD and ORIG_HEAD, whatever its reflog
+        // says: a detached HEAD's commit is otherwise named nowhere else.
+        for name in ["HEAD", "ORIG_HEAD"] {
+            if let Ok(commit) = run_git_text(
+                worktree,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{name}^{{commit}}"),
+                ],
+            ) {
+                candidates.insert(commit.trim().to_string());
             }
         }
         let per_worktree_refs = run_git_text(
@@ -3130,6 +3164,83 @@ mod tests {
                 ],
             );
         }
+    }
+
+    /// A detached HEAD's commit is pinned even when the worktree has no
+    /// HEAD reflog, and the missing reflog is recorded.
+    #[test]
+    fn a_detached_head_without_a_reflog_is_pinned() {
+        let (_owner, _storage, mut broker) = fixture();
+        let mut detached = String::new();
+        let (session, worktree) = closed(&mut broker, "detached no reflog", |worktree| {
+            git(worktree, &["checkout", "-q", "--detach"]);
+            std::fs::write(worktree.join("detached.txt"), "only HEAD\n").unwrap();
+            git(worktree, &["add", "detached.txt"]);
+            git(worktree, &["commit", "-qm", "detached work"]);
+            detached = git(worktree, &["rev-parse", "HEAD"]).trim().to_string();
+        });
+        let git_dir = crate::git::checked_worktree_git_dir(&worktree)
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(git_dir.join("logs/HEAD")).unwrap();
+        let recorder = crate::phase_telemetry::Recorder::default();
+        {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker
+                .pin_reflog_only_commits(session.id, &worktree)
+                .unwrap();
+        }
+        assert_eq!(
+            recorder
+                .totals()
+                .1
+                .get("checkout_trash_worktree_reflog_missing")
+                .copied(),
+            Some(1)
+        );
+        git(
+            broker.main_root(),
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/aethyme/retired/{}/{detached}", session.id),
+            ],
+        );
+    }
+
+    /// More candidates than the per-checkout cap keeps the checkout, with
+    /// the reason remembered for `broker gc plan --json`.
+    #[test]
+    fn too_many_pin_candidates_keep_the_checkout_with_the_reason() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "huge reflog", |_| {});
+        let git_dir = crate::git::checked_worktree_git_dir(&worktree)
+            .unwrap()
+            .unwrap();
+        let mut reflog = std::fs::read_to_string(git_dir.join("logs/HEAD")).unwrap_or_default();
+        for index in 0..=RETIRE_PIN_CANDIDATES_MAX {
+            let id = format!("{:040x}", index + 1);
+            reflog.push_str(&format!(
+                "{id} {id} Retire test <r@example.invalid> 0 +0000\tfake\n"
+            ));
+        }
+        std::fs::write(git_dir.join("logs/HEAD"), reflog).unwrap();
+
+        let report = run(&mut broker);
+
+        assert_eq!(report.kept.get("trash_refused"), Some(&1), "{report:#?}");
+        assert!(worktree.join("base.txt").exists());
+        let keep = broker
+            .checkout_retirement_keep_report()
+            .into_iter()
+            .find(|keep| keep.session_id == session.id)
+            .expect("remembered");
+        assert!(
+            keep.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains(&RETIRE_PIN_CANDIDATES_MAX.to_string())),
+            "{keep:?}"
+        );
     }
 
     /// A kept checkout is not planned again every lap; a change to its
