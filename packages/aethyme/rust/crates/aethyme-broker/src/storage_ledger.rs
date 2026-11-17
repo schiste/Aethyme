@@ -868,6 +868,13 @@ pub(crate) fn archive_meta(path: &Path) -> ArchiveMeta {
     }
 }
 
+/// Whether `name` is an archive still being written (a partial operation
+/// archive, or a recovery archive's staging directory): never an archive,
+/// never expired by age. Its writer, or the retirement lane's sweep, removes it.
+pub fn is_partial_archive_name(name: &str) -> bool {
+    name.starts_with(".partial-") || name.ends_with(".partial")
+}
+
 /// Suffix of the keep marker written beside an archive directory (outside
 /// it, so the archive's own verified file set never changes).
 pub const KEEP_SUFFIX: &str = ".aethyme-keep";
@@ -930,7 +937,7 @@ impl Notice {
 /// expiry is off, the archive is kept, or its manifest has no valid creation
 /// time (never removed by age). Removal also needs a served [`Notice`].
 pub fn archive_expiry(child: &Child, budgets: &Budgets) -> Option<u64> {
-    if budgets.unlanded_archive_days == 0 || child.kept {
+    if budgets.unlanded_archive_days == 0 || child.kept || is_partial_archive_name(&child.name) {
         return None;
     }
     let created = child.created_ms?;

@@ -3012,7 +3012,7 @@ fn push_checkout_retirement_advice(
         view.advice.push(StatusAdvice {
             id: "cleanup.retire-abandoned-operations-archived",
             severity: StatusAdviceSeverity::Info,
-            reason: "closed checkouts whose merge, rebase, cherry-pick, revert or bisect was left in progress past [cleanup] abandoned_operation_after_hours were retired after their operation state, index and changed files were archived and verified; each archive's README.md says how to restore it",
+            reason: "closed checkouts whose merge, rebase, cherry-pick, revert or bisect was left in progress past [cleanup] abandoned_operation_after_hours were retired after their operation state, index, index-only objects and changed files were archived and verified; each archive's README.md says how to restore it. These archives expire by age like every recovery archive (by default 30 days, after 7 days named in broker status); keep one with `aethyme storage keep-archive <pool>/<archive>`",
             summary: format!(
                 "{} closed checkout(s) with an abandoned Git operation archived and retired",
                 progress.abandoned_operations_archived

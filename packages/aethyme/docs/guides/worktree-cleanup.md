@@ -477,6 +477,12 @@ unattended_unlinks_per_second = 1000 # background worker pace, also under load; 
 abandoned_operation_after_hours = 24 # the default; a closed checkout's merge/rebase left in progress longer is archived, then retired
 ```
 
+A `finish cleanup resolve` plan refuses a checkout holding an ignored
+directory nothing catalogues as regenerable. Pass
+`--archive-ignored-directories` to the plan and to its `--confirm` to archive
+every file under such a directory instead (links as links, at most 20,000
+files and 512 MiB); the retirement lane always does.
+
 Two phase counters show the file rule at work in `aethyme broker advanced
 metrics`: `cleanup_checkout_released_by_file_pattern` counts ignored-content
 verdicts that passed with at least one standalone file released by a file

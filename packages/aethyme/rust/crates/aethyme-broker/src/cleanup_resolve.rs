@@ -933,7 +933,9 @@ fn ignored_inventory(
                 }
             }
             crate::auto_cleanup::RecoveryIgnoredClassification::Preserve(_)
-                if metadata.is_dir() && !file_type.is_symlink() =>
+                if metadata.is_dir()
+                    && !file_type.is_symlink()
+                    && ARCHIVE_IGNORED_DIRECTORIES.with(std::cell::Cell::get) =>
             {
                 // An ignored directory nothing catalogues as regenerable:
                 // every file in it is archived (a link as the link), so the
@@ -1000,6 +1002,31 @@ pub(crate) fn preserved_ignored_files(
     deadline: Option<Instant>,
 ) -> Result<Vec<ArchivedFile>, BrokerOpError> {
     ignored_inventory(checkout, worktree, policy, session_id, deadline).map(|(_, files)| files)
+}
+
+thread_local! {
+    /// Set while the checkout retirement lane, or a resolve command given
+    /// `--archive-ignored-directories`, plans on this thread: an ignored
+    /// directory nothing catalogues as regenerable is then archived file by
+    /// file instead of refusing the plan.
+    static ARCHIVE_IGNORED_DIRECTORIES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Archives unknown ignored directories file by file on this thread until
+/// dropped.
+pub(crate) struct ArchiveIgnoredDirectoriesScope(bool);
+
+impl ArchiveIgnoredDirectoriesScope {
+    pub(crate) fn enter() -> Self {
+        Self(ARCHIVE_IGNORED_DIRECTORIES.with(|cell| cell.replace(true)))
+    }
+}
+
+impl Drop for ArchiveIgnoredDirectoriesScope {
+    fn drop(&mut self) {
+        ARCHIVE_IGNORED_DIRECTORIES.with(|cell| cell.set(self.0));
+    }
 }
 
 /// Files at most archived out of ignored directories nothing catalogues as
@@ -9154,14 +9181,16 @@ mod tests {
         std::os::unix::fs::symlink("history.jsonl", repository.join("tool-notes/latest")).unwrap();
 
         let checkout = GitRepo::discover(repository).unwrap();
-        let (roots, files) = ignored_inventory(
-            &checkout,
-            repository,
-            &crate::AutoCleanupPolicy::default(),
-            1,
-            None,
-        )
-        .unwrap();
+        let policy = crate::AutoCleanupPolicy::default();
+        let refusal = ignored_inventory(&checkout, repository, &policy, 1, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refusal.contains("tool-notes/"),
+            "without the opt-in: {refusal}"
+        );
+        let _opted_in = ArchiveIgnoredDirectoriesScope::enter();
+        let (roots, files) = ignored_inventory(&checkout, repository, &policy, 1, None).unwrap();
 
         assert_eq!(
             files

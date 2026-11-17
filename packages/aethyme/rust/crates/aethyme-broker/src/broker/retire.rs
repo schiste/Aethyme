@@ -129,6 +129,8 @@ pub(super) fn in_retirement_lane() -> bool {
 struct RetirementLaneScope {
     previous: bool,
     installed_live_paths: bool,
+    /// The lane archives unknown ignored directories file by file.
+    _ignored_directories: crate::cleanup_resolve::ArchiveIgnoredDirectoriesScope,
 }
 
 impl RetirementLaneScope {
@@ -146,6 +148,7 @@ impl RetirementLaneScope {
         Self {
             previous,
             installed_live_paths,
+            _ignored_directories: crate::cleanup_resolve::ArchiveIgnoredDirectoriesScope::enter(),
         }
     }
 }
@@ -284,6 +287,26 @@ fn retire_archive_max_bytes() -> u64 {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Test seam: runs after an operation archive is written, before the
+    /// sources are re-checked and the checkout moves.
+    pub(super) static BEFORE_OPERATION_MOVE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_before_operation_move() {
+    BEFORE_OPERATION_MOVE.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_before_operation_move() {}
+
+#[cfg(test)]
 fn run_before_retire_claim() {
     BEFORE_RETIRE_CLAIM.with(|hook| {
         if let Some(hook) = hook.borrow_mut().as_mut() {
@@ -360,6 +383,8 @@ fn kept_counter(code: &'static str) -> &'static str {
         "deferred_to_lane" => "checkout_retirement_kept_deferred_to_lane",
         "archive_deferred" => "checkout_retirement_kept_archive_deferred",
         "operation_archive_failed" => "checkout_retirement_kept_operation_archive_failed",
+        "holder_alive" => "checkout_retirement_kept_holder_alive",
+        "holder_unknown" => "checkout_retirement_kept_holder_unknown",
         _ => "checkout_retirement_kept_other",
     }
 }
@@ -1252,7 +1277,16 @@ impl Broker {
             {
                 Ok(None) => false,
                 Ok(Some(_)) => {
+                    // Abandoned only when nothing touched the operation (its
+                    // markers, index, reflog or any changed working file)
+                    // and the broker saw no activity for the session within
+                    // the threshold.
+                    let now_ms = crate::clock::epoch_ms();
+                    let last_activity_ms =
+                        session.last_activity_at.max(session.closed_at.unwrap_or(0));
                     let abandoned = !run.inline
+                        && now_ms.saturating_sub(last_activity_ms)
+                            >= run.abandoned_operation_after_ms
                         && super::retire_operation::operation_state_age_ms(&worktree)
                             .is_some_and(|age| age >= run.abandoned_operation_after_ms);
                     if !abandoned {
@@ -1460,6 +1494,26 @@ impl Broker {
         run: &mut RetireRun,
     ) -> Result<RetireOutcome, BrokerOpError> {
         use RetireOutcome::Kept;
+        // No live holder may be bound to the session: an agent that still
+        // holds it may come back to the operation.
+        let mut holders = crate::session_holder::RecordedHolderProcessTable::default();
+        match crate::session_holder::recorded_holder_liveness(
+            self.store_ref(),
+            session.id,
+            &mut holders,
+            true,
+        )
+        .liveness
+        {
+            crate::session_holder::RecordedHolderLiveness::Unbound
+            | crate::session_holder::RecordedHolderLiveness::Gone => {}
+            crate::session_holder::RecordedHolderLiveness::Alive => {
+                return Ok(Kept("holder_alive"));
+            }
+            crate::session_holder::RecordedHolderLiveness::Unknown => {
+                return Ok(Kept("holder_unknown"));
+            }
+        }
         run_before_retire_claim();
         let Some(_claim) = self.try_claim_worktree_lifecycle("retire")? else {
             return Ok(Kept("lifecycle_busy"));
@@ -1522,6 +1576,17 @@ impl Broker {
                 ));
                 return Ok(Kept("operation_archive_failed"));
             }
+        }
+        run_before_operation_move();
+        // Someone who worked in the checkout after the copy keeps it: an
+        // edit that reached only the trash would be deleted with it.
+        if let Err(reason) = super::retire_operation::sources_unchanged(&archived, worktree) {
+            run.keep_detail = Some(format!(
+                "{reason} (archive {} kept)",
+                archived.path.display()
+            ));
+            self.forget_keep(session.id);
+            return Ok(Kept("changed"));
         }
         let moved = {
             let _phase = crate::phase_telemetry::span("checkout_retirement_phase_move");
@@ -1657,6 +1722,9 @@ impl Broker {
             );
         }
         report.trash = self.drain_checkout_trash(deadline);
+        if let Ok(root) = self.recovery_archive_root() {
+            super::retire_operation::sweep_stale_partials(&root);
+        }
         let retired_pins = match self.prune_retired_pins() {
             Ok(remaining) => remaining,
             Err(error) => {
@@ -2475,57 +2543,111 @@ mod tests {
         );
     }
 
-    /// A closed session's merge abandoned past the threshold is archived
-    /// (operation state, raw index, conflicted files) and its checkout
-    /// retired; the commits the state names are pinned.
-    #[test]
-    fn an_abandoned_merge_is_archived_with_its_state_then_retired() {
-        let (_owner, _storage, mut broker) = fixture();
+    /// What an abandoned-merge fixture left behind.
+    struct AbandonedMerge {
+        session: crate::Session,
+        worktree: PathBuf,
+        session_head: String,
+        staged_blob: String,
+    }
+
+    /// Set `path`'s modification time two days back.
+    fn two_days_old(path: &Path) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(48 * 3_600))
+            .unwrap();
+    }
+
+    /// A closed session left mid-merge: a conflicted file, an untracked
+    /// file, and a file staged then edited again (its staged version lives
+    /// only in the index). Every marker, the index, the reflog and the
+    /// changed files are two days old, and so is the session's activity.
+    fn abandoned_merge(broker: &mut crate::Broker) -> AbandonedMerge {
         let root = broker.main_root().to_path_buf();
-        let mut merge_head = String::new();
         let mut session_head = String::new();
-        let (session, worktree) = closed(&mut broker, "abandoned merge", |worktree| {
+        let mut staged_blob = String::new();
+        let (session, worktree) = closed(broker, "abandoned merge", |worktree| {
             std::fs::write(worktree.join("base.txt"), "session side\n").unwrap();
             git(worktree, &["commit", "-qam", "session side"]);
             session_head = git(worktree, &["rev-parse", "HEAD"]).trim().to_string();
             std::fs::write(root.join("base.txt"), "main side\n").unwrap();
             git(&root, &["commit", "-qam", "main side"]);
-            merge_head = git(&root, &["rev-parse", "HEAD"]).trim().to_string();
             assert!(
                 !git_status(worktree, &["merge", "main"]),
                 "the merge conflicts"
             );
             std::fs::write(worktree.join("scratch.txt"), "untracked notes\n").unwrap();
+            std::fs::write(worktree.join("extra.txt"), "staged version\n").unwrap();
+            git(worktree, &["add", "extra.txt"]);
+            staged_blob = git(worktree, &["rev-parse", ":extra.txt"])
+                .trim()
+                .to_string();
+            std::fs::write(worktree.join("extra.txt"), "edited after staging\n").unwrap();
         });
         let git_dir = crate::git::checked_worktree_git_dir(&worktree)
             .unwrap()
             .unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(git_dir.join("MERGE_HEAD"))
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() - Duration::from_secs(48 * 3_600))
+        for path in [
+            git_dir.join("MERGE_HEAD"),
+            git_dir.join("index"),
+            git_dir.join("logs/HEAD"),
+            worktree.join("base.txt"),
+            worktree.join("scratch.txt"),
+            worktree.join("extra.txt"),
+        ] {
+            if path.exists() {
+                two_days_old(&path);
+            }
+        }
+        let old = crate::clock::epoch_ms() - 48 * 3_600_000;
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE sessions SET last_activity_at = ?1, closed_at = ?1 WHERE id = ?2",
+                rusqlite::params![old, session.id],
+            )
             .unwrap();
+        AbandonedMerge {
+            session,
+            worktree,
+            session_head,
+            staged_blob,
+        }
+    }
+
+    /// The operation archives written for `session_id`.
+    fn operation_archive(broker: &crate::Broker, session_id: i64) -> Option<PathBuf> {
+        archives(broker, session_id).into_iter().find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("-operation-"))
+        })
+    }
+
+    /// A closed session's merge abandoned past the threshold is archived
+    /// (operation state, raw index, conflicted files, and a pack of every
+    /// object only the index held) and its checkout retired. After `git gc`
+    /// prunes everything unreachable, the archive restores every staged and
+    /// unmerged blob.
+    #[test]
+    fn an_abandoned_merge_is_archived_with_its_state_then_retired() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_owner, _storage, mut broker) = fixture();
+        let root = broker.main_root().to_path_buf();
+        let fixture = abandoned_merge(&mut broker);
+        let (session, worktree) = (&fixture.session, &fixture.worktree);
 
         let report = run(&mut broker);
 
         assert_eq!(report.retired_operation_archived, 1, "{report:#?}");
         assert!(!worktree.exists());
         assert!(is_cleaned(&broker, session.id));
-        let archive = archives(&broker, session.id)
-            .into_iter()
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains("-operation-"))
-            })
-            .expect("an operation archive");
-        assert_eq!(
-            std::fs::read_to_string(archive.join("git-state/MERGE_HEAD"))
-                .unwrap()
-                .trim(),
-            merge_head
-        );
+        let archive = operation_archive(&broker, session.id).expect("an operation archive");
+        assert!(archive.join("git-state/MERGE_HEAD").is_file());
         assert!(archive.join("git-state/index").is_file());
         assert!(
             std::fs::read_to_string(archive.join("worktree/base.txt"))
@@ -2534,19 +2656,29 @@ mod tests {
             "the conflicted file is archived as it was"
         );
         assert_eq!(
-            std::fs::read_to_string(archive.join("worktree/scratch.txt")).unwrap(),
-            "untracked notes\n"
+            std::fs::read_to_string(archive.join("worktree/extra.txt")).unwrap(),
+            "edited after staging\n"
         );
         assert!(archive.join("README.md").is_file());
         assert!(archive.join("manifest.json").is_file());
-        // The session's own commit is pinned (the merged-in one is on the
-        // default branch, so its pin may already have expired).
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&archive), 0o700);
+        assert_eq!(
+            mode(archive.parent().unwrap()),
+            0o700,
+            "the archive root is private"
+        );
+        assert_eq!(mode(&archive.join("worktree/scratch.txt")), 0o600);
+        // The session's own commit is pinned.
         git(
             &root,
             &[
                 "rev-parse",
                 "--verify",
-                &format!("refs/aethyme/retired/{}/{session_head}", session.id),
+                &format!(
+                    "refs/aethyme/retired/{}/{}",
+                    session.id, fixture.session_head
+                ),
             ],
         );
         assert_eq!(
@@ -2566,6 +2698,137 @@ mod tests {
                 .iter()
                 .any(|advice| advice.id == "cleanup.retire-abandoned-operations-archived")
         );
+
+        // Nothing but the archive holds the staged version once Git prunes.
+        git(&root, &["reflog", "expire", "--expire=now", "--all"]);
+        git(&root, &["gc", "--prune=now", "-q"]);
+        assert!(
+            !git_status(&root, &["cat-file", "-e", &fixture.staged_blob]),
+            "pruned from the repository"
+        );
+        let pack_dir = root.join(".git/objects/pack");
+        for entry in std::fs::read_dir(archive.join("objects")).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_str().unwrap().to_string();
+            if name.ends_with(".pack") || name.ends_with(".idx") {
+                std::fs::copy(&path, pack_dir.join(&name)).unwrap();
+            }
+        }
+        assert!(git_status(&root, &["cat-file", "-e", &fixture.staged_blob]));
+        let mut listing = Command::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                listing.env_remove(key);
+            }
+        }
+        let output = listing
+            .env("GIT_INDEX_FILE", archive.join("git-state/index"))
+            .args(["ls-files", "--stage"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let entries = String::from_utf8(output.stdout).unwrap();
+        let stages = entries
+            .lines()
+            .map(|line| line.split_whitespace().nth(1).unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            stages.len() >= 4,
+            "three conflict stages and the staged file: {entries}"
+        );
+        for id in stages {
+            assert!(
+                git_status(&root, &["cat-file", "-e", &id]),
+                "{id} reads back"
+            );
+        }
+    }
+
+    /// A working file edited recently keeps the checkout, however old the
+    /// merge markers are: someone may be resolving the conflicts.
+    #[test]
+    fn a_recently_edited_working_file_keeps_an_old_merge() {
+        let (_owner, _storage, mut broker) = fixture();
+        let fixture = abandoned_merge(&mut broker);
+        std::fs::write(fixture.worktree.join("scratch.txt"), "still working\n").unwrap();
+
+        let report = run(&mut broker);
+
+        assert_eq!(
+            report.kept.get("operation_in_progress"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert!(fixture.worktree.join("scratch.txt").is_file());
+        assert!(operation_archive(&broker, fixture.session.id).is_none());
+    }
+
+    /// An edit between the copy and the move keeps the checkout (the edit
+    /// would otherwise reach only the trash) and forgets the keep.
+    #[test]
+    fn an_edit_between_the_copy_and_the_move_keeps_the_checkout() {
+        let (_owner, _storage, mut broker) = fixture();
+        let fixture = abandoned_merge(&mut broker);
+        let scratch = fixture.worktree.join("scratch.txt");
+        let edited = scratch.clone();
+        super::BEFORE_OPERATION_MOVE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(&edited, "edited after the copy\n").unwrap();
+            }));
+        });
+        let report = run(&mut broker);
+        super::BEFORE_OPERATION_MOVE.with(|hook| *hook.borrow_mut() = None);
+
+        assert_eq!(report.kept.get("changed"), Some(&1), "{report:#?}");
+        assert_eq!(
+            std::fs::read_to_string(&scratch).unwrap(),
+            "edited after the copy\n"
+        );
+        assert!(!is_cleaned(&broker, fixture.session.id));
+        assert!(
+            !broker
+                .checkout_retirement_keeps()
+                .contains_key(&fixture.session.id)
+        );
+    }
+
+    /// A partial operation archive older than a day whose creator is gone
+    /// is swept; a recent one and a finished archive are left alone, and
+    /// the storage ledger never reads either partial as an archive.
+    #[test]
+    fn stale_partial_operation_archives_are_swept_once_their_creator_is_gone() {
+        let root = tempfile::tempdir().unwrap();
+        let now = crate::clock::epoch_ms();
+        let gone_pid = i32::MAX;
+        let stale = root.path().join(format!(
+            ".partial-operation-7-{}-{gone_pid}-1-ab",
+            now - 48 * 3_600_000
+        ));
+        let fresh = root
+            .path()
+            .join(format!(".partial-operation-7-{now}-{gone_pid}-1-cd"));
+        let finished = root.path().join("7-operation-0123456789ab-ef");
+        for directory in [&stale, &fresh, &finished] {
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::write(directory.join("ids.txt"), "x\n").unwrap();
+        }
+
+        assert_eq!(
+            super::super::retire_operation::sweep_stale_partials(root.path()),
+            1
+        );
+        assert!(!stale.exists());
+        assert!(fresh.exists() && finished.exists());
+        assert!(crate::storage_ledger::is_partial_archive_name(
+            fresh.file_name().unwrap().to_str().unwrap()
+        ));
+        assert!(crate::storage_ledger::is_partial_archive_name(
+            "12.retirement-v6.partial"
+        ));
+        assert!(!crate::storage_ledger::is_partial_archive_name(
+            "7-operation-0123456789ab-ef"
+        ));
     }
 
     /// A plan refusal is remembered with the refusing step's own words,
