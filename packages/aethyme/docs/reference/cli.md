@@ -958,21 +958,31 @@ Commands are argv arrays, not shell strings; Aethyme does not infer npm,
 pnpm, Yarn, Cargo, Python, or any other ecosystem.
 
 Each `[[runtimes]]` probe is a repository command. `submit prepare` runs every
-probe once per run, in the checkout, with the environment the steps inherit
-(the invoking process's, including its `PATH`), for at most 5 seconds each,
-and only when the policy is already trusted and storage is not under
-pressure. The prepared state is valid for the digest of each probe's exit
-status and standard output, so a runtime whose output changes behind an
-unchanged executable (a Python probe launched through Node) makes the
-checkout stale, while a reinstall of the same version does not. The
-preparation digest itself keys each runtime on its resolved canonical path
-only. Status reads and storage sweeps never run a probe: the recorded output
-stands while the runtime resolves to the same executable (path, size,
-modification time), and a changed executable sends the checkout back to
-`submit prepare`, which probes again and, when the output is unchanged,
-reports it current without running a step. `submit prepare status --json`
-lists the recorded `runtimes` (`executable`, `size`, `modified_ns`,
-`probe_sha256`, `probe_summary`, `probe_timed_out`). Every input and output is a
+probe once per run, only when the policy is already trusted and storage is
+not under pressure: it executes exactly the file the key resolved (canonical
+path, executable bit checked, `argv[0]` kept as written, never re-resolved
+through `PATH`) in the checkout, with the environment the steps inherit (the
+invoking process's; steps add only `AETHYME_PREPARE_*`), in its own process
+group, for at most 5 seconds. A zero exit makes the runtime `verified` and
+the SHA-256 of its standard output enters the preparation key, so a runtime
+whose output changes behind an unchanged executable (a Python probe launched
+through Node) rekeys, and a reinstall of the same version does not. A probe
+that cannot start, exits non-zero, times out, prints more than 64 KiB, or
+leaves a process holding its output is `unverified`: its key falls back to
+the executable's path, size and modification time plus a per-run nonce, so no
+other run shares it, the checkout reports `stale` with the reason, and the
+next `submit prepare` probes again. Verified outputs are cached per exact
+executable and command in the checkout's Git directory
+(`aethyme-runtime-probes.json`), which is how status reads and storage
+sweeps, which never run a probe, compute the same key. A probe whose output
+changes for an unchanged executable on consecutive preparations raises the
+`broker status` warning `prepare.runtime-probe-unstable`. Raw output is never
+stored: `submit prepare status --json` lists each recorded runtime's
+`executable`, `size`, `modified_ns`, `runtime_identity`
+(`verified`/`unverified`), `probe_sha256`, a `probe_summary` (first line, at
+most 64 characters from `[A-Za-z0-9 ._+:/()-]`) and `unverified_reason`.
+
+Every input and output is a
 validated repository-relative path. Outputs remain inside the worktree and a
 symlink at an output path is refused. Repositories should ignore local outputs
 in Git. `worktree_local` steps receive no shared cache. A
@@ -990,9 +1000,22 @@ shared by every input set, so a lockfile or requirements change downloads and
 imports only the packages that differ. Each digest directory also links
 `pnpm-store`, `npm-cache`, `uv-cache` and `pip-cache` to that store, so a
 command written as `$AETHYME_PREPARE_CACHE_DIR/pnpm-store` shares it too; a
-real directory left there by an earlier version is kept. `[shared_cache]
+real directory left there by an earlier version is kept and the manager
+variable then names it too, so both spellings agree. `[shared_cache]
 package_store = "per_input"` restores one store per preparation digest for
-explicit isolation. The variables are:
+explicit isolation. The store key's platform part is the broker's OS and
+architecture; beyond that it relies on each manager's own keys (pnpm's store
+layout version and its side-effects cache keyed by Node platform and
+version, uv and pip wheel tags), not on the probed runtime's reported
+platform. A storage sweep (`gc`, and the recovery worker started by a
+storage refusal) rotates the shared store on its own when its volume is
+under the free-space reserve or a bounded measurement finds it over 8 GiB:
+it takes the repository's exclusive cache lease (never while any
+preparation holds the cache, alone or shared), renames the store to
+`packages-retired-*` and removes it within the sweep budget. A preparation
+refused for storage first tries the same rotation, with up to 30 seconds of
+removal, and refuses only if space is still short. `[shared_cache]
+max_bytes = 0` now means the 8 GiB default; the store is never unbounded. The variables are:
 `pnpm` provides `AETHYME_PREPARE_PNPM_STORE_DIR`, `npm` provides
 `AETHYME_PREPARE_NPM_CACHE_DIR`, `uv` provides `AETHYME_PREPARE_UV_CACHE_DIR`,
 and `pip` provides `AETHYME_PREPARE_PIP_CACHE_DIR`. The broker only supplies

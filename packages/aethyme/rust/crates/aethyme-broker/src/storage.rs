@@ -2755,9 +2755,91 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                 continue;
             }
             let key = entry.file_name().to_string_lossy().into_owned();
-            // The repository-wide package store serves every input set; only
-            // a whole-store rotation, under the exclusive lease, removes it.
+            // The repository-wide package store serves every input set. It
+            // is rotated on its own, holding the repository's exclusive lease
+            // (so no preparation holds it alone or shared), when its volume
+            // is under the free-space reserve or a bounded measurement finds
+            // it over its cap; the retired tree is then removed at once.
             if is_shared_package_store(&key) {
+                let store_path = entry.path();
+                let measurement_deadline = deadline.min(Instant::now() + Duration::from_secs(5));
+                let over_cap = crate::preparation::package_store::store_exceeds(
+                    &store_path,
+                    crate::preparation::package_store::DEFAULT_PACKAGE_STORE_MAX_BYTES,
+                    measurement_deadline,
+                    PACKAGE_STORE_MEASUREMENT_MAX_ENTRIES,
+                ) == Some(true);
+                let under_pressure =
+                    crate::preparation::package_store::volume_under_pressure(&store_path);
+                if !(over_cap || under_pressure) {
+                    continue;
+                }
+                let grant = match acquire_preparation_cache_lease(
+                    &mut coordinator,
+                    resource_db_path,
+                    cache_root,
+                    lease_repository,
+                    deadline,
+                ) {
+                    Ok(grant) => grant,
+                    Err(_) => {
+                        crate::phase_telemetry::add("package_store_rotation_busy", Duration::ZERO);
+                        complete = false;
+                        continue;
+                    }
+                };
+                let retired = if root_binding.is_some_and(|binding| binding.validate().is_err()) {
+                    Ok(None)
+                } else {
+                    crate::preparation::package_store::retire_shared_store(&repository_path)
+                };
+                if !release_preparation_cache_lease(&mut coordinator, &grant) {
+                    complete = false;
+                }
+                match retired {
+                    Ok(Some(retired)) => {
+                        crate::phase_telemetry::add(
+                            if under_pressure {
+                                "package_store_rotated_pressure"
+                            } else {
+                                "package_store_rotated_over_cap"
+                            },
+                            Duration::ZERO,
+                        );
+                        eprintln!(
+                            "preparation cache: rotated the shared package store of {lease_repository} ({})",
+                            if under_pressure {
+                                "volume under the free-space reserve"
+                            } else {
+                                "over its cap"
+                            }
+                        );
+                        if !remove_retired_package_store(
+                            &retired,
+                            deadline,
+                            root_binding,
+                            &mut removed,
+                            &mut filesystem_entries_reclaimed,
+                        ) {
+                            complete = false;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => complete = false,
+                }
+                continue;
+            }
+            // A retired package store is referenced by nothing.
+            if crate::preparation::package_store::is_retired_store_name(&key) {
+                if !remove_retired_package_store(
+                    &entry.path(),
+                    deadline,
+                    root_binding,
+                    &mut removed,
+                    &mut filesystem_entries_reclaimed,
+                ) {
+                    complete = false;
+                }
                 continue;
             }
             if !is_preparation_cache_key(&key) {
@@ -4052,6 +4134,44 @@ fn is_shared_package_store(value: &str) -> bool {
     value == crate::preparation::package_store::SHARED_PACKAGE_STORE_DIR
 }
 
+/// Entries a sweep's bounded package-store measurement may visit.
+const PACKAGE_STORE_MEASUREMENT_MAX_ENTRIES: usize = 200_000;
+
+/// Remove a retired package store within `deadline`, counting it as one
+/// removed entry when complete. Returns whether it is gone.
+fn remove_retired_package_store(
+    path: &Path,
+    deadline: std::time::Instant,
+    root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
+    removed: &mut usize,
+    filesystem_entries_reclaimed: &mut usize,
+) -> bool {
+    let started = Instant::now();
+    let result = remove_preparation_cache_tree_with_binding_and_observer(
+        path,
+        Some(deadline),
+        root_binding,
+        &mut || Ok(()),
+    );
+    crate::phase_telemetry::add("package_store_retired_removal", started.elapsed());
+    match result {
+        Ok((TreeRemoval::Complete, count)) => {
+            *removed = removed.saturating_add(1);
+            *filesystem_entries_reclaimed = filesystem_entries_reclaimed.saturating_add(count);
+            true
+        }
+        Ok((TreeRemoval::Interrupted, count)) => {
+            *filesystem_entries_reclaimed = filesystem_entries_reclaimed.saturating_add(count);
+            false
+        }
+        Err(error) => {
+            *filesystem_entries_reclaimed =
+                filesystem_entries_reclaimed.saturating_add(error.entries_reclaimed);
+            false
+        }
+    }
+}
+
 fn preparation_cache_repository_identity(name: &str) -> Option<(&str, bool)> {
     if is_lowercase_hex(name, 64) {
         return Some((name, false));
@@ -4099,7 +4219,9 @@ fn retired_preparation_store_layout(path: &Path, deadline: Option<std::time::Ins
         let name = name.to_string_lossy();
         if file_type.is_symlink()
             || !file_type.is_dir()
-            || !(is_preparation_cache_key(&name) || is_shared_package_store(&name))
+            || !(is_preparation_cache_key(&name)
+                || is_shared_package_store(&name)
+                || crate::preparation::package_store::is_retired_store_name(&name))
         {
             return false;
         }

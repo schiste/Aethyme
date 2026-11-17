@@ -58,6 +58,7 @@ impl Broker {
         self.push_checkout_capacity_advice(&mut view, deadline);
         self.push_shared_cache_inventory_advice(&mut view);
         self.push_package_store_volume_advice(&mut view);
+        self.push_unstable_runtime_probe_advice(&mut view);
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
@@ -450,6 +451,28 @@ impl Broker {
         });
     }
 
+    /// Warn when a runtime probe printed different output for the same
+    /// executable on consecutive preparations: each preparation then rekeys.
+    /// One metadata read.
+    fn push_unstable_runtime_probe_advice(&self, view: &mut StatusView) {
+        let Some(record) = self.unstable_runtime_probes() else {
+            return;
+        };
+        view.advice.push(StatusAdvice {
+            id: "prepare.runtime-probe-unstable",
+            severity: StatusAdviceSeverity::Warning,
+            reason: "the prepared state is keyed on each runtime probe's output; a probe whose output changes while its executable does not makes every preparation reinstall",
+            summary: format!(
+                "runtime probe output changed for an unchanged executable: {}; make the probe print only the runtime's version",
+                record.runtimes.join(", ")
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: vec![format!("observed at (ms since epoch): {}", record.at_ms)],
+            commands: vec!["aethyme broker status --json".into()],
+        });
+    }
+
     /// Warn when the last preparation's package store was on another volume
     /// than its checkout: a package manager can then only copy every file,
     /// so no two sessions share dependency bytes. One metadata read.
@@ -587,6 +610,7 @@ impl Broker {
         self.push_checkout_capacity_advice(&mut view, deadline);
         self.push_shared_cache_inventory_advice(&mut view);
         self.push_package_store_volume_advice(&mut view);
+        self.push_unstable_runtime_probe_advice(&mut view);
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,

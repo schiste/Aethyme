@@ -74,15 +74,27 @@ pub struct PackageStoreKey {
     pub arch: String,
 }
 
+/// Whether a runtime's probe output keys the prepared state.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeIdentityState {
+    /// The probe ran to a zero exit; its output digest is in the key.
+    Verified,
+    /// The probe could not start, failed or timed out. The key falls back to
+    /// the executable identity plus a per-run nonce, so no other run shares
+    /// it and the next preparation probes again.
+    Unverified,
+}
+
 /// One runtime the preparation declares: the executable its probe resolves
 /// to (canonical path, size, modification time) and, once a preparation has
 /// run the probe, a digest of what it printed.
 ///
-/// The prepared state is valid for a probe *output*, not for a binary: the
-/// executable identity only tells a status read, which never runs a probe,
-/// whether the recorded output can still stand. A probe that reaches another
-/// interpreter (a Python probe launched through Node) is judged by its output
-/// like any other.
+/// The prepared state is keyed on the probe *output*: a runtime reached
+/// through another interpreter (a Python probe launched through Node) is
+/// judged by its output like any other. The executable identity only lets a
+/// status read or a storage sweep, which never run a probe, find the output a
+/// preparation recorded for that exact executable.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RuntimeIdentity {
     pub name: String,
@@ -92,16 +104,20 @@ pub struct RuntimeIdentity {
     pub size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_ns: Option<u64>,
-    /// SHA-256 of the probe's exit status and standard output; absent when
-    /// the probe has not been run.
+    /// Absent until a preparation has run the probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_identity: Option<RuntimeIdentityState>,
+    /// SHA-256 of the probe's standard output, when verified. Raw output is
+    /// never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_sha256: Option<String>,
-    /// The first non-empty line the probe printed, at most 120 characters.
+    /// A version-shaped extract of the first output line: at most 64
+    /// characters from `[A-Za-z0-9 ._+:/()-]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_summary: Option<String>,
-    /// The probe did not finish within its time limit and was killed.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub probe_timed_out: bool,
+    /// Why the probe is unverified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unverified_reason: Option<String>,
 }
 
 impl RuntimeIdentity {
@@ -111,36 +127,67 @@ impl RuntimeIdentity {
             && self.size == other.size
             && self.modified_ns == other.modified_ns
     }
+
+    pub(crate) fn verified(&self) -> bool {
+        self.runtime_identity == Some(RuntimeIdentityState::Verified) && self.probe_sha256.is_some()
+    }
 }
 
-/// How long one runtime probe may run before it is killed.
+/// How long one runtime probe may run before its process group is killed.
 pub(crate) const RUNTIME_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-/// The most standard output read from one probe.
-const RUNTIME_PROBE_MAX_OUTPUT: u64 = 64 * 1024;
+/// The most standard output read from one probe; more is a failure.
+const RUNTIME_PROBE_MAX_OUTPUT: usize = 64 * 1024;
+/// After the probe exits, how long its output pipe may stay open (held by a
+/// leftover grandchild) before the probe counts as failed.
+const RUNTIME_PROBE_PIPE_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// What one probe run produced.
+/// What a successful probe produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeProbeOutput {
     pub(crate) sha256: String,
     pub(crate) summary: Option<String>,
-    pub(crate) timed_out: bool,
 }
 
-/// Run one declared runtime probe in `root` with the broker's environment,
-/// which is the environment preparation steps inherit. Standard input is
-/// closed, standard error discarded, and the probe (with its process group
-/// on Unix) is killed after `timeout`. Returns `None` when it cannot start.
+/// A version-shaped extract of `output`'s first non-empty line, so a probe
+/// that prints a secret never puts it in a record, a report or a metric.
+pub(crate) fn probe_summary(output: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(output);
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let summary = line
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || " ._+:/()-".contains(*character))
+        .take(64)
+        .collect::<String>();
+    (!summary.trim().is_empty()).then(|| summary.trim().to_owned())
+}
+
+/// Run one declared runtime probe: execute exactly `executable` (the
+/// canonical file the preparation digest resolved, never re-resolved through
+/// `PATH`) with `command[0]` as its `argv[0]` and `command[1..]` as its
+/// arguments, in `root`, with the broker's environment, which is the
+/// environment preparation steps inherit. Standard input is closed and
+/// standard error discarded. The probe runs in its own process group, which
+/// is killed at `timeout`. Any non-zero exit, timeout, oversized output, or
+/// an output pipe still held open after exit is a failure (`Err(reason)`).
 pub(crate) fn run_runtime_probe(
     root: &Path,
+    executable: &Path,
     command: &[String],
     timeout: std::time::Duration,
-) -> Option<RuntimeProbeOutput> {
+) -> Result<RuntimeProbeOutput, String> {
     use sha2::{Digest, Sha256};
-    use std::io::Read;
     use std::process::{Command, Stdio};
 
-    let (program, arguments) = command.split_first()?;
-    let mut builder = Command::new(program);
+    let (program, arguments) = command
+        .split_first()
+        .ok_or_else(|| "the probe command is empty".to_owned())?;
+    if !executable.is_absolute() || !is_executable_file(executable) {
+        return Err(format!(
+            "{} is not an executable regular file",
+            executable.display()
+        ));
+    }
+    let mut builder = Command::new(executable);
     builder
         .args(arguments)
         .current_dir(root)
@@ -150,65 +197,150 @@ pub(crate) fn run_runtime_probe(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        builder.process_group(0);
+        builder.arg0(program).process_group(0);
     }
-    let mut child = builder.spawn().ok()?;
-    let mut stdout = child.stdout.take()?;
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut output = Vec::new();
-        if (&mut stdout)
-            .take(RUNTIME_PROBE_MAX_OUTPUT)
-            .read_to_end(&mut output)
-            .is_err()
-        {
-            output.clear();
+    #[cfg(not(unix))]
+    let _program = program;
+    let mut child = builder
+        .spawn()
+        .map_err(|error| format!("the probe could not start: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "the probe's output pipe is unavailable".to_owned())?;
+    let outcome = collect_probe_output(&mut child, stdout, timeout);
+    match outcome {
+        Ok((status, output)) if status == Some(0) => {
+            let mut hasher = Sha256::new();
+            hasher.update(&output);
+            Ok(RuntimeProbeOutput {
+                sha256: format!("{:x}", hasher.finalize()),
+                summary: probe_summary(&output),
+            })
         }
-        // The receiver is gone only when the probe timed out; nothing waits.
-        drop(sender.send(output));
-    });
-    let deadline = std::time::Instant::now() + timeout;
-    let mut timed_out = false;
-    let exit_code = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status.code(),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Ok(None) | Err(_) => {
-                timed_out = true;
-                kill_probe(&mut child);
-                break None;
-            }
-        }
-    };
-    // A grandchild may hold the pipe open; never wait on it past the limit.
-    let output = receiver
-        .recv_timeout(
-            deadline
-                .saturating_duration_since(std::time::Instant::now())
-                .max(std::time::Duration::from_millis(100)),
-        )
-        .unwrap_or_default();
-    let mut hasher = Sha256::new();
-    if timed_out {
-        hasher.update(b"timed-out\n");
-    } else {
-        hasher.update(format!("exit:{exit_code:?}\n").as_bytes());
-        hasher.update(&output);
+        Ok((status, _)) => Err(match status {
+            Some(code) => format!("the probe exited with status {code}"),
+            None => "the probe was terminated by a signal".to_owned(),
+        }),
+        Err(reason) => Err(reason),
     }
-    let summary = String::from_utf8_lossy(&output)
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(|line| line.chars().take(120).collect::<String>());
-    Some(RuntimeProbeOutput {
-        sha256: format!("{:x}", hasher.finalize()),
-        summary,
-        timed_out,
-    })
 }
 
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
+}
+
+/// Read the probe's output without a helper thread: the pipe is
+/// non-blocking and polled until the probe exits and the pipe closes, both
+/// within `timeout`; anything else kills the process group.
+#[cfg(unix)]
+fn collect_probe_output(
+    child: &mut std::process::Child,
+    stdout: std::process::ChildStdout,
+    timeout: std::time::Duration,
+) -> Result<(Option<i32>, Vec<u8>), String> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let fd = stdout.as_raw_fd();
+    // SAFETY: `fd` is the open read end of the probe's stdout pipe, owned by
+    // `stdout` for the whole function.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        kill_probe(child);
+        return Err("the probe's output pipe could not be made non-blocking".into());
+    }
+    let mut stdout = stdout;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut status = None;
+    let mut exited_at = None;
+    loop {
+        let mut closed = false;
+        loop {
+            match stdout.read(&mut buffer) {
+                Ok(0) => {
+                    closed = true;
+                    break;
+                }
+                Ok(read) => {
+                    output.extend_from_slice(&buffer[..read]);
+                    if output.len() > RUNTIME_PROBE_MAX_OUTPUT {
+                        kill_probe(child);
+                        return Err("the probe printed more than 64 KiB".into());
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    kill_probe(child);
+                    return Err(format!("the probe's output could not be read: {error}"));
+                }
+            }
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit)) => {
+                    status = Some(exit.code());
+                    exited_at = Some(std::time::Instant::now());
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    kill_probe(child);
+                    return Err(format!("the probe could not be waited on: {error}"));
+                }
+            }
+        }
+        let now = std::time::Instant::now();
+        match (status, closed) {
+            (Some(code), true) => return Ok((code, output)),
+            (Some(_), false)
+                if exited_at.is_some_and(|at| now >= at + RUNTIME_PROBE_PIPE_GRACE) =>
+            {
+                kill_probe(child);
+                return Err("a process left by the probe kept its output open".into());
+            }
+            _ if now >= deadline => {
+                kill_probe(child);
+                return Err(format!(
+                    "the probe did not finish within {} ms",
+                    timeout.as_millis()
+                ));
+            }
+            _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn collect_probe_output(
+    child: &mut std::process::Child,
+    mut stdout: std::process::ChildStdout,
+    _timeout: std::time::Duration,
+) -> Result<(Option<i32>, Vec<u8>), String> {
+    use std::io::Read;
+    let mut output = Vec::new();
+    stdout
+        .read_to_end(&mut output)
+        .map_err(|error| format!("the probe's output could not be read: {error}"))?;
+    let status = child
+        .wait()
+        .map_err(|error| format!("the probe could not be waited on: {error}"))?;
+    Ok((status.code(), output))
+}
+
+/// Kill the probe's process group (Unix) and the probe, then reap it.
 fn kill_probe(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
@@ -228,6 +360,88 @@ fn kill_probe(child: &mut std::process::Child) {
     if let Err(error) = child.wait() {
         eprintln!("warning: aethyme could not reap a runtime probe: {error}");
     }
+}
+
+/// Where a checkout keeps its runtime-probe cache: inside its own Git
+/// directory (`.git/` or the linked worktree's `gitdir`), so it is never part
+/// of the working tree and goes away with the checkout.
+pub(crate) fn probe_cache_path(root: &Path) -> Option<PathBuf> {
+    const FILE: &str = "aethyme-runtime-probes.json";
+    let dot_git = root.join(".git");
+    let metadata = fs::symlink_metadata(&dot_git).ok()?;
+    if metadata.is_dir() {
+        return Some(dot_git.join(FILE));
+    }
+    if !metadata.is_file() || metadata.len() > 4096 {
+        return None;
+    }
+    let text = fs::read_to_string(&dot_git).ok()?;
+    let gitdir = text
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir: "))?;
+    let gitdir = Path::new(gitdir.trim());
+    let gitdir = if gitdir.is_absolute() {
+        gitdir.to_path_buf()
+    } else {
+        root.join(gitdir)
+    };
+    fs::symlink_metadata(&gitdir)
+        .ok()
+        .filter(fs::Metadata::is_dir)
+        .map(|_| gitdir.join(FILE))
+}
+
+/// One cached probe result: the output digest and extract a preparation got
+/// from exactly this executable and command.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct CachedProbe {
+    pub(crate) sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) summary: Option<String>,
+    pub(crate) recorded_at_ms: i64,
+}
+
+/// The cache key for a probe: runtime name, full command, and the resolved
+/// executable's canonical path, size and modification time.
+pub(crate) fn probe_cache_key(
+    name: &str,
+    command: &[String],
+    identity: &RuntimeIdentity,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    for argument in command {
+        hasher.update([0]);
+        hasher.update(argument.as_bytes());
+    }
+    hasher.update([1]);
+    if let Some(executable) = &identity.executable {
+        hasher.update(executable.to_string_lossy().as_bytes());
+    }
+    hasher.update(identity.size.unwrap_or(0).to_le_bytes());
+    hasher.update(identity.modified_ns.unwrap_or(0).to_le_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Parse a probe cache file's bytes; anything unreadable is an empty cache.
+pub(crate) fn parse_probe_cache(bytes: &[u8]) -> std::collections::BTreeMap<String, CachedProbe> {
+    serde_json::from_slice(bytes).unwrap_or_default()
+}
+
+/// Replace the checkout's probe cache atomically.
+pub(crate) fn write_probe_cache(
+    path: &Path,
+    entries: &std::collections::BTreeMap<String, CachedProbe>,
+) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("the probe cache path has no parent"))?;
+    let bytes = serde_json::to_vec(entries).map_err(io::Error::other)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::Write::write_all(&mut file, &bytes)?;
+    file.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 /// What one preparation used for package storage, and what it cost the
@@ -479,6 +693,99 @@ fn clone_file(_source: &Path, _destination: &Path) -> io::Result<()> {
     ))
 }
 
+/// Prefix of a shared store renamed away by a rotation. Nothing references a
+/// retired store, so it is removed without the repository lease.
+pub(crate) const RETIRED_PACKAGE_STORE_PREFIX: &str = "packages-retired-";
+
+/// Byte cap on a repository's shared package store when its own
+/// `[shared_cache] max_bytes` is not known (storage sweeps).
+pub(crate) const DEFAULT_PACKAGE_STORE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+pub(crate) fn is_retired_store_name(name: &str) -> bool {
+    name.strip_prefix(RETIRED_PACKAGE_STORE_PREFIX)
+        .is_some_and(|rest| {
+            !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+/// Rename `<repository>/packages` to a retired name. The caller holds the
+/// repository's exclusive preparation-cache lease, so no preparation is
+/// using it. Returns the retired path, or `None` when there is no store.
+pub(crate) fn retire_shared_store(repository_dir: &Path) -> io::Result<Option<PathBuf>> {
+    let store = repository_dir.join(SHARED_PACKAGE_STORE_DIR);
+    match fs::symlink_metadata(&store) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(io::Error::other(
+                "the shared package store is not a real directory",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let retired = repository_dir.join(format!(
+        "{RETIRED_PACKAGE_STORE_PREFIX}{nanos}-{}",
+        std::process::id()
+    ));
+    fs::rename(&store, &retired)?;
+    Ok(Some(retired))
+}
+
+/// Whether the store at `path` holds more than `cap` logical bytes: `Some`
+/// when a bounded no-follow walk decided, `None` when it stopped at
+/// `deadline` or `max_entries` first.
+pub(crate) fn store_exceeds(
+    path: &Path,
+    cap: u64,
+    deadline: std::time::Instant,
+    max_entries: usize,
+) -> Option<bool> {
+    let mut stack = vec![path.to_path_buf()];
+    let mut bytes = 0_u64;
+    let mut entries = 0_usize;
+    while let Some(directory) = stack.pop() {
+        let Ok(children) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for child in children.flatten() {
+            entries += 1;
+            if entries > max_entries || std::time::Instant::now() >= deadline {
+                return None;
+            }
+            let Ok(metadata) = fs::symlink_metadata(child.path()) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                stack.push(child.path());
+            } else {
+                bytes = bytes.saturating_add(metadata.len());
+                if bytes > cap {
+                    return Some(true);
+                }
+            }
+        }
+    }
+    Some(false)
+}
+
+/// Whether the volume holding `path` is below the broker's free-space or
+/// free-inode reserve.
+pub(crate) fn volume_under_pressure(path: &Path) -> bool {
+    crate::disk_headroom::available_headroom(path).is_some_and(|headroom| {
+        crate::disk_headroom::refusal_with_headroom(
+            Some(headroom.bytes),
+            headroom.inodes,
+            crate::DEFAULT_GATE_HEADROOM_BYTES,
+            crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
+        )
+        .is_some()
+    })
+}
+
 /// Free bytes on the volume holding `path`, or `None` when unknown.
 pub(crate) fn volume_free_bytes(path: &Path) -> Option<u64> {
     crate::disk_headroom::available_headroom(path).map(|headroom| headroom.bytes)
@@ -620,35 +927,140 @@ mod tests {
     #[test]
     fn a_runtime_probe_is_judged_by_its_output_and_bounded() {
         let root = tempfile::tempdir().unwrap();
-        let probe = |script: &str| {
+        let shell = fs::canonicalize("/bin/sh").unwrap();
+        let probe = |script: &str, timeout_ms: u64| {
             run_runtime_probe(
                 root.path(),
+                &shell,
                 &["sh".into(), "-c".into(), script.into()],
-                std::time::Duration::from_secs(5),
+                std::time::Duration::from_millis(timeout_ms),
             )
-            .unwrap()
         };
-        let first = probe("echo v1.2.3");
+        let first = probe("echo v1.2.3", 5_000).unwrap();
         assert_eq!(first.summary.as_deref(), Some("v1.2.3"));
-        assert!(!first.timed_out);
-        assert_eq!(probe("echo v1.2.3").sha256, first.sha256);
-        assert_ne!(probe("echo v1.2.4").sha256, first.sha256);
-        assert_ne!(probe("echo v1.2.3; exit 3").sha256, first.sha256);
-        let slow = run_runtime_probe(
-            root.path(),
-            &["sh".into(), "-c".into(), "sleep 30".into()],
-            std::time::Duration::from_millis(200),
-        )
-        .unwrap();
-        assert!(slow.timed_out);
+        assert_eq!(probe("echo v1.2.3", 5_000).unwrap().sha256, first.sha256);
+        assert_ne!(probe("echo v1.2.4", 5_000).unwrap().sha256, first.sha256);
+        // Failures never produce an output digest.
+        assert!(
+            probe("echo v1.2.3; exit 3", 5_000)
+                .unwrap_err()
+                .contains("status 3")
+        );
+        assert!(
+            probe("sleep 30", 200)
+                .unwrap_err()
+                .contains("did not finish")
+        );
+        assert!(
+            probe("(sleep 30 &) ; echo started", 5_000)
+                .unwrap_err()
+                .contains("kept its output open")
+        );
         assert!(
             run_runtime_probe(
                 root.path(),
-                &["aethyme-no-such-probe-binary".into()],
+                &root.path().join("missing"),
+                &["missing".into()],
                 RUNTIME_PROBE_TIMEOUT
             )
-            .is_none()
+            .is_err()
         );
+    }
+
+    #[test]
+    fn a_probe_summary_keeps_only_a_version_shaped_extract() {
+        assert_eq!(
+            probe_summary(b"\n  v24.15.0\nsecond").as_deref(),
+            Some("v24.15.0")
+        );
+        assert_eq!(
+            probe_summary(b"token=abc$%^&*\"'secret").as_deref(),
+            Some("tokenabcsecret")
+        );
+        assert_eq!(probe_summary(&[b'9'; 200]).map(|s| s.len()), Some(64));
+        assert_eq!(probe_summary(b"$$$"), None);
+    }
+
+    #[test]
+    fn the_probe_cache_lives_in_the_checkout_git_directory() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(probe_cache_path(root.path()), None);
+        fs::create_dir(root.path().join(".git")).unwrap();
+        assert_eq!(
+            probe_cache_path(root.path()),
+            Some(root.path().join(".git/aethyme-runtime-probes.json"))
+        );
+        let linked = tempfile::tempdir().unwrap();
+        let gitdir = root.path().join(".git/worktrees/linked");
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(
+            linked.path().join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        let path = probe_cache_path(linked.path()).unwrap();
+        assert_eq!(path, gitdir.join("aethyme-runtime-probes.json"));
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "key".to_string(),
+            CachedProbe {
+                sha256: "abc".into(),
+                summary: Some("v1".into()),
+                recorded_at_ms: 1,
+            },
+        );
+        write_probe_cache(&path, &entries).unwrap();
+        assert_eq!(parse_probe_cache(&fs::read(&path).unwrap()), entries);
+        assert!(parse_probe_cache(b"not json").is_empty());
+    }
+
+    #[test]
+    fn the_cache_key_changes_with_the_executable_and_the_command() {
+        let identity = RuntimeIdentity {
+            name: "node".into(),
+            executable: Some(PathBuf::from("/usr/bin/node")),
+            size: Some(1),
+            modified_ns: Some(2),
+            runtime_identity: None,
+            probe_sha256: None,
+            probe_summary: None,
+            unverified_reason: None,
+        };
+        let command = vec!["node".to_string(), "--version".to_string()];
+        let key = probe_cache_key("node", &command, &identity);
+        let mut reinstalled = identity.clone();
+        reinstalled.modified_ns = Some(3);
+        assert_ne!(probe_cache_key("node", &command, &reinstalled), key);
+        assert_ne!(
+            probe_cache_key("node", &["node".to_string(), "-v".to_string()], &identity),
+            key
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rotation_retires_the_shared_store_and_bounds_its_measurement() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let store = repository
+            .join(SHARED_PACKAGE_STORE_DIR)
+            .join("linux-x86_64/pnpm-store");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("file"), vec![0_u8; 1000]).unwrap();
+        let shared = repository.join(SHARED_PACKAGE_STORE_DIR);
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert_eq!(store_exceeds(&shared, 999, far, 1_000), Some(true));
+        assert_eq!(store_exceeds(&shared, 1_000, far, 1_000), Some(false));
+        assert_eq!(store_exceeds(&shared, 1_000, far, 1), None);
+        let retired = retire_shared_store(&repository).unwrap().unwrap();
+        assert!(is_retired_store_name(
+            retired.file_name().unwrap().to_str().unwrap()
+        ));
+        assert!(!shared.exists());
+        assert!(retired.join("linux-x86_64/pnpm-store/file").is_file());
+        assert_eq!(retire_shared_store(&repository).unwrap(), None);
+        assert!(!is_retired_store_name("packages-retired-"));
+        assert!(!is_retired_store_name("packages"));
     }
 
     #[test]
