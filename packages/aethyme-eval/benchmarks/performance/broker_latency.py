@@ -386,10 +386,12 @@ def seed_released_resource_history(binary, command, root, cwd, repo, count):
 
 
 def run_playground(binary, samples, output, aged_released_resource_leases=0,
-                   session_count=1, request_status_diagnostics=False):
+                   session_count=1, request_status_diagnostics=False, retained_closed_sessions=0):
     aged_released_resource_leases = validate_aged_released_resource_lease_count(
         aged_released_resource_leases)
     session_count = validate_session_count(session_count)
+    if not 0 <= retained_closed_sessions <= 16:
+        raise ValueError('retained closed-session count must be 0..16')
     collect_status_diagnostics = status_diagnostics_enabled(
         session_count, request_status_diagnostics)
     receipts = []
@@ -431,6 +433,7 @@ def run_playground(binary, samples, output, aged_released_resource_leases=0,
             'stale_broker_sessions': 0,
             'observed_status_session_counts': None,
             'closed_broker_sessions': 0,
+            'retained_registered_worktrees': 0,
             'terminal_queue_entries': 0,
             'aged_released_host_resource_leases_requested': aged_released_resource_leases,
             'aged_released_host_resource_leases': 0,
@@ -548,6 +551,34 @@ def run_playground(binary, samples, output, aged_released_resource_leases=0,
             'open_broker_sessions': len(sessions),
         })
         (output / 'workload.json').write_text(json.dumps(workload, indent=2) + '\n')
+        for index in range(retained_closed_sessions):
+            # Adopted checkouts keep their registrant's ownership. An active
+            # cleanup worker can remove broker-owned disposable checkouts
+            # under pressure, which would change the measured cohort.
+            checkout = root / 'worktrees' / f'retained-{index}'
+            command([git, 'worktree', 'add', '-qb', f'agent/retained-{index}',
+                     str(checkout), 'origin/main'])
+            raw, _ = command(
+                [str(binary), 'broker', 'start', '--adopt', '--task',
+                 f'Retained Playground record {index}', '--short-name', f'retained-{index}',
+                 '--json'], checkout, label=f'retained_session_{index}')
+            closed = json.loads(raw)
+            if closed.get('origin') != 'adopted' or Path(closed['worktree_path']).resolve() != checkout:
+                raise RuntimeError('broker did not adopt the fixture-owned checkout')
+            command([str(binary), 'broker', 'finish', 'close', '--session', str(closed['id']),
+                     '--json'], checkout, label=f'close_retained_session_{index}')
+            if not checkout.is_dir():
+                raise RuntimeError('state-only close did not retain the worktree')
+        registrations, _ = command([git, 'worktree', 'list', '--porcelain'])
+        workload['closed_broker_sessions'] = retained_closed_sessions
+        workload['retained_registered_worktrees'] = (
+            sum(line.startswith('worktree ') for line in registrations.splitlines())
+            - len(worktrees) - 1)
+        if workload['retained_registered_worktrees'] != retained_closed_sessions:
+            raise RuntimeError(
+                f"retained registry count {workload['retained_registered_worktrees']} differs "
+                f"from the requested {retained_closed_sessions}")
+        (output / 'workload.json').write_text(json.dumps(workload, indent=2) + '\n')
         # Publish once outside measurement; timed pushes are unchanged, with local transport.
         command([str(binary), 'broker', 'push', '--session', sid], worktree)
         try:
@@ -633,6 +664,12 @@ def run_playground(binary, samples, output, aged_released_resource_leases=0,
                     history_samples.append(elapsed)
                 else:
                     measured[name].append(elapsed)
+        if retained_closed_sessions:
+            registrations, _ = command([git, 'worktree', 'list', '--porcelain'])
+            if sum(line.startswith('worktree ') for line in registrations.splitlines()) != (
+                1 + len(worktrees) + retained_closed_sessions
+            ):
+                raise RuntimeError('retained checkout registrations changed during measurement')
         return measured, diagnostic_samples, history_samples, workload, binary_version_raw
 
 
@@ -652,6 +689,8 @@ def main():
         '--aged-released-resource-leases', type=int, default=0, metavar='N',
         help=('opt in to seed N old released host-resource lease records in the isolated '
               f'Playground fixture (0..{MAX_AGED_RELEASED_RESOURCE_LEASES}; default: 0)'))
+    parser.add_argument('--retained-closed-sessions', type=int, choices=range(17), default=0,
+                        metavar='N', help='retain N terminal rows and adopted linked checkouts (0..16)')
     args = parser.parse_args()
     try:
         aged_released_resource_leases = validate_aged_released_resource_lease_count(
@@ -666,7 +705,7 @@ def main():
     budgets = json.loads(budget_bytes)
     measured, diagnostic_samples, history_samples, workload, binary_version_raw = run_playground(
         binary, args.samples, args.output, aged_released_resource_leases, session_count,
-        args.status_diagnostics)
+        args.status_diagnostics, args.retained_closed_sessions)
     results = assess(budgets, measured)
     diagnostics = {name: summarize_diagnostic(values)
                    for name, values in diagnostic_samples.items()}
