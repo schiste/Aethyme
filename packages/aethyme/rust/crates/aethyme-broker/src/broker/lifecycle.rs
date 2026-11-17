@@ -7366,42 +7366,7 @@ impl Broker {
         session_id: i64,
         other_session_id: i64,
     ) -> Result<(), BrokerOpError> {
-        let session = self.store.session(session_id)?;
-        if session.status.is_closed() {
-            return Ok(());
-        }
-        if !self.duplicate_work_for(&session).iter().any(|candidate| {
-            candidate.session_id == other_session_id
-                && matches!(
-                    candidate.status,
-                    SessionStatus::Active | SessionStatus::Idle
-                )
-        }) {
-            return Err(BrokerOpError::InvalidSessionNote {
-                reason:
-                    "the named live session is absent from the broker's duplicate-work evidence"
-                        .into(),
-            });
-        }
-        let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
-        if checkout.root() != Path::new(&session.worktree_path)
-            || checkout.current_branch()? != session.branch
-            || !checkout.uncommitted_summary()?.is_empty()
-            || session.diff_base.as_deref() != Some(checkout.head_commit()?.as_str())
-        {
-            return Err(BrokerOpError::InvalidSessionNote {
-                reason:
-                    "recording duplicate work avoided requires an unchanged registered checkout"
-                        .into(),
-            });
-        }
-        self.close(session_id)?;
-        self.store.append_event(
-            "coordination.duplicate_work_avoided",
-            Some(session_id),
-            Some(&serde_json::json!({"other_session_id": other_session_id})),
-        )?;
-        Ok(())
+        self.close_with_duplicate(session_id, Some(other_session_id))
     }
 
     /// [`Broker::close`] for a session whose unpushed commits the caller has
@@ -7462,6 +7427,14 @@ impl Broker {
     }
 
     pub(super) fn close_unchecked(&mut self, session_id: i64) -> Result<(), BrokerOpError> {
+        self.close_with_duplicate(session_id, None)
+    }
+
+    fn close_with_duplicate(
+        &mut self,
+        session_id: i64,
+        duplicate_of: Option<i64>,
+    ) -> Result<(), BrokerOpError> {
         let should_wake_checkout_cleanup = {
             let initial_session = self.store.session(session_id)?;
             let _lifecycle_claim = self.claim_worktree_lifecycle()?;
@@ -7476,6 +7449,36 @@ impl Broker {
             {
                 return Ok(());
             }
+            if let Some(other_session_id) = duplicate_of {
+                if session.status.is_closed() {
+                    return Ok(());
+                }
+                if !self.duplicate_work_for(&session).iter().any(|candidate| {
+                    candidate.session_id == other_session_id
+                        && matches!(
+                            candidate.status,
+                            SessionStatus::Active | SessionStatus::Idle
+                        )
+                }) {
+                    return Err(BrokerOpError::InvalidSessionNote {
+                        reason:
+                            "the named live session is absent from the broker's duplicate-work evidence"
+                                .into(),
+                    });
+                }
+                let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
+                if checkout.root() != Path::new(&session.worktree_path)
+                    || checkout.current_branch()? != session.branch
+                    || !checkout.uncommitted_summary()?.is_empty()
+                    || session.diff_base.as_deref() != Some(checkout.head_commit()?.as_str())
+                {
+                    return Err(BrokerOpError::InvalidSessionNote {
+                        reason:
+                            "recording duplicate work avoided requires an unchanged registered checkout"
+                                .into(),
+                    });
+                }
+            }
             let cleanup_request = self.checkout_cleanup_request_policy(&session);
             if session.cleanup_state != crate::SessionCleanupState::Closed
                 || !session.status.is_closed()
@@ -7485,12 +7488,13 @@ impl Broker {
                 // Spawned row: it repairs an older missing outbox without
                 // moving the original close timestamp or emitting a second
                 // status transition.
-                self.store.set_session_status_with_cleanup_request(
+                self.store.set_session_status_with_cleanup_and_duplicate(
                     session_id,
                     SessionStatus::Closed,
                     None,
                     cleanup_request.map(|request| request.grace_hours),
                     cleanup_request.is_some_and(|request| request.compact_checkout),
+                    duplicate_of,
                 )?;
             }
             session.origin == crate::SessionOrigin::Spawned && cleanup_request.is_some()

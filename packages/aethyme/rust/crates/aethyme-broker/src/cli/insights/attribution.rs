@@ -139,7 +139,7 @@ pub(super) fn collect(
             {
                 costs.entry(id).or_default().conflicts_resolved += 1;
             }
-            "coordination.duplicate_work_avoided" if duplicates.insert(id) => {
+            crate::events::DUPLICATE_WORK_AVOIDED if duplicates.insert(id) => {
                 costs.entry(id).or_default().reported_duplicate_work_avoided += 1;
             }
             _ => {}

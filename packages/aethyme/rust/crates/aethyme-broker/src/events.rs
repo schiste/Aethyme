@@ -85,6 +85,8 @@ pub const LEASE_RELEASE_DECLINED: &str = "lease.release_declined";
 /// The holder was gone past the stale grace; the broker released for it.
 pub const LEASE_RELEASE_GRANTED: &str = "lease.release_granted";
 pub const LEASE_OVERLAP: &str = "lease.overlap";
+/// An explicitly confirmed duplicate closed before edits began.
+pub const DUPLICATE_WORK_AVOIDED: &str = "coordination.duplicate_work_avoided";
 pub const GUARD_OUT_OF_LEASE_WRITE: &str = "guard.out_of_lease_write";
 pub const GUARD_UNTRACKED_ARTIFACT: &str = "guard.untracked_artifact";
 // gate.<status> kinds derive from GateStatus::as_str (pass/fail/cancelled/error).

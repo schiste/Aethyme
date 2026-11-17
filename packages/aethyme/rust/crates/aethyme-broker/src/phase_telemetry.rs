@@ -92,11 +92,20 @@ fn record(name: &'static str, start: Instant, end: Instant) {
                 .micros
                 .saturating_add((end - start).as_micros() as u64);
             entry.count += 1;
-            if matches!(name, "subprocess_git" | "subprocess_other") {
+            if matches!(
+                name,
+                "subprocess_git" | "subprocess_other" | "review_on_push_child_wait"
+            ) {
                 accumulated.intervals.push((start, end, true));
             } else if matches!(
                 name,
-                "lifecycle_lock_wait" | "process_spawn_lock_wait" | "repository_write_lock_wait"
+                "lifecycle_lock_wait"
+                    | "lifecycle_lock_promoted_wait"
+                    | "process_spawn_lock_wait"
+                    | "repository_write_lock_wait"
+                    | "install_slot_wait"
+                    | "shared_cache_wait_exhausted"
+                    | "operation_outcome_record_wait"
             ) {
                 accumulated.intervals.push((start, end, false));
             }

@@ -135,7 +135,7 @@ fn assemble(
     events.extend(store.events_after_filtered(
         0,
         i64::MAX,
-        Some("coordination.duplicate_work_avoided"),
+        Some(crate::events::DUPLICATE_WORK_AVOIDED),
     )?);
     events.retain(|event| event.ts >= since_ms);
     // Merge events arrive out of order across prefixes; the fold takes the
