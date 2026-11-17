@@ -910,7 +910,7 @@ fn status_json_carries_the_blockers_and_advice_names_unblock() {
     )
     .unwrap();
 
-    let output = fixture.run(&["status", "--json"]);
+    let output = fixture.run(&["status", "--full", "--json"]);
     assert!(output.status.success(), "{}", stderr(&output));
     let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let blockers = status["blockers"].as_array().expect("blockers array");
@@ -1149,7 +1149,7 @@ fn a_killed_write_reports_both_halves_and_their_recovery_order() {
         String::from_utf8_lossy(&text.stdout)
     );
 
-    let status = fixture.run(&["status", "--json"]);
+    let status = fixture.run(&["status", "--full", "--json"]);
     assert!(status.status.success(), "{}", stderr(&status));
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     let advice = status["advice"]

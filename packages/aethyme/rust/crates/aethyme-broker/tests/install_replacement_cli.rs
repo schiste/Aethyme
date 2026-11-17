@@ -75,7 +75,7 @@ impl Fixture {
     }
 
     fn replaced_advice(&self) -> Vec<serde_json::Value> {
-        let output = self.run_as("0", &["status", "--json"]);
+        let output = self.run_as("0", &["status", "--full", "--json"]);
         let status: serde_json::Value =
             serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
                 panic!(

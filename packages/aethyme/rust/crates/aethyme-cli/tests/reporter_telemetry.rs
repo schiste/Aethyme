@@ -141,7 +141,7 @@ fn report_only_commands_do_not_append_metrics() {
     assert!(rows[0]["over_budget_phases"].is_array(), "{appended}");
     let before = after_affected.into_bytes();
 
-    let stateful_args = ["broker", "status", "--json"];
+    let stateful_args = ["broker", "status", "--full", "--json"];
     assert_success(&aethyme(temp.path(), &stateful_args), &stateful_args);
     assert!(
         fs::read(&metrics_path)

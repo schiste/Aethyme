@@ -1418,6 +1418,85 @@ fn a_pull_request_the_push_opens_gets_its_opening_recorded() {
     );
 }
 
+/// `push --plan` reads the remote once and describes the push, pushing
+/// nothing; the push it describes then reports what the lock's read saw and
+/// exactly which refs it sent.
+#[test]
+fn a_push_plan_describes_the_push_and_pushes_nothing() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, worktree) = fixture.session_with_commit();
+    let head = git_output(&worktree, &["rev-parse", "HEAD"]);
+
+    let plan = json(&fixture.push(session, &["--plan"]));
+    let branch = plan["branch"].as_str().unwrap().to_string();
+    let destination = format!("refs/heads/{branch}");
+    assert_eq!(plan["mode"], "fast_forward", "{plan}");
+    assert_eq!(plan["pushed"], false);
+    assert_eq!(plan["remote"], "origin");
+    assert_eq!(plan["destination_ref"], destination.as_str());
+    assert_eq!(plan["proposed_sha"], head.as_str());
+    assert_eq!(plan["remote_observed"], true, "{plan}");
+    assert_eq!(plan["remote_sha_observed"], serde_json::Value::Null);
+    assert_eq!(plan["remote_sha_last_known"], serde_json::Value::Null);
+    assert_eq!(plan["commits_to_push"], 1);
+    assert_eq!(
+        plan["command"],
+        format!("aethyme broker push --session {session}")
+    );
+    assert_eq!(fixture.remote_branch(&branch), None, "a plan never pushes");
+    assert!(fixture.session_push_operations().is_empty());
+
+    let pushed = json(&fixture.push(session, &[]));
+    assert_eq!(pushed["pre_push_remote_observed"], true, "{pushed}");
+    assert_eq!(pushed["pre_push_remote_oid"], serde_json::Value::Null);
+    assert_eq!(
+        pushed["pushed_refs"],
+        serde_json::json!([{"destination_ref": destination, "proposed_sha": head}])
+    );
+
+    let up_to_date = json(&fixture.push(session, &["--plan"]));
+    assert_eq!(up_to_date["mode"], "up_to_date", "{up_to_date}");
+    assert_eq!(up_to_date["remote_sha_observed"], head.as_str());
+    assert_eq!(up_to_date["remote_sha_last_known"], head.as_str());
+    assert_eq!(up_to_date["remote_sha_recorded"], head.as_str());
+
+    git(&worktree, &["commit", "--amend", "-qm", "feat: reworded"]);
+    let lease = json(&fixture.push(session, &["--plan", "--json"]));
+    assert_eq!(lease["mode"], "lease", "{lease}");
+    assert_eq!(lease["lease_expected_sha"], head.as_str());
+    assert_eq!(
+        fixture.remote_branch(&branch).as_deref(),
+        Some(head.as_str()),
+        "the plan left the remote where the push put it"
+    );
+
+    let text = fixture.run(&["push", "--session", &session.to_string(), "--plan"]);
+    assert!(text.status.success(), "{}", stderr(&text));
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("nothing pushed"), "{text}");
+    assert!(text.contains("mode: lease"), "{text}");
+}
+
+/// A plan reports a push the repository would refuse instead of failing.
+#[test]
+fn a_push_plan_reports_a_refusal_without_pushing() {
+    let fixture = Fixture::new();
+    let (session, _) = fixture.session_with_commit();
+    let plan = json(&fixture.push(session, &["--plan"]));
+    assert_eq!(plan["mode"], "would_refuse", "{plan}");
+    assert!(
+        plan["refusal"]
+            .as_str()
+            .unwrap()
+            .contains("delivery.push_session_branches"),
+        "{plan}"
+    );
+    assert_eq!(plan["pushed"], false);
+    let refused = fixture.push(session, &["--plan", "--pr"]);
+    assert!(!refused.status.success());
+}
+
 #[test]
 fn push_state_counts_commits_no_remote_holds() {
     let fixture = Fixture::new();
@@ -1425,7 +1504,7 @@ fn push_state_counts_commits_no_remote_holds() {
     let (session, worktree) = fixture.session_with_commit();
     fixture.commit(&worktree, "second.txt", "two\n", "feat: second step");
 
-    let mut broker = fixture.broker();
+    let broker = fixture.broker();
     let before = broker.session_push_state(session).unwrap();
     assert_eq!(before.unpushed_commits, 2);
     assert!(before.oldest_unpushed_at_ms.is_some());

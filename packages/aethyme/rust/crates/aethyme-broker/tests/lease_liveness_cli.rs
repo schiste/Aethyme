@@ -172,7 +172,7 @@ fn a_running_holder_is_active_and_reported_in_status_and_explain() {
     );
     assert_eq!(lease["liveness_evidence"]["holds"], true);
 
-    let status = fx.json_as("0", &["status", "--json"]);
+    let status = fx.json_as("0", &["status", "--full", "--json"]);
     let rows = status["lease_liveness"].as_array().unwrap();
     let row = rows
         .iter()
@@ -205,7 +205,7 @@ fn a_gone_holder_is_stale_and_keeps_its_hold_through_the_grace() {
 
     holder.stop();
     // Status persists the first sighting, which starts the grace clock.
-    fx.json_as("0", &["status", "--json"]);
+    fx.json_as("0", &["status", "--full", "--json"]);
     let first = fx.explain();
     assert_eq!(first["liveness"], "stale");
     assert_eq!(first["liveness_evidence"]["basis"], "holder_gone");
@@ -240,7 +240,7 @@ fn past_the_grace_a_stale_lease_no_longer_conflicts_but_is_listed() {
     assert!(fx.plan_conflicts(&planner.pid(), planning));
 
     holder.stop();
-    fx.json_as("0", &["status", "--json"]);
+    fx.json_as("0", &["status", "--full", "--json"]);
     let lease = fx.explain();
     assert_eq!(lease["session_id"], session);
     assert_eq!(lease["liveness"], "stale");

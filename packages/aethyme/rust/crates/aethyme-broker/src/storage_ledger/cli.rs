@@ -319,6 +319,30 @@ fn status(json_output: bool) -> u8 {
     crate::exit_status::SUCCESS
 }
 
+/// How many unlanded recovery archives `storage.over-budget` names one by one.
+const UNLANDED_ARCHIVE_EXAMPLES: usize = 5;
+
+/// The `storage.over-budget` lines for archives kept because their work is
+/// not landed: a few by name and a count. Every such archive used to be its
+/// own line, and on a host that kept thousands this one advice entry was most
+/// of the full status document. `aethyme storage status --json` lists them all.
+pub(super) fn unlanded_archive_evidence(archives: &[String]) -> Vec<String> {
+    let mut evidence: Vec<String> = archives
+        .iter()
+        .take(UNLANDED_ARCHIVE_EXAMPLES)
+        .map(|id| format!("recovery archive {id} holds unlanded work and is kept"))
+        .collect();
+    if archives.len() > UNLANDED_ARCHIVE_EXAMPLES {
+        evidence.push(format!(
+            "and {} more recovery archive(s) holding unlanded work ({} in all); \
+             `aethyme storage status --json` lists every one",
+            archives.len() - UNLANDED_ARCHIVE_EXAMPLES,
+            archives.len()
+        ));
+    }
+    evidence
+}
+
 /// `broker status` advice: over budget, below floor, unclassified. Class
 /// names and sizes only; archive ids are paths inside Aethyme's own root.
 pub fn status_advice(host_state: &Path) -> Vec<crate::StatusAdvice> {
@@ -332,12 +356,7 @@ pub fn status_advice(host_state: &Path) -> Vec<crate::StatusAdvice> {
                 format!("{name}: {} over a {} budget", human(*bytes), human(*budget))
             })
             .collect();
-        evidence.extend(
-            summary
-                .unlanded_archives
-                .iter()
-                .map(|id| format!("recovery archive {id} holds unlanded work and is kept")),
-        );
+        evidence.extend(unlanded_archive_evidence(&summary.unlanded_archives));
         advice.push(crate::StatusAdvice {
             id: "storage.over-budget",
             severity: crate::StatusAdviceSeverity::Notice,

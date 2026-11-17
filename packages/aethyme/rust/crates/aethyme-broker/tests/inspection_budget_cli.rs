@@ -304,7 +304,7 @@ fn interactive_reads_stay_under_ten_seconds_with_sixty_five_sessions() {
     let fixture = many_session_fixture(65);
     for args in [
         &(["status", "--summary", "--json"] as [&str; 3])[..],
-        &(["status", "--json"] as [&str; 2])[..],
+        &(["status", "--full", "--json"] as [&str; 3])[..],
         &(["status", "--refresh", "--json"] as [&str; 3])[..],
         &(["status", "doctor", "--json"] as [&str; 3])[..],
         &(["advanced", "worktrees", "--json"] as [&str; 3])[..],

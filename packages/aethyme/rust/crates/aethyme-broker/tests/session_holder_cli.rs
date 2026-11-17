@@ -275,7 +275,7 @@ fn codex_in(dir: &Path, bin: &Path) -> Agent {
 }
 
 fn foreign_advice(fx: &Fixture) -> Vec<serde_json::Value> {
-    let output = fx.run_as("0", &["status", "--json"]);
+    let output = fx.run_as("0", &["status", "--full", "--json"]);
     let status: serde_json::Value = serde_json::from_slice(&output.stdout)
         .unwrap_or_else(|error| panic!("status --json: {error}: {}", stderr(&output)));
     if status["deferred_checks"]

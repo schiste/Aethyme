@@ -372,9 +372,10 @@ const PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after an ed
 
 Other agents may be working in sibling worktrees.
 
-For routine coordination, use `aethyme broker status --compact --json`.
-It groups advice and reports deferred checks as unknown. Use full
-`aethyme broker status --json` when exact session or lease-path evidence is
+For routine coordination, use `aethyme broker status --json` (compact).
+Branch on `advice.categories[].severity` and `.commands`, `summary` and
+`drilldown`; deferred checks are unknown, not clean. Use
+`aethyme broker status --full --json` only when exact session or lease-path evidence is
 needed. Check overlapping work before duplicating it. Overlaps with an active
 session's explicit lease are advisory. Accepted warnings permit work in your
 session; reconcile before merging. Resolve blockers and refusals.
@@ -407,9 +408,10 @@ const NON_PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after a
 
 Other agents may be working in sibling worktrees.
 
-For routine coordination, use `aethyme broker status --compact --json`.
-It groups advice and reports deferred checks as unknown. Use full
-`aethyme broker status --json` when exact session or lease-path evidence is
+For routine coordination, use `aethyme broker status --json` (compact).
+Branch on `advice.categories[].severity` and `.commands`, `summary` and
+`drilldown`; deferred checks are unknown, not clean. Use
+`aethyme broker status --full --json` only when exact session or lease-path evidence is
 needed. Check overlapping work before duplicating it. Overlaps with an active
 session's explicit lease are advisory. Accepted warnings permit work in your
 session; reconcile before merging. Resolve blockers and refusals.
@@ -613,7 +615,7 @@ limit (`trigger` `steady` below three quarters of it, `pressure` from there);
 `broker start` at the limit, `gc apply`, `gc abandon` and `gc forget-abandoned`
 wait up to 30 seconds for the GC lock, and the worker steps aside while they
 wait. When the count still grows, read `capacity_removal` in
-`aethyme broker status --json` (`trigger`, `outcome`, `stop_reason`, `kept_by_code`,
+`aethyme broker status --full --json` (`trigger`, `outcome`, `stop_reason`, `kept_by_code`,
 `blocked_by_ignored`) and fix the most common keep code. For ignored output,
 add the reported `config_line` to `[cleanup] regenerable` only when the path
 holds nothing but output its tools regenerate; a `config_refusal` means no
@@ -640,7 +642,7 @@ Stop only a verified group owned by the interrupted work, then recheck the
 whole group before reconciling the lease generation.
 
 Before starting or delegating a fix for shared CI failures or generated
-files, use `aethyme broker status --compact --json` and open PRs on affected
+files, use `aethyme broker status --json` and open PRs on affected
 paths. Read the matching task, claimed paths and PR diff even when the graph
 is unavailable. Coordinate with the owning session before starting duplicate
 work; use `aethyme broker advanced note send --to-session <id>` for a broker
@@ -662,13 +664,15 @@ blocked.
    isolated broker worktree, and work from that checkout:
 
    ```bash
-   aethyme broker status --compact --json  # concise coordination summary
+   aethyme broker status --json  # concise coordination summary (compact)
    aethyme broker start --task "<your task>" --short-name "<short name>" --path <planned-path>
    ```
 
    Routine status groups repeated advice categories, reports deferred checks
-   as unknown, and omits per-session evidence and lease paths. Use full
-   `aethyme broker status --json` when you need exact session, lease-path or
+   as unknown, and omits per-session evidence and lease paths. Branch on
+   `advice.categories[].severity` and `.commands`, `summary` and `drilldown`;
+   `status --session <id> --json` adds a `session` block with `next_action`. Use
+   `aethyme broker status --full --json` only when you need exact session, lease-path or
    evidence detail before deciding what to edit. A deferred check is not a
    clean result.
 
@@ -710,8 +714,8 @@ blocked.
    Leases record planned or observed path overlap; they do not lock files
    across isolated worktrees. A lease or warning alone is not a reason to
    wait or switch tasks: continue on independent work in your own worktree.
-   Before contacting a holder, inspect their task and claimed paths in full
-   `aethyme broker status --json`; an explicit lease may record intent without
+   Before contacting a holder, inspect their task and claimed paths in
+   `aethyme broker status --full --json`; an explicit lease may record intent without
    any edit. Every overlap the broker reports, warning or refusal, carries that
    session's capped changes to the overlapping files, committed and uncommitted
    (`other_changes` in JSON), or says it has only declared intent. It is another
@@ -1137,7 +1141,7 @@ blocked.
    The broker surfaces outstanding session advisories after post-commit,
    before expensive gates, and on common broker commands. When a notice
    appears—or after rebasing or reusing a worktree—inspect
-   `aethyme broker status --json` before continuing on the named paths.
+   `aethyme broker status --full --json` before continuing on the named paths.
 
    If status output is too large to inspect directly, retain the complete
    unfiltered JSON in a temporary file and use a JSON parser to project the
@@ -1595,8 +1599,8 @@ mod tests {
         let doc = render_agents_document(Some(&repo)).unwrap();
         for needle in [
             "## Broker Coordination: before and after an edit",
-            "`aethyme broker status --compact --json`",
-            "`aethyme broker status --json` when exact session or lease-path evidence is",
+            "`aethyme broker status --json` (compact)",
+            "`aethyme broker status --full --json` only when exact session or lease-path evidence is",
             "`aethyme broker start --task \"<task>\" [--short-name \"<label>\"]`",
             "work only in the worktree it\n   reports",
             "follow the working agreement it prints.",
@@ -1629,9 +1633,9 @@ mod tests {
         // What left the root file lives in the reference, in current spellings.
         let reference = render_broker_reference();
         for moved in [
-            "aethyme broker status --compact --json",
+            "aethyme broker status --json  # concise coordination summary (compact)",
             "Routine status groups repeated advice categories",
-            "`aethyme broker status --json` when you need exact session, lease-path or",
+            "`aethyme broker status --full --json` only when you need exact session, lease-path or",
             "start command is still running",
             "that same command to completion before retrying",
             "session's reported repository",
@@ -1822,8 +1826,8 @@ mod tests {
         let doc = render_agents_document(Some(&repo)).unwrap();
         for needle in [
             "## Broker Coordination: before and after an edit",
-            "`aethyme broker status --compact --json`",
-            "`aethyme broker status --json` when exact session or lease-path evidence is",
+            "`aethyme broker status --json` (compact)",
+            "`aethyme broker status --full --json` only when exact session or lease-path evidence is",
             "Commit early and small, and after each commit run\n   `aethyme broker push --session <id>`",
             "open a draft PR with `aethyme broker push --session <id> --pr`",
             "keep pushing until it is ready. Run `aethyme broker sync --session <id>`\n   before resuming a reused session and when push reports related or unknown\n   impact. A graph-disjoint verdict permits deferring intermediate sync; validate\n   the current merge candidate before merging. Never leave work only in the worktree.",
@@ -1862,8 +1866,8 @@ mod tests {
                 "{tag}: missing the working-agreement pointer:\n{doc}"
             );
             for required in [
-                "For routine coordination, use `aethyme broker status --compact --json`.",
-                "`aethyme broker status --json` when exact session or lease-path evidence is",
+                "For routine coordination, use `aethyme broker status --json` (compact).",
+                "`aethyme broker status --full --json` only when exact session or lease-path evidence is",
                 "session's explicit lease are advisory. Accepted warnings permit work in your",
                 "Resolve blockers and refusals.",
             ] {

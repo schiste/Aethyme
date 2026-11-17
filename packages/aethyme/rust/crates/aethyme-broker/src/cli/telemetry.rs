@@ -249,6 +249,55 @@ pub(super) fn record_command_outcome(args: &[String], exit: u8, error: Option<&s
     );
 }
 
+/// The name of the process that ran this command: its parent's executable
+/// name, so a caller that polls an expensive form can be identified. Only the
+/// final path component is kept -- never arguments, never a directory -- and
+/// it is cut to 64 characters of `[A-Za-z0-9._+-]`. `None` when unknown.
+pub(super) fn caller_hint() -> Option<String> {
+    #[cfg(unix)]
+    {
+        let raw = parent_process_name(std::os::unix::process::parent_id())?;
+        sanitize_process_name(&raw)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parent_process_name(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()
+}
+
+/// `ps -o comm=` prints the executable (on macOS its full path) without
+/// arguments; only its last component survives `sanitize_process_name`.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn parent_process_name(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn sanitize_process_name(raw: &str) -> Option<String> {
+    let name = raw.trim().rsplit(['/', '\\']).next().unwrap_or_default();
+    // A login shell is reported as `-zsh`.
+    let name = name.trim_start_matches('-');
+    let name: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+        .take(64)
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
 /// Record one command's cost. `output_bytes` counts stdout emitted through
 /// `out!`; stderr is excluded because it carries diagnostics rather than the
 /// payload an agent pays to read.
@@ -460,6 +509,8 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
         // Listing the outbox is a read; claims, dispatches and completions
         // change it.
         Some("deliveries") => args.get(1).map(String::as_str) != Some("list"),
+        // A push plan reads the remote and changes nothing.
+        Some("push") => !args.iter().any(|arg| arg == "--plan"),
         _ => true,
     }
 }
@@ -482,7 +533,14 @@ fn command_metric_enabled(args: &[String], opted_in: bool, has_details: bool) ->
     ) {
         return false;
     }
-    command_records_metric(args) || opted_in || has_details
+    // Every `status` call appends its row, routine compact status included:
+    // identifying who polls status, and in which form, is what the row is
+    // for. It is a log append, so routine status still writes no broker
+    // state and no outcome event (`command_records_outcome` stays false).
+    command_records_metric(args)
+        || opted_in
+        || has_details
+        || args.first().map(String::as_str) == Some("status")
 }
 
 /// `gates affected` opts into a timing line while preserving its read-only
@@ -523,6 +581,31 @@ mod tests {
         command_metric_enabled, command_records_metric, command_records_outcome, metric_line,
         safe_command_surface, with_spans,
     };
+
+    #[test]
+    fn caller_hints_keep_only_the_executable_name() {
+        use super::sanitize_process_name;
+        assert_eq!(sanitize_process_name("zsh\n").as_deref(), Some("zsh"));
+        assert_eq!(
+            sanitize_process_name("/usr/local/bin/node").as_deref(),
+            Some("node")
+        );
+        assert_eq!(sanitize_process_name("-zsh").as_deref(), Some("zsh"));
+        assert_eq!(
+            sanitize_process_name("/opt/My Tools/poll er").as_deref(),
+            Some("poller")
+        );
+        assert_eq!(sanitize_process_name("  \n"), None);
+        assert_eq!(sanitize_process_name(&"x".repeat(200)).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn this_process_reports_a_bare_parent_name() {
+        if let Some(name) = super::caller_hint() {
+            assert!(!name.is_empty() && name.len() <= 64);
+            assert!(!name.contains('/') && !name.contains(' '));
+        }
+    }
 
     #[test]
     fn every_metric_row_names_the_release_that_wrote_it() {
@@ -604,6 +687,27 @@ mod tests {
         let worker = ["gc", "__continue-artifacts", "/repository"].map(str::to_string);
         assert!(command_records_metric(&worker));
         assert!(!command_records_outcome(&worker));
+    }
+
+    #[test]
+    fn a_push_plan_is_an_observation_and_a_push_is_not() {
+        let plan = ["push", "--session", "7", "--plan"].map(str::to_string);
+        assert!(!command_records_metric(&plan));
+        assert!(!command_records_outcome(&plan));
+        let push = ["push", "--session", "7"].map(str::to_string);
+        assert!(command_records_metric(&push));
+    }
+
+    #[test]
+    fn compact_status_is_routine_and_full_status_is_recorded() {
+        let compact = ["status", "--json"].map(str::to_string);
+        assert!(!command_records_metric(&compact));
+        assert!(!command_records_outcome(&compact));
+        assert!(command_metric_enabled(&compact, false, false));
+        let focused = ["status", "--session", "7", "--json"].map(str::to_string);
+        assert!(command_metric_enabled(&focused, false, false));
+        let full = ["status", "--full", "--json"].map(str::to_string);
+        assert!(command_records_metric(&full));
     }
 
     #[test]

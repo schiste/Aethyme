@@ -193,7 +193,7 @@ fn compact_status_groups_repeated_warnings_and_marks_omitted_details() {
     assert!(text.contains("lease.overlap-conflict"));
     assert!(text.contains("count 3, 2 duplicates"));
     assert!(text.contains("Deferred checks (unknown, not clean)"));
-    assert!(text.contains("aethyme broker status --json"));
+    assert!(text.contains("aethyme broker status --full --json"));
     assert!(text.contains("Dirty sessions and promoted conflicts: not checked."));
     assert!(!text.contains("0 dirty"));
     if let Some(command) = compact["summary"]["commands"]
@@ -211,7 +211,8 @@ fn compact_json_is_additive_and_legacy_json_shapes_are_unchanged() {
     let fixture = tempfile::tempdir().unwrap();
     init_repo(fixture.path());
 
-    let full = json_status(fixture.path(), &["status", "--json"]);
+    let full = json_status(fixture.path(), &["status", "--full", "--json"]);
+    assert_eq!(full["form"], "full");
     for key in [
         "agents",
         "blockers",
@@ -241,8 +242,26 @@ fn compact_json_is_additive_and_legacy_json_shapes_are_unchanged() {
 
     let compact = json_status(fixture.path(), &["status", "--compact", "--json"]);
     assert_eq!(compact["schema"], "aethyme.broker-status-compact/v1");
+    assert_eq!(compact["form"], "compact");
+    assert!(compact["hint"].as_str().unwrap().contains("--full"));
     assert!(compact.get("agents").is_none());
     assert!(compact.get("blockers").is_none());
+    assert!(compact.get("session").is_none());
+
+    // Compact is the default JSON form; `--compact` changes nothing.
+    let default = json_status(fixture.path(), &["status", "--json"]);
+    assert_eq!(default["schema"], "aethyme.broker-status-compact/v1");
+    assert_eq!(default["form"], "compact");
+    assert!(default.get("agents").is_none());
+    let keys = |value: &serde_json::Value| {
+        value
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(keys(&default), keys(&compact));
 
     for args in [
         ["status", "--compact", "--refresh"].as_slice(),
@@ -251,6 +270,21 @@ fn compact_json_is_additive_and_legacy_json_shapes_are_unchanged() {
         let output = run_status(fixture.path(), args);
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("--compact"));
+    }
+    for args in [
+        ["status", "--full", "--compact", "--json"].as_slice(),
+        ["status", "--full", "--summary", "--json"].as_slice(),
+        ["status", "--full", "--session", "1", "--json"].as_slice(),
+    ] {
+        let output = run_status(fixture.path(), args);
+        assert!(!output.status.success(), "{args:?}");
+        // A `--json` refusal is a JSON error document on stdout.
+        let message = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(message.contains("--full"), "{args:?}: {message}");
     }
 }
 
@@ -391,6 +425,40 @@ fn session_focused_status_keeps_global_safety_information_and_checks_identity() 
     assert_eq!(implicit["focus"]["session_id"], session.id);
     assert_eq!(implicit["schema"], focused["schema"]);
     assert_eq!(warnings(&implicit), warnings(&focused));
+
+    // The session block: local facts only, the PR unknown when unrecorded.
+    let block = &implicit["session"];
+    assert_eq!(block["id"], session.id, "{block}");
+    assert_eq!(block["branch"], "focused-first");
+    assert_eq!(block["status"], "active");
+    assert!(
+        block["worktree"]
+            .as_str()
+            .unwrap()
+            .ends_with("focused-first")
+    );
+    let head = block["head_oid"].as_str().expect("head oid");
+    assert_eq!(head.len(), 40, "{block}");
+    assert_eq!(block["remote_oid"], serde_json::Value::Null);
+    assert!(block["unpushed_commits"].as_u64().unwrap() >= 1, "{block}");
+    assert_eq!(block["pr"], serde_json::Value::Null);
+    assert_eq!(block["pr_state"], "unknown");
+    assert!(block["preparation"]["state"].is_string(), "{block}");
+    assert!(block["advice"].is_array() && block["blockers"].is_array());
+    let next = block["next_action"]["command"].as_str().unwrap();
+    assert!(
+        next.starts_with("aethyme broker ") && next.contains(&format!("--session {session_id}")),
+        "{next}"
+    );
+    assert!(block["next_action"]["reason"].is_string());
+    assert!(global.get("session").is_none());
+    let text = run_status(fixture.path(), &["status", "--session", &session_id]);
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.contains(&format!("Session {session_id}: active on focused-first")),
+        "{text}"
+    );
+    assert!(text.contains("pull request: unknown"), "{text}");
 }
 
 #[test]

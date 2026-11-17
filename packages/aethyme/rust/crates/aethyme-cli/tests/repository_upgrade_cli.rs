@@ -1067,7 +1067,7 @@ fn homebrew_upgrade_mid_session_preserves_commit_and_recovery_lanes() {
     // 10:11 — diagnostic and coordinated recovery surfaces remain reachable
     // while the new binary sees the old repository deployment.
     for args in [
-        &["broker", "status", "--json"][..],
+        &["broker", "status", "--full", "--json"][..],
         &["broker", "advanced", "leases", "--json"][..],
         &["broker", "advanced", "operations", "--json"][..],
         &[
@@ -1226,7 +1226,7 @@ fn obsolete_repository_status_is_a_genuinely_non_mutating_snapshot() {
     let metrics_path = repo.join(".aethyme/logs/command-metrics.jsonl");
     let before_metrics = fs::read(&metrics_path).ok();
 
-    let status = run(&repo, &["broker", "status", "--json"]);
+    let status = run(&repo, &["broker", "status", "--full", "--json"]);
     let report = json(&status);
     assert!(report["agents"].as_array().unwrap().iter().any(|agent| {
         agent["id"] == session && agent["repository_contract"]["repository_schema"].is_null()
@@ -1296,7 +1296,7 @@ fn read_only_refresh_refusal_names_the_cause_and_the_next_action() {
             assert!(stderr.contains(needle), "missing {needle:?} in: {stderr}");
         }
 
-        let snapshot = run(&repo, &["broker", "status", "--json"]);
+        let snapshot = run(&repo, &["broker", "status", "--full", "--json"]);
         assert!(
             snapshot.status.success(),
             "the suggested alternative must work: {}",
@@ -1313,7 +1313,7 @@ fn older_repository_allows_diagnostics_recovery_and_only_pinned_continuation() {
     let session = adopt_legacy_session(&repo);
 
     for args in [
-        &["broker", "status", "--json"][..],
+        &["broker", "status", "--full", "--json"][..],
         &["broker", "advanced", "agents", "--json"][..],
         &["broker", "advanced", "leases", "--json"][..],
         &["broker", "advanced", "operations", "--json"][..],
@@ -1533,7 +1533,7 @@ fn repository_compatibility_states_preserve_refusal_remediation() {
         old_canonical_deployment(&repo);
         fs::write(repo.join(".aethyme/repository.json"), marker).unwrap();
 
-        let diagnostic = run(&repo, &["broker", "status", "--json"]);
+        let diagnostic = run(&repo, &["broker", "status", "--full", "--json"]);
         assert!(
             diagnostic.status.success(),
             "read-only diagnostics must survive {expected}: {}",

@@ -269,7 +269,7 @@ impl Fixture {
     }
 
     fn status(&self) -> serde_json::Value {
-        json(&self.run(&["status", "--json"]))
+        json(&self.run(&["status", "--full", "--json"]))
     }
 
     fn gh_log(&self) -> String {

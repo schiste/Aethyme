@@ -437,7 +437,7 @@ fn the_legacy_verdict_is_printed_before_the_advisory_capture() {
 #[test]
 fn status_reports_the_collaboration_fence() {
     let (required, _origin) = Fixture::with_origin(REQUIRED);
-    let output = required.cli(&["status", "--json"], None);
+    let output = required.cli(&["status", "--full", "--json"], None);
     assert!(
         output.status.success(),
         "{}",
@@ -465,7 +465,7 @@ fn status_reports_the_collaboration_fence() {
     );
 
     let (advisory, _origin) = Fixture::with_origin(ADVISORY);
-    let output = advisory.cli(&["status", "--json"], None);
+    let output = advisory.cli(&["status", "--full", "--json"], None);
     let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(status.get("collaboration_fence").is_none(), "{status:#}");
 }
