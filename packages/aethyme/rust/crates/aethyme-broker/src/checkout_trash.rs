@@ -53,6 +53,8 @@ pub(crate) const TRASH_FAILURE_REPORT_AFTER: u32 = 3;
 pub(crate) const DELETER_STEADY_UNLINKS_PER_SECOND: u32 = 2_000;
 /// The rate the deleter never goes below, however loaded the host.
 pub(crate) const DELETER_FLOOR_UNLINKS_PER_SECOND: u32 = 200;
+/// Unlinks between checks that an entry being deleted is still in the trash.
+const TRASH_LOCATION_CHECK_EVERY: u32 = 256;
 /// File name of the host-wide single-flight lock.
 pub(crate) const DELETER_LOCK_FILE: &str = "checkout-trash-deleter.lock";
 
@@ -68,11 +70,58 @@ pub(crate) struct TrashRow {
     #[serde(default)]
     pub(crate) failures: u32,
     /// Written before the rename (with the source directory's identity,
-    /// which a same-volume rename keeps) and cleared after it. A pending row
-    /// whose entry is absent is a rename that never happened and is dropped;
-    /// one whose entry is present is a rename whose confirmation was lost.
+    /// which a same-volume rename keeps) and cleared when the mover confirms
+    /// it. The deleter never deletes a pending row's entry while its creator
+    /// may still run: only once the creator is proven gone and the entry
+    /// still matches the recorded identity is it confirmed.
     #[serde(default)]
     pub(crate) pending: bool,
+    /// The process that wrote the row, and when it started (epoch ms; 0 when
+    /// unknown, which never confirms a pending row on its own).
+    #[serde(default)]
+    pub(crate) creator_pid: i64,
+    #[serde(default)]
+    pub(crate) creator_started_ms: i64,
+}
+
+/// This process's id and start time, as a process-table snapshot reads it.
+fn this_process_identity() -> (i64, i64) {
+    let pid = i64::from(std::process::id());
+    let started = crate::session_holder::ProcessTable::snapshot()
+        .and_then(|table| table.process(pid))
+        .and_then(|process| crate::session_holder::lstart_epoch_ms(&process.started))
+        .unwrap_or(0);
+    (pid, started)
+}
+
+/// Whether the creator recorded in `row` is proven gone: `table` does not
+/// list a process with its pid and start time. Unknown start time or no
+/// table proves nothing.
+fn creator_gone(row: &TrashRow, table: Option<&crate::session_holder::ProcessTable>) -> bool {
+    let Some(table) = table else {
+        return false;
+    };
+    if row.creator_pid <= 0 || row.creator_started_ms <= 0 {
+        return false;
+    }
+    table.process(row.creator_pid).is_none_or(|process| {
+        crate::session_holder::lstart_epoch_ms(&process.started) != Some(row.creator_started_ms)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: environment destruction fails.
+    pub(crate) static FAIL_ENVIRONMENT_DESTROY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn destroy_environments(worktree: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    if FAIL_ENVIRONMENT_DESTROY.with(std::cell::Cell::get) {
+        return Err("simulated environment destruction failure".into());
+    }
+    crate::environments::lifecycle::destroy_for_worktree(worktree).map(|_| ())
 }
 
 /// Recorded trash entries: trash directory path, then entry name.
@@ -424,12 +473,13 @@ fn rename_noreplace(from_dir: RawFd, from: &str, to_dir: RawFd, to: &str) -> std
 /// `repo`, whose Git common directory is `common_dir`).
 ///
 /// Order: the registration and any lock are checked first (a lock anyone
-/// but the broker placed refuses); `record_pending` stores the entry's row
-/// (the source directory's identity) before anything moves; the exclusive
-/// rename comes next, and a failure there leaves the checkout exactly as it
-/// was. Only then are environments bound to the checkout destroyed (a
-/// failure renames the checkout back) and the registration, with the
-/// broker's lock, removed. Nothing in the checkout is unlinked here.
+/// but the broker placed refuses); environments bound to the checkout are
+/// destroyed (a failure keeps everything in place); `record_pending` stores
+/// the entry's row (the source directory's identity and this process) before
+/// anything moves; the exclusive rename comes next, and a failure there
+/// leaves the checkout exactly as it was. After a successful rename nothing
+/// moves the entry back. The registration, with the broker's lock, goes last.
+/// Nothing in the checkout is unlinked here.
 pub(crate) fn move_worktree_to_trash(
     repo: &crate::git::GitRepo,
     common_dir: &Path,
@@ -469,12 +519,19 @@ pub(crate) fn move_worktree_to_trash(
     if !is_directory(&source) {
         return Err(format!("{} is not a real directory", worktree.display()));
     }
+    // Environments bound to the checkout are destroyed first (their hooks
+    // live in it): a failure keeps everything where it is, and once the
+    // rename succeeds nothing ever moves the entry back into the pool.
+    destroy_environments(worktree).map_err(|reason| {
+        format!("environments bound to the checkout could not be destroyed: {reason}")
+    })?;
     let entry = format!(
         "{:013}-{session_id}-{}-{}",
         crate::clock::epoch_ms().max(0),
         std::process::id(),
         TRASH_NONCE.fetch_add(1, Ordering::Relaxed)
     );
+    let (creator_pid, creator_started_ms) = this_process_identity();
     #[allow(clippy::unnecessary_cast)]
     let mut row = TrashRow {
         device: source.st_dev as u64,
@@ -482,6 +539,8 @@ pub(crate) fn move_worktree_to_trash(
         session_id,
         failures: 0,
         pending: true,
+        creator_pid,
+        creator_started_ms,
     };
     record_pending(&trash.path, &entry, row)?;
     rename_noreplace(
@@ -491,21 +550,6 @@ pub(crate) fn move_worktree_to_trash(
         &entry,
     )
     .map_err(|error| format!("cannot move the checkout into the trash: {error}"))?;
-    if let Err(reason) = crate::environments::lifecycle::destroy_for_worktree(worktree) {
-        return match rename_noreplace(
-            trash.trash.as_raw_fd(),
-            &entry,
-            trash.pool.as_raw_fd(),
-            &name,
-        ) {
-            Ok(()) => Err(format!(
-                "environments bound to the checkout could not be destroyed; it was put back: {reason}"
-            )),
-            Err(error) => Err(format!(
-                "environments bound to the checkout could not be destroyed ({reason}) and it could not be put back from the trash: {error}"
-            )),
-        };
-    }
     crate::phase_telemetry::add("checkout_trashed", Duration::ZERO);
     let registration_removed = match std::fs::remove_dir_all(&admin) {
         Ok(()) => true,
@@ -716,6 +760,14 @@ pub(crate) fn drain_trash(
         DeleterPace::Steady => {}
     }
     let started = Instant::now();
+    // One process table, only when some row is still unconfirmed: it is
+    // what proves a pending row's creator gone.
+    let any_pending = rows
+        .values()
+        .any(|entries| entries.values().any(|row| row.pending));
+    let table = any_pending
+        .then(crate::session_holder::ProcessTable::snapshot)
+        .flatten();
     // The worker's unattended pacer would stop this deleter on memory
     // pressure; it paces itself instead.
     crate::gc::unattended_pacing::without_pacer(|| {
@@ -748,24 +800,46 @@ pub(crate) fn drain_trash(
                 if !is_broker_entry_name(name) || !entries.contains_key(name) {
                     report.unrecognized += 1;
                     if report.unrecognized_names.len() < 20 {
-                        report
-                            .unrecognized_names
-                            .push(format!("{}/{name}", trash.path().display()));
+                        report.unrecognized_names.push(name.clone());
                     }
                     crate::phase_telemetry::add("checkout_trash_unrecognized", Duration::ZERO);
                 }
             }
-            // Recorded entries no longer present are forgotten: a pending
-            // row whose rename never happened, or an entry already deleted.
-            entries.retain(|name, _| listed.contains(name));
-            // A pending row whose entry is present was renamed; its
-            // identity is re-checked on the pinned directory below.
-            for row in entries.values_mut() {
-                row.pending = false;
+            // A pending row is never deleted while its creator may still
+            // run (the move may be mid-way). Once the creator is proven
+            // gone, an entry that still matches the recorded identity is
+            // confirmed; a mismatch, or no entry, drops the row.
+            let mut dropped = Vec::new();
+            for (name, row) in entries.iter_mut() {
+                let present = listed.contains(name);
+                if !row.pending {
+                    if !present {
+                        dropped.push(name.clone());
+                    }
+                    continue;
+                }
+                if !creator_gone(row, table.as_ref()) {
+                    continue;
+                }
+                let matches = present
+                    && fstatat_nofollow(trash.trash.as_raw_fd(), name).is_ok_and(|stat| {
+                        #[allow(clippy::unnecessary_cast)]
+                        let identity = (stat.st_dev as u64, stat.st_ino as u64);
+                        is_directory(&stat) && identity == (row.device, row.inode)
+                    });
+                if matches {
+                    row.pending = false;
+                    crate::phase_telemetry::add("checkout_trash_pending_confirmed", Duration::ZERO);
+                } else {
+                    dropped.push(name.clone());
+                }
+            }
+            for name in dropped {
+                entries.remove(&name);
             }
             let mut order = entries
                 .iter()
-                .filter(|(name, _)| is_broker_entry_name(name))
+                .filter(|(name, row)| is_broker_entry_name(name) && !row.pending)
                 .map(|(name, row)| (row.failures >= TRASH_FAILURE_REPORT_AFTER, name.clone()))
                 .collect::<Vec<_>>();
             order.sort();
@@ -794,11 +868,36 @@ pub(crate) fn drain_trash(
                     crate::phase_telemetry::add("checkout_trash_unrecognized", Duration::ZERO);
                     continue;
                 }
+                // The pinned directory must still be this trash's entry, at
+                // the start and every batch: anything that moved it away
+                // stops its deletion.
+                let trash_fd = trash.trash.as_raw_fd();
+                let still_in_trash = || {
+                    fstatat_nofollow(trash_fd, &name).is_ok_and(|stat| {
+                        #[allow(clippy::unnecessary_cast)]
+                        let identity = (stat.st_dev as u64, stat.st_ino as u64);
+                        identity == (row.device, row.inode)
+                    })
+                };
+                if !still_in_trash() {
+                    report.unrecognized += 1;
+                    continue;
+                }
+                let left_trash = std::cell::Cell::new(false);
                 let mut limiter = UnlinkLimiter::new(pace);
+                let mut since_check = 0_u32;
                 match pinned.remove_with_progress_and_observed_file_bytes_and_guard(
                     None,
                     Some(deadline),
                     || {
+                        since_check += 1;
+                        if since_check >= TRASH_LOCATION_CHECK_EVERY {
+                            since_check = 0;
+                            if !still_in_trash() {
+                                left_trash.set(true);
+                                return Err(std::io::Error::other("the entry left the trash"));
+                            }
+                        }
                         limiter.before_unlink();
                         Ok(())
                     },
@@ -818,6 +917,15 @@ pub(crate) fn drain_trash(
                         report.unlinks = report.unlinks.saturating_add(unlinks);
                         report.bytes = report.bytes.saturating_add(bytes);
                         break 'dirs;
+                    }
+                    Err(error) if left_trash.get() => {
+                        report.unlinks = report.unlinks.saturating_add(error.entries_reclaimed);
+                        report.unrecognized += 1;
+                        entries.remove(&name);
+                        crate::phase_telemetry::add(
+                            "checkout_trash_entry_moved_away",
+                            Duration::ZERO,
+                        );
                     }
                     Err(error) => {
                         report.unlinks = report.unlinks.saturating_add(error.entries_reclaimed);
@@ -1165,52 +1273,125 @@ mod tests {
         assert_eq!(resumed.entries_pending, 0);
     }
 
-    /// The row is written before the rename, with the source's identity,
-    /// which the rename keeps: a pending row whose entry exists is deleted
-    /// like any other; one whose rename never happened is dropped.
+    /// A move whose environments cannot be destroyed changes nothing: no
+    /// row is written and nothing enters the trash.
     #[test]
-    fn a_pending_row_is_written_first_and_reconciled() {
+    fn a_failed_environment_destruction_moves_nothing() {
         let fixture = Fixture::new();
         let checkout = fixture.checkout("one");
-        let mut recorded = Vec::new();
+        FAIL_ENVIRONMENT_DESTROY.with(|flag| flag.set(true));
+        let mut recorded = 0;
+        let result = move_worktree_to_trash(
+            &fixture.repo,
+            &fixture.common(),
+            &fixture.pool,
+            &checkout,
+            3,
+            &mut |_, _, _| {
+                recorded += 1;
+                Ok(())
+            },
+        );
+        FAIL_ENVIRONMENT_DESTROY.with(|flag| flag.set(false));
+        assert!(result.is_err());
+        assert_eq!(recorded, 0, "no pending row");
+        assert!(checkout.join("base.txt").exists());
+        let entries = std::fs::read_dir(fixture.pool.join(TRASH_DIR))
+            .map(|listing| {
+                listing
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_name() != TRASH_MARKER)
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(entries, 0, "nothing entered the trash");
+    }
+
+    /// Move one checkout, capturing its pending row instead of confirming.
+    fn move_unconfirmed(fixture: &Fixture, name: &str) -> (TrashedCheckout, TrashRow) {
+        let checkout = fixture.checkout(name);
+        let mut pending = None;
         let trashed = move_worktree_to_trash(
             &fixture.repo,
             &fixture.common(),
             &fixture.pool,
             &checkout,
             3,
-            &mut |dir, entry, row| {
-                recorded.push((dir.to_path_buf(), entry.to_string(), row));
-                // The checkout has not moved yet when the row is written.
-                assert!(checkout.exists());
+            &mut |_, _, row| {
+                pending = Some(row);
                 Ok(())
             },
         )
         .unwrap();
-        let (dir, entry, pending) = recorded.pop().unwrap();
+        (trashed, pending.expect("a pending row was written first"))
+    }
+
+    fn rows_with(trashed: &TrashedCheckout, row: TrashRow) -> TrashRows {
+        let mut rows = TrashRows::new();
+        rows.entry(trashed.trash_dir.clone())
+            .or_default()
+            .insert(trashed.entry.clone(), row);
+        rows
+    }
+
+    /// A drain running while a move is unconfirmed (its creator, this
+    /// process, still runs) deletes nothing and keeps the row.
+    #[test]
+    fn an_unconfirmed_move_is_never_deleted() {
+        let fixture = Fixture::new();
+        let (trashed, pending) = move_unconfirmed(&fixture, "one");
         assert!(pending.pending);
         assert_eq!(
             (pending.device, pending.inode),
-            (trashed.row.device, trashed.row.inode)
+            (trashed.row.device, trashed.row.inode),
+            "the source identity survives the rename"
         );
+        let mut rows = rows_with(&trashed, pending);
+        let report = drain_trash(
+            &mut rows,
+            Instant::now() + Duration::from_secs(600),
+            DeleterPace::Unpaced,
+        );
+        assert_eq!(report.entries_removed, 0, "{report:?}");
+        assert!(trashed.path().join("base.txt").exists());
+        assert_eq!(rows.values().map(BTreeMap::len).sum::<usize>(), 1);
+    }
 
-        // The confirmation was lost: the pending row alone still deletes it.
-        let mut rows = TrashRows::new();
-        rows.entry(dir.clone()).or_default().insert(entry, pending);
-        // A rename that never happened: its pending row is dropped.
-        let mut ghost = pending;
-        ghost.inode = ghost.inode.wrapping_add(1);
-        rows.entry(dir)
-            .or_default()
-            .insert("0000000000001-3-1-1".to_string(), ghost);
+    /// A pending row whose creator is gone is confirmed only when its entry
+    /// still has the recorded identity; otherwise the row is dropped and the
+    /// entry left alone.
+    #[test]
+    fn a_dead_creators_pending_row_is_confirmed_only_on_identity() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        child.wait().unwrap();
+        let dead = i64::from(child.id());
+        let fixture = Fixture::new();
+
+        let (matching, mut row) = move_unconfirmed(&fixture, "one");
+        row.creator_pid = dead;
+        row.creator_started_ms = 1;
+        let mut rows = rows_with(&matching, row);
         let report = drain_trash(
             &mut rows,
             Instant::now() + Duration::from_secs(600),
             DeleterPace::Unpaced,
         );
         assert_eq!(report.entries_removed, 1, "{report:?}");
-        assert!(!trashed.path().exists());
-        assert!(rows.is_empty(), "{rows:?}");
+        assert!(!matching.path().exists());
+
+        let (mismatched, mut row) = move_unconfirmed(&fixture, "two");
+        row.creator_pid = dead;
+        row.creator_started_ms = 1;
+        row.inode = row.inode.wrapping_add(1);
+        let mut rows = rows_with(&mismatched, row);
+        let report = drain_trash(
+            &mut rows,
+            Instant::now() + Duration::from_secs(600),
+            DeleterPace::Unpaced,
+        );
+        assert_eq!(report.entries_removed, 0, "{report:?}");
+        assert!(mismatched.path().join("base.txt").exists());
+        assert!(rows.is_empty(), "the unmatched row is dropped");
     }
 
     /// The rename never replaces an existing destination, so a failed move

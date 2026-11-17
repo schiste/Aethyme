@@ -3008,11 +3008,26 @@ fn push_checkout_retirement_advice(
             commands: Vec::new(),
         });
     }
+    if progress.retired_pins > 0 {
+        view.advice.push(StatusAdvice {
+            id: "cleanup.retired-pins",
+            severity: StatusAdviceSeverity::Info,
+            reason: "commits only a retired checkout's reflog reached are pinned under refs/aethyme/retired/ until another ref holds them or their session has been cleaned for recovery_archive_days",
+            summary: format!(
+                "{} retired-commit pin(s) under refs/aethyme/retired/",
+                progress.retired_pins
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: Vec::new(),
+            commands: vec!["git for-each-ref refs/aethyme/retired/".into()],
+        });
+    }
     if !progress.unrecognized_trash_entries.is_empty() {
         view.advice.push(StatusAdvice {
             id: "cleanup.trash-unrecognized",
             severity: StatusAdviceSeverity::Notice,
-            reason: "the checkout trash holds entries the broker did not record; they are left alone",
+            reason: "the checkout trash holds entries the broker did not record; they are left alone (names only)",
             summary: format!(
                 "{} unrecognized checkout trash entr(y/ies)",
                 progress.unrecognized_trash_entries.len()

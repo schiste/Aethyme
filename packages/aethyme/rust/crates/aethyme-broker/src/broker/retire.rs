@@ -71,6 +71,8 @@ pub(crate) const RETIRE_STALLED_RUNS: u32 = 3;
 const RETIRE_KEEP_BACKOFF_MS: [i64; 3] = [3_600_000, 6 * 3_600_000, 24 * 3_600_000];
 /// Remembered keeps at most; the oldest go first.
 const RETIRE_KEEPS_MAX: usize = 4_096;
+/// The longest the fresh process-use observation before a rename may take.
+const RETIRE_PROCESS_USE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 /// Inline retirement after an automatic close runs only with at least this
 /// much of the caller's deadline left, and uses at most this much.
 const RETIRE_INLINE_MIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
@@ -201,6 +203,7 @@ fn kept_counter(code: &'static str) -> &'static str {
         "archive_failed" => "checkout_retirement_kept_archive_failed",
         "archive_cleanup_failed" => "checkout_retirement_kept_archive_cleanup_failed",
         "deadline" => "checkout_retirement_kept_deadline",
+        "deferred_to_lane" => "checkout_retirement_kept_deferred_to_lane",
         _ => "checkout_retirement_kept_other",
     }
 }
@@ -240,6 +243,9 @@ pub(crate) struct RetireRun {
     process_table: crate::session_holder::RecordedHolderProcessTable,
     plan_context: Option<crate::cleanup_resolve::CleanupResolveRetirementContext>,
     deadline: Instant,
+    /// Inline retirement at close: only the clean, no-archive path; anything
+    /// needing an archive is left to the lane.
+    inline: bool,
 }
 
 /// What one retirement run did.
@@ -269,6 +275,31 @@ pub(crate) struct CheckoutRetirementProgress {
     pub reported_trash_entries: Vec<String>,
     #[serde(default)]
     pub unrecognized_trash_entries: Vec<String>,
+    /// Refs under `refs/aethyme/retired/` still pinning reflog-only commits.
+    #[serde(default)]
+    pub retired_pins: usize,
+}
+
+/// Run Git in `dir`, bounded by the general Git limit, and return stdout.
+fn run_git_text(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let mut command = crate::git::git_command();
+    command.args(args).current_dir(dir);
+    match crate::bounded_output::output_limited(
+        &mut command,
+        crate::git::git_timeout(),
+        64 * 1024 * 1024,
+    ) {
+        Ok(crate::bounded_output::LimitedOutput::Completed(output)) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        Ok(crate::bounded_output::LimitedOutput::Completed(output)) => Err(format!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Ok(_) => Err(format!("git {}: stopped at its limit", args.join(" "))),
+        Err(error) => Err(format!("git {}: {error}", args.join(" "))),
+    }
 }
 
 /// The key a remembered keep is bound to: the checkout's HEAD and index
@@ -524,7 +555,10 @@ impl Broker {
             Err(error) => return Err(refuse(format!("cannot read the operation state: {error}"))),
         }
         let mut fresh = crate::session_holder::RecordedHolderProcessTable::default();
-        match fresh.process_use_snapshot_for_retirement(Path::new("/"), None) {
+        match fresh.process_use_snapshot_for_retirement(
+            Path::new("/"),
+            Some(Instant::now() + RETIRE_PROCESS_USE_BUDGET),
+        ) {
             Some(snapshot) => {
                 if let Some(reason) =
                     crate::reclaim::open_file_snapshot_blocker_for_worktree(snapshot, worktree)
@@ -543,28 +577,7 @@ impl Broker {
     /// `refs/aethyme/retired/<session_id>/<commit>`, one ref per tip, so
     /// removing the worktree's registration and reflog loses no commit.
     fn pin_reflog_only_commits(&self, session_id: i64, worktree: &Path) -> Result<(), String> {
-        let run = |dir: &Path, args: &[&str]| -> Result<String, String> {
-            let mut command = crate::git::git_command();
-            command.args(args).current_dir(dir);
-            match crate::bounded_output::output_limited(
-                &mut command,
-                crate::git::git_timeout(),
-                64 * 1024 * 1024,
-            ) {
-                Ok(crate::bounded_output::LimitedOutput::Completed(output))
-                    if output.status.success() =>
-                {
-                    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-                }
-                Ok(crate::bounded_output::LimitedOutput::Completed(output)) => Err(format!(
-                    "git {}: {}",
-                    args.join(" "),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )),
-                Ok(_) => Err(format!("git {}: stopped at its limit", args.join(" "))),
-                Err(error) => Err(format!("git {}: {error}", args.join(" "))),
-            }
-        };
+        let run = run_git_text;
         let listing = run(
             worktree,
             &["rev-list", "--parents", "--reflog", "--not", "--all"],
@@ -598,6 +611,60 @@ impl Broker {
         Ok(())
     }
 
+    /// Expire `refs/aethyme/retired/<session>/<commit>` pins: a pin goes once
+    /// its commit is contained in another ref (the default branch included),
+    /// or once its session has been cleaned for `recovery_archive_days` (0
+    /// keeps pins forever); never otherwise. Returns the pins left.
+    pub(crate) fn prune_retired_pins(&self) -> Result<usize, String> {
+        let root = self.main_root().to_path_buf();
+        let listing = run_git_text(
+            &root,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/aethyme/retired/",
+            ],
+        )?;
+        let days = crate::load_retention_policy(&root)
+            .map(|policy| policy.recovery_archive_days)
+            .unwrap_or(30);
+        let now = crate::clock::epoch_ms();
+        let mut remaining = 0;
+        for line in listing.lines() {
+            let Some((refname, commit)) = line.split_once(' ') else {
+                continue;
+            };
+            let contained = run_git_text(
+                &root,
+                &["for-each-ref", "--contains", commit, "--format=%(refname)"],
+            )?
+            .lines()
+            .any(|other| !other.starts_with("refs/aethyme/retired/"));
+            let session_cleaned_long_ago = days > 0
+                && refname
+                    .strip_prefix("refs/aethyme/retired/")
+                    .and_then(|rest| rest.split('/').next())
+                    .and_then(|id| id.parse::<i64>().ok())
+                    .and_then(|id| self.store_ref().session(id).ok())
+                    .is_some_and(|session| {
+                        session.cleanup_state == crate::SessionCleanupState::Cleaned
+                            && session.cleanup_completed_at.is_some_and(|cleaned| {
+                                now.saturating_sub(cleaned) > i64::from(days) * 86_400_000
+                            })
+                    });
+            if contained || session_cleaned_long_ago {
+                run_git_text(&root, &["update-ref", "-d", refname, commit])?;
+                crate::phase_telemetry::add(
+                    "checkout_retirement_pins_expired",
+                    std::time::Duration::ZERO,
+                );
+            } else {
+                remaining += 1;
+            }
+        }
+        Ok(remaining)
+    }
+
     /// Take the evidence one retirement run shares: the open sessions'
     /// checkout paths, resolved once. `None` when they could not be resolved
     /// before `deadline`.
@@ -621,6 +688,7 @@ impl Broker {
             process_table: crate::session_holder::RecordedHolderProcessTable::default(),
             plan_context: None,
             deadline,
+            inline: false,
         }))
     }
 
@@ -666,7 +734,10 @@ impl Broker {
         let outcome = self
             .begin_checkout_retirement_run(inline_deadline)
             .and_then(|run| match run {
-                Some(mut run) => self.retire_closed_checkout(session_id, &mut run).map(Some),
+                Some(mut run) => {
+                    run.inline = true;
+                    self.retire_closed_checkout(session_id, &mut run).map(Some)
+                }
                 None => Ok(None),
             });
         match outcome {
@@ -794,6 +865,10 @@ impl Broker {
             || plan.unstaged_patch_bytes > 0
             || !plan.untracked_files.is_empty()
             || !plan.ignored_files.is_empty();
+        if preserves && run.inline {
+            // The archive writer is not bounded by a close's pass.
+            return Ok(Kept("deferred_to_lane"));
+        }
         run_before_retire_claim();
         if !preserves {
             // Everything is in Git: no archive. Re-check under the
@@ -956,6 +1031,13 @@ impl Broker {
             );
         }
         report.trash = self.drain_checkout_trash(deadline);
+        let retired_pins = match self.prune_retired_pins() {
+            Ok(remaining) => remaining,
+            Err(error) => {
+                crate::warn_unrecorded::<(), _>("expire retired-commit pins", Err(error));
+                self.checkout_retirement_progress().retired_pins
+            }
+        };
         let kept = report.kept.values().sum::<usize>();
         let previous = self.checkout_retirement_progress();
         let shrinking = report.retired_clean + report.retired_archived > 0
@@ -971,6 +1053,7 @@ impl Broker {
             },
             reported_trash_entries: report.trash.reported.clone(),
             unrecognized_trash_entries: report.trash.unrecognized_names.clone(),
+            retired_pins,
         };
         crate::warn_unrecorded(
             "record checkout retirement progress",
@@ -1106,6 +1189,11 @@ impl Broker {
         let refuse = |reason: String| BrokerOpError::DirtyWorktree {
             id: session.id,
             reason,
+        };
+        let Some(_claim) = self.try_claim_worktree_lifecycle()? else {
+            return Err(refuse(
+                "another checkout lifecycle operation is running; retry in a moment".into(),
+            ));
         };
         if let Ok(root) = self.recovery_archive_root()
             && let Ok(listing) = std::fs::read_dir(&root)
@@ -1704,6 +1792,8 @@ mod tests {
                     session_id: session.id,
                     failures: 0,
                     pending: false,
+                    creator_pid: 0,
+                    creator_started_ms: 0,
                 },
             )
             .unwrap();
@@ -1778,5 +1868,74 @@ mod tests {
             .to_string();
         assert!(error.contains("README.md"), "{error}");
         assert!(!dirty_path.exists());
+    }
+
+    /// Recreating a retired checkout takes the lifecycle claim: while
+    /// another holder has it, nothing is created.
+    #[test]
+    fn recreating_a_retired_checkout_takes_the_lifecycle_claim() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (_session, path) = closed(&mut broker, "claimed", |_| {});
+        assert_eq!(run(&mut broker).retired_clean, 1);
+        let held = broker.try_claim_worktree_lifecycle().unwrap().unwrap();
+        let error = broker
+            .recreate_retired_checkout(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lifecycle"), "{error}");
+        assert!(!path.exists());
+        drop(held);
+        assert!(broker.recreate_retired_checkout(&path).unwrap());
+    }
+
+    /// A retired-commit pin expires once another ref holds its commit, is
+    /// counted in status meanwhile, and is never pruned otherwise.
+    #[test]
+    fn retired_commit_pins_expire_only_when_held_elsewhere_or_old() {
+        let (_owner, _storage, mut broker) = fixture();
+        let mut lost = String::new();
+        let (session, _) = closed(&mut broker, "pinned", |worktree| {
+            std::fs::write(worktree.join("work.txt"), "only in the reflog\n").unwrap();
+            git(worktree, &["add", "work.txt"]);
+            git(worktree, &["commit", "-qm", "soon unreachable"]);
+            lost = git(worktree, &["rev-parse", "HEAD"]).trim().to_string();
+            git(worktree, &["reset", "-q", "--hard", "HEAD~1"]);
+        });
+        assert_eq!(run(&mut broker).retired_clean, 1);
+        let pin = format!("refs/aethyme/retired/{}/{lost}", session.id);
+        let root = broker.main_root().to_path_buf();
+        assert_eq!(
+            broker.prune_retired_pins().unwrap(),
+            1,
+            "kept while only it holds the commit"
+        );
+        assert_eq!(broker.checkout_retirement_progress().retired_pins, 1);
+        let view = broker.status(crate::clock::epoch_ms()).unwrap();
+        assert!(
+            view.advice
+                .iter()
+                .any(|advice| advice.id == "cleanup.retired-pins")
+        );
+
+        git(&root, &["branch", "keeps-it", &lost]);
+        assert_eq!(broker.prune_retired_pins().unwrap(), 0);
+        assert!(!git_status(&root, &["rev-parse", "--verify", &pin]));
+    }
+
+    /// Inline retirement at close takes only the clean path: a checkout that
+    /// needs an archive is left to the lane.
+    #[test]
+    fn inline_retirement_leaves_archives_to_the_lane() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "needs an archive", |worktree| {
+            std::fs::write(worktree.join("notes.txt"), "leftover\n").unwrap();
+        });
+        broker
+            .retire_inline_after_close(session.id, Some(Instant::now() + Duration::from_secs(600)));
+        assert!(worktree.join("notes.txt").exists());
+        assert!(!is_cleaned(&broker, session.id));
+        assert!(archives(&broker, session.id).is_empty());
+        let report = run(&mut broker);
+        assert_eq!(report.retired_archived, 1, "the lane archives it");
     }
 }
