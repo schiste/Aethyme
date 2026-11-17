@@ -58,11 +58,32 @@ pub(crate) struct ReservationRecord {
     pub(crate) created_at_ms: i64,
 }
 
+/// The reason every removal lane records when it refuses a reserved path.
+pub(crate) const START_IN_PROGRESS: &str = "start_in_progress";
+
+/// Destinations this process holds reservations for. Its own rollback may
+/// remove them; every other remover refuses (see [`refuse_if_start_in_progress`]).
+fn held_here() -> &'static std::sync::Mutex<std::collections::BTreeSet<PathBuf>> {
+    static HELD: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    HELD.get_or_init(Default::default)
+}
+
+fn comparable(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| {
+        path.parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .zip(path.file_name())
+            .map_or_else(|| path.to_path_buf(), |(parent, name)| parent.join(name))
+    })
+}
+
 /// A live reservation held by this process. Dropping it releases it.
 #[derive(Debug)]
 pub(crate) struct StartReservation {
     file: Option<File>,
     lock_path: PathBuf,
+    worktree_path: Option<PathBuf>,
 }
 
 impl StartReservation {
@@ -76,6 +97,11 @@ impl StartReservation {
         let Some(file) = self.file.take() else {
             return;
         };
+        if let Some(path) = self.worktree_path.take()
+            && let Ok(mut held) = held_here().lock()
+        {
+            held.remove(&path);
+        }
         if same_inode(&self.lock_path, &file) {
             crate::warn_unrecorded(
                 "remove the start reservation file",
@@ -224,6 +250,7 @@ pub(crate) fn reserve(
     let mut reservation = StartReservation {
         file: Some(file),
         lock_path,
+        worktree_path: None,
     };
     let record = ReservationRecord {
         pid: std::process::id(),
@@ -246,7 +273,14 @@ pub(crate) fn reserve(
         std::fs::create_dir_all(parent)?;
     }
     match std::fs::create_dir(worktree_path) {
-        Ok(()) => Ok(Reserve::Reserved(reservation)),
+        Ok(()) => {
+            let held = comparable(worktree_path);
+            if let Ok(mut set) = held_here().lock() {
+                set.insert(held.clone());
+            }
+            reservation.worktree_path = Some(held);
+            Ok(Reserve::Reserved(reservation))
+        }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             drop(reservation);
             Ok(Reserve::Taken)
@@ -410,27 +444,45 @@ fn live_records(main_root: &Path) -> Vec<ReservationRecord> {
     live
 }
 
-/// Whether a running start has reserved `path`. Lanes that act on checkouts
-/// no session row claims yet (storage's stray-directory review) refuse such a
-/// path.
+/// Whether a running `broker start` has reserved checkout `path` of the
+/// repository whose primary checkout is `main_root`: its reservation file
+/// exists and its lock is held (by any process, this one included). This is
+/// the stable helper every lane that retires, trashes, cleans, strips or
+/// removes a checkout consults under the lifecycle claim.
 pub(crate) fn path_is_reserved(main_root: &Path, path: &Path) -> bool {
-    let wanted = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    live_records(main_root).iter().any(|record| {
-        record.worktree_path == path
-            || record
-                .worktree_path
-                .canonicalize()
-                .is_ok_and(|reserved| reserved == wanted)
-    })
-}
-
-/// Live reservations whose checkout Git has not registered yet. The checkout
-/// limit counts them, since each is about to become a registration.
-pub(crate) fn in_flight_unregistered_count(main_root: &Path) -> usize {
+    let wanted = comparable(path);
     live_records(main_root)
         .iter()
-        .filter(|record| !record.worktree_path.join(".git").exists())
-        .count()
+        .any(|record| record.worktree_path == path || comparable(&record.worktree_path) == wanted)
+}
+
+/// Refuse removing `path` while another start has it reserved; `Err` carries
+/// the recorded reason, starting with [`START_IN_PROGRESS`]. A reservation this
+/// process holds is its own start's rollback and is allowed.
+pub(crate) fn refuse_if_start_in_progress(main_root: &Path, path: &Path) -> Result<(), String> {
+    if held_here()
+        .lock()
+        .is_ok_and(|held| held.contains(&comparable(path)))
+    {
+        return Ok(());
+    }
+    if path_is_reserved(main_root, path) {
+        return Err(format!(
+            "{START_IN_PROGRESS}: a running broker start has reserved {}; it is not removed",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Checkout paths of live reservations. Each one is a checkout that has no
+/// session row yet (a start releases its reservation once its row is
+/// committed), so the checkout limit and the free-space reserve count them.
+pub(crate) fn live_reserved_paths(main_root: &Path) -> Vec<PathBuf> {
+    live_records(main_root)
+        .into_iter()
+        .map(|record| record.worktree_path)
+        .collect()
 }
 
 /// Test seam: runs once, on this thread, after `start` released the
@@ -486,6 +538,24 @@ pub(crate) fn write_dead_reservation(
     .unwrap();
 }
 
+/// What a start running in another process holds: a reservation whose lock
+/// is held, but not one this process's own rollback may remove. Dropping the
+/// returned file releases it.
+#[cfg(test)]
+pub(crate) fn hold_foreign_reservation(
+    main_root: &Path,
+    slug: &str,
+    destination: &Path,
+    branch: &str,
+    base: &str,
+) -> File {
+    write_dead_reservation(main_root, slug, destination, branch, base);
+    let directory = reservations_directory(main_root).unwrap();
+    let file = open_existing(&reservation_path(&directory, slug)).unwrap();
+    file.lock().unwrap();
+    file
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,14 +578,28 @@ mod tests {
         assert!(destination.is_dir());
         assert!(slug_is_reserved(root.path(), "task"));
         assert!(path_is_reserved(root.path(), &destination));
-        assert_eq!(in_flight_unregistered_count(root.path()), 1);
+        assert_eq!(live_reserved_paths(root.path()), vec![destination.clone()]);
         assert!(matches!(
             reserve(root.path(), "task", &destination, "agent/task", "base").unwrap(),
             Reserve::Taken
         ));
+        // This process's own reservation is its rollback's to remove.
+        assert!(refuse_if_start_in_progress(root.path(), &destination).is_ok());
         reservation.release();
         assert!(!slug_is_reserved(root.path(), "task"));
         assert!(!path_is_reserved(root.path(), &destination));
+    }
+
+    #[test]
+    fn another_start_s_reservation_is_refused_with_start_in_progress() {
+        let root = main_root();
+        let destination = root.path().join("pool/task");
+        std::fs::create_dir_all(&destination).unwrap();
+        let held = hold_foreign_reservation(root.path(), "task", &destination, "agent/task", "b");
+        let reason = refuse_if_start_in_progress(root.path(), &destination).unwrap_err();
+        assert!(reason.starts_with(START_IN_PROGRESS), "{reason}");
+        drop(held);
+        assert!(refuse_if_start_in_progress(root.path(), &destination).is_ok());
     }
 
     #[test]

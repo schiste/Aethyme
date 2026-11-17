@@ -3051,15 +3051,27 @@ see:
   `start` (the lease-holder refresh's abandoned close, for one) answer busy
   without touching the lock, as they did while `start` held it.
 - **Slug choice** treats a reserved slug as taken even before its path or
-  branch exists.
-- **Checkout limit** counts live reservations whose destination has no `.git`
-  yet as checkouts.
-- **Storage stray-directory apply** refuses a path a live reservation holds
-  (`a running broker start has reserved this checkout path`). Cleanup, GC,
-  retirement and missing-checkout lanes act only on session rows, which a
-  reserved checkout does not have until it is registered, so they cannot
-  reach it; Git marks a worktree `locked` ("initializing") while `worktree
-  add` runs, so `git worktree prune` keeps it.
+  branch exists, and never hands out a path any session row records, cleaned
+  rows included (schema v65 adds the index `sessions_by_worktree_path`;
+  compatible, floor stays v60). Otherwise a lane acting on the old row could
+  reach the new checkout while `worktree add` runs.
+- **Checkout limit** counts every live reservation as a checkout (each has no
+  session row yet). One whose checkout Git already registered is counted
+  twice until its row lands.
+- **Free-space reserve.** Storage admission subtracts, per live reservation,
+  the median recorded size of checkouts under the pool root (at least
+  256 MiB) from the free space it compares with the reserve.
+- **Removal lanes refuse reserved checkouts.** Every checkout removal goes
+  through `GitRepo::worktree_remove`/`worktree_remove_registered` or
+  `checkout_trash::move_worktree_to_trash`; each refuses a path another
+  process's live reservation holds, with an error starting
+  `start_in_progress:` that the lane records as its reason (a start's own
+  rollback is allowed). Storage stray-directory apply refuses one too
+  (`a running broker start has reserved this checkout path`). The shared
+  helper is `start_reservation::path_is_reserved(main_root, path) -> bool`
+  (reservation file present and its lock held); lanes check it under the
+  lifecycle claim. Git also marks a worktree `locked` ("initializing") while
+  `worktree add` runs, so `git worktree prune` keeps it.
 - **Nested-destination check** no longer runs `git worktree list` (17 s over
   857 registrations on the busiest repository): it walks from the
   destination's parent up to the pool root and refuses if any of them holds a

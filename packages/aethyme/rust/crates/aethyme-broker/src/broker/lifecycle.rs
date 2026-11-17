@@ -25,6 +25,10 @@ const CHECKOUT_CAPACITY_LOCK_WAIT: std::time::Duration = crate::gc::GC_LOCK_FORE
 /// The removal budget `broker start` spends at the checkout limit before it
 /// refuses.
 const CHECKOUT_CAPACITY_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+/// The least space one in-flight start is assumed to still need, when
+/// nothing better is measured: the storage admission of a concurrent start
+/// subtracts it per live reservation.
+const IN_FLIGHT_CHECKOUT_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
 
 fn timed_start_phase<T>(
     phases: &mut std::collections::BTreeMap<String, u64>,
@@ -8000,6 +8004,11 @@ impl Broker {
                 self.claim_worktree_lifecycle()
             })?;
         let mut reserve_hold_started = std::time::Instant::now();
+        // Reap first, so a dead start's reservation counts against neither
+        // the checkout limit nor the free-space reserve below.
+        let reap = timed_start_phase(&mut phase_timings_ms, "start_reservation_reap", || {
+            self.reap_stale_start_reservations()
+        });
         let full = timed_start_phase(&mut phase_timings_ms, "checkout_count", || {
             self.worktree_checkout_limit()
         })?;
@@ -8055,9 +8064,6 @@ impl Broker {
         timed_start_phase(&mut phase_timings_ms, "storage_admission", || {
             self.preflight_session_checkout_storage(&placement)
         })?;
-        let reap = timed_start_phase(&mut phase_timings_ms, "start_reservation_reap", || {
-            self.reap_stale_start_reservations()
-        });
         // Choose the unique branch and destination and reserve both. Nothing
         // after the reservation can fail while the wide claim is held, so the
         // reserved (empty) destination never outlives its reservation without
@@ -10312,10 +10318,13 @@ impl Broker {
     }
 
     fn worktree_checkout_limit(&self) -> Result<Option<(usize, u32)>, BrokerOpError> {
-        // Starts already reserved but not yet registered by Git are about to
-        // become registrations; count them so concurrent starts outside the
-        // lifecycle claim cannot overshoot the limit.
-        let in_flight = crate::start_reservation::in_flight_unregistered_count(&self.main_root);
+        // Every live start reservation is a checkout with no session row yet
+        // (its start releases it once the row is committed); count each so
+        // concurrent starts outside the lifecycle claim cannot overshoot the
+        // limit. A reservation whose `worktree add` already registered the
+        // checkout is counted twice until its row lands: conservative, and
+        // only for that short window.
+        let in_flight = crate::start_reservation::live_reserved_paths(&self.main_root).len();
         let usage = self
             .worktree_checkout_usage()?
             .map(|(count, maximum)| (count + in_flight, maximum));
@@ -10378,6 +10387,15 @@ impl Broker {
         placement: &WorktreePlacement,
     ) -> Result<(), BrokerOpError> {
         let configured_minimum = self.configured_worktree_minimum(placement.source)?;
+        // Starts holding reservations passed this check before their
+        // `worktree add`, which now runs outside the lifecycle claim; their
+        // checkouts will still consume space, so count them against it.
+        let in_flight = crate::start_reservation::live_reserved_paths(&self.main_root).len();
+        let in_flight_bytes = if in_flight == 0 {
+            0
+        } else {
+            (in_flight as u64).saturating_mul(self.estimated_checkout_bytes(&placement.root))
+        };
         preflight_worktree_root(
             &self.main_root,
             &placement.root,
@@ -10387,13 +10405,30 @@ impl Broker {
             crate::verification::removable_volume_unavailable_reason,
             |candidate| {
                 crate::disk_headroom::available_headroom_at_or_above_for(&self.main_root, candidate)
-                    .map(|headroom| headroom.bytes)
+                    .map(|headroom| headroom.bytes.saturating_sub(in_flight_bytes))
             },
         )
         .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
             path: placement.root.clone(),
             reason,
         })
+    }
+
+    /// Expected size of one new checkout under `root`: the median of the
+    /// recorded sizes of checkouts directly under it, never below
+    /// [`IN_FLIGHT_CHECKOUT_FLOOR_BYTES`].
+    fn estimated_checkout_bytes(&self, root: &Path) -> u64 {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let records = crate::measurement::load_size_records(&self.main_root);
+        let mut sizes = records
+            .records
+            .iter()
+            .filter(|(path, _)| Path::new(path).parent() == Some(root.as_path()))
+            .map(|(_, record)| record.bytes)
+            .collect::<Vec<_>>();
+        sizes.sort_unstable();
+        let median = sizes.get(sizes.len() / 2).copied().unwrap_or(0);
+        median.max(IN_FLIGHT_CHECKOUT_FLOOR_BYTES)
     }
 
     fn worktree_root_marker_exists_or_empty(&self, root: &Path) -> Result<bool, BrokerOpError> {
@@ -10697,6 +10732,26 @@ impl Broker {
         }
     }
 
+    /// Whether a session row records `path` (as given or under the
+    /// canonical root). An unreadable store counts as recorded.
+    fn session_row_records_path(&self, path: &Path) -> bool {
+        let given = path.to_string_lossy().into_owned();
+        let canonical = path
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .zip(path.file_name())
+            .map(|(parent, name)| parent.join(name).to_string_lossy().into_owned());
+        let mut candidates = vec![given.as_str()];
+        if let Some(canonical) = canonical.as_deref()
+            && canonical != given
+        {
+            candidates.push(canonical);
+        }
+        self.store
+            .any_session_records_worktree(&candidates)
+            .unwrap_or(true)
+    }
+
     pub(super) fn next_worktree_slug(&self, task: &str, worktree_root: &Path) -> String {
         let base = slugify(task);
         for attempt in 0..1000 {
@@ -10707,10 +10762,14 @@ impl Broker {
             };
             let branch = format!("refs/heads/agent/{slug}");
             let worktree_path = worktree_root.join(&slug);
-            // A reserved slug is taken even before its path or branch exists.
+            // A reserved slug is taken even before its path or branch exists,
+            // and so is a path any session row records, cleaned ones included:
+            // lanes acting on that old row would otherwise reach the new
+            // checkout while `worktree add` runs outside the lifecycle claim.
             if !worktree_path.exists()
                 && self.repo.resolve_ref(&branch).is_none()
                 && !crate::start_reservation::slug_is_reserved(&self.main_root, &slug)
+                && !self.session_row_records_path(&worktree_path)
             {
                 return slug;
             }

@@ -204,3 +204,70 @@ fn a_dead_start_never_loses_a_checkout_it_completed() {
         "kept"
     ));
 }
+
+#[test]
+fn a_path_a_cleaned_session_recorded_is_never_handed_out_again() {
+    let repo = repository();
+    let storage = crate::test_storage::TestStorage::new();
+    let mut broker = storage.open(repo.path()).unwrap();
+    let old = broker.start_worktree("reused name", None).unwrap();
+    let old_path = PathBuf::from(&old.worktree_path);
+    // The old checkout and branch are gone; only the cleaned row remains.
+    git(
+        repo.path(),
+        &["worktree", "remove", "--force", &old.worktree_path],
+    );
+    git(repo.path(), &["branch", "-D", &old.branch]);
+    broker
+        .store()
+        .set_session_status(old.id, crate::types::SessionStatus::Cleaned, None)
+        .unwrap();
+    assert!(!old_path.exists());
+
+    let new = broker.start_worktree("reused name", None).unwrap();
+    assert_ne!(PathBuf::from(&new.worktree_path), old_path);
+    assert_eq!(new.branch, "agent/reused-name-2");
+}
+
+#[test]
+fn every_removal_lane_refuses_a_checkout_another_start_reserved() {
+    let repo = repository();
+    let storage = crate::test_storage::TestStorage::new();
+    let mut broker = storage.open(repo.path()).unwrap();
+    let session = broker.start_worktree("racing", None).unwrap();
+    let path = PathBuf::from(&session.worktree_path);
+    let base = git(repo.path(), &["rev-parse", "HEAD"]);
+    let held = crate::start_reservation::hold_foreign_reservation(
+        repo.path(),
+        "racing",
+        &path,
+        "agent/racing",
+        &base,
+    );
+    let main = crate::git::GitRepo::discover(repo.path()).unwrap();
+
+    for error in [
+        main.worktree_remove(&path, true).unwrap_err().to_string(),
+        main.worktree_remove_registered(&path, true)
+            .unwrap_err()
+            .to_string(),
+    ] {
+        assert!(error.contains("start_in_progress"), "{error}");
+    }
+    let common = main.git_common_dir().unwrap();
+    let error = crate::checkout_trash::move_worktree_to_trash(
+        &main,
+        &common,
+        path.parent().unwrap(),
+        &path,
+        session.id,
+        &mut |_, _, _| panic!("nothing is recorded for a reserved checkout"),
+    )
+    .unwrap_err();
+    assert!(error.contains("start_in_progress"), "{error}");
+    assert!(path.join(".git").exists());
+
+    drop(held);
+    main.worktree_remove(&path, true).unwrap();
+    assert!(!path.exists());
+}

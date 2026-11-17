@@ -642,6 +642,28 @@ impl BrokerStore {
             .map_err(Into::into)
     }
 
+    /// Whether any session row, cleaned ones included, records one of
+    /// `worktree_paths`. Uses `sessions_by_worktree_path` (v65).
+    pub(crate) fn any_session_records_worktree(
+        &self,
+        worktree_paths: &[&str],
+    ) -> Result<bool, BrokerError> {
+        for path in worktree_paths {
+            let found = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM sessions WHERE worktree_path = ?1 LIMIT 1",
+                    params![path],
+                    |_| Ok(()),
+                )
+                .optional()?;
+            if found.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The latest session recorded for `worktree_path`, whatever its state.
     pub(crate) fn latest_session_for_worktree_any_state(
         &self,
