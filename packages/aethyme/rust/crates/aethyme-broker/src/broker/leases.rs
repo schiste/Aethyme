@@ -906,19 +906,27 @@ fn process_use_verdict(
             AbandonedSessionCloseOutcome::OperationEvidenceUnavailable
         });
     };
-    // The broker's own state under the primary checkout's `.aethyme/` (its
-    // database, locks and logs, open in every broker process) is not anyone
-    // using the checkout: without this, a session adopted on the primary
-    // checkout could never close.
+    // The broker's own state files under the primary checkout's `.aethyme/`
+    // (its database, locks, logs and runtime records, open in every broker
+    // process) are not anyone using the checkout: without this, a session
+    // adopted on the primary checkout could never close. Nothing else there
+    // is excluded (review checkouts live under `.aethyme/reviews/`), never a
+    // working directory, and nothing at all when the session's own checkout
+    // is under the state directory.
     let state_dir = root.join(".aethyme");
+    let checkout_in_state_dir = worktree.starts_with(&state_dir)
+        || std::fs::canonicalize(worktree).is_ok_and(|real| real.starts_with(&state_dir));
     let without_broker_state;
     let open_files = match open_files {
         crate::reclaim::OpenFileSnapshot::Complete(uses)
-            if uses.iter().any(|open| open.path.starts_with(&state_dir)) =>
+            if !checkout_in_state_dir
+                && uses
+                    .iter()
+                    .any(|open| is_broker_state_file(open, &state_dir)) =>
         {
             without_broker_state = crate::reclaim::OpenFileSnapshot::Complete(
                 uses.iter()
-                    .filter(|open| !open.path.starts_with(&state_dir))
+                    .filter(|open| !is_broker_state_file(open, &state_dir))
                     .cloned()
                     .collect(),
             );
@@ -946,6 +954,32 @@ fn process_use_verdict(
         )),
     };
     verdict.map(|(reason, outcome)| keep_with(process_table, reason, outcome))
+}
+
+/// Whether `open` is one of the broker's own state files under `state_dir`
+/// (the primary checkout's `.aethyme/`): the database and its siblings
+/// (`broker.db`, `-wal`, `-shm`, `-journal`, its bootstrap lock), a lock file
+/// directly in it, or anything under `run/`, `logs/` or `locks/`. A working
+/// directory never is.
+pub(crate) fn is_broker_state_file(
+    open: &crate::reclaim::OpenFileUse,
+    state_dir: &std::path::Path,
+) -> bool {
+    if open.descriptor == "cwd" {
+        return false;
+    }
+    let Ok(relative) = open.path.strip_prefix(state_dir) else {
+        return false;
+    };
+    let mut components = relative.components();
+    let Some(first) = components.next() else {
+        return false;
+    };
+    let first = first.as_os_str().to_string_lossy();
+    if components.next().is_some() {
+        return matches!(first.as_ref(), "run" | "logs" | "locks");
+    }
+    first.starts_with("broker.db") || first.ends_with(".lock")
 }
 
 /// The checkout's HEAD commit, or `None` when it cannot be read.
@@ -6887,6 +6921,48 @@ mod generic_guarded_exec_tests {
             )
             .unwrap();
         old_ms
+    }
+
+    #[test]
+    fn only_broker_state_files_and_never_a_working_directory_are_broker_state() {
+        let state = Path::new("/repo/.aethyme");
+        let open = |descriptor: &str, path: &str| crate::reclaim::OpenFileUse {
+            pid: 1,
+            command: "x".into(),
+            descriptor: descriptor.into(),
+            file_type: None,
+            path: path.into(),
+        };
+        for ignored in [
+            "/repo/.aethyme/broker.db",
+            "/repo/.aethyme/broker.db-wal",
+            "/repo/.aethyme/broker.db-shm",
+            "/repo/.aethyme/broker.db-journal",
+            "/repo/.aethyme/gc.lock",
+            "/repo/.aethyme/run/worktree-lifecycle.lock",
+            "/repo/.aethyme/logs/command-metrics.jsonl",
+            "/repo/.aethyme/locks/session-7.lock",
+        ] {
+            assert!(
+                super::is_broker_state_file(&open("3u", ignored), state),
+                "{ignored}"
+            );
+        }
+        for kept in [
+            "/repo/.aethyme/reviews/pr-7/code/src/lib.rs",
+            "/repo/.aethyme/worktrees/task/file.rs",
+            "/repo/.aethyme",
+            "/repo/src/lib.rs",
+        ] {
+            assert!(
+                !super::is_broker_state_file(&open("3u", kept), state),
+                "{kept}"
+            );
+        }
+        assert!(
+            !super::is_broker_state_file(&open("cwd", "/repo/.aethyme/run"), state),
+            "a working directory is never broker state"
+        );
     }
 
     #[test]

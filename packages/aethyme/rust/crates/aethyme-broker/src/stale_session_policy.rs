@@ -422,13 +422,16 @@ pub(crate) fn latest_closing_soon_note(
     store: &crate::BrokerStore,
     session_id: i64,
 ) -> Result<Option<(i64, Option<i64>)>, crate::BrokerError> {
+    // The newest by the time it was left (then by id), whatever order the
+    // store lists notes in.
     Ok(store
         .automation_notes(session_id)?
         .into_iter()
-        .find(|note| {
+        .filter(|note| {
             note.sender == crate::session_auto_close::NOTE_SENDER
                 && note.fingerprint.as_deref() == Some(CLOSING_SOON_NOTE_FINGERPRINT)
         })
+        .max_by_key(|note| (note.created_at, note.id))
         .map(|note| {
             (
                 note.created_at,

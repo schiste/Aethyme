@@ -3647,6 +3647,85 @@ mod lane_tests {
         assert!(is_open(&broker, idle.id));
     }
 
+    fn opened_file(path: PathBuf) -> crate::reclaim::OpenFileSnapshot {
+        crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+            pid: std::process::id(),
+            command: "reviewer".into(),
+            descriptor: "4r".into(),
+            file_type: Some("REG".into()),
+            path,
+        }])
+    }
+
+    /// The broker's own database open under the primary checkout's
+    /// `.aethyme/` does not keep a session adopted on the primary checkout,
+    /// but a file open in a review checkout under `.aethyme/reviews/` keeps
+    /// the session bound to that checkout.
+    #[test]
+    fn only_the_brokers_own_state_files_are_ignored_by_the_open_file_check() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let root = std::fs::canonicalize(broker.main_root()).unwrap();
+        let review = root.join(".aethyme/reviews/pr-7/code");
+        std::fs::create_dir_all(review.parent().unwrap()).unwrap();
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "review-pr-7",
+                review.to_str().unwrap(),
+            ],
+        );
+        let reviewed = broker.adopt(&review, Some("review checkout")).unwrap();
+        age(&mut broker, &reviewed, 80);
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(opened_file(
+            review.join("base.txt"),
+        )));
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_abandoned_directly(&mut broker, &reviewed, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::OperationActive
+        );
+        assert_eq!(
+            table.keep_reason(),
+            Some(crate::broker::AbandonmentKeepReason::OpenFilesInCheckout)
+        );
+        assert!(is_open(&broker, reviewed.id));
+
+        let primary = broker.adopt(&root, Some("primary checkout")).unwrap();
+        age(&mut broker, &primary, 80);
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(vec![
+                crate::reclaim::OpenFileUse {
+                    pid: std::process::id(),
+                    command: "aethyme".into(),
+                    descriptor: "5u".into(),
+                    file_type: Some("REG".into()),
+                    path: root.join(".aethyme/broker.db"),
+                },
+                crate::reclaim::OpenFileUse {
+                    pid: std::process::id(),
+                    command: "aethyme".into(),
+                    descriptor: "6u".into(),
+                    file_type: Some("REG".into()),
+                    path: root.join(".aethyme/broker.db-wal"),
+                },
+            ]),
+        ));
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_abandoned_directly(&mut broker, &primary, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::Closed,
+            "{:?}",
+            table.keep_reason()
+        );
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+        ));
+    }
+
     /// A foreground command never judges: the `agents` view leaves a due
     /// session open (the shared worker closes it); a library caller still
     /// judges it inline.
