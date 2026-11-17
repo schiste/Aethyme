@@ -60,10 +60,7 @@ fn pass(host_state: &Path, roots: Vec<Root>, budgets: Budgets) -> super::Ledger 
 }
 
 fn root(path: &Path, kind: RootKind) -> Root {
-    Root {
-        path: path.to_path_buf(),
-        kind,
-    }
+    Root::new(path, kind)
 }
 
 fn empty_registry(host_state: &Path) -> PathBuf {
@@ -151,7 +148,7 @@ fn a_directory_is_a_storage_root_only_with_the_marker_and_never_a_repository() {
     fs::create_dir_all(&host_state).unwrap();
     fs::create_dir_all(named_aethyme.join("target")).unwrap();
     // Registered without the marker: not a root, whatever its name.
-    check::register_root(&host_state, &named_aethyme, RootKind::Storage);
+    check::register_root(&host_state, &named_aethyme, RootKind::Storage, None);
     let roots = check::roots(&host_state, None);
     assert!(
         !roots.iter().any(|root| root.path == named_aethyme),
@@ -296,7 +293,7 @@ fn a_gate_that_takes_the_cache_after_selection_keeps_it() {
         None
     );
     let grant = lease(&registry, "late-gate", "rust-workspace-v1");
-    let removed = evict::remove_protected(&candidate, &registry, &mut || {});
+    let removed = evict::remove_protected(&candidate, &registry, &mut || {}, None);
     assert!(
         removed
             .as_ref()
@@ -316,7 +313,7 @@ fn a_gate_that_takes_the_cache_after_selection_keeps_it() {
             &grant.ownership_token,
         )
         .unwrap();
-    evict::remove_protected(&candidate, &registry, &mut || {}).unwrap();
+    assert!(evict::remove_protected(&candidate, &registry, &mut || {}, None).unwrap());
     assert!(!cache.join("gates/example-0123/rust-workspace-v1").exists());
     assert!(evict::leased_gate_caches(&registry).unwrap().is_empty());
 }
@@ -536,7 +533,7 @@ fn a_walk_refreshes_the_heartbeat_as_it_goes() {
     assert_eq!(usage.entries, 21);
     // Deleting refreshes it too.
     let mut deletion_beats = 0;
-    evict::delete_tree(dir.path(), &mut || deletion_beats += 1).unwrap();
+    assert!(evict::delete_tree(dir.path(), &mut || deletion_beats += 1, None).unwrap());
     assert!(!dir.path().exists());
     assert!(
         deletion_beats <= 21,
@@ -590,7 +587,7 @@ fn only_writing_commands_refuse_and_only_below_the_hard_minimum() {
     let walks = super::WALKS.with(std::cell::Cell::get);
 
     // Between the minimum and the floor: no refusal (advice warns).
-    let decision = check::decide(host_state, &start, &mut |_| Some(500), &mut || {});
+    let decision = check::decide(host_state, &start, None, &mut |_| Some(500), &mut || {});
     assert_eq!(decision.refuse, None);
     assert!(
         regenerable.exists() && other.exists(),
@@ -599,7 +596,7 @@ fn only_writing_commands_refuse_and_only_below_the_hard_minimum() {
 
     // Below the minimum: the oldest regenerable entry is enough; one goes.
     let mut free = |_: &Path| Some(if other.exists() { 50 } else { 5_000 });
-    let decision = check::decide(host_state, &start, &mut free, &mut || {});
+    let decision = check::decide(host_state, &start, None, &mut free, &mut || {});
     assert_eq!(decision.refuse, None);
     assert_eq!(decision.reclaimed, 1024);
     assert!(
@@ -610,12 +607,12 @@ fn only_writing_commands_refuse_and_only_below_the_hard_minimum() {
     // A reader never refuses, even below the minimum.
     let reader = check::writes_to(&words("submit prepare status"));
     assert_eq!(
-        check::decide(host_state, &reader, &mut |_| Some(1), &mut || {}).refuse,
+        check::decide(host_state, &reader, None, &mut |_| Some(1), &mut || {}).refuse,
         None
     );
 
     // A writer still short after reclaim refuses, naming the key and override.
-    let decision = check::decide(host_state, &start, &mut |_| Some(1), &mut || {});
+    let decision = check::decide(host_state, &start, None, &mut |_| Some(1), &mut || {});
     let refusal = decision.refuse.expect("refused");
     assert!(
         refusal.contains("hard_minimum_bytes") && refusal.contains("AETHYME_STORAGE_LEDGER"),
@@ -643,14 +640,18 @@ fn worker_starts_are_rate_limited_and_skipped_while_one_runs() {
     .unwrap();
     let mut kicks = 0;
     for _ in 0..3 {
-        check::decide(host_state, &[], &mut |_| Some(500), &mut || kicks += 1);
+        check::decide(host_state, &[], None, &mut |_| Some(500), &mut || {
+            kicks += 1
+        });
     }
     assert_eq!(kicks, 1, "at most one start a minute, even below the floor");
     let mut summary = Summary::load(host_state);
     summary.last_kick_ms = 0;
     summary.save(host_state).unwrap();
     let _lock = WorkerLock::acquire(host_state).unwrap();
-    check::decide(host_state, &[], &mut |_| Some(500), &mut || kicks += 1);
+    check::decide(host_state, &[], None, &mut |_| Some(500), &mut || {
+        kicks += 1
+    });
     assert_eq!(kicks, 1, "never while a worker holds a fresh lock");
 }
 
@@ -758,4 +759,152 @@ fn links_recent_use_and_unknown_recency_keep_an_entry() {
         ..Budgets::default()
     };
     assert!(evict::plan(&ledger, &budgets, now, &Default::default()).is_empty());
+}
+
+// Second review 1: the lock token is re-read before each removal.
+#[test]
+fn a_worker_that_lost_its_lock_removes_nothing_more() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path();
+    file(&host_state.join("rollout-v0.1.0-old/files.bin"), 4096);
+    age(&host_state.join("rollout-v0.1.0-old"), 30);
+    let mut lock = WorkerLock::acquire(host_state).unwrap();
+    // Taken over by another worker, with no heartbeat in between.
+    fs::write(
+        host_state.join(check::LOCK_FILE),
+        serde_json::to_vec(&check::LockRecord {
+            pid: std::process::id(),
+            started: String::new(),
+            heartbeat_ms: super::now_ms(),
+            token: "another-worker".into(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(!lock.lost(), "the cached flag has not noticed");
+    let registry = host_state.join("host-resources.db");
+    let mut free = |_: &Path| Some((u64::MAX / 2, u64::MAX / 2));
+    let ledger = check::run_pass(
+        PassInputs {
+            host_state,
+            roots: vec![root(host_state, RootKind::HostState)],
+            budgets: Budgets::default(),
+            free: &mut free,
+            measure_budget: Duration::from_secs(60),
+            pace: Duration::ZERO,
+            registry,
+        },
+        Some(&mut lock),
+    )
+    .unwrap();
+    assert!(host_state.join("rollout-v0.1.0-old/files.bin").exists());
+    let report = ledger.last_pass.unwrap();
+    assert!(report.evicted.is_empty());
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|line| line.contains("taken over")),
+        "{report:?}"
+    );
+}
+
+// Second review 2: only this repository's worktree root counts for `start`.
+#[test]
+fn another_repositorys_full_volume_does_not_refuse_this_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path().join("state");
+    let ours = dir.path().join("our-worktrees");
+    let theirs = dir.path().join("their-worktrees");
+    let our_repository = dir.path().join("our-repository");
+    for path in [&host_state, &ours, &theirs, &our_repository] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let worktree_root = |path: &Path, repository: &Path| Root {
+        path: path.to_path_buf(),
+        kind: RootKind::WorktreeRoot,
+        repositories: vec![repository.to_path_buf()],
+    };
+    Summary {
+        updated_at_ms: super::now_ms(),
+        roots: vec![
+            root(&host_state, RootKind::HostState),
+            worktree_root(&ours, &our_repository),
+            worktree_root(&theirs, &dir.path().join("their-repository")),
+        ],
+        floor_bytes: 1000,
+        hard_minimum_bytes: 100,
+        ..Summary::default()
+    }
+    .save(&host_state)
+    .unwrap();
+    let start = check::writes_to(&["start".to_string()]);
+    let cwd = our_repository.join("src");
+    let theirs_full = |path: &Path| Some(if path == theirs { 1 } else { 5_000 });
+    let decision = check::decide(
+        &host_state,
+        &start,
+        Some(&cwd),
+        &mut { theirs_full },
+        &mut || {},
+    );
+    assert_eq!(
+        decision.refuse, None,
+        "their volume is not ours to refuse for"
+    );
+    let ours_full = |path: &Path| Some(if path == ours { 1 } else { 5_000 });
+    let decision = check::decide(
+        &host_state,
+        &start,
+        Some(&cwd),
+        &mut { ours_full },
+        &mut || {},
+    );
+    assert!(decision.refuse.is_some(), "our own worktree volume is");
+    // From inside a session worktree of ours, too.
+    let session = ours.join("repository-key/session");
+    let decision = check::decide(
+        &host_state,
+        &start,
+        Some(&session),
+        &mut { ours_full },
+        &mut || {},
+    );
+    assert!(decision.refuse.is_some());
+}
+
+// Second review 3: the reclaim deadline holds inside a deletion.
+#[test]
+fn an_interrupted_removal_leaves_its_remainder_for_the_sweep() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path();
+    for index in 0..200 {
+        file(&cache.join(format!("symbol-index/big/part-{index}")), 16);
+    }
+    let candidate = Candidate {
+        class: Class::SymbolIndex,
+        root_kind: RootKind::HostCache,
+        root: cache.to_path_buf(),
+        relative: "symbol-index/big".into(),
+        bytes: 1,
+        newest_ms: 0,
+        reason: Reason::OverBudget,
+    };
+    let finished = evict::remove(&candidate, &mut || {}, Some(Instant::now())).unwrap();
+    assert!(!finished, "the deadline stopped the deletion");
+    assert!(
+        !cache.join("symbol-index/big").exists(),
+        "gone from its live location"
+    );
+    let aside: Vec<String> = super::read_names(cache)
+        .into_iter()
+        .filter(|name| name.starts_with(".aethyme-storage-evicting-"))
+        .collect();
+    assert_eq!(aside.len(), 1, "the remainder is recorded by its name");
+    evict::sweep_aside(cache, &mut || {});
+    assert!(
+        super::read_names(cache)
+            .iter()
+            .all(|name| !name.starts_with(".aethyme-storage-evicting-"))
+    );
 }

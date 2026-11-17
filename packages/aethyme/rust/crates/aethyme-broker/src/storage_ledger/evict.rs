@@ -480,14 +480,17 @@ pub fn refuse(
 ///   its live location atomically first, so a process that opens it after
 ///   the rename finds it absent (and rebuilds), never half deleted.
 ///
-/// `Err` says why it stayed.
+/// `Ok(false)` when `deadline` interrupted the deletion after the rename:
+/// the remainder is left aside for the worker's sweep. `Err` says why it
+/// stayed.
 pub fn remove_protected(
     candidate: &Candidate,
     registry: &Path,
     beat: &mut dyn FnMut(),
-) -> Result<(), String> {
+    deadline: Option<Instant>,
+) -> Result<bool, String> {
     if candidate.class != Class::GateCache {
-        return remove(candidate, beat).map_err(|error| error.to_string());
+        return remove(candidate, beat, deadline).map_err(|error| error.to_string());
     }
     let mut parts = candidate.relative.splitn(3, '/');
     let (Some(_), Some(repository), Some(key)) = (parts.next(), parts.next(), parts.next()) else {
@@ -521,7 +524,7 @@ pub fn remove_protected(
     let grant = coordinator
         .acquire(&request)
         .map_err(|error| format!("a gate holds it ({error})"))?;
-    let removed = remove(candidate, beat).map_err(|error| error.to_string());
+    let removed = remove(candidate, beat, deadline).map_err(|error| error.to_string());
     crate::warn_unrecorded(
         "release the gate cache lease storage eviction took",
         coordinator.release(
@@ -534,8 +537,14 @@ pub fn remove_protected(
 }
 
 /// Remove a candidate: renamed aside first (so a half-removed tree is never
-/// mistaken for a valid one), then deleted without following links.
-pub fn remove(candidate: &Candidate, beat: &mut dyn FnMut()) -> std::io::Result<()> {
+/// mistaken for a valid one), then deleted without following links;
+/// `Ok(false)` when `deadline` stopped the deletion (the renamed remainder
+/// is swept by [`sweep_aside`] on the next pass).
+pub fn remove(
+    candidate: &Candidate,
+    beat: &mut dyn FnMut(),
+    deadline: Option<Instant>,
+) -> std::io::Result<bool> {
     let path = candidate.path();
     let aside = candidate.root.join(format!(
         ".aethyme-storage-evicting-{}-{}",
@@ -543,12 +552,16 @@ pub fn remove(candidate: &Candidate, beat: &mut dyn FnMut()) -> std::io::Result<
         super::now_ms()
     ));
     fs::rename(&path, &aside)?;
-    delete_tree(&aside, beat)
+    delete_tree(&aside, beat, deadline)
 }
 
 /// Delete a tree bottom up, never following a link, refreshing `beat` at
-/// least every second.
-pub fn delete_tree(path: &Path, beat: &mut dyn FnMut()) -> std::io::Result<()> {
+/// least every second; `Ok(false)` when `deadline` passed first.
+pub fn delete_tree(
+    path: &Path,
+    beat: &mut dyn FnMut(),
+    deadline: Option<Instant>,
+) -> std::io::Result<bool> {
     let mut last_beat = Instant::now();
     let mut stack = vec![(path.to_path_buf(), false)];
     while let Some((next, visited)) = stack.pop() {
@@ -574,8 +587,11 @@ pub fn delete_tree(path: &Path, beat: &mut dyn FnMut()) -> std::io::Result<()> {
             beat();
             last_beat = Instant::now();
         }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) && !stack.is_empty() {
+            return Ok(false);
+        }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Leftovers of removals interrupted after the rename.
@@ -586,7 +602,7 @@ pub fn sweep_aside(root: &Path, beat: &mut dyn FnMut()) {
         }
         crate::warn_unrecorded(
             "remove an interrupted storage eviction",
-            delete_tree(&root.join(&name), beat),
+            delete_tree(&root.join(&name), beat, None).map(drop),
         );
     }
 }

@@ -394,6 +394,36 @@ impl Budgets {
 pub struct Root {
     pub path: PathBuf,
     pub kind: RootKind,
+    /// Worktree roots: the main checkouts of the repositories whose
+    /// configured worktree root it is.
+    #[serde(default)]
+    pub repositories: Vec<PathBuf>,
+}
+
+impl Root {
+    pub fn new(path: &Path, kind: RootKind) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            kind,
+            repositories: Vec::new(),
+        }
+    }
+
+    /// Whether a command running in `cwd` writes to this root: always for
+    /// the host state and cache; for a worktree root only from inside it or
+    /// from one of its repositories.
+    pub fn written_from(&self, cwd: Option<&Path>) -> bool {
+        match self.kind {
+            RootKind::WorktreeRoot => cwd.is_some_and(|cwd| {
+                cwd.starts_with(&self.path)
+                    || self
+                        .repositories
+                        .iter()
+                        .any(|repository| cwd.starts_with(repository))
+            }),
+            _ => true,
+        }
+    }
 }
 
 /// One measured child of an entry (an archive, a gate cache key, an index).
@@ -1111,7 +1141,12 @@ impl crate::Broker {
             && let Some(root) = plan.preferred_root
             && !root.starts_with(self.main_root())
         {
-            check::register_root(&host_state, &root, RootKind::WorktreeRoot);
+            check::register_root(
+                &host_state,
+                &root,
+                RootKind::WorktreeRoot,
+                Some(self.main_root()),
+            );
         }
         cli::status_advice(&host_state)
     }

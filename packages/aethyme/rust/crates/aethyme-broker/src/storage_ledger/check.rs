@@ -95,6 +95,8 @@ impl Summary {
 struct Registered {
     path: PathBuf,
     kind: RootKind,
+    #[serde(default)]
+    repositories: Vec<PathBuf>,
 }
 
 fn registered(host_state: &Path) -> Vec<Registered> {
@@ -107,15 +109,9 @@ fn registered(host_state: &Path) -> Vec<Registered> {
 /// The roots: host state and host cache (exact), registered worktree roots
 /// (exact configured paths), and storage roots that carry the marker.
 pub fn roots(host_state: &Path, host_cache: Option<&Path>) -> Vec<Root> {
-    let mut roots = vec![Root {
-        path: host_state.to_path_buf(),
-        kind: RootKind::HostState,
-    }];
+    let mut roots = vec![Root::new(host_state, RootKind::HostState)];
     if let Some(cache) = host_cache.filter(|cache| cache.is_dir()) {
-        roots.push(Root {
-            path: cache.to_path_buf(),
-            kind: RootKind::HostCache,
-        });
+        roots.push(Root::new(cache, RootKind::HostCache));
     }
     for entry in registered(host_state) {
         let usable = entry.path.is_dir()
@@ -129,23 +125,34 @@ pub fn roots(host_state: &Path, host_cache: Option<&Path>) -> Vec<Root> {
             roots.push(Root {
                 path: entry.path,
                 kind: entry.kind,
+                repositories: entry.repositories,
             });
         }
     }
     roots
 }
 
-/// Remember an exact root (a no-op when already known).
-pub fn register_root(host_state: &Path, path: &Path, kind: RootKind) {
+/// Remember an exact root, and for a worktree root the repository whose
+/// root it is (a no-op when already known).
+pub fn register_root(host_state: &Path, path: &Path, kind: RootKind, repository: Option<&Path>) {
     let file = host_state.join(ROOTS_FILE);
     let mut known = registered(host_state);
-    if known.iter().any(|entry| entry.path == path) || path == host_state {
+    if path == host_state {
         return;
     }
-    known.push(Registered {
-        path: path.to_path_buf(),
-        kind,
-    });
+    match known.iter_mut().find(|entry| entry.path == path) {
+        Some(entry) => match repository {
+            Some(repository) if !entry.repositories.iter().any(|known| known == repository) => {
+                entry.repositories.push(repository.to_path_buf());
+            }
+            _ => return,
+        },
+        None => known.push(Registered {
+            path: path.to_path_buf(),
+            kind,
+            repositories: repository.map(Path::to_path_buf).into_iter().collect(),
+        }),
+    }
     crate::warn_unrecorded(
         "register a storage root",
         serde_json::to_vec(&known)
@@ -176,7 +183,7 @@ pub fn adopt(host_state: &Path, path: &Path) -> Result<PathBuf, String> {
         "This directory is an Aethyme storage root (`aethyme storage adopt`).\n",
     )
     .map_err(|error| error.to_string())?;
-    register_root(host_state, &path, RootKind::Storage);
+    register_root(host_state, &path, RootKind::Storage, None);
     Ok(path)
 }
 
@@ -274,6 +281,7 @@ fn worker_alive(host_state: &Path) -> bool {
 pub fn decide(
     host_state: &Path,
     writes: &[RootKind],
+    cwd: Option<&Path>,
     free: &mut dyn FnMut(&Path) -> Option<u64>,
     kick: &mut dyn FnMut(),
 ) -> Decision {
@@ -291,10 +299,7 @@ pub fn decide(
     };
     let mut decision = Decision::default();
     let roots = if summary.roots.is_empty() {
-        vec![Root {
-            path: host_state.to_path_buf(),
-            kind: RootKind::HostState,
-        }]
+        vec![Root::new(host_state, RootKind::HostState)]
     } else {
         summary.roots.clone()
     };
@@ -318,10 +323,11 @@ pub fn decide(
         summary.last_kick_ms = now;
         crate::warn_unrecorded("record a storage worker start", summary.save(host_state));
     }
-    // Only a writer, only for the volumes it writes, only below the minimum.
+    // Only a writer, only for the volumes it writes (its own repository's
+    // worktree root, not another's), only below the minimum.
     let written: Vec<&Root> = roots
         .iter()
-        .filter(|root| writes.contains(&root.kind))
+        .filter(|root| writes.contains(&root.kind) && root.written_from(cwd))
         .collect();
     let short = |free: &mut dyn FnMut(&Path) -> Option<u64>, root: &Root| {
         free(&root.path).is_some_and(|available| available < minimum)
@@ -361,10 +367,20 @@ pub fn decide(
             newest_ms: entry.newest_ms,
             reason: Reason::OverBudget,
         };
-        if evict::refuse(&candidate, leases.as_ref(), now).is_none()
-            && evict::remove_protected(&candidate, &registry, &mut || {}).is_ok()
-        {
-            decision.reclaimed += entry.bytes;
+        if evict::refuse(&candidate, leases.as_ref(), now).is_some() {
+            continue;
+        }
+        // The deadline holds inside the deletion too: an interrupted one
+        // leaves its renamed remainder, which every worker pass sweeps.
+        match evict::remove_protected(
+            &candidate,
+            &registry,
+            &mut || {},
+            Some(started + RECLAIM_TIME),
+        ) {
+            Ok(true) => decision.reclaimed += entry.bytes,
+            Ok(false) => break,
+            Err(_) => {}
         }
     }
     let still_short: Vec<String> = written
@@ -433,9 +449,11 @@ pub fn command_start(args: &[String]) -> Option<u8> {
     if !host_state.is_dir() || !enabled(&host_state) {
         return None;
     }
+    let cwd = std::env::current_dir().ok();
     let decision = decide(
         &host_state,
         &writes_to(args),
+        cwd.as_deref(),
         &mut |path| crate::disk_headroom::available_bytes(path),
         &mut || crate::warn_unrecorded("start the storage worker", spawn_worker()),
     );
@@ -744,7 +762,11 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
         if !still_needed {
             continue;
         }
-        if lock.as_deref().is_some_and(WorkerLock::lost) {
+        // A real re-read of the lock token before each removal.
+        if lock
+            .as_deref()
+            .is_some_and(|lock| lock.lost() || !lock.held())
+        {
             report
                 .skipped
                 .push("the storage worker lock was taken over".into());
@@ -762,8 +784,8 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
                 lock.beat();
             }
         };
-        match evict::remove_protected(&candidate, &inputs.registry, &mut beat) {
-            Ok(()) => {
+        match evict::remove_protected(&candidate, &inputs.registry, &mut beat, None) {
+            Ok(_) => {
                 report.evicted.push(candidate.label());
                 report.bytes_reclaimed += candidate.bytes;
                 let telemetry = ledger.telemetry.entry(candidate.class).or_default();
