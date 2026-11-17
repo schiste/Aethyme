@@ -97,15 +97,18 @@ read the `.jsonl.zst` archives natively) and manual operators. A reader of
 `status --json` `config.archive_after_days` must read
 `config.archive_after_inactive_days`; a host that relied on the old
 off-by-default must write `archive = false` (`aethyme transcripts disable`).
-Since 2026-11-17 one host-wide open-file observation serves a pass for up
-to 30 seconds (no longer one listing per provider root every 2 seconds plus
-one per removed original); `open_listings` now counts those observations.
-Archive reports and `runs.jsonl` lines gain the additive counters
-`open_observation_refreshes`, `open_files_judged`,
-`open_files_judged_max_per_observation` and `removals_refused_changed` (an
-original whose stamp changed after the observation, also counted under
-`modified_during_compression`), and `runs.jsonl` gains `open_listings`;
-lifetime counters gain `removals_refused_changed`.
+Since 2026-11-17 one host-wide open-file observation serves a pass's
+judging for up to 30 seconds, and originals are removed in batches (200
+copies or 60 seconds) judged against one observation taken after the
+batch's last copy was verified, instead of one listing per provider root
+every 2 seconds plus one per removed original; `open_listings` counts
+those observations. Archive reports and `runs.jsonl`
+lines gain the additive counters `open_observation_refreshes`,
+`open_files_judged`, `open_files_judged_max_per_observation`,
+`removal_batches`, `removals_refused_open`, `removals_refused_unobserved`
+and `removals_refused_changed` (each also counted under its skip reason),
+`runs.jsonl` gains `open_listings`, `phases_ms` gains `transcripts_remove`,
+and lifetime counters gain the three `removals_refused_*`.
 See [the guide](../guides/transcript-archiving.md).
 
 ## Opt-in MCP server launching (`aethyme mcp`)

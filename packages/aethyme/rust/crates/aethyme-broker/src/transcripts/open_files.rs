@@ -134,28 +134,9 @@ pub(crate) fn proc_open_under(proc_root: &Path, root: &Path) -> Result<Vec<OpenF
     Ok(found)
 }
 
-#[cfg(test)]
-thread_local! {
-    static TEST_CLOCK_SKEW: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
-}
-
-/// Move this thread's observation clock forward, so a test can age an
-/// observation without sleeping.
-#[cfg(test)]
-pub(crate) fn advance_test_clock(by: Duration) {
-    TEST_CLOCK_SKEW.with(|skew| skew.set(skew.get() + by));
-}
-
 /// The clock observations are aged by.
 fn now() -> Instant {
-    #[cfg(test)]
-    {
-        Instant::now() + TEST_CLOCK_SKEW.with(std::cell::Cell::get)
-    }
-    #[cfg(not(test))]
-    {
-        Instant::now()
-    }
+    Instant::now()
 }
 
 /// One host-wide observation and what was judged against it.
@@ -170,13 +151,21 @@ struct Observation {
 
 /// Open-file observations shared across a pass.
 ///
-/// Safety: a transcript is never judged, for archiving or for removing its
-/// original, against an observation older than `refresh_after`; an older
-/// one is replaced first. An incomplete observation answers
-/// [`OpenState::Unknown`] for every transcript, so nothing judged against it
-/// is archived (fail closed). A process that opens a transcript after the
-/// observation and writes to it changes its size or modification time,
-/// which the archiver re-checks immediately before unlinking the original.
+/// A transcript is never judged against an observation older than
+/// `refresh_after`; an older one is replaced first. An incomplete
+/// observation answers [`OpenState::Unknown`] for every transcript, so
+/// nothing judged against it is archived or removed (fail closed).
+///
+/// The shared observation only decides which transcripts are worth
+/// compressing. Before originals are removed the archiver [`renew`]s it, so
+/// a batch of removals is judged against one observation taken after the
+/// batch's last copy was verified. A process that opens a transcript after
+/// that observation changes its size or modification time only once it
+/// writes, which the archiver re-checks immediately before each unlink; one
+/// that opens it and has not yet written by the unlink is the residual
+/// window, now one listing per batch rather than one per transcript.
+///
+/// [`renew`]: OpenFiles::renew
 pub(crate) struct OpenFiles<P> {
     probe: P,
     refresh_after: Duration,
@@ -186,6 +175,9 @@ pub(crate) struct OpenFiles<P> {
     pub probe_time: Duration,
     /// Observations taken because the previous one had grown too old.
     pub refreshes: u64,
+    /// Observations asked for by [`renew`](Self::renew) (one per removal
+    /// batch).
+    pub renewals: u64,
     /// Transcripts judged against an observation, in total and at most per
     /// observation.
     pub judged: u64,
@@ -201,6 +193,7 @@ impl<P: OpenFileProbe> OpenFiles<P> {
             probes: 0,
             probe_time: Duration::ZERO,
             refreshes: 0,
+            renewals: 0,
             judged: 0,
             max_judged_per_observation: 0,
         }
@@ -243,8 +236,7 @@ impl<P: OpenFileProbe> OpenFiles<P> {
     }
 
     /// Whether `path` is open, from an observation at most `refresh_after`
-    /// old. Used to judge a transcript and again right before its original
-    /// is removed.
+    /// old (the one [`renew`](Self::renew) asked for, when it did).
     pub fn state_of(&mut self, path: &Path) -> OpenState {
         let canonical = fs::canonicalize(path).ok();
         let observation = self.observation();
@@ -269,10 +261,17 @@ impl<P: OpenFileProbe> OpenFiles<P> {
         state
     }
 
+    /// Make the next judgement take a new observation: used once per batch
+    /// of removals, after the batch's last copy was verified.
+    pub fn renew(&mut self) {
+        self.observation = None;
+        self.renewals += 1;
+    }
+
     /// Whether `path` is open, from an observation taken now. Used by
     /// restore, which judges one file and can afford it.
     pub fn fresh_state_of(&mut self, path: &Path) -> OpenState {
-        self.observation = None;
+        self.renew();
         self.state_of(path)
     }
 

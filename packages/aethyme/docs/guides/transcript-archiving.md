@@ -66,10 +66,14 @@ A transcript is archived only when all of these hold:
 - no process has it open, checked when the pass judges it, when archiving
   starts and again just before the original is removed (a running Codex
   keeps its transcript files open; a running Claude Code does not, which is
-  why the age rule matters). One host-wide open-file observation (`/proc`
-  on Linux, one bounded `lsof` elsewhere) serves every transcript for up to
-  30 seconds and is replaced before any check once it is older; an
-  observation that could not be taken completely archives nothing;
+  why the age rule matters). For judging, one host-wide open-file
+  observation (`/proc` on Linux, one bounded `lsof` elsewhere) serves every
+  transcript for up to 30 seconds. Originals are removed in batches (up to
+  200 copies or 60 seconds, and always at the end of a pass, when the
+  budget runs out or when space runs short), each judged against its own
+  observation taken after the batch's last copy was verified. An
+  observation that could not be taken completely archives or removes
+  nothing;
 - when it is linked to broker sessions in any repository's broker database
   known on this host, every linked session is closed or cleaned and its
   checkout directory no longer exists.
@@ -195,16 +199,22 @@ data in the drive cache), re-checked (size, mtime and inode unchanged), and
 decompressed again to compare its length and SHA-256 with the source. Only a
 verified copy is published (a no-clobber link, then a directory sync) and
 recorded in the index; any sync failure keeps the source and drops the copy.
-The source is removed last, after one more check that it is not open in
-the pass's open-file observation (never older than 30 seconds) and then,
-immediately before the unlink, that its size, mtime and inode are
-unchanged, which catches a process that opened it after the observation
-and wrote to it; if it is open, changed, or the observation was
-incomplete, the copy is discarded instead.
+The source is removed last, in a batch: it must not be open in an
+open-file observation taken after the batch's last copy was verified, and,
+checked immediately before the unlink, its size, mtime and inode must be
+unchanged. If it is open, changed, or the observation was incomplete, the
+copy is discarded instead (an incomplete observation discards the whole
+batch, so no index row ever names an archive whose original is still
+there). A process that opens a transcript after the batch observation
+changes it only once it writes; one that has opened it and not yet written
+by the unlink is the remaining window, one listing per batch.
 The original and the archive are therefore never both gone. A run killed
 after publishing leaves both; the next run verifies the archive decodes to
-exactly the source and finishes the removal. A temporary file left by a
-killed run is removed by the next run.
+exactly the source and removes the source in its own batch; if the source
+has changed since and the copy is the one this lane indexed, the stale copy
+is discarded and the source is archived afresh later, so a source and a
+divergent copy never both remain. A temporary file left by a killed run is
+removed by the next run.
 
 ## Confinement and privacy
 
@@ -244,10 +254,12 @@ command-metrics row, appends one line to
 `first_run_gate`, `record_tails_read`, eligible count and bytes, archived
 count, bytes in and out, skips by reason, and the open-file counters
 `open_listings` (observations taken), `open_observation_refreshes`,
-`open_files_judged`, `open_files_judged_max_per_observation` and
-`removals_refused_changed`), and adds to lifetime counters
+`open_files_judged`, `open_files_judged_max_per_observation`,
+`removal_batches`, `removals_refused_open`, `removals_refused_unobserved`
+and `removals_refused_changed`), and adds to lifetime counters
 (`examined`, `archived`, `bytes_in`, `bytes_out`, `resumed`,
-`verify_failures`, `removals_refused_changed`, `restored`,
-`skipped_<reason>`) shown by `status --json`. `transcripts_open_check` is
-the time spent taking observations. Verification decodes the whole copy
+`verify_failures`, `removals_refused_open`, `removals_refused_unobserved`,
+`removals_refused_changed`, `restored`, `skipped_<reason>`) shown by
+`status --json`. `transcripts_open_check` is the time spent taking
+observations and `transcripts_remove` the time spent removing batches. Verification decodes the whole copy
 and compares its SHA-256, but is paced on the compressed bytes it reads.

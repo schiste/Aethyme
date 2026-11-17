@@ -30,6 +30,12 @@ pub const STATUS_SCHEMA: &str = "aethyme.transcripts-status/v1";
 /// an older observation is replaced before it is used again. Each costs
 /// most of a second on a busy host, so one per transcript dominated a pass.
 pub(crate) const OPEN_LISTING_MAX_AGE: Duration = Duration::from_secs(30);
+/// Published copies whose originals are removed together, judged against
+/// one open-file observation taken after the last of them was verified;
+/// a batch is also flushed once its first copy is this old, when space
+/// runs out, and at the end of every pass.
+pub(crate) const REMOVAL_BATCH_FILES: usize = 200;
+pub(crate) const REMOVAL_BATCH_AGE: Duration = Duration::from_secs(60);
 /// Wall time one background-worker pass may spend; the next pass resumes.
 pub(crate) const WORKER_RUN_BUDGET: Duration = Duration::from_secs(10 * 60);
 /// Examples of skipped transcripts a report lists (all are counted).
@@ -269,9 +275,14 @@ pub struct RunReport {
     /// by one observation.
     pub open_files_judged: u64,
     pub open_files_judged_max_per_observation: u64,
-    /// Originals kept because their size, mtime or identity changed between
-    /// the observation and the unlink (also counted as
-    /// `modified_during_compression`).
+    /// Batches of removals, each judged against its own observation.
+    pub removal_batches: u64,
+    /// Originals kept at removal, and their copies discarded: open in the
+    /// batch observation (also `open_by_process`), the batch observation
+    /// incomplete (also `open_check_unavailable`), or changed in size, mtime
+    /// or identity since compression (also `modified_during_compression`).
+    pub removals_refused_open: u64,
+    pub removals_refused_unobserved: u64,
     pub removals_refused_changed: u64,
     /// Full syncs that fell back to `fsync` (macOS file systems refusing
     /// `F_FULLFSYNC`).
@@ -318,6 +329,9 @@ impl RunReport {
             open_observation_refreshes: 0,
             open_files_judged: 0,
             open_files_judged_max_per_observation: 0,
+            removal_batches: 0,
+            removals_refused_open: 0,
+            removals_refused_unobserved: 0,
             removals_refused_changed: 0,
             full_sync_fallbacks: 0,
             paced_bytes_per_second: None,
@@ -378,6 +392,14 @@ impl RunReport {
         );
         counters.insert("reconciled_missing".to_string(), self.reconciled_missing);
         counters.insert("full_sync_fallbacks".to_string(), self.full_sync_fallbacks);
+        counters.insert(
+            "removals_refused_open".to_string(),
+            self.removals_refused_open,
+        );
+        counters.insert(
+            "removals_refused_unobserved".to_string(),
+            self.removals_refused_unobserved,
+        );
         counters.insert(
             "removals_refused_changed".to_string(),
             self.removals_refused_changed,
@@ -526,6 +548,9 @@ fn append_run_log(host_dir: &Path, report: &RunReport) {
         "open_observation_refreshes": report.open_observation_refreshes,
         "open_files_judged": report.open_files_judged,
         "open_files_judged_max_per_observation": report.open_files_judged_max_per_observation,
+        "removal_batches": report.removal_batches,
+        "removals_refused_open": report.removals_refused_open,
+        "removals_refused_unobserved": report.removals_refused_unobserved,
         "removals_refused_changed": report.removals_refused_changed,
         "budget_exhausted": report.budget_exhausted,
         "paced_bytes_per_second": report.paced_bytes_per_second,
@@ -821,6 +846,82 @@ impl Pass<'_> {
             .map(|headroom| headroom.bytes)
     }
 
+    /// Remove the originals of a batch of published copies, judged against
+    /// one host-wide open-file observation taken now, after the batch's last
+    /// copy was verified. A source that is open in it, or changed since it
+    /// was compressed, keeps its place and its copy is discarded. An
+    /// incomplete observation removes nothing and discards every copy of
+    /// the batch: the pass's state is then exactly as before it compressed
+    /// them (no index row for an archive whose original is still there), at
+    /// the cost of compressing them again on a later pass.
+    fn flush_removals<P: OpenFileProbe>(
+        &self,
+        pending: &mut Vec<archive::Published>,
+        transcripts: &mut Vec<Transcript>,
+        probes: &mut Probes<'_, P>,
+        report: &mut RunReport,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        let started = Instant::now();
+        report.removal_batches += 1;
+        probes.open_files.renew();
+        for (published, transcript) in pending.drain(..).zip(transcripts.drain(..)) {
+            let Some((source, destination)) = self.roots.for_provider(transcript.provider) else {
+                report.skip(
+                    &transcript,
+                    SkipReason::UnsafePath,
+                    "provider root failed validation",
+                );
+                continue;
+            };
+            let confinement = archive::Confinement {
+                source,
+                destination,
+            };
+            match archive::remove_published(
+                self.index,
+                probes.open_files,
+                &transcript,
+                &confinement,
+                published.before,
+            ) {
+                Ok(()) => {
+                    let done = published.archived;
+                    report.bytes_in += done.bytes_in;
+                    report.bytes_out += done.bytes_out;
+                    if done.resumed {
+                        report.resumed += 1;
+                    }
+                    report.archived.push(ArchivedView {
+                        provider: transcript.provider,
+                        path: transcript.path.clone(),
+                        destination: transcript.destination.clone(),
+                        bytes_in: done.bytes_in,
+                        bytes_out: done.bytes_out,
+                        sha256: done.sha256,
+                        resumed: done.resumed,
+                    });
+                }
+                Err(skipped) => {
+                    match skipped.reason {
+                        SkipReason::OpenByProcess => report.removals_refused_open += 1,
+                        SkipReason::OpenCheckUnavailable => {
+                            report.removals_refused_unobserved += 1;
+                        }
+                        SkipReason::ModifiedDuringCompression => {
+                            report.removals_refused_changed += 1;
+                        }
+                        _ => {}
+                    }
+                    report.skip(&transcript, skipped.reason, &skipped.detail);
+                }
+            }
+        }
+        report.phase("transcripts_remove", started.elapsed());
+    }
+
     fn archive_eligible<P: OpenFileProbe>(
         &self,
         mut remaining: Vec<Transcript>,
@@ -832,7 +933,17 @@ impl Pass<'_> {
         let mut pacer = Pacer::new(Some(self.config.effective_bytes_per_second()));
         let mut compress = Duration::ZERO;
         let mut verify = Duration::ZERO;
+        // Published copies whose originals are still in place; removed in
+        // batches (see `flush_removals`), and always before this returns.
+        let mut pending: Vec<archive::Published> = Vec::new();
+        let mut pending_transcripts: Vec<Transcript> = Vec::new();
+        let mut batch_started = Instant::now();
         while !remaining.is_empty() {
+            if pending.len() >= REMOVAL_BATCH_FILES
+                || (!pending.is_empty() && batch_started.elapsed() >= REMOVAL_BATCH_AGE)
+            {
+                self.flush_removals(&mut pending, &mut pending_transcripts, probes, report);
+            }
             if self
                 .options
                 .budget
@@ -852,6 +963,11 @@ impl Pass<'_> {
                     pacing::fits(available, transcript.bytes).then_some((position, available))
                 });
             let Some((position, available)) = chosen else {
+                if !pending.is_empty() {
+                    // Removing the batch's originals frees their space.
+                    self.flush_removals(&mut pending, &mut pending_transcripts, probes, report);
+                    continue;
+                }
                 report.insufficient_space = true;
                 for _ in 0..remaining.len() {
                     report.count_skip(SkipReason::InsufficientSpace);
@@ -905,29 +1021,17 @@ impl Pass<'_> {
                 pacer: &mut pacer,
                 hooks: &mut *hooks,
                 now_ms: self.now_ms,
-                removals_refused_changed: 0,
             };
-            let outcome = archive::archive_one(&mut context, &transcript, &confinement);
-            report.removals_refused_changed += context.removals_refused_changed;
-            match outcome {
-                Ok(done) => {
+            match archive::archive_one(&mut context, &transcript, &confinement) {
+                Ok(published) => {
                     super::best_effort(self.index.clear_conflict(&transcript.path));
-                    compress += done.compress_time;
-                    verify += done.verify_time;
-                    report.bytes_in += done.bytes_in;
-                    report.bytes_out += done.bytes_out;
-                    if done.resumed {
-                        report.resumed += 1;
+                    compress += published.archived.compress_time;
+                    verify += published.archived.verify_time;
+                    if pending.is_empty() {
+                        batch_started = Instant::now();
                     }
-                    report.archived.push(ArchivedView {
-                        provider: transcript.provider,
-                        path: transcript.path.clone(),
-                        destination: transcript.destination.clone(),
-                        bytes_in: done.bytes_in,
-                        bytes_out: done.bytes_out,
-                        sha256: done.sha256,
-                        resumed: done.resumed,
-                    });
+                    pending.push(published);
+                    pending_transcripts.push(transcript);
                 }
                 Err(skipped) => {
                     if skipped.reason == SkipReason::DestinationConflict {
@@ -940,6 +1044,8 @@ impl Pass<'_> {
                 }
             }
         }
+        // Every exit from the loop (done, budget, no space) lands here.
+        self.flush_removals(&mut pending, &mut pending_transcripts, probes, report);
         report.paced_bytes_per_second = pacer.rate();
         report.pacing_slept_ms = pacer.slept().as_millis() as u64;
         report.phase("transcripts_compress", compress);

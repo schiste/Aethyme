@@ -13,21 +13,23 @@
 //! 4. decompress the temporary file and compare its length and SHA-256 with
 //!    the source's; any difference discards it and skips;
 //! 5. publish it with a no-clobber `linkat` and flush the directory (any
-//!    sync failure removes the copy and keeps the source), record the index
-//!    row, then check the source once more: not open in the pass's shared
-//!    open-file observation (never older than its refresh interval), and
-//!    then, immediately before the unlink, unchanged in size, mtime, inode
-//!    and device, which catches a writer that opened it after the
-//!    observation;
-//! 6. only then unlink the source (relative to its validated root, and only
-//!    if its identity is still the one compressed) and flush its directory.
+//!    sync failure removes the copy and keeps the source) and record the
+//!    index row ([`archive_one`] stops here and returns a [`Published`]);
+//! 6. later, in a batch ([`remove_published`]): check the source is not
+//!    open in a host-wide open-file observation taken after the batch's
+//!    last copy was verified, and that its size, mtime, inode and device
+//!    are still the ones compressed, then unlink it (relative to its
+//!    validated root) and flush its directory; otherwise discard the copy.
 //!
 //! The source is never removed before a verified, durable copy exists, and
 //! the copy is only ever removed while the source still exists, so the two
 //! are never both gone. A crash between steps 5 and 6 leaves both; the next
-//! run finds the destination, verifies it decodes to exactly the source's
-//! bytes, and finishes the removal. A crash before step 5 leaves a temporary
-//! file, which the next run removes.
+//! run finds the destination and verifies it decodes to exactly the
+//! source's bytes, then removes the source in its own batch. If the source
+//! changed meanwhile and the copy is the one this lane indexed, the stale
+//! copy is discarded, so a source and a divergent copy of it never both
+//! remain. A crash before step 5 leaves a temporary file, which the next
+//! run removes.
 //!
 //! Every file operation goes through [`super::safe_fs`]: no symbolic link is
 //! followed beneath a provider root and no mount point is crossed.
@@ -202,9 +204,6 @@ pub(crate) struct ArchiveContext<'a, P> {
     pub pacer: &'a mut Pacer,
     pub hooks: &'a mut dyn Hooks,
     pub now_ms: i64,
-    /// Originals kept because their size, mtime or identity changed between
-    /// the open-file observation and the unlink (telemetry).
-    pub removals_refused_changed: u64,
 }
 
 fn row_for(
@@ -243,24 +242,36 @@ impl Entries {
     }
 }
 
-/// Remove the source once a verified, durable copy exists. Otherwise
-/// remove the (stale) copy instead.
+/// A verified, durable, indexed copy whose source is still in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Published {
+    pub archived: Archived,
+    /// The source as it was compressed.
+    pub before: Stamp,
+}
+
+/// Remove the source of a [`Published`] copy, or discard the copy.
 ///
-/// Safety: the source must be closed in the pass's shared open-file
-/// observation, which [`OpenFiles`] never lets grow older than its refresh
-/// interval and which fails closed when incomplete. A process that opened
-/// the source after that observation and wrote to it has changed its size
-/// or mtime, so the stamp is compared after the open check, immediately
-/// before the unlink (and once more by `unlink_if` itself).
-fn remove_source<P: OpenFileProbe>(
-    context: &mut ArchiveContext<'_, P>,
+/// The caller judges a whole batch against one host-wide observation it
+/// renewed after the batch's last copy was verified
+/// ([`OpenFiles::renew`]). Safety: the source is unlinked only when that
+/// observation is complete and does not show it open, and, checked after
+/// it, its size, mtime, inode and device are still the ones compressed
+/// (once here and once more by `unlink_if`). Anything else discards the
+/// copy and keeps the source. Residual window: a process that opens the
+/// source after the batch observation and has not written by the unlink
+/// would write to the unlinked file; that window is one listing per batch.
+pub(crate) fn remove_published<P: OpenFileProbe>(
+    index: &Index,
+    open_files: &mut OpenFiles<P>,
     transcript: &Transcript,
-    entries: &Entries,
+    confinement: &Confinement<'_>,
     before: Stamp,
 ) -> Result<(), Skipped> {
-    let open = context.open_files.state_of(&transcript.path);
+    let entries = entries_for(transcript, confinement, false)?;
+    let open = open_files.state_of(&transcript.path);
     if open != OpenState::Closed {
-        entries.discard_copy(context.index, transcript);
+        entries.discard_copy(index, transcript);
         let reason = if open == OpenState::Open {
             SkipReason::OpenByProcess
         } else {
@@ -268,7 +279,7 @@ fn remove_source<P: OpenFileProbe>(
         };
         return Err(Skipped::new(
             reason,
-            "source opened, or its open state is unknown, before removal; copy discarded",
+            "source open, or its open state unknown, before removal; copy discarded",
         ));
     }
     let unchanged = entries
@@ -276,8 +287,7 @@ fn remove_source<P: OpenFileProbe>(
         .stamp(&entries.source_name)
         .is_ok_and(|now| now == before);
     if !unchanged {
-        entries.discard_copy(context.index, transcript);
-        context.removals_refused_changed += 1;
+        entries.discard_copy(index, transcript);
         return Err(Skipped::new(
             SkipReason::ModifiedDuringCompression,
             "source changed before removal; copy discarded",
@@ -293,6 +303,28 @@ fn remove_source<P: OpenFileProbe>(
     Ok(())
 }
 
+/// Open the source and destination entries beneath their roots.
+fn entries_for(
+    transcript: &Transcript,
+    confinement: &Confinement<'_>,
+    create_destination: bool,
+) -> Result<Entries, Skipped> {
+    let (source_dir, source_name) = confinement
+        .source
+        .parent_of(&transcript.path, false)
+        .map_err(|error| unsafe_path(&transcript.path, &error))?;
+    let (destination_dir, destination_name) = confinement
+        .destination
+        .parent_of(&transcript.destination, create_destination)
+        .map_err(|error| unsafe_path(&transcript.destination, &error))?;
+    Ok(Entries {
+        source_dir,
+        source_name,
+        destination_dir,
+        destination_name,
+    })
+}
+
 /// Finish an archive an interrupted run published but did not complete:
 /// the destination must decode to exactly the source's bytes.
 fn resume<P: OpenFileProbe>(
@@ -300,7 +332,7 @@ fn resume<P: OpenFileProbe>(
     transcript: &Transcript,
     entries: &Entries,
     before: Stamp,
-) -> Result<Archived, Skipped> {
+) -> Result<Published, Skipped> {
     let started = Instant::now();
     let (source_file, opened) = entries
         .source_dir
@@ -323,6 +355,22 @@ fn resume<P: OpenFileProbe>(
     let copy = digest_compressed(copy_file, context.pacer)
         .map_err(|error| conflict(format!("{destination} exists and does not decode: {error}")))?;
     if copy != source {
+        let ours = context
+            .index
+            .archive_for(&transcript.path)
+            .ok()
+            .flatten()
+            .is_some_and(|row| row.sha256 == copy.1);
+        if ours {
+            // This lane's copy of an older version of a source that has
+            // since changed: the source is the newer data, so the stale copy
+            // goes and the source is archived afresh once it is idle again.
+            entries.discard_copy(context.index, transcript);
+            return Err(Skipped::new(
+                SkipReason::ModifiedDuringCompression,
+                "source changed after an earlier run published its copy; stale copy discarded",
+            ));
+        }
         return Err(conflict(format!(
             "{destination} exists with different content"
         )));
@@ -358,14 +406,16 @@ fn resume<P: OpenFileProbe>(
             .record_archive(&row)
             .map_err(|error| Skipped::new(SkipReason::Io, error))?;
     }
-    remove_source(context, transcript, entries, before)?;
-    Ok(Archived {
-        bytes_in: source.0,
-        bytes_out: copy_stamp.len,
-        sha256: source.1,
-        resumed: true,
-        compress_time: Duration::ZERO,
-        verify_time,
+    Ok(Published {
+        archived: Archived {
+            bytes_in: source.0,
+            bytes_out: copy_stamp.len,
+            sha256: source.1,
+            resumed: true,
+            compress_time: Duration::ZERO,
+            verify_time,
+        },
+        before,
     })
 }
 
@@ -376,12 +426,14 @@ fn unsafe_path(path: &Path, error: &io::Error) -> Skipped {
     )
 }
 
-/// Archive one transcript (see the module documentation for the steps).
+/// Archive one transcript up to a published, indexed copy (steps 1-5 of the
+/// module documentation); the source is removed later, in a batch, by
+/// [`remove_published`].
 pub(crate) fn archive_one<P: OpenFileProbe>(
     context: &mut ArchiveContext<'_, P>,
     transcript: &Transcript,
     confinement: &Confinement<'_>,
-) -> Result<Archived, Skipped> {
+) -> Result<Published, Skipped> {
     if transcript.path.to_str().is_none() || transcript.destination.to_str().is_none() {
         return Err(Skipped::new(
             SkipReason::UnsupportedPath,
@@ -531,14 +583,16 @@ pub(crate) fn archive_one<P: OpenFileProbe>(
             "stopped after publishing",
         ));
     }
-    remove_source(context, transcript, &entries, before)?;
-    Ok(Archived {
-        bytes_in,
-        bytes_out,
-        sha256,
-        resumed: false,
-        compress_time,
-        verify_time,
+    Ok(Published {
+        archived: Archived {
+            bytes_in,
+            bytes_out,
+            sha256,
+            resumed: false,
+            compress_time,
+            verify_time,
+        },
+        before,
     })
 }
 
