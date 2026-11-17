@@ -26,6 +26,7 @@ mod open_files;
 mod pacing;
 mod providers;
 mod run;
+mod safe_fs;
 #[cfg(test)]
 mod tests;
 
@@ -119,9 +120,27 @@ pub(crate) fn ensure_private_directory(directory: &Path) -> io::Result<()> {
     crate::host_state::protect_host_state_path(directory, true)
 }
 
+/// Discard the outcome of best-effort cleanup: removing a temporary file,
+/// syncing a directory, dropping a stale row a later pass reconciles.
+pub(crate) fn best_effort<T, E>(_outcome: Result<T, E>) {}
+
 /// fsync a directory, best effort.
 pub(crate) fn sync_directory(directory: &Path) {
-    archive::sync_directory(directory);
+    if let Ok(handle) = fs::File::open(directory) {
+        best_effort(handle.sync_all());
+    }
+}
+
+/// Create `path` if absent with mode 0600 (never widening an existing
+/// file's mode, always narrowing it to 0600).
+pub(crate) fn ensure_private_file(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    crate::host_state::protect_host_state_path(path, false)
 }
 
 pub(crate) fn now_ms() -> i64 {
@@ -146,7 +165,9 @@ impl LaneLock {
     /// `None` when another process holds it.
     pub fn try_acquire(host_dir: &Path) -> io::Result<Option<Self>> {
         ensure_private_directory(host_dir)?;
-        let file = crate::file_lock::open_lock_file(&host_dir.join(LOCK_FILE))?;
+        let path = host_dir.join(LOCK_FILE);
+        let file = crate::file_lock::open_lock_file(&path)?;
+        crate::host_state::protect_host_state_path(&path, false)?;
         let Some(lock) = crate::file_lock::ExclusiveFileLock::try_acquire(file)? else {
             return Ok(None);
         };

@@ -89,16 +89,17 @@ pub(crate) struct Index {
 impl Index {
     /// Open (creating when absent) the index under `host_dir`.
     pub fn open(host_dir: &Path) -> Result<Self, String> {
+        // The index names transcripts: it is created 0600 in a 0700
+        // directory before SQLite opens it (SQLite gives its journal the
+        // database file's mode).
         super::ensure_private_directory(host_dir)
-            .map_err(|error| format!("cannot create {}: {error}", host_dir.display()))?;
+            .map_err(|error| format!("cannot create the transcript state directory: {error}"))?;
         let path = host_dir.join(INDEX_FILE);
+        super::ensure_private_file(&path)
+            .map_err(|error| format!("cannot create the transcript index: {error}"))?;
         let conn = Connection::open(&path).map_err(sql)?;
         conn.busy_timeout(Duration::from_secs(5)).map_err(sql)?;
         conn.execute_batch(SCHEMA).map_err(sql)?;
-        crate::warn_unrecorded(
-            "restrict the transcript index's permissions",
-            crate::host_state::protect_host_state_path(&path, false),
-        );
         Ok(Self { conn })
     }
 

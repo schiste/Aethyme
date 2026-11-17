@@ -54,16 +54,20 @@ pub(crate) fn known_broker_dbs(
 ) -> (Vec<PathBuf>, Vec<String>) {
     let mut found = BTreeSet::new();
     let mut warnings = Vec::new();
+    let mut missing = 0;
     for repository in repositories {
         match broker_db_for_directory(repository) {
             Some(db) => {
                 found.insert(db);
             }
-            None => warnings.push(format!(
-                "configured repository {} has no broker database",
-                repository.display()
-            )),
+            None => missing += 1,
         }
+    }
+    if missing > 0 {
+        // Counted, never named: logs carry no path outside the provider roots.
+        warnings.push(format!(
+            "{missing} configured repository(ies) have no broker database"
+        ));
     }
     if use_registry && let Ok(host_db) = crate::host_operations::default_host_operation_db_path() {
         let inventory = crate::worktree_registry::inventory(
@@ -98,9 +102,9 @@ pub(crate) fn open_broker_db(path: &Path) -> Result<Connection, String> {
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    .map_err(|error| format!("cannot open a broker database: {error}"))?;
     conn.busy_timeout(Duration::from_secs(2))
-        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+        .map_err(|error| format!("cannot open a broker database: {error}"))?;
     Ok(conn)
 }
 
@@ -137,8 +141,7 @@ fn link_for_open_file(broker_db: &Path, session_id: i64, provider: Provider, pat
 pub(crate) fn backfill(index: &Index, broker_db: &Path, now_ms: i64) -> Result<u64, String> {
     let conn = open_broker_db(broker_db)?;
     let cursor = index.backfill_cursor(broker_db)?;
-    let unreadable =
-        |error: rusqlite::Error| format!("cannot read {}: {error}", broker_db.display());
+    let unreadable = |error: rusqlite::Error| format!("cannot read a broker database: {error}");
     let mut statement = conn
         .prepare(
             "SELECT id, session_id, payload_json FROM events
@@ -372,6 +375,6 @@ pub(crate) fn note_holder_bound(
     };
     let now_ms = super::now_ms();
     for link in &links {
-        let _ = index.add_link(link, now_ms);
+        super::best_effort(index.add_link(link, now_ms));
     }
 }

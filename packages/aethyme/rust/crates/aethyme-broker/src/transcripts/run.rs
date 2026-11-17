@@ -17,6 +17,7 @@ use super::linkage::{self, BrokerDbs};
 use super::open_files::{OpenFileProbe, OpenFiles, SystemProbe};
 use super::pacing::{self, Pacer};
 use super::providers::{self, Provider, Transcript};
+use super::safe_fs::Root;
 use super::{Environment, LaneLock, TranscriptsConfig};
 
 pub const RUN_SCHEMA: &str = "aethyme.transcripts-archive/v1";
@@ -102,6 +103,9 @@ pub struct RunReport {
     pub skipped: BTreeMap<String, u64>,
     pub skipped_examples: Vec<SkippedView>,
     pub leftover_temps_removed: u64,
+    /// Index rows whose archive had been moved away (for example by
+    /// `codex unarchive`), dropped so totals never overcount.
+    pub reconciled_missing: u64,
     pub unreadable_entries: u64,
     pub scan_truncated: bool,
     pub broker_databases: u64,
@@ -133,6 +137,7 @@ impl RunReport {
             skipped: BTreeMap::new(),
             skipped_examples: Vec::new(),
             leftover_temps_removed: 0,
+            reconciled_missing: 0,
             unreadable_entries: 0,
             scan_truncated: false,
             broker_databases: 0,
@@ -179,6 +184,7 @@ impl RunReport {
             "leftover_temps_removed".to_string(),
             self.leftover_temps_removed,
         );
+        counters.insert("reconciled_missing".to_string(), self.reconciled_missing);
         for (reason, count) in &self.skipped {
             counters.insert(format!("skipped_{reason}"), *count);
         }
@@ -186,24 +192,106 @@ impl RunReport {
     }
 }
 
-fn remove_leftover_temps(paths: &[PathBuf]) -> u64 {
-    let mut removed = 0;
-    for path in paths {
-        if std::fs::remove_file(path).is_ok() {
-            removed += 1;
-            if let Some(parent) = path.parent() {
-                super::sync_directory(parent);
-            }
+/// The validated roots one pass works beneath.
+struct Roots {
+    /// The Codex home: Codex sources and their archives.
+    codex: Option<Root>,
+    /// Claude Code's `projects/` directory: Claude sources.
+    claude: Option<Root>,
+    /// Aethyme's transcript state: Claude archives.
+    state: Option<Root>,
+}
+
+/// Validate one root; a missing directory is silently absent, any other
+/// failure is a path-free warning.
+fn validated(path: Option<PathBuf>, what: &str, warnings: &mut Vec<String>) -> Option<Root> {
+    let path = path?;
+    match Root::open(&path) {
+        Ok(root) => Some(root),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            warnings.push(format!(
+                "the {what} failed validation and is skipped: {error}"
+            ));
+            None
         }
     }
-    removed
+}
+
+impl Roots {
+    fn open(
+        environment: &Environment,
+        layout: &providers::Layout,
+        warnings: &mut Vec<String>,
+    ) -> Self {
+        let state = match super::ensure_private_directory(&environment.host_dir) {
+            Ok(()) => validated(
+                Some(environment.host_dir.clone()),
+                "transcript state directory",
+                warnings,
+            ),
+            Err(error) => {
+                warnings.push(format!(
+                    "cannot create the transcript state directory: {error}"
+                ));
+                None
+            }
+        };
+        Self {
+            codex: validated(layout.codex_home.clone(), "Codex home", warnings),
+            claude: validated(
+                layout.claude_projects(),
+                "Claude projects directory",
+                warnings,
+            ),
+            state,
+        }
+    }
+
+    /// The source and destination roots for `provider`.
+    fn for_provider(&self, provider: Provider) -> Option<(&Root, &Root)> {
+        match provider {
+            Provider::Codex => self.codex.as_ref().map(|root| (root, root)),
+            Provider::Claude => self.claude.as_ref().zip(self.state.as_ref()),
+        }
+    }
+
+    fn all(&self) -> Vec<&Root> {
+        [&self.codex, &self.claude, &self.state]
+            .into_iter()
+            .filter_map(Option::as_ref)
+            .collect()
+    }
+}
+
+/// Whether an archive file is still where the index says.
+fn archive_present(row: &ArchiveRow) -> bool {
+    !matches!(
+        std::fs::symlink_metadata(&row.archive_path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// Drop index rows whose archive was moved away; returns how many.
+fn reconcile_index(index: &Index) -> Result<u64, String> {
+    let mut dropped = 0;
+    for row in index.archives()? {
+        if !archive_present(&row) {
+            index.remove_archive(&row.original_path)?;
+            dropped += 1;
+        }
+    }
+    Ok(dropped)
 }
 
 /// Append one line to `<host dir>/runs.jsonl`, rotating it past its cap.
 fn append_run_log(host_dir: &Path, report: &RunReport) {
     let path = host_dir.join(RUN_LOG);
     if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > RUN_LOG_MAX_BYTES) {
-        let _ = std::fs::rename(&path, host_dir.join(format!("{RUN_LOG}.1")));
+        super::best_effort(std::fs::rename(
+            &path,
+            host_dir.join(format!("{RUN_LOG}.1")),
+        ));
     }
     let line = serde_json::json!({
         "at_ms": super::now_ms(),
@@ -222,10 +310,8 @@ fn append_run_log(host_dir: &Path, report: &RunReport) {
         "pacing_slept_ms": report.pacing_slept_ms,
         "phases_ms": report.phases_ms,
     });
-    let written = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
+    let written = super::ensure_private_file(&path)
+        .and_then(|()| OpenOptions::new().append(true).open(&path))
         .and_then(|mut file| writeln!(file, "{line}"));
     crate::warn_unrecorded("record the transcript archive run", written);
 }
@@ -264,10 +350,7 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
                 return Ok(report);
             }
             Err(error) => {
-                return Err(format!(
-                    "cannot take the transcript archive lock in {}: {error}",
-                    environment.host_dir.display()
-                ));
+                return Err(format!("cannot take the transcript archive lock: {error}"));
             }
         }
     } else {
@@ -282,10 +365,16 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
     report.examined = scan.transcripts.len() as u64;
     report.unreadable_entries = scan.unreadable;
     report.scan_truncated = scan.truncated;
+    let roots = Roots::open(environment, &layout, &mut report.warnings);
     if options.apply {
         // Only one run holds the lock, so every temporary file is a dead
         // run's: none is being written.
-        report.leftover_temps_removed = remove_leftover_temps(&scan.leftover_temps);
+        report.leftover_temps_removed =
+            archive::remove_leftover_temps(&scan.leftover_temps, &roots.all());
+        match reconcile_index(&index) {
+            Ok(dropped) => report.reconciled_missing = dropped,
+            Err(error) => report.warnings.push(error),
+        }
     }
 
     // The age rule first: recent transcripts need no linkage work at all.
@@ -310,11 +399,18 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
     );
     report.warnings.extend(warnings);
     report.broker_databases = broker_dbs.len() as u64;
+    let mut unreadable_databases = 0;
     for db in &broker_dbs {
         match linkage::backfill(&index, db, now_ms) {
             Ok(added) => report.links_added += added,
-            Err(error) => report.warnings.push(error),
+            Err(_) => unreadable_databases += 1,
         }
+    }
+    if unreadable_databases > 0 {
+        // Counted, never named: logs carry no path outside the provider roots.
+        report.warnings.push(format!(
+            "{unreadable_databases} broker database(s) could not be read; their links may be missing"
+        ));
     }
     match linkage::link_live_holders(
         &index,
@@ -366,6 +462,7 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
             options,
             &index,
             &layout,
+            &roots,
             eligible,
             open_files,
             hooks,
@@ -392,6 +489,7 @@ fn archive_eligible<P: OpenFileProbe>(
     options: Options,
     index: &Index,
     layout: &providers::Layout,
+    roots: &Roots,
     eligible: Vec<Transcript>,
     open_files: &mut OpenFiles<P>,
     hooks: &mut dyn Hooks,
@@ -417,8 +515,21 @@ fn archive_eligible<P: OpenFileProbe>(
             report.budget_exhausted = true;
             break;
         }
-        let Some(root) = layout.open_root(transcript.provider) else {
+        let Some(open_root) = layout.open_root(transcript.provider) else {
             continue;
+        };
+        let Some((source, destination)) = roots.for_provider(transcript.provider) else {
+            report.skip(
+                &transcript.path,
+                SkipReason::UnsafePath,
+                "provider root failed validation",
+            );
+            continue;
+        };
+        let confinement = archive::Confinement {
+            source,
+            destination,
+            open_root: &open_root,
         };
         pacer.set_rate(pacing::choose_rate(
             config.effective_bytes_per_second(),
@@ -432,7 +543,7 @@ fn archive_eligible<P: OpenFileProbe>(
             hooks: &mut *hooks,
             now_ms,
         };
-        match archive::archive_one(&mut context, &transcript, &root) {
+        match archive::archive_one(&mut context, &transcript, &confinement) {
             Ok(done) => {
                 compress += done.compress_time;
                 verify += done.verify_time;
@@ -555,7 +666,13 @@ pub(crate) fn status<P: OpenFileProbe>(
         warnings: Vec::new(),
     };
     if let Some(index) = Index::open_existing(&environment.host_dir)? {
-        let rows = index.archives()?;
+        // Rows whose archive was moved away (by `codex unarchive`, say) are
+        // not counted, even before the next pass drops them.
+        let rows: Vec<ArchiveRow> = index
+            .archives()?
+            .into_iter()
+            .filter(archive_present)
+            .collect();
         status.archived_files = rows.len() as u64;
         status.archived_bytes_before = rows.iter().map(|row| row.bytes_in).sum();
         status.archived_bytes_after = rows.iter().map(|row| row.bytes_out).sum();
@@ -661,9 +778,34 @@ pub(crate) fn restore(
         return Err("an archive run is in progress; retry when it finishes".into());
     };
     let index = Index::open(&environment.host_dir)?;
+    let layout = environment.layout(&TranscriptsConfig {
+        providers: vec![Provider::Codex, Provider::Claude],
+        ..config.clone()
+    });
+    let mut warnings = Vec::new();
+    let roots = Roots::open(environment, &layout, &mut warnings);
     let mut restored = Vec::new();
     for plan in &plans {
-        restored.push(archive::restore_one(plan, Some(&index))?);
+        let (archive_root, original_root) = match (&roots.codex, &roots.claude, &roots.state) {
+            (Some(codex), _, _) if codex.contains(&plan.archive) => (codex, codex),
+            (_, Some(claude), Some(state)) if state.contains(&plan.archive) => (state, claude),
+            _ => {
+                let mut message = format!(
+                    "{} is not beneath a validated provider root",
+                    plan.archive.display()
+                );
+                if let Some(warning) = warnings.first() {
+                    message.push_str(&format!(" ({warning})"));
+                }
+                return Err(message);
+            }
+        };
+        restored.push(archive::restore_one(
+            plan,
+            archive_root,
+            original_root,
+            Some(&index),
+        )?);
     }
     let mut counters = BTreeMap::new();
     counters.insert("restored".to_string(), restored.len() as u64);

@@ -144,9 +144,9 @@ impl TranscriptsConfig {
     pub fn load(host_dir: &Path) -> Result<Self, String> {
         let path = host_dir.join(SETTINGS_FILE);
         match fs::read_to_string(&path) {
-            Ok(text) => Self::parse(&text).map_err(|error| format!("{}: {error}", path.display())),
+            Ok(text) => Self::parse(&text).map_err(|error| format!("transcript settings: {error}")),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(format!("cannot read {}: {error}", path.display())),
+            Err(error) => Err(format!("cannot read the transcript settings: {error}")),
         }
     }
 
@@ -174,11 +174,11 @@ pub(crate) fn write_settings(
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+        Err(error) => return Err(format!("cannot read the transcript settings: {error}")),
     };
     let mut document: toml_edit::DocumentMut = text
         .parse()
-        .map_err(|error| format!("{} is not valid TOML: {error}", path.display()))?;
+        .map_err(|error| format!("the transcript settings are not valid TOML: {error}"))?;
     if !document.contains_key("transcripts") {
         document.insert(
             "transcripts",
@@ -202,11 +202,11 @@ pub(crate) fn write_settings(
     let rendered = document.to_string();
     let config = TranscriptsConfig::parse(&rendered)?;
     super::ensure_private_directory(host_dir)
-        .map_err(|error| format!("cannot create {}: {error}", host_dir.display()))?;
+        .map_err(|error| format!("cannot create the transcript state directory: {error}"))?;
     crate::atomic_file::with_synced_temporary(&path, rendered.as_bytes(), |temporary| {
         fs::rename(temporary, &path)
     })
-    .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    .map_err(|error| format!("cannot write the transcript settings: {error}"))?;
     super::sync_directory(host_dir);
     Ok(config)
 }

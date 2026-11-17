@@ -45,6 +45,10 @@ pub enum SkipReason {
     Io,
     /// The path is not valid UTF-8, so the index cannot record it.
     UnsupportedPath,
+    /// The provider root failed validation (missing, a symbolic link, not
+    /// owned by the current user), or the path follows a link or crosses a
+    /// mount point beneath it.
+    UnsafePath,
     /// A test stopped the archiver at a crash point.
     Interrupted,
 }
@@ -65,6 +69,7 @@ impl SkipReason {
             SkipReason::DestinationConflict => "destination_conflict",
             SkipReason::Io => "io",
             SkipReason::UnsupportedPath => "unsupported_path",
+            SkipReason::UnsafePath => "unsafe_path",
             SkipReason::Interrupted => "interrupted",
         }
     }

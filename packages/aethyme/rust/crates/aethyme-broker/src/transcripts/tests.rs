@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::io::Write as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use super::open_files::{self, OpenFile, OpenFileProbe, OpenFiles};
 use super::pacing::{self, Pacer};
 use super::providers::{self, Provider};
 use super::run::{self, Options};
+use super::safe_fs::Root;
 use super::{Environment, LaneLock};
 
 const UUID: &str = "0b9f6c1e-2d3a-4b5c-8d7e-1f2a3b4c5d6e";
@@ -960,7 +962,8 @@ fn restore_refuses_to_overwrite_and_checks_the_hash() {
         original: source.clone(),
         sha256: Some("0".repeat(64)),
     };
-    assert!(archive::restore_one(&wrong, None).is_err());
+    let root = Root::open(&host.codex_dir()).unwrap();
+    assert!(archive::restore_one(&wrong, &root, &root, None).is_err());
     assert!(!source.exists(), "a mismatched restore publishes nothing");
     assert!(destination.is_file());
 }
@@ -979,4 +982,203 @@ fn an_unindexed_codex_archive_restores_to_its_dated_directory() {
     assert_eq!(restored.len(), 1);
     assert!(!restored[0].hash_checked);
     assert_eq!(fs::read(&source).unwrap(), original);
+}
+
+// ── confinement, privacy and reconciliation ──────────────────────────
+
+fn mode(path: &Path) -> u32 {
+    fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[test]
+fn archives_the_index_and_their_directories_are_private() {
+    let host = Host::new();
+    let codex = host.codex_transcript(UUID, Path::new("/work/invented"));
+    let claude = host.claude_transcript(OTHER_UUID);
+    let config = enabled(vec![Provider::Codex, Provider::Claude]);
+    let mut open = probe(Vec::new());
+    let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    assert_eq!(report.archived.len(), 2, "{report:?}");
+    let codex_archive = codex_destination(&host, &codex);
+    assert_eq!(mode(&codex_archive), 0o600);
+    assert_eq!(mode(codex_archive.parent().unwrap()), 0o700);
+    let host_dir = &host.environment.host_dir;
+    let claude_archive = host_dir
+        .join("claude/-work-invented-project")
+        .join(format!("{OTHER_UUID}.jsonl.zst"));
+    assert_eq!(mode(&claude_archive), 0o600);
+    assert_eq!(mode(claude_archive.parent().unwrap()), 0o700);
+    assert_eq!(mode(&host_dir.join("claude")), 0o700);
+    assert_eq!(mode(host_dir), 0o700);
+    assert_eq!(mode(&host_dir.join(super::index::INDEX_FILE)), 0o600);
+    assert_eq!(mode(&host_dir.join(run::RUN_LOG)), 0o600);
+    assert_eq!(mode(&host_dir.join(super::LOCK_FILE)), 0o600);
+    assert!(!claude.exists());
+}
+
+#[test]
+fn an_existing_archive_directory_is_narrowed_to_owner_only() {
+    let host = Host::new();
+    let source = host.codex_transcript(UUID, Path::new("/work/invented"));
+    let archived = host.codex_dir().join("archived_sessions");
+    fs::create_dir_all(&archived).unwrap();
+    fs::set_permissions(&archived, fs::Permissions::from_mode(0o755)).unwrap();
+    let config = enabled(vec![Provider::Codex]);
+    let mut open = probe(Vec::new());
+    let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    assert_eq!(report.archived.len(), 1, "{report:?}");
+    assert_eq!(mode(&archived), 0o700);
+    assert!(!source.exists());
+}
+
+#[test]
+fn run_logs_and_warnings_carry_no_content_or_outside_paths() {
+    let host = Host::new();
+    let repository = Repository::new(&host, UUID, "closed");
+    fs::remove_dir_all(&repository.checkout).unwrap();
+    let source = host.codex_transcript(UUID, &repository.root);
+    let missing_repository = host.root.join("repository-without-broker");
+    fs::create_dir_all(&missing_repository).unwrap();
+    let config = TranscriptsConfig {
+        repositories: vec![missing_repository.clone()],
+        ..enabled(vec![Provider::Codex])
+    };
+    let mut open = probe(Vec::new());
+    let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    assert_eq!(report.archived.len(), 1, "{report:?}");
+    let log = fs::read_to_string(host.environment.host_dir.join(run::RUN_LOG)).unwrap();
+    let warnings = report.warnings.join("\n");
+    for text in [&log, &warnings] {
+        assert!(!text.contains("invented transcript line"), "{text}");
+        assert!(!text.contains(source.to_str().unwrap()), "{text}");
+        assert!(!text.contains(repository.root.to_str().unwrap()), "{text}");
+        assert!(
+            !text.contains(missing_repository.to_str().unwrap()),
+            "{text}"
+        );
+    }
+    assert!(warnings.contains("configured repository"), "{warnings}");
+}
+
+#[test]
+fn a_symlinked_provider_root_is_refused() {
+    let host = Host::new();
+    let real = host.root.join("real-codex-home");
+    fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, host.codex_dir()).unwrap();
+    let source = host.codex_transcript(UUID, Path::new("/work/invented"));
+    assert!(real.join("sessions").is_dir());
+    let config = enabled(vec![Provider::Codex]);
+    let mut open = probe(Vec::new());
+    let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    assert!(report.archived.is_empty(), "{report:?}");
+    assert_eq!(report.skipped.get("unsafe_path"), Some(&1), "{report:?}");
+    assert!(source.is_file());
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Codex home")),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn confined_operations_never_follow_links_or_replace_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let root_path = base.join("root");
+    let outside = base.join("outside");
+    fs::create_dir_all(root_path.join("real")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("secret.jsonl"), b"outside").unwrap();
+    std::os::unix::fs::symlink(&outside, root_path.join("linked")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.join("secret.jsonl"),
+        root_path.join("real/alias.jsonl"),
+    )
+    .unwrap();
+    let root = Root::open(&root_path).unwrap();
+
+    // A symbolic link component is never followed.
+    assert!(
+        root.parent_of(&root_path.join("linked/secret.jsonl"), false)
+            .is_err()
+    );
+    assert!(
+        root.parent_of(&root_path.join("linked/new/x"), true)
+            .is_err()
+    );
+    assert!(!outside.join("new").exists());
+    // A symbolic link entry is never treated as a file.
+    let (directory, name) = root
+        .parent_of(&root_path.join("real/alias.jsonl"), false)
+        .unwrap();
+    assert!(directory.stamp(&name).is_err());
+    assert!(directory.open_read(&name).is_err());
+    // Paths outside the root, or with `..`, are refused.
+    assert!(
+        root.parent_of(&outside.join("secret.jsonl"), false)
+            .is_err()
+    );
+    assert!(
+        root.parent_of(&root_path.join("real/../linked/secret.jsonl"), false)
+            .is_err()
+    );
+
+    // New files are private and never replace an entry.
+    let (directory, _) = root.parent_of(&root_path.join("real/x"), false).unwrap();
+    let temporary = directory.create_temp(".t-", ".part").unwrap();
+    let temporary_path = root_path
+        .join("real")
+        .join(temporary.name.to_str().unwrap());
+    assert_eq!(mode(&temporary_path), 0o600);
+    let existing = std::ffi::CString::new("alias.jsonl").unwrap();
+    assert_eq!(
+        temporary.publish(&existing).unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(fs::read(outside.join("secret.jsonl")).unwrap(), b"outside");
+    assert!(
+        !temporary_path.exists(),
+        "an unpublished temporary file is removed"
+    );
+
+    // The root itself must not be a symbolic link.
+    let link_root = base.join("link-root");
+    std::os::unix::fs::symlink(&root_path, &link_root).unwrap();
+    assert!(Root::open(&link_root).is_err());
+}
+
+/// Moves the Codex archive back the way `codex unarchive` does.
+fn codex_unarchive(host: &Host, source: &Path) {
+    let archive = codex_destination(host, source);
+    let back = source.with_file_name(format!(
+        "{}.zst",
+        source.file_name().unwrap().to_str().unwrap()
+    ));
+    fs::rename(archive, back).unwrap();
+}
+
+#[test]
+fn an_archive_moved_away_is_reconciled_and_never_overcounted() {
+    let host = Host::new();
+    let source = host.codex_transcript(UUID, Path::new("/work/invented"));
+    let config = enabled(vec![Provider::Codex]);
+    let mut open = probe(Vec::new());
+    pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    codex_unarchive(&host, &source);
+
+    let status = run::status(&host.environment, &config, &mut open).unwrap();
+    assert_eq!(status.archived_files, 0, "{status:?}");
+    assert_eq!(status.archived_bytes_after, 0);
+
+    let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    assert_eq!(report.reconciled_missing, 1, "{report:?}");
+    let index = Index::open(&host.environment.host_dir).unwrap();
+    assert!(index.archives().unwrap().is_empty());
+    assert!(
+        report.archived.is_empty(),
+        "an unarchived .jsonl.zst is left to Codex"
+    );
 }

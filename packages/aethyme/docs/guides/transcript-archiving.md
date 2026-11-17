@@ -115,6 +115,30 @@ after publishing leaves both; the next run verifies the archive decodes to
 exactly the source and finishes the removal. A temporary file left by a
 killed run is removed by the next run.
 
+## Confinement and privacy
+
+Transcripts hold secrets, so every file operation is confined:
+
+- Each provider root (the Codex home, Claude Code's `projects/` directory,
+  and Aethyme's `<host state>/transcripts/`) must exist, be a real directory
+  rather than a symbolic link, and be owned by the current user; otherwise
+  that provider is skipped (`unsafe_path`) with a warning.
+- Below a root, paths are opened one component at a time without following
+  symbolic links, every directory must be on the root's device (no mount
+  point is crossed), and an original is only removed by name in its opened
+  directory when it is still exactly the file that was compressed.
+- Archives and temporary files are created exclusively (never through an
+  existing entry or link) with mode 0600; directories the lane creates are
+  0700, and a directory an archive is written into is narrowed to 0700.
+  The index, run log, lock and settings files are 0600 in a 0700 directory.
+- Logs, metrics and warnings carry counts and reasons only: no transcript
+  content, and no path outside the provider roots (an unreadable broker
+  database or repository is counted, not named).
+
+When an archive is moved away by something else (for example
+`codex unarchive`), its index row stops counting at once and is dropped by
+the next pass.
+
 ## Telemetry
 
 Each pass records phase timings (`transcripts_scan`, `transcripts_linkage`,
