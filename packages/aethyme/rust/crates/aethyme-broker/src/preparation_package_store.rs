@@ -210,7 +210,7 @@ pub(crate) fn run_runtime_probe(
         .ok_or_else(|| "the probe's output pipe is unavailable".to_owned())?;
     let outcome = collect_probe_output(&mut child, stdout, timeout);
     match outcome {
-        Ok((status, output)) if status == Some(0) => {
+        Ok((Some(0), output)) => {
             let mut hasher = Sha256::new();
             hasher.update(&output);
             Ok(RuntimeProbeOutput {
@@ -256,7 +256,13 @@ fn collect_probe_output(
     // SAFETY: `fd` is the open read end of the probe's stdout pipe, owned by
     // `stdout` for the whole function.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+    let set = if flags < 0 {
+        -1
+    } else {
+        // SAFETY: as above; F_SETFL only changes this descriptor's flags.
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) }
+    };
+    if set < 0 {
         kill_probe(child);
         return Err("the probe's output pipe could not be made non-blocking".into());
     }
