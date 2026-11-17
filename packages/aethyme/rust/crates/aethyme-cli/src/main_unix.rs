@@ -440,6 +440,9 @@ fn main_with_args(args: &[String]) -> ExitCode {
         // Opt-in MCP server launching: offline launcher resolution and an
         // exec'ing connect (no extra process). Writes no agent configuration.
         "mcp" => ExitCode::from(aethyme_broker::mcp::cli::run(&args[1..])),
+        // What Aethyme stores on this host, its budgets and the worker
+        // that keeps it within them.
+        "storage" => ExitCode::from(aethyme_broker::storage_ledger::cli::run(&args[1..])),
         // Broker commands have been native Rust from birth (issue #31).
         "broker" if readiness_remediation::is_command(command.args) => {
             ExitCode::from(readiness_remediation::run(&command.args[1..]))
@@ -750,6 +753,11 @@ MCP servers (opt-in; <host state>/mcp/services.toml, .aethyme/mcp.toml):
                               matching calls through connect, agent config
                               repair, and a count of servers that bypass it
 
+Storage (everything Aethyme keeps on this host):
+  storage status              per class bytes, budget, what is reclaimable
+                              and why not; reads the ledger only
+  storage run                 one pass: measure, evict over budget or expired
+
 Collaboration (opt-in, experimental; disabled unless [collaboration] enables it):
   collab status|enroll        policy, state root and captures; mint a project ID
   collab capture|gc|context|brief
@@ -818,6 +826,7 @@ fn answer_help(route: help::HelpRoute, args: &[String]) -> ExitCode {
                 "collab" => aethyme_broker::collaboration_cli::run(rest),
                 "env" => aethyme_broker::environments::cli::run(rest),
                 "mcp" => aethyme_broker::mcp::cli::run(rest),
+                "storage" => aethyme_broker::storage_ledger::cli::run(rest),
                 other => {
                     eprintln!("Error: no help route for {other}");
                     2

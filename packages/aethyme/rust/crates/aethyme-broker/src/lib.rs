@@ -269,6 +269,7 @@ mod shared_edit_advice;
 mod ship;
 mod status_reads;
 mod storage;
+pub mod storage_ledger;
 mod store;
 mod types;
 mod update;

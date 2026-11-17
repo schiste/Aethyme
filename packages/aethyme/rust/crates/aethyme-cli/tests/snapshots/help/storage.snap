@@ -1,0 +1,14 @@
+exit: 0
+--- stdout
+aethyme storage — what Aethyme stores on this host, and its budgets
+
+  storage status [--json]   the ledger: per class bytes, entries, oldest,
+                            budget, what is reclaimable now and why not;
+                            reads the ledger only (milliseconds)
+  storage run [--json]      one worker pass in the foreground: measure a few
+                            entries, evict what is over budget or expired
+  storage worker            the same pass, detached (started by broker
+                            commands when a budget or floor is breached)
+
+Budgets: defaults, overridden by <host state>/storage.toml [budget].
+--- stderr
