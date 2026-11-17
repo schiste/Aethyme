@@ -389,13 +389,12 @@ resolve blockers and refusals.
    status and follow its `next_action` when dependencies are required:
    `aethyme broker submit prepare status --session <id> --json`. Preparation
    is explicit; do not assume a fresh worktree has installed dependencies.
-2. Commit early and small, and after each commit run
-   `aethyme broker push --session <id>`. Once there is a first meaningful
-   commit, open a draft PR with `aethyme broker push --session <id> --pr`, and
-   keep pushing until it is ready. Run `aethyme broker sync --session <id>`
-   before resuming a reused session and when push reports related or unknown
-   impact. A graph-disjoint verdict permits deferring intermediate sync; validate
-   the current merge candidate before merging. Never leave work only in the worktree.
+2. Commit early and small. Run `aethyme broker advance --session <id>` from a
+   clean worktree and follow its next action. Add `--pr` after the first meaningful
+   commit to open a draft. Use `aethyme broker push --session <id>` directly
+   when publishing only the committed changes from a dirty worktree. Sync before
+   resuming a reused session and validate the current merge candidate before merging.
+   Never leave work only in the worktree.
 3. When done: `aethyme broker submit --session <id>` runs the gates and lands
    nothing. Merge the PR on GitHub, then `aethyme broker finish --session <id>`
    (it refuses while commits are unpushed).
@@ -1852,9 +1851,10 @@ mod tests {
             "`aethyme broker status --json`",
             "Add `--session <id>` from another checkout",
             "`aethyme broker status --full --json` for exact session or lease-path",
-            "Commit early and small, and after each commit run\n   `aethyme broker push --session <id>`",
-            "open a draft PR with `aethyme broker push --session <id> --pr`",
-            "keep pushing until it is ready. Run `aethyme broker sync --session <id>`\n   before resuming a reused session and when push reports related or unknown\n   impact. A graph-disjoint verdict permits deferring intermediate sync; validate\n   the current merge candidate before merging. Never leave work only in the worktree.",
+            "Run `aethyme broker advance --session <id>`",
+            "Add `--pr` after the first meaningful",
+            "`aethyme broker push --session <id>` directly",
+            "Sync before\n   resuming a reused session and validate the current merge candidate",
             "`aethyme broker finish --session <id>`\n   (it refuses while commits are unpushed)",
             "authorizes pushing your own\nsession branch and opening a draft PR; nothing else.",
             "`aethyme broker advanced git`",
