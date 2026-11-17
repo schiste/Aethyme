@@ -206,10 +206,11 @@ mod tests {
 
     #[test]
     fn a_timed_out_git_is_an_environment_failure_and_other_git_errors_are_not() {
-        let timed_out = BrokerOpError::Git(crate::GitError::TimedOut {
-            args: "fetch origin".to_string(),
-            seconds: 600,
-        });
+        let timed_out = BrokerOpError::Git(crate::GitError::timed_out_before_start(
+            "fetch origin",
+            None,
+            std::time::Duration::ZERO,
+        ));
         assert_eq!(for_broker_error(&timed_out), ENVIRONMENT);
         let failed = BrokerOpError::Git(crate::GitError::Git {
             args: "fetch origin".to_string(),
