@@ -306,6 +306,46 @@ repair_on_session_start = true` makes `aethyme hook SessionStart` run
 `aethyme.mcp-bypass/v1`, or `aethyme.mcp-error/v1` (`code`, `message`). See
 the [MCP servers guide](../guides/mcp-servers.md).
 
+## Storage Commands
+
+`aethyme storage status [--json]` (`aethyme.storage-status/v1`) reads the host
+storage ledger only and returns in milliseconds: per class (`recovery_archives`,
+`gate_cache`, `symbol_index`, `graph_stores`, `preparation_cache`,
+`qualification_retained`, `release_artifacts`, `rollout_artifacts`,
+`quick_test_pools`, `tool_caches`, `worktrees`, `coordination`,
+`unclassified`) its bytes, entries, oldest change, budget, bytes reclaimable now
+and, for classes never removed here, why; per root (host state, host cache,
+registered storage roots) its total, budget, free space, floor and floor
+breaches; what is over budget; unclassified entries; recovery archives kept
+over budget because their work is not landed; and the last worker pass with
+phase timings, evictions and bytes reclaimed.
+
+`aethyme storage run [--json]` (`aethyme.storage-pass/v1`) runs one worker pass
+in the foreground; `aethyme storage worker` runs it detached. A pass measures a
+few entries round robin (never inside a command), then evicts, oldest or least
+recently used first: expired release, rollout and test-pool leftovers;
+regenerable index and cache children not used within their idle time while
+their class is over budget; all but the most recently used gate cache entry per
+gate kind while a repository's gate cache is over its budget (never an entry a
+live lease holds); and recovery archives over budget only when their content is
+proven landed in the default branch, or once older than the retention. Paced,
+except when a volume is below its free-space floor or a root is over its total.
+
+Every broker command first runs an O(1) check (a statvfs per root and a read of
+the ledger summary). Over a budget or below a floor it starts the worker
+detached; `start`, `submit`, gates and preparation, when a volume is below its
+floor, remove regenerable data the last pass proved removable and refuse (exit
+6) only if the volume is still below the floor. `AETHYME_STORAGE_LEDGER=0`
+turns this off; it is off by default for a host state directory under the
+system temporary directory.
+
+Budgets default to: recovery archives 4 GiB, gate cache 4 GiB per repository
+(a repository's configured `gate_cache_bytes_budget` wins), symbol index 2 GiB,
+graph stores 2 GiB, qualification retained 1 GiB, tool caches 8 GiB, host state
+total 16 GiB, host cache total 12 GiB, storage roots total 48 GiB (worktrees
+excluded), free-space floor 10 GiB per volume, recovery archive retention 30
+days. `<host state>/storage.toml` `[budget]` overrides them.
+
 ## Broker Commands
 
 The broker is the stable product front door for multi-agent coordination:
