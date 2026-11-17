@@ -339,8 +339,9 @@ blocked.
 
    When adding or changing a public broker verb or its JSON report, update the
    generated CLI help snapshots and `docs/architecture/cross-process-consumers.md`.
-   The help snapshot test derives public verbs from the surface table; keep the
-   no-side-effect help coverage in sync as well.
+   Run the CLI help snapshot suite. A verb can appear in its own help, in
+   parent command help, and in the no-argument usage output. Review the
+   full snapshot diff and keep no-side-effect help coverage in sync.
 
    Before hosted qualification of native filesystem changes, compare every
    platform-specific FFI field and type with the dependency version pinned in
