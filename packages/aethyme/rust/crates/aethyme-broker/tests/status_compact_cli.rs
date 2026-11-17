@@ -278,7 +278,13 @@ fn compact_json_is_additive_and_legacy_json_shapes_are_unchanged() {
     ] {
         let output = run_status(fixture.path(), args);
         assert!(!output.status.success(), "{args:?}");
-        assert!(String::from_utf8_lossy(&output.stderr).contains("--full"));
+        // A `--json` refusal is a JSON error document on stdout.
+        let message = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(message.contains("--full"), "{args:?}: {message}");
     }
 }
 
