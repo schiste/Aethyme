@@ -592,8 +592,28 @@ fn unknown_ignored_directory_is_preserved_by_archive_resolution() {
     std::fs::write(&target, "untouched\n").unwrap();
     std::os::unix::fs::symlink(&target, opaque.join("external-link")).unwrap();
 
-    let error = refused_plan(tmp.path(), &id);
-    assert!(error.contains("opaque-cache"), "{error}");
+    // The plan archives every file under it, a link as the link (never
+    // what it points at), instead of refusing the checkout.
+    let reviewed = plan(tmp.path(), &id);
+    let ignored = reviewed["ignored_files"].as_array().unwrap();
+    let preserved: Vec<(&str, bool)> = ignored
+        .iter()
+        .filter(|file| file["path"].as_str().unwrap().starts_with("opaque-cache/"))
+        .map(|file| {
+            (
+                file["path"].as_str().unwrap(),
+                file["symlink"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        preserved,
+        [
+            ("opaque-cache/external-link", true),
+            ("opaque-cache/nested.bin", false)
+        ],
+        "{reviewed}"
+    );
     assert!(opaque.join("nested.bin").is_file());
     assert!(worktree.exists());
     assert_eq!(std::fs::read(target).unwrap(), b"untouched\n");

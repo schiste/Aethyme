@@ -183,19 +183,27 @@ pub(super) fn write_operation_archive(
     let (bytes, _files) = match written {
         Ok(written) => written,
         Err(error) => {
-            let _ = std::fs::remove_dir_all(&partial);
+            remove_partial(&partial);
             return Err(error);
         }
     };
     let archive = request.archive_root.join(&name);
     if let Err(error) = std::fs::rename(&partial, &archive) {
-        let _ = std::fs::remove_dir_all(&partial);
+        remove_partial(&partial);
         return Err(refuse(format!(
             "cannot move the verified archive into place: {error}"
         )));
     }
-    if let Ok(root) = std::fs::File::open(request.archive_root) {
-        let _ = root.sync_all();
+    // The archive is in place; a root that cannot be synced is only
+    // counted (the archive's own files and directories were synced).
+    if std::fs::File::open(request.archive_root)
+        .and_then(|root| root.sync_all())
+        .is_err()
+    {
+        crate::phase_telemetry::add(
+            "checkout_retirement_operation_archive_root_unsynced",
+            std::time::Duration::ZERO,
+        );
     }
     crate::phase_telemetry::add(
         "checkout_retirement_operation_archive_files",
@@ -344,13 +352,12 @@ fn fill_archive(
         }
     }
     for directory in ["git-state", "worktree", "ignored"] {
-        if let Ok(handle) = std::fs::File::open(partial.join(directory)) {
-            let _ = handle.sync_all();
+        let path = partial.join(directory);
+        if path.is_dir() {
+            sync_directory(&path).map_err(refuse)?;
         }
     }
-    if let Ok(handle) = std::fs::File::open(partial) {
-        let _ = handle.sync_all();
-    }
+    sync_directory(partial).map_err(refuse)?;
     Ok((budget.bytes, budget.files))
 }
 
@@ -456,11 +463,8 @@ fn copy_entry(
     output
         .sync_all()
         .map_err(|error| refuse(format!("cannot sync the copy of {relative}: {error}")))?;
-    if let Ok(permissions) =
-        std::fs::symlink_metadata(source).map(|metadata| metadata.permissions())
-    {
-        let _ = std::fs::set_permissions(&target, permissions);
-    }
+    std::fs::set_permissions(&target, metadata.permissions())
+        .map_err(|error| refuse(format!("cannot keep the mode of {relative}: {error}")))?;
     Ok(ArchivedEntry {
         path: relative.to_string(),
         bytes,
@@ -535,6 +539,24 @@ fn link_digest(target: &Path) -> String {
     let mut hashed = b"symlink\0".to_vec();
     hashed.extend_from_slice(target.as_os_str().as_encoded_bytes());
     format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&hashed))
+}
+
+/// Sync the directory at `path` so its entries survive a crash.
+fn sync_directory(path: &Path) -> Result<(), String> {
+    std::fs::File::open(path)
+        .and_then(|handle| handle.sync_all())
+        .map_err(|error| format!("cannot sync {}: {error}", path.display()))
+}
+
+/// Remove a partial copy after a failure; one that cannot be removed is
+/// counted (it holds copies only, and is named `.partial`).
+fn remove_partial(partial: &Path) {
+    if std::fs::remove_dir_all(partial).is_err() {
+        crate::phase_telemetry::add(
+            "checkout_retirement_operation_archive_partial_left",
+            std::time::Duration::ZERO,
+        );
+    }
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), String> {
