@@ -226,8 +226,8 @@ fn close_reason_basis(payload: &Value) -> String {
             "no pull request was recorded for it and it was inactive for {idle} with no live \
              agent{}",
             if payload.get("unlanded_commits").and_then(Value::as_bool) == Some(true) {
-                "; its commits are not on the default branch yet, so its branch and checkout \
-                 are kept"
+                "; its commits are not on the default branch yet, so its branch is kept and \
+                 they are bundled into a recovery archive before its checkout is retired"
             } else {
                 ""
             }
@@ -385,9 +385,10 @@ mod tests {
         let note = close_note(9, "/nonexistent/auto-close-fixture", &none);
         assert!(note.contains("no pull request was recorded"), "{note}");
         assert!(note.contains("3 days"), "{note}");
-        assert!(note.contains("branch and checkout are kept"), "{note}");
+        assert!(note.contains("its branch is kept"), "{note}");
         assert!(note.contains("moved on to session 77"), "{note}");
-        assert!(note.contains("has since been removed"), "{note}");
+        assert!(note.contains("has been retired"), "{note}");
+        assert!(note.contains("start --reuse"), "{note}");
     }
 
     #[test]
