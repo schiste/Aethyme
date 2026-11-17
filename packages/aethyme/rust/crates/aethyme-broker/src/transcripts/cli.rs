@@ -6,10 +6,11 @@
 
 use serde_json::{Value, json};
 
+use super::agents::SystemAgents;
 use super::config::{self, SettingsChange};
 use super::open_files::{OpenFiles, SystemProbe};
 use super::providers::Provider;
-use super::run::{self, OPEN_LISTING_MAX_AGE, Options};
+use super::run::{self, OPEN_LISTING_MAX_AGE, Options, Probes};
 use super::{Environment, TranscriptsConfig};
 use crate::exit_status;
 
@@ -21,14 +22,17 @@ pub const SETTINGS_SCHEMA: &str = "aethyme.transcripts-settings/v1";
 pub const USAGE: &str = "\
 aethyme transcripts — archive closed agent transcripts (opt-in, off by default)
 
-When enabled, a transcript older than archive_after_days (default 3), open
-in no process, and whose linked broker sessions are all closed with their
-checkouts gone, is compressed with zstd and moved. Codex transcripts go to
+When enabled, a transcript older than archive_after_days (default 3; for
+Claude Code archive_after_days_claude, default 14), open in no process,
+whose linked broker sessions are all closed with their checkouts gone, and
+(Claude Code) with no running claude process for its project or session, is
+compressed with zstd and moved. Codex transcripts go to
 <codex home>/archived_sessions/<name>.jsonl.zst, which `codex unarchive`
 and `codex resume` read natively. Claude Code transcripts go under
 <host state>/transcripts/claude/; restore them with `transcripts restore`.
 Settings: <host state>/transcripts/settings.toml, [transcripts] archive,
-archive_after_days, providers (\"codex\", \"claude\"), codex_home,
+archive_after_days, archive_after_days_claude, providers (\"codex\",
+\"claude\"), codex_home,
 claude_home, repositories, bytes_per_second, free_space_floor_bytes.
 Nothing is listed or moved while archive = false.
 
@@ -44,7 +48,8 @@ Usage:
       background worker runs the same pass when archiving is enabled.
   aethyme transcripts restore <session-id|path> [--json]
       Decompress an archived transcript back to where it came from,
-      verifying its SHA-256, then remove the archive.
+      verifying its SHA-256, then remove the archive. When a newer transcript
+      exists at that path, the result is the archive followed by it.
   aethyme transcripts enable [--after-days <n>] [--providers codex,claude] [--json]
   aethyme transcripts disable [--json]
       Turn archiving on or off. Writes only the settings file above.
@@ -158,7 +163,12 @@ fn run_status(environment: &Environment, rest: &[String], json: bool) -> u8 {
         Err(code) => return code,
     };
     let mut open_files = OpenFiles::new(SystemProbe, OPEN_LISTING_MAX_AGE);
-    let status = match run::status(environment, &config, &mut open_files) {
+    let mut agents = SystemAgents;
+    let mut probes = Probes {
+        open_files: &mut open_files,
+        agents: &mut agents,
+    };
+    let status = match run::status(environment, &config, &mut probes) {
         Ok(status) => status,
         Err(error) => return report_error(json, "status_failed", &error, exit_status::ENVIRONMENT),
     };
@@ -178,9 +188,10 @@ fn run_status(environment: &Environment, rest: &[String], json: bool) -> u8 {
     if status.enabled {
         let providers: Vec<&str> = config.providers.iter().map(|p| p.label()).collect();
         println!(
-            "  providers: {}; archive after {} days",
+            "  providers: {}; archive after {} days (Claude Code: {} days)",
             providers.join(", "),
-            config.archive_after_days
+            config.archive_after_days,
+            config.archive_after_days_claude
         );
     }
     println!(
@@ -215,13 +226,18 @@ fn run_list(environment: &Environment, rest: &[String], json: bool) -> u8 {
         Ok(config) => config,
         Err(code) => return code,
     };
-    let archived = match run::archived_rows(environment) {
+    let archived = match run::archived_rows(environment, &config) {
         Ok(rows) => rows,
         Err(error) => {
             return report_error(json, "index_unreadable", &error, exit_status::ENVIRONMENT);
         }
     };
     let mut open_files = OpenFiles::new(SystemProbe, OPEN_LISTING_MAX_AGE);
+    let mut agents = SystemAgents;
+    let mut probes = Probes {
+        open_files: &mut open_files,
+        agents: &mut agents,
+    };
     let pass = match run::run_pass(
         environment,
         &config,
@@ -229,7 +245,7 @@ fn run_list(environment: &Environment, rest: &[String], json: bool) -> u8 {
             apply: false,
             budget: None,
         },
-        &mut open_files,
+        &mut probes,
         &mut super::archive::NoHooks,
         super::now_ms(),
     ) {
@@ -330,6 +346,11 @@ fn run_archive(environment: &Environment, rest: &[String], json: bool) -> u8 {
         );
     }
     let mut open_files = OpenFiles::new(SystemProbe, OPEN_LISTING_MAX_AGE);
+    let mut agents = SystemAgents;
+    let mut probes = Probes {
+        open_files: &mut open_files,
+        agents: &mut agents,
+    };
     let pass = match run::run_pass(
         environment,
         &config,
@@ -337,7 +358,7 @@ fn run_archive(environment: &Environment, rest: &[String], json: bool) -> u8 {
             apply,
             budget: None,
         },
-        &mut open_files,
+        &mut probes,
         &mut super::archive::NoHooks,
         super::now_ms(),
     ) {
@@ -411,6 +432,12 @@ fn run_restore(environment: &Environment, rest: &[String], json: bool) -> u8 {
                             "; zstd checksum verified, no index row"
                         }
                     );
+                    if item.merged_fragment_bytes > 0 {
+                        println!(
+                            "  a newer transcript at that path ({}) was appended after the archived content",
+                            human_bytes(item.merged_fragment_bytes)
+                        );
+                    }
                 }
             }
             exit_status::SUCCESS

@@ -44,6 +44,12 @@ CREATE TABLE IF NOT EXISTS archives (
     archived_at      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS archives_by_agent ON archives (agent_session_id);
+CREATE TABLE IF NOT EXISTS conflicts (
+    original_path   TEXT PRIMARY KEY,
+    attempts        INTEGER NOT NULL,
+    first_seen      INTEGER NOT NULL,
+    next_attempt_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS counters (
     name  TEXT PRIMARY KEY,
     value INTEGER NOT NULL
@@ -293,6 +299,59 @@ impl Index {
             .archive_rows("WHERE original_path = ?1", &key)?
             .into_iter()
             .next())
+    }
+
+    /// Whether a transcript with a recorded destination conflict may be
+    /// tried again at `now_ms` (true when none is recorded).
+    pub fn conflict_due(&self, original_path: &Path, now_ms: i64) -> Result<bool, String> {
+        let next: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT next_attempt_at FROM conflicts WHERE original_path = ?1",
+                [text(original_path)],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        Ok(next.is_none_or(|next| now_ms >= next))
+    }
+
+    /// Record a destination conflict; the next attempt waits 1, 2, 4 ... up
+    /// to 32 days.
+    pub fn record_conflict(&self, original_path: &Path, now_ms: i64) -> Result<(), String> {
+        let attempts: i64 = self
+            .conn
+            .query_row(
+                "SELECT attempts FROM conflicts WHERE original_path = ?1",
+                [text(original_path)],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?
+            .unwrap_or(0)
+            + 1;
+        let backoff = super::eligibility::DAY_MS << (attempts - 1).clamp(0, 5);
+        self.conn
+            .execute(
+                "INSERT INTO conflicts (original_path, attempts, first_seen, next_attempt_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(original_path) DO UPDATE SET
+                   attempts = excluded.attempts,
+                   next_attempt_at = excluded.next_attempt_at",
+                params![text(original_path), attempts, now_ms, now_ms + backoff],
+            )
+            .map(|_| ())
+            .map_err(sql)
+    }
+
+    pub fn clear_conflict(&self, original_path: &Path) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM conflicts WHERE original_path = ?1",
+                [text(original_path)],
+            )
+            .map(|_| ())
+            .map_err(sql)
     }
 
     pub fn add_counters(&self, deltas: &BTreeMap<String, u64>) -> Result<(), String> {

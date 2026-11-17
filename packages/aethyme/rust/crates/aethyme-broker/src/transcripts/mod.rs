@@ -16,6 +16,7 @@
 //! `aethyme transcripts archive --apply`. It never touches broker databases
 //! except to read them, and keeps its own small index beside its settings.
 
+mod agents;
 mod archive;
 pub mod cli;
 mod config;
@@ -58,6 +59,9 @@ pub(crate) struct Environment {
     pub claude_home: Option<PathBuf>,
     /// Whether the host's worktree registry is consulted for repositories.
     pub use_registry: bool,
+    /// Free bytes to assume on every archive volume (tests); `None` reads
+    /// the volume.
+    pub free_space_override: Option<u64>,
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -76,6 +80,7 @@ impl Environment {
             codex_home: env_path("CODEX_HOME"),
             claude_home: env_path("CLAUDE_CONFIG_DIR"),
             use_registry: true,
+            free_space_override: None,
         })
     }
 
@@ -112,6 +117,22 @@ impl Environment {
             host_dir: self.host_dir.clone(),
         }
     }
+}
+
+static HOST_SETTINGS: std::sync::OnceLock<Option<(Environment, TranscriptsConfig)>> =
+    std::sync::OnceLock::new();
+
+/// This host's environment and transcript settings, read once per process.
+/// `None` when the host state cannot be resolved or the settings cannot be
+/// read (then nothing runs).
+pub(crate) fn host_settings() -> Option<&'static (Environment, TranscriptsConfig)> {
+    HOST_SETTINGS
+        .get_or_init(|| {
+            let environment = Environment::from_process()?;
+            let config = TranscriptsConfig::load(&environment.host_dir).ok()?;
+            Some((environment, config))
+        })
+        .as_ref()
 }
 
 /// Create `directory` (and parents) and restrict it to the owner.

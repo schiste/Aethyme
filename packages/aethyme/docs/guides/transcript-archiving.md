@@ -8,14 +8,16 @@ over. `aethyme transcripts` compresses and moves the transcripts of finished
 sessions, and puts any of them back on request. zstd at level 3 shrinks agent
 transcripts four to five times.
 
-It is opt-in and off by default. While it is off nothing runs and no agent
-directory is even listed.
+It is opt-in and off by default. While it is off nothing runs: no agent
+directory is opened, listed or stat'ed, and only Aethyme's own settings file
+is read (once per process).
 
 ## What qualifies
 
 A transcript is archived only when all of these hold:
 
-- it was last modified more than `archive_after_days` ago (default 3);
+- it was last modified more than `archive_after_days` ago (default 3), or
+  for Claude Code `archive_after_days_claude` (default 14);
 - no process has it open, checked when archiving starts and again just
   before the original is removed (a running Codex keeps its transcript files
   open; a running Claude Code does not, which is why the age rule matters);
@@ -23,8 +25,16 @@ A transcript is archived only when all of these hold:
   known on this host, every linked session is closed or cleaned and its
   checkout directory no longer exists.
 
+- Claude Code only: no running `claude` process has a working directory
+  that maps to the transcript's project directory, and none names its
+  session id. Claude Code keeps no file open while a session is idle, so
+  without this an idle session's transcript would be split. If the process
+  table cannot be read, every Claude transcript is skipped.
+
 A transcript linked to no broker session needs only the age and not-open
-conditions. Anything unreadable or ambiguous is skipped and counted with a
+(and, for Claude, no-live-process) conditions, and only when every broker
+database and live-holder listing was read that pass: if any could not be
+read, unlinked transcripts are skipped as `linkage_unreadable`. Anything unreadable or ambiguous is skipped and counted with a
 reason (`session_open`, `checkout_present`, `open_by_process`,
 `open_check_unavailable`, `linkage_unreadable`, ...).
 
@@ -77,7 +87,10 @@ each time it runs: at background CPU and I/O priority, at most
 `bytes_per_second` (never slower than 4 MiB/s), largest transcripts first so
 space comes back early, for at most ten minutes per pass. When the archive
 volume has less free space than `free_space_floor_bytes` the pass runs
-unpaced. Memory pressure does not pause it. One pass runs at a time per host;
+unpaced. Either way a transcript is only archived when its volume has room
+for the compressed copy (a third of its size plus 256 MiB), largest that fits
+first; when none fits the pass stops with an `insufficient_space` warning. A
+destination conflict is recorded once and retried after 1, 2, 4 ... 32 days. Memory pressure does not pause it. One pass runs at a time per host;
 the lock is released by the kernel if a run dies.
 
 ## Commands
@@ -96,8 +109,12 @@ aethyme transcripts restore 0b9f6c1e-2d3a-4b5c-8d7e-1f2a3b4c5d6e
 - `list`: archived transcripts, plus the ones a pass would archive or skip.
 - `archive --dry-run` prints what would move; `archive --apply` does it now.
 - `restore <session-id|path>` decompresses back to the original location,
-  checks the SHA-256 against the index, then removes the archive. It refuses
-  when a file already exists at the original path. A Codex archive with no
+  checks the SHA-256 against the index, then removes the archive. When a
+  newer transcript exists at the original path (a session that continued
+  after it was archived), the result is the archived content followed by
+  that file's lines: written to a temporary file, verified by re-reading it,
+  and atomically put in its place, with the newer file kept under a backup
+  name until then. A Codex archive with no
   index row (for example after the index was lost) is found by its id and
   restored to Codex's dated `sessions/` directory, vouched for by the zstd
   frame checksum.
@@ -105,11 +122,14 @@ aethyme transcripts restore 0b9f6c1e-2d3a-4b5c-8d7e-1f2a3b4c5d6e
 ## Crash safety
 
 A transcript is compressed into a temporary file beside its destination,
-synced, re-checked (size, mtime and inode unchanged since the start), and
+flushed to stable storage (`F_FULLFSYNC` on macOS, where `fsync` leaves
+data in the drive cache), re-checked (size, mtime and inode unchanged), and
 decompressed again to compare its length and SHA-256 with the source. Only a
 verified copy is published (a no-clobber link, then a directory sync) and
-recorded in the index. The source is removed last, after one more check that
-it is unchanged and not open; if it changed, the copy is discarded instead.
+recorded in the index; any sync failure keeps the source and drops the copy.
+The source is removed last, after one more check that it is unchanged and
+not open in an open-file listing taken right then; if it changed, is open,
+or the listing cannot be taken, the copy is discarded instead.
 The original and the archive are therefore never both gone. A run killed
 after publishing leaves both; the next run verifies the archive decodes to
 exactly the source and finishes the removal. A temporary file left by a

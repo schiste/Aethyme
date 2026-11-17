@@ -43,6 +43,17 @@ pub(crate) fn broker_db_for_directory(directory: &Path) -> Option<PathBuf> {
         .map(|candidate| fs::canonicalize(&candidate).unwrap_or(candidate))
 }
 
+/// The broker databases a pass reads, and whether the list may be missing
+/// some.
+#[derive(Debug, Default)]
+pub(crate) struct KnownDatabases {
+    pub databases: Vec<PathBuf>,
+    pub warnings: Vec<String>,
+    /// The index or the worktree registry could not be read completely, so
+    /// a database that links some transcript may be missing.
+    pub index_unreadable: bool,
+}
+
 /// Every broker database known on this host: configured repositories, the
 /// host's worktree registry, databases the index already names, and the
 /// databases governing `cwds`.
@@ -51,9 +62,10 @@ pub(crate) fn known_broker_dbs(
     index: &Index,
     cwds: &BTreeSet<PathBuf>,
     use_registry: bool,
-) -> (Vec<PathBuf>, Vec<String>) {
+) -> KnownDatabases {
     let mut found = BTreeSet::new();
     let mut warnings = Vec::new();
+    let mut index_unreadable = false;
     let mut missing = 0;
     for repository in repositories {
         match broker_db_for_directory(repository) {
@@ -74,6 +86,13 @@ pub(crate) fn known_broker_dbs(
             &host_db,
             Some(std::time::Instant::now() + Duration::from_secs(5)),
         );
+        if !inventory.complete {
+            index_unreadable = true;
+            warnings.push(format!(
+                "the worktree registry could not be read completely ({} issue(s))",
+                inventory.issues.len()
+            ));
+        }
         for record in inventory.roots {
             if let Some(db) = broker_db_for_directory(&record.repository_root) {
                 found.insert(db);
@@ -86,14 +105,21 @@ pub(crate) fn known_broker_dbs(
                 found.insert(db);
             }
         }
-        Err(error) => warnings.push(format!("transcript index unreadable: {error}")),
+        Err(error) => {
+            index_unreadable = true;
+            warnings.push(format!("transcript index unreadable: {error}"));
+        }
     }
     for cwd in cwds {
         if let Some(db) = broker_db_for_directory(cwd) {
             found.insert(db);
         }
     }
-    (found.into_iter().collect(), warnings)
+    KnownDatabases {
+        databases: found.into_iter().collect(),
+        warnings,
+        index_unreadable,
+    }
 }
 
 /// Open a broker database for reading only; never migrates or writes it.
@@ -221,8 +247,16 @@ fn open_session_holders(conn: &Connection) -> Result<Vec<(i64, u32)>, String> {
     Ok(holders)
 }
 
-/// Link every transcript a live holder of an open session has open. Returns
-/// the number of new links.
+/// What linking live holders did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct LiveLinks {
+    pub added: u64,
+    /// A database, its open sessions, or an open-file listing could not be
+    /// read: some live holder's transcripts may be unlinked.
+    pub incomplete: bool,
+}
+
+/// Link every transcript a live holder of an open session has open.
 pub(crate) fn link_live_holders<P: OpenFileProbe>(
     index: &Index,
     broker_dbs: &[PathBuf],
@@ -230,13 +264,16 @@ pub(crate) fn link_live_holders<P: OpenFileProbe>(
     providers: &[Provider],
     open_files: &mut OpenFiles<P>,
     now_ms: i64,
-) -> Result<u64, String> {
+) -> Result<LiveLinks, String> {
+    let mut live = LiveLinks::default();
     let mut by_pid: BTreeMap<u32, Vec<(PathBuf, i64)>> = BTreeMap::new();
     for db in broker_dbs {
         let Ok(conn) = open_broker_db(db) else {
+            live.incomplete = true;
             continue;
         };
         let Ok(holders) = open_session_holders(&conn) else {
+            live.incomplete = true;
             continue;
         };
         for (session_id, pid) in holders {
@@ -247,14 +284,14 @@ pub(crate) fn link_live_holders<P: OpenFileProbe>(
         }
     }
     if by_pid.is_empty() {
-        return Ok(0);
+        return Ok(live);
     }
-    let mut added = 0;
     for provider in providers {
         let Some(root) = layout.open_root(*provider) else {
             continue;
         };
         let Ok(holders) = open_files.holders(&root) else {
+            live.incomplete = true;
             continue;
         };
         for open in holders {
@@ -264,12 +301,12 @@ pub(crate) fn link_live_holders<P: OpenFileProbe>(
             for (db, session_id) in sessions {
                 let link = link_for_open_file(db, *session_id, *provider, &open.path);
                 if index.add_link(&link, now_ms)? {
-                    added += 1;
+                    live.added += 1;
                 }
             }
         }
     }
-    Ok(added)
+    Ok(live)
 }
 
 /// Read-only connections to broker databases, opened once per run.
@@ -337,10 +374,8 @@ pub(crate) fn note_holder_bound(
     if crate::gc::background_process_is_suppressed() {
         return;
     }
-    let Some(environment) = super::Environment::from_process() else {
-        return;
-    };
-    let Ok(config) = super::TranscriptsConfig::load(&environment.host_dir) else {
+    // Read once per process; disabled returns before touching anything.
+    let Some((environment, config)) = super::host_settings() else {
         return;
     };
     if !config.archive {
@@ -356,7 +391,7 @@ pub(crate) fn note_holder_bound(
         if let Ok(pid) = u32::try_from(holder.pid)
             && pid > 0
         {
-            let layout = environment.layout(&config);
+            let layout = environment.layout(config);
             for provider in &config.providers {
                 let Some(root) = layout.open_root(*provider) else {
                     continue;

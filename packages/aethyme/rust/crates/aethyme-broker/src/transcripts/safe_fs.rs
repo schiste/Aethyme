@@ -29,10 +29,57 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Times `F_FULLFSYNC` was refused and plain `fsync` stood in (macOS).
+static FULL_SYNC_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// How many full syncs fell back to `fsync` in this process so far.
+pub(crate) fn full_sync_fallbacks() -> u64 {
+    FULL_SYNC_FALLBACKS.load(Ordering::Relaxed)
+}
+
+/// Flush a file or directory to stable storage. On macOS `fsync` leaves
+/// data in the drive's cache, so `fcntl(F_FULLFSYNC)` is used, falling back
+/// to `fsync` (and counting it) only when the file system refuses it with
+/// ENOTSUP or EINVAL. Any other failure is returned.
+pub(crate) fn full_sync(fd: libc::c_int) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `fd` is an open descriptor for the duration of the call;
+        // F_FULLFSYNC takes no further argument.
+        let result = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) };
+        if result != -1 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::ENOTSUP) | Some(libc::EINVAL)
+        ) {
+            return Err(error);
+        }
+        FULL_SYNC_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+    // SAFETY: `fd` is an open descriptor for the duration of the call.
+    check(unsafe { libc::fsync(fd) }).map(|_| ())
+}
 
 fn c_name(name: &OsStr) -> io::Result<CString> {
     CString::new(name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains a NUL byte"))
+}
+
+/// `<prefix><pid>-<counter>-<nanos><suffix>`: unique within the process,
+/// unlikely to collide across processes (callers retry on a collision).
+fn unique_name(prefix: &str, suffix: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.subsec_nanos())
+        .unwrap_or(0);
+    format!(
+        "{prefix}{}-{}-{nanos}{suffix}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn check(result: libc::c_int) -> io::Result<libc::c_int> {
@@ -314,16 +361,7 @@ impl Dir {
     /// Never follows or replaces an existing entry.
     pub fn create_temp(&self, prefix: &str, suffix: &str) -> io::Result<TempFile<'_>> {
         for _ in 0..64 {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|since| since.subsec_nanos())
-                .unwrap_or(0);
-            let name = format!(
-                "{prefix}{}-{}-{nanos}{suffix}",
-                std::process::id(),
-                TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-            );
-            let name = c_name(OsStr::new(&name))?;
+            let name = c_name(OsStr::new(&unique_name(prefix, suffix)))?;
             let mode: libc::c_uint = 0o600;
             // SAFETY: `self.fd` is an open directory descriptor and `name` a
             // valid NUL-terminated string; the mode argument is passed as the
@@ -366,6 +404,23 @@ impl Dir {
         ))
     }
 
+    /// Hard-link `from` to a new unique name `<prefix>…<suffix>` and return
+    /// that name. Never replaces an entry.
+    pub fn link_unique(&self, from: &CString, prefix: &str, suffix: &str) -> io::Result<CString> {
+        for _ in 0..64 {
+            let name = c_name(OsStr::new(&unique_name(prefix, suffix)))?;
+            match self.link_noclobber(from, &name) {
+                Ok(()) => return Ok(name),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not find a free backup name",
+        ))
+    }
+
     /// Publish `from` as `to` with a hard link; fails with `AlreadyExists`
     /// rather than replace anything.
     pub fn link_noclobber(&self, from: &CString, to: &CString) -> io::Result<()> {
@@ -399,10 +454,24 @@ impl Dir {
         check(unsafe { libc::unlinkat(self.fd.as_raw_fd(), name.as_ptr(), 0) }).map(|_| ())
     }
 
-    /// Make the directory durable after an entry changed. Best effort.
-    pub fn sync(&self) {
-        // SAFETY: `self.fd` is an open descriptor owned by `self`.
-        unsafe { libc::fsync(self.fd.as_raw_fd()) };
+    /// Make the directory durable after an entry changed.
+    pub fn sync(&self) -> io::Result<()> {
+        full_sync(self.fd.as_raw_fd())
+    }
+
+    /// Atomically replace `to` with `from` (both in this directory).
+    pub fn replace(&self, from: &CString, to: &CString) -> io::Result<()> {
+        // SAFETY: both descriptors are this open directory and both names are
+        // valid NUL-terminated strings; `renameat` never follows `to`.
+        check(unsafe {
+            libc::renameat(
+                self.fd.as_raw_fd(),
+                from.as_ptr(),
+                self.fd.as_raw_fd(),
+                to.as_ptr(),
+            )
+        })
+        .map(|_| ())
     }
 
     /// Narrow the directory to 0700 when group or others may enter it.
@@ -425,14 +494,29 @@ pub(crate) struct TempFile<'a> {
 }
 
 impl TempFile<'_> {
-    /// Publish under `to` (no-clobber), then remove the temporary name.
+    /// Flush the file's data to stable storage (see [`full_sync`]).
+    pub fn sync(&self) -> io::Result<()> {
+        full_sync(self.file.as_raw_fd())
+    }
+
+    /// Publish under `to` (no-clobber), then remove the temporary name and
+    /// make the directory durable. A sync failure is returned after the
+    /// link: the caller must then treat the published entry as not durable.
     pub fn publish(mut self, to: &CString) -> io::Result<()> {
-        self.file.sync_all()?;
+        self.sync()?;
         self.dir.link_noclobber(&self.name, to)?;
         self.armed = false;
         super::best_effort(self.dir.unlink(&self.name));
-        self.dir.sync();
-        Ok(())
+        self.dir.sync()
+    }
+
+    /// Atomically replace `to` with this file, then make the directory
+    /// durable.
+    pub fn publish_replacing(mut self, to: &CString) -> io::Result<()> {
+        self.sync()?;
+        self.dir.replace(&self.name, to)?;
+        self.armed = false;
+        self.dir.sync()
     }
 }
 

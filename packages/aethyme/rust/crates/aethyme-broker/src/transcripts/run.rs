@@ -10,19 +10,21 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use super::agents::{self, AgentProbe, ClaudeProcess, SystemAgents};
 use super::archive::{self, ArchiveContext, Hooks, NoHooks, RestorePlan, Restored};
-use super::eligibility::{self, Facts, SkipReason};
+use super::eligibility::{self, Facts, Linkage, SkipReason};
 use super::index::{ArchiveRow, Index};
 use super::linkage::{self, BrokerDbs};
 use super::open_files::{OpenFileProbe, OpenFiles, SystemProbe};
 use super::pacing::{self, Pacer};
 use super::providers::{self, Provider, Transcript};
-use super::safe_fs::Root;
+use super::safe_fs::{self, Root};
 use super::{Environment, LaneLock, TranscriptsConfig};
 
 pub const RUN_SCHEMA: &str = "aethyme.transcripts-archive/v1";
 pub const STATUS_SCHEMA: &str = "aethyme.transcripts-status/v1";
-/// How long an open-file listing is reused before it is taken again.
+/// How long an open-file listing is reused before it is taken again (the
+/// listing right before an original is removed is always fresh).
 pub(crate) const OPEN_LISTING_MAX_AGE: Duration = Duration::from_secs(2);
 /// Wall time one background-worker pass may spend; the next pass resumes.
 pub(crate) const WORKER_RUN_BUDGET: Duration = Duration::from_secs(10 * 60);
@@ -75,10 +77,12 @@ pub struct ArchivedView {
     pub resumed: bool,
 }
 
-/// One skipped transcript in a report.
+/// One skipped transcript in a report. Interactive output shows the path;
+/// the run log keeps only the session id and the reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SkippedView {
     pub path: PathBuf,
+    pub agent_session_id: Option<String>,
     pub reason: SkipReason,
     pub detail: String,
 }
@@ -110,11 +114,20 @@ pub struct RunReport {
     pub scan_truncated: bool,
     pub broker_databases: u64,
     pub links_added: u64,
+    /// True when a broker database or a live-holder listing could not be
+    /// read this pass: unlinked transcripts were then all skipped.
+    pub linkage_degraded: bool,
     /// Open-file listings taken (each covers one provider root).
     pub open_listings: u64,
+    /// Full syncs that fell back to `fsync` (macOS file systems refusing
+    /// `F_FULLFSYNC`).
+    pub full_sync_fallbacks: u64,
     pub paced_bytes_per_second: Option<u64>,
     pub pacing_slept_ms: u64,
     pub budget_exhausted: bool,
+    /// Set when no remaining eligible transcript fits in the free space of
+    /// its archive volume (`size/3 + 256 MiB`): the pass stopped.
+    pub insufficient_space: bool,
     pub phases_ms: BTreeMap<String, u64>,
     pub warnings: Vec<String>,
 }
@@ -142,23 +155,37 @@ impl RunReport {
             scan_truncated: false,
             broker_databases: 0,
             links_added: 0,
+            linkage_degraded: false,
             open_listings: 0,
+            full_sync_fallbacks: 0,
             paced_bytes_per_second: None,
             pacing_slept_ms: 0,
             budget_exhausted: false,
+            insufficient_space: false,
             phases_ms: BTreeMap::new(),
             warnings: Vec::new(),
         }
     }
 
-    fn skip(&mut self, path: &Path, reason: SkipReason, detail: &str) {
+    /// Count a skip without an example.
+    fn count_skip(&mut self, reason: SkipReason) {
         *self.skipped.entry(reason.label().to_string()).or_default() += 1;
         if reason == SkipReason::VerifyFailed {
             self.verify_failures += 1;
         }
-        if reason != SkipReason::TooRecent && self.skipped_examples.len() < MAX_SKIPPED_EXAMPLES {
+    }
+
+    /// Count a skip and keep an example (except for the routine ones).
+    fn skip(&mut self, transcript: &Transcript, reason: SkipReason, detail: &str) {
+        self.count_skip(reason);
+        let routine = matches!(
+            reason,
+            SkipReason::TooRecent | SkipReason::DestinationConflictBackoff
+        );
+        if !routine && self.skipped_examples.len() < MAX_SKIPPED_EXAMPLES {
             self.skipped_examples.push(SkippedView {
-                path: path.to_path_buf(),
+                path: transcript.path.clone(),
+                agent_session_id: transcript.agent_session_id.clone(),
                 reason,
                 detail: detail.to_string(),
             });
@@ -185,6 +212,7 @@ impl RunReport {
             self.leftover_temps_removed,
         );
         counters.insert("reconciled_missing".to_string(), self.reconciled_missing);
+        counters.insert("full_sync_fallbacks".to_string(), self.full_sync_fallbacks);
         for (reason, count) in &self.skipped {
             counters.insert(format!("skipped_{reason}"), *count);
         }
@@ -285,6 +313,8 @@ fn reconcile_index(index: &Index) -> Result<u64, String> {
 }
 
 /// Append one line to `<host dir>/runs.jsonl`, rotating it past its cap.
+/// The line holds counts, reasons, timings and session ids: never a path
+/// (project directory names encode repository paths) and never content.
 fn append_run_log(host_dir: &Path, report: &RunReport) {
     let path = host_dir.join(RUN_LOG);
     if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > RUN_LOG_MAX_BYTES) {
@@ -293,6 +323,16 @@ fn append_run_log(host_dir: &Path, report: &RunReport) {
             host_dir.join(format!("{RUN_LOG}.1")),
         ));
     }
+    let skipped_sessions: Vec<serde_json::Value> = report
+        .skipped_examples
+        .iter()
+        .map(|example| {
+            serde_json::json!({
+                "agent_session_id": example.agent_session_id,
+                "reason": example.reason,
+            })
+        })
+        .collect();
     let line = serde_json::json!({
         "at_ms": super::now_ms(),
         "apply": report.apply,
@@ -305,6 +345,10 @@ fn append_run_log(host_dir: &Path, report: &RunReport) {
         "resumed": report.resumed,
         "verify_failures": report.verify_failures,
         "skipped": report.skipped,
+        "skipped_sessions": skipped_sessions,
+        "linkage_degraded": report.linkage_degraded,
+        "insufficient_space": report.insufficient_space,
+        "full_sync_fallbacks": report.full_sync_fallbacks,
         "budget_exhausted": report.budget_exhausted,
         "paced_bytes_per_second": report.paced_bytes_per_second,
         "pacing_slept_ms": report.pacing_slept_ms,
@@ -324,13 +368,51 @@ fn last_run(host_dir: &Path) -> Option<serde_json::Value> {
         .find_map(|line| serde_json::from_str(line).ok())
 }
 
+/// The project directory name of a Claude transcript (its parent's name).
+fn claude_project(transcript: &Transcript) -> String {
+    transcript
+        .path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Whether a Claude transcript may belong to a live session, from a process
+/// listing: `Err` when the listing is unavailable.
+fn claude_check(
+    processes: &Result<Vec<ClaudeProcess>, String>,
+    transcript: &Transcript,
+) -> Result<(), SkipReason> {
+    match processes {
+        Err(_) => Err(SkipReason::ProcessCheckUnavailable),
+        Ok(processes) => {
+            if agents::claude_session_live(
+                processes,
+                &claude_project(transcript),
+                transcript.agent_session_id.as_deref(),
+            ) {
+                Err(SkipReason::AgentRunning)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Probes one pass reads the host through.
+pub(crate) struct Probes<'a, P> {
+    pub open_files: &'a mut OpenFiles<P>,
+    pub agents: &'a mut dyn AgentProbe,
+}
+
 /// One pass. Does nothing at all, not even list a directory, unless
 /// archiving is enabled.
 pub(crate) fn run_pass<P: OpenFileProbe>(
     environment: &Environment,
     config: &TranscriptsConfig,
     options: Options,
-    open_files: &mut OpenFiles<P>,
+    probes: &mut Probes<'_, P>,
     hooks: &mut dyn Hooks,
     now_ms: i64,
 ) -> Result<RunReport, String> {
@@ -339,6 +421,7 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
         return Ok(report);
     }
     let started = Instant::now();
+    let fallbacks_before = safe_fs::full_sync_fallbacks();
     let _lock = if options.apply {
         match LaneLock::try_acquire(&environment.host_dir) {
             Ok(Some(lock)) => {
@@ -380,9 +463,13 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
     // The age rule first: recent transcripts need no linkage work at all.
     let mut aged = Vec::new();
     for transcript in scan.transcripts {
-        match eligibility::judge_age(now_ms, transcript.modified_ms, config.archive_after_days) {
+        match eligibility::judge_age(
+            now_ms,
+            transcript.modified_ms,
+            config.days_for(transcript.provider),
+        ) {
             Ok(()) => aged.push(transcript),
-            Err(reason) => report.skip(&transcript.path, reason, ""),
+            Err(reason) => report.skip(&transcript, reason, ""),
         }
     }
 
@@ -391,63 +478,95 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
         .iter()
         .filter_map(|transcript| providers::transcript_cwd(&transcript.path))
         .collect();
-    let (broker_dbs, warnings) = linkage::known_broker_dbs(
+    let known = linkage::known_broker_dbs(
         &config.repositories,
         &index,
         &cwds,
         environment.use_registry,
     );
-    report.warnings.extend(warnings);
-    report.broker_databases = broker_dbs.len() as u64;
+    report.warnings.extend(known.warnings);
+    let mut degraded = known.index_unreadable;
+    report.broker_databases = known.databases.len() as u64;
     let mut unreadable_databases = 0;
-    for db in &broker_dbs {
+    for db in &known.databases {
         match linkage::backfill(&index, db, now_ms) {
             Ok(added) => report.links_added += added,
             Err(_) => unreadable_databases += 1,
         }
     }
     if unreadable_databases > 0 {
+        degraded = true;
         // Counted, never named: logs carry no path outside the provider roots.
         report.warnings.push(format!(
-            "{unreadable_databases} broker database(s) could not be read; their links may be missing"
+            "{unreadable_databases} broker database(s) could not be read; unlinked transcripts are skipped this pass"
         ));
     }
     match linkage::link_live_holders(
         &index,
-        &broker_dbs,
+        &known.databases,
         &layout,
         &config.providers,
-        open_files,
+        probes.open_files,
         now_ms,
     ) {
-        Ok(added) => report.links_added += added,
-        Err(error) => report.warnings.push(error),
+        Ok(live) => {
+            report.links_added += live.added;
+            if live.incomplete {
+                degraded = true;
+                report.warnings.push(
+                    "live session holders could not all be listed; unlinked transcripts are skipped this pass"
+                        .into(),
+                );
+            }
+        }
+        Err(error) => {
+            degraded = true;
+            report.warnings.push(error);
+        }
     }
+    report.linkage_degraded = degraded;
     report.phase("transcripts_linkage", phase.elapsed());
 
     let phase = Instant::now();
     let mut databases = BrokerDbs::default();
+    let mut claude_processes: Option<Result<Vec<ClaudeProcess>, String>> = None;
     let mut eligible = Vec::new();
     for transcript in aged {
         let linkage =
             match index.links_for(transcript.agent_session_id.as_deref(), &transcript.path) {
                 Ok(links) => databases.linkage(&links),
-                Err(_) => eligibility::Linkage::Unreadable,
+                Err(_) => Linkage::Unreadable,
             };
+        // An unlinked transcript is only trusted when every source of links
+        // was read: otherwise it may belong to a session we could not see.
+        let linkage = if degraded && linkage == Linkage::Unlinked {
+            Linkage::Unreadable
+        } else {
+            linkage
+        };
         let facts = Facts {
             now_ms,
             modified_ms: transcript.modified_ms,
-            archive_after_days: config.archive_after_days,
+            archive_after_days: config.days_for(transcript.provider),
             linkage: &linkage,
         };
         let open = match layout.open_root(transcript.provider) {
-            Some(root) => open_files.state_of(&root, &transcript.path),
+            Some(root) => probes.open_files.state_of(&root, &transcript.path),
             None => eligibility::OpenState::Unknown,
         };
-        match eligibility::judge(&facts, open) {
-            Ok(()) => eligible.push(transcript),
-            Err(reason) => report.skip(&transcript.path, reason, ""),
+        if let Err(reason) = eligibility::judge(&facts, open) {
+            report.skip(&transcript, reason, "");
+            continue;
         }
+        if transcript.provider == Provider::Claude {
+            let processes =
+                claude_processes.get_or_insert_with(|| probes.agents.claude_processes());
+            if let Err(reason) = claude_check(processes, &transcript) {
+                report.skip(&transcript, reason, "");
+                continue;
+            }
+        }
+        eligible.push(transcript);
     }
     // Largest first, so space comes back early.
     eligible.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
@@ -456,25 +575,23 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
     report.phase("transcripts_judge", phase.elapsed());
 
     if options.apply {
-        archive_eligible(
+        let pass = Pass {
             environment,
             config,
             options,
-            &index,
-            &layout,
-            &roots,
-            eligible,
-            open_files,
-            hooks,
+            index: &index,
+            layout: &layout,
+            roots: &roots,
             now_ms,
-            &mut report,
-        );
+        };
+        pass.archive_eligible(eligible, probes, hooks, &mut report);
+        report.full_sync_fallbacks = safe_fs::full_sync_fallbacks() - fallbacks_before;
         if let Err(error) = index.add_counters(&report.counters()) {
             report.warnings.push(error);
         }
     }
-    report.open_listings = open_files.probes;
-    report.phase("transcripts_open_check", open_files.probe_time);
+    report.open_listings = probes.open_files.probes;
+    report.phase("transcripts_open_check", probes.open_files.probe_time);
     report.phase("transcripts_total", started.elapsed());
     if options.apply {
         append_run_log(&environment.host_dir, &report);
@@ -482,94 +599,150 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
     Ok(report)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn archive_eligible<P: OpenFileProbe>(
-    environment: &Environment,
-    config: &TranscriptsConfig,
+/// What the archiving half of a pass shares.
+struct Pass<'a> {
+    environment: &'a Environment,
+    config: &'a TranscriptsConfig,
     options: Options,
-    index: &Index,
-    layout: &providers::Layout,
-    roots: &Roots,
-    eligible: Vec<Transcript>,
-    open_files: &mut OpenFiles<P>,
-    hooks: &mut dyn Hooks,
+    index: &'a Index,
+    layout: &'a providers::Layout,
+    roots: &'a Roots,
     now_ms: i64,
-    report: &mut RunReport,
-) {
-    let started = Instant::now();
-    let space_probe = |transcript: &Transcript| {
-        transcript
-            .destination
-            .parent()
-            .and_then(crate::disk_headroom::available_bytes)
-            .or_else(|| crate::disk_headroom::available_bytes(&environment.host_dir))
-    };
-    let mut pacer = Pacer::new(Some(config.effective_bytes_per_second()));
-    let mut compress = Duration::ZERO;
-    let mut verify = Duration::ZERO;
-    for transcript in eligible {
-        if options
-            .budget
-            .is_some_and(|budget| started.elapsed() >= budget)
-        {
-            report.budget_exhausted = true;
-            break;
+}
+
+impl Pass<'_> {
+    /// Free bytes on the volume an archive of `transcript` would go to.
+    fn available_for(&self, transcript: &Transcript) -> Option<u64> {
+        if let Some(bytes) = self.environment.free_space_override {
+            return Some(bytes);
         }
-        let Some(open_root) = layout.open_root(transcript.provider) else {
-            continue;
-        };
-        let Some((source, destination)) = roots.for_provider(transcript.provider) else {
-            report.skip(
-                &transcript.path,
-                SkipReason::UnsafePath,
-                "provider root failed validation",
-            );
-            continue;
-        };
-        let confinement = archive::Confinement {
-            source,
-            destination,
-            open_root: &open_root,
-        };
-        pacer.set_rate(pacing::choose_rate(
-            config.effective_bytes_per_second(),
-            space_probe(&transcript),
-            config.free_space_floor_bytes,
-        ));
-        let mut context = ArchiveContext {
-            index,
-            open_files: &mut *open_files,
-            pacer: &mut pacer,
-            hooks: &mut *hooks,
-            now_ms,
-        };
-        match archive::archive_one(&mut context, &transcript, &confinement) {
-            Ok(done) => {
-                compress += done.compress_time;
-                verify += done.verify_time;
-                report.bytes_in += done.bytes_in;
-                report.bytes_out += done.bytes_out;
-                if done.resumed {
-                    report.resumed += 1;
-                }
-                report.archived.push(ArchivedView {
-                    provider: transcript.provider,
-                    path: transcript.path.clone(),
-                    destination: transcript.destination.clone(),
-                    bytes_in: done.bytes_in,
-                    bytes_out: done.bytes_out,
-                    sha256: done.sha256.clone(),
-                    resumed: done.resumed,
-                });
-            }
-            Err(skipped) => report.skip(&transcript.path, skipped.reason, &skipped.detail),
-        }
+        crate::disk_headroom::available_headroom_at_or_above(&transcript.destination)
+            .map(|headroom| headroom.bytes)
     }
-    report.paced_bytes_per_second = pacer.rate();
-    report.pacing_slept_ms = pacer.slept().as_millis() as u64;
-    report.phase("transcripts_compress", compress);
-    report.phase("transcripts_verify", verify);
-    report.phase("transcripts_archive", started.elapsed());
+
+    fn archive_eligible<P: OpenFileProbe>(
+        &self,
+        mut remaining: Vec<Transcript>,
+        probes: &mut Probes<'_, P>,
+        hooks: &mut dyn Hooks,
+        report: &mut RunReport,
+    ) {
+        let started = Instant::now();
+        let mut pacer = Pacer::new(Some(self.config.effective_bytes_per_second()));
+        let mut compress = Duration::ZERO;
+        let mut verify = Duration::ZERO;
+        while !remaining.is_empty() {
+            if self
+                .options
+                .budget
+                .is_some_and(|budget| started.elapsed() >= budget)
+            {
+                report.budget_exhausted = true;
+                break;
+            }
+            // The largest transcript whose compressed copy fits next to it:
+            // the original only goes after the copy exists, so the lane must
+            // never need space it does not have.
+            let chosen = remaining
+                .iter()
+                .enumerate()
+                .find_map(|(position, transcript)| {
+                    let available = self.available_for(transcript)?;
+                    pacing::fits(available, transcript.bytes).then_some((position, available))
+                });
+            let Some((position, available)) = chosen else {
+                report.insufficient_space = true;
+                for _ in 0..remaining.len() {
+                    report.count_skip(SkipReason::InsufficientSpace);
+                }
+                report.warnings.push(
+                    "insufficient_space: no remaining eligible transcript fits in the free space of its archive volume (it needs a third of its size plus 256 MiB); free space elsewhere, then run again"
+                        .into(),
+                );
+                break;
+            };
+            let transcript = remaining.remove(position);
+            let Some(open_root) = self.layout.open_root(transcript.provider) else {
+                continue;
+            };
+            let Some((source, destination)) = self.roots.for_provider(transcript.provider) else {
+                report.skip(
+                    &transcript,
+                    SkipReason::UnsafePath,
+                    "provider root failed validation",
+                );
+                continue;
+            };
+            if !self
+                .index
+                .conflict_due(&transcript.path, self.now_ms)
+                .unwrap_or(true)
+            {
+                report.skip(&transcript, SkipReason::DestinationConflictBackoff, "");
+                continue;
+            }
+            if transcript.provider == Provider::Claude {
+                // Fresh: a session may have started since the pass judged it.
+                let processes = probes.agents.claude_processes();
+                if let Err(reason) = claude_check(&processes, &transcript) {
+                    report.skip(&transcript, reason, "");
+                    continue;
+                }
+            }
+            let confinement = archive::Confinement {
+                source,
+                destination,
+                open_root: &open_root,
+            };
+            pacer.set_rate(pacing::choose_rate(
+                self.config.effective_bytes_per_second(),
+                Some(available),
+                self.config.free_space_floor_bytes,
+            ));
+            let mut context = ArchiveContext {
+                index: self.index,
+                open_files: &mut *probes.open_files,
+                pacer: &mut pacer,
+                hooks: &mut *hooks,
+                now_ms: self.now_ms,
+            };
+            match archive::archive_one(&mut context, &transcript, &confinement) {
+                Ok(done) => {
+                    super::best_effort(self.index.clear_conflict(&transcript.path));
+                    compress += done.compress_time;
+                    verify += done.verify_time;
+                    report.bytes_in += done.bytes_in;
+                    report.bytes_out += done.bytes_out;
+                    if done.resumed {
+                        report.resumed += 1;
+                    }
+                    report.archived.push(ArchivedView {
+                        provider: transcript.provider,
+                        path: transcript.path.clone(),
+                        destination: transcript.destination.clone(),
+                        bytes_in: done.bytes_in,
+                        bytes_out: done.bytes_out,
+                        sha256: done.sha256,
+                        resumed: done.resumed,
+                    });
+                }
+                Err(skipped) => {
+                    if skipped.reason == SkipReason::DestinationConflict {
+                        // Recorded once, then retried with a growing backoff.
+                        super::best_effort(
+                            self.index.record_conflict(&transcript.path, self.now_ms),
+                        );
+                    }
+                    report.skip(&transcript, skipped.reason, &skipped.detail);
+                }
+            }
+        }
+        report.paced_bytes_per_second = pacer.rate();
+        report.pacing_slept_ms = pacer.slept().as_millis() as u64;
+        report.phase("transcripts_compress", compress);
+        report.phase("transcripts_verify", verify);
+        report.phase("transcripts_archive", started.elapsed());
+    }
 }
 
 /// The background worker's lane: one paced, budgeted pass when this host
@@ -583,20 +756,18 @@ pub(crate) fn run_worker_lane() {
     ) {
         return;
     }
-    let Some(environment) = Environment::from_process() else {
+    let Some((environment, config)) = super::host_settings() else {
         return;
-    };
-    let config = match TranscriptsConfig::load(&environment.host_dir) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("warning: aethyme transcripts: {error}");
-            return;
-        }
     };
     if !config.archive {
         return;
     }
     let mut open_files = OpenFiles::new(SystemProbe, OPEN_LISTING_MAX_AGE);
+    let mut agents = SystemAgents;
+    let mut probes = Probes {
+        open_files: &mut open_files,
+        agents: &mut agents,
+    };
     let options = Options {
         apply: true,
         budget: Some(WORKER_RUN_BUDGET),
@@ -604,10 +775,10 @@ pub(crate) fn run_worker_lane() {
     crate::warn_unrecorded(
         "archive closed agent transcripts",
         run_pass(
-            &environment,
-            &config,
+            environment,
+            config,
             options,
-            &mut open_files,
+            &mut probes,
             &mut NoHooks,
             super::now_ms(),
         ),
@@ -636,10 +807,21 @@ pub struct StatusReport {
     pub warnings: Vec<String>,
 }
 
-/// Every archived transcript the index records.
-pub(crate) fn archived_rows(environment: &Environment) -> Result<Vec<ArchiveRow>, String> {
+/// Every archived transcript the index records (empty when disabled: a
+/// disabled host touches nothing but its settings).
+pub(crate) fn archived_rows(
+    environment: &Environment,
+    config: &TranscriptsConfig,
+) -> Result<Vec<ArchiveRow>, String> {
+    if !config.archive {
+        return Ok(Vec::new());
+    }
     match Index::open_existing(&environment.host_dir)? {
-        Some(index) => index.archives(),
+        Some(index) => Ok(index
+            .archives()?
+            .into_iter()
+            .filter(archive_present)
+            .collect()),
         None => Ok(Vec::new()),
     }
 }
@@ -647,7 +829,7 @@ pub(crate) fn archived_rows(environment: &Environment) -> Result<Vec<ArchiveRow>
 pub(crate) fn status<P: OpenFileProbe>(
     environment: &Environment,
     config: &TranscriptsConfig,
-    open_files: &mut OpenFiles<P>,
+    probes: &mut Probes<'_, P>,
 ) -> Result<StatusReport, String> {
     let mut status = StatusReport {
         schema: STATUS_SCHEMA,
@@ -665,6 +847,10 @@ pub(crate) fn status<P: OpenFileProbe>(
         last_run: None,
         warnings: Vec::new(),
     };
+    if !config.archive {
+        // Disabled means no file-system access beyond the settings.
+        return Ok(status);
+    }
     if let Some(index) = Index::open_existing(&environment.host_dir)? {
         // Rows whose archive was moved away (by `codex unarchive`, say) are
         // not counted, even before the next pass drops them.
@@ -680,23 +866,21 @@ pub(crate) fn status<P: OpenFileProbe>(
     }
     status.lock_holder = LaneLock::recorded_holder(&environment.host_dir);
     status.last_run = last_run(&environment.host_dir);
-    if config.archive {
-        let dry = run_pass(
-            environment,
-            config,
-            Options {
-                apply: false,
-                budget: None,
-            },
-            open_files,
-            &mut NoHooks,
-            super::now_ms(),
-        )?;
-        status.reclaimable_now_bytes = dry.eligible_bytes;
-        status.eligible_now = dry.eligible.len() as u64;
-        status.skipped_now = dry.skipped;
-        status.warnings = dry.warnings;
-    }
+    let dry = run_pass(
+        environment,
+        config,
+        Options {
+            apply: false,
+            budget: None,
+        },
+        probes,
+        &mut NoHooks,
+        super::now_ms(),
+    )?;
+    status.reclaimable_now_bytes = dry.eligible_bytes;
+    status.eligible_now = dry.eligible.len() as u64;
+    status.skipped_now = dry.skipped;
+    status.warnings = dry.warnings;
     Ok(status)
 }
 
@@ -800,12 +984,9 @@ pub(crate) fn restore(
                 return Err(message);
             }
         };
-        restored.push(archive::restore_one(
-            plan,
-            archive_root,
-            original_root,
-            Some(&index),
-        )?);
+        let done = archive::restore_one(plan, archive_root, original_root, Some(&index))?;
+        super::best_effort(index.clear_conflict(&plan.original));
+        restored.push(done);
     }
     let mut counters = BTreeMap::new();
     counters.insert("restored".to_string(), restored.len() as u64);

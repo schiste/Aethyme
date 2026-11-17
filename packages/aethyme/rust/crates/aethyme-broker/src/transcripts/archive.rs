@@ -6,16 +6,18 @@
 //! 2. stream it through zstd (level 3, with the frame checksum) into a new
 //!    0600 temporary file (`O_CREAT | O_EXCL | O_NOFOLLOW`) in the
 //!    destination directory, hashing the source bytes with SHA-256 as they
-//!    are read, then fsync the temporary file;
+//!    are read, then flush it to stable storage (`F_FULLFSYNC` on macOS);
 //! 3. stat the source again: a changed size, mtime, inode or device, or a
 //!    byte count that differs from the size, discards the temporary file and
 //!    skips;
 //! 4. decompress the temporary file and compare its length and SHA-256 with
 //!    the source's; any difference discards it and skips;
-//! 5. publish it with a no-clobber `linkat` and fsync the directory, record
-//!    the index row, then check the source once more (unchanged, not open);
+//! 5. publish it with a no-clobber `linkat` and flush the directory (any
+//!    sync failure removes the copy and keeps the source), record the index
+//!    row, then check the source once more: unchanged, and not open in a
+//!    listing taken right then;
 //! 6. only then unlink the source (relative to its validated root, and only
-//!    if its identity is still the one compressed) and fsync its directory.
+//!    if its identity is still the one compressed) and flush its directory.
 //!
 //! The source is never removed before a verified, durable copy exists, and
 //! the copy is only ever removed while the source still exists, so the two
@@ -30,6 +32,7 @@
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -40,7 +43,7 @@ use super::index::{ArchiveRow, Index};
 use super::open_files::{OpenFileProbe, OpenFiles};
 use super::pacing::Pacer;
 use super::providers::{TEMP_PREFIX, Transcript};
-use super::safe_fs::{Dir, Root, Stamp};
+use super::safe_fs::{self, Dir, Root, Stamp};
 
 /// zstd level 3: zstd's own default, 4-5x on agent transcripts.
 pub(crate) const ZSTD_LEVEL: i32 = 3;
@@ -131,7 +134,8 @@ fn digest_compressed(file: File, pacer: &mut Pacer) -> io::Result<(u64, String)>
 }
 
 /// Stream `source` through zstd into `temporary`, returning the bytes read
-/// and their SHA-256. The temporary file is synced before this returns.
+/// and their SHA-256. The temporary file is on stable storage before this
+/// returns.
 fn compress_into(source: File, temporary: &File, pacer: &mut Pacer) -> io::Result<(u64, String)> {
     let mut reader = BufReader::with_capacity(CHUNK, source);
     let mut encoder =
@@ -155,7 +159,7 @@ fn compress_into(source: File, temporary: &File, pacer: &mut Pacer) -> io::Resul
     let mut writer = encoder.finish()?;
     writer.flush()?;
     drop(writer);
-    temporary.sync_all()?;
+    safe_fs::full_sync(temporary.as_raw_fd())?;
     Ok((total, hex(&hasher.finalize())))
 }
 
@@ -205,8 +209,18 @@ struct Entries {
     destination_name: CString,
 }
 
-/// Remove the source once a verified copy exists, after one last check that
-/// it is unchanged and not open. Otherwise remove the (stale) copy instead.
+impl Entries {
+    /// Remove the copy (the source still exists) and its index row.
+    fn discard_copy(&self, index: &Index, transcript: &Transcript) {
+        super::best_effort(self.destination_dir.unlink(&self.destination_name));
+        super::best_effort(self.destination_dir.sync());
+        super::best_effort(index.remove_archive(&transcript.path));
+    }
+}
+
+/// Remove the source once a verified, durable copy exists, after one last
+/// check that it is unchanged and not open in a listing taken right now.
+/// Otherwise remove the (stale) copy instead.
 fn remove_source<P: OpenFileProbe>(
     context: &mut ArchiveContext<'_, P>,
     transcript: &Transcript,
@@ -220,12 +234,9 @@ fn remove_source<P: OpenFileProbe>(
         .is_ok_and(|now| now == before);
     let open = context
         .open_files
-        .state_of(confinement.open_root, &transcript.path);
+        .fresh_state_of(confinement.open_root, &transcript.path);
     if !unchanged || open != OpenState::Closed {
-        // The source moved on after the copy was taken: the copy is stale.
-        super::best_effort(entries.destination_dir.unlink(&entries.destination_name));
-        entries.destination_dir.sync();
-        super::best_effort(context.index.remove_archive(&transcript.path));
+        entries.discard_copy(context.index, transcript);
         let reason = if !unchanged {
             SkipReason::ModifiedDuringCompression
         } else if open == OpenState::Open {
@@ -235,14 +246,16 @@ fn remove_source<P: OpenFileProbe>(
         };
         return Err(Skipped::new(
             reason,
-            "source changed or opened before removal; copy discarded",
+            "source changed, opened, or its open state is unknown before removal; copy discarded",
         ));
     }
     entries
         .source_dir
         .unlink_if(&entries.source_name, before)
         .map_err(|error| Skipped::io("cannot remove", &transcript.path, &error))?;
-    entries.source_dir.sync();
+    // The copy is durable already; a failure here only delays the removal's
+    // durability, it cannot lose data.
+    super::best_effort(entries.source_dir.sync());
     Ok(())
 }
 
@@ -280,6 +293,11 @@ fn resume<P: OpenFileProbe>(
         return Err(conflict(format!(
             "{destination} exists with different content"
         )));
+    }
+    // The copy may predate a durable sync: make it durable before relying
+    // on it.
+    if let Err(error) = entries.destination_dir.sync() {
+        return Err(Skipped::io("cannot sync", &transcript.destination, &error));
     }
     let verify_time = started.elapsed();
     let indexed = context
@@ -437,24 +455,36 @@ pub(crate) fn archive_one<P: OpenFileProbe>(
         .map(|metadata| metadata.len())
         .unwrap_or(0);
 
-    temporary
-        .publish(&entries.destination_name)
-        .map_err(|error| {
-            if error.kind() == io::ErrorKind::AlreadyExists {
-                Skipped::new(
-                    SkipReason::DestinationConflict,
-                    "destination appeared meanwhile",
-                )
-            } else {
-                Skipped::io("cannot publish", &transcript.destination, &error)
+    match temporary.publish(&entries.destination_name) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(Skipped::new(
+                SkipReason::DestinationConflict,
+                "destination appeared meanwhile",
+            ));
+        }
+        Err(error) => {
+            // The link may exist but is not proven durable: drop it, keep the
+            // source, record no row.
+            if entries
+                .destination_dir
+                .exists(&entries.destination_name)
+                .unwrap_or(false)
+            {
+                entries.discard_copy(context.index, transcript);
             }
-        })?;
+            return Err(Skipped::io(
+                "cannot publish durably",
+                &transcript.destination,
+                &error,
+            ));
+        }
+    }
     let row = row_for(transcript, bytes_in, bytes_out, &sha256, context.now_ms);
     if let Err(error) = context.index.record_archive(&row) {
         // Without its index row a copy cannot be restored with its hash
         // checked; keep the source and drop the copy.
-        super::best_effort(entries.destination_dir.unlink(&entries.destination_name));
-        entries.destination_dir.sync();
+        entries.discard_copy(context.index, transcript);
         return Err(Skipped::new(SkipReason::Io, error));
     }
     if !context.hooks.after_publish(&transcript.path) {
@@ -488,14 +518,79 @@ pub(crate) struct RestorePlan {
 pub struct Restored {
     pub archive: PathBuf,
     pub original: PathBuf,
+    /// Bytes of the restored file.
     pub bytes: u64,
+    /// SHA-256 of the archived content (what the index recorded).
     pub sha256: String,
     pub hash_checked: bool,
+    /// Bytes of a newer transcript found at the original path and appended
+    /// after the archived content (0 when there was none).
+    pub merged_fragment_bytes: u64,
+}
+
+/// Copies the archive's decoded content, then an optional fragment, into a
+/// temporary file, hashing what it writes.
+struct Merge<'w> {
+    writer: BufWriter<&'w File>,
+    archive_hasher: Sha256,
+    all_hasher: Sha256,
+    archive_bytes: u64,
+    total: u64,
+    last: Option<u8>,
+}
+
+impl<'w> Merge<'w> {
+    fn new(file: &'w File) -> Self {
+        Self {
+            writer: BufWriter::with_capacity(CHUNK, file),
+            archive_hasher: Sha256::new(),
+            all_hasher: Sha256::new(),
+            archive_bytes: 0,
+            total: 0,
+            last: None,
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8], from_archive: bool) -> io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if from_archive {
+            self.archive_hasher.update(bytes);
+            self.archive_bytes += bytes.len() as u64;
+        }
+        self.all_hasher.update(bytes);
+        self.writer.write_all(bytes)?;
+        self.total += bytes.len() as u64;
+        self.last = bytes.last().copied();
+        Ok(())
+    }
+
+    fn copy(&mut self, mut reader: impl Read, from_archive: bool) -> io::Result<()> {
+        let mut buffer = vec![0u8; CHUNK];
+        loop {
+            let read = match reader.read(&mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            self.write(&buffer[..read], from_archive)?;
+        }
+    }
 }
 
 /// Decompress `plan.archive` (beneath `archive_root`) back to
 /// `plan.original` (beneath `original_root`), verifying the hash, then
-/// remove the archive. Refuses when the original path exists.
+/// remove the archive.
+///
+/// When a newer transcript (a fragment an agent started at the same path
+/// after the archive was taken) exists at the original path, the result is
+/// the archived content followed by the fragment's lines: written to a
+/// temporary file, verified by re-reading it, and atomically put in place
+/// of the fragment. The fragment is kept under a backup name until the
+/// merged file is published, and the merge is abandoned if the fragment
+/// changes meanwhile.
 pub(crate) fn restore_one(
     plan: &RestorePlan,
     archive_root: &Root,
@@ -507,71 +602,140 @@ pub(crate) fn restore_one(
     let (original_dir, original_name) = original_root
         .parent_of(&plan.original, true)
         .map_err(|error| format!("unsafe restore target {original}: {error}"))?;
-    match original_dir.exists(&original_name) {
-        Ok(false) => {}
-        Ok(true) => {
-            return Err(format!(
-                "{original} already exists; move it aside before restoring"
-            ));
-        }
+    let fragment = match original_dir.exists(&original_name) {
+        Ok(false) => None,
+        Ok(true) => Some(
+            original_dir
+                .stamp(&original_name)
+                .map_err(|error| format!("{original} exists but is not a plain file: {error}"))?,
+        ),
         Err(error) => return Err(format!("cannot stat {original}: {error}")),
-    }
+    };
     let (archive_dir, archive_name) = archive_root
         .parent_of(&plan.archive, false)
         .map_err(|error| format!("unsafe archive path {archive}: {error}"))?;
     let (archive_file, archive_stamp) = archive_dir
         .open_read(&archive_name)
         .map_err(|error| format!("cannot open {archive}: {error}"))?;
-    let temporary = original_dir
-        .create_temp(TEMP_PREFIX, TEMP_SUFFIX)
-        .map_err(|error| format!("cannot create a temporary file beside {original}: {error}"))?;
-    let mut decoder = zstd::stream::read::Decoder::new(archive_file)
-        .map_err(|error| format!("cannot decode {archive}: {error}"))?;
-    let mut hasher = Sha256::new();
-    let mut writer = BufWriter::with_capacity(CHUNK, &temporary.file);
-    let mut buffer = vec![0u8; CHUNK];
-    let mut total = 0u64;
-    loop {
-        let read = match decoder.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(format!("cannot decode {archive}: {error}")),
-        };
-        hasher.update(&buffer[..read]);
-        writer
-            .write_all(&buffer[..read])
-            .map_err(|error| format!("cannot write beside {original}: {error}"))?;
-        total += read as u64;
+    // Keep the fragment reachable under a backup name until the merged file
+    // is published.
+    let backup = match fragment {
+        Some(_) => Some(
+            original_dir
+                .link_unique(&original_name, TEMP_PREFIX, ".fragment")
+                .map_err(|error| format!("cannot back up {original}: {error}"))?,
+        ),
+        None => None,
+    };
+    let result = write_restored(plan, &original_dir, &original_name, archive_file, fragment);
+    if let Some(backup) = &backup {
+        // Published or abandoned, the fragment is no longer needed under its
+        // backup name: it is either merged or still at the original path.
+        super::best_effort(original_dir.unlink(backup));
+        super::best_effort(original_dir.sync());
     }
-    writer
-        .flush()
-        .map_err(|error| format!("cannot write beside {original}: {error}"))?;
-    drop(writer);
-    let digest = hex(&hasher.finalize());
-    if let Some(expected) = &plan.sha256
-        && *expected != digest
-    {
-        return Err(format!(
-            "{archive} decodes to SHA-256 {digest}, the index recorded {expected}; archive kept"
-        ));
-    }
-    temporary
-        .publish(&original_name)
-        .map_err(|error| format!("cannot publish {original}: {error}"))?;
+    let restored = result?;
     archive_dir
         .unlink_if(&archive_name, archive_stamp)
         .map_err(|error| format!("restored {original} but could not remove {archive}: {error}"))?;
-    archive_dir.sync();
+    super::best_effort(archive_dir.sync());
     if let Some(index) = index {
         index.remove_archive(&plan.original)?;
+    }
+    Ok(restored)
+}
+
+/// Write the restored transcript (archived content, then any fragment) to
+/// a temporary file beside the original, verify it by re-reading it, and
+/// publish it: no-clobber when there was no fragment, atomically in place
+/// of the fragment otherwise.
+fn write_restored(
+    plan: &RestorePlan,
+    original_dir: &Dir,
+    original_name: &CString,
+    archive_file: File,
+    fragment: Option<Stamp>,
+) -> Result<Restored, String> {
+    let original = plan.original.display();
+    let archive = plan.archive.display();
+    let temporary = original_dir
+        .create_temp(TEMP_PREFIX, TEMP_SUFFIX)
+        .map_err(|error| format!("cannot create a temporary file beside {original}: {error}"))?;
+    let mut merge = Merge::new(&temporary.file);
+    let decoder = zstd::stream::read::Decoder::new(archive_file)
+        .map_err(|error| format!("cannot decode {archive}: {error}"))?;
+    merge
+        .copy(decoder, true)
+        .map_err(|error| format!("cannot restore {archive}: {error}"))?;
+    let archive_digest = hex(&merge.archive_hasher.clone().finalize());
+    if let Some(expected) = &plan.sha256
+        && *expected != archive_digest
+    {
+        return Err(format!(
+            "{archive} decodes to SHA-256 {archive_digest}, the index recorded {expected}; archive kept"
+        ));
+    }
+    let mut merged_fragment_bytes = 0;
+    if let Some(expected) = fragment {
+        let (fragment_file, opened) = original_dir
+            .open_read(original_name)
+            .map_err(|error| format!("cannot read {original}: {error}"))?;
+        if opened != expected {
+            return Err(format!(
+                "{original} changed during the restore; nothing was changed"
+            ));
+        }
+        if expected.len > 0 && merge.last.is_some_and(|byte| byte != b'\n') {
+            merge
+                .write(b"\n", false)
+                .map_err(|error| format!("cannot write beside {original}: {error}"))?;
+        }
+        merge
+            .copy(fragment_file, false)
+            .map_err(|error| format!("cannot merge {original}: {error}"))?;
+        merged_fragment_bytes = expected.len;
+    }
+    merge
+        .writer
+        .flush()
+        .map_err(|error| format!("cannot write beside {original}: {error}"))?;
+    let total = merge.total;
+    let written = hex(&merge.all_hasher.clone().finalize());
+    drop(merge);
+    // Verify what reached the file, not what was handed to the writer.
+    let (reread, _) = original_dir
+        .open_read(&temporary.name)
+        .map_err(|error| format!("cannot verify the restore of {original}: {error}"))?;
+    let mut unpaced = Pacer::new(None);
+    let check = digest_reader(reread, &mut unpaced)
+        .map_err(|error| format!("cannot verify the restore of {original}: {error}"))?;
+    if check != (total, written) {
+        return Err(format!(
+            "the restore of {original} did not verify; nothing was changed"
+        ));
+    }
+    match fragment {
+        None => temporary
+            .publish(original_name)
+            .map_err(|error| format!("cannot publish {original}: {error}"))?,
+        Some(expected) => {
+            if original_dir.stamp(original_name).ok() != Some(expected) {
+                return Err(format!(
+                    "{original} changed during the restore; nothing was changed"
+                ));
+            }
+            temporary
+                .publish_replacing(original_name)
+                .map_err(|error| format!("cannot publish {original}: {error}"))?;
+        }
     }
     Ok(Restored {
         archive: plan.archive.clone(),
         original: plan.original.clone(),
         bytes: total,
-        sha256: digest,
+        sha256: archive_digest,
         hash_checked: plan.sha256.is_some(),
+        merged_fragment_bytes,
     })
 }
 
@@ -586,7 +750,7 @@ pub(crate) fn remove_leftover_temps(paths: &[PathBuf], roots: &[&Root]) -> u64 {
             continue;
         };
         if directory.stamp(&name).is_ok() && directory.unlink(&name).is_ok() {
-            directory.sync();
+            super::best_effort(directory.sync());
             removed += 1;
         }
     }

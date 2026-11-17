@@ -51,6 +51,16 @@ pub enum SkipReason {
     UnsafePath,
     /// A test stopped the archiver at a crash point.
     Interrupted,
+    /// A Claude Code process may be the transcript's live session (its
+    /// working directory maps to the project, or it names the session).
+    AgentRunning,
+    /// The process table could not be read, so a live Claude Code session
+    /// cannot be ruled out.
+    ProcessCheckUnavailable,
+    /// The archive volume lacks room for the compressed copy.
+    InsufficientSpace,
+    /// A destination conflict was recorded earlier; retried after a backoff.
+    DestinationConflictBackoff,
 }
 
 impl SkipReason {
@@ -71,6 +81,10 @@ impl SkipReason {
             SkipReason::UnsupportedPath => "unsupported_path",
             SkipReason::UnsafePath => "unsafe_path",
             SkipReason::Interrupted => "interrupted",
+            SkipReason::AgentRunning => "agent_running",
+            SkipReason::ProcessCheckUnavailable => "process_check_unavailable",
+            SkipReason::InsufficientSpace => "insufficient_space",
+            SkipReason::DestinationConflictBackoff => "destination_conflict_backoff",
         }
     }
 }

@@ -13,6 +13,9 @@ use super::providers::Provider;
 /// The settings file, under `<host state>/transcripts/`.
 pub const SETTINGS_FILE: &str = "settings.toml";
 pub const DEFAULT_ARCHIVE_AFTER_DAYS: u32 = 3;
+/// Claude Code keeps no transcript open while a session is idle, so its
+/// transcripts wait longer before they count as finished.
+pub const DEFAULT_ARCHIVE_AFTER_DAYS_CLAUDE: u32 = 14;
 const MAX_ARCHIVE_AFTER_DAYS: i64 = 3650;
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -28,7 +31,10 @@ pub const DEFAULT_FREE_SPACE_FLOOR_BYTES: u64 = 20 * GIB;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TranscriptsConfig {
     pub archive: bool,
+    /// Age before a Codex transcript qualifies.
     pub archive_after_days: u32,
+    /// Age before a Claude Code transcript qualifies.
+    pub archive_after_days_claude: u32,
     pub providers: Vec<Provider>,
     /// Overrides `$CODEX_HOME` and `~/.codex`.
     pub codex_home: Option<PathBuf>,
@@ -46,6 +52,7 @@ impl Default for TranscriptsConfig {
         Self {
             archive: false,
             archive_after_days: DEFAULT_ARCHIVE_AFTER_DAYS,
+            archive_after_days_claude: DEFAULT_ARCHIVE_AFTER_DAYS_CLAUDE,
             providers: vec![Provider::Codex],
             codex_home: None,
             claude_home: None,
@@ -76,7 +83,25 @@ fn positive_integer(key: &str, value: &toml::Value, minimum: i64) -> Result<u64,
     }
 }
 
+fn days(key: &str, value: &toml::Value) -> Result<u32, String> {
+    let days = positive_integer(key, value, 1)?;
+    if days > MAX_ARCHIVE_AFTER_DAYS as u64 {
+        return Err(format!(
+            "transcripts.{key} must be at most {MAX_ARCHIVE_AFTER_DAYS}"
+        ));
+    }
+    Ok(days as u32)
+}
+
 impl TranscriptsConfig {
+    /// The age, in days, before `provider`'s transcripts qualify.
+    pub fn days_for(&self, provider: Provider) -> u32 {
+        match provider {
+            Provider::Codex => self.archive_after_days,
+            Provider::Claude => self.archive_after_days_claude,
+        }
+    }
+
     /// Parse a settings file. A file without `[transcripts]` is the default.
     pub fn parse(text: &str) -> Result<Self, String> {
         let table: toml::Table = toml::from_str(text)
@@ -95,14 +120,9 @@ impl TranscriptsConfig {
                         .as_bool()
                         .ok_or("transcripts.archive must be true or false")?;
                 }
-                "archive_after_days" => {
-                    let days = positive_integer(key, value, 1)?;
-                    if days > MAX_ARCHIVE_AFTER_DAYS as u64 {
-                        return Err(format!(
-                            "transcripts.archive_after_days must be at most {MAX_ARCHIVE_AFTER_DAYS}"
-                        ));
-                    }
-                    config.archive_after_days = days as u32;
+                "archive_after_days" => config.archive_after_days = days(key, value)?,
+                "archive_after_days_claude" => {
+                    config.archive_after_days_claude = days(key, value)?;
                 }
                 "providers" => {
                     let Some(items) = value.as_array() else {

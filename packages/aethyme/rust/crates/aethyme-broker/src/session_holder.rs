@@ -303,6 +303,24 @@ impl ProcessTable {
             .is_some_and(|row| row.started == process.started)
     }
 
+    /// Every process whose command line satisfies `predicate`, with that
+    /// command line, in pid order.
+    pub(crate) fn processes_matching(
+        &self,
+        predicate: impl Fn(&str) -> bool,
+    ) -> Vec<(i64, String)> {
+        let mut found: Vec<(i64, String)> = self
+            .rows
+            .iter()
+            .filter_map(|(pid, row)| {
+                let args = row.args(*pid);
+                predicate(args).then(|| (*pid, args.to_owned()))
+            })
+            .collect();
+        found.sort_unstable_by_key(|(pid, _)| *pid);
+        found
+    }
+
     /// Every process that is itself an agent runtime.
     pub fn agent_pids(&self) -> Vec<i64> {
         let mut pids: Vec<i64> = self

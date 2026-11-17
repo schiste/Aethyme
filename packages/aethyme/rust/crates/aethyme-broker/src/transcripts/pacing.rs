@@ -22,6 +22,17 @@ pub(crate) fn choose_rate(
     }
 }
 
+/// Room an archive needs on its volume before the original is removed: a
+/// third of the original's size (zstd -3 does 4-5x on transcripts) plus a
+/// fixed margin, so archiving never fills the disk to make space.
+pub(crate) const SPACE_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Whether `bytes` of transcript may be archived with `available` bytes
+/// free on the archive volume.
+pub(crate) fn fits(available: u64, bytes: u64) -> bool {
+    available >= (bytes / 3).saturating_add(SPACE_MARGIN_BYTES)
+}
+
 /// Sleeps as needed so the bytes it is told about never run ahead of the rate.
 #[derive(Debug)]
 pub(crate) struct Pacer {

@@ -200,6 +200,13 @@ impl<P: OpenFileProbe> OpenFiles<P> {
         }
     }
 
+    /// Whether `path` (beneath `root`) is open, from a listing taken now.
+    /// Used immediately before an original is removed.
+    pub fn fresh_state_of(&mut self, root: &Path, path: &Path) -> OpenState {
+        self.listings.retain(|listing| listing.root != root);
+        self.state_of(root, path)
+    }
+
     /// Every open file beneath `root`, from a listing at most `max_age` old.
     pub fn holders(&mut self, root: &Path) -> Result<Vec<OpenFile>, String> {
         self.listing(root).clone()

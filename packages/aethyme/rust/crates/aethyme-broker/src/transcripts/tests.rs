@@ -7,6 +7,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::agents::{self, AgentProbe, ClaudeProcess};
 use super::archive::{self, Hooks, NoHooks};
 use super::config::{self, SettingsChange, TranscriptsConfig};
 use super::eligibility::{
@@ -17,7 +18,7 @@ use super::linkage;
 use super::open_files::{self, OpenFile, OpenFileProbe, OpenFiles};
 use super::pacing::{self, Pacer};
 use super::providers::{self, Provider};
-use super::run::{self, Options};
+use super::run::{self, Options, Probes};
 use super::safe_fs::Root;
 use super::{Environment, LaneLock};
 
@@ -75,6 +76,7 @@ impl Host {
             codex_home: Some(root.join("codex-home")),
             claude_home: Some(root.join("claude-home")),
             use_registry: false,
+            free_space_override: Some(1 << 40),
         };
         Self {
             _temp: temp,
@@ -126,6 +128,8 @@ fn enabled(providers: Vec<Provider>) -> TranscriptsConfig {
     TranscriptsConfig {
         archive: true,
         providers,
+        // Claude's own default (14 days) is covered by its own test.
+        archive_after_days_claude: 3,
         // Fast enough that tests never wait on pacing.
         bytes_per_second: 1 << 40,
         ..TranscriptsConfig::default()
@@ -150,6 +154,55 @@ fn dry() -> Options {
     }
 }
 
+/// A process table with a fixed set of Claude Code processes.
+#[derive(Default)]
+struct FakeAgents {
+    processes: Option<Vec<ClaudeProcess>>,
+    calls: u64,
+}
+
+impl FakeAgents {
+    fn none() -> Self {
+        Self {
+            processes: Some(Vec::new()),
+            calls: 0,
+        }
+    }
+}
+
+impl AgentProbe for FakeAgents {
+    fn claude_processes(&mut self) -> Result<Vec<ClaudeProcess>, String> {
+        self.calls += 1;
+        self.processes
+            .clone()
+            .ok_or_else(|| "process table unavailable (test)".to_string())
+    }
+}
+
+fn pass_at<P: OpenFileProbe>(
+    host: &Host,
+    config: &TranscriptsConfig,
+    options: Options,
+    open: &mut OpenFiles<P>,
+    agents: &mut dyn AgentProbe,
+    hooks: &mut dyn Hooks,
+    now_ms: i64,
+) -> run::RunReport {
+    let mut probes = Probes {
+        open_files: open,
+        agents,
+    };
+    run::run_pass(
+        &host.environment,
+        config,
+        options,
+        &mut probes,
+        hooks,
+        now_ms,
+    )
+    .unwrap()
+}
+
 fn pass(
     host: &Host,
     config: &TranscriptsConfig,
@@ -157,7 +210,28 @@ fn pass(
     open: &mut OpenFiles<FakeProbe>,
     hooks: &mut dyn Hooks,
 ) -> run::RunReport {
-    run::run_pass(&host.environment, config, options, open, hooks, later()).unwrap()
+    pass_at(
+        host,
+        config,
+        options,
+        open,
+        &mut FakeAgents::none(),
+        hooks,
+        later(),
+    )
+}
+
+fn status(
+    host: &Host,
+    config: &TranscriptsConfig,
+    open: &mut OpenFiles<FakeProbe>,
+) -> run::StatusReport {
+    let mut agents = FakeAgents::none();
+    let mut probes = Probes {
+        open_files: open,
+        agents: &mut agents,
+    };
+    run::status(&host.environment, config, &mut probes).unwrap()
 }
 
 fn decompress(path: &Path) -> Vec<u8> {
@@ -609,7 +683,7 @@ fn disabled_settings_do_nothing_at_all() {
         !host.environment.host_dir.exists(),
         "no state directory, lock or index is created"
     );
-    let status = run::status(&host.environment, &config, &mut open).unwrap();
+    let status = status(&host, &config, &mut open);
     assert!(!status.enabled);
     assert_eq!(status.reclaimable_now_bytes, 0);
     assert!(!host.environment.host_dir.exists());
@@ -677,15 +751,15 @@ fn a_transcript_held_open_by_a_real_process_is_skipped() {
     let config = enabled(vec![Provider::Codex]);
     let _held = fs::File::open(&source).unwrap();
     let mut open = OpenFiles::new(super::open_files::SystemProbe, Duration::ZERO);
-    let report = run::run_pass(
-        &host.environment,
+    let report = pass_at(
+        &host,
         &config,
         apply(),
         &mut open,
+        &mut FakeAgents::none(),
         &mut NoHooks,
         later(),
-    )
-    .unwrap();
+    );
     assert!(report.archived.is_empty(), "{report:?}");
     assert_eq!(report.skipped.get("open_by_process"), Some(&1));
     assert!(source.is_file());
@@ -697,15 +771,15 @@ fn a_recent_transcript_is_left_alone() {
     let source = host.codex_transcript(UUID, Path::new("/work/invented"));
     let config = enabled(vec![Provider::Codex]);
     let mut open = probe(Vec::new());
-    let report = run::run_pass(
-        &host.environment,
+    let report = pass_at(
+        &host,
         &config,
         apply(),
         &mut open,
+        &mut FakeAgents::none(),
         &mut NoHooks,
         super::now_ms(),
-    )
-    .unwrap();
+    );
     assert!(report.archived.is_empty());
     assert_eq!(report.skipped.get("too_recent"), Some(&1));
     assert!(source.is_file());
@@ -944,18 +1018,13 @@ fn restore_round_trips_codex_and_claude_byte_identically() {
 }
 
 #[test]
-fn restore_refuses_to_overwrite_and_checks_the_hash() {
+fn restore_checks_the_hash_before_publishing() {
     let host = Host::new();
     let source = host.codex_transcript(UUID, Path::new("/work/invented"));
     let config = enabled(vec![Provider::Codex]);
     let mut open = probe(Vec::new());
     pass(&host, &config, apply(), &mut open, &mut NoHooks);
     let destination = codex_destination(&host, &source);
-
-    fs::write(&source, b"something new").unwrap();
-    assert!(run::restore(&host.environment, &config, UUID).is_err());
-    assert!(destination.is_file(), "the archive is kept");
-    fs::remove_file(&source).unwrap();
 
     let wrong = archive::RestorePlan {
         archive: destination.clone(),
@@ -1169,7 +1238,7 @@ fn an_archive_moved_away_is_reconciled_and_never_overcounted() {
     pass(&host, &config, apply(), &mut open, &mut NoHooks);
     codex_unarchive(&host, &source);
 
-    let status = run::status(&host.environment, &config, &mut open).unwrap();
+    let status = status(&host, &config, &mut open);
     assert_eq!(status.archived_files, 0, "{status:?}");
     assert_eq!(status.archived_bytes_after, 0);
 
@@ -1181,4 +1250,380 @@ fn an_archive_moved_away_is_reconciled_and_never_overcounted() {
         report.archived.is_empty(),
         "an unarchived .jsonl.zst is left to Codex"
     );
+}
+
+// ── review fixes: linkage, live Claude sessions, space, durability ───
+
+#[test]
+fn an_unreadable_broker_database_skips_unlinked_transcripts() {
+    let host = Host::new();
+    let repository = Repository::new(&host, OTHER_UUID, "closed");
+    // The transcript's cwd finds this database, which cannot be read.
+    fs::write(&repository.db, b"not a database at all").unwrap();
+    let source = host.codex_transcript(UUID, &repository.root);
+    let config = enabled(vec![Provider::Codex]);
+    let mut open = probe(Vec::new());
+    let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    assert!(report.linkage_degraded, "{report:?}");
+    assert!(report.archived.is_empty(), "{report:?}");
+    assert_eq!(report.skipped.get("linkage_unreadable"), Some(&1));
+    assert!(source.is_file());
+}
+
+#[test]
+fn claude_names_and_project_directories() {
+    assert!(agents::is_claude("claude --resume x"));
+    assert!(agents::is_claude("/opt/bin/claude"));
+    assert!(agents::is_claude(
+        "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+    ));
+    assert!(!agents::is_claude("codex resume x"));
+    assert!(!agents::is_claude("vim claude.md"));
+    assert_eq!(
+        agents::project_dir_name(Path::new("/work/invented.project_x")),
+        "-work-invented-project-x"
+    );
+    let live = |cwd: &str| ClaudeProcess {
+        cwd: Some(PathBuf::from(cwd)),
+        args: "claude".into(),
+    };
+    let project = "-work-invented-project";
+    assert!(agents::claude_session_live(
+        &[live("/work/invented/project")],
+        project,
+        None
+    ));
+    assert!(agents::claude_session_live(
+        &[live("/work/invented-project/sub")],
+        project,
+        None
+    ));
+    assert!(!agents::claude_session_live(
+        &[live("/work/other")],
+        project,
+        None
+    ));
+    let unknown_cwd = ClaudeProcess {
+        cwd: None,
+        args: "claude".into(),
+    };
+    assert!(agents::claude_session_live(&[unknown_cwd], project, None));
+    let named = ClaudeProcess {
+        cwd: Some(PathBuf::from("/elsewhere")),
+        args: format!("claude --resume {OTHER_UUID}"),
+    };
+    assert!(agents::claude_session_live(
+        &[named],
+        project,
+        Some(OTHER_UUID)
+    ));
+}
+
+fn claude_enabled() -> TranscriptsConfig {
+    TranscriptsConfig {
+        archive_after_days_claude: 3,
+        ..enabled(vec![Provider::Claude])
+    }
+}
+
+#[test]
+fn a_live_or_unverifiable_claude_session_is_never_archived() {
+    let host = Host::new();
+    let source = host.claude_transcript(OTHER_UUID);
+    let config = claude_enabled();
+    let mut open = probe(Vec::new());
+
+    let mut running = FakeAgents {
+        processes: Some(vec![ClaudeProcess {
+            cwd: Some(PathBuf::from("/work/invented-project")),
+            args: "claude".into(),
+        }]),
+        calls: 0,
+    };
+    let report = pass_at(
+        &host,
+        &config,
+        apply(),
+        &mut open,
+        &mut running,
+        &mut NoHooks,
+        later(),
+    );
+    assert!(report.archived.is_empty(), "{report:?}");
+    assert_eq!(report.skipped.get("agent_running"), Some(&1));
+
+    let mut unavailable = FakeAgents::default();
+    let report = pass_at(
+        &host,
+        &config,
+        apply(),
+        &mut open,
+        &mut unavailable,
+        &mut NoHooks,
+        later(),
+    );
+    assert!(report.archived.is_empty(), "{report:?}");
+    assert_eq!(report.skipped.get("process_check_unavailable"), Some(&1));
+    assert!(source.is_file());
+
+    let mut elsewhere = FakeAgents {
+        processes: Some(vec![ClaudeProcess {
+            cwd: Some(PathBuf::from("/work/unrelated")),
+            args: "claude".into(),
+        }]),
+        calls: 0,
+    };
+    let report = pass_at(
+        &host,
+        &config,
+        apply(),
+        &mut open,
+        &mut elsewhere,
+        &mut NoHooks,
+        later(),
+    );
+    assert_eq!(report.archived.len(), 1, "{report:?}");
+    assert!(
+        elsewhere.calls >= 2,
+        "checked at judging and again before archiving"
+    );
+}
+
+#[test]
+fn claude_transcripts_wait_fourteen_days_by_default() {
+    let host = Host::new();
+    let claude = host.claude_transcript(OTHER_UUID);
+    let codex = host.codex_transcript(UUID, Path::new("/work/invented"));
+    assert_eq!(TranscriptsConfig::default().archive_after_days_claude, 14);
+    let config = TranscriptsConfig {
+        archive_after_days_claude: config::DEFAULT_ARCHIVE_AFTER_DAYS_CLAUDE,
+        ..enabled(vec![Provider::Codex, Provider::Claude])
+    };
+    let mut open = probe(Vec::new());
+    // `later()` is ten days on.
+    let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    assert_eq!(report.archived.len(), 1, "{report:?}");
+    assert!(!codex.exists());
+    assert!(claude.is_file());
+    assert_eq!(report.skipped.get("too_recent"), Some(&1));
+    assert!(
+        TranscriptsConfig::parse("[transcripts]\narchive_after_days_claude = 30\n")
+            .unwrap()
+            .archive_after_days_claude
+            == 30
+    );
+}
+
+#[test]
+fn restore_merges_a_newer_fragment_after_the_archived_content() {
+    let host = Host::new();
+    let source = host.claude_transcript(OTHER_UUID);
+    let archived = fs::read(&source).unwrap();
+    let config = claude_enabled();
+    let mut open = probe(Vec::new());
+    let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    assert_eq!(report.archived.len(), 1, "{report:?}");
+    // The idle session wrote again: a fragment at the same path.
+    let fragment = b"{\"type\":\"user\",\"n\":\"after the archive\"}\n";
+    fs::write(&source, fragment).unwrap();
+
+    let restored = run::restore(&host.environment, &config, OTHER_UUID).unwrap();
+    assert_eq!(restored[0].merged_fragment_bytes, fragment.len() as u64);
+    let mut expected = archived.clone();
+    expected.extend_from_slice(fragment);
+    assert_eq!(fs::read(&source).unwrap(), expected);
+    assert!(!report.archived[0].destination.exists());
+    let leftovers: Vec<String> = fs::read_dir(source.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(providers::TEMP_PREFIX))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the fragment backup is removed: {leftovers:?}"
+    );
+}
+
+#[test]
+fn a_destination_conflict_is_recorded_once_then_backed_off() {
+    let host = Host::new();
+    let source = host.codex_transcript(UUID, Path::new("/work/invented"));
+    let destination = codex_destination(&host, &source);
+    fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    fs::write(&destination, b"not this transcript").unwrap();
+    let config = enabled(vec![Provider::Codex]);
+    let mut open = probe(Vec::new());
+    let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    assert_eq!(report.skipped.get("destination_conflict"), Some(&1));
+    let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    assert_eq!(report.skipped.get("destination_conflict"), None);
+    assert_eq!(report.skipped.get("destination_conflict_backoff"), Some(&1));
+    assert!(report.skipped_examples.is_empty(), "{report:?}");
+    // Due again after the backoff.
+    let index = Index::open(&host.environment.host_dir).unwrap();
+    assert!(!index.conflict_due(&source, later()).unwrap());
+    assert!(index.conflict_due(&source, later() + 2 * DAY_MS).unwrap());
+    assert!(source.is_file());
+}
+
+/// Reports `path` open from the `open_from`-th listing on.
+struct OpensLater {
+    path: PathBuf,
+    open_from: u64,
+    calls: u64,
+}
+
+impl OpenFileProbe for OpensLater {
+    fn open_under(&mut self, _root: &Path) -> Result<Vec<OpenFile>, String> {
+        self.calls += 1;
+        Ok(if self.calls >= self.open_from {
+            vec![OpenFile {
+                pid: 77,
+                path: self.path.clone(),
+            }]
+        } else {
+            Vec::new()
+        })
+    }
+}
+
+#[test]
+fn a_fresh_listing_is_taken_right_before_the_original_is_removed() {
+    let host = Host::new();
+    let source = host.codex_transcript(UUID, Path::new("/work/invented"));
+    let config = enabled(vec![Provider::Codex]);
+    // Cached listings would say "closed" for an hour; only a fresh one sees
+    // the process that opened the transcript meanwhile.
+    let mut open = OpenFiles::new(
+        OpensLater {
+            path: source.clone(),
+            open_from: 2,
+            calls: 0,
+        },
+        Duration::from_secs(3600),
+    );
+    let report = pass_at(
+        &host,
+        &config,
+        apply(),
+        &mut open,
+        &mut FakeAgents::none(),
+        &mut NoHooks,
+        later(),
+    );
+    assert!(report.archived.is_empty(), "{report:?}");
+    assert_eq!(report.skipped.get("open_by_process"), Some(&1));
+    assert!(source.is_file());
+    assert!(
+        !codex_destination(&host, &source).exists(),
+        "the copy is discarded"
+    );
+}
+
+#[test]
+fn below_the_free_space_floor_only_what_fits_is_archived_unpaced() {
+    assert!(pacing::fits(256 * 1024 * 1024 + 100, 300));
+    assert!(!pacing::fits(256 * 1024 * 1024, 3 * 1024 * 1024));
+
+    let mut host = Host::new();
+    let source = host.codex_transcript(UUID, Path::new("/work/invented"));
+    let config = enabled(vec![Provider::Codex]);
+    let mut open = probe(Vec::new());
+
+    host.environment.free_space_override = Some(100 * 1024 * 1024);
+    let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    assert!(report.archived.is_empty(), "{report:?}");
+    assert!(report.insufficient_space);
+    assert_eq!(report.skipped.get("insufficient_space"), Some(&1));
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("insufficient_space")),
+        "{report:?}"
+    );
+    assert!(source.is_file());
+
+    host.environment.free_space_override = Some(300 * 1024 * 1024);
+    let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    assert_eq!(report.archived.len(), 1, "{report:?}");
+    assert_eq!(
+        report.paced_bytes_per_second, None,
+        "unpaced below the floor"
+    );
+}
+
+#[test]
+fn full_sync_flushes_a_file_and_a_directory() {
+    use std::os::fd::AsRawFd as _;
+    let temp = tempfile::tempdir().unwrap();
+    let file = fs::File::create(temp.path().join("f")).unwrap();
+    super::safe_fs::full_sync(file.as_raw_fd()).unwrap();
+    let directory = fs::File::open(temp.path()).unwrap();
+    super::safe_fs::full_sync(directory.as_raw_fd()).unwrap();
+}
+
+#[test]
+fn disabled_reads_no_provider_root_and_no_state() {
+    let host = Host::new();
+    let source = host.codex_transcript(UUID, Path::new("/work/invented"));
+    // An index from an earlier, enabled time.
+    let enabled_config = enabled(vec![Provider::Codex]);
+    let mut open = probe(Vec::new());
+    pass(&host, &enabled_config, dry(), &mut open, &mut NoHooks);
+    fs::set_permissions(host.codex_dir(), fs::Permissions::from_mode(0o000)).unwrap();
+    let disabled = TranscriptsConfig {
+        archive: false,
+        ..enabled_config
+    };
+    let mut open = probe(Vec::new());
+    let mut agents = FakeAgents::none();
+    let report = pass_at(
+        &host,
+        &disabled,
+        apply(),
+        &mut open,
+        &mut agents,
+        &mut NoHooks,
+        later(),
+    );
+    let status = status(&host, &disabled, &mut open);
+    let rows = run::archived_rows(&host.environment, &disabled).unwrap();
+    fs::set_permissions(host.codex_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(report.examined, 0);
+    assert!(report.warnings.is_empty(), "{report:?}");
+    assert_eq!(open.probes, 0);
+    assert_eq!(agents.calls, 0);
+    assert!(status.last_run.is_none() && status.counters.is_empty());
+    assert!(rows.is_empty());
+    assert!(source.is_file());
+}
+
+#[test]
+fn the_run_log_keeps_session_ids_and_reasons_but_no_paths() {
+    let host = Host::new();
+    let source = host.claude_transcript(OTHER_UUID);
+    let config = claude_enabled();
+    let mut open = probe(Vec::new());
+    let mut running = FakeAgents {
+        processes: Some(vec![ClaudeProcess {
+            cwd: Some(PathBuf::from("/work/invented-project")),
+            args: "claude".into(),
+        }]),
+        calls: 0,
+    };
+    pass_at(
+        &host,
+        &config,
+        apply(),
+        &mut open,
+        &mut running,
+        &mut NoHooks,
+        later(),
+    );
+    let log = fs::read_to_string(host.environment.host_dir.join(run::RUN_LOG)).unwrap();
+    assert!(log.contains(OTHER_UUID), "{log}");
+    assert!(log.contains("agent_running"), "{log}");
+    assert!(!log.contains("-work-invented-project"), "{log}");
+    assert!(!log.contains(source.to_str().unwrap()), "{log}");
 }
