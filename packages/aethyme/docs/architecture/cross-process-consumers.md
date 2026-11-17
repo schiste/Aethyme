@@ -704,6 +704,44 @@ succeeded. Dropping any part of the run binding lets a stale journal settle
 another run that reuses the id after a database reset. Covered by
 `operations/outcome_journal/tests.rs` and the v64 schema test.
 
+## Stale sessions close from the background worker, by work class (2026-11-17)
+
+**Changed behaviour.** CLI commands (`status`, `agents`, `exec`, `leases
+claim`, `start`, `submit` ...) no longer close abandoned or no-work sessions
+inline: the `agents` view counts them (`agents_view_abandonment_due_deferred`)
+and queues the shared detached worker (`gc __continue-artifacts`), which
+judges them. A reader that expected one `broker status` to close an old
+session must now wait for the worker. Library callers of `Broker::agents`
+still judge inline.
+
+**New `[cleanup]` keys** (validated by the `[cleanup]` loader; an invalid
+value keeps sessions open): `stale_landed_close_after_hours` (24),
+`stale_pushed_close_after_hours` (72), `stale_unpushed_close_after_hours`
+(168), `stale_closing_notice_hours` (24). Past the abandonment window, a
+session with no live holder waits for its class window. A holder bound to a
+newer session of the repository (same pid and start time, no bind back) is no
+live holder. The keep reason `holder_moved_on_dirty` (counter
+`session_abandonment_kept_holder_moved_on_dirty`) is removed; the new keep
+reason is `work_class_not_due`.
+
+**New fields and records.** `session.abandoned` from the abandonment window
+gains `work_class` (`landed`, `pushed_unmerged`, `unpushed`). A closing-soon
+automation note (sender `automation:session-auto-close`, fingerprint
+`session-closing-soon`) is left once inside the notice period. Status advice:
+`sessions.stale-backlog`, `sessions.closing-soon`,
+`sessions.process-table-denied`. Meta keys `stale_sessions.classes`,
+`stale_sessions.process_table_observed_at`,
+`stale_sessions.process_table_denied_at`.
+
+**Worker.** A retirement pass refused the process listing defers its
+sessions (they are no longer counted in
+`landed_session_retirement.abandonment.kept`), and the worker stops its
+retirement lane with the request pending
+(`session_retirement_stopped_process_table_denied`).
+
+Covered by `stale_session_policy` unit tests, the `session_auto_close` lane
+tests, `file_lock` tests and `tests/session_abandonment.rs`.
+
 ## Compact status by default, session block and push plan (2026-11-17)
 
 **Changed default.** `aethyme broker status --json` now prints the compact

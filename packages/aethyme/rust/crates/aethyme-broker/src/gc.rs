@@ -7779,6 +7779,30 @@ impl Broker {
         }
     }
 
+    /// A foreground `agents` view found stale sessions due for retirement and
+    /// left them to the shared detached worker: queue its request (one CAS
+    /// row update; nothing waits). Best effort, counted as
+    /// `agents_view_retirement_requested` when this call queued it.
+    pub(crate) fn request_session_retirement_for_due_sessions(&mut self) {
+        let Ok(policy) = load_retention_policy(self.main_root()) else {
+            return;
+        };
+        let pending_before = matches!(
+            self.session_retirement_request_state(),
+            Ok((requested, completed)) if requested > completed
+        );
+        match self.request_session_retirement_if_due(&policy, ArtifactSweepScope::Inline) {
+            Ok(Some(_)) if !pending_before => {
+                crate::phase_telemetry::add("agents_view_retirement_requested", Duration::ZERO);
+            }
+            Ok(_) => {}
+            Err(error) => crate::warn_unrecorded(
+                "queue a session-retirement request for due sessions",
+                Err::<(), _>(error),
+            ),
+        }
+    }
+
     fn request_session_retirement_if_due(
         &mut self,
         policy: &RetentionPolicy,
@@ -10946,6 +10970,27 @@ impl Broker {
                     return Ok(());
                 }
             };
+            if crate::stale_session_policy::last_pass_process_table_denied() {
+                // This worker inherited a sandboxed caller's sandbox and
+                // cannot list processes: another pass would only defer every
+                // session again. Stop the lane with the request pending (the
+                // refusal is recorded for `broker status`), so the next
+                // worker, started by a command that can list processes or by
+                // the managed sweep, judges them.
+                crate::phase_telemetry::add(
+                    "session_retirement_stopped_process_table_denied",
+                    Duration::ZERO,
+                );
+                aggregate.absorb_landed_report(&report);
+                self.record_auto_cleanup_report(&aggregate)?;
+                self.defer_session_retirement_request_for(
+                    request_generation,
+                    "session_retirement_process_table_denied",
+                    SESSION_RETIREMENT_LOCK_BUSY_RETRY_MS,
+                )?;
+                drop(pass_lock);
+                return Ok(());
+            }
             aggregate.enabled = report.enabled;
             aggregate.config_error = report.config_error.clone();
             aggregate.evaluated_at_ms = report.evaluated_at_ms;

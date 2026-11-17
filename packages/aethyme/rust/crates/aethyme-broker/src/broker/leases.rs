@@ -422,6 +422,10 @@ pub(crate) enum AbandonmentKeepReason {
     WorktreeActivityUnavailable,
     /// Session or checkout activity is newer than the window.
     RecentActivity,
+    /// Past the abandonment window, but not past the window of what closing
+    /// would put at risk (`[cleanup] stale_*_close_after_hours`: landed,
+    /// pushed but unmerged, unpushed or uncommitted work).
+    WorkClassNotDue,
     /// The recorded holder could not be checked.
     HolderUnknown,
     /// This command was refused the process listing (a sandboxed caller), so
@@ -433,9 +437,6 @@ pub(crate) enum AbandonmentKeepReason {
     HolderRecordUnavailable,
     /// A live holder whose task lease expired is a shared agent service.
     HolderSharedService,
-    /// The live holder moved on to a later session, but the checkout is not
-    /// clean.
-    HolderMovedOnDirty,
     /// A live holder's task lease no longer reads as expired under the claims.
     TaskLeaseCurrent,
     /// An admitted session command holds the task operation guard.
@@ -526,12 +527,12 @@ impl AbandonmentKeepReason {
             Self::FollowUpProtected => "follow_up_protected",
             Self::WorktreeActivityUnavailable => "worktree_activity_unavailable",
             Self::RecentActivity => "recent_activity",
+            Self::WorkClassNotDue => "work_class_not_due",
             Self::HolderUnknown => "holder_unknown",
             Self::HolderProcessTableDenied => "holder_process_table_denied",
             Self::HolderAliveCurrent => "holder_alive_current",
             Self::HolderRecordUnavailable => "holder_record_unavailable",
             Self::HolderSharedService => "holder_shared_service",
-            Self::HolderMovedOnDirty => "holder_moved_on_dirty",
             Self::TaskLeaseCurrent => "task_lease_current",
             Self::OperationGuardBusy => "operation_guard_busy",
             Self::OperationGuardUnavailable => "operation_guard_unavailable",
@@ -584,6 +585,7 @@ impl AbandonmentKeepReason {
                 "session_abandonment_kept_worktree_activity_unavailable"
             }
             Self::RecentActivity => "session_abandonment_kept_recent_activity",
+            Self::WorkClassNotDue => "session_abandonment_kept_work_class_not_due",
             Self::HolderUnknown => "session_abandonment_kept_holder_unknown",
             Self::HolderProcessTableDenied => {
                 "session_abandonment_kept_holder_process_table_denied"
@@ -591,7 +593,6 @@ impl AbandonmentKeepReason {
             Self::HolderAliveCurrent => "session_abandonment_kept_holder_alive_current",
             Self::HolderRecordUnavailable => "session_abandonment_kept_holder_record_unavailable",
             Self::HolderSharedService => "session_abandonment_kept_holder_shared_service",
-            Self::HolderMovedOnDirty => "session_abandonment_kept_holder_moved_on_dirty",
             Self::TaskLeaseCurrent => "session_abandonment_kept_task_lease_current",
             Self::OperationGuardBusy => "session_abandonment_kept_operation_guard_busy",
             Self::OperationGuardUnavailable => {
@@ -1236,12 +1237,20 @@ impl Broker {
             })
             .map(|session| session.id)
             .collect::<std::collections::HashSet<_>>();
-        let primed = retirement_candidates
-            .iter()
-            .copied()
-            .chain(no_work_candidates.iter().copied())
-            .collect::<Vec<_>>();
-        holder_process_table.prime(self.store_ref(), &primed, None);
+        // A foreground command only records that sessions are due and queues
+        // the shared detached worker: judging them here meant a nonblocking
+        // lifecycle claim such a command lost on every busy repository, and a
+        // sandboxed caller's refused process listing read as a keep.
+        let judge_inline = crate::file_lock::inline_session_retirement_allowed();
+        let mut due_deferred = 0_usize;
+        if judge_inline {
+            let primed = retirement_candidates
+                .iter()
+                .copied()
+                .chain(no_work_candidates.iter().copied())
+                .collect::<Vec<_>>();
+            holder_process_table.prime(self.store_ref(), &primed, None);
+        }
         // Only a session past the window by its row can be closed here (the
         // close path keeps any session whose row or checkout activity is
         // newer), and one the retirement memo knows is not due yet would be
@@ -1302,7 +1311,18 @@ impl Broker {
                     std::time::Duration::ZERO,
                 );
             }
-            let abandoned_now = !derived_status.is_closed()
+            if !judge_inline
+                && !derived_status.is_closed()
+                && (judge || no_work_candidates.contains(&session.id))
+            {
+                due_deferred += 1;
+                crate::phase_telemetry::add(
+                    "agents_view_abandonment_due_deferred",
+                    std::time::Duration::ZERO,
+                );
+            }
+            let abandoned_now = judge_inline
+                && !derived_status.is_closed()
                 && judge
                 && matches!(
                     self.try_close_abandoned_session(
@@ -1316,7 +1336,8 @@ impl Broker {
                     AbandonedSessionCloseOutcome::Closed
                 );
             let abandoned_now = abandoned_now
-                || (!derived_status.is_closed()
+                || (judge_inline
+                    && !derived_status.is_closed()
                     && no_work_candidates.contains(&session.id)
                     && matches!(
                         self.try_close_no_work_session(
@@ -1347,6 +1368,9 @@ impl Broker {
                 derived_status,
                 pid_alive,
             });
+        }
+        if due_deferred > 0 {
+            self.request_session_retirement_for_due_sessions();
         }
         Ok(views)
     }
@@ -1648,6 +1672,82 @@ impl Broker {
             crate::phase_telemetry::add(reason.no_work_telemetry_name(), std::time::Duration::ZERO);
         }
         Ok(outcome)
+    }
+
+    /// The abandonment window's per-class gate (`[cleanup]
+    /// stale_*_close_after_hours`): the session's class when its class window
+    /// has elapsed, otherwise the keep. A class that holds work gets one
+    /// closing-soon note once it is inside the notice period, and is judged
+    /// again at the start of that period (the not-due memo honours it), so
+    /// the note comes before the close. Every judgement is remembered for
+    /// `broker status`. The first look (`under_claims` false), made before
+    /// any holder evidence, lets a session inside its notice period through
+    /// so the note is left only once its holder is known not to be live.
+    fn stale_class_gate(
+        &mut self,
+        session: &Session,
+        activity_ms: i64,
+        now_ms: i64,
+        process_table: &crate::session_holder::RecordedHolderProcessTable,
+        under_claims: bool,
+    ) -> Result<crate::stale_session_policy::StaleWorkClass, AbandonedSessionCloseOutcome> {
+        use crate::stale_session_policy as stale;
+        let Ok(policy) = stale::StaleSessionPolicy::load(self.main_root()) else {
+            return Err(keep_with(
+                process_table,
+                AbandonmentKeepReason::PolicyUnavailable,
+                AbandonedSessionCloseOutcome::OperationEvidenceUnavailable,
+            ));
+        };
+        let class = self.stale_work_class(session);
+        let activity_ms = activity_ms.max(session.created_at);
+        match policy.judge(class, activity_ms, now_ms) {
+            stale::StaleClassVerdict::Due { due_at_ms } => {
+                stale::remember_class(
+                    self.store_ref(),
+                    session.id,
+                    stale::ClassRecord { class, due_at_ms },
+                );
+                Ok(class)
+            }
+            stale::StaleClassVerdict::NotDue {
+                due_at_ms,
+                revisit_at_ms,
+                closing_soon,
+            } => {
+                stale::remember_class(
+                    self.store_ref(),
+                    session.id,
+                    stale::ClassRecord { class, due_at_ms },
+                );
+                if closing_soon && !under_claims {
+                    return Ok(class);
+                }
+                if closing_soon {
+                    crate::phase_telemetry::add(
+                        "stale_closing_soon_noted",
+                        std::time::Duration::ZERO,
+                    );
+                    crate::warn_unrecorded(
+                        "leave a closing-soon note",
+                        self.store()
+                            .record_automation_note(
+                                crate::session_auto_close::NOTE_SENDER,
+                                session.id,
+                                &stale::closing_soon_note(session.id, class, due_at_ms, now_ms),
+                                Some(stale::CLOSING_SOON_NOTE_FINGERPRINT),
+                            )
+                            .map(|_| ()),
+                    );
+                }
+                process_table.note_not_due_before(revisit_at_ms);
+                Err(keep_with(
+                    process_table,
+                    AbandonmentKeepReason::WorkClassNotDue,
+                    AbandonedSessionCloseOutcome::NotDue,
+                ))
+            }
+        }
     }
 
     /// The no-work window from the retention policy, in milliseconds; `0`
@@ -2530,6 +2630,21 @@ impl Broker {
                 AbandonedSessionCloseOutcome::NotDue,
             ));
         }
+        // Past the abandonment window, what closing would put at risk sets
+        // how much longer the session waits (landed, pushed but unmerged,
+        // unpushed or uncommitted work). Asked before any holder or process
+        // evidence: it is the cheaper keep, and asked again under the claims.
+        if lane == SessionCloseLane::Abandonment
+            && let Err(kept) = self.stale_class_gate(
+                &candidate,
+                database_activity,
+                decision_now_ms,
+                process_table,
+                false,
+            )
+        {
+            return Ok(kept);
+        }
         // The landing proof is asked before any holder, lease or process
         // evidence: most open sessions have not landed, and saying so costs
         // one ancestry check. It is asked again under both claims below.
@@ -2668,34 +2783,15 @@ impl Broker {
         if moved_on_to.is_some() {
             crate::phase_telemetry::add("holder_moved_on_candidates", std::time::Duration::ZERO);
         }
-        // The abandonment window treats a moved-on holder as gone only for a
-        // clean checkout: the owner's "close stale sessions if clean".
-        if !require_landed && moved_on_to.is_some() {
-            let worktree = std::path::Path::new(&candidate.worktree_path);
-            let clean = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root())
-                .ok()
-                .and_then(|policy| {
-                    crate::auto_cleanup::uncommitted_reason(
-                        worktree,
-                        Some(candidate.branch.as_str()),
-                        self.main_root(),
-                        &policy,
-                    )
-                    .ok()
-                })
-                .is_some_and(|reason| reason.is_none());
-            if !clean {
-                crate::phase_telemetry::add(
-                    "holder_moved_on_dirty_kept",
-                    std::time::Duration::ZERO,
-                );
-                return Ok(keep_with(
-                    process_table,
-                    AbandonmentKeepReason::HolderMovedOnDirty,
-                    AbandonedSessionCloseOutcome::ActiveProcess,
-                ));
-            }
-        }
+        // A moved-on holder is no live holder of this session: the per-class
+        // gate above (and again under the claims) decides how long its work
+        // waits, uncommitted work included (the unpushed window, then the
+        // archive path). Moved on means the same process (pid and start
+        // time) was bound to another session of this repository after this
+        // session's last activity and its latest binding here, so a bind
+        // back, or any later activity here, makes it this session's holder
+        // again. A process working in this checkout, a live explicit claim
+        // and a shared agent service still keep it (below).
         if require_landed {
             match holder.liveness {
                 crate::session_holder::RecordedHolderLiveness::Gone => {}
@@ -3466,27 +3562,6 @@ impl Broker {
                     AbandonedSessionCloseOutcome::Changed,
                 ));
             }
-            if !require_landed {
-                let clean = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root())
-                    .ok()
-                    .and_then(|policy| {
-                        crate::auto_cleanup::uncommitted_reason(
-                            std::path::Path::new(&current.worktree_path),
-                            Some(current.branch.as_str()),
-                            self.main_root(),
-                            &policy,
-                        )
-                        .ok()
-                    })
-                    .is_some_and(|reason| reason.is_none());
-                if !clean {
-                    return Ok(keep_with(
-                        process_table,
-                        AbandonmentKeepReason::HolderMovedOnDirty,
-                        AbandonedSessionCloseOutcome::ActiveProcess,
-                    ));
-                }
-            }
         }
 
         // Recheck delivery and local changes while lifecycle and operation
@@ -3628,6 +3703,16 @@ impl Broker {
                 AbandonedSessionCloseOutcome::NotDue,
             ));
         }
+        // The work class is read again under both claims: a push, a merge or
+        // new uncommitted work since the first look changes its window.
+        let stale_class = if lane == SessionCloseLane::Abandonment {
+            match self.stale_class_gate(&current, activity_at, observed_at, process_table, true) {
+                Ok(class) => Some(class),
+                Err(kept) => return Ok(kept),
+            }
+        } else {
+            None
+        };
         let pid_alive = current.pid.map(crate::broker::session_pid_alive);
         let holder_evidence = if live_task_holder.is_some() {
             "lease_expired"
@@ -3698,6 +3783,8 @@ impl Broker {
                         &payload,
                         crate::session_auto_close::CLOSE_REASON_INACTIVE_NO_WORK,
                     )
+                } else if let Some(class) = stale_class {
+                    crate::session_auto_close::with_work_class(&payload, class.code())
                 } else {
                     payload
                 }

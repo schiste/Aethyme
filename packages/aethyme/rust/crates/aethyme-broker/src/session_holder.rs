@@ -1154,6 +1154,28 @@ pub(crate) fn trash_deleter_process_use_snapshot(
         .unwrap_or_else(|| crate::reclaim::OpenFileSnapshot::Complete(Vec::new()))
 }
 
+thread_local! {
+    /// What the process-table observations on this thread since the last
+    /// [`take_last_process_table_observation`] saw: `Some(true)` once any was
+    /// complete, `Some(false)` when every one was refused.
+    static LAST_PROCESS_TABLE_OBSERVATION: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn note_process_table_observation(complete: bool) {
+    LAST_PROCESS_TABLE_OBSERVATION.with(|last| {
+        if last.get() != Some(true) {
+            last.set(Some(complete));
+        }
+    });
+}
+
+/// Whether this thread listed processes since the last call (`Some(true)`),
+/// was refused every time (`Some(false)`), or did not try (`None`); resets.
+pub(crate) fn take_last_process_table_observation() -> Option<bool> {
+    LAST_PROCESS_TABLE_OBSERVATION.with(std::cell::Cell::take)
+}
+
 /// The process snapshot is valid only for the holder event it observed.
 /// Holder events are append-only identities, so a rebind forces a fresh
 /// snapshot instead of reusing a process table captured for another owner.
@@ -1281,8 +1303,12 @@ impl RecordedHolderProcessTable {
     /// schedule, and a refusal for the rest of the pass.
     fn record_observation(&mut self, observation: ProcessTableObservation) -> Option<ProcessTable> {
         match observation {
-            ProcessTableObservation::Complete(table) => Some(table),
+            ProcessTableObservation::Complete(table) => {
+                note_process_table_observation(true);
+                Some(table)
+            }
             ProcessTableObservation::Denied => {
+                note_process_table_observation(false);
                 // A refusal is a property of this command, not of the host's
                 // load: retrying cannot help, and the holders it hides are
                 // not judged "unknown" one by one.

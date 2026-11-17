@@ -44,6 +44,18 @@ pub(crate) fn with_close_reason(payload: &str, close_reason: &str) -> String {
     value.to_string()
 }
 
+/// `payload` with `work_class` set: what the abandonment window's per-class
+/// gate found the session's work to be when it closed (`landed`,
+/// `pushed_unmerged`, `unpushed`).
+pub(crate) fn with_work_class(payload: &str, work_class: &str) -> String {
+    let mut value: Value =
+        serde_json::from_str(payload).unwrap_or_else(|_| Value::Object(Default::default()));
+    if let Value::Object(fields) = &mut value {
+        fields.insert("work_class".into(), json!(work_class));
+    }
+    value.to_string()
+}
+
 /// The pull requests recorded for one session, from
 /// `BrokerStore::session_pull_request_merges`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -423,6 +435,10 @@ mod lane_tests {
 
     const HOUR_MS: i64 = 3_600_000;
 
+    /// `[cleanup]` per-class windows no longer than the abandonment window.
+    const CLASS_WINDOWS_OFF: &str = "[cleanup]\nstale_landed_close_after_hours = 1\n\
+        stale_pushed_close_after_hours = 1\nstale_unpushed_close_after_hours = 1\n";
+
     fn git(root: &Path, args: &[&str]) {
         let mut command = Command::new("git");
         let git_keys = std::env::vars_os()
@@ -475,6 +491,9 @@ mod lane_tests {
             format!("[retention]\nsession_abandoned_after_hours = 72\n{retention}"),
         )
         .unwrap();
+        // Every test here judges the abandonment window alone, except the
+        // per-class tests, which remove this file to get the shipped windows.
+        std::fs::write(root.join(".aethyme/config.toml"), CLASS_WINDOWS_OFF).unwrap();
         let storage = crate::test_storage::TestStorage::new();
         let broker = storage.open(&root).unwrap();
         // No process on this test thread uses any checkout: the open-file
@@ -1989,17 +2008,14 @@ mod lane_tests {
             .unwrap()
     }
 
-    /// The abandonment window treats a moved-on live holder as gone only for
-    /// a clean checkout; unlanded commits do not keep a clean one, and they
-    /// survive every later removal pass with their branch.
+    /// The abandonment window treats a moved-on live holder as no holder of
+    /// the older session: unlanded commits do not keep a clean checkout, and
+    /// they survive every later removal pass with their branch. (Uncommitted
+    /// work waits for its own window: see the per-class tests.)
     #[test]
-    fn the_abandonment_window_closes_a_moved_on_session_only_when_clean() {
+    fn the_abandonment_window_closes_a_moved_on_session_by_its_work() {
         let (_owner, _storage, mut broker) = fixture("closed_worktree_grace_hours = 0\n");
         let holder = live_holder();
-
-        let (dirty, dirty_tree) = session(&mut broker, "dirty, no pull request", false);
-        std::fs::write(dirty_tree.join("base.txt"), "edited, not committed\n").unwrap();
-        let mut dirty_table = held_by_live_holder(&mut broker, &dirty, &holder, 80);
 
         let (clean, clean_tree) = session(&mut broker, "clean with unlanded commits", false);
         let clean_head = crate::git::GitRepo::discover(&clean_tree)
@@ -2010,12 +2026,6 @@ mod lane_tests {
 
         let (newer, _) = session(&mut broker, "the agent's next task", false);
         bind_holder(&mut broker, &newer, &holder);
-
-        assert_eq!(
-            close_abandoned_directly(&mut broker, &dirty, &mut dirty_table),
-            crate::broker::AbandonedSessionCloseOutcome::ActiveProcess
-        );
-        assert!(is_open(&broker, dirty.id));
 
         assert_eq!(
             close_abandoned_directly(&mut broker, &clean, &mut clean_table),
@@ -2937,20 +2947,11 @@ mod lane_tests {
         table.fail_process_table_for_test(unknown.id, event_id, true);
         kept(&mut broker, &unknown, &mut table, Reason::HolderUnknown);
 
-        // The holder moved on: a dirty checkout, and a process in a clean one.
-        let (dirty, dirty_tree) = session(&mut broker, "moved on, dirty", false);
-        std::fs::write(dirty_tree.join("base.txt"), "edited, not committed\n").unwrap();
-        let mut dirty_table = held_by_live_holder(&mut broker, &dirty, &holder, 80);
+        // The holder moved on, but a process works in the checkout.
         let (in_use, in_use_tree) = session(&mut broker, "moved on, in use", false);
         let mut in_use_table = held_by_live_holder(&mut broker, &in_use, &holder, 80);
         let (newer, _) = session(&mut broker, "the agent's next task", false);
         bind_holder(&mut broker, &newer, &holder);
-        kept(
-            &mut broker,
-            &dirty,
-            &mut dirty_table,
-            Reason::HolderMovedOnDirty,
-        );
         crate::session_holder::set_process_use_snapshot_for_tests(Some(opened_in(&in_use_tree)));
         kept(
             &mut broker,
@@ -2986,12 +2987,12 @@ mod lane_tests {
             Reason::FollowUpProtected,
             Reason::WorktreeActivityUnavailable,
             Reason::RecentActivity,
+            Reason::WorkClassNotDue,
             Reason::HolderUnknown,
             Reason::HolderProcessTableDenied,
             Reason::HolderAliveCurrent,
             Reason::HolderRecordUnavailable,
             Reason::HolderSharedService,
-            Reason::HolderMovedOnDirty,
             Reason::TaskLeaseCurrent,
             Reason::OperationGuardBusy,
             Reason::OperationGuardUnavailable,
@@ -3039,12 +3040,12 @@ mod lane_tests {
                 | Reason::FollowUpProtected
                 | Reason::WorktreeActivityUnavailable
                 | Reason::RecentActivity
+                | Reason::WorkClassNotDue
                 | Reason::HolderUnknown
                 | Reason::HolderProcessTableDenied
                 | Reason::HolderAliveCurrent
                 | Reason::HolderRecordUnavailable
                 | Reason::HolderSharedService
-                | Reason::HolderMovedOnDirty
                 | Reason::TaskLeaseCurrent
                 | Reason::OperationGuardBusy
                 | Reason::OperationGuardUnavailable
@@ -3300,5 +3301,222 @@ mod lane_tests {
                 kept.task
             );
         }
+    }
+
+    /// The shipped per-class windows instead of the fixture's.
+    fn shipped_class_windows(broker: &crate::Broker) {
+        std::fs::remove_file(broker.main_root().join(".aethyme/config.toml")).unwrap();
+    }
+
+    /// Push the session branch so its remote-tracking ref holds HEAD.
+    fn push_branch(broker: &crate::Broker, session: &crate::Session) {
+        let root = broker.main_root().to_path_buf();
+        git(&root, &["push", "-q", "origin", session.branch.as_str()]);
+    }
+
+    fn table_with_live(
+        session: &crate::Session,
+        event_id: i64,
+        holder: &crate::session_holder::AgentProcess,
+    ) -> crate::session_holder::RecordedHolderProcessTable {
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        table.install_holder_process_table_for_test(
+            session.id,
+            event_id,
+            crate::session_holder::ProcessTable::parse(&format!(
+                "{} 1 {} {}\n",
+                holder.pid, holder.started, holder.command
+            )),
+        );
+        table
+    }
+
+    /// Past the abandonment window with its holder gone, a session waits for
+    /// the window of what closing would put at risk: unpushed work a week
+    /// (announced a day ahead), pushed but unmerged work three days (branch
+    /// left on the remote), work with nothing to lose closes at once.
+    #[test]
+    fn each_work_class_closes_after_its_own_window() {
+        let (_owner, _storage, mut broker) = fixture("");
+        shipped_class_windows(&broker);
+        let (early, _) = session(&mut broker, "unpushed, three days idle", false);
+        let (soon, _) = session(&mut broker, "unpushed, six days idle", false);
+        let (due, _) = session(&mut broker, "unpushed, a week idle", false);
+        let (pushed, _) = session(&mut broker, "pushed, unmerged", false);
+        let nothing = broker.start_worktree("never committed", None).unwrap();
+        push_branch(&broker, &pushed);
+        quiet(&mut broker, &early, 80);
+        quiet(&mut broker, &soon, 150);
+        quiet(&mut broker, &due, 170);
+        quiet(&mut broker, &pushed, 80);
+        quiet(&mut broker, &nothing, 80);
+
+        for kept in [&early, &soon] {
+            let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+            assert_eq!(
+                close_abandoned_directly(&mut broker, kept, &mut table),
+                crate::broker::AbandonedSessionCloseOutcome::NotDue
+            );
+            assert_eq!(
+                table.keep_reason(),
+                Some(crate::broker::AbandonmentKeepReason::WorkClassNotDue)
+            );
+            assert!(is_open(&broker, kept.id));
+        }
+        assert!(
+            broker
+                .store_ref()
+                .unread_automation_notes(early.id)
+                .unwrap()
+                .is_empty(),
+            "a session days from its close is not announced yet"
+        );
+        let notes = broker.store_ref().unread_automation_notes(soon.id).unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(
+            notes[0].fingerprint.as_deref(),
+            Some(crate::stale_session_policy::CLOSING_SOON_NOTE_FINGERPRINT)
+        );
+        assert!(notes[0].message.contains("closes it automatically"));
+
+        for (closed, class) in [
+            (&due, "unpushed"),
+            (&pushed, "pushed_unmerged"),
+            (&nothing, "landed"),
+        ] {
+            let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+            assert_eq!(
+                close_abandoned_directly(&mut broker, closed, &mut table),
+                crate::broker::AbandonedSessionCloseOutcome::Closed,
+                "{class}"
+            );
+            assert_eq!(close_payload(&broker, closed.id)["work_class"], class);
+        }
+        assert!(
+            broker
+                .repo_handle()
+                .resolve_ref(&format!("refs/remotes/origin/{}", pushed.branch))
+                .is_some(),
+            "closing leaves the pushed branch alone"
+        );
+
+        let view = broker.status(now_ms()).unwrap();
+        let backlog = view
+            .advice
+            .iter()
+            .find(|advice| advice.id == "sessions.stale-backlog")
+            .expect("open sessions past the window are reported by class");
+        assert!(
+            backlog.summary.contains("2 with unpushed"),
+            "{}",
+            backlog.summary
+        );
+        let closing = view
+            .advice
+            .iter()
+            .find(|advice| advice.id == "sessions.closing-soon")
+            .expect("the announced session is advised");
+        assert_eq!(closing.session_id, Some(soon.id));
+    }
+
+    /// A live holder bound to a newer session of this repository is no live
+    /// holder of the older one: its uncommitted work closes after the
+    /// unpushed window, through the archive path.
+    #[test]
+    fn a_holder_that_moved_on_counts_as_no_live_holder_for_the_work_class() {
+        let (_owner, _storage, mut broker) = fixture("");
+        shipped_class_windows(&broker);
+        let holder = live_holder();
+        let (old, tree) = session(&mut broker, "uncommitted, holder moved on", false);
+        std::fs::write(tree.join("base.txt"), "edited, not committed\n").unwrap();
+        let mut table = held_by_live_holder(&mut broker, &old, &holder, 170);
+        let (newer, _) = session(&mut broker, "the agent's next task", false);
+        bind_holder(&mut broker, &newer, &holder);
+
+        assert_eq!(
+            close_abandoned_directly(&mut broker, &old, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::Closed
+        );
+        let payload = close_payload(&broker, old.id);
+        assert_eq!(payload["holder_evidence"], "moved_on");
+        assert_eq!(payload["holder_moved_on_to_session"], newer.id);
+        assert_eq!(payload["work_class"], "unpushed");
+        assert!(
+            is_open(&broker, newer.id),
+            "the holder's latest session stays"
+        );
+    }
+
+    /// A bind back to the older session makes the process its holder again.
+    #[test]
+    fn a_holder_bound_back_keeps_the_older_session() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let holder = live_holder();
+        let (old, _) = session(&mut broker, "holder came back", false);
+        held_by_live_holder(&mut broker, &old, &holder, 80);
+        let (newer, _) = session(&mut broker, "a task in between", false);
+        bind_holder(&mut broker, &newer, &holder);
+        let back = bind_holder(&mut broker, &old, &holder);
+        let mut table = table_with_live(&old, back, &holder);
+
+        assert_eq!(
+            close_abandoned_directly(&mut broker, &old, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::ActiveProcess
+        );
+        assert_eq!(
+            table.keep_reason(),
+            Some(crate::broker::AbandonmentKeepReason::HolderAliveCurrent)
+        );
+        assert!(is_open(&broker, old.id));
+    }
+
+    /// One process may legitimately work two sessions at once: an explicit
+    /// claim it still holds on the older one keeps that session, however
+    /// the newer binding reads.
+    #[test]
+    fn an_explicit_claim_of_a_moved_on_holder_keeps_the_older_session() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let holder = live_holder();
+        let (old, _) = session(&mut broker, "two sessions at once", false);
+        let mut table = held_by_live_holder(&mut broker, &old, &holder, 80);
+        broker
+            .store()
+            .claim_lease(old.id, "base.txt", None)
+            .unwrap();
+        let (newer, _) = session(&mut broker, "the other session", false);
+        bind_holder(&mut broker, &newer, &holder);
+
+        assert_ne!(
+            close_abandoned_directly(&mut broker, &old, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::Closed
+        );
+        assert_eq!(
+            table.keep_reason(),
+            Some(crate::broker::AbandonmentKeepReason::LeaseHeld)
+        );
+        assert!(is_open(&broker, old.id));
+    }
+
+    /// A foreground command never judges: the `agents` view leaves a due
+    /// session open (the shared worker closes it); a library caller still
+    /// judges it inline.
+    #[test]
+    fn a_foreground_agents_view_leaves_due_sessions_to_the_worker() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let (session, _) = session(&mut broker, "due, holder gone", false);
+        quiet(&mut broker, &session, 80);
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        {
+            let _foreground = crate::file_lock::ForegroundCommand::enter();
+            broker.agents(now_ms()).unwrap();
+        }
+        assert!(is_open(&broker, session.id));
+        assert_eq!(
+            phase_count(&recorder, "agents_view_abandonment_due_deferred"),
+            1
+        );
+        broker.agents(now_ms()).unwrap();
+        assert!(!is_open(&broker, session.id));
     }
 }

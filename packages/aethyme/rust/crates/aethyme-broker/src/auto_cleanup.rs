@@ -714,6 +714,10 @@ impl AutoCleanupPolicy {
                     // Read by the checkout retirement lane; validated here.
                     parse_abandoned_operation_after_hours(Some(value))?;
                 }
+                // Read by the abandonment window's per-class gate; validated here.
+                key if crate::stale_session_policy::is_policy_key(key) => {
+                    crate::stale_session_policy::parse_hours(key, value)?;
+                }
                 other => return Err(format!("[cleanup] has no key {other:?}")),
             }
         }
@@ -7374,7 +7378,16 @@ impl Broker {
         &mut self,
         deadline: Option<Instant>,
     ) -> Result<SessionRetirementSummary, BrokerOpError> {
+        // Whether this pass could list processes is remembered per
+        // repository, so `broker status` can say when no pass on the host
+        // could judge holders (`sessions.process-table-denied`).
+        crate::session_holder::take_last_process_table_observation();
         let summary = self.retire_abandoned_session_page(deadline)?;
+        crate::stale_session_policy::record_process_table_observation(
+            self.store_ref(),
+            crate::session_holder::take_last_process_table_observation(),
+            now_ms(),
+        );
         if let (Some(start), Some(end)) = (summary.cursor_start, summary.cursor) {
             crate::phase_telemetry::add(
                 if start == end {
@@ -7686,7 +7699,18 @@ impl Broker {
                     let reason = holder_process_table
                         .keep_reason()
                         .unwrap_or(crate::broker::AbandonmentKeepReason::Unrecorded);
-                    *summary.abandonment_kept.entry(reason.code()).or_default() += 1;
+                    if reason == crate::broker::AbandonmentKeepReason::HolderProcessTableDenied {
+                        // A pass refused the process listing (a worker started
+                        // from a sandboxed caller) is no evidence about the
+                        // holder: the session is deferred, the request stays
+                        // pending, and a pass that can list processes decides.
+                        crate::phase_telemetry::add(
+                            "session_abandonment_deferred_process_table_denied",
+                            Duration::ZERO,
+                        );
+                    } else {
+                        *summary.abandonment_kept.entry(reason.code()).or_default() += 1;
+                    }
                 }
             }
             let idle_enough_for_landed = idle_enough_for_landed
