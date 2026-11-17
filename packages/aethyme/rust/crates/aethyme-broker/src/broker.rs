@@ -3514,6 +3514,7 @@ mod leases;
 mod missing_checkout;
 mod owners;
 mod remote_heads;
+mod retire;
 pub(crate) use leases::{
     AbandonedSessionCloseOutcome, AbandonmentKeepReason, LandedProof, LandedSessionDecline,
     long_proof_grant, validate_session_commit_args,

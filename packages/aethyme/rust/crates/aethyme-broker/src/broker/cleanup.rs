@@ -4915,6 +4915,64 @@ impl Broker {
         self.cleanup_under_lifecycle_claim(&session, force, None)
     }
 
+    /// Remove a checkout whose content the caller's proofs cover (every byte
+    /// in Git, in a verified archive, or catalogued regenerable output; or a
+    /// `force` discard) by moving it into its pool's trash, O(1), and
+    /// dropping its Git registration; the host deleter unlinks it later.
+    /// Without `force`, Git's own refusal stays the last word: a checkout
+    /// that gained uncommitted or untracked content since the proof is
+    /// handed to `git worktree remove`, which refuses it. A checkout outside
+    /// a pool, or one the move refuses, is removed by Git as before.
+    pub(crate) fn remove_checkout_through_trash(
+        &self,
+        session_id: i64,
+        worktree: &Path,
+        force: bool,
+    ) -> Result<(), BrokerOpError> {
+        if !force {
+            let clean = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root())
+                .ok()
+                .and_then(|policy| {
+                    crate::auto_cleanup::uncommitted_reason(
+                        worktree,
+                        None,
+                        self.main_root(),
+                        &policy,
+                    )
+                    .ok()
+                })
+                .is_some_and(|reason| reason.is_none());
+            if !clean {
+                crate::phase_telemetry::add(
+                    "checkout_trash_declined_unclean",
+                    std::time::Duration::ZERO,
+                );
+                self.repo.worktree_remove_registered(worktree, false)?;
+                return Ok(());
+            }
+        }
+        let moved = self
+            .main_git_common_dir()
+            .map_err(|error| error.to_string())
+            .and_then(|common_dir| {
+                crate::checkout_trash::move_worktree_to_trash(&common_dir, worktree, session_id)
+            });
+        match moved {
+            Ok(trashed) => {
+                self.note_checkout_trashed(&trashed);
+                Ok(())
+            }
+            Err(_) => {
+                crate::phase_telemetry::add(
+                    "checkout_trash_fell_back_to_git",
+                    std::time::Duration::ZERO,
+                );
+                self.repo.worktree_remove_registered(worktree, force)?;
+                Ok(())
+            }
+        }
+    }
+
     /// Remove a worktree only after an archive was written and verified.
     /// The exact reviewed plan, including protected ignored files and policy,
     /// is recomputed under the lifecycle claim immediately before removal.
@@ -5401,8 +5459,9 @@ impl Broker {
                     force,
                 )?);
             } else {
-                self.repo
-                    .worktree_remove_registered(&worktree_path, force)?;
+                // Every proof above held (or `force` discards): the checkout
+                // goes into the trash in O(1) and the deleter unlinks it.
+                self.remove_checkout_through_trash(session_id, &worktree_path, force)?;
             }
         }
         require_worktree_path_absent(&worktree_path, session_id)?;
