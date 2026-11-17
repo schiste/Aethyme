@@ -306,15 +306,21 @@ fn session_for_metric(
     store: &crate::BrokerStore,
     repo: &crate::GitRepo,
 ) -> Option<i64> {
-    let explicit = args
-        .iter()
-        .take_while(|arg| arg.as_str() != "--")
-        .collect::<Vec<_>>();
-    if let Some(pair) = explicit.windows(2).find(|pair| pair[0] == "--session") {
-        return pair[1]
-            .parse::<i64>()
-            .ok()
-            .filter(|id| store.session(*id).is_ok());
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--session" {
+            return args
+                .next()?
+                .parse::<i64>()
+                .ok()
+                .filter(|id| store.session(*id).is_ok());
+        }
+        if super::VALUE_FLAGS.contains(&arg.as_str()) {
+            args.next();
+        }
     }
     store
         .session_for_worktree(repo.root().to_string_lossy().as_ref())
