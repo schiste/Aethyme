@@ -47,6 +47,17 @@ const LIFECYCLE_TICKET_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 /// How long one waiter trusts a ticket's liveness verdict before checking the
 /// process again.
 const LIFECYCLE_LIVENESS_CACHE: Duration = Duration::from_secs(1);
+/// A waiter passed by this many later arrivals is aged: it then outranks every
+/// later arrival whatever its budget.
+const LIFECYCLE_TICKET_MAX_PASSES: usize = 3;
+/// A waiter that has had no earlier arrival ahead of it for this long is aged
+/// too, so deadline order cannot keep a long-budget waiter behind a steady
+/// stream of short budgets until its own deadline.
+const LIFECYCLE_TICKET_MAX_PASSED_FOR: Duration = Duration::from_secs(20);
+/// Ticket times further ahead of this host's monotonic clock than this were
+/// written before the last boot. Wide, so a heartbeat written while a slow scan
+/// was reading other tickets is never mistaken for one.
+const LIFECYCLE_TICKET_PRE_BOOT_SLACK: Duration = Duration::from_secs(60);
 
 /// Directory, under `.aethyme/run`, where each background lane records since
 /// when, and how many times in a row, it has yielded to queued waiters.
@@ -779,18 +790,31 @@ struct LifecycleQueueObservation {
     /// Whether this claim got a ticket; without one it polls unordered, as
     /// binaries before the queue did.
     ticketed: bool,
+    /// Distinct later arrivals seen ahead of this claim.
+    passed_by: usize,
+    /// Whether the claim aged (see [`LIFECYCLE_TICKET_MAX_PASSES`]).
+    aged: bool,
 }
 
 /// Wait for the lifecycle lock in ticket order. Each waiter keeps a ticket
 /// under `.aethyme/run` naming its deadline (enqueue time plus its wait budget),
 /// its enqueue time, PID, process start time and a sequence, all times on the
 /// host's monotonic clock. Tickets are served earliest deadline first, ties by
-/// enqueue time, then PID and sequence: a short-budget caller such as gate
-/// admission goes ahead of a `start` with three minutes to spare, and a newer
-/// arrival outranks a waiter only if its own deadline is earlier. So a waiter
-/// with `r` seconds left is never passed by an arrival whose budget is `r`
-/// seconds or more; with every caller's budget at least `b`, nothing that
-/// arrives in a waiter's last `b` seconds goes ahead of it.
+/// enqueue time, then PID and sequence, so a short-budget caller such as gate
+/// admission goes ahead of a `start` with three minutes to spare. An arrival
+/// with budget `b` goes ahead of an earlier waiter only while that waiter
+/// still has more than `b` seconds left.
+///
+/// Deadline order alone would let a steady stream of short budgets keep a long
+/// waiter back until its last seconds, so tickets age. Once a waiter has been
+/// passed by [`LIFECYCLE_TICKET_MAX_PASSES`] later arrivals, or has had no
+/// earlier arrival ahead of it for [`LIFECYCLE_TICKET_MAX_PASSED_FOR`],
+/// whichever comes first, it writes `aged=1` into its ticket. Aged tickets rank
+/// before every unaged one, among themselves in enqueue order. The rank is
+/// derived from each ticket's name and contents alone, so every process sees
+/// the same total order. A waiter is therefore passed by at most three later
+/// arrivals it saw, or for at most 20 s, before only earlier arrivals and the
+/// current holder stand between it and the lock.
 ///
 /// Only the waiter with no live ticket ahead tries the lock. A ticket whose
 /// process has exited, or whose PID now belongs to another process, is
@@ -828,6 +852,8 @@ pub(crate) fn acquire_repository_lifecycle_lock_with_wait(
             "queue_position_at_enqueue": observation.position_at_enqueue,
             "queue_length_at_enqueue": observation.length_at_enqueue,
             "queued": observation.ticketed,
+            "passed_by_later_arrivals": observation.passed_by,
+            "aged": observation.aged,
             "waited_behind": observation.waited_behind,
             "holder_operation": lifecycle_operation(),
         }),
@@ -861,7 +887,8 @@ fn acquire_lifecycle_lock_in_turn(
     let mut ticket = LifecycleTicket::enqueue(main_root, wait);
     let mut liveness = LifecycleLivenessCache::default();
     if let Some(ticket) = &ticket {
-        let view = scan_lifecycle_queue(&ticket.directory, Some(ticket.key), Some(&mut liveness));
+        let view =
+            scan_lifecycle_queue(&ticket.directory, Some(ticket.rank()), Some(&mut liveness));
         observation.position_at_enqueue = view.ahead;
         observation.length_at_enqueue = view.live;
         observation.ticketed = true;
@@ -870,7 +897,15 @@ fn acquire_lifecycle_lock_in_turn(
         let ahead = match ticket.as_mut() {
             Some(ticket) => {
                 ticket.heartbeat();
-                scan_lifecycle_queue(&ticket.directory, Some(ticket.key), Some(&mut liveness)).ahead
+                let view = scan_lifecycle_queue(
+                    &ticket.directory,
+                    Some(ticket.rank()),
+                    Some(&mut liveness),
+                );
+                ticket.observe(&view);
+                observation.passed_by = ticket.passed_by.len();
+                observation.aged = ticket.aged;
+                view.ahead
             }
             None => 0,
         };
@@ -900,7 +935,7 @@ fn acquire_lifecycle_lock_in_turn(
         let now = Instant::now();
         if now >= deadline {
             let queued = ticket.as_ref().map_or(0, |ticket| {
-                scan_lifecycle_queue(&ticket.directory, Some(ticket.key), None).live
+                scan_lifecycle_queue(&ticket.directory, Some(ticket.rank()), None).live
             });
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -969,14 +1004,52 @@ fn host_monotonic_ns() -> u128 {
         .map_or(0, |since| since.as_nanos())
 }
 
-/// Ordering key of one ticket: earliest deadline first, then enqueue time,
-/// then PID, then the per-process sequence. A total order.
+/// What a ticket's name fixes: deadline, enqueue time, PID and per-process
+/// sequence. Together with the aged flag its contents carry it gives the
+/// ticket's [`LifecycleRank`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct LifecycleTicketKey {
     deadline_ns: u128,
     enqueue_ns: u128,
     pid: u32,
     sequence: u64,
+}
+
+/// A ticket's place in the queue. Aged tickets come first, in enqueue order;
+/// the rest by earliest deadline, then enqueue time; PID and sequence break
+/// any tie. A total order derived from ticket name and contents only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LifecycleRank {
+    key: LifecycleTicketKey,
+    aged: bool,
+}
+
+impl LifecycleRank {
+    /// A ticket that has not aged.
+    fn fresh(key: LifecycleTicketKey) -> Self {
+        Self { key, aged: false }
+    }
+
+    fn order(&self) -> (u8, u128, u128, u32, u64) {
+        let key = self.key;
+        if self.aged {
+            (0, key.enqueue_ns, key.deadline_ns, key.pid, key.sequence)
+        } else {
+            (1, key.deadline_ns, key.enqueue_ns, key.pid, key.sequence)
+        }
+    }
+}
+
+impl Ord for LifecycleRank {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order().cmp(&other.order())
+    }
+}
+
+impl PartialOrd for LifecycleRank {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// A ticket's file name,
@@ -1023,6 +1096,24 @@ fn lifecycle_ticket_heartbeat(text: &str) -> Option<u128> {
         .and_then(|value| value.parse().ok())
 }
 
+/// Whether a ticket's owner marked it aged (`aged=1`).
+fn lifecycle_ticket_aged(text: &str) -> bool {
+    text.split_whitespace().any(|word| word == "aged=1")
+}
+
+/// Whether a waiter passed by `passed_by` distinct later arrivals, and with no
+/// earlier arrival ahead of it since `eligible_since_ns`, has aged at `now_ns`.
+fn lifecycle_ticket_has_aged(
+    passed_by: usize,
+    eligible_since_ns: Option<u128>,
+    now_ns: u128,
+) -> bool {
+    passed_by >= LIFECYCLE_TICKET_MAX_PASSES
+        || eligible_since_ns.is_some_and(|since| {
+            now_ns.saturating_sub(since) >= LIFECYCLE_TICKET_MAX_PASSED_FOR.as_nanos()
+        })
+}
+
 fn own_process_start() -> u64 {
     static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *START.get_or_init(|| {
@@ -1053,8 +1144,8 @@ fn lifecycle_ticket_state(
     now_ns: u128,
 ) -> LifecycleTicketState {
     let last_beat = heartbeat_ns.unwrap_or(name.key.enqueue_ns);
-    // Times ahead of this clock were written before the last boot.
-    let boot_slack = Duration::from_secs(1).as_nanos();
+    // Times well ahead of this clock were written before the last boot.
+    let boot_slack = LIFECYCLE_TICKET_PRE_BOOT_SLACK.as_nanos();
     if name.key.enqueue_ns > now_ns.saturating_add(boot_slack)
         || last_beat > now_ns.saturating_add(boot_slack)
         || now_ns.saturating_sub(name.key.enqueue_ns) > LIFECYCLE_TICKET_MAX_AGE.as_nanos()
@@ -1086,17 +1177,18 @@ fn lifecycle_ticket_state(
 /// probe every process on every pass.
 #[derive(Default)]
 struct LifecycleLivenessCache {
-    verdicts: std::collections::HashMap<String, (LifecycleTicketState, Instant)>,
+    /// Per ticket name: its state, whether it had aged, and when it was read.
+    verdicts: std::collections::HashMap<String, (LifecycleTicketState, bool, Instant)>,
 }
 
 impl LifecycleLivenessCache {
-    fn cached(&self, name: &str, now: Instant) -> Option<LifecycleTicketState> {
+    fn cached(&self, name: &str, now: Instant) -> Option<(LifecycleTicketState, bool)> {
         self.verdicts
             .get(name)
-            .filter(|(_, checked)| {
+            .filter(|(_, _, checked)| {
                 now.saturating_duration_since(*checked) < LIFECYCLE_LIVENESS_CACHE
             })
-            .map(|(state, _)| *state)
+            .map(|(state, aged, _)| (*state, *aged))
     }
 }
 
@@ -1106,6 +1198,10 @@ struct LifecycleQueueView {
     ahead: usize,
     /// Live tickets other than `own`.
     live: usize,
+    /// Live tickets ahead of `own` that were enqueued after it, by name.
+    later_ahead: Vec<String>,
+    /// Live tickets ahead of `own` that were enqueued before it.
+    earlier_ahead: usize,
 }
 
 /// Count the live tickets in `directory` other than `own`, and those ahead of
@@ -1114,7 +1210,7 @@ struct LifecycleQueueView {
 /// [`LIFECYCLE_LIVENESS_CACHE`] is reused instead of probing again.
 fn scan_lifecycle_queue(
     directory: &Path,
-    own: Option<LifecycleTicketKey>,
+    own: Option<LifecycleRank>,
     mut cache: Option<&mut LifecycleLivenessCache>,
 ) -> LifecycleQueueView {
     let mut view = LifecycleQueueView::default();
@@ -1122,7 +1218,6 @@ fn scan_lifecycle_queue(
         return view;
     };
     let checked_at = Instant::now();
-    let now_ns = host_monotonic_ns();
     let mut seen = std::collections::HashSet::new();
     for entry in entries.flatten() {
         let Ok(file_name) = entry.file_name().into_string() else {
@@ -1131,14 +1226,14 @@ fn scan_lifecycle_queue(
         let Some(name) = parse_lifecycle_ticket_name(&file_name) else {
             continue;
         };
-        if Some(name.key) == own {
+        if own.is_some_and(|own| own.key == name.key) {
             continue;
         }
         let cached = cache
             .as_deref()
             .and_then(|cache| cache.cached(&file_name, checked_at));
-        let state = match cached {
-            Some(state) => state,
+        let (state, aged) = match cached {
+            Some(verdict) => verdict,
             None => {
                 let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
                     continue;
@@ -1146,17 +1241,18 @@ fn scan_lifecycle_queue(
                 if !metadata.file_type().is_file() {
                     continue;
                 }
-                let heartbeat = std::fs::read_to_string(entry.path())
-                    .ok()
-                    .as_deref()
-                    .and_then(lifecycle_ticket_heartbeat);
-                let state = lifecycle_ticket_state(&name, heartbeat, now_ns);
+                let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+                let heartbeat = lifecycle_ticket_heartbeat(&text);
+                let aged = lifecycle_ticket_aged(&text);
+                // Read the clock after the ticket, per entry: a scan of a slow
+                // volume can outlast a heartbeat written during it.
+                let state = lifecycle_ticket_state(&name, heartbeat, host_monotonic_ns());
                 if let Some(cache) = cache.as_deref_mut() {
                     cache
                         .verdicts
-                        .insert(file_name.clone(), (state, checked_at));
+                        .insert(file_name.clone(), (state, aged, checked_at));
                 }
-                state
+                (state, aged)
             }
         };
         match state {
@@ -1169,8 +1265,19 @@ fn scan_lifecycle_queue(
             }
             LifecycleTicketState::Live => {
                 view.live += 1;
-                if own.is_some_and(|own| name.key < own) {
+                let rank = LifecycleRank {
+                    key: name.key,
+                    aged,
+                };
+                if let Some(own) = own
+                    && rank < own
+                {
                     view.ahead += 1;
+                    if name.key.enqueue_ns > own.key.enqueue_ns {
+                        view.later_ahead.push(file_name.clone());
+                    } else {
+                        view.earlier_ahead += 1;
+                    }
                 }
                 seen.insert(file_name);
             }
@@ -1208,6 +1315,12 @@ struct LifecycleTicket {
     key: LifecycleTicketKey,
     process_start: u64,
     refreshed: Instant,
+    /// Whether this waiter has aged; written into the ticket for others.
+    aged: bool,
+    /// Distinct later arrivals this waiter has seen ahead of it.
+    passed_by: std::collections::HashSet<String>,
+    /// Since when no earlier arrival has been ahead of this waiter.
+    eligible_since_ns: Option<u128>,
 }
 
 impl LifecycleTicket {
@@ -1233,6 +1346,9 @@ impl LifecycleTicket {
             key,
             process_start,
             refreshed: Instant::now(),
+            aged: false,
+            passed_by: std::collections::HashSet::new(),
+            eligible_since_ns: None,
         };
         ticket.write_heartbeat();
         Some(ticket)
@@ -1250,15 +1366,43 @@ impl LifecycleTicket {
         options.open(path).ok()
     }
 
+    fn rank(&self) -> LifecycleRank {
+        LifecycleRank {
+            key: self.key,
+            aged: self.aged,
+        }
+    }
+
     /// Fixed width, so a rewrite in place never leaves a longer tail behind.
+    /// Only the owner writes its ticket; others only read it.
     fn write_heartbeat(&self) {
         use std::os::unix::fs::FileExt;
-        self.file
-            .write_all_at(
-                format!("heartbeat={:039}\n", host_monotonic_ns()).as_bytes(),
-                0,
-            )
-            .ok();
+        let contents = format!(
+            "heartbeat={:039} aged={} passed={:03} eligible_since={:039}\n",
+            host_monotonic_ns(),
+            u8::from(self.aged),
+            self.passed_by.len().min(999),
+            self.eligible_since_ns.unwrap_or(0),
+        );
+        self.file.write_all_at(contents.as_bytes(), 0).ok();
+    }
+
+    /// Count the later arrivals a scan found ahead of this waiter and note
+    /// when no earlier arrival was; once it has aged, publish that at once.
+    fn observe(&mut self, view: &LifecycleQueueView) {
+        if self.aged {
+            return;
+        }
+        let now_ns = host_monotonic_ns();
+        self.passed_by.extend(view.later_ahead.iter().cloned());
+        if view.earlier_ahead == 0 && self.eligible_since_ns.is_none() {
+            self.eligible_since_ns = Some(now_ns);
+        }
+        if lifecycle_ticket_has_aged(self.passed_by.len(), self.eligible_since_ns, now_ns) {
+            self.aged = true;
+            self.write_heartbeat();
+            crate::phase_telemetry::add("lifecycle_lock_ticket_aged", Duration::ZERO);
+        }
     }
 
     /// At most every [`LIFECYCLE_TICKET_HEARTBEAT`]: write a fresh heartbeat so
@@ -1868,12 +2012,12 @@ mod tests {
         std::fs::write(&reused, format!("heartbeat={now}")).unwrap();
         let view = scan_lifecycle_queue(
             &directory,
-            Some(LifecycleTicketKey {
+            Some(LifecycleRank::fresh(LifecycleTicketKey {
                 deadline_ns: u128::MAX,
                 enqueue_ns: u128::MAX,
                 pid: std::process::id(),
                 sequence: 0,
-            }),
+            })),
             None,
         );
         assert_eq!(view, LifecycleQueueView::default());
@@ -2112,12 +2256,19 @@ mod tests {
         // Any newer arrival whose budget is at least the time it has left
         // queues behind it, however short that budget is.
         for budget in [Duration::from_secs(5), Duration::from_secs(10)] {
-            let view = scan_lifecycle_queue(&directory, Some(arrival(budget)), None);
+            let view = scan_lifecycle_queue(
+                &directory,
+                Some(LifecycleRank::fresh(arrival(budget))),
+                None,
+            );
             assert_eq!(view.ahead, 1, "{budget:?}");
         }
         // Only a budget shorter than its remaining time goes first.
-        let view =
-            scan_lifecycle_queue(&directory, Some(arrival(Duration::from_millis(100))), None);
+        let view = scan_lifecycle_queue(
+            &directory,
+            Some(LifecycleRank::fresh(arrival(Duration::from_millis(100)))),
+            None,
+        );
         assert_eq!(view.ahead, 0);
         drop(waiting);
     }
@@ -2290,6 +2441,166 @@ mod tests {
     }
 
     #[test]
+    fn a_long_waiter_ages_and_acquires_under_a_stream_of_short_budgets() {
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path().canonicalize().unwrap();
+        let held = acquire_repository_lifecycle_lock(&root).unwrap();
+        let (order_tx, order_rx) = std::sync::mpsc::channel();
+        let long_root = root.clone();
+        let long_tx = order_tx.clone();
+        let long = thread::spawn(move || {
+            let claim = acquire_repository_lifecycle_lock(&long_root).unwrap();
+            long_tx.send("long").unwrap();
+            drop(claim);
+        });
+        wait_for_tickets(&root, 1);
+        // A continuous stream of 10 s budgets, each holding the lock 400 ms:
+        // by deadline alone every one of them would go first.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let producer_stop = stop.clone();
+        let producer_root = root.clone();
+        let producer = thread::spawn(move || {
+            let mut shorts = Vec::new();
+            while !producer_stop.load(Ordering::SeqCst) {
+                let root = producer_root.clone();
+                let order_tx = order_tx.clone();
+                shorts.push(thread::spawn(move || {
+                    if let Ok(claim) =
+                        acquire_repository_lifecycle_lock_with_wait(&root, Duration::from_secs(10))
+                    {
+                        order_tx.send("short").ok();
+                        thread::sleep(Duration::from_millis(400));
+                        drop(claim);
+                    }
+                }));
+                thread::sleep(Duration::from_millis(150));
+            }
+            for short in shorts {
+                short.join().unwrap();
+            }
+        });
+        // Let a few short arrivals queue ahead, then free the lock.
+        wait_for_tickets(&root, 3);
+        let released = Instant::now();
+        drop(held);
+        let mut served_before_long = 0;
+        loop {
+            match order_rx.recv_timeout(Duration::from_secs(60)).unwrap() {
+                "long" => break,
+                _ => served_before_long += 1,
+            }
+        }
+        let waited = released.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        long.join().unwrap();
+        producer.join().unwrap();
+        assert!(
+            served_before_long <= LIFECYCLE_TICKET_MAX_PASSES
+                || waited <= LIFECYCLE_TICKET_MAX_PASSED_FOR + Duration::from_secs(5),
+            "served {served_before_long} short claims first over {waited:?}"
+        );
+        assert!(
+            waited <= LIFECYCLE_TICKET_MAX_PASSED_FOR + Duration::from_secs(5),
+            "{waited:?}"
+        );
+    }
+
+    #[test]
+    fn an_aged_ticket_outranks_every_later_arrival_and_the_order_stays_total() {
+        let at = |enqueue_s: u64, budget_s: u64, aged: bool| LifecycleRank {
+            key: LifecycleTicketKey {
+                deadline_ns: Duration::from_secs(enqueue_s + budget_s).as_nanos(),
+                enqueue_ns: Duration::from_secs(enqueue_s).as_nanos(),
+                pid: 1,
+                sequence: enqueue_s,
+            },
+            aged,
+        };
+        let long = at(100, 180, false);
+        let short = at(110, 10, false);
+        assert!(short < long, "unaged: earliest deadline first");
+        let long_aged = at(100, 180, true);
+        assert!(
+            long_aged < short,
+            "aged: ahead of a later arrival whatever its budget"
+        );
+        assert!(long_aged < at(101, 1, false));
+        // Among aged tickets, the earlier arrival goes first.
+        assert!(at(90, 300, true) < long_aged);
+        // A total order: sorting is stable and consistent in any input order.
+        let mut ranks = vec![short, long_aged, at(90, 300, true), long, at(101, 1, false)];
+        ranks.sort();
+        let mut reversed = ranks.clone();
+        reversed.reverse();
+        reversed.sort();
+        assert_eq!(ranks, reversed);
+        assert_eq!(ranks[0], at(90, 300, true));
+        assert_eq!(ranks[1], long_aged);
+    }
+
+    #[test]
+    fn a_waiter_ages_after_three_passes_or_twenty_seconds() {
+        let second = Duration::from_secs(1).as_nanos();
+        let now = 1_000 * second;
+        assert!(!lifecycle_ticket_has_aged(2, None, now));
+        assert!(lifecycle_ticket_has_aged(
+            LIFECYCLE_TICKET_MAX_PASSES,
+            None,
+            now
+        ));
+        assert!(!lifecycle_ticket_has_aged(0, Some(now - 19 * second), now));
+        assert!(lifecycle_ticket_has_aged(0, Some(now - 20 * second), now));
+        // The owner publishes the flag, and others rank by it.
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path().canonicalize().unwrap();
+        let directory = lifecycle_waiters_directory(&root).unwrap();
+        let mut ticket =
+            LifecycleTicket::create(directory, far_deadline_key(), own_process_start()).unwrap();
+        let view = LifecycleQueueView {
+            later_ahead: vec!["a".into(), "b".into(), "c".into()],
+            ..LifecycleQueueView::default()
+        };
+        ticket.observe(&view);
+        assert!(ticket.aged);
+        assert!(lifecycle_ticket_aged(
+            &std::fs::read_to_string(&ticket.path).unwrap()
+        ));
+        drop(ticket);
+    }
+
+    #[test]
+    fn a_heartbeat_written_during_a_slow_scan_is_not_mistaken_for_a_pre_boot_ticket() {
+        let now = host_monotonic_ns();
+        let name = LifecycleTicketName {
+            key: LifecycleTicketKey {
+                deadline_ns: now + Duration::from_secs(180).as_nanos(),
+                enqueue_ns: now,
+                pid: std::process::id(),
+                sequence: 0,
+            },
+            process_start: 0,
+        };
+        // A heartbeat 30 s past the clock reading the scan took earlier.
+        let later = now + Duration::from_secs(30).as_nanos();
+        assert_eq!(
+            lifecycle_ticket_state(&name, Some(later), now),
+            LifecycleTicketState::Live
+        );
+        // Far ahead of the clock means written before the last boot.
+        let pre_boot = LifecycleTicketName {
+            key: LifecycleTicketKey {
+                enqueue_ns: now + Duration::from_secs(120).as_nanos(),
+                ..name.key
+            },
+            process_start: 0,
+        };
+        assert_eq!(
+            lifecycle_ticket_state(&pre_boot, None, now),
+            LifecycleTicketState::Dead
+        );
+    }
+
+    #[test]
     fn a_waiter_puts_back_a_ticket_someone_removed() {
         let repository = tempfile::tempdir().unwrap();
         let root = repository.path().canonicalize().unwrap();
@@ -2349,7 +2660,7 @@ mod tests {
             1
         );
         // Once the verdict expires the ticket is judged again: stalled.
-        for (_, checked) in cache.verdicts.values_mut() {
+        for (_, _, checked) in cache.verdicts.values_mut() {
             *checked -= LIFECYCLE_LIVENESS_CACHE;
         }
         assert_eq!(

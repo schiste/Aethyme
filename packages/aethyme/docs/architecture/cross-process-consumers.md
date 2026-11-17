@@ -2818,15 +2818,22 @@ reports.
   deadline first, ties by enqueue time, PID and sequence (a total order), and a
   waiter tries the lock only while no live ticket sorts before its own. So gate
   admission (10 s budget) goes ahead of a `start` that still has minutes left,
-  and a newer arrival outranks a waiter only when its own deadline is earlier:
-  a waiter with `r` seconds left is never passed by an arrival whose budget is
-  `r` seconds or more. The head of the queue polls every 50 ms, others rescan
+  and an arrival with budget `b` goes ahead of an earlier waiter only while
+  that waiter still has more than `b` seconds left. Tickets also age: a waiter
+  passed by 3 later arrivals, or with no earlier arrival ahead of it for 20 s
+  (whichever first), rewrites its ticket with `aged=1`. Aged tickets rank before
+  every unaged one, in enqueue order. The rank comes from ticket name and
+  contents alone (the owner writes `heartbeat=<ns> aged=<0|1> passed=<n>
+  eligible_since=<ns>`, others only read), so all processes agree on one total
+  order, and a `start` behind a stream of gate admissions waits for at most 3
+  of them or 20 s before only earlier arrivals and the holder remain ahead. The head of the queue polls every 50 ms, others rescan
   every 250 ms, and each waiter reuses a ticket's liveness verdict for 1 s.
   While it waits, a waiter writes `heartbeat=<monotonic ns>` into its ticket
   every 2 s and re-creates the ticket under the same name if it disappeared;
   it removes the ticket once it holds the lock, on timeout, or on error. A
   ticket whose PID has exited, whose PID now has a different process start
-  time, whose times lie ahead of the clock (written before a reboot), or that
+  time, whose times lie more than 60 s ahead of the clock (written before a
+  reboot; the clock is re-read for every ticket a scan reads), or that
   was enqueued more than 15 minutes ago is removed by the next waiter that
   scans. A live ticket whose heartbeat is more than 10 s old is passed over
   but kept. File modification times are not consulted, so a wall-clock jump
@@ -2871,7 +2878,7 @@ reports.
   `lifecycle_lock_wait` and (when it held the claim) `lifecycle_lock_held` under
   `phase_timings_ms`/`phase_counts`, and a top-level object `lifecycle_lock`
   with `claim`, `outcome` (`acquired`, `timeout`, `failed`), `wait_ms`,
-  `held_ms`, `queue_position_at_enqueue`, `queue_length_at_enqueue`, `queued`,
+  `held_ms`, `queue_position_at_enqueue`, `queue_length_at_enqueue`, `queued`, `passed_by_later_arrivals`, `aged`,
   `waited_behind` (the holder's command when this claim first found the lock
   held) and `holder_operation`. A command that claims more than once reports
   summed phases and the last queued claim's object. A nonblocking claim adds
