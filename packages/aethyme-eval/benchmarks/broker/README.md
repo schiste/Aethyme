@@ -203,3 +203,39 @@ agent, mostly cache reads. That is about 6M to 20M tokens per arm-run.
 It launches no agent and never runs the broker. The arm C `gates.toml` was
 checked with `aethyme broker advanced gates validate` (0.8.3), using a scratch
 `HOME`.
+
+## Paired Codex comparison
+
+`paired.py` compares the installed verify-only workflow with a lightweight
+Git workflow. Each task runs twice with one pinned Codex model and reasoning
+effort, a fresh worktree and bare local origin for each arm, the same allowed
+paths, tests, and exact-head publication checks. The seed assigns a balanced
+order and all trials run serially. Use a fresh output directory.
+
+```sh
+cd packages/aethyme-eval
+.venv/bin/python benchmarks/broker/paired.py \
+  --binary "$(command -v aethyme)" --model gpt-6-sol --seed 19 \
+  --output /private/tmp/aethyme-paired
+```
+
+The default batch has six matched tasks. Two get a reproducible peer edit on
+the same function after the candidate is published. The harness opens the
+conflicting merge inside each agent's worktree and grants one repair turn.
+This keeps writes to Git administrative state in the harness and lets Codex
+remain in workspace-write mode. A final fast-forward check and the common
+suite guard integration after repair. Hidden task checks remain outside the
+worktree. The harness never pushes to a real forge.
+
+The plan records the task order, model, and Aethyme binary fingerprint.
+Per-trial results retain outcome and rework flags, elapsed time from worktree
+allocation through validation, and native Codex usage summed across turns.
+The summary compares median and nearest-rank p90 on tasks completed in both
+arms. Assess failed trials separately, and include the paired count when
+quoting an effect. Rework includes a required repair even if it succeeds.
+The harness makes no human interventions during a trial. Raw transcripts
+stay in the chosen local output directory. Publish aggregate numbers only.
+
+This measures the configured workflow and fixture. A peer introduced after
+publication exercises conflict recovery. It cannot establish how often
+early broker advisories prevent overlapping work in production.
