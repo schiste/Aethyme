@@ -1212,6 +1212,11 @@ pub(super) fn run_git_gh(parsed: Parsed, subcommand: &str) -> Result<(), UsageEr
     if let Some(pending) = &report.outcome_record_pending {
         eprintln!("warning: {}", pending.message(report.operation.status));
     }
+    // The database disagrees with what this run's child did: the observed
+    // result above stands, and the disagreement is kept for review.
+    if let Some(conflict) = &report.outcome_conflict {
+        eprintln!("warning: {}", conflict.message());
+    }
     // After the coordinated operation returned, so the repository
     // write lock is released. Starting the watch inside it would hold
     // that lock across a provider call (#138). Opt-in only: a fleet

@@ -3943,6 +3943,17 @@ impl Broker {
                 ) {
                     continue;
                 }
+                // A row whose run left a journal with a definite outcome is
+                // decided even when the replay above could not write it yet
+                // (its owner may still be retrying after releasing its
+                // locks): never mark it unknown or block on it.
+                if matches!(
+                    operation.status,
+                    OperationStatus::Running | OperationStatus::OutcomeUnknown
+                ) && self.has_decided_outcome_journal(&operation)
+                {
+                    continue;
+                }
                 match operation.status {
                     // A prepared record now also covers an operation queued for
                     // this lock, so only a record whose owner is gone is abandoned.
@@ -4142,12 +4153,10 @@ impl Broker {
             running_details["fetch_reconciliation"] = serde_json::to_value(journal)
                 .expect("fetch journal contains only serializable fields");
         }
-        self.store().transition_coordinated_operation(
-            operation.id,
-            OperationStatus::Running,
-            None,
-            Some(&running_details.to_string()),
-        )?;
+        // The run nonce binds this run's outcome journal to this row alone.
+        let (_, run_nonce) = self
+            .store()
+            .start_coordinated_operation_run(operation.id, &running_details.to_string())?;
 
         // This is the spawn that performs the remote mutation, so the binary
         // it names is the whole point -- see `provider_command`.
@@ -4305,12 +4314,17 @@ impl Broker {
                 );
                 let recorded = self.record_coordinated_outcome(
                     &operation,
+                    &run_nonce,
                     status,
                     None,
                     &details.to_string(),
+                    || Ok(()),
                 )?;
                 if let Some(pending) = &recorded.pending {
                     eprintln!("warning: {}", pending.message(status));
+                }
+                if let Some(conflict) = &recorded.conflict {
+                    eprintln!("warning: {}", conflict.message());
                 }
                 let operation = recorded.operation;
                 if should_invalidate_open_pr_listing(
@@ -4378,12 +4392,17 @@ impl Broker {
                 );
                 let recorded = self.record_coordinated_outcome(
                     &operation,
+                    &run_nonce,
                     OperationStatus::Failed,
                     None,
                     &details.to_string(),
+                    || Ok(()),
                 )?;
                 if let Some(pending) = &recorded.pending {
                     eprintln!("warning: {}", pending.message(OperationStatus::Failed));
+                }
+                if let Some(conflict) = &recorded.conflict {
+                    eprintln!("warning: {}", conflict.message());
                 }
                 let operation = recorded.operation;
                 if let Some(guard) = &mut host_guard {
@@ -4682,15 +4701,37 @@ impl Broker {
         // before the database is asked, and a busy database is retried and
         // then left to replay instead of losing the result (and write-
         // blocking every session over a write that may have succeeded).
-        let recorded =
-            self.record_coordinated_outcome(&operation, status, exit_code, &details.to_string())?;
+        //
+        // Once the journal is on disk, the host lane is finished with the
+        // observed outcome and every coordination lock is dropped before the
+        // database retries: other sessions' writes then replay this journal
+        // before their write-block check instead of queueing behind it.
+        let lanes_to_release = (
+            lock,
+            _git_repository_guard,
+            _git_destination_guard,
+            _git_common_guard,
+        );
+        let host_guard_slot = &mut host_guard;
+        let recorded = self.record_coordinated_outcome(
+            &operation,
+            &run_nonce,
+            status,
+            exit_code,
+            &details.to_string(),
+            move || {
+                if let Some(mut guard) = host_guard_slot.take() {
+                    guard.finish(status)?;
+                }
+                drop(lanes_to_release);
+                Ok(())
+            },
+        )?;
         let outcome_record_pending = recorded.pending;
+        let outcome_conflict = recorded.conflict;
         let operation = recorded.operation;
         if should_invalidate_open_pr_listing(request.provider, &request.args, operation.status) {
             self.invalidate_cached_open_pr_listing();
-        }
-        if let Some(guard) = &mut host_guard {
-            guard.finish(operation.status)?;
         }
         let created_pull_request_number = (output.status.success()
             && request.provider == OperationProvider::Github
@@ -4712,6 +4753,7 @@ impl Broker {
             representing_commit: None,
             created_pull_request: created_pull_request_number,
             outcome_record_pending,
+            outcome_conflict,
             remote_default_observation,
             pushed_refs: if output.status.success() {
                 match &push_planning {

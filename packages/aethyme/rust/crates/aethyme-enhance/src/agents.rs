@@ -1226,18 +1226,23 @@ blocked.
 
    A busy broker database never loses a finished command's outcome. Once the
    `git`/`gh` child exits, the broker writes its result to an outcome journal
-   under `.aethyme/run/operation-outcomes/` before recording it, and retries
-   the record for up to a minute. If the database is still busy, the command
-   reports the child's real result plus a warning that operation `<id>`'s
-   record is pending; `operations show <id> --json` reports
+   under `.aethyme/run/operation-outcomes/`, releases the operation's locks,
+   and retries the record for up to a minute. If the database is still busy,
+   the command reports the child's real result plus a warning that operation
+   `<id>`'s record is pending; `operations show <id> --json` reports
    `outcome_journal: pending`. Do not reconcile such an operation by hand and
    do not retry the command: the next writable broker command, and every
    coordinated write before its write-block check, records the journaled
-   outcome automatically. A journal that does not match its operation's id,
-   session and command is refused and reported, never applied. An operation
-   with no journal (its process died before the child's result was known)
-   still needs the inspection and reconciliation above. `broker status`
-   warns about a journal that has waited for more than ten minutes.
+   outcome automatically. A journal settles only the exact run that wrote it
+   (operation id, session, command, creation time, run nonce and process); one
+   that does not match is set aside as `*.refused` and `broker status` names
+   the operation and the reason. If the database already holds a different
+   outcome, the command reports what its child actually did, keeps the journal
+   as `*.conflict`, and `broker status` reports the conflict: inspect external
+   state before correcting either. An operation with no journal (its process
+   died before the child's result was known) still needs the inspection and
+   reconciliation above. `broker status` also warns about a journal that has
+   waited for more than ten minutes.
 
    Direct Git is limited to read-only inspection and operations confined to
    the isolated session worktree and session branch that cannot affect other

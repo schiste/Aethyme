@@ -949,6 +949,12 @@ pub struct CoordinatedOperationReport {
     /// records it from the journal (see `operations::outcome_journal`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome_record_pending: Option<PendingOutcomeRecord>,
+    /// Set when the database already held a different outcome than the one
+    /// this run's child produced. `operation` carries the observed outcome;
+    /// the database row was left as it was and the journal kept as
+    /// `*.conflict` for review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome_conflict: Option<OutcomeConflict>,
     /// The remote's default branch, read in the same `ls-remote` as a push's
     /// pre-push evidence when the caller asked for it. `None` when it was not
     /// asked for or could not be read unambiguously.
@@ -4107,7 +4113,7 @@ pub(crate) mod outcome_journal;
 mod push_and_coordinated;
 mod redaction;
 pub(crate) use git_scopes::{canonical_fetch_args, strict_push_args};
-pub use outcome_journal::PendingOutcomeRecord;
+pub use outcome_journal::{OutcomeConflict, PendingOutcomeRecord};
 pub(crate) use push_and_coordinated::{github_command, is_within, worktree_relative_push_sources};
 use push_and_coordinated::{is_github_pull_request_merge, provider_command};
 
