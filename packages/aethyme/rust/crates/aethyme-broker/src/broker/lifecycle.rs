@@ -10735,6 +10735,9 @@ impl Broker {
     /// Whether a session row records `path` (as given or under the
     /// canonical root). An unreadable store counts as recorded.
     fn session_row_records_path(&self, path: &Path) -> bool {
+        if crate::start_reservation::recorded_path_reuse_allowed() {
+            return false;
+        }
         let given = path.to_string_lossy().into_owned();
         let canonical = path
             .parent()

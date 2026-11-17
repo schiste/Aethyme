@@ -11407,6 +11407,8 @@ mod tests {
                 .latest_handoff_for_session(self.session.id)
                 .unwrap();
 
+            // A successor at the predecessor's exact path, as adoption makes.
+            let _reuse = crate::start_reservation::AllowRecordedPathReuse::enter();
             let successor = self
                 .broker
                 .start_worktree("retirement fixture", None)
@@ -12086,7 +12088,10 @@ mod tests {
         assert!(report.cleanup.completed && report.cleanup.worktree_removed);
         let alias = broker.store().session(first.id).unwrap();
         let handoff = broker.latest_handoff_for_session(first.id).unwrap();
+        // A fresh instance at the same path, as adoption makes.
+        let reuse = crate::start_reservation::AllowRecordedPathReuse::enter();
         let mut current = broker.start_worktree("retirement fixture", None).unwrap();
+        drop(reuse);
         assert_eq!(current.worktree_path, first.worktree_path);
         // Declare strict temporal ordering without relying on clock resolution.
         // Real handoffs at a tied timestamp conservatively remain blockers.

@@ -513,6 +513,45 @@ pub(crate) fn run_before_add_hook(_destination: &Path, _branch: &str) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static RECORDED_PATH_REUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test seam for fixtures that need a successor checkout at a predecessor's
+/// exact path (as adoption or reuse produces): while the guard lives, `start`
+/// on this thread may hand out a path an old session row records.
+#[cfg(test)]
+pub(crate) struct AllowRecordedPathReuse(());
+
+#[cfg(test)]
+impl AllowRecordedPathReuse {
+    pub(crate) fn enter() -> Self {
+        RECORDED_PATH_REUSE.with(|flag| flag.set(true));
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for AllowRecordedPathReuse {
+    fn drop(&mut self) {
+        RECORDED_PATH_REUSE.with(|flag| flag.set(false));
+    }
+}
+
+/// Whether the test seam above is active on this thread; always false in
+/// production builds.
+pub(crate) fn recorded_path_reuse_allowed() -> bool {
+    #[cfg(test)]
+    {
+        RECORDED_PATH_REUSE.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// What a killed start leaves: a reservation file whose lock nobody holds.
 #[cfg(test)]
 pub(crate) fn write_dead_reservation(
