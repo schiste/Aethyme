@@ -261,7 +261,8 @@ pub fn decide(
     }
     // Space is needed now: remove what the last pass proved removable,
     // regenerable classes first, until every volume is above its floor.
-    let leases = evict::leased_gate_caches(&host_state.join("host-resources.db"));
+    let registry = host_state.join("host-resources.db");
+    let leases = evict::leased_gate_caches(&registry);
     let mut reclaimable = summary.reclaimable.clone();
     reclaimable.sort_by_key(|entry| (entry.class == Class::RecoveryArchives, entry.newest_ms));
     for entry in reclaimable {
@@ -281,7 +282,8 @@ pub fn decide(
             newest_ms: entry.newest_ms,
             reason: Reason::OverBudget,
         };
-        if evict::refuse(&candidate, leases.as_ref()).is_none() && evict::remove(&candidate).is_ok()
+        if evict::refuse(&candidate, leases.as_ref()).is_none()
+            && evict::remove_protected(&candidate, &registry).is_ok()
         {
             decision.reclaimed += entry.bytes;
         }
@@ -635,7 +637,7 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
             report.skipped.push(format!("{}: {why}", candidate.label()));
             continue;
         }
-        match evict::remove(&candidate) {
+        match evict::remove_protected(&candidate, &inputs.registry) {
             Ok(()) => {
                 report.evicted.push(candidate.label());
                 report.bytes_reclaimed += candidate.bytes;

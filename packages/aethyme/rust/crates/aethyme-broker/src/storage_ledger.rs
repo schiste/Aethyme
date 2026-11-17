@@ -763,8 +763,8 @@ impl crate::Broker {
                     .and_then(check::storage_root_for),
             );
         }
-        if let Ok(Some(preparation)) = self.preparation_cache_root()
-            && let Some(root) = check::storage_root_for(&preparation)
+        if let Ok(Some(preparation)) = self.storage_context().preparation_cache_root_binding()
+            && let Some(root) = check::storage_root_for(&preparation.path)
         {
             storage_roots.push(root);
         }

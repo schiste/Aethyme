@@ -415,6 +415,64 @@ pub fn refuse(
     None
 }
 
+/// Remove a candidate under its class's protection against a live user:
+/// - a gate cache entry: the gate cache's exclusive lease
+///   (`managed_cache_lease_name`) is acquired first, held across the rename
+///   and the deletion, and released on every path; if a gate holds it, the
+///   entry stays;
+/// - every other removable class has no lease: the entry is renamed out of
+///   its live location atomically first, so a process that opens it after
+///   the rename finds it absent (and rebuilds), never half deleted.
+///
+/// `Err` says why it stayed.
+pub fn remove_protected(candidate: &Candidate, registry: &Path) -> Result<(), String> {
+    if candidate.class != Class::GateCache {
+        return remove(candidate).map_err(|error| error.to_string());
+    }
+    let mut parts = candidate.relative.splitn(3, '/');
+    let (Some(_), Some(repository), Some(key)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err("not a gate cache entry".into());
+    };
+    // `open` would create a missing registry: a lease there proves nothing.
+    if !registry.is_file() {
+        return Err("the lease registry cannot be read".into());
+    }
+    let mut coordinator =
+        crate::HostResourceCoordinator::open(registry).map_err(|error| error.to_string())?;
+    let request = crate::HostResourceRequest {
+        schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+        request_id: format!(
+            "storage-gate-cache-{}-{}-{key}",
+            std::process::id(),
+            super::now_ms()
+        ),
+        repository: repository.to_string(),
+        worktree_fingerprint: "storage".into(),
+        run_id: format!("storage-{}", std::process::id()),
+        ttl_seconds: 300,
+        holder_pid: Some(std::process::id()),
+        resources: vec![crate::HostResourceRequirement {
+            key: "managed_cache".into(),
+            resource: crate::HostResourceKind::ExclusiveKey {
+                name: crate::gates::managed_cache_lease_name(repository, key),
+            },
+        }],
+    };
+    let grant = coordinator
+        .acquire(&request)
+        .map_err(|error| format!("a gate holds it ({error})"))?;
+    let removed = remove(candidate).map_err(|error| error.to_string());
+    crate::warn_unrecorded(
+        "release the gate cache lease storage eviction took",
+        coordinator.release(
+            &grant.lease.lease_id,
+            grant.lease.generation,
+            &grant.ownership_token,
+        ),
+    );
+    removed
+}
+
 /// Remove a candidate: renamed aside first (so a half-removed tree is never
 /// mistaken for a valid one), then deleted.
 pub fn remove(candidate: &Candidate) -> std::io::Result<()> {

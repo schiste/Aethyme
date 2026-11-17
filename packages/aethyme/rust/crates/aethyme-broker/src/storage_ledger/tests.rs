@@ -399,3 +399,71 @@ fn storage_roots_are_only_aethyme_directories() {
         None
     );
 }
+
+#[test]
+fn a_gate_that_takes_the_cache_after_selection_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path().join("state");
+    let cache = dir.path().join("cache");
+    fs::create_dir_all(&host_state).unwrap();
+    let registry = empty_registry(&host_state);
+    gate_entry(&cache, "rust-workspace-v1", 9);
+    // Selected for removal while nothing held it...
+    let candidate = super::evict::Candidate {
+        class: Class::GateCache,
+        root_kind: RootKind::HostCache,
+        root: cache.clone(),
+        relative: "gates/example-0123/rust-workspace-v1".into(),
+        bytes: 1,
+        newest_ms: 0,
+        reason: super::evict::Reason::OverBudget,
+    };
+    let leases = super::evict::leased_gate_caches(&registry).unwrap();
+    assert_eq!(super::evict::refuse(&candidate, Some(&leases)), None);
+    // ...then a gate starts and takes its lease before the removal.
+    let mut coordinator = crate::HostResourceCoordinator::open(&registry).unwrap();
+    let grant = coordinator
+        .acquire(&crate::HostResourceRequest {
+            schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+            request_id: "late-gate".into(),
+            repository: "example".into(),
+            worktree_fingerprint: "fingerprint".into(),
+            run_id: "run".into(),
+            ttl_seconds: 600,
+            holder_pid: Some(std::process::id()),
+            resources: vec![crate::HostResourceRequirement {
+                key: "cache".into(),
+                resource: crate::HostResourceKind::ExclusiveKey {
+                    name: crate::gates::managed_cache_lease_name(
+                        "example-0123",
+                        "rust-workspace-v1",
+                    ),
+                },
+            }],
+        })
+        .unwrap();
+    let removed = super::evict::remove_protected(&candidate, &registry);
+    assert!(
+        removed
+            .as_ref()
+            .is_err_and(|why| why.contains("a gate holds it")),
+        "{removed:?}"
+    );
+    assert!(
+        cache
+            .join("gates/example-0123/rust-workspace-v1/target/blob")
+            .exists()
+    );
+    // Once the gate is done, the removal holds the lease itself and frees it.
+    coordinator
+        .release(
+            &grant.lease.lease_id,
+            grant.lease.generation,
+            &grant.ownership_token,
+        )
+        .unwrap();
+    super::evict::remove_protected(&candidate, &registry).unwrap();
+    assert!(!cache.join("gates/example-0123/rust-workspace-v1").exists());
+    let held = super::evict::leased_gate_caches(&registry).unwrap();
+    assert!(held.is_empty(), "the removal released its lease: {held:?}");
+}
