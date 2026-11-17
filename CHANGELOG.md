@@ -4,6 +4,34 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.122] - 2026-11-17
+
+### Fixed
+
+- The strip and leftover-retirement lanes added in 0.8.120 reclaimed almost nothing on a busy host. Each pass first counted its backlog with one file-system check per recorded session, which took over 99% of the pass, so discovery never ran. A pass now lists each pool folder once, judges each folder that exists once, and counts the backlog afterwards under its own 5-second budget (#1774).
+- Regenerable directories are found by a bounded listing two levels down instead of a Git listing per checkout, then proved with two batched Git calls per checkout. Every earlier proof still applies to each candidate before any move: ignored, no tracked file, same device, no symlink component, witness, nested repository kept. A failed probe refuses every candidate of that checkout (#1774).
+- A reused path is judged by one rule: a cleaned session judges a folder only when every session at that path is cleaned; a closed session only when no newer open or closed session uses the path. The closed lap applies it before planning (#1774).
+- A checkout kept for a transient reason (`probe_failed`, `deadline`, `move_failed`) is no longer remembered as done. It is retried after 5 minutes, doubling to at most 4 hours, and does not count toward the per-pass limit while it waits (#1774).
+
+### Added
+
+- `[cleanup] venv_markers` in `.aethyme/config.toml`: exact file names a repository's tooling writes inside its Python environments (at most 16, no path separator or glob; `.env`, `.env.*`, `.envrc`, `.netrc`, `.npmrc` and `.pypirc` are never accepted). A `.venv` is stripped only when it holds the usual layout, files environment tools write themselves (`CACHEDIR.TAG`, `.gitignore`, `.lock`) and declared markers; anything else keeps it as `unexpected_content`. Advice `storage.venv-unexpected-content` names the file names seen, never their content, and the key to declare them (#1774).
+- Counters for every strip outcome by reason, timings for discovery, proof and move, a per-pass `checkout_strip` summary, and `checkout_strip_skipped_backoff`, `checkout_strip_backoff_set` and `checkout_strip_backoff_cleared` (#1774).
+
+- The repository's primary checkout is kept fast-forwarded to its remote default branch. The background worker attempts once per `[main_checkout] sync_interval_minutes` (15) per repository, with one bounded fetch of the default branch only (explicit refspec, no tags, no prune, no hooks, no credential prompt). It moves only on the default branch, strictly behind, with no local commits, no operation in progress and no sparse, assume-unchanged or skip-worktree entries; unrelated local changes stay in place. It holds, naming the paths, when an upstream change overlaps a locally changed path or an untracked file (compared case-insensitively), when a smudge or process filter applies to a changed path unless `allow_filters = true`, or while a session is adopted on the checkout. Each step writes the files and index first and moves the branch last by compare-and-swap; a marker under `.aethyme/run/` lets the next attempt finish or undo an interrupted step, and anything it cannot prove holds with advice `main-checkout.interrupted`. Jumps over 2,000 changed paths advance in steps along the first-parent line. No repository hooks run. `[main_checkout] auto_sync = false` turns it off. Advice `main-checkout.behind`, a `main_checkout` block in `status --json`, and one line on `start` (#1775).
+- The broker's own leftovers in the primary checkout's `.aethyme/` (staged `gc.lock` files and completed maintenance-hold directories) no longer count as local changes; the worker removes a lock file over an hour old whose process is gone and a hold directory a day after its manifest says complete, and keeps anything else (#1775).
+
+### Changed
+
+- **Breaking:** the primary checkout now moves by itself as described above. Before this release it was fast-forwarded only before a few commands run from that checkout, never fetched, and refused on any local change. Upgrade note: set `[main_checkout] auto_sync = false` to keep the old behaviour. Foreground commands attempt before the same commands as before; `status` moves only a checkout with no local changes (#1775).
+- Upgrade note: a repository whose tooling drops its own marker file inside `.venv` keeps those environments on disk until it declares the name under `[cleanup] venv_markers`; `aethyme broker status` reports the names to declare.
+
+### Known issues
+
+- Checkouts refused at the trash step for a failed environment-database teardown or a ref lock are still remembered instead of retried.
+- `closed_with_regenerable` in the backlog count still looks only at top-level directories.
+- `start --adopt` can still hold the lifecycle lock for minutes while comparing patches.
+
 ## [0.8.121] - 2026-11-17
 
 ### Added
