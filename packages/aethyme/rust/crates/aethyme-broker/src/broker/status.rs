@@ -968,6 +968,11 @@ impl Broker {
         ) {
             advice.insert(0, headroom_advice);
         }
+        // Opt-in transcript archiving whose session links stayed unreadable
+        // for several passes (a no-op unless the host enabled it).
+        if let Some(transcripts_advice) = crate::transcripts::linkage_degraded_advice() {
+            advice.push(transcripts_advice);
+        }
         if refresh && cleanup_retention.broker_owned_worktree_count > 0 {
             let count = cleanup_retention.broker_owned_worktree_count;
             let required = crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES;
