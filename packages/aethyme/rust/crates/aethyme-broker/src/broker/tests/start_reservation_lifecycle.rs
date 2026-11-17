@@ -5,6 +5,10 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+/// What the hook saw: lock free, destination reserved, destination, the
+/// concurrent start's checkout.
+type HookObservation = Rc<RefCell<Option<(bool, bool, PathBuf, PathBuf)>>>;
+
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .args(args)
@@ -53,7 +57,7 @@ fn a_second_start_proceeds_while_the_first_is_in_worktree_add() {
     let options = storage.options();
     let mut first = storage.open(repo.path()).unwrap();
 
-    let observed: Rc<RefCell<Option<(bool, bool, PathBuf, PathBuf)>>> = Rc::default();
+    let observed: HookObservation = Rc::default();
     let observed_in_hook = Rc::clone(&observed);
     let repo_path = repo.path().to_path_buf();
     crate::start_reservation::set_before_add_hook(Box::new(

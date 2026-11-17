@@ -3046,6 +3046,10 @@ see:
   `.git`. Anything else is left (and named in a warning) for the existing
   recovery lanes. A reader must tolerate the new directory; nothing else may
   write or remove its files.
+- **Inline claims stay busy.** From the release of the claim until its row
+  and reports are done, nonblocking lifecycle claims made by the same
+  `start` (the lease-holder refresh's abandoned close, for one) answer busy
+  without touching the lock, as they did while `start` held it.
 - **Slug choice** treats a reserved slug as taken even before its path or
   branch exists.
 - **Checkout limit** counts live reservations whose destination has no `.git`

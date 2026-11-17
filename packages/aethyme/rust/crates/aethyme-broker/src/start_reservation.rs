@@ -77,9 +77,13 @@ impl StartReservation {
             return;
         };
         if same_inode(&self.lock_path, &file) {
-            let _ = std::fs::remove_file(&self.lock_path);
+            crate::warn_unrecorded(
+                "remove the start reservation file",
+                std::fs::remove_file(&self.lock_path),
+            );
         }
-        let _ = file.unlock();
+        // Best effort: closing the file releases the lock anyway.
+        file.unlock().ok();
     }
 }
 
@@ -210,7 +214,10 @@ pub(crate) fn reserve(
     // for an instant (reapers and other reservations need the wide lock we
     // hold), so wait for it rather than abandon the slug.
     if let Err(error) = file.lock() {
-        let _ = std::fs::remove_file(&lock_path);
+        crate::warn_unrecorded(
+            "remove an unlockable start reservation file",
+            std::fs::remove_file(&lock_path),
+        );
         return Err(error);
     }
     // From here on, dropping `reservation` unlinks and unlocks the file.
@@ -292,7 +299,7 @@ pub(crate) fn reap_stale(
         }
         if !same_inode(&path, &file) {
             // Released (and unlinked) while we opened it.
-            let _ = file.unlock();
+            file.unlock().ok();
             continue;
         }
         if let Some(record) = read_record(&file) {
@@ -306,8 +313,11 @@ pub(crate) fn reap_stale(
         }
         // A record that cannot be read was written by a start that died
         // before its destination existed (invariant 1: file first).
-        let _ = std::fs::remove_file(&path);
-        let _ = file.unlock();
+        crate::warn_unrecorded(
+            "remove a dead start reservation file",
+            std::fs::remove_file(&path),
+        );
+        file.unlock().ok();
         report.reaped += 1;
     }
     report
@@ -391,7 +401,8 @@ fn live_records(main_root: &Path) -> Vec<ReservationRecord> {
         let record = read_record(&file);
         match file.try_lock() {
             Ok(()) => {
-                let _ = file.unlock();
+                // A dead reservation: release the probe at once.
+                file.unlock().ok();
             }
             Err(_) => live.extend(record),
         }

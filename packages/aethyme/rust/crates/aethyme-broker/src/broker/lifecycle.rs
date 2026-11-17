@@ -7517,6 +7517,9 @@ impl Broker {
             selected_promote_branch,
             reservation,
         } = self.create_session_worktree(task, explicit_base, &planned_paths)?;
+        // Until this start's row and reports are done, inline nonblocking
+        // lifecycle claims stay "busy", as when start held the lock throughout.
+        let _decline_inline_claims = crate::file_lock::DeclineNonblockingLifecycleClaims::enter();
         let base = start_base.commit.clone();
         let base_observation = crate::broker::SessionBaseObservation::from_start_base(
             &start_base,
@@ -7682,6 +7685,9 @@ impl Broker {
             selected_promote_branch,
             reservation,
         } = self.create_session_worktree(task, explicit_base, &[])?;
+        // Until this start's row and reports are done, inline nonblocking
+        // lifecycle claims stay "busy", as when start held the lock throughout.
+        let _decline_inline_claims = crate::file_lock::DeclineNonblockingLifecycleClaims::enter();
         let agent_setup_started = std::time::Instant::now();
         let base = start_base.commit.clone();
         let base_observation = crate::broker::SessionBaseObservation::from_start_base(
