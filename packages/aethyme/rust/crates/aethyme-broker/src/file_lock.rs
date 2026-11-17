@@ -60,6 +60,10 @@ const BACKGROUND_YIELD_COUNT: u32 = 5;
 /// How long a promoted background lane waits in the queue before it gives up
 /// for this pass (never past an active command Git deadline).
 const BACKGROUND_PROMOTED_WAIT: Duration = Duration::from_secs(30);
+/// The promoted wait while this process holds the GC lock: short enough that
+/// a foreground command waiting for the GC lock (`broker start` at the
+/// checkout limit, `gc apply`, 30 s) is never outwaited by it.
+const BACKGROUND_PROMOTED_WAIT_UNDER_GC_LOCK: Duration = Duration::from_secs(3);
 
 /// Orders tickets one process creates within the same clock tick.
 static LIFECYCLE_TICKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -95,6 +99,42 @@ impl Drop for ForegroundLifecycleTryClaim {
 
 fn foreground_try_claim_active() -> bool {
     FOREGROUND_TRY_CLAIM.with(|depth| depth.get() > 0)
+}
+
+thread_local! {
+    /// Depth of [`DetachedBackgroundWorker`] scopes on this thread.
+    static DETACHED_BACKGROUND_WORKER: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Marks this thread as a detached background worker process (the artifact,
+/// cleanup and retirement worker, the managed GC sweep tick, the storage
+/// worker), entered where that worker starts. Only inside it may a background
+/// lane that has yielded too long queue and wait for its turn. Everywhere else
+/// (inline maintenance inside `status`, `start`, `push` and every other
+/// foreground command) a lane only try-claims and yields, so no user waits on
+/// background work; its yields still count toward the lane's streak, so the
+/// next detached pass promotes.
+pub(crate) struct DetachedBackgroundWorker {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl DetachedBackgroundWorker {
+    pub(crate) fn enter() -> Self {
+        DETACHED_BACKGROUND_WORKER.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Self {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for DetachedBackgroundWorker {
+    fn drop(&mut self) {
+        DETACHED_BACKGROUND_WORKER.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+fn detached_background_worker() -> bool {
+    DETACHED_BACKGROUND_WORKER.with(|depth| depth.get() > 0)
 }
 
 /// Which side of the queue a lifecycle claim came from.
@@ -282,10 +322,14 @@ fn describe_lifecycle_holder(path: &Path) -> String {
 /// Queued waiters outrank it: while any live ticket is queued it returns
 /// `None` without touching the lock. That yielding is bounded per lane: once
 /// the lane has yielded [`BACKGROUND_YIELD_COUNT`] times in a row, or for
-/// [`BACKGROUND_YIELD_LIMIT`], its next attempt takes a ticket and waits its
-/// turn for at most [`BACKGROUND_PROMOTED_WAIT`], so a queue that is never
-/// empty cannot starve retirement, cleanup or GC. A
-/// [`ForegroundLifecycleTryClaim`] scope on this thread skips the yielding.
+/// [`BACKGROUND_YIELD_LIMIT`], its next attempt inside a
+/// [`DetachedBackgroundWorker`] takes a ticket and waits its turn for at most
+/// [`BACKGROUND_PROMOTED_WAIT`] ([`BACKGROUND_PROMOTED_WAIT_UNDER_GC_LOCK`]
+/// while this process holds the GC lock), so a queue that is never empty
+/// cannot starve retirement, cleanup or GC. Inline in a foreground command it
+/// never waits: it yields and the streak carries over to the next detached
+/// pass. A [`ForegroundLifecycleTryClaim`] scope on this thread skips the
+/// yielding.
 pub(crate) fn try_acquire_repository_lifecycle_lock(
     main_root: &Path,
     lane: &'static str,
@@ -406,7 +450,12 @@ fn yield_or_promote_background_lane(
     let yielding_for_ms = previous.map_or(0, |previous| {
         u64::try_from(now_ns.saturating_sub(previous.since_ns) / 1_000_000).unwrap_or(u64::MAX)
     });
-    if !background_lane_due_for_promotion(previous, now_ns) {
+    let detached = detached_background_worker();
+    let context = if detached { "detached" } else { "inline" };
+    let due = background_lane_due_for_promotion(previous, now_ns);
+    // Inline, a lane never waits: it yields, and its streak keeps growing
+    // until a detached worker pass promotes it.
+    if !due || !detached {
         let yields = BackgroundYields {
             since_ns: previous.map_or(now_ns, |previous| previous.since_ns),
             count: previous.map_or(1, |previous| previous.count.saturating_add(1)),
@@ -419,17 +468,29 @@ fn yield_or_promote_background_lane(
             "lifecycle_lock_background",
             serde_json::json!({
                 "lane": lane,
+                "context": context,
                 "outcome": "yielded",
                 "consecutive_yields": yields.count,
                 "yielding_for_ms": yielding_for_ms,
+                "promotion_deferred_to_detached_worker": due,
             }),
         );
         return Ok(None);
     }
     // Promoted: the run of yields ends here whatever the wait's outcome.
     clear_background_yields(main_root, lane);
-    let wait = crate::git::active_git_deadline().map_or(BACKGROUND_PROMOTED_WAIT, |deadline| {
-        BACKGROUND_PROMOTED_WAIT.min(deadline.saturating_duration_since(Instant::now()))
+    // Waiting while holding the GC lock would make a foreground GC-lock
+    // waiter lose to background work, so that wait is capped instead of the
+    // GC lock being released: the GC lock guards a pass's journaled plan, and
+    // re-validating every plan after re-taking it is not provably safe here.
+    let capped_by_gc_lock = crate::gc::this_process_holds_gc_lock();
+    let ceiling = if capped_by_gc_lock {
+        BACKGROUND_PROMOTED_WAIT_UNDER_GC_LOCK
+    } else {
+        BACKGROUND_PROMOTED_WAIT
+    };
+    let wait = crate::git::active_git_deadline().map_or(ceiling, |deadline| {
+        ceiling.min(deadline.saturating_duration_since(Instant::now()))
     });
     let started = Instant::now();
     let mut observation = LifecycleQueueObservation::default();
@@ -446,6 +507,8 @@ fn yield_or_promote_background_lane(
         "lifecycle_lock_background",
         serde_json::json!({
             "lane": lane,
+            "context": context,
+            "promoted_capped_gc_lock": capped_by_gc_lock,
             "outcome": match &result {
                 Ok(_) => "promoted_acquired",
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => "promoted_timeout",
@@ -2061,6 +2124,7 @@ mod tests {
 
     #[test]
     fn a_background_lane_queues_after_five_consecutive_yields() {
+        let _detached = DetachedBackgroundWorker::enter();
         let repository = tempfile::tempdir().unwrap();
         let root = repository.path().canonicalize().unwrap();
         let directory = lifecycle_waiters_directory(&root).unwrap();
@@ -2110,6 +2174,7 @@ mod tests {
 
     #[test]
     fn a_background_lane_queues_after_a_minute_of_yielding() {
+        let _detached = DetachedBackgroundWorker::enter();
         let repository = tempfile::tempdir().unwrap();
         let root = repository.path().canonicalize().unwrap();
         let directory = lifecycle_waiters_directory(&root).unwrap();
@@ -2129,6 +2194,99 @@ mod tests {
         assert!(!record.exists(), "the promotion ends the run of yields");
         drop(claim);
         drop(foreground);
+    }
+
+    #[test]
+    fn an_inline_lane_never_waits_and_leaves_promotion_to_the_detached_worker() {
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path().canonicalize().unwrap();
+        let directory = lifecycle_waiters_directory(&root).unwrap();
+        let foreground =
+            LifecycleTicket::create(directory, far_deadline_key(), own_process_start()).unwrap();
+        // The lane is already due: five yields in a row.
+        let record = background_yields_path(&root, "test_lane", true).unwrap();
+        write_background_yields(
+            &record,
+            BackgroundYields {
+                since_ns: host_monotonic_ns(),
+                count: BACKGROUND_YIELD_COUNT,
+            },
+        );
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        let started = Instant::now();
+        assert!(
+            try_acquire_repository_lifecycle_lock(&root, "test_lane")
+                .unwrap()
+                .is_none(),
+            "inline, a due lane still only yields"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "inline never waits"
+        );
+        let attached = &recorder.attachments()["lifecycle_lock_background"];
+        assert_eq!(attached["context"], "inline");
+        assert_eq!(attached["outcome"], "yielded");
+        assert_eq!(attached["promotion_deferred_to_detached_worker"], true);
+        assert_eq!(attached["consecutive_yields"], BACKGROUND_YIELD_COUNT + 1);
+        let (_, counts) = recorder.totals();
+        assert!(!counts.contains_key("lifecycle_lock_promoted_wait"));
+
+        // The streak carries over: the next detached pass promotes at once.
+        let _detached = DetachedBackgroundWorker::enter();
+        let claim = try_acquire_repository_lifecycle_lock(&root, "test_lane").unwrap();
+        assert!(claim.is_some());
+        let attached = &recorder.attachments()["lifecycle_lock_background"];
+        assert_eq!(attached["context"], "detached");
+        assert_eq!(attached["outcome"], "promoted_acquired");
+        assert_eq!(attached["promoted_capped_gc_lock"], false);
+        drop(claim);
+        drop(foreground);
+    }
+
+    #[test]
+    fn a_promoted_wait_under_the_gc_lock_is_capped_below_the_foreground_gc_wait() {
+        // A `start` at the checkout limit waits this long for the GC lock; a
+        // background wait made while holding it must end well before.
+        assert!(BACKGROUND_PROMOTED_WAIT_UNDER_GC_LOCK < crate::gc::GC_LOCK_FOREGROUND_WAIT / 2);
+        let _detached = DetachedBackgroundWorker::enter();
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path().canonicalize().unwrap();
+        // The lifecycle lock stays held throughout, so the promoted lane can
+        // only time out; taken before any ticket exists.
+        let held = acquire_repository_lifecycle_lock(&root).unwrap();
+        let directory = lifecycle_waiters_directory(&root).unwrap();
+        let foreground =
+            LifecycleTicket::create(directory, far_deadline_key(), own_process_start()).unwrap();
+        let record = background_yields_path(&root, "test_lane", true).unwrap();
+        write_background_yields(
+            &record,
+            BackgroundYields {
+                since_ns: host_monotonic_ns(),
+                count: BACKGROUND_YIELD_COUNT,
+            },
+        );
+        let gc_lock = crate::gc::GcLock::acquire(&root).unwrap();
+        assert!(crate::gc::this_process_holds_gc_lock());
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        let started = Instant::now();
+        let claim = try_acquire_repository_lifecycle_lock(&root, "test_lane").unwrap();
+        let waited = started.elapsed();
+        assert!(claim.is_none(), "the held lifecycle lock never came free");
+        assert!(
+            waited >= BACKGROUND_PROMOTED_WAIT_UNDER_GC_LOCK - Duration::from_millis(100)
+                && waited < BACKGROUND_PROMOTED_WAIT_UNDER_GC_LOCK + Duration::from_secs(2),
+            "{waited:?}"
+        );
+        let attached = &recorder.attachments()["lifecycle_lock_background"];
+        assert_eq!(attached["promoted_capped_gc_lock"], true);
+        assert_eq!(attached["outcome"], "promoted_timeout");
+        drop(gc_lock);
+        assert!(!crate::gc::this_process_holds_gc_lock());
+        drop(foreground);
+        drop(held);
     }
 
     #[test]

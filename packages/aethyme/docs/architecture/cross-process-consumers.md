@@ -2779,10 +2779,19 @@ reports.
   "busy" while any live ticket exists, even when the lock is free. Each lane
   records its run of yields in `.aethyme/run/lifecycle-lock-yields/<lane>`
   (`since_ns=<monotonic ns> count=<n>`). After 5 consecutive yields or 60 s of
-  yielding, the lane's next attempt takes a ticket itself and waits its turn
-  for at most 30 s (less under a command Git deadline). It then holds the claim
-  or reports busy, and its run of yields starts over. A direct acquisition also
-  clears the record. `broker start` making room at the checkout limit and
+  yielding, the lane's next attempt in a detached background worker process
+  (the `gc __continue-artifacts` artifact, cleanup and retirement worker, the
+  macOS managed `gc sweep` tick, `storage worker`; each enters that context
+  where it starts) takes a ticket itself and waits its turn for at most 30 s
+  (less under a command Git deadline). It then holds the claim or reports
+  busy, and its run of yields starts over. While that process holds the GC
+  lock the wait is capped at 3 s, so a foreground command waiting 30 s for the
+  GC lock (`start` at the checkout limit, `gc apply`) is never outwaited. The
+  GC lock is not released for the wait: it guards a pass's journaled plan, and
+  re-validating that plan after re-taking it is not provably safe. Inline
+  maintenance inside a foreground command (`status`, `start`, `push`, ...)
+  never waits: a due lane only yields, and its streak carries over to the next
+  detached pass. A direct acquisition also clears the record. `broker start` making room at the checkout limit and
   `gc artifact-use reconcile apply` claim inside a foreground scope and never
   yield. The background worker's capacity slice is not foreground.
 - **Compatibility.** Binaries older than this change keep no ticket and poll
@@ -2809,9 +2818,12 @@ reports.
   to `lifecycle_lock_held` and counts `lifecycle_lock_nonblocking_acquired`
   (or `lifecycle_lock_yielded_to_waiter` when it yielded) but never writes the
   object. Background lanes write a separate object, `lifecycle_lock_background`:
-  `lane`, `outcome` (`yielded`, `promoted_acquired`, `promoted_timeout`,
-  `promoted_failed`), `consecutive_yields`, `yielding_for_ms` and, when
-  promoted, `promoted_wait_ms` and `queue_position_at_enqueue`, plus the timed
+  `lane`, `context` (`inline` or `detached`), `outcome` (`yielded`,
+  `promoted_acquired`, `promoted_timeout`, `promoted_failed`),
+  `consecutive_yields`, `yielding_for_ms`, on a yield
+  `promotion_deferred_to_detached_worker` and, when promoted,
+  `promoted_capped_gc_lock`, `promoted_wait_ms` and
+  `queue_position_at_enqueue`, plus the timed
   phase `lifecycle_lock_promoted_wait`. A waiter that had to re-create its
   ticket counts `lifecycle_lock_ticket_recreated`. `broker start`'s own
   `phase_timings_ms.lifecycle_lock_wait` takes precedence over the span of the

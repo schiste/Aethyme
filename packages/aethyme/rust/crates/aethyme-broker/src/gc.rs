@@ -3222,6 +3222,15 @@ pub(crate) struct GcLock {
     path: PathBuf,
 }
 
+/// How many [`GcLock`]s this process holds right now.
+static GC_LOCKS_HELD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether this process holds a GC lock, so a wait it starts now would keep
+/// every foreground GC-lock waiter waiting too.
+pub(crate) fn this_process_holds_gc_lock() -> bool {
+    GC_LOCKS_HELD.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
 /// What waking post-close checkout cleanup did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PostCloseCleanupWake {
@@ -3237,7 +3246,10 @@ impl GcLock {
         let path = main_root.join(".aethyme/gc.lock");
         for _ in 0..2 {
             match create_gc_lock_file(&path) {
-                Ok(()) => return Ok(Self { path }),
+                Ok(()) => {
+                    GC_LOCKS_HELD.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(Self { path });
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     let owner = std::fs::read_to_string(&path).unwrap_or_default();
                     let pid = owner.trim().parse::<i64>().ok();
@@ -3348,6 +3360,7 @@ impl GcLock {
 impl Drop for GcLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        GC_LOCKS_HELD.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

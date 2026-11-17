@@ -1596,6 +1596,11 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     if action == "__continue-artifacts" {
         return run_artifact_sweep_continuation_worker(parsed);
     }
+    // A managed sweep tick is a detached worker: its starved background lanes
+    // may queue for the lifecycle lock (see `DetachedBackgroundWorker`).
+    #[cfg(target_os = "macos")]
+    let _detached_worker = (action == "sweep" && crate::gc_sweep_service::managed_tick_requested())
+        .then(crate::file_lock::DetachedBackgroundWorker::enter);
     if action == "artifact-use" {
         return run_gc_artifact_use_reconcile(parsed);
     }
@@ -2261,6 +2266,9 @@ fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageErr
         parsed.positional.len(),
         artifact_worker_test_or_build_environment(),
     )?;
+    // Nobody waits on this process: its starved background lanes may queue
+    // for the lifecycle lock (see `DetachedBackgroundWorker`).
+    let _detached_worker = crate::file_lock::DetachedBackgroundWorker::enter();
     // Nobody waits on this process: drop to background CPU and I/O priority
     // before anything else runs, so every later child inherits it.
     let priority = crate::gc::lower_artifact_worker_priority();
