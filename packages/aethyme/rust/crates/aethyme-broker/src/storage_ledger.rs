@@ -212,6 +212,7 @@ pub fn classify(kind: RootKind, name: &str) -> Class {
                 | SUMMARY_FILE
                 | BUDGET_FILE
                 | DIRTY_DIRECTORY
+                | CHECKOUTS_DIRECTORY
                 | check::LOCK_FILE
                 | check::ROOTS_FILE
                 | check::GATE_BUDGETS_FILE => Class::Coordination,
@@ -698,12 +699,13 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Per-repository checkout counts the retirement lane writes after each run
-/// (`<host state>/storage-ledger-checkouts.json`), shown as the `checkouts`
-/// class of `aethyme storage status`. Counts only: checkout folders are never
-/// walked for bytes; the bytes are those the deleter measured while removing
-/// stripped directories.
-pub const CHECKOUTS_FILE: &str = "storage-ledger-checkouts.json";
+/// Per-repository checkout counts the retirement lane writes after each run,
+/// one file per repository (`<host state>/storage-ledger-checkouts/<sha256 of
+/// the repository root>.json`, so two repositories never overwrite each
+/// other), shown as the `checkouts` class of `aethyme storage status`. Counts
+/// only: checkout folders are never walked for bytes; the bytes are those the
+/// deleter measured while removing stripped directories.
+pub const CHECKOUTS_DIRECTORY: &str = "storage-ledger-checkouts";
 
 /// One repository's checkout counts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -728,27 +730,45 @@ pub struct CheckoutCounts {
     pub checkouts_retired_today: usize,
 }
 
-/// The checkout counts of every repository that recorded them.
-pub fn checkout_counts(host_state: &Path) -> BTreeMap<String, CheckoutCounts> {
-    fs::read(host_state.join(CHECKOUTS_FILE))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+/// One repository's recorded counts, with the repository it names.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct CheckoutCountsRecord {
+    repository: String,
+    counts: CheckoutCounts,
 }
 
-/// Record `repository`'s checkout counts (read, replace its entry, write
-/// atomically). Two repositories writing at once may drop the other's entry
-/// until its next run rewrites it; nothing acts on these counts.
+/// The checkout counts of every repository that recorded them, by
+/// repository.
+pub fn checkout_counts(host_state: &Path) -> BTreeMap<String, CheckoutCounts> {
+    let Ok(listing) = fs::read_dir(host_state.join(CHECKOUTS_DIRECTORY)) else {
+        return BTreeMap::new();
+    };
+    listing
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+        .filter_map(|entry| fs::read(entry.path()).ok())
+        .filter_map(|bytes| serde_json::from_slice::<CheckoutCountsRecord>(&bytes).ok())
+        .map(|record| (record.repository, record.counts))
+        .collect()
+}
+
+/// Record `repository`'s checkout counts in its own file, written
+/// atomically: only this repository's worker writes it.
 pub fn record_checkout_counts(
     host_state: &Path,
     repository: &str,
     counts: CheckoutCounts,
 ) -> io::Result<()> {
-    fs::create_dir_all(host_state)?;
-    let mut all = checkout_counts(host_state);
-    all.insert(repository.to_string(), counts);
-    let bytes = serde_json::to_vec(&all).map_err(io::Error::other)?;
-    write_atomically(&host_state.join(CHECKOUTS_FILE), &bytes)
+    use sha2::Digest as _;
+    let directory = host_state.join(CHECKOUTS_DIRECTORY);
+    fs::create_dir_all(&directory)?;
+    let name = format!("{:x}.json", sha2::Sha256::digest(repository.as_bytes()));
+    let bytes = serde_json::to_vec(&CheckoutCountsRecord {
+        repository: repository.to_string(),
+        counts,
+    })
+    .map_err(io::Error::other)?;
+    write_atomically(&directory.join(name), &bytes)
 }
 
 thread_local! {

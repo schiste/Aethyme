@@ -8059,9 +8059,50 @@ impl Broker {
                 });
             }
         }
-        let placement = timed_start_phase(&mut phase_timings_ms, "worktree_root", || {
+        let mut placement = timed_start_phase(&mut phase_timings_ms, "worktree_root", || {
             self.prepare_broker_worktree_root()
         })?;
+        let admission = timed_start_phase(&mut phase_timings_ms, "storage_admission", || {
+            self.preflight_session_checkout_storage(&placement)
+        });
+        if let Err(refusal) = admission {
+            // Below the reserve: release the claim, strip regenerable
+            // directories out of closed checkouts (each checkout's renames
+            // under its own short claim, without yielding to queued
+            // waiters, since a user waits on this start) and let the deleter
+            // run unpaced outside any claim, within one bound; then take the
+            // claim again, prepare the root again and ask again. Still
+            // short, the refusal says what is left.
+            drop(lifecycle_claim);
+            let relief =
+                timed_start_phase(&mut phase_timings_ms, "storage_pressure_relief", || {
+                    let _foreground = crate::file_lock::ForegroundLifecycleTryClaim::enter();
+                    self.strip_closed_checkouts_under_pressure(STORAGE_PRESSURE_STRIP_BUDGET)
+                });
+            phase_timings_ms.insert("storage_pressure_strip".into(), relief.strip_ms);
+            phase_timings_ms.insert("storage_pressure_drain".into(), relief.drain_ms);
+            lifecycle_claim = timed_start_phase(
+                &mut phase_timings_ms,
+                "lifecycle_lock_wait_after_strip",
+                || self.claim_worktree_lifecycle(),
+            )?;
+            placement =
+                timed_start_phase(&mut phase_timings_ms, "worktree_root_after_strip", || {
+                    self.prepare_broker_worktree_root()
+                })?;
+            let readmission = timed_start_phase(
+                &mut phase_timings_ms,
+                "storage_admission_after_strip",
+                || self.preflight_session_checkout_storage(&placement),
+            );
+            if readmission.is_err() {
+                return Err(storage_pressure_refusal(
+                    refusal,
+                    &relief.report,
+                    relief.freed,
+                ));
+            }
+        }
         // Choose the unique branch and recheck the destination immediately
         // before the checkout is allocated. The returned guard stays held
         // until the caller registers the session or rolls the checkout back.
@@ -8069,27 +8110,6 @@ impl Broker {
         let worktree_path = placement.root.join(&slug);
         self.refuse_nested_worktree_path(&worktree_path)?;
         let branch = format!("agent/{slug}");
-        let admission = timed_start_phase(&mut phase_timings_ms, "storage_admission", || {
-            self.preflight_session_checkout_storage(&placement)
-        });
-        if let Err(refusal) = admission {
-            // Below the reserve: strip regenerable directories out of closed
-            // checkouts (O(1) renames under the claim this start already
-            // holds) and let the deleter run unpaced for a short while, then
-            // ask again. Still short, the refusal says what is left.
-            let (strip, freed) =
-                timed_start_phase(&mut phase_timings_ms, "storage_pressure_strip", || {
-                    self.strip_closed_checkouts_under_pressure(STORAGE_PRESSURE_STRIP_BUDGET)
-                });
-            let readmission = timed_start_phase(
-                &mut phase_timings_ms,
-                "storage_admission_after_strip",
-                || self.preflight_session_checkout_storage(&placement),
-            );
-            if readmission.is_err() {
-                return Err(storage_pressure_refusal(refusal, &strip, freed));
-            }
-        }
         let (worktree, sparse_setup_fallback) =
             match timed_start_phase(&mut phase_timings_ms, "git_worktree_add", || {
                 self.repo.worktree_add_with_sparse_paths(

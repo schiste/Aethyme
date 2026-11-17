@@ -611,7 +611,11 @@ pub(crate) struct CheckoutRetirementProgress {
 fn inspection_failed(error: &BrokerOpError) -> bool {
     match error {
         BrokerOpError::CleanupResolveRefused { reason, .. } => {
-            reason.contains("is inspection_failed") || reason.contains("did not finish within")
+            reason.contains("is inspection_failed")
+                || reason.contains("did not finish within")
+                || (reason.contains("git ")
+                    && (reason.contains(" timed out after ")
+                        || reason.contains(" was not started: the command's deadline")))
         }
         BrokerOpError::Git(crate::git::GitError::TimedOut { .. }) => true,
         _ => false,
@@ -1016,6 +1020,24 @@ impl Broker {
         };
         let operation_archived =
             OPERATION_STATE_ARCHIVED.with(std::cell::Cell::get) == Some(session.id);
+        // Inside the retirement lane the checkout was judged before this
+        // claim: a `start --reuse` or a new session may have reopened or
+        // recreated the path since. Ask again here, under the claim (the
+        // holder too where the lane asked it: leftovers of cleaned sessions
+        // and abandoned operations).
+        if in_retirement_lane() {
+            let check_holder =
+                operation_archived || session.cleanup_state == crate::SessionCleanupState::Cleaned;
+            if let Some(code) = self.reused_path_keep(session, worktree, check_holder) {
+                crate::phase_telemetry::add(
+                    "checkout_retirement_reused_path_kept",
+                    std::time::Duration::ZERO,
+                );
+                return Err(refuse(format!(
+                    "the checkout's path may have been reused since it was judged ({code})"
+                )));
+            }
+        }
         match GitRepo::discover(worktree).and_then(|checkout| checkout.operation_in_progress()) {
             Ok(None) => {}
             Ok(Some(_)) if operation_archived => {}
@@ -3764,6 +3786,9 @@ mod tests {
             std::fs::create_dir_all(worktree.join(dir)).unwrap();
             std::fs::write(worktree.join(dir).join("index.js"), "module.exports = 1;\n").unwrap();
         }
+        for dir in ["node_modules", "packages/app/node_modules"] {
+            std::fs::write(worktree.join(dir).join(".package-lock.json"), "{}\n").unwrap();
+        }
         std::fs::create_dir_all(worktree.join("vendor")).unwrap();
         std::fs::write(worktree.join("vendor/keep.js"), "kept\n").unwrap();
         (session, worktree)
@@ -3872,6 +3897,11 @@ mod tests {
         let (session, worktree) = closed(&mut broker, "strip then retire", |_| {});
         std::fs::create_dir_all(worktree.join("node_modules/dep")).unwrap();
         std::fs::write(worktree.join("node_modules/dep/index.js"), "x\n").unwrap();
+        std::fs::write(
+            worktree.join("node_modules/.modules.yaml"),
+            "layoutVersion: 5\n",
+        )
+        .unwrap();
 
         let report = run(&mut broker);
 
@@ -3911,6 +3941,11 @@ mod tests {
         };
         assert!(inspection_failed(&timed_out));
         assert!(!inspection_failed(&refused));
+        let enriched = BrokerOpError::CleanupResolveRefused {
+            id: 7,
+            reason: "its worktree is checked (git status timed out after 3.0 s (limit 3.0 s, outer command deadline) in a/b)".into(),
+        };
+        assert!(inspection_failed(&enriched));
         assert!(!remembered_keep("inspection_failed"));
         assert!(remembered_keep("plan_refused"));
         assert_eq!(
@@ -3948,6 +3983,11 @@ mod tests {
         let (session, worktree) = closed(&mut broker, "leftover", |_| {});
         std::fs::create_dir_all(worktree.join("node_modules/dep")).unwrap();
         std::fs::write(worktree.join("node_modules/dep/index.js"), "x\n").unwrap();
+        std::fs::write(
+            worktree.join("node_modules/.modules.yaml"),
+            "layoutVersion: 5\n",
+        )
+        .unwrap();
         broker
             .store()
             .set_session_status(session.id, crate::SessionStatus::Cleaned, None)
@@ -3965,5 +4005,92 @@ mod tests {
         assert_eq!(today.cleaned_leftovers_retired, 1, "{progress:#?}");
         assert!(today.sessions_created >= 1, "{progress:#?}");
         assert!(today.checkouts_retired >= 1, "{progress:#?}");
+    }
+
+    /// Under the claim, a path another open session now names keeps the
+    /// checkout.
+    #[test]
+    fn a_path_reopened_by_another_session_is_kept() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "reopened", |_| {});
+        // Cleaned, so the path is free for another live registration (the
+        // live-worktree index is partial on cleaned rows).
+        broker
+            .store()
+            .set_session_status(session.id, crate::SessionStatus::Cleaned, None)
+            .unwrap();
+        let current = broker.store_ref().session(session.id).unwrap();
+        assert_eq!(broker.reused_path_keep(&current, &worktree, true), None);
+        let other = broker.start_worktree("other", None).unwrap();
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE sessions SET worktree_path = ?1 WHERE id = ?2",
+                rusqlite::params![session.worktree_path, other.id],
+            )
+            .unwrap();
+        assert_eq!(
+            broker.reused_path_keep(&current, &worktree, true),
+            Some("open_session")
+        );
+    }
+
+    /// A folder born after the session closed is not the one it left.
+    #[test]
+    fn a_folder_created_after_the_close_is_kept() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "recreated", |_| {});
+        let old = crate::clock::epoch_ms() - 10 * 60_000;
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE sessions SET created_at = ?1, closed_at = ?2 WHERE id = ?3",
+                rusqlite::params![old, old + 1_000, session.id],
+            )
+            .unwrap();
+        let current = broker.store_ref().session(session.id).unwrap();
+        assert_eq!(
+            broker.reused_path_keep(&current, &worktree, false),
+            Some("created_after_close")
+        );
+    }
+
+    /// A start holding the folder's reservation keeps it, in the strip pass
+    /// too (the reservation is asked only under the claim).
+    #[test]
+    fn a_held_start_reservation_keeps_the_folder() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed_with_dependencies(&mut broker, "reserved");
+        let name = worktree.file_name().unwrap().to_str().unwrap().to_string();
+        let reservation = super::super::strip::start_reservation_path(broker.main_root(), &name);
+        std::fs::create_dir_all(reservation.parent().unwrap()).unwrap();
+        std::fs::write(&reservation, "").unwrap();
+        let held = crate::file_lock::ExclusiveFileLock::try_acquire(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&reservation)
+                .unwrap(),
+        )
+        .unwrap()
+        .expect("the test holds the reservation");
+        let current = broker.store_ref().session(session.id).unwrap();
+        assert_eq!(
+            broker.reused_path_keep(&current, &worktree, false),
+            Some("start_reserved")
+        );
+
+        let report = strip_pass(&broker);
+
+        assert_eq!(
+            report.refused.get("start_reserved"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert!(worktree.join("node_modules/left-pad/index.js").exists());
+        drop(held);
+        assert_eq!(broker.reused_path_keep(&current, &worktree, false), None);
     }
 }

@@ -8,8 +8,8 @@
 //! `node_modules` (1.6 of 2.4 GiB, ~127,000 files), which is regenerable by
 //! definition. So it goes first, in O(1) per directory:
 //!
-//! 1. find the catalogued directories ([`crate::artifact_catalog`], the
-//!    entries the unattended sweep may remove, with their witness) among the
+//! 1. find the catalogued directories ([`StripKind`]: `node_modules`,
+//!    `.pnpm-store`, `.venv`, Cargo `target`) among the
 //!    collapsed ignored directories Git lists with
 //!    `ls-files --others --ignored --exclude-standard --directory`, which
 //!    prints an ignored directory as one `dir/` record and never descends
@@ -19,8 +19,9 @@
 //!    on the directory itself (ignored), `git ls-files -- <dir>` printing
 //!    nothing (no tracked file: an index read, bounded output), every path
 //!    component a real directory on the checkout's device (no symlink, no
-//!    mount point), and the checkout used by no process (the run's single
-//!    open-file observation);
+//!    mount point), the producing tool's witness present and no nested
+//!    repository at its top, and the checkout used by no process (the run's
+//!    single open-file observation);
 //! 3. rename it into the pool's existing trash with one exclusive
 //!    same-volume rename, recorded first like a retired checkout; the paced
 //!    host deleter unlinks it later. No archive: the content is regenerable.
@@ -34,6 +35,10 @@
 //! - never a directory that is tracked (or holds a tracked file), not
 //!   ignored, a symlink (itself or any component above it), on another
 //!   device, outside the catalogue, or missing its witness;
+//! - never a path that may have been reused since it was judged: asked
+//!   again under the lifecycle claim ([`Broker::reused_path_keep`]: another
+//!   open or newer session at the path, a live holder, a folder born after
+//!   the close, a start holding the folder's reservation);
 //! - any check that fails or cannot complete keeps the directory;
 //! - only same-volume renames; never a copy followed by a delete.
 //!
@@ -152,8 +157,144 @@ pub(crate) struct CheckoutStripProgress {
 pub(crate) struct StripCandidate {
     /// Relative to the checkout, slash-separated, no trailing slash.
     pub relative: String,
-    pub witness: crate::artifact_catalog::ArtifactWitness,
+    pub kind: StripKind,
 }
+
+/// The directories the strip may move, each with the witness that must be
+/// present for it to count as that tool's output. Deliberately narrower than
+/// the unattended artifact catalogue: a strip is unattended and removes the
+/// whole directory, so every witness fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StripKind {
+    /// `node_modules`: a package manager's own marker at its top
+    /// (`.modules.yaml`, `.package-lock.json`, `.yarn-integrity`) or pnpm's
+    /// `.pnpm` directory.
+    NodeModules,
+    /// `.pnpm-store`: pnpm's store layout, a `v<digit>...` directory.
+    PnpmStore,
+    /// `.venv`: `pyvenv.cfg`, and nothing at its top outside the usual
+    /// virtual-environment layout.
+    Venv,
+    /// Cargo `target`: `CACHEDIR.TAG` carrying the standard signature.
+    CargoTarget,
+}
+
+/// Top-level entries a virtual environment may hold.
+const VENV_LAYOUT: &[&str] = &[
+    "bin",
+    "lib",
+    "lib64",
+    "include",
+    "share",
+    "etc",
+    "pyvenv.cfg",
+    ".gitignore",
+    "Scripts",
+    "man",
+];
+
+/// Top-level entries read at most to judge a witness.
+const WITNESS_ENTRY_LIMIT: usize = 4_096;
+
+impl StripKind {
+    pub(crate) fn for_name(name: &str) -> Option<Self> {
+        match name {
+            "node_modules" => Some(Self::NodeModules),
+            ".pnpm-store" => Some(Self::PnpmStore),
+            ".venv" => Some(Self::Venv),
+            "target" => Some(Self::CargoTarget),
+            _ => None,
+        }
+    }
+
+    /// Whether `path` (a real directory) is this tool's output. `Err` is
+    /// the keep reason: `witness_missing`, `unexpected_content`, or
+    /// `nested_repository` when a `.git` entry sits at its top (a nested
+    /// repository or submodule is never regenerable). Reads only the
+    /// directory's own top level (bounded) and at most one small file.
+    pub(crate) fn witness(self, path: &Path) -> Result<(), &'static str> {
+        match std::fs::symlink_metadata(path.join(".git")) {
+            Ok(_) => return Err("nested_repository"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("witness_missing"),
+        }
+        let is_file = |name: &str| {
+            std::fs::symlink_metadata(path.join(name)).is_ok_and(|metadata| metadata.is_file())
+        };
+        let is_dir = |name: &str| {
+            std::fs::symlink_metadata(path.join(name)).is_ok_and(|metadata| metadata.is_dir())
+        };
+        let top_names = || -> Result<Vec<String>, &'static str> {
+            let mut names = Vec::new();
+            for entry in std::fs::read_dir(path).map_err(|_| "witness_missing")? {
+                let entry = entry.map_err(|_| "witness_missing")?;
+                names.push(
+                    entry
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| "unexpected_content")?,
+                );
+                if names.len() > WITNESS_ENTRY_LIMIT {
+                    return Err("unexpected_content");
+                }
+            }
+            Ok(names)
+        };
+        match self {
+            Self::NodeModules => {
+                if [".modules.yaml", ".package-lock.json", ".yarn-integrity"]
+                    .iter()
+                    .any(|&name| is_file(name))
+                    || is_dir(".pnpm")
+                {
+                    Ok(())
+                } else {
+                    Err("witness_missing")
+                }
+            }
+            Self::PnpmStore => {
+                let layout = top_names()?.iter().any(|name| {
+                    name.strip_prefix('v')
+                        .and_then(|rest| rest.chars().next())
+                        .is_some_and(|first| first.is_ascii_digit())
+                        && is_dir(name.as_str())
+                });
+                if layout {
+                    Ok(())
+                } else {
+                    Err("witness_missing")
+                }
+            }
+            Self::Venv => {
+                if !is_file("pyvenv.cfg") {
+                    return Err("witness_missing");
+                }
+                if top_names()?
+                    .iter()
+                    .all(|name| VENV_LAYOUT.contains(&name.as_str()))
+                {
+                    Ok(())
+                } else {
+                    Err("unexpected_content")
+                }
+            }
+            Self::CargoTarget => {
+                let mut signature = [0_u8; 43];
+                let read = std::fs::File::open(path.join("CACHEDIR.TAG"))
+                    .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut signature));
+                if is_file("CACHEDIR.TAG") && read.is_ok() && signature == *CACHEDIR_TAG_SIGNATURE {
+                    Ok(())
+                } else {
+                    Err("witness_missing")
+                }
+            }
+        }
+    }
+}
+
+/// The first bytes of a `CACHEDIR.TAG` under the Cache Directory Tagging
+/// specification.
+const CACHEDIR_TAG_SIGNATURE: &[u8; 43] = b"Signature: 8a477f597d28d172789f06886806bc55";
 
 /// The catalogued regenerable directories of `worktree`, from Git's
 /// collapsed ignored-directory listing (`ls-files --others --ignored
@@ -195,13 +336,12 @@ pub(crate) fn regenerable_candidates(
             continue;
         }
         let name = relative.rsplit('/').next().unwrap_or(relative.as_str());
-        let Some(witness) = crate::artifact_catalog::unattended_witness(name, &[]) else {
+        let Some(kind) = StripKind::for_name(name) else {
             continue;
         };
-        if !witness.confirms(&worktree.join(&relative)) {
-            continue;
-        }
-        candidates.push(StripCandidate { relative, witness });
+        // The witness is judged by `prove_strippable`, which records why a
+        // directory without it is kept.
+        candidates.push(StripCandidate { relative, kind });
     }
     Ok(candidates)
 }
@@ -267,9 +407,7 @@ pub(crate) fn prove_strippable(
             return Err("crosses_device");
         }
     }
-    if !candidate.witness.confirms(&path) {
-        return Err("witness_missing");
-    }
+    candidate.kind.witness(&path)?;
     // The directory itself, not its contents: exit 0 is ignored, 1 is not.
     // `check-ignore` takes plain paths and refuses pathspec magic, so no
     // `--literal-pathspecs` here.
@@ -336,6 +474,13 @@ fn refused_counter(code: &str) -> &'static str {
         "symlink" => "checkout_strip_refused_symlink",
         "crosses_device" => "checkout_strip_refused_crosses_device",
         "witness_missing" => "checkout_strip_refused_witness_missing",
+        "unexpected_content" => "checkout_strip_refused_unexpected_content",
+        "nested_repository" => "checkout_strip_refused_nested_repository",
+        "start_reserved" => "checkout_strip_refused_start_reserved",
+        "start_reservation_unknown" => "checkout_strip_refused_start_reservation_unknown",
+        "created_after_close" => "checkout_strip_refused_created_after_close",
+        "creation_time_unknown" => "checkout_strip_refused_creation_time_unknown",
+        "leftover_superseded" => "checkout_strip_refused_leftover_superseded",
         "not_ignored" => "checkout_strip_refused_not_ignored",
         "holds_tracked" => "checkout_strip_refused_holds_tracked",
         "probe_failed" => "checkout_strip_refused_probe_failed",
@@ -354,13 +499,13 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// How the strip pass treats the repository lifecycle claim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StripClaim {
-    /// Take it (without waiting) around each checkout's renames.
-    Take,
-    /// The caller already holds it for the whole pass.
-    Held,
+/// What `broker start`'s pressure pass did.
+pub(crate) struct PressureRelief {
+    pub report: CheckoutStripReport,
+    /// Bytes the deleter freed.
+    pub freed: u64,
+    pub strip_ms: u64,
+    pub drain_ms: u64,
 }
 
 /// One checkout's outcome.
@@ -371,7 +516,138 @@ enum CheckoutStrip {
     Refused(&'static str),
 }
 
+/// How long after a session's creation its checkout folder may still be
+/// born without reading as recreated (see `reused_path_keep`).
+const CREATION_SLACK_MS: i64 = 60_000;
+
+/// Where a `broker start` in progress holds its reservation for the
+/// checkout folder `name` (`.aethyme/run/start-reservations/<name>.lock`,
+/// held exclusively while the start creates the destination).
+pub(crate) fn start_reservation_path(main_root: &Path, name: &str) -> PathBuf {
+    main_root
+        .join(".aethyme/run/start-reservations")
+        .join(format!("{name}.lock"))
+}
+
+/// Whether a start holds the reservation for `worktree`'s folder: the
+/// reservation file exists and its lock cannot be taken. `Err` when that
+/// cannot be told (which keeps the folder). Correct whether or not starts
+/// write reservations: no file means no start is reserving it.
+pub(crate) fn start_reservation_held(main_root: &Path, worktree: &Path) -> Result<bool, String> {
+    let Some(name) = worktree.file_name().and_then(|name| name.to_str()) else {
+        return Err("the checkout folder has no usable name".into());
+    };
+    let path = start_reservation_path(main_root, name);
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("cannot open {}: {error}", path.display())),
+    };
+    match crate::file_lock::ExclusiveFileLock::try_acquire(file) {
+        // Taken and released at once: nobody is starting there.
+        Ok(Some(_lock)) => Ok(false),
+        Ok(None) => Ok(true),
+        Err(error) => Err(format!("cannot test {}: {error}", path.display())),
+    }
+}
+
+/// When the checkout folder was created (epoch ms): the directory's birth
+/// time where the filesystem records one, otherwise the status-change time
+/// of its `.git` file (written once when Git creates the worktree; the
+/// directory's own change time moves whenever an entry is added).
+pub(crate) fn checkout_created_ms(worktree: &Path) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt;
+    let to_ms = |time: std::time::SystemTime| {
+        time.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|since| i64::try_from(since.as_millis()).ok())
+    };
+    if let Some(born) = std::fs::symlink_metadata(worktree)
+        .ok()
+        .and_then(|metadata| metadata.created().ok())
+        .and_then(to_ms)
+    {
+        return Some(born);
+    }
+    let dot_git = std::fs::symlink_metadata(worktree.join(".git")).ok()?;
+    dot_git
+        .ctime()
+        .checked_mul(1_000)
+        .map(|ms| ms + dot_git.ctime_nsec() / 1_000_000)
+}
+
 impl Broker {
+    /// What keeps `session`'s checkout `worktree`, checked under the
+    /// lifecycle claim right before anything is moved out of it, because a
+    /// `start --reuse` or a new session may have reopened or recreated the
+    /// path since the checkout was judged: another open session at the
+    /// path, a newer session recorded there, a live or unknown holder (when
+    /// `check_holder`), a folder created after the session closed, or a
+    /// start holding the folder's reservation. `None` lets the move go on.
+    pub(crate) fn reused_path_keep(
+        &self,
+        session: &Session,
+        worktree: &Path,
+        check_holder: bool,
+    ) -> Option<&'static str> {
+        let _span = crate::phase_telemetry::span("checkout_reused_path_check");
+        match self
+            .store_ref()
+            .other_open_session_at_path(session.id, &session.worktree_path)
+        {
+            Ok(false) => {}
+            Ok(true) => return Some("open_session"),
+            Err(_) => return Some("open_session_unknown"),
+        }
+        match self
+            .store_ref()
+            .latest_session_for_worktree_any_state(&session.worktree_path)
+        {
+            Ok(Some(latest)) if latest.id == session.id => {}
+            Ok(_) => return Some("leftover_superseded"),
+            Err(_) => return Some("open_session_unknown"),
+        }
+        if check_holder {
+            let mut holders = crate::session_holder::RecordedHolderProcessTable::default();
+            match crate::session_holder::recorded_holder_liveness(
+                self.store_ref(),
+                session.id,
+                &mut holders,
+                true,
+            )
+            .liveness
+            {
+                crate::session_holder::RecordedHolderLiveness::Unbound
+                | crate::session_holder::RecordedHolderLiveness::Gone => {}
+                crate::session_holder::RecordedHolderLiveness::Alive => {
+                    return Some("holder_alive");
+                }
+                crate::session_holder::RecordedHolderLiveness::Unknown => {
+                    return Some("holder_unknown");
+                }
+            }
+        }
+        let Some(closed_at) = session.closed_at.or(session.cleanup_completed_at) else {
+            return Some("creation_time_unknown");
+        };
+        // A folder born after the close is not the one the session left.
+        // The reference never precedes a minute after the session's own
+        // creation: Git creates the folder around the time the session row
+        // is written, and a record whose close predates its creation (a
+        // clock step, a rewritten row) must not read as a recreated folder.
+        let reference = closed_at.max(session.created_at.saturating_add(CREATION_SLACK_MS));
+        match checkout_created_ms(worktree) {
+            Some(created) if created > reference => return Some("created_after_close"),
+            Some(_) => {}
+            None => return Some("creation_time_unknown"),
+        }
+        match start_reservation_held(self.main_root(), worktree) {
+            Ok(false) => None,
+            Ok(true) => Some("start_reserved"),
+            Err(_) => Some("start_reservation_unknown"),
+        }
+    }
+
     /// Strip catalogued regenerable directories from closed checkouts,
     /// oldest close first, at most `cap` checkouts, until `deadline`, with
     /// the evidence of `run` (open sessions' paths resolved once, one
@@ -382,16 +658,6 @@ impl Broker {
         run: &mut super::retire::RetireRun,
         deadline: Instant,
         cap: usize,
-    ) -> CheckoutStripReport {
-        self.strip_closed_checkouts_with_claim(run, deadline, cap, StripClaim::Take)
-    }
-
-    pub(crate) fn strip_closed_checkouts_with_claim(
-        &self,
-        run: &mut super::retire::RetireRun,
-        deadline: Instant,
-        cap: usize,
-        claim: StripClaim,
     ) -> CheckoutStripReport {
         let _span = crate::phase_telemetry::span("checkout_strip_pass");
         let mut report = CheckoutStripReport::default();
@@ -440,8 +706,7 @@ impl Broker {
                 break;
             }
             report.checkouts_examined += 1;
-            match self.strip_one_checkout(session, run, &mut holders, deadline, claim, &mut report)
-            {
+            match self.strip_one_checkout(session, run, &mut holders, deadline, &mut report) {
                 CheckoutStrip::Done(directories) => {
                     if directories > 0 {
                         report.checkouts_stripped += 1;
@@ -506,14 +771,7 @@ impl Broker {
         };
         let mut report = CheckoutStripReport::default();
         let mut holders = crate::session_holder::RecordedHolderProcessTable::default();
-        match self.strip_one_checkout(
-            &session,
-            &mut run,
-            &mut holders,
-            deadline,
-            StripClaim::Take,
-            &mut report,
-        ) {
+        match self.strip_one_checkout(&session, &mut run, &mut holders, deadline, &mut report) {
             CheckoutStrip::Done(directories) => {
                 if directories > 0 {
                     crate::phase_telemetry::add(
@@ -530,29 +788,33 @@ impl Broker {
         }
     }
 
-    /// Under storage pressure at `broker start`: strip closed checkouts and
-    /// let the deleter run unpaced, within `budget`. The caller holds the
-    /// lifecycle claim. Returns the pass and the bytes the deleter freed.
-    pub(crate) fn strip_closed_checkouts_under_pressure(
-        &self,
-        budget: Duration,
-    ) -> (CheckoutStripReport, u64) {
+    /// Under storage pressure at `broker start`: strip closed checkouts
+    /// (each checkout's renames under its own short lifecycle claim; the
+    /// caller holds none) and then let the deleter run unpaced outside any
+    /// claim, all within `budget`.
+    pub(crate) fn strip_closed_checkouts_under_pressure(&self, budget: Duration) -> PressureRelief {
         let _span = crate::phase_telemetry::span("checkout_strip_under_pressure");
         let started = Instant::now();
         let deadline = started + budget;
         let strip_deadline = started + budget / 3;
-        let _inventory = crate::git::WorktreeInventoryRunScope::enter();
-        let report = match self.begin_checkout_retirement_run(strip_deadline) {
-            Ok(Some(mut run)) => self.strip_closed_checkouts_with_claim(
-                &mut run,
-                strip_deadline,
-                STRIP_CHECKOUTS_PER_RUN,
-                StripClaim::Held,
-            ),
-            Ok(None) | Err(_) => CheckoutStripReport::default(),
+        let report = {
+            let _inventory = crate::git::WorktreeInventoryRunScope::enter();
+            match self.begin_checkout_retirement_run(strip_deadline) {
+                Ok(Some(mut run)) => {
+                    self.strip_closed_checkouts(&mut run, strip_deadline, STRIP_CHECKOUTS_PER_RUN)
+                }
+                Ok(None) | Err(_) => CheckoutStripReport::default(),
+            }
         };
+        let strip_ms = elapsed_ms(started);
+        let drain_started = Instant::now();
         let drained = self.drain_checkout_trash(deadline);
-        (report, drained.bytes)
+        PressureRelief {
+            report,
+            freed: drained.bytes,
+            strip_ms,
+            drain_ms: elapsed_ms(drain_started),
+        }
     }
 
     fn strip_one_checkout(
@@ -561,7 +823,6 @@ impl Broker {
         run: &mut super::retire::RetireRun,
         holders: &mut crate::session_holder::RecordedHolderProcessTable,
         deadline: Instant,
-        claim: StripClaim,
         report: &mut CheckoutStripReport,
     ) -> CheckoutStrip {
         use CheckoutStrip::Refused;
@@ -664,19 +925,22 @@ impl Broker {
         // The renames, and the cheap proofs right before them, under the
         // lifecycle claim (taken without waiting, so a foreground command
         // never queues behind this pass).
-        let _claim = match claim {
-            StripClaim::Held => None,
-            StripClaim::Take => match self.try_claim_worktree_lifecycle("retire") {
-                Ok(Some(claim)) => Some(claim),
-                Ok(None) | Err(_) => return Refused("lifecycle_busy"),
-            },
+        let _claim = match self.try_claim_worktree_lifecycle("retire") {
+            Ok(Some(claim)) => claim,
+            Ok(None) | Err(_) => return Refused("lifecycle_busy"),
         };
-        match self.store_ref().session(session.id) {
+        let current = match self.store_ref().session(session.id) {
             Ok(current)
                 if current.status.is_closed()
                     && current.cleanup_state == session.cleanup_state
-                    && current.worktree_path == session.worktree_path => {}
+                    && current.worktree_path == session.worktree_path =>
+            {
+                current
+            }
             _ => return Refused("changed"),
+        };
+        if let Some(code) = self.reused_path_keep(&current, &worktree, true) {
+            return Refused(code);
         }
         let mut stripped = 0_usize;
         for candidate in &candidates {
@@ -884,6 +1148,9 @@ mod tests {
             std::fs::create_dir_all(root.join(dir)).unwrap();
             std::fs::write(root.join(dir).join("index.js"), "x\n").unwrap();
         }
+        for dir in ["node_modules", "packages/app/node_modules"] {
+            std::fs::write(root.join(dir).join(".package-lock.json"), "{}\n").unwrap();
+        }
         dir
     }
 
@@ -956,7 +1223,7 @@ mod tests {
         git(&root, &["add", "-f", "node_modules/keep.txt"]);
         let candidate = StripCandidate {
             relative: "node_modules".into(),
-            witness: crate::artifact_catalog::ArtifactWitness::NonEmptyDirectory,
+            kind: StripKind::NodeModules,
         };
         // `check-ignore` already reports a directory holding a tracked
         // file as not ignored; the index read refuses it independently.
@@ -976,7 +1243,7 @@ mod tests {
         std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
         let candidate = StripCandidate {
             relative: "node_modules".into(),
-            witness: crate::artifact_catalog::ArtifactWitness::NonEmptyDirectory,
+            kind: StripKind::NodeModules,
         };
         assert_eq!(
             prove_strippable(&root, &candidate, far()),
@@ -1000,7 +1267,7 @@ mod tests {
         std::os::unix::fs::symlink(elsewhere.path(), root.join("node_modules")).unwrap();
         let candidate = StripCandidate {
             relative: "node_modules".into(),
-            witness: crate::artifact_catalog::ArtifactWitness::NonEmptyDirectory,
+            kind: StripKind::NodeModules,
         };
         assert_eq!(prove_strippable(&root, &candidate, far()), Err("symlink"));
         // A symlinked parent refuses the nested directory too.
@@ -1010,9 +1277,67 @@ mod tests {
         std::os::unix::fs::symlink(real_packages.path(), root.join("linked")).unwrap();
         let nested = StripCandidate {
             relative: "linked/node_modules".into(),
-            witness: crate::artifact_catalog::ArtifactWitness::NonEmptyDirectory,
+            kind: StripKind::NodeModules,
         };
         assert_eq!(prove_strippable(&root, &nested, far()), Err("symlink"));
         assert!(elsewhere.path().join("index.js").exists());
+    }
+
+    /// Every witness fails closed: a directory with the right name but not
+    /// the producing tool's marker or layout is kept, with its reason.
+    #[test]
+    fn witnesses_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        };
+        let modules = at("a/node_modules");
+        std::fs::write(modules.join("index.js"), "x\n").unwrap();
+        assert_eq!(
+            StripKind::NodeModules.witness(&modules),
+            Err("witness_missing")
+        );
+        std::fs::write(modules.join(".yarn-integrity"), "{}\n").unwrap();
+        assert_eq!(StripKind::NodeModules.witness(&modules), Ok(()));
+        let pnpm = at("b/node_modules");
+        std::fs::create_dir_all(pnpm.join(".pnpm")).unwrap();
+        assert_eq!(StripKind::NodeModules.witness(&pnpm), Ok(()));
+        // A nested repository or submodule is never regenerable.
+        std::fs::write(pnpm.join(".git"), "gitdir: elsewhere\n").unwrap();
+        assert_eq!(
+            StripKind::NodeModules.witness(&pnpm),
+            Err("nested_repository")
+        );
+
+        let store = at(".pnpm-store");
+        std::fs::create_dir_all(store.join("files")).unwrap();
+        assert_eq!(StripKind::PnpmStore.witness(&store), Err("witness_missing"));
+        std::fs::create_dir_all(store.join("v10")).unwrap();
+        assert_eq!(StripKind::PnpmStore.witness(&store), Ok(()));
+
+        let venv = at(".venv");
+        std::fs::create_dir_all(venv.join("lib")).unwrap();
+        assert_eq!(StripKind::Venv.witness(&venv), Err("witness_missing"));
+        std::fs::write(venv.join("pyvenv.cfg"), "home = /usr\n").unwrap();
+        assert_eq!(StripKind::Venv.witness(&venv), Ok(()));
+        std::fs::write(venv.join("notes.txt"), "mine\n").unwrap();
+        assert_eq!(StripKind::Venv.witness(&venv), Err("unexpected_content"));
+
+        let target = at("target");
+        std::fs::write(target.join("CACHEDIR.TAG"), "not a cache tag\n").unwrap();
+        assert_eq!(
+            StripKind::CargoTarget.witness(&target),
+            Err("witness_missing")
+        );
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n# cargo\n",
+        )
+        .unwrap();
+        assert_eq!(StripKind::CargoTarget.witness(&target), Ok(()));
+        assert_eq!(StripKind::for_name("build"), None);
+        assert_eq!(StripKind::for_name("dist"), None);
     }
 }

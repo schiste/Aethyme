@@ -8865,18 +8865,36 @@ impl GitRepo {
         }
     }
 
+    /// The lock reason of the registration naming `worktree`, found from the
+    /// repository side (each `<common>/worktrees/<name>/gitdir`) when the
+    /// checkout's own `.git` cannot name it, and read fresh from that
+    /// registration's `locked` file: a lock placed a moment ago counts. No
+    /// listing is involved, cached or not.
     fn listed_worktree_lock_reason(&self, worktree: &Path) -> Option<String> {
-        let inventory = self.worktree_inventory_for_run().ok()?;
         let wanted = worktree
             .canonicalize()
-            .unwrap_or_else(|_| worktree.to_path_buf());
-        inventory
-            .into_iter()
-            .find(|entry| {
-                entry.path == wanted || entry.path.canonicalize().ok().as_ref() == Some(&wanted)
-            })
-            .filter(|entry| entry.locked)
-            .map(|entry| entry.lock_reason.unwrap_or_default())
+            .unwrap_or_else(|_| worktree.to_path_buf())
+            .join(".git");
+        let registrations = self.git_common_dir().ok()?.join("worktrees");
+        for entry in fs::read_dir(&registrations).ok()?.filter_map(Result::ok) {
+            let admin = entry.path();
+            let Ok(named) = fs::read_to_string(admin.join("gitdir")) else {
+                continue;
+            };
+            let named = PathBuf::from(named.trim());
+            let same = named == wanted
+                || named
+                    .canonicalize()
+                    .is_ok_and(|resolved| resolved == wanted);
+            if !same {
+                continue;
+            }
+            return match fs::read_to_string(admin.join("locked")) {
+                Ok(reason) => Some(reason.trim_end_matches(['\n', '\r']).to_string()),
+                Err(_) => None,
+            };
+        }
+        None
     }
 
     pub fn worktree_remove(&self, worktree: &Path, force: bool) -> Result<(), GitError> {

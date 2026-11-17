@@ -652,16 +652,33 @@ removal as well.
 
 ## Stripping regenerable directories from closed checkouts
 
-Before the retirement lane judges a closed checkout, it strips the
-catalogued regenerable directories out of it (`node_modules`, Cargo `target`
-with its `CACHEDIR.TAG`, a `.venv` with its `pyvenv.cfg`, `.pnpm-store`):
-each is renamed into the pool's checkout trash in O(1) and the paced deleter
+Before the retirement lane judges a closed checkout, it strips regenerable
+directories out of it, each only when the tool that makes it has left its
+witness:
+
+| Directory | Witness | Kept otherwise as |
+|---|---|---|
+| `node_modules` | `.modules.yaml`, `.package-lock.json` or `.yarn-integrity`, or a `.pnpm` directory, at its top | `witness_missing` |
+| `.pnpm-store` | a `v<digit>...` directory (the store layout) | `witness_missing` |
+| `.venv` | `pyvenv.cfg`, and nothing at its top except `bin`, `lib`, `lib64`, `include`, `share`, `etc`, `pyvenv.cfg`, `.gitignore`, `Scripts`, `man` | `witness_missing`, `unexpected_content` |
+| `target` | `CACHEDIR.TAG` beginning with the standard signature | `witness_missing` |
+
+Any of them holding a `.git` entry at its top (a nested repository or a
+submodule) is kept as `nested_repository`. Each stripped directory is
+renamed into the pool's checkout trash in O(1) and the paced deleter
 removes it later. Nothing is archived, because these directories are rebuilt
 by the next install or build. Closed and cleaned sessions whose folders are
 still on disk are handled oldest close first, at most 200 checkouts per run.
 `finish` does the same for its own checkout once the session is closed,
 unless `--keep-worktree` was given; when below the storage reserve, `broker
-start` runs a short strip and deletion pass before refusing.
+start` releases its claim, runs a short strip and deletion pass (at most 30
+seconds) and checks again before refusing.
+
+Right before anything moves, under the lifecycle claim, the lane checks again
+that the path was not reused since it was judged: no other open session
+there, no newer session recorded there, the folder not created after the
+session closed, and no `broker start` holding the folder's reservation
+(`.aethyme/run/start-reservations/<folder>.lock`).
 
 Finding and proving a directory never walks it. The directories come from
 Git's collapsed ignored-directory listing (`git ls-files --others --ignored
