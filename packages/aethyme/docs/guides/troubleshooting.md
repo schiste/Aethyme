@@ -433,6 +433,34 @@ rm -f "$dir/git-probe/verdicts.json"
 To disable the cache for one shell, `export AETHYME_GIT_PROBE_CACHE=off`.
 `aethyme certify` reports which `git` was selected and which were bypassed.
 
+## A Git Command Timed Out
+
+### Symptoms
+
+A message such as `git status timed out after 16.2 s (limit 15.0 s, per-call) in
+repo/worktree` or `git status was not started: the command's deadline had 0.3 s
+left`.
+
+### Checks
+
+The message names the source of the limit:
+
+- `per-call`: the single Git command ran past its own limit
+  (`AETHYME_GIT_TIMEOUT_SECS`, ten minutes by default, or a shorter cap the
+  caller set). Look for a wedged lock, a slow remote or a stalled filesystem in
+  the named directory.
+- `outer command deadline`: the enclosing command's wall-clock budget ran out
+  while Git was running, so a shorter limit than the per-call one applied.
+- `was not started`: the enclosing deadline was already spent, so Git never ran
+  and nothing was killed. Raise the command's budget or find what used it up
+  earlier; the Git command is not the culprit.
+
+The directory is shortened to its last two path components. Each timeout adds one
+to `git_timeout_per_call`, `git_timeout_outer_deadline` or
+`git_timeout_not_started` on the command's metric line, and the latest one is
+attached as `git_timeout_last` with `source`, `started`, `subcommand`, `args`,
+`directory`, `limit_ms` and `elapsed_ms`.
+
 ## First Debug Commands
 
 ```bash

@@ -368,13 +368,16 @@ pub enum GitError {
     #[error("refusing to judge this checkout: {detail}")]
     UntrustedOutput { detail: String },
 
-    /// git ran past its deadline and was killed (#219). Nothing about the
-    /// repository is known from it; the host, a remote or a lock is wedged.
-    #[error(
-        "git {args} did not finish within {seconds}s and was killed \
-         (AETHYME_GIT_TIMEOUT_SECS changes the general limit; caller caps may be shorter)"
-    )]
-    TimedOut { args: String, seconds: u64 },
+    /// git ran past its deadline and was killed, or was never started because
+    /// the deadline had already passed (#219). Nothing about the repository
+    /// is known from it; the host, a remote or a lock is wedged. `detail`
+    /// says which limit fired, whether Git started, where and for how long.
+    #[error("{}", display_git_timeout(.args, .detail))]
+    TimedOut {
+        args: String,
+        seconds: u64,
+        detail: Box<GitTimeoutDetail>,
+    },
 
     #[error("could not parse git worktree list --porcelain -z: {reason}")]
     WorktreeListParse { reason: String },
@@ -389,6 +392,227 @@ impl From<aethyme_config::ConfigSourceError> for GitError {
     fn from(error: aethyme_config::ConfigSourceError) -> Self {
         Self::Config(Box::new(error))
     }
+}
+
+/// Which limit ended a Git command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitTimeoutSource {
+    /// The per-call limit (`AETHYME_GIT_TIMEOUT_SECS` or a caller cap) fired.
+    PerCall,
+    /// The enclosing command's wall-clock deadline fired first.
+    OuterDeadline,
+    /// The deadline had already passed, so Git was never started.
+    NotStarted,
+}
+
+impl GitTimeoutSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PerCall => "per_call",
+            Self::OuterDeadline => "outer_deadline",
+            Self::NotStarted => "not_started",
+        }
+    }
+
+    fn counter(self) -> &'static str {
+        match self {
+            Self::PerCall => "git_timeout_per_call",
+            Self::OuterDeadline => "git_timeout_outer_deadline",
+            Self::NotStarted => "git_timeout_not_started",
+        }
+    }
+}
+
+/// The facts behind a [`GitError::TimedOut`]. `directory` is shortened to its
+/// last two path components (or `~` for a home directory), so a message never
+/// carries an absolute path or a user name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitTimeoutDetail {
+    pub source: GitTimeoutSource,
+    pub started: bool,
+    pub subcommand: String,
+    pub directory: Option<String>,
+    /// The limit that applied; for a command that never started, the time
+    /// the deadline had left.
+    pub limit_ms: u64,
+    pub elapsed_ms: u64,
+}
+
+impl GitTimeoutDetail {
+    fn seconds(ms: u64) -> String {
+        format!("{:.1} s", ms as f64 / 1000.0)
+    }
+
+    /// One line: `git status timed out after 16.2 s (limit 15.0 s, per-call) in repo/wt`.
+    pub fn message(&self, args: &str) -> String {
+        let subcommand = if self.subcommand.is_empty() {
+            args
+        } else {
+            self.subcommand.as_str()
+        };
+        let place = self
+            .directory
+            .as_deref()
+            .map(|directory| format!(" in {directory}"))
+            .unwrap_or_default();
+        match self.source {
+            GitTimeoutSource::NotStarted if self.limit_ms == 0 => format!(
+                "git {subcommand} was not started: the command's deadline had no time left{place}"
+            ),
+            GitTimeoutSource::NotStarted => format!(
+                "git {subcommand} was not started: the command's deadline had {} left{place}",
+                Self::seconds(self.limit_ms)
+            ),
+            GitTimeoutSource::PerCall => format!(
+                "git {subcommand} timed out after {} (limit {}, per-call){place} \
+                 (AETHYME_GIT_TIMEOUT_SECS changes the general limit; caller caps may be shorter)",
+                Self::seconds(self.elapsed_ms),
+                Self::seconds(self.limit_ms),
+            ),
+            GitTimeoutSource::OuterDeadline => format!(
+                "git {subcommand} timed out after {} (limit {}, outer command deadline){place}",
+                Self::seconds(self.elapsed_ms),
+                Self::seconds(self.limit_ms),
+            ),
+        }
+    }
+
+    /// The same fields for `--json` output, events and keep details.
+    pub fn to_json(&self, args: &str) -> serde_json::Value {
+        serde_json::json!({
+            "source": self.source.as_str(),
+            "started": self.started,
+            "subcommand": self.subcommand,
+            "args": args,
+            "directory": self.directory,
+            "limit_ms": self.limit_ms,
+            "elapsed_ms": self.elapsed_ms,
+        })
+    }
+}
+
+fn display_git_timeout(args: &str, detail: &GitTimeoutDetail) -> String {
+    detail.message(args)
+}
+
+/// The first argument that is not an option or an option's value
+/// (`-c key=value`, `-C path`), which is the Git subcommand.
+fn git_subcommand(args: &str) -> String {
+    let mut words = args.split_whitespace();
+    while let Some(word) = words.next() {
+        if matches!(
+            word,
+            "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace"
+        ) {
+            words.next();
+        } else if !word.starts_with('-') {
+            return word.to_owned();
+        }
+    }
+    String::new()
+}
+
+/// A directory for a message: its last two components, or `~` for a home
+/// directory. Never an absolute path.
+fn git_timeout_directory(directory: &Path) -> String {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    if home.is_some_and(|home| Path::new(&home) == directory) {
+        return "~".to_owned();
+    }
+    let names = directory
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    match names.as_slice() {
+        [] => ".".to_owned(),
+        [only] => only.clone(),
+        [.., parent, leaf] => format!("{parent}/{leaf}"),
+    }
+}
+
+impl GitError {
+    fn timed_out(
+        args: impl Into<String>,
+        source: GitTimeoutSource,
+        directory: Option<&Path>,
+        limit: Duration,
+        elapsed: Duration,
+    ) -> Self {
+        let args: String = args.into();
+        let detail = GitTimeoutDetail {
+            source,
+            started: source != GitTimeoutSource::NotStarted,
+            subcommand: git_subcommand(&args),
+            directory: directory.map(git_timeout_directory),
+            limit_ms: u64::try_from(limit.as_millis()).unwrap_or(u64::MAX),
+            elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        };
+        crate::phase_telemetry::add(source.counter(), Duration::ZERO);
+        crate::phase_telemetry::attach("git_timeout_last", detail.to_json(&args));
+        Self::TimedOut {
+            seconds: limit.as_secs().max(1),
+            args,
+            detail: Box::new(detail),
+        }
+    }
+
+    /// Git ran and was stopped (or finished past) `limit`. `outer` is true
+    /// when the enclosing command's deadline, not the per-call limit, set it.
+    pub(crate) fn timed_out_running(
+        args: impl Into<String>,
+        directory: Option<&Path>,
+        started: Instant,
+        outer: bool,
+        limit: Duration,
+    ) -> Self {
+        let source = if outer {
+            GitTimeoutSource::OuterDeadline
+        } else {
+            GitTimeoutSource::PerCall
+        };
+        Self::timed_out(args, source, directory, limit, started.elapsed())
+    }
+
+    /// The deadline had `remaining` left, so Git was never started.
+    pub(crate) fn timed_out_before_start(
+        args: impl Into<String>,
+        directory: Option<&Path>,
+        remaining: Duration,
+    ) -> Self {
+        Self::timed_out(
+            args,
+            GitTimeoutSource::NotStarted,
+            directory,
+            remaining,
+            Duration::ZERO,
+        )
+    }
+
+    /// The structured form of a timeout, for `--json`, events and keep details.
+    pub fn timeout_json(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::TimedOut { args, detail, .. } => Some(detail.to_json(args)),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the enclosing deadline, not a per-call limit of `per_call` from
+/// `started`, is what bounds a command.
+fn outer_deadline_bounds(started: Instant, per_call: Duration) -> bool {
+    active_git_deadline().is_some_and(|outer| {
+        started
+            .checked_add(per_call)
+            .is_none_or(|requested| outer <= requested)
+    })
+}
+
+/// Whether `deadline` is the enclosing deadline itself.
+fn deadline_is_outer(deadline: Instant) -> bool {
+    active_git_deadline().is_some_and(|outer| outer <= deadline)
 }
 
 /// Overrides [`DEFAULT_GIT_TIMEOUT`], in whole seconds.
@@ -1930,6 +2154,7 @@ fn run_isolated_graph_git(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, GitError
     let budget = active_git_deadline().map_or_else(git_timeout, |deadline| {
         git_timeout().min(deadline.saturating_duration_since(Instant::now()))
     });
+    let started = Instant::now();
     match crate::bounded_output::output_limited(&mut command, budget, 16 * 1024 * 1024).map_err(
         |source| GitError::Spawn {
             args: args.join(" "),
@@ -1945,10 +2170,13 @@ fn run_isolated_graph_git(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, GitError
             }
             Ok(output.stdout)
         }
-        crate::bounded_output::LimitedOutput::Deadline => Err(GitError::TimedOut {
-            args: args.join(" "),
-            seconds: budget.as_secs().max(1),
-        }),
+        crate::bounded_output::LimitedOutput::Deadline => Err(GitError::timed_out_running(
+            args.join(" "),
+            Some(cwd),
+            started,
+            outer_deadline_bounds(started, git_timeout()),
+            budget,
+        )),
         crate::bounded_output::LimitedOutput::OutputLimit => Err(graph_snapshot_error(
             "graph snapshot Git output exceeds 16 MiB",
         )),
@@ -2076,10 +2304,13 @@ fn run_git_bytes_with_stdin(cwd: &Path, args: &[&str], input: &[u8]) -> Result<V
         crate::bounded_output::LimitedOutput::Completed(output) => output,
         crate::bounded_output::LimitedOutput::Deadline => {
             note_git_timeout();
-            return Err(GitError::TimedOut {
-                args: args_display,
-                seconds: budget.as_secs().max(1),
-            });
+            return Err(GitError::timed_out_running(
+                args_display,
+                Some(cwd),
+                started,
+                deadline_is_outer(deadline),
+                budget,
+            ));
         }
         crate::bounded_output::LimitedOutput::OutputLimit => {
             return Err(GitError::Git {
@@ -2438,6 +2669,7 @@ fn capture_bounded_git_config(root: &Path) -> Result<Vec<GitConfigEntry>, GitErr
         .args(["config", "--null", "--list", "--includes"])
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0");
+    let started = Instant::now();
     let output = match crate::bounded_output::output_limited(
         &mut command,
         git_timeout(),
@@ -2449,10 +2681,13 @@ fn capture_bounded_git_config(root: &Path) -> Result<Vec<GitConfigEntry>, GitErr
     })? {
         crate::bounded_output::LimitedOutput::Completed(output) => output,
         crate::bounded_output::LimitedOutput::Deadline => {
-            return Err(GitError::TimedOut {
-                args: DISPLAY_ARGS.into(),
-                seconds: git_timeout().as_secs().max(1),
-            });
+            return Err(GitError::timed_out_running(
+                DISPLAY_ARGS,
+                Some(root),
+                started,
+                outer_deadline_bounds(started, git_timeout()),
+                git_timeout(),
+            ));
         }
         crate::bounded_output::LimitedOutput::OutputLimit => {
             return Err(GitError::Git {
@@ -2986,20 +3221,23 @@ fn run_git_process_output(
     args: &[&str],
     budget: Duration,
 ) -> Result<std::process::Output, GitError> {
+    let per_call = budget;
     let budget = match active_git_deadline() {
         Some(deadline) => {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 note_git_timeout();
-                return Err(GitError::TimedOut {
-                    args: args.join(" "),
-                    seconds: 1,
-                });
+                return Err(GitError::timed_out_before_start(
+                    args.join(" "),
+                    command.get_current_dir(),
+                    Duration::ZERO,
+                ));
             }
             budget.min(remaining)
         }
         None => budget,
     };
+    let started = Instant::now();
     let output = crate::bounded_output::output_within(&mut command, budget).map_err(|source| {
         GitError::Spawn {
             args: args.join(" "),
@@ -3008,10 +3246,13 @@ fn run_git_process_output(
     })?;
     let Some(output) = output else {
         note_git_timeout();
-        return Err(GitError::TimedOut {
-            args: args.join(" "),
-            seconds: budget.as_secs().max(1),
-        });
+        return Err(GitError::timed_out_running(
+            args.join(" "),
+            command.get_current_dir(),
+            started,
+            outer_deadline_bounds(started, per_call),
+            budget,
+        ));
     };
     Ok(output)
 }
@@ -3023,15 +3264,17 @@ fn run_git_process_output_in_owned_group(
     budget: Duration,
     writers_quiescent: &mut bool,
 ) -> Result<std::process::Output, GitError> {
+    let per_call = budget;
     let budget = match active_git_deadline() {
         Some(deadline) => {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 note_git_timeout();
-                return Err(GitError::TimedOut {
-                    args: args.join(" "),
-                    seconds: 1,
-                });
+                return Err(GitError::timed_out_before_start(
+                    args.join(" "),
+                    command.get_current_dir(),
+                    Duration::ZERO,
+                ));
             }
             budget.min(remaining)
         }
@@ -3044,6 +3287,7 @@ fn run_git_process_output_in_owned_group(
             source: std::io::Error::other("git process-group deadline overflow"),
         })?;
     *writers_quiescent = false;
+    let started = Instant::now();
     let output = crate::bounded_output::output_limited_in_owned_group(
         &mut command,
         budget,
@@ -3064,10 +3308,13 @@ fn run_git_process_output_in_owned_group(
         crate::bounded_output::LimitedOutput::Completed(_)
         | crate::bounded_output::LimitedOutput::Deadline => {
             note_git_timeout();
-            Err(GitError::TimedOut {
-                args: args.join(" "),
-                seconds: budget.as_secs().max(1),
-            })
+            Err(GitError::timed_out_running(
+                args.join(" "),
+                command.get_current_dir(),
+                started,
+                outer_deadline_bounds(started, per_call),
+                budget,
+            ))
         }
         crate::bounded_output::LimitedOutput::OutputLimit => Err(GitError::UntrustedOutput {
             detail: format!(
@@ -3091,10 +3338,11 @@ fn effective_git_deadline(
     let deadline = active_git_deadline().map_or(requested, |outer| requested.min(outer));
     if Instant::now() >= deadline {
         note_git_timeout();
-        return Err(GitError::TimedOut {
-            args: args.to_string(),
-            seconds: deadline.saturating_duration_since(started).as_secs().max(1),
-        });
+        return Err(GitError::timed_out_before_start(
+            args.to_string(),
+            None,
+            Duration::ZERO,
+        ));
     }
     Ok(deadline)
 }
@@ -3103,10 +3351,11 @@ fn remaining_git_budget(args: &str, deadline: Instant) -> Result<Duration, GitEr
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         note_git_timeout();
-        return Err(GitError::TimedOut {
-            args: args.to_string(),
-            seconds: 1,
-        });
+        return Err(GitError::timed_out_before_start(
+            args.to_string(),
+            None,
+            Duration::ZERO,
+        ));
     }
     Ok(remaining)
 }
@@ -3280,8 +3529,8 @@ fn checked_git_batch_check_input_len(
 
 fn git_batch_input_error(
     args: &str,
-    started: Instant,
-    deadline: Instant,
+    _started: Instant,
+    _deadline: Instant,
     error: GitBatchInputError,
 ) -> GitError {
     match error {
@@ -3295,10 +3544,7 @@ fn git_batch_input_error(
         },
         GitBatchInputError::TimedOut => {
             note_git_timeout();
-            GitError::TimedOut {
-                args: args.to_string(),
-                seconds: deadline.saturating_duration_since(started).as_secs().max(1),
-            }
+            GitError::timed_out_before_start(args.to_string(), None, Duration::ZERO)
         }
         GitBatchInputError::Io(source) => GitError::Spawn {
             args: args.to_string(),
@@ -5315,10 +5561,13 @@ impl GitRepo {
                 crate::bounded_output::LimitedOutput::Completed(output) => output,
                 crate::bounded_output::LimitedOutput::Deadline => {
                     note_git_timeout();
-                    return Err(GitError::TimedOut {
-                        args: args.into(),
-                        seconds: budget.as_secs().max(1),
-                    });
+                    return Err(GitError::timed_out_running(
+                        args,
+                        Some(&self.root),
+                        started,
+                        deadline_is_outer(deadline),
+                        budget,
+                    ));
                 }
                 crate::bounded_output::LimitedOutput::OutputLimit => {
                     return Err(GitError::Git {
@@ -5337,10 +5586,13 @@ impl GitRepo {
         }
         if Instant::now() >= deadline {
             note_git_timeout();
-            return Err(GitError::TimedOut {
-                args: args.into(),
-                seconds: deadline.saturating_duration_since(started).as_secs().max(1),
-            });
+            return Err(GitError::timed_out_running(
+                args,
+                Some(&self.root),
+                started,
+                deadline_is_outer(deadline),
+                deadline.saturating_duration_since(started),
+            ));
         }
         Ok(String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -5625,10 +5877,13 @@ impl GitRepo {
         }
         if Instant::now() >= deadline {
             note_git_timeout();
-            return Err(GitError::TimedOut {
-                args: args.into(),
-                seconds: deadline.saturating_duration_since(started).as_secs().max(1),
-            });
+            return Err(GitError::timed_out_running(
+                args,
+                Some(&self.root),
+                started,
+                deadline_is_outer(deadline),
+                deadline.saturating_duration_since(started),
+            ));
         }
         Ok(answers)
     }
@@ -5671,10 +5926,13 @@ impl GitRepo {
             crate::bounded_output::LimitedOutput::Completed(output) => output,
             crate::bounded_output::LimitedOutput::Deadline => {
                 note_git_timeout();
-                return Err(GitError::TimedOut {
-                    args: args.into(),
-                    seconds: budget.as_secs().max(1),
-                });
+                return Err(GitError::timed_out_running(
+                    args,
+                    Some(&self.root),
+                    started,
+                    deadline_is_outer(deadline),
+                    budget,
+                ));
             }
             crate::bounded_output::LimitedOutput::OutputLimit => {
                 return Err(GitError::Git {
@@ -5713,10 +5971,13 @@ impl GitRepo {
         }
         if Instant::now() >= deadline {
             note_git_timeout();
-            return Err(GitError::TimedOut {
-                args: args.into(),
-                seconds: deadline.saturating_duration_since(started).as_secs().max(1),
-            });
+            return Err(GitError::timed_out_running(
+                args,
+                Some(&self.root),
+                started,
+                deadline_is_outer(deadline),
+                deadline.saturating_duration_since(started),
+            ));
         }
         Ok(answers)
     }
@@ -6154,10 +6415,13 @@ impl GitRepo {
             } => (first_status, first_stderr, second),
             crate::bounded_output::LimitedPipelineOutput::Deadline => {
                 note_git_timeout();
-                return Err(GitError::TimedOut {
-                    args: pipeline_args,
-                    seconds: budget.as_secs().max(1),
-                });
+                return Err(GitError::timed_out_running(
+                    pipeline_args,
+                    Some(&self.root),
+                    started,
+                    deadline_is_outer(deadline),
+                    budget,
+                ));
             }
             crate::bounded_output::LimitedPipelineOutput::OutputLimit => {
                 return Err(GitError::Git {
@@ -6234,10 +6498,13 @@ impl GitRepo {
             crate::bounded_output::LimitedOutput::Completed(output) => output,
             crate::bounded_output::LimitedOutput::Deadline => {
                 note_git_timeout();
-                return Err(GitError::TimedOut {
-                    args: args_display,
-                    seconds: budget.as_secs().max(1),
-                });
+                return Err(GitError::timed_out_running(
+                    args_display,
+                    Some(&self.root),
+                    started,
+                    deadline_is_outer(deadline),
+                    budget,
+                ));
             }
             crate::bounded_output::LimitedOutput::OutputLimit => return Ok(None),
         };
@@ -8882,10 +9149,11 @@ pub(crate) fn ignored_listing_preflight() -> Result<(), String> {
 fn ensure_bounded_git_listing_before(deadline: Instant, args: &[&str]) -> Result<(), GitError> {
     if Instant::now() >= deadline {
         note_git_timeout();
-        Err(GitError::TimedOut {
-            args: args.join(" "),
-            seconds: 1,
-        })
+        Err(GitError::timed_out_before_start(
+            args.join(" "),
+            None,
+            Duration::ZERO,
+        ))
     } else {
         Ok(())
     }
@@ -8925,12 +9193,14 @@ pub(crate) fn run_git_process_output_limited(
     let remaining = effective_deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         note_git_timeout();
-        return Err(GitError::TimedOut {
-            args: args.join(" "),
-            seconds: 1,
-        });
+        return Err(GitError::timed_out_before_start(
+            args.join(" "),
+            command.get_current_dir(),
+            remaining,
+        ));
     }
     let budget = remaining.min(git_timeout());
+    let started = Instant::now();
     match crate::bounded_output::output_limited(command, budget, max_output_bytes).map_err(
         |source| GitError::Spawn {
             args: args.join(" "),
@@ -8940,20 +9210,26 @@ pub(crate) fn run_git_process_output_limited(
         crate::bounded_output::LimitedOutput::Completed(output) => {
             if Instant::now() >= effective_deadline {
                 note_git_timeout();
-                Err(GitError::TimedOut {
-                    args: args.join(" "),
-                    seconds: 1,
-                })
+                Err(GitError::timed_out_running(
+                    args.join(" "),
+                    command.get_current_dir(),
+                    started,
+                    deadline_is_outer(effective_deadline),
+                    budget,
+                ))
             } else {
                 Ok(output)
             }
         }
         crate::bounded_output::LimitedOutput::Deadline => {
             note_git_timeout();
-            Err(GitError::TimedOut {
-                args: args.join(" "),
-                seconds: budget.as_secs().max(1),
-            })
+            Err(GitError::timed_out_running(
+                args.join(" "),
+                command.get_current_dir(),
+                started,
+                deadline_is_outer(effective_deadline),
+                budget,
+            ))
         }
         crate::bounded_output::LimitedOutput::OutputLimit => Err(GitError::UntrustedOutput {
             detail: format!(
@@ -11019,7 +11295,7 @@ mod timeout_tests {
             matches!(&error, GitError::TimedOut { args, .. } if args == "rev-parse --show-toplevel"),
             "discovery must preserve the actual timeout: {error:?}"
         );
-        assert!(error.to_string().contains("did not finish within"));
+        assert!(error.to_string().contains("was not started"), "{error}");
     }
 
     #[test]
@@ -11059,6 +11335,106 @@ mod timeout_tests {
             error.to_string().contains("caller caps may be shorter"),
             "{error}"
         );
+        let GitError::TimedOut { detail, .. } = &error else {
+            unreachable!("matched above")
+        };
+        assert_eq!(detail.source, GitTimeoutSource::PerCall);
+        assert!(detail.started);
+        assert_eq!(detail.subcommand, "fetch");
+        assert_eq!(detail.limit_ms, 300);
+        assert!(detail.elapsed_ms >= 250, "{detail:?}");
+    }
+
+    #[test]
+    fn the_scoped_deadline_is_named_as_the_source_when_it_cuts_git_short() {
+        let error = with_git_deadline(Duration::from_millis(300), || {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exec sleep 30"]);
+            run_git_command(command, &["status"], Duration::from_secs(60))
+                .expect_err("the scoped deadline must stop a wedged git")
+        });
+        let GitError::TimedOut { detail, .. } = &error else {
+            panic!("expected a timeout: {error:?}");
+        };
+        assert_eq!(detail.source, GitTimeoutSource::OuterDeadline);
+        assert!(detail.started);
+        assert!(
+            error.to_string().contains("outer command deadline"),
+            "{error}"
+        );
+        assert!(
+            !error.to_string().contains("killed"),
+            "the message must not claim a kill: {error}"
+        );
+    }
+
+    #[test]
+    fn a_spent_budget_says_git_was_not_started_and_never_says_killed() {
+        let error = with_git_deadline(Duration::ZERO, || {
+            let mut command = Command::new("sh");
+            command.current_dir(std::env::temp_dir());
+            run_git_command(
+                command,
+                &["-c", "core.fsmonitor=false", "status"],
+                git_timeout(),
+            )
+            .expect_err("a spent budget cannot start git")
+        });
+        let GitError::TimedOut { detail, .. } = &error else {
+            panic!("expected a timeout: {error:?}");
+        };
+        assert_eq!(detail.source, GitTimeoutSource::NotStarted);
+        assert!(!detail.started);
+        assert_eq!(detail.subcommand, "status");
+        let message = error.to_string();
+        assert!(
+            message.starts_with("git status was not started"),
+            "{message}"
+        );
+        assert!(!message.contains("killed"), "{message}");
+        let json = error.timeout_json().expect("a timeout has a JSON form");
+        assert_eq!(json["source"], "not_started");
+        assert_eq!(json["started"], false);
+        assert_eq!(json["subcommand"], "status");
+    }
+
+    #[test]
+    fn the_timeout_message_reads_as_one_line_with_a_shortened_directory() {
+        let per_call = GitTimeoutDetail {
+            source: GitTimeoutSource::PerCall,
+            started: true,
+            subcommand: git_subcommand(
+                "-c core.fsmonitor=false -c core.untrackedCache=false status --porcelain",
+            ),
+            directory: Some(git_timeout_directory(Path::new(
+                "/home/someone/work/repo-a/wt-1",
+            ))),
+            limit_ms: 15_000,
+            elapsed_ms: 16_200,
+        };
+        let message = per_call.message("status");
+        assert!(
+            message.starts_with(
+                "git status timed out after 16.2 s (limit 15.0 s, per-call) in repo-a/wt-1"
+            ),
+            "{message}"
+        );
+        assert!(
+            !message.contains('\n') && !message.contains("someone"),
+            "{message}"
+        );
+        let not_started = GitTimeoutDetail {
+            source: GitTimeoutSource::NotStarted,
+            started: false,
+            elapsed_ms: 0,
+            limit_ms: 300,
+            ..per_call.clone()
+        };
+        assert_eq!(
+            not_started.message("status"),
+            "git status was not started: the command's deadline had 0.3 s left in repo-a/wt-1"
+        );
+        assert_eq!(git_timeout_directory(Path::new("/")), ".");
     }
 
     #[test]
