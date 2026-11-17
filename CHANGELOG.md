@@ -4,6 +4,29 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.119] - 2026-11-17
+
+### Changed
+
+- **Breaking:** transcript archiving is on by default. With no settings file, or one that does not set `archive`, closed Codex and Claude Code transcripts are compressed and moved once they have had no activity for `archive_after_inactive_days` (default 3) or `archive_after_inactive_days_claude` (default 14). Activity is the newest of the file's modification time, the newest record near its end, and the last broker activity of any linked session. The old setting names are still read. On a host that never opted in, nothing is archived until 24 hours after the notice `transcripts.archiving-default-on` first appears in `aethyme broker status`, `broker start` or `aethyme transcripts status`. Upgrade note: run `aethyme transcripts disable` to keep transcripts untouched, or `aethyme transcripts enable --after-inactive-days <n>` to choose the age (#1762).
+
+### Fixed
+
+- A coordinated GitHub or Git write whose outcome could not be recorded because the broker database was busy no longer write-blocks the repository. The child's result is journaled under `.aethyme/run/operation-outcomes/` before it is recorded, the record is retried for up to 60 seconds after the coordination lock is released, and any later broker command replays a pending journal before its write-block check. A journal settles only the run that wrote it (run nonce, creation time, session, command and process must match); refused and conflicting journals are kept and reported in `broker status`. An operation with no journal still needs `operations reconcile` (#1759).
+- Opening the broker database no longer takes the write lock when the schema floor is unchanged (#1759).
+- Retiring a checkout pins the commits only that checkout referred to: its own reflog, its bisect and per-worktree refs, the bisect files, and its current and original HEAD. The previous step skipped bisect and per-worktree refs, treated a local branch as protection, and pinned commits from shared reflogs the checkout never named (#1760).
+
+### Added
+
+- `aethyme broker advanced operations show --json` reports `outcome_journal`; coordinated commands report `outcome_record_pending` and `outcome_conflict` (#1759).
+- `aethyme transcripts status` reports `enabled_source` and the first-run state; `enable` accepts `--after-inactive-days` (#1762).
+- `--archive-ignored-directories` is listed in the `finish cleanup resolve` help (#1760).
+
+### Known issues
+
+- `git worktree add` and the directory removal in `finish` still run under the repository-wide lifecycle lock.
+- A host on which `aethyme broker status` never runs never starts automatic transcript archiving.
+
 ## [0.8.118] - 2026-11-17
 
 ### Fixed
