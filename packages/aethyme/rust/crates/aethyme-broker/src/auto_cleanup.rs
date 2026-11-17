@@ -17822,6 +17822,10 @@ mod tests {
         let writer = rusqlite::Connection::open(broker.store().db_path()).unwrap();
         writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
         let mut process_table = crate::session_holder::RecordedHolderProcessTable::default();
+        // The pass's process listing is taken before this bound is measured:
+        // it is about not waiting on the writer, not about `ps`.
+        process_table
+            .install_process_table_for_test(crate::session_holder::ProcessTable::parse(""));
 
         let started = Instant::now();
         let outcome = broker

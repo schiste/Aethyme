@@ -1607,6 +1607,12 @@ impl RecordedHolderProcessTable {
         }
     }
 
+    /// A complete process listing for the pass, as if one had been taken.
+    #[cfg(test)]
+    pub(crate) fn install_process_table_for_test(&mut self, snapshot: ProcessTable) {
+        self.snapshot = Some(Some(snapshot));
+    }
+
     #[cfg(test)]
     pub(crate) fn install_holder_process_table_for_test(
         &mut self,
