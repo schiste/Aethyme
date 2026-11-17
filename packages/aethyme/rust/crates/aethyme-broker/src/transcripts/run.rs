@@ -25,9 +25,11 @@ use super::{Environment, LaneLock, TranscriptsConfig};
 
 pub const RUN_SCHEMA: &str = "aethyme.transcripts-archive/v1";
 pub const STATUS_SCHEMA: &str = "aethyme.transcripts-status/v1";
-/// How long an open-file listing is reused before it is taken again (the
-/// listing right before an original is removed is always fresh).
-pub(crate) const OPEN_LISTING_MAX_AGE: Duration = Duration::from_secs(2);
+/// How long one host-wide open-file observation serves the transcripts a
+/// pass judges, including the check right before an original is removed;
+/// an older observation is replaced before it is used again. Each costs
+/// most of a second on a busy host, so one per transcript dominated a pass.
+pub(crate) const OPEN_LISTING_MAX_AGE: Duration = Duration::from_secs(30);
 /// Wall time one background-worker pass may spend; the next pass resumes.
 pub(crate) const WORKER_RUN_BUDGET: Duration = Duration::from_secs(10 * 60);
 /// Examples of skipped transcripts a report lists (all are counted).
@@ -257,8 +259,20 @@ pub struct RunReport {
     pub linkage_degraded: bool,
     /// What could not be read, by kind (counts and flags; no paths).
     pub linkage_issues: LinkageIssues,
-    /// Open-file listings taken (each covers one provider root).
+    /// Host-wide open-file observations taken (one serves every provider
+    /// root and every transcript judged while it is young enough).
     pub open_listings: u64,
+    /// Observations taken because the previous one outgrew
+    /// [`OPEN_LISTING_MAX_AGE`].
+    pub open_observation_refreshes: u64,
+    /// Open-state judgements served by an observation, in total and at most
+    /// by one observation.
+    pub open_files_judged: u64,
+    pub open_files_judged_max_per_observation: u64,
+    /// Originals kept because their size, mtime or identity changed between
+    /// the observation and the unlink (also counted as
+    /// `modified_during_compression`).
+    pub removals_refused_changed: u64,
     /// Full syncs that fell back to `fsync` (macOS file systems refusing
     /// `F_FULLFSYNC`).
     pub full_sync_fallbacks: u64,
@@ -301,6 +315,10 @@ impl RunReport {
             linkage_degraded: false,
             linkage_issues: LinkageIssues::default(),
             open_listings: 0,
+            open_observation_refreshes: 0,
+            open_files_judged: 0,
+            open_files_judged_max_per_observation: 0,
+            removals_refused_changed: 0,
             full_sync_fallbacks: 0,
             paced_bytes_per_second: None,
             pacing_slept_ms: 0,
@@ -360,6 +378,10 @@ impl RunReport {
         );
         counters.insert("reconciled_missing".to_string(), self.reconciled_missing);
         counters.insert("full_sync_fallbacks".to_string(), self.full_sync_fallbacks);
+        counters.insert(
+            "removals_refused_changed".to_string(),
+            self.removals_refused_changed,
+        );
         for (reason, count) in &self.skipped {
             counters.insert(format!("skipped_{reason}"), *count);
         }
@@ -500,6 +522,11 @@ fn append_run_log(host_dir: &Path, report: &RunReport) {
         "linkage_issues": report.linkage_issues,
         "insufficient_space": report.insufficient_space,
         "full_sync_fallbacks": report.full_sync_fallbacks,
+        "open_listings": report.open_listings,
+        "open_observation_refreshes": report.open_observation_refreshes,
+        "open_files_judged": report.open_files_judged,
+        "open_files_judged_max_per_observation": report.open_files_judged_max_per_observation,
+        "removals_refused_changed": report.removals_refused_changed,
         "budget_exhausted": report.budget_exhausted,
         "paced_bytes_per_second": report.paced_bytes_per_second,
         "pacing_slept_ms": report.pacing_slept_ms,
@@ -721,7 +748,7 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
             linkage: &linkage,
         };
         let open = match layout.open_root(transcript.provider) {
-            Some(root) => probes.open_files.state_of(&root, &transcript.path),
+            Some(_) => probes.open_files.state_of(&transcript.path),
             None => eligibility::OpenState::Unknown,
         };
         if let Err(reason) = eligibility::judge(&facts, open) {
@@ -761,6 +788,9 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
         }
     }
     report.open_listings = probes.open_files.probes;
+    report.open_observation_refreshes = probes.open_files.refreshes;
+    report.open_files_judged = probes.open_files.judged;
+    report.open_files_judged_max_per_observation = probes.open_files.max_judged_per_observation;
     report.phase("transcripts_open_check", probes.open_files.probe_time);
     report.phase("transcripts_total", started.elapsed());
     if options.apply {
@@ -833,9 +863,9 @@ impl Pass<'_> {
                 break;
             };
             let transcript = remaining.remove(position);
-            let Some(open_root) = self.layout.open_root(transcript.provider) else {
+            if self.layout.open_root(transcript.provider).is_none() {
                 continue;
-            };
+            }
             let Some((source, destination)) = self.roots.for_provider(transcript.provider) else {
                 report.skip(
                     &transcript,
@@ -863,7 +893,6 @@ impl Pass<'_> {
             let confinement = archive::Confinement {
                 source,
                 destination,
-                open_root: &open_root,
             };
             pacer.set_rate(pacing::choose_rate(
                 self.config.effective_bytes_per_second(),
@@ -876,8 +905,11 @@ impl Pass<'_> {
                 pacer: &mut pacer,
                 hooks: &mut *hooks,
                 now_ms: self.now_ms,
+                removals_refused_changed: 0,
             };
-            match archive::archive_one(&mut context, &transcript, &confinement) {
+            let outcome = archive::archive_one(&mut context, &transcript, &confinement);
+            report.removals_refused_changed += context.removals_refused_changed;
+            match outcome {
                 Ok(done) => {
                     super::best_effort(self.index.clear_conflict(&transcript.path));
                     compress += done.compress_time;
@@ -1235,7 +1267,7 @@ fn refuse_live_merge<P: OpenFileProbe>(
         }
         Provider::Codex => {
             let open = match open_root {
-                Some(root) => probes.open_files.fresh_state_of(root, &plan.original),
+                Some(_) => probes.open_files.fresh_state_of(&plan.original),
                 None => eligibility::OpenState::Unknown,
             };
             match open {

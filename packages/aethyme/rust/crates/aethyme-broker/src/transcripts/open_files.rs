@@ -1,17 +1,30 @@
 //! Whether any process has a transcript open.
 //!
+//! One pass shares one host-wide open-file observation across every
+//! transcript it judges, and takes a new one only once the last is older
+//! than the refresh interval ([`OpenFiles`]): listing every open file on a
+//! host costs most of a second, and taking one per transcript was most of
+//! an archiving pass.
+//!
 //! Linux reads `/proc/<pid>/fd` directly. Other Unix hosts use the broker's
-//! bounded, NUL-delimited `lsof` snapshot (`reclaim::open_file_snapshot_under`),
-//! whose parser anchors every field, so a file name cannot forge a record. An
-//! incomplete listing is never read as "nothing is open": the transcript is
-//! skipped as `open_check_unavailable`.
+//! bounded, NUL-delimited, host-wide `lsof` observation, the one checkout
+//! retirement shares across a run
+//! (`session_holder::retirement_run_process_use_snapshot`), whose parser
+//! anchors every field, so a file name cannot forge a record. An incomplete
+//! observation is never read as "nothing is open": every transcript judged
+//! against it is skipped as `open_check_unavailable`.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::eligibility::OpenState;
+
+/// How long one host-wide `lsof` observation may run.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+const OBSERVATION_BUDGET: Duration = Duration::from_secs(10);
 
 /// One open descriptor: which process, which file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,10 +33,10 @@ pub(crate) struct OpenFile {
     pub path: PathBuf,
 }
 
-/// A source of open-file listings.
+/// A source of open-file observations.
 pub(crate) trait OpenFileProbe {
-    /// Every file open beneath `root`, or why the listing is incomplete.
-    fn open_under(&mut self, root: &Path) -> Result<Vec<OpenFile>, String>;
+    /// Every file open on the host, or why the observation is incomplete.
+    fn observe(&mut self) -> Result<Vec<OpenFile>, String>;
 }
 
 /// The host's own process table.
@@ -31,14 +44,14 @@ pub(crate) trait OpenFileProbe {
 pub(crate) struct SystemProbe;
 
 impl OpenFileProbe for SystemProbe {
-    fn open_under(&mut self, root: &Path) -> Result<Vec<OpenFile>, String> {
+    fn observe(&mut self) -> Result<Vec<OpenFile>, String> {
         #[cfg(target_os = "linux")]
         {
-            proc_open_under(Path::new("/proc"), root)
+            proc_open_under(Path::new("/proc"), Path::new("/"))
         }
         #[cfg(not(target_os = "linux"))]
         {
-            match crate::reclaim::open_file_snapshot_under(root) {
+            match crate::session_holder::retirement_run_process_use_snapshot(OBSERVATION_BUDGET) {
                 crate::reclaim::OpenFileSnapshot::Complete(uses) => Ok(uses
                     .into_iter()
                     .map(|open| OpenFile {
@@ -121,94 +134,161 @@ pub(crate) fn proc_open_under(proc_root: &Path, root: &Path) -> Result<Vec<OpenF
     Ok(found)
 }
 
-struct Listing {
-    root: PathBuf,
-    taken: Instant,
-    files: Result<Vec<OpenFile>, String>,
+#[cfg(test)]
+thread_local! {
+    static TEST_CLOCK_SKEW: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
 }
 
-/// Open-file listings per root, reused while younger than `max_age`.
+/// Move this thread's observation clock forward, so a test can age an
+/// observation without sleeping.
+#[cfg(test)]
+pub(crate) fn advance_test_clock(by: Duration) {
+    TEST_CLOCK_SKEW.with(|skew| skew.set(skew.get() + by));
+}
+
+/// The clock observations are aged by.
+fn now() -> Instant {
+    #[cfg(test)]
+    {
+        Instant::now() + TEST_CLOCK_SKEW.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        Instant::now()
+    }
+}
+
+/// One host-wide observation and what was judged against it.
+struct Observation {
+    taken: Instant,
+    /// Every open file, or why the observation is incomplete.
+    files: Result<Vec<OpenFile>, String>,
+    /// The open paths, for a constant-time lookup per transcript.
+    paths: HashSet<PathBuf>,
+    judged: u64,
+}
+
+/// Open-file observations shared across a pass.
+///
+/// Safety: a transcript is never judged, for archiving or for removing its
+/// original, against an observation older than `refresh_after`; an older
+/// one is replaced first. An incomplete observation answers
+/// [`OpenState::Unknown`] for every transcript, so nothing judged against it
+/// is archived (fail closed). A process that opens a transcript after the
+/// observation and writes to it changes its size or modification time,
+/// which the archiver re-checks immediately before unlinking the original.
 pub(crate) struct OpenFiles<P> {
     probe: P,
-    max_age: Duration,
-    listings: Vec<Listing>,
-    /// Listings taken, and the time they took (telemetry).
+    refresh_after: Duration,
+    observation: Option<Observation>,
+    /// Observations taken, and the time they took (telemetry).
     pub probes: u64,
     pub probe_time: Duration,
+    /// Observations taken because the previous one had grown too old.
+    pub refreshes: u64,
+    /// Transcripts judged against an observation, in total and at most per
+    /// observation.
+    pub judged: u64,
+    pub max_judged_per_observation: u64,
 }
 
 impl<P: OpenFileProbe> OpenFiles<P> {
-    pub fn new(probe: P, max_age: Duration) -> Self {
+    pub fn new(probe: P, refresh_after: Duration) -> Self {
         Self {
             probe,
-            max_age,
-            listings: Vec::new(),
+            refresh_after,
+            observation: None,
             probes: 0,
             probe_time: Duration::ZERO,
+            refreshes: 0,
+            judged: 0,
+            max_judged_per_observation: 0,
         }
     }
 
-    fn take(&mut self, root: &Path) -> Listing {
-        let started = Instant::now();
-        let files = self.probe.open_under(root);
+    fn take(&mut self) -> Observation {
+        let started = now();
+        let files = self.probe.observe();
         self.probes += 1;
-        self.probe_time += started.elapsed();
-        Listing {
-            root: root.to_path_buf(),
-            taken: Instant::now(),
+        self.probe_time += now().saturating_duration_since(started);
+        let paths = match &files {
+            Ok(files) => files.iter().map(|file| file.path.clone()).collect(),
+            Err(_) => HashSet::new(),
+        };
+        // Aged from when it started: it may reflect any moment of its run.
+        Observation {
+            taken: started,
             files,
+            paths,
+            judged: 0,
         }
     }
 
-    fn listing(&mut self, root: &Path) -> &Result<Vec<OpenFile>, String> {
-        let position = self
-            .listings
-            .iter()
-            .position(|listing| listing.root == root);
-        let index = match position {
-            Some(index) if self.listings[index].taken.elapsed() <= self.max_age => index,
-            Some(index) => {
-                let listing = self.take(root);
-                self.listings[index] = listing;
-                index
+    /// The current observation, replaced first when older than
+    /// `refresh_after`.
+    fn observation(&mut self) -> &mut Observation {
+        let stale = self.observation.as_ref().is_some_and(|observation| {
+            now().saturating_duration_since(observation.taken) > self.refresh_after
+        });
+        if stale {
+            self.refreshes += 1;
+        }
+        match self.observation.take() {
+            Some(current) if !stale => self.observation.insert(current),
+            _ => {
+                let fresh = self.take();
+                self.observation.insert(fresh)
             }
-            None => {
-                let listing = self.take(root);
-                self.listings.push(listing);
-                self.listings.len() - 1
-            }
-        };
-        &self.listings[index].files
+        }
     }
 
-    /// Whether `path` (beneath `root`) is open, from a listing at most
-    /// `max_age` old.
-    pub fn state_of(&mut self, root: &Path, path: &Path) -> OpenState {
+    /// Whether `path` is open, from an observation at most `refresh_after`
+    /// old. Used to judge a transcript and again right before its original
+    /// is removed.
+    pub fn state_of(&mut self, path: &Path) -> OpenState {
         let canonical = fs::canonicalize(path).ok();
-        match self.listing(root) {
+        let observation = self.observation();
+        observation.judged += 1;
+        let judged = observation.judged;
+        let state = match &observation.files {
             Err(_) => OpenState::Unknown,
-            Ok(files) => {
-                let open = files
-                    .iter()
-                    .any(|file| file.path == path || canonical.as_ref() == Some(&file.path));
+            Ok(_) => {
+                let open = observation.paths.contains(path)
+                    || canonical
+                        .as_ref()
+                        .is_some_and(|canonical| observation.paths.contains(canonical));
                 if open {
                     OpenState::Open
                 } else {
                     OpenState::Closed
                 }
             }
-        }
+        };
+        self.judged += 1;
+        self.max_judged_per_observation = self.max_judged_per_observation.max(judged);
+        state
     }
 
-    /// Whether `path` (beneath `root`) is open, from a listing taken now.
-    /// Used immediately before an original is removed.
-    pub fn fresh_state_of(&mut self, root: &Path, path: &Path) -> OpenState {
-        self.listings.retain(|listing| listing.root != root);
-        self.state_of(root, path)
+    /// Whether `path` is open, from an observation taken now. Used by
+    /// restore, which judges one file and can afford it.
+    pub fn fresh_state_of(&mut self, path: &Path) -> OpenState {
+        self.observation = None;
+        self.state_of(path)
     }
 
-    /// Every open file beneath `root`, from a listing at most `max_age` old.
+    /// Every open file beneath `root`, from an observation at most
+    /// `refresh_after` old.
     pub fn holders(&mut self, root: &Path) -> Result<Vec<OpenFile>, String> {
-        self.listing(root).clone()
+        let canonical_root = fs::canonicalize(root).ok();
+        let files = self
+            .observation()
+            .files
+            .as_ref()
+            .map_err(|error| error.clone())?;
+        Ok(files
+            .iter()
+            .filter(|file| descends(&file.path, root, canonical_root.as_deref()))
+            .cloned()
+            .collect())
     }
 }

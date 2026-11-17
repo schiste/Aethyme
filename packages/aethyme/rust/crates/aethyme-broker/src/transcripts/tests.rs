@@ -35,7 +35,7 @@ struct FakeProbe {
 }
 
 impl OpenFileProbe for FakeProbe {
-    fn open_under(&mut self, _root: &Path) -> Result<Vec<OpenFile>, String> {
+    fn observe(&mut self) -> Result<Vec<OpenFile>, String> {
         if self.incomplete {
             return Err("listing incomplete (test)".into());
         }
@@ -1524,7 +1524,7 @@ struct OpensLater {
 }
 
 impl OpenFileProbe for OpensLater {
-    fn open_under(&mut self, _root: &Path) -> Result<Vec<OpenFile>, String> {
+    fn observe(&mut self) -> Result<Vec<OpenFile>, String> {
         self.calls += 1;
         Ok(if self.calls >= self.open_from {
             vec![OpenFile {
@@ -1537,13 +1537,25 @@ impl OpenFileProbe for OpensLater {
     }
 }
 
+/// Ages the open-file observation past any refresh interval after the copy
+/// is published, as a long compression would.
+struct AgeObservationAfterPublish;
+
+impl Hooks for AgeObservationAfterPublish {
+    fn after_publish(&mut self, _source: &Path) -> bool {
+        open_files::advance_test_clock(Duration::from_secs(2 * 3600));
+        true
+    }
+}
+
 #[test]
-fn a_fresh_listing_is_taken_right_before_the_original_is_removed() {
+fn a_stale_observation_is_refreshed_before_the_original_is_removed() {
     let host = Host::new();
     let source = host.codex_transcript(UUID, Path::new("/work/invented"));
     let config = enabled(vec![Provider::Codex]);
-    // Cached listings would say "closed" for an hour; only a fresh one sees
-    // the process that opened the transcript meanwhile.
+    // The first observation says "closed" and would serve for an hour; once
+    // it is older than that, the removal takes a new one, which sees the
+    // process that opened the transcript meanwhile.
     let mut open = OpenFiles::new(
         OpensLater {
             path: source.clone(),
@@ -1558,15 +1570,111 @@ fn a_fresh_listing_is_taken_right_before_the_original_is_removed() {
         apply(),
         &mut open,
         &mut FakeAgents::none(),
-        &mut NoHooks,
+        &mut AgeObservationAfterPublish,
         later(),
     );
     assert!(report.archived.is_empty(), "{report:?}");
     assert_eq!(report.skipped.get("open_by_process"), Some(&1));
+    assert_eq!(report.open_listings, 2, "{report:?}");
+    assert_eq!(report.open_observation_refreshes, 1, "{report:?}");
     assert!(source.is_file());
     assert!(
         !codex_destination(&host, &source).exists(),
         "the copy is discarded"
+    );
+}
+
+/// `count` Codex transcripts with distinct session ids.
+fn codex_transcripts(host: &Host, count: usize) -> Vec<PathBuf> {
+    (0..count)
+        .map(|n| {
+            let uuid = format!("0b9f6c1e-2d3a-4b5c-8d7e-1f2a3b4c5d{n:02x}");
+            host.codex_transcript(&uuid, Path::new("/work/invented"))
+        })
+        .collect()
+}
+
+#[test]
+fn one_observation_serves_every_transcript_while_it_is_young() {
+    let host = Host::new();
+    let sources = codex_transcripts(&host, 5);
+    let config = enabled(vec![Provider::Codex]);
+    let mut open = OpenFiles::new(FakeProbe::default(), Duration::from_secs(3600));
+    let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    assert_eq!(report.archived.len(), 5, "{report:?}");
+    assert_eq!(report.open_listings, 1, "one observation for the pass");
+    assert_eq!(report.open_observation_refreshes, 0);
+    // Judged once when eligibility is decided, once when archiving starts
+    // and once right before the original is removed.
+    assert_eq!(report.open_files_judged, 15, "{report:?}");
+    assert_eq!(report.open_files_judged_max_per_observation, 15);
+    assert_eq!(report.removals_refused_changed, 0);
+    for source in &sources {
+        assert!(!source.exists());
+        assert!(codex_destination(&host, source).is_file());
+    }
+}
+
+#[test]
+fn an_incomplete_observation_archives_nothing() {
+    let host = Host::new();
+    let sources = codex_transcripts(&host, 3);
+    let config = enabled(vec![Provider::Codex]);
+    let mut open = OpenFiles::new(
+        FakeProbe {
+            open: Vec::new(),
+            incomplete: true,
+        },
+        Duration::from_secs(3600),
+    );
+    let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    assert!(report.archived.is_empty(), "{report:?}");
+    assert!(report.eligible.is_empty(), "{report:?}");
+    assert_eq!(report.skipped.get("open_check_unavailable"), Some(&3));
+    assert_eq!(report.open_listings, 1);
+    for source in &sources {
+        assert!(source.is_file());
+        assert!(!codex_destination(&host, source).exists());
+    }
+}
+
+/// Appends to the source after its copy is published: a writer that opened
+/// it after the open-file observation.
+struct WriteAfterPublish;
+
+impl Hooks for WriteAfterPublish {
+    fn after_publish(&mut self, source: &Path) -> bool {
+        let mut file = fs::OpenOptions::new().append(true).open(source).unwrap();
+        file.write_all(b"{\"late\":true}\n").unwrap();
+        true
+    }
+}
+
+#[test]
+fn a_transcript_written_between_observation_and_unlink_is_kept() {
+    let host = Host::new();
+    let source = host.codex_transcript(UUID, Path::new("/work/invented"));
+    let config = enabled(vec![Provider::Codex]);
+    let mut open = OpenFiles::new(FakeProbe::default(), Duration::from_secs(3600));
+    let report = pass(&host, &config, apply(), &mut open, &mut WriteAfterPublish);
+    assert!(report.archived.is_empty(), "{report:?}");
+    assert_eq!(report.removals_refused_changed, 1, "{report:?}");
+    assert_eq!(report.skipped.get("modified_during_compression"), Some(&1));
+    assert_eq!(report.open_listings, 1, "the young observation served");
+    assert!(
+        fs::read_to_string(&source)
+            .unwrap()
+            .ends_with("{\"late\":true}\n")
+    );
+    assert!(
+        !codex_destination(&host, &source).exists(),
+        "the copy is discarded"
+    );
+    let index = Index::open(&host.environment.host_dir).unwrap();
+    assert!(index.archives().unwrap().is_empty());
+    assert_eq!(
+        index.counters().unwrap().get("removals_refused_changed"),
+        Some(&1)
     );
 }
 

@@ -14,8 +14,11 @@
 //!    the source's; any difference discards it and skips;
 //! 5. publish it with a no-clobber `linkat` and flush the directory (any
 //!    sync failure removes the copy and keeps the source), record the index
-//!    row, then check the source once more: unchanged, and not open in a
-//!    listing taken right then;
+//!    row, then check the source once more: not open in the pass's shared
+//!    open-file observation (never older than its refresh interval), and
+//!    then, immediately before the unlink, unchanged in size, mtime, inode
+//!    and device, which catches a writer that opened it after the
+//!    observation;
 //! 6. only then unlink the source (relative to its validated root, and only
 //!    if its identity is still the one compressed) and flush its directory.
 //!
@@ -128,9 +131,30 @@ fn digest_reader(mut reader: impl Read, pacer: &mut Pacer) -> io::Result<(u64, S
     Ok((total, hex(&hasher.finalize())))
 }
 
-/// Length and SHA-256 of what an open zstd file decompresses to.
+/// Paces the bytes read from the inner reader.
+struct PacedReader<'p, R> {
+    inner: R,
+    pacer: &'p mut Pacer,
+}
+
+impl<R: Read> Read for PacedReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.pacer.consume(read as u64);
+        Ok(read)
+    }
+}
+
+/// Length and SHA-256 of what an open zstd file decompresses to. Paced on
+/// the compressed bytes read from disk, which is the I/O the pacing bounds;
+/// the decoded stream (about five times larger) is hashed in full but not
+/// paced again.
 fn digest_compressed(file: File, pacer: &mut Pacer) -> io::Result<(u64, String)> {
-    digest_reader(zstd::stream::read::Decoder::new(file)?, pacer)
+    let paced = PacedReader { inner: file, pacer };
+    digest_reader(
+        zstd::stream::read::Decoder::new(paced)?,
+        &mut Pacer::new(None),
+    )
 }
 
 /// Stream `source` through zstd into `temporary`, returning the bytes read
@@ -169,8 +193,6 @@ pub(crate) struct Confinement<'r> {
     pub source: &'r Root,
     /// Where its archive goes (Codex home, Aethyme's transcript state).
     pub destination: &'r Root,
-    /// The directory whose open-file listing covers the transcript.
-    pub open_root: &'r Path,
 }
 
 /// Context one archiving pass shares across files.
@@ -180,6 +202,9 @@ pub(crate) struct ArchiveContext<'a, P> {
     pub pacer: &'a mut Pacer,
     pub hooks: &'a mut dyn Hooks,
     pub now_ms: i64,
+    /// Originals kept because their size, mtime or identity changed between
+    /// the open-file observation and the unlink (telemetry).
+    pub removals_refused_changed: u64,
 }
 
 fn row_for(
@@ -218,35 +243,44 @@ impl Entries {
     }
 }
 
-/// Remove the source once a verified, durable copy exists, after one last
-/// check that it is unchanged and not open in a listing taken right now.
-/// Otherwise remove the (stale) copy instead.
+/// Remove the source once a verified, durable copy exists. Otherwise
+/// remove the (stale) copy instead.
+///
+/// Safety: the source must be closed in the pass's shared open-file
+/// observation, which [`OpenFiles`] never lets grow older than its refresh
+/// interval and which fails closed when incomplete. A process that opened
+/// the source after that observation and wrote to it has changed its size
+/// or mtime, so the stamp is compared after the open check, immediately
+/// before the unlink (and once more by `unlink_if` itself).
 fn remove_source<P: OpenFileProbe>(
     context: &mut ArchiveContext<'_, P>,
     transcript: &Transcript,
-    confinement: &Confinement<'_>,
     entries: &Entries,
     before: Stamp,
 ) -> Result<(), Skipped> {
-    let unchanged = entries
-        .source_dir
-        .stamp(&entries.source_name)
-        .is_ok_and(|now| now == before);
-    let open = context
-        .open_files
-        .fresh_state_of(confinement.open_root, &transcript.path);
-    if !unchanged || open != OpenState::Closed {
+    let open = context.open_files.state_of(&transcript.path);
+    if open != OpenState::Closed {
         entries.discard_copy(context.index, transcript);
-        let reason = if !unchanged {
-            SkipReason::ModifiedDuringCompression
-        } else if open == OpenState::Open {
+        let reason = if open == OpenState::Open {
             SkipReason::OpenByProcess
         } else {
             SkipReason::OpenCheckUnavailable
         };
         return Err(Skipped::new(
             reason,
-            "source changed, opened, or its open state is unknown before removal; copy discarded",
+            "source opened, or its open state is unknown, before removal; copy discarded",
+        ));
+    }
+    let unchanged = entries
+        .source_dir
+        .stamp(&entries.source_name)
+        .is_ok_and(|now| now == before);
+    if !unchanged {
+        entries.discard_copy(context.index, transcript);
+        context.removals_refused_changed += 1;
+        return Err(Skipped::new(
+            SkipReason::ModifiedDuringCompression,
+            "source changed before removal; copy discarded",
         ));
     }
     entries
@@ -264,7 +298,6 @@ fn remove_source<P: OpenFileProbe>(
 fn resume<P: OpenFileProbe>(
     context: &mut ArchiveContext<'_, P>,
     transcript: &Transcript,
-    confinement: &Confinement<'_>,
     entries: &Entries,
     before: Stamp,
 ) -> Result<Archived, Skipped> {
@@ -325,7 +358,7 @@ fn resume<P: OpenFileProbe>(
             .record_archive(&row)
             .map_err(|error| Skipped::new(SkipReason::Io, error))?;
     }
-    remove_source(context, transcript, confinement, entries, before)?;
+    remove_source(context, transcript, entries, before)?;
     Ok(Archived {
         bytes_in: source.0,
         bytes_out: copy_stamp.len,
@@ -362,10 +395,7 @@ pub(crate) fn archive_one<P: OpenFileProbe>(
     let before = source_dir
         .stamp(&source_name)
         .map_err(|error| unsafe_path(&transcript.path, &error))?;
-    match context
-        .open_files
-        .state_of(confinement.open_root, &transcript.path)
-    {
+    match context.open_files.state_of(&transcript.path) {
         OpenState::Closed => {}
         OpenState::Open => {
             return Err(Skipped::new(SkipReason::OpenByProcess, "open by a process"));
@@ -391,7 +421,7 @@ pub(crate) fn archive_one<P: OpenFileProbe>(
         destination_name,
     };
     match entries.destination_dir.exists(&entries.destination_name) {
-        Ok(true) => return resume(context, transcript, confinement, &entries, before),
+        Ok(true) => return resume(context, transcript, &entries, before),
         Ok(false) => {}
         Err(error) => return Err(Skipped::io("cannot stat", &transcript.destination, &error)),
     }
@@ -501,7 +531,7 @@ pub(crate) fn archive_one<P: OpenFileProbe>(
             "stopped after publishing",
         ));
     }
-    remove_source(context, transcript, confinement, &entries, before)?;
+    remove_source(context, transcript, &entries, before)?;
     Ok(Archived {
         bytes_in,
         bytes_out,
