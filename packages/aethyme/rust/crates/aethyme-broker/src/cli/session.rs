@@ -2393,7 +2393,7 @@ fn open_cleanup_resolve_broker(read_only_snapshot: bool) -> Result<Broker, Usage
 }
 
 fn run_cleanup_resolve(parsed: Parsed) -> Result<(), UsageError> {
-    let usage = "usage: aethyme broker finish cleanup resolve <session-id>... --archive [--batch] [--retire] [--allow-adopted] [--confirm <sha256>] [--json]";
+    let usage = "usage: aethyme broker finish cleanup resolve <session-id>... --archive [--batch] [--retire] [--allow-adopted] [--archive-ignored-directories] [--confirm <sha256>] [--json]";
     let Some((command, ids)) = parsed.positional.split_first() else {
         return Err(UsageError::Message(usage.into()));
     };

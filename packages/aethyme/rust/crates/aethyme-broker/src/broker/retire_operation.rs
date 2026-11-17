@@ -1175,7 +1175,11 @@ fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
 
 /// Run Git in `dir` with `input` as its stdin, bounded by the general Git
 /// limit, and return stdout.
-fn git_bytes_with_input(dir: &Path, args: &[&str], input: &Path) -> Result<Vec<u8>, String> {
+pub(super) fn git_bytes_with_input(
+    dir: &Path,
+    args: &[&str],
+    input: &Path,
+) -> Result<Vec<u8>, String> {
     let file = std::fs::File::open(input)
         .map_err(|error| format!("cannot open {}: {error}", input.display()))?;
     let mut command = crate::git::git_command();

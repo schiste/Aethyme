@@ -69,6 +69,9 @@ const CHECKOUT_RETIREMENT_PIN_CURSOR_KEY: &str = "checkout_retirement.pin_cursor
 const RETIRED_PIN_CHECKS_PER_RUN: usize = 64;
 #[cfg(test)]
 const RETIRED_PIN_CHECKS_PER_RUN: usize = 2;
+/// Commits named by one checkout's HEAD reflog, per-worktree refs and
+/// bisect state that are checked for pinning, at most; more keeps it.
+const RETIRE_PIN_CANDIDATES_MAX: usize = 2_000;
 /// The largest recovery archive retirement writes on its own.
 pub(crate) const RETIRE_ARCHIVE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// Closed sessions read per page.
@@ -964,37 +967,137 @@ impl Broker {
             .map_err(|reason| refuse(format!("reflog commits could not be pinned: {reason}")))
     }
 
-    /// Pin the commits only `worktree`'s reflogs reach (none of the
-    /// repository's refs, remote-tracking ones included, holds them) under
-    /// `refs/aethyme/retired/<session_id>/<commit>`, one ref per tip, so
-    /// removing the worktree's registration and reflog loses no commit.
+    /// Pin, as `refs/aethyme/retired/<session_id>/<commit>`, every commit
+    /// only `worktree` itself refers to, so dropping its registration (its
+    /// HEAD reflog, its per-worktree refs, its bisect state) loses none: the
+    /// commits its HEAD reflog names (old and new ids), the commits its
+    /// per-worktree refs (`refs/bisect/*`, `refs/worktree/*`,
+    /// `refs/rewritten/*`) point at, and those `BISECT_LOG`/`BISECT_START`
+    /// name, each unless already reachable from the default branch, a
+    /// remote-tracking ref or an existing pin. Reachability is decided in one
+    /// `rev-list` for at most [`RETIRE_PIN_CANDIDATES_MAX`] candidates; more
+    /// refuses (the caller keeps the checkout). Pins expire by the rule of
+    /// [`Self::prune_retired_pins`].
     fn pin_reflog_only_commits(&self, session_id: i64, worktree: &Path) -> Result<(), String> {
-        let run = run_git_text;
-        let listing = run(
-            worktree,
-            &["rev-list", "--parents", "--reflog", "--not", "--all"],
-        )?;
-        let mut commits = Vec::new();
-        let mut parents = std::collections::BTreeSet::new();
-        for line in listing.lines() {
-            let mut ids = line.split_whitespace();
-            if let Some(commit) = ids.next() {
-                commits.push(commit.to_string());
-                parents.extend(ids.map(str::to_string));
+        let _span = crate::phase_telemetry::span("checkout_trash_worktree_commit_pins");
+        let git_dir = crate::git::checked_worktree_git_dir(worktree)
+            .map_err(|error| format!("cannot find the checkout's Git directory: {error}"))?
+            .ok_or("the checkout has no linked Git directory")?;
+        let mut candidates = std::collections::BTreeSet::new();
+        if let Ok(reflog) = std::fs::read_to_string(git_dir.join("logs/HEAD")) {
+            for line in reflog.lines() {
+                candidates.extend(line.split_whitespace().take(2).map(str::to_string));
             }
         }
-        for tip in commits.iter().filter(|commit| !parents.contains(*commit)) {
-            if tip.is_empty() || !tip.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err(format!("unexpected commit id {tip:?}"));
+        let per_worktree_refs = run_git_text(
+            worktree,
+            &[
+                "for-each-ref",
+                "--format=%(objectname)",
+                "refs/bisect/",
+                "refs/worktree/",
+                "refs/rewritten/",
+            ],
+        )?;
+        candidates.extend(
+            per_worktree_refs
+                .lines()
+                .map(|line| line.trim().to_string()),
+        );
+        for name in ["BISECT_LOG", "BISECT_START"] {
+            if let Ok(text) = std::fs::read_to_string(git_dir.join(name)) {
+                candidates.extend(text.split_whitespace().map(str::to_string));
             }
-            run(
-                self.main_root(),
-                &[
-                    "update-ref",
-                    &format!("refs/aethyme/retired/{session_id}/{tip}"),
-                    tip,
-                ],
-            )?;
+        }
+        let candidates = candidates
+            .into_iter()
+            .filter(|id| {
+                matches!(id.len(), 40 | 64)
+                    && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && id.bytes().any(|byte| byte != b'0')
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        if candidates.len() > RETIRE_PIN_CANDIDATES_MAX {
+            return Err(format!(
+                "the checkout's reflog, per-worktree refs and bisect state name {} commits, more than the {RETIRE_PIN_CANDIDATES_MAX} checked per checkout; it is kept",
+                candidates.len()
+            ));
+        }
+        crate::phase_telemetry::add(
+            "checkout_trash_worktree_commit_candidates",
+            std::time::Duration::ZERO,
+        );
+        let scratch = tempfile::NamedTempFile::new()
+            .map_err(|error| format!("cannot create a scratch file: {error}"))?;
+        std::fs::write(scratch.path(), format!("{}\n", candidates.join("\n")))
+            .map_err(|error| format!("cannot write a scratch file: {error}"))?;
+        // Only commits that still exist: an old reflog id may be gone.
+        let typed = String::from_utf8_lossy(&super::retire_operation::git_bytes_with_input(
+            self.main_root(),
+            &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            scratch.path(),
+        )?)
+        .into_owned();
+        let commits = typed
+            .lines()
+            .filter_map(|line| line.strip_suffix(" commit"))
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>();
+        if commits.is_empty() {
+            return Ok(());
+        }
+        // What already keeps a commit: the default branch, remote-tracking
+        // refs and existing pins (the rule pins expire by).
+        let mut kept_by = vec![
+            "refs/remotes/".to_string(),
+            "refs/aethyme/retired/".to_string(),
+        ];
+        if let Some((upstream_ref, _)) = self.repo_handle().upstream_default()
+            && let Some((_, branch)) = upstream_ref
+                .trim_start_matches("refs/remotes/")
+                .split_once('/')
+        {
+            kept_by.push(format!("refs/heads/{branch}"));
+        }
+        let mut args = vec!["for-each-ref", "--format=%(objectname)"];
+        args.extend(kept_by.iter().map(String::as_str));
+        let excluded = run_git_text(self.main_root(), &args)?;
+        let mut input = commits
+            .iter()
+            .map(|commit| format!("{commit}\n"))
+            .collect::<String>();
+        for id in excluded.lines().map(str::trim).filter(|id| !id.is_empty()) {
+            input.push_str(&format!("^{id}\n"));
+        }
+        std::fs::write(scratch.path(), input)
+            .map_err(|error| format!("cannot write a scratch file: {error}"))?;
+        let unreachable = String::from_utf8_lossy(&super::retire_operation::git_bytes_with_input(
+            self.main_root(),
+            &["rev-list", "--stdin"],
+            scratch.path(),
+        )?)
+        .lines()
+        .map(str::to_string)
+        .filter(|commit| commits.contains(commit))
+        .collect::<Vec<_>>();
+        if unreachable.is_empty() {
+            return Ok(());
+        }
+        let updates = unreachable
+            .iter()
+            .map(|commit| format!("update refs/aethyme/retired/{session_id}/{commit} {commit}\n"))
+            .collect::<String>();
+        std::fs::write(scratch.path(), updates)
+            .map_err(|error| format!("cannot write a scratch file: {error}"))?;
+        super::retire_operation::git_bytes_with_input(
+            self.main_root(),
+            &["update-ref", "--stdin"],
+            scratch.path(),
+        )?;
+        for _ in &unreachable {
             crate::phase_telemetry::add(
                 "checkout_trash_reflog_commits_pinned",
                 std::time::Duration::ZERO,
@@ -2938,6 +3041,62 @@ mod tests {
             ],
         );
         assert_eq!(pinned.trim(), lost);
+    }
+
+    /// A commit reset away in the checkout (only its HEAD reflog names it)
+    /// and a commit only a per-worktree bisect ref points at both survive
+    /// retirement, `reflog expire` and `gc --prune=now`: they are pinned.
+    #[test]
+    fn reflog_and_bisect_ref_commits_survive_retirement_and_gc() {
+        let (_owner, _storage, mut broker) = fixture();
+        let mut reset_away = String::new();
+        let mut bisect_only = String::new();
+        let (session, worktree) = closed(&mut broker, "reflog and bisect", |worktree| {
+            std::fs::write(worktree.join("work.txt"), "reset away\n").unwrap();
+            git(worktree, &["add", "work.txt"]);
+            git(worktree, &["commit", "-qm", "soon reset away"]);
+            reset_away = git(worktree, &["rev-parse", "HEAD"]).trim().to_string();
+            git(worktree, &["reset", "-q", "--hard", "HEAD~1"]);
+            let tree = git(worktree, &["rev-parse", "HEAD^{tree}"])
+                .trim()
+                .to_string();
+            bisect_only = git(
+                worktree,
+                &[
+                    "commit-tree",
+                    "-p",
+                    "HEAD",
+                    "-m",
+                    "only a bisect ref",
+                    &tree,
+                ],
+            )
+            .trim()
+            .to_string();
+            git(worktree, &["update-ref", "refs/bisect/bad", &bisect_only]);
+        });
+
+        let report = run(&mut broker);
+
+        assert_eq!(report.retired_clean, 1, "{report:#?}");
+        assert!(!worktree.exists());
+        let root = broker.main_root().to_path_buf();
+        git(&root, &["reflog", "expire", "--expire=now", "--all"]);
+        git(&root, &["gc", "--prune=now", "-q"]);
+        for commit in [&reset_away, &bisect_only] {
+            assert!(
+                git_status(&root, &["cat-file", "-e", &format!("{commit}^{{commit}}")]),
+                "{commit} survived"
+            );
+            git(
+                &root,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    &format!("refs/aethyme/retired/{}/{commit}", session.id),
+                ],
+            );
+        }
     }
 
     /// A kept checkout is not planned again every lap; a change to its

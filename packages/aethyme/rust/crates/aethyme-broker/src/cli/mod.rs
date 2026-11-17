@@ -859,7 +859,7 @@ Usage:
       by default; --apply revalidates and removes only clean worktrees whose
       session work is represented on main, integration, or configured upstream.
       Adopted worktrees are never included in the bulk sweep.
-  aethyme broker cleanup resolve <session-id>... --archive [--batch] [--retire] [--allow-adopted] [--confirm <sha256>] [--json]
+  aethyme broker cleanup resolve <session-id>... --archive [--batch] [--retire] [--allow-adopted] [--archive-ignored-directories] [--confirm <sha256>] [--json]
       Preserve, then remove, a closed session's worktree that cleanup refuses
       because it is dirty, holds pending commits, or cannot be proved landed.
       Without --confirm it prints what would be archived and a digest. With it,
