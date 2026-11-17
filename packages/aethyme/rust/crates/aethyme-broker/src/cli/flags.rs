@@ -654,6 +654,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
             "--batch",
             "--allow-adopted",
             "--retire",
+            "--archive-ignored-directories",
         ],
     ),
     ("representation scan", &["--session"]),

@@ -3008,6 +3008,21 @@ fn push_checkout_retirement_advice(
             commands: Vec::new(),
         });
     }
+    if progress.abandoned_operations_archived > 0 {
+        view.advice.push(StatusAdvice {
+            id: "cleanup.retire-abandoned-operations-archived",
+            severity: StatusAdviceSeverity::Info,
+            reason: "closed checkouts whose merge, rebase, cherry-pick, revert or bisect was left in progress past [cleanup] abandoned_operation_after_hours were retired after their operation state, index, index-only objects and changed files were archived and verified; each archive's README.md says how to restore it. These archives expire by age like every recovery archive (by default 30 days, after 7 days named in broker status); keep one with `aethyme storage keep-archive <pool>/<archive>`",
+            summary: format!(
+                "{} closed checkout(s) with an abandoned Git operation archived and retired",
+                progress.abandoned_operations_archived
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: Vec::new(),
+            commands: vec!["aethyme storage archives".into()],
+        });
+    }
     if progress.retired_pins > 0 {
         view.advice.push(StatusAdvice {
             id: "cleanup.retired-pins",
@@ -3080,6 +3095,17 @@ fn push_checkout_retirement_advice(
                 progress.kept
             ),
         ];
+        if progress.process_use_unavailable {
+            evidence.push(
+                "the last run could not take its open-file observation (lsof), so it judged and deleted nothing past that point; it is retried within a minute".into(),
+            );
+        }
+        if progress.trash_entries_in_use > 0 {
+            evidence.push(format!(
+                "{} trash entr(y/ies) left alone because a process still uses them",
+                progress.trash_entries_in_use
+            ));
+        }
         evidence.extend(
             progress
                 .reported_trash_entries
@@ -3634,6 +3660,7 @@ mod missing_checkout;
 mod owners;
 mod remote_heads;
 mod retire;
+mod retire_operation;
 pub(crate) use leases::{
     AbandonedSessionCloseOutcome, AbandonmentKeepReason, LandedProof, LandedSessionDecline,
     long_proof_grant, validate_session_commit_args,

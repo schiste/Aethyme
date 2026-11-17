@@ -540,7 +540,11 @@ pub fn archives_value(host_state: &Path) -> Value {
         .iter()
         .filter(|item| item.class == Class::RecoveryArchives)
     {
-        for child in &item.children {
+        for child in item
+            .children
+            .iter()
+            .filter(|child| !super::is_partial_archive_name(&child.name))
+        {
             let path = item.path().join(&child.name);
             let landed = super::evict::archive_landed(&path);
             let kept = super::keep_marker(&path).exists();
