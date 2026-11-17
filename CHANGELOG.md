@@ -4,6 +4,30 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.116] - 2026-11-17
+
+0.8.115 was tagged but never published: its static Linux build failed to link. This release carries everything listed under 0.8.115 plus the changes below.
+
+### Added
+
+- Recovery archives expire by age. `[budget] unlanded_archive_days` in `<host state>/storage.toml` (default 30; 0 turns it off) sets the age, counted from the archive manifest's creation time and never shorter than the archive's recorded minimum retention. An archive is removed only after it has been listed as expiring for at least 7 days, in at least two worker passes a day apart. A pass that follows a gap of more than 7 days, or a clock that went back, removes nothing by age and restarts the notices. Each pass removes at most 50 archives or 1 GiB by age. An archive without a plausible creation time is never removed by age (#1746).
+- `broker status --json` advice `storage.archives-expiring`: the archives that expire within 7 days (first 20 and a total), with the command to keep one (#1746).
+- `aethyme storage keep-archive <id> [--unkeep]` exempts an archive from age expiry; `aethyme storage archives [--json]` lists archives with landed state, creation time, expiry time and kept state (#1746).
+- `storage status` starts with a total and one line per root, shows archives kept for unlanded work as a count with the first five ids, and reports how often age expiry was paused and how many notices were restarted (#1746).
+
+### Fixed
+
+- The static Linux (musl) build links again: the checkout trash calls `renameat2` as a raw system call (#1748).
+- The storage check no longer starts a worker, or evicts inline, from a temporary or self-update staging copy of the binary. The worker starts only from an installed copy of the same build; when none is found it is not started and the skip is counted (#1746).
+
+### Changed
+
+- Upgrade note: archives already older than the configured age are not removed on upgrade. They are listed in `broker status` for at least 7 days first; keep one with `aethyme storage keep-archive <id>`, or set `unlanded_archive_days = 0` to keep all.
+
+### Known issues
+
+- Checkout retirement, transcript archiving and archive expiry have been validated on Linux CI only before this release.
+
 ## [0.8.115] - 2026-11-17
 
 ### Added
