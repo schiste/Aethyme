@@ -2991,7 +2991,38 @@ fn push_checkout_retirement_advice(
     view: &mut StatusView,
     progress: &retire::CheckoutRetirementProgress,
     too_large: &std::collections::BTreeSet<i64>,
+    in_progress: &std::collections::BTreeSet<i64>,
 ) {
+    if let Some(&first) = in_progress.first() {
+        view.advice.push(StatusAdvice {
+            id: "cleanup.retire-operation-in-progress",
+            severity: StatusAdviceSeverity::Notice,
+            reason: "a merge, rebase, cherry-pick, revert or bisect is in progress in these closed checkouts, or their index holds unmerged entries; that state is neither in Git nor archived, so they are kept",
+            summary: format!(
+                "{} closed checkout(s) are kept with an operation in progress",
+                in_progress.len()
+            ),
+            session_id: Some(first),
+            queue_entry_id: None,
+            evidence: unprovable_advice_evidence(in_progress),
+            commands: Vec::new(),
+        });
+    }
+    if !progress.unrecognized_trash_entries.is_empty() {
+        view.advice.push(StatusAdvice {
+            id: "cleanup.trash-unrecognized",
+            severity: StatusAdviceSeverity::Notice,
+            reason: "the checkout trash holds entries the broker did not record; they are left alone",
+            summary: format!(
+                "{} unrecognized checkout trash entr(y/ies)",
+                progress.unrecognized_trash_entries.len()
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: progress.unrecognized_trash_entries.clone(),
+            commands: Vec::new(),
+        });
+    }
     if let Some(&first) = too_large.first() {
         view.advice.push(StatusAdvice {
             id: "cleanup.retire-archive-too-large",

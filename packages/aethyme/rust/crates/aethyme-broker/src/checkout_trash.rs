@@ -67,6 +67,12 @@ pub(crate) struct TrashRow {
     pub(crate) session_id: i64,
     #[serde(default)]
     pub(crate) failures: u32,
+    /// Written before the rename (with the source directory's identity,
+    /// which a same-volume rename keeps) and cleared after it. A pending row
+    /// whose entry is absent is a rename that never happened and is dropped;
+    /// one whose entry is present is a rename whose confirmation was lost.
+    #[serde(default)]
+    pub(crate) pending: bool,
 }
 
 /// Recorded trash entries: trash directory path, then entry name.
@@ -361,18 +367,76 @@ pub(crate) fn registration_of(
     Ok(admin.clone())
 }
 
+/// `rename` that refuses to replace an existing destination:
+/// `renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on
+/// macOS.
+fn rename_noreplace(from_dir: RawFd, from: &str, to_dir: RawFd, to: &str) -> std::io::Result<()> {
+    let from = c_name(from)?;
+    let to = c_name(to)?;
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: both names are NUL-terminated; both descriptors are open.
+        checked(unsafe {
+            libc::renameat2(
+                from_dir,
+                from.as_ptr(),
+                to_dir,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        })?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // <sys/stdio.h>:
+        //   int renameatx_np(int fromfd, const char *from, int tofd,
+        //                    const char *to, unsigned int flags);
+        //   #define RENAME_EXCL 0x00000004
+        unsafe extern "C" {
+            fn renameatx_np(
+                fromfd: libc::c_int,
+                from: *const libc::c_char,
+                tofd: libc::c_int,
+                to: *const libc::c_char,
+                flags: libc::c_uint,
+            ) -> libc::c_int;
+        }
+        const RENAME_EXCL: libc::c_uint = 0x0000_0004;
+        // SAFETY: both names are NUL-terminated; both descriptors are open.
+        checked(unsafe {
+            renameatx_np(from_dir, from.as_ptr(), to_dir, to.as_ptr(), RENAME_EXCL)
+        })?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _unsupported = (from_dir, from, to_dir, to);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "an exclusive rename is unavailable on this platform",
+        ))
+    }
+}
+
 /// Move `worktree`, a checkout directly inside the broker-owned pool `pool`,
 /// into the pool's trash and drop its Git registration (looked up from
-/// `repo`, whose Git common directory is `common_dir`). A lock the broker
-/// placed is released; any other lock refuses the move. Environments bound
-/// to the checkout are destroyed first (their hooks live in it). Nothing in
-/// the checkout is unlinked here.
+/// `repo`, whose Git common directory is `common_dir`).
+///
+/// Order: the registration and any lock are checked first (a lock anyone
+/// but the broker placed refuses); `record_pending` stores the entry's row
+/// (the source directory's identity) before anything moves; the exclusive
+/// rename comes next, and a failure there leaves the checkout exactly as it
+/// was. Only then are environments bound to the checkout destroyed (a
+/// failure renames the checkout back) and the registration, with the
+/// broker's lock, removed. Nothing in the checkout is unlinked here.
 pub(crate) fn move_worktree_to_trash(
     repo: &crate::git::GitRepo,
     common_dir: &Path,
     pool: &Path,
     worktree: &Path,
     session_id: i64,
+    record_pending: &mut dyn FnMut(&Path, &str, TrashRow) -> Result<(), String>,
 ) -> Result<TrashedCheckout, String> {
     let _span = crate::phase_telemetry::span("checkout_trash_move");
     if worktree.parent() != Some(pool) {
@@ -388,12 +452,8 @@ pub(crate) fn move_worktree_to_trash(
         .ok_or_else(|| format!("{} has no usable name", worktree.display()))?
         .to_owned();
     let admin = registration_of(repo, common_dir, worktree)?;
-    let lock = admin.join("locked");
-    match std::fs::read_to_string(&lock) {
-        Ok(reason) if reason.trim() == crate::git::BROKER_WORKTREE_LOCK_REASON => {
-            std::fs::remove_file(&lock)
-                .map_err(|error| format!("cannot release the broker's worktree lock: {error}"))?;
-        }
+    match std::fs::read_to_string(admin.join("locked")) {
+        Ok(reason) if reason.trim() == crate::git::BROKER_WORKTREE_LOCK_REASON => {}
         Ok(reason) => {
             return Err(format!(
                 "the worktree is locked ({}); its lock is somebody else's protection",
@@ -409,35 +469,43 @@ pub(crate) fn move_worktree_to_trash(
     if !is_directory(&source) {
         return Err(format!("{} is not a real directory", worktree.display()));
     }
-    crate::environments::lifecycle::destroy_for_worktree(worktree)?;
     let entry = format!(
         "{:013}-{session_id}-{}-{}",
         crate::clock::epoch_ms().max(0),
         std::process::id(),
         TRASH_NONCE.fetch_add(1, Ordering::Relaxed)
     );
-    let from = c_name(&name).map_err(|error| error.to_string())?;
-    let to = c_name(&entry).map_err(|error| error.to_string())?;
-    // SAFETY: both names are NUL-terminated; both descriptors are open
-    // directories on the same volume (the trash is inside the pool).
-    checked(unsafe {
-        libc::renameat(
-            trash.pool.as_raw_fd(),
-            from.as_ptr(),
-            trash.trash.as_raw_fd(),
-            to.as_ptr(),
-        )
-    })
-    .map_err(|error| format!("cannot move the checkout into the trash: {error}"))?;
-    let moved = fstatat_nofollow(trash.trash.as_raw_fd(), &entry)
-        .map_err(|error| format!("cannot inspect the trashed checkout: {error}"))?;
     #[allow(clippy::unnecessary_cast)]
-    let row = TrashRow {
-        device: moved.st_dev as u64,
-        inode: moved.st_ino as u64,
+    let mut row = TrashRow {
+        device: source.st_dev as u64,
+        inode: source.st_ino as u64,
         session_id,
         failures: 0,
+        pending: true,
     };
+    record_pending(&trash.path, &entry, row)?;
+    rename_noreplace(
+        trash.pool.as_raw_fd(),
+        &name,
+        trash.trash.as_raw_fd(),
+        &entry,
+    )
+    .map_err(|error| format!("cannot move the checkout into the trash: {error}"))?;
+    if let Err(reason) = crate::environments::lifecycle::destroy_for_worktree(worktree) {
+        return match rename_noreplace(
+            trash.trash.as_raw_fd(),
+            &entry,
+            trash.pool.as_raw_fd(),
+            &name,
+        ) {
+            Ok(()) => Err(format!(
+                "environments bound to the checkout could not be destroyed; it was put back: {reason}"
+            )),
+            Err(error) => Err(format!(
+                "environments bound to the checkout could not be destroyed ({reason}) and it could not be put back from the trash: {error}"
+            )),
+        };
+    }
     crate::phase_telemetry::add("checkout_trashed", Duration::ZERO);
     let registration_removed = match std::fs::remove_dir_all(&admin) {
         Ok(()) => true,
@@ -447,6 +515,7 @@ pub(crate) fn move_worktree_to_trash(
             false
         }
     };
+    row.pending = false;
     Ok(TrashedCheckout {
         trash_dir: trash.path.clone(),
         entry,
@@ -612,6 +681,8 @@ pub(crate) struct TrashDrainReport {
     pub(crate) reported: Vec<String>,
     /// Names in a trash the broker did not record (left alone).
     pub(crate) unrecognized: usize,
+    /// The first of those names, with their trash directory.
+    pub(crate) unrecognized_names: Vec<String>,
     /// Trash directories that failed verification (left alone).
     pub(crate) invalid_trash_dirs: usize,
     pub(crate) pace: Option<DeleterPace>,
@@ -662,23 +733,36 @@ pub(crate) fn drain_trash(
                 crate::phase_telemetry::add("checkout_trash_invalid_dir", Duration::ZERO);
                 continue;
             };
-            let listed = std::fs::read_dir(trash.path())
-                .map(|listing| {
-                    listing
-                        .filter_map(Result::ok)
-                        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
-                        .filter(|name| name != TRASH_MARKER)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            // A listing that fails says nothing about which entries are
+            // gone: the directory is skipped and its rows are kept.
+            let Ok(listing) = std::fs::read_dir(trash.path()) else {
+                report.invalid_trash_dirs += 1;
+                continue;
+            };
+            let listed = listing
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+                .filter(|name| name != TRASH_MARKER)
+                .collect::<Vec<_>>();
             for name in &listed {
                 if !is_broker_entry_name(name) || !entries.contains_key(name) {
                     report.unrecognized += 1;
+                    if report.unrecognized_names.len() < 20 {
+                        report
+                            .unrecognized_names
+                            .push(format!("{}/{name}", trash.path().display()));
+                    }
                     crate::phase_telemetry::add("checkout_trash_unrecognized", Duration::ZERO);
                 }
             }
-            // Recorded entries no longer present are forgotten.
+            // Recorded entries no longer present are forgotten: a pending
+            // row whose rename never happened, or an entry already deleted.
             entries.retain(|name, _| listed.contains(name));
+            // A pending row whose entry is present was renamed; its
+            // identity is re-checked on the pinned directory below.
+            for row in entries.values_mut() {
+                row.pending = false;
+            }
             let mut order = entries
                 .iter()
                 .filter(|(name, _)| is_broker_entry_name(name))
@@ -830,7 +914,14 @@ mod tests {
         }
 
         fn trash(&self, checkout: &Path, session_id: i64) -> Result<TrashedCheckout, String> {
-            move_worktree_to_trash(&self.repo, &self.common(), &self.pool, checkout, session_id)
+            move_worktree_to_trash(
+                &self.repo,
+                &self.common(),
+                &self.pool,
+                checkout,
+                session_id,
+                &mut |_, _, _| Ok(()),
+            )
         }
     }
 
@@ -958,6 +1049,7 @@ mod tests {
             &fixture.pool,
             &elsewhere,
             1,
+            &mut |_, _, _| Ok(()),
         )
         .unwrap_err();
         assert!(error.contains("not directly inside"), "{error}");
@@ -1071,6 +1163,97 @@ mod tests {
         assert_eq!(resumed.entries_removed, 1, "{resumed:?}");
         assert!(!trashed.path().exists());
         assert_eq!(resumed.entries_pending, 0);
+    }
+
+    /// The row is written before the rename, with the source's identity,
+    /// which the rename keeps: a pending row whose entry exists is deleted
+    /// like any other; one whose rename never happened is dropped.
+    #[test]
+    fn a_pending_row_is_written_first_and_reconciled() {
+        let fixture = Fixture::new();
+        let checkout = fixture.checkout("one");
+        let mut recorded = Vec::new();
+        let trashed = move_worktree_to_trash(
+            &fixture.repo,
+            &fixture.common(),
+            &fixture.pool,
+            &checkout,
+            3,
+            &mut |dir, entry, row| {
+                recorded.push((dir.to_path_buf(), entry.to_string(), row));
+                // The checkout has not moved yet when the row is written.
+                assert!(checkout.exists());
+                Ok(())
+            },
+        )
+        .unwrap();
+        let (dir, entry, pending) = recorded.pop().unwrap();
+        assert!(pending.pending);
+        assert_eq!(
+            (pending.device, pending.inode),
+            (trashed.row.device, trashed.row.inode)
+        );
+
+        // The confirmation was lost: the pending row alone still deletes it.
+        let mut rows = TrashRows::new();
+        rows.entry(dir.clone()).or_default().insert(entry, pending);
+        // A rename that never happened: its pending row is dropped.
+        let mut ghost = pending;
+        ghost.inode = ghost.inode.wrapping_add(1);
+        rows.entry(dir)
+            .or_default()
+            .insert("0000000000001-3-1-1".to_string(), ghost);
+        let report = drain_trash(
+            &mut rows,
+            Instant::now() + Duration::from_secs(600),
+            DeleterPace::Unpaced,
+        );
+        assert_eq!(report.entries_removed, 1, "{report:?}");
+        assert!(!trashed.path().exists());
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// The rename never replaces an existing destination, so a failed move
+    /// leaves the checkout where it was.
+    #[test]
+    fn the_rename_never_replaces_a_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("source")).unwrap();
+        std::fs::write(dir.path().join("source/file"), "kept\n").unwrap();
+        std::fs::create_dir(dir.path().join("taken")).unwrap();
+        let fd = open_dir_nofollow(dir.path()).unwrap();
+        assert!(rename_noreplace(fd.as_raw_fd(), "source", fd.as_raw_fd(), "taken").is_err());
+        assert!(dir.path().join("source/file").exists());
+        rename_noreplace(fd.as_raw_fd(), "source", fd.as_raw_fd(), "moved").unwrap();
+        assert!(dir.path().join("moved/file").exists());
+    }
+
+    /// A trash whose listing fails is skipped with its rows kept, not
+    /// treated as empty.
+    #[test]
+    fn an_unreadable_trash_keeps_its_rows() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let trashed = fixture.trash(&fixture.checkout("one"), 1).unwrap();
+        let mut rows = rows_of(&trashed);
+        std::fs::set_permissions(&trashed.trash_dir, std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let readable_anyway = std::fs::read_dir(&trashed.trash_dir).is_ok();
+        let report = drain_trash(
+            &mut rows,
+            Instant::now() + Duration::from_secs(600),
+            DeleterPace::Unpaced,
+        );
+        std::fs::set_permissions(&trashed.trash_dir, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        if readable_anyway {
+            // A privileged runner reads it regardless; nothing to show.
+            return;
+        }
+        assert_eq!(report.entries_removed, 0);
+        assert_eq!(report.invalid_trash_dirs, 1, "{report:?}");
+        assert_eq!(rows.values().map(BTreeMap::len).sum::<usize>(), 1);
+        assert!(trashed.path().exists());
     }
 
     /// The pace follows disk pressure and load, never memory: below the

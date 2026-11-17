@@ -2686,4 +2686,14 @@ Introduced 2026-11-17. Changes consumers may see:
 - New status advice `cleanup.retire-archive-too-large` (session ids only) and `cleanup.retirement-stalled` (trash or kept checkouts not shrinking for 3 runs).
 - New phase spans `checkout_trash_move`, `checkout_trash_drain`, `checkout_retirement_run`, `checkout_retirement_judge`, `checkout_retirement_open_paths`. New counters `checkout_trashed`, `checkout_trash_registration_left`, `checkout_trash_declined_unclean`, `checkout_trash_outside_pool`, `checkout_trash_fell_back_to_git`, `checkout_trash_entries_removed`, `checkout_trash_entry_failed`, `checkout_trash_unrecognized`, `checkout_trash_invalid_dir`, `checkout_trash_deleter_busy`, `checkout_trash_unpaced_runs`, `checkout_trash_floor_runs`, `checkout_trash_drain_time`, `checkout_retirement_retired_clean`, `checkout_retirement_retired_archived`, `checkout_retirement_kept_<precondition>`, `checkout_retirement_open_paths_unresolved`.
 
+- Before any checkout is moved into the trash, checked under the caller's claims:
+  - a merge, rebase, cherry-pick, revert or bisect in progress, or unmerged index entries, keep it (`checkout_retirement_kept_operation_in_progress`, advice `cleanup.retire-operation-in-progress` by session id);
+  - a fresh process-use observation must show nobody in it;
+  - commits only its reflog reaches are pinned as `refs/aethyme/retired/<session>/<commit>`.
+
+  Retirement re-checks cleanliness under the lifecycle claim with ignored files included. Trash rows are written before the rename as `pending` (source identity) and are confirmed after it; every row change is a compare-and-set. A refused move inside the lane keeps the checkout (`trash_refused`) instead of running `git worktree remove`. The rename never replaces a destination (`renameat2(RENAME_NOREPLACE)` / `renameatx_np(RENAME_EXCL)`). The deleter runs only under the host-wide lock and never uses a weaker one. Unrecognized trash entries are named in advice `cleanup.trash-unrecognized`.
+- Keeps about content or ownership are remembered in meta key `checkout_retirement.keeps`, keyed by HEAD and index modification time, and judged again after 1 h, 6 h, then 24 h, or at once when the key changes (`checkout_retirement_keep_memo_skips`). The old removal and compaction lanes skip any session the retirement lane kept on purpose or trashed.
+- An automatic close with at least 15 s of its pass left retires the checkout inline (`checkout_retirement_inline_retired`); the lane remains the fallback.
+- No grace period applies to the directory: the cleanup request's `grace_hours` is ignored by retirement. The close note says the checkout is retired and how to continue. `start --reuse <path>` on a retired checkout recreates it from the session branch, or refuses with the recovery archive's README when an archive holds leftovers.
+
 Covered by `checkout_trash.rs` and `broker/retire.rs` tests.

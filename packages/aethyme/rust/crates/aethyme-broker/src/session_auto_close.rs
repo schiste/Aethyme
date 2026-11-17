@@ -241,19 +241,25 @@ fn close_reason_basis(payload: &Value) -> String {
 }
 
 /// How to go on after an automatic close, depending on whether the checkout
-/// is still on disk (automatic removal takes it once its grace has passed
-/// and its work is contained).
+/// is still on disk. The checkout gets no grace period: the broker retires
+/// it soon after the close (committed work stays on the session branch;
+/// anything else goes into a verified recovery archive first).
 fn continuation(worktree_path: &str) -> String {
     match std::fs::symlink_metadata(worktree_path) {
         Ok(_) => format!(
-            "Its checkout {worktree_path} is still on disk. To continue there, run \
+            "Its checkout {worktree_path} is still on disk for now; the broker retires it shortly \
+             (committed work stays on the session branch, anything uncommitted goes into a \
+             recovery archive first). To continue there, run \
              `aethyme broker start --reuse --task \"<task>\" --short-name \"<name>\"` from \
              inside that checkout"
         ),
-        Err(_) => "Its checkout has since been removed by automatic cleanup; start a new \
-                   session with `aethyme broker start --task \"<task>\" --short-name \
-                   \"<name>\"`"
-            .to_string(),
+        Err(_) => format!(
+            "Its checkout has been retired. Committed work is on the session branch; anything \
+             uncommitted was kept in a recovery archive. To continue, run \
+             `aethyme broker start --reuse {worktree_path} --task \"<task>\" --short-name \
+             \"<name>\"`: it recreates the checkout from the session branch, or names the \
+             archive and its restore steps when one holds leftovers"
+        ),
     }
 }
 

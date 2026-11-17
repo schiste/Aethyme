@@ -9624,6 +9624,19 @@ impl Broker {
             .first()
             .map(|session| session.id)
             .unwrap_or_default();
+        // A checkout the retirement lane kept on purpose or already moved
+        // into the trash is that lane's: this lane never acts on it too.
+        if candidate
+            .sessions
+            .iter()
+            .any(|session| self.checkout_retirement_owns(session.id))
+        {
+            return Err(crate::BrokerError::Io {
+                path: candidate.worktree.clone(),
+                source: std::io::Error::other("owned by the checkout retirement lane"),
+            }
+            .into());
+        }
         self.refuse_live_checkout(first, &candidate.worktree)?;
         // Durable before Git deletes anything: only this record lets a later
         // pass finish a removal that stopped part-way.
