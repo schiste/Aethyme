@@ -29,6 +29,10 @@ pub const PUBLIC_VERBS: &[(&str, &str)] = &[
     ),
     ("submit", "simulate and gate a session; preparation"),
     (
+        "advance",
+        "prepare and validate the session, then publish its committed head",
+    ),
+    (
         "push",
         "publish this session's own branch as you work; --pr opens a draft PR",
     ),

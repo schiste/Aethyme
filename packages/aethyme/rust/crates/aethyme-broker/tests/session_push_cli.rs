@@ -605,6 +605,68 @@ fn an_authorized_push_publishes_the_session_branch_and_records_it() {
     assert_eq!(state.remote_oid.as_deref(), Some(head.as_str()));
 }
 
+#[test]
+fn advance_validates_then_publishes_only_a_clean_committed_head() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, worktree) = fixture.session_with_commit();
+    let id = session.to_string();
+    let branch = fixture.broker().store().session(session).unwrap().branch;
+    let run = || fixture.run(&["advance", "--session", &id, "--json"]);
+
+    let scratch = worktree.join("scratch.txt");
+    std::fs::write(&scratch, "uncommitted\n").unwrap();
+    let refused = run();
+    assert_eq!(
+        refused.status.code(),
+        Some(aethyme_broker::exit_status::REFUSED)
+    );
+    let blocked: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(blocked["state"], "blocked");
+    assert!(
+        blocked["next_action"]
+            .as_str()
+            .unwrap()
+            .ends_with("status --short")
+    );
+    assert_eq!(fixture.remote_branch(&branch), None);
+
+    std::fs::remove_file(scratch).unwrap();
+    let published = json(&run());
+    let head = git_output(&worktree, &["rev-parse", "HEAD"]);
+    assert_eq!(published["schema"], "aethyme.broker-advance/v1");
+    assert_eq!(published["state"], "published");
+    assert_eq!(published["pushed_head"], head);
+    assert_eq!(
+        published["next_action"],
+        format!("aethyme broker submit --session {id}")
+    );
+    assert_eq!(
+        fixture.remote_branch(&branch).as_deref(),
+        Some(head.as_str())
+    );
+
+    let operation_count = fixture.session_push_operations().len();
+    let already_current = json(&run());
+    assert_eq!(already_current["state"], "ready");
+    assert_eq!(fixture.session_push_operations().len(), operation_count);
+}
+
+#[test]
+fn advance_routes_a_non_publishing_repository_to_validation() {
+    let fixture = Fixture::new();
+    fixture.authorize(false);
+    let (session, _) = fixture.session_with_commit();
+    let id = session.to_string();
+    let report = json(&fixture.run(&["advance", "--session", &id, "--json"]));
+    assert_eq!(report["state"], "ready");
+    assert_eq!(
+        report["next_action"],
+        format!("aethyme broker submit --session {id}")
+    );
+    assert!(fixture.session_push_operations().is_empty());
+}
+
 /// A session push names one exact branch through a configured remote, so it
 /// holds only that branch's lane and still updates the branch's tracking ref
 /// (which the unpushed-commit count reads). A configured `core.sshCommand`

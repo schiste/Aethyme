@@ -3295,3 +3295,17 @@ After the closed-session lap, a second lap (cursor meta key `checkout_retirement
 Progress field `strip` of `checkout_retirement.progress` carries `last_checkouts_examined`, `last_checkouts_stripped`, `last_directories_stripped`, `last_refused` (by code), `last_phase_ms` (`discover`, `prove`, `move`), `backlog` (`folders`, `closed_folders`, `closed_with_regenerable`, `observed_at_ms`: counts from one `lstat` per folder and per top-level catalogued name, no byte walk), `bytes_freed_total`, and `days` (UTC day number to `sessions_created`, `sessions_closed`, `checkouts_retired`, `cleaned_leftovers_retired`, `checkouts_stripped`, `directories_stripped`, `bytes_freed`, 14 days kept). `TrashDrainReport` gains `stripped_bytes` and `stripped_entries_removed`. The host state directory gains `storage-ledger-checkouts/` (classified as coordination), one atomically written `<sha256 of the repository root>.json` per repository holding its root and those counts, shown as the `checkouts` class of `aethyme storage status --json` (`folders`, `closed_folders`, `closed_with_regenerable`, `bytes_freed_by_strip`, `sessions_created_today`, `checkouts_retired_today`, `repositories`, `why_not`; absent until a run wrote it). `broker status` gains the advice `storage.closed-checkouts-backlog` (notice) at 50 or more closed-session folders. New spans `checkout_strip_pass`, `checkout_strip_discover`, `checkout_strip_prove`, `checkout_strip_move`, `checkout_strip_backlog`, `checkout_strip_at_finish`, `checkout_strip_under_pressure`; counters `checkout_strip_directory_trashed`, `checkout_strip_checkouts_stripped`, `checkout_strip_at_finish_stripped`, `checkout_strip_refused_<code>`, `checkout_retirement_inspection_retried`. Consumers must tolerate the new fields.
 
 Covered by `broker/strip.rs` and `broker/retire.rs` tests.
+
+### Broker advance
+
+`broker advance --json` reports `aethyme.broker-advance/v1`, including
+the stage reached, preparation state, published head or pull request when
+confirmed, and one `next_action`. Exit 5 marks an ambiguous write with
+an `operation_id` for read-only inspection before reconciliation. The
+transition does not replay remote writes. The existing push coordinator can
+re-evaluate one proven pre-write remote tip race.
+
+Command metrics record `advance_broker_open`, `advance_state_validation`,
+`advance_preparation_status`, `advance_prepare`, `advance_commit_state`,
+and `advance_publish` when those phases run. Existing child spans still
+record the preparation and push work within those phases.
