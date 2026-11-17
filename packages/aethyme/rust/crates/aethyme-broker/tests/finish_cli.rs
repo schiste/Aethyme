@@ -478,7 +478,8 @@ fn finish_preserves_discovery_errors_before_closing_the_session() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("git rev-parse --show-toplevel did not finish within 1s"),
+        stderr.contains("git rev-parse timed out after")
+            && stderr.contains("outer command deadline"),
         "{stderr}"
     );
     assert!(

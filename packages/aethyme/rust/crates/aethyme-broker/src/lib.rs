@@ -397,8 +397,8 @@ pub use gc::{
 };
 pub use git::enable_repository_identity_memory;
 pub use git::{
-    CherrySide, CommitShape, GitError, GitRepo, LoggedCommit, MergeSimulation, RemoteDefaultBranch,
-    UncommittedSummary,
+    CherrySide, CommitShape, GitError, GitRepo, GitTimeoutDetail, GitTimeoutSource, LoggedCommit,
+    MergeSimulation, RemoteDefaultBranch, UncommittedSummary,
 };
 pub use github_target::{
     GithubApiTargetEvidence, GithubTargetError, ResolvedGithubTarget, resolve_github_target,
