@@ -3296,6 +3296,20 @@ Progress field `strip` of `checkout_retirement.progress` carries `last_checkouts
 
 Covered by `broker/strip.rs` and `broker/retire.rs` tests.
 
+### Broker advance
+
+`broker advance --json` reports `aethyme.broker-advance/v1`, including
+the stage reached, preparation state, published head or pull request when
+confirmed, and one `next_action`. Exit 5 marks an ambiguous write with
+an `operation_id` for read-only inspection before reconciliation. The
+transition does not replay remote writes. The existing push coordinator can
+re-evaluate one proven pre-write remote tip race.
+
+Command metrics record `advance_broker_open`, `advance_state_validation`,
+`advance_preparation_status`, `advance_prepare`, `advance_commit_state`,
+and `advance_publish` when those phases run. Existing child spans still
+record the preparation and push work within those phases.
+
 ### Broker command attribution
 
 Command metric JSONL rows may carry a numeric `session_id`, a classified
