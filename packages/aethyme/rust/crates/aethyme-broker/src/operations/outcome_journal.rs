@@ -559,8 +559,18 @@ impl Broker {
                 remove_journal(path);
                 ReplayResult::Discarded
             }
-            Ok(OperationSettlement::Mismatch(_) | OperationSettlement::Missing) => {
-                refuse_journal(path, &format!("operation {id} changed while replaying"));
+            Ok(OperationSettlement::Mismatch(changed)) => {
+                refuse_journal(
+                    path,
+                    &format!(
+                        "operation {id} changed while replaying (now session {})",
+                        changed.session_id
+                    ),
+                );
+                ReplayResult::Refused
+            }
+            Ok(OperationSettlement::Missing) => {
+                refuse_journal(path, &format!("operation {id} disappeared while replaying"));
                 ReplayResult::Refused
             }
             Err(error) => {
