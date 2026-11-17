@@ -4,6 +4,29 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.115] - 2026-11-17
+
+### Added
+
+- Checkouts of closed sessions are retired as soon as the session closes. A retirement lane walks closed sessions once per run and keeps a checkout only for a hard reason: a held lease, a running gate or unresolved operation, a process using it, an open session on the same path, or an in-progress merge, rebase, cherry-pick, revert or bisect. A clean checkout whose work is in Git is retired directly; otherwise the existing verified recovery archive is written first. An automatic close retires a clean checkout inline (#1738).
+- A retired checkout is renamed into a broker-marked trash directory inside the broker's own worktree pool, its Git registration is removed from the repository side, and one host-wide deleter removes recorded trash entries. The deleter never waits on memory pressure, keeps a floor under load, and runs unpaced when the volume is below its headroom. Checkouts outside a broker pool keep the existing Git removal path (#1738).
+- Commits reachable only from a retired worktree's own history are pinned under `refs/aethyme/retired/`. A pin expires when the default branch or a remote-tracking ref holds the commit, or after `recovery_archive_days` (#1738).
+- `start --reuse` on a retired checkout recreates it from the session branch, or points to the archive when leftovers were saved (#1738).
+- `aethyme transcripts` (opt-in): archives closed agent transcripts to reclaim disk. With `[transcripts] archive = true` (or `aethyme transcripts enable`), a transcript older than `archive_after_days` (3; `archive_after_days_claude` 14), open in no process, with no live agent for it and with every linked broker session closed and its checkout gone, is compressed with zstd, verified against the original by hash, moved, and only then removed. Codex transcripts go to `archived_sessions/<name>.jsonl.zst`, which Codex unarchives and resumes natively; Claude Code transcripts go under Aethyme's host state. Commands: `status`, `list`, `archive --dry-run|--apply`, `restore`, `enable`, `disable` (#1740).
+- `broker status --json` advice: `cleanup.retire-archive-too-large`, `cleanup.retire-operation-in-progress`, `cleanup.retirement-stalled`, `cleanup.trash-unrecognized`, `cleanup.retired-pins`, `transcripts.linkage-degraded` (#1738, #1740).
+
+### Changed
+
+- The 24-hour grace no longer keeps a closed session's checkout directory: its work is in Git, in pinned refs or in a verified archive. The close note says the checkout was retired and how to continue (#1738).
+- The older automatic removal and compaction lanes skip sessions the retirement lane owns, and their removals pass through the same pre-move checks (#1738).
+- New dependency: `zstd` (#1740).
+
+### Known issues
+
+- Checkout retirement and transcript archiving have been validated on Linux CI only before this release.
+- A checkout with ignored content outside the regenerable catalog that the archive plan refuses is still kept.
+- Pool directories with no session record are not swept.
+
 ## [0.8.114] - 2026-11-17
 
 ### Added
