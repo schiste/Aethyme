@@ -56,6 +56,19 @@ pub(crate) const CHECKOUT_RETIREMENT_IN_PROGRESS_KEY: &str =
 /// Meta key: remembered keeps (JSON: session id to key, reason, time and
 /// attempts), so a kept checkout is not re-planned every lap.
 pub(crate) const CHECKOUT_RETIREMENT_KEEPS_KEY: &str = "checkout_retirement.keeps";
+/// Meta key: sessions whose checkout the broker confirmed moved into the
+/// trash (JSON array), kept after the entry is deleted until the session is
+/// recorded as cleaned: the tombstone that lets a lost cleaned record be
+/// reconciled.
+pub(crate) const CHECKOUT_RETIREMENT_TRASHED_SESSIONS_KEY: &str =
+    "checkout_retirement.trashed_sessions";
+/// Meta key: the last pin `prune_retired_pins` checked (its cursor).
+const CHECKOUT_RETIREMENT_PIN_CURSOR_KEY: &str = "checkout_retirement.pin_cursor";
+/// Pins checked for containment per run, at most.
+#[cfg(not(test))]
+const RETIRED_PIN_CHECKS_PER_RUN: usize = 64;
+#[cfg(test)]
+const RETIRED_PIN_CHECKS_PER_RUN: usize = 2;
 /// The largest recovery archive retirement writes on its own.
 pub(crate) const RETIRE_ARCHIVE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// Closed sessions read per page.
@@ -278,6 +291,9 @@ pub(crate) struct CheckoutRetirementProgress {
     /// Refs under `refs/aethyme/retired/` still pinning reflog-only commits.
     #[serde(default)]
     pub retired_pins: usize,
+    /// Pending trash entries over a day old nothing but `gc apply` confirms.
+    #[serde(default)]
+    pub stale_pending_trash_entries: Vec<String>,
 }
 
 /// Run Git in `dir`, bounded by the general Git limit, and return stdout.
@@ -404,7 +420,113 @@ impl Broker {
             "confirm a checkout trash entry",
             self.record_checkout_trash_row(&trashed.trash_dir, &trashed.entry, trashed.row),
         );
+        self.mark_session_in_set(
+            CHECKOUT_RETIREMENT_TRASHED_SESSIONS_KEY,
+            trashed.row.session_id,
+            true,
+        );
         self.request_checkout_retirement_run();
+    }
+
+    /// Whether the broker proved it moved `session_id`'s checkout into the
+    /// trash: a confirmed row, or the tombstone left after its deletion.
+    fn checkout_proven_trashed(&self, session_id: i64) -> bool {
+        self.checkout_trash_rows()
+            .values()
+            .flat_map(|entries| entries.values())
+            .any(|row| row.session_id == session_id && !row.pending)
+            || self
+                .meta_json::<std::collections::BTreeSet<i64>>(
+                    CHECKOUT_RETIREMENT_TRASHED_SESSIONS_KEY,
+                )
+                .contains(&session_id)
+    }
+
+    /// Record `session_id` as cleaned after its checkout went into the trash;
+    /// a failure leaves the tombstone, so the next run reconciles it.
+    fn record_trashed_session_cleaned(&mut self, session_id: i64) -> bool {
+        match self.mark_removed_checkout_sessions_cleaned(&[session_id], session_id) {
+            Ok(()) => {
+                self.mark_session_in_set(
+                    CHECKOUT_RETIREMENT_TRASHED_SESSIONS_KEY,
+                    session_id,
+                    false,
+                );
+                true
+            }
+            Err(error) => {
+                crate::warn_unrecorded::<(), _>(
+                    "record a retired checkout's session as cleaned",
+                    Err(error),
+                );
+                false
+            }
+        }
+    }
+
+    /// Confirm pending trash rows nothing else can confirm (their creator's
+    /// start time was unreadable) once they are a day old, when the entry
+    /// still has its recorded identity and no open session uses the
+    /// session's path: the explicit `gc apply` path. Returns how many.
+    pub(crate) fn confirm_stale_pending_trash_rows(&self) -> usize {
+        let now = crate::clock::epoch_ms();
+        let mut eligible = Vec::new();
+        for (dir, entries) in self.checkout_trash_rows() {
+            let Some(pool) = dir.parent().map(Path::to_path_buf) else {
+                continue;
+            };
+            for (name, row) in entries {
+                if !crate::checkout_trash::stale_unconfirmable(&name, &row, now)
+                    || !crate::checkout_trash::entry_matches(&pool, &name, &row)
+                {
+                    continue;
+                }
+                let Ok(session) = self.store_ref().session(row.session_id) else {
+                    continue;
+                };
+                let open_elsewhere = self
+                    .store_ref()
+                    .other_open_session_at_path(row.session_id, &session.worktree_path)
+                    .unwrap_or(true);
+                if session.cleanup_state == crate::SessionCleanupState::Open || open_elsewhere {
+                    continue;
+                }
+                eligible.push((dir.clone(), name, row));
+            }
+        }
+        if eligible.is_empty() {
+            return 0;
+        }
+        let applied = self.update_meta_json(
+            CHECKOUT_RETIREMENT_TRASH_ROWS_KEY,
+            |rows: &mut crate::checkout_trash::TrashRows| {
+                for (dir, name, row) in &eligible {
+                    if let Some(stored) =
+                        rows.get_mut(dir).and_then(|entries| entries.get_mut(name))
+                        && stored.pending
+                        && (stored.device, stored.inode) == (row.device, row.inode)
+                    {
+                        stored.pending = false;
+                    }
+                }
+            },
+        );
+        match applied {
+            Ok(()) => {
+                for (_, _, row) in &eligible {
+                    self.mark_session_in_set(
+                        CHECKOUT_RETIREMENT_TRASHED_SESSIONS_KEY,
+                        row.session_id,
+                        true,
+                    );
+                }
+                eligible.len()
+            }
+            Err(error) => {
+                crate::warn_unrecorded::<(), _>("confirm stale trash entries", Err(error));
+                0
+            }
+        }
     }
 
     /// Whether a trash row names `session_id`.
@@ -612,9 +734,12 @@ impl Broker {
     }
 
     /// Expire `refs/aethyme/retired/<session>/<commit>` pins: a pin goes once
-    /// its commit is contained in another ref (the default branch included),
-    /// or once its session has been cleaned for `recovery_archive_days` (0
-    /// keeps pins forever); never otherwise. Returns the pins left.
+    /// its commit is contained in a delivery target (the default branch or
+    /// its remote-tracking ref) or another remote-tracking ref, which a
+    /// session branch or scratch ref deleted later cannot undo; or once its
+    /// session has been cleaned for `recovery_archive_days` (0 keeps pins
+    /// forever). Never otherwise. At most `RETIRED_PIN_CHECKS_PER_RUN` pins
+    /// are checked per run, from a cursor. Returns the pins left.
     pub(crate) fn prune_retired_pins(&self) -> Result<usize, String> {
         let root = self.main_root().to_path_buf();
         let listing = run_git_text(
@@ -625,21 +750,54 @@ impl Broker {
                 "refs/aethyme/retired/",
             ],
         )?;
+        let pins = listing
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .map(|(refname, commit)| (refname.to_string(), commit.to_string()))
+            .collect::<Vec<_>>();
+        if pins.is_empty() {
+            return Ok(0);
+        }
+        let mut targets = vec!["refs/remotes/".to_string()];
+        if let Some((upstream_ref, _)) = self.repo_handle().upstream_default()
+            && let Some((_, branch)) = upstream_ref
+                .trim_start_matches("refs/remotes/")
+                .split_once('/')
+        {
+            targets.push(format!("refs/heads/{branch}"));
+        }
         let days = crate::load_retention_policy(&root)
             .map(|policy| policy.recovery_archive_days)
             .unwrap_or(30);
         let now = crate::clock::epoch_ms();
-        let mut remaining = 0;
-        for line in listing.lines() {
-            let Some((refname, commit)) = line.split_once(' ') else {
-                continue;
-            };
-            let contained = run_git_text(
-                &root,
-                &["for-each-ref", "--contains", commit, "--format=%(refname)"],
-            )?
-            .lines()
-            .any(|other| !other.starts_with("refs/aethyme/retired/"));
+        let cursor = self
+            .store_ref()
+            .meta_get(CHECKOUT_RETIREMENT_PIN_CURSOR_KEY)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let start = pins
+            .iter()
+            .position(|(refname, _)| refname.as_str() > cursor.as_str())
+            .unwrap_or(0);
+        let mut removed = 0;
+        let mut last = cursor.clone();
+        for (refname, commit) in pins
+            .iter()
+            .cycle()
+            .skip(start)
+            .take(RETIRED_PIN_CHECKS_PER_RUN.min(pins.len()))
+        {
+            last.clone_from(refname);
+            let mut args = vec![
+                "for-each-ref",
+                "--count=1",
+                "--contains",
+                commit.as_str(),
+                "--format=%(refname)",
+            ];
+            args.extend(targets.iter().map(String::as_str));
+            let contained = !run_git_text(&root, &args)?.trim().is_empty();
             let session_cleaned_long_ago = days > 0
                 && refname
                     .strip_prefix("refs/aethyme/retired/")
@@ -654,15 +812,19 @@ impl Broker {
                     });
             if contained || session_cleaned_long_ago {
                 run_git_text(&root, &["update-ref", "-d", refname, commit])?;
+                removed += 1;
                 crate::phase_telemetry::add(
                     "checkout_retirement_pins_expired",
                     std::time::Duration::ZERO,
                 );
-            } else {
-                remaining += 1;
             }
         }
-        Ok(remaining)
+        crate::warn_unrecorded(
+            "advance the retired-pin cursor",
+            self.store_ref()
+                .meta_set(CHECKOUT_RETIREMENT_PIN_CURSOR_KEY, &last),
+        );
+        Ok(pins.len() - removed)
     }
 
     /// Take the evidence one retirement run shares: the open sessions'
@@ -921,7 +1083,9 @@ impl Broker {
                     }));
                 }
             }
-            self.mark_removed_checkout_sessions_cleaned(&[session_id], session_id)?;
+            // The checkout is in the trash either way; a failed record is
+            // reconciled by the next run from the tombstone.
+            self.record_trashed_session_cleaned(session_id);
             return Ok(RetireOutcome::RetiredClean);
         }
         let bytes = plan
@@ -988,8 +1152,9 @@ impl Broker {
                         // lost: record it now. Any other missing checkout
                         // is the missing-checkout lane's, which proves the
                         // absence first.
-                        if self.checkout_in_trash(session.id) {
-                            self.mark_removed_checkout_sessions_cleaned(&[session.id], session.id)?;
+                        if self.checkout_proven_trashed(session.id)
+                            && self.record_trashed_session_cleaned(session.id)
+                        {
                             report.reconciled_trashed += 1;
                             crate::phase_telemetry::add(
                                 "checkout_retirement_reconciled_trashed",
@@ -1054,6 +1219,7 @@ impl Broker {
             reported_trash_entries: report.trash.reported.clone(),
             unrecognized_trash_entries: report.trash.unrecognized_names.clone(),
             retired_pins,
+            stale_pending_trash_entries: report.trash.stale_pending.clone(),
         };
         crate::warn_unrecorded(
             "record checkout retirement progress",
@@ -1917,7 +2083,15 @@ mod tests {
                 .any(|advice| advice.id == "cleanup.retired-pins")
         );
 
-        git(&root, &["branch", "keeps-it", &lost]);
+        // Another local branch (a session's, deleted later) is not enough.
+        git(&root, &["branch", "keeps-it-for-now", &lost]);
+        assert_eq!(broker.prune_retired_pins().unwrap(), 1);
+        assert!(git_status(&root, &["rev-parse", "--verify", &pin]));
+        // A remote-tracking ref holds it: the pin expires.
+        git(
+            &root,
+            &["update-ref", "refs/remotes/origin/keeps-it", &lost],
+        );
         assert_eq!(broker.prune_retired_pins().unwrap(), 0);
         assert!(!git_status(&root, &["rev-parse", "--verify", &pin]));
     }
@@ -1937,5 +2111,100 @@ mod tests {
         assert!(archives(&broker, session.id).is_empty());
         let report = run(&mut broker);
         assert_eq!(report.retired_archived, 1, "the lane archives it");
+    }
+
+    /// Pins are checked a bounded number per run, from a cursor: every pin
+    /// is reached across runs.
+    #[test]
+    fn retired_pins_are_checked_in_bounded_batches() {
+        let (_owner, _storage, broker) = fixture();
+        let root = broker.main_root().to_path_buf();
+        let base = git(&root, &["rev-parse", "origin/main"]).trim().to_string();
+        for session in [901, 902, 903] {
+            git(
+                &root,
+                &[
+                    "update-ref",
+                    &format!("refs/aethyme/retired/{session}/{base}"),
+                    &base,
+                ],
+            );
+        }
+        assert_eq!(
+            broker.prune_retired_pins().unwrap(),
+            1,
+            "two checked this run"
+        );
+        assert_eq!(
+            broker.prune_retired_pins().unwrap(),
+            0,
+            "the cursor reaches the third"
+        );
+    }
+
+    /// A pending row nothing could confirm (its mover's start time unknown)
+    /// is confirmed by the explicit gc path once a day old, when its entry
+    /// still matches and no open session uses the path; then it is drained.
+    #[test]
+    fn gc_confirms_a_stale_unconfirmable_trash_row() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "unconfirmable", |_| {});
+        let pool = worktree.parent().unwrap().to_path_buf();
+        let common = broker.main_git_common_dir().unwrap();
+        let repo = crate::git::GitRepo::discover(broker.main_root()).unwrap();
+        let mut pending = None;
+        let trashed = crate::checkout_trash::move_worktree_to_trash(
+            &repo,
+            &common,
+            &pool,
+            &worktree,
+            session.id,
+            &mut |_, _, row| {
+                pending = Some(row);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let mut row = pending.unwrap();
+        row.creator_started_ms = 0;
+        let old = format!("0000000000001-{}-1-1", session.id);
+        std::fs::rename(trashed.path(), trashed.trash_dir.join(&old)).unwrap();
+        broker
+            .record_checkout_trash_row(&trashed.trash_dir, &old, row)
+            .unwrap();
+
+        let report = broker.drain_checkout_trash(Instant::now() + Duration::from_secs(600));
+        assert_eq!(report.stale_pending, vec![old.clone()], "{report:?}");
+        assert_eq!(report.entries_removed, 0);
+
+        assert_eq!(broker.confirm_stale_pending_trash_rows(), 1);
+        let report = broker.drain_checkout_trash(Instant::now() + Duration::from_secs(600));
+        assert_eq!(report.entries_removed, 1, "{report:?}");
+    }
+
+    /// A session whose cleaned record was lost after its checkout was
+    /// trashed and drained is reconciled from the tombstone.
+    #[test]
+    fn a_lost_cleaned_record_is_reconciled_after_the_drain() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "tombstone", |_| {});
+        let first = run(&mut broker);
+        assert_eq!(first.retired_clean, 1, "{first:#?}");
+        assert!(!worktree.exists());
+        assert!(broker.checkout_trash_rows().is_empty(), "drained");
+        // The cleaned record is lost, as a database error would leave it.
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE sessions SET cleanup_state = 'closed', cleanup_completed_at = NULL WHERE id = ?1",
+                [session.id],
+            )
+            .unwrap();
+        broker.mark_session_in_set(CHECKOUT_RETIREMENT_TRASHED_SESSIONS_KEY, session.id, true);
+
+        let second = run(&mut broker);
+        assert_eq!(second.reconciled_trashed, 1, "{second:#?}");
+        assert!(is_cleaned(&broker, session.id));
     }
 }

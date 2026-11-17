@@ -334,6 +334,37 @@ fn remove_trash_if_empty(trash: &TrashDir) {
     }
 }
 
+/// After this long, a pending row whose creator's start time was unreadable
+/// is reported: nothing confirms it on its own.
+pub(crate) const STALE_PENDING_AFTER_MS: i64 = 24 * 3_600_000;
+
+/// When the entry `name` was created (its leading epoch milliseconds).
+pub(crate) fn entry_created_ms(name: &str) -> Option<i64> {
+    name.split('-').next()?.parse().ok()
+}
+
+/// Whether a pending row can never be confirmed by the deleter (its
+/// creator's start time is unknown) and is older than a day.
+pub(crate) fn stale_unconfirmable(name: &str, row: &TrashRow, now_ms: i64) -> bool {
+    row.pending
+        && row.creator_started_ms <= 0
+        && entry_created_ms(name)
+            .is_some_and(|created| now_ms.saturating_sub(created) > STALE_PENDING_AFTER_MS)
+}
+
+/// Whether the entry `name` in the trash of `pool` is a real directory with
+/// the identity `row` recorded.
+pub(crate) fn entry_matches(pool: &Path, name: &str, row: &TrashRow) -> bool {
+    let Ok(trash) = open_trash(pool) else {
+        return false;
+    };
+    fstatat_nofollow(trash.trash.as_raw_fd(), name).is_ok_and(|stat| {
+        #[allow(clippy::unnecessary_cast)]
+        let identity = (stat.st_dev as u64, stat.st_ino as u64);
+        is_directory(&stat) && identity == (row.device, row.inode)
+    })
+}
+
 /// Whether `name` has the shape of an entry the broker names:
 /// `<13-digit ms>-<session>-<pid>-<nonce>`, all decimal.
 pub(crate) fn is_broker_entry_name(name: &str) -> bool {
@@ -725,8 +756,11 @@ pub(crate) struct TrashDrainReport {
     pub(crate) reported: Vec<String>,
     /// Names in a trash the broker did not record (left alone).
     pub(crate) unrecognized: usize,
-    /// The first of those names, with their trash directory.
+    /// The first of those names (entry names only).
     pub(crate) unrecognized_names: Vec<String>,
+    /// Pending entries older than a day whose creator cannot be identified,
+    /// so only an explicit `gc apply` can confirm them (entry names only).
+    pub(crate) stale_pending: Vec<String>,
     /// Trash directories that failed verification (left alone).
     pub(crate) invalid_trash_dirs: usize,
     pub(crate) pace: Option<DeleterPace>,
@@ -817,6 +851,11 @@ pub(crate) fn drain_trash(
                         dropped.push(name.clone());
                     }
                     continue;
+                }
+                if stale_unconfirmable(name, row, crate::clock::epoch_ms())
+                    && report.stale_pending.len() < 20
+                {
+                    report.stale_pending.push(name.clone());
                 }
                 if !creator_gone(row, table.as_ref()) {
                     continue;
@@ -1392,6 +1431,30 @@ mod tests {
         assert_eq!(report.entries_removed, 0, "{report:?}");
         assert!(mismatched.path().join("base.txt").exists());
         assert!(rows.is_empty(), "the unmatched row is dropped");
+    }
+
+    /// A pending row whose creator cannot be identified is reported by name
+    /// once it is a day old, and left alone.
+    #[test]
+    fn an_unconfirmable_pending_row_is_reported_after_a_day() {
+        let fixture = Fixture::new();
+        let (trashed, mut row) = move_unconfirmed(&fixture, "one");
+        row.creator_started_ms = 0;
+        let old = "0000000000001-3-1-1".to_string();
+        std::fs::rename(trashed.path(), trashed.trash_dir.join(&old)).unwrap();
+        let mut rows = TrashRows::new();
+        rows.entry(trashed.trash_dir.clone())
+            .or_default()
+            .insert(old.clone(), row);
+        let report = drain_trash(
+            &mut rows,
+            Instant::now() + Duration::from_secs(600),
+            DeleterPace::Unpaced,
+        );
+        assert_eq!(report.stale_pending, vec![old.clone()]);
+        assert_eq!(report.entries_removed, 0);
+        assert!(trashed.trash_dir.join(&old).join("base.txt").exists());
+        assert!(entry_matches(&fixture.pool, &old, &row));
     }
 
     /// The rename never replaces an existing destination, so a failed move

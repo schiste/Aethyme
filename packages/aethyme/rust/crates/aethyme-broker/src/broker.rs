@@ -3023,18 +3023,29 @@ fn push_checkout_retirement_advice(
             commands: vec!["git for-each-ref refs/aethyme/retired/".into()],
         });
     }
-    if !progress.unrecognized_trash_entries.is_empty() {
+    if !progress.unrecognized_trash_entries.is_empty()
+        || !progress.stale_pending_trash_entries.is_empty()
+    {
+        let mut evidence = progress
+            .unrecognized_trash_entries
+            .iter()
+            .map(|name| format!("unrecorded: {name}"))
+            .collect::<Vec<_>>();
+        evidence.extend(progress.stale_pending_trash_entries.iter().map(|name| {
+            format!("unconfirmed for over a day (confirm with `aethyme broker gc apply`): {name}")
+        }));
         view.advice.push(StatusAdvice {
             id: "cleanup.trash-unrecognized",
             severity: StatusAdviceSeverity::Notice,
-            reason: "the checkout trash holds entries the broker did not record; they are left alone (names only)",
+            reason: "the checkout trash holds entries the broker did not record, or recorded but could never confirm; both are left alone (names only)",
             summary: format!(
-                "{} unrecognized checkout trash entr(y/ies)",
-                progress.unrecognized_trash_entries.len()
+                "{} unrecorded and {} unconfirmed checkout trash entr(y/ies)",
+                progress.unrecognized_trash_entries.len(),
+                progress.stale_pending_trash_entries.len()
             ),
             session_id: None,
             queue_entry_id: None,
-            evidence: progress.unrecognized_trash_entries.clone(),
+            evidence,
             commands: Vec::new(),
         });
     }

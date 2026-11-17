@@ -7069,6 +7069,10 @@ impl Broker {
         exclude_orphans: bool,
     ) -> Result<GcApplyReport, BrokerOpError> {
         let planning_deadline = (!full_scan).then(|| Instant::now() + MANUAL_GC_PLAN_BUDGET);
+        // The explicit apply confirms checkout trash entries nothing else
+        // can (their mover's start time was unreadable), when they still
+        // match their recorded identity and no open session uses the path.
+        self.confirm_stale_pending_trash_rows();
         // The operator's `gc apply` waits for a holder; every other apply
         // (a broker open resuming a confirmed journal) fails fast.
         self.gc_apply_with_scope(
