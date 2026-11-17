@@ -2085,7 +2085,11 @@ fn finish_error_context(
         UsageError::Exit { message, code } => (message, Some(code)),
         other => return other,
     };
-    if !message.contains("did not finish within") {
+    let timed_out = message.contains("did not finish within")
+        || (message.contains("git ")
+            && (message.contains(" timed out after ")
+                || message.contains(" was not started: the command's deadline")));
+    if !timed_out {
         let next = match state {
             Some(state) if !state.is_closed() => format!(
                 "session {session} is still {} and nothing was closed; inspect \
@@ -2820,5 +2824,24 @@ mod finish_error_context_tests {
         assert_eq!(code, 7);
         assert!(message.contains("finish timed out after 1s"));
         assert!(message.contains("finish --session 42 --timeout 2"));
+    }
+
+    #[test]
+    fn the_enriched_git_timeout_wording_still_gets_bounded_retry_guidance() {
+        for text in [
+            "git rev-parse timed out after 1.0 s (limit 1.0 s, outer command deadline) in a/b",
+            "git status was not started: the command's deadline had no time left",
+        ] {
+            let result = finish_error_context(
+                UsageError::Message(text.into()),
+                1,
+                42,
+                Some(crate::SessionStatus::Active),
+            );
+            let UsageError::Message(message) = result else {
+                panic!("timeout errors must retain their class");
+            };
+            assert!(message.contains("finish timed out after 1s"), "{message}");
+        }
     }
 }
