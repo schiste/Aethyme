@@ -580,6 +580,61 @@ printed), `remote_write_outcome_unknown`, and for a
 provider killed at its budget `remote_write_outcome_unknown_timeout` or
 `remote_write_failed_timeout`. Consumers must ignore names they do not know.
 
+## Compact status by default, session block and push plan (2026-11-17)
+
+**Changed default.** `aethyme broker status --json` now prints the compact
+document (`aethyme.broker-status-compact/v1`), not the full one. A reader that
+needs the full document (`agents[]`, `leases`, `queue`, `blockers`,
+`outstanding_advisories`, `cleanup_retention`, `capacity_removal`, top-level
+`deferred_checks` ...) must pass `--full` (or `--refresh`). Field names of both
+documents are unchanged; each now carries `form` (`"compact"` or `"full"`), and
+compact adds `hint`. `--compact` is still accepted and changes nothing; it,
+`--summary`, `--session` and `--since-revision` are refused beside `--full`.
+Compact JSON status is routine status: a read-only snapshot that writes no
+metric row unless `AETHYME_MEASURE_OUTPUT` is set. Every internal reader of the
+full fields (tests, the JSON-shape snapshot, generated agent docs, the agent
+hook's advisory pointer, finish's recovery hint, the owners drilldown) now
+names `--full`. The ignored `local_compatibility` old-binary test still runs
+`broker status --json` against a pinned pre-change binary, whose default is
+the full document.
+
+**Evidence cap.** In every form, an advice entry whose `evidence` array
+serializes to more than 8 KiB keeps its first items (at most 20, about 4 KiB)
+and gains `evidence_truncation` (`truncated: true`, `count`, `shown`,
+`omitted`, `evidence_bytes`, `cap_bytes`, `command`).
+`AETHYME_STATUS_EVIDENCE_CAP=off` disables the cap. `storage.over-budget` now
+names five unlanded recovery archives and one "and N more" line instead of one
+line per archive; `aethyme storage status --json` lists them all.
+
+**Session block.** `status --session <id> --json` adds `session` (`id`,
+`status`, `branch`, `worktree`, `head_oid`, `remote_oid`, `unpushed_commits`,
+`push_state_error`, `pr`, `pr_state`, `preparation`, `blockers`, `advice`,
+`next_action`). `pr` comes from the broker's pull-request watch only; its
+`mergeable`, `merge_state` and `required_checks` are null and listed in
+`unknown_fields`. Without a recorded watch, `pr` is null and `pr_state` is
+`"unknown"`. No network call is made on this path.
+
+**Push plan and report.** `broker push --session <id> --plan [--json]` pushes
+nothing, writes no metric row or outcome event, reads the remote branch once
+and prints `remote`, `destination_ref`, `proposed_sha`, `remote_sha_last_known`,
+`remote_sha_recorded`, `remote_sha_tracking`, `remote_sha_observed`,
+`remote_observed`, optional `remote_read_error`, `mode` (`fast_forward`,
+`lease` + `lease_expected_sha`, `up_to_date`, `would_refuse` + `refusal`),
+`commits_to_push`, `pushed: false` and `command`. The push report adds
+`pre_push_remote_oid`, `pre_push_remote_observed` and `pushed_refs[]`
+(`destination_ref`, `proposed_sha`).
+
+**Telemetry.** Full status rows in `.aethyme/logs/command-metrics.jsonl` add
+`status_form`, `status_json`, `status_session_flag`,
+`status_evidence_truncated` and `caller_hint` (the parent process's executable
+name, at most 64 characters of `[A-Za-z0-9._+-]`; never arguments or paths).
+Compact `phase_timings_ms` gains `session_block`.
+
+Covered by `aethyme-broker/tests/status_compact_cli.rs`,
+`aethyme-broker/tests/session_push_cli.rs`, the `cli::status_extras` and
+`cli::telemetry` unit tests, `storage_ledger` tests, and the `aethyme-cli`
+help and JSON-shape snapshots.
+
 ## Push finalization and review-on-push reads (2026-11-13)
 
 `broker push` reports `duplicate_work` exactly as before, but derives liveness
