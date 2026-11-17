@@ -565,6 +565,54 @@ fn auto_cleanup_lap_range<T>(
     start..end
 }
 
+/// `[cleanup] abandoned_operation_after_hours`: a merge, rebase, cherry-pick,
+/// revert or bisect left in progress in a closed session's checkout longer
+/// than this is archived (state, index and changed files) and the checkout
+/// retired.
+pub(crate) const ABANDONED_OPERATION_CONFIG_KEY: &str = "abandoned_operation_after_hours";
+/// The default of [`ABANDONED_OPERATION_CONFIG_KEY`].
+pub(crate) const DEFAULT_ABANDONED_OPERATION_AFTER_HOURS: i64 = 24;
+const MAX_ABANDONED_OPERATION_AFTER_HOURS: i64 = 24 * 365;
+
+/// Parse [`ABANDONED_OPERATION_CONFIG_KEY`]; absent is the default.
+pub(crate) fn parse_abandoned_operation_after_hours(
+    value: Option<&toml::Value>,
+) -> Result<i64, String> {
+    match value {
+        None => Ok(DEFAULT_ABANDONED_OPERATION_AFTER_HOURS),
+        Some(toml::Value::Integer(hours))
+            if (1..=MAX_ABANDONED_OPERATION_AFTER_HOURS).contains(hours) =>
+        {
+            Ok(*hours)
+        }
+        Some(_) => Err(format!(
+            "[cleanup] {ABANDONED_OPERATION_CONFIG_KEY} must be a whole number of hours between 1 and {MAX_ABANDONED_OPERATION_AFTER_HOURS}"
+        )),
+    }
+}
+
+/// [`ABANDONED_OPERATION_CONFIG_KEY`] of the primary checkout's config, in
+/// milliseconds. An unreadable or invalid value keeps the default (the
+/// cleanup policy loader reports it).
+pub(crate) fn abandoned_operation_after_ms(main_root: &Path) -> i64 {
+    let hours = (|| -> Result<i64, String> {
+        let Some((path, text)) =
+            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
+                .map_err(|error| error.to_string())?
+        else {
+            return parse_abandoned_operation_after_hours(None);
+        };
+        let root: toml::Value = toml::from_str(&text)
+            .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+        parse_abandoned_operation_after_hours(
+            root.get("cleanup")
+                .and_then(|cleanup| cleanup.get(ABANDONED_OPERATION_CONFIG_KEY)),
+        )
+    })()
+    .unwrap_or(DEFAULT_ABANDONED_OPERATION_AFTER_HOURS);
+    hours.saturating_mul(3_600_000)
+}
+
 /// `[cleanup]` in `.aethyme/config.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoCleanupPolicy {
@@ -662,6 +710,10 @@ impl AutoCleanupPolicy {
                     }
                 }
                 "unattended_unlinks_per_second" => {} // Parsed by gc::unattended_pacing.
+                ABANDONED_OPERATION_CONFIG_KEY => {
+                    // Read by the checkout retirement lane; validated here.
+                    parse_abandoned_operation_after_hours(Some(value))?;
+                }
                 other => return Err(format!("[cleanup] has no key {other:?}")),
             }
         }

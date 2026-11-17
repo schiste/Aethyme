@@ -84,8 +84,15 @@ pub(crate) const RETIRE_STALLED_RUNS: u32 = 3;
 const RETIRE_KEEP_BACKOFF_MS: [i64; 3] = [3_600_000, 6 * 3_600_000, 24 * 3_600_000];
 /// Remembered keeps at most; the oldest go first.
 const RETIRE_KEEPS_MAX: usize = 4_096;
-/// The longest the fresh process-use observation before a rename may take.
+/// The longest one process-use observation may take: the run's single one,
+/// or the fresh one a caller outside the lane takes before a rename.
 const RETIRE_PROCESS_USE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+/// An archive (written, read back, re-planned, then the checkout moved) is
+/// started only with at least this much of the lane's deadline left;
+/// otherwise the lap stops at that checkout and the next run starts with it.
+const RETIRE_ARCHIVE_MIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+/// Keep details are cut to this many bytes.
+const RETIRE_KEEP_DETAIL_MAX: usize = 400;
 /// Inline retirement after an automatic close runs only with at least this
 /// much of the caller's deadline left, and uses at most this much.
 const RETIRE_INLINE_MIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
@@ -96,6 +103,21 @@ thread_local! {
     /// thread: a refused trash move then keeps the checkout instead of
     /// falling back to a synchronous `git worktree remove`.
     static RETIREMENT_LANE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The open-file observation of the retirement run judging the checkout
+    /// on this thread: the rename reuses it instead of taking another.
+    static RUN_PROCESS_USE: std::cell::RefCell<Option<std::rc::Rc<crate::reclaim::OpenFileSnapshot>>> =
+        const { std::cell::RefCell::new(None) };
+    /// The session whose abandoned operation state was just archived: its
+    /// move into the trash does not refuse for that state.
+    static OPERATION_STATE_ARCHIVED: std::cell::Cell<Option<i64>> =
+        const { std::cell::Cell::new(None) };
+    /// Live sessions' resolved checkout paths, by session id and recorded
+    /// path, while the lane runs on this thread: each live-checkout check of
+    /// the lane resolves only sessions it has not seen (a new session, or one
+    /// whose recorded path changed) instead of every live path again.
+    static LANE_LIVE_PATHS: std::cell::RefCell<
+        Option<std::collections::HashMap<(i64, String), crate::auto_cleanup::ResolvedWorktreePath>>,
+    > = const { std::cell::RefCell::new(None) };
 }
 
 /// Whether the retirement lane runs on this thread.
@@ -104,18 +126,129 @@ pub(super) fn in_retirement_lane() -> bool {
 }
 
 /// Marks this thread as the retirement lane until dropped.
-struct RetirementLaneScope(bool);
+struct RetirementLaneScope {
+    previous: bool,
+    installed_live_paths: bool,
+    /// The lane archives unknown ignored directories file by file.
+    _ignored_directories: crate::cleanup_resolve::ArchiveIgnoredDirectoriesScope,
+}
 
 impl RetirementLaneScope {
     fn enter() -> Self {
-        Self(RETIREMENT_LANE.with(|cell| cell.replace(true)))
+        let previous = RETIREMENT_LANE.with(|cell| cell.replace(true));
+        let installed_live_paths = LANE_LIVE_PATHS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.is_none() {
+                *cache = Some(std::collections::HashMap::new());
+                true
+            } else {
+                false
+            }
+        });
+        Self {
+            previous,
+            installed_live_paths,
+            _ignored_directories: crate::cleanup_resolve::ArchiveIgnoredDirectoriesScope::enter(),
+        }
     }
 }
 
 impl Drop for RetirementLaneScope {
     fn drop(&mut self) {
-        RETIREMENT_LANE.with(|cell| cell.set(self.0));
+        RETIREMENT_LANE.with(|cell| cell.set(self.previous));
+        if self.installed_live_paths {
+            LANE_LIVE_PATHS.with(|cache| *cache.borrow_mut() = None);
+        }
     }
+}
+
+/// Resolve the checkout paths of `sessions`, in order, by `deadline`
+/// (`None` past it). Inside the retirement lane a path this run already
+/// resolved for the same session and recorded path is reused, so the
+/// repeated live-checkout checks of one archive cost a database read
+/// instead of canonicalizing every live checkout again; outside the lane
+/// every path is resolved.
+pub(super) fn resolve_live_paths_for_lane(
+    sessions: &[Session],
+    deadline: Option<Instant>,
+) -> Option<Vec<crate::auto_cleanup::ResolvedWorktreePath>> {
+    let cached = LANE_LIVE_PATHS.with(|cache| cache.borrow().is_some());
+    if !cached {
+        return crate::auto_cleanup::resolve_live_worktree_paths(sessions, deadline);
+    }
+    LANE_LIVE_PATHS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let cache = cache.as_mut()?;
+        let mut reused = 0_u32;
+        for session in sessions {
+            match cache.entry((session.id, session.worktree_path.clone())) {
+                std::collections::hash_map::Entry::Occupied(_) => reused += 1,
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        return None;
+                    }
+                    slot.insert(crate::auto_cleanup::ResolvedWorktreePath::resolve(
+                        Path::new(&session.worktree_path),
+                    ));
+                }
+            }
+        }
+        if reused > 0 {
+            crate::phase_telemetry::add(
+                "checkout_retirement_live_paths_reused",
+                std::time::Duration::ZERO,
+            );
+        }
+        sessions
+            .iter()
+            .map(|session| {
+                cache
+                    .get(&(session.id, session.worktree_path.clone()))
+                    .cloned()
+            })
+            .collect()
+    })
+}
+
+/// Shares the run's open-file observation with the rename until dropped.
+struct RunProcessUseScope(Option<std::rc::Rc<crate::reclaim::OpenFileSnapshot>>);
+
+impl RunProcessUseScope {
+    fn enter(snapshot: std::rc::Rc<crate::reclaim::OpenFileSnapshot>) -> Self {
+        Self(RUN_PROCESS_USE.with(|cell| cell.replace(Some(snapshot))))
+    }
+}
+
+impl Drop for RunProcessUseScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        RUN_PROCESS_USE.with(|cell| *cell.borrow_mut() = previous);
+    }
+}
+
+/// Lets `session_id`'s move into the trash pass its archived operation
+/// state until dropped.
+struct OperationStateArchivedScope(Option<i64>);
+
+impl OperationStateArchivedScope {
+    fn enter(session_id: i64) -> Self {
+        Self(OPERATION_STATE_ARCHIVED.with(|cell| cell.replace(Some(session_id))))
+    }
+}
+
+impl Drop for OperationStateArchivedScope {
+    fn drop(&mut self) {
+        OPERATION_STATE_ARCHIVED.with(|cell| cell.set(self.0));
+    }
+}
+
+/// `text` cut to [`RETIRE_KEEP_DETAIL_MAX`] bytes on a character boundary.
+fn bounded_detail(text: &str) -> String {
+    let mut end = text.len().min(RETIRE_KEEP_DETAIL_MAX);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 #[cfg(test)]
@@ -154,6 +287,26 @@ fn retire_archive_max_bytes() -> u64 {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Test seam: runs after an operation archive is written, before the
+    /// sources are re-checked and the checkout moves.
+    pub(super) static BEFORE_OPERATION_MOVE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_before_operation_move() {
+    BEFORE_OPERATION_MOVE.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_before_operation_move() {}
+
+#[cfg(test)]
 fn run_before_retire_claim() {
     BEFORE_RETIRE_CLAIM.with(|hook| {
         if let Some(hook) = hook.borrow_mut().as_mut() {
@@ -172,6 +325,10 @@ pub(crate) enum RetireOutcome {
     RetiredClean,
     /// Archived, verified, then moved into the trash.
     RetiredArchived { bytes: u64 },
+    /// A closed session's long-abandoned merge, rebase, cherry-pick, revert
+    /// or bisect: its operation state, index and changed files archived and
+    /// verified, its commits pinned, then moved into the trash.
+    RetiredOperationArchived { bytes: u64 },
     /// Kept for now; the code names the precondition (counter
     /// `checkout_retirement_kept_<code>`).
     Kept(&'static str),
@@ -182,8 +339,15 @@ impl RetireOutcome {
         match self {
             Self::RetiredClean => "checkout_retirement_retired_clean",
             Self::RetiredArchived { .. } => "checkout_retirement_retired_archived",
+            Self::RetiredOperationArchived { .. } => {
+                "checkout_retirement_retired_operation_archived"
+            }
             Self::Kept(code) => kept_counter(code),
         }
+    }
+
+    fn retired(self) -> bool {
+        !matches!(self, Self::Kept(_))
     }
 }
 
@@ -217,6 +381,10 @@ fn kept_counter(code: &'static str) -> &'static str {
         "archive_cleanup_failed" => "checkout_retirement_kept_archive_cleanup_failed",
         "deadline" => "checkout_retirement_kept_deadline",
         "deferred_to_lane" => "checkout_retirement_kept_deferred_to_lane",
+        "archive_deferred" => "checkout_retirement_kept_archive_deferred",
+        "operation_archive_failed" => "checkout_retirement_kept_operation_archive_failed",
+        "holder_alive" => "checkout_retirement_kept_holder_alive",
+        "holder_unknown" => "checkout_retirement_kept_holder_unknown",
         _ => "checkout_retirement_kept_other",
     }
 }
@@ -232,6 +400,7 @@ fn remembered_keep(code: &str) -> bool {
             | "archive_too_large"
             | "archive_failed"
             | "archive_cleanup_failed"
+            | "operation_archive_failed"
             | "operation_in_progress"
             | "not_owned"
             | "adopted"
@@ -247,18 +416,64 @@ pub(crate) struct RetireKeep {
     pub reason: String,
     pub at_ms: i64,
     pub attempts: u32,
+    /// Why, in the words of the step that refused (a plan refusal, an
+    /// archive or cleanup error), bounded; shown per session by
+    /// `broker gc plan --json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Evidence one retirement run takes once and shares with every session it
-/// judges: no per-session re-reading of the live sessions.
+/// judges: no per-session re-reading of the live sessions, and one host-wide
+/// open-file observation for the whole run.
 pub(crate) struct RetireRun {
     open_paths: Vec<(i64, crate::auto_cleanup::ResolvedWorktreePath)>,
-    process_table: crate::session_holder::RecordedHolderProcessTable,
+    /// The run's open-file observation: `None` until the first checkout
+    /// reaches the process-use precondition, then reused for every later
+    /// one however old (the deleter re-checks before deleting anything).
+    /// An observation that could not be taken completely is the error.
+    process_use: Option<Result<std::rc::Rc<crate::reclaim::OpenFileSnapshot>, String>>,
     plan_context: Option<crate::cleanup_resolve::CleanupResolveRetirementContext>,
     deadline: Instant,
+    /// The lane's own deadline, which an archive may use past the sweep's.
+    archive_deadline: Instant,
     /// Inline retirement at close: only the clean, no-archive path; anything
     /// needing an archive is left to the lane.
     inline: bool,
+    /// An operation state older than this (ms) in a closed session's
+    /// checkout is abandoned: archived, then the checkout is retired.
+    abandoned_operation_after_ms: i64,
+    /// The refusing step's own words for the last keep, if it had any.
+    keep_detail: Option<String>,
+}
+
+impl RetireRun {
+    /// The run's open-file observation, taken on first use within
+    /// [`RETIRE_PROCESS_USE_BUDGET`] (never past the run's deadline).
+    fn process_use(&mut self) -> Result<std::rc::Rc<crate::reclaim::OpenFileSnapshot>, String> {
+        if self.process_use.is_none() {
+            let budget = self
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .min(RETIRE_PROCESS_USE_BUDGET);
+            let started = Instant::now();
+            let observed = crate::session_holder::retirement_run_process_use_snapshot(budget);
+            crate::phase_telemetry::add("checkout_retirement_process_snapshot", started.elapsed());
+            self.process_use = Some(match observed {
+                crate::reclaim::OpenFileSnapshot::Incomplete { reason, .. } => {
+                    crate::phase_telemetry::add(
+                        "checkout_retirement_process_snapshot_unavailable",
+                        std::time::Duration::ZERO,
+                    );
+                    Err(reason)
+                }
+                complete => Ok(std::rc::Rc::new(complete)),
+            });
+        }
+        self.process_use
+            .clone()
+            .unwrap_or_else(|| Err("process use was not observed".into()))
+    }
 }
 
 /// What one retirement run did.
@@ -267,7 +482,13 @@ pub(crate) struct CheckoutRetirementReport {
     pub examined: usize,
     pub retired_clean: usize,
     pub retired_archived: usize,
+    /// Checkouts retired through the abandoned-operation archive.
+    pub retired_operation_archived: usize,
     pub archive_bytes: u64,
+    /// The run's open-file observation could not be taken completely: the
+    /// lap stopped at the checkout that needed it, and the run is retried
+    /// soon instead of keeping every later checkout as unknown.
+    pub process_use_unavailable: bool,
     pub kept: std::collections::BTreeMap<String, usize>,
     /// Kept checkouts not judged again this run (remembered keep, same key).
     pub keep_memo_skips: usize,
@@ -294,6 +515,17 @@ pub(crate) struct CheckoutRetirementProgress {
     /// Pending trash entries over a day old nothing but `gc apply` confirms.
     #[serde(default)]
     pub stale_pending_trash_entries: Vec<String>,
+    /// Closed checkouts retired through the abandoned-operation archive,
+    /// across runs.
+    #[serde(default)]
+    pub abandoned_operations_archived: usize,
+    /// The last run could not take its open-file observation.
+    #[serde(default)]
+    pub process_use_unavailable: bool,
+    /// Trash entries the last deleter run left alone because a process
+    /// still used them.
+    #[serde(default)]
+    pub trash_entries_in_use: usize,
 }
 
 /// Run Git in `dir`, bounded by the general Git limit, and return stdout.
@@ -577,6 +809,22 @@ impl Broker {
         self.meta_json(CHECKOUT_RETIREMENT_KEEPS_KEY)
     }
 
+    /// The remembered keeps as `broker gc plan --json` shows them.
+    pub(crate) fn checkout_retirement_keep_report(
+        &self,
+    ) -> Vec<crate::retention::GcRetirementKeep> {
+        self.checkout_retirement_keeps()
+            .into_iter()
+            .map(|(session_id, keep)| crate::retention::GcRetirementKeep {
+                session_id,
+                reason: keep.reason,
+                detail: keep.detail,
+                kept_at_ms: keep.at_ms,
+                attempts: keep.attempts,
+            })
+            .collect()
+    }
+
     /// Whether the checkout retirement lane owns `session_id`: it kept it on
     /// purpose or moved its checkout into the trash. The old removal lanes
     /// skip such sessions, so old and new never act on one checkout.
@@ -598,8 +846,9 @@ impl Broker {
             && now_ms.saturating_sub(keep.at_ms) < backoff
     }
 
-    fn remember_keep(&self, session: &Session, reason: &'static str) {
+    fn remember_keep(&self, session: &Session, reason: &'static str, detail: Option<String>) {
         let key = checkout_keep_key(Path::new(&session.worktree_path));
+        let detail = detail.as_deref().map(bounded_detail);
         crate::warn_unrecorded(
             "remember a checkout retirement keep",
             self.update_meta_json(
@@ -617,6 +866,7 @@ impl Broker {
                                 reason: reason.to_string(),
                                 at_ms: crate::clock::epoch_ms(),
                                 attempts,
+                                detail: detail.clone(),
                             },
                         );
                         while keeps.len() > RETIRE_KEEPS_MAX {
@@ -653,9 +903,12 @@ impl Broker {
     /// What must hold immediately before a checkout is moved into the trash,
     /// checked under the caller's claims: no merge, rebase, cherry-pick,
     /// revert or bisect in progress and no unmerged index entry (that state
-    /// lives in the registration the move removes); a fresh process-use
-    /// observation shows nobody in the checkout; and commits only the
-    /// checkout's reflog reaches are pinned under
+    /// lives in the registration the move removes), unless the retirement
+    /// lane just archived exactly that state; no process in the checkout,
+    /// by the retirement run's observation when one runs on this thread
+    /// (a process arriving after it keeps a now-trashed directory, which the
+    /// deleter never deletes while it is in use), otherwise by a fresh one;
+    /// and commits only the checkout's reflog reaches are pinned under
     /// `refs/aethyme/retired/<session>/`.
     pub(super) fn prepare_checkout_for_trash(
         &self,
@@ -666,8 +919,11 @@ impl Broker {
             id: session.id,
             reason,
         };
+        let operation_archived =
+            OPERATION_STATE_ARCHIVED.with(std::cell::Cell::get) == Some(session.id);
         match GitRepo::discover(worktree).and_then(|checkout| checkout.operation_in_progress()) {
             Ok(None) => {}
+            Ok(Some(_)) if operation_archived => {}
             Ok(Some(_)) => {
                 self.mark_session_in_set(CHECKOUT_RETIREMENT_IN_PROGRESS_KEY, session.id, true);
                 return Err(refuse(
@@ -675,6 +931,20 @@ impl Broker {
                 ));
             }
             Err(error) => return Err(refuse(format!("cannot read the operation state: {error}"))),
+        }
+        if let Some(snapshot) = RUN_PROCESS_USE.with(|cell| cell.borrow().clone()) {
+            if let Some(reason) =
+                crate::reclaim::open_file_snapshot_blocker_for_worktree(&snapshot, worktree)
+            {
+                return Err(refuse(format!("a process uses the checkout: {reason}")));
+            }
+            crate::phase_telemetry::add(
+                "checkout_trash_run_process_use_reused",
+                std::time::Duration::ZERO,
+            );
+            return self
+                .pin_reflog_only_commits(session.id, worktree)
+                .map_err(|reason| refuse(format!("reflog commits could not be pinned: {reason}")));
         }
         let mut fresh = crate::session_holder::RecordedHolderProcessTable::default();
         match fresh.process_use_snapshot_for_retirement(
@@ -841,16 +1111,20 @@ impl Broker {
             .filter(|session| session.cleanup_state == crate::SessionCleanupState::Open)
             .collect::<Vec<_>>();
         let _span = crate::phase_telemetry::span("checkout_retirement_open_paths");
-        let Some(paths) = crate::auto_cleanup::resolve_live_worktree_paths(&open, Some(deadline))
-        else {
+        let Some(paths) = resolve_live_paths_for_lane(&open, Some(deadline)) else {
             return Ok(None);
         };
         Ok(Some(RetireRun {
             open_paths: open.iter().map(|session| session.id).zip(paths).collect(),
-            process_table: crate::session_holder::RecordedHolderProcessTable::default(),
+            process_use: None,
             plan_context: None,
             deadline,
+            archive_deadline: deadline,
             inline: false,
+            abandoned_operation_after_ms: crate::auto_cleanup::abandoned_operation_after_ms(
+                self.main_root(),
+            ),
+            keep_detail: None,
         }))
     }
 
@@ -863,16 +1137,19 @@ impl Broker {
     ) -> Result<RetireOutcome, BrokerOpError> {
         let _span = crate::phase_telemetry::span("checkout_retirement_judge");
         let _lane = RetirementLaneScope::enter();
+        run.keep_detail = None;
         let outcome = self.retire_closed_checkout_inner(session_id, run)?;
         crate::phase_telemetry::add(outcome.counter(), std::time::Duration::ZERO);
         match outcome {
             RetireOutcome::Kept(code) if remembered_keep(code) => {
                 if let Ok(session) = self.store_ref().session(session_id) {
-                    self.remember_keep(&session, code);
+                    self.remember_keep(&session, code, run.keep_detail.take());
                 }
             }
             RetireOutcome::Kept(_) => {}
-            RetireOutcome::RetiredClean | RetireOutcome::RetiredArchived { .. } => {
+            RetireOutcome::RetiredClean
+            | RetireOutcome::RetiredArchived { .. }
+            | RetireOutcome::RetiredOperationArchived { .. } => {
                 self.forget_keep(session_id);
                 self.mark_session_in_set(CHECKOUT_RETIREMENT_TOO_LARGE_KEY, session_id, false);
                 self.mark_session_in_set(CHECKOUT_RETIREMENT_IN_PROGRESS_KEY, session_id, false);
@@ -903,7 +1180,7 @@ impl Broker {
                 None => Ok(None),
             });
         match outcome {
-            Ok(Some(RetireOutcome::RetiredClean | RetireOutcome::RetiredArchived { .. })) => {
+            Ok(Some(outcome)) if outcome.retired() => {
                 crate::phase_telemetry::add(
                     "checkout_retirement_inline_retired",
                     std::time::Duration::ZERO,
@@ -925,7 +1202,7 @@ impl Broker {
         if Instant::now() >= run.deadline {
             return Ok(Kept("deadline"));
         }
-        let _git_deadline = crate::git::limit_git_until(run.deadline);
+        let git_deadline = crate::git::limit_git_until(run.deadline);
         let session = self.store_ref().session(session_id)?;
         if !session.status.is_closed()
             || session.cleanup_state != crate::SessionCleanupState::Closed
@@ -940,11 +1217,15 @@ impl Broker {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             _ => return Ok(Kept("checkout_missing")),
         }
-        match self.is_broker_owned_worktree_checked(&session, &worktree) {
-            Ok(true) => {}
-            Ok(false) => return Ok(Kept("not_owned")),
-            Err(_) => return Ok(Kept("ownership_unknown")),
+        {
+            let _phase = crate::phase_telemetry::span("checkout_retirement_phase_ownership");
+            match self.is_broker_owned_worktree_checked(&session, &worktree) {
+                Ok(true) => {}
+                Ok(false) => return Ok(Kept("not_owned")),
+                Err(_) => return Ok(Kept("ownership_unknown")),
+            }
         }
+        let sessions_phase = crate::phase_telemetry::span("checkout_retirement_phase_sessions");
         let candidate = crate::auto_cleanup::ResolvedWorktreePath::resolve(&worktree);
         for (open_id, open_path) in &run.open_paths {
             if *open_id == session_id {
@@ -984,44 +1265,98 @@ impl Broker {
             Ok(true) => return Ok(Kept("operation_unresolved")),
             Err(_) => return Ok(Kept("operations_unknown")),
         }
+        drop(sessions_phase);
         // A merge, rebase, cherry-pick, revert or bisect in progress, or
         // unmerged index entries: that state lives in the registration and
-        // is neither archived nor in Git. Asked again under the claim.
-        match GitRepo::discover(&worktree).and_then(|checkout| checkout.operation_in_progress()) {
-            Ok(None) => {}
-            Ok(Some(_)) => {
-                self.mark_session_in_set(CHECKOUT_RETIREMENT_IN_PROGRESS_KEY, session_id, true);
-                return Ok(Kept("operation_in_progress"));
+        // is neither archived nor in Git. A young one keeps the checkout
+        // (asked again under the claim); one older than the abandonment
+        // threshold in this closed session is archived below, state and all.
+        let abandoned_operation = {
+            let _phase = crate::phase_telemetry::span("checkout_retirement_phase_operation_state");
+            match GitRepo::discover(&worktree).and_then(|checkout| checkout.operation_in_progress())
+            {
+                Ok(None) => false,
+                Ok(Some(_)) => {
+                    // Abandoned only when nothing touched the operation (its
+                    // markers, index, reflog or any changed working file)
+                    // and the broker saw no activity for the session within
+                    // the threshold.
+                    let now_ms = crate::clock::epoch_ms();
+                    let last_activity_ms =
+                        session.last_activity_at.max(session.closed_at.unwrap_or(0));
+                    let abandoned = !run.inline
+                        && now_ms.saturating_sub(last_activity_ms)
+                            >= run.abandoned_operation_after_ms
+                        && super::retire_operation::operation_state_age_ms(&worktree)
+                            .is_some_and(|age| age >= run.abandoned_operation_after_ms);
+                    if !abandoned {
+                        self.mark_session_in_set(
+                            CHECKOUT_RETIREMENT_IN_PROGRESS_KEY,
+                            session_id,
+                            true,
+                        );
+                        return Ok(Kept("operation_in_progress"));
+                    }
+                    true
+                }
+                Err(_) => return Ok(Kept("operation_state_unknown")),
             }
-            Err(_) => return Ok(Kept("operation_state_unknown")),
-        }
-        match run
-            .process_table
-            .process_use_snapshot_for_retirement(Path::new("/"), Some(run.deadline))
-        {
-            Some(snapshot) => {
-                if crate::reclaim::open_file_snapshot_blocker_for_worktree(snapshot, &worktree)
-                    .is_some()
-                {
-                    return Ok(Kept("process_using_checkout"));
+        };
+        // One observation for the whole run. Could not look is not a
+        // verdict about this checkout: the caller stops the lap here and
+        // retries soon instead of keeping every later checkout as unknown.
+        let run_process_use = {
+            let _phase = crate::phase_telemetry::span("checkout_retirement_phase_process_use");
+            match run.process_use() {
+                Ok(snapshot) => snapshot,
+                Err(reason) => {
+                    run.keep_detail = Some(reason);
+                    return Ok(Kept("process_use_unknown"));
                 }
             }
-            None => return Ok(Kept("process_use_unknown")),
-        }
-        if run.plan_context.is_none() {
-            match self.cleanup_resolve_retirement_context_until(Some(run.deadline)) {
-                Ok(context) => run.plan_context = Some(context),
-                Err(_) => return Ok(Kept("plan_context_unavailable")),
-            }
-        }
-        let Some(context) = run.plan_context.as_ref() else {
-            return Ok(Kept("plan_context_unavailable"));
         };
-        let plan =
+        if crate::reclaim::open_file_snapshot_blocker_for_worktree(&run_process_use, &worktree)
+            .is_some()
+        {
+            return Ok(Kept("process_using_checkout"));
+        }
+        let _run_process_use = RunProcessUseScope::enter(run_process_use);
+        if abandoned_operation {
+            if run
+                .archive_deadline
+                .saturating_duration_since(Instant::now())
+                < RETIRE_ARCHIVE_MIN_BUDGET
+            {
+                return Ok(Kept("archive_deferred"));
+            }
+            drop(git_deadline);
+            let _archive_git_deadline = crate::git::limit_git_until(run.archive_deadline);
+            let _phase =
+                crate::phase_telemetry::span("checkout_retirement_phase_operation_archive");
+            return self.retire_abandoned_operation(&session, &worktree, run);
+        }
+        let plan = {
+            let _phase = crate::phase_telemetry::span("checkout_retirement_phase_plan");
+            if run.plan_context.is_none() {
+                match self.cleanup_resolve_retirement_context_until(Some(run.deadline)) {
+                    Ok(context) => run.plan_context = Some(context),
+                    Err(error) => {
+                        run.keep_detail = Some(error.to_string());
+                        return Ok(Kept("plan_context_unavailable"));
+                    }
+                }
+            }
+            let Some(context) = run.plan_context.as_ref() else {
+                return Ok(Kept("plan_context_unavailable"));
+            };
             match self.cleanup_resolve_retirement_plan_with_context(session_id, false, context) {
                 Ok(plan) => plan,
-                Err(_) => return Ok(Kept("plan_refused")),
-            };
+                Err(error) => {
+                    run.keep_detail = Some(error.to_string());
+                    return Ok(Kept("plan_refused"));
+                }
+            }
+        };
         let preserves = !plan.unlanded_commits.is_empty()
             || plan.staged_patch_bytes > 0
             || plan.unstaged_patch_bytes > 0
@@ -1069,10 +1404,15 @@ impl Broker {
             if !clean {
                 return Ok(Kept("changed"));
             }
-            match self.remove_checkout_through_trash(&current, &worktree, true) {
+            let moved = {
+                let _phase = crate::phase_telemetry::span("checkout_retirement_phase_move");
+                self.remove_checkout_through_trash(&current, &worktree, true)
+            };
+            match moved {
                 Ok(()) if !worktree.exists() => {}
                 Ok(()) => return Ok(Kept("trash_refused")),
-                Err(_) => {
+                Err(error) => {
+                    run.keep_detail = Some(error.to_string());
                     let in_progress = GitRepo::discover(&worktree)
                         .and_then(|checkout| checkout.operation_in_progress())
                         .is_ok_and(|state| state.is_some());
@@ -1097,16 +1437,181 @@ impl Broker {
             self.mark_session_in_set(CHECKOUT_RETIREMENT_TOO_LARGE_KEY, session_id, true);
             return Ok(Kept("archive_too_large"));
         }
+        // Too little of the lane's time left for an archive: the lap stops
+        // here and the next run (a minute later) starts with this checkout,
+        // instead of an archive that a deadline cuts off after it was
+        // written, every run.
+        if run
+            .archive_deadline
+            .saturating_duration_since(Instant::now())
+            < RETIRE_ARCHIVE_MIN_BUDGET
+        {
+            return Ok(Kept("archive_deferred"));
+        }
         let digest = plan.digest.clone();
+        drop(git_deadline);
+        let _archive_git_deadline = crate::git::limit_git_until(run.archive_deadline);
+        let _phase = crate::phase_telemetry::span("checkout_retirement_phase_archive");
         // The archive writer writes and reads back the archive, re-plans
         // under the lifecycle claim, and only then moves the checkout into
         // the trash (with the checks of `prepare_checkout_for_trash`); any
-        // failure keeps the checkout and the archive.
-        match self.cleanup_resolve_retirement_apply(session_id, &digest, false) {
+        // failure keeps the checkout and the archive. A failure the lane's
+        // deadline caused is retried next run (the verified archive is
+        // reused), not remembered for an hour.
+        let applied = self.cleanup_resolve_retirement_apply(session_id, &digest, false);
+        let out_of_time = Instant::now() >= run.archive_deadline;
+        match applied {
             Ok(outcome) if outcome.worktree_removed => Ok(RetireOutcome::RetiredArchived { bytes }),
-            Ok(_) => Ok(Kept("archive_cleanup_failed")),
-            Err(_) => Ok(Kept("archive_failed")),
+            Ok(outcome) => {
+                run.keep_detail = outcome.cleanup_error;
+                Ok(Kept(if out_of_time {
+                    "deadline"
+                } else {
+                    "archive_cleanup_failed"
+                }))
+            }
+            Err(error) => {
+                run.keep_detail = Some(error.to_string());
+                Ok(Kept(if out_of_time {
+                    "deadline"
+                } else {
+                    "archive_failed"
+                }))
+            }
         }
+    }
+
+    /// Retire the checkout of a closed session whose merge, rebase,
+    /// cherry-pick, revert or bisect was abandoned: archive the operation
+    /// state, the raw index, every changed or untracked file and the
+    /// protected ignored files, verified by reading them back; pin every
+    /// commit the state names; then move the checkout into the trash under
+    /// the lifecycle claim. Any failure keeps the checkout.
+    fn retire_abandoned_operation(
+        &mut self,
+        session: &Session,
+        worktree: &Path,
+        run: &mut RetireRun,
+    ) -> Result<RetireOutcome, BrokerOpError> {
+        use RetireOutcome::Kept;
+        // No live holder may be bound to the session: an agent that still
+        // holds it may come back to the operation.
+        let mut holders = crate::session_holder::RecordedHolderProcessTable::default();
+        match crate::session_holder::recorded_holder_liveness(
+            self.store_ref(),
+            session.id,
+            &mut holders,
+            true,
+        )
+        .liveness
+        {
+            crate::session_holder::RecordedHolderLiveness::Unbound
+            | crate::session_holder::RecordedHolderLiveness::Gone => {}
+            crate::session_holder::RecordedHolderLiveness::Alive => {
+                return Ok(Kept("holder_alive"));
+            }
+            crate::session_holder::RecordedHolderLiveness::Unknown => {
+                return Ok(Kept("holder_unknown"));
+            }
+        }
+        run_before_retire_claim();
+        let Some(_claim) = self.try_claim_worktree_lifecycle("retire")? else {
+            return Ok(Kept("lifecycle_busy"));
+        };
+        let current = self.store_ref().session(session.id)?;
+        if !current.status.is_closed()
+            || current.cleanup_state != crate::SessionCleanupState::Closed
+            || current.worktree_path != session.worktree_path
+        {
+            return Ok(Kept("changed"));
+        }
+        let policy = match crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root()) {
+            Ok(policy) => policy,
+            Err(error) => {
+                run.keep_detail = Some(error);
+                return Ok(Kept("operation_archive_failed"));
+            }
+        };
+        let archive_root = self.recovery_archive_root()?;
+        let archived = super::retire_operation::write_operation_archive(
+            &super::retire_operation::OperationArchiveRequest {
+                session_id: session.id,
+                branch: &current.branch,
+                task: current.task.as_deref(),
+                worktree,
+                archive_root: &archive_root,
+                policy: &policy,
+                max_bytes: retire_archive_max_bytes(),
+                deadline: run.archive_deadline,
+            },
+        );
+        let archived = match archived {
+            Ok(archived) => archived,
+            Err(super::retire_operation::OperationArchiveError::TooLarge(reason)) => {
+                run.keep_detail = Some(reason);
+                self.mark_session_in_set(CHECKOUT_RETIREMENT_TOO_LARGE_KEY, session.id, true);
+                return Ok(Kept("archive_too_large"));
+            }
+            Err(super::retire_operation::OperationArchiveError::Refused(reason)) => {
+                run.keep_detail = Some(reason);
+                return Ok(Kept(if Instant::now() >= run.archive_deadline {
+                    "deadline"
+                } else {
+                    "operation_archive_failed"
+                }));
+            }
+        };
+        for commit in &archived.commits {
+            if let Err(reason) = run_git_text(
+                self.main_root(),
+                &[
+                    "update-ref",
+                    &format!("refs/aethyme/retired/{}/{commit}", session.id),
+                    commit,
+                ],
+            ) {
+                run.keep_detail = Some(format!(
+                    "the operation's commits could not be pinned (archive {} kept): {reason}",
+                    archived.path.display()
+                ));
+                return Ok(Kept("operation_archive_failed"));
+            }
+        }
+        run_before_operation_move();
+        // Someone who worked in the checkout after the copy keeps it: an
+        // edit that reached only the trash would be deleted with it.
+        if let Err(reason) = super::retire_operation::sources_unchanged(&archived, worktree) {
+            run.keep_detail = Some(format!(
+                "{reason} (archive {} kept)",
+                archived.path.display()
+            ));
+            self.forget_keep(session.id);
+            return Ok(Kept("changed"));
+        }
+        let moved = {
+            let _phase = crate::phase_telemetry::span("checkout_retirement_phase_move");
+            let _archived_state = OperationStateArchivedScope::enter(session.id);
+            self.remove_checkout_through_trash(&current, worktree, true)
+        };
+        match moved {
+            Ok(()) if !worktree.exists() => {}
+            Ok(()) => return Ok(Kept("trash_refused")),
+            Err(error) => {
+                run.keep_detail = Some(format!(
+                    "{error} (archive {} kept)",
+                    archived.path.display()
+                ));
+                return Ok(Kept("trash_refused"));
+            }
+        }
+        crate::phase_telemetry::add(
+            "checkout_retirement_abandoned_operation_archived",
+            std::time::Duration::ZERO,
+        );
+        self.record_trashed_session_cleaned(session.id);
+        Ok(RetireOutcome::RetiredOperationArchived {
+            bytes: archived.bytes,
+        })
     }
 
     /// The worker lane: judge closed sessions that still have a checkout,
@@ -1122,6 +1627,7 @@ impl Broker {
         let sweep_deadline = started + deadline.saturating_duration_since(started) * 2 / 3;
         let mut report = CheckoutRetirementReport::default();
         if let Some(mut run) = self.begin_checkout_retirement_run(sweep_deadline)? {
+            run.archive_deadline = deadline;
             report.open_path_resolutions = 1;
             let mut cursor = self
                 .store_ref()
@@ -1146,6 +1652,7 @@ impl Broker {
                     if Instant::now() >= sweep_deadline {
                         break 'lap;
                     }
+                    let previous_cursor = cursor;
                     cursor = session.id;
                     if !Path::new(&session.worktree_path).exists() {
                         // Moved into the trash but the cleaned record was
@@ -1178,6 +1685,25 @@ impl Broker {
                             report.retired_archived += 1;
                             report.archive_bytes = report.archive_bytes.saturating_add(bytes);
                         }
+                        RetireOutcome::RetiredOperationArchived { bytes } => {
+                            report.retired_operation_archived += 1;
+                            report.archive_bytes = report.archive_bytes.saturating_add(bytes);
+                        }
+                        RetireOutcome::Kept(code)
+                            if code == "process_use_unknown"
+                                || (code == "archive_deferred" && report.examined > 1) =>
+                        {
+                            // Not a verdict about this checkout: the run
+                            // could not look, or has too little time left
+                            // for its archive. The next run, due soon,
+                            // starts with it. (An archive deferred as the
+                            // run's first judgement is passed over instead,
+                            // so a slow start can never wedge the lap.)
+                            *report.kept.entry(code.to_string()).or_default() += 1;
+                            report.process_use_unavailable |= code == "process_use_unknown";
+                            cursor = previous_cursor;
+                            break 'lap;
+                        }
                         RetireOutcome::Kept(code) => {
                             *report.kept.entry(code.to_string()).or_default() += 1;
                         }
@@ -1196,6 +1722,9 @@ impl Broker {
             );
         }
         report.trash = self.drain_checkout_trash(deadline);
+        if let Ok(root) = self.recovery_archive_root() {
+            super::retire_operation::sweep_stale_partials(&root);
+        }
         let retired_pins = match self.prune_retired_pins() {
             Ok(remaining) => remaining,
             Err(error) => {
@@ -1205,9 +1734,10 @@ impl Broker {
         };
         let kept = report.kept.values().sum::<usize>();
         let previous = self.checkout_retirement_progress();
-        let shrinking = report.retired_clean + report.retired_archived > 0
-            || report.trash.entries_removed > 0
-            || (report.trash.entries_pending == 0 && kept == 0);
+        let shrinking =
+            report.retired_clean + report.retired_archived + report.retired_operation_archived > 0
+                || report.trash.entries_removed > 0
+                || (report.trash.entries_pending == 0 && kept == 0);
         let progress = CheckoutRetirementProgress {
             trash_pending: report.trash.entries_pending,
             kept,
@@ -1220,6 +1750,12 @@ impl Broker {
             unrecognized_trash_entries: report.trash.unrecognized_names.clone(),
             retired_pins,
             stale_pending_trash_entries: report.trash.stale_pending.clone(),
+            abandoned_operations_archived: previous
+                .abandoned_operations_archived
+                .saturating_add(report.retired_operation_archived),
+            process_use_unavailable: report.process_use_unavailable
+                || report.trash.process_use_unknown,
+            trash_entries_in_use: report.trash.entries_in_use,
         };
         crate::warn_unrecorded(
             "record checkout retirement progress",
@@ -1772,6 +2308,27 @@ mod tests {
             Some(1),
             "open paths resolved once per run, not per page or session"
         );
+        let counts = recorder.totals().1;
+        assert_eq!(
+            counts.get("checkout_retirement_process_snapshot").copied(),
+            Some(1),
+            "one open-file observation for the whole run"
+        );
+        assert_eq!(
+            counts.get("checkout_trash_run_process_use_reused").copied(),
+            Some(5),
+            "no rename took another"
+        );
+        for phase in [
+            "checkout_retirement_phase_ownership",
+            "checkout_retirement_phase_sessions",
+            "checkout_retirement_phase_operation_state",
+            "checkout_retirement_phase_process_use",
+            "checkout_retirement_phase_plan",
+            "checkout_retirement_phase_move",
+        ] {
+            assert_eq!(counts.get(phase).copied(), Some(5), "{phase}");
+        }
         for (session, worktree) in backlog {
             assert!(!worktree.exists());
             assert!(is_cleaned(&broker, session.id));
@@ -1836,10 +2393,12 @@ mod tests {
         assert!(!is_cleaned(&broker, session.id));
     }
 
-    /// A process that starts using the checkout after the sweep's snapshot
-    /// keeps it: the observation is taken again right before the rename.
+    /// The run's one observation decides: a process arriving after it does
+    /// not cost a second system-wide observation before the rename. The
+    /// rename goes ahead (on Unix a process keeps a working directory that
+    /// moved), and the deleter is what never deletes an entry in use.
     #[test]
-    fn a_process_arriving_before_the_rename_keeps_the_checkout() {
+    fn a_process_arriving_after_the_run_observation_does_not_stop_the_rename() {
         let (_owner, _storage, mut broker) = fixture();
         let (session, worktree) = closed(&mut broker, "late process", |_| {});
         let used = std::fs::canonicalize(&worktree).unwrap();
@@ -1854,12 +2413,475 @@ mod tests {
                 }]),
             ));
         })));
-        let report = run(&mut broker);
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let report = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            run(&mut broker)
+        };
         set_hook(None);
 
-        assert_eq!(report.kept.get("trash_refused"), Some(&1), "{report:#?}");
-        assert!(worktree.join("base.txt").exists());
-        assert!(!is_cleaned(&broker, session.id));
+        assert_eq!(report.retired_clean, 1, "{report:#?}");
+        assert!(!worktree.exists());
+        assert!(is_cleaned(&broker, session.id));
+        let counts = recorder.totals().1;
+        assert_eq!(
+            counts.get("checkout_retirement_process_snapshot").copied(),
+            Some(1)
+        );
+        assert_eq!(
+            counts.get("checkout_trash_run_process_use_reused").copied(),
+            Some(1),
+            "the rename reused the run's observation"
+        );
+    }
+
+    /// The deleter leaves an entry alone while a process still has its
+    /// working directory inside, and deletes it once the process is gone.
+    #[test]
+    fn the_deleter_never_deletes_an_entry_a_process_still_uses() {
+        let (owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "still inside", |_| {});
+        let current = broker.store_ref().session(session.id).unwrap();
+        {
+            let _lane = super::RetirementLaneScope::enter();
+            broker
+                .remove_checkout_through_trash(&current, &worktree, true)
+                .unwrap();
+        }
+        let (trash_dir, entry) = broker
+            .checkout_trash_rows()
+            .into_iter()
+            .flat_map(|(dir, entries)| entries.into_keys().map(move |name| (dir.clone(), name)))
+            .next()
+            .unwrap();
+        let inside = std::fs::canonicalize(trash_dir.join(&entry)).unwrap();
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+                pid: std::process::id(),
+                command: "shell".into(),
+                descriptor: "cwd".into(),
+                file_type: Some("DIR".into()),
+                path: inside.clone(),
+            }]),
+        ));
+        let lock = owner.path().join(crate::checkout_trash::DELETER_LOCK_FILE);
+        let far = Instant::now() + Duration::from_secs(600);
+
+        let held = broker.drain_checkout_trash_with_lock(Some(&lock), far);
+        assert_eq!(
+            (
+                held.entries_removed,
+                held.entries_in_use,
+                held.entries_pending
+            ),
+            (0, 1, 1),
+            "{held:?}"
+        );
+        assert!(inside.exists());
+
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Incomplete {
+                reason: "lsof timed out".into(),
+                observed: Vec::new(),
+            },
+        ));
+        let unknown = broker.drain_checkout_trash_with_lock(Some(&lock), far);
+        assert!(unknown.process_use_unknown, "{unknown:?}");
+        assert_eq!(unknown.entries_removed, 0);
+        assert!(inside.exists());
+
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+        ));
+        let drained = broker.drain_checkout_trash_with_lock(Some(&lock), far);
+        assert_eq!(drained.entries_removed, 1, "{drained:?}");
+        assert!(!inside.exists());
+    }
+
+    /// An open-file observation the run cannot take completely is not a
+    /// verdict about any checkout: the lap stops where it needed it, keeps
+    /// nothing in memory, says so, and the next run retires it.
+    #[test]
+    fn an_unavailable_process_observation_stops_the_lap_and_retries() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (first, first_path) = closed(&mut broker, "first", |_| {});
+        let (second, second_path) = closed(&mut broker, "second", |_| {});
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Incomplete {
+                reason: "lsof exceeded its time limit".into(),
+                observed: Vec::new(),
+            },
+        ));
+
+        let stalled = run(&mut broker);
+
+        assert!(stalled.process_use_unavailable, "{stalled:#?}");
+        assert_eq!(
+            stalled.examined, 1,
+            "the lap stopped at the first: {stalled:#?}"
+        );
+        assert_eq!(stalled.kept.get("process_use_unknown"), Some(&1));
+        assert!(!stalled.lap_complete);
+        assert!(first_path.exists() && second_path.exists());
+        assert!(broker.checkout_retirement_keeps().is_empty());
+        assert!(
+            broker
+                .checkout_retirement_progress()
+                .process_use_unavailable
+        );
+
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+        ));
+        let resumed = run(&mut broker);
+        assert_eq!(resumed.retired_clean, 2, "{resumed:#?}");
+        assert!(is_cleaned(&broker, first.id) && is_cleaned(&broker, second.id));
+        assert!(
+            !broker
+                .checkout_retirement_progress()
+                .process_use_unavailable
+        );
+    }
+
+    /// What an abandoned-merge fixture left behind.
+    struct AbandonedMerge {
+        session: crate::Session,
+        worktree: PathBuf,
+        session_head: String,
+        staged_blob: String,
+    }
+
+    /// Set `path`'s modification time two days back.
+    fn two_days_old(path: &Path) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(48 * 3_600))
+            .unwrap();
+    }
+
+    /// A closed session left mid-merge: a conflicted file, an untracked
+    /// file, and a file staged then edited again (its staged version lives
+    /// only in the index). Every marker, the index, the reflog and the
+    /// changed files are two days old, and so is the session's activity.
+    fn abandoned_merge(broker: &mut crate::Broker) -> AbandonedMerge {
+        let root = broker.main_root().to_path_buf();
+        let mut session_head = String::new();
+        let mut staged_blob = String::new();
+        let (session, worktree) = closed(broker, "abandoned merge", |worktree| {
+            std::fs::write(worktree.join("base.txt"), "session side\n").unwrap();
+            git(worktree, &["commit", "-qam", "session side"]);
+            session_head = git(worktree, &["rev-parse", "HEAD"]).trim().to_string();
+            std::fs::write(root.join("base.txt"), "main side\n").unwrap();
+            git(&root, &["commit", "-qam", "main side"]);
+            assert!(
+                !git_status(worktree, &["merge", "main"]),
+                "the merge conflicts"
+            );
+            std::fs::write(worktree.join("scratch.txt"), "untracked notes\n").unwrap();
+            std::fs::write(worktree.join("extra.txt"), "staged version\n").unwrap();
+            git(worktree, &["add", "extra.txt"]);
+            staged_blob = git(worktree, &["rev-parse", ":extra.txt"])
+                .trim()
+                .to_string();
+            std::fs::write(worktree.join("extra.txt"), "edited after staging\n").unwrap();
+        });
+        let git_dir = crate::git::checked_worktree_git_dir(&worktree)
+            .unwrap()
+            .unwrap();
+        for path in [
+            git_dir.join("MERGE_HEAD"),
+            git_dir.join("index"),
+            git_dir.join("logs/HEAD"),
+            worktree.join("base.txt"),
+            worktree.join("scratch.txt"),
+            worktree.join("extra.txt"),
+        ] {
+            if path.exists() {
+                two_days_old(&path);
+            }
+        }
+        let old = crate::clock::epoch_ms() - 48 * 3_600_000;
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE sessions SET last_activity_at = ?1, closed_at = ?1 WHERE id = ?2",
+                rusqlite::params![old, session.id],
+            )
+            .unwrap();
+        AbandonedMerge {
+            session,
+            worktree,
+            session_head,
+            staged_blob,
+        }
+    }
+
+    /// The operation archives written for `session_id`.
+    fn operation_archive(broker: &crate::Broker, session_id: i64) -> Option<PathBuf> {
+        archives(broker, session_id).into_iter().find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("-operation-"))
+        })
+    }
+
+    /// A closed session's merge abandoned past the threshold is archived
+    /// (operation state, raw index, conflicted files, and a pack of every
+    /// object only the index held) and its checkout retired. After `git gc`
+    /// prunes everything unreachable, the archive restores every staged and
+    /// unmerged blob.
+    #[test]
+    fn an_abandoned_merge_is_archived_with_its_state_then_retired() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_owner, _storage, mut broker) = fixture();
+        let root = broker.main_root().to_path_buf();
+        let fixture = abandoned_merge(&mut broker);
+        let (session, worktree) = (&fixture.session, &fixture.worktree);
+
+        let report = run(&mut broker);
+
+        assert_eq!(report.retired_operation_archived, 1, "{report:#?}");
+        assert!(!worktree.exists());
+        assert!(is_cleaned(&broker, session.id));
+        let archive = operation_archive(&broker, session.id).expect("an operation archive");
+        assert!(archive.join("git-state/MERGE_HEAD").is_file());
+        assert!(archive.join("git-state/index").is_file());
+        assert!(
+            std::fs::read_to_string(archive.join("worktree/base.txt"))
+                .unwrap()
+                .contains("<<<<<<<"),
+            "the conflicted file is archived as it was"
+        );
+        assert_eq!(
+            std::fs::read_to_string(archive.join("worktree/extra.txt")).unwrap(),
+            "edited after staging\n"
+        );
+        assert!(archive.join("README.md").is_file());
+        assert!(archive.join("manifest.json").is_file());
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&archive), 0o700);
+        assert_eq!(
+            mode(archive.parent().unwrap()),
+            0o700,
+            "the archive root is private"
+        );
+        assert_eq!(mode(&archive.join("worktree/scratch.txt")), 0o600);
+        // The session's own commit is pinned.
+        git(
+            &root,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!(
+                    "refs/aethyme/retired/{}/{}",
+                    session.id, fixture.session_head
+                ),
+            ],
+        );
+        assert_eq!(
+            broker
+                .checkout_retirement_progress()
+                .abandoned_operations_archived,
+            1
+        );
+        assert!(
+            !broker
+                .checkout_retirement_in_progress()
+                .contains(&session.id)
+        );
+        let view = broker.status(crate::clock::epoch_ms()).unwrap();
+        assert!(
+            view.advice
+                .iter()
+                .any(|advice| advice.id == "cleanup.retire-abandoned-operations-archived")
+        );
+
+        // Nothing but the archive holds the staged version once Git prunes.
+        git(&root, &["reflog", "expire", "--expire=now", "--all"]);
+        git(&root, &["gc", "--prune=now", "-q"]);
+        assert!(
+            !git_status(&root, &["cat-file", "-e", &fixture.staged_blob]),
+            "pruned from the repository"
+        );
+        let pack_dir = root.join(".git/objects/pack");
+        for entry in std::fs::read_dir(archive.join("objects")).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_str().unwrap().to_string();
+            if name.ends_with(".pack") || name.ends_with(".idx") {
+                std::fs::copy(&path, pack_dir.join(&name)).unwrap();
+            }
+        }
+        assert!(git_status(&root, &["cat-file", "-e", &fixture.staged_blob]));
+        let mut listing = Command::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                listing.env_remove(key);
+            }
+        }
+        let output = listing
+            .env("GIT_INDEX_FILE", archive.join("git-state/index"))
+            .args(["ls-files", "--stage"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let entries = String::from_utf8(output.stdout).unwrap();
+        let stages = entries
+            .lines()
+            .map(|line| line.split_whitespace().nth(1).unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            stages.len() >= 4,
+            "three conflict stages and the staged file: {entries}"
+        );
+        for id in stages {
+            assert!(
+                git_status(&root, &["cat-file", "-e", &id]),
+                "{id} reads back"
+            );
+        }
+    }
+
+    /// A working file edited recently keeps the checkout, however old the
+    /// merge markers are: someone may be resolving the conflicts.
+    #[test]
+    fn a_recently_edited_working_file_keeps_an_old_merge() {
+        let (_owner, _storage, mut broker) = fixture();
+        let fixture = abandoned_merge(&mut broker);
+        std::fs::write(fixture.worktree.join("scratch.txt"), "still working\n").unwrap();
+
+        let report = run(&mut broker);
+
+        assert_eq!(
+            report.kept.get("operation_in_progress"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert!(fixture.worktree.join("scratch.txt").is_file());
+        assert!(operation_archive(&broker, fixture.session.id).is_none());
+    }
+
+    /// An edit between the copy and the move keeps the checkout (the edit
+    /// would otherwise reach only the trash) and forgets the keep.
+    #[test]
+    fn an_edit_between_the_copy_and_the_move_keeps_the_checkout() {
+        let (_owner, _storage, mut broker) = fixture();
+        let fixture = abandoned_merge(&mut broker);
+        let scratch = fixture.worktree.join("scratch.txt");
+        let edited = scratch.clone();
+        super::BEFORE_OPERATION_MOVE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(&edited, "edited after the copy\n").unwrap();
+            }));
+        });
+        let report = run(&mut broker);
+        super::BEFORE_OPERATION_MOVE.with(|hook| *hook.borrow_mut() = None);
+
+        assert_eq!(report.kept.get("changed"), Some(&1), "{report:#?}");
+        assert_eq!(
+            std::fs::read_to_string(&scratch).unwrap(),
+            "edited after the copy\n"
+        );
+        assert!(!is_cleaned(&broker, fixture.session.id));
+        assert!(
+            !broker
+                .checkout_retirement_keeps()
+                .contains_key(&fixture.session.id)
+        );
+    }
+
+    /// A partial operation archive older than a day whose creator is gone
+    /// is swept; a recent one and a finished archive are left alone, and
+    /// the storage ledger never reads either partial as an archive.
+    #[test]
+    fn stale_partial_operation_archives_are_swept_once_their_creator_is_gone() {
+        let root = tempfile::tempdir().unwrap();
+        let now = crate::clock::epoch_ms();
+        let gone_pid = i32::MAX;
+        let stale = root.path().join(format!(
+            ".partial-operation-7-{}-{gone_pid}-1-ab",
+            now - 48 * 3_600_000
+        ));
+        let fresh = root
+            .path()
+            .join(format!(".partial-operation-7-{now}-{gone_pid}-1-cd"));
+        let finished = root.path().join("7-operation-0123456789ab-ef");
+        for directory in [&stale, &fresh, &finished] {
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::write(directory.join("ids.txt"), "x\n").unwrap();
+        }
+
+        assert_eq!(
+            super::super::retire_operation::sweep_stale_partials(root.path()),
+            1
+        );
+        assert!(!stale.exists());
+        assert!(fresh.exists() && finished.exists());
+        assert!(crate::storage_ledger::is_partial_archive_name(
+            fresh.file_name().unwrap().to_str().unwrap()
+        ));
+        assert!(crate::storage_ledger::is_partial_archive_name(
+            "12.retirement-v6.partial"
+        ));
+        assert!(!crate::storage_ledger::is_partial_archive_name(
+            "7-operation-0123456789ab-ef"
+        ));
+    }
+
+    /// A plan refusal is remembered with the refusing step's own words,
+    /// which `broker gc plan --json` shows per session.
+    #[test]
+    fn a_plan_refusal_keeps_its_reason_for_the_gc_plan() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "nested repository", |worktree| {
+            let nested = worktree.join("nested");
+            std::fs::create_dir_all(&nested).unwrap();
+            git(&nested, &["init", "-q"]);
+        });
+
+        let report = run(&mut broker);
+
+        assert_eq!(report.kept.get("plan_refused"), Some(&1), "{report:#?}");
+        assert!(worktree.exists());
+        let keeps = broker.checkout_retirement_keep_report();
+        let keep = keeps
+            .iter()
+            .find(|keep| keep.session_id == session.id)
+            .expect("remembered");
+        assert_eq!(keep.reason, "plan_refused");
+        assert!(
+            keep.detail
+                .as_deref()
+                .is_some_and(|detail| !detail.trim().is_empty()),
+            "{keep:?}"
+        );
+    }
+
+    /// An ignored directory nothing catalogues as regenerable no longer
+    /// refuses the plan: its files are archived and the checkout retired.
+    #[test]
+    fn an_unknown_ignored_directory_is_archived_then_retired() {
+        let (_owner, _storage, mut broker) = fixture();
+        let root = broker.main_root().to_path_buf();
+        std::fs::create_dir_all(root.join(".git/info")).unwrap();
+        std::fs::write(root.join(".git/info/exclude"), "/tool-notes/\n").unwrap();
+        let (session, worktree) = closed(&mut broker, "ignored directory", |worktree| {
+            std::fs::create_dir_all(worktree.join("tool-notes/quality")).unwrap();
+            std::fs::write(worktree.join("tool-notes/quality/index.json"), "{}\n").unwrap();
+        });
+
+        let report = run(&mut broker);
+
+        assert_eq!(report.retired_archived, 1, "{report:#?}");
+        assert!(!worktree.exists());
+        let archive = archives(&broker, session.id).into_iter().next().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(archive.join("ignored/tool-notes/quality/index.json")).unwrap(),
+            "{}\n"
+        );
     }
 
     /// A worktree its user locked is kept, never removed synchronously by

@@ -2420,6 +2420,11 @@ fn run_cleanup_resolve(parsed: Parsed) -> Result<(), UsageError> {
         ));
     }
     let mut broker = open_cleanup_resolve_broker(parsed.read_only_snapshot)?;
+    // Pass the flag to both the plan and its `--confirm`: it is part of
+    // what the digest describes.
+    let _ignored_directories = parsed
+        .archive_ignored_directories
+        .then(crate::cleanup_resolve::ArchiveIgnoredDirectoriesScope::enter);
     if parsed.cleanup_batch || ids.len() > 1 {
         return run_cleanup_resolve_batch(&mut broker, &ids, &parsed);
     }
