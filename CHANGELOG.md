@@ -4,6 +4,27 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.114] - 2026-11-17
+
+### Added
+
+- `aethyme storage status [--json]`: a ledger of everything Aethyme stores on a host, per class and per root, with bytes, entries, budget, reclaimable bytes and free space. It reads saved measurements only and never walks the disk. `aethyme storage run` runs one pass in the foreground; `aethyme storage adopt <dir>` marks an extra directory as Aethyme storage (#1739).
+- Storage budgets, enforced by a low-priority background worker: recovery archives 4 GiB, gate cache 4 GiB per repository, symbol index 2 GiB, graph stores 2 GiB, tool caches 8 GiB, host state 16 GiB and host cache 12 GiB in total, and a 10 GiB free-space floor per volume. Override in `<host state>/storage.toml` (#1739).
+- `broker status --json` advice `storage.over-budget`, `storage.below-floor` and `storage.unclassified`, with class names and sizes only (#1739).
+
+### Changed
+
+- A gate cache over its budget now keeps only the most recently used entry per gate kind; an entry a gate holds is never removed, and its lease is held across the removal (#1739).
+- Leftover release and rollout directories expire after 14 days and generated test pools after 1 day. Anything Aethyme does not recognise by exact name is listed as `unclassified` and never deleted (#1739).
+- Recovery archives are never removed by age. One holding unlanded work is never removed; a landed one is removed only when the class is over budget and past its recorded minimum retention (#1739).
+- Every broker command does a constant-time storage check and starts the worker when a budget or floor is breached. `start` and `submit` refuse only when the volume they write to is below `hard_minimum_bytes` (2 GiB) after a 500 ms reclaim; the message names the setting and `AETHYME_STORAGE_LEDGER=0` (#1739).
+- `gc plan` uses a gate cache size measured within the last hour instead of walking it (#1739).
+
+### Known issues
+
+- Checkouts of closed sessions are still removed by the old lanes, which do not keep up on a busy repository; the replacement is in review.
+- The storage worker's macOS priority settings and the budget thresholds have not yet run on a busy macOS host.
+
 ## [0.8.113] - 2026-11-16
 
 ### Added
