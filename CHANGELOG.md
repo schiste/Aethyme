@@ -4,6 +4,28 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.117] - 2026-11-17
+
+### Changed
+
+- **Breaking:** `aethyme broker status --json` returns the compact document by default. The full document requires `--full` (or `--refresh`); `--compact` is still accepted and does nothing. Field names of both forms are unchanged; both gain a top-level `form`, and the compact form a `hint` naming `--full`. In the compact form advice is under `advice.categories[]` (`severity`, `commands`); `advice[]` exists only with `--full` or `--summary`. Upgrade note: a script or tool that parses the full status document must add `--full` (#1754).
+- A single advice entry's evidence is capped at 8 KiB in both forms, with `evidence_truncation` naming the count and the command that prints the rest. The storage advice names five archives and counts the others (#1754).
+- Every status call appends a command-metrics row with its form, output bytes, `--session` presence, per-section timings and the calling process's name (name only) (#1754).
+- Waiters for the repository lifecycle lock are served from a ticket queue, earliest deadline first; a waiter passed three times or for 20 seconds outranks every later arrival. Background lanes yield to waiting foreground commands for at most five attempts or 60 seconds, then queue from a detached worker only; maintenance running inside a foreground command never waits. The file lock still provides exclusion, so mixed versions stay safe (#1753).
+
+### Added
+
+- Standing authorizations, on by default: `[authorization] prepare_session_worktrees` and `disposable_test_environments` in `.aethyme/config.toml`. The generated agent instructions and `broker start` state that an agent may, in every session without asking again, run `aethyme broker submit prepare` in its own worktree (the declared pinned installs, no dependency or lockfile change) and create, use and drop local test databases and environments named for the session; never shared, staging or production data. `false` restores "ask the owner first". `start --json` gains `standing_authorizations`, and preparation reports `authorized_by_policy` (#1752).
+- `aethyme broker status --session <id> --json` adds a `session` block: branch, worktree, head, pushed commit, unpushed count, preparation state and `next_action` (#1754).
+- `aethyme broker push --session <id> --plan [--json]` shows the remote, destination ref, proposed commit, the remote commit last known and observed now, and the push mode, without pushing. The push report gains the observed pre-push commit and `pushed_refs` (#1754).
+- Lifecycle lock telemetry on every command, including timeouts: wait, hold, holder kind, queue position, passes and aging; background lanes record yields and promotions. A timeout names the holder's command kind, session and the queue length (#1753).
+
+### Known issues
+
+- `git worktree add` and the directory removal in `finish` still run under the repository-wide lifecycle lock, so long waits on a busy repository are bounded and measured, not removed.
+- Checkout retirement keeps most closed checkouts on a busy host when it cannot determine process use or finds an abandoned Git operation; a fix is in progress.
+- The pull-request fields of the `status --session` block are empty: the broker stores no merge state or check results locally.
+
 ## [0.8.116] - 2026-11-17
 
 0.8.115 was tagged but never published: its static Linux build failed to link. This release carries everything listed under 0.8.115 plus the changes below.
