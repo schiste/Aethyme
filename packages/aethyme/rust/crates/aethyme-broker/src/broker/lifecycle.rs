@@ -29,6 +29,38 @@ const CHECKOUT_CAPACITY_CLEANUP_BUDGET: std::time::Duration = std::time::Duratio
 /// nothing better is measured: the storage admission of a concurrent start
 /// subtracts it per live reservation.
 const IN_FLIGHT_CHECKOUT_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
+/// How long `broker start` below the storage reserve spends stripping closed
+/// checkouts and deleting what that moved into the trash before refusing.
+const STORAGE_PRESSURE_STRIP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The storage refusal of `broker start`, naming what the pressure strip did
+/// and how many closed checkouts still hold regenerable directories.
+fn storage_pressure_refusal(
+    refusal: BrokerOpError,
+    strip: &super::strip::CheckoutStripReport,
+    freed: u64,
+) -> BrokerOpError {
+    let note = format!(
+        "; {} closed checkout(s) held top-level regenerable directories before a strip pass moved {} director{} from {} of them into the trash and the deleter freed {freed} bytes (`aethyme storage status`)",
+        strip.backlog.closed_with_regenerable,
+        strip.directories_stripped,
+        if strip.directories_stripped == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        strip.checkouts_stripped,
+    );
+    match refusal {
+        BrokerOpError::WorktreeRootUnavailable { path, reason } => {
+            BrokerOpError::WorktreeRootUnavailable {
+                path,
+                reason: format!("{reason}{note}"),
+            }
+        }
+        other => other,
+    }
+}
 
 fn timed_start_phase<T>(
     phases: &mut std::collections::BTreeMap<String, u64>,
@@ -8058,12 +8090,51 @@ impl Broker {
                 });
             }
         }
-        let placement = timed_start_phase(&mut phase_timings_ms, "worktree_root", || {
+        let mut placement = timed_start_phase(&mut phase_timings_ms, "worktree_root", || {
             self.prepare_broker_worktree_root()
         })?;
-        timed_start_phase(&mut phase_timings_ms, "storage_admission", || {
+        let admission = timed_start_phase(&mut phase_timings_ms, "storage_admission", || {
             self.preflight_session_checkout_storage(&placement)
-        })?;
+        });
+        if let Err(refusal) = admission {
+            // Below the reserve: release the claim, strip regenerable
+            // directories out of closed checkouts (each checkout's renames
+            // under its own short claim, without yielding to queued
+            // waiters, since a user waits on this start) and let the deleter
+            // run unpaced outside any claim, within one bound; then take the
+            // claim again, prepare the root again and ask again. Still
+            // short, the refusal says what is left.
+            drop(lifecycle_claim);
+            let relief =
+                timed_start_phase(&mut phase_timings_ms, "storage_pressure_relief", || {
+                    let _foreground = crate::file_lock::ForegroundLifecycleTryClaim::enter();
+                    self.strip_closed_checkouts_under_pressure(STORAGE_PRESSURE_STRIP_BUDGET)
+                });
+            phase_timings_ms.insert("storage_pressure_strip".into(), relief.strip_ms);
+            phase_timings_ms.insert("storage_pressure_drain".into(), relief.drain_ms);
+            lifecycle_claim = timed_start_phase(
+                &mut phase_timings_ms,
+                "lifecycle_lock_wait_after_strip",
+                || self.claim_worktree_lifecycle(),
+            )?;
+            reserve_hold_started = std::time::Instant::now();
+            placement =
+                timed_start_phase(&mut phase_timings_ms, "worktree_root_after_strip", || {
+                    self.prepare_broker_worktree_root()
+                })?;
+            let readmission = timed_start_phase(
+                &mut phase_timings_ms,
+                "storage_admission_after_strip",
+                || self.preflight_session_checkout_storage(&placement),
+            );
+            if readmission.is_err() {
+                return Err(storage_pressure_refusal(
+                    refusal,
+                    &relief.report,
+                    relief.freed,
+                ));
+            }
+        }
         // Choose the unique branch and destination and reserve both. Nothing
         // after the reservation can fail while the wide claim is held, so the
         // reserved (empty) destination never outlives its reservation without

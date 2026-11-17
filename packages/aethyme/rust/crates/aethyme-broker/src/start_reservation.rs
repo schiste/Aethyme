@@ -410,9 +410,12 @@ fn reap_leftovers(
     Ok((directory_removed, branch_removed))
 }
 
-/// Live reservations, by record. A reader lock taken on a dead reservation is
-/// released at once; it never removes anything.
-fn live_records(main_root: &Path) -> Vec<ReservationRecord> {
+/// Live reservations: each one's slug (its file stem, which is also the
+/// destination folder's name) and record. A record can be missing for the
+/// instant between a start creating its file and writing it; the slug still
+/// names the folder. A reader lock taken on a dead reservation is released at
+/// once; it never removes anything.
+fn live_reservations(main_root: &Path) -> Vec<(String, Option<ReservationRecord>)> {
     let Some(directory) = existing_reservations_directory(main_root) else {
         return Vec::new();
     };
@@ -422,13 +425,14 @@ fn live_records(main_root: &Path) -> Vec<ReservationRecord> {
     let mut live = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path
+        let Some(slug) = path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_none_or(|name| !name.ends_with(RESERVATION_SUFFIX))
-        {
+            .and_then(|name| name.strip_suffix(RESERVATION_SUFFIX))
+            .map(str::to_owned)
+        else {
             continue;
-        }
+        };
         let Ok(file) = open_existing(&path) else {
             continue;
         };
@@ -438,7 +442,7 @@ fn live_records(main_root: &Path) -> Vec<ReservationRecord> {
                 // A dead reservation: release the probe at once.
                 file.unlock().ok();
             }
-            Err(_) => live.extend(record),
+            Err(_) => live.push((slug, record)),
         }
     }
     live
@@ -449,11 +453,21 @@ fn live_records(main_root: &Path) -> Vec<ReservationRecord> {
 /// exists and its lock is held (by any process, this one included). This is
 /// the stable helper every lane that retires, trashes, cleans, strips or
 /// removes a checkout consults under the lifecycle claim.
+///
+/// The file is `<primary checkout>/.aethyme/run/start-reservations/<slug>.lock`
+/// and the slug is the destination folder's name. A live reservation whose
+/// record is not written yet matches by that folder name.
 pub(crate) fn path_is_reserved(main_root: &Path, path: &Path) -> bool {
     let wanted = comparable(path);
-    live_records(main_root)
+    let folder = path.file_name().and_then(|name| name.to_str());
+    live_reservations(main_root)
         .iter()
-        .any(|record| record.worktree_path == path || comparable(&record.worktree_path) == wanted)
+        .any(|(slug, record)| match record {
+            Some(record) => {
+                record.worktree_path == path || comparable(&record.worktree_path) == wanted
+            }
+            None => folder == Some(slug.as_str()),
+        })
 }
 
 /// Refuse removing `path` while another start has it reserved; `Err` carries
@@ -479,9 +493,9 @@ pub(crate) fn refuse_if_start_in_progress(main_root: &Path, path: &Path) -> Resu
 /// session row yet (a start releases its reservation once its row is
 /// committed), so the checkout limit and the free-space reserve count them.
 pub(crate) fn live_reserved_paths(main_root: &Path) -> Vec<PathBuf> {
-    live_records(main_root)
+    live_reservations(main_root)
         .into_iter()
-        .map(|record| record.worktree_path)
+        .filter_map(|(_, record)| record.map(|record| record.worktree_path))
         .collect()
 }
 
