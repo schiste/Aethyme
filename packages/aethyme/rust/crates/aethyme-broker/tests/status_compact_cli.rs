@@ -249,7 +249,7 @@ fn compact_json_is_additive_and_legacy_json_shapes_are_unchanged() {
     assert!(compact.get("session").is_none());
 
     // Compact is the default JSON form; `--compact` changes nothing.
-    let default = json_status(fixture.path(), &["status", "--full", "--json"]);
+    let default = json_status(fixture.path(), &["status", "--json"]);
     assert_eq!(default["schema"], "aethyme.broker-status-compact/v1");
     assert_eq!(default["form"], "compact");
     assert!(default.get("agents").is_none());
