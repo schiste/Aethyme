@@ -2993,6 +2993,37 @@ fn push_checkout_retirement_advice(
     too_large: &std::collections::BTreeSet<i64>,
     in_progress: &std::collections::BTreeSet<i64>,
 ) {
+    let backlog = &progress.strip.backlog;
+    if backlog.closed_folders >= strip::CLOSED_CHECKOUT_BACKLOG_ADVICE_AT {
+        let mut evidence = vec![
+            format!(
+                "{} checkout folder(s) on disk, {} of them for closed or cleaned sessions; {} of those still hold a top-level regenerable directory",
+                backlog.folders, backlog.closed_folders, backlog.closed_with_regenerable
+            ),
+            format!(
+                "last strip pass: {} director(ies) from {} checkout(s); {} byte(s) freed by strip so far",
+                progress.strip.last_directories_stripped,
+                progress.strip.last_checkouts_stripped,
+                progress.strip.bytes_freed_total
+            ),
+        ];
+        if let Some(failure) = &progress.last_inspection_failure {
+            evidence.push(format!("last inspection retried: {failure}"));
+        }
+        view.advice.push(StatusAdvice {
+            id: "storage.closed-checkouts-backlog",
+            severity: StatusAdviceSeverity::Notice,
+            reason: "checkout folders of closed sessions are still on disk; the retirement lane strips their regenerable directories first and then retires what is left, oldest close first",
+            summary: format!(
+                "{} closed-session checkout folder(s) still on disk",
+                backlog.closed_folders
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence,
+            commands: vec!["aethyme storage status".into(), "aethyme broker gc plan".into()],
+        });
+    }
     if let Some(&first) = in_progress.first() {
         view.advice.push(StatusAdvice {
             id: "cleanup.retire-operation-in-progress",
@@ -3661,6 +3692,7 @@ mod owners;
 mod remote_heads;
 mod retire;
 mod retire_operation;
+mod strip;
 pub(crate) use leases::{
     AbandonedSessionCloseOutcome, AbandonmentKeepReason, LandedProof, LandedSessionDecline,
     long_proof_grant, validate_session_commit_args,

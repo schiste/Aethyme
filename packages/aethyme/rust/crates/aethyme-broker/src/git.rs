@@ -125,6 +125,66 @@ pub(crate) fn active_git_deadline() -> Option<Instant> {
     GIT_DEADLINE.with(std::cell::Cell::get)
 }
 
+thread_local! {
+    /// Worktree registrations listed once per run while a
+    /// [`WorktreeInventoryRunScope`] is active on this thread, by the
+    /// repository root that was asked. `git worktree list` costs seconds per
+    /// call once a repository has hundreds of worktrees (17 s with 857), and
+    /// the retirement lane asked it once per checkout it judged.
+    static WORKTREE_INVENTORY_RUN_CACHE: std::cell::RefCell<
+        Option<std::collections::HashMap<PathBuf, Vec<GitWorktreeInfo>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Reuses one `git worktree list` per repository root on this thread until
+/// dropped. Thread-local by design: a worker thread that does not enter the
+/// scope lists afresh, which is slower but never wrong. Callers still verify
+/// the registration they act on from the repository's `worktrees/` directory,
+/// so the cached listing only ever narrows, never authorizes.
+pub(crate) struct WorktreeInventoryRunScope {
+    installed: bool,
+}
+
+impl WorktreeInventoryRunScope {
+    pub(crate) fn enter() -> Self {
+        let installed = WORKTREE_INVENTORY_RUN_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.is_none() {
+                *cache = Some(std::collections::HashMap::new());
+                true
+            } else {
+                false
+            }
+        });
+        Self { installed }
+    }
+}
+
+impl Drop for WorktreeInventoryRunScope {
+    fn drop(&mut self) {
+        if self.installed {
+            WORKTREE_INVENTORY_RUN_CACHE.with(|cache| *cache.borrow_mut() = None);
+        }
+    }
+}
+
+/// Drop `worktree` from every cached listing on this thread: its
+/// registration was just removed, so a later lookup in the same run must
+/// not find it.
+pub(crate) fn forget_cached_worktree_registration(worktree: &Path) {
+    let canonical = worktree.canonicalize().ok();
+    WORKTREE_INVENTORY_RUN_CACHE.with(|cache| {
+        if let Some(cache) = cache.borrow_mut().as_mut() {
+            for entries in cache.values_mut() {
+                entries.retain(|entry| {
+                    entry.path != worktree
+                        && (canonical.is_none() || entry.path.canonicalize().ok() != canonical)
+                });
+            }
+        }
+    });
+}
+
 struct RestoreGraphVerificationGit(bool);
 
 impl Drop for RestoreGraphVerificationGit {
@@ -8669,8 +8729,29 @@ impl GitRepo {
     /// and entries Git marks prunable. A failed or malformed listing is an
     /// error so cleanup callers cannot mistake unknown state for no worktrees.
     pub fn worktree_inventory(&self) -> Result<Vec<GitWorktreeInfo>, GitError> {
+        let cached = WORKTREE_INVENTORY_RUN_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .as_ref()
+                .map(|cache| cache.get(&self.root).cloned())
+        });
+        match cached {
+            Some(Some(entries)) => {
+                crate::phase_telemetry::add("git_worktree_list_reused", Duration::ZERO);
+                return Ok(entries);
+            }
+            Some(None) | None => {}
+        }
+        let started = Instant::now();
         let listing = run_git_bytes(&self.root, &["worktree", "list", "--porcelain", "-z"])?;
-        parse_worktree_porcelain_z(&listing)
+        let entries = parse_worktree_porcelain_z(&listing)?;
+        crate::phase_telemetry::add("git_worktree_list", started.elapsed());
+        WORKTREE_INVENTORY_RUN_CACHE.with(|cache| {
+            if let Some(cache) = cache.borrow_mut().as_mut() {
+                cache.insert(self.root.clone(), entries.clone());
+            }
+        });
+        Ok(entries)
     }
 
     /// Return a complete, bounded listing of Git-ignored paths in this

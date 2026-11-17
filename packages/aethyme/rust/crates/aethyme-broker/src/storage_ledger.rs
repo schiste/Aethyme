@@ -698,6 +698,53 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Per-repository checkout counts the retirement lane writes after each run
+/// (`<host state>/storage-ledger-checkouts.json`), shown as the `checkouts`
+/// class of `aethyme storage status`. Counts only: checkout folders are never
+/// walked for bytes; the bytes are those the deleter measured while removing
+/// stripped directories.
+pub const CHECKOUTS_FILE: &str = "storage-ledger-checkouts.json";
+
+/// One repository's checkout counts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckoutCounts {
+    /// Checkout folders on disk the broker knows of.
+    pub folders: usize,
+    /// Of those, folders of closed or cleaned sessions no open session uses.
+    pub closed_folders: usize,
+    /// Of those, folders still holding a top-level catalogued regenerable
+    /// directory.
+    pub closed_with_regenerable: usize,
+    /// Bytes the deleter freed removing stripped directories, all runs.
+    pub bytes_freed_by_strip: u64,
+    pub last_checkouts_stripped: usize,
+    pub last_directories_stripped: usize,
+    pub observed_at_ms: i64,
+}
+
+/// The checkout counts of every repository that recorded them.
+pub fn checkout_counts(host_state: &Path) -> BTreeMap<String, CheckoutCounts> {
+    fs::read(host_state.join(CHECKOUTS_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Record `repository`'s checkout counts (read, replace its entry, write
+/// atomically). Two repositories writing at once may drop the other's entry
+/// until its next run rewrites it; nothing acts on these counts.
+pub fn record_checkout_counts(
+    host_state: &Path,
+    repository: &str,
+    counts: CheckoutCounts,
+) -> io::Result<()> {
+    fs::create_dir_all(host_state)?;
+    let mut all = checkout_counts(host_state);
+    all.insert(repository.to_string(), counts);
+    let bytes = serde_json::to_vec(&all).map_err(io::Error::other)?;
+    write_atomically(&host_state.join(CHECKOUTS_FILE), &bytes)
+}
+
 thread_local! {
     /// Entries visited by walks on this thread, so tests can prove a path
     /// never walks.

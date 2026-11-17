@@ -565,6 +565,27 @@ impl Broker {
                 }
             }
         }
+        if report.closed
+            && !report.cleanup.worktree_removed
+            && !options.keep_worktree
+            && Path::new(&report.worktree_path).is_dir()
+        {
+            // Strip catalogued regenerable directories (`node_modules`, ...)
+            // into the trash now, O(1) each, under the lane's rules. A
+            // refusal (a process such as the finishing shell still in the
+            // checkout) leaves them for the retirement lane.
+            match self.strip_checkout_at_finish(session_id) {
+                Ok(count) if count > 0 => report.warnings.push(format!(
+                    "moved {count} regenerable {} into the trash for paced deletion",
+                    if count == 1 {
+                        "directory"
+                    } else {
+                        "directories"
+                    }
+                )),
+                Ok(_) | Err(_) => {}
+            }
+        }
         if report.closed && !report.cleanup.worktree_removed {
             let reclaim = {
                 let _span = crate::phase_telemetry::span("finish_kept_worktree_artifact_reclaim");

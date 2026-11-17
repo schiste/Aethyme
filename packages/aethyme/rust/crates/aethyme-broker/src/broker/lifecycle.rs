@@ -25,6 +25,38 @@ const CHECKOUT_CAPACITY_LOCK_WAIT: std::time::Duration = crate::gc::GC_LOCK_FORE
 /// The removal budget `broker start` spends at the checkout limit before it
 /// refuses.
 const CHECKOUT_CAPACITY_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long `broker start` below the storage reserve spends stripping closed
+/// checkouts and deleting what that moved into the trash before refusing.
+const STORAGE_PRESSURE_STRIP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The storage refusal of `broker start`, naming what the pressure strip did
+/// and how many closed checkouts still hold regenerable directories.
+fn storage_pressure_refusal(
+    refusal: BrokerOpError,
+    strip: &super::strip::CheckoutStripReport,
+    freed: u64,
+) -> BrokerOpError {
+    let note = format!(
+        "; {} closed checkout(s) held top-level regenerable directories before a strip pass moved {} director{} from {} of them into the trash and the deleter freed {freed} bytes (`aethyme storage status`)",
+        strip.backlog.closed_with_regenerable,
+        strip.directories_stripped,
+        if strip.directories_stripped == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        strip.checkouts_stripped,
+    );
+    match refusal {
+        BrokerOpError::WorktreeRootUnavailable { path, reason } => {
+            BrokerOpError::WorktreeRootUnavailable {
+                path,
+                reason: format!("{reason}{note}"),
+            }
+        }
+        other => other,
+    }
+}
 
 fn timed_start_phase<T>(
     phases: &mut std::collections::BTreeMap<String, u64>,
@@ -8037,9 +8069,27 @@ impl Broker {
         let worktree_path = placement.root.join(&slug);
         self.refuse_nested_worktree_path(&worktree_path)?;
         let branch = format!("agent/{slug}");
-        timed_start_phase(&mut phase_timings_ms, "storage_admission", || {
+        let admission = timed_start_phase(&mut phase_timings_ms, "storage_admission", || {
             self.preflight_session_checkout_storage(&placement)
-        })?;
+        });
+        if let Err(refusal) = admission {
+            // Below the reserve: strip regenerable directories out of closed
+            // checkouts (O(1) renames under the claim this start already
+            // holds) and let the deleter run unpaced for a short while, then
+            // ask again. Still short, the refusal says what is left.
+            let (strip, freed) =
+                timed_start_phase(&mut phase_timings_ms, "storage_pressure_strip", || {
+                    self.strip_closed_checkouts_under_pressure(STORAGE_PRESSURE_STRIP_BUDGET)
+                });
+            let readmission = timed_start_phase(
+                &mut phase_timings_ms,
+                "storage_admission_after_strip",
+                || self.preflight_session_checkout_storage(&placement),
+            );
+            if readmission.is_err() {
+                return Err(storage_pressure_refusal(refusal, &strip, freed));
+            }
+        }
         let (worktree, sparse_setup_fallback) =
             match timed_start_phase(&mut phase_timings_ms, "git_worktree_add", || {
                 self.repo.worktree_add_with_sparse_paths(

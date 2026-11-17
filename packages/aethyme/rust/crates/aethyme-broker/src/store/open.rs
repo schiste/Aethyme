@@ -626,6 +626,38 @@ impl BrokerStore {
         Ok(sessions)
     }
 
+    /// Spawned sessions that are no longer open (closed or cleaned), oldest
+    /// close first, at most `limit`: the strip pass's candidates, whose
+    /// checkout folders may still exist.
+    pub(crate) fn closed_spawned_sessions_oldest_closed_first(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<Session>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SESSION_SELECT} WHERE origin = 'spawned' AND cleanup_state IN ('closed', 'cleaned')
+               ORDER BY COALESCE(closed_at, updated_at), id LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map(
+            params![i64::try_from(limit).unwrap_or(i64::MAX)],
+            session_from_row,
+        )?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row??);
+        }
+        Ok(sessions)
+    }
+
+    /// Sessions whose close was recorded at or after `since_ms`.
+    pub(crate) fn count_sessions_closed_since(&self, since_ms: i64) -> Result<usize, BrokerError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE closed_at IS NOT NULL AND closed_at >= ?1",
+            params![since_ms],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
     /// Whether an open session other than `session_id` names `worktree_path`.
     pub(crate) fn other_open_session_at_path(
         &self,

@@ -650,6 +650,50 @@ separately, even when a checkout must be kept. `auto_remove = false` disables
 whole-checkout removal, while `strict = true` disables unattended ignored-artifact
 removal as well.
 
+## Stripping regenerable directories from closed checkouts
+
+Before the retirement lane judges a closed checkout, it strips the
+catalogued regenerable directories out of it (`node_modules`, Cargo `target`
+with its `CACHEDIR.TAG`, a `.venv` with its `pyvenv.cfg`, `.pnpm-store`):
+each is renamed into the pool's checkout trash in O(1) and the paced deleter
+removes it later. Nothing is archived, because these directories are rebuilt
+by the next install or build. Closed and cleaned sessions whose folders are
+still on disk are handled oldest close first, at most 200 checkouts per run.
+`finish` does the same for its own checkout once the session is closed,
+unless `--keep-worktree` was given; when below the storage reserve, `broker
+start` runs a short strip and deletion pass before refusing.
+
+Finding and proving a directory never walks it. The directories come from
+Git's collapsed ignored-directory listing (`git ls-files --others --ignored
+--exclude-standard --directory`), which prints an ignored directory once and
+does not read below it, so a nested `packages/app/node_modules` is found but
+none of its files are read. Each one must then pass these checks, and if any
+fails or cannot finish, the directory stays where it is:
+
+- `git check-ignore -q -- <dir>` reports the directory itself ignored;
+- `git ls-files -z -- <dir>` prints nothing (no tracked file under it; this
+  reads the index only);
+- every component of the path is a real directory on the checkout's device
+  (no symlink, no mount point), and the trash is on that device too, so the
+  move is a rename and never a copy;
+- the session is closed or cleaned, no open session uses the folder, its
+  recorded holder is gone or was never bound, it holds no lease, runs no
+  gate or operation, and no process has its working directory or an open
+  file in it.
+
+Anything outside the catalogue is left for the retirement lane's careful
+path, which then inspects a much smaller tree. A retirement inspection that
+fails or times out is retried on the next run rather than remembered as a
+refusal; the last such failure, with the Git step that failed, is shown in
+`storage.closed-checkouts-backlog`.
+
+`aethyme storage status` shows a `checkouts` class with counts only: checkout
+folders, how many belong to closed sessions, how many of those still hold a
+top-level regenerable directory, and the bytes the deleter freed removing
+stripped directories. `broker status` adds the advice
+`storage.closed-checkouts-backlog` once 50 or more closed-session folders are
+on disk.
+
 ## Maintenance during broker open
 
 Opening a broker handle may resume an already-authorized durable GC journal
