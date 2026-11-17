@@ -450,13 +450,42 @@ pub fn archive_path(host_state: &Path, id: &str) -> Result<std::path::PathBuf, S
 pub fn keep_archive(host_state: &Path, id: &str, keep: bool) -> Result<std::path::PathBuf, String> {
     let path = archive_path(host_state, id)?;
     let marker = super::keep_marker(&path);
+    let existing = std::fs::symlink_metadata(&marker).ok();
+    if existing
+        .as_ref()
+        .is_some_and(|metadata| !metadata.file_type().is_file())
+    {
+        return Err(format!(
+            "{} exists and is not a plain file (a link?); remove it first",
+            marker.display()
+        ));
+    }
     if keep {
-        std::fs::write(
-            &marker,
-            "Kept by `aethyme storage keep-archive`: never expired by age.\n",
+        if existing.is_some() {
+            // Already kept.
+            return Ok(path);
+        }
+        // Created new, never through a link.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW).mode(0o644);
+        }
+        let mut file = match options.open(&marker) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Ok(path);
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        std::io::Write::write_all(
+            &mut file,
+            b"Kept by `aethyme storage keep-archive`: never expired by age.\n",
         )
         .map_err(|error| error.to_string())?;
-    } else if marker.exists() {
+    } else if existing.is_some() {
         std::fs::remove_file(&marker).map_err(|error| error.to_string())?;
     }
     Ok(path)
@@ -476,7 +505,7 @@ pub fn archives_value(host_state: &Path) -> Value {
             let path = item.path().join(&child.name);
             let landed = super::evict::archive_landed(&path);
             let kept = super::keep_marker(&path).exists();
-            let first_seen = ledger.archive_first_seen.get(&child.name).copied();
+            let notice = ledger.archive_notices.get(&child.name);
             let mut probe = child.clone();
             probe.kept = kept;
             rows.push(json!({
@@ -486,7 +515,8 @@ pub fn archives_value(host_state: &Path) -> Value {
                 "landed": landed.is_ok(),
                 "not_landed_because": landed.err(),
                 "created_ms": child.created_ms,
-                "expires_ms": super::archive_expiry(&probe, &budgets, first_seen),
+                "expires_ms": super::archive_expiry(&probe, &budgets),
+                "noticed_at_ms": notice.map(|notice| notice.noticed_at_ms),
                 "kept": kept,
             }));
         }

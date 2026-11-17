@@ -185,10 +185,13 @@ pub fn plan(
                     .collect();
                 children.sort_by_key(|(_, created)| *created);
                 for (child, created) in children {
-                    let first_seen = ledger.archive_first_seen.get(&child.name).copied();
-                    match super::archive_expiry(child, budgets, first_seen) {
-                        // An age rule: whatever the budget, landed or not.
-                        Some(expires) if now >= expires => {
+                    let notice = ledger.archive_notices.get(&child.name);
+                    let deletable =
+                        !ledger.age_frozen && super::archive_deletable(child, budgets, notice, now);
+                    match super::archive_expiry(child, budgets) {
+                        // An age rule: whatever the budget, landed or not,
+                        // once its notice was served.
+                        Some(expires) if deletable => {
                             let mut candidate = child_candidate(item, child, Reason::Expired);
                             candidate.newest_ms = created;
                             candidate.expires_ms = Some(expires);

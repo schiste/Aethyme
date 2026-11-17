@@ -559,9 +559,14 @@ pub struct Ledger {
     pub items: Vec<Item>,
     pub volumes: Vec<Volume>,
     pub telemetry: BTreeMap<Class, ClassTelemetry>,
-    /// When the ledger first saw each recovery archive (`<pool>/<id>`).
+    /// Recovery archives announced as expiring (`<pool>/<id>`): when first
+    /// published, in how many passes, and when last.
     #[serde(default)]
-    pub archive_first_seen: BTreeMap<String, u64>,
+    pub archive_notices: BTreeMap<String, Notice>,
+    /// Set for one pass when the clock went back or passes stopped for over
+    /// a week: nothing is removed by age in that pass.
+    #[serde(skip)]
+    pub age_frozen: bool,
     #[serde(default)]
     pub archive_telemetry: ArchiveTelemetry,
     /// Round-robin position of the next entry to measure.
@@ -837,8 +842,14 @@ pub(crate) fn archive_meta(path: &Path) -> ArchiveMeta {
         .flatten()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok());
     let field = |name: &str| value.as_ref().and_then(|value| value.get(name)).cloned();
+    // An implausible creation time is unknown: never expired by age.
+    let now = now_ms();
     ArchiveMeta {
-        created_ms: field("created_at_ms").and_then(|value| value.as_u64()),
+        created_ms: field("created_at_ms")
+            .and_then(|value| value.as_u64())
+            .filter(|created| {
+                *created >= EARLIEST_MANIFEST_MS && *created <= now.saturating_add(MANIFEST_SKEW_MS)
+            }),
         min_retention_ms: field("minimum_archive_retention_ms").and_then(|value| value.as_u64()),
         session_id: field("session_id").and_then(|value| value.as_i64()),
     }
@@ -858,16 +869,54 @@ pub fn keep_marker(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Notice every archive gets before it can expire, counted from when the
-/// ledger first saw it.
+/// How long an archive's expiry is announced before it can be removed.
 pub const ARCHIVE_NOTICE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// The notice must be published in two passes at least this far apart.
+pub const NOTICE_REPEAT: Duration = Duration::from_secs(24 * 60 * 60);
+/// At most this many archives, or bytes, expire by age in one pass.
+pub const AGE_EXPIRY_PER_PASS: usize = 50;
+pub const AGE_EXPIRY_BYTES_PER_PASS: u64 = GIB;
 
-/// When an archive expires by age: its manifest creation time plus the
-/// larger of `unlanded_archive_days` and its own minimum retention, and
-/// never before [`ARCHIVE_NOTICE`] after the ledger first saw it. `None`
-/// when expiry is off, the archive is kept, or its manifest has no creation
-/// time (never removed by age).
-pub fn archive_expiry(child: &Child, budgets: &Budgets, first_seen_ms: Option<u64>) -> Option<u64> {
+/// An expiry announcement, as published to the summary `broker status`
+/// reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Notice {
+    pub noticed_at_ms: u64,
+    pub passes: u32,
+    pub last_published_ms: u64,
+}
+
+impl Notice {
+    pub fn new(now: u64) -> Self {
+        Self {
+            noticed_at_ms: now,
+            passes: 1,
+            last_published_ms: now,
+        }
+    }
+
+    /// Record one more publication (counted once per [`NOTICE_REPEAT`]).
+    pub fn publish(&mut self, now: u64) {
+        let repeat = u64::try_from(NOTICE_REPEAT.as_millis()).unwrap_or(u64::MAX);
+        if now.saturating_sub(self.last_published_ms) >= repeat {
+            self.passes = self.passes.saturating_add(1);
+            self.last_published_ms = now;
+        }
+    }
+
+    /// Whether the notice ran its course: a week since first published, in
+    /// at least two passes a day or more apart.
+    pub fn served(&self, now: u64) -> bool {
+        let week = u64::try_from(ARCHIVE_NOTICE.as_millis()).unwrap_or(u64::MAX);
+        now.saturating_sub(self.noticed_at_ms) >= week && self.passes >= 2
+    }
+}
+
+/// When an archive's age is up: its manifest creation time plus the larger
+/// of `unlanded_archive_days` and its own minimum retention. `None` when
+/// expiry is off, the archive is kept, or its manifest has no valid creation
+/// time (never removed by age). Removal also needs a served [`Notice`].
+pub fn archive_expiry(child: &Child, budgets: &Budgets) -> Option<u64> {
     if budgets.unlanded_archive_days == 0 || child.kept {
         return None;
     }
@@ -880,11 +929,24 @@ pub fn archive_expiry(child: &Child, budgets: &Budgets, first_seen_ms: Option<u6
                 .min_retention_ms
                 .unwrap_or(crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS),
         );
-    let notice = first_seen_ms
-        .unwrap_or(u64::MAX)
-        .saturating_add(u64::try_from(ARCHIVE_NOTICE.as_millis()).unwrap_or(u64::MAX));
-    Some(created.saturating_add(age).max(notice))
+    Some(created.saturating_add(age))
 }
+
+/// Whether an archive may be removed by age now.
+pub fn archive_deletable(
+    child: &Child,
+    budgets: &Budgets,
+    notice: Option<&Notice>,
+    now: u64,
+) -> bool {
+    archive_expiry(child, budgets).is_some_and(|expires| now >= expires)
+        && notice.is_some_and(|notice| notice.served(now))
+}
+
+/// The earliest plausible manifest time (2017-07-14), and how far ahead of
+/// this clock a manifest time may be.
+const EARLIEST_MANIFEST_MS: u64 = 1_500_000_000_000;
+const MANIFEST_SKEW_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Add top-level entries that appeared under the roots and drop those that
 /// disappeared.

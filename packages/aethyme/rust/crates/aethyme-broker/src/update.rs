@@ -1576,7 +1576,7 @@ pub fn execute_confirmed_update_with(
         ));
     }
     verify_archive_members(&archive_path)?;
-    let payload = temp.path().join("payload");
+    let payload = temp.path().join(PAYLOAD_DIRECTORY);
     fs::create_dir(&payload).map_err(|error| format!("create payload directory: {error}"))?;
     run_tar(&["-xzf"], &archive_path, Some(&payload))?;
     verify_payload(&payload, &plan.target_version)?;
@@ -1727,6 +1727,11 @@ fn write_receipt(receipt: &InstallReceipt) -> Result<(), String> {
         .map_err(|error| format!("publish {}: {}", destination.display(), error.error))?;
     sync_directory(&receipt.managed_root)
 }
+
+/// The directory, inside a fresh temporary directory, where `update apply`
+/// unpacks and verifies a release payload. The storage check recognises an
+/// executable there and never acts from it.
+pub(crate) const PAYLOAD_DIRECTORY: &str = "payload";
 
 fn activate_payload_with_completion(
     payload: &Path,
