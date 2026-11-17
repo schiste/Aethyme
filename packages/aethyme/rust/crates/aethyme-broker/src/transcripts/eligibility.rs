@@ -61,6 +61,8 @@ pub enum SkipReason {
     InsufficientSpace,
     /// A destination conflict was recorded earlier; retried after a backoff.
     DestinationConflictBackoff,
+    /// The copy could not be flushed to stable storage: the source was kept.
+    SyncFailed,
 }
 
 impl SkipReason {
@@ -85,6 +87,7 @@ impl SkipReason {
             SkipReason::ProcessCheckUnavailable => "process_check_unavailable",
             SkipReason::InsufficientSpace => "insufficient_space",
             SkipReason::DestinationConflictBackoff => "destination_conflict_backoff",
+            SkipReason::SyncFailed => "sync_failed",
         }
     }
 }

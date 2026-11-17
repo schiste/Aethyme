@@ -357,6 +357,30 @@ impl Dir {
         Ok((File::from(fd), Stamp::of(&stat)))
     }
 
+    /// Open an existing regular file for appending, without following a
+    /// link.
+    pub fn open_append(&self, name: &CString) -> io::Result<File> {
+        // SAFETY: `self.fd` is an open directory descriptor and `name` a
+        // valid NUL-terminated string; a non-negative result is owned below.
+        let fd = check(unsafe {
+            libc::openat(
+                self.fd.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        })?;
+        // SAFETY: `fd` was just returned by `openat` and nothing else owns it.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let stat = fstat(&fd)?;
+        if !is_regular(&stat) || stat.st_dev as u64 != self.device {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file on the root's device",
+            ));
+        }
+        Ok(File::from(fd))
+    }
+
     /// Create a new private (0600) temporary file named `<prefix>…<suffix>`.
     /// Never follows or replaces an existing entry.
     pub fn create_temp(&self, prefix: &str, suffix: &str) -> io::Result<TempFile<'_>> {

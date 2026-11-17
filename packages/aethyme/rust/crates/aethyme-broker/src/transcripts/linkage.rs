@@ -49,9 +49,10 @@ pub(crate) fn broker_db_for_directory(directory: &Path) -> Option<PathBuf> {
 pub(crate) struct KnownDatabases {
     pub databases: Vec<PathBuf>,
     pub warnings: Vec<String>,
-    /// The index or the worktree registry could not be read completely, so
-    /// a database that links some transcript may be missing.
+    /// The transcript index could not be read.
     pub index_unreadable: bool,
+    /// The worktree registry could not be read completely.
+    pub registry_incomplete: bool,
 }
 
 /// Every broker database known on this host: configured repositories, the
@@ -66,6 +67,7 @@ pub(crate) fn known_broker_dbs(
     let mut found = BTreeSet::new();
     let mut warnings = Vec::new();
     let mut index_unreadable = false;
+    let mut registry_incomplete = false;
     let mut missing = 0;
     for repository in repositories {
         match broker_db_for_directory(repository) {
@@ -87,7 +89,7 @@ pub(crate) fn known_broker_dbs(
             Some(std::time::Instant::now() + Duration::from_secs(5)),
         );
         if !inventory.complete {
-            index_unreadable = true;
+            registry_incomplete = true;
             warnings.push(format!(
                 "the worktree registry could not be read completely ({} issue(s))",
                 inventory.issues.len()
@@ -119,6 +121,7 @@ pub(crate) fn known_broker_dbs(
         databases: found.into_iter().collect(),
         warnings,
         index_unreadable,
+        registry_incomplete,
     }
 }
 

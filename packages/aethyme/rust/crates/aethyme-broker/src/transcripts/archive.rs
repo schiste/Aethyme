@@ -297,7 +297,13 @@ fn resume<P: OpenFileProbe>(
     // The copy may predate a durable sync: make it durable before relying
     // on it.
     if let Err(error) = entries.destination_dir.sync() {
-        return Err(Skipped::io("cannot sync", &transcript.destination, &error));
+        return Err(Skipped::new(
+            SkipReason::SyncFailed,
+            format!(
+                "cannot sync {}: {error}; source kept",
+                transcript.destination.display()
+            ),
+        ));
     }
     let verify_time = started.elapsed();
     let indexed = context
@@ -473,10 +479,12 @@ pub(crate) fn archive_one<P: OpenFileProbe>(
             {
                 entries.discard_copy(context.index, transcript);
             }
-            return Err(Skipped::io(
-                "cannot publish durably",
-                &transcript.destination,
-                &error,
+            return Err(Skipped::new(
+                SkipReason::SyncFailed,
+                format!(
+                    "cannot publish {} durably: {error}; source kept",
+                    transcript.destination.display()
+                ),
             ));
         }
     }
@@ -526,6 +534,11 @@ pub struct Restored {
     /// Bytes of a newer transcript found at the original path and appended
     /// after the archived content (0 when there was none).
     pub merged_fragment_bytes: u64,
+    /// The file at the original path already started with the archive's
+    /// exact bytes (an interrupted earlier restore): only the cleanup ran.
+    pub already_restored: bool,
+    /// A fragment backup that could not be reconciled and was kept.
+    pub fragment_backup_kept: Option<PathBuf>,
 }
 
 /// Copies the archive's decoded content, then an optional fragment, into a
@@ -589,13 +602,20 @@ impl<'w> Merge<'w> {
 /// the archived content followed by the fragment's lines: written to a
 /// temporary file, verified by re-reading it, and atomically put in place
 /// of the fragment. The fragment is kept under a backup name until the
-/// merged file is published, and the merge is abandoned if the fragment
-/// changes meanwhile.
+/// merged file is published and every byte written to it meanwhile has been
+/// carried over; a backup that cannot be reconciled is kept.
+///
+/// A restore intent is recorded before publishing and cleared after the
+/// archive is removed. When the file at the original path already starts
+/// with exactly the archive's bytes (a restore that published and stopped
+/// before removing the archive), nothing is merged again: only the cleanup
+/// is finished.
 pub(crate) fn restore_one(
     plan: &RestorePlan,
     archive_root: &Root,
     original_root: &Root,
     index: Option<&Index>,
+    now_ms: i64,
 ) -> Result<Restored, String> {
     let original = plan.original.display();
     let archive = plan.archive.display();
@@ -614,11 +634,58 @@ pub(crate) fn restore_one(
     let (archive_dir, archive_name) = archive_root
         .parent_of(&plan.archive, false)
         .map_err(|error| format!("unsafe archive path {archive}: {error}"))?;
-    let (archive_file, archive_stamp) = archive_dir
-        .open_read(&archive_name)
-        .map_err(|error| format!("cannot open {archive}: {error}"))?;
+    let open_archive = || {
+        archive_dir
+            .open_read(&archive_name)
+            .map_err(|error| format!("cannot open {archive}: {error}"))
+    };
+    let (_, archive_stamp) = open_archive()?;
+    let cleanup = |restored: Restored| -> Result<Restored, String> {
+        archive_dir
+            .unlink_if(&archive_name, archive_stamp)
+            .map_err(|error| {
+                format!("restored {original} but could not remove {archive}: {error}")
+            })?;
+        super::best_effort(archive_dir.sync());
+        if let Some(index) = index {
+            index.remove_archive(&plan.original)?;
+            index.clear_restore_intent(&plan.original)?;
+        }
+        Ok(restored)
+    };
+
+    if let Some(present) = fragment {
+        let (archive_file, _) = open_archive()?;
+        let mut unpaced = Pacer::new(None);
+        let (archive_len, archive_digest) = digest_compressed(archive_file, &mut unpaced)
+            .map_err(|error| format!("cannot decode {archive}: {error}"))?;
+        if let Some(expected) = &plan.sha256
+            && *expected != archive_digest
+        {
+            return Err(format!(
+                "{archive} decodes to SHA-256 {archive_digest}, the index recorded {expected}; archive kept"
+            ));
+        }
+        if present.len >= archive_len
+            && prefix_digest(&original_dir, &original_name, archive_len).as_deref()
+                == Some(archive_digest.as_str())
+        {
+            return cleanup(Restored {
+                archive: plan.archive.clone(),
+                original: plan.original.clone(),
+                bytes: present.len,
+                sha256: archive_digest,
+                hash_checked: plan.sha256.is_some(),
+                merged_fragment_bytes: 0,
+                already_restored: true,
+                fragment_backup_kept: None,
+            });
+        }
+    }
+
+    let (archive_file, _) = open_archive()?;
     // Keep the fragment reachable under a backup name until the merged file
-    // is published.
+    // is published and reconciled.
     let backup = match fragment {
         Some(_) => Some(
             original_dir
@@ -627,22 +694,106 @@ pub(crate) fn restore_one(
         ),
         None => None,
     };
+    if let Some(index) = index
+        && let Err(error) = index.record_restore_intent(&plan.original, &plan.archive, now_ms)
+    {
+        if let Some(backup) = &backup {
+            super::best_effort(original_dir.unlink(backup));
+        }
+        return Err(error);
+    }
     let result = write_restored(plan, &original_dir, &original_name, archive_file, fragment);
-    if let Some(backup) = &backup {
-        // Published or abandoned, the fragment is no longer needed under its
-        // backup name: it is either merged or still at the original path.
-        super::best_effort(original_dir.unlink(backup));
-        super::best_effort(original_dir.sync());
+    let backup_kept = match (&backup, fragment) {
+        (Some(backup), Some(before)) => {
+            let published = result.is_ok();
+            reconcile_backup(&original_dir, &original_name, backup, before, published).map(|kept| {
+                plan.original
+                    .with_file_name(kept.to_string_lossy().into_owned())
+            })
+        }
+        _ => None,
+    };
+    let mut restored = result?;
+    restored.fragment_backup_kept = backup_kept;
+    cleanup(restored)
+}
+
+/// SHA-256 of the first `len` bytes of `name`, or `None` when it is shorter
+/// or unreadable.
+fn prefix_digest(directory: &Dir, name: &CString, len: u64) -> Option<String> {
+    let (file, _) = directory.open_read(name).ok()?;
+    let mut unpaced = Pacer::new(None);
+    let (read, digest) = digest_reader(file.take(len), &mut unpaced).ok()?;
+    (read == len).then_some(digest)
+}
+
+/// Settle the fragment's backup link after a merge attempt. Returns the
+/// backup's name when it had to be kept.
+///
+/// Unpublished: the original path still holds the fragment, so the backup
+/// (the same file) is simply removed. Published: the backup is the old
+/// fragment file; bytes a writer appended to it after the merge read it are
+/// appended to the published file, and the backup is removed only once it
+/// is exactly what was carried over. Anything else keeps it.
+pub(crate) fn reconcile_backup(
+    directory: &Dir,
+    original_name: &CString,
+    backup: &CString,
+    before: Stamp,
+    published: bool,
+) -> Option<CString> {
+    let Ok(now) = directory.stamp(backup) else {
+        return Some(backup.clone());
+    };
+    if !published {
+        let same_file = directory
+            .stamp(original_name)
+            .is_ok_and(|original| original.inode == now.inode && original.device == now.device);
+        if same_file {
+            super::best_effort(directory.unlink(backup));
+            super::best_effort(directory.sync());
+            return None;
+        }
+        return Some(backup.clone());
     }
-    let restored = result?;
-    archive_dir
-        .unlink_if(&archive_name, archive_stamp)
-        .map_err(|error| format!("restored {original} but could not remove {archive}: {error}"))?;
-    super::best_effort(archive_dir.sync());
-    if let Some(index) = index {
-        index.remove_archive(&plan.original)?;
+    if now == before {
+        super::best_effort(directory.unlink(backup));
+        super::best_effort(directory.sync());
+        return None;
     }
-    Ok(restored)
+    let grew = now.inode == before.inode && now.device == before.device && now.len > before.len;
+    if !grew {
+        return Some(backup.clone());
+    }
+    let appended = append_growth(directory, original_name, backup, before, now);
+    if appended.is_ok() && directory.stamp(backup).ok() == Some(now) {
+        super::best_effort(directory.unlink(backup));
+        super::best_effort(directory.sync());
+        return None;
+    }
+    Some(backup.clone())
+}
+
+/// Append to the published file what a writer added to the old fragment
+/// (now the backup) after the merge read it.
+fn append_growth(
+    directory: &Dir,
+    original_name: &CString,
+    backup: &CString,
+    before: Stamp,
+    now: Stamp,
+) -> io::Result<()> {
+    let (mut source, opened) = directory.open_read(backup)?;
+    if opened != now {
+        return Err(io::Error::other("the fragment changed again"));
+    }
+    std::io::Seek::seek(&mut source, std::io::SeekFrom::Start(before.len))?;
+    let target = directory.open_append(original_name)?;
+    let mut writer = BufWriter::with_capacity(CHUNK, &target);
+    std::io::copy(&mut source.take(now.len - before.len), &mut writer)?;
+    writer.flush()?;
+    drop(writer);
+    safe_fs::full_sync(target.as_raw_fd())
 }
 
 /// Write the restored transcript (archived content, then any fragment) to
@@ -690,8 +841,10 @@ fn write_restored(
                 .write(b"\n", false)
                 .map_err(|error| format!("cannot write beside {original}: {error}"))?;
         }
+        // Exactly the bytes stamped: anything appended later is carried
+        // over from the backup after publication.
         merge
-            .copy(fragment_file, false)
+            .copy(fragment_file.take(expected.len), false)
             .map_err(|error| format!("cannot merge {original}: {error}"))?;
         merged_fragment_bytes = expected.len;
     }
@@ -719,9 +872,16 @@ fn write_restored(
             .publish(original_name)
             .map_err(|error| format!("cannot publish {original}: {error}"))?,
         Some(expected) => {
-            if original_dir.stamp(original_name).ok() != Some(expected) {
+            // Growth is carried over from the backup afterwards; a replaced
+            // file is not, so it aborts the merge.
+            let same_file = original_dir.stamp(original_name).is_ok_and(|now| {
+                now.inode == expected.inode
+                    && now.device == expected.device
+                    && now.len >= expected.len
+            });
+            if !same_file {
                 return Err(format!(
-                    "{original} changed during the restore; nothing was changed"
+                    "{original} was replaced during the restore; nothing was changed"
                 ));
             }
             temporary
@@ -736,6 +896,8 @@ fn write_restored(
         sha256: archive_digest,
         hash_checked: plan.sha256.is_some(),
         merged_fragment_bytes,
+        already_restored: false,
+        fragment_backup_kept: None,
     })
 }
 

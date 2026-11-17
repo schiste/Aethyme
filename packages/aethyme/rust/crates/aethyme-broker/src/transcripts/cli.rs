@@ -415,7 +415,13 @@ fn run_restore(environment: &Environment, rest: &[String], json: bool) -> u8 {
         Ok(config) => config,
         Err(code) => return code,
     };
-    match run::restore(environment, &config, key) {
+    let mut open_files = OpenFiles::new(SystemProbe, OPEN_LISTING_MAX_AGE);
+    let mut agents = SystemAgents;
+    let mut probes = Probes {
+        open_files: &mut open_files,
+        agents: &mut agents,
+    };
+    match run::restore(environment, &config, key, &mut probes) {
         Ok(restored) => {
             if json {
                 print_json(&json!({"schema": RESTORE_SCHEMA, "restored": restored}));
@@ -432,6 +438,17 @@ fn run_restore(environment: &Environment, rest: &[String], json: bool) -> u8 {
                             "; zstd checksum verified, no index row"
                         }
                     );
+                    if item.already_restored {
+                        println!(
+                            "  it was already restored by an interrupted run; only the cleanup ran"
+                        );
+                    }
+                    if let Some(backup) = &item.fragment_backup_kept {
+                        println!(
+                            "  Warning: the newer transcript changed during the restore; its previous copy is kept at {}",
+                            backup.display()
+                        );
+                    }
                     if item.merged_fragment_bytes > 0 {
                         println!(
                             "  a newer transcript at that path ({}) was appended after the archived content",

@@ -41,7 +41,7 @@ pub use eligibility::SkipReason;
 pub use index::ArchiveRow;
 pub(crate) use linkage::note_holder_bound;
 pub use providers::Provider;
-pub(crate) use run::run_worker_lane;
+pub(crate) use run::{linkage_degraded_advice, run_worker_lane};
 pub use run::{RunReport, StatusReport};
 
 /// Directory under the host state directory that holds everything here.

@@ -105,7 +105,11 @@ aethyme transcripts restore 0b9f6c1e-2d3a-4b5c-8d7e-1f2a3b4c5d6e
 
 - `status`: settings, archived files, bytes before and after compression,
   bytes an archive pass could reclaim now, skip counts by reason, lifetime
-  counters, and the last run.
+  counters, the last run, linkage health (whether session links could all
+  be read now, and for how many passes in a row they could not, by kind of
+  issue) and durability (sources kept because a sync failed, `fsync`
+  fallbacks, unfinished restores). After three degraded passes in a row,
+  `aethyme broker status` shows the advice `transcripts.linkage-degraded`.
 - `list`: archived transcripts, plus the ones a pass would archive or skip.
 - `archive --dry-run` prints what would move; `archive --apply` does it now.
 - `restore <session-id|path>` decompresses back to the original location,
@@ -114,7 +118,14 @@ aethyme transcripts restore 0b9f6c1e-2d3a-4b5c-8d7e-1f2a3b4c5d6e
   after it was archived), the result is the archived content followed by
   that file's lines: written to a temporary file, verified by re-reading it,
   and atomically put in its place, with the newer file kept under a backup
-  name until then. A Codex archive with no
+  name until then; bytes appended to it meanwhile are carried over, and a
+  backup that cannot be reconciled is kept and reported. Such a merge is
+  refused while the session may still be writing (a matching `claude`
+  process, or for Codex the file open or a `codex` process naming the
+  session; an unreadable process table counts as live). A restore records
+  an intent before publishing; if it was interrupted after publishing, the
+  next `restore` finds the file already starting with the archive's exact
+  bytes and only finishes the cleanup, never merging twice. A Codex archive with no
   index row (for example after the index was lost) is found by its id and
   restored to Codex's dated `sessions/` directory, vouched for by the zstd
   frame checksum.

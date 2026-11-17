@@ -50,6 +50,15 @@ CREATE TABLE IF NOT EXISTS conflicts (
     first_seen      INTEGER NOT NULL,
     next_attempt_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS restore_intents (
+    original_path TEXT PRIMARY KEY,
+    archive_path  TEXT NOT NULL,
+    started_at    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS counters (
     name  TEXT PRIMARY KEY,
     value INTEGER NOT NULL
@@ -349,6 +358,67 @@ impl Index {
             .execute(
                 "DELETE FROM conflicts WHERE original_path = ?1",
                 [text(original_path)],
+            )
+            .map(|_| ())
+            .map_err(sql)
+    }
+
+    /// Record that a restore of `original_path` is about to publish; a crash
+    /// before [`Index::clear_restore_intent`] leaves it as evidence.
+    pub fn record_restore_intent(
+        &self,
+        original_path: &Path,
+        archive_path: &Path,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO restore_intents (original_path, archive_path, started_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(original_path) DO UPDATE SET
+                   archive_path = excluded.archive_path,
+                   started_at = excluded.started_at",
+                params![text(original_path), text(archive_path), now_ms],
+            )
+            .map(|_| ())
+            .map_err(sql)
+    }
+
+    /// Restores that recorded an intent and have not finished their cleanup.
+    pub fn pending_restore_intents(&self) -> Result<u64, String> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM restore_intents", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|count| count.max(0) as u64)
+            .map_err(sql)
+    }
+
+    pub fn clear_restore_intent(&self, original_path: &Path) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM restore_intents WHERE original_path = ?1",
+                [text(original_path)],
+            )
+            .map(|_| ())
+            .map_err(sql)
+    }
+
+    pub fn meta(&self, key: &str) -> Result<Option<String>, String> {
+        self.conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(sql)
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
             )
             .map(|_| ())
             .map_err(sql)

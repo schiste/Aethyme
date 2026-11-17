@@ -154,10 +154,11 @@ fn dry() -> Options {
     }
 }
 
-/// A process table with a fixed set of Claude Code processes.
+/// A process table with a fixed set of Claude Code and Codex processes.
 #[derive(Default)]
 struct FakeAgents {
     processes: Option<Vec<ClaudeProcess>>,
+    codex: Option<Vec<String>>,
     calls: u64,
 }
 
@@ -165,6 +166,7 @@ impl FakeAgents {
     fn none() -> Self {
         Self {
             processes: Some(Vec::new()),
+            codex: Some(Vec::new()),
             calls: 0,
         }
     }
@@ -177,6 +179,41 @@ impl AgentProbe for FakeAgents {
             .clone()
             .ok_or_else(|| "process table unavailable (test)".to_string())
     }
+
+    fn codex_command_lines(&mut self) -> Result<Vec<String>, String> {
+        self.calls += 1;
+        self.codex
+            .clone()
+            .ok_or_else(|| "process table unavailable (test)".to_string())
+    }
+}
+
+fn restore_with(
+    host: &Host,
+    config: &TranscriptsConfig,
+    key: &str,
+    open: &mut OpenFiles<FakeProbe>,
+    agents: &mut FakeAgents,
+) -> Result<Vec<archive::Restored>, String> {
+    let mut probes = Probes {
+        open_files: open,
+        agents,
+    };
+    run::restore(&host.environment, config, key, &mut probes)
+}
+
+fn restore(
+    host: &Host,
+    config: &TranscriptsConfig,
+    key: &str,
+) -> Result<Vec<archive::Restored>, String> {
+    restore_with(
+        host,
+        config,
+        key,
+        &mut probe(Vec::new()),
+        &mut FakeAgents::none(),
+    )
 }
 
 fn pass_at<P: OpenFileProbe>(
@@ -1000,13 +1037,13 @@ fn restore_round_trips_codex_and_claude_byte_identically() {
     assert!(claude_archive.is_file());
     assert!(!claude.exists() && !codex.exists());
 
-    let restored = run::restore(&host.environment, &config, UUID).unwrap();
+    let restored = restore(&host, &config, UUID).unwrap();
     assert_eq!(restored.len(), 1);
     assert!(restored[0].hash_checked);
     assert_eq!(fs::read(&codex).unwrap(), codex_bytes);
     assert!(!codex_destination(&host, &codex).exists());
 
-    let restored = run::restore(&host.environment, &config, claude.to_str().unwrap()).unwrap();
+    let restored = restore(&host, &config, claude.to_str().unwrap()).unwrap();
     assert_eq!(restored.len(), 1);
     assert_eq!(fs::read(&claude).unwrap(), claude_bytes);
     assert!(!claude_archive.exists());
@@ -1014,7 +1051,7 @@ fn restore_round_trips_codex_and_claude_byte_identically() {
     let index = Index::open(&host.environment.host_dir).unwrap();
     assert!(index.archives().unwrap().is_empty());
     assert_eq!(index.counters().unwrap().get("restored"), Some(&2));
-    assert!(run::restore(&host.environment, &config, UUID).is_err());
+    assert!(restore(&host, &config, UUID).is_err());
 }
 
 #[test]
@@ -1032,7 +1069,7 @@ fn restore_checks_the_hash_before_publishing() {
         sha256: Some("0".repeat(64)),
     };
     let root = Root::open(&host.codex_dir()).unwrap();
-    assert!(archive::restore_one(&wrong, &root, &root, None).is_err());
+    assert!(archive::restore_one(&wrong, &root, &root, None, later()).is_err());
     assert!(!source.exists(), "a mismatched restore publishes nothing");
     assert!(destination.is_file());
 }
@@ -1047,7 +1084,7 @@ fn an_unindexed_codex_archive_restores_to_its_dated_directory() {
     pass(&host, &config, apply(), &mut open, &mut NoHooks);
     // The index is lost; the archive alone must still restore.
     fs::remove_file(host.environment.host_dir.join(super::index::INDEX_FILE)).unwrap();
-    let restored = run::restore(&host.environment, &config, UUID).unwrap();
+    let restored = restore(&host, &config, UUID).unwrap();
     assert_eq!(restored.len(), 1);
     assert!(!restored[0].hash_checked);
     assert_eq!(fs::read(&source).unwrap(), original);
@@ -1338,6 +1375,7 @@ fn a_live_or_unverifiable_claude_session_is_never_archived() {
             cwd: Some(PathBuf::from("/work/invented-project")),
             args: "claude".into(),
         }]),
+        codex: Some(Vec::new()),
         calls: 0,
     };
     let report = pass_at(
@@ -1371,6 +1409,7 @@ fn a_live_or_unverifiable_claude_session_is_never_archived() {
             cwd: Some(PathBuf::from("/work/unrelated")),
             args: "claude".into(),
         }]),
+        codex: Some(Vec::new()),
         calls: 0,
     };
     let report = pass_at(
@@ -1427,7 +1466,7 @@ fn restore_merges_a_newer_fragment_after_the_archived_content() {
     let fragment = b"{\"type\":\"user\",\"n\":\"after the archive\"}\n";
     fs::write(&source, fragment).unwrap();
 
-    let restored = run::restore(&host.environment, &config, OTHER_UUID).unwrap();
+    let restored = restore(&host, &config, OTHER_UUID).unwrap();
     assert_eq!(restored[0].merged_fragment_bytes, fragment.len() as u64);
     let mut expected = archived.clone();
     expected.extend_from_slice(fragment);
@@ -1610,6 +1649,7 @@ fn the_run_log_keeps_session_ids_and_reasons_but_no_paths() {
             cwd: Some(PathBuf::from("/work/invented-project")),
             args: "claude".into(),
         }]),
+        codex: Some(Vec::new()),
         calls: 0,
     };
     pass_at(
@@ -1626,4 +1666,221 @@ fn the_run_log_keeps_session_ids_and_reasons_but_no_paths() {
     assert!(log.contains("agent_running"), "{log}");
     assert!(!log.contains("-work-invented-project"), "{log}");
     assert!(!log.contains(source.to_str().unwrap()), "{log}");
+}
+
+// ── second review: restore idempotence, live writers, names, health ──
+
+#[test]
+fn an_interrupted_merge_is_finished_without_duplicating_the_archive() {
+    let host = Host::new();
+    let source = host.claude_transcript(OTHER_UUID);
+    let archived = fs::read(&source).unwrap();
+    let config = claude_enabled();
+    let mut open = probe(Vec::new());
+    let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    assert_eq!(report.archived.len(), 1, "{report:?}");
+    // The state a crash after publishing leaves: the merged file, the
+    // archive, its row and the restore intent.
+    let fragment = b"{\"n\":\"newer\"}\n";
+    let mut merged = archived.clone();
+    merged.extend_from_slice(fragment);
+    fs::write(&source, &merged).unwrap();
+    let index = Index::open(&host.environment.host_dir).unwrap();
+    index
+        .record_restore_intent(&source, &report.archived[0].destination, later())
+        .unwrap();
+    assert_eq!(
+        status(&host, &config, &mut open)
+            .durability
+            .restore_intents_pending,
+        1
+    );
+
+    let restored = restore(&host, &config, OTHER_UUID).unwrap();
+    assert!(restored[0].already_restored);
+    assert_eq!(fs::read(&source).unwrap(), merged, "nothing merged twice");
+    assert!(!report.archived[0].destination.exists());
+    assert!(index.archives().unwrap().is_empty());
+    assert_eq!(index.pending_restore_intents().unwrap(), 0);
+}
+
+#[test]
+fn a_merge_is_refused_while_its_session_may_be_writing() {
+    let host = Host::new();
+    let claude = host.claude_transcript(OTHER_UUID);
+    let codex = host.codex_transcript(UUID, Path::new("/work/invented"));
+    let config = enabled(vec![Provider::Codex, Provider::Claude]);
+    let mut open = probe(Vec::new());
+    let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    assert_eq!(report.archived.len(), 2, "{report:?}");
+    fs::write(&claude, b"{\"n\":1}\n").unwrap();
+    fs::write(&codex, b"{\"n\":1}\n").unwrap();
+
+    let mut running = FakeAgents {
+        processes: Some(vec![ClaudeProcess {
+            cwd: Some(PathBuf::from("/work/invented-project")),
+            args: "claude".into(),
+        }]),
+        codex: Some(Vec::new()),
+        calls: 0,
+    };
+    let error = restore_with(
+        &host,
+        &config,
+        OTHER_UUID,
+        &mut probe(Vec::new()),
+        &mut running,
+    )
+    .unwrap_err();
+    assert!(error.contains("running"), "{error}");
+    let error = restore_with(
+        &host,
+        &config,
+        OTHER_UUID,
+        &mut probe(Vec::new()),
+        &mut FakeAgents::default(),
+    )
+    .unwrap_err();
+    assert!(error.contains("cannot be ruled out"), "{error}");
+
+    let error = restore_with(
+        &host,
+        &config,
+        UUID,
+        &mut probe(vec![codex.clone()]),
+        &mut FakeAgents::none(),
+    )
+    .unwrap_err();
+    assert!(error.contains("open"), "{error}");
+    let mut naming = FakeAgents {
+        codex: Some(vec![format!("codex resume {UUID}")]),
+        ..FakeAgents::none()
+    };
+    let error =
+        restore_with(&host, &config, UUID, &mut probe(Vec::new()), &mut naming).unwrap_err();
+    assert!(error.contains("Codex process"), "{error}");
+    // Nothing was changed by any refusal.
+    assert_eq!(fs::read(&claude).unwrap(), b"{\"n\":1}\n");
+    assert_eq!(fs::read(&codex).unwrap(), b"{\"n\":1}\n");
+}
+
+#[test]
+fn bytes_written_to_the_old_fragment_after_the_merge_are_carried_over() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let root = Root::open(&base).unwrap();
+    let original = base.join("t.jsonl");
+    fs::write(&original, b"fragment\n").unwrap();
+    let (directory, name) = root.parent_of(&original, false).unwrap();
+    let before = directory.stamp(&name).unwrap();
+    let backup = directory
+        .link_unique(&name, providers::TEMP_PREFIX, ".fragment")
+        .unwrap();
+    let backup_path = base.join(backup.to_str().unwrap());
+    // Publication replaces the original with the merged file...
+    let merged = base.join("merged");
+    fs::write(&merged, b"archived\nfragment\n").unwrap();
+    fs::rename(&merged, &original).unwrap();
+    // ...while a writer still appends to the old fragment.
+    let mut writer = fs::OpenOptions::new()
+        .append(true)
+        .open(&backup_path)
+        .unwrap();
+    writer.write_all(b"late\n").unwrap();
+    drop(writer);
+    let kept = archive::reconcile_backup(&directory, &name, &backup, before, true);
+    assert_eq!(kept, None);
+    assert_eq!(fs::read(&original).unwrap(), b"archived\nfragment\nlate\n");
+    assert!(!backup_path.exists());
+
+    // A backup that shrank cannot be reconciled and is kept.
+    fs::write(&original, b"fragment two\n").unwrap();
+    let before = directory.stamp(&name).unwrap();
+    let backup = directory
+        .link_unique(&name, providers::TEMP_PREFIX, ".fragment")
+        .unwrap();
+    fs::write(base.join("merged"), b"x").unwrap();
+    fs::rename(base.join("merged"), &original).unwrap();
+    fs::write(base.join(backup.to_str().unwrap()), b"short").unwrap();
+    let kept = archive::reconcile_backup(&directory, &name, &backup, before, true);
+    assert_eq!(kept, Some(backup.clone()));
+    assert!(base.join(backup.to_str().unwrap()).exists());
+}
+
+#[test]
+fn project_names_map_utf16_units_and_tolerate_truncation() {
+    assert_eq!(agents::project_dir_name(Path::new("/a/\u{e9}")), "-a--");
+    assert_eq!(agents::project_dir_name(Path::new("/a/\u{1F600}")), "-a---");
+    let process = |cwd: &str| ClaudeProcess {
+        cwd: Some(PathBuf::from(cwd)),
+        args: "claude".into(),
+    };
+    let long_cwd = format!("/work/{}", "x".repeat(200));
+    let full = agents::project_dir_name(Path::new(&long_cwd));
+    // Cut short, and cut short with a suffix added after the cut.
+    let truncated = full[..150].to_string();
+    let suffixed = format!("{}-1a2b3c", &full[..140]);
+    assert!(agents::claude_session_live(
+        &[process(&long_cwd)],
+        &truncated,
+        None
+    ));
+    assert!(agents::claude_session_live(
+        &[process(&long_cwd)],
+        &suffixed,
+        None
+    ));
+    assert!(!agents::claude_session_live(
+        &[process("/work/short")],
+        &truncated,
+        None
+    ));
+}
+
+#[test]
+fn status_shows_linkage_degradation_and_broker_status_advises_after_three_passes() {
+    let host = Host::new();
+    let repository = Repository::new(&host, OTHER_UUID, "closed");
+    fs::write(&repository.db, b"not a database at all").unwrap();
+    host.codex_transcript(UUID, &repository.root);
+    let config = enabled(vec![Provider::Codex]);
+    let mut open = probe(Vec::new());
+    let index = || Index::open(&host.environment.host_dir).unwrap();
+    for pass_number in 1..=3 {
+        let report = pass(&host, &config, apply(), &mut open, &mut NoHooks);
+        assert_eq!(report.linkage_issues.unreadable_databases, 1);
+        let advice = run::linkage_advice_from(&index());
+        assert_eq!(advice.is_some(), pass_number >= 3, "pass {pass_number}");
+    }
+    let advice = run::linkage_advice_from(&index()).unwrap();
+    assert_eq!(advice.id, "transcripts.linkage-degraded");
+    assert!(
+        advice.summary.contains("1 unreadable broker database"),
+        "{}",
+        advice.summary
+    );
+    assert!(!advice.summary.contains(repository.root.to_str().unwrap()));
+
+    let shown = status(&host, &config, &mut open);
+    assert!(shown.linkage.degraded_now);
+    assert_eq!(shown.linkage.issues_now.unreadable_databases, 1);
+    assert_eq!(shown.linkage.consecutive_degraded_passes, 3);
+    index()
+        .add_counters(
+            &[("skipped_sync_failed".to_string(), 2)]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+    assert_eq!(
+        status(&host, &config, &mut open)
+            .durability
+            .sources_kept_sync_failed,
+        2
+    );
+
+    // A pass that can read everything resets the streak.
+    fs::remove_dir_all(&repository.root).unwrap();
+    pass(&host, &config, apply(), &mut open, &mut NoHooks);
+    assert!(run::linkage_advice_from(&index()).is_none());
 }

@@ -87,6 +87,133 @@ pub struct SkippedView {
     pub detail: String,
 }
 
+/// Why a pass could not trust "unlinked": counts and flags only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct LinkageIssues {
+    /// Broker databases that could not be read.
+    pub unreadable_databases: u64,
+    /// The worktree registry could not be read completely.
+    pub registry_incomplete: bool,
+    /// The transcript index could not be read.
+    pub index_unreadable: bool,
+    /// Live session holders or their open files could not all be listed.
+    pub live_holders_incomplete: bool,
+}
+
+impl LinkageIssues {
+    pub fn any(&self) -> bool {
+        self.unreadable_databases > 0
+            || self.registry_incomplete
+            || self.index_unreadable
+            || self.live_holders_incomplete
+    }
+
+    /// The kinds of issue present, for advice and status.
+    pub fn kinds(&self) -> Vec<String> {
+        let mut kinds = Vec::new();
+        if self.unreadable_databases > 0 {
+            kinds.push(format!(
+                "{} unreadable broker database(s)",
+                self.unreadable_databases
+            ));
+        }
+        if self.registry_incomplete {
+            kinds.push("incomplete worktree registry".to_string());
+        }
+        if self.index_unreadable {
+            kinds.push("unreadable transcript index".to_string());
+        }
+        if self.live_holders_incomplete {
+            kinds.push("live session holders not fully listed".to_string());
+        }
+        kinds
+    }
+}
+
+/// Index meta keys for pass health.
+const META_DEGRADED_PASSES: &str = "consecutive_degraded_passes";
+const META_LAST_ISSUES: &str = "last_linkage_issues";
+/// Consecutive degraded passes before `broker status` advises.
+pub(crate) const DEGRADED_PASSES_FOR_ADVICE: u64 = 3;
+
+/// Record whether this applied pass could read every source of links.
+fn record_pass_health(index: &Index, report: &RunReport) {
+    let previous = index
+        .meta(META_DEGRADED_PASSES)
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let passes = if report.linkage_degraded {
+        previous + 1
+    } else {
+        0
+    };
+    let issues = serde_json::to_string(&report.linkage_issues).unwrap_or_default();
+    crate::warn_unrecorded(
+        "record transcript linkage health",
+        index
+            .set_meta(META_DEGRADED_PASSES, &passes.to_string())
+            .and_then(|()| index.set_meta(META_LAST_ISSUES, &issues)),
+    );
+}
+
+/// Linkage health as the index last recorded it.
+fn pass_health(index: &Index) -> (u64, Option<LinkageIssues>) {
+    let passes = index
+        .meta(META_DEGRADED_PASSES)
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let issues = index
+        .meta(META_LAST_ISSUES)
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_str(&value).ok());
+    (passes, issues)
+}
+
+/// The `broker status` advice for linkage that stayed degraded for
+/// [`DEGRADED_PASSES_FOR_ADVICE`] passes, from `index`.
+pub(crate) fn linkage_advice_from(index: &Index) -> Option<crate::StatusAdvice> {
+    let (passes, issues) = pass_health(index);
+    if passes < DEGRADED_PASSES_FOR_ADVICE {
+        return None;
+    }
+    let kinds = issues.unwrap_or_default().kinds();
+    Some(crate::StatusAdvice {
+        id: "transcripts.linkage-degraded",
+        severity: crate::StatusAdviceSeverity::Warning,
+        reason: "transcript archiving could not read every source of session links for several passes",
+        summary: format!(
+            "the last {passes} transcript archive passes skipped every unlinked transcript because session links could not all be read ({})",
+            if kinds.is_empty() {
+                "unknown cause".to_string()
+            } else {
+                kinds.join(", ")
+            }
+        ),
+        session_id: None,
+        queue_entry_id: None,
+        evidence: kinds,
+        commands: vec!["aethyme transcripts status".into()],
+    })
+}
+
+/// The advice for this host, when transcript archiving is enabled here.
+pub(crate) fn linkage_degraded_advice() -> Option<crate::StatusAdvice> {
+    if crate::gc::background_process_is_suppressed() {
+        return None;
+    }
+    let (environment, config) = super::host_settings()?;
+    if !config.archive {
+        return None;
+    }
+    let index = Index::open_existing(&environment.host_dir).ok()??;
+    linkage_advice_from(&index)
+}
+
 /// What one pass found and did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunReport {
@@ -117,6 +244,8 @@ pub struct RunReport {
     /// True when a broker database or a live-holder listing could not be
     /// read this pass: unlinked transcripts were then all skipped.
     pub linkage_degraded: bool,
+    /// What could not be read, by kind (counts and flags; no paths).
+    pub linkage_issues: LinkageIssues,
     /// Open-file listings taken (each covers one provider root).
     pub open_listings: u64,
     /// Full syncs that fell back to `fsync` (macOS file systems refusing
@@ -156,6 +285,7 @@ impl RunReport {
             broker_databases: 0,
             links_added: 0,
             linkage_degraded: false,
+            linkage_issues: LinkageIssues::default(),
             open_listings: 0,
             full_sync_fallbacks: 0,
             paced_bytes_per_second: None,
@@ -347,6 +477,7 @@ fn append_run_log(host_dir: &Path, report: &RunReport) {
         "skipped": report.skipped,
         "skipped_sessions": skipped_sessions,
         "linkage_degraded": report.linkage_degraded,
+        "linkage_issues": report.linkage_issues,
         "insufficient_space": report.insufficient_space,
         "full_sync_fallbacks": report.full_sync_fallbacks,
         "budget_exhausted": report.budget_exhausted,
@@ -485,7 +616,8 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
         environment.use_registry,
     );
     report.warnings.extend(known.warnings);
-    let mut degraded = known.index_unreadable;
+    report.linkage_issues.index_unreadable = known.index_unreadable;
+    report.linkage_issues.registry_incomplete = known.registry_incomplete;
     report.broker_databases = known.databases.len() as u64;
     let mut unreadable_databases = 0;
     for db in &known.databases {
@@ -494,8 +626,8 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
             Err(_) => unreadable_databases += 1,
         }
     }
+    report.linkage_issues.unreadable_databases = unreadable_databases;
     if unreadable_databases > 0 {
-        degraded = true;
         // Counted, never named: logs carry no path outside the provider roots.
         report.warnings.push(format!(
             "{unreadable_databases} broker database(s) could not be read; unlinked transcripts are skipped this pass"
@@ -512,7 +644,7 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
         Ok(live) => {
             report.links_added += live.added;
             if live.incomplete {
-                degraded = true;
+                report.linkage_issues.live_holders_incomplete = true;
                 report.warnings.push(
                     "live session holders could not all be listed; unlinked transcripts are skipped this pass"
                         .into(),
@@ -520,10 +652,11 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
             }
         }
         Err(error) => {
-            degraded = true;
+            report.linkage_issues.live_holders_incomplete = true;
             report.warnings.push(error);
         }
     }
+    let degraded = report.linkage_issues.any();
     report.linkage_degraded = degraded;
     report.phase("transcripts_linkage", phase.elapsed());
 
@@ -594,6 +727,7 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
     report.phase("transcripts_open_check", probes.open_files.probe_time);
     report.phase("transcripts_total", started.elapsed());
     if options.apply {
+        record_pass_health(&index, &report);
         append_run_log(&environment.host_dir, &report);
     }
     Ok(report)
@@ -804,7 +938,33 @@ pub struct StatusReport {
     pub counters: BTreeMap<String, u64>,
     pub lock_holder: Option<String>,
     pub last_run: Option<serde_json::Value>,
+    /// Whether session links could be read, now and over recent passes.
+    pub linkage: LinkageStatus,
+    /// Sources kept because their copy could not be made durable.
+    pub durability: DurabilityStatus,
     pub warnings: Vec<String>,
+}
+
+/// Linkage health in `transcripts status`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct LinkageStatus {
+    pub degraded_now: bool,
+    pub issues_now: LinkageIssues,
+    /// Applied passes in a row that were degraded.
+    pub consecutive_degraded_passes: u64,
+    pub last_pass_issues: Option<LinkageIssues>,
+}
+
+/// Durability health in `transcripts status`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DurabilityStatus {
+    /// Transcripts left in place because a sync of their copy failed.
+    pub sources_kept_sync_failed: u64,
+    /// Full syncs that fell back to `fsync` (`F_FULLFSYNC` unsupported).
+    pub full_sync_fallbacks: u64,
+    /// Restores that published and have not finished removing their archive
+    /// (the next `restore` of the same transcript finishes them).
+    pub restore_intents_pending: u64,
 }
 
 /// Every archived transcript the index records (empty when disabled: a
@@ -845,6 +1005,8 @@ pub(crate) fn status<P: OpenFileProbe>(
         counters: BTreeMap::new(),
         lock_holder: None,
         last_run: None,
+        linkage: LinkageStatus::default(),
+        durability: DurabilityStatus::default(),
         warnings: Vec::new(),
     };
     if !config.archive {
@@ -863,7 +1025,24 @@ pub(crate) fn status<P: OpenFileProbe>(
         status.archived_bytes_before = rows.iter().map(|row| row.bytes_in).sum();
         status.archived_bytes_after = rows.iter().map(|row| row.bytes_out).sum();
         status.counters = index.counters()?;
+        status.durability.restore_intents_pending = index.pending_restore_intents().unwrap_or(0);
+        let (passes, issues) = pass_health(&index);
+        status.linkage.consecutive_degraded_passes = passes;
+        status.linkage.last_pass_issues = issues;
     }
+    status.durability = DurabilityStatus {
+        restore_intents_pending: status.durability.restore_intents_pending,
+        sources_kept_sync_failed: status
+            .counters
+            .get("skipped_sync_failed")
+            .copied()
+            .unwrap_or(0),
+        full_sync_fallbacks: status
+            .counters
+            .get("full_sync_fallbacks")
+            .copied()
+            .unwrap_or(0),
+    };
     status.lock_holder = LaneLock::recorded_holder(&environment.host_dir);
     status.last_run = last_run(&environment.host_dir);
     let dry = run_pass(
@@ -880,6 +1059,8 @@ pub(crate) fn status<P: OpenFileProbe>(
     status.reclaimable_now_bytes = dry.eligible_bytes;
     status.eligible_now = dry.eligible.len() as u64;
     status.skipped_now = dry.skipped;
+    status.linkage.degraded_now = dry.linkage_degraded;
+    status.linkage.issues_now = dry.linkage_issues;
     status.warnings = dry.warnings;
     Ok(status)
 }
@@ -946,11 +1127,82 @@ pub(crate) fn restore_plans(
     Ok(plans)
 }
 
-/// Restore every archive `key` names, under the lane lock.
-pub(crate) fn restore(
+/// Refuse to merge into a transcript whose session may still be writing
+/// it. Unknown counts as live.
+fn refuse_live_merge<P: OpenFileProbe>(
+    plan: &RestorePlan,
+    provider: Provider,
+    open_root: Option<&Path>,
+    probes: &mut Probes<'_, P>,
+) -> Result<(), String> {
+    let session_id = plan
+        .original
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| providers::session_id_from_file_name(provider, name));
+    let original = plan.original.display();
+    match provider {
+        Provider::Claude => {
+            let project = plan
+                .original
+                .parent()
+                .and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let processes = probes.agents.claude_processes().map_err(|error| {
+                format!(
+                    "{original} has a newer transcript and a live Claude Code session cannot be ruled out ({error}); retry when the process table can be read"
+                )
+            })?;
+            if agents::claude_session_live(&processes, &project, session_id.as_deref()) {
+                return Err(format!(
+                    "{original} has a newer transcript and a Claude Code session for its project is running; close that session, then restore"
+                ));
+            }
+        }
+        Provider::Codex => {
+            let open = match open_root {
+                Some(root) => probes.open_files.fresh_state_of(root, &plan.original),
+                None => eligibility::OpenState::Unknown,
+            };
+            match open {
+                eligibility::OpenState::Closed => {}
+                eligibility::OpenState::Open => {
+                    return Err(format!(
+                        "{original} is open in a running process; close that Codex session, then restore"
+                    ));
+                }
+                eligibility::OpenState::Unknown => {
+                    return Err(format!(
+                        "{original} has a newer transcript and its open-file listing is unavailable; retry later"
+                    ));
+                }
+            }
+            let lines = probes.agents.codex_command_lines().map_err(|error| {
+                format!(
+                    "{original} has a newer transcript and a live Codex session cannot be ruled out ({error}); retry later"
+                )
+            })?;
+            if session_id
+                .as_deref()
+                .is_some_and(|id| agents::names_session(&lines, id))
+            {
+                return Err(format!(
+                    "{original} has a newer transcript and a Codex process for that session is running; close it, then restore"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Restore every archive `key` names, under the lane lock. A merge into a
+/// newer transcript is refused while its session may be live.
+pub(crate) fn restore<P: OpenFileProbe>(
     environment: &Environment,
     config: &TranscriptsConfig,
     key: &str,
+    probes: &mut Probes<'_, P>,
 ) -> Result<Vec<Restored>, String> {
     let plans = restore_plans(environment, config, key)?;
     if plans.is_empty() {
@@ -970,21 +1222,39 @@ pub(crate) fn restore(
     let roots = Roots::open(environment, &layout, &mut warnings);
     let mut restored = Vec::new();
     for plan in &plans {
-        let (archive_root, original_root) = match (&roots.codex, &roots.claude, &roots.state) {
-            (Some(codex), _, _) if codex.contains(&plan.archive) => (codex, codex),
-            (_, Some(claude), Some(state)) if state.contains(&plan.archive) => (state, claude),
-            _ => {
-                let mut message = format!(
-                    "{} is not beneath a validated provider root",
-                    plan.archive.display()
-                );
-                if let Some(warning) = warnings.first() {
-                    message.push_str(&format!(" ({warning})"));
+        let (archive_root, original_root, provider) =
+            match (&roots.codex, &roots.claude, &roots.state) {
+                (Some(codex), _, _) if codex.contains(&plan.archive) => {
+                    (codex, codex, Provider::Codex)
                 }
-                return Err(message);
-            }
-        };
-        let done = archive::restore_one(plan, archive_root, original_root, Some(&index))?;
+                (_, Some(claude), Some(state)) if state.contains(&plan.archive) => {
+                    (state, claude, Provider::Claude)
+                }
+                _ => {
+                    let mut message = format!(
+                        "{} is not beneath a validated provider root",
+                        plan.archive.display()
+                    );
+                    if let Some(warning) = warnings.first() {
+                        message.push_str(&format!(" ({warning})"));
+                    }
+                    return Err(message);
+                }
+            };
+        // A newer transcript at the original path means a merge (or the
+        // cleanup of an interrupted one): refused while its session may be
+        // writing it.
+        if std::fs::symlink_metadata(&plan.original).is_ok() {
+            let open_root = layout.open_root(provider);
+            refuse_live_merge(plan, provider, open_root.as_deref(), probes)?;
+        }
+        let done = archive::restore_one(
+            plan,
+            archive_root,
+            original_root,
+            Some(&index),
+            super::now_ms(),
+        )?;
         super::best_effort(index.clear_conflict(&plan.original));
         restored.push(done);
     }
