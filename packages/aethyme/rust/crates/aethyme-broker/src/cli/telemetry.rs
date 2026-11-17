@@ -320,6 +320,11 @@ fn with_spans(
     mut fields: serde_json::Map<String, serde_json::Value>,
     spans: &crate::phase_telemetry::Recorder,
 ) -> serde_json::Map<String, serde_json::Value> {
+    // Attached facts (a lock's queue position, who held it) are top-level
+    // fields; one the command attached itself under the same name wins.
+    for (name, value) in spans.attachments() {
+        fields.entry(name).or_insert(value);
+    }
     let (millis, counts) = spans.totals();
     if millis.is_empty() {
         return fields;
@@ -690,6 +695,26 @@ mod tests {
         assert_eq!(fields["phase_counts"]["subprocess_git"], 1);
         assert_eq!(fields["phase_timings_ms"]["measured"], 1);
         assert_eq!(fields["phase_timings_ms"]["subprocess_git"], 2);
+    }
+
+    #[test]
+    fn attached_facts_reach_the_metric_line_without_replacing_the_commands_own() {
+        let spans = crate::phase_telemetry::Recorder::default();
+        {
+            let _installed = crate::phase_telemetry::install(spans.clone());
+            crate::phase_telemetry::attach(
+                "lifecycle_lock",
+                serde_json::json!({"queue_position": 2, "outcome": "timeout"}),
+            );
+            crate::phase_telemetry::attach("owned", serde_json::json!("from a span"));
+        }
+        let attached = serde_json::json!({"owned": "by the command"});
+
+        let fields = with_spans(attached.as_object().unwrap().clone(), &spans);
+
+        assert_eq!(fields["lifecycle_lock"]["queue_position"], 2);
+        assert_eq!(fields["lifecycle_lock"]["outcome"], "timeout");
+        assert_eq!(fields["owned"], "by the command");
     }
 
     #[test]

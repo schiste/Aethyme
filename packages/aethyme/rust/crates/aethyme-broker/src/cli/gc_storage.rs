@@ -1919,6 +1919,9 @@ fn run_gc_artifact_use_reconcile(parsed: Parsed) -> Result<(), UsageError> {
     };
 
     let mut broker = open_broker(true)?;
+    // An operator's explicit apply is foreground work: it does not yield to
+    // queued lifecycle waiters, it only refuses while the lock is held.
+    let _foreground = crate::file_lock::ForegroundLifecycleTryClaim::enter();
     let _lifecycle_claim =
         if action == "apply" {
             Some(broker.try_claim_worktree_lifecycle()?.ok_or_else(|| {

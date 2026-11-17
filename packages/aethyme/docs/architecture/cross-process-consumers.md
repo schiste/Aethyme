@@ -2741,3 +2741,65 @@ Introduced 2026-11-17. Changes consumers may see:
 - Pins under `refs/aethyme/retired/` expire once a delivery target (the default branch or its remote-tracking ref) or another remote-tracking ref holds the commit, or once their session has been cleaned for `recovery_archive_days` (0 keeps them). At most 64 pins are checked per run, from a cursor (meta key `checkout_retirement.pin_cursor`). They are counted in advice `cleanup.retired-pins` and the progress field `retired_pins`. Inline retirement at close takes only the no-archive path (`kept_deferred_to_lane` otherwise). Recreating a retired checkout for `start --reuse` takes the lifecycle claim.
 - A pending trash row whose mover's start time was unreadable is named in `cleanup.trash-unrecognized` once a day old (progress field `stale_pending_trash_entries`). An explicit `gc apply` confirms it when the entry still matches its device and inode and no open session uses the session's path. The meta key `checkout_retirement.trashed_sessions` keeps a tombstone per confirmed move until the session is recorded as cleaned, so a lost cleaned record is reconciled on the next run.
 Covered by `checkout_trash.rs` and `broker/retire.rs` tests.
+
+## Repository lifecycle lock: ticket queue and telemetry (2026-11-17)
+
+`.aethyme/run/worktree-lifecycle.lock` stays the one flock that serialises
+checkout creation, adoption and removal; nothing about exclusion changed. What
+changed is who tries it next, what a holder records, and what every claim
+reports.
+
+- **Queue.** A blocking claim (start, adopt, finish, cleanup, close, submit,
+  gate admission, storage removal) creates a ticket under
+  `.aethyme/run/lifecycle-lock-waiters/` named
+  `<enqueue epoch ns>.<pid>.<process start>.<sequence>` and tries the lock only
+  while no live ticket sorts before its own. It refreshes the ticket's mtime
+  every second while it waits and removes the ticket once it holds the lock, on
+  timeout, or on error. A ticket whose PID has exited, whose PID now has a
+  different process start time, or that is older than 15 minutes is removed by
+  the next waiter that scans; a live ticket not refreshed for 10 seconds is
+  passed over but kept. Anything else in the directory is ignored. The wait
+  stays bounded at 180 seconds (less under a command Git deadline, at most 10
+  seconds for gate admission).
+- **Foreground first.** A nonblocking claim (`try_claim_worktree_lifecycle`:
+  retirement, auto-cleanup, GC, missing-checkout repair, abandoned-session
+  close) returns "busy" while any live ticket exists, even when the lock itself
+  is free. `broker start` making room at the checkout limit and
+  `gc artifact-use reconcile apply` claim inside a foreground scope and do not
+  yield. The background worker's capacity slice is not foreground.
+- **Compatibility.** Binaries older than this change keep no ticket and poll
+  unordered, so they can take the lock out of turn; ordering degrades, mutual
+  exclusion does not. A reader must tolerate the new directory.
+- **Holder record.** The lock file now reads
+  `pid=<pid> since_ms=<epoch ms> kind=<foreground|nonblocking> session=<id|-> operation=<first command words>`
+  (`operation=` stays last) and is emptied, still under the lock, when the claim
+  is released. The session is taken only from a numeric `--session` argument.
+  Readers of the older `pid=… since_ms=… operation=…` form keep working.
+- **Refusal text.** A timeout names the holder's command, session, kind and
+  hold age, how many other commands are queued, how many were ahead of this one
+  then and when it queued, and still ends in "retry this command after it
+  finishes".
+- **Telemetry.** Every command that takes the claim, the timeout and error
+  paths included, adds to its `command-metrics.jsonl` row the timed phases
+  `lifecycle_lock_wait` and (when it held the claim) `lifecycle_lock_held` under
+  `phase_timings_ms`/`phase_counts`, and a top-level object `lifecycle_lock`
+  with `claim`, `outcome` (`acquired`, `timeout`, `failed`), `wait_ms`,
+  `held_ms`, `queue_position_at_enqueue`, `queue_length_at_enqueue`, `queued`,
+  `waited_behind` (the holder's command when this claim first found the lock
+  held) and `holder_operation`. A command that claims more than once reports
+  summed phases and the last queued claim's object. A nonblocking claim adds
+  to `lifecycle_lock_held` and counts `lifecycle_lock_nonblocking_acquired`
+  (or `lifecycle_lock_yielded_to_waiter` when it yielded) but never writes the
+  object. `broker start`'s own
+  `phase_timings_ms.lifecycle_lock_wait` takes precedence over the span of the
+  same name on success.
+- **Shorter `start` hold.** The sparse-checkout plan is computed before the
+  claim, and the claim is released as soon as the session row is registered
+  (before lease and preparation reporting). `git worktree add`, contract and
+  witness capture and registration still run under it: storage's stray-checkout
+  review, GC orphan review, the worktree-registry orphan sweep and the
+  retirement lanes recognise a half-created checkout only by that exclusion,
+  so moving `worktree add` outside it needs a reservation every one of those
+  lanes honours first. Plain `finish`/`cleanup` still removes through
+  `git worktree remove` under the claim; only verified-archive and retirement
+  removals rename into the trash.

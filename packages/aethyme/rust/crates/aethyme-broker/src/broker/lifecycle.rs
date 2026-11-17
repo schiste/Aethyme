@@ -7504,7 +7504,7 @@ impl Broker {
             worktree,
             worktree_placement,
             selected_promote_branch,
-            _lifecycle_claim,
+            _lifecycle_claim: lifecycle_claim,
         } = self.create_session_worktree(task, explicit_base, &planned_paths)?;
         let base = start_base.commit.clone();
         let base_observation = crate::broker::SessionBaseObservation::from_start_base(
@@ -7569,6 +7569,9 @@ impl Broker {
             }
         };
         self.store.set_session_foreign_files(session.id, &[])?;
+        // The registered row now protects the checkout from every lane that
+        // honours the claim; what follows only reads it.
+        drop(lifecycle_claim);
         let planned_explicit_leases = self.planned_explicit_leases(session.id, &planned_paths)?;
         phase_timings_ms.insert(
             "session_registration".into(),
@@ -7667,7 +7670,7 @@ impl Broker {
             worktree,
             worktree_placement,
             selected_promote_branch,
-            _lifecycle_claim,
+            _lifecycle_claim: lifecycle_claim,
         } = self.create_session_worktree(task, explicit_base, &[])?;
         let agent_setup_started = std::time::Instant::now();
         let base = start_base.commit.clone();
@@ -7837,6 +7840,8 @@ impl Broker {
                 }
             }
         };
+        // Registered: the row protects the checkout from here on.
+        drop(lifecycle_claim);
 
         if let Err(source) = agent.release() {
             let cleanup = match agent.abort() {
@@ -7958,6 +7963,10 @@ impl Broker {
             self.select_session_start_base_with_promote(explicit_base, &selected_promote)
         })?;
         refresh.record(&mut start_base);
+        // The sparse plan reads only configuration and the selected base
+        // commit's tree, never the checkout pool, so it needs no claim.
+        let (sparse_paths, sparse_plan_fallback) =
+            self.sparse_paths_for_new_session(&start_base.commit, planned_paths);
         // Refresh may wait on another process or a remote. Acquire the
         // repository lifecycle claim only after that work. Root preparation
         // writes the marker and build defaults, so it belongs under the same
@@ -7980,6 +7989,10 @@ impl Broker {
             // instead of refusing at once.
             let cleanup =
                 timed_start_phase(&mut phase_timings_ms, "checkout_capacity_cleanup", || {
+                    // This start makes room for its own waiting user, so its
+                    // nonblocking lifecycle claims do not yield to queued
+                    // waiters the way the background worker's do.
+                    let _foreground = crate::file_lock::ForegroundLifecycleTryClaim::enter();
                     self.auto_cleanup_for_checkout_capacity(
                         CHECKOUT_CAPACITY_LOCK_WAIT,
                         CHECKOUT_CAPACITY_CLEANUP_BUDGET,
@@ -8024,8 +8037,6 @@ impl Broker {
         timed_start_phase(&mut phase_timings_ms, "storage_admission", || {
             self.preflight_session_checkout_storage(&placement)
         })?;
-        let (sparse_paths, sparse_plan_fallback) =
-            self.sparse_paths_for_new_session(&start_base.commit, planned_paths);
         let (worktree, sparse_setup_fallback) =
             match timed_start_phase(&mut phase_timings_ms, "git_worktree_add", || {
                 self.repo.worktree_add_with_sparse_paths(
