@@ -967,8 +967,15 @@ at once; see the host resource coordination guide. The cache path and ownership 
 are absent from JSON and broker journals.
 
 Steps with `cache = "repository_shared"` may declare `shared_package_caches`
-to expose package-manager-specific directories beneath that same identity- and
-digest-bound cache:
+to expose package-manager-specific directories. By default they live in one
+repository-wide store per platform, `<cache root>/<repository>/packages/<os>-<arch>/`,
+shared by every input set, so a lockfile or requirements change downloads and
+imports only the packages that differ. Each digest directory also links
+`pnpm-store`, `npm-cache`, `uv-cache` and `pip-cache` to that store, so a
+command written as `$AETHYME_PREPARE_CACHE_DIR/pnpm-store` shares it too; a
+real directory left there by an earlier version is kept. `[shared_cache]
+package_store = "per_input"` restores one store per preparation digest for
+explicit isolation. The variables are:
 `pnpm` provides `AETHYME_PREPARE_PNPM_STORE_DIR`, `npm` provides
 `AETHYME_PREPARE_NPM_CACHE_DIR`, `uv` provides `AETHYME_PREPARE_UV_CACHE_DIR`,
 and `pip` provides `AETHYME_PREPARE_PIP_CACHE_DIR`. The broker only supplies
@@ -997,6 +1004,19 @@ and installed executables; the broker leaves it untouched. Keep generated
 worktree outputs such as `node_modules/`, `.venv/`, and `target/` per worktree.
 Before starting a command, the broker creates each selected alias directory if
 needed and refuses symlink or non-directory leaves under the bound cache root.
+
+The prepare report and `submit prepare status --json` carry `package_store`:
+the store `path`, `scope`, `key` (`repository`, `os`, `arch`), the `runtimes`
+the preparation digest keyed on (resolved executable, size, modification
+time), `same_volume`, the `import_method` the volume supports between store
+and checkout (`clone`, `hardlink` or `copy`, probed in the order pnpm's
+default `auto` import tries them), the `compatibility_links` created, and the
+worktree volume's free bytes before and after with their best-effort
+difference `volume_bytes_allocated` (also per step). The report's
+`cache_outcome` says whether the checkout was already current (`hit`) and, on
+a miss, `miss_reason`, naming runtimes whose identity changed. When the store
+is on another volume than the checkouts, `broker status` warns
+`prepare.store-on-other-volume`: dependencies are then copied, never shared.
 
 By default, the broker derives the shared preparation cache from the captured
 host-resource database location. To place that cache on a separate volume, set

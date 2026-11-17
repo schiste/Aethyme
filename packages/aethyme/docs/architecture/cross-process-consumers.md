@@ -1386,10 +1386,29 @@ writes made by preparation commands.
 
 A `repository_shared` preparation step may opt into `shared_package_caches`
 with unique values `pnpm`, `npm`, `uv`, or `pip`. The broker exposes only the
-selected `AETHYME_PREPARE_*_DIR` paths, each beneath the existing canonical
-remote identity and preparation-digest directory. Steps selecting the same
-manager under one digest reuse that manager's directory. The pnpm alias keeps
-the existing `AETHYME_PREPARE_CACHE_DIR/pnpm-store` path. The command must
+selected `AETHYME_PREPARE_*_DIR` paths. By default each is beneath the
+repository-wide package store `<cache root>/<repository>/packages/<os>-<arch>/`,
+shared by every preparation digest: the store key is the captured cache root,
+canonical remote identity, OS, architecture and manager directory, and the
+manager's own layout version (pnpm `v10/`, uv and pip wheel tags) keeps
+incompatible content apart. Every digest directory links `pnpm-store`,
+`npm-cache`, `uv-cache` and `pip-cache` to that store with relative symlinks,
+so `AETHYME_PREPARE_CACHE_DIR/pnpm-store` reaches the shared store; an existing
+real directory there (the earlier layout) is left in place.
+`[shared_cache] package_store = "per_input"` keeps the earlier per-digest
+stores; the default is not serialized, so existing preparation digests and
+trusted policies are unchanged. The `packages` directory is never swept as a
+stale digest; only a whole-store rotation under the exclusive lease removes
+it, and a retired store containing it keeps a managed layout.
+
+Output contract (additive): the prepare report gains `package_store`,
+`cache_outcome` (`hit`, `miss_reason`) and per-step `volume_bytes_allocated`;
+the command metric's `preparation` object carries `package_store` and
+`cache_outcome`; `submit prepare status --json` gains `package_store` from the
+session's last recorded preparation (store path, scope, key components,
+runtime identities, `same_volume`, `import_method`, free-space readings);
+`broker status` gains the warning `prepare.store-on-other-volume`, read from
+the broker metadata key `preparation.package_store_volume`. The command must
 explicitly route its manager to the alias; native package-manager variables
 remain caller-controlled. `CARGO_HOME` is deliberately unsupported because it
 also contains configuration, credentials, and executables. The broker does

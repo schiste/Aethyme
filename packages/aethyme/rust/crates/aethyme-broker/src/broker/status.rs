@@ -57,6 +57,7 @@ impl Broker {
         );
         self.push_checkout_capacity_advice(&mut view, deadline);
         self.push_shared_cache_inventory_advice(&mut view);
+        self.push_package_store_volume_advice(&mut view);
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
@@ -449,6 +450,31 @@ impl Broker {
         });
     }
 
+    /// Warn when the last preparation's package store was on another volume
+    /// than its checkout: a package manager can then only copy every file,
+    /// so no two sessions share dependency bytes. One metadata read.
+    fn push_package_store_volume_advice(&self, view: &mut StatusView) {
+        let Some(record) = self.package_store_on_other_volume() else {
+            return;
+        };
+        view.advice.push(StatusAdvice {
+            id: "prepare.store-on-other-volume",
+            severity: StatusAdviceSeverity::Warning,
+            reason: "a package manager can clone or hard link from its store only within one volume; across volumes every preparation copies every dependency file",
+            summary: format!(
+                "the shared package store {} is on another volume than the session checkouts; dependencies are copied, not shared",
+                record.store.display()
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: vec![format!(
+                "observed by the preparation at (ms since epoch): {}",
+                record.at_ms
+            )],
+            commands: vec!["aethyme broker status --json".into()],
+        });
+    }
+
     fn push_checkout_capacity_advice(&self, view: &mut StatusView, deadline: std::time::Instant) {
         let advice = if std::time::Instant::now() >= deadline {
             None
@@ -560,6 +586,7 @@ impl Broker {
         );
         self.push_checkout_capacity_advice(&mut view, deadline);
         self.push_shared_cache_inventory_advice(&mut view);
+        self.push_package_store_volume_advice(&mut view);
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,

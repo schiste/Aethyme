@@ -2755,6 +2755,11 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                 continue;
             }
             let key = entry.file_name().to_string_lossy().into_owned();
+            // The repository-wide package store serves every input set; only
+            // a whole-store rotation, under the exclusive lease, removes it.
+            if is_shared_package_store(&key) {
+                continue;
+            }
             if !is_preparation_cache_key(&key) {
                 complete = false;
                 continue;
@@ -3945,6 +3950,15 @@ fn inspect_preparation_cache_with_liveness(
         for key_entry in keys.flatten() {
             let path = key_entry.path();
             let key = key_entry.file_name().to_string_lossy().into_owned();
+            if is_real_directory(&path) && is_shared_package_store(&key) {
+                entries.push(retained_preparation_entry(
+                    path,
+                    repository_name.clone(),
+                    key,
+                    "repository-wide package store shared by every input set; removed only by a whole-store rotation",
+                ));
+                continue;
+            }
             if !is_real_directory(&path) || !is_preparation_cache_key(&key) {
                 entries.push(retained_preparation_entry(
                     path,
@@ -4033,6 +4047,11 @@ fn is_preparation_cache_key(value: &str) -> bool {
     is_lowercase_hex(value, 12)
 }
 
+/// The repository-wide package-manager store beside the digest keys.
+fn is_shared_package_store(value: &str) -> bool {
+    value == crate::preparation::package_store::SHARED_PACKAGE_STORE_DIR
+}
+
 fn preparation_cache_repository_identity(name: &str) -> Option<(&str, bool)> {
     if is_lowercase_hex(name, 64) {
         return Some((name, false));
@@ -4076,9 +4095,11 @@ fn retired_preparation_store_layout(path: &Path, deadline: Option<std::time::Ins
         let Ok(file_type) = entry.file_type() else {
             return false;
         };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
         if file_type.is_symlink()
             || !file_type.is_dir()
-            || !is_preparation_cache_key(&entry.file_name().to_string_lossy())
+            || !(is_preparation_cache_key(&name) || is_shared_package_store(&name))
         {
             return false;
         }
@@ -6133,6 +6154,24 @@ fn is_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_retired_store_holding_the_shared_package_store_keeps_a_managed_layout() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("retired");
+        std::fs::create_dir_all(store.join("0123456789ab")).unwrap();
+        std::fs::create_dir_all(
+            store
+                .join(crate::preparation::package_store::SHARED_PACKAGE_STORE_DIR)
+                .join("linux-x86_64/pnpm-store"),
+        )
+        .unwrap();
+        assert!(retired_preparation_store_layout(&store, None));
+        std::fs::create_dir(store.join("unexpected")).unwrap();
+        assert!(!retired_preparation_store_layout(&store, None));
+        assert!(is_shared_package_store("packages"));
+        assert!(!is_preparation_cache_key("packages"));
+    }
 
     const TEST_PREPARATION_REPOSITORY: &str = concat!(
         "aaaaaaaaaaaaaaaa",

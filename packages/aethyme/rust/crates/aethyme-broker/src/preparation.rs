@@ -25,6 +25,8 @@ use crate::{
 pub(crate) mod cache_activity;
 #[path = "preparation_cache_measurement.rs"]
 pub(crate) mod cache_measurement;
+#[path = "preparation_package_store.rs"]
+pub(crate) mod package_store;
 #[path = "preparation_recovery_state.rs"]
 pub(crate) mod recovery_state;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -263,6 +265,9 @@ pub enum PreparationPackageCache {
 }
 
 impl PreparationPackageCache {
+    /// Every manager, in declaration order.
+    const ALL: [Self; 4] = [Self::Pnpm, Self::Npm, Self::Uv, Self::Pip];
+
     fn directory_name(self) -> &'static str {
         match self {
             Self::Pnpm => "pnpm-store",
@@ -322,6 +327,16 @@ pub struct SharedCacheBudget {
         skip_serializing_if = "is_default_shared_cache_max_concurrent"
     )]
     pub max_concurrent: u32,
+    /// Where package-manager stores live. Omission means `repository`: one
+    /// content-addressed store per repository, platform and manager, shared
+    /// by every input set. `per_input` keys the stores by the preparation
+    /// digest instead, so each distinct input set downloads and imports its
+    /// packages afresh; choose it only for explicit isolation.
+    #[serde(
+        default,
+        skip_serializing_if = "package_store::PackageStoreScope::is_repository"
+    )]
+    pub package_store: package_store::PackageStoreScope,
 }
 
 /// The most sessions `[shared_cache] max_concurrent` can admit at once.
@@ -692,6 +707,7 @@ impl Default for SharedCacheBudget {
             max_bytes: default_shared_cache_max_bytes(),
             root: SharedCacheRoot::default(),
             max_concurrent: default_shared_cache_max_concurrent(),
+            package_store: package_store::PackageStoreScope::default(),
         }
     }
 }
@@ -785,6 +801,11 @@ pub struct PreparationStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_cache_background_measurement:
         Option<cache_measurement::SharedCacheMeasurementStatus>,
+    /// What this session's last recorded preparation used for package
+    /// storage: the store path and key components, the runtimes the digest
+    /// keyed on, the import the volume supports and the free-space change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_store: Option<package_store::PackageStoreReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -794,6 +815,10 @@ pub struct PreparationStepResult {
     pub succeeded: bool,
     /// Elapsed wall time for this step, including execution supervision.
     pub duration_ms: u64,
+    /// Best effort: the worktree volume's free-space drop during this step.
+    /// Other writers on the volume add to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_bytes_allocated: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -824,6 +849,14 @@ pub struct PreparationReport {
     pub shared_cache_background_measurement:
         Option<cache_measurement::SharedCacheBackgroundMeasurementReport>,
     pub steps: Vec<PreparationStepResult>,
+    /// Whether the checkout was already prepared for the current key (a
+    /// hit, no command ran) and, on a miss, why the key did not match.
+    pub cache_outcome: PreparationCacheOutcome,
+    /// The package store this preparation used, its key, the import the
+    /// volume supports, and the volume's free-space change; absent when no
+    /// step shares the cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_store: Option<package_store::PackageStoreReport>,
     pub next_action: String,
 }
 
@@ -837,6 +870,7 @@ impl PreparationReport {
             "shared_cache_wait_ms": self.shared_cache_wait_ms,
             "shared_cache_mode": self.shared_cache_mode.map(|mode| mode.as_str()),
             "steps": self.steps,
+            "cache_outcome": self.cache_outcome,
         });
         if let Some(rotation) = &self.shared_cache_rotation {
             preparation["shared_cache_rotation"] = serde_json::json!(rotation);
@@ -848,7 +882,54 @@ impl PreparationReport {
         if let Some(background) = &self.shared_cache_background_measurement {
             preparation["shared_cache_background_measurement"] = serde_json::json!(background);
         }
+        if let Some(store) = &self.package_store {
+            preparation["package_store"] = serde_json::json!(store);
+        }
         serde_json::json!({ "preparation": preparation })
+    }
+}
+
+/// Whether a preparation found its checkout current for the key it computed.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PreparationCacheOutcome {
+    pub hit: bool,
+    /// On a miss: the preparation state before this run and why. A stale
+    /// checkout whose recorded runtimes differ from the resolved ones names
+    /// them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub miss_reason: Option<String>,
+}
+
+impl PreparationCacheOutcome {
+    fn hit() -> Self {
+        Self {
+            hit: true,
+            miss_reason: None,
+        }
+    }
+
+    fn miss(
+        status: &PreparationStatus,
+        current_runtimes: &[package_store::RuntimeIdentity],
+    ) -> Self {
+        let mut reason = format!("{}: {}", status.state.as_str(), status.reason);
+        if status.state == PreparationState::Stale
+            && let Some(recorded) = status.package_store.as_ref()
+            && !recorded.runtimes.is_empty()
+        {
+            let changed = current_runtimes
+                .iter()
+                .filter(|runtime| !recorded.runtimes.contains(runtime))
+                .map(|runtime| runtime.name.as_str())
+                .collect::<Vec<_>>();
+            if !changed.is_empty() {
+                reason.push_str(&format!(" (runtimes changed: {})", changed.join(", ")));
+            }
+        }
+        Self {
+            hit: false,
+            miss_reason: Some(reason),
+        }
     }
 }
 
@@ -865,6 +946,8 @@ struct PreparationRecord {
     exit_code: Option<i32>,
     host_lease_id: Option<String>,
     host_lease_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    package_store: Option<package_store::PackageStoreReport>,
 }
 
 impl Broker {
@@ -1040,6 +1123,7 @@ impl Broker {
                     current_operation: None,
                     waiting_on: None,
                     shared_cache_background_measurement: None,
+                    package_store: None,
                 });
             }
             Ok(Some(config)) => config,
@@ -1063,6 +1147,9 @@ impl Broker {
         };
         let missing_outputs = missing_outputs(root, config)?;
         let record = read_record(&record_path(self.main_root(), session_id))?;
+        let package_store = record
+            .as_ref()
+            .and_then(|record| record.package_store.clone());
         let (state, reason, recorded_digest, recorded_source_digest) = match record {
             None => (
                 PreparationState::Required,
@@ -1160,6 +1247,7 @@ impl Broker {
                 .any(|step| step.cache == PreparationCachePolicy::RepositoryShared)
                 .then(|| self.shared_cache_measurement_status())
                 .flatten(),
+            package_store,
         })
     }
 
@@ -1230,10 +1318,14 @@ impl Broker {
                 shared_cache_operations: Vec::new(),
                 shared_cache_background_measurement: None,
                 steps: Vec::new(),
+                cache_outcome: PreparationCacheOutcome::hit(),
+                package_store: None,
                 next_action: "dependencies are already current".into(),
             });
         }
         ensure_preparation_retry_allowed(session_id, status.state)?;
+        let current_runtimes = runtime_identities(&root, &config);
+        let cache_outcome = PreparationCacheOutcome::miss(&status, &current_runtimes);
         // Everything below runs the repository's own commands. The policy is
         // this worktree's: its gates and the preparation just loaded.
         let gates = match crate::gates::load_gates(&root) {
@@ -1634,6 +1726,23 @@ impl Broker {
                 )
             })?;
         }
+        let package_store_scope = config
+            .shared_cache
+            .as_ref()
+            .map_or_else(Default::default, |cache| cache.package_store);
+        let mut package_store_report = cache_dir.as_deref().map(|cache_dir| {
+            prepare_package_store(
+                &root,
+                cache_dir,
+                package_store_scope,
+                &repository_identity(self),
+                current_runtimes.clone(),
+            )
+        });
+        let shared_store_root = package_store_report
+            .as_ref()
+            .filter(|report| report.scope == package_store::PackageStoreScope::Repository)
+            .map(|report| report.path.clone());
 
         let started_at = now_ms();
         let mut record = PreparationRecord {
@@ -1648,6 +1757,7 @@ impl Broker {
             exit_code: None,
             host_lease_id: grant.as_ref().map(|grant| grant.lease.lease_id.clone()),
             host_lease_generation: grant.as_ref().map(|grant| grant.lease.generation),
+            package_store: None,
         };
         let state_path = record_path(self.main_root(), session_id);
         self.release_grant_after_error(
@@ -1668,6 +1778,7 @@ impl Broker {
         let mut heartbeat = PreparationHeartbeat::new(Instant::now());
         for step in &config.steps {
             let step_started = Instant::now();
+            let step_free_before = package_store::volume_free_bytes(&root);
             let _step_span = crate::phase_telemetry::span("preparation_step");
             cache_activity::enter(
                 cache_activity::PreparationCacheOperation::PreparationStep,
@@ -1688,8 +1799,12 @@ impl Broker {
             )
             .map_err(BrokerOpError::from)
             .and_then(|()| {
-                let environment = preparation_step_environment(cache_dir.as_deref(), step)
-                    .map_err(BrokerOpError::from)?;
+                let environment = preparation_step_environment_with_store(
+                    cache_dir.as_deref(),
+                    shared_store_root.as_deref(),
+                    step,
+                )
+                .map_err(BrokerOpError::from)?;
                 let supervisor = match next_supervisor.take() {
                     Some(supervisor) => supervisor,
                     None => self.start_preparation_exec_supervisor()?,
@@ -1763,6 +1878,10 @@ impl Broker {
                 exit_code: report.exit_code,
                 succeeded: report.ok,
                 duration_ms: step_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                volume_bytes_allocated: package_store::allocated_between(
+                    step_free_before,
+                    package_store::volume_free_bytes(&root),
+                ),
             });
             if !report.ok {
                 let error = PreparationError::StepFailed {
@@ -1856,10 +1975,19 @@ impl Broker {
             .take()
             .map(cache_activity::ActivityGuard::finish)
             .unwrap_or_default();
+        if let Some(report) = package_store_report.as_mut() {
+            report.volume_free_bytes_after = package_store::volume_free_bytes(&root);
+            report.volume_bytes_allocated = package_store::allocated_between(
+                report.volume_free_bytes_before,
+                report.volume_free_bytes_after,
+            );
+        }
+        self.record_package_store_volume(package_store_report.as_ref());
         record.state = PreparationState::Current;
         record.completed_at = Some(now_ms());
         record.host_lease_id = None;
         record.host_lease_generation = None;
+        record.package_store = package_store_report.clone();
         self.release_grant_after_error(
             write_record(&state_path, &record),
             &mut coordinator,
@@ -1893,6 +2021,8 @@ impl Broker {
             shared_cache_operations,
             shared_cache_background_measurement,
             steps: results,
+            cache_outcome,
+            package_store: package_store_report,
             next_action: "continue work in the prepared session".into(),
         })
     }
@@ -2034,26 +2164,130 @@ fn validate_config(config: &PreparationConfig) -> Result<(), PreparationError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn preparation_step_environment(
     cache_dir: Option<&Path>,
+    step: &PreparationStep,
+) -> Result<Vec<(String, String)>, PreparationError> {
+    preparation_step_environment_with_store(cache_dir, None, step)
+}
+
+/// The step's `AETHYME_PREPARE_*` variables. Manager stores live under
+/// `store_root` when one is given (the repository-wide store) and under the
+/// digest directory `cache_dir` otherwise (`per_input` isolation).
+fn preparation_step_environment_with_store(
+    cache_dir: Option<&Path>,
+    store_root: Option<&Path>,
     step: &PreparationStep,
 ) -> Result<Vec<(String, String)>, PreparationError> {
     let Some(cache_dir) = cache_dir else {
         return Ok(Vec::new());
     };
+    let package_root = store_root.unwrap_or(cache_dir);
     let mut environment = vec![(
         "AETHYME_PREPARE_CACHE_DIR".into(),
         cache_dir.to_string_lossy().into_owned(),
     )];
     for package_cache in &step.shared_package_caches {
         let path =
-            ensure_shared_package_cache_directory(cache_dir, package_cache.directory_name())?;
+            ensure_shared_package_cache_directory(package_root, package_cache.directory_name())?;
         environment.push((
             package_cache.environment_variable().into(),
             path.to_string_lossy().into_owned(),
         ));
     }
     Ok(environment)
+}
+
+/// Set up the package store for one preparation and describe it. A store
+/// that cannot be created falls back to the digest directory (the earlier
+/// layout) with a warning; a compatibility link that cannot be created is
+/// only warned about. Neither fails the preparation.
+fn prepare_package_store(
+    worktree: &Path,
+    cache_dir: &Path,
+    scope: package_store::PackageStoreScope,
+    repository: &str,
+    runtimes: Vec<package_store::RuntimeIdentity>,
+) -> package_store::PackageStoreReport {
+    let names = PreparationPackageCache::ALL.map(PreparationPackageCache::directory_name);
+    let volume_free_bytes_before = package_store::volume_free_bytes(worktree);
+    let (path, scope, compatibility_links) = match scope {
+        package_store::PackageStoreScope::Repository => {
+            match package_store::ensure_shared_store(cache_dir, &names) {
+                Ok(store_root) => {
+                    let linked = package_store::link_digest_directory(cache_dir, &names)
+                        .unwrap_or_else(|error| {
+                            eprintln!(
+                                "warning: aethyme could not link {} to the repository package store; commands using $AETHYME_PREPARE_CACHE_DIR/<store> keep a digest-specific store: {error}",
+                                cache_dir.display()
+                            );
+                            Vec::new()
+                        });
+                    (store_root, scope, linked)
+                }
+                Err(error) => {
+                    eprintln!(
+                        "warning: aethyme could not create the repository package store; this preparation keeps digest-specific stores: {error}"
+                    );
+                    (
+                        cache_dir.to_path_buf(),
+                        package_store::PackageStoreScope::PerInput,
+                        Vec::new(),
+                    )
+                }
+            }
+        }
+        package_store::PackageStoreScope::PerInput => (cache_dir.to_path_buf(), scope, Vec::new()),
+    };
+    let same_volume = package_store::same_volume(&path, worktree);
+    let import_method = package_store::probe_import_method(&path, same_volume);
+    package_store::PackageStoreReport {
+        path,
+        scope,
+        key: package_store::PackageStoreKey {
+            repository: repository.to_owned(),
+            os: std::env::consts::OS.to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+        },
+        runtimes,
+        same_volume,
+        import_method,
+        compatibility_links,
+        volume_free_bytes_before,
+        volume_free_bytes_after: None,
+        volume_bytes_allocated: None,
+    }
+}
+
+/// The runtime identities the preparation digest keys on, resolved the same
+/// way: the declared probe's executable, canonicalized, with its size and
+/// modification time. The probe command itself is not run.
+fn runtime_identities(
+    root: &Path,
+    config: &PreparationConfig,
+) -> Vec<package_store::RuntimeIdentity> {
+    config
+        .runtimes
+        .iter()
+        .map(|runtime| {
+            let executable = resolve_runtime_executable_before(root, &runtime.command[0], None)
+                .ok()
+                .flatten()
+                .and_then(|path| path.canonicalize().ok());
+            let metadata = executable.as_ref().and_then(|path| fs::metadata(path).ok());
+            package_store::RuntimeIdentity {
+                name: runtime.name.clone(),
+                size: metadata.as_ref().map(fs::Metadata::len),
+                modified_ns: metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok()),
+                executable,
+            }
+        })
+        .collect()
 }
 
 fn ensure_shared_package_cache_directory(
@@ -4304,6 +4538,58 @@ impl Broker {
     }
 }
 
+impl Broker {
+    /// Remember whether the last preparation's package store shared a volume
+    /// with its checkout, so `broker status` can say when sharing is
+    /// impossible. One metadata write only when the answer is or was "no".
+    fn record_package_store_volume(&mut self, report: Option<&package_store::PackageStoreReport>) {
+        let Some(report) = report else {
+            return;
+        };
+        let Some(same_volume) = report.same_volume else {
+            return;
+        };
+        if same_volume && self.package_store_on_other_volume().is_none() {
+            return;
+        }
+        let record = PackageStoreVolumeRecord {
+            other_volume: !same_volume,
+            store: report.path.clone(),
+            at_ms: now_ms(),
+        };
+        let written = serde_json::to_string(&record)
+            .map_err(|error| error.to_string())
+            .and_then(|value| {
+                self.store()
+                    .meta_set(PACKAGE_STORE_VOLUME_KEY, &value)
+                    .map_err(|error| error.to_string())
+            });
+        crate::warn_unrecorded("record the package-store volume", written);
+    }
+
+    /// The last preparation's package store, when it was on another volume
+    /// than its checkout. Read-only: one metadata read.
+    pub(crate) fn package_store_on_other_volume(&self) -> Option<PackageStoreVolumeRecord> {
+        self.store_ref()
+            .meta_get(PACKAGE_STORE_VOLUME_KEY)
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_str::<PackageStoreVolumeRecord>(&value).ok())
+            .filter(|record| record.other_volume)
+    }
+}
+
+/// Broker metadata key for the last package-store volume observation.
+const PACKAGE_STORE_VOLUME_KEY: &str = "preparation.package_store_volume";
+
+/// Whether the last preparation's package store was on another volume.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PackageStoreVolumeRecord {
+    pub(crate) other_volume: bool,
+    pub(crate) store: PathBuf,
+    pub(crate) at_ms: i64,
+}
+
 /// Broker metadata key counting consecutive inconclusive budget inventories.
 const SHARED_CACHE_INVENTORY_INCONCLUSIVE_KEY: &str =
     "preparation.shared_cache_inventory_inconclusive";
@@ -5326,6 +5612,7 @@ fn invalid_status(session_id: i64, reason: String) -> PreparationStatus {
         current_operation: None,
         waiting_on: None,
         shared_cache_background_measurement: None,
+        package_store: None,
     }
 }
 
@@ -6170,6 +6457,7 @@ mod tests {
             exit_code: None,
             host_lease_id: Some(grant.lease.lease_id.clone()),
             host_lease_generation: Some(grant.lease.generation),
+            package_store: None,
         }
     }
 
@@ -6442,6 +6730,186 @@ mod tests {
             shared_cache: None,
             managed_storage: None,
         }
+    }
+
+    #[test]
+    fn package_store_scope_defaults_to_repository_and_keeps_existing_digests() {
+        let text = r#"
+schema_version = 1
+
+[[steps]]
+name = "deps"
+command = ["tool", "install"]
+outputs = ["vendor/"]
+cache = "repository_shared"
+"#;
+        let config = parse_config(text).unwrap();
+        let cache = config.shared_cache.unwrap();
+        assert_eq!(
+            cache.package_store,
+            package_store::PackageStoreScope::Repository
+        );
+        // The default is not serialized, so existing preparation digests and
+        // trusted policies are unchanged.
+        assert!(
+            !serde_json::to_string(&config)
+                .unwrap()
+                .contains("package_store")
+        );
+
+        let isolated = parse_config(&format!(
+            "{text}\n[shared_cache]\npackage_store = \"per_input\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            isolated.shared_cache.unwrap().package_store,
+            package_store::PackageStoreScope::PerInput
+        );
+        assert!(
+            parse_config(&format!(
+                "{text}\n[shared_cache]\npackage_store = \"per_session\"\n"
+            ))
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_caches_resolve_to_the_repository_store_across_input_sets() {
+        let cache_owner = tempfile::tempdir().unwrap();
+        let repository = cache_owner.path().join("canonical-repository");
+        let first = repository.join("0123456789ab");
+        let second = repository.join("ba9876543210");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let worktree = cache_owner.path().join("checkout");
+        fs::create_dir_all(&worktree).unwrap();
+        let mut base_config = config();
+        let mut step = base_config.steps.remove(0);
+        step.cache = PreparationCachePolicy::RepositoryShared;
+        step.shared_package_caches = vec![PreparationPackageCache::Pnpm];
+
+        let report = prepare_package_store(
+            &worktree,
+            &first,
+            package_store::PackageStoreScope::Repository,
+            "canonical-repository",
+            Vec::new(),
+        );
+        assert_eq!(report.scope, package_store::PackageStoreScope::Repository);
+        assert_eq!(report.same_volume, Some(true));
+        assert_ne!(
+            report.import_method,
+            package_store::PackageImportMethod::Copy
+        );
+        assert_eq!(report.compatibility_links.len(), 4);
+        assert_eq!(report.key.os, std::env::consts::OS);
+        assert_eq!(report.key.arch, std::env::consts::ARCH);
+        let second_report = prepare_package_store(
+            &worktree,
+            &second,
+            package_store::PackageStoreScope::Repository,
+            "canonical-repository",
+            Vec::new(),
+        );
+        assert_eq!(report.path, second_report.path);
+
+        let pnpm = |cache_dir: &Path, store: Option<&Path>| {
+            preparation_step_environment_with_store(Some(cache_dir), store, &step)
+                .unwrap()
+                .into_iter()
+                .find(|(name, _)| name == "AETHYME_PREPARE_PNPM_STORE_DIR")
+                .unwrap()
+                .1
+        };
+        let shared = report
+            .path
+            .join("pnpm-store")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(pnpm(&first, Some(&report.path)), shared);
+        assert_eq!(pnpm(&second, Some(&report.path)), shared);
+        // The digest-directory spelling reaches the same store.
+        assert_eq!(
+            fs::canonicalize(first.join("pnpm-store")).unwrap(),
+            fs::canonicalize(second.join("pnpm-store")).unwrap()
+        );
+
+        let isolated = repository.join("aaaaaaaaaaaa");
+        fs::create_dir_all(&isolated).unwrap();
+        let per_input = prepare_package_store(
+            &worktree,
+            &isolated,
+            package_store::PackageStoreScope::PerInput,
+            "canonical-repository",
+            Vec::new(),
+        );
+        assert_eq!(per_input.path, isolated);
+        assert!(per_input.compatibility_links.is_empty());
+        assert_eq!(
+            pnpm(&isolated, None),
+            isolated.join("pnpm-store").to_string_lossy().into_owned()
+        );
+    }
+
+    #[test]
+    fn a_stale_miss_names_the_runtimes_that_changed() {
+        let runtime = |name: &str, size: u64| package_store::RuntimeIdentity {
+            name: name.into(),
+            executable: Some(PathBuf::from(format!("/usr/bin/{name}"))),
+            size: Some(size),
+            modified_ns: Some(1),
+        };
+        let mut status = invalid_status(1, "unused".into());
+        status.state = PreparationState::Stale;
+        status.reason = "configuration, inputs, platform, or architecture changed".into();
+        status.package_store = Some(package_store::PackageStoreReport {
+            path: PathBuf::from("/cache/repository/packages/linux-x86_64"),
+            scope: package_store::PackageStoreScope::Repository,
+            key: package_store::PackageStoreKey {
+                repository: "repository".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+            },
+            runtimes: vec![runtime("node", 1), runtime("pnpm", 1)],
+            same_volume: Some(true),
+            import_method: package_store::PackageImportMethod::Clone,
+            compatibility_links: Vec::new(),
+            volume_free_bytes_before: None,
+            volume_free_bytes_after: None,
+            volume_bytes_allocated: None,
+        });
+        let outcome =
+            PreparationCacheOutcome::miss(&status, &[runtime("node", 2), runtime("pnpm", 1)]);
+        assert!(!outcome.hit);
+        let reason = outcome.miss_reason.unwrap();
+        assert!(reason.starts_with("stale: "), "{reason}");
+        assert!(reason.ends_with("(runtimes changed: node)"), "{reason}");
+        let unchanged =
+            PreparationCacheOutcome::miss(&status, &[runtime("node", 1), runtime("pnpm", 1)]);
+        assert!(!unchanged.miss_reason.unwrap().contains("runtimes changed"));
+        assert!(PreparationCacheOutcome::hit().hit);
+    }
+
+    #[test]
+    fn runtime_identities_name_every_declared_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.runtimes = vec![
+            RuntimeProbe {
+                name: "present".into(),
+                command: vec!["sh".into(), "-c".into(), "true".into()],
+            },
+            RuntimeProbe {
+                name: "absent".into(),
+                command: vec!["aethyme-no-such-runtime-binary".into()],
+            },
+        ];
+        let identities = runtime_identities(root.path(), &config);
+        assert_eq!(identities.len(), 2);
+        assert_eq!(identities[0].name, "present");
+        assert!(identities[0].executable.is_some() && identities[0].size.is_some());
+        assert_eq!(identities[1].executable, None);
     }
 
     #[test]
@@ -8806,6 +9274,8 @@ mod tests {
                 },
             ),
             steps: Vec::new(),
+            cache_outcome: PreparationCacheOutcome::hit(),
+            package_store: None,
             next_action: "continue".into(),
         };
         let details = report.metric_details();
