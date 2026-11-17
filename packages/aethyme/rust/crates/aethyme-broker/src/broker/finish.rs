@@ -596,6 +596,28 @@ impl Broker {
                 )),
             }
         }
+        if report.closed
+            && !report.cleanup.worktree_removed
+            && !options.keep_worktree
+            && Path::new(&report.worktree_path).is_dir()
+        {
+            // After the existing reclaim (which reports its bytes), strip what
+            // catalogued regenerable directories remain into the trash, O(1)
+            // each, under the lane's rules. A
+            // refusal (a process such as the finishing shell still in the
+            // checkout) leaves them for the retirement lane.
+            match self.strip_checkout_at_finish(session_id) {
+                Ok(count) if count > 0 => report.warnings.push(format!(
+                    "moved {count} regenerable {} into the trash for paced deletion",
+                    if count == 1 {
+                        "directory"
+                    } else {
+                        "directories"
+                    }
+                )),
+                Ok(_) | Err(_) => {}
+            }
+        }
         if report.closed {
             // Broker open only nibbles at an unfinished sweep; an agent that
             // is leaving pays the full budget to drain it instead.

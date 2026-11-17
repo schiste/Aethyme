@@ -650,6 +650,71 @@ separately, even when a checkout must be kept. `auto_remove = false` disables
 whole-checkout removal, while `strict = true` disables unattended ignored-artifact
 removal as well.
 
+## Stripping regenerable directories from closed checkouts
+
+Before the retirement lane judges a closed checkout, it strips regenerable
+directories out of it, each only when the tool that makes it has left its
+witness:
+
+| Directory | Witness | Kept otherwise as |
+|---|---|---|
+| `node_modules` | `.modules.yaml`, `.package-lock.json` or `.yarn-integrity`, or a `.pnpm` directory, at its top | `witness_missing` |
+| `.pnpm-store` | a `v<digit>...` directory (the store layout) | `witness_missing` |
+| `.venv` | `pyvenv.cfg`, and nothing at its top except `bin`, `lib`, `lib64`, `include`, `share`, `etc`, `pyvenv.cfg`, `.gitignore`, `Scripts`, `man` | `witness_missing`, `unexpected_content` |
+| `target` | `CACHEDIR.TAG` beginning with the standard signature | `witness_missing` |
+
+Any of them holding a `.git` entry at its top (a nested repository or a
+submodule) is kept as `nested_repository`. Each stripped directory is
+renamed into the pool's checkout trash in O(1) and the paced deleter
+removes it later. Nothing is archived, because these directories are rebuilt
+by the next install or build. Closed and cleaned sessions whose folders are
+still on disk are handled oldest close first, at most 200 checkouts per run.
+`finish` does the same for its own checkout once the session is closed,
+unless `--keep-worktree` was given; when below the storage reserve, `broker
+start` releases its claim, runs a short strip and deletion pass (at most 30
+seconds) and checks again before refusing.
+
+Right before anything moves, under the lifecycle claim, the lane checks again
+that the path was not reused since it was judged: no other open session
+there, no newer session recorded there, the folder not created after the
+session closed, and no `broker start` holding the folder's reservation
+(`.aethyme/run/start-reservations/<folder>.lock`).
+
+Finding and proving a directory never walks it. The directories come from
+Git's collapsed ignored-directory listing (`git ls-files --others --ignored
+--exclude-standard --directory`), which prints an ignored directory once and
+does not read below it, so a nested `packages/app/node_modules` is found but
+none of its files are read. Each one must then pass these checks, and if any
+fails or cannot finish, the directory stays where it is:
+
+- `git check-ignore -q -- <dir>` reports the directory itself ignored;
+- `git ls-files -z -- <dir>` prints nothing (no tracked file under it; this
+  reads the index only);
+- every component of the path is a real directory on the checkout's device
+  (no symlink, no mount point), and the trash is on that device too, so the
+  move is a rename and never a copy;
+- the session is closed or cleaned, no open session uses the folder, its
+  recorded holder is gone or was never bound, it holds no lease, runs no
+  gate or operation, and no process has its working directory or an open
+  file in it.
+
+Anything outside the catalogue is left for the retirement lane's careful
+path, which then inspects a much smaller tree. After the closed sessions,
+the lane also walks folders left behind by sessions already recorded as
+cleaned, oldest first: each is judged, archived when needed and trashed by
+the same rules, through the newest session recorded for its path and only
+once that session's holder is gone. A retirement inspection that
+fails or times out is retried on the next run rather than remembered as a
+refusal; the last such failure, with the Git step that failed, is shown in
+`storage.closed-checkouts-backlog`.
+
+`aethyme storage status` shows a `checkouts` class with counts only: checkout
+folders, how many belong to closed sessions, how many of those still hold a
+top-level regenerable directory, and the bytes the deleter freed removing
+stripped directories. `broker status` adds the advice
+`storage.closed-checkouts-backlog` once 50 or more closed-session folders are
+on disk.
+
 ## Maintenance during broker open
 
 Opening a broker handle may resume an already-authorized durable GC journal

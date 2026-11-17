@@ -205,6 +205,28 @@ pub fn status_value(host_state: &Path) -> Value {
             })
         })
         .collect();
+    // Checkout folders are counted, never walked: the class carries counts
+    // per repository and the bytes the deleter measured removing stripped
+    // regenerable directories.
+    let checkouts = super::checkout_counts(host_state);
+    let mut classes = serde_json::to_value(&classes).unwrap_or_else(|_| json!({}));
+    if !checkouts.is_empty()
+        && let Some(object) = classes.as_object_mut()
+    {
+        object.insert(
+            "checkouts".into(),
+            json!({
+                "folders": checkouts.values().map(|counts| counts.folders).sum::<usize>(),
+                "closed_folders": checkouts.values().map(|counts| counts.closed_folders).sum::<usize>(),
+                "closed_with_regenerable": checkouts.values().map(|counts| counts.closed_with_regenerable).sum::<usize>(),
+                "bytes_freed_by_strip": checkouts.values().map(|counts| counts.bytes_freed_by_strip).sum::<u64>(),
+                "sessions_created_today": checkouts.values().map(|counts| counts.sessions_created_today).sum::<usize>(),
+                "checkouts_retired_today": checkouts.values().map(|counts| counts.checkouts_retired_today).sum::<usize>(),
+                "repositories": checkouts,
+                "why_not": "counts only: checkout folders are not walked for bytes",
+            }),
+        );
+    }
     json!({
         "schema": "aethyme.storage-status/v1",
         "updated_at_ms": ledger.updated_at_ms,
@@ -272,6 +294,18 @@ fn status(json_output: bool) -> u8 {
     }
     if let Some(classes) = value["classes"].as_object() {
         for (class, entry) in classes {
+            if class == "checkouts" {
+                println!(
+                    "{class:<24} {} folder(s), {} closed, {} closed holding regenerable directories, {} freed by strip; today {} created, {} retired  (counts only)",
+                    entry["folders"].as_u64().unwrap_or(0),
+                    entry["closed_folders"].as_u64().unwrap_or(0),
+                    entry["closed_with_regenerable"].as_u64().unwrap_or(0),
+                    human(entry["bytes_freed_by_strip"].as_u64().unwrap_or(0)),
+                    entry["sessions_created_today"].as_u64().unwrap_or(0),
+                    entry["checkouts_retired_today"].as_u64().unwrap_or(0),
+                );
+                continue;
+            }
             let budget = entry["budget_bytes"]
                 .as_u64()
                 .map_or_else(|| "-".to_string(), human);
