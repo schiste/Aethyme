@@ -1736,6 +1736,10 @@ struct Parsed {
     cleanup_after_session: Option<i64>,
     cleanup_batch: bool,
     allow_adopted: bool,
+    /// `--archive-ignored-directories`: a resolve plan archives ignored
+    /// directories nothing catalogues as regenerable file by file instead
+    /// of refusing.
+    archive_ignored_directories: bool,
     retire: bool,
     archive: bool,
     abandon: bool,
@@ -1895,6 +1899,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         cleanup_after_session: None,
         cleanup_batch: false,
         allow_adopted: false,
+        archive_ignored_directories: false,
         retire: false,
         archive: false,
         abandon: false,
@@ -2014,6 +2019,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--archive" => parsed.archive = true,
             "--batch" => parsed.cleanup_batch = true,
             "--allow-adopted" => parsed.allow_adopted = true,
+            "--archive-ignored-directories" => parsed.archive_ignored_directories = true,
             "--retire" => parsed.retire = true,
             "--abandon" => parsed.abandon = true,
             "--keep-worktree" => parsed.keep_worktree = true,

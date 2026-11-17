@@ -599,6 +599,78 @@ fn unknown_ignored_directory_is_preserved_by_archive_resolution() {
     assert_eq!(std::fs::read(target).unwrap(), b"untouched\n");
 }
 
+/// With `--archive-ignored-directories` the plan archives every file under
+/// an unknown ignored directory, a link as the link (never what it points
+/// at), and applying it removes the worktree with the files in the archive.
+#[cfg(unix)]
+#[test]
+fn archive_ignored_directories_flag_archives_unknown_ignored_directories() {
+    let tmp = repo();
+    let (id, worktree) = dirty_closed_session(tmp.path());
+    let opaque = worktree.join("opaque-cache");
+    std::fs::create_dir_all(&opaque).unwrap();
+    std::fs::write(opaque.join("nested.bin"), b"kept in the archive").unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("outside.txt");
+    std::fs::write(&target, "untouched\n").unwrap();
+    std::os::unix::fs::symlink(&target, opaque.join("external-link")).unwrap();
+
+    let reviewed = json(&run(
+        tmp.path(),
+        &[
+            "finish",
+            "cleanup",
+            "resolve",
+            &id,
+            "--archive",
+            "--archive-ignored-directories",
+            "--json",
+        ],
+    ));
+    let preserved: Vec<(&str, bool)> = reviewed["ignored_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|file| file["path"].as_str().unwrap().starts_with("opaque-cache/"))
+        .map(|file| {
+            (
+                file["path"].as_str().unwrap(),
+                file["symlink"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        preserved,
+        [
+            ("opaque-cache/external-link", true),
+            ("opaque-cache/nested.bin", false)
+        ],
+        "{reviewed}"
+    );
+    let applied = run(
+        tmp.path(),
+        &[
+            "finish",
+            "cleanup",
+            "resolve",
+            &id,
+            "--archive",
+            "--archive-ignored-directories",
+            "--confirm",
+            reviewed["digest"].as_str().unwrap(),
+            "--json",
+        ],
+    );
+    let outcome = json(&applied);
+    assert_eq!(outcome["worktree_removed"], true, "{outcome}");
+    let archive = PathBuf::from(outcome["archive"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read(archive.join("ignored/opaque-cache/nested.bin")).unwrap(),
+        b"kept in the archive"
+    );
+    assert_eq!(std::fs::read(target).unwrap(), b"untouched\n");
+}
+
 /// Any failure between the confirmed plan and removal keeps the worktree.
 #[test]
 fn a_failed_archive_leaves_the_worktree_in_place() {
