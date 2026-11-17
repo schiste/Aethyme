@@ -134,6 +134,15 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         // the whole wait budget: nothing ran, and retrying later is the remedy.
         // Any other refusal (a dead holder to reconcile, a capacity-policy
         // mismatch) needs its precondition fixed first.
+        // Every host install slot stayed busy for the wait budget: retrying
+        // later is the remedy. A refusal waiting cannot resolve needs a fix.
+        E::Preparation(crate::PreparationError::InstallSlotUnavailable { timed_out, .. }) => {
+            if *timed_out {
+                ENVIRONMENT
+            } else {
+                REFUSED
+            }
+        }
         E::Preparation(crate::PreparationError::HostResource(
             crate::HostResourceError::Conflict { code, .. },
         )) => {

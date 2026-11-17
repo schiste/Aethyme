@@ -1424,6 +1424,26 @@ use the same captured root and repository-scoped lease. The root setting
 changes placement only; it does not impose a disk quota or bound arbitrary
 writes made by preparation commands.
 
+### Host-wide preparation install cap
+
+`submit prepare` holds one unit of the host capacity pool
+`aethyme-prepare-installs` (request run id `prepare-install-s<session>`,
+memory-pressure admission) while its steps run. The limit comes from
+`<host state>/preparation.toml` `[installs] max_concurrent` (1 to 64) or
+defaults to min(CPUs / 2, physical memory / 4 GiB), at least 1, persisted in
+`<host state>/preparation-install-limit.json`; a request always adopts the
+active holders' limit. Steps receive `AETHYME_PREPARE_INSTALL_SLOT`, and a
+nested preparation reuses that slot. A failed slot renewal never stops a
+running install. Output
+contract (additive): the prepare report and the `preparation` metric object
+gain `install_slot` (`limit`, `limit_source`
+`configured`/`default`/`active_pool`/`parent_slot`, `wait_ms`,
+`other_holders`, `configuration_warning`, `renewal_failures`). A wait that ends with every slot busy is a new
+error, "no host install slot for session N: H of L preparation install(s)
+are running ...", with exit 6 (environment); a refusal waiting cannot resolve
+exits as refused. Renaming the pool, the file or the key breaks hosts that set
+or read them.
+
 ### Shared package-manager content caches
 
 A `repository_shared` preparation step may opt into `shared_package_caches`

@@ -490,6 +490,57 @@ worktree outputs such as Python virtual environments remain per-worktree.
 tracked-file mutation the worktree guard refuses without an explicit lease.
 Commit `package-lock.json` and the draft uses `npm ci`.
 
+### Cap Concurrent Preparation Installs Per Host
+
+Every `submit prepare`, in any repository, runs its steps holding one unit of
+the host capacity pool `aethyme-prepare-installs` in the host-resource
+database. Waiters are served in arrival order with every other repository's
+preparations, and admission follows host memory pressure like any pool that
+declares it. The slot is taken after the repository's shared-cache lease and
+held only while steps run, renewed by the preparation heartbeat; it is
+released when the steps finish or the preparation fails.
+
+The limit is a host property, because the coordinator refuses a request whose
+limit differs from an active holder's. Set it in `<host state>/preparation.toml`:
+
+```toml
+[installs]
+max_concurrent = 4   # 1 to 64
+```
+
+A request always adopts the limit of the installs already holding the pool,
+so a configured value edited while installs run applies once they finish
+(the preparation prints a warning and reports `limit_source: active_pool`);
+with no holder, the configured value applies. Without it the default is half
+the CPU count or one install per 4 GiB of physical memory, whichever is
+smaller (at least 1). The default is persisted in
+`<host state>/preparation-install-limit.json` and reused: it is recomputed
+only while no install holds the pool and the host facts changed, and never
+from a caller that cannot see the physical memory size (a sandboxed caller
+reuses it). Free memory, which changes between requests, is followed through
+memory-pressure admission instead of the limit. An unreadable or
+out-of-range file counts as unset and prints a warning.
+
+A renewal of the slot that fails while steps run is reported, counted in
+`renewal_failures` and phase `install_slot_renewal_failed`, and otherwise
+ignored: a running install is never stopped for its slot, at the cost of
+possibly admitting one install too many later. A preparation started from
+inside a preparation step inherits `AETHYME_PREPARE_INSTALL_SLOT` (the
+parent's lease id) and, while that lease is active, runs under the parent's
+slot (`limit_source: parent_slot`) instead of waiting for one, which at limit
+1 would wait on itself.
+
+The wait shares `submit prepare --wait` with the shared-cache wait: what the
+cache wait left. A wait that ends with every slot busy fails with exit 6 and
+says how many installs are running, the limit, and the next action (retry with
+a longer `--wait`, or raise `max_concurrent`); `aethyme broker advanced
+resources list` shows the holders. After the slot is granted the broker
+checks the free-space reserve again and starts no step below it. The prepare
+report and the command metric's `preparation` object carry `install_slot`
+(`limit`, `limit_source` `configured`/`default`, `wait_ms`, `other_holders`,
+optional `configuration_warning`); phase telemetry records `install_slot_wait`,
+`install_slot_admitted`, `install_slot_timed_out` and `install_slot_refused`.
+
 ## Tune Git For Repeated Worktree Status
 
 Linked worktrees already share the repository object database. Avoid cloning
