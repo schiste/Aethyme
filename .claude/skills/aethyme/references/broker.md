@@ -179,6 +179,15 @@ blocked.
    `aethyme broker submit prepare status --session <your-session-id> --json`.
    Worktrees do not inherit ignored dependencies such as `node_modules/` or
    `.venv/` from the main checkout; preparation is explicit.
+   Unless `.aethyme/config.toml` sets
+   `[authorization] prepare_session_worktrees = false`, that preparation is a
+   standing authorization: it covers every session, so do not ask again per
+   session id, and run it as soon as the broker reports preparation required.
+   It applies in your own session worktree only, only through
+   `aethyme broker submit prepare --session <your-session-id>` (the frozen,
+   pinned installs the repository declares), with lockfiles unchanged -- no
+   dependency upgrades, additions or lockfile edits. Anything else still needs
+   the owner. When the key is `false`, ask the owner before preparing.
    For patch tools without a per-call worktree setting, use the reported
    worktree's absolute path and verify the target path there before editing;
    relative paths can resolve against the shared checkout.
@@ -498,6 +507,20 @@ blocked.
    Gate commands that need a test database, cache namespace, or similar
    external state should suffix it with that value instead of sharing one
    fixed name.
+
+   Unless `.aethyme/config.toml` sets
+   `[authorization] disposable_test_environments = false`, creating, using and
+   dropping disposable test state is a standing authorization for every
+   session (do not ask again per session id): the broker-leased environments
+   the repository declares in `.aethyme/environments.toml` (`aethyme env up`,
+   `aethyme env exec`, `aethyme env down <id>`), and local scratch databases
+   made by the repository's own declared test or scratch commands, provided
+   each is named for the session (the session's `$AETHYME_TEST_DB_SUFFIX` or
+   the script's own scratch naming) and dropped afterwards. Never a shared,
+   staging or production database, service or data (not `aethyme env shared`),
+   and never data that outlives the session; nothing else is implied, and
+   dispatching CI workflows is not covered. When the key is `false`, ask the
+   owner before creating any test environment or database.
 
    Tests that run `git` against fixture repositories must clear inherited and
    explicitly configured `GIT_*` variables from every subprocess, including

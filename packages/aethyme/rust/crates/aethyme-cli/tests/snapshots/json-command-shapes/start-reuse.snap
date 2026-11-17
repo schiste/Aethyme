@@ -60,6 +60,7 @@
   "pid": "null",
   "planned_explicit_leases": [],
   "preparation": {
+    "authorized_by_policy": "bool",
     "expected_digest": "null",
     "hook_required": "bool",
     "missing_outputs": [],
@@ -82,6 +83,13 @@
   "repository_name": "null",
   "scope_overlaps_warning": "string",
   "short_name": "string",
+  "standing_authorizations": {
+    "disposable_test_environments": "bool",
+    "lines": [
+      "string"
+    ],
+    "prepare_session_worktrees": "bool"
+  },
   "status": "string",
   "tab_name": "null",
   "tab_rename": {

@@ -1129,6 +1129,46 @@ Without the policy, the generated instructions keep the conservative default:
 submitting never authorizes publishing; opt in to `push_session_branches` so
 sessions deliver through pull requests.
 
+### Standing authorizations: preparation and disposable test state
+
+Agents otherwise stop to ask the owner, session after session, before two
+routine and bounded actions. `[authorization]` grants both by default, for
+every session, so an approval never has to be repeated per session id:
+
+```toml
+# .aethyme/config.toml -- both keys default to true when absent
+[authorization]
+prepare_session_worktrees = true
+disposable_test_environments = true
+```
+
+- `prepare_session_worktrees`: when the broker reports preparation required,
+  the agent runs `aethyme broker submit prepare --session <id>` at once, in its
+  own session worktree only. That runs the frozen, pinned installs the
+  repository declares in `.aethyme/prepare.toml`, with lockfiles unchanged: no
+  dependency upgrades, additions or lockfile edits.
+- `disposable_test_environments`: the agent creates, uses and drops local test
+  databases and environments, whether broker-leased (`aethyme env up`,
+  `aethyme env exec`, `aethyme env down <id>`) or made by the repository's own
+  declared test or scratch commands, provided each is named for the session
+  (`$AETHYME_TEST_DB_SUFFIX` or the script's own scratch naming) and dropped
+  afterwards. Never a shared, staging or production database, service or data
+  (`aethyme env shared` is excluded), and never data that outlives the session.
+
+Nothing else is implied: neither key authorizes dependency changes, other
+remote writes or dispatching CI workflows. Set a key to `false` and the
+generated instructions and the `broker start` agreement tell agents to ask the
+owner first instead. A value that is not a boolean, or a configuration that
+cannot be read, grants nothing.
+
+`aethyme deploy` renders the paragraph into `AGENTS.md` and `CLAUDE.md` from
+the working copy; `broker start` prints the same grants under its working
+agreement (`standing_authorizations` in `--json`, shown even when
+`[session] guidance = []`) from the configuration committed on the fetched
+default branch. `broker submit prepare status --json` and `broker start --json`
+set `preparation.authorized_by_policy` when the `next_action` is the prepare
+command and the policy grants it.
+
 ### Repositories do not use integration
 
 Each session branch and its pull request are the delivery path, and the

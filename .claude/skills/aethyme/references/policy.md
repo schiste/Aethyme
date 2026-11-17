@@ -10,6 +10,7 @@ practices, or how the generated agent files are maintained. The generated root
 - Orientation skills
 - Commit hygiene
 - Branch and review practices
+- Standing authorizations
 - Verifying the enhancement
 
 ## Generated Files And Overrides
@@ -93,6 +94,32 @@ implying it passed.
   cherry-picking to assemble a release from trunk is not.** Assembling produces
   a combination nobody tested, and hides dependencies between the changes being
   picked. Cut a release from a tested point instead, then patch it.
+
+## Standing Authorizations
+
+`[authorization]` in `.aethyme/config.toml` grants two bounded actions for
+every session, so agents do not ask the owner again per session id. Both keys
+default to `true` when absent; `false` means ask the owner first, and a value
+that is not a boolean grants nothing.
+
+- `prepare_session_worktrees`: run
+  `aethyme broker submit prepare --session <id>` as soon as the broker reports
+  preparation required, in your own session worktree only. It installs the
+  frozen, pinned dependency set the repository declares; lockfiles stay
+  unchanged, with no dependency upgrades, additions or lockfile edits.
+- `disposable_test_environments`: create, use and drop local test databases
+  and environments, broker-leased (`aethyme env up`, `aethyme env exec`,
+  `aethyme env down <id>`) or made by the repository's own declared test or
+  scratch commands, when each is named for the session
+  (`$AETHYME_TEST_DB_SUFFIX` or the script's own scratch naming) and dropped
+  afterwards. Never a shared, staging or production database, service or data,
+  and never data that outlives the session.
+
+Nothing else is implied: not dependency changes, other remote writes, or
+dispatching CI workflows. `aethyme broker start` prints the grants in force,
+and `preparation.authorized_by_policy` in its `--json` (and in
+`aethyme broker submit prepare status --json`) says whether the reported
+`next_action` may run without asking.
 
 ## Verifying The Enhancement
 
