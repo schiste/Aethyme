@@ -4,6 +4,32 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.121] - 2026-11-17
+
+### Added
+
+- Stale sessions are closed by the background worker. Foreground commands only count due sessions and queue one detached worker; the worker closes a session past the abandonment window by work class, only with no live or unknown holder and a complete process listing: landed, merged or no commits after `[cleanup] stale_landed_close_after_hours` (24); pushed but unmerged after `stale_pushed_close_after_hours` (72), branch and pull request untouched; unpushed commits or uncommitted work after `stale_unpushed_close_after_hours` (168), through the verified archive path. A session holding work closes only after a closing-soon note has stood for `stale_closing_notice_hours` (24), counted from when the note was left; activity after the note voids it and a failed note write keeps the session. The class is read from the session branch as well as HEAD and the more protective one wins. A holder process that has since bound to a newer session no longer counts as holding the older one. `[cleanup] stale_session_auto_close = false` turns this off. Advice `sessions.stale-backlog`, `sessions.closing-soon` and `sessions.process-table-denied`. A closed session resumes with `broker start --reuse` (#1768).
+- One package store per repository, shared across input sets, instead of one per input digest. `gc` and the storage recovery worker rotate it without a preparation when its volume is under the free-space reserve or it exceeds `[shared_cache] max_bytes`, under the exclusive cache lease only (#1765).
+- A host-wide cap on concurrent preparation installs: every `submit prepare` holds one unit of a host pool while its steps run, served in arrival order. `[installs] max_concurrent` (1 to 64) in the host's `preparation.toml`; the default is half the CPU count or one install per 4 GiB of memory, whichever is smaller, persisted and reused. The free-space reserve is re-checked after the grant. The prepare report gains `install_slot` (#1771).
+- Advice `prepare.runtime-probe-unverified` and `prepare.runtime-probe-unstable` (#1765).
+
+### Changed
+
+- **Breaking:** the preparation key hashes each declared runtime probe's output instead of the executable's size and modification time. Upgrade note: every prepared checkout reports stale once and re-prepares. A probe that fails, times out or cannot start is `unverified`: the checkout never reports current, and a step marked `required_for_hooks` then blocks commit hooks until the probe is fixed; before this release a broken probe was never run (#1765).
+- **Breaking:** `[shared_cache] max_bytes = 0` means an 8 GiB cap instead of unbounded (#1765).
+- `broker start` holds the repository lifecycle lock only to reserve its destination; `git worktree add` runs outside it and the nested-path check no longer lists worktrees. A path recorded on any session row is never handed out again (schema v65 adds one index; older binaries are unaffected). Every checkout removal refuses a path a running start has reserved. Starts in progress count against the free-space reserve and the checkout limit (#1767).
+- Upgrade note: repositories that set nothing now have stale sessions closed automatically as above; sessions with uncommitted work whose holder moved on were previously kept indefinitely (#1768).
+
+### Fixed
+
+- Probe output is never stored raw: only its hash and a short version-shaped extract are recorded (#1765).
+
+### Known issues
+
+- On a busy host the strip and leftover-retirement lanes added in 0.8.120 reclaim very little: discovery is slow per checkout, nested dependency directories are not found, and a leftover folder is kept whenever its path has a newer session row. A fix is in progress.
+- `start --adopt` can still hold the lifecycle lock for minutes while comparing patches.
+- Sessions held by `artifact_producer_active` are not closed by the new lane.
+
 ## [0.8.120] - 2026-11-17
 
 ### Fixed
