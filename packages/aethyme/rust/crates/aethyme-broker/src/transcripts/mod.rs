@@ -47,13 +47,33 @@ use std::path::{Path, PathBuf};
 pub use archive::Restored;
 pub use config::{EnabledSource, SETTINGS_FILE, TranscriptsConfig};
 pub use eligibility::SkipReason;
-pub(crate) use first_run::default_on_advice;
 pub use first_run::{FirstRunState, FirstRunStatus, Gate};
+#[cfg(test)]
+pub(crate) use first_run::{
+    notice_advice_at as default_on_advice_at, start_lines as default_on_start_lines,
+};
 pub use index::ArchiveRow;
 pub(crate) use linkage::note_holder_bound;
 pub use providers::Provider;
+pub(crate) use run::run_worker_lane;
 pub use run::{RunReport, StatusReport};
-pub(crate) use run::{linkage_degraded_advice, run_worker_lane};
+
+/// The transcript rows of `broker status` (every form): linkage that stayed
+/// degraded, and the default-on notice while the first-run wait runs.
+pub(crate) fn status_advice() -> Vec<crate::StatusAdvice> {
+    run::linkage_degraded_advice()
+        .into_iter()
+        .chain(first_run::default_on_advice())
+        .collect()
+}
+
+/// The default-on notice for `broker start`, starting the first-run wait
+/// when it is shown for the first time (a no-op in tests).
+pub(crate) fn start_notice_lines() -> Vec<String> {
+    first_run::default_on_advice()
+        .map(|advice| first_run::start_lines(&advice))
+        .unwrap_or_default()
+}
 
 /// Directory under the host state directory that holds everything here.
 pub const HOST_DIRECTORY: &str = "transcripts";

@@ -31,10 +31,25 @@ the wait is over. Either of these skips the wait:
 - a manual `aethyme transcripts archive --apply` (recorded in
   `first-run.json` as `acknowledged_by = "archive_apply"`).
 
-`aethyme transcripts status --json` reports `enabled`, `enabled_source`
-(`default` or `settings`) and `first_run` (`gate`: `open`,
-`notice_pending` or `waiting`; `noticed_at_ms`, `acknowledged_at_ms`,
-`acknowledged_by`, `automatic_archiving_from_ms`).
+The clock starts the first time `broker status` (any form, including an
+agent's `status --json`) or `broker start` computes the notice. So that a
+person sees it during the wait, it is shown on every surface while the gate
+is waiting, always with the start time:
+
+- `aethyme broker status` text (compact, `--summary` and `--full`) and its
+  JSON: the advice summary names the start time (`at <RFC 3339 UTC> (in
+  about N h)`), so the compact document, which keeps only id, severity,
+  summary and commands, carries it; the full form also has the evidence
+  `automatic_archiving_from_ms=<ms>`;
+- `aethyme broker start` text output: a `Notice (transcripts.archiving-default-on): ...`
+  line followed by the commands;
+- `aethyme transcripts status`: a `first run:` line with the gate and the
+  start time, the notice and the commands. `--json` reports `enabled`,
+  `enabled_source` (`default` or `settings`) and `first_run` (`gate`:
+  `open`, `notice_pending` or `waiting`; `noticed_at_ms`,
+  `acknowledged_at_ms`, `acknowledged_by`, `automatic_archiving_from_ms`,
+  `automatic_archiving_from`, `notice`, `commands`). Reading the status
+  never starts the wait.
 
 ## What qualifies
 

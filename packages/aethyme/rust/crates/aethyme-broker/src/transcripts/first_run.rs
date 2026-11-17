@@ -127,30 +127,97 @@ pub struct FirstRunStatus {
     pub state: FirstRunState,
     /// When automatic archiving may start, once the notice was shown.
     pub automatic_archiving_from_ms: Option<i64>,
+    /// The same instant as RFC 3339 UTC.
+    pub automatic_archiving_from: Option<String>,
+    /// The one-line notice while the worker waits (`None` once open).
+    pub notice: Option<String>,
+    /// How to change the days or turn archiving off (empty once open).
+    pub commands: Vec<String>,
+}
+
+/// The commands every surface of the notice names.
+fn notice_commands() -> Vec<String> {
+    vec![
+        "aethyme transcripts status".into(),
+        "aethyme transcripts enable --after-inactive-days <n>".into(),
+        "aethyme transcripts disable".into(),
+    ]
+}
+
+/// Unix milliseconds as RFC 3339 UTC.
+fn instant(ms: i64) -> String {
+    crate::cli::insights::timestamp_millis(ms)
 }
 
 /// Disabled reads nothing beyond the settings, so it reports an empty state.
+/// Reading never starts the wait: only `broker status` (or `broker start`)
+/// showing the notice does.
 pub(crate) fn status(config: &TranscriptsConfig, host_dir: &Path, now_ms: i64) -> FirstRunStatus {
+    let open = |state| FirstRunStatus {
+        gate: Gate::Open,
+        state,
+        automatic_archiving_from_ms: None,
+        automatic_archiving_from: None,
+        notice: None,
+        commands: Vec::new(),
+    };
     if !config.archive {
-        return FirstRunStatus {
-            gate: Gate::Open,
-            state: FirstRunState::default(),
-            automatic_archiving_from_ms: None,
-        };
+        return open(FirstRunState::default());
     }
     let state = read(host_dir);
-    let gate = gate(config, &state, now_ms);
-    let automatic_archiving_from_ms = match gate {
-        Gate::Open | Gate::NoticePending => None,
-        Gate::Waiting => state
-            .noticed_at_ms
-            .map(|noticed| noticed.saturating_add(NOTICE_WAIT_MS)),
-    };
-    FirstRunStatus {
-        gate,
-        state,
-        automatic_archiving_from_ms,
+    match gate(config, &state, now_ms) {
+        Gate::Open => open(state),
+        Gate::NoticePending => FirstRunStatus {
+            gate: Gate::NoticePending,
+            state,
+            automatic_archiving_from_ms: None,
+            automatic_archiving_from: None,
+            notice: Some(format!(
+                "transcript archiving is on by default for {}; the background worker starts 24 h after `aethyme broker status` first shows the notice {ADVICE_ID} (not shown yet); change the days with `aethyme transcripts enable --after-inactive-days <n>` or turn it off with `aethyme transcripts disable`",
+                scope(config)
+            )),
+            commands: notice_commands(),
+        },
+        Gate::Waiting => {
+            let starts = state
+                .noticed_at_ms
+                .unwrap_or(now_ms)
+                .saturating_add(NOTICE_WAIT_MS);
+            FirstRunStatus {
+                gate: Gate::Waiting,
+                state,
+                automatic_archiving_from_ms: Some(starts),
+                automatic_archiving_from: Some(instant(starts)),
+                notice: Some(notice_summary(config, starts, now_ms)),
+                commands: notice_commands(),
+            }
+        }
     }
+}
+
+/// The first-run lines of `transcripts status` text output.
+pub(crate) fn status_lines(status: &FirstRunStatus) -> Vec<String> {
+    let mut lines = Vec::new();
+    match status.gate {
+        Gate::Open => return lines,
+        Gate::NoticePending => {
+            lines.push("  first run: waiting for the notice (gate notice_pending)".to_string());
+        }
+        Gate::Waiting => lines.push(format!(
+            "  first run: waiting (gate waiting); automatic archiving starts at {}",
+            status
+                .automatic_archiving_from
+                .as_deref()
+                .unwrap_or("an unknown time")
+        )),
+    }
+    if let Some(notice) = &status.notice {
+        lines.push(format!("  Notice: {notice}"));
+    }
+    for command in &status.commands {
+        lines.push(format!("  run: {command}"));
+    }
+    lines
 }
 
 /// What is archived and after how many inactive days, in a few words.
@@ -176,9 +243,23 @@ fn scope(config: &TranscriptsConfig) -> String {
     }
 }
 
+/// The one-line notice while the worker waits for `starts` (milliseconds).
+fn notice_summary(config: &TranscriptsConfig, starts: i64, now_ms: i64) -> String {
+    // Positive while waiting, so rounding up is plain integer arithmetic.
+    let hour_ms = 60 * 60 * 1000;
+    let hours = (starts.saturating_sub(now_ms).max(0) + hour_ms - 1) / hour_ms;
+    format!(
+        "transcript archiving is on by default: at {} (in about {hours} h) the background worker starts compressing and moving {} (closed sessions only, open in no process); change the days with `aethyme transcripts enable --after-inactive-days <n>` (Claude Code: archive_after_inactive_days_claude in the settings file) or turn it off with `aethyme transcripts disable`",
+        instant(starts),
+        scope(config)
+    )
+}
+
 /// The notice for a default-on host, recording when it is first shown.
 /// `None` once the wait is over, when acknowledged, or when the host set
-/// `archive` explicitly.
+/// `archive` explicitly. The summary names the start time, so the compact
+/// status document (which keeps only id, severity, summary and commands)
+/// carries it too.
 pub(crate) fn notice_advice_at(
     host_dir: &Path,
     config: &TranscriptsConfig,
@@ -202,26 +283,32 @@ pub(crate) fn notice_advice_at(
     if now_ms >= starts {
         return None;
     }
-    // Positive here, so rounding up is plain integer arithmetic.
-    let hour_ms = 60 * 60 * 1000;
-    let hours = (starts - now_ms + hour_ms - 1) / hour_ms;
     Some(crate::StatusAdvice {
         id: ADVICE_ID,
         severity: crate::StatusAdviceSeverity::Notice,
         reason: "transcript archiving is on by default and starts after a 24-hour notice",
-        summary: format!(
-            "transcript archiving is on by default: in about {hours} h the background worker starts compressing and moving {} (closed sessions only, open in no process); change the days with `aethyme transcripts enable --after-inactive-days <n>` (Claude Code: archive_after_inactive_days_claude in the settings file) or turn it off with `aethyme transcripts disable`",
-            scope(config)
-        ),
+        summary: notice_summary(config, starts, now_ms),
         session_id: None,
         queue_entry_id: None,
-        evidence: vec!["enabled_source=default".into(), "gate=waiting".into()],
-        commands: vec![
-            "aethyme transcripts status".into(),
-            "aethyme transcripts enable --after-inactive-days <n>".into(),
-            "aethyme transcripts disable".into(),
+        evidence: vec![
+            "enabled_source=default".into(),
+            "gate=waiting".into(),
+            format!("automatic_archiving_from_ms={starts}"),
         ],
+        commands: notice_commands(),
     })
+}
+
+/// The notice block `broker start` prints while the worker waits.
+pub(crate) fn start_lines(advice: &crate::StatusAdvice) -> Vec<String> {
+    let mut lines = vec![format!("Notice ({}): {}", advice.id, advice.summary)];
+    lines.extend(
+        advice
+            .commands
+            .iter()
+            .map(|command| format!("  run: {command}")),
+    );
+    lines
 }
 
 /// The notice for this host (a no-op in tests and inside the worker).

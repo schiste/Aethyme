@@ -206,14 +206,8 @@ fn run_status(environment: &Environment, rest: &[String], json: bool) -> u8 {
             config.archive_after_inactive_days,
             config.archive_after_inactive_days_claude
         );
-        match status.first_run.gate {
-            super::Gate::Open => {}
-            super::Gate::NoticePending => println!(
-                "  automatic archiving: waits for the notice in `aethyme broker status`, then 24 h (enable or archive --apply skips the wait)"
-            ),
-            super::Gate::Waiting => println!(
-                "  automatic archiving: starts 24 h after the first-run notice (enable or archive --apply skips the wait)"
-            ),
+        for line in super::first_run::status_lines(&status.first_run) {
+            println!("{line}");
         }
     }
     println!(

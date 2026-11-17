@@ -77,12 +77,16 @@ the file's mtime, its last record's `timestamp` (tail only) and its linked
 broker sessions' `last_activity_at` must be older than the setting.
 `status --json` gains `enabled_source` (`default`|`settings`, also under
 `config`) and `first_run` (`gate`, `noticed_at_ms`, `acknowledged_at_ms`,
-`acknowledged_by`, `automatic_archiving_from_ms`); `config` renames
+`acknowledged_by`, `automatic_archiving_from_ms`,
+`automatic_archiving_from`, `notice`, `commands`); `config` renames
 `archive_after_days*` to `archive_after_inactive_days*`. Archive reports gain
 `enabled_source`, `first_run_gate`, `record_tails_read` and the skip reasons
 `recent_record` and `recent_session_activity`. On a default-on host
 `aethyme broker status` shows the advice `transcripts.archiving-default-on`
-(severity notice) and records when in `<host state>/transcripts/first-run.json`;
+(severity notice; in every status form including compact, its summary
+names the start time) and records when in
+`<host state>/transcripts/first-run.json`; `broker start` text output
+prints the same notice while the wait runs;
 the background worker archives nothing until 24 hours later, unless
 `enable` or a manual `archive --apply` (recorded as `acknowledged_by`) skips
 the wait. It writes `<host state>/transcripts/` (`index.sqlite3`,

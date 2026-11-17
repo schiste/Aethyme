@@ -2263,3 +2263,98 @@ fn enable_or_a_manual_apply_skips_the_first_run_wait() {
     assert_eq!(report.archived.len(), 1, "{report:?}");
     assert!(!source.exists());
 }
+
+#[test]
+fn transcripts_status_shows_the_first_run_wait_in_text_and_json() {
+    let host = Host::new();
+    let config = TranscriptsConfig::default();
+    let host_dir = &host.environment.host_dir;
+    let mut open = probe(Vec::new());
+
+    // Not shown yet: status says so, and reading does not start the wait.
+    let pending = status(&host, &config, &mut open);
+    assert_eq!(pending.first_run.gate, super::Gate::NoticePending);
+    assert!(super::first_run::read(host_dir).noticed_at_ms.is_none());
+    let lines = super::first_run::status_lines(&pending.first_run).join("\n");
+    assert!(lines.contains("notice_pending"), "{lines}");
+    assert!(
+        lines.contains("run: aethyme transcripts disable"),
+        "{lines}"
+    );
+
+    // Shown by `broker status`: the start time, the notice and the commands.
+    let noticed = super::now_ms();
+    super::first_run::notice_advice_at(host_dir, &config, noticed).unwrap();
+    let starts = noticed + super::first_run::NOTICE_WAIT_MS;
+    let starts_text = crate::cli::insights::timestamp_millis(starts);
+    let waiting = status(&host, &config, &mut open);
+    let value = serde_json::to_value(&waiting).unwrap();
+    assert_eq!(value["first_run"]["gate"], "waiting");
+    assert_eq!(value["first_run"]["noticed_at_ms"], noticed);
+    assert_eq!(value["first_run"]["automatic_archiving_from_ms"], starts);
+    assert_eq!(
+        value["first_run"]["automatic_archiving_from"],
+        starts_text.as_str()
+    );
+    let notice = value["first_run"]["notice"].as_str().unwrap();
+    assert!(notice.contains(&starts_text), "{notice}");
+    assert!(notice.contains("--after-inactive-days"), "{notice}");
+    assert!(notice.contains("aethyme transcripts disable"), "{notice}");
+    assert!(
+        value["first_run"]["commands"]
+            .to_string()
+            .contains("aethyme transcripts disable")
+    );
+    let lines = super::first_run::status_lines(&waiting.first_run).join("\n");
+    assert!(
+        lines.contains(&format!("automatic archiving starts at {starts_text}")),
+        "{lines}"
+    );
+    assert!(lines.contains("Notice: transcript archiving is on by default"));
+    assert!(lines.contains("run: aethyme transcripts enable --after-inactive-days <n>"));
+
+    // Open (explicitly enabled): nothing to say.
+    let explicit = TranscriptsConfig {
+        enabled_source: config::EnabledSource::Settings,
+        ..TranscriptsConfig::default()
+    };
+    let open_status = status(&host, &explicit, &mut open);
+    assert_eq!(open_status.first_run.gate, super::Gate::Open);
+    assert!(open_status.first_run.notice.is_none());
+    assert!(super::first_run::status_lines(&open_status.first_run).is_empty());
+}
+
+#[test]
+fn broker_start_prints_the_notice_while_the_wait_runs() {
+    let host = Host::new();
+    let config = TranscriptsConfig::default();
+    let now = later();
+    let advice = super::default_on_advice_at(&host.environment.host_dir, &config, now).unwrap();
+    let lines = super::default_on_start_lines(&advice);
+    let starts_text =
+        crate::cli::insights::timestamp_millis(now + super::first_run::NOTICE_WAIT_MS);
+    assert!(
+        lines[0].starts_with("Notice (transcripts.archiving-default-on): "),
+        "{lines:?}"
+    );
+    assert!(lines[0].contains(&starts_text), "{lines:?}");
+    assert!(lines.contains(&"  run: aethyme transcripts disable".to_string()));
+    assert!(
+        lines.contains(&"  run: aethyme transcripts enable --after-inactive-days <n>".to_string())
+    );
+    // The compact JSON keeps the start time in the summary; the full form
+    // also has it as evidence.
+    assert!(advice.evidence.contains(&format!(
+        "automatic_archiving_from_ms={}",
+        now + super::first_run::NOTICE_WAIT_MS
+    )));
+    // Once the wait is over there is nothing to print.
+    assert!(
+        super::default_on_advice_at(
+            &host.environment.host_dir,
+            &config,
+            now + super::first_run::NOTICE_WAIT_MS
+        )
+        .is_none()
+    );
+}

@@ -1637,6 +1637,11 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
             out!("{line}");
         }
         render_duplicate_work(session.id, &broker.duplicate_work_for(session));
+        // Transcript archiving on by default: while the first-run wait runs,
+        // say so where a person starting work will read it.
+        for line in crate::transcripts::start_notice_lines() {
+            out!("{line}");
+        }
         out!("Worktree: cd {}", session.worktree_path);
         record_start_render_timings(&mut phase_timings_ms, render_started);
         out!(
