@@ -82,6 +82,12 @@ pub(crate) struct TrashRow {
     pub(crate) creator_pid: i64,
     #[serde(default)]
     pub(crate) creator_started_ms: i64,
+    /// The entry is a regenerable directory stripped out of a checkout that
+    /// is still in place, not the checkout itself: it never proves the
+    /// session's checkout gone (`checkout_proven_trashed`), and its bytes
+    /// count as freed by strip.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) stripped: bool,
 }
 
 /// This process's id and start time, as a process-table snapshot reads it.
@@ -390,7 +396,7 @@ pub(crate) fn registration_of(
         .canonicalize()
         .map_err(|error| format!("cannot resolve {}: {error}", worktree.display()))?;
     let listed = repo
-        .worktree_inventory()
+        .worktree_inventory_for_run()
         .map_err(|error| format!("cannot list worktrees: {error}"))?
         .iter()
         .any(|entry| entry.path.canonicalize().ok().as_ref() == Some(&canonical_worktree));
@@ -580,6 +586,7 @@ pub(crate) fn move_worktree_to_trash(
         pending: true,
         creator_pid,
         creator_started_ms,
+        stripped: false,
     };
     record_pending(&trash.path, &entry, row)?;
     rename_noreplace(
@@ -590,6 +597,7 @@ pub(crate) fn move_worktree_to_trash(
     )
     .map_err(|error| format!("cannot move the checkout into the trash: {error}"))?;
     crate::phase_telemetry::add("checkout_trashed", Duration::ZERO);
+    crate::git::forget_cached_worktree_registration(worktree);
     let registration_removed = match std::fs::remove_dir_all(&admin) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
@@ -604,6 +612,154 @@ pub(crate) fn move_worktree_to_trash(
         entry,
         row,
         registration_removed,
+    })
+}
+
+/// A regenerable directory renamed out of a checkout into the pool's trash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StrippedDirectory {
+    pub(crate) trash_dir: PathBuf,
+    pub(crate) entry: String,
+    pub(crate) row: TrashRow,
+}
+
+/// Why a directory was not moved out of its checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StripMoveRefusal {
+    /// A component of the path is a symbolic link, not a directory, or the
+    /// path is malformed.
+    NotARealDirectory(String),
+    /// The directory, or a component above it, is on another device than
+    /// the checkout (a mount point), or the trash is.
+    CrossesDevice,
+    /// Anything else (the trash, the rename, the record): the directory
+    /// stays where it is.
+    Failed(String),
+}
+
+impl std::fmt::Display for StripMoveRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotARealDirectory(reason) | Self::Failed(reason) => formatter.write_str(reason),
+            Self::CrossesDevice => formatter.write_str("the directory is on another device"),
+        }
+    }
+}
+
+/// Move the directory `relative` (slash-separated, inside `worktree`, which
+/// sits directly inside the broker-owned pool `pool`) into the pool's trash
+/// with one exclusive same-volume rename, without reading its contents.
+///
+/// Every component is opened relative to its parent's descriptor without
+/// following a link, and must be a real directory on the checkout's device
+/// (no symlink, no mount point crossed); the trash must be on that device
+/// too, so the rename is O(1) and never a copy. The row is recorded pending
+/// before the rename, exactly as for a checkout; nothing is unlinked here.
+/// The caller has already proved the directory regenerable, ignored, free of
+/// tracked files, and the checkout unused.
+pub(crate) fn move_directory_to_trash(
+    pool: &Path,
+    worktree: &Path,
+    relative: &str,
+    session_id: i64,
+    record_pending: &mut dyn FnMut(&Path, &str, TrashRow) -> Result<(), String>,
+) -> Result<StrippedDirectory, StripMoveRefusal> {
+    use StripMoveRefusal::{CrossesDevice, Failed, NotARealDirectory};
+    let _span = crate::phase_telemetry::span("checkout_strip_move");
+    if worktree.parent() != Some(pool) {
+        return Err(Failed(format!(
+            "{} is not directly inside the pool {}",
+            worktree.display(),
+            pool.display()
+        )));
+    }
+    let checkout_name = worktree
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Failed(format!("{} has no usable name", worktree.display())))?
+        .to_owned();
+    let components = relative.split('/').collect::<Vec<_>>();
+    if components
+        .iter()
+        .any(|part| part.is_empty() || *part == "." || *part == ".." || part.contains('\0'))
+    {
+        return Err(NotARealDirectory(format!("invalid path {relative:?}")));
+    }
+    let Some((last, parents)) = components.split_last() else {
+        return Err(NotARealDirectory(format!("invalid path {relative:?}")));
+    };
+    let trash = open_trash(pool).map_err(Failed)?;
+    let checkout = openat_dir_nofollow(trash.pool.as_raw_fd(), &checkout_name)
+        .map_err(|error| NotARealDirectory(format!("cannot open the checkout: {error}")))?;
+    let checkout_device = fstat(checkout.as_raw_fd())
+        .map_err(|error| Failed(error.to_string()))?
+        .st_dev;
+    let trash_device = fstat(trash.trash.as_raw_fd())
+        .map_err(|error| Failed(error.to_string()))?
+        .st_dev;
+    if trash_device != checkout_device {
+        return Err(CrossesDevice);
+    }
+    let mut parent = checkout;
+    for part in parents {
+        let next = openat_dir_nofollow(parent.as_raw_fd(), part).map_err(|error| {
+            NotARealDirectory(format!(
+                "{part} in {relative} is not a real directory: {error}"
+            ))
+        })?;
+        if fstat(next.as_raw_fd())
+            .map_err(|error| Failed(error.to_string()))?
+            .st_dev
+            != checkout_device
+        {
+            return Err(CrossesDevice);
+        }
+        parent = next;
+    }
+    let source = fstatat_nofollow(parent.as_raw_fd(), last)
+        .map_err(|error| NotARealDirectory(format!("cannot inspect {relative}: {error}")))?;
+    if !is_directory(&source) {
+        return Err(NotARealDirectory(format!(
+            "{relative} is not a real directory"
+        )));
+    }
+    if source.st_dev != checkout_device {
+        return Err(CrossesDevice);
+    }
+    let entry = format!(
+        "{:013}-{session_id}-{}-{}",
+        crate::clock::epoch_ms().max(0),
+        std::process::id(),
+        TRASH_NONCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let (creator_pid, creator_started_ms) = this_process_identity();
+    #[allow(clippy::unnecessary_cast)]
+    let mut row = TrashRow {
+        device: source.st_dev as u64,
+        inode: source.st_ino as u64,
+        session_id,
+        failures: 0,
+        pending: true,
+        creator_pid,
+        creator_started_ms,
+        stripped: true,
+    };
+    record_pending(&trash.path, &entry, row).map_err(Failed)?;
+    rename_noreplace(parent.as_raw_fd(), last, trash.trash.as_raw_fd(), &entry).map_err(
+        |error| {
+            if error.raw_os_error() == Some(libc::EXDEV) {
+                CrossesDevice
+            } else {
+                Failed(format!("cannot move {relative} into the trash: {error}"))
+            }
+        },
+    )?;
+    crate::phase_telemetry::add("checkout_strip_directory_trashed", Duration::ZERO);
+    row.pending = false;
+    Ok(StrippedDirectory {
+        trash_dir: trash.path.clone(),
+        entry,
+        row,
     })
 }
 
@@ -758,6 +914,11 @@ pub(crate) struct TrashDrainReport {
     pub(crate) entries_interrupted: usize,
     pub(crate) unlinks: usize,
     pub(crate) bytes: u64,
+    /// Of `bytes`, those of entries that were regenerable directories
+    /// stripped out of a closed checkout (measured as they were deleted).
+    pub(crate) stripped_bytes: u64,
+    /// Stripped-directory entries removed this run.
+    pub(crate) stripped_entries_removed: usize,
     /// Entries that failed this run.
     pub(crate) failed: Vec<String>,
     /// Entries that have failed at least [`TRASH_FAILURE_REPORT_AFTER`] times.
@@ -996,6 +1157,10 @@ pub(crate) fn drain_trash(
                         report.entries_removed += 1;
                         report.unlinks = report.unlinks.saturating_add(unlinks);
                         report.bytes = report.bytes.saturating_add(bytes);
+                        if row.stripped {
+                            report.stripped_entries_removed += 1;
+                            report.stripped_bytes = report.stripped_bytes.saturating_add(bytes);
+                        }
                         entries.remove(&name);
                         crate::phase_telemetry::add(
                             "checkout_trash_entries_removed",
@@ -1006,6 +1171,9 @@ pub(crate) fn drain_trash(
                         report.entries_interrupted += 1;
                         report.unlinks = report.unlinks.saturating_add(unlinks);
                         report.bytes = report.bytes.saturating_add(bytes);
+                        if row.stripped {
+                            report.stripped_bytes = report.stripped_bytes.saturating_add(bytes);
+                        }
                         break 'dirs;
                     }
                     Err(error) if left_trash.get() => {
