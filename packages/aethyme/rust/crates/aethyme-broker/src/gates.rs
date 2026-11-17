@@ -2705,6 +2705,22 @@ impl GateResourceRuntime {
             self.grant.lease.generation,
             &self.grant.ownership_token,
         )?;
+        // The gate wrote its managed cache: the storage worker re-measures
+        // it first instead of waiting for its turn.
+        if let Some(host_state) = self.resource_db_path.parent() {
+            let prefix = managed_cache_lease_name("", "");
+            for allocation in &self.grant.lease.allocations {
+                if let Some(rest) = allocation.value.strip_prefix(prefix.trim_end_matches(':'))
+                    && let Some((repository, key)) = rest.trim_start_matches(':').split_once(':')
+                {
+                    crate::storage_ledger::note_written(
+                        host_state,
+                        crate::storage_ledger::RootKind::HostCache,
+                        &format!("gates/{repository}/{key}"),
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }

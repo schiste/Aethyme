@@ -204,6 +204,25 @@ are preserved. It submits no work and enables no default routing. Startup
 budgets, log behavior and lifecycle limits are specified in
 [broker-service.md](broker-service.md).
 
+## Host storage ledger (`aethyme storage`)
+
+`aethyme storage status [--json]` (`aethyme.storage-status/v1`) and `storage
+run [--json]` (`aethyme.storage-pass/v1`) are operator surfaces; `storage
+worker` is internal, started detached by broker commands. Files, all in the
+host state directory: `storage-ledger.json` (the ledger, written by the worker
+only), `storage-ledger-summary.json` (what the start-of-command check reads),
+`storage-worker.lock` (pid, start time, heartbeat, token; a dead or stalled
+owner's lock is taken over), `storage-roots.json` and
+`storage-gate-budgets.json` (worktree roots, adopted storage roots and gate
+cache budgets), `storage-ledger-dirty/` (producers' notes of entries they
+wrote; gate runs write one per managed cache), and the optional owner file
+`storage.toml` (`[budget]`). `aethyme storage adopt <dir>` writes
+`.aethyme-storage-root` into a directory; a storage root must carry it.
+`broker status --json` adds advice `storage.over-budget`,
+`storage.below-floor` and `storage.unclassified` (class names and sizes; no
+paths outside Aethyme's roots). `AETHYME_STORAGE_LEDGER` (`0`/`1`) turns the
+start-of-command check off or on.
+
 ## Build output of kept worktrees
 
 `broker finish --json` adds `cleanup.artifact_bytes_reclaimed`: bytes of
