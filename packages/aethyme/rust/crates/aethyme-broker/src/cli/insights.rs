@@ -132,11 +132,6 @@ fn assemble(
     for prefix in insights::STAGE_EVENT_PREFIXES {
         events.extend(store.events_after_filtered(0, i64::MAX, Some(prefix))?);
     }
-    events.extend(store.events_after_filtered(
-        0,
-        i64::MAX,
-        Some(crate::events::DUPLICATE_WORK_AVOIDED),
-    )?);
     events.retain(|event| event.ts >= since_ms);
     // Merge events arrive out of order across prefixes; the fold takes the
     // first of each kind by timestamp, so order does not change the answer.
@@ -203,29 +198,16 @@ fn assemble(
     };
 
     let report = insights::report(query, &input);
-    let completed = input
-        .sessions
-        .iter()
-        .filter(|session| {
-            session.created_at >= since_ms
-                && (session.closed_at.is_some()
-                    || input
-                        .stage_times
-                        .get(&session.session_id)
-                        .is_some_and(|stages| {
-                            stages.contains_key(&insights::Stage::Landed)
-                                || stages.contains_key(&insights::Stage::PullRequestMerged)
-                        }))
-        })
-        .map(|session| session.session_id)
-        .collect();
-    let visible = report
-        .sessions
-        .iter()
-        .map(|session| session.session_id)
-        .collect();
-    let costs = attribution::collect(&root, since_ms, &completed, &visible, &events)
-        .map_err(|error| UsageError::Message(format!("read command metrics: {error}")))?;
+    for kind in [
+        crate::events::SESSION_REUSED,
+        "session.closed",
+        "session.cleaned",
+        crate::events::DUPLICATE_WORK_AVOIDED,
+    ] {
+        events.extend(store.events_after_filtered(0, i64::MAX, Some(kind))?);
+    }
+    events.sort_by_key(|event| (event.ts, event.id));
+    let costs = attribution::collect(&root, since_ms, session_limit, &input, &events);
     Ok((report, costs))
 }
 

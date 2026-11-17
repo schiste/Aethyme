@@ -3309,10 +3309,11 @@ command output and stderr. Read-only metrics remain opt-in with
 `AETHYME_MEASURE_OUTPUT` to preserve the default read-only contract.
 
 `aethyme broker advanced insights --json` adds `task_attribution` with totals
-for closed or landed sessions and a bounded per-session breakdown. The report
-exposes the count with measurements, the 16 MiB scan limit, and command rows
-that lack a session identity. Commands and outcomes refer to the observed
-window and retained history. Tasks reusing a session share its history.
+for observed closed or landed tasks and a bounded newest-first breakdown.
+A task is identified by its session and start timestamp. A recorded reuse event
+starts a new task within that session. The report exposes measurement coverage,
+the 16 MiB command-history limit, read errors, and command rows without a known
+task. Commands and outcomes refer to the observed window and retained history.
 `merge.conflict` opens one episode per session until a verification or landing
 resolves it. To explicitly record an intervention that prevented duplicate work,
 use `aethyme broker finish close --session <id> --duplicate-of <peer-id>`.
