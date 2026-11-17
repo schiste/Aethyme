@@ -587,6 +587,10 @@ pub const CONFIG_SCHEMA_VERSION: i64 = 1;
 const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("promote", &["mode", "branch"]),
     ("delivery", &["default", "push_session_branches"]),
+    (
+        "authorization",
+        &["prepare_session_worktrees", "disposable_test_environments"],
+    ),
     ("issue_workflows", &["issue_sets"]),
     (
         "automation",
@@ -1288,6 +1292,8 @@ const CONFIG_TEMPLATE: &str = "\
 #   [promote] mode    \"auto\" | \"manual\" | \"verify-only\"
 #   [promote] branch  integration branch name
 #   [delivery] push_session_branches  true | false (default false; authorizes `broker push`)
+#   [authorization] prepare_session_worktrees  true | false (default true; standing `submit prepare`)
+#   [authorization] disposable_test_environments  true | false (default true; session test databases)
 #   [issue_workflows] issue_sets  \"allow\" | \"deny\" (default deny)
 #   [broker.pr] open_as  \"draft\" | \"ready\" (default draft for new PRs)
 #   [leases]  ignore  paths never leased (trailing / = directory prefix)
@@ -1318,6 +1324,16 @@ mode = \"verify-only\"
 # worktree. It authorizes nothing else: no merging and no other refs. For a
 # repository that delivers through pull requests.
 # push_session_branches = true
+
+# [authorization]
+# Standing authorizations for every session, both on when absent. The first
+# lets agents run `aethyme broker submit prepare --session <id>` (the declared,
+# pinned installs; no lockfile edits) without asking; the second lets them
+# create, use and drop local test databases and environments named for the
+# session and dropped afterwards (never shared, staging or production). Set a
+# key to false to make agents ask the owner first.
+# prepare_session_worktrees = true
+# disposable_test_environments = true
 
 # How broker push --pr opens a new pull request. Read from the trusted default
 # branch; changing it never edits an existing pull request.
@@ -1978,6 +1994,17 @@ mod config_key_tests {
     }
 
     /// `broker push` reads this key; certify must not call it unknown.
+    #[test]
+    fn standing_authorization_keys_are_known() {
+        assert!(
+            unknown(
+                "[authorization]\nprepare_session_worktrees = false\n\
+                 disposable_test_environments = true\n"
+            )
+            .is_empty()
+        );
+    }
+
     #[test]
     fn push_session_branches_is_a_known_delivery_key() {
         assert!(unknown("[delivery]\npush_session_branches = true\n").is_empty());

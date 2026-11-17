@@ -705,6 +705,26 @@ line names `broker push` and a draft PR only when
 `[delivery] push_session_branches = true`. `start-agent`, `status` and other
 commands do not print the agreement.
 
+Under the agreement, `start` prints the repository's standing authorizations
+(`[authorization]` in `.aethyme/config.toml`, read from the committed default
+branch like `[session]`), even when the agreement is disabled:
+
+- `prepare_session_worktrees` (default `true`): run
+  `aethyme broker submit prepare --session <id>` without asking as soon as
+  preparation is reported required, in the session's own worktree, with
+  lockfiles unchanged. `false`: ask the owner first.
+- `disposable_test_environments` (default `true`): create, use and drop local
+  test databases and environments named for the session
+  (`$AETHYME_TEST_DB_SUFFIX` or a script's own scratch naming), broker-leased
+  or made by the repository's declared test commands, and drop them
+  afterwards; never shared, staging or production data. `false`: ask the
+  owner first.
+
+Both grants are standing: they cover every session. A non-boolean value or an
+unreadable configuration grants nothing. `--json` reports them as
+`standing_authorizations` (`prepare_session_worktrees`,
+`disposable_test_environments`, `lines`).
+
 Worktrees the broker places on the configured root are locked with
 `git worktree lock`, so `git worktree prune` (including the automatic one in
 `git gc`) keeps their registration while the drive is unplugged; the broker
@@ -841,7 +861,7 @@ the limit; `--reuse` without it keeps the session's existing name. When Chau7 is
 `<session-id> - <short-name>`; a missing tab leaves the session registered
 with a pending rename, while ambiguous or mismatched identity is refused with
 a reason.
-- `aethyme broker submit prepare status --session <id> [--json]`
+- `aethyme broker submit prepare status --session <id> [--json]` — `authorized_by_policy` is true when `next_action` is the prepare command and `[authorization] prepare_session_worktrees` (default `true`) grants it, so an agent runs it without asking.
 - `aethyme broker submit prepare --session <id> [--offline] [--wait <duration>] [--json]` — a shared cache held by another session is waited for, 10 minutes by default; `--wait 0s` fails fast instead.
 - `aethyme broker advanced heartbeat --session <id> [--json]` — renew the exact current holder's task lease during quiet work; guarded commands renew automatically.
 - `aethyme broker advanced exec --session <id> [--non-interactive] [--json] -- <command>`
