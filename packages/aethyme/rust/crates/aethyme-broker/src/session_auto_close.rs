@@ -2997,6 +2997,7 @@ mod lane_tests {
             Reason::TaskLeaseCurrent,
             Reason::OperationGuardBusy,
             Reason::OperationGuardUnavailable,
+            Reason::StartReserved,
             Reason::LifecycleBusy,
             Reason::DeadlineReached,
             Reason::GateRunning,
@@ -3050,6 +3051,7 @@ mod lane_tests {
                 | Reason::TaskLeaseCurrent
                 | Reason::OperationGuardBusy
                 | Reason::OperationGuardUnavailable
+                | Reason::StartReserved
                 | Reason::LifecycleBusy
                 | Reason::DeadlineReached
                 | Reason::GateRunning
@@ -3724,6 +3726,55 @@ mod lane_tests {
         crate::session_holder::set_process_use_snapshot_for_tests(Some(
             crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
         ));
+    }
+
+    /// A path a running `broker start` has reserved is in use: the close
+    /// keeps the session until the reservation is released.
+    #[test]
+    fn a_start_reservation_on_the_checkout_keeps_the_session() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let session = broker.start_worktree("reserved by a start", None).unwrap();
+        quiet(&mut broker, &session, 80);
+        let root = broker.main_root().to_path_buf();
+        std::fs::create_dir_all(root.join(".aethyme/run")).unwrap();
+        // `reserve` creates the destination, so the checkout steps aside for
+        // the moment it takes and comes back under the held reservation.
+        let checkout = PathBuf::from(&session.worktree_path);
+        let aside = checkout.with_file_name("reserved-checkout-aside");
+        std::fs::rename(&checkout, &aside).unwrap();
+        let crate::start_reservation::Reserve::Reserved(reservation) =
+            crate::start_reservation::reserve(
+                &root,
+                checkout.file_name().unwrap().to_str().unwrap(),
+                &checkout,
+                &session.branch,
+                session.diff_base.as_deref().unwrap_or_default(),
+            )
+            .unwrap()
+        else {
+            panic!("the reservation is taken");
+        };
+        std::fs::remove_dir(&checkout).unwrap();
+        std::fs::rename(&aside, &checkout).unwrap();
+        assert!(crate::start_reservation::path_is_reserved(&root, &checkout));
+
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_abandoned_directly(&mut broker, &session, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::OperationActive
+        );
+        assert_eq!(
+            table.keep_reason(),
+            Some(crate::broker::AbandonmentKeepReason::StartReserved)
+        );
+        assert!(is_open(&broker, session.id));
+
+        reservation.release();
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert_eq!(
+            close_abandoned_directly(&mut broker, &session, &mut table),
+            crate::broker::AbandonedSessionCloseOutcome::Closed
+        );
     }
 
     /// A foreground command never judges: the `agents` view leaves a due

@@ -494,7 +494,13 @@ is the checkout's Git index and HEAD times plus broker activity; editing files
 without Git does not move it, so a moved-on holder's session (and an `Unbound`
 one: no holder recorded, or a shared agent service) closes only after the
 complete open-file and working-directory observation finds nothing in the
-checkout. A live explicit claim and a shared agent service still keep it.
+checkout. A live explicit claim and a shared agent service still keep it, and
+so does a start reservation on the checkout's path (`start_reserved`: a
+running `broker start` is recreating it). The open-file observation ignores
+only the broker's own state files under the primary checkout's `.aethyme/`
+(the database and its siblings, lock files, `run/`, `logs/`, `locks/`), never
+a working directory, and nothing when the session's checkout is itself under
+`.aethyme/` (review checkouts live in `.aethyme/reviews/`).
 Closing deletes nothing: committed work stays on the branch, and
 `aethyme broker start --reuse` resumes the session from its checkout (or with
 its path once the checkout is retired).

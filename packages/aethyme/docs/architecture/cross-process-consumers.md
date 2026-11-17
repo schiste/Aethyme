@@ -766,7 +766,8 @@ period earlier with no activity since. A holder bound to a newer session of
 the repository (same pid and start time, no bind back) is no live holder, in
 the abandonment and no-work windows. The keep reason `holder_moved_on_dirty`
 (counter `session_abandonment_kept_holder_moved_on_dirty`) is removed; the new
-keep reason is `work_class_not_due`.
+keep reasons are `work_class_not_due` and `start_reserved` (a held start
+reservation on the checkout's path).
 
 **New fields and records.** `session.abandoned` from the abandonment window
 gains `work_class` (`landed`, `pushed_unmerged`, `unpushed`). A closing-soon

@@ -443,6 +443,8 @@ pub(crate) enum AbandonmentKeepReason {
     OperationGuardBusy,
     /// The task operation guard could not be tried.
     OperationGuardUnavailable,
+    /// A running `broker start` has reserved the checkout's path.
+    StartReserved,
     /// Another lifecycle operation holds the repository lifecycle claim.
     LifecycleBusy,
     /// The pass deadline ran out during the running-work checks.
@@ -536,6 +538,7 @@ impl AbandonmentKeepReason {
             Self::TaskLeaseCurrent => "task_lease_current",
             Self::OperationGuardBusy => "operation_guard_busy",
             Self::OperationGuardUnavailable => "operation_guard_unavailable",
+            Self::StartReserved => "start_reserved",
             Self::LifecycleBusy => "lifecycle_busy",
             Self::DeadlineReached => "deadline_reached",
             Self::GateRunning => "gate_running",
@@ -598,6 +601,7 @@ impl AbandonmentKeepReason {
             Self::OperationGuardUnavailable => {
                 "session_abandonment_kept_operation_guard_unavailable"
             }
+            Self::StartReserved => "session_abandonment_kept_start_reserved",
             Self::LifecycleBusy => "session_abandonment_kept_lifecycle_busy",
             Self::DeadlineReached => "session_abandonment_kept_deadline_reached",
             Self::GateRunning => "session_abandonment_kept_gate_running",
@@ -3137,6 +3141,19 @@ impl Broker {
                 process_table,
                 AbandonmentKeepReason::Changed,
                 AbandonedSessionCloseOutcome::Changed,
+            ));
+        }
+        // A running `broker start` (a `--reuse` of this checkout included)
+        // reserves the path before it records anything: the checkout is in
+        // use, and closing it now would race that start.
+        if crate::start_reservation::path_is_reserved(
+            self.main_root(),
+            std::path::Path::new(&current.worktree_path),
+        ) {
+            return Ok(keep_with(
+                process_table,
+                AbandonmentKeepReason::StartReserved,
+                AbandonedSessionCloseOutcome::OperationActive,
             ));
         }
         let fs_activity = match checked_worktree_activity_ms(self.main_root(), &current) {
