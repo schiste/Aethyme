@@ -112,41 +112,6 @@ impl StaleWorkClass {
     }
 }
 
-/// What the classifier read about one session. `None` is evidence that could
-/// not be read, which never shortens a window.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct WorkEvidence {
-    /// Uncommitted, untracked or in-progress content in the checkout.
-    pub dirty: Option<bool>,
-    /// Every recorded pull request merged and the tip is contained in a
-    /// merged pull request's recorded head.
-    pub merged_pull_request_contains_tip: bool,
-    /// HEAD is an ancestor of the fetched default branch.
-    pub head_landed: Option<bool>,
-    /// HEAD is still the session's diff base.
-    pub no_commits: Option<bool>,
-    /// HEAD is an ancestor of the session branch's remote-tracking ref.
-    pub head_pushed: Option<bool>,
-}
-
-/// The class `evidence` puts a session in: any uncommitted or unreadable
-/// checkout content is unpushed work, whatever its commits.
-pub(crate) fn classify(evidence: &WorkEvidence) -> StaleWorkClass {
-    if evidence.dirty != Some(false) {
-        return StaleWorkClass::Unpushed;
-    }
-    if evidence.merged_pull_request_contains_tip
-        || evidence.head_landed == Some(true)
-        || evidence.no_commits == Some(true)
-    {
-        return StaleWorkClass::Landed;
-    }
-    if evidence.head_pushed == Some(true) {
-        return StaleWorkClass::PushedUnmerged;
-    }
-    StaleWorkClass::Unpushed
-}
-
 /// The per-class windows, in milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StaleSessionPolicy {
@@ -521,13 +486,24 @@ impl crate::Broker {
     /// conservative.
     pub(crate) fn stale_work_class(&self, session: &crate::Session) -> StaleWorkClass {
         let started = std::time::Instant::now();
+        let class = self.stale_work_class_uncounted(session);
+        crate::phase_telemetry::add(class.telemetry_name(), Duration::ZERO);
+        crate::phase_telemetry::add("stale_work_classification", started.elapsed());
+        class
+    }
+
+    /// [`Self::stale_work_class`] without its counters. Evidence is read
+    /// lazily, cheapest first, and only as far as it can still change the
+    /// answer: uncommitted work is unpushed whatever the commits, a tip still
+    /// at the diff base has nothing to lose, and only then are ancestry and
+    /// remote-tracking refs asked.
+    fn stale_work_class_uncounted(&self, session: &crate::Session) -> StaleWorkClass {
         let worktree = Path::new(&session.worktree_path);
-        let checkout_exists = std::fs::symlink_metadata(worktree).is_ok();
         let repo = self.repo_handle();
         let branch_tip = repo.resolve_ref(&format!("refs/heads/{}", session.branch));
         // A checkout that is gone holds nothing beyond its branch.
-        let (dirty, head) = if checkout_exists {
-            let dirty = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root())
+        let head = if std::fs::symlink_metadata(worktree).is_ok() {
+            let clean = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root())
                 .ok()
                 .and_then(|policy| {
                     crate::auto_cleanup::uncommitted_reason(
@@ -538,60 +514,83 @@ impl crate::Broker {
                     )
                     .ok()
                 })
-                .map(|reason| reason.is_some());
-            let head = crate::git::GitRepo::discover(worktree)
+                .is_some_and(|reason| reason.is_none());
+            if !clean {
+                return StaleWorkClass::Unpushed;
+            }
+            crate::git::GitRepo::discover(worktree)
                 .ok()
-                .and_then(|checkout| checkout.head_commit().ok());
-            (dirty, head)
+                .and_then(|checkout| checkout.head_commit().ok())
         } else {
-            (Some(false), branch_tip.clone())
-        };
-        let all_merged =
-            crate::session_auto_close::PullRequestMerges::read(self.store_ref(), session.id)
-                .is_some_and(|merges| merges.all_merged());
-        let merged_heads = if all_merged {
-            self.store_ref()
-                .merged_pull_request_heads(session.id)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let upstream = repo.upstream_default();
-        let remote = upstream
-            .as_ref()
-            .and_then(|(name, _)| name.split_once('/').map(|(remote, _)| remote.to_string()))
-            .unwrap_or_else(|| "origin".to_string());
-        let remote_tip = repo.resolve_ref(&format!("refs/remotes/{remote}/{}", session.branch));
-        let contains = |ancestor: &str, descendant: &str| {
-            ancestor == descendant
-                || matches!(repo.is_ancestor_checked(ancestor, descendant), Ok(true))
+            branch_tip.clone()
         };
         // HEAD and the branch tip are classed apart and the more protective
         // class wins: a detached HEAD at the base or a landed commit, or a
         // checkout switched to another branch, cannot hide the branch's
         // commits, nor the branch hide commits made on a detached HEAD.
-        let class_of = |tip: Option<&str>| -> StaleWorkClass {
+        let mut tips = Vec::new();
+        for tip in [head, branch_tip] {
             let Some(tip) = tip else {
                 return StaleWorkClass::Unpushed;
             };
-            classify(&WorkEvidence {
-                dirty,
-                merged_pull_request_contains_tip: merged_heads
-                    .iter()
-                    .any(|merged| contains(tip, merged.as_str())),
-                head_landed: upstream
-                    .as_ref()
-                    .and_then(|(_, upstream_tip)| repo.is_ancestor_checked(tip, upstream_tip).ok()),
-                no_commits: session.diff_base.as_deref().map(|base| tip == base),
-                head_pushed: remote_tip
-                    .as_deref()
-                    .map(|remote_tip| contains(tip, remote_tip)),
-            })
+            if !tips.contains(&tip) {
+                tips.push(tip);
+            }
+        }
+        let tips = tips
+            .into_iter()
+            .filter(|tip| session.diff_base.as_deref() != Some(tip.as_str()))
+            .collect::<Vec<_>>();
+        if tips.is_empty() {
+            return StaleWorkClass::Landed;
+        }
+        let contains = |ancestor: &str, descendant: &str| {
+            ancestor == descendant
+                || matches!(repo.is_ancestor_checked(ancestor, descendant), Ok(true))
         };
-        let class = class_of(head.as_deref()).max(class_of(branch_tip.as_deref()));
-        crate::phase_telemetry::add(class.telemetry_name(), Duration::ZERO);
-        crate::phase_telemetry::add("stale_work_classification", started.elapsed());
-        class
+        let upstream = repo.upstream_default();
+        let merged_heads =
+            if crate::session_auto_close::PullRequestMerges::read(self.store_ref(), session.id)
+                .is_some_and(|merges| merges.all_merged())
+            {
+                self.store_ref()
+                    .merged_pull_request_heads(session.id)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+        let landed = |tip: &str| {
+            merged_heads
+                .iter()
+                .any(|merged| contains(tip, merged.as_str()))
+                || upstream
+                    .as_ref()
+                    .is_some_and(|(_, upstream_tip)| contains(tip, upstream_tip.as_str()))
+        };
+        let unlanded = tips
+            .iter()
+            .filter(|tip| !landed(tip.as_str()))
+            .collect::<Vec<_>>();
+        if unlanded.is_empty() {
+            return StaleWorkClass::Landed;
+        }
+        let remote = upstream
+            .as_ref()
+            .and_then(|(name, _)| name.split_once('/').map(|(remote, _)| remote.to_string()))
+            .unwrap_or_else(|| "origin".to_string());
+        let Some(remote_tip) =
+            repo.resolve_ref(&format!("refs/remotes/{remote}/{}", session.branch))
+        else {
+            return StaleWorkClass::Unpushed;
+        };
+        if unlanded
+            .iter()
+            .all(|tip| contains(tip.as_str(), remote_tip.as_str()))
+        {
+            StaleWorkClass::PushedUnmerged
+        } else {
+            StaleWorkClass::Unpushed
+        }
     }
 }
 
@@ -636,74 +635,6 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-    }
-
-    fn evidence() -> WorkEvidence {
-        WorkEvidence {
-            dirty: Some(false),
-            merged_pull_request_contains_tip: false,
-            head_landed: Some(false),
-            no_commits: Some(false),
-            head_pushed: Some(false),
-        }
-    }
-
-    #[test]
-    fn landed_commits_a_merged_pull_request_or_no_commits_are_landed() {
-        for landed in [
-            WorkEvidence {
-                head_landed: Some(true),
-                ..evidence()
-            },
-            WorkEvidence {
-                merged_pull_request_contains_tip: true,
-                ..evidence()
-            },
-            WorkEvidence {
-                no_commits: Some(true),
-                ..evidence()
-            },
-        ] {
-            assert_eq!(classify(&landed), StaleWorkClass::Landed, "{landed:?}");
-        }
-    }
-
-    #[test]
-    fn pushed_unlanded_commits_are_pushed_unmerged() {
-        let pushed = WorkEvidence {
-            head_pushed: Some(true),
-            ..evidence()
-        };
-        assert_eq!(classify(&pushed), StaleWorkClass::PushedUnmerged);
-    }
-
-    #[test]
-    fn dirty_unreadable_or_unpushed_work_is_unpushed() {
-        for unpushed in [
-            evidence(),
-            WorkEvidence {
-                head_pushed: None,
-                ..evidence()
-            },
-            // Uncommitted content outranks a landed HEAD or a merged PR.
-            WorkEvidence {
-                dirty: Some(true),
-                head_landed: Some(true),
-                merged_pull_request_contains_tip: true,
-                ..evidence()
-            },
-            WorkEvidence {
-                dirty: None,
-                no_commits: Some(true),
-                ..evidence()
-            },
-        ] {
-            assert_eq!(
-                classify(&unpushed),
-                StaleWorkClass::Unpushed,
-                "{unpushed:?}"
-            );
-        }
     }
 
     #[test]
