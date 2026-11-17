@@ -90,7 +90,7 @@ fn status_shows_a_wedged_operation_and_what_is_parked_behind_it() {
             ..make("issues/1/comments", r#"["gh","api"]"#)
         })
         .unwrap();
-    let mut command = common::broker_cli(CLI, &["status"]);
+    let mut command = common::broker_cli(CLI, &["status", "--full"]);
     command.current_dir(tmp.path());
     broker
         .configure_storage_context_for_child(&mut command)

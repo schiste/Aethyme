@@ -1482,7 +1482,7 @@ its pending release requests. A recorded overlap is advisory. Reported
 repository warnings and recorded stale sessions are information. The broker
 checks exact resource conflicts when an operation is requested.
 `--session <id>` provides the same view from another checkout. Use `--json` for
-the `aethyme.broker-session-view/v1` snapshot or `--since-revision <token>`
+the `aethyme.broker-session-view/v2` snapshot or `--since-revision <token>`
 for the sections that changed.
 
 Without a session, compact status shows repository counts and the command to

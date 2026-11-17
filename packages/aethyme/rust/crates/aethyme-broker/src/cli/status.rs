@@ -220,11 +220,8 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
     };
     if let Some(session_id) = session_id {
         let coordination = crate::agent_hook::session_coordination(&broker, Some(session_id));
-        let block = super::status_extras::routine_session_block(
-            &broker,
-            session_id,
-            &coordination.actions,
-        )?;
+        let block =
+            super::status_extras::routine_session_block(&broker, session_id, &coordination)?;
         let requests = broker.session_pending_lease_release_requests(session_id)?;
         let count = requests.len();
         let records: Vec<_> = requests.into_iter().take(10)
@@ -235,7 +232,7 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         let peers = crate::agent_hook::session_peer_view(&broker, session_id)?;
         if parsed.json {
             let snapshot = serde_json::json!({
-                "schema": "aethyme.broker-session-view/v1",
+                "schema": "aethyme.broker-session-view/v2",
                 "session": block,
                 "peer_state": peers,
                 "global_state": coordination.information,

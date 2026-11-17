@@ -386,7 +386,7 @@ fn default_status_identifies_the_worktree_session_and_reports_only_its_conflicts
         fixture.path(),
         &["status", "--compact", "--session", &session_id, "--json"],
     );
-    assert_eq!(focused["schema"], "aethyme.broker-session-view/v1");
+    assert_eq!(focused["schema"], "aethyme.broker-session-view/v2");
     assert_eq!(focused["peer_state"]["lease_count"], 1);
     assert!(focused["global_state"].get("records").is_none());
     assert!(focused.get("session_contexts").is_none());
@@ -430,7 +430,7 @@ fn default_status_identifies_the_worktree_session_and_reports_only_its_conflicts
     assert!(block["advice"].is_array() && block["blockers"].is_array());
     let next = block["next_action"]["command"].as_str().unwrap();
     assert!(
-        next.starts_with("git -C ") && next.ends_with("status --short"),
+        !next.contains("broker push") && next.contains("status --short"),
         "{next}"
     );
     assert!(block["next_action"]["reason"].is_string());
@@ -524,7 +524,7 @@ fn session_view_ignores_unrelated_sessions_and_resets_other_revision_scopes() {
         fixture.path(),
         &["status", "--session", &id, "--session-view", "--json"],
     );
-    assert_eq!(first["schema"], "aethyme.broker-session-view/v1");
+    assert_eq!(first["schema"], "aethyme.broker-session-view/v2");
     assert_eq!(
         first["data_freshness"]["global_warnings"],
         "recorded_partial"
@@ -682,6 +682,59 @@ fn session_event_follower_drains_backlog_without_another_write() {
     });
     assert_eq!(ids.len(), 1001);
     assert!(ids.iter().all(|id| *id == session.id));
+}
+
+#[test]
+fn focused_status_reports_only_live_waits_owned_by_the_selected_session() {
+    let fixture = common::FixtureRepository::new();
+    init_repo(fixture.path());
+    let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
+    let root = fixture.worktree_root();
+    let first = add_worktree(fixture.path(), &root, "waiting-first");
+    let other = add_worktree(fixture.path(), &root, "waiting-other");
+    let session = broker.adopt(&first, None).unwrap();
+    let peer = broker.adopt(&other, None).unwrap();
+    broker
+        .store()
+        .set_session_status(peer.id, aethyme_broker::SessionStatus::Stale, None)
+        .unwrap();
+    drop(broker);
+    let waits = fixture.path().join(".aethyme/run/waits");
+    std::fs::create_dir_all(&waits).unwrap();
+    for (id, pid, resource) in [
+        (session.id, std::process::id(), "my-owned-ref"),
+        (peer.id, std::process::id(), "unrelated-ref"),
+        (session.id, i32::MAX as u32, "dead-waiter"),
+    ] {
+        let row = aethyme_broker::WaitRecord {
+            pid: i64::from(pid),
+            session_id: Some(id),
+            kind: "coordinated_write_lock".into(),
+            resource: resource.into(),
+            holder: "fixture holder".into(),
+            started_at_ms: 1,
+        };
+        std::fs::write(
+            waits.join(format!("{resource}.json")),
+            serde_json::to_vec(&row).unwrap(),
+        )
+        .unwrap();
+    }
+    let view = json_status(&first, &["status", "--json"]);
+    assert_eq!(view["global_state"]["recorded_stale_sessions"], 1);
+    assert_eq!(view["session"]["waiting"]["count"], 1, "{view}");
+    assert_eq!(
+        view["session"]["waiting"]["records"][0]["resource"],
+        "my-owned-ref"
+    );
+    assert!(!view.to_string().contains("unrelated-ref"));
+    assert!(!view.to_string().contains("dead-waiter"));
+    assert!(
+        view["session"]["next_action"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("running wait")
+    );
 }
 
 #[test]

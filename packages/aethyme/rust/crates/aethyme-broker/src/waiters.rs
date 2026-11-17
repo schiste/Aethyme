@@ -59,10 +59,28 @@ pub struct CurrentWaiter {
 
 /// Every wait recorded in this repository, longest first.
 pub fn current_waiters(main_root: &Path, now_ms: i64) -> Vec<CurrentWaiter> {
-    current_with(main_root, now_ms, crate::broker::pid_alive)
+    current_with(main_root, now_ms, None, crate::broker::pid_alive)
 }
 
-fn current_with(main_root: &Path, now_ms: i64, alive: impl Fn(i64) -> bool) -> Vec<CurrentWaiter> {
+pub(crate) fn current_session_waiters(
+    main_root: &Path,
+    now_ms: i64,
+    session_id: i64,
+) -> Vec<CurrentWaiter> {
+    current_with(
+        main_root,
+        now_ms,
+        Some(session_id),
+        crate::broker::pid_alive,
+    )
+}
+
+fn current_with(
+    main_root: &Path,
+    now_ms: i64,
+    session_id: Option<i64>,
+    alive: impl Fn(i64) -> bool,
+) -> Vec<CurrentWaiter> {
     let Ok(entries) = std::fs::read_dir(waits_dir(main_root)) else {
         return Vec::new();
     };
@@ -71,6 +89,7 @@ fn current_with(main_root: &Path, now_ms: i64, alive: impl Fn(i64) -> bool) -> V
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
         .filter_map(|entry| std::fs::read(entry.path()).ok())
         .filter_map(|bytes| serde_json::from_slice::<WaitRecord>(&bytes).ok())
+        .filter(|record: &WaitRecord| session_id.is_none() || record.session_id == session_id)
         .map(|record| CurrentWaiter {
             alive: alive(record.pid),
             waited_ms: now_ms.saturating_sub(record.started_at_ms).max(0),
@@ -267,7 +286,7 @@ mod tests {
             .unwrap();
         }
         std::fs::write(dir.join("junk.json"), b"not json").unwrap();
-        let waiters = current_with(root.path(), 10_000, |pid| pid == 41);
+        let waiters = current_with(root.path(), 10_000, None, |pid| pid == 41);
         assert!(
             dir.join("42-1.json").exists(),
             "status never removes a record"

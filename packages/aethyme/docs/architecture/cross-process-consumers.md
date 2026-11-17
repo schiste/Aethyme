@@ -40,9 +40,11 @@ consumer. This file exists so that doesn't happen again.
 
 Routine `broker status --json` in a registered worktree and
 `broker status --session <id> --json` both return the
-`aethyme.broker-session-view/v1` document. The earlier `--session-view` spelling
-selects the same view and revision scope. `session.next_action` is the current
-session's next safe step. `session.blockers` reports its own recovery findings,
+`aethyme.broker-session-view/v2` document. The earlier `--session-view` spelling
+selects the same view and revision scope. Version 2 makes global recovery a
+count summary and omits per-observation evidence from default advice. `session.next_action` is the current
+session's next safe step. A running wait can supply an instruction with a null
+command. `session.blockers` reports its own recovery findings,
 `peer_state` scopes overlaps to its leases and declared scopes, and
 `global_state` counts other recorded coordination warnings by kind. A repository
 count can change without naming the record. Use `--full --json` for exact
@@ -50,8 +52,8 @@ evidence and `broker unblock` for recovery inspection. The broker verifies
 exact resource conflicts when carrying out a requested operation.
 
 With `--since-revision`, `aethyme.broker-status-delta/v1` carries section
-replacements for a valid revision of that same session. Old focused compact
-tokens and other scopes reset. An empty section map leaves deferred checks
+replacements for a valid revision of that same session. Old focused compact and v1 session-view
+tokens reset, as do tokens from other scopes. An empty section map leaves deferred checks
 unknown.
 
 `aethyme broker advanced events --session <id> --since <event-id> --follow
@@ -2122,7 +2124,7 @@ help; only manual audit of every consumer can.
 worktree inspection, Git conflict/history checks and cleanup eligibility.
 Routine `broker status` and its alias `--compact` infer the current session
 from the worktree or accept `--session <id>`. Readers should dispatch on
-`schema`. Session selection gives `aethyme.broker-session-view/v1`; elsewhere
+`schema`. Session selection gives `aethyme.broker-session-view/v2`; elsewhere
 `aethyme.broker-status-compact/v1` exposes repository counts and warning
 categories. In the repository form, count-bearing lists omit records and
 advice categories omit per-observation summaries and commands. In the session

@@ -45,8 +45,7 @@ pub(super) fn render_session(
     since: Option<&str>,
 ) -> Result<Value, serde_json::Error> {
     // Polling a watch refreshes its observation time even when no PR facts
-    // change. Keep it out of both the projection and its revision; focused
-    // status retains the timestamp for callers needing freshness evidence.
+    // change. Keep it out of both the projection and its revision.
     if let Some(pr) = snapshot
         .pointer_mut("/session/pr")
         .and_then(Value::as_object_mut)
@@ -64,7 +63,7 @@ fn render_inner(
     session_view: bool,
 ) -> Result<Value, serde_json::Error> {
     let scope_text = if session_view {
-        format!("{}\0{:?}\0session-view", root.display(), session)
+        format!("{}\0{:?}\0session-view-v2", root.display(), session)
     } else {
         format!("{}\0{:?}", root.display(), session)
     };

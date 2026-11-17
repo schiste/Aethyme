@@ -1626,8 +1626,8 @@ mod tests {
         for needle in [
             "## Broker Coordination: before and after an edit",
             "`aethyme broker status --json`",
-            "`aethyme broker status --json` for repository-wide advice",
-            "`aethyme broker status --full --json` only when exact session or lease-path evidence is",
+            "Add `--session <id>` from another checkout",
+            "`aethyme broker status --full --json` for exact session or lease-path",
             "`aethyme broker start --task \"<task>\" [--short-name \"<label>\"]`",
             "work only in the worktree it\n   reports",
             "follow the working agreement it prints.",
@@ -1661,8 +1661,8 @@ mod tests {
         let reference = render_broker_reference();
         for moved in [
             "aethyme broker status --json  # concise coordination summary (compact)",
-            "Routine status groups repeated advice categories",
-            "`aethyme broker status --full --json` only when you need exact session, lease-path or",
+            "Routine status gives your worktree's session",
+            "when you need exact session, lease-path or recovery evidence.",
             "start command is still running",
             "that same command to completion before retrying",
             "session's reported repository",
@@ -1854,8 +1854,8 @@ mod tests {
         for needle in [
             "## Broker Coordination: before and after an edit",
             "`aethyme broker status --json`",
-            "`aethyme broker status --json` for repository-wide advice",
-            "`aethyme broker status --full --json` only when exact session or lease-path evidence is",
+            "Add `--session <id>` from another checkout",
+            "`aethyme broker status --full --json` for exact session or lease-path",
             "Commit early and small, and after each commit run\n   `aethyme broker push --session <id>`",
             "open a draft PR with `aethyme broker push --session <id> --pr`",
             "keep pushing until it is ready. Run `aethyme broker sync --session <id>`\n   before resuming a reused session and when push reports related or unknown\n   impact. A graph-disjoint verdict permits deferring intermediate sync; validate\n   the current merge candidate before merging. Never leave work only in the worktree.",
@@ -1894,13 +1894,13 @@ mod tests {
                 "{tag}: missing the working-agreement pointer:\n{doc}"
             );
             for required in [
-                "Installed, trusted hooks deliver session and relevant peer and blocker changes",
+                "Installed, trusted hooks deliver current-session actions, relevant peer",
                 "`aethyme broker status --json`",
-                "with `--since-revision <token>` for changes only. Deferred checks are unknown.",
-                "Use `aethyme broker status --json` for repository-wide advice",
-                "`aethyme broker status --full --json` only when exact session or lease-path evidence is",
-                "session's explicit lease are advisory. Accepted warnings permit work in your",
-                "Resolve blockers and refusals.",
+                "`--since-revision <token>` for changes only. Treat deferred checks as unknown.",
+                "changes and changes to repository warning counts at prompt and tool boundaries.",
+                "`aethyme broker status --full --json` for exact session or lease-path",
+                "active session's explicit lease are advisory. Reconcile before merging",
+                "resolve blockers and refusals.",
             ] {
                 assert!(
                     doc.contains(required),

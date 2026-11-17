@@ -261,7 +261,7 @@ pub(crate) fn session_block(
 pub(crate) fn routine_session_block(
     broker: &crate::Broker,
     session_id: i64,
-    coordination: &[crate::Blocker],
+    coordination: &crate::agent_hook::SessionCoordination,
 ) -> Result<Value, crate::BrokerOpError> {
     use crate::blockers::BlockerKind;
 
@@ -276,7 +276,7 @@ pub(crate) fn routine_session_block(
     let Some(blockers) = block["blockers"].as_array_mut() else {
         return Ok(block);
     };
-    blockers.extend(coordination.iter().take(10).map(|item| json!({
+    blockers.extend(coordination.actions.iter().take(10).map(|item| json!({
         "id": item.id,
         "summary": match item.kind {
             BlockerKind::Operation => "A write from this session has an unknown outcome",
@@ -286,7 +286,7 @@ pub(crate) fn routine_session_block(
             _ => "A coordination record for this session needs inspection",
         },
     })));
-    if let Some(first) = coordination.first()
+    if let Some(first) = coordination.actions.first()
         && block["status"] != "cleaned"
         && block["status"] != "closed"
     {
@@ -298,6 +298,25 @@ pub(crate) fn routine_session_block(
                 "aethyme broker unblock".to_string()
             },
             "reason": "inspect recovery evidence for this session",
+        });
+    }
+    block["waiting"] = json!({
+        "count": coordination.waiters.len(),
+        "records": coordination.waiters.iter().take(3).map(|waiter| json!({
+            "kind": waiter.kind, "resource": waiter.resource, "holder": waiter.holder,
+        })).collect::<Vec<_>>(),
+    });
+    if !coordination.waiters.is_empty()
+        && block["blockers"].as_array().is_some_and(Vec::is_empty)
+        && block["status"] != "closed"
+        && block["status"] != "cleaned"
+    {
+        let command = (coordination.waiters[0].kind == crate::waiters::WAIT_COORDINATED_WRITE_LOCK)
+            .then(|| format!("aethyme broker advanced operations list --session {session_id}"));
+        block["next_action"] = json!({
+            "command": command,
+            "instruction": "let the running command return before retrying",
+            "reason": "this session has a running wait",
         });
     }
     Ok(block)
@@ -334,8 +353,20 @@ pub(crate) fn render_routine_session(block: &Value, show_worktree: bool) -> Stri
             let _ = write!(text, "\nAction required: {summary}");
         }
     }
+    for waiter in block["waiting"]["records"].as_array().into_iter().flatten() {
+        let _ = write!(
+            text,
+            "\nWaiting: {} on {}",
+            waiter["kind"], waiter["resource"]
+        );
+        if let Some(holder) = waiter["holder"].as_str().filter(|text| !text.is_empty()) {
+            let _ = write!(text, " ({holder})");
+        }
+    }
     if let (Some(command), Some(reason)) = (
-        block["next_action"]["command"].as_str(),
+        block["next_action"]["command"]
+            .as_str()
+            .or_else(|| block["next_action"]["instruction"].as_str()),
         block["next_action"]["reason"].as_str(),
     ) {
         let _ = write!(text, "\nNext: {command} ({reason})");

@@ -454,7 +454,11 @@ fn status_reports_the_collaboration_fence() {
             "state": "active",
         })
     );
-    let text = required.cli(&["status"], None);
+    let compact = required.cli(&["status"], None);
+    assert!(
+        String::from_utf8_lossy(&compact.stdout).contains("recorded collaboration fence present")
+    );
+    let text = required.cli(&["status", "--full"], None);
     assert!(
         String::from_utf8_lossy(&text.stdout).contains(&format!(
             "Collaboration fence: broker.db requires schema {}",

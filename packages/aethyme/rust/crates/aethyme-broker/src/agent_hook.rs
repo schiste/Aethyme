@@ -482,6 +482,7 @@ pub(crate) fn session_peer_view(
 
 pub(crate) struct SessionCoordination {
     pub(crate) actions: Vec<crate::Blocker>,
+    pub(crate) waiters: Vec<crate::CurrentWaiter>,
     pub(crate) information: serde_json::Value,
 }
 
@@ -523,8 +524,15 @@ pub(crate) fn session_coordination(
         "unavailable_source_count": report.unavailable.len(),
         "recovery_checks": "not_inspected",
     });
+    let waiters = session_id.map_or_else(Vec::new, |id| {
+        crate::waiters::current_session_waiters(broker.main_root(), now_ms(), id)
+            .into_iter()
+            .filter(|waiter| waiter.alive)
+            .collect()
+    });
     SessionCoordination {
         actions,
+        waiters,
         information,
     }
 }
@@ -562,8 +570,7 @@ fn own_view_update(broker: &Broker, session: &Session, force: bool) -> Option<St
 
     let coordination = session_coordination(broker, Some(session.id));
     let view =
-        crate::cli::status_extras::routine_session_block(broker, session.id, &coordination.actions)
-            .ok()?;
+        crate::cli::status_extras::routine_session_block(broker, session.id, &coordination).ok()?;
     let brief = crate::cli::status_extras::render_routine_session(&view, false);
     let information = coordination.information;
     let mut messages = Vec::new();

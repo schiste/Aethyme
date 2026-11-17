@@ -228,7 +228,9 @@ fn start_cli_records_chau7_session_context_for_status_and_json() {
     assert_eq!(report["tab_rename"]["status"], "pending");
 
     let status = stdout(&run(tmp.path(), &["status"]));
-    assert!(status.contains("Aethyme / Fix auth / claude"), "{status}");
+    assert!(!status.contains("Fix auth"), "{status}");
+    let full = stdout(&run(tmp.path(), &["status", "--full"]));
+    assert!(full.contains("Aethyme / Fix auth / claude"), "{full}");
 }
 
 #[cfg(unix)]
