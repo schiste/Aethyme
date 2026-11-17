@@ -5525,7 +5525,17 @@ impl Broker {
                 // the trash in O(1) and the deleter unlinks it. A plain
                 // `finish`/cleanup keeps Git's removal in this slice; the
                 // retirement lane owns everything it leaves behind.
-                if archive_guard.is_some() {
+                if let Some(archive_guard) = archive_guard {
+                    // The verified archive's bundle carries these commits:
+                    // they need no pin to survive the checkout.
+                    let plan = archive_guard.plan();
+                    let _archived = super::retire::ArchivedCommitsScope::enter(
+                        std::iter::once(plan.head.clone())
+                            .chain(plan.branch_tip.clone())
+                            .chain(plan.checkout_branch_tip.clone())
+                            .chain(plan.unlanded_commits.iter().cloned())
+                            .collect(),
+                    );
                     self.remove_checkout_through_trash(session, &worktree_path, force)?;
                 } else {
                     self.repo

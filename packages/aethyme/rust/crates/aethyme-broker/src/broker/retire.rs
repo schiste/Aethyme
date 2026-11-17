@@ -213,6 +213,29 @@ pub(super) fn resolve_live_paths_for_lane(
     })
 }
 
+thread_local! {
+    /// Commits a verified recovery archive's bundle carries for the checkout
+    /// being moved on this thread: they, and their ancestors, need no pin.
+    static ARCHIVED_COMMITS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Marks commits as carried by a verified archive until dropped.
+pub(super) struct ArchivedCommitsScope(Vec<String>);
+
+impl ArchivedCommitsScope {
+    pub(super) fn enter(commits: Vec<String>) -> Self {
+        Self(ARCHIVED_COMMITS.with(|cell| cell.replace(commits)))
+    }
+}
+
+impl Drop for ArchivedCommitsScope {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.0);
+        ARCHIVED_COMMITS.with(|cell| *cell.borrow_mut() = previous);
+    }
+}
+
 /// Shares the run's open-file observation with the rename until dropped.
 struct RunProcessUseScope(Option<std::rc::Rc<crate::reclaim::OpenFileSnapshot>>);
 
@@ -974,7 +997,8 @@ impl Broker {
     /// per-worktree refs (`refs/bisect/*`, `refs/worktree/*`,
     /// `refs/rewritten/*`) point at, and those `BISECT_LOG`/`BISECT_START`
     /// name, each unless already reachable from the default branch, a
-    /// remote-tracking ref or an existing pin. Reachability is decided in one
+    /// remote-tracking ref, an existing pin, or (on the archive path) a
+    /// commit the verified archive's bundle carries. Reachability is decided in one
     /// `rev-list` for at most [`RETIRE_PIN_CANDIDATES_MAX`] candidates; more
     /// refuses (the caller keeps the checkout). Pins expire by the rule of
     /// [`Self::prune_retired_pins`].
@@ -1069,7 +1093,16 @@ impl Broker {
             .iter()
             .map(|commit| format!("{commit}\n"))
             .collect::<String>();
-        for id in excluded.lines().map(str::trim).filter(|id| !id.is_empty()) {
+        // A verified archive's bundle also keeps what it carries.
+        let archived = ARCHIVED_COMMITS.with(|cell| cell.borrow().clone());
+        for id in excluded
+            .lines()
+            .map(str::trim)
+            .chain(archived.iter().map(String::as_str))
+            .filter(|id| {
+                matches!(id.len(), 40 | 64) && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
             input.push_str(&format!("^{id}\n"));
         }
         std::fs::write(scratch.path(), input)
