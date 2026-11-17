@@ -1300,6 +1300,25 @@ impl BrokerStore {
         cleanup_grace_hours: Option<u32>,
         compact_checkout: bool,
     ) -> Result<(), BrokerError> {
+        self.set_session_status_with_cleanup_and_duplicate(
+            id,
+            status,
+            exit_code,
+            cleanup_grace_hours,
+            compact_checkout,
+            None,
+        )
+    }
+
+    pub(crate) fn set_session_status_with_cleanup_and_duplicate(
+        &mut self,
+        id: i64,
+        status: SessionStatus,
+        exit_code: Option<i64>,
+        cleanup_grace_hours: Option<u32>,
+        compact_checkout: bool,
+        duplicate_of: Option<i64>,
+    ) -> Result<(), BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
         if status == SessionStatus::Closed {
@@ -1396,6 +1415,17 @@ impl BrokerStore {
                 .map(crate::events::session_exit_payload)
                 .as_deref(),
         )?;
+        if status == SessionStatus::Closed
+            && let Some(peer) = duplicate_of
+        {
+            insert_event(
+                &tx,
+                now,
+                crate::events::DUPLICATE_WORK_AVOIDED,
+                Some(id),
+                Some(&serde_json::json!({"other_session_id": peer}).to_string()),
+            )?;
+        }
         if status == SessionStatus::Closed
             && let Some(grace_hours) = cleanup_grace_hours
         {
@@ -2915,6 +2945,32 @@ mod abandoned_close_cas_tests {
             })
             .unwrap();
         (owner, store, session)
+    }
+
+    #[test]
+    fn repeated_duplicate_close_emits_one_intervention_with_a_terminal_session() {
+        let (_owner, mut store, session) = store_with_session();
+        for _ in 0..2 {
+            store
+                .set_session_status_with_cleanup_and_duplicate(
+                    session.id,
+                    SessionStatus::Closed,
+                    None,
+                    None,
+                    false,
+                    Some(71),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.session(session.id).unwrap().cleanup_state,
+            SessionCleanupState::Closed
+        );
+        let events = store
+            .events_after_filtered(0, 10, Some(crate::events::DUPLICATE_WORK_AVOIDED))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id, Some(session.id));
     }
 
     fn assert_unclosed_without_abandoned_event(store: &BrokerStore, session_id: i64) {

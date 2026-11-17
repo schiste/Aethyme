@@ -130,13 +130,14 @@ Usage:
       --replace-stale closes it and registers fresh; policy may reclaim known ignored build artifacts;
       neither flag = error listing your options. Every --path is validated
       and claimed explicitly in the same transaction as create/reuse.
-  aethyme broker close --session <id> [--abandon --reason <why>] [--json]
+  aethyme broker close --session <id> [--abandon --reason <why> | --duplicate-of <session>] [--json]
       Low-level close. Retains the checkout and branch; policy may reclaim
       known ignored build artifacts. Does not check whether commits were
       submitted. Where the repository sets [delivery] push_session_branches,
       refuses while the session holds commits no remote has, unless
       --abandon --reason records that they are being left behind. Prefer
-      finish for normal lifecycle use.
+      finish for normal lifecycle use. Use --duplicate-of to report work
+      avoided after identifying an overlapping session, from a clean, unchanged checkout.
   aethyme broker heartbeat --session <id> [--json]
       Renew the exact current holder's task lease for long-running work.
       Guarded session commands renew it automatically; send this at least once
@@ -1170,6 +1171,9 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
     // the shared detached worker (see `ForegroundCommand`).
     let _foreground_command = crate::file_lock::ForegroundCommand::enter();
     let started = std::time::Instant::now();
+    let command_output = crate::cli_output::snapshot();
+    let spans = crate::phase_telemetry::Recorder::default();
+    let _recording = crate::phase_telemetry::install(spans.clone());
     // The opt-in host service has its own bounded parser and never opens a
     // repository, runs startup maintenance or fast-forwards a checkout.
     if args.first().map(String::as_str) == Some("service") {
@@ -1194,9 +1198,6 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
     if args.first().map(String::as_str) == Some("check-contract") {
         return crate::contract_check::run(&args[1..]);
     }
-    let command_output = crate::cli_output::snapshot();
-    let spans = crate::phase_telemetry::Recorder::default();
-    let _recording = crate::phase_telemetry::install(spans.clone());
     let (code, record_outcome, error) = match run_inner(args, &mode) {
         Ok(()) => (0, true, None),
         Err(UsageError::Help) => {
@@ -1230,10 +1231,18 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
             Some("pre-commit" | "post-commit")
         );
     if mode == CompatibilityMode::Normal && !internal_hook && !idle_delivery_poll(code) {
+        let ended = std::time::Instant::now();
         if record_outcome {
             record_command_outcome(args, code, error.as_deref());
         }
-        record_command_metric(args, code, started.elapsed().as_millis() as i64, &spans);
+        record_command_metric(
+            args,
+            code,
+            started,
+            ended,
+            crate::cli_output::emitted_bytes_since(command_output),
+            &spans,
+        );
     }
     code
 }
@@ -1748,6 +1757,7 @@ struct Parsed {
     retire: bool,
     archive: bool,
     abandon: bool,
+    duplicate_of: Option<i64>,
     keep_worktree: bool,
     chau7: bool,
     fix_version: bool,
@@ -1909,6 +1919,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         retire: false,
         archive: false,
         abandon: false,
+        duplicate_of: None,
         keep_worktree: false,
         chau7: false,
         fix_version: false,
@@ -2029,6 +2040,15 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--archive-ignored-directories" => parsed.archive_ignored_directories = true,
             "--retire" => parsed.retire = true,
             "--abandon" => parsed.abandon = true,
+            "--duplicate-of" => {
+                parsed.duplicate_of = Some(
+                    iter.next()
+                        .and_then(|raw| raw.parse::<i64>().ok().filter(|id| *id > 0))
+                        .ok_or(UsageError::Message(
+                            "--duplicate-of requires a positive session id".into(),
+                        ))?,
+                );
+            }
             "--keep-worktree" => parsed.keep_worktree = true,
             "--open-pr" => parsed.open_pr = true,
             "--chau7" => parsed.chau7 = true,

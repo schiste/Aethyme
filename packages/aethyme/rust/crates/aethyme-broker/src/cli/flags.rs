@@ -93,6 +93,7 @@ pub(super) const VALUE_FLAGS: &[&str] = &[
     "--timeout",
     "--title",
     "--to-session",
+    "--duplicate-of",
     "--ttl",
     "--type",
     "--upstream",
@@ -629,7 +630,13 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ),
     (
         "close",
-        &["--session", "--abandon", "--reason", "--take-over"],
+        &[
+            "--session",
+            "--abandon",
+            "--reason",
+            "--take-over",
+            "--duplicate-of",
+        ],
     ),
     ("heartbeat", &["--session"]),
     (

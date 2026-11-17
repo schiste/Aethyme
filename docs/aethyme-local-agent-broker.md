@@ -258,3 +258,39 @@ and are labeled as experiments.
 
 Each phase lands only with tests, and none of it modifies the graph engine's
 contracts.
+
+## Session hygiene and retained-state latency
+
+Stale-session retirement uses a policy window appropriate to landed,
+published, or unpublished work. A live holder, an inconclusive process
+check, and unsafe recovery evidence defer retirement. Terminal transitions
+release session path leases. Cleanup reconciles checkout registrations after
+checking identity and disk ownership. Adopted checkouts retain their owner's
+protection. Reports and cleanup plans expose the evidence for investigation
+before applying any removal.
+
+The retained-state latency harness in
+`packages/aethyme-eval/benchmarks/performance/broker_latency.py` accepts
+`--retained-closed-sessions N`. Compare an isolated baseline with the same
+number of active sessions, samples, and status diagnostics. It verifies that
+the requested adopted checkout registrations survive through measurement.
+The separate `--aged-released-resource-leases` workload measures retained
+host-resource history.
+
+On November 17, 2026, the installed Aethyme 0.8.120 was timed with one live
+session and 0 or 12 closed sessions with retained adopted checkout
+registrations. Ten samples per command produced these wall-clock medians.
+
+| Operation | 0 retained | 12 retained |
+| --- | ---: | ---: |
+| Routine status | 292.6 ms | 286.1 ms |
+| Full status | 349.1 ms | 246.9 ms |
+| Guarded no-op | 1,358.0 ms | 1,328.5 ms |
+| Unchanged sync | 1,333.9 ms | 1,178.8 ms |
+| Unchanged push | 2,479.1 ms | 2,377.3 ms |
+| Status doctor | 2,234.8 ms | 2,102.1 ms |
+
+The routine-status open phase moved from 5.0 to 7.5 ms. This was one run per
+fixture on a busy host, with the retained fixture first. The measurements
+provide no evidence of a large end-to-end slowdown at this retained size and
+do not support a latency savings claim from more aggressive cleanup.

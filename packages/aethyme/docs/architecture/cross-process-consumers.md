@@ -3309,3 +3309,27 @@ Command metrics record `advance_broker_open`, `advance_state_validation`,
 `advance_preparation_status`, `advance_prepare`, `advance_commit_state`,
 and `advance_publish` when those phases run. Existing child spans still
 record the preparation and push work within those phases.
+
+### Broker command attribution
+
+Command metric JSONL rows may carry a numeric `session_id`, a classified
+`outcome`, and `attribution.schema_version = 1`. The timing fields
+`child_command_ms`, `queue_wait_ms`, and `broker_and_unattributed_ms`
+partition the observed CLI wall clock. Overlapping children count once, and
+instrumented lock waits take precedence over concurrent child spans. The
+residual includes uninstrumented work. `retries` counts observed remote-tip
+redecisions. `output_bytes` counts broker-rendered stdout, excluding forwarded
+command output and stderr. Read-only metrics remain opt-in with
+`AETHYME_MEASURE_OUTPUT` to preserve the default read-only contract.
+
+`aethyme broker advanced insights --json` adds `task_attribution` with totals
+for observed closed or landed tasks and a bounded newest-first breakdown.
+A task is identified by its session and start timestamp. A recorded reuse event
+starts a new task within that session. The report exposes measurement coverage,
+the 16 MiB command-history limit, read errors, and command rows without a known
+task. Commands and outcomes refer to the observed window and retained history.
+`merge.conflict` opens one episode per session until a verification or landing
+resolves it. To explicitly record an intervention that prevented duplicate work,
+use `aethyme broker finish close --session <id> --duplicate-of <peer-id>`.
+This requires the broker's current live duplicate-work evidence and a clean,
+unchanged checkout. Ordinary overlap warnings remain a separate count.
