@@ -1404,7 +1404,19 @@ impl Broker {
         self.require_trusted_policy(&policy, Some(session_id))?;
         let probes = match early_probes {
             Some(probes) => probes,
-            None => run_runtime_probes(&root, &config),
+            None => {
+                // Nothing of the repository's runs under storage pressure:
+                // refuse here exactly as the storage check below would.
+                if let Err(error) = require_preparation_storage(
+                    self.main_root(),
+                    &[root.clone(), self.main_root().join(".aethyme")],
+                ) {
+                    let error = BrokerOpError::from(error);
+                    self.recover_storage_refusal(&error);
+                    return Err(error);
+                }
+                run_runtime_probes(&root, &config)
+            }
         };
         if offline
             && let Some(step) = config
