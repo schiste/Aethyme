@@ -185,6 +185,13 @@ impl Fixture {
             .unwrap()
     }
 
+    /// The attempt before a command records its result only in an existing
+    /// broker database; a fixture's first command would otherwise create it
+    /// after the attempt ran.
+    fn create_broker_database(&self) {
+        drop(BrokerStore::open_in_repo(&self.repo).unwrap());
+    }
+
     fn checkout_fast_forward_events(&self) -> Vec<aethyme_broker::Event> {
         BrokerStore::open_in_repo(&self.repo)
             .unwrap()
@@ -506,6 +513,7 @@ fn clean_main_checkout_fast_forwards_and_records_the_event() {
 #[test]
 fn unrelated_local_changes_ride_along_a_fast_forward_untouched() {
     let fixture = Fixture::new("verify-only");
+    fixture.create_broker_database();
     std::fs::write(fixture.repo.join("rename-me.txt"), "rename\n").unwrap();
     git(&fixture.repo, &["add", "rename-me.txt"]);
     git(&fixture.repo, &["commit", "-qm", "add rename-me"]);
@@ -576,6 +584,7 @@ fn unrelated_local_changes_ride_along_a_fast_forward_untouched() {
 #[test]
 fn an_overlapping_local_change_keeps_the_main_checkout_and_names_the_path() {
     let fixture = Fixture::new("verify-only");
+    fixture.create_broker_database();
     let (before, _) = fixture.advance_origin("tracked.txt", "upstream\n");
     std::fs::write(fixture.repo.join("tracked.txt"), "local edit\n").unwrap();
 
@@ -611,6 +620,7 @@ fn an_overlapping_local_change_keeps_the_main_checkout_and_names_the_path() {
 fn an_untracked_file_the_update_would_create_keeps_the_main_checkout() {
     for local_name in ["created.txt", "Created.txt"] {
         let fixture = Fixture::new("verify-only");
+        fixture.create_broker_database();
         let (before, _) = fixture.advance_origin("created.txt", "upstream\n");
         std::fs::write(fixture.repo.join(local_name), "local file\n").unwrap();
 
@@ -686,6 +696,7 @@ fn the_brokers_own_leftovers_are_not_local_changes() {
 #[test]
 fn a_checkout_on_another_branch_is_not_moved() {
     let fixture = Fixture::new("verify-only");
+    fixture.create_broker_database();
     let (before, _) = fixture.advance_origin("other.txt", "upstream\n");
     git(&fixture.repo, &["checkout", "-q", "-b", "feature", &before]);
     git(
@@ -714,6 +725,7 @@ fn a_checkout_on_another_branch_is_not_moved() {
 #[test]
 fn a_main_checkout_far_behind_is_reported_by_status() {
     let fixture = Fixture::new("verify-only");
+    fixture.create_broker_database();
     std::fs::write(
         fixture.repo.join(".aethyme/config.toml"),
         "[promote]\nmode = \"verify-only\"\n\n[delivery]\npush_session_branches = true\n\n[main_checkout]\nbehind_threshold_commits = 1\n",

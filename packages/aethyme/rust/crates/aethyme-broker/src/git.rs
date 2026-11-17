@@ -5387,10 +5387,11 @@ impl GitRepo {
         // so a file touched without being edited is not taken for a local
         // change. It never rewrites an entry whose content differs. Best
         // effort: `read-tree` stays the arbiter when this cannot run.
-        let _ = run_git(
+        run_git(
             &self.root,
             &["-c", &hooks_off, "update-index", "-q", "--refresh"],
-        );
+        )
+        .ok();
         let reference = format!("refs/heads/{branch}");
         run_git(
             &self.root,
