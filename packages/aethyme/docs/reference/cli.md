@@ -1183,7 +1183,7 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker advanced representation record --session <id> --confirm <sha256> [--json]`
 - `aethyme broker finish cleanup <session-id> [--force] [--json]`
 - `aethyme broker finish cleanup --all-cleaned [--closed-before-ms <UTC-ms> --limit <1-1000> [--after-session <id>]] [--apply --confirm <sha256>] [--json]`
-- `aethyme broker finish cleanup resolve <session-id>... --archive [--batch] [--retire] [--allow-adopted] [--confirm <sha256>] [--json]`
+- `aethyme broker finish cleanup resolve <session-id>... --archive [--batch] [--retire] [--allow-adopted] [--archive-ignored-directories] [--confirm <sha256>] [--json]`
 - `aethyme broker finish cleanup audit [--repo <path>] [--detail] [--json]`
 - `aethyme broker gc plan [--include-active-gate-cache] [--full-scan] [--json]`
 - `aethyme broker gc apply --confirm <sha256> [--include-active-gate-cache] [--full-scan] [--json]`
