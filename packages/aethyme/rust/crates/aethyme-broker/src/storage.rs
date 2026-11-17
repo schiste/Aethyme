@@ -2763,9 +2763,11 @@ fn sweep_preparation_cache_with_coverage_and_observer(
             if is_shared_package_store(&key) {
                 let store_path = entry.path();
                 let measurement_deadline = deadline.min(Instant::now() + Duration::from_secs(5));
+                // The repository's configured `[shared_cache] max_bytes`, as
+                // its last preparation recorded it; 8 GiB when unset or zero.
                 let over_cap = crate::preparation::package_store::store_exceeds(
                     &store_path,
-                    crate::preparation::package_store::DEFAULT_PACKAGE_STORE_MAX_BYTES,
+                    crate::preparation::package_store::store_cap(&store_path),
                     measurement_deadline,
                     PACKAGE_STORE_MEASUREMENT_MAX_ENTRIES,
                 ) == Some(true);

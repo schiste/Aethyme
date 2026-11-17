@@ -971,7 +971,11 @@ that cannot start, exits non-zero, times out, prints more than 64 KiB, or
 leaves a process holding its output is `unverified`: its key falls back to
 the executable's path, size and modification time plus a per-run nonce, so no
 other run shares it, the checkout reports `stale` with the reason, and the
-next `submit prepare` probes again. Verified outputs are cached per exact
+next `submit prepare` probes again. A probe that fails permanently therefore
+makes every preparation reinstall; the checkout never reports `current`, so a
+`required_for_hooks` step blocks its hooks, and each run's digest directory
+is reclaimed by the next storage sweep. `broker status` warns
+`prepare.runtime-probe-unverified`, naming the probe and its reason. Verified outputs are cached per exact
 executable and command in the checkout's Git directory
 (`aethyme-runtime-probes.json`), which is how status reads and storage
 sweeps, which never run a probe, compute the same key. A probe whose output
@@ -1009,7 +1013,9 @@ layout version and its side-effects cache keyed by Node platform and
 version, uv and pip wheel tags), not on the probed runtime's reported
 platform. A storage sweep (`gc`, and the recovery worker started by a
 storage refusal) rotates the shared store on its own when its volume is
-under the free-space reserve or a bounded measurement finds it over 8 GiB:
+under the free-space reserve or a bounded measurement finds it over the
+repository's `[shared_cache] max_bytes` (recorded by each preparation in
+`packages/.aethyme-store-cap`; 8 GiB when unset or zero):
 it takes the repository's exclusive cache lease (never while any
 preparation holds the cache, alone or shared), renames the store to
 `packages-retired-*` and removes it within the sweep budget. A preparation

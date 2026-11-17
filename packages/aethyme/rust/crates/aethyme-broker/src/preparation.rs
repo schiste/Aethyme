@@ -1354,6 +1354,7 @@ impl Broker {
         if let Some(probes) = early_probes.as_deref() {
             let unstable = update_runtime_probe_cache(&root, &config, probes);
             self.record_unstable_runtime_probes(&unstable);
+            self.record_unverified_runtime_probes(session_id, probes);
         }
         let status = self.preparation_status_for_config(
             session_id,
@@ -1515,6 +1516,7 @@ impl Broker {
         let (source_digest, digest) = if probed_late {
             let unstable = update_runtime_probe_cache(&root, &config, &probes);
             self.record_unstable_runtime_probes(&unstable);
+            self.record_unverified_runtime_probes(session_id, &probes);
             let source_digest = preparation_source_digest_with(
                 &root,
                 &config,
@@ -1875,6 +1877,17 @@ impl Broker {
         // The directory the manager variables point into: the repository
         // store, an isolated fallback, or (explicit `per_input`) the digest
         // directory itself, which is what `None` selects.
+        // Record the configured cap where storage sweeps read it.
+        if let (Some(report), Some(cache)) =
+            (package_store_report.as_ref(), config.shared_cache.as_ref())
+            && report.scope == package_store::PackageStoreScope::Repository
+            && let Some(packages_dir) = report.path.parent()
+        {
+            crate::warn_unrecorded(
+                "record the shared package store's cap",
+                package_store::write_store_cap(packages_dir, cache.max_bytes),
+            );
+        }
         let shared_store_root = package_store_report
             .as_ref()
             .filter(|report| cache_dir.as_deref() != Some(report.path.as_path()))
@@ -5077,6 +5090,56 @@ impl Broker {
         crate::warn_unrecorded("record unstable runtime probes", written);
     }
 
+    /// Remember this repository's last unverified runtime probes (or that
+    /// there are none), for `broker status`: such a checkout never reports
+    /// current, so a `required_for_hooks` step blocks its hooks.
+    fn record_unverified_runtime_probes(
+        &mut self,
+        session_id: i64,
+        probes: &[package_store::RuntimeIdentity],
+    ) {
+        let failing = probes
+            .iter()
+            .filter(|probe| {
+                probe.runtime_identity == Some(package_store::RuntimeIdentityState::Unverified)
+            })
+            .map(|probe| UnverifiedRuntimeProbe {
+                name: probe.name.clone(),
+                reason: probe
+                    .unverified_reason
+                    .clone()
+                    .unwrap_or_else(|| "the probe failed".into()),
+            })
+            .collect::<Vec<_>>();
+        if failing.is_empty() && self.unverified_runtime_probes().is_none() {
+            return;
+        }
+        let record = UnverifiedRuntimeProbes {
+            session_id,
+            runtimes: failing,
+            at_ms: now_ms(),
+        };
+        let written = serde_json::to_string(&record)
+            .map_err(|error| error.to_string())
+            .and_then(|value| {
+                self.store()
+                    .meta_set(UNVERIFIED_RUNTIME_PROBES_KEY, &value)
+                    .map_err(|error| error.to_string())
+            });
+        crate::warn_unrecorded("record unverified runtime probes", written);
+    }
+
+    /// The last preparation's unverified runtime probes, when there were
+    /// any. Read-only: one metadata read.
+    pub(crate) fn unverified_runtime_probes(&self) -> Option<UnverifiedRuntimeProbes> {
+        self.store_ref()
+            .meta_get(UNVERIFIED_RUNTIME_PROBES_KEY)
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_str::<UnverifiedRuntimeProbes>(&value).ok())
+            .filter(|record| !record.runtimes.is_empty())
+    }
+
     /// Runtimes whose probe output changed under an unchanged executable in
     /// the last day. Read-only: one metadata read.
     pub(crate) fn unstable_runtime_probes(&self) -> Option<UnstableRuntimeProbes> {
@@ -5098,6 +5161,24 @@ impl Broker {
             .and_then(|value| serde_json::from_str::<PackageStoreVolumeRecord>(&value).ok())
             .filter(|record| record.other_volume)
     }
+}
+
+/// Broker metadata key for the last preparation's unverified runtime probes.
+const UNVERIFIED_RUNTIME_PROBES_KEY: &str = "preparation.runtime_probe_unverified";
+
+/// The runtime probes the last preparation could not verify.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct UnverifiedRuntimeProbes {
+    pub(crate) session_id: i64,
+    pub(crate) runtimes: Vec<UnverifiedRuntimeProbe>,
+    pub(crate) at_ms: i64,
+}
+
+/// One unverified runtime probe and why.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct UnverifiedRuntimeProbe {
+    pub(crate) name: String,
+    pub(crate) reason: String,
 }
 
 /// Broker metadata key for the last unstable runtime-probe observation.

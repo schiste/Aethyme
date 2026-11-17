@@ -59,6 +59,7 @@ impl Broker {
         self.push_shared_cache_inventory_advice(&mut view);
         self.push_package_store_volume_advice(&mut view);
         self.push_unstable_runtime_probe_advice(&mut view);
+        self.push_unverified_runtime_probe_advice(&mut view);
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
@@ -451,6 +452,37 @@ impl Broker {
         });
     }
 
+    /// Warn when the last preparation could not verify a runtime probe: that
+    /// checkout reinstalls on every preparation, never reports current, and a
+    /// `required_for_hooks` step then blocks its hooks. One metadata read.
+    fn push_unverified_runtime_probe_advice(&self, view: &mut StatusView) {
+        let Some(record) = self.unverified_runtime_probes() else {
+            return;
+        };
+        view.advice.push(StatusAdvice {
+            id: "prepare.runtime-probe-unverified",
+            severity: StatusAdviceSeverity::Warning,
+            reason: "a runtime probe that cannot start, fails or times out keys each preparation uniquely, so the checkout reinstalls every time, never reports current, and hooks requiring preparation refuse",
+            summary: format!(
+                "session {} could not verify runtime probe(s): {}; fix the probe command in .aethyme/prepare.toml or install the runtime",
+                record.session_id,
+                record
+                    .runtimes
+                    .iter()
+                    .map(|probe| format!("{} ({})", probe.name, probe.reason))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            session_id: Some(record.session_id),
+            queue_entry_id: None,
+            evidence: vec![format!("observed at (ms since epoch): {}", record.at_ms)],
+            commands: vec![format!(
+                "aethyme broker submit prepare status --session {} --json",
+                record.session_id
+            )],
+        });
+    }
+
     /// Warn when a runtime probe printed different output for the same
     /// executable on consecutive preparations: each preparation then rekeys.
     /// One metadata read.
@@ -611,6 +643,7 @@ impl Broker {
         self.push_shared_cache_inventory_advice(&mut view);
         self.push_package_store_volume_advice(&mut view);
         self.push_unstable_runtime_probe_advice(&mut view);
+        self.push_unverified_runtime_probe_advice(&mut view);
         push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,

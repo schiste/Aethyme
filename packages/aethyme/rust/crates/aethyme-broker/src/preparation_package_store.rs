@@ -707,6 +707,31 @@ pub(crate) const RETIRED_PACKAGE_STORE_PREFIX: &str = "packages-retired-";
 /// `[shared_cache] max_bytes` is not known (storage sweeps).
 pub(crate) const DEFAULT_PACKAGE_STORE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+/// The file in `<repository>/packages/` holding the repository's configured
+/// `[shared_cache] max_bytes`, written by each preparation so storage sweeps,
+/// which do not read repository configuration, apply the same cap.
+pub(crate) const STORE_CAP_FILE: &str = ".aethyme-store-cap";
+
+/// Record `max_bytes` as the shared store's cap (zero means the default).
+pub(crate) fn write_store_cap(packages_dir: &Path, max_bytes: u64) -> io::Result<()> {
+    let mut file = tempfile::NamedTempFile::new_in(packages_dir)?;
+    std::io::Write::write_all(&mut file, max_bytes.to_string().as_bytes())?;
+    file.persist(packages_dir.join(STORE_CAP_FILE))
+        .map_err(|error| error.error)?;
+    Ok(())
+}
+
+/// The cap a sweep applies to `<repository>/packages`: the recorded
+/// configured value, or [`DEFAULT_PACKAGE_STORE_MAX_BYTES`] when none is
+/// recorded, it is unreadable, or it is zero.
+pub(crate) fn store_cap(packages_dir: &Path) -> u64 {
+    fs::read_to_string(packages_dir.join(STORE_CAP_FILE))
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(DEFAULT_PACKAGE_STORE_MAX_BYTES)
+}
+
 pub(crate) fn is_retired_store_name(name: &str) -> bool {
     name.strip_prefix(RETIRED_PACKAGE_STORE_PREFIX)
         .is_some_and(|rest| {
@@ -1067,6 +1092,18 @@ mod tests {
         assert_eq!(retire_shared_store(&repository).unwrap(), None);
         assert!(!is_retired_store_name("packages-retired-"));
         assert!(!is_retired_store_name("packages"));
+    }
+
+    #[test]
+    fn a_sweep_applies_the_recorded_configured_cap() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(store_cap(root.path()), DEFAULT_PACKAGE_STORE_MAX_BYTES);
+        write_store_cap(root.path(), 1234).unwrap();
+        assert_eq!(store_cap(root.path()), 1234);
+        write_store_cap(root.path(), 0).unwrap();
+        assert_eq!(store_cap(root.path()), DEFAULT_PACKAGE_STORE_MAX_BYTES);
+        fs::write(root.path().join(STORE_CAP_FILE), "garbage").unwrap();
+        assert_eq!(store_cap(root.path()), DEFAULT_PACKAGE_STORE_MAX_BYTES);
     }
 
     #[test]

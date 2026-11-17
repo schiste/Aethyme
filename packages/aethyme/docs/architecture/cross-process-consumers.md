@@ -1411,7 +1411,11 @@ directory (`aethyme-runtime-probes.json`), from which status reads and
 storage sweeps compute the same key without running anything. A failed,
 unstartable or timed-out probe is `unverified`: its key is the executable
 identity plus a per-run nonce, never shared, and the next preparation probes
-again. Advice `prepare.runtime-probe-unstable` (broker metadata key
+again. A permanently failing probe makes every preparation reinstall, the
+checkout never reports `current` (so `required_for_hooks` steps block hooks),
+and each run's digest directory is reclaimed by the next sweep; advice
+`prepare.runtime-probe-unverified` (metadata key
+`preparation.runtime_probe_unverified`) names the probe and its reason. Advice `prepare.runtime-probe-unstable` (broker metadata key
 `preparation.runtime_probe_unstable`) reports a probe whose output changed
 for an unchanged executable. `[shared_cache] max_bytes = 0` now means the
 8 GiB default rather than unbounded.
@@ -1419,7 +1423,9 @@ for an unchanged executable. `[shared_cache] max_bytes = 0` now means the
 Package-store reclamation: preparation-cache sweeps (`gc` and the storage
 recovery worker) rotate `<repository>/packages` under the repository's
 exclusive lease when its volume is under the free-space reserve or a bounded
-measurement finds it over 8 GiB, rename it to `packages-retired-*`, and remove
+measurement finds it over the repository's `[shared_cache] max_bytes` (each
+preparation records it in `packages/.aethyme-store-cap`; 8 GiB when unset or
+zero), rename it to `packages-retired-*`, and remove
 retired stores without a lease. A preparation refused for storage tries the
 same rotation first. Telemetry phases: `package_store_rotated_pressure`,
 `package_store_rotated_over_cap`, `package_store_rotation_busy`,
