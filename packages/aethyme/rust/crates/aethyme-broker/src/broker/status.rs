@@ -256,6 +256,10 @@ impl Broker {
                 agents.iter().map(|agent| agent.session.id),
             ),
         ));
+        advice.extend(crate::operations::outcome_journal::outcome_journal_advice(
+            self.store_ref(),
+            now_ms,
+        ));
         phase_timings_ms.insert("submits".into(), phase_started.elapsed().as_millis() as u64);
         let phase_started = std::time::Instant::now();
         advice.extend(overlap_pair_advice(&pairs));
@@ -1306,6 +1310,10 @@ impl Broker {
             )
         };
         advice.extend(stalled_submit_advice(&in_flight_submits));
+        advice.extend(crate::operations::outcome_journal::outcome_journal_advice(
+            self.store_ref(),
+            now_ms,
+        ));
         let foreign_started = std::time::Instant::now();
         // The main checkout is where agents gather before starting their own
         // sessions, so several of them there is normal, not co-tenancy.

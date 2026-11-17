@@ -4,7 +4,10 @@
 //! classifies the requested argv, journals a redacted intent, serializes
 //! repository writes with `flock`, and records the outcome. A process death
 //! after the command starts becomes `outcome_unknown`; later writes fail
-//! closed until an operator reconciles that journal row.
+//! closed until an operator reconciles that journal row. Once the child has
+//! exited, its known outcome is written to an on-disk outcome journal before
+//! the database is asked, so a busy database delays the record instead of
+//! losing it (see the `outcome_journal` module).
 
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
@@ -940,6 +943,18 @@ pub struct CoordinatedOperationReport {
     /// the repository write lock, which is the head-of-line stall of #138.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_pull_request: Option<i64>,
+    /// Set when the child finished and its outcome is journaled, but the
+    /// broker database stayed busy past the retry budget. `operation` then
+    /// carries the child's true outcome in memory; the next broker command
+    /// records it from the journal (see `operations::outcome_journal`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome_record_pending: Option<PendingOutcomeRecord>,
+    /// Set when the database already held a different outcome than the one
+    /// this run's child produced. `operation` carries the observed outcome;
+    /// the database row was left as it was and the journal kept as
+    /// `*.conflict` for review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome_conflict: Option<OutcomeConflict>,
     /// The remote's default branch, read in the same `ls-remote` as a push's
     /// pre-push evidence when the caller asked for it. `None` when it was not
     /// asked for or could not be read unambiguously.
@@ -1275,6 +1290,9 @@ pub struct OperationReconciliation {
 pub struct OperationShowReport {
     pub operation: CoordinatedOperation,
     pub reconciliation: OperationReconciliation,
+    /// `pending` while a journaled outcome waits to be recorded (the next
+    /// writable broker command records it), otherwise `none`.
+    pub outcome_journal: &'static str,
 }
 
 impl OperationShowReport {
@@ -1327,6 +1345,7 @@ impl OperationShowReport {
         });
         Self {
             operation,
+            outcome_journal: "none",
             reconciliation: OperationReconciliation {
                 state,
                 required: state == OperationReconciliationState::Required,
@@ -4090,9 +4109,11 @@ fn journal_details(
 }
 
 mod git_scopes;
+pub(crate) mod outcome_journal;
 mod push_and_coordinated;
 mod redaction;
 pub(crate) use git_scopes::{canonical_fetch_args, strict_push_args};
+pub use outcome_journal::{OutcomeConflict, PendingOutcomeRecord};
 pub(crate) use push_and_coordinated::{github_command, is_within, worktree_relative_push_sources};
 use push_and_coordinated::{is_github_pull_request_merge, provider_command};
 

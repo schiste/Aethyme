@@ -251,6 +251,12 @@ pub(super) fn render_operation_show(report: &crate::OperationShowReport) {
         }
     );
     out!("Automatic retry: forbidden");
+    if report.outcome_journal == "pending" {
+        out!(
+            "Outcome journal: pending (the child finished; its journaled outcome is recorded \
+             automatically by the next writable broker command)"
+        );
+    }
     if let Some(evidence) = &report.reconciliation.evidence {
         out!("Evidence:       {evidence}");
     }
@@ -1200,6 +1206,17 @@ pub(super) fn run_git_gh(parsed: Parsed, subcommand: &str) -> Result<(), UsageEr
         Err(error) => return Err(error.into()),
     };
     render_coordinated_operation(&report, session_worktree.as_deref(), parsed.json)?;
+    // The child's result above is true; only its database record is late.
+    // Say so on stderr so a `--json` report stays machine-readable (it
+    // carries the same fact as `outcome_record_pending`).
+    if let Some(pending) = &report.outcome_record_pending {
+        eprintln!("warning: {}", pending.message(report.operation.status));
+    }
+    // The database disagrees with what this run's child did: the observed
+    // result above stands, and the disagreement is kept for review.
+    if let Some(conflict) = &report.outcome_conflict {
+        eprintln!("warning: {}", conflict.message());
+    }
     // After the coordinated operation returned, so the repository
     // write lock is released. Starting the watch inside it would hold
     // that lock across a provider call (#138). Opt-in only: a fleet

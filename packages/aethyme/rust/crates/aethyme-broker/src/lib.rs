@@ -467,8 +467,8 @@ pub(crate) use operations::{
 };
 pub use operations::{
     OperationReconciliation, OperationReconciliationRecovery, OperationReconciliationState,
-    OperationShowReport, PostMergeCleanupReport, PostMergeCleanupState, QueueWait,
-    UnknownOutcomeRecovery, classify_gh, classify_git,
+    OperationShowReport, OutcomeConflict, PendingOutcomeRecord, PostMergeCleanupReport,
+    PostMergeCleanupState, QueueWait, UnknownOutcomeRecovery, classify_gh, classify_git,
 };
 pub use outcome_issues::{
     AUTOMATION_ISSUES_POLICY_KEY, AutomationIssuesPolicy, IssueRef, OUTCOME_ISSUE_SCHEMA,

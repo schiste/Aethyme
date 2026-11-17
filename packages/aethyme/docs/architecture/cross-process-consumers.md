@@ -580,6 +580,106 @@ printed), `remote_write_outcome_unknown`, and for a
 provider killed at its budget `remote_write_outcome_unknown_timeout` or
 `remote_write_failed_timeout`. Consumers must ignore names they do not know.
 
+## Coordinated operation outcome journal (2026-11-17)
+
+Schema v64 adds a nullable `coordinated_operations.run_nonce`, a random value
+set when a run moves to `running`. It is compatible: older writers leave it
+NULL, older readers ignore it, and `min_compatible_schema` stays 60.
+
+Once a coordinated `git`/`gh` child exits (or fails to spawn, or is killed
+at its budget), the broker writes the known result to
+`<broker db dir>/run/operation-outcomes/operation-<id>.json` before it
+touches the database: schema `aethyme.coordinated-operation-outcome/v2`,
+`operation_id`, `session_id`, `command_sha256` (SHA-256 of the row's exact
+`command_json`), `operation_created_at` (the row's `created_at`), `run_nonce`,
+`writer_pid` (the row's `pid`), `status` (`succeeded`, `failed` or
+`outcome_unknown`), `exit_code`, `details_json` (the details the row would
+carry, including any created URL, pushed refs or reconciliation evidence) and
+`child_finished_at`. The file is a synced temporary renamed into place,
+followed by a sync of the directory.
+
+With the journal on disk, the operation's host lane is finished with the
+observed outcome and its coordination locks are released; only then is the row
+updated, in one `IMMEDIATE` transaction that does nothing else (update plus its
+`operation.<status>` event), committed with `synchronous = FULL` so the WAL is
+synced before the journal is deleted. The update applies only while the row is
+`running` or `outcome_unknown` and every field of the run binding matches
+(id, session, command, `created_at`, `run_nonce`, `pid`); it is retried with
+exponential backoff (50 ms doubling to 2 s, each attempt waiting at most 5 s
+for the lock) for up to 60 s. A power loss at any point leaves the journal or
+the durable record, never neither. If the journal cannot be written, the locks
+are held through the record as before.
+
+If the database stays busy past that budget, the command still reports the
+child's true result. `broker advanced git|gh --json` gains
+`outcome_record_pending` (`operation_id`, `journal_path`, `database_error`,
+`attempts`, `waited_ms`), stderr gains a `warning:` line naming the operation
+and saying it will be recorded automatically, and the exit code follows the
+child's outcome. `broker advanced operations show <id> --json` gains
+`outcome_journal: pending|none`.
+
+If the row already holds a different outcome than the run observed (for
+example an operator reconciled it the other way), or no longer matches the
+run, the command reports the observed result, the row is left unchanged, the
+journal is kept as `operation-<id>.json.conflict`, an
+`operation.outcome_conflict` event is recorded (`operation_id`, `provider`,
+`repository`, `observed_status`, `recorded_status`, `reason`, `source`:
+`record` or `replay`), and `--json` gains `outcome_conflict`
+(`operation_id`, `observed_status`, `recorded_status`, `reason`,
+`journal_path`). `outcome_unknown` is not evidence and never conflicts.
+
+Replay: every writable broker open (every CLI command and the detached
+artifact worker; snapshot opens excluded), and every coordinated write before
+its write-block check, replays pending journals. A journal is applied only if
+its operation exists, the full run binding matches, and the row is `running` or
+`outcome_unknown`; the replayed row's details add `outcome_journal`
+(`replayed_by`: `broker_open` or `write_block_check`, `replayed_at`,
+`child_finished_at`, `writer_pid`, `status_before_replay`). A row with no
+`run_nonce` (run by an older binary) is never settled from a journal. A journal
+for a row already settled with the same outcome is deleted; a different
+outcome is a conflict as above. A journal that is unreadable, carries another
+schema, names a missing operation or does not match the run is kept as
+`operation-<id>.json.refused` and never applied. Set-aside files use schema
+`aethyme.coordinated-operation-outcome-set-aside/v1` (`operation_id`, `kind`,
+`reason`, `set_aside_at`, `observed_status`, `recorded_status`, `journal`). A
+replay waits at most 1 s for the write lock and otherwise leaves the journal
+for the next opener. While a replay cannot write, the write-block check treats a
+row whose matching journal holds `succeeded` or `failed` as decided rather than
+marking it `outcome_unknown`.
+
+`broker status` warns with `operation.outcome-journal-unreplayed` per journal
+older than ten minutes, `operation.outcome-journal-refused` per refused journal
+while its operation is still `running` or `outcome_unknown` (naming the
+reason), and `operation.outcome-journal-conflict` per conflict file until it is
+removed.
+
+Invariant: success is never inferred without a journal of the same run. A
+`running` row with no journal (the process died before the child's result was
+known) keeps the previous path: `outcome_unknown`, a write block, and explicit
+reconciliation.
+
+Telemetry: phase counts `operation_outcome_journal_written`,
+`operation_outcome_journal_write_failed`,
+`operation_outcome_locks_released_early`, `operation_outcome_record_retry`,
+`operation_outcome_record_attempt_failed`, `operation_outcome_record_pending`,
+`operation_outcome_journal_replayed`, `operation_outcome_journal_discarded`,
+`operation_outcome_journal_still_pending`, `operation_outcome_journal_refused`,
+`operation_outcome_journal_conflict`; phases `operation_outcome_record_wait`
+(total wait) and `operation_outcome_journal_replay`; attachment
+`operation_outcome_record` (`outcome`, `attempts`, `retries`, `waited_ms`,
+`journal`).
+
+Every broker open also stopped writing `meta.min_compatible_schema` when the
+recorded floor is already at least the binary's: the unconditional upsert took
+the database write lock on every open, including each running operation's
+10-second heartbeat.
+
+Removing the journal, or recording before it is written, brings back the
+stranded `running` row that write-blocks every session after a write that
+succeeded. Dropping any part of the run binding lets a stale journal settle
+another run that reuses the id after a database reset. Covered by
+`operations/outcome_journal/tests.rs` and the v64 schema test.
+
 ## Compact status by default, session block and push plan (2026-11-17)
 
 **Changed default.** `aethyme broker status --json` now prints the compact

@@ -34,7 +34,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 63;
+pub const SCHEMA_VERSION: i64 = 64;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -115,6 +115,11 @@ pub const SCHEMA_VERSION: i64 = 63;
 ///   their columns and leave it NULL; a NULL boot id falls back to the
 ///   conservative timestamp rule, and older readers ignore the column, so the
 ///   floor stays v60.
+/// - v64: a nullable `run_nonce` on coordinated operations, set when a run
+///   starts and bound into its outcome journal. Older writers name their
+///   columns and leave it NULL; a NULL nonce only means a journal can never
+///   auto-settle that row (it keeps the manual reconcile path), and older
+///   readers ignore the column, so the floor stays v60.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 60;
 
 /// Migration that introduced profile-bound gate-cache reads and writes.
@@ -2134,6 +2139,12 @@ const MIGRATION_V63: &str = "
 ALTER TABLE guarded_exec_receipts ADD COLUMN boot_id TEXT;
 ";
 
+/// The random identity of one run of a coordinated operation, bound into
+/// its outcome journal so a journal settles only the run that wrote it.
+const MIGRATION_V64: &str = "
+ALTER TABLE coordinated_operations ADD COLUMN run_nonce TEXT;
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -2198,6 +2209,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V61,
     MIGRATION_V62,
     MIGRATION_V63,
+    MIGRATION_V64,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
@@ -2207,6 +2219,7 @@ const COLUMN_ONLY_MIGRATIONS: &[(i64, &[(&str, &str)])] = &[
     (49, &[("coordinated_operations", "agent_provenance_json")]),
     (52, &[("gate_results", "execution_profile_hash")]),
     (63, &[("guarded_exec_receipts", "boot_id")]),
+    (64, &[("coordinated_operations", "run_nonce")]),
 ];
 
 /// Migrations whose tables the repair pass re-creates, with `IF NOT EXISTS`,
@@ -2547,6 +2560,19 @@ pub(crate) fn record_min_compatible_schema_floor(
     conn: &Connection,
     minimum: i64,
 ) -> Result<(), BrokerError> {
+    // Read first. The upsert takes the database write lock even when its
+    // `WHERE` makes it a no-op, and every open runs this -- including each
+    // running coordinated operation's 10-second heartbeat -- so on a busy
+    // repository an already-recorded floor cost a write-lock round trip per
+    // open and queued behind every other writer.
+    let recorded: Option<i64> = rusqlite::OptionalExtension::optional(conn.query_row(
+        "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'min_compatible_schema'",
+        [],
+        |row| row.get(0),
+    ))?;
+    if recorded.is_some_and(|recorded| recorded >= minimum) {
+        return Ok(());
+    }
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('min_compatible_schema', ?1)
          ON CONFLICT (key) DO UPDATE SET value = excluded.value
@@ -4504,6 +4530,34 @@ mod tests {
             })
             .unwrap();
         assert_eq!(boot_id, None, "an older writer's receipt keeps NULL");
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v64_adds_a_nullable_operation_run_nonce_and_keeps_the_floor() {
+        let conn = migrated_through(63);
+        set_meta(&conn, "min_compatible_schema", 60);
+        conn.execute_batch(
+            "INSERT INTO sessions (id, worktree_path, branch, origin, status,
+                 created_at, updated_at, last_activity_at)
+             VALUES (1, '/w', 'agent/w', 'adopted', 'active', 1, 1, 1);
+             INSERT INTO coordinated_operations (session_id, provider, repository,
+                 scope, effect, status, command_json, pid, created_at, updated_at)
+             VALUES (1, 'git', 'local:/w', 'repository', 'write', 'running',
+                 '[\"git\",\"branch\",\"x\"]', 1, 1, 1);",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 60);
+        assert!(schema_is_compatible_with(&conn, 64, 60).unwrap());
+        let nonce: Option<String> = conn
+            .query_row("SELECT run_nonce FROM coordinated_operations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(nonce, None, "an older binary's run keeps NULL");
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 
