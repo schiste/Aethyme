@@ -1,7 +1,8 @@
 exit: 0
 --- stdout
-  aethyme broker advanced events [--since <id>] [--kind <prefix>] [--follow] [--json]
+  aethyme broker advanced events [--session <id>] [--since <id>] [--kind <prefix>] [--follow] [--json]
       Show the append-only event log (see docs/events-contract.md).
+      --session selects events owned by that session, not global or peer events.
       --kind filters by prefix (e.g. merge. or lease.overlap); --follow
       waits for database file notifications and retries transient read errors.
   aethyme broker advanced events prune --keep-days <n> [--json]

@@ -1,6 +1,6 @@
 exit: 0
 --- stdout
-  aethyme broker status [--json] [--full] [--session <id>] [--since-revision <token>] [--summary] [--refresh]
+  aethyme broker status [--json] [--full] [--session <id>] [--session-view] [--since-revision <token>] [--summary] [--refresh]
       Compact by default, as text and as --json: a versioned summary that
       groups advice and marks omitted details and deferred checks; those
       checks are unknown, not clean. Branch on
@@ -17,6 +17,8 @@ exit: 0
       `session` block: branch, head and remote oids, unpushed commits, the
       locally recorded pull request (no network call), preparation, that
       session's advice and the exact next command.
+      --session-view requires --session and --json and emits only session facts
+      and its lease requests. Global warnings and peer state are not inspected.
       --since-revision returns changed sections of compact JSON; invalid or
       differently scoped revisions return a fresh snapshot. Deferred checks
       remain unknown even when no sections changed.

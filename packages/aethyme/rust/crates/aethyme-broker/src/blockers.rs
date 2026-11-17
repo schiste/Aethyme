@@ -260,7 +260,7 @@ impl Broker {
         self.collect_blockers_with_recovery(true)
     }
 
-    fn collect_blockers_with_recovery(&self, inspect_recovery: bool) -> BlockerReport {
+    pub(crate) fn collect_blockers_with_recovery(&self, inspect_recovery: bool) -> BlockerReport {
         let _span = crate::phase_telemetry::span("blockers");
         let mut report = BlockerReport::default();
         let mut linked_host_operations = Vec::new();

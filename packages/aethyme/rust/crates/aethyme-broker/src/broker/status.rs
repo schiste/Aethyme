@@ -135,6 +135,41 @@ impl Broker {
         Ok(brief)
     }
 
+    /// Advice derived from this session alone, without constructing global agent views.
+    pub(crate) fn session_status_advice(
+        &self,
+        session_id: i64,
+        now_ms: i64,
+    ) -> Result<Vec<StatusAdvice>, BrokerOpError> {
+        let session = self.store.session(session_id)?;
+        let agents = self.agent_views(vec![session], now_ms)?;
+        let agent = &agents[0];
+        let mut advice = Vec::new();
+        if let Some(entry) = self.store.latest_merge_queue_for_session(session_id)? {
+            match entry.status {
+                MergeStatus::Rejected => advice.push(rejected_submit_advice(agent, &entry)),
+                MergeStatus::Submitted if submission_was_deferred(&entry) => {
+                    advice.push(deferred_submit_advice(agent, &entry));
+                }
+                MergeStatus::Conflict => advice.push(conflict_submit_advice(agent, &entry)),
+                _ => {}
+            }
+        }
+        if let Ok(Some(graph)) = self.finish_last_graph_integrity(session_id)
+            && let Some(row) = graph_integrity_advice(agent, &graph)
+        {
+            advice.push(row);
+        }
+        advice.extend(stalled_submit_advice(
+            &crate::submit_progress::in_flight_for_sessions(
+                &self.main_root,
+                now_ms,
+                std::iter::once(session_id),
+            ),
+        ));
+        Ok(advice)
+    }
+
     /// Read coordination records for compact presentation without inspecting
     /// retained checkouts, Git history, or submission recovery remedies.
     pub(crate) fn routine_status_context(

@@ -186,6 +186,15 @@ fn record_status_metric(
 pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
     // Status reports and never decides, so it may reuse changed-path answers.
     crate::worktree_watch::allow_reuse_for_this_command();
+    if parsed.session_view
+        && (!parsed.json
+            || parsed.session.is_none()
+            || parsed.full
+            || parsed.summary
+            || parsed.refresh)
+    {
+        return Err(UsageError::Message("--session-view requires --session <id> and --json, and cannot be combined with --full, --summary or --refresh".into()));
+    }
     if parsed.full
         && (parsed.compact
             || parsed.summary
@@ -242,6 +251,39 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         open_broker(parsed.read_only_snapshot)?
     };
     let open_ms = opened.elapsed().as_millis() as u64;
+    if parsed.session_view {
+        let session_id = parsed.session.expect("validated session view");
+        let advice = broker.session_status_advice(session_id, now_ms())?;
+        let block = super::status_extras::session_block(&broker, session_id, &advice);
+        let requests: Vec<_> = broker.session_pending_lease_release_requests(session_id)?.into_iter()
+            .map(|request| serde_json::json!({
+                "request_id": request.request_id, "requester_session_id": request.requester_session_id,
+                "holder_session_id": request.holder_session_id, "path": request.path
+            })).collect();
+        let count = requests.len();
+        let peers = crate::agent_hook::session_peer_view(&broker, session_id)?;
+        let global = crate::agent_hook::session_global_view(&broker, session_id);
+        let mut value = serde_json::json!({
+            "schema": "aethyme.broker-session-view/v1",
+            "session": block,
+            "peer_state": peers,
+            "global_state": global,
+            "lease_release_requests": {"count": count, "omitted_count": count.saturating_sub(10), "records": requests.into_iter().take(10).collect::<Vec<_>>()},
+            "data_freshness": {"global_warnings": "recorded_partial", "peer_state": "recorded_only", "ownership_claims": "not_inspected", "session_advice": "partial", "deferred_checks_are_unknown": true},
+            "drilldown": {"focused_status": format!("aethyme broker status --session {session_id} --json"), "full_status": "aethyme broker status --full --json"}
+        });
+        super::status_extras::cap_document_advice_evidence(&mut value);
+        let mut value = super::status_revision::render_session(
+            value,
+            broker.main_root(),
+            Some(session_id),
+            parsed.status_revision.as_deref(),
+        )?;
+        value["form"] = serde_json::json!(StatusForm::Compact.as_str());
+        value["hint"] = serde_json::json!(super::status_extras::COMPACT_HINT);
+        out!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
     if form == StatusForm::Compact {
         let mut brief = if parsed.read_only_snapshot {
             broker.status_brief_snapshot(now_ms())?
@@ -316,6 +358,10 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                     "summary_and_blockers_are_global": true,
                 });
             }
+            if let Some(block) = session_block {
+                value["session"] = block;
+            }
+            evidence_truncated = super::status_extras::cap_document_advice_evidence(&mut value);
             let mut value = super::status_revision::render(
                 value,
                 broker.main_root(),
@@ -325,10 +371,6 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             // Outside the revision: always present, never a "changed section".
             value["form"] = serde_json::json!(StatusForm::Compact.as_str());
             value["hint"] = serde_json::json!(super::status_extras::COMPACT_HINT);
-            if let Some(block) = session_block {
-                value["session"] = block;
-            }
-            evidence_truncated = super::status_extras::cap_document_advice_evidence(&mut value);
             out!("{}", serde_json::to_string_pretty(&value)?);
         } else {
             if let Some(session_id) = parsed.session {
@@ -747,6 +789,9 @@ pub(super) fn run_events(parsed: Parsed) -> Result<(), UsageError> {
         return Ok(());
     }
     let mut broker = open_broker(parsed.read_only_snapshot)?;
+    if let Some(session_id) = parsed.session {
+        broker.store_ref().session(session_id)?;
+    }
     let mut cursor = parsed.since.unwrap_or(0);
     // Register before reading so a commit between the first query and wait is
     // buffered by the OS watcher and cannot be missed.
@@ -760,27 +805,34 @@ pub(super) fn run_events(parsed: Parsed) -> Result<(), UsageError> {
     // or a busy writer) with bounded retries instead of dying.
     let mut consecutive_errors = 0u32;
     loop {
-        let events =
-            match broker
+        let events = match if let Some(session_id) = parsed.session {
+            broker.store().session_events_after_filtered(
+                session_id,
+                cursor,
+                1000,
+                parsed.kind.as_deref(),
+            )
+        } else {
+            broker
                 .store()
                 .events_after_filtered(cursor, 1000, parsed.kind.as_deref())
-            {
-                Ok(events) => {
-                    consecutive_errors = 0;
-                    events
+        } {
+            Ok(events) => {
+                consecutive_errors = 0;
+                events
+            }
+            Err(err) if parsed.follow && consecutive_errors < 5 => {
+                consecutive_errors += 1;
+                eprintln!("events: transient read error ({err}); retrying");
+                if let Some(event_wakeup) = &event_wakeup {
+                    event_wakeup
+                        .wait_timeout(std::time::Duration::from_millis(700))
+                        .map_err(UsageError::Message)?;
                 }
-                Err(err) if parsed.follow && consecutive_errors < 5 => {
-                    consecutive_errors += 1;
-                    eprintln!("events: transient read error ({err}); retrying");
-                    if let Some(event_wakeup) = &event_wakeup {
-                        event_wakeup
-                            .wait_timeout(std::time::Duration::from_millis(700))
-                            .map_err(UsageError::Message)?;
-                    }
-                    continue;
-                }
-                Err(err) => return Err(err.into()),
-            };
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
         for event in &events {
             cursor = event.id;
             if parsed.json {
@@ -801,6 +853,11 @@ pub(super) fn run_events(parsed: Parsed) -> Result<(), UsageError> {
         }
         if !parsed.follow {
             break;
+        }
+        // A full page may have more rows behind it already. Waiting for a
+        // future database write here would strand that backlog indefinitely.
+        if events.len() == 1000 {
+            continue;
         }
         if let Some(event_wakeup) = &event_wakeup {
             event_wakeup.wait().map_err(UsageError::Message)?;

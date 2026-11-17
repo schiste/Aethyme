@@ -2212,6 +2212,86 @@ impl BrokerStore {
         Ok(leases)
     }
 
+    /// Recorded peer leases overlapping this session's live leases.
+    /// These are advisory observations, not a fresh worktree inspection.
+    pub(crate) fn session_peer_lease_overlaps(
+        &self,
+        session_id: i64,
+        now: i64,
+    ) -> Result<Vec<(i64, String, String)>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT peer.session_id, mine.path, peer.path
+             FROM leases mine JOIN leases peer ON peer.session_id <> mine.session_id
+             JOIN sessions peer_session ON peer_session.id = peer.session_id
+             JOIN sessions own_session ON own_session.id = mine.session_id
+             WHERE mine.session_id = ?1 AND mine.released_at IS NULL AND peer.released_at IS NULL
+               AND (mine.expires_at IS NULL OR mine.expires_at > ?2)
+               AND (peer.expires_at IS NULL OR peer.expires_at > ?2)
+               AND own_session.status IN ('active', 'idle', 'stale')
+               AND peer_session.status IN ('active', 'idle', 'stale')
+               AND (mine.path = peer.path
+                    OR (substr(mine.path, -1) = '/' AND instr(peer.path, mine.path) = 1)
+                    OR (substr(peer.path, -1) = '/' AND instr(mine.path, peer.path) = 1))
+             ORDER BY peer.session_id, mine.path, peer.path",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![session_id, now], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Declared peer scopes matching a scope of this session.
+    pub(crate) fn session_peer_scopes(
+        &self,
+        session_id: i64,
+    ) -> Result<Vec<(i64, String, String)>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT peer.session_id, mine.kind, mine.value
+             FROM session_scopes mine JOIN session_scopes peer
+               ON peer.kind = mine.kind AND peer.value = mine.value AND peer.session_id <> mine.session_id
+             JOIN sessions peer_session ON peer_session.id = peer.session_id
+             JOIN sessions own_session ON own_session.id = mine.session_id
+             WHERE mine.session_id = ?1 AND mine.released_at IS NULL AND peer.released_at IS NULL
+               AND own_session.status IN ('active', 'idle', 'stale')
+               AND peer_session.status IN ('active', 'idle', 'stale')
+             ORDER BY peer.session_id, mine.kind, mine.value"
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Live leases held by sessions named in this session's release requests.
+    pub(crate) fn active_leases_for_release_session(
+        &self,
+        session_id: i64,
+        now: i64,
+    ) -> Result<Vec<Lease>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{LEASE_SELECT} WHERE released_at IS NULL
+               AND (expires_at IS NULL OR expires_at > ?1)
+               AND session_id IN (SELECT id FROM sessions WHERE status IN ('active', 'idle', 'stale'))
+               AND session_id IN (
+                   SELECT CASE WHEN json_valid(payload_json)
+                       THEN json_extract(payload_json, '$.holder_session_id') END
+                   FROM events WHERE kind = ?2 AND CASE WHEN json_valid(payload_json)
+                       THEN json_extract(payload_json, '$.requester_session_id') = ?3
+                         OR json_extract(payload_json, '$.holder_session_id') = ?3
+                       ELSE 0 END
+               ) ORDER BY id"
+        ))?;
+        let rows = stmt.query_map(
+            rusqlite::params![now, crate::events::LEASE_RELEASE_REQUESTED, session_id],
+            lease_from_row,
+        )?;
+        let mut leases = Vec::new();
+        for row in rows {
+            leases.push(row??);
+        }
+        Ok(leases)
+    }
+
     /// Every lease row recorded for one session, regardless of session or
     /// lease state — introspection for tests and doctor-style audits.
     pub fn session_leases(&self, session_id: i64) -> Result<Vec<Lease>, BrokerError> {
