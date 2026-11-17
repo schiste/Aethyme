@@ -255,8 +255,7 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         let session_id = parsed.session.expect("validated session view");
         let advice = broker.session_status_advice(session_id, now_ms())?;
         let block = super::status_extras::session_block(&broker, session_id, &advice);
-        let requests: Vec<_> = broker.pending_lease_release_requests()?.into_iter()
-            .filter(|request| request.requester_session_id == session_id || request.holder_session_id == session_id)
+        let requests: Vec<_> = broker.session_pending_lease_release_requests(session_id)?.into_iter()
             .map(|request| serde_json::json!({
                 "request_id": request.request_id, "requester_session_id": request.requester_session_id,
                 "holder_session_id": request.holder_session_id, "path": request.path

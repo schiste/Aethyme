@@ -1255,6 +1255,48 @@ impl BrokerStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Release requests involving one session and their explicit outcomes.
+    /// Invalid payloads are ignored, as in the full-history consumer.
+    pub(crate) fn session_lease_release_events(
+        &self,
+        session_id: i64,
+    ) -> Result<Vec<Event>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "WITH requests AS (
+                SELECT id FROM events WHERE kind = ?1 AND CASE WHEN json_valid(payload_json)
+                    THEN json_extract(payload_json, '$.requester_session_id') = ?2
+                      OR json_extract(payload_json, '$.holder_session_id') = ?2
+                    ELSE 0 END
+             )
+             SELECT id, schema_version, ts, kind, session_id, payload_json FROM events
+             WHERE id IN (SELECT id FROM requests)
+                OR (kind IN (?3, ?4, ?5) AND CASE WHEN json_valid(payload_json)
+                    THEN json_extract(payload_json, '$.request_id') IN (SELECT id FROM requests)
+                    ELSE 0 END)
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                crate::events::LEASE_RELEASE_REQUESTED,
+                session_id,
+                crate::events::LEASE_RELEASE_ACKED,
+                crate::events::LEASE_RELEASE_DECLINED,
+                crate::events::LEASE_RELEASE_GRANTED
+            ],
+            |row| {
+                Ok(Event {
+                    id: row.get(0)?,
+                    schema_version: row.get(1)?,
+                    ts: row.get(2)?,
+                    kind: row.get(3)?,
+                    session_id: row.get(4)?,
+                    payload_json: row.get(5)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Lease releases after a request event, for every holder in one read.
     /// `lease_requests` applies each holder's own window.
     pub(crate) fn lease_release_events_since(
