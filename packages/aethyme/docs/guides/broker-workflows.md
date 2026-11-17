@@ -1298,7 +1298,9 @@ only when that cannot touch anything local:
 Unrelated local edits, staged work and untracked files stay exactly as they
 were. Each step updates the index and tree first, with Git's own two-tree
 merge (`read-tree -m -u`), which refuses rather than overwrite a local
-change, and moves the branch last by compare-and-swap. No stash, reset or
+change, and moves the branch last by compare-and-swap. If someone else
+moves the branch in between, the broker acts only when HEAD is at one end of
+the step, and otherwise leaves the tree for you to inspect. No stash, reset or
 forced checkout runs, submodules are not updated, and repository hooks
 (`post-merge`, `post-checkout`, `reference-transaction`) do not run. The
 broker's own files under `.aethyme/` never count as local changes.

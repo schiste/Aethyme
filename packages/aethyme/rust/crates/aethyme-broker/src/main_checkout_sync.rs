@@ -1032,8 +1032,9 @@ fn first_line(error: &crate::GitError) -> String {
 
 /// Move the primary checkout one step, `from` to `to`, journaled: marker,
 /// tree and index first, branch ref last (compare-and-swap). If the swap
-/// loses (HEAD moved), the tree goes back by the same two-tree merge. Any
-/// state that cannot be proven to be one of the two ends keeps the marker.
+/// loses, HEAD is re-read: at the target the move is done; unmoved, the swap
+/// is retried once and otherwise the tree goes back by the same two-tree
+/// merge; anywhere else the tree is left alone and the marker kept.
 /// `between` runs after the tree update; returning false stops there, as a
 /// killed process would (tests).
 pub(crate) fn move_step(
@@ -1087,16 +1088,47 @@ pub(crate) fn move_step(
             clear_marker(main_root);
             StepResult::Moved
         }
-        Err(swap) => match checkout.update_tree_preserving_local_changes(to, from, MOVE_BUDGET) {
-            Ok(()) => {
+        // The swap lost: act on where HEAD actually is, never on where it
+        // was expected to be.
+        Err(swap) => match checkout.head_commit() {
+            // Another writer (a person's pull, say) took HEAD to the same
+            // target: the tree is already right for it.
+            Ok(head) if head == to => {
                 clear_marker(main_root);
-                StepResult::Refused(format!(
-                    "HEAD moved during the update, so the tree was moved back: {}",
-                    first_line(&swap)
-                ))
+                StepResult::Moved
             }
+            // HEAD did not move (a transient ref lock): retry the swap once,
+            // then move the tree back to match HEAD.
+            Ok(head) if head == from => {
+                if checkout
+                    .swap_branch_ref(branch, from, to, MOVE_BUDGET)
+                    .is_ok()
+                {
+                    clear_marker(main_root);
+                    return StepResult::Moved;
+                }
+                match checkout.update_tree_preserving_local_changes(to, from, MOVE_BUDGET) {
+                    Ok(()) => {
+                        clear_marker(main_root);
+                        StepResult::Refused(format!(
+                            "the branch ref could not be moved, so the tree was moved back: {}",
+                            first_line(&swap)
+                        ))
+                    }
+                    Err(error) => StepResult::Unresolved(format!(
+                        "the branch ref could not be moved and the tree could not be moved back: {}",
+                        first_line(&error)
+                    )),
+                }
+            }
+            // Anywhere else (another commit, or past the target): the tree
+            // matches neither HEAD nor its start provably. Leave it and the
+            // marker for a person.
+            Ok(head) => StepResult::Unresolved(format!(
+                "HEAD moved to {head} during the update, which is neither the move's start {from} nor its target {to}; the tree was left as the update wrote it"
+            )),
             Err(error) => StepResult::Unresolved(format!(
-                "HEAD moved during the update and the tree could not be moved back: {}",
+                "the branch ref swap failed and HEAD could not be read: {}",
                 first_line(&error)
             )),
         },

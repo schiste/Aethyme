@@ -664,7 +664,7 @@ fn a_partly_written_move_is_held_with_its_marker_and_advice() {
 }
 
 #[test]
-fn a_concurrent_commit_stops_the_move_and_the_tree_goes_back() {
+fn a_concurrent_commit_stops_the_move_without_guessing() {
     let (tmp, from, to) = behind_repository(&[], &[("up.txt", "up\n")]);
     let root = tmp.path();
     std::fs::write(root.join("README.md"), "local edit\n").unwrap();
@@ -681,21 +681,98 @@ fn a_concurrent_commit_stops_the_move_and_the_tree_goes_back() {
     assert!(!marker_path(root).exists());
     git(root, &["update-ref", "refs/heads/main", &from]);
 
-    // Between the tree update and the ref swap.
+    // Between the tree update and the ref swap, another commit takes HEAD
+    // somewhere that is neither end: the tree and marker are left alone.
     let mut concurrent = String::new();
     let step = move_step(&checkout, root, "main", &from, &to, &mut || {
         concurrent = git(root, &["commit-tree", &tree, "-p", &from, "-m", "late"]);
         git(root, &["update-ref", "refs/heads/main", &concurrent]);
         true
     });
-    assert!(matches!(step, StepResult::Refused(_)), "{step:?}");
+    assert!(matches!(step, StepResult::Unresolved(_)), "{step:?}");
     assert_eq!(head(root), concurrent, "the other writer's ref is kept");
-    assert!(!root.join("up.txt").exists(), "the tree went back");
-    assert!(!marker_path(root).exists());
+    assert_eq!(
+        std::fs::read(root.join("up.txt")).unwrap(),
+        b"up\n",
+        "the tree is not touched"
+    );
+    assert!(marker_path(root).exists(), "the marker is kept");
+    assert!(interrupted_advice(root).is_some());
     assert_eq!(
         std::fs::read(root.join("README.md")).unwrap(),
         b"local edit\n"
     );
+}
+
+#[test]
+fn a_concurrent_fast_forward_to_the_target_completes_the_move() {
+    let (tmp, from, to) = behind_repository(&[], &[("up.txt", "up\n")]);
+    let root = tmp.path();
+    std::fs::write(root.join("README.md"), "local edit\n").unwrap();
+    let checkout = GitRepo::discover(root).unwrap();
+
+    let step = move_step(&checkout, root, "main", &from, &to, &mut || {
+        git(root, &["update-ref", "refs/heads/main", &to]);
+        true
+    });
+    assert_eq!(step, StepResult::Moved);
+    assert_eq!(head(root), to);
+    assert!(!marker_path(root).exists());
+    assert_eq!(std::fs::read(root.join("up.txt")).unwrap(), b"up\n");
+    assert_eq!(git(root, &["diff", "--cached", "--name-only"]), "");
+    assert_eq!(git(root, &["status", "--porcelain"]), "M README.md");
+    let next = attempt(&checkout, root, dirty_options());
+    assert_eq!(next.outcome, SyncOutcome::Current, "{next:?}");
+}
+
+#[test]
+fn a_concurrent_fast_forward_past_the_target_is_left_for_a_person() {
+    let (tmp, from, to) = behind_repository(&[], &[("up.txt", "up\n")]);
+    let root = tmp.path();
+    let checkout = GitRepo::discover(root).unwrap();
+    let to_tree = git(root, &["rev-parse", &format!("{to}^{{tree}}")]);
+    let beyond = git(root, &["commit-tree", &to_tree, "-p", &to, "-m", "beyond"]);
+
+    let step = move_step(&checkout, root, "main", &from, &to, &mut || {
+        git(root, &["update-ref", "refs/heads/main", &beyond]);
+        true
+    });
+    assert!(matches!(step, StepResult::Unresolved(_)), "{step:?}");
+    assert_eq!(head(root), beyond);
+    assert_eq!(std::fs::read(root.join("up.txt")).unwrap(), b"up\n");
+    assert!(marker_path(root).exists());
+    let next = attempt(&checkout, root, dirty_options());
+    match &next.outcome {
+        SyncOutcome::Held(hold) => assert_eq!(hold.reason, SyncReason::Interrupted, "{hold:?}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        marker_path(root).exists(),
+        "never reported current, never moved"
+    );
+}
+
+#[test]
+fn a_ref_swap_that_fails_with_head_unmoved_moves_the_tree_back() {
+    let (tmp, from, to) = behind_repository(&[], &[("up.txt", "up\n")]);
+    let root = tmp.path();
+    std::fs::write(root.join("README.md"), "local edit\n").unwrap();
+    let checkout = GitRepo::discover(root).unwrap();
+    let lock = root.join(git(
+        root,
+        &["rev-parse", "--git-path", "refs/heads/main.lock"],
+    ));
+
+    let step = move_step(&checkout, root, "main", &from, &to, &mut || {
+        // A held ref lock makes both swap tries fail without moving HEAD.
+        std::fs::write(&lock, "").unwrap();
+        true
+    });
+    std::fs::remove_file(&lock).unwrap();
+    assert!(matches!(step, StepResult::Refused(_)), "{step:?}");
+    assert_eq!(head(root), from);
+    assert!(!root.join("up.txt").exists(), "the tree went back");
+    assert!(!marker_path(root).exists());
     assert_eq!(git(root, &["status", "--porcelain"]), "M README.md");
 }
 
