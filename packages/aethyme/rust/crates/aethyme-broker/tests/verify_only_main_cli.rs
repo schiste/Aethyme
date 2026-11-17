@@ -480,7 +480,7 @@ fn clean_main_checkout_fast_forwards_and_records_the_event() {
     let (before, upstream) = fixture.advance_origin("other.txt", "upstream\n");
     std::fs::write(fixture.repo.join(".aethyme/ignored-cache"), "ignored\n").unwrap();
 
-    let status = json(&fixture.run(&["status", "--json"], &fixture.remote));
+    let status = json(&fixture.run(&["status", "--full", "--json"], &fixture.remote));
 
     assert!(status["summary"].is_object(), "{status:#}");
     assert_eq!(git_output(&fixture.repo, &["rev-parse", "HEAD"]), upstream);
@@ -496,7 +496,7 @@ fn clean_main_checkout_fast_forwards_and_records_the_event() {
     assert_eq!(payload["from"], before);
     assert_eq!(payload["to"], upstream);
 
-    let _ = json(&fixture.run(&["status", "--json"], &fixture.remote));
+    let _ = json(&fixture.run(&["status", "--full", "--json"], &fixture.remote));
     assert_eq!(fixture.checkout_fast_forward_events().len(), 1);
 }
 
@@ -506,7 +506,7 @@ fn tracked_changes_keep_the_main_checkout_in_place_and_report_status_command() {
     let (before, _) = fixture.advance_origin("other.txt", "upstream\n");
     std::fs::write(fixture.repo.join("tracked.txt"), "local edit\n").unwrap();
 
-    let output = fixture.run(&["status", "--json"], &fixture.remote);
+    let output = fixture.run(&["status", "--full", "--json"], &fixture.remote);
     let _ = json(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -524,7 +524,7 @@ fn untracked_changes_keep_the_main_checkout_in_place_and_report_status_command()
     let (before, _) = fixture.advance_origin("other.txt", "upstream\n");
     std::fs::write(fixture.repo.join("untracked.txt"), "local file\n").unwrap();
 
-    let output = fixture.run(&["status", "--json"], &fixture.remote);
+    let output = fixture.run(&["status", "--full", "--json"], &fixture.remote);
     let _ = json(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -544,7 +544,7 @@ fn ahead_main_checkout_is_not_moved_and_reports_its_unique_commits() {
     git(&fixture.repo, &["commit", "-qm", "local commit"]);
     let before = git_output(&fixture.repo, &["rev-parse", "HEAD"]);
 
-    let output = fixture.run(&["status", "--json"], &fixture.remote);
+    let output = fixture.run(&["status", "--full", "--json"], &fixture.remote);
     let _ = json(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -564,7 +564,7 @@ fn diverged_main_checkout_is_not_moved_and_reports_both_sides() {
     git(&fixture.repo, &["commit", "-qm", "local commit"]);
     let before = git_output(&fixture.repo, &["rev-parse", "HEAD"]);
 
-    let output = fixture.run(&["status", "--json"], &fixture.remote);
+    let output = fixture.run(&["status", "--full", "--json"], &fixture.remote);
     let _ = json(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -581,7 +581,7 @@ fn detached_main_checkout_is_not_moved_and_reports_status_command() {
     let (before, _) = fixture.advance_origin("other.txt", "upstream\n");
     git(&fixture.repo, &["checkout", "--detach", "-q", &before]);
 
-    let output = fixture.run(&["status", "--json"], &fixture.remote);
+    let output = fixture.run(&["status", "--full", "--json"], &fixture.remote);
     let _ = json(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -604,7 +604,7 @@ fn broker_commands_in_session_worktrees_never_fast_forward_them() {
     let (session, worktree) = fixture.session_changing("tracked.txt", "session\n");
     let worktree_before = git_output(&worktree, &["rev-parse", "HEAD"]);
 
-    let output = fixture.run_from(&["status", "--json"], &worktree, &fixture.remote);
+    let output = fixture.run_from(&["status", "--full", "--json"], &worktree, &fixture.remote);
     let _ = json(&output);
 
     assert_eq!(
@@ -627,7 +627,7 @@ fn broker_commands_in_session_worktrees_never_fast_forward_them() {
 /// The fast-forward must refuse for one stated reason and leave HEAD where it
 /// was, without recording a fast-forward.
 fn assert_main_checkout_held(fixture: &Fixture, before: &str, reason: &str) {
-    let output = fixture.run(&["status", "--json"], &fixture.remote);
+    let output = fixture.run(&["status", "--full", "--json"], &fixture.remote);
     let _ = json(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(git_output(&fixture.repo, &["rev-parse", "HEAD"]), before);

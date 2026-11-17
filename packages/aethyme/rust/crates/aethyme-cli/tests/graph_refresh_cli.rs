@@ -1046,7 +1046,7 @@ fn graph_impact_without_a_broker_succeeds_and_creates_no_broker_database() {
 #[test]
 fn graph_impact_with_a_broker_records_its_evaluation_event() {
     let (_temporary, repo) = fixture();
-    success(run(&repo, &["broker", "status", "--json"]));
+    success(run(&repo, &["broker", "status", "--full", "--json"]));
     assert!(repo.join(".aethyme/broker.db").is_file());
     success(impact(&repo));
     // `events --json` prints one event object per line.

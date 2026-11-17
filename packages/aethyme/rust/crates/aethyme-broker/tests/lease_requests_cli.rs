@@ -219,7 +219,7 @@ fn the_holder_sees_the_request_and_an_ack_releases_the_path() {
     assert_eq!(request["holder_session_id"], holding);
     let id = request["request_id"].as_i64().unwrap();
 
-    let status = fx.json_as("0", &["status", "--json"]);
+    let status = fx.json_as("0", &["status", "--full", "--json"]);
     let advice = status["advice"]
         .as_array()
         .unwrap()
@@ -419,13 +419,13 @@ fn a_holder_gone_past_the_grace_is_granted_against_during_the_wait() {
     );
 
     holder.stop();
-    fx.json_as("0", &["status", "--json"]);
+    fx.json_as("0", &["status", "--full", "--json"]);
     assert_eq!(
         fx.wait(&requester.pid(), asking, "10"),
         (Some(10), "granted".into())
     );
     assert!(!fx.holds(holding));
-    let status = fx.json_as("0", &["status", "--json"]);
+    let status = fx.json_as("0", &["status", "--full", "--json"]);
     let row = status["lease_release_requests"]
         .as_array()
         .unwrap()
@@ -490,7 +490,7 @@ fn compact_status_keeps_new_pending_request_after_resolved_lease_is_reclaimed() 
     let second = fx.request(&requester.pid(), asking)["request_id"]
         .as_i64()
         .unwrap();
-    let full = fx.json_as("0", &["status", "--json"]);
+    let full = fx.json_as("0", &["status", "--full", "--json"]);
     let compact = fx.json_as("0", &["status", "--compact", "--json"]);
     let pending: Vec<_> = full["lease_release_requests"]
         .as_array()

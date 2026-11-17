@@ -127,7 +127,7 @@ Stop only a verified group owned by the interrupted work, then recheck the
 whole group before reconciling the lease generation.
 
 Before starting or delegating a fix for shared CI failures or generated
-files, use `aethyme broker status --compact --json` and open PRs on affected
+files, use `aethyme broker status --json` and open PRs on affected
 paths. Read the matching task, claimed paths and PR diff even when the graph
 is unavailable. Coordinate with the owning session before starting duplicate
 work; use `aethyme broker advanced note send --to-session <id>` for a broker
@@ -149,13 +149,13 @@ blocked.
    isolated broker worktree, and work from that checkout:
 
    ```bash
-   aethyme broker status --compact --json  # concise coordination summary
+   aethyme broker status --json  # concise coordination summary (compact)
    aethyme broker start --task "<your task>" --short-name "<short name>" --path <planned-path>
    ```
 
    Routine status groups repeated advice categories, reports deferred checks
-   as unknown, and omits per-session evidence and lease paths. Use full
-   `aethyme broker status --json` when you need exact session, lease-path or
+   as unknown, and omits per-session evidence and lease paths. Use
+   `aethyme broker status --full --json` only when you need exact session, lease-path or
    evidence detail before deciding what to edit. A deferred check is not a
    clean result.
 
@@ -188,8 +188,8 @@ blocked.
    Leases record planned or observed path overlap; they do not lock files
    across isolated worktrees. A lease or warning alone is not a reason to
    wait or switch tasks: continue on independent work in your own worktree.
-   Before contacting a holder, inspect their task and claimed paths in full
-   `aethyme broker status --json`; an explicit lease may record intent without
+   Before contacting a holder, inspect their task and claimed paths in
+   `aethyme broker status --full --json`; an explicit lease may record intent without
    any edit. Every overlap the broker reports, warning or refusal, carries that
    session's capped changes to the overlapping files, committed and uncommitted
    (`other_changes` in JSON), or says it has only declared intent. It is another
@@ -597,7 +597,7 @@ blocked.
    The broker surfaces outstanding session advisories after post-commit,
    before expensive gates, and on common broker commands. When a notice
    appears—or after rebasing or reusing a worktree—inspect
-   `aethyme broker status --json` before continuing on the named paths.
+   `aethyme broker status --full --json` before continuing on the named paths.
 
    If status output is too large to inspect directly, retain the complete
    unfiltered JSON in a temporary file and use a JSON parser to project the

@@ -2071,7 +2071,7 @@ fn finish_error_context(
             ),
             None => format!(
                 "the session record could not be read back; inspect \
-                 `aethyme broker status --json` before retrying, and \
+                 `aethyme broker status --full --json` before retrying, and \
                  `aethyme broker advanced handoff --session {session}` if the session is already closed"
             ),
         };
@@ -2098,7 +2098,8 @@ fn finish_error_context(
             state.as_str()
         ),
         None => format!(
-            "the session record could not be read back; inspect `aethyme broker status --json` \
+            "the session record could not be read back; inspect \
+             `aethyme broker status --full --json` \
              before retrying, and `aethyme broker advanced handoff --session {session}` if the \
              session is already closed"
         ),
@@ -2739,7 +2740,7 @@ mod finish_error_context_tests {
             };
             assert_eq!(code, 7);
             assert!(message.starts_with("repository metadata is unreadable;"));
-            assert!(message.contains("broker status --json"));
+            assert!(message.contains("aethyme broker status"));
             assert!(!message.contains("--timeout 2"));
             match state {
                 Some(crate::SessionStatus::Active) => {

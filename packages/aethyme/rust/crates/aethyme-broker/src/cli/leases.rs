@@ -64,7 +64,7 @@ fn shared_edit_owner_groups(report: &crate::LeasePlan) -> Vec<SharedEditOwnerGro
 fn coordination_history_drilldown(session_id: Option<i64>) -> CoordinationHistoryDrilldown {
     CoordinationHistoryDrilldown {
         loaded: false,
-        release_requests_command: "aethyme broker status --json",
+        release_requests_command: "aethyme broker status --full --json",
         notes_command: session_id
             .map(|id| format!("aethyme broker advanced note list --session {id}")),
     }
@@ -159,7 +159,7 @@ pub(super) fn render_lease_plan(report: &crate::LeasePlan, json: bool) -> Result
             }
         }
         out!(
-            "  Coordination history was not loaded: inspect `aethyme broker status --json` for release requests and `aethyme broker advanced note list --session <id>` for messages."
+            "  Coordination history was not loaded: inspect `aethyme broker status --full --json` for release requests and `aethyme broker advanced note list --session <id>` for messages."
         );
     }
     Ok(())
@@ -1663,7 +1663,7 @@ mod tests {
         assert_eq!(history["loaded"], false);
         assert_eq!(
             history["release_requests_command"],
-            "aethyme broker status --json"
+            "aethyme broker status --full --json"
         );
         assert_eq!(
             history["notes_command"],

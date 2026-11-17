@@ -87,10 +87,119 @@ pub(super) fn run_readiness(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+/// The `--session` block as text: the same facts the JSON block carries.
+fn render_session_block(block: &serde_json::Value) {
+    let text = |value: &serde_json::Value| -> String {
+        match value {
+            serde_json::Value::Null => "unknown".into(),
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        }
+    };
+    out!(
+        "Session {}: {} on {}",
+        text(&block["id"]),
+        text(&block["status"]),
+        text(&block["branch"])
+    );
+    out!("  worktree: {}", text(&block["worktree"]));
+    out!(
+        "  head {} / remote {}; {} unpushed commit(s)",
+        text(&block["head_oid"]),
+        text(&block["remote_oid"]),
+        text(&block["unpushed_commits"])
+    );
+    if block["pr"].is_null() {
+        out!("  pull request: unknown (none recorded locally)");
+    } else {
+        out!(
+            "  pull request: #{} (draft: {}; head {}; mergeability and checks not recorded locally)",
+            text(&block["pr"]["number"]),
+            text(&block["pr"]["draft"]),
+            text(&block["pr"]["head_sha"])
+        );
+    }
+    out!("  preparation: {}", text(&block["preparation"]["state"]));
+    if let Some(blockers) = block["blockers"].as_array() {
+        for blocker in blockers {
+            out!("  blocker: {}", text(&blocker["summary"]));
+        }
+    }
+    out!(
+        "  next: {} ({})",
+        text(&block["next_action"]["command"]),
+        text(&block["next_action"]["reason"])
+    );
+}
+
+/// Which document `broker status` prints. Telemetry records it so a caller
+/// that keeps paying for the full form can be found.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatusForm {
+    Compact,
+    Summary,
+    Full,
+}
+
+impl StatusForm {
+    fn of(parsed: &Parsed) -> Self {
+        if parsed.full || parsed.refresh {
+            Self::Full
+        } else if parsed.summary {
+            Self::Summary
+        } else {
+            Self::Compact
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Summary => "summary",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// Attach the status form, `--session` presence, caller hint and section
+/// timings to this command's metric row. Routine status writes no row unless
+/// output measurement is opted in, and attaching details would force one, so
+/// they are attached only when a row is written anyway.
+fn record_status_metric(
+    parsed: &Parsed,
+    form: StatusForm,
+    routine: bool,
+    phase_timings_ms: &std::collections::BTreeMap<String, u64>,
+    evidence_truncated: usize,
+) {
+    if routine && !telemetry::output_measurement_opted_in() {
+        return;
+    }
+    telemetry::set_command_metric_details(serde_json::json!({
+        "status_form": form.as_str(),
+        "status_json": parsed.json,
+        "status_session_flag": parsed.session.is_some(),
+        "status_evidence_truncated": evidence_truncated,
+        "caller_hint": telemetry::caller_hint(),
+        "phase_timings_ms": phase_timings_ms,
+    }));
+}
+
 /// `broker status`.
 pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
     // Status reports and never decides, so it may reuse changed-path answers.
     crate::worktree_watch::allow_reuse_for_this_command();
+    if parsed.full
+        && (parsed.compact
+            || parsed.summary
+            || parsed.session.is_some()
+            || parsed.status_revision.is_some())
+    {
+        return Err(UsageError::Message(
+            "--full cannot be combined with --compact, --summary, --session or --since-revision"
+                .into(),
+        ));
+    }
     if parsed.status_revision.is_some() && (!parsed.json || parsed.summary || parsed.refresh) {
         return Err(UsageError::Message(
             "--since-revision requires JSON compact status and cannot be combined with --summary or --refresh".into(),
@@ -123,13 +232,11 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             "run `aethyme broker status` without --refresh",
         ));
     }
+    let form = StatusForm::of(&parsed);
     let opened = std::time::Instant::now();
-    let routine = !parsed.refresh
-        && (parsed.compact
-            || parsed.summary
-            || parsed.session.is_some()
-            || parsed.status_revision.is_some()
-            || !parsed.json);
+    // Compact is the default for text and JSON alike; only `--full` and
+    // `--refresh` build the full `StatusView`.
+    let routine = form != StatusForm::Full;
     let mut broker = if routine {
         let cwd = std::env::current_dir()
             .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
@@ -138,14 +245,7 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         open_broker(parsed.read_only_snapshot)?
     };
     let open_ms = opened.elapsed().as_millis() as u64;
-    // Routine text is the compact, recorded-observation path. Full JSON stays
-    // on the established StatusView contract; --compact opts JSON callers into
-    // the separate versioned envelope below.
-    if parsed.compact
-        || parsed.status_revision.is_some()
-        || parsed.session.is_some()
-        || (!parsed.json && !parsed.summary && !parsed.refresh)
-    {
+    if form == StatusForm::Compact {
         let mut brief = if parsed.read_only_snapshot {
             broker.status_brief_snapshot(now_ms())?
         } else {
@@ -154,12 +254,19 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         let context_started = std::time::Instant::now();
         let mut context = broker.routine_status_context(now_ms())?;
         let mut omitted_unrelated_advice = 0;
+        let mut session_advice = Vec::new();
         if let Some(session_id) = parsed.session {
             broker.store_ref().session(session_id).map_err(|error| {
                 UsageError::Message(format!(
                     "cannot focus status on session {session_id}: {error}"
                 ))
             })?;
+            session_advice = brief
+                .advice
+                .iter()
+                .filter(|item| item.session_id == Some(session_id))
+                .cloned()
+                .collect();
             let before = brief.advice.len();
             brief.advice.retain(|item| {
                 item.session_id.is_none()
@@ -188,11 +295,21 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             "context_records".into(),
             context_started.elapsed().as_millis() as u64,
         );
+        let session_block = parsed.session.map(|session_id| {
+            let started = std::time::Instant::now();
+            let block = super::status_extras::session_block(&broker, session_id, &session_advice);
+            brief
+                .phase_timings_ms
+                .insert("session_block".into(), started.elapsed().as_millis() as u64);
+            block
+        });
         brief.phase_timings_ms.insert("open".into(), open_ms);
         brief
             .phase_timings_ms
             .insert("command_total".into(), opened.elapsed().as_millis() as u64);
+        let phase_timings_ms = brief.phase_timings_ms.clone();
         let compact = super::status_compact::CompactStatus::from_brief(brief, context);
+        let mut evidence_truncated = 0;
         if parsed.json {
             let mut value = serde_json::to_value(&compact)?;
             if let Some(session_id) = parsed.session {
@@ -202,27 +319,44 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                     "summary_and_blockers_are_global": true,
                 });
             }
-            let value = super::status_revision::render(
+            let mut value = super::status_revision::render(
                 value,
                 broker.main_root(),
                 parsed.session,
                 parsed.status_revision.as_deref(),
             )?;
+            // Outside the revision: always present, never a "changed section".
+            value["form"] = serde_json::json!(StatusForm::Compact.as_str());
+            value["hint"] = serde_json::json!(super::status_extras::COMPACT_HINT);
+            if let Some(block) = session_block {
+                value["session"] = block;
+            }
+            evidence_truncated = super::status_extras::cap_document_advice_evidence(&mut value);
             out!("{}", serde_json::to_string_pretty(&value)?);
         } else {
             if let Some(session_id) = parsed.session {
                 out!(
                     "Focused on session {session_id}; summary and blockers remain global. {omitted_unrelated_advice} unrelated notices or informational observations omitted."
                 );
+                if let Some(block) = &session_block {
+                    render_session_block(block);
+                }
             }
             out!("{}", compact.render_text().trim_end());
         }
+        record_status_metric(
+            &parsed,
+            form,
+            routine,
+            &phase_timings_ms,
+            evidence_truncated,
+        );
         return Ok(());
     }
     // The mandated first step of every session, so its cost is a tax
     // on every agent. `--summary` skips the per-session diff that
     // dominates it and prints only what that step is read for (#182).
-    if parsed.summary {
+    if form == StatusForm::Summary {
         let mut brief = if parsed.read_only_snapshot {
             broker.status_brief_snapshot(now_ms())?
         } else {
@@ -232,13 +366,23 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         brief
             .phase_timings_ms
             .insert("command_total".into(), opened.elapsed().as_millis() as u64);
+        let mut evidence_truncated = 0;
         if parsed.json {
-            out!("{}", serde_json::to_string_pretty(&brief)?);
+            let mut value = serde_json::to_value(&brief)?;
+            evidence_truncated = super::status_extras::cap_document_advice_evidence(&mut value);
+            out!("{}", serde_json::to_string_pretty(&value)?);
         } else {
             out!("{}", brief.summary.message);
             render_waiters(&brief.waiters);
             render_status_advice(&brief.advice);
         }
+        record_status_metric(
+            &parsed,
+            form,
+            routine,
+            &brief.phase_timings_ms,
+            evidence_truncated,
+        );
         return Ok(());
     }
     let mut status = if parsed.read_only_snapshot {
@@ -253,8 +397,21 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         .phase_timings_ms
         .insert("command_total".into(), opened.elapsed().as_millis() as u64);
     if parsed.json {
-        out!("{}", serde_json::to_string_pretty(&status)?);
-    } else {
+        let mut value = serde_json::to_value(&status)?;
+        value["form"] = serde_json::json!(StatusForm::Full.as_str());
+        let evidence_truncated = super::status_extras::cap_document_advice_evidence(&mut value);
+        out!("{}", serde_json::to_string_pretty(&value)?);
+        record_status_metric(
+            &parsed,
+            form,
+            routine,
+            &status.phase_timings_ms,
+            evidence_truncated,
+        );
+        return Ok(());
+    }
+    record_status_metric(&parsed, form, routine, &status.phase_timings_ms, 0);
+    {
         out!(
             "Integration: {} @ {}",
             status.integration_branch,

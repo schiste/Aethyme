@@ -161,7 +161,7 @@ fn start_cli_returns_deterministic_planned_leases_and_status_exposes_them() {
         vec!["generated/", "zeta.txt"]
     );
 
-    let status = stdout(&run(tmp.path(), &["status", "--json"]));
+    let status = stdout(&run(tmp.path(), &["status", "--full", "--json"]));
     let status: serde_json::Value = serde_json::from_str(&status).unwrap();
     assert_eq!(
         status["leases"]

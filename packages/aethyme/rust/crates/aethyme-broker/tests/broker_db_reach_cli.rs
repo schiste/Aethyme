@@ -72,7 +72,7 @@ fn the_database_override_moves_state_out_of_the_repository() {
     let pinned = elsewhere.path().join("pinned.db");
 
     let out = Command::new(CLI)
-        .args(["status", "--json"])
+        .args(["status", "--full", "--json"])
         .current_dir(repo.path())
         .env(aethyme_broker::BROKER_DB_ENV, &pinned)
         .output()

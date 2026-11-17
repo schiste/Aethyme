@@ -29,6 +29,7 @@ mod service;
 mod session;
 mod status;
 mod status_compact;
+mod status_extras;
 mod status_revision;
 mod submit;
 mod surface;
@@ -730,7 +731,7 @@ Usage:
       push, sync, finish, close, git, gh and adopt --reuse refuse another
       live agent; --take-over moves the session to the caller and records
       a session.holder_bound event. Unidentified callers are not refused.
-  aethyme broker push --session <id> [--pr] [--json]
+  aethyme broker push --session <id> [--pr] [--plan] [--json]
       Publish this session's own agent/* branch to the default branch's
       remote, and nothing else. Commit, then push, as often as you like:
       work that exists only in a worktree is lost with it. A branch that only
@@ -740,6 +741,11 @@ Usage:
       the default branch. --pr opens a new pull request using the trusted
       default branch's `[broker.pr] open_as = \"draft\" | \"ready\"` setting
       (default: draft); an existing pull request is reported unchanged.
+      --plan pushes nothing: it reads the remote branch once and prints the
+      remote, destination ref, proposed oid, the remote oid as this broker
+      last knew it and as observed now, and the mode (fast-forward, lease,
+      or would refuse, and why). The report of a push names the remote oid
+      observed under the push lock and the refs it pushed.
   aethyme broker sync --session <id> [--json]
       Bring this session up to the freshly fetched default branch when it
       is safe: the tree must be clean and nothing in progress. An unpushed
@@ -782,19 +788,26 @@ Usage:
       queue attestations and per-SHA unrecorded-commit dispositions. The
       template option atomically writes a no-clobber schema-v2 document with
       exact identifiers and deliberately invalid null operator judgments.
-  aethyme broker status [--json] [--compact] [--session <id>] [--since-revision <token>] [--summary] [--refresh]
-      Default text is compact. --compact --json returns a versioned summary
-      that groups advice and marks omitted details and deferred checks; those
-      checks are unknown, not clean. Full --json retains per-session detail;
-      session records use `agents[].id` for every --session flag. The legacy
+  aethyme broker status [--json] [--full] [--session <id>] [--since-revision <token>] [--summary] [--refresh]
+      Compact by default, as text and as --json: a versioned summary that
+      groups advice and marks omitted details and deferred checks; those
+      checks are unknown, not clean. Both JSON forms carry `form`. --full
+      returns the full document with per-session detail; use it only for
+      exact session or lease-path evidence. Session records there use
+      `agents[].id` for every --session flag. --compact is accepted and
+      changes nothing. Advice evidence over 8 KiB is truncated, with the
+      count and the command that prints the rest. The legacy
       --summary --json shape is unchanged; --summary text remains brief.
       --session focuses compact status on one session while preserving global
-      warnings, blockers and counts, including with --json.
+      warnings, blockers and counts, including with --json, and adds a
+      `session` block: branch, head and remote oids, unpushed commits, the
+      locally recorded pull request (no network call), preparation, that
+      session's advice and the exact next command.
       --since-revision returns changed sections of compact JSON; invalid or
       differently scoped revisions return a fresh snapshot. Deferred checks
       remain unknown even when no sections changed.
       --refresh explicitly performs the expensive full lease, conflict and
-      cleanup audit; use it when needed.
+      cleanup audit and prints the full form; use it when needed.
   aethyme broker events [--since <id>] [--kind <prefix>] [--follow] [--json]
       Show the append-only event log (see docs/events-contract.md).
       --kind filters by prefix (e.g. merge. or lease.overlap); --follow
@@ -1094,36 +1107,29 @@ pub fn with_status_read_context<T>(args: &[String], operation: impl FnOnce() -> 
 }
 
 fn routine_status(args: &[String]) -> bool {
-    args.first().map(String::as_str) == Some("status")
-        && {
-            let mut index = 1;
-            let mut valid = true;
-            while index < args.len() {
-                if args[index] == "--session" {
-                    index += 1;
-                    valid &= args.get(index).is_some_and(|id| id.parse::<i64>().is_ok());
-                } else if args[index] == "--since-revision" {
-                    index += 1;
-                    valid &= args.get(index).is_some();
-                } else {
-                    valid &= matches!(
-                        args[index].as_str(),
-                        "--json" | "--json-output" | "--summary" | "--compact"
-                    );
-                }
+    args.first().map(String::as_str) == Some("status") && {
+        let mut index = 1;
+        let mut valid = true;
+        while index < args.len() {
+            if args[index] == "--session" {
                 index += 1;
+                valid &= args.get(index).is_some_and(|id| id.parse::<i64>().is_ok());
+            } else if args[index] == "--since-revision" {
+                index += 1;
+                valid &= args.get(index).is_some();
+            } else {
+                valid &= matches!(
+                    args[index].as_str(),
+                    "--json" | "--json-output" | "--summary" | "--compact"
+                );
             }
-            valid
+            index += 1;
         }
-        && (!args
-            .iter()
-            .any(|arg| matches!(arg.as_str(), "--json" | "--json-output"))
-            || args.iter().any(|arg| {
-                matches!(
-                    arg.as_str(),
-                    "--summary" | "--compact" | "--session" | "--since-revision"
-                )
-            }))
+        // Compact is the default form, text and JSON alike; only `--full`
+        // and `--refresh` (refused above as unknown here) leave the
+        // routine path.
+        valid
+    }
 }
 
 /// Dispatch an internal command with the router-selected compatibility mode.
@@ -1589,8 +1595,11 @@ struct Parsed {
     read_only_compatibility: Option<ReadOnlyCompatibility>,
     /// `status --summary`: skip the per-session lease refresh (#182).
     summary: bool,
-    /// `status --compact`: emit a compact routine response.
+    /// `status --compact`: the default JSON form since compact became the
+    /// default; still accepted, and refused only beside `--full`.
     compact: bool,
+    /// `status --full`: the full `StatusView` document.
+    full: bool,
     status_revision: Option<String>,
     refresh: bool,
     positional: Vec<String>,
@@ -1613,6 +1622,8 @@ struct Parsed {
     ai_provider: Option<String>,
     pr_number: Option<i64>,
     open_pr: bool,
+    /// `push --plan`: describe the push and do not push.
+    push_plan: bool,
     session: Option<i64>,
     to_session: Option<i64>,
     /// `note send --from automation:<name>` (#1238).
@@ -1775,6 +1786,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         read_only_compatibility: None,
         summary: false,
         compact: false,
+        full: false,
         status_revision: None,
         refresh: false,
         positional: Vec::new(),
@@ -1795,6 +1807,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         ai_provider: None,
         pr_number: None,
         open_pr: false,
+        push_plan: false,
         session: None,
         to_session: None,
         note_from: None,
@@ -1932,6 +1945,8 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--non-interactive" => parsed.non_interactive = true,
             "--summary" => parsed.summary = true,
             "--compact" => parsed.compact = true,
+            "--full" => parsed.full = true,
+            "--plan" => parsed.push_plan = true,
             "--since-revision" => {
                 parsed.status_revision = Some(
                     iter.next()
@@ -3108,6 +3123,8 @@ fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseComma
     }
     match subcommand {
         "prepare" if action == Some("status") => TaskLeaseCommandClass::ObservationOnly,
+        // A push plan reads the remote branch and pushes nothing.
+        "push" if parsed.push_plan => TaskLeaseCommandClass::ObservationOnly,
         "leases" if matches!(action, None | Some("plan" | "explain" | "export")) => {
             TaskLeaseCommandClass::ObservationOnly
         }

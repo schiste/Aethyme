@@ -362,7 +362,7 @@ impl CompactStatus {
                 "lease request reasons, operation liveness details and other per-session metadata",
             ],
             drilldown: CompactDrilldown {
-                full_status_json: "aethyme broker status --json",
+                full_status_json: "aethyme broker status --full --json",
                 fresh_audit_json: "aethyme broker status --refresh --json",
             },
         }

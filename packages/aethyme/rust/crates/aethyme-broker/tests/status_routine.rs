@@ -53,7 +53,7 @@ fn status(repo: &std::path::Path, args: &[&str]) -> serde_json::Value {
 #[test]
 fn cli_routine_and_explicit_audit_have_distinct_freshness_contracts() {
     let repo = fixture();
-    let routine = status(repo.path(), &["status", "--json"]);
+    let routine = status(repo.path(), &["status", "--full", "--json"]);
     assert_eq!(routine["leases_refreshed"], false);
     assert_eq!(routine["summary"]["integration_relation"], "not_checked");
     assert!(

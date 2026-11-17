@@ -681,8 +681,8 @@ pub use session_abandonment::{
     decide as decide_abandonment, survey as survey_abandonment,
 };
 pub use session_push::{
-    SESSION_PUSH_POLICY_KEY, SessionPullRequest, SessionPushReport, SessionPushState,
-    UncommittedCounts,
+    SESSION_PUSH_POLICY_KEY, SessionPullRequest, SessionPushPlan, SessionPushReport,
+    SessionPushState, UncommittedCounts,
 };
 pub use session_sync::{SessionSyncReport, SyncOutcome, SyncStrategy};
 pub use ship::{

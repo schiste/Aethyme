@@ -465,7 +465,7 @@ fn session_commands_surface_notices_without_corrupting_json() {
     assert!(stderr.contains(&"a".repeat(40)));
     assert!(stderr.contains("safe next action: aethyme broker status --json"));
 
-    let status = run(&tmp, &["status", "--json"]);
+    let status = run(&tmp, &["status", "--full", "--json"]);
     assert!(status.status.success());
     let status_json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status_json["outstanding_advisories"][0]["id"], advisory.id);

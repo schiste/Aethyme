@@ -9,8 +9,9 @@ state.
 
 ## Status and doctor
 
-Routine default text and `broker status --compact --json` use the compact
-recorded-observation view. Its schema is
+Routine default text and `broker status --json` (compact by default; `--compact`
+is accepted) use the compact recorded-observation view; `--full` prints the
+full document. Its schema is
 `aethyme.broker-status-compact/v1`; advice is grouped by `(id, severity)` with
 observation and duplicate counts, and every distinct category and its
 drilldown commands remain present. `omitted_details` names evidence and

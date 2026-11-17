@@ -736,7 +736,7 @@ fn a_resumed_journal_never_removes_a_gate_cache_unattended_or_changed() {
     .unwrap();
 
     // Any command that opens the broker resumes the journal.
-    let opened = world.run(&["status", "--json"]);
+    let opened = world.run(&["status", "--full", "--json"]);
     assert!(
         opened.status.success(),
         "{}",

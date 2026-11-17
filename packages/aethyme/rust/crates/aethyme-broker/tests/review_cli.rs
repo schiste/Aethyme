@@ -1664,7 +1664,7 @@ fn broker_status_states_why_a_refused_review_cannot_clear() {
     let (_session, head, run) = refused_review_tick(&fixture);
     assert!(!run.status.success());
 
-    let status = fixture.run(&["status", "--json"], &head, true, None);
+    let status = fixture.run(&["status", "--full", "--json"], &head, true, None);
     assert!(
         status.status.success(),
         "{}",
@@ -1747,7 +1747,7 @@ fn a_refusal_a_later_request_superseded_stops_being_reported() {
         );
     }
 
-    let status = fixture.run(&["status", "--json"], &head, true, None);
+    let status = fixture.run(&["status", "--full", "--json"], &head, true, None);
     let view: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     assert!(view["review_refusals"].as_array().unwrap().is_empty());
     assert!(

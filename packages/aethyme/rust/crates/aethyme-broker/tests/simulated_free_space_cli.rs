@@ -90,7 +90,7 @@ impl Fixture {
     }
 
     fn advice_ids(&self, available: &str) -> Vec<String> {
-        let output = self.run(available, &["status", "--json"]);
+        let output = self.run(available, &["status", "--full", "--json"]);
         assert!(output.status.success(), "{output:?}");
         let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         status["advice"]

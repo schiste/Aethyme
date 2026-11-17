@@ -714,7 +714,7 @@ fn render_start(facts: &StartFacts) -> String {
     } else if facts.unintegrated_commits > 0 {
         format!("aethyme broker submit --session {}", session.id)
     } else if facts.advisories > 0 {
-        "aethyme broker status --json (read the advisories before editing the named paths)"
+        "aethyme broker status --full --json (read the advisories before editing the named paths)"
             .to_string()
     } else {
         format!(
@@ -1869,7 +1869,7 @@ mod tests {
             ..base.clone()
         });
         assert!(
-            next_line(&advised).starts_with("aethyme broker status --json"),
+            next_line(&advised).starts_with("aethyme broker status --full --json"),
             "{advised}"
         );
 

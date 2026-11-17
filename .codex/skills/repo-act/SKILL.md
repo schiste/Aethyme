@@ -378,7 +378,7 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   control that detects a known changed path before treating empty diff output
   as equality.
 - For routine broker status checks, prefer `aethyme broker status --summary
-  --json`; capture full `status --json` only when its additional detail is needed.
+  --json`; capture `status --full --json` only when its additional detail is needed.
   Retain complete stdout and stderr before parsing exact session IDs and
   structured advice fields such as severity and commands. Never infer absence
   from truncated output or suppressed stderr.

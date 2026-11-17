@@ -2243,7 +2243,11 @@ fn default_policy_reclaims_closed_session_build_caches() {
         String::from_utf8_lossy(&branch_check.stderr)
     );
 
-    let output = run(repo.path(), container.path(), &["status", "--json"]);
+    let output = run(
+        repo.path(),
+        container.path(),
+        &["status", "--full", "--json"],
+    );
     assert!(
         output.status.success(),
         "status: {}",
@@ -2265,7 +2269,11 @@ fn explicit_opt_out_preserves_closed_session_build_caches() {
     let (_id, worktree) = blocked_session_with_build_cache(repo.path(), container.path());
     let target = worktree.join("rust/target");
 
-    let output = run(repo.path(), container.path(), &["status", "--json"]);
+    let output = run(
+        repo.path(),
+        container.path(),
+        &["status", "--full", "--json"],
+    );
     assert!(
         output.status.success(),
         "status: {}",
@@ -2345,7 +2353,11 @@ fn unknown_retention_fields_warn_without_disabling_gc_or_status() {
         "retention.future_sweep_days"
     );
 
-    let output = run(repo.path(), container.path(), &["status", "--json"]);
+    let output = run(
+        repo.path(),
+        container.path(),
+        &["status", "--full", "--json"],
+    );
     assert!(
         output.status.success(),
         "status: {}",
@@ -2370,7 +2382,11 @@ fn unknown_retention_fields_warn_without_disabling_gc_or_status() {
 fn invalid_retention_config_is_explained_by_status_instead_of_hiding_the_error() {
     let (repo, container) = fixture("[retention]\nstartup_budget_ms = 0\n");
 
-    let output = run(repo.path(), container.path(), &["status", "--json"]);
+    let output = run(
+        repo.path(),
+        container.path(),
+        &["status", "--full", "--json"],
+    );
     assert!(
         output.status.success(),
         "status: {}",
@@ -2430,7 +2446,11 @@ fn tracked_directory_with_a_cache_witness_is_never_reclaimed() {
     );
     assert!(output.status.success());
 
-    let output = run(repo.path(), container.path(), &["status", "--json"]);
+    let output = run(
+        repo.path(),
+        container.path(),
+        &["status", "--full", "--json"],
+    );
     assert!(output.status.success());
     assert!(
         target.join("tracked.txt").exists(),

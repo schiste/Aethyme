@@ -2110,7 +2110,7 @@ fn host_failures_exit_environment_and_a_repeated_git_is_accepted() {
     let status = stdout(run_with_managed_worktree_root(
         &worktree,
         &root,
-        &["status", "--json"],
+        &["status", "--full", "--json"],
     ));
     assert!(status.contains("inspect the gate log"), "{status}");
     assert!(!status.contains("the code was not judged"), "{status}");

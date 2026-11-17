@@ -350,7 +350,7 @@ fn abandoning_unpushed_work_needs_a_reason_and_is_recorded() {
 fn routine_status_marks_unpushed_work_unknown_until_an_explicit_audit() {
     let fixture = fixture("");
     let (session, _, _) = session_with_commit(&fixture.repo, "pending.txt");
-    let routine = json(&run(&fixture.repo, &["status", "--json"]));
+    let routine = json(&run(&fixture.repo, &["status", "--full", "--json"]));
     assert!(
         routine["deferred_checks"]
             .as_array()
