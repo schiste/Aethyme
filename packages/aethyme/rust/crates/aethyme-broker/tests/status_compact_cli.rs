@@ -542,11 +542,14 @@ fn session_view_ignores_unrelated_sessions_and_resets_other_revision_scopes() {
         &["status", "--session", &id, "--session-view", "--json"],
     );
     assert_eq!(first["schema"], "aethyme.broker-session-view/v1");
-    assert_eq!(first["data_freshness"]["global_warnings"], "not_inspected");
+    assert_eq!(
+        first["data_freshness"]["global_warnings"],
+        "recorded_partial"
+    );
     let revision = first["revision"].as_str().unwrap();
     let other = add_worktree(fixture.path(), &fixture.worktree_root(), "view-other");
     let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
-    broker.adopt(&other, Some("unrelated")).unwrap();
+    let peer = broker.adopt(&other, Some("unrelated")).unwrap();
     drop(broker);
     let same = json_status(
         fixture.path(),
@@ -576,6 +579,28 @@ fn session_view_ignores_unrelated_sessions_and_resets_other_revision_scopes() {
         ],
     );
     assert_eq!(full["revision_reset"], true);
+    let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
+    broker
+        .claim_lease(session.id, "src/shared.txt", None)
+        .unwrap();
+    broker.claim_lease(peer.id, "src/shared.txt", None).unwrap();
+    drop(broker);
+    let peer_change = json_status(
+        fixture.path(),
+        &[
+            "status",
+            "--session",
+            &id,
+            "--session-view",
+            "--since-revision",
+            revision,
+            "--json",
+        ],
+    );
+    assert_eq!(
+        peer_change["changed_sections"]["peer_state"]["lease_count"],
+        1
+    );
     std::fs::write(worktree.join("new-view.txt"), "changed").unwrap();
     git(&worktree, &["add", "new-view.txt"]);
     git(&worktree, &["commit", "-qm", "change session"]);
@@ -721,7 +746,8 @@ fn session_view_does_not_load_unrelated_agent_records() {
     drop(broker);
     let db = rusqlite::Connection::open(aethyme_broker::broker_db_path(fixture.path()).unwrap())
         .unwrap();
-    db.execute_batch("PRAGMA ignore_check_constraints = ON").unwrap();
+    db.execute_batch("PRAGMA ignore_check_constraints = ON")
+        .unwrap();
     db.execute(
         "UPDATE sessions SET origin = 'unrecognized-origin' WHERE id = ?1",
         [peer.id],
@@ -735,5 +761,5 @@ fn session_view_does_not_load_unrelated_agent_records() {
     );
     assert_eq!(view["session"]["id"], session.id);
     assert_eq!(view["data_freshness"]["session_advice"], "partial");
-    assert_eq!(view["data_freshness"]["peer_state"], "not_inspected");
+    assert_eq!(view["data_freshness"]["peer_state"], "recorded_only");
 }

@@ -204,3 +204,14 @@ event never breaks an older CLI either.
 It does not re-inject `AGENTS.md` or `CLAUDE.md`. Codex loads those natively,
 and injecting them again from a hook is pure duplication — measured at 142M
 tokens over 48 hours before it was removed.
+
+## Codex
+
+The plugin includes a Codex compatibility manifest and uses the same hook
+entry point as Claude. Install the plugin in Codex and review and trust its
+hooks when prompted; installation alone does not enable untrusted hooks.
+The hooks run at supported lifecycle and tool boundaries. Session and global
+observations are refreshed at most once every 30 seconds during a continuing
+session; peer lease and declared-scope observations are checked at tool and
+prompt boundaries. Recovery-only checks remain unknown in the compact view;
+use focused or full broker status for detailed evidence.

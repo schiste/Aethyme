@@ -36,7 +36,7 @@ fn evidence_cap_enabled() -> bool {
 /// Cap the evidence of every advice entry in `document["advice"]` (the full
 /// and `--summary` documents) and in `document["session"]["advice"]`.
 /// Returns how many entries were truncated.
-pub(super) fn cap_document_advice_evidence(document: &mut Value) -> usize {
+pub(crate) fn cap_document_advice_evidence(document: &mut Value) -> usize {
     if !evidence_cap_enabled() {
         return 0;
     }
@@ -125,7 +125,7 @@ fn truncate_text(text: &str, limit: usize) -> String {
 /// reaches the network: the pull request comes from the broker's own watch
 /// records, and mergeability and required checks, which it does not record,
 /// are reported unknown rather than fetched.
-pub(super) fn session_block(
+pub(crate) fn session_block(
     broker: &crate::Broker,
     session_id: i64,
     session_advice: &[crate::StatusAdvice],

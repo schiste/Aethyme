@@ -29,7 +29,7 @@ mod service;
 mod session;
 mod status;
 mod status_compact;
-mod status_extras;
+pub(crate) mod status_extras;
 mod status_revision;
 mod submit;
 mod surface;

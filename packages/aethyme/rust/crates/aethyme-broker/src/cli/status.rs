@@ -261,11 +261,15 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                 "holder_session_id": request.holder_session_id, "path": request.path
             })).collect();
         let count = requests.len();
+        let peers = crate::agent_hook::session_peer_view(&broker, session_id)?;
+        let global = crate::agent_hook::session_global_view(&broker, session_id);
         let mut value = serde_json::json!({
             "schema": "aethyme.broker-session-view/v1",
             "session": block,
+            "peer_state": peers,
+            "global_state": global,
             "lease_release_requests": {"count": count, "omitted_count": count.saturating_sub(10), "records": requests.into_iter().take(10).collect::<Vec<_>>()},
-            "data_freshness": {"global_warnings": "not_inspected", "peer_state": "not_inspected", "ownership_claims": "not_inspected", "session_advice": "partial", "deferred_checks_are_unknown": true},
+            "data_freshness": {"global_warnings": "recorded_partial", "peer_state": "recorded_only", "ownership_claims": "not_inspected", "session_advice": "partial", "deferred_checks_are_unknown": true},
             "drilldown": {"focused_status": format!("aethyme broker status --session {session_id} --json"), "full_status": "aethyme broker status --full --json"}
         });
         super::status_extras::cap_document_advice_evidence(&mut value);

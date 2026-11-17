@@ -1,0 +1,8 @@
+{
+  "name": "aethyme",
+  "version": "0.1.2",
+  "description": "Broker coordination and incremental session context for agents.",
+  "author": { "name": "Aethyme" },
+  "homepage": "https://github.com/schiste/Aethyme/tree/main/packages/aethyme/plugins/aethyme",
+  "hooks": "./hooks/hooks.json"
+}

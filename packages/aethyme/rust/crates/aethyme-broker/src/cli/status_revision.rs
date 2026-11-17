@@ -11,6 +11,8 @@ const SECTIONS: &[&str] = &[
     "advice",
     "waiters",
     "session_contexts",
+    "peer_state",
+    "global_state",
     "collaboration_fence",
     "lease_release_requests",
     "coordinated_operations",
