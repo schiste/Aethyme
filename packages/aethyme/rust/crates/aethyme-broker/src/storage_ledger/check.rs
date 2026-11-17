@@ -1,17 +1,21 @@
 //! The start-of-command check, the detached worker and its lock.
 //!
 //! Every broker command calls [`command_start`]: one `statvfs` per root and a
-//! read of the small summary file, never a walk. Below a floor or over a
-//! budget it starts the worker detached (at most once a minute) and, for
-//! commands that need space now (`start`, preparation, gates), first removes
-//! what the last pass already proved removable and refuses only if the
-//! volume is still below its floor.
+//! read of two small files (the summary and the worker lock), never a walk
+//! and never `ps`. Over a budget or below a floor it starts the worker
+//! detached, at most once a minute and never while a worker is alive. Only
+//! commands on an explicit list of writers (`start`, a bare `submit`, a bare
+//! `submit prepare`) may refuse, only for the volumes they write to, and
+//! only below the hard minimum after a bounded reclaim (time and bytes)
+//! failed; between the minimum and the floor they proceed and advice warns.
 //!
 //! The worker holds `<host state>/storage-worker.lock`, a record of its pid,
-//! start time and heartbeat. A lock whose owner is gone (pid not running, or
-//! running with another start time) or whose heartbeat stopped for longer
-//! than [`STALE_HEARTBEAT`] is taken over; the old owner checks its token
-//! before every removal and stops once it lost the lock.
+//! start time and heartbeat. Every walk and deletion refreshes the
+//! heartbeat at least every second, so a lock is taken over only when its
+//! owner is gone (pid not running, or running with another start time) or
+//! its heartbeat stopped for [`STALE_HEARTBEAT`], far longer than any step
+//! between two refreshes; the old owner checks its token at every refresh
+//! and stops once it lost the lock, so two workers never walk at once.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -21,14 +25,14 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::evict::{self, Candidate, Reason};
+use super::evict::{self, Candidate, Reason, duration_ms};
 use super::{
-    Budgets, Class, Ledger, PassReport, Root, RootKind, SUMMARY_FILE, Volume, now_ms,
-    write_atomically,
+    Budgets, Class, Ledger, PassReport, Root, RootKind, STORAGE_ROOT_MARKER, SUMMARY_FILE, Volume,
+    now_ms, write_atomically,
 };
 
 pub const LOCK_FILE: &str = "storage-worker.lock";
-/// Storage roots registered by repositories (`<host state>/storage-roots.json`).
+/// Roots registered by repositories and adoptions (`<host state>/storage-roots.json`).
 pub const ROOTS_FILE: &str = "storage-roots.json";
 /// Repositories' configured gate cache budgets
 /// (`<host state>/storage-gate-budgets.json`).
@@ -38,6 +42,8 @@ const KICK_EVERY: Duration = Duration::from_secs(60);
 const REFRESH_EVERY: Duration = Duration::from_secs(10 * 60);
 const MEASURE_BUDGET: Duration = Duration::from_secs(60);
 const PACE: Duration = Duration::from_millis(200);
+/// Reclaim at command start stops after this long.
+pub const RECLAIM_TIME: Duration = Duration::from_millis(500);
 
 /// What a command reads at start.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,8 +54,10 @@ pub struct Summary {
     pub unclassified_bytes: u64,
     pub unclassified_entries: u64,
     pub floor_bytes: u64,
-    /// Removals the last pass proved safe but did not do (paced or within
-    /// budget then), for a command that needs space now.
+    #[serde(default)]
+    pub hard_minimum_bytes: u64,
+    /// Removals the last pass found eligible, for a command short of space;
+    /// each is re-checked before removal.
     pub reclaimable: Vec<Reclaimable>,
     pub unlanded_archives: Vec<String>,
     pub last_kick_ms: u64,
@@ -82,65 +90,94 @@ impl Summary {
     }
 }
 
-/// The roots: host state, host cache, and registered storage roots.
+/// A registered root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Registered {
+    path: PathBuf,
+    kind: RootKind,
+}
+
+fn registered(host_state: &Path) -> Vec<Registered> {
+    fs::read(host_state.join(ROOTS_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// The roots: host state and host cache (exact), registered worktree roots
+/// (exact configured paths), and storage roots that carry the marker.
 pub fn roots(host_state: &Path, host_cache: Option<&Path>) -> Vec<Root> {
     let mut roots = vec![Root {
         path: host_state.to_path_buf(),
         kind: RootKind::HostState,
     }];
-    if let Some(cache) = host_cache {
+    if let Some(cache) = host_cache.filter(|cache| cache.is_dir()) {
         roots.push(Root {
             path: cache.to_path_buf(),
             kind: RootKind::HostCache,
         });
     }
-    let registered: Vec<PathBuf> = fs::read(host_state.join(ROOTS_FILE))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
-    for path in registered {
-        if path.is_dir() && !roots.iter().any(|root| root.path == path) {
+    for entry in registered(host_state) {
+        let usable = entry.path.is_dir()
+            && !roots.iter().any(|root| root.path == entry.path)
+            && match entry.kind {
+                RootKind::Storage => entry.path.join(STORAGE_ROOT_MARKER).is_file(),
+                RootKind::WorktreeRoot => true,
+                RootKind::HostState | RootKind::HostCache => false,
+            };
+        if usable {
             roots.push(Root {
-                path,
-                kind: RootKind::Storage,
+                path: entry.path,
+                kind: entry.kind,
             });
         }
     }
     roots
 }
 
-/// A storage root for a repository's worktree root or preparation cache:
-/// its parent, when that parent is an Aethyme directory (so siblings that are
-/// not Aethyme's are never inventoried).
-pub fn storage_root_for(path: &Path) -> Option<PathBuf> {
-    let parent = path.parent()?;
-    let name = parent.file_name()?.to_str()?;
-    name.to_ascii_lowercase()
-        .contains("aethyme")
-        .then(|| parent.to_path_buf())
+/// Remember an exact root (a no-op when already known).
+pub fn register_root(host_state: &Path, path: &Path, kind: RootKind) {
+    let file = host_state.join(ROOTS_FILE);
+    let mut known = registered(host_state);
+    if known.iter().any(|entry| entry.path == path) || path == host_state {
+        return;
+    }
+    known.push(Registered {
+        path: path.to_path_buf(),
+        kind,
+    });
+    crate::warn_unrecorded(
+        "register a storage root",
+        serde_json::to_vec(&known)
+            .map_err(io::Error::other)
+            .and_then(|bytes| write_atomically(&file, &bytes)),
+    );
 }
 
-/// Remember storage roots (cheap; a no-op when already known).
-pub fn register_storage_roots(host_state: &Path, paths: &[PathBuf]) {
-    let file = host_state.join(ROOTS_FILE);
-    let mut known: Vec<PathBuf> = fs::read(&file)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
-    let before = known.len();
-    for path in paths {
-        if path != host_state && !known.contains(path) {
-            known.push(path.clone());
-        }
+/// Adopt a directory as a storage root: write the marker and register it.
+/// Refused for a repository's `.aethyme/`, a repository checkout, or a
+/// path inside one.
+pub fn adopt(host_state: &Path, path: &Path) -> Result<PathBuf, String> {
+    let path = fs::canonicalize(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if !path.is_dir() {
+        return Err(format!("{} is not a directory", path.display()));
     }
-    if known.len() != before {
-        crate::warn_unrecorded(
-            "register a storage root",
-            serde_json::to_vec(&known)
-                .map_err(io::Error::other)
-                .and_then(|bytes| write_atomically(&file, &bytes)),
-        );
+    if path.ancestors().any(|ancestor| {
+        ancestor.file_name().is_some_and(|name| name == ".aethyme")
+            || ancestor.join(".git").exists()
+    }) {
+        return Err(format!(
+            "{} is a repository or inside one; a repository's `.aethyme/` is never a storage root",
+            path.display()
+        ));
     }
+    fs::write(
+        path.join(STORAGE_ROOT_MARKER),
+        "This directory is an Aethyme storage root (`aethyme storage adopt`).\n",
+    )
+    .map_err(|error| error.to_string())?;
+    register_root(host_state, &path, RootKind::Storage);
+    Ok(path)
 }
 
 /// Remember a repository's configured gate cache budget (a no-op when
@@ -194,9 +231,9 @@ fn total_bytes(_path: &Path) -> Option<u64> {
 /// What the start-of-command check decided.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Decision {
-    /// The worker was (or should be) started.
+    /// The worker was started.
     pub kick: bool,
-    /// Roots whose volume is below the floor.
+    /// Roots whose volume is below the floor (warn) or the hard minimum.
     pub below_floor: Vec<(RootKind, u64)>,
     /// Bytes removed at once for a command that needs space.
     pub reclaimed: u64,
@@ -204,29 +241,53 @@ pub struct Decision {
     pub refuse: Option<String>,
 }
 
-/// Whether a broker command needs free space now (and so may reclaim and
-/// refuse).
-pub fn needs_space(args: &[String]) -> bool {
-    match args.first().map(String::as_str) {
-        Some("start" | "gate" | "gates") => true,
-        Some("submit") => true,
-        _ => args.iter().any(|arg| arg == "prepare"),
+/// The volumes a broker command writes to, from an explicit list of
+/// writers: `start` (the worktree root), a bare `submit` (gates: the host
+/// cache), a bare `submit prepare` (preparation: storage roots). Every other
+/// command, `submit prepare status` included, writes none and never refuses.
+pub fn writes_to(args: &[String]) -> Vec<RootKind> {
+    let words: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .take_while(|arg| !arg.starts_with('-'))
+        .collect();
+    match words.as_slice() {
+        ["start"] => vec![RootKind::WorktreeRoot, RootKind::HostState],
+        ["submit"] => vec![RootKind::HostCache],
+        ["submit", "prepare"] => vec![RootKind::Storage, RootKind::HostState],
+        _ => Vec::new(),
     }
 }
 
+/// Whether a live worker holds the lock (read from the lock file only).
+fn worker_alive(host_state: &Path) -> bool {
+    fs::read(host_state.join(LOCK_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<LockRecord>(&bytes).ok())
+        .is_some_and(|record| {
+            now_ms().saturating_sub(record.heartbeat_ms) <= duration_ms(STALE_HEARTBEAT)
+        })
+}
+
 /// The O(1) check: `free` reads a volume's free bytes, `kick` starts the
-/// worker. Reads only the summary file.
+/// worker. Reads only the summary and lock files.
 pub fn decide(
     host_state: &Path,
-    needs_space: bool,
+    writes: &[RootKind],
     free: &mut dyn FnMut(&Path) -> Option<u64>,
     kick: &mut dyn FnMut(),
 ) -> Decision {
     let mut summary = Summary::load(host_state);
+    let defaults = Budgets::default();
     let floor = if summary.floor_bytes == 0 {
-        Budgets::default().free_floor_bytes
+        defaults.free_floor_bytes
     } else {
         summary.floor_bytes
+    };
+    let minimum = if summary.hard_minimum_bytes == 0 {
+        defaults.hard_minimum_bytes
+    } else {
+        summary.hard_minimum_bytes
     };
     let mut decision = Decision::default();
     let roots = if summary.roots.is_empty() {
@@ -249,28 +310,46 @@ pub fn decide(
     let now = now_ms();
     let stale = now.saturating_sub(summary.updated_at_ms) > duration_ms(REFRESH_EVERY);
     let wanted = stale || !decision.below_floor.is_empty() || !summary.over_budget.is_empty();
+    // One spawn a minute at most, and never while a worker runs.
     let recently_kicked = now.saturating_sub(summary.last_kick_ms) < duration_ms(KICK_EVERY);
-    if wanted && (!recently_kicked || !decision.below_floor.is_empty()) {
+    if wanted && !recently_kicked && !worker_alive(host_state) {
         kick();
         decision.kick = true;
         summary.last_kick_ms = now;
         crate::warn_unrecorded("record a storage worker start", summary.save(host_state));
     }
-    if !needs_space || decision.below_floor.is_empty() {
+    // Only a writer, only for the volumes it writes, only below the minimum.
+    let written: Vec<&Root> = roots
+        .iter()
+        .filter(|root| writes.contains(&root.kind))
+        .collect();
+    let short = |free: &mut dyn FnMut(&Path) -> Option<u64>, root: &Root| {
+        free(&root.path).is_some_and(|available| available < minimum)
+    };
+    if !written.iter().any(|root| short(free, root)) {
         return decision;
     }
-    // Space is needed now: remove what the last pass proved removable,
-    // regenerable classes first, until every volume is above its floor.
+    // Bounded reclaim: regenerable data the last pass found, oldest first,
+    // for at most RECLAIM_TIME and only on the short volumes.
+    let started = Instant::now();
     let registry = host_state.join("host-resources.db");
     let leases = evict::leased_gate_caches(&registry);
     let mut reclaimable = summary.reclaimable.clone();
-    reclaimable.sort_by_key(|entry| (entry.class == Class::RecoveryArchives, entry.newest_ms));
+    reclaimable.sort_by_key(|entry| entry.newest_ms);
     for entry in reclaimable {
-        let short = roots.iter().any(|root| {
-            free(&root.path).is_some_and(|available| available < floor)
-                && root.kind == entry.root_kind
-        });
-        if !short {
+        if started.elapsed() >= RECLAIM_TIME {
+            break;
+        }
+        let Some(root) = roots.iter().find(|root| root.path == entry.root) else {
+            continue;
+        };
+        if super::device_of(&root.path).is_none() || !short(free, root) {
+            continue;
+        }
+        let shares_volume = written
+            .iter()
+            .any(|written| super::device_of(&written.path) == super::device_of(&root.path));
+        if !shares_volume {
             continue;
         }
         let candidate = Candidate {
@@ -282,41 +361,39 @@ pub fn decide(
             newest_ms: entry.newest_ms,
             reason: Reason::OverBudget,
         };
-        if evict::refuse(&candidate, leases.as_ref()).is_none()
-            && evict::remove_protected(&candidate, &registry).is_ok()
+        if evict::refuse(&candidate, leases.as_ref(), now).is_none()
+            && evict::remove_protected(&candidate, &registry, &mut || {}).is_ok()
         {
             decision.reclaimed += entry.bytes;
         }
     }
-    let still_short: Vec<String> = roots
+    let still_short: Vec<String> = written
         .iter()
         .filter_map(|root| {
             free(&root.path)
-                .filter(|available| *available < floor)
+                .filter(|available| *available < minimum)
                 .map(|available| {
                     format!(
-                        "{} has {} free, below the {} floor",
+                        "the {} volume has {} free, below the {} minimum",
                         super::root_kind_name(root.kind),
                         human(available),
-                        human(floor)
+                        human(minimum)
                     )
                 })
         })
         .collect();
     if !still_short.is_empty() {
         decision.refuse = Some(format!(
-            "not enough free disk space: {} (removed {} of regenerable data first). Free space \
-             on that volume, or see `aethyme storage status` for what Aethyme holds and why it \
-             is kept",
+            "not enough free disk space for this command: {} (removed {} of regenerable data \
+             first; the storage worker continues). Free space on that volume, lower \
+             `hard_minimum_bytes` in <host state>/storage.toml [budget], or set \
+             AETHYME_STORAGE_LEDGER=0 to skip this check; `aethyme storage status` shows what \
+             Aethyme holds",
             still_short.join("; "),
             human(decision.reclaimed)
         ));
     }
     decision
-}
-
-fn duration_ms(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 pub fn human(bytes: u64) -> String {
@@ -334,24 +411,6 @@ pub fn human(bytes: u64) -> String {
     }
 }
 
-/// The check every broker command runs first. `None` to continue; an exit
-/// code after a refusal.
-pub fn command_start(args: &[String]) -> Option<u8> {
-    let host_state = crate::host_state::default_host_state_dir()?;
-    if !host_state.is_dir() || !enabled(&host_state) {
-        return None;
-    }
-    let decision = decide(
-        &host_state,
-        needs_space(args),
-        &mut |path| crate::disk_headroom::available_bytes(path),
-        &mut || crate::warn_unrecorded("start the storage worker", spawn_worker()),
-    );
-    let refusal = decision.refuse?;
-    eprintln!("Error: {refusal}");
-    Some(crate::exit_status::ENVIRONMENT)
-}
-
 /// The variable that turns the ledger on (`1`) or off (`0`); by default it
 /// is on except for a host state directory under the system temporary
 /// directory (test fixtures and scratch runs).
@@ -367,9 +426,27 @@ pub fn enabled(host_state: &Path) -> bool {
     }
 }
 
-/// Start `aethyme storage worker` detached, in its own session. Only the
-/// `aethyme` executable starts it (never a test harness or another binary
-/// linking the broker).
+/// The check every broker command runs first. `None` to continue; an exit
+/// code after a refusal.
+pub fn command_start(args: &[String]) -> Option<u8> {
+    let host_state = crate::host_state::default_host_state_dir()?;
+    if !host_state.is_dir() || !enabled(&host_state) {
+        return None;
+    }
+    let decision = decide(
+        &host_state,
+        &writes_to(args),
+        &mut |path| crate::disk_headroom::available_bytes(path),
+        &mut || crate::warn_unrecorded("start the storage worker", spawn_worker()),
+    );
+    let refusal = decision.refuse?;
+    eprintln!("Error: {refusal}");
+    Some(crate::exit_status::ENVIRONMENT)
+}
+
+/// Start `aethyme storage worker` detached, in its own process group. Only
+/// the `aethyme` executable starts it (never a test harness or another
+/// binary linking the broker).
 pub fn spawn_worker() -> io::Result<()> {
     let executable = std::env::current_exe()?;
     if executable.file_name().and_then(|name| name.to_str()) != Some("aethyme") {
@@ -387,10 +464,39 @@ pub fn spawn_worker() -> io::Result<()> {
         command.process_group(0);
     }
     let child = command.spawn()?;
-    // Not waited for: it outlives this command. Its exit is reaped by init
-    // once this process ends.
+    // Not waited for: it outlives this command.
     std::mem::forget(child);
     Ok(())
+}
+
+/// Lower this process's CPU and I/O priority (best effort).
+pub fn lower_priority() {
+    #[cfg(unix)]
+    {
+        // SAFETY: setpriority takes no pointers; it changes this process's
+        // nice value.
+        let _niced = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 10) };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // ioprio_set(IOPRIO_WHO_PROCESS = 1, self, IOPRIO_CLASS_IDLE = 3 << 13).
+        // SAFETY: a raw syscall with integer arguments only.
+        let _idle = unsafe { libc::syscall(libc::SYS_ioprio_set, 1, 0, 3 << 13) };
+    }
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn setiopolicy_np(
+                iotype: libc::c_int,
+                scope: libc::c_int,
+                policy: libc::c_int,
+            ) -> libc::c_int;
+        }
+        // IOPOL_TYPE_DISK = 0, IOPOL_SCOPE_PROCESS = 0, IOPOL_THROTTLE = 3
+        // (<sys/resource.h>).
+        // SAFETY: integer arguments only; it changes this process's policy.
+        let _throttled = unsafe { setiopolicy_np(0, 0, 3) };
+    }
 }
 
 /// The worker lock record.
@@ -433,6 +539,7 @@ pub fn owner_state(pid: u32, started: &str) -> Owner {
 pub struct WorkerLock {
     path: PathBuf,
     record: LockRecord,
+    lost: bool,
 }
 
 impl WorkerLock {
@@ -456,25 +563,25 @@ impl WorkerLock {
                 Ok(mut file) => {
                     let bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
                     io::Write::write_all(&mut file, &bytes).map_err(|error| error.to_string())?;
-                    return Ok(Self { path, record });
+                    return Ok(Self {
+                        path,
+                        record,
+                        lost: false,
+                    });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     let held: Option<LockRecord> = fs::read(&path)
                         .ok()
                         .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-                    let takeover = match &held {
-                        None => true,
-                        Some(held) => {
-                            owner_state(held.pid, &held.started) == Owner::Gone
-                                || now_ms().saturating_sub(held.heartbeat_ms)
-                                    > duration_ms(STALE_HEARTBEAT)
+                    if let Some(held) = &held {
+                        let gone = owner_state(held.pid, &held.started) == Owner::Gone;
+                        let stalled = now_ms().saturating_sub(held.heartbeat_ms)
+                            > duration_ms(STALE_HEARTBEAT);
+                        if !gone && !stalled {
+                            return Err(format!("worker pid {} holds the storage lock", held.pid));
                         }
-                    };
-                    if !takeover {
-                        let held = held.expect("checked above");
-                        return Err(format!("worker pid {} holds the storage lock", held.pid));
                     }
-                    // Remove the stale record and race for a fresh one.
+                    // Remove the dead or stalled record and race for a fresh one.
                     crate::warn_unrecorded(
                         "take over the storage worker lock",
                         fs::remove_file(&path),
@@ -486,9 +593,11 @@ impl WorkerLock {
         Err("the storage worker lock changed hands while taking it over".into())
     }
 
-    /// Refresh the heartbeat; false when the lock was taken over.
+    /// Refresh the heartbeat; false (and from then on) when the lock was
+    /// taken over.
     pub fn beat(&mut self) -> bool {
-        if !self.held() {
+        if self.lost || !self.held() {
+            self.lost = true;
             return false;
         }
         self.record.heartbeat_ms = now_ms();
@@ -504,6 +613,10 @@ impl WorkerLock {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<LockRecord>(&bytes).ok())
             .is_some_and(|record| record.token == self.record.token)
+    }
+
+    pub fn lost(&self) -> bool {
+        self.lost
     }
 }
 
@@ -537,16 +650,26 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
         started_at_ms: now_ms(),
         ..PassReport::default()
     };
+    let mut lock = lock;
+    let mut beat = || {
+        if let Some(lock) = lock.as_deref_mut() {
+            lock.beat();
+        }
+    };
     let mut ledger = Ledger::load(inputs.host_state);
     ledger.roots = inputs.roots.clone();
     for root in &ledger.roots {
-        evict::sweep_aside(&root.path);
+        evict::sweep_aside(&root.path, &mut beat);
     }
     let mut phase = Instant::now();
     super::discover(&mut ledger);
     report.phases_ms.insert("discover".into(), elapsed(phase));
     phase = Instant::now();
-    report.measured = super::measure_some(&mut ledger, inputs.measure_budget);
+    let dirty = super::take_dirty(inputs.host_state, &ledger.roots);
+    let (measured, resumable) =
+        super::measure_some(&mut ledger, inputs.measure_budget, &dirty, &mut beat);
+    report.measured = measured;
+    report.resumable = resumable;
     report.phases_ms.insert("measure".into(), elapsed(phase));
 
     // Volumes and pressure.
@@ -599,7 +722,6 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
     let mut class_bytes = ledger.class_bytes();
     let mut gate_bytes = evict::gate_cache_by_repository(&ledger);
     let mut root_bytes = ledger.root_bytes();
-    let mut lock = lock;
     for candidate in candidates {
         let still_needed = match candidate.reason {
             Reason::Expired => true,
@@ -622,22 +744,25 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
         if !still_needed {
             continue;
         }
-        if let Some(lock) = lock.as_deref_mut()
-            && !lock.beat()
-        {
+        if lock.as_deref().is_some_and(WorkerLock::lost) {
             report
                 .skipped
                 .push("the storage worker lock was taken over".into());
             break;
         }
-        if let Some(why) = evict::refuse(&candidate, leases.as_ref()) {
+        if let Some(why) = evict::refuse(&candidate, leases.as_ref(), now) {
             if candidate.class == Class::RecoveryArchives && why.starts_with("unlanded") {
                 report.unlanded_archives.push(candidate.relative.clone());
             }
             report.skipped.push(format!("{}: {why}", candidate.label()));
             continue;
         }
-        match evict::remove_protected(&candidate, &inputs.registry) {
+        let mut beat = || {
+            if let Some(lock) = lock.as_deref_mut() {
+                lock.beat();
+            }
+        };
+        match evict::remove_protected(&candidate, &inputs.registry, &mut beat) {
             Ok(()) => {
                 report.evicted.push(candidate.label());
                 report.bytes_reclaimed += candidate.bytes;
@@ -686,18 +811,28 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
         updated_at_ms: ledger.updated_at_ms,
         roots: ledger.roots.clone(),
         over_budget: ledger.over_budget(&inputs.budgets),
-        unclassified_bytes: unclassified.iter().map(|item| item.bytes).sum(),
+        unclassified_bytes: unclassified
+            .iter()
+            .filter(|item| item.measured)
+            .map(|item| item.bytes)
+            .sum(),
         unclassified_entries: unclassified.len() as u64,
         floor_bytes: floor,
+        hard_minimum_bytes: inputs.budgets.hard_minimum_bytes,
         // What a command short of space may remove at once: regenerable
         // data only (never an archive), still re-checked before removal.
         reclaimable: evict::plan(
             &ledger,
             &inputs.budgets,
             now_ms(),
-            &[RootKind::HostState, RootKind::HostCache, RootKind::Storage]
-                .into_iter()
-                .collect(),
+            &[
+                RootKind::HostState,
+                RootKind::HostCache,
+                RootKind::WorktreeRoot,
+                RootKind::Storage,
+            ]
+            .into_iter()
+            .collect(),
         )
         .into_iter()
         .filter(|candidate| candidate.class != Class::RecoveryArchives)
@@ -723,22 +858,18 @@ fn forget(ledger: &mut Ledger, candidate: &Candidate) {
         Some((name, child)) => (name, Some(child)),
         None => (candidate.relative.as_str(), None),
     };
-    for item in &mut ledger.items {
-        if item.root != candidate.root || item.name != name {
-            continue;
-        }
-        match child {
-            None => item.bytes = 0,
-            Some(child) => {
-                item.children.retain(|entry| entry.name != child);
-                item.bytes = item.bytes.saturating_sub(candidate.bytes);
+    match child {
+        None => ledger
+            .items
+            .retain(|item| !(item.root == candidate.root && item.name == name)),
+        Some(child) => {
+            for item in &mut ledger.items {
+                if item.root == candidate.root && item.name == name {
+                    item.children.retain(|entry| entry.name != child);
+                    item.bytes = item.bytes.saturating_sub(candidate.bytes);
+                }
             }
         }
-    }
-    if child.is_none() {
-        ledger
-            .items
-            .retain(|item| !(item.root == candidate.root && item.name == name));
     }
 }
 
@@ -746,11 +877,13 @@ fn elapsed(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// The detached worker: take the lock and run one pass over this host.
+/// The detached worker: lower its priority, take the lock and run one pass
+/// over this host.
 pub fn run_worker_pass() -> Result<Ledger, String> {
     let host_state = crate::host_state::default_host_state_dir()
         .ok_or("the host state directory cannot be resolved")?;
     let host_cache = crate::host_state::default_host_cache_dir();
+    lower_priority();
     let mut lock = WorkerLock::acquire(&host_state)?;
     let (budgets, _) = Budgets::load(&host_state);
     let inputs = PassInputs {

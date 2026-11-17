@@ -1,29 +1,29 @@
 //! One ledger of everything Aethyme stores on a host, with a hard budget per
 //! class, a total per root and a free-space floor per volume.
 //!
-//! Aethyme writes in three kinds of root: the host state directory, the host
-//! cache directory, and storage roots (the `Aethyme` directory that holds a
-//! repository's worktree root or preparation cache, often on another volume).
-//! Every top-level entry of a root is classified by name ([`classify`]);
-//! anything that does not match one of Aethyme's own names is
-//! `unclassified`, listed with its size and never deleted.
+//! Roots are exact paths, never guessed from names: the host state directory,
+//! the host cache directory, each repository's configured worktree root (as
+//! its broker registers it), and storage directories an owner adopted with
+//! `aethyme storage adopt`, which writes the [`STORAGE_ROOT_MARKER`] a root
+//! must carry. A repository's `.aethyme/` is never a root.
+//!
+//! Inside a root, a top-level entry gets a class only by an exact name, or an
+//! exact generated pattern with a validated suffix, and only in the one kind
+//! of root where Aethyme creates it ([`classify`]). Anything else is
+//! `unclassified`: listed, never deleted.
 //!
 //! Sizes are never measured inside a command. The detached worker
-//! ([`check::run_worker_pass`]) re-measures a few entries per pass, round
-//! robin, and persists the result in `<host state>/storage-ledger.json`; a
-//! small summary beside it is all a command reads ([`check::command_start`]),
-//! so `aethyme storage status` and the start-of-command check cost
-//! milliseconds and never walk a tree.
-//!
-//! Classes that are checkout removal (worktrees and their recovery copies)
-//! belong to another component and are only measured here. Deletion sites and
-//! why each is safe are in [`evict`].
+//! ([`check::run_worker_pass`]) measures evictable entries with a deadline
+//! checked inside the walk and a persisted, resumable cursor; it never
+//! crosses a mount point and never walks a class it does not remove
+//! (worktrees are counted from their directory entries only). A small
+//! summary is all a command reads ([`check::command_start`]).
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -39,10 +39,18 @@ pub const LEDGER_FILE: &str = "storage-ledger.json";
 pub const SUMMARY_FILE: &str = "storage-ledger-summary.json";
 /// Optional owner overrides of the budgets.
 pub const BUDGET_FILE: &str = "storage.toml";
-const LEDGER_SCHEMA: u32 = 1;
+/// Producers' notes of entries they wrote (`<host state>/storage-ledger-dirty`).
+pub const DIRTY_DIRECTORY: &str = "storage-ledger-dirty";
+/// The file `aethyme storage adopt` writes into a storage root.
+pub const STORAGE_ROOT_MARKER: &str = ".aethyme-storage-root";
+const LEDGER_SCHEMA: u32 = 2;
 const GIB: u64 = 1024 * 1024 * 1024;
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 const HOUR: Duration = Duration::from_secs(60 * 60);
+/// Directory entries counted for a class that is not walked.
+const COUNT_LIMIT: u64 = 100_000;
+/// How often a walk refreshes the worker's heartbeat.
+pub(crate) const BEAT_EVERY: Duration = Duration::from_secs(1);
 
 /// What a top-level entry is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -89,13 +97,17 @@ impl Class {
 pub enum RootKind {
     HostState,
     HostCache,
+    /// A repository's configured worktree root.
+    WorktreeRoot,
+    /// A directory an owner adopted (it carries [`STORAGE_ROOT_MARKER`]).
     Storage,
 }
 
 /// How a class is kept within its budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
-    /// Never deleted here: owned by another component, or live state.
+    /// Never deleted here, and never walked: owned by another component, or
+    /// live state, or not Aethyme's.
     ReportOnly(&'static str),
     /// Children are evicted least recently used first while the class is
     /// over budget, except those used within `idle`; children older than
@@ -109,58 +121,103 @@ pub enum Policy {
     /// Over budget, every entry but the most recently used one per gate
     /// kind goes; an entry with a live lease is never touched.
     GateCache,
-    /// Oldest first, only archives whose content is proven landed in Git or
-    /// that are older than the retention.
+    /// Over budget, oldest first, only archives proven landed and past their
+    /// recorded minimum retention; never by age alone.
     RecoveryArchives,
+}
+
+fn all(text: &str, allowed: impl Fn(char) -> bool) -> bool {
+    !text.is_empty() && text.chars().all(allowed)
+}
+
+/// `<major>.<minor>.<patch>` followed by `-` tokens of `[A-Za-z0-9.]`.
+fn versioned_suffix(rest: &str) -> bool {
+    let (version, tail) = match rest.split_once('-') {
+        Some((version, tail)) => (version, Some(tail)),
+        None => (rest, None),
+    };
+    let parts: Vec<&str> = version.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|part| all(part, |c| c.is_ascii_digit()))
+        && tail.is_none_or(|tail| {
+            tail.split('-')
+                .all(|token| all(token, |c| c.is_ascii_alphanumeric() || c == '.'))
+        })
+}
+
+/// `aethyme-broker-quick-test-<pid>-<time>-<16 hex>`: the worktree container
+/// of a broker quick-test fixture repository.
+pub fn is_quick_test_pool(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("aethyme-broker-quick-test-") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('-').collect();
+    parts.len() == 3
+        && all(parts[0], |c| c.is_ascii_digit())
+        && all(parts[1], |c| c.is_ascii_digit())
+        && parts[2].len() == 16
+        && all(parts[2], |c| matches!(c, '0'..='9' | 'a'..='f'))
 }
 
 /// The class of the top-level entry `name` in a root of `kind`.
 pub fn classify(kind: RootKind, name: &str) -> Class {
-    let starts = |prefix: &str| name.starts_with(prefix);
-    if name.contains("-quick-test-") {
-        return Class::QuickTestPools;
-    }
     match kind {
-        RootKind::HostState => match name {
-            "recovery-archives" => Class::RecoveryArchives,
-            "qualification-retained" => Class::QualificationRetained,
-            "worktrees" => Class::Worktrees,
-            _ if starts("preparation-cache") && !name.contains("activity") => {
-                Class::PreparationCache
-            }
-            _ if starts("worktree-roots-") || starts("worktree-watch") => Class::Worktrees,
-            _ if starts("rollout-v")
-                || starts("rollout-prep-")
-                || starts("rollout-before-files-")
-                || starts("preupgrade-db-backup-") =>
+        RootKind::HostState => {
+            if let Some(rest) = [
+                "rollout-v",
+                "rollout-prep-v",
+                "rollout-before-files-v",
+                "preupgrade-db-backup-v",
+            ]
+            .iter()
+            .find_map(|prefix| name.strip_prefix(prefix))
+                && versioned_suffix(rest)
             {
-                Class::RolloutArtifacts
+                return Class::RolloutArtifacts;
             }
-            _ if starts("release-") => Class::ReleaseArtifacts,
-            "collaboration"
-            | "console-markers"
-            | "environments"
-            | "environments.db"
-            | "gate-trust"
-            | "gc-sweep-services"
-            | "host-operations.db"
-            | "host-resources.db"
-            | "operation-locks"
-            | "preparation-cache-activity"
-            | "preparation-rotation-recovery"
-            | "rollout-holds"
-            | "run"
-            | "watch-services"
-            | "mcp"
-            | LEDGER_FILE
-            | SUMMARY_FILE
-            | BUDGET_FILE
-            | check::LOCK_FILE
-            | check::ROOTS_FILE
-            | check::GATE_BUDGETS_FILE => Class::Coordination,
-            _ if name.starts_with("host-") && name.contains(".db") => Class::Coordination,
-            _ => Class::Unclassified,
-        },
+            if let Some(rest) = ["release-assets-v", "release-recovery-v"]
+                .iter()
+                .find_map(|prefix| name.strip_prefix(prefix))
+                && versioned_suffix(rest)
+            {
+                return Class::ReleaseArtifacts;
+            }
+            if let Some(hash) = name.strip_prefix("worktree-roots-")
+                && hash.len() == 64
+                && all(hash, |c| c.is_ascii_hexdigit())
+            {
+                return Class::Worktrees;
+            }
+            match name {
+                "recovery-archives" => Class::RecoveryArchives,
+                "qualification-retained" => Class::QualificationRetained,
+                "preparation-cache" => Class::PreparationCache,
+                "worktrees" | "worktree-watch-v1" | "worktree-watch-v2" => Class::Worktrees,
+                "collaboration"
+                | "console-markers"
+                | "environments"
+                | "environments.db"
+                | "gate-trust"
+                | "gc-sweep-services"
+                | "host-operations.db"
+                | "host-resources.db"
+                | "operation-locks"
+                | "preparation-cache-activity"
+                | "preparation-rotation-recovery"
+                | "rollout-holds"
+                | "run"
+                | "watch-services"
+                | "mcp"
+                | LEDGER_FILE
+                | SUMMARY_FILE
+                | BUDGET_FILE
+                | DIRTY_DIRECTORY
+                | check::LOCK_FILE
+                | check::ROOTS_FILE
+                | check::GATE_BUDGETS_FILE => Class::Coordination,
+                _ => Class::Unclassified,
+            }
+        }
         RootKind::HostCache => match name {
             "gates" => Class::GateCache,
             "symbol-index" => Class::SymbolIndex,
@@ -169,25 +226,33 @@ pub fn classify(kind: RootKind, name: &str) -> Class {
             "worktrees" => Class::Worktrees,
             _ => Class::Unclassified,
         },
-        RootKind::Storage => match name {
-            "worktrees" | "checkout-preserved" => Class::Worktrees,
-            _ if starts("worktrees-recovery-") => Class::Worktrees,
-            "qualification-retained" => Class::QualificationRetained,
-            "build-cache"
-            | "cache"
-            | "task-caches"
-            | "private-caches"
-            | "private-pnpm-stores"
-            | "private-stores"
-            | "target" => Class::ToolCaches,
-            _ if starts("uv-cache-") => Class::ToolCaches,
-            _ if starts("preparation-cache") || starts("schema-preparation-cache") => {
-                Class::PreparationCache
+        // Repository worktree containers: removed by checkout cleanup only.
+        RootKind::WorktreeRoot if is_quick_test_pool(name) => Class::QuickTestPools,
+        RootKind::WorktreeRoot => Class::Worktrees,
+        RootKind::Storage => {
+            if let Some(rest) = name.strip_prefix("release-")
+                && let Some((number, tail)) = rest.split_once('-')
+                && number.len() == 4
+                && all(number, |c| c.is_ascii_digit())
+                && all(tail, |c| {
+                    c.is_ascii_alphanumeric() || matches!(c, '.' | '-')
+                })
+            {
+                return Class::ReleaseArtifacts;
             }
-            _ if starts("release-") => Class::ReleaseArtifacts,
-            _ if starts("rollout-v") || starts("rollout-prep-") => Class::RolloutArtifacts,
-            _ => Class::Unclassified,
-        },
+            match name {
+                "build-cache"
+                | "private-caches"
+                | "private-pnpm-stores"
+                | "private-stores"
+                | "task-caches" => Class::ToolCaches,
+                "qualification-retained" => Class::QualificationRetained,
+                "preparation-cache" | "preparation-cache-isolated" => Class::PreparationCache,
+                "worktrees" | "checkout-preserved" => Class::Worktrees,
+                STORAGE_ROOT_MARKER => Class::Coordination,
+                _ => Class::Unclassified,
+            }
+        }
     }
 }
 
@@ -234,10 +299,12 @@ pub struct Budgets {
     pub host_state_total_bytes: u64,
     pub host_cache_total_bytes: u64,
     pub storage_total_bytes: u64,
-    /// Free space each volume holding a root keeps.
+    /// Below this free space on a volume, eviction runs unpaced and advice
+    /// warns.
     pub free_floor_bytes: u64,
-    /// Archives older than this go whatever their content.
-    pub recovery_archive_retention_days: u64,
+    /// Below this, commands that write to that volume refuse once a bounded
+    /// reclaim did not free enough.
+    pub hard_minimum_bytes: u64,
     /// Each repository's own `gate_cache_bytes_budget`, as its broker last
     /// registered it; it wins over the host default.
     #[serde(skip)]
@@ -258,7 +325,7 @@ impl Default for Budgets {
             host_cache_total_bytes: 12 * GIB,
             storage_total_bytes: 48 * GIB,
             free_floor_bytes: 10 * GIB,
-            recovery_archive_retention_days: 30,
+            hard_minimum_bytes: 2 * GIB,
             gate_cache_by_repository: BTreeMap::new(),
         }
     }
@@ -299,8 +366,7 @@ impl Budgets {
             .unwrap_or(self.gate_cache_bytes_per_repository)
     }
 
-    /// The class budget, if the class has one. The gate cache budget is per
-    /// repository and applied by [`evict`].
+    /// The class budget, if the class has one.
     pub fn class_bytes(&self, class: Class) -> Option<u64> {
         match class {
             Class::RecoveryArchives => Some(self.recovery_archives_bytes),
@@ -318,7 +384,7 @@ impl Budgets {
         match kind {
             RootKind::HostState => self.host_state_total_bytes,
             RootKind::HostCache => self.host_cache_total_bytes,
-            RootKind::Storage => self.storage_total_bytes,
+            RootKind::WorktreeRoot | RootKind::Storage => self.storage_total_bytes,
         }
     }
 }
@@ -336,8 +402,29 @@ pub struct Root {
 pub struct Child {
     pub name: String,
     pub bytes: u64,
-    /// The most recent change inside it.
+    /// The most recent change inside it; 0 when unknown.
     pub newest_ms: u64,
+    /// Its own status-change time; 0 when unknown.
+    #[serde(default)]
+    pub ctime_ms: u64,
+    /// Recovery archives: the manifest's creation time and minimum
+    /// retention.
+    #[serde(default)]
+    pub created_ms: Option<u64>,
+    #[serde(default)]
+    pub min_retention_ms: Option<u64>,
+}
+
+/// A walk in progress, persisted so the next pass resumes it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Walk {
+    /// Children not started yet.
+    pub children_left: Vec<String>,
+    /// The child being walked, its pending paths and what was found so far.
+    pub current: Option<String>,
+    pub pending: Vec<PathBuf>,
+    pub usage: Usage,
+    pub done: Vec<Child>,
 }
 
 /// One top-level entry of a root, as last measured.
@@ -349,7 +436,9 @@ pub struct Item {
     pub class: Class,
     /// The volume (device) the root is on.
     pub device: u64,
+    /// Meaningful only when `measured`.
     pub bytes: u64,
+    pub measured: bool,
     pub entries: u64,
     pub oldest_ms: u64,
     pub newest_ms: u64,
@@ -358,6 +447,9 @@ pub struct Item {
     /// Kept for classes that are evicted child by child.
     #[serde(default)]
     pub children: Vec<Child>,
+    /// A walk the deadline interrupted.
+    #[serde(default)]
+    pub walk: Option<Walk>,
 }
 
 impl Item {
@@ -395,6 +487,8 @@ pub struct PassReport {
     pub started_at_ms: u64,
     pub phases_ms: BTreeMap<String, u64>,
     pub measured: Vec<String>,
+    /// Entries whose walk the deadline interrupted (resumed next pass).
+    pub resumable: Vec<String>,
     pub evicted: Vec<String>,
     pub bytes_reclaimed: u64,
     pub skipped: Vec<String>,
@@ -436,23 +530,19 @@ impl Ledger {
         )
     }
 
-    /// Bytes per class.
+    /// Measured bytes per class.
     pub fn class_bytes(&self) -> BTreeMap<Class, u64> {
         let mut totals = BTreeMap::new();
-        for item in &self.items {
+        for item in self.items.iter().filter(|item| item.measured) {
             *totals.entry(item.class).or_insert(0) += item.bytes;
         }
         totals
     }
 
-    /// Bytes per root (worktrees excluded: another component removes them).
+    /// Measured bytes per root (worktrees are never measured here).
     pub fn root_bytes(&self) -> BTreeMap<RootKind, u64> {
         let mut totals = BTreeMap::new();
-        for item in self
-            .items
-            .iter()
-            .filter(|item| item.class != Class::Worktrees)
-        {
+        for item in self.items.iter().filter(|item| item.measured) {
             *totals.entry(item.root_kind).or_insert(0) += item.bytes;
         }
         totals
@@ -488,6 +578,7 @@ pub fn root_kind_name(kind: RootKind) -> &'static str {
     match kind {
         RootKind::HostState => "host_state",
         RootKind::HostCache => "host_cache",
+        RootKind::WorktreeRoot => "worktree_root",
         RootKind::Storage => "storage",
     }
 }
@@ -500,7 +591,7 @@ pub(crate) fn now_ms() -> u64 {
         })
 }
 
-fn mtime_ms(metadata: &fs::Metadata) -> u64 {
+pub(crate) fn mtime_ms(metadata: &fs::Metadata) -> u64 {
     metadata
         .modified()
         .ok()
@@ -508,6 +599,19 @@ fn mtime_ms(metadata: &fs::Metadata) -> u64 {
         .map_or(0, |elapsed| {
             u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+#[cfg(unix)]
+pub(crate) fn ctime_ms(metadata: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    u64::try_from(metadata.ctime())
+        .unwrap_or(0)
+        .saturating_mul(1000)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn ctime_ms(_metadata: &fs::Metadata) -> u64 {
+    0
 }
 
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -519,13 +623,13 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 thread_local! {
-    /// Tree walks performed by this thread, so tests can prove a path never
-    /// walks.
+    /// Entries visited by walks on this thread, so tests can prove a path
+    /// never walks.
     pub(crate) static WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// What a walk found.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub bytes: u64,
     pub entries: u64,
@@ -533,32 +637,18 @@ pub struct Usage {
     pub newest_ms: u64,
 }
 
-/// Allocated bytes, entries and modification range of `path`, without
-/// following symbolic links.
-pub fn measure(path: &Path) -> Usage {
-    WALKS.with(|walks| walks.set(walks.get() + 1));
-    let mut usage = Usage::default();
-    let mut pending = vec![path.to_path_buf()];
-    while let Some(next) = pending.pop() {
-        let Ok(metadata) = fs::symlink_metadata(&next) else {
-            continue;
-        };
-        usage.entries += 1;
-        usage.bytes += allocated(&metadata);
-        let modified = mtime_ms(&metadata);
-        usage.newest_ms = usage.newest_ms.max(modified);
-        usage.oldest_ms = if usage.oldest_ms == 0 {
+impl Usage {
+    fn add(&mut self, metadata: &fs::Metadata) {
+        self.entries += 1;
+        self.bytes += allocated(metadata);
+        let modified = mtime_ms(metadata);
+        self.newest_ms = self.newest_ms.max(modified);
+        self.oldest_ms = if self.oldest_ms == 0 {
             modified
         } else {
-            usage.oldest_ms.min(modified)
+            self.oldest_ms.min(modified)
         };
-        if metadata.is_dir()
-            && let Ok(entries) = fs::read_dir(&next)
-        {
-            pending.extend(entries.flatten().map(|entry| entry.path()));
-        }
     }
-    usage
 }
 
 #[cfg(unix)]
@@ -575,7 +665,9 @@ fn allocated(metadata: &fs::Metadata) -> u64 {
 #[cfg(unix)]
 pub(crate) fn device_of(path: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
-    fs::metadata(path).ok().map(|metadata| metadata.dev())
+    fs::symlink_metadata(path)
+        .ok()
+        .map(|metadata| metadata.dev())
 }
 
 #[cfg(not(unix))]
@@ -583,40 +675,52 @@ pub(crate) fn device_of(_path: &Path) -> Option<u64> {
     Some(0)
 }
 
-/// The children worth keeping for an entry of `class`: `<group>/<name>` for
-/// two-level classes, `<name>` for the others; empty when the class is not
-/// evicted child by child.
-pub fn measure_children(class: Class, path: &Path) -> Vec<Child> {
-    let two_level = matches!(class, Class::RecoveryArchives | Class::GateCache);
-    let one_level = matches!(policy(class), Policy::LruChildren { .. });
-    if !two_level && !one_level {
-        return Vec::new();
-    }
-    let mut children = Vec::new();
-    for group in read_names(path) {
-        let group_path = path.join(&group);
-        if two_level {
-            if !group_path.is_dir() {
-                continue;
+#[cfg(unix)]
+fn device(metadata: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.dev()
+}
+
+#[cfg(not(unix))]
+fn device(_metadata: &fs::Metadata) -> u64 {
+    0
+}
+
+/// Walk `pending` until it is empty (`true`) or `deadline` passes
+/// (`false`, with `pending` and `usage` holding where it stopped). Never
+/// follows a symbolic link and never enters another device than `root_device`.
+/// `beat` is called at least every `beat_every` ([`BEAT_EVERY`] in the
+/// worker).
+pub fn walk_until(
+    pending: &mut Vec<PathBuf>,
+    usage: &mut Usage,
+    root_device: u64,
+    deadline: Instant,
+    beat_every: Duration,
+    beat: &mut dyn FnMut(),
+) -> bool {
+    let mut last_beat = Instant::now();
+    while let Some(next) = pending.pop() {
+        WALKS.with(|walks| walks.set(walks.get() + 1));
+        if let Ok(metadata) = fs::symlink_metadata(&next)
+            && device(&metadata) == root_device
+        {
+            usage.add(&metadata);
+            if metadata.is_dir()
+                && let Ok(entries) = fs::read_dir(&next)
+            {
+                pending.extend(entries.flatten().map(|entry| entry.path()));
             }
-            for name in read_names(&group_path) {
-                let usage = measure(&group_path.join(&name));
-                children.push(Child {
-                    name: format!("{group}/{name}"),
-                    bytes: usage.bytes,
-                    newest_ms: usage.newest_ms,
-                });
-            }
-        } else {
-            let usage = measure(&group_path);
-            children.push(Child {
-                name: group,
-                bytes: usage.bytes,
-                newest_ms: usage.newest_ms,
-            });
+        }
+        if last_beat.elapsed() >= beat_every {
+            beat();
+            last_beat = Instant::now();
+        }
+        if Instant::now() >= deadline && !pending.is_empty() {
+            return false;
         }
     }
-    children
+    true
 }
 
 /// Names in a directory (UTF-8 only; others are left alone and unmeasured).
@@ -633,8 +737,49 @@ pub(crate) fn read_names(path: &Path) -> Vec<String> {
     names
 }
 
+/// The children of an evictable entry: `<group>/<name>` for two-level
+/// classes, `<name>` otherwise.
+fn child_names(class: Class, path: &Path) -> Vec<String> {
+    let two_level = matches!(class, Class::RecoveryArchives | Class::GateCache);
+    let mut names = Vec::new();
+    for group in read_names(path) {
+        let group_path = path.join(&group);
+        if two_level {
+            if fs::symlink_metadata(&group_path).is_ok_and(|metadata| metadata.is_dir()) {
+                names.extend(
+                    read_names(&group_path)
+                        .into_iter()
+                        .map(|name| format!("{group}/{name}")),
+                );
+            }
+        } else {
+            names.push(group);
+        }
+    }
+    names
+}
+
+/// Read an archive manifest's creation time and minimum retention.
+fn archive_times(path: &Path) -> (Option<u64>, Option<u64>) {
+    let manifest = path.join("manifest.json");
+    let small = fs::metadata(&manifest).is_ok_and(|metadata| metadata.len() <= 32 * 1024 * 1024);
+    let value: Option<serde_json::Value> = small
+        .then(|| fs::read(&manifest).ok())
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let created = value
+        .as_ref()
+        .and_then(|value| value.get("created_at_ms"))
+        .and_then(serde_json::Value::as_u64);
+    let retention = value
+        .as_ref()
+        .and_then(|value| value.get("minimum_archive_retention_ms"))
+        .and_then(serde_json::Value::as_u64);
+    (created, retention)
+}
+
 /// Add top-level entries that appeared under the roots and drop those that
-/// disappeared; sizes of new entries are unknown (0) until measured.
+/// disappeared.
 pub fn discover(ledger: &mut Ledger) {
     let mut seen = Vec::new();
     for root in &ledger.roots {
@@ -642,7 +787,7 @@ pub fn discover(ledger: &mut Ledger) {
             continue;
         };
         for name in read_names(&root.path) {
-            if name.starts_with(".aethyme-storage-") {
+            if name.starts_with(".aethyme-storage-evicting-") {
                 continue;
             }
             seen.push((root.path.clone(), name.clone()));
@@ -658,11 +803,13 @@ pub fn discover(ledger: &mut Ledger) {
                     name,
                     device,
                     bytes: 0,
+                    measured: false,
                     entries: 0,
                     oldest_ms: 0,
                     newest_ms: 0,
                     measured_at_ms: 0,
                     children: Vec::new(),
+                    walk: None,
                 });
             }
         }
@@ -673,40 +820,162 @@ pub fn discover(ledger: &mut Ledger) {
     });
 }
 
-/// Measure entries round robin until `budget` elapses, never-measured
-/// entries first; the names measured.
-pub fn measure_some(ledger: &mut Ledger, budget: Duration) -> Vec<String> {
-    let started = std::time::Instant::now();
-    let mut measured = Vec::new();
-    if ledger.items.is_empty() {
-        return measured;
+/// Measure (or count) one item until `deadline`; `true` when it finished.
+pub fn measure_item(item: &mut Item, deadline: Instant, beat: &mut dyn FnMut()) -> bool {
+    let path = item.path();
+    // A symbolic link entry is never walked, removed or counted into.
+    let Ok(top) = fs::symlink_metadata(&path) else {
+        return true;
+    };
+    if top.file_type().is_symlink() {
+        item.measured = false;
+        item.measured_at_ms = now_ms();
+        return true;
     }
-    let mut order: Vec<usize> = (0..ledger.items.len())
-        .filter(|index| ledger.items[*index].measured_at_ms == 0)
-        .collect();
+    if let Policy::ReportOnly(_) = policy(item.class) {
+        // Counted from its directory entries only, never walked.
+        item.entries = fs::read_dir(&path)
+            .map(|entries| {
+                entries
+                    .take(usize::try_from(COUNT_LIMIT).unwrap_or(usize::MAX))
+                    .count() as u64
+            })
+            .unwrap_or(1);
+        item.measured = false;
+        item.measured_at_ms = now_ms();
+        return true;
+    }
+    let root_device = device(&top);
+    let child_level = !matches!(policy(item.class), Policy::ExpireEntry { .. });
+    let mut walk = item.walk.take().unwrap_or_else(|| {
+        if child_level {
+            Walk {
+                children_left: child_names(item.class, &path).into_iter().rev().collect(),
+                ..Walk::default()
+            }
+        } else {
+            Walk {
+                current: Some(String::new()),
+                pending: vec![path.clone()],
+                ..Walk::default()
+            }
+        }
+    });
+    loop {
+        if walk.current.is_none() {
+            let Some(next) = walk.children_left.pop() else {
+                break;
+            };
+            walk.pending = vec![path.join(&next)];
+            walk.usage = Usage::default();
+            walk.current = Some(next);
+        }
+        if !walk_until(
+            &mut walk.pending,
+            &mut walk.usage,
+            root_device,
+            deadline,
+            BEAT_EVERY,
+            beat,
+        ) {
+            item.walk = Some(walk);
+            return false;
+        }
+        let name = walk.current.take().unwrap_or_default();
+        if child_level {
+            let child_path = path.join(&name);
+            let ctime = fs::symlink_metadata(&child_path).map_or(0, |metadata| ctime_ms(&metadata));
+            let (created_ms, min_retention_ms) = if item.class == Class::RecoveryArchives {
+                archive_times(&child_path)
+            } else {
+                (None, None)
+            };
+            walk.done.push(Child {
+                name,
+                bytes: walk.usage.bytes,
+                newest_ms: walk.usage.newest_ms,
+                ctime_ms: ctime,
+                created_ms,
+                min_retention_ms,
+            });
+        } else {
+            item.bytes = walk.usage.bytes;
+            item.entries = walk.usage.entries;
+            item.oldest_ms = walk.usage.oldest_ms;
+            item.newest_ms = walk.usage.newest_ms;
+        }
+        if Instant::now() >= deadline && !walk.children_left.is_empty() {
+            item.walk = Some(walk);
+            return false;
+        }
+    }
+    if child_level {
+        item.bytes = walk.done.iter().map(|child| child.bytes).sum();
+        item.entries = walk.done.len() as u64;
+        item.newest_ms = walk
+            .done
+            .iter()
+            .map(|child| child.newest_ms)
+            .max()
+            .unwrap_or(0);
+        item.oldest_ms = walk
+            .done
+            .iter()
+            .map(|child| child.newest_ms)
+            .filter(|ms| *ms > 0)
+            .min()
+            .unwrap_or(0);
+        item.children = walk.done;
+    }
+    item.measured = true;
+    item.measured_at_ms = now_ms();
+    true
+}
+
+/// Measure entries round robin until `budget` elapses: dirty (noted by a
+/// producer) and never-measured entries first, then unfinished walks.
+pub fn measure_some(
+    ledger: &mut Ledger,
+    budget: Duration,
+    dirty: &[(PathBuf, String)],
+    beat: &mut dyn FnMut(),
+) -> (Vec<String>, Vec<String>) {
+    let deadline = Instant::now() + budget;
+    let mut measured = Vec::new();
+    let mut resumable = Vec::new();
     let count = ledger.items.len();
+    if count == 0 {
+        return (measured, resumable);
+    }
+    let mut order: Vec<usize> = (0..count)
+        .filter(|index| {
+            let item = &ledger.items[*index];
+            dirty
+                .iter()
+                .any(|(root, name)| *root == item.root && *name == item.name)
+        })
+        .collect();
+    order.extend((0..count).filter(|index| ledger.items[*index].measured_at_ms == 0));
+    order.extend((0..count).filter(|index| ledger.items[*index].walk.is_some()));
     order.extend((0..count).map(|offset| (ledger.cursor + offset) % count));
     let mut done = std::collections::BTreeSet::new();
     for index in order {
-        if started.elapsed() >= budget {
+        if Instant::now() >= deadline {
             break;
         }
         if !done.insert(index) {
             continue;
         }
         let item = &mut ledger.items[index];
-        let path = item.path();
-        let usage = measure(&path);
-        item.bytes = usage.bytes;
-        item.entries = usage.entries;
-        item.oldest_ms = usage.oldest_ms;
-        item.newest_ms = usage.newest_ms;
-        item.children = measure_children(item.class, &path);
-        item.measured_at_ms = now_ms();
-        measured.push(format!("{}:{}", root_kind_name(item.root_kind), item.name));
+        let label = format!("{}:{}", root_kind_name(item.root_kind), item.name);
+        if measure_item(item, deadline, beat) {
+            measured.push(label);
+        } else {
+            resumable.push(label);
+        }
         ledger.cursor = (index + 1) % count;
     }
-    measured
+    (measured, resumable)
 }
 
 /// Record over-budget time for each class.
@@ -728,10 +997,98 @@ pub fn update_over_budget_clock(ledger: &mut Ledger, budgets: &Budgets, now: u64
     }
 }
 
+/// A producer's note that it wrote `relative` under the root of `kind`
+/// (cheap: one small file; the worker re-measures it first).
+pub fn note_written(host_state: &Path, kind: RootKind, relative: &str) {
+    if !check::enabled(host_state) {
+        return;
+    }
+    let directory = host_state.join(DIRTY_DIRECTORY);
+    let name = format!(
+        "{:x}.json",
+        <sha2::Sha256 as sha2::Digest>::digest(format!("{kind:?}:{relative}").as_bytes())
+    );
+    let written = fs::create_dir_all(&directory).and_then(|()| {
+        serde_json::to_vec(&serde_json::json!({"kind": kind, "relative": relative}))
+            .map_err(io::Error::other)
+            .and_then(|bytes| write_atomically(&directory.join(name), &bytes))
+    });
+    crate::warn_unrecorded("note a storage write", written);
+}
+
+/// Take the producers' notes: `(root path, top-level entry name)` to
+/// re-measure first.
+pub(crate) fn take_dirty(host_state: &Path, roots: &[Root]) -> Vec<(PathBuf, String)> {
+    let directory = host_state.join(DIRTY_DIRECTORY);
+    let mut dirty = Vec::new();
+    for name in read_names(&directory) {
+        let path = directory.join(&name);
+        let note: Option<serde_json::Value> = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        crate::warn_unrecorded("consume a storage write note", fs::remove_file(&path));
+        let Some(note) = note else {
+            continue;
+        };
+        let kind: Option<RootKind> = note
+            .get("kind")
+            .cloned()
+            .and_then(|kind| serde_json::from_value(kind).ok());
+        let top = note
+            .get("relative")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|relative| relative.split('/').next())
+            .map(str::to_string);
+        if let (Some(kind), Some(top)) = (kind, top) {
+            for root in roots.iter().filter(|root| root.kind == kind) {
+                dirty.push((root.path.clone(), top.clone()));
+            }
+        }
+    }
+    dirty
+}
+
+/// A gate cache entry's size from the ledger when measured within `fresh`,
+/// for `gc plan`; read once per process.
+pub(crate) fn fresh_gate_cache_size(path: &Path, fresh: Duration) -> Option<(u64, i64)> {
+    static LEDGER: std::sync::OnceLock<Option<Ledger>> = std::sync::OnceLock::new();
+    let ledger = LEDGER
+        .get_or_init(|| {
+            let host_state = crate::host_state::default_host_state_dir()?;
+            check::enabled(&host_state).then(|| Ledger::load(&host_state))
+        })
+        .as_ref()?;
+    let now = now_ms();
+    for item in ledger
+        .items
+        .iter()
+        .filter(|item| item.class == Class::GateCache && item.measured)
+    {
+        if now.saturating_sub(item.measured_at_ms)
+            > u64::try_from(fresh.as_millis()).unwrap_or(u64::MAX)
+        {
+            continue;
+        }
+        let base = item.path();
+        if let Ok(relative) = path.strip_prefix(&base)
+            && let Some(child) = item
+                .children
+                .iter()
+                .find(|child| Path::new(&child.name) == relative)
+        {
+            return Some((
+                child.bytes,
+                i64::try_from(item.measured_at_ms).unwrap_or(i64::MAX),
+            ));
+        }
+    }
+    None
+}
+
 impl crate::Broker {
-    /// `broker status` advice from the storage ledger; also registers this
-    /// repository's storage roots (its worktree root's and preparation
-    /// cache's Aethyme directory) so the worker inventories them. Cheap: one
+    /// `broker status` advice from the storage ledger. Also registers this
+    /// repository's configured worktree root (an exact path from its own
+    /// configuration, never a guess) and its gate cache budget. Cheap: one
     /// small file read and a statvfs per root.
     pub(crate) fn storage_ledger_advice(&self) -> Vec<crate::StatusAdvice> {
         let Some(host_state) = self.storage_context().host_state_dir.clone() else {
@@ -740,35 +1097,22 @@ impl crate::Broker {
         if !host_state.is_dir() || !check::enabled(&host_state) {
             return Vec::new();
         }
-        let mut storage_roots = Vec::new();
-        if let Ok(plan) = self.worktree_root_plan() {
-            if let Ok(policy) = crate::retention::load_retention_policy(self.main_root()) {
-                check::register_gate_budget(
-                    &host_state,
-                    &plan.repository_key,
-                    policy.gate_cache_bytes_budget,
-                );
-            }
-            // The configured root's parent, or the keyed container's
-            // grandparent: whichever is an Aethyme directory.
-            storage_roots.extend(
-                plan.preferred_root
-                    .as_deref()
-                    .and_then(check::storage_root_for),
-            );
-            storage_roots.extend(
-                plan.root_container
-                    .as_deref()
-                    .and_then(Path::parent)
-                    .and_then(check::storage_root_for),
-            );
-        }
-        if let Ok(Some(preparation)) = self.storage_context().preparation_cache_root_binding()
-            && let Some(root) = check::storage_root_for(&preparation.path)
+        let gate_storage = self.storage_context().gate_storage_locations();
+        if let Some(location) = crate::gate_cache_gc::location_in(self.main_root(), &gate_storage)
+            && let Ok(policy) = crate::retention::load_retention_policy(self.main_root())
         {
-            storage_roots.push(root);
+            check::register_gate_budget(
+                &host_state,
+                &location.repository_key,
+                policy.gate_cache_bytes_budget,
+            );
         }
-        check::register_storage_roots(&host_state, &storage_roots);
+        if let Ok(plan) = self.worktree_root_plan()
+            && let Some(root) = plan.preferred_root
+            && !root.starts_with(self.main_root())
+        {
+            check::register_root(&host_state, &root, RootKind::WorktreeRoot);
+        }
         cli::status_advice(&host_state)
     }
 }

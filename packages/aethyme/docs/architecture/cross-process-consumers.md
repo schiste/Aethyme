@@ -196,8 +196,11 @@ host state directory: `storage-ledger.json` (the ledger, written by the worker
 only), `storage-ledger-summary.json` (what the start-of-command check reads),
 `storage-worker.lock` (pid, start time, heartbeat, token; a dead or stalled
 owner's lock is taken over), `storage-roots.json` and
-`storage-gate-budgets.json` (storage roots and gate cache budgets registered by
-`broker status`), and the optional owner file `storage.toml` (`[budget]`).
+`storage-gate-budgets.json` (worktree roots, adopted storage roots and gate
+cache budgets), `storage-ledger-dirty/` (producers' notes of entries they
+wrote; gate runs write one per managed cache), and the optional owner file
+`storage.toml` (`[budget]`). `aethyme storage adopt <dir>` writes
+`.aethyme-storage-root` into a directory; a storage root must carry it.
 `broker status --json` adds advice `storage.over-budget`,
 `storage.below-floor` and `storage.unclassified` (class names and sizes; no
 paths outside Aethyme's roots). `AETHYME_STORAGE_LEDGER` (`0`/`1`) turns the

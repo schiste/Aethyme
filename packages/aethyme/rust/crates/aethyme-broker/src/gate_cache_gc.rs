@@ -507,33 +507,48 @@ fn inspect_with_expiration(
                     .as_ref()
                     .map_or_else(|| entry.clone(), |(key, _)| key.clone());
                 let key = path.to_string_lossy().into_owned();
-                let (estimated_bytes, estimated_inodes) = if scan.measures() {
-                    let measured = match deadline {
-                        Some(deadline) => {
-                            crate::disk_headroom::directory_usage_bounded(&path, deadline)
+                // A fresh measurement by the storage worker costs nothing to
+                // read, so the deadline is not spent walking it again.
+                let ledger_size = scan
+                    .measures()
+                    .then(|| {
+                        crate::storage_ledger::fresh_gate_cache_size(
+                            &path,
+                            std::time::Duration::from_secs(60 * 60),
+                        )
+                    })
+                    .flatten();
+                let (estimated_bytes, estimated_inodes) =
+                    if let Some((bytes, measured_at)) = ledger_size {
+                        records.record(&key, bytes, measured_at);
+                        (Some(bytes), None)
+                    } else if scan.measures() {
+                        let measured = match deadline {
+                            Some(deadline) => {
+                                crate::disk_headroom::directory_usage_bounded(&path, deadline)
+                            }
+                            None => {
+                                crate::disk_headroom::directory_usage_without_following_links(&path)
+                                    .ok()
+                            }
+                        };
+                        if let Some(usage) = measured {
+                            records.record_usage(
+                                &key,
+                                usage.bytes,
+                                Some(usage.inodes),
+                                age.evaluated_at,
+                            );
                         }
-                        None => {
-                            crate::disk_headroom::directory_usage_without_following_links(&path)
-                                .ok()
-                        }
+                        measured
+                            .map(|usage| (Some(usage.bytes), Some(usage.inodes)))
+                            .unwrap_or((None, None))
+                    } else {
+                        records
+                            .get(&key)
+                            .map(|record| (Some(record.bytes), record.inodes))
+                            .unwrap_or((None, None))
                     };
-                    if let Some(usage) = measured {
-                        records.record_usage(
-                            &key,
-                            usage.bytes,
-                            Some(usage.inodes),
-                            age.evaluated_at,
-                        );
-                    }
-                    measured
-                        .map(|usage| (Some(usage.bytes), Some(usage.inodes)))
-                        .unwrap_or((None, None))
-                } else {
-                    records
-                        .get(&key)
-                        .map(|record| (Some(record.bytes), record.inodes))
-                        .unwrap_or((None, None))
-                };
                 let last_used_at_ms = match last_used_at_ms_until(&path, &mut expired) {
                     Ok(value) => value,
                     Err(()) if entry_budget.is_some() => return (None, Vec::new(), false),

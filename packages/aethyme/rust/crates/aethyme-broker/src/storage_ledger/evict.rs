@@ -2,26 +2,30 @@
 //!
 //! Deletion sites, and why each removal is safe:
 //! - `gate_cache` (`<host cache>/gates/<repository>/<key>`): a cargo target a
-//!   gate rebuilds; regenerable. Never while a lease in the host resource
-//!   registry names it, and never when the registry cannot be read.
+//!   gate rebuilds; regenerable. Removed only while holding the entry's
+//!   exclusive gate cache lease, so a gate never loses it mid-run.
 //! - `recovery_archives` (`<host state>/recovery-archives/<repository>/<id>`):
-//!   for size, only when every commit it records is contained in the
+//!   only for size, only when every commit it records is contained in the
 //!   repository's default branch and it holds no patch, untracked or ignored
-//!   file (landed); otherwise only once older than the retention (expired).
+//!   file (landed), and only after its manifest's creation time plus its
+//!   recorded minimum retention. Never by age alone; an unlanded archive is
+//!   never removed here, only reported by id.
 //! - `symbol_index`, `graph_stores`, `tool_caches`, `qualification_retained`:
 //!   indexes and caches rebuilt on demand; a child used within the class's
-//!   idle time is kept.
-//! - `release_artifacts`, `rollout_artifacts`, `quick_test_pools`: logs,
-//!   backups and pools left by release and test runs, removed whole once
-//!   nothing in them changed for their age (expired).
+//!   idle time is kept, and recency is re-read just before removal.
+//! - `release_artifacts`, `rollout_artifacts`, `quick_test_pools`: leftovers
+//!   of release and test runs with Aethyme's exact generated names, removed
+//!   whole once nothing in them changed for their age.
 //!
-//! Everything else is never removed here.
+//! Every removal first renames the entry aside (atomically, out of its live
+//! location), then deletes the renamed copy without following links. A path
+//! with a symbolic link anywhere below its root is never removed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -45,6 +49,7 @@ pub struct Candidate {
     pub root: PathBuf,
     pub relative: String,
     pub bytes: u64,
+    /// The most recent change the measurement saw (0 when unknown).
     pub newest_ms: u64,
     pub reason: Reason,
 }
@@ -60,7 +65,7 @@ impl Candidate {
     }
 }
 
-fn duration_ms(duration: Duration) -> u64 {
+pub(crate) fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
@@ -71,9 +76,17 @@ fn child_candidate(item: &Item, child: &Child, reason: Reason) -> Candidate {
         root: item.root.clone(),
         relative: format!("{}/{}", item.name, child.name),
         bytes: child.bytes,
-        newest_ms: child.newest_ms,
+        newest_ms: child.newest_ms.max(child.ctime_ms),
         reason,
     }
+}
+
+/// When a child was last used: its newest change, else its status-change
+/// time; `None` when neither is known (then it is kept).
+fn last_used(child: &Child) -> Option<u64> {
+    [child.newest_ms, child.ctime_ms]
+        .into_iter()
+        .find(|ms| *ms > 0)
 }
 
 /// Gate cache bytes per repository, from the ledger's children.
@@ -82,7 +95,7 @@ pub fn gate_cache_by_repository(ledger: &Ledger) -> BTreeMap<String, u64> {
     for item in ledger
         .items
         .iter()
-        .filter(|item| item.class == Class::GateCache)
+        .filter(|item| item.class == Class::GateCache && item.measured)
     {
         for child in &item.children {
             if let Some((repository, _)) = child.name.split_once('/') {
@@ -106,15 +119,12 @@ pub fn plan(
     let mut expired = Vec::new();
     let mut over = Vec::new();
     let class_bytes = ledger.class_bytes();
-    for item in &ledger.items {
+    for item in ledger.items.iter().filter(|item| item.measured) {
         let pressing = aggressive.contains(&item.root_kind);
         match policy(item.class) {
             Policy::ReportOnly(_) => {}
             Policy::ExpireEntry { age } => {
-                if item.measured_at_ms > 0
-                    && item.newest_ms > 0
-                    && now.saturating_sub(item.newest_ms) > duration_ms(age)
-                {
+                if item.newest_ms > 0 && now.saturating_sub(item.newest_ms) > duration_ms(age) {
                     expired.push(Candidate {
                         class: item.class,
                         root_kind: item.root_kind,
@@ -127,13 +137,17 @@ pub fn plan(
                 }
             }
             Policy::LruChildren { idle, expire } => {
-                let mut kept: Vec<&Child> = Vec::new();
+                let mut idle_children: Vec<(&Child, u64)> = Vec::new();
                 for child in &item.children {
-                    let age = now.saturating_sub(child.newest_ms);
+                    // Unknown recency is not "oldest": such a child is kept.
+                    let Some(used) = last_used(child) else {
+                        continue;
+                    };
+                    let age = now.saturating_sub(used);
                     if expire.is_some_and(|expire| age > duration_ms(expire)) {
                         expired.push(child_candidate(item, child, Reason::Expired));
-                    } else {
-                        kept.push(child);
+                    } else if age >= duration_ms(idle) {
+                        idle_children.push((child, used));
                     }
                 }
                 let budget = if pressing {
@@ -141,40 +155,35 @@ pub fn plan(
                 } else {
                     budgets.class_bytes(item.class).unwrap_or(u64::MAX)
                 };
-                let mut total = class_bytes.get(&item.class).copied().unwrap_or(0);
-                kept.sort_by_key(|child| child.newest_ms);
-                for child in kept {
-                    if total <= budget {
-                        break;
-                    }
-                    if now.saturating_sub(child.newest_ms) < duration_ms(idle) {
-                        continue;
-                    }
-                    total = total.saturating_sub(child.bytes);
-                    over.push(child_candidate(item, child, Reason::OverBudget));
+                if class_bytes.get(&item.class).copied().unwrap_or(0) > budget {
+                    idle_children.sort_by_key(|(_, used)| *used);
+                    over.extend(
+                        idle_children
+                            .into_iter()
+                            .map(|(child, _)| child_candidate(item, child, Reason::OverBudget)),
+                    );
                 }
             }
             Policy::GateCache => over.extend(plan_gate_cache(item, budgets, pressing)),
             Policy::RecoveryArchives => {
-                let retention = budgets
-                    .recovery_archive_retention_days
-                    .saturating_mul(86_400_000);
-                let mut children: Vec<&Child> = item.children.iter().collect();
-                children.sort_by_key(|child| child.newest_ms);
                 let budget = if pressing {
                     0
                 } else {
                     budgets.recovery_archives_bytes
                 };
-                let total = class_bytes.get(&item.class).copied().unwrap_or(0);
-                for child in children {
-                    if now.saturating_sub(child.newest_ms) > retention {
-                        expired.push(child_candidate(item, child, Reason::Expired));
-                    } else if total > budget {
-                        // Each is proven landed before removal; the executor
-                        // stops once the class is within budget.
-                        over.push(child_candidate(item, child, Reason::OverBudget));
-                    }
+                if class_bytes.get(&item.class).copied().unwrap_or(0) > budget {
+                    // Oldest by manifest creation; one without it is kept.
+                    let mut children: Vec<(&Child, u64)> = item
+                        .children
+                        .iter()
+                        .filter_map(|child| child.created_ms.map(|created| (child, created)))
+                        .collect();
+                    children.sort_by_key(|(_, created)| *created);
+                    over.extend(
+                        children
+                            .into_iter()
+                            .map(|(child, _)| child_candidate(item, child, Reason::OverBudget)),
+                    );
                 }
             }
         }
@@ -202,19 +211,21 @@ fn plan_gate_cache(item: &Item, budgets: &Budgets, pressing: bool) -> Vec<Candid
         for child in children {
             let key = child.name.split_once('/').map_or("", |(_, key)| key);
             let kind = crate::gate_cache_gc::cache_kind(key);
+            // Unknown recency counts as most recent: it is kept.
+            let used = last_used(child).unwrap_or(u64::MAX);
             let entry = newest_per_kind
                 .entry(kind)
-                .or_insert((child.newest_ms, child.name.as_str()));
-            if child.newest_ms > entry.0 {
-                *entry = (child.newest_ms, child.name.as_str());
+                .or_insert((used, child.name.as_str()));
+            if used > entry.0 {
+                *entry = (used, child.name.as_str());
             }
         }
         let keep: BTreeSet<&str> = newest_per_kind.values().map(|(_, name)| *name).collect();
         let mut evict: Vec<&&Child> = children
             .iter()
-            .filter(|child| !keep.contains(child.name.as_str()))
+            .filter(|child| !keep.contains(child.name.as_str()) && last_used(child).is_some())
             .collect();
-        evict.sort_by_key(|child| child.newest_ms);
+        evict.sort_by_key(|child| last_used(child).unwrap_or(u64::MAX));
         candidates.extend(
             evict
                 .into_iter()
@@ -225,7 +236,7 @@ fn plan_gate_cache(item: &Item, budgets: &Budgets, pressing: bool) -> Vec<Candid
 }
 
 /// Gate cache keys a live lease holds, per repository; `None` when the
-/// registry cannot be read (then no gate cache entry is removed).
+/// registry cannot be read.
 pub fn leased_gate_caches(registry: &Path) -> Option<BTreeSet<(String, String)>> {
     if !registry.is_file() {
         return None;
@@ -369,29 +380,68 @@ fn default_branch(repository: &Path) -> Option<String> {
     })
 }
 
+/// Whether `relative` under `root` is a plain path with no symbolic link in
+/// it (the root itself is trusted: it is an exact configured path).
+pub fn link_free(root: &Path, relative: &str) -> bool {
+    let relative = Path::new(relative);
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return false;
+    }
+    let mut path = root.to_path_buf();
+    for component in relative.components() {
+        path.push(component);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.file_type().is_symlink() => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The newest modification of an entry's top two levels (bounded), read
+/// just before removal.
+fn recent_change(path: &Path) -> u64 {
+    let mut newest = fs::symlink_metadata(path).map_or(0, |metadata| super::mtime_ms(&metadata));
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten().take(1000) {
+            if let Ok(metadata) = fs::symlink_metadata(entry.path()) {
+                newest = newest.max(super::mtime_ms(&metadata));
+            }
+        }
+    }
+    newest
+}
+
 /// Why a candidate may not be removed right now, checked just before
 /// removal; `None` when it may.
 pub fn refuse(
     candidate: &Candidate,
     leases: Option<&BTreeSet<(String, String)>>,
+    now: u64,
 ) -> Option<String> {
-    let relative = Path::new(&candidate.relative);
-    let safe = relative
-        .components()
-        .all(|component| matches!(component, std::path::Component::Normal(_)));
-    if !safe || candidate.relative.is_empty() {
-        return Some("not a plain path inside its root".into());
+    if !link_free(&candidate.root, &candidate.relative) {
+        return Some("a symbolic link, or not a plain path inside its root".into());
     }
     let path = candidate.path();
-    match fs::symlink_metadata(&path) {
-        Err(_) => return Some("already gone".into()),
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Some("a symbolic link".into());
+    match policy(candidate.class) {
+        Policy::ReportOnly(why) => return Some(why.into()),
+        Policy::LruChildren { idle, .. } => {
+            let changed = recent_change(&path);
+            if changed > candidate.newest_ms || now.saturating_sub(changed) < duration_ms(idle) {
+                return Some("used since it was measured".into());
+            }
         }
-        Ok(_) => {}
-    }
-    match candidate.class {
-        Class::GateCache => {
+        Policy::ExpireEntry { age } => {
+            let changed = recent_change(&path);
+            if changed > candidate.newest_ms || now.saturating_sub(changed) <= duration_ms(age) {
+                return Some("changed since it was measured".into());
+            }
+        }
+        Policy::GateCache => {
             let mut parts = candidate.relative.splitn(3, '/');
             let (Some(_), Some(repository), Some(key)) = (parts.next(), parts.next(), parts.next())
             else {
@@ -405,12 +455,18 @@ pub fn refuse(
                 Some(_) => {}
             }
         }
-        Class::RecoveryArchives if candidate.reason == Reason::OverBudget => {
+        Policy::RecoveryArchives => {
             if let Err(why) = archive_landed(&path) {
                 return Some(format!("unlanded: {why}"));
             }
+            let (created, retention) = super::archive_times(&path);
+            let retention =
+                retention.unwrap_or(crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS);
+            match created {
+                Some(created) if now >= created.saturating_add(retention) => {}
+                _ => return Some("within its promised minimum retention".into()),
+            }
         }
-        _ => {}
     }
     None
 }
@@ -425,9 +481,13 @@ pub fn refuse(
 ///   the rename finds it absent (and rebuilds), never half deleted.
 ///
 /// `Err` says why it stayed.
-pub fn remove_protected(candidate: &Candidate, registry: &Path) -> Result<(), String> {
+pub fn remove_protected(
+    candidate: &Candidate,
+    registry: &Path,
+    beat: &mut dyn FnMut(),
+) -> Result<(), String> {
     if candidate.class != Class::GateCache {
-        return remove(candidate).map_err(|error| error.to_string());
+        return remove(candidate, beat).map_err(|error| error.to_string());
     }
     let mut parts = candidate.relative.splitn(3, '/');
     let (Some(_), Some(repository), Some(key)) = (parts.next(), parts.next(), parts.next()) else {
@@ -461,7 +521,7 @@ pub fn remove_protected(candidate: &Candidate, registry: &Path) -> Result<(), St
     let grant = coordinator
         .acquire(&request)
         .map_err(|error| format!("a gate holds it ({error})"))?;
-    let removed = remove(candidate).map_err(|error| error.to_string());
+    let removed = remove(candidate, beat).map_err(|error| error.to_string());
     crate::warn_unrecorded(
         "release the gate cache lease storage eviction took",
         coordinator.release(
@@ -474,8 +534,8 @@ pub fn remove_protected(candidate: &Candidate, registry: &Path) -> Result<(), St
 }
 
 /// Remove a candidate: renamed aside first (so a half-removed tree is never
-/// mistaken for a valid one), then deleted.
-pub fn remove(candidate: &Candidate) -> std::io::Result<()> {
+/// mistaken for a valid one), then deleted without following links.
+pub fn remove(candidate: &Candidate, beat: &mut dyn FnMut()) -> std::io::Result<()> {
     let path = candidate.path();
     let aside = candidate.root.join(format!(
         ".aethyme-storage-evicting-{}-{}",
@@ -483,25 +543,50 @@ pub fn remove(candidate: &Candidate) -> std::io::Result<()> {
         super::now_ms()
     ));
     fs::rename(&path, &aside)?;
-    if fs::symlink_metadata(&aside)?.is_dir() {
-        fs::remove_dir_all(&aside)
-    } else {
-        fs::remove_file(&aside)
+    delete_tree(&aside, beat)
+}
+
+/// Delete a tree bottom up, never following a link, refreshing `beat` at
+/// least every second.
+pub fn delete_tree(path: &Path, beat: &mut dyn FnMut()) -> std::io::Result<()> {
+    let mut last_beat = Instant::now();
+    let mut stack = vec![(path.to_path_buf(), false)];
+    while let Some((next, visited)) = stack.pop() {
+        let metadata = match fs::symlink_metadata(&next) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if metadata.is_dir() {
+            if visited {
+                fs::remove_dir(&next)?;
+            } else {
+                stack.push((next.clone(), true));
+                for entry in fs::read_dir(&next)?.flatten() {
+                    stack.push((entry.path(), false));
+                }
+            }
+        } else {
+            // A file or a link: the link itself goes, never its target.
+            fs::remove_file(&next)?;
+        }
+        if last_beat.elapsed() >= super::BEAT_EVERY {
+            beat();
+            last_beat = Instant::now();
+        }
     }
+    Ok(())
 }
 
 /// Leftovers of removals interrupted after the rename.
-pub fn sweep_aside(root: &Path) {
+pub fn sweep_aside(root: &Path, beat: &mut dyn FnMut()) {
     for name in super::read_names(root) {
         if !name.starts_with(".aethyme-storage-evicting-") {
             continue;
         }
-        let path = root.join(&name);
-        let removed = if path.is_dir() {
-            fs::remove_dir_all(&path)
-        } else {
-            fs::remove_file(&path)
-        };
-        crate::warn_unrecorded("remove an interrupted storage eviction", removed);
+        crate::warn_unrecorded(
+            "remove an interrupted storage eviction",
+            delete_tree(&root.join(&name), beat),
+        );
     }
 }

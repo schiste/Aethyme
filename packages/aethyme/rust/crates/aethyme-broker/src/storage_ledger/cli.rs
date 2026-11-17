@@ -17,6 +17,9 @@ const USAGE: &str = "aethyme storage — what Aethyme stores on this host, and i
                             entries, evict what is over budget or expired
   storage worker            the same pass, detached (started by broker
                             commands when a budget or floor is breached)
+  storage adopt <dir>       make <dir> a storage root: writes the marker
+                            file the worker requires before it inventories
+                            a directory other than the host state and cache
 
 Budgets: defaults, overridden by <host state>/storage.toml [budget].
 ";
@@ -64,6 +67,26 @@ pub fn run(args: &[String]) -> u8 {
                 crate::exit_status::FAILED
             }
         },
+        Some("adopt") => {
+            let Some(target) = args.get(1).filter(|arg| !arg.starts_with('-')) else {
+                eprintln!("Error: storage adopt needs a directory\n\n{USAGE}");
+                return crate::exit_status::USAGE;
+            };
+            let Some(host_state) = crate::host_state::default_host_state_dir() else {
+                eprintln!("Error: the host state directory cannot be resolved");
+                return crate::exit_status::ENVIRONMENT;
+            };
+            match check::adopt(&host_state, Path::new(target)) {
+                Ok(path) => {
+                    println!("adopted {} as a storage root", path.display());
+                    crate::exit_status::SUCCESS
+                }
+                Err(message) => {
+                    eprintln!("Error: {message}");
+                    crate::exit_status::REFUSED
+                }
+            }
+        }
         Some("worker") => match check::run_worker_pass() {
             Ok(_) => crate::exit_status::SUCCESS,
             Err(_) => crate::exit_status::FAILED,

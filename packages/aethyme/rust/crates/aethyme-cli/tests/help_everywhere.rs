@@ -141,6 +141,7 @@ const COMMANDS: &[&str] = &[
     "storage status",
     "storage run",
     "storage worker",
+    "storage adopt",
     "certify",
     "init",
     "deploy",

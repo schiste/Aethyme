@@ -9,6 +9,9 @@ aethyme storage — what Aethyme stores on this host, and its budgets
                             entries, evict what is over budget or expired
   storage worker            the same pass, detached (started by broker
                             commands when a budget or floor is breached)
+  storage adopt <dir>       make <dir> a storage root: writes the marker
+                            file the worker requires before it inventories
+                            a directory other than the host state and cache
 
 Budgets: defaults, overridden by <host state>/storage.toml [budget].
 --- stderr

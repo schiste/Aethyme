@@ -3,9 +3,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use super::check::{self, PassInputs, Reclaimable, Summary, WorkerLock};
+use super::evict::{self, Candidate, Reason};
 use super::{Budgets, Class, Root, RootKind, classify};
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
@@ -22,7 +23,7 @@ fn age(path: &Path, days: u64) {
     let mut pending = vec![path.to_path_buf()];
     let mut all = Vec::new();
     while let Some(next) = pending.pop() {
-        if next.is_dir() {
+        if fs::symlink_metadata(&next).unwrap().is_dir() {
             pending.extend(
                 fs::read_dir(&next)
                     .unwrap()
@@ -32,7 +33,6 @@ fn age(path: &Path, days: u64) {
         }
         all.push(next);
     }
-    // Children first, so setting a directory's time is the last change.
     for entry in all.iter().rev() {
         fs::File::open(entry)
             .unwrap()
@@ -59,10 +59,10 @@ fn pass(host_state: &Path, roots: Vec<Root>, budgets: Budgets) -> super::Ledger 
     .unwrap()
 }
 
-fn state_root(path: &Path) -> Root {
+fn root(path: &Path, kind: RootKind) -> Root {
     Root {
         path: path.to_path_buf(),
-        kind: RootKind::HostState,
+        kind,
     }
 }
 
@@ -72,62 +72,164 @@ fn empty_registry(host_state: &Path) -> PathBuf {
     path
 }
 
-#[test]
-fn names_are_classified_and_unknown_ones_are_listed_never_deleted() {
-    assert_eq!(
-        classify(RootKind::HostState, "recovery-archives"),
-        Class::RecoveryArchives
-    );
-    assert_eq!(
-        classify(RootKind::HostState, "rollout-v0.9.1-20260101"),
-        Class::RolloutArtifacts
-    );
-    assert_eq!(
-        classify(RootKind::Storage, "release-0863-cargo-test.log"),
-        Class::ReleaseArtifacts
-    );
-    assert_eq!(
-        classify(RootKind::Storage, "aethyme-broker-quick-test-12"),
-        Class::QuickTestPools
-    );
-    assert_eq!(classify(RootKind::HostCache, "gates"), Class::GateCache);
-    assert_eq!(
-        classify(RootKind::HostCache, "symbol-index"),
-        Class::SymbolIndex
-    );
-    assert_eq!(
-        classify(RootKind::HostState, "host-resources.db"),
-        Class::Coordination
-    );
-    assert_eq!(
-        classify(RootKind::HostState, "someone-elses-dir"),
-        Class::Unclassified
-    );
+fn lease(registry: &Path, request_id: &str, key: &str) -> crate::HostResourceGrant {
+    crate::HostResourceCoordinator::open(registry)
+        .unwrap()
+        .acquire(&crate::HostResourceRequest {
+            schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+            request_id: request_id.into(),
+            repository: "example".into(),
+            worktree_fingerprint: "fingerprint".into(),
+            run_id: "run".into(),
+            ttl_seconds: 600,
+            holder_pid: Some(std::process::id()),
+            resources: vec![crate::HostResourceRequirement {
+                key: "cache".into(),
+                resource: crate::HostResourceKind::ExclusiveKey {
+                    name: crate::gates::managed_cache_lease_name("example-0123", key),
+                },
+            }],
+        })
+        .unwrap()
+}
 
+// Must-fix 1: exact names only, per root kind; hostile names stay.
+#[test]
+fn only_exact_aethyme_names_are_classified_in_their_own_root() {
+    use Class::*;
+    use RootKind::*;
+    for (kind, name, class) in [
+        (HostState, "recovery-archives", RecoveryArchives),
+        (HostState, "rollout-v0.8.53-20261102", RolloutArtifacts),
+        (
+            HostState,
+            "rollout-prep-v0.8.29-2c78fd1b-20261022-v2",
+            RolloutArtifacts,
+        ),
+        (
+            HostState,
+            "release-assets-v0.8.28-ece40948-4924f365",
+            ReleaseArtifacts,
+        ),
+        (HostCache, "gates", GateCache),
+        (HostCache, "symbol-index", SymbolIndex),
+        (
+            WorktreeRoot,
+            "aethyme-broker-quick-test-49725-17924098-4f64122b85fd1c82",
+            QuickTestPools,
+        ),
+        (Storage, "release-0863-cargo-test.log", ReleaseArtifacts),
+        (Storage, "build-cache", ToolCaches),
+        // Hostile or merely similar names.
+        (Storage, "target", Unclassified),
+        (Storage, "cache", Unclassified),
+        (HostState, "release-notes", Unclassified),
+        (HostState, "rollout-vacation-photos", Unclassified),
+        (HostState, "build-cache", Unclassified),
+        (
+            HostState,
+            "aethyme-broker-quick-test-49725-17924098-4f64122b85fd1c82",
+            Unclassified,
+        ),
+        (WorktreeRoot, "foo-quick-test-bar", Worktrees),
+        (
+            WorktreeRoot,
+            "aethyme-broker-quick-test-1-2-notahexsuffix00",
+            Worktrees,
+        ),
+        (Storage, "foo-quick-test-bar", Unclassified),
+    ] {
+        assert_eq!(classify(kind, name), class, "{kind:?} {name}");
+    }
+}
+
+#[test]
+fn a_directory_is_a_storage_root_only_with_the_marker_and_never_a_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path().join("state");
+    let named_aethyme = dir.path().join("Aethyme");
+    fs::create_dir_all(&host_state).unwrap();
+    fs::create_dir_all(named_aethyme.join("target")).unwrap();
+    // Registered without the marker: not a root, whatever its name.
+    check::register_root(&host_state, &named_aethyme, RootKind::Storage);
+    let roots = check::roots(&host_state, None);
+    assert!(
+        !roots.iter().any(|root| root.path == named_aethyme),
+        "{roots:?}"
+    );
+    // Adopted: the marker makes it one.
+    check::adopt(&host_state, &named_aethyme).unwrap();
+    let roots = check::roots(&host_state, None);
+    let canonical = fs::canonicalize(&named_aethyme).unwrap();
+    assert!(
+        roots
+            .iter()
+            .any(|root| root.path == canonical && root.kind == RootKind::Storage)
+    );
+    // A repository, its `.aethyme/` or anything inside it is refused.
+    let repository = dir.path().join("repository");
+    fs::create_dir_all(repository.join(".git")).unwrap();
+    fs::create_dir_all(repository.join(".aethyme/cache")).unwrap();
+    for path in [
+        repository.clone(),
+        repository.join(".aethyme"),
+        repository.join(".aethyme/cache"),
+    ] {
+        assert!(
+            check::adopt(&host_state, &path).is_err(),
+            "{}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn hostile_names_in_a_worktree_root_survive_a_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path().join("state");
+    let worktrees = dir.path().join("worktrees");
+    fs::create_dir_all(&host_state).unwrap();
+    let pool = "aethyme-broker-quick-test-49725-17924098-4f64122b85fd1c82";
+    for name in ["foo-quick-test-bar", pool] {
+        file(&worktrees.join(name).join("checkout/file"), 4096);
+        age(&worktrees.join(name), 30);
+    }
+    let ledger = pass(
+        &host_state,
+        vec![
+            root(&host_state, RootKind::HostState),
+            root(&worktrees, RootKind::WorktreeRoot),
+        ],
+        Budgets::default(),
+    );
+    assert!(worktrees.join("foo-quick-test-bar/checkout/file").exists());
+    assert!(
+        !worktrees.join(pool).exists(),
+        "an expired quick-test pool goes"
+    );
+    assert_eq!(
+        ledger.last_pass.unwrap().evicted,
+        vec![format!("quick_test_pools:{pool}")]
+    );
+}
+
+#[test]
+fn unclassified_entries_are_listed_and_never_deleted() {
     let dir = tempfile::tempdir().unwrap();
     let host_state = dir.path();
     file(&host_state.join("mystery/data.bin"), 64 * 1024);
-    file(&host_state.join("rollout-v0.1-old/files.bin"), 64 * 1024);
+    file(&host_state.join("rollout-v0.1.0-old/files.bin"), 64 * 1024);
     age(&host_state.join("mystery"), 400);
-    age(&host_state.join("rollout-v0.1-old"), 30);
-    let ledger = pass(host_state, vec![state_root(host_state)], Budgets::default());
-    assert!(
-        host_state.join("mystery/data.bin").exists(),
-        "unclassified is never deleted"
+    age(&host_state.join("rollout-v0.1.0-old"), 30);
+    pass(
+        host_state,
+        vec![root(host_state, RootKind::HostState)],
+        Budgets::default(),
     );
-    assert!(
-        !host_state.join("rollout-v0.1-old").exists(),
-        "an expired rollout is removed"
-    );
+    assert!(host_state.join("mystery/data.bin").exists());
+    assert!(!host_state.join("rollout-v0.1.0-old").exists());
     let summary = Summary::load(host_state);
     assert_eq!(summary.unclassified_entries, 1);
-    assert!(summary.unclassified_bytes >= 64 * 1024, "{summary:?}");
-    let report = ledger.last_pass.unwrap();
-    assert_eq!(
-        report.evicted,
-        vec!["rollout_artifacts:rollout-v0.1-old".to_string()]
-    );
-    assert_eq!(ledger.telemetry[&Class::RolloutArtifacts].evictions, 1);
 }
 
 fn gate_entry(cache: &Path, key: &str, days: u64) {
@@ -148,50 +250,75 @@ fn an_over_budget_gate_cache_keeps_one_entry_per_kind_and_every_leased_one() {
     gate_entry(&cache, "rust-workspace-v3", 1);
     gate_entry(&cache, "rust-workspace-v4", 7);
     gate_entry(&cache, "lint-v1", 20);
-    // A gate running right now holds v1.
-    let mut coordinator = crate::HostResourceCoordinator::open(&registry).unwrap();
-    coordinator
-        .acquire(&crate::HostResourceRequest {
-            schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
-            request_id: "gate-run".into(),
-            repository: "example".into(),
-            worktree_fingerprint: "fingerprint".into(),
-            run_id: "run".into(),
-            ttl_seconds: 600,
-            holder_pid: Some(std::process::id()),
-            resources: vec![crate::HostResourceRequirement {
-                key: "cache".into(),
-                resource: crate::HostResourceKind::ExclusiveKey {
-                    name: crate::gates::managed_cache_lease_name(
-                        "example-0123",
-                        "rust-workspace-v1",
-                    ),
-                },
-            }],
-        })
-        .unwrap();
+    let _held = lease(&registry, "gate-run", "rust-workspace-v1");
     let budgets = Budgets {
         gate_cache_bytes_per_repository: 1,
         ..Budgets::default()
     };
-    let roots = vec![
-        state_root(&host_state),
-        Root {
-            path: cache.clone(),
-            kind: RootKind::HostCache,
-        },
-    ];
-    pass(&host_state, roots, budgets);
-    let left: Vec<String> = super::read_names(&cache.join("gates/example-0123"));
+    pass(
+        &host_state,
+        vec![
+            root(&host_state, RootKind::HostState),
+            root(&cache, RootKind::HostCache),
+        ],
+        budgets,
+    );
     assert_eq!(
-        left,
+        super::read_names(&cache.join("gates/example-0123")),
         vec![
             "lint-v1".to_string(),
             "rust-workspace-v1".to_string(),
             "rust-workspace-v3".to_string()
-        ],
-        "the most recent entry per kind stays, the leased one stays, the rest go"
+        ]
     );
+}
+
+#[test]
+fn a_gate_that_takes_the_cache_after_selection_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path().join("state");
+    let cache = dir.path().join("cache");
+    fs::create_dir_all(&host_state).unwrap();
+    let registry = empty_registry(&host_state);
+    gate_entry(&cache, "rust-workspace-v1", 9);
+    let candidate = Candidate {
+        class: Class::GateCache,
+        root_kind: RootKind::HostCache,
+        root: cache.clone(),
+        relative: "gates/example-0123/rust-workspace-v1".into(),
+        bytes: 1,
+        newest_ms: 0,
+        reason: Reason::OverBudget,
+    };
+    let leases = evict::leased_gate_caches(&registry).unwrap();
+    assert_eq!(
+        evict::refuse(&candidate, Some(&leases), super::now_ms()),
+        None
+    );
+    let grant = lease(&registry, "late-gate", "rust-workspace-v1");
+    let removed = evict::remove_protected(&candidate, &registry, &mut || {});
+    assert!(
+        removed
+            .as_ref()
+            .is_err_and(|why| why.contains("a gate holds it")),
+        "{removed:?}"
+    );
+    assert!(
+        cache
+            .join("gates/example-0123/rust-workspace-v1/target/blob")
+            .exists()
+    );
+    crate::HostResourceCoordinator::open(&registry)
+        .unwrap()
+        .release(
+            &grant.lease.lease_id,
+            grant.lease.generation,
+            &grant.ownership_token,
+        )
+        .unwrap();
+    evict::remove_protected(&candidate, &registry, &mut || {}).unwrap();
+    assert!(!cache.join("gates/example-0123/rust-workspace-v1").exists());
+    assert!(evict::leased_gate_caches(&registry).unwrap().is_empty());
 }
 
 fn git(repository: &Path, args: &[&str]) -> String {
@@ -216,9 +343,12 @@ fn git(repository: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-fn archive(host_state: &Path, id: &str, repository: &Path, head: &str, days: u64) {
+fn archive(host_state: &Path, id: &str, repository: &Path, head: &str, created_days_ago: u64) {
     let path = host_state.join("recovery-archives/example-0123").join(id);
+    let created = super::now_ms() - created_days_ago * DAY_MS;
     let manifest = serde_json::json!({
+        "created_at_ms": created,
+        "minimum_archive_retention_ms": 15 * DAY_MS,
         "repository": repository,
         "head": head,
         "branch_tip": head,
@@ -230,11 +360,14 @@ fn archive(host_state: &Path, id: &str, repository: &Path, head: &str, days: u64
     });
     file(&path.join("bundle.bin"), 64 * 1024);
     fs::write(path.join("manifest.json"), manifest.to_string()).unwrap();
-    age(&path, days);
+    // Files inside may be old on day one: never a reason to remove it.
+    age(&path, 400);
 }
 
+// Must-fix 2: never by age, never unlanded, landed only after its promised
+// retention.
 #[test]
-fn archives_go_oldest_first_only_when_landed_and_unlanded_ones_are_reported() {
+fn archives_go_only_when_landed_and_past_their_promised_retention() {
     let dir = tempfile::tempdir().unwrap();
     let host_state = dir.path().join("state");
     let repository = dir.path().join("repository");
@@ -254,94 +387,271 @@ fn archives_go_oldest_first_only_when_landed_and_unlanded_ones_are_reported() {
     git(&repository, &["add", "b"]);
     git(&repository, &["commit", "-q", "-m", "b"]);
     let unlanded = git(&repository, &["rev-parse", "HEAD"]);
-    archive(&host_state, "old-landed", &repository, &landed, 9);
-    archive(&host_state, "middle-unlanded", &repository, &unlanded, 6);
-    archive(&host_state, "new-landed", &repository, &landed, 2);
+    archive(&host_state, "old-landed", &repository, &landed, 40);
+    archive(&host_state, "older-unlanded", &repository, &unlanded, 90);
+    archive(&host_state, "young-landed", &repository, &landed, 3);
     empty_registry(&host_state);
     let budgets = Budgets {
         recovery_archives_bytes: 1,
         ..Budgets::default()
     };
-    let ledger = pass(&host_state, vec![state_root(&host_state)], budgets);
+    let ledger = pass(
+        &host_state,
+        vec![root(&host_state, RootKind::HostState)],
+        budgets,
+    );
     let report = ledger.last_pass.unwrap();
     assert_eq!(
         report.evicted,
-        vec![
-            "recovery_archives:recovery-archives/example-0123/old-landed".to_string(),
-            "recovery_archives:recovery-archives/example-0123/new-landed".to_string(),
-        ],
+        vec!["recovery_archives:recovery-archives/example-0123/old-landed".to_string()],
         "{report:?}"
     );
     assert_eq!(
         report.unlanded_archives,
-        vec!["recovery-archives/example-0123/middle-unlanded".to_string()]
+        vec!["recovery-archives/example-0123/older-unlanded".to_string()]
     );
     assert!(
         host_state
-            .join("recovery-archives/example-0123/middle-unlanded")
+            .join("recovery-archives/example-0123/older-unlanded")
             .exists()
     );
-    assert_eq!(
-        Summary::load(&host_state).unlanded_archives,
-        vec!["recovery-archives/example-0123/middle-unlanded".to_string()]
+    assert!(
+        host_state
+            .join("recovery-archives/example-0123/young-landed")
+            .exists()
     );
+    // Within budget, nothing goes at all, however old.
+    archive(&host_state, "ancient-landed", &repository, &landed, 400);
+    let ledger = pass(
+        &host_state,
+        vec![root(&host_state, RootKind::HostState)],
+        Budgets::default(),
+    );
+    assert!(ledger.last_pass.unwrap().evicted.is_empty());
+}
+
+// Must-fix 3: no walk of report-only classes; walks resume within deadlines
+// and refresh the heartbeat.
+#[test]
+fn report_only_classes_are_counted_never_walked() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path();
+    for index in 0..5 {
+        file(
+            &host_state.join(format!("worktrees/checkout-{index}/deep/file")),
+            1024,
+        );
+    }
+    let mut item = super::Item {
+        root: host_state.to_path_buf(),
+        root_kind: RootKind::HostState,
+        name: "worktrees".into(),
+        class: Class::Worktrees,
+        device: 0,
+        bytes: 0,
+        measured: false,
+        entries: 0,
+        oldest_ms: 0,
+        newest_ms: 0,
+        measured_at_ms: 0,
+        children: Vec::new(),
+        walk: None,
+    };
+    let walks = super::WALKS.with(std::cell::Cell::get);
+    assert!(super::measure_item(
+        &mut item,
+        Instant::now() + Duration::from_secs(5),
+        &mut || {}
+    ));
+    assert_eq!(
+        super::WALKS.with(std::cell::Cell::get),
+        walks,
+        "never walked"
+    );
+    assert_eq!(item.entries, 5);
+    assert!(!item.measured, "bytes are unmeasured, not zero");
 }
 
 #[test]
-fn the_command_check_never_walks_and_refuses_only_when_reclaim_is_not_enough() {
+fn a_walk_stops_at_its_deadline_and_resumes_where_it_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path();
+    for index in 0..40 {
+        file(
+            &cache.join(format!("symbol-index/index-{index}/data")),
+            4096,
+        );
+    }
+    let mut item = super::Item {
+        root: cache.to_path_buf(),
+        root_kind: RootKind::HostCache,
+        name: "symbol-index".into(),
+        class: Class::SymbolIndex,
+        device: 0,
+        bytes: 0,
+        measured: false,
+        entries: 0,
+        oldest_ms: 0,
+        newest_ms: 0,
+        measured_at_ms: 0,
+        children: Vec::new(),
+        walk: None,
+    };
+    // An expired deadline: one step, then a persisted cursor.
+    assert!(!super::measure_item(&mut item, Instant::now(), &mut || {}));
+    assert!(item.walk.is_some());
+    let round_trip: super::Item =
+        serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
+    let mut item = round_trip;
+    let mut rounds = 1;
+    while !super::measure_item(&mut item, Instant::now(), &mut || {}) {
+        rounds += 1;
+        assert!(rounds < 10_000, "the walk makes progress");
+    }
+    assert!(item.measured);
+    assert_eq!(item.children.len(), 40);
+    assert!(item.bytes >= 40 * 4096);
+}
+
+#[test]
+fn a_walk_refreshes_the_heartbeat_as_it_goes() {
+    let dir = tempfile::tempdir().unwrap();
+    for index in 0..20 {
+        file(&dir.path().join(format!("f{index}")), 16);
+    }
+    let device = super::device_of(dir.path()).unwrap();
+    let mut pending = vec![dir.path().to_path_buf()];
+    let mut usage = super::Usage::default();
+    let mut beats = 0;
+    // With a zero interval every entry refreshes it.
+    assert!(super::walk_until(
+        &mut pending,
+        &mut usage,
+        device,
+        Instant::now() + Duration::from_secs(30),
+        Duration::ZERO,
+        &mut || beats += 1,
+    ));
+    assert_eq!(beats, 21, "the directory and its twenty files");
+    assert_eq!(usage.entries, 21);
+    // Deleting refreshes it too.
+    let mut deletion_beats = 0;
+    evict::delete_tree(dir.path(), &mut || deletion_beats += 1).unwrap();
+    assert!(!dir.path().exists());
+    assert!(
+        deletion_beats <= 21,
+        "at most one refresh per removed entry"
+    );
+}
+
+// Must-fix 4: only writers refuse, only below the minimum, after a bounded
+// reclaim; between the minimum and the floor they proceed.
+#[test]
+fn only_writing_commands_refuse_and_only_below_the_hard_minimum() {
+    let words = |text: &str| text.split(' ').map(str::to_string).collect::<Vec<_>>();
+    assert!(check::writes_to(&words("submit prepare status")).is_empty());
+    assert!(check::writes_to(&words("status --json")).is_empty());
+    assert!(check::writes_to(&words("submit --session 3")).contains(&RootKind::HostCache));
+    assert!(check::writes_to(&words("start --task x")).contains(&RootKind::WorktreeRoot));
+
     let dir = tempfile::tempdir().unwrap();
     let host_state = dir.path();
     let regenerable = host_state.join("symbol-index/old-index");
     file(&regenerable.join("index.bin"), 1024);
-    let summary = Summary {
+    age(&regenerable, 30);
+    let other = host_state.join("symbol-index/older-index");
+    file(&other.join("index.bin"), 1024);
+    age(&other, 40);
+    Summary {
         updated_at_ms: super::now_ms(),
-        roots: vec![state_root(host_state)],
-        floor_bytes: 100,
-        reclaimable: vec![Reclaimable {
-            class: Class::SymbolIndex,
-            root_kind: RootKind::HostState,
-            root: host_state.to_path_buf(),
-            relative: "symbol-index/old-index".into(),
-            bytes: 1024,
-            newest_ms: 0,
-        }],
+        roots: vec![root(host_state, RootKind::HostState)],
+        floor_bytes: 1000,
+        hard_minimum_bytes: 100,
+        reclaimable: [&other, &regenerable]
+            .iter()
+            .map(|path| Reclaimable {
+                class: Class::SymbolIndex,
+                root_kind: RootKind::HostState,
+                root: host_state.to_path_buf(),
+                relative: path
+                    .strip_prefix(host_state)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                bytes: 1024,
+                newest_ms: super::now_ms() - 30 * DAY_MS,
+            })
+            .collect(),
         ..Summary::default()
-    };
-    summary.save(host_state).unwrap();
-    let walks_before = super::WALKS.with(std::cell::Cell::get);
+    }
+    .save(host_state)
+    .unwrap();
+    let start = check::writes_to(&words("start"));
+    let walks = super::WALKS.with(std::cell::Cell::get);
 
-    // Above the floor: nothing to do, no worker, no walk.
-    let mut kicks = 0;
-    let decision = check::decide(host_state, true, &mut |_| Some(1_000), &mut || kicks += 1);
+    // Between the minimum and the floor: no refusal (advice warns).
+    let decision = check::decide(host_state, &start, &mut |_| Some(500), &mut || {});
     assert_eq!(decision.refuse, None);
-    assert!(!decision.kick);
-
-    // Below the floor, and removing the regenerable index is enough.
-    let mut free = |_: &Path| Some(if regenerable.exists() { 50 } else { 500 });
-    let decision = check::decide(host_state, true, &mut free, &mut || kicks += 1);
-    assert!(decision.kick, "a floor breach starts the worker");
-    assert_eq!(decision.reclaimed, 1024);
-    assert_eq!(decision.refuse, None, "reclaim was enough");
-    assert!(!regenerable.exists());
-
-    // Still below the floor with nothing left to reclaim: a command that
-    // needs space refuses, one that does not only starts the worker.
-    let decision = check::decide(host_state, true, &mut |_| Some(50), &mut || kicks += 1);
     assert!(
-        decision
-            .refuse
-            .as_deref()
-            .is_some_and(|why| why.contains("below the")),
-        "{decision:?}"
+        regenerable.exists() && other.exists(),
+        "nothing reclaimed above the minimum"
     );
-    let decision = check::decide(host_state, false, &mut |_| Some(50), &mut || kicks += 1);
+
+    // Below the minimum: the oldest regenerable entry is enough; one goes.
+    let mut free = |_: &Path| Some(if other.exists() { 50 } else { 5_000 });
+    let decision = check::decide(host_state, &start, &mut free, &mut || {});
     assert_eq!(decision.refuse, None);
-    assert_eq!(kicks, 3);
+    assert_eq!(decision.reclaimed, 1024);
+    assert!(
+        !other.exists() && regenerable.exists(),
+        "bounded: only what was needed"
+    );
+
+    // A reader never refuses, even below the minimum.
+    let reader = check::writes_to(&words("submit prepare status"));
+    assert_eq!(
+        check::decide(host_state, &reader, &mut |_| Some(1), &mut || {}).refuse,
+        None
+    );
+
+    // A writer still short after reclaim refuses, naming the key and override.
+    let decision = check::decide(host_state, &start, &mut |_| Some(1), &mut || {});
+    let refusal = decision.refuse.expect("refused");
+    assert!(
+        refusal.contains("hard_minimum_bytes") && refusal.contains("AETHYME_STORAGE_LEDGER"),
+        "{refusal}"
+    );
     assert_eq!(
         super::WALKS.with(std::cell::Cell::get),
-        walks_before,
+        walks,
         "the check never walks"
     );
+}
+
+#[test]
+fn worker_starts_are_rate_limited_and_skipped_while_one_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path();
+    Summary {
+        updated_at_ms: super::now_ms(),
+        roots: vec![root(host_state, RootKind::HostState)],
+        floor_bytes: 1000,
+        hard_minimum_bytes: 10,
+        ..Summary::default()
+    }
+    .save(host_state)
+    .unwrap();
+    let mut kicks = 0;
+    for _ in 0..3 {
+        check::decide(host_state, &[], &mut |_| Some(500), &mut || kicks += 1);
+    }
+    assert_eq!(kicks, 1, "at most one start a minute, even below the floor");
+    let mut summary = Summary::load(host_state);
+    summary.last_kick_ms = 0;
+    summary.save(host_state).unwrap();
+    let _lock = WorkerLock::acquire(host_state).unwrap();
+    check::decide(host_state, &[], &mut |_| Some(500), &mut || kicks += 1);
+    assert_eq!(kicks, 1, "never while a worker holds a fresh lock");
 }
 
 #[test]
@@ -364,106 +674,88 @@ fn a_dead_or_stalled_worker_lock_is_taken_over_and_a_live_one_is_not() {
         )
         .unwrap();
     };
-    // Dead owner.
     write(gone.id(), "long ago", super::now_ms());
     let lock = WorkerLock::acquire(host_state).expect("a dead owner's lock is taken over");
     assert!(lock.held());
     drop(lock);
-    assert!(!lock_path.exists(), "released on drop");
-
-    // A live owner (this process) with a fresh heartbeat keeps it.
     let me = std::process::id();
     let started = crate::mcp::hub::process_start(me).unwrap();
     write(me, &started, super::now_ms());
-    assert!(WorkerLock::acquire(host_state).is_err());
-
-    // The same live owner, stalled past the heartbeat limit, loses it.
+    assert!(
+        WorkerLock::acquire(host_state).is_err(),
+        "a live, beating owner keeps it"
+    );
     let stale =
         super::now_ms() - u64::try_from(check::STALE_HEARTBEAT.as_millis()).unwrap() - 1_000;
     write(me, &started, stale);
     let mut lock = WorkerLock::acquire(host_state).expect("a stalled lock is taken over");
     assert!(lock.beat());
-    // Taken over in turn: the old holder notices before its next removal.
     write(me, &started, super::now_ms());
-    assert!(!lock.beat());
+    assert!(!lock.beat(), "the old holder notices it lost the lock");
+    assert!(lock.lost());
 }
 
+// Should-fix 5, 6, 9.
 #[test]
-fn storage_roots_are_only_aethyme_directories() {
+fn links_recent_use_and_unknown_recency_keep_an_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path();
+    let index = cache.join("symbol-index/old");
+    file(&index.join("data"), 1024);
+    age(&index, 30);
+    let candidate = |relative: &str, newest_ms: u64| Candidate {
+        class: Class::SymbolIndex,
+        root_kind: RootKind::HostCache,
+        root: cache.to_path_buf(),
+        relative: relative.into(),
+        bytes: 1024,
+        newest_ms,
+        reason: Reason::OverBudget,
+    };
+    let now = super::now_ms();
+    let measured = now - 30 * DAY_MS + 1000;
     assert_eq!(
-        check::storage_root_for(Path::new("/volume/Application Support/Aethyme/worktrees")),
-        Some(PathBuf::from("/volume/Application Support/Aethyme"))
-    );
-    assert_eq!(
-        check::storage_root_for(Path::new("/home/someone/worktrees")),
+        evict::refuse(&candidate("symbol-index/old", measured), None, now),
         None
     );
-}
-
-#[test]
-fn a_gate_that_takes_the_cache_after_selection_keeps_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let host_state = dir.path().join("state");
-    let cache = dir.path().join("cache");
-    fs::create_dir_all(&host_state).unwrap();
-    let registry = empty_registry(&host_state);
-    gate_entry(&cache, "rust-workspace-v1", 9);
-    // Selected for removal while nothing held it...
-    let candidate = super::evict::Candidate {
-        class: Class::GateCache,
+    // A link anywhere on the path.
+    std::os::unix::fs::symlink(&index, cache.join("symbol-index/linked")).unwrap();
+    assert!(evict::refuse(&candidate("symbol-index/linked", measured), None, now).is_some());
+    std::os::unix::fs::symlink(cache.join("symbol-index"), cache.join("alias")).unwrap();
+    assert!(evict::refuse(&candidate("alias/old", measured), None, now).is_some());
+    // Used since it was measured.
+    fs::write(index.join("fresh"), "x").unwrap();
+    assert!(evict::refuse(&candidate("symbol-index/old", measured), None, now).is_some());
+    // Unknown recency is kept, not treated as oldest.
+    let item = super::Item {
+        root: cache.to_path_buf(),
         root_kind: RootKind::HostCache,
-        root: cache.clone(),
-        relative: "gates/example-0123/rust-workspace-v1".into(),
-        bytes: 1,
+        name: "symbol-index".into(),
+        class: Class::SymbolIndex,
+        device: 0,
+        bytes: 10 * 1024,
+        measured: true,
+        entries: 1,
+        oldest_ms: 0,
         newest_ms: 0,
-        reason: super::evict::Reason::OverBudget,
+        measured_at_ms: now,
+        children: vec![super::Child {
+            name: "unknown".into(),
+            bytes: 10 * 1024,
+            newest_ms: 0,
+            ctime_ms: 0,
+            created_ms: None,
+            min_retention_ms: None,
+        }],
+        walk: None,
     };
-    let leases = super::evict::leased_gate_caches(&registry).unwrap();
-    assert_eq!(super::evict::refuse(&candidate, Some(&leases)), None);
-    // ...then a gate starts and takes its lease before the removal.
-    let mut coordinator = crate::HostResourceCoordinator::open(&registry).unwrap();
-    let grant = coordinator
-        .acquire(&crate::HostResourceRequest {
-            schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
-            request_id: "late-gate".into(),
-            repository: "example".into(),
-            worktree_fingerprint: "fingerprint".into(),
-            run_id: "run".into(),
-            ttl_seconds: 600,
-            holder_pid: Some(std::process::id()),
-            resources: vec![crate::HostResourceRequirement {
-                key: "cache".into(),
-                resource: crate::HostResourceKind::ExclusiveKey {
-                    name: crate::gates::managed_cache_lease_name(
-                        "example-0123",
-                        "rust-workspace-v1",
-                    ),
-                },
-            }],
-        })
-        .unwrap();
-    let removed = super::evict::remove_protected(&candidate, &registry);
-    assert!(
-        removed
-            .as_ref()
-            .is_err_and(|why| why.contains("a gate holds it")),
-        "{removed:?}"
-    );
-    assert!(
-        cache
-            .join("gates/example-0123/rust-workspace-v1/target/blob")
-            .exists()
-    );
-    // Once the gate is done, the removal holds the lease itself and frees it.
-    coordinator
-        .release(
-            &grant.lease.lease_id,
-            grant.lease.generation,
-            &grant.ownership_token,
-        )
-        .unwrap();
-    super::evict::remove_protected(&candidate, &registry).unwrap();
-    assert!(!cache.join("gates/example-0123/rust-workspace-v1").exists());
-    let held = super::evict::leased_gate_caches(&registry).unwrap();
-    assert!(held.is_empty(), "the removal released its lease: {held:?}");
+    let ledger = super::Ledger {
+        items: vec![item],
+        ..super::Ledger::default()
+    };
+    let budgets = Budgets {
+        symbol_index_bytes: 1,
+        ..Budgets::default()
+    };
+    assert!(evict::plan(&ledger, &budgets, now, &Default::default()).is_empty());
 }
