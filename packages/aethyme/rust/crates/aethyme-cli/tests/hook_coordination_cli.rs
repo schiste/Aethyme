@@ -318,6 +318,8 @@ fn finished_sessions_own_files_and_read_tools_stay_silent() {
         "tool_input": {"file_path": my_tree.join("third.txt").to_string_lossy()},
     });
     assert!(fixture.hook(&my_tree, "PreToolUse", &read).is_empty());
+    // The first boundary establishes the incremental coordination baseline.
+    fixture.hook(&my_tree, "PostToolUse", &read);
     assert!(
         fixture.hook(&my_tree, "PostToolUse", &read).is_empty(),
         "no note waiting"

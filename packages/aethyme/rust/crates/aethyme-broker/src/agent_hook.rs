@@ -126,6 +126,15 @@ pub fn run_with_build_banner(args: &[String], running_build_banner: &str) -> u8 
 }
 
 fn run_with_optional_build_banner(args: &[String], running_build_banner: Option<&str>) -> u8 {
+    // The compatibility shim probes before streaming. Older routers answer
+    // unknown hook events silently, so they retain the buffered fallback.
+    if args
+        .first()
+        .is_some_and(|arg| arg == "__stream_protocol_v1")
+    {
+        println!("aethyme-hook-stream-v1");
+        return 0;
+    }
     let Some(event) = args.first().map(String::as_str).and_then(HookEvent::parse) else {
         // Includes `--help` and every future event this binary predates.
         // An older CLI must stay silent in front of a newer plugin.
@@ -252,7 +261,7 @@ fn decide(
                     .and_then(|session| global_view_update(&broker, session, true))
             };
             with_installation_notice(
-                append_context(append_context(start, peers), global),
+                append_context(append_context(append_context(start, own), peers), global),
                 &installation_notice,
             )
         }
@@ -1001,7 +1010,10 @@ fn on_post_tool_use(cwd: &std::path::Path) -> HookOutcome {
         );
     };
     append_context(
-        append_context(deliver_notes(&mut broker, &session), peers),
+        append_context(
+            append_context(deliver_notes(&mut broker, &session), own),
+            peers,
+        ),
         global,
     )
 }
