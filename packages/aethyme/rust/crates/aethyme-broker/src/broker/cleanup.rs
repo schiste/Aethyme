@@ -2845,7 +2845,7 @@ impl Broker {
         }
 
         let head = checkout.head_commit()?;
-        let registrations = self.repo.worktree_inventory()?;
+        let registrations = self.repo.worktree_inventory_for_run()?;
         let matching = registrations
             .iter()
             .filter(|entry| entry.path == canonical_path)
@@ -4258,7 +4258,7 @@ impl Broker {
             return None;
         }
 
-        let inventory = self.repo.worktree_inventory().ok()?;
+        let inventory = self.repo.worktree_inventory_for_run().ok()?;
         let matching_path = inventory
             .iter()
             .filter(|entry| entry.path.canonicalize().ok().as_ref() == Some(&canonical_path))

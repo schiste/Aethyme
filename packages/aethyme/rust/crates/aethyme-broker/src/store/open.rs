@@ -626,6 +626,39 @@ impl BrokerStore {
         Ok(sessions)
     }
 
+    /// Spawned sessions recorded as cleaned, after `after_id`, oldest first,
+    /// at most `limit`: the leftover-folder lap's pages (most have no folder
+    /// left; the caller checks).
+    pub(crate) fn cleaned_spawned_sessions_after(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<Session>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SESSION_SELECT} WHERE origin = 'spawned' AND cleanup_state = 'cleaned'
+               AND id > ?1 ORDER BY id LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(
+            params![after_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+            session_from_row,
+        )?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row??);
+        }
+        Ok(sessions)
+    }
+
+    /// Sessions created at or after `since_ms`.
+    pub(crate) fn count_sessions_created_since(&self, since_ms: i64) -> Result<usize, BrokerError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE created_at >= ?1",
+            params![since_ms],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
     /// Spawned sessions that are no longer open (closed or cleaned), oldest
     /// close first, at most `limit`: the strip pass's candidates, whose
     /// checkout folders may still exist.

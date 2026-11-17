@@ -111,10 +111,16 @@ pub(crate) struct CheckoutBacklog {
 /// One day's comparable counters.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CheckoutStripDay {
+    /// Sessions created that day (UTC): the checkouts that arrived.
+    #[serde(default)]
+    pub sessions_created: usize,
     /// Sessions whose close was recorded that day (UTC).
     pub sessions_closed: usize,
     /// Checkouts the retirement lane moved into the trash that day.
     pub checkouts_retired: usize,
+    /// Of those, leftover folders of sessions already recorded as cleaned.
+    #[serde(default)]
+    pub cleaned_leftovers_retired: usize,
     pub checkouts_stripped: usize,
     pub directories_stripped: usize,
     /// Bytes of stripped directories the deleter removed that day.
@@ -265,10 +271,11 @@ pub(crate) fn prove_strippable(
         return Err("witness_missing");
     }
     // The directory itself, not its contents: exit 0 is ignored, 1 is not.
+    // `check-ignore` takes plain paths and refuses pathspec magic, so no
+    // `--literal-pathspecs` here.
     match git_probe(
         worktree,
         &[
-            "--literal-pathspecs",
             "-c",
             "core.fsmonitor=false",
             "check-ignore",
@@ -632,13 +639,6 @@ impl Broker {
                 return Refused("holder_unknown");
             }
         }
-        let snapshot = match run.process_use() {
-            Ok(snapshot) => snapshot,
-            Err(_) => return Refused("process_use_unknown"),
-        };
-        if crate::reclaim::open_file_snapshot_blocker_for_worktree(&snapshot, &worktree).is_some() {
-            return Refused("process_using_checkout");
-        }
         report.checkouts_listed += 1;
         let discover_started = Instant::now();
         let candidates = regenerable_candidates(&worktree, deadline);
@@ -651,6 +651,15 @@ impl Broker {
         };
         if candidates.is_empty() {
             return CheckoutStrip::Done(0);
+        }
+        // Only a checkout with something to strip pays for the open-file
+        // observation (the lane's single one is shared by the whole run).
+        let snapshot = match run.process_use() {
+            Ok(snapshot) => snapshot,
+            Err(_) => return Refused("process_use_unknown"),
+        };
+        if crate::reclaim::open_file_snapshot_blocker_for_worktree(&snapshot, &worktree).is_some() {
+            return Refused("process_using_checkout");
         }
         // The renames, and the cheap proofs right before them, under the
         // lifecycle claim (taken without waiting, so a foreground command
@@ -782,6 +791,15 @@ impl Broker {
         if let Ok(closed) = self.store_ref().count_sessions_closed_since(today * DAY_MS) {
             day.sessions_closed = closed;
         }
+        if let Ok(created) = self
+            .store_ref()
+            .count_sessions_created_since(today * DAY_MS)
+        {
+            day.sessions_created = created;
+        }
+        day.cleaned_leftovers_retired = day
+            .cleaned_leftovers_retired
+            .saturating_add(report.retired_cleaned_leftovers);
         day.checkouts_retired = day.checkouts_retired.saturating_add(
             report.retired_clean + report.retired_archived + report.retired_operation_archived,
         );

@@ -682,7 +682,11 @@ fails or cannot finish, the directory stays where it is:
   file in it.
 
 Anything outside the catalogue is left for the retirement lane's careful
-path, which then inspects a much smaller tree. A retirement inspection that
+path, which then inspects a much smaller tree. After the closed sessions,
+the lane also walks folders left behind by sessions already recorded as
+cleaned, oldest first: each is judged, archived when needed and trashed by
+the same rules, through the newest session recorded for its path and only
+once that session's holder is gone. A retirement inspection that
 fails or times out is retried on the next run rather than remembered as a
 refusal; the last such failure, with the Git step that failed, is shown in
 `storage.closed-checkouts-backlog`.

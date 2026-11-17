@@ -220,6 +220,8 @@ pub fn status_value(host_state: &Path) -> Value {
                 "closed_folders": checkouts.values().map(|counts| counts.closed_folders).sum::<usize>(),
                 "closed_with_regenerable": checkouts.values().map(|counts| counts.closed_with_regenerable).sum::<usize>(),
                 "bytes_freed_by_strip": checkouts.values().map(|counts| counts.bytes_freed_by_strip).sum::<u64>(),
+                "sessions_created_today": checkouts.values().map(|counts| counts.sessions_created_today).sum::<usize>(),
+                "checkouts_retired_today": checkouts.values().map(|counts| counts.checkouts_retired_today).sum::<usize>(),
                 "repositories": checkouts,
                 "why_not": "counts only: checkout folders are not walked for bytes",
             }),
@@ -294,11 +296,13 @@ fn status(json_output: bool) -> u8 {
         for (class, entry) in classes {
             if class == "checkouts" {
                 println!(
-                    "{class:<24} {} folder(s), {} closed, {} closed holding regenerable directories, {} freed by strip  (counts only)",
+                    "{class:<24} {} folder(s), {} closed, {} closed holding regenerable directories, {} freed by strip; today {} created, {} retired  (counts only)",
                     entry["folders"].as_u64().unwrap_or(0),
                     entry["closed_folders"].as_u64().unwrap_or(0),
                     entry["closed_with_regenerable"].as_u64().unwrap_or(0),
                     human(entry["bytes_freed_by_strip"].as_u64().unwrap_or(0)),
+                    entry["sessions_created_today"].as_u64().unwrap_or(0),
+                    entry["checkouts_retired_today"].as_u64().unwrap_or(0),
                 );
                 continue;
             }

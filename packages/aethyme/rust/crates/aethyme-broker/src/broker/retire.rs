@@ -39,6 +39,8 @@ use std::time::Instant;
 pub(crate) const CHECKOUT_RETIREMENT_DUE_KEY: &str = "checkout_retirement.due_at_ms";
 /// Meta key: the last session id the backlog sweep judged.
 const CHECKOUT_RETIREMENT_CURSOR_KEY: &str = "checkout_retirement.cursor";
+/// Meta key: the last cleaned session id the leftover-folder lap judged.
+const CHECKOUT_RETIREMENT_CLEANED_CURSOR_KEY: &str = "checkout_retirement.cleaned_cursor";
 /// Meta key: the trash entries this repository recorded when it moved a
 /// checkout in (JSON: trash directory, then entry name, then device, inode,
 /// session, failed deletions and whether the rename is still unconfirmed).
@@ -412,6 +414,7 @@ fn kept_counter(code: &'static str) -> &'static str {
         "operation_archive_failed" => "checkout_retirement_kept_operation_archive_failed",
         "holder_alive" => "checkout_retirement_kept_holder_alive",
         "holder_unknown" => "checkout_retirement_kept_holder_unknown",
+        "leftover_superseded" => "checkout_retirement_kept_leftover_superseded",
         _ => "checkout_retirement_kept_other",
     }
 }
@@ -555,6 +558,11 @@ pub(crate) struct CheckoutRetirementReport {
     /// Sessions whose checkout is in the trash, recorded as cleaned.
     pub reconciled_trashed: usize,
     pub lap_complete: bool,
+    /// The lap over cleaned sessions' leftover folders reached its end.
+    pub cleaned_lap_complete: bool,
+    /// Of the retired checkouts, leftover folders of sessions already
+    /// recorded as cleaned.
+    pub retired_cleaned_leftovers: usize,
     pub trash: crate::checkout_trash::TrashDrainReport,
     /// How many times the open sessions' paths were resolved (once per run).
     pub open_path_resolutions: usize,
@@ -1436,8 +1444,12 @@ impl Broker {
         }
         let git_deadline = crate::git::limit_git_until(run.deadline);
         let session = self.store_ref().session(session_id)?;
+        let leftover = session.cleanup_state == crate::SessionCleanupState::Cleaned;
         if !session.status.is_closed()
-            || session.cleanup_state != crate::SessionCleanupState::Closed
+            || !matches!(
+                session.cleanup_state,
+                crate::SessionCleanupState::Closed | crate::SessionCleanupState::Cleaned
+            )
         {
             return Ok(Kept("not_closed"));
         }
@@ -1448,6 +1460,38 @@ impl Broker {
         match std::fs::symlink_metadata(&worktree) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             _ => return Ok(Kept("checkout_missing")),
+        }
+        if leftover {
+            // A folder left behind by a session already recorded as
+            // cleaned: judged only through the newest session recorded for
+            // its path (a later session there owns it), and only once that
+            // session's recorded holder is gone or was never bound.
+            match self
+                .store_ref()
+                .latest_session_for_worktree_any_state(&session.worktree_path)
+            {
+                Ok(Some(latest)) if latest.id == session.id => {}
+                Ok(_) => return Ok(Kept("leftover_superseded")),
+                Err(_) => return Ok(Kept("open_session_unknown")),
+            }
+            let mut holders = crate::session_holder::RecordedHolderProcessTable::default();
+            match crate::session_holder::recorded_holder_liveness(
+                self.store_ref(),
+                session.id,
+                &mut holders,
+                true,
+            )
+            .liveness
+            {
+                crate::session_holder::RecordedHolderLiveness::Unbound
+                | crate::session_holder::RecordedHolderLiveness::Gone => {}
+                crate::session_holder::RecordedHolderLiveness::Alive => {
+                    return Ok(Kept("holder_alive"));
+                }
+                crate::session_holder::RecordedHolderLiveness::Unknown => {
+                    return Ok(Kept("holder_unknown"));
+                }
+            }
         }
         {
             let _phase = crate::phase_telemetry::span("checkout_retirement_phase_ownership");
@@ -1612,7 +1656,7 @@ impl Broker {
             };
             let current = self.store_ref().session(session_id)?;
             if !current.status.is_closed()
-                || current.cleanup_state != crate::SessionCleanupState::Closed
+                || current.cleanup_state != session.cleanup_state
                 || current.worktree_path != session.worktree_path
             {
                 return Ok(Kept("changed"));
@@ -1754,7 +1798,7 @@ impl Broker {
         };
         let current = self.store_ref().session(session.id)?;
         if !current.status.is_closed()
-            || current.cleanup_state != crate::SessionCleanupState::Closed
+            || current.cleanup_state != session.cleanup_state
             || current.worktree_path != session.worktree_path
         {
             return Ok(Kept("changed"));
@@ -1876,92 +1920,19 @@ impl Broker {
                 strip_deadline,
                 super::strip::STRIP_CHECKOUTS_PER_RUN,
             );
-            let mut cursor = self
-                .store_ref()
-                .meta_get(CHECKOUT_RETIREMENT_CURSOR_KEY)
-                .ok()
-                .flatten()
-                .and_then(|value| value.parse::<i64>().ok())
-                .unwrap_or(0);
-            'lap: loop {
-                if Instant::now() >= sweep_deadline {
-                    break;
-                }
-                let page = self
-                    .store_ref()
-                    .closed_spawned_sessions_after(cursor, RETIRE_PAGE)?;
-                if page.is_empty() {
-                    cursor = 0;
-                    report.lap_complete = true;
-                    break;
-                }
-                for session in page {
-                    if Instant::now() >= sweep_deadline {
-                        break 'lap;
-                    }
-                    let previous_cursor = cursor;
-                    cursor = session.id;
-                    if !Path::new(&session.worktree_path).exists() {
-                        // Moved into the trash but the cleaned record was
-                        // lost: record it now. Any other missing checkout
-                        // is the missing-checkout lane's, which proves the
-                        // absence first.
-                        if self.checkout_proven_trashed(session.id)
-                            && self.record_trashed_session_cleaned(session.id)
-                        {
-                            report.reconciled_trashed += 1;
-                            crate::phase_telemetry::add(
-                                "checkout_retirement_reconciled_trashed",
-                                std::time::Duration::ZERO,
-                            );
-                        }
-                        continue;
-                    }
-                    if self.remembered_keep_holds(&session, crate::clock::epoch_ms()) {
-                        report.keep_memo_skips += 1;
-                        crate::phase_telemetry::add(
-                            "checkout_retirement_keep_memo_skips",
-                            std::time::Duration::ZERO,
-                        );
-                        continue;
-                    }
-                    report.examined += 1;
-                    match self.retire_closed_checkout(session.id, &mut run)? {
-                        RetireOutcome::RetiredClean => report.retired_clean += 1,
-                        RetireOutcome::RetiredArchived { bytes } => {
-                            report.retired_archived += 1;
-                            report.archive_bytes = report.archive_bytes.saturating_add(bytes);
-                        }
-                        RetireOutcome::RetiredOperationArchived { bytes } => {
-                            report.retired_operation_archived += 1;
-                            report.archive_bytes = report.archive_bytes.saturating_add(bytes);
-                        }
-                        RetireOutcome::Kept(code)
-                            if code == "process_use_unknown"
-                                || (code == "archive_deferred" && report.examined > 1) =>
-                        {
-                            // Not a verdict about this checkout: the run
-                            // could not look, or has too little time left
-                            // for its archive. The next run, due soon,
-                            // starts with it. (An archive deferred as the
-                            // run's first judgement is passed over instead,
-                            // so a slow start can never wedge the lap.)
-                            *report.kept.entry(code.to_string()).or_default() += 1;
-                            report.process_use_unavailable |= code == "process_use_unknown";
-                            cursor = previous_cursor;
-                            break 'lap;
-                        }
-                        RetireOutcome::Kept(code) => {
-                            *report.kept.entry(code.to_string()).or_default() += 1;
-                        }
-                    }
-                }
+            // Closed sessions first, then the leftover folders of sessions
+            // already recorded as cleaned, each lap with its own cursor so
+            // neither starves the other: the closed lap may use the time up
+            // to halfway between the strip and the sweep deadline, the
+            // cleaned lap the rest (and whatever the closed lap left).
+            let closed_deadline =
+                strip_deadline + sweep_deadline.saturating_duration_since(strip_deadline) / 2;
+            report.lap_complete =
+                self.retirement_lap(&mut run, &mut report, false, closed_deadline)?;
+            if !report.process_use_unavailable {
+                report.cleaned_lap_complete =
+                    self.retirement_lap(&mut run, &mut report, true, sweep_deadline)?;
             }
-            crate::warn_unrecorded(
-                "advance the checkout retirement cursor",
-                self.store_ref()
-                    .meta_set(CHECKOUT_RETIREMENT_CURSOR_KEY, &cursor.to_string()),
-            );
             last_inspection_failure = run.last_inspection_failure.take();
         } else {
             crate::phase_telemetry::add(
@@ -2012,6 +1983,7 @@ impl Broker {
             && let Some((host_state, _)) = crate::host_state::resolve_host_state_dir()
         {
             let backlog = &progress.strip.backlog;
+            let today = progress.strip.days.last_key_value().map(|(_, day)| day);
             crate::warn_unrecorded(
                 "record checkout counts in the storage ledger",
                 crate::storage_ledger::record_checkout_counts(
@@ -2025,6 +1997,8 @@ impl Broker {
                         last_checkouts_stripped: progress.strip.last_checkouts_stripped,
                         last_directories_stripped: progress.strip.last_directories_stripped,
                         observed_at_ms: backlog.observed_at_ms,
+                        sessions_created_today: today.map_or(0, |day| day.sessions_created),
+                        checkouts_retired_today: today.map_or(0, |day| day.checkouts_retired),
                     },
                 ),
             );
@@ -2036,8 +2010,10 @@ impl Broker {
                 &serde_json::to_string(&progress).unwrap_or_default(),
             ),
         );
-        let busy =
-            !report.lap_complete || report.trash.entries_pending > 0 || report.strip.more_remaining;
+        let busy = !report.lap_complete
+            || !report.cleaned_lap_complete
+            || report.trash.entries_pending > 0
+            || report.strip.more_remaining;
         let next = crate::clock::epoch_ms().saturating_add(if busy {
             RETIRE_BUSY_RECHECK_MS
         } else {
@@ -2049,6 +2025,132 @@ impl Broker {
                 .meta_set(CHECKOUT_RETIREMENT_DUE_KEY, &next.to_string()),
         );
         Ok(report)
+    }
+
+    /// One retirement lap from its cursor until `deadline`: over closed
+    /// sessions, or (`cleaned`) over sessions already recorded as cleaned
+    /// whose checkout folder is still on disk. `Ok(true)` when the lap
+    /// reached its end (the cursor wraps).
+    fn retirement_lap(
+        &mut self,
+        run: &mut RetireRun,
+        report: &mut CheckoutRetirementReport,
+        cleaned: bool,
+        deadline: Instant,
+    ) -> Result<bool, BrokerOpError> {
+        let _span = crate::phase_telemetry::span(if cleaned {
+            "checkout_retirement_cleaned_lap"
+        } else {
+            "checkout_retirement_closed_lap"
+        });
+        let cursor_key = if cleaned {
+            CHECKOUT_RETIREMENT_CLEANED_CURSOR_KEY
+        } else {
+            CHECKOUT_RETIREMENT_CURSOR_KEY
+        };
+        let mut complete = false;
+        let mut cursor = self
+            .store_ref()
+            .meta_get(cursor_key)
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        'lap: loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let page = if cleaned {
+                self.store_ref()
+                    .cleaned_spawned_sessions_after(cursor, RETIRE_PAGE)?
+            } else {
+                self.store_ref()
+                    .closed_spawned_sessions_after(cursor, RETIRE_PAGE)?
+            };
+            if page.is_empty() {
+                cursor = 0;
+                complete = true;
+                break;
+            }
+            for session in page {
+                if Instant::now() >= deadline {
+                    break 'lap;
+                }
+                let previous_cursor = cursor;
+                cursor = session.id;
+                if cleaned && !Path::new(&session.worktree_path).exists() {
+                    // The usual cleaned session: nothing left on disk.
+                    continue;
+                }
+                if !Path::new(&session.worktree_path).exists() {
+                    // Moved into the trash but the cleaned record was
+                    // lost: record it now. Any other missing checkout
+                    // is the missing-checkout lane's, which proves the
+                    // absence first.
+                    if self.checkout_proven_trashed(session.id)
+                        && self.record_trashed_session_cleaned(session.id)
+                    {
+                        report.reconciled_trashed += 1;
+                        crate::phase_telemetry::add(
+                            "checkout_retirement_reconciled_trashed",
+                            std::time::Duration::ZERO,
+                        );
+                    }
+                    continue;
+                }
+                if self.remembered_keep_holds(&session, crate::clock::epoch_ms()) {
+                    report.keep_memo_skips += 1;
+                    crate::phase_telemetry::add(
+                        "checkout_retirement_keep_memo_skips",
+                        std::time::Duration::ZERO,
+                    );
+                    continue;
+                }
+                report.examined += 1;
+                let outcome = self.retire_closed_checkout(session.id, run)?;
+                if cleaned && outcome.retired() {
+                    report.retired_cleaned_leftovers += 1;
+                    crate::phase_telemetry::add(
+                        "checkout_retirement_cleaned_leftover_retired",
+                        std::time::Duration::ZERO,
+                    );
+                }
+                match outcome {
+                    RetireOutcome::RetiredClean => report.retired_clean += 1,
+                    RetireOutcome::RetiredArchived { bytes } => {
+                        report.retired_archived += 1;
+                        report.archive_bytes = report.archive_bytes.saturating_add(bytes);
+                    }
+                    RetireOutcome::RetiredOperationArchived { bytes } => {
+                        report.retired_operation_archived += 1;
+                        report.archive_bytes = report.archive_bytes.saturating_add(bytes);
+                    }
+                    RetireOutcome::Kept(code)
+                        if code == "process_use_unknown"
+                            || (code == "archive_deferred" && report.examined > 1) =>
+                    {
+                        // Not a verdict about this checkout: the run
+                        // could not look, or has too little time left
+                        // for its archive. The next run, due soon,
+                        // starts with it. (An archive deferred as the
+                        // run's first judgement is passed over instead,
+                        // so a slow start can never wedge the lap.)
+                        *report.kept.entry(code.to_string()).or_default() += 1;
+                        report.process_use_unavailable |= code == "process_use_unknown";
+                        cursor = previous_cursor;
+                        break 'lap;
+                    }
+                    RetireOutcome::Kept(code) => {
+                        *report.kept.entry(code.to_string()).or_default() += 1;
+                    }
+                }
+            }
+        }
+        crate::warn_unrecorded(
+            "advance the checkout retirement cursor",
+            self.store_ref().meta_set(cursor_key, &cursor.to_string()),
+        );
+        Ok(complete)
     }
 
     /// Drain this repository's recorded trash entries until `deadline`, as
@@ -3655,15 +3757,16 @@ mod tests {
         label: &str,
     ) -> (crate::Session, PathBuf) {
         exclude_node_modules(broker);
-        closed(broker, label, |worktree| {
-            for dir in ["node_modules/left-pad", "packages/app/node_modules/dep"] {
-                std::fs::create_dir_all(worktree.join(dir)).unwrap();
-                std::fs::write(worktree.join(dir).join("index.js"), "module.exports = 1;\n")
-                    .unwrap();
-            }
-            std::fs::create_dir_all(worktree.join("vendor")).unwrap();
-            std::fs::write(worktree.join("vendor/keep.js"), "kept\n").unwrap();
-        })
+        // Populated after the close: closing already reclaims build output
+        // and strips; these tests exercise the lane's pass.
+        let (session, worktree) = closed(broker, label, |_| {});
+        for dir in ["node_modules/left-pad", "packages/app/node_modules/dep"] {
+            std::fs::create_dir_all(worktree.join(dir)).unwrap();
+            std::fs::write(worktree.join(dir).join("index.js"), "module.exports = 1;\n").unwrap();
+        }
+        std::fs::create_dir_all(worktree.join("vendor")).unwrap();
+        std::fs::write(worktree.join("vendor/keep.js"), "kept\n").unwrap();
+        (session, worktree)
     }
 
     fn strip_pass(broker: &crate::Broker) -> super::super::strip::CheckoutStripReport {
@@ -3766,10 +3869,9 @@ mod tests {
     fn a_run_strips_then_retires_the_remainder() {
         let (_owner, _storage, mut broker) = fixture();
         exclude_node_modules(&broker);
-        let (session, worktree) = closed(&mut broker, "strip then retire", |worktree| {
-            std::fs::create_dir_all(worktree.join("node_modules/dep")).unwrap();
-            std::fs::write(worktree.join("node_modules/dep/index.js"), "x\n").unwrap();
-        });
+        let (session, worktree) = closed(&mut broker, "strip then retire", |_| {});
+        std::fs::create_dir_all(worktree.join("node_modules/dep")).unwrap();
+        std::fs::write(worktree.join("node_modules/dep/index.js"), "x\n").unwrap();
 
         let report = run(&mut broker);
 
@@ -3823,12 +3925,45 @@ mod tests {
         let (_owner, _storage, broker) = fixture();
         let repo = broker.repo_handle();
         let scope = crate::git::WorktreeInventoryRunScope::enter();
-        let first = repo.worktree_inventory().unwrap();
+        let first = repo.worktree_inventory_for_run().unwrap();
         let root = broker.main_root().to_path_buf();
         git(&root, &["worktree", "add", "-q", "-b", "later", "../later"]);
-        let second = repo.worktree_inventory().unwrap();
+        let second = repo.worktree_inventory_for_run().unwrap();
         assert_eq!(first, second, "the run reuses its listing");
         drop(scope);
         assert_eq!(repo.worktree_inventory().unwrap().len(), first.len() + 1);
+        assert_eq!(
+            repo.worktree_inventory_for_run().unwrap().len(),
+            first.len() + 1,
+            "outside a run scope nothing is cached"
+        );
+    }
+
+    /// A folder left behind by a session already recorded as cleaned is
+    /// stripped, judged and retired by the leftover lap, and counted.
+    #[test]
+    fn a_cleaned_sessions_leftover_folder_is_retired() {
+        let (_owner, _storage, mut broker) = fixture();
+        exclude_node_modules(&broker);
+        let (session, worktree) = closed(&mut broker, "leftover", |_| {});
+        std::fs::create_dir_all(worktree.join("node_modules/dep")).unwrap();
+        std::fs::write(worktree.join("node_modules/dep/index.js"), "x\n").unwrap();
+        broker
+            .store()
+            .set_session_status(session.id, crate::SessionStatus::Cleaned, None)
+            .unwrap();
+        assert!(is_cleaned(&broker, session.id));
+        assert!(worktree.exists(), "the folder outlived its cleaned record");
+
+        let report = run(&mut broker);
+
+        assert_eq!(report.strip.directories_stripped, 1, "{report:#?}");
+        assert_eq!(report.retired_cleaned_leftovers, 1, "{report:#?}");
+        assert!(!worktree.exists());
+        let progress = broker.checkout_strip_progress();
+        let today = progress.days.values().last().expect("a day recorded");
+        assert_eq!(today.cleaned_leftovers_retired, 1, "{progress:#?}");
+        assert!(today.sessions_created >= 1, "{progress:#?}");
+        assert!(today.checkouts_retired >= 1, "{progress:#?}");
     }
 }

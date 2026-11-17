@@ -396,7 +396,7 @@ pub(crate) fn registration_of(
         .canonicalize()
         .map_err(|error| format!("cannot resolve {}: {error}", worktree.display()))?;
     let listed = repo
-        .worktree_inventory()
+        .worktree_inventory_for_run()
         .map_err(|error| format!("cannot list worktrees: {error}"))?
         .iter()
         .any(|entry| entry.path.canonicalize().ok().as_ref() == Some(&canonical_worktree));

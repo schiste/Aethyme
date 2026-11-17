@@ -3007,6 +3007,16 @@ fn push_checkout_retirement_advice(
                 progress.strip.bytes_freed_total
             ),
         ];
+        if let Some((_, today)) = progress.strip.days.last_key_value() {
+            evidence.push(format!(
+                "today (UTC): {} session(s) created, {} closed, {} checkout(s) retired ({} leftover folder(s) of cleaned sessions), {} stripped",
+                today.sessions_created,
+                today.sessions_closed,
+                today.checkouts_retired,
+                today.cleaned_leftovers_retired,
+                today.checkouts_stripped
+            ));
+        }
         if let Some(failure) = &progress.last_inspection_failure {
             evidence.push(format!("last inspection retried: {failure}"));
         }

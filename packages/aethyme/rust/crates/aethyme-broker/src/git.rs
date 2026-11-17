@@ -8599,25 +8599,17 @@ impl GitRepo {
     }
 
     fn listed_worktree_lock_reason(&self, worktree: &Path) -> Option<String> {
-        let listing = run_git(&self.root, &["worktree", "list", "--porcelain"]).ok()?;
+        let inventory = self.worktree_inventory_for_run().ok()?;
         let wanted = worktree
             .canonicalize()
             .unwrap_or_else(|_| worktree.to_path_buf());
-        let mut current: Option<PathBuf> = None;
-        for line in listing.lines() {
-            if let Some(path) = line.strip_prefix("worktree ") {
-                let path = PathBuf::from(path);
-                current = Some(path.canonicalize().unwrap_or(path));
-            } else if current.as_deref() == Some(wanted.as_path()) {
-                if line == "locked" {
-                    return Some(String::new());
-                }
-                if let Some(reason) = line.strip_prefix("locked ") {
-                    return Some(reason.to_string());
-                }
-            }
-        }
-        None
+        inventory
+            .into_iter()
+            .find(|entry| {
+                entry.path == wanted || entry.path.canonicalize().ok().as_ref() == Some(&wanted)
+            })
+            .filter(|entry| entry.locked)
+            .map(|entry| entry.lock_reason.unwrap_or_default())
     }
 
     pub fn worktree_remove(&self, worktree: &Path, force: bool) -> Result<(), GitError> {
@@ -8729,23 +8721,32 @@ impl GitRepo {
     /// and entries Git marks prunable. A failed or malformed listing is an
     /// error so cleanup callers cannot mistake unknown state for no worktrees.
     pub fn worktree_inventory(&self) -> Result<Vec<GitWorktreeInfo>, GitError> {
+        let started = Instant::now();
+        let listing = run_git_bytes(&self.root, &["worktree", "list", "--porcelain", "-z"])?;
+        let entries = parse_worktree_porcelain_z(&listing)?;
+        crate::phase_telemetry::add("git_worktree_list", started.elapsed());
+        Ok(entries)
+    }
+
+    /// [`Self::worktree_inventory`], listed once per run while a
+    /// [`WorktreeInventoryRunScope`] is active on this thread. Only for
+    /// lookups whose caller verifies what it acts on from the filesystem
+    /// (a checkout's own `.git` and its admin directory), or that look up a
+    /// checkout whose directory exists (Git never registers a second
+    /// worktree at an existing path); a check that a branch is checked out
+    /// nowhere, or that a missing checkout is unregistered, lists afresh.
+    pub(crate) fn worktree_inventory_for_run(&self) -> Result<Vec<GitWorktreeInfo>, GitError> {
         let cached = WORKTREE_INVENTORY_RUN_CACHE.with(|cache| {
             cache
                 .borrow()
                 .as_ref()
                 .map(|cache| cache.get(&self.root).cloned())
         });
-        match cached {
-            Some(Some(entries)) => {
-                crate::phase_telemetry::add("git_worktree_list_reused", Duration::ZERO);
-                return Ok(entries);
-            }
-            Some(None) | None => {}
+        if let Some(Some(entries)) = cached {
+            crate::phase_telemetry::add("git_worktree_list_reused", Duration::ZERO);
+            return Ok(entries);
         }
-        let started = Instant::now();
-        let listing = run_git_bytes(&self.root, &["worktree", "list", "--porcelain", "-z"])?;
-        let entries = parse_worktree_porcelain_z(&listing)?;
-        crate::phase_telemetry::add("git_worktree_list", started.elapsed());
+        let entries = self.worktree_inventory()?;
         WORKTREE_INVENTORY_RUN_CACHE.with(|cache| {
             if let Some(cache) = cache.borrow_mut().as_mut() {
                 cache.insert(self.root.clone(), entries.clone());

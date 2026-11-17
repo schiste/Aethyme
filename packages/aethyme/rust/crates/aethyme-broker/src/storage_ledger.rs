@@ -720,6 +720,12 @@ pub struct CheckoutCounts {
     pub last_checkouts_stripped: usize,
     pub last_directories_stripped: usize,
     pub observed_at_ms: i64,
+    /// Today (UTC): sessions created and checkouts retired, so throughput
+    /// against arrivals is visible.
+    #[serde(default)]
+    pub sessions_created_today: usize,
+    #[serde(default)]
+    pub checkouts_retired_today: usize,
 }
 
 /// The checkout counts of every repository that recorded them.
