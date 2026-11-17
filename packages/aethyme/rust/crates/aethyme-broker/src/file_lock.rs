@@ -1026,6 +1026,7 @@ struct LifecycleRank {
 
 impl LifecycleRank {
     /// A ticket that has not aged.
+    #[cfg(test)]
     fn fresh(key: LifecycleTicketKey) -> Self {
         Self { key, aged: false }
     }
