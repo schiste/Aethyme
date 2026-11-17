@@ -1163,6 +1163,13 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
     if args.first().map(String::as_str) == Some("service") {
         return service::run_service(&args[1..]);
     }
+    // O(1) storage check: a statvfs per root and a read of the ledger
+    // summary. Starts the storage worker when a budget or floor is breached;
+    // a command that needs space reclaims regenerable data first and refuses
+    // only if the volume is still below its floor.
+    if let Some(code) = crate::storage_ledger::check::command_start(args) {
+        return code;
+    }
     if command_can_discard_work(args) {
         crate::git::require_fresh_git_probe();
     }
