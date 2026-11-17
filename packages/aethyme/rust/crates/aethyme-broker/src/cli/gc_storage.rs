@@ -2307,7 +2307,11 @@ fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageErr
     // The read-only cache measurement may walk for minutes: the worker
     // releases this repository's lock before it, so the next deletion run
     // can start.
-    broker.run_artifact_sweep_recovery_worker(move || drop(worker_lock))?;
+    let result = broker.run_artifact_sweep_recovery_worker(move || drop(worker_lock));
+    // Opt-in host lane: archive closed agent transcripts at this worker's
+    // background priority. A no-op unless the host enabled it.
+    crate::transcripts::run_worker_lane();
+    result?;
     Ok(())
 }
 

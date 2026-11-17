@@ -1,0 +1,126 @@
+# Archiving closed agent transcripts
+
+Last Updated: 2026-11-17
+
+Agent CLIs keep every session's transcript forever. On a busy host they add
+up to tens of GiB, almost none of which is read again once the session is
+over. `aethyme transcripts` compresses and moves the transcripts of finished
+sessions, and puts any of them back on request. zstd at level 3 shrinks agent
+transcripts four to five times.
+
+It is opt-in and off by default. While it is off nothing runs and no agent
+directory is even listed.
+
+## What qualifies
+
+A transcript is archived only when all of these hold:
+
+- it was last modified more than `archive_after_days` ago (default 3);
+- no process has it open, checked when archiving starts and again just
+  before the original is removed (a running Codex keeps its transcript files
+  open; a running Claude Code does not, which is why the age rule matters);
+- when it is linked to broker sessions in any repository's broker database
+  known on this host, every linked session is closed or cleaned and its
+  checkout directory no longer exists.
+
+A transcript linked to no broker session needs only the age and not-open
+conditions. Anything unreadable or ambiguous is skipped and counted with a
+reason (`session_open`, `checkout_present`, `open_by_process`,
+`open_check_unavailable`, `linkage_unreadable`, ...).
+
+Links come from the `session.holder_bound` event the broker records when an
+agent takes a session: its command usually names the agent session id
+(`codex ... resume <id>`). New bindings are also linked through the holder's
+open transcript files on Linux. Older events are read lazily from every broker
+database the lane can find: configured `repositories`, the host's worktree
+registry, and the repository a transcript's recorded `cwd` belongs to.
+
+## Where archives go
+
+- Codex: `<codex home>/archived_sessions/<same name>.jsonl.zst`. Codex reads
+  `.jsonl.zst` natively: `codex unarchive <id>` moves it back and
+  `codex resume <id>` resumes it (and rewrites it as plain `.jsonl`). A
+  `.jsonl.gz` file does not work: `codex unarchive` fails on it. Transcripts
+  Codex already archived uncompressed are compressed in place.
+- Claude Code is not known to read a compressed transcript, so its archives
+  live under Aethyme's host state, `<host state>/transcripts/claude/<project
+  directory>/<id>.jsonl.zst`, and come back only through
+  `aethyme transcripts restore`.
+
+Every archive is recorded in `<host state>/transcripts/index.sqlite3` with
+its original path and SHA-256.
+
+## Turning it on
+
+```bash
+aethyme transcripts enable
+aethyme transcripts enable --after-days 5 --providers codex,claude
+aethyme transcripts disable
+```
+
+`enable` and `disable` write only `<host state>/transcripts/settings.toml`:
+
+```toml
+[transcripts]
+archive = true
+archive_after_days = 3
+providers = ["codex"]          # "claude" is allowed too
+# codex_home = "/absolute/path"     default: $CODEX_HOME, then ~/.codex
+# claude_home = "/absolute/path"    default: $CLAUDE_CONFIG_DIR, then ~/.claude
+# repositories = ["/absolute/repo"] extra broker databases to read
+# bytes_per_second = 33554432       unattended read rate (floor 4 MiB/s)
+# free_space_floor_bytes = 21474836480
+```
+
+Once enabled, the broker's detached background worker runs one archive pass
+each time it runs: at background CPU and I/O priority, at most
+`bytes_per_second` (never slower than 4 MiB/s), largest transcripts first so
+space comes back early, for at most ten minutes per pass. When the archive
+volume has less free space than `free_space_floor_bytes` the pass runs
+unpaced. Memory pressure does not pause it. One pass runs at a time per host;
+the lock is released by the kernel if a run dies.
+
+## Commands
+
+```bash
+aethyme transcripts status --json
+aethyme transcripts list --json
+aethyme transcripts archive --dry-run
+aethyme transcripts archive --apply
+aethyme transcripts restore 0b9f6c1e-2d3a-4b5c-8d7e-1f2a3b4c5d6e
+```
+
+- `status`: settings, archived files, bytes before and after compression,
+  bytes an archive pass could reclaim now, skip counts by reason, lifetime
+  counters, and the last run.
+- `list`: archived transcripts, plus the ones a pass would archive or skip.
+- `archive --dry-run` prints what would move; `archive --apply` does it now.
+- `restore <session-id|path>` decompresses back to the original location,
+  checks the SHA-256 against the index, then removes the archive. It refuses
+  when a file already exists at the original path. A Codex archive with no
+  index row (for example after the index was lost) is found by its id and
+  restored to Codex's dated `sessions/` directory, vouched for by the zstd
+  frame checksum.
+
+## Crash safety
+
+A transcript is compressed into a temporary file beside its destination,
+synced, re-checked (size, mtime and inode unchanged since the start), and
+decompressed again to compare its length and SHA-256 with the source. Only a
+verified copy is published (a no-clobber link, then a directory sync) and
+recorded in the index. The source is removed last, after one more check that
+it is unchanged and not open; if it changed, the copy is discarded instead.
+The original and the archive are therefore never both gone. A run killed
+after publishing leaves both; the next run verifies the archive decodes to
+exactly the source and finishes the removal. A temporary file left by a
+killed run is removed by the next run.
+
+## Telemetry
+
+Each pass records phase timings (`transcripts_scan`, `transcripts_linkage`,
+`transcripts_judge`, `transcripts_open_check`, `transcripts_compress`,
+`transcripts_verify`, `transcripts_archive`, `transcripts_total`) into the
+background worker's command-metrics row, appends one line to
+`<host state>/transcripts/runs.jsonl`, and adds to lifetime counters
+(`examined`, `archived`, `bytes_in`, `bytes_out`, `resumed`,
+`verify_failures`, `restored`, `skipped_<reason>`) shown by `status --json`.
