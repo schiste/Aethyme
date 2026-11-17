@@ -619,7 +619,7 @@ fn advance_validates_then_publishes_only_a_clean_committed_head() {
     let refused = run();
     assert_eq!(
         refused.status.code(),
-        Some(aethyme_broker::exit_status::REFUSED)
+        Some(i32::from(aethyme_broker::exit_status::REFUSED))
     );
     let blocked: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
     assert_eq!(blocked["state"], "blocked");
