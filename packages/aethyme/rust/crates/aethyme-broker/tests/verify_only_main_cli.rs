@@ -185,6 +185,13 @@ impl Fixture {
             .unwrap()
     }
 
+    /// The attempt before a command records its result only in an existing
+    /// broker database; a fixture's first command would otherwise create it
+    /// after the attempt ran.
+    fn create_broker_database(&self) {
+        drop(BrokerStore::open_in_repo(&self.repo).unwrap());
+    }
+
     fn checkout_fast_forward_events(&self) -> Vec<aethyme_broker::Event> {
         BrokerStore::open_in_repo(&self.repo)
             .unwrap()
@@ -500,40 +507,295 @@ fn clean_main_checkout_fast_forwards_and_records_the_event() {
     assert_eq!(fixture.checkout_fast_forward_events().len(), 1);
 }
 
+/// Unrelated local work rides along a fast-forward untouched: a tracked
+/// edit, a staged rename, a staged new file and an untracked file are all
+/// byte-identical afterwards, and so is what `git status` and both diffs say.
 #[test]
-fn tracked_changes_keep_the_main_checkout_in_place_and_report_status_command() {
+fn unrelated_local_changes_ride_along_a_fast_forward_untouched() {
     let fixture = Fixture::new("verify-only");
-    let (before, _) = fixture.advance_origin("other.txt", "upstream\n");
+    fixture.create_broker_database();
+    std::fs::write(fixture.repo.join("rename-me.txt"), "rename\n").unwrap();
+    git(&fixture.repo, &["add", "rename-me.txt"]);
+    git(&fixture.repo, &["commit", "-qm", "add rename-me"]);
+    fixture.git_env(&["push", "-q", "origin", "main"]);
+    let (before, upstream) = fixture.advance_origin("other.txt", "upstream\n");
+    std::fs::write(fixture.repo.join("tracked.txt"), "local edit\n").unwrap();
+    git(&fixture.repo, &["mv", "rename-me.txt", "renamed.txt"]);
+    std::fs::write(fixture.repo.join("staged-new.txt"), "staged\n").unwrap();
+    git(&fixture.repo, &["add", "staged-new.txt"]);
+    std::fs::write(fixture.repo.join("untracked.txt"), "local file\n").unwrap();
+    let porcelain_before = git_output(&fixture.repo, &["status", "--porcelain=v1"]);
+    let worktree_diff_before = git_output(&fixture.repo, &["diff"]);
+    let staged_diff_before = git_output(&fixture.repo, &["diff", "--cached", "-M"]);
+
+    // `status` is read-only: it leaves a dirty checkout to the background
+    // sync, quietly.
+    let read_only = fixture.run(&["status", "--full", "--json"], &fixture.remote);
+    let status = json(&read_only);
+    let quiet = String::from_utf8_lossy(&read_only.stderr);
+    assert_eq!(git_output(&fixture.repo, &["rev-parse", "HEAD"]), before);
+    assert!(
+        !quiet.contains("left the main checkout unchanged"),
+        "{quiet}"
+    );
+    assert_eq!(
+        status["main_checkout"]["reason"], "deferred_to_background",
+        "{status:#}"
+    );
+
+    // A mutating command moves it. The command itself may refuse (no
+    // session here); the attempt runs before it.
+    let output = fixture.run(&["sync", "--json"], &fixture.remote);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_ne!(before, upstream);
+    assert_eq!(
+        git_output(&fixture.repo, &["rev-parse", "HEAD"]),
+        upstream,
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.repo.join("other.txt")).unwrap(),
+        b"upstream\n"
+    );
+    for (path, body) in [
+        ("tracked.txt", b"local edit\n".as_slice()),
+        ("renamed.txt", b"rename\n".as_slice()),
+        ("staged-new.txt", b"staged\n".as_slice()),
+        ("untracked.txt", b"local file\n".as_slice()),
+    ] {
+        assert_eq!(
+            std::fs::read(fixture.repo.join(path)).unwrap(),
+            body,
+            "{path}"
+        );
+    }
+    assert!(!fixture.repo.join("rename-me.txt").exists());
+    assert_eq!(
+        git_output(&fixture.repo, &["status", "--porcelain=v1"]),
+        porcelain_before
+    );
+    assert_eq!(git_output(&fixture.repo, &["diff"]), worktree_diff_before);
+    assert_eq!(
+        git_output(&fixture.repo, &["diff", "--cached", "-M"]),
+        staged_diff_before
+    );
+    assert!(stderr.contains("Updated main checkout"), "{stderr}");
+    assert!(
+        stderr.contains("local change(s) left as they were"),
+        "{stderr}"
+    );
+    let events = fixture.checkout_fast_forward_events();
+    assert_eq!(events.len(), 1);
+    let payload: serde_json::Value =
+        serde_json::from_str(events[0].payload_json.as_deref().unwrap()).unwrap();
+    assert_eq!(payload["trigger"], "broker.sync");
+    let status = json(&fixture.run(&["status", "--full", "--json"], &fixture.remote));
+    assert_eq!(status["main_checkout"]["behind"], 0, "{status:#}");
+    assert_eq!(status["main_checkout"]["branch"], "main", "{status:#}");
+    assert!(status["main_checkout"]["last_sync_at"].as_i64().is_some());
+}
+
+/// A local edit to a path the update changes holds the checkout, and the
+/// refusal names the path.
+#[test]
+fn an_overlapping_local_change_keeps_the_main_checkout_and_names_the_path() {
+    let fixture = Fixture::new("verify-only");
+    fixture.create_broker_database();
+    let (before, _) = fixture.advance_origin("tracked.txt", "upstream\n");
     std::fs::write(fixture.repo.join("tracked.txt"), "local edit\n").unwrap();
 
     let output = fixture.run(&["status", "--full", "--json"], &fixture.remote);
-    let _ = json(&output);
+    let status = json(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert_eq!(git_output(&fixture.repo, &["rev-parse", "HEAD"]), before);
-    assert!(stderr.contains("tracked or non-ignored untracked changes are present"));
-    assert!(stderr.contains("git -C "));
-    assert!(stderr.contains(fixture.repo.to_str().unwrap()));
-    assert!(stderr.contains("status --short --branch"));
+    assert_eq!(
+        std::fs::read(fixture.repo.join("tracked.txt")).unwrap(),
+        b"local edit\n"
+    );
+    assert!(
+        stderr.contains("left the main checkout unchanged"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("would be changed by the update: tracked.txt"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("status --short --branch"), "{stderr}");
     assert!(fixture.checkout_fast_forward_events().is_empty());
+    let record = &status["main_checkout"];
+    assert_eq!(record["last_result"], "held", "{status:#}");
+    assert_eq!(record["reason"], "local_changes_overlap", "{status:#}");
+    assert_eq!(record["blocking_paths"], serde_json::json!(["tracked.txt"]));
+    assert_eq!(record["behind"], 1, "{status:#}");
 }
 
+/// An untracked file where the update would create one holds the checkout,
+/// including one that differs only in case.
 #[test]
-fn untracked_changes_keep_the_main_checkout_in_place_and_report_status_command() {
+fn an_untracked_file_the_update_would_create_keeps_the_main_checkout() {
+    for local_name in ["created.txt", "Created.txt"] {
+        let fixture = Fixture::new("verify-only");
+        fixture.create_broker_database();
+        let (before, _) = fixture.advance_origin("created.txt", "upstream\n");
+        std::fs::write(fixture.repo.join(local_name), "local file\n").unwrap();
+
+        let output = fixture.run(&["status", "--full", "--json"], &fixture.remote);
+        let status = json(&output);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(git_output(&fixture.repo, &["rev-parse", "HEAD"]), before);
+        assert_eq!(
+            std::fs::read(fixture.repo.join(local_name)).unwrap(),
+            b"local file\n"
+        );
+        assert!(
+            stderr.contains("left the main checkout unchanged"),
+            "{stderr}"
+        );
+        assert!(stderr.contains(local_name), "{stderr}");
+        assert!(fixture.checkout_fast_forward_events().is_empty());
+        assert_eq!(
+            status["main_checkout"]["reason"], "local_changes_overlap",
+            "{status:#}"
+        );
+    }
+}
+
+/// The broker's own leftovers under `.aethyme/` are not local changes.
+#[test]
+fn the_brokers_own_leftovers_are_not_local_changes() {
     let fixture = Fixture::new("verify-only");
-    let (before, _) = fixture.advance_origin("other.txt", "upstream\n");
-    std::fs::write(fixture.repo.join("untracked.txt"), "local file\n").unwrap();
+    // Ignore only part of the broker's state, as an older managed block did,
+    // so its other files show up as untracked.
+    std::fs::write(
+        fixture.repo.join(".gitignore"),
+        ".aethyme/broker.db*\n.aethyme/logs/\n.aethyme/run/\n.aethyme/locks/\n.aethyme/worktrees/\n",
+    )
+    .unwrap();
+    git(&fixture.repo, &["add", ".gitignore"]);
+    git(&fixture.repo, &["commit", "-qm", "narrow ignores"]);
+    fixture.git_env(&["push", "-q", "origin", "main"]);
+    let (_, upstream) = fixture.advance_origin("other.txt", "upstream\n");
+    std::fs::write(
+        fixture
+            .repo
+            .join(".aethyme/.gc.lock.4242.1794768075467388000"),
+        "4242\n",
+    )
+    .unwrap();
+    let hold = fixture
+        .repo
+        .join(".aethyme/.operator-v0.0.1-maintenance-hold-1-abc");
+    std::fs::create_dir_all(&hold).unwrap();
+    std::fs::write(hold.join("manifest.json"), "{}").unwrap();
+    let litter = git_output(
+        &fixture.repo,
+        &["ls-files", "--others", "--exclude-standard", ".aethyme"],
+    );
+    assert!(litter.contains(".gc.lock.4242"), "{litter}");
 
     let output = fixture.run(&["status", "--full", "--json"], &fixture.remote);
     let _ = json(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
+    assert_eq!(git_output(&fixture.repo, &["rev-parse", "HEAD"]), upstream);
+    assert!(stderr.contains("Updated main checkout"), "{stderr}");
+    assert!(
+        !stderr.contains("local change(s)"),
+        "broker leftovers counted as local changes: {stderr}"
+    );
+}
+
+/// A checkout parked on a branch other than the default branch stays there,
+/// quietly; status records why.
+#[test]
+fn a_checkout_on_another_branch_is_not_moved() {
+    let fixture = Fixture::new("verify-only");
+    fixture.create_broker_database();
+    let (before, _) = fixture.advance_origin("other.txt", "upstream\n");
+    git(&fixture.repo, &["checkout", "-q", "-b", "feature", &before]);
+    git(
+        &fixture.repo,
+        &["branch", "-q", "--set-upstream-to", "origin/main"],
+    );
+
+    let output = fixture.run(&["status", "--full", "--json"], &fixture.remote);
+    let status = json(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
     assert_eq!(git_output(&fixture.repo, &["rev-parse", "HEAD"]), before);
-    assert!(stderr.contains("tracked or non-ignored untracked changes are present"));
-    assert!(stderr.contains("git -C "));
-    assert!(stderr.contains(fixture.repo.to_str().unwrap()));
-    assert!(stderr.contains("status --short --branch"));
     assert!(fixture.checkout_fast_forward_events().is_empty());
+    assert!(
+        !stderr.contains("left the main checkout unchanged"),
+        "{stderr}"
+    );
+    assert_eq!(
+        status["main_checkout"]["reason"], "not_on_default_branch",
+        "{status:#}"
+    );
+}
+
+/// Past the commit threshold, status says so in both forms with the reason,
+/// the blocking path and the next commands.
+#[test]
+fn a_main_checkout_far_behind_is_reported_by_status() {
+    let fixture = Fixture::new("verify-only");
+    fixture.create_broker_database();
+    std::fs::write(
+        fixture.repo.join(".aethyme/config.toml"),
+        "[promote]\nmode = \"verify-only\"\n\n[delivery]\npush_session_branches = true\n\n[main_checkout]\nbehind_threshold_commits = 1\n",
+    )
+    .unwrap();
+    git(&fixture.repo, &["add", ".aethyme/config.toml"]);
+    git(&fixture.repo, &["commit", "-qm", "low threshold"]);
+    fixture.git_env(&["push", "-q", "origin", "main"]);
+    // Two commits land on the default branch; the checkout stays at `before`.
+    let (before, _) = fixture.advance_origin("tracked.txt", "one\n");
+    git(&fixture.repo, &["merge", "-q", "--ff-only", "origin/main"]);
+    fixture.advance_origin("other.txt", "two\n");
+    git(&fixture.repo, &["reset", "-q", "--hard", &before]);
+    std::fs::write(fixture.repo.join("tracked.txt"), "local edit\n").unwrap();
+
+    let full = json(&fixture.run(&["status", "--full", "--json"], &fixture.remote));
+    assert_eq!(git_output(&fixture.repo, &["rev-parse", "HEAD"]), before);
+    let rows = advice_rows(&full, "main-checkout.behind");
+    assert_eq!(rows.len(), 1, "{full:#}");
+    let row = rows[0];
+    assert_eq!(row["severity"], "warning");
+    let summary = row["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("2 commit(s) behind origin/main"),
+        "{summary}"
+    );
+    assert!(summary.contains("local_changes_overlap"), "{summary}");
+    assert!(summary.contains("tracked.txt"), "{summary}");
+    let evidence = row["evidence"].to_string();
+    assert!(
+        evidence.contains("blocking path: tracked.txt"),
+        "{evidence}"
+    );
+    let commands = row["commands"].to_string();
+    assert!(commands.contains("status --short --branch"), "{commands}");
+    assert!(
+        commands.contains("diff --stat -- tracked.txt"),
+        "{commands}"
+    );
+
+    let compact = json(&fixture.run(&["status", "--json"], &fixture.remote));
+    let categories = compact["advice"]["categories"].as_array().unwrap();
+    assert!(
+        categories
+            .iter()
+            .any(|category| category["id"] == "main-checkout.behind"),
+        "{compact:#}"
+    );
+    assert_eq!(compact["main_checkout"]["behind"], 2, "{compact:#}");
+    assert_eq!(
+        compact["main_checkout"]["reason"], "local_changes_overlap",
+        "{compact:#}"
+    );
 }
 
 #[test]

@@ -2003,6 +2003,11 @@ pub struct StatusView {
     /// Omitted until a slice has run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capacity_removal: Option<crate::CapacityRemovalSlice>,
+    /// The primary checkout's sync state as the last attempt recorded it:
+    /// branch, commits behind and ahead, last sync and attempt times, and
+    /// why it was held. Omitted until an attempt has been recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main_checkout: Option<crate::MainCheckoutStatus>,
 }
 
 /// How many refused reviews `broker status` carries.
@@ -2066,6 +2071,9 @@ pub struct StatusBrief {
     /// from the database, so it costs a directory listing.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub waiters: Vec<crate::CurrentWaiter>,
+    /// Same as the full view's `main_checkout`: one meta read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main_checkout: Option<crate::MainCheckoutStatus>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

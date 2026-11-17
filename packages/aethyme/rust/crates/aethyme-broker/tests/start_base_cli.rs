@@ -272,6 +272,12 @@ fn reuse_flag_as_task_text_still_creates_an_independent_checkout() {
 fn adopt_reuse_and_replace_stale_keep_primary_maintenance() {
     for flag in ["--adopt", "--reuse", "--replace-stale"] {
         let tmp = fixture();
+        // The default branch moves README.md, which the operator has also
+        // edited: primary maintenance must run and hold the checkout.
+        let base = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+        let upstream = commit_file(tmp.path(), "README.md", "upstream readme");
+        git(tmp.path(), &["reset", "-q", "--hard", &base]);
+        track_origin_main(tmp.path(), &upstream);
         std::fs::write(tmp.path().join("README.md"), "operator changes\n").unwrap();
         let output = run(
             tmp.path(),

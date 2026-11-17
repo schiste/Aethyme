@@ -144,6 +144,7 @@ pub mod local_restore;
 pub mod local_source_transport;
 pub mod local_target;
 pub mod local_wave;
+mod main_checkout_sync;
 mod main_drift;
 pub mod managed_services;
 // Opt-in MCP server launching without launcher chains (`aethyme mcp`).
@@ -446,6 +447,7 @@ pub use lease_export::{
     LeaseRoutingExportOptions, LeaseRoutingItem, MAX_LEASE_ROUTING_EXPORT_LIMIT,
 };
 pub use leases::{LeaseIgnoreRules, Overlap, detect_overlaps};
+pub use main_checkout_sync::{MainCheckoutStatus, SyncReason};
 pub use main_drift::DefaultBranchDrift;
 pub use measurement::{
     BudgetVerdict, MeasuredTotal, SizeRecord, SizeRecords, SizeScan, budget_verdict,

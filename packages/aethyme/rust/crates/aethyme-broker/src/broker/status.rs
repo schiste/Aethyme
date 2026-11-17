@@ -336,6 +336,18 @@ impl Broker {
             "transcripts".into(),
             phase_started.elapsed().as_millis() as u64,
         );
+        // Recorded by the last main-checkout sync attempt: one meta read.
+        let phase_started = std::time::Instant::now();
+        let main_checkout = crate::main_checkout_sync::load_state(&self.store);
+        advice.extend(crate::main_checkout_sync::status_advice(
+            &self.store,
+            &self.main_root,
+            now_ms,
+        ));
+        phase_timings_ms.insert(
+            "main_checkout".into(),
+            phase_started.elapsed().as_millis() as u64,
+        );
         advice.push(StatusAdvice {
             id: "status.recorded-observations", severity: StatusAdviceSeverity::Notice,
             reason: "summary reads broker records without scanning Git history or retained checkouts",
@@ -371,6 +383,7 @@ impl Broker {
             advice,
             leases_refreshed: false,
             waiters,
+            main_checkout,
         };
         brief
             .phase_timings_ms
@@ -1217,6 +1230,11 @@ impl Broker {
         // several passes, and the default-on notice that starts the 24-hour
         // first-run wait (no-ops while the host has archiving turned off).
         advice.extend(crate::transcripts::status_advice());
+        advice.extend(crate::main_checkout_sync::status_advice(
+            &self.store,
+            &self.main_root,
+            now_ms,
+        ));
         if refresh && cleanup_retention.broker_owned_worktree_count > 0 {
             let count = cleanup_retention.broker_owned_worktree_count;
             let required = crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES;
@@ -1721,6 +1739,7 @@ impl Broker {
             waiters: crate::waiters::current_waiters(&self.main_root, now_ms),
             landed_session_retirement: None,
             capacity_removal: None,
+            main_checkout: crate::main_checkout_sync::load_state(&self.store),
         })
     }
 

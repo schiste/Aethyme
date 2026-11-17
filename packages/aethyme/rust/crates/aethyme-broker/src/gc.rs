@@ -8848,13 +8848,19 @@ impl Broker {
         let measurement_due = self.shared_cache_measurement_due(now_ms());
         // Closed checkouts to retire or trash to drain (one metadata read).
         let checkout_retirement_due = self.checkout_retirement_due(now_ms());
+        // The main-checkout sync timer (one metadata read; claimed at most
+        // once per interval, so a worker that cannot start is not retried on
+        // every open).
+        let main_checkout_sync_due =
+            crate::main_checkout_sync::claim_timer_slot(self.store_ref(), &root, now_ms());
         if !(artifact_pending
             || checkout_cleanup_pending
             || session_retirement_pending
             || compact_pending
             || capacity_removal_due
             || measurement_due
-            || checkout_retirement_due)
+            || checkout_retirement_due
+            || main_checkout_sync_due)
         {
             return Ok(());
         }
@@ -8875,7 +8881,8 @@ impl Broker {
             || compact_due
             || capacity_removal_due
             || measurement_due
-            || checkout_retirement_due)
+            || checkout_retirement_due
+            || main_checkout_sync_due)
         {
             return Ok(());
         }
@@ -9151,6 +9158,9 @@ impl Broker {
                     .map(|_| ()),
             );
         }
+        // The main-checkout sync timer: one bounded fetch and one
+        // fast-forward attempt when a launcher claimed the slot.
+        crate::main_checkout_sync::run_timer_lane(self.store_ref(), self.main_root(), now_ms());
         let artifact_pending = self.artifact_sweep_backlog_pending()?
             && crate::AutoCleanupPolicy::artifact_sweep_allowed(self.main_root());
         let checkout_cleanup_pending = self.auto_checkout_cleanup_recovery_requested()?;

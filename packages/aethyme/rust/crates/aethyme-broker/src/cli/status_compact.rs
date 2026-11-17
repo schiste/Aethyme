@@ -15,6 +15,10 @@ pub(crate) struct CompactStatus {
     data_freshness: CompactFreshness,
     advice: CompactAdvice,
     waiters: CompactWaiters,
+    /// The primary checkout's recorded sync state; omitted until an attempt
+    /// has been recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    main_checkout: Option<crate::MainCheckoutStatus>,
     session_contexts: BoundedRecords,
     #[serde(skip_serializing_if = "Option::is_none")]
     collaboration_fence: Option<crate::CollaborationFence>,
@@ -230,6 +234,7 @@ impl CompactStatus {
             records: [],
         };
         let waiter_count = brief.waiters.len();
+        let main_checkout = brief.main_checkout;
 
         Self {
             schema: SCHEMA,
@@ -247,6 +252,7 @@ impl CompactStatus {
                 omitted_count: waiter_count,
                 records: [],
             },
+            main_checkout,
             session_contexts,
             collaboration_fence: context.collaboration_fence,
             lease_release_requests,

@@ -1567,6 +1567,18 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
     phase_timings_ms.insert("broker_open".into(), open_ms);
     phase_timings_ms.insert("session_allocation".into(), allocation_ms);
     let response_started = std::time::Instant::now();
+    // One line on stderr, so `--json` stays parseable: agents that read the
+    // primary checkout while it trails the default branch read stale code.
+    {
+        let _span = crate::phase_telemetry::span("main_checkout_reminder");
+        if let Some(line) = crate::main_checkout_sync::start_reminder(
+            broker.store_ref(),
+            broker.main_root(),
+            crate::clock::epoch_ms(),
+        ) {
+            eprintln!("{line}");
+        }
+    }
     // `start-agent` binds nothing: the agent it spawns is a different process
     // from its caller, and binds on its own first command.
     telemetry::set_metric_session(report.session.id);
