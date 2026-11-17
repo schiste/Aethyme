@@ -20010,14 +20010,14 @@ mod fail_closed_removal_tests {
             "[cleanup]\nvenv_markers = [\".env-check.json\"]\n",
         )
         .unwrap();
-        assert!(AutoCleanupPolicy::load(root.path()).is_ok());
+        assert!(super::AutoCleanupPolicy::load(root.path()).is_ok());
         assert_eq!(super::venv_markers(root.path()), [".env-check.json"]);
         std::fs::write(
             root.path().join(".aethyme/config.toml"),
             "[cleanup]\nvenv_markers = [\".env\"]\n",
         )
         .unwrap();
-        assert!(AutoCleanupPolicy::load(root.path()).is_err());
+        assert!(super::AutoCleanupPolicy::load(root.path()).is_err());
         assert!(super::venv_markers(root.path()).is_empty());
     }
 }

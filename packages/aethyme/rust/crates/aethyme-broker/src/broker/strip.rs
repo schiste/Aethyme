@@ -548,8 +548,6 @@ pub(crate) fn regenerable_candidates(
     Ok(candidates)
 }
 
-/// Run one read-only Git probe in `worktree` under `deadline`; returns its
-/// exit code and bounded stdout. Anything but a completed run is an error.
 #[cfg(test)]
 thread_local! {
     /// Makes every strip probe fail, as a Git that cannot complete would.
@@ -561,6 +559,8 @@ pub(crate) fn set_probes_fail_for_tests(fail: bool) {
     PROBES_FAIL.with(|cell| cell.set(fail));
 }
 
+/// Run one read-only Git probe in `worktree` under `deadline`; returns its
+/// exit code and bounded stdout. Anything but a completed run is an error.
 fn git_probe(worktree: &Path, args: &[&str], deadline: Instant) -> Result<(i32, Vec<u8>), String> {
     #[cfg(test)]
     if PROBES_FAIL.with(std::cell::Cell::get) {
