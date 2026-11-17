@@ -577,10 +577,20 @@ pub(crate) fn prove_strippable_all(
         return verdicts;
     }
     // The directories themselves, not their contents: Git prints each
-    // ignored one it was given (exit 0), and exits 1 when none is.
+    // ignored one it was given, one per line (exit 0), and exits 1 when
+    // none is. `-z` needs `--stdin`, so paths are read as lines, unquoted
+    // by `core.quotePath=false`; a name Git still quotes (a control
+    // character, a quote or a backslash) matches nothing and is kept.
     // `check-ignore` takes plain paths and refuses pathspec magic, so no
     // `--literal-pathspecs` here.
-    let mut args = vec!["-c", "core.fsmonitor=false", "check-ignore", "-z", "--"];
+    let mut args = vec![
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.quotePath=false",
+        "check-ignore",
+        "--",
+    ];
     args.extend(
         asked
             .iter()
@@ -589,7 +599,11 @@ pub(crate) fn prove_strippable_all(
     match git_probe(worktree, &args, deadline) {
         Ok((code @ (0 | 1), stdout)) => {
             let ignored = if code == 0 {
-                records(stdout.as_slice())
+                stdout
+                    .split(|byte| *byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(<[u8]>::to_vec)
+                    .collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
@@ -988,7 +1002,7 @@ impl Broker {
                     continue;
                 }
                 if let Some(current) = by_path.get_mut(path) {
-                    if judges_before(row, *current) {
+                    if judges_before(row, current) {
                         *current = row;
                     }
                 } else if listing.is_real_dir(path) {
