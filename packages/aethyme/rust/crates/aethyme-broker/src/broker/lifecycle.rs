@@ -5105,6 +5105,14 @@ impl Broker {
         // because of it.
         broker.collaboration_fence_state(FenceTrigger::Open);
         broker.backfill_live_repository_contracts()?;
+        // Record outcomes a busy database could not take when their child
+        // exited, before anything reads rows that may still say `running`.
+        // Best effort: a journal left behind is retried by the next opener
+        // and by every coordinated write before its write-block check.
+        crate::warn_unrecorded(
+            "replay pending coordinated operation outcomes",
+            broker.replay_operation_outcome_journals("broker_open"),
+        );
         broker.reap_abandoned_prepared_operations()?;
         // Best effort: an unresolved repeatable fetch keeps blocking only
         // until the next write reaches its lock, which retries the same step.

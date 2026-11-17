@@ -77,15 +77,16 @@ Storage (everything Aethyme keeps on this host):
                               and why not; reads the ledger only
   storage run                 one pass: measure, evict over budget or expired
 
-Agent transcripts (opt-in; <host state>/transcripts/settings.toml):
+Agent transcripts (on by default; <host state>/transcripts/settings.toml):
   transcripts status|list     archived and reclaimable bytes, eligible and
                               skipped transcripts with reasons
   transcripts archive --dry-run|--apply
-                              compress and move closed sessions' transcripts
+                              compress and move transcripts of closed
+                              sessions after N inactive days
                               (Codex: archived_sessions/*.jsonl.zst)
   transcripts restore <id|path>
                               decompress one back, verifying its hash
-  transcripts enable|disable  turn archiving on or off for this host
+  transcripts enable|disable  set archiving on or off explicitly for this host
 
 Collaboration (opt-in, experimental; disabled unless [collaboration] enables it):
   collab status|enroll        policy, state root and captures; mint a project ID

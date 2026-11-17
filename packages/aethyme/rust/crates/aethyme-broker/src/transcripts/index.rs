@@ -133,6 +133,12 @@ impl Index {
         Ok(Some(Self { conn }))
     }
 
+    /// Start a transaction the next writes join until it is committed
+    /// (dropping it rolls them back).
+    pub fn transaction(&self) -> Result<rusqlite::Transaction<'_>, String> {
+        self.conn.unchecked_transaction().map_err(sql)
+    }
+
     pub fn add_link(&self, link: &Link, now_ms: i64) -> Result<bool, String> {
         let inserted = self
             .conn

@@ -20,39 +20,48 @@ pub const RESTORE_SCHEMA: &str = "aethyme.transcripts-restore/v1";
 pub const SETTINGS_SCHEMA: &str = "aethyme.transcripts-settings/v1";
 
 pub const USAGE: &str = "\
-aethyme transcripts — archive closed agent transcripts (opt-in, off by default)
+aethyme transcripts — archive closed agent transcripts (on by default)
 
-When enabled, a transcript older than archive_after_days (default 3; for
-Claude Code archive_after_days_claude, default 14), open in no process,
-whose linked broker sessions are all closed with their checkouts gone, and
-(Claude Code) with no running claude process for its project or session, is
-compressed with zstd and moved. Codex transcripts go to
+A transcript inactive for more than archive_after_inactive_days (default 3;
+for Claude Code archive_after_inactive_days_claude, default 14) is
+archived. Its last activity is the newest of its modification time, the
+timestamp of its last record, and the last activity of any broker session
+linked to it. It must also be open in no process, have every linked broker
+session closed with its checkout gone, and (Claude Code) have no running
+claude process for its project or session. It is compressed with zstd,
+verified by SHA-256, and moved. Codex transcripts go to
 <codex home>/archived_sessions/<name>.jsonl.zst, which `codex unarchive`
 and `codex resume` read natively. Claude Code transcripts go under
 <host state>/transcripts/claude/; restore them with `transcripts restore`.
 Settings: <host state>/transcripts/settings.toml, [transcripts] archive,
-archive_after_days, archive_after_days_claude, providers (\"codex\",
-\"claude\"), codex_home,
-claude_home, repositories, bytes_per_second, free_space_floor_bytes.
-Nothing is listed or moved while archive = false.
+archive_after_inactive_days, archive_after_inactive_days_claude (the older
+archive_after_days names are still read), providers (\"codex\",
+\"claude\"; default both), codex_home, claude_home, repositories,
+bytes_per_second, free_space_floor_bytes. Without the file, or without
+archive in it, archiving is on; the background worker then waits 24 hours
+after `aethyme broker status` first shows the notice
+transcripts.archiving-default-on (enable or a manual archive --apply skips
+the wait). Nothing is listed or moved while archive = false.
 
 Usage:
   aethyme transcripts status [--json]
-      Settings, archived files and bytes before/after compression, bytes an
+      Settings and where `enabled` came from (enabled_source), the first-run
+      wait, archived files and bytes before/after compression, bytes an
       archive pass could reclaim now, lifetime counters, the last run.
   aethyme transcripts list [--json]
       Archived transcripts, and the ones a pass would archive or skip (with
       the reason for each skip).
   aethyme transcripts archive --dry-run|--apply [--json]
       Print what would move, or archive it now (largest first, paced). The
-      background worker runs the same pass when archiving is enabled.
+      background worker runs the same pass while archiving is on.
   aethyme transcripts restore <session-id|path> [--json]
       Decompress an archived transcript back to where it came from,
       verifying its SHA-256, then remove the archive. When a newer transcript
       exists at that path, the result is the archive followed by it.
-  aethyme transcripts enable [--after-days <n>] [--providers codex,claude] [--json]
+  aethyme transcripts enable [--after-inactive-days <n>] [--providers codex,claude] [--json]
   aethyme transcripts disable [--json]
-      Turn archiving on or off. Writes only the settings file above.
+      Turn archiving on or off explicitly (--after-days is an alias of
+      --after-inactive-days). Writes only the settings file above.
 ";
 
 fn json_requested(args: &[String]) -> bool {
@@ -177,22 +186,29 @@ fn run_status(environment: &Environment, rest: &[String], json: bool) -> u8 {
         return exit_status::SUCCESS;
     }
     println!(
-        "transcript archiving: {}",
+        "transcript archiving: {} ({})",
         if status.enabled {
             "enabled"
         } else {
             "disabled"
+        },
+        match status.enabled_source {
+            super::EnabledSource::Default => "default",
+            super::EnabledSource::Settings => "settings file",
         }
     );
     println!("  settings: {}", status.settings_file.display());
     if status.enabled {
         let providers: Vec<&str> = config.providers.iter().map(|p| p.label()).collect();
         println!(
-            "  providers: {}; archive after {} days (Claude Code: {} days)",
+            "  providers: {}; archive after {} inactive days (Claude Code: {} inactive days)",
             providers.join(", "),
-            config.archive_after_days,
-            config.archive_after_days_claude
+            config.archive_after_inactive_days,
+            config.archive_after_inactive_days_claude
         );
+        for line in super::first_run::status_lines(&status.first_run) {
+            println!("{line}");
+        }
     }
     println!(
         "  archived: {} files, {} before compression, {} now",
@@ -345,6 +361,12 @@ fn run_archive(environment: &Environment, rest: &[String], json: bool) -> u8 {
             exit_status::REFUSED,
         );
     }
+    if apply {
+        // Archiving by hand lifts the first-run wait for the worker too.
+        if let Some(warning) = run::acknowledge_manual_apply(environment, super::now_ms()) {
+            eprintln!("aethyme transcripts: Warning: {warning}");
+        }
+    }
     let mut open_files = OpenFiles::new(SystemProbe, OPEN_LISTING_MAX_AGE);
     let mut agents = SystemAgents;
     let mut probes = Probes {
@@ -463,7 +485,10 @@ fn run_restore(environment: &Environment, rest: &[String], json: bool) -> u8 {
     }
 }
 
-fn parse_settings_flags(rest: &[String], enable: bool) -> Result<SettingsChange, String> {
+pub(crate) fn parse_settings_flags(
+    rest: &[String],
+    enable: bool,
+) -> Result<SettingsChange, String> {
     let mut change = SettingsChange {
         archive: enable,
         ..SettingsChange::default()
@@ -472,14 +497,16 @@ fn parse_settings_flags(rest: &[String], enable: bool) -> Result<SettingsChange,
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--json" => {}
-            "--after-days" if enable => {
-                let value = iter.next().ok_or("--after-days needs a number of days")?;
+            flag @ ("--after-inactive-days" | "--after-days") if enable => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| format!("{flag} needs a number of days"))?;
                 let days = value
                     .parse::<u32>()
                     .ok()
                     .filter(|days| *days >= 1)
-                    .ok_or("--after-days must be a whole number of at least 1")?;
-                change.archive_after_days = Some(days);
+                    .ok_or_else(|| format!("{flag} must be a whole number of at least 1"))?;
+                change.archive_after_inactive_days = Some(days);
             }
             "--providers" if enable => {
                 let value = iter

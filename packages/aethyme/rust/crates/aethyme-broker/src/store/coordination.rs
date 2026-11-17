@@ -484,6 +484,217 @@ impl BrokerStore {
             .ok_or(BrokerError::CoordinatedOperationNotFound(id))
     }
 
+    /// Move a prepared operation to `running` and give this run a random
+    /// `run_nonce` (schema v64), in one immediate transaction with its
+    /// `operation.running` event. The nonce binds an outcome journal to this
+    /// one run: a journal can only ever settle the row it was written for,
+    /// never a later operation that reuses the id after a database reset.
+    pub(crate) fn start_coordinated_operation_run(
+        &mut self,
+        id: i64,
+        details_json: &str,
+    ) -> Result<(CoordinatedOperation, String), BrokerError> {
+        let operation = self
+            .coordinated_operation(id)?
+            .ok_or(BrokerError::CoordinatedOperationNotFound(id))?;
+        let now = now_ms();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE coordinated_operations
+             SET status = 'running', details_json = ?2, updated_at = ?3,
+                 run_nonce = lower(hex(randomblob(16)))
+             WHERE id = ?1",
+            params![id, details_json, now],
+        )?;
+        let nonce: String = tx.query_row(
+            "SELECT run_nonce FROM coordinated_operations WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        let payload = crate::events::operation_payload(
+            id,
+            operation.provider,
+            &operation.repository,
+            &operation.scope,
+            operation.effect,
+            OperationStatus::Running,
+            None,
+        );
+        insert_event(
+            &tx,
+            now,
+            "operation.running",
+            Some(operation.session_id),
+            Some(&payload),
+        )?;
+        tx.commit()?;
+        let operation = self
+            .coordinated_operation(id)?
+            .ok_or(BrokerError::CoordinatedOperationNotFound(id))?;
+        Ok((operation, nonce))
+    }
+
+    /// The run nonce of an operation; `None` for a row an older binary ran.
+    pub(crate) fn coordinated_operation_run_nonce(
+        &self,
+        id: i64,
+    ) -> Result<Option<String>, BrokerError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT run_nonce FROM coordinated_operations WHERE id = ?1",
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Record the known final outcome of a coordinated operation whose child
+    /// process has exited.
+    ///
+    /// One `IMMEDIATE` transaction that does nothing else: it takes the write
+    /// lock up front (so it never fails a deferred read-to-write upgrade with
+    /// an instant `SQLITE_BUSY`), re-reads the row, checks it is the same run
+    /// of the same operation ([`OperationRunBinding`]: session, exact
+    /// `command_json`, `created_at`, the run nonce and the pid that ran it),
+    /// and only then moves a `running` or `outcome_unknown` row to `status`
+    /// and appends the matching `operation.<status>` event. A row that
+    /// already left those states -- settled by an earlier replay, or
+    /// reconciled by an operator -- is returned untouched. A row with no run
+    /// nonce (run by an older binary) never matches. `busy_timeout` bounds
+    /// how long this one attempt waits for the write lock; the connection's
+    /// usual timeout is restored afterwards. Callers retry a busy error.
+    ///
+    /// The commit runs with `synchronous = FULL`, so the WAL is synced before
+    /// this returns and a caller may delete its outcome journal: a power loss
+    /// after that cannot take the record back.
+    pub(crate) fn settle_coordinated_operation(
+        &mut self,
+        binding: &OperationRunBinding,
+        status: OperationStatus,
+        exit_code: Option<i64>,
+        details_json: &str,
+        busy_timeout: std::time::Duration,
+    ) -> Result<OperationSettlement, BrokerError> {
+        self.conn.busy_timeout(busy_timeout)?;
+        self.conn.pragma_update(None, "synchronous", "FULL")?;
+        let settled =
+            self.settle_coordinated_operation_once(binding, status, exit_code, details_json);
+        let synchronous = self.conn.pragma_update(None, "synchronous", "NORMAL");
+        let restored = self
+            .conn
+            .busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS));
+        let settled = settled?;
+        synchronous?;
+        restored?;
+        Ok(settled)
+    }
+
+    fn settle_coordinated_operation_once(
+        &mut self,
+        binding: &OperationRunBinding,
+        status: OperationStatus,
+        exit_code: Option<i64>,
+        details_json: &str,
+    ) -> Result<OperationSettlement, BrokerError> {
+        let id = binding.operation_id;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let read = |tx: &rusqlite::Transaction<'_>| {
+            tx.query_row(
+                "SELECT id, session_id, provider, repository, scope, effect,
+                        status, authorization_reason, command_json, pid,
+                        exit_code, details_json, created_at, updated_at, finished_at,
+                        host_operation_id, identity_provenance, agent_provenance_json
+                 FROM coordinated_operations WHERE id = ?1",
+                [id],
+                coordinated_operation_from_row,
+            )
+            .optional()
+        };
+        let Some(current) = read(&tx)?.transpose()? else {
+            return Ok(OperationSettlement::Missing);
+        };
+        let run_nonce: Option<String> = tx.query_row(
+            "SELECT run_nonce FROM coordinated_operations WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        if !binding.matches(&current, run_nonce.as_deref()) {
+            return Ok(OperationSettlement::Mismatch(current));
+        }
+        if !matches!(
+            current.status,
+            OperationStatus::Running | OperationStatus::OutcomeUnknown
+        ) {
+            return Ok(OperationSettlement::AlreadySettled(current));
+        }
+        // As in `transition_coordinated_operation`: completion evidence of an
+        // exact fetch survives a transition whose new details lack it.
+        let mut details = serde_json::from_str::<serde_json::Value>(details_json)
+            .ok()
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(proof) = current
+            .details_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .and_then(|value| value.get("fetch_reconciliation").cloned())
+            && let Some(object) = details.as_object_mut()
+        {
+            object.entry("fetch_reconciliation").or_insert(proof);
+        }
+        let now = now_ms();
+        let finished_at = matches!(
+            status,
+            OperationStatus::Succeeded
+                | OperationStatus::Failed
+                | OperationStatus::OutcomeUnknown
+                | OperationStatus::ReconciledSucceeded
+                | OperationStatus::ReconciledFailed
+        )
+        .then_some(now);
+        tx.execute(
+            "UPDATE coordinated_operations
+             SET status = ?2, exit_code = ?3, details_json = ?4,
+                 updated_at = ?5, finished_at = ?6
+             WHERE id = ?1 AND status IN ('running', 'outcome_unknown')",
+            params![
+                id,
+                status.as_str(),
+                exit_code,
+                details.to_string(),
+                now,
+                finished_at,
+            ],
+        )?;
+        let payload = crate::events::operation_payload(
+            id,
+            current.provider,
+            &current.repository,
+            &current.scope,
+            current.effect,
+            status,
+            exit_code,
+        );
+        insert_event(
+            &tx,
+            now,
+            &format!("operation.{}", status.as_str()),
+            Some(current.session_id),
+            Some(&payload),
+        )?;
+        let recorded = read(&tx)?
+            .transpose()?
+            .ok_or(BrokerError::CoordinatedOperationNotFound(id))?;
+        tx.commit()?;
+        Ok(OperationSettlement::Recorded(recorded))
+    }
+
     /// Attach inspection evidence only to the exact operation observed before
     /// the remote read. Inspection must never overwrite a concurrent operator
     /// reconciliation or a newer inspection.

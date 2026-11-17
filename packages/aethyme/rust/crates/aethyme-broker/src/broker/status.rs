@@ -256,6 +256,10 @@ impl Broker {
                 agents.iter().map(|agent| agent.session.id),
             ),
         ));
+        advice.extend(crate::operations::outcome_journal::outcome_journal_advice(
+            self.store_ref(),
+            now_ms,
+        ));
         phase_timings_ms.insert("submits".into(), phase_started.elapsed().as_millis() as u64);
         let phase_started = std::time::Instant::now();
         advice.extend(overlap_pair_advice(&pairs));
@@ -285,6 +289,14 @@ impl Broker {
             }
             Err(_) => true,
         };
+        // The routine (compact and summary) forms show the transcript rows
+        // too: the default-on notice must reach the status people read.
+        let phase_started = std::time::Instant::now();
+        advice.extend(crate::transcripts::status_advice());
+        phase_timings_ms.insert(
+            "transcripts".into(),
+            phase_started.elapsed().as_millis() as u64,
+        );
         advice.push(StatusAdvice {
             id: "status.recorded-observations", severity: StatusAdviceSeverity::Notice,
             reason: "summary reads broker records without scanning Git history or retained checkouts",
@@ -968,11 +980,10 @@ impl Broker {
         ) {
             advice.insert(0, headroom_advice);
         }
-        // Opt-in transcript archiving whose session links stayed unreadable
-        // for several passes (a no-op unless the host enabled it).
-        if let Some(transcripts_advice) = crate::transcripts::linkage_degraded_advice() {
-            advice.push(transcripts_advice);
-        }
+        // Transcript archiving whose session links stayed unreadable for
+        // several passes, and the default-on notice that starts the 24-hour
+        // first-run wait (no-ops while the host has archiving turned off).
+        advice.extend(crate::transcripts::status_advice());
         if refresh && cleanup_retention.broker_owned_worktree_count > 0 {
             let count = cleanup_retention.broker_owned_worktree_count;
             let required = crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES;
@@ -1306,6 +1317,10 @@ impl Broker {
             )
         };
         advice.extend(stalled_submit_advice(&in_flight_submits));
+        advice.extend(crate::operations::outcome_journal::outcome_journal_advice(
+            self.store_ref(),
+            now_ms,
+        ));
         let foreign_started = std::time::Instant::now();
         // The main checkout is where agents gather before starting their own
         // sessions, so several of them there is normal, not co-tenancy.

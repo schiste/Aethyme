@@ -191,6 +191,9 @@ pub(crate) fn backfill(index: &Index, broker_db: &Path, now_ms: i64) -> Result<u
         .map_err(unreadable)?;
     let mut last = cursor;
     let mut added = 0;
+    // One transaction for the whole batch: a first backfill can add
+    // thousands of links, and one commit each is one sync each.
+    let transaction = index.transaction()?;
     for row in rows {
         let (id, session_id, payload) = row.map_err(unreadable)?;
         last = last.max(id);
@@ -217,6 +220,9 @@ pub(crate) fn backfill(index: &Index, broker_db: &Path, now_ms: i64) -> Result<u
     if last > cursor {
         index.set_backfill_cursor(broker_db, last)?;
     }
+    transaction
+        .commit()
+        .map_err(|error| format!("cannot record transcript links: {error}"))?;
     Ok(added)
 }
 
@@ -289,6 +295,7 @@ pub(crate) fn link_live_holders<P: OpenFileProbe>(
     if by_pid.is_empty() {
         return Ok(live);
     }
+    let mut links = Vec::new();
     for provider in providers {
         let Some(root) = layout.open_root(*provider) else {
             continue;
@@ -302,13 +309,21 @@ pub(crate) fn link_live_holders<P: OpenFileProbe>(
                 continue;
             };
             for (db, session_id) in sessions {
-                let link = link_for_open_file(db, *session_id, *provider, &open.path);
-                if index.add_link(&link, now_ms)? {
-                    live.added += 1;
-                }
+                links.push(link_for_open_file(db, *session_id, *provider, &open.path));
             }
         }
     }
+    // Written in one transaction once every listing is taken, so the index
+    // is never held for writing while a listing runs.
+    let transaction = index.transaction()?;
+    for link in &links {
+        if index.add_link(link, now_ms)? {
+            live.added += 1;
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("cannot record transcript links: {error}"))?;
     Ok(live)
 }
 
@@ -336,19 +351,29 @@ impl BrokerDbs {
             let Some(conn) = self.connection(db) else {
                 return Linkage::Unreadable;
             };
+            // `last_activity_at` has been in `sessions` since the first
+            // broker schema; a database without it is unreadable here.
             let row = conn
                 .query_row(
-                    "SELECT cleanup_state, worktree_path FROM sessions WHERE id = ?1",
+                    "SELECT cleanup_state, worktree_path, last_activity_at
+                     FROM sessions WHERE id = ?1",
                     [session_id],
-                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                        ))
+                    },
                 )
                 .optional();
-            let Ok(Some((cleanup_state, worktree_path))) = row else {
+            let Ok(Some((cleanup_state, worktree_path, last_activity_ms))) = row else {
                 return Linkage::Unreadable;
             };
             sessions.push(LinkedSession {
                 cleanup_state,
                 checkout: checkout_state(Path::new(&worktree_path)),
+                last_activity_ms,
             });
         }
         Linkage::Linked(sessions)

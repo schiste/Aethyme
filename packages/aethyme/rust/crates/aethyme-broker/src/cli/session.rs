@@ -1637,6 +1637,11 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
             out!("{line}");
         }
         render_duplicate_work(session.id, &broker.duplicate_work_for(session));
+        // Transcript archiving on by default: while the first-run wait runs,
+        // say so where a person starting work will read it.
+        for line in crate::transcripts::start_notice_lines() {
+            out!("{line}");
+        }
         out!("Worktree: cd {}", session.worktree_path);
         record_start_render_timings(&mut phase_timings_ms, render_started);
         out!(
@@ -2393,7 +2398,7 @@ fn open_cleanup_resolve_broker(read_only_snapshot: bool) -> Result<Broker, Usage
 }
 
 fn run_cleanup_resolve(parsed: Parsed) -> Result<(), UsageError> {
-    let usage = "usage: aethyme broker finish cleanup resolve <session-id>... --archive [--batch] [--retire] [--allow-adopted] [--confirm <sha256>] [--json]";
+    let usage = "usage: aethyme broker finish cleanup resolve <session-id>... --archive [--batch] [--retire] [--allow-adopted] [--archive-ignored-directories] [--confirm <sha256>] [--json]";
     let Some((command, ids)) = parsed.positional.split_first() else {
         return Err(UsageError::Message(usage.into()));
     };

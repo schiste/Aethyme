@@ -26,6 +26,9 @@ const MAX_SCAN_ENTRIES: u64 = 2_000_000;
 /// How much of a transcript's head is read to find its working directory.
 const CWD_PROBE_BYTES: u64 = 64 * 1024;
 const CWD_PROBE_LINES: usize = 16;
+/// How much of a transcript's tail is read to find its last record's
+/// timestamp.
+pub(crate) const RECORD_TAIL_BYTES: u64 = 64 * 1024;
 
 /// An agent whose transcripts can be archived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -257,6 +260,44 @@ pub(crate) fn transcript_cwd(path: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// The newest `timestamp` (RFC 3339, UTC) among the complete records in the
+/// last [`RECORD_TAIL_BYTES`] of a transcript, in milliseconds. Only the tail
+/// is read, never following a symbolic link, and nothing read is kept. `None`
+/// when the tail holds no complete timestamped record (a record longer than
+/// the tail, say): the modification time then stands alone.
+pub(crate) fn last_record_ms(path: &Path) -> Option<i64> {
+    use std::io::{Seek as _, SeekFrom};
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(RECORD_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = Vec::new();
+    file.take(RECORD_TAIL_BYTES).read_to_end(&mut tail).ok()?;
+    let mut lines = tail.split(|byte| *byte == b'\n');
+    if start > 0 {
+        // The first line of a tail that starts mid-file is partial.
+        lines.next();
+    }
+    lines.filter_map(record_timestamp_ms).max()
+}
+
+/// The top-level `timestamp` of one JSON record.
+fn record_timestamp_ms(line: &[u8]) -> Option<i64> {
+    if line.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(line).ok()?;
+    value
+        .get("timestamp")
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::pr_watch::parse_iso8601_utc_ms)
 }
 
 struct Walker<'a> {

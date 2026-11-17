@@ -83,22 +83,46 @@ The exact wire schema, permission rules and staged migration are documented in
 [broker-service.md](broker-service.md). Initial external consumers are manual
 operators; no installed hook, scheduled task or application is migrated yet.
 
-## Opt-in transcript archiving (`aethyme transcripts`)
+## Transcript archiving, on by default (`aethyme transcripts`)
 
 `aethyme transcripts status|list|archive --dry-run|--apply|restore
-<session-id|path>|enable|disable [--json]` is a host-level operator surface.
-JSON output names its shape: `aethyme.transcripts-status/v1`,
-`aethyme.transcripts-list/v1`, `aethyme.transcripts-archive/v1`,
-`aethyme.transcripts-restore/v1`, `aethyme.transcripts-settings/v1`;
-refusals are `aethyme.transcripts-error/v1` with `code` and `message`. Its
-input is `<host state>/transcripts/settings.toml` (`[transcripts] archive`,
-off by default); `enable` and `disable` write only that file. It writes
-`<host state>/transcripts/` (`index.sqlite3`, `runs.jsonl`, `archive.lock`,
-`claude/`), Codex's `archived_sessions/*.jsonl.zst`, and reads broker
-databases read-only. The external consumers are Codex itself (`codex
-unarchive` and `codex resume` read the `.jsonl.zst` archives natively) and
-manual operators. The detached background worker runs the same pass when the
-host opted in. See [the guide](../guides/transcript-archiving.md).
+<session-id|path>|enable [--after-inactive-days <n>]|disable [--json]` is a
+host-level operator surface. JSON output names its shape:
+`aethyme.transcripts-status/v1`, `aethyme.transcripts-list/v1`,
+`aethyme.transcripts-archive/v1`, `aethyme.transcripts-restore/v1`,
+`aethyme.transcripts-settings/v1`; refusals are
+`aethyme.transcripts-error/v1` with `code` and `message`. Its input is
+`<host state>/transcripts/settings.toml` (`[transcripts] archive`, **on by
+default** since 2026-11-17 when the file is absent or omits `archive`;
+`archive_after_inactive_days`, `archive_after_inactive_days_claude`, with
+the older `archive_after_days*` names still read and losing to the new
+ones); `enable` and `disable` write only that file (`--after-days` stays an
+alias of `--after-inactive-days`). Eligibility is inactivity: the newest of
+the file's mtime, its last record's `timestamp` (tail only) and its linked
+broker sessions' `last_activity_at` must be older than the setting.
+`status --json` gains `enabled_source` (`default`|`settings`, also under
+`config`) and `first_run` (`gate`, `noticed_at_ms`, `acknowledged_at_ms`,
+`acknowledged_by`, `automatic_archiving_from_ms`,
+`automatic_archiving_from`, `notice`, `commands`); `config` renames
+`archive_after_days*` to `archive_after_inactive_days*`. Archive reports gain
+`enabled_source`, `first_run_gate`, `record_tails_read` and the skip reasons
+`recent_record` and `recent_session_activity`. On a default-on host
+`aethyme broker status` shows the advice `transcripts.archiving-default-on`
+(severity notice; in every status form including compact, its summary
+names the start time) and records when in
+`<host state>/transcripts/first-run.json`; `broker start` text output
+prints the same notice while the wait runs;
+the background worker archives nothing until 24 hours later, unless
+`enable` or a manual `archive --apply` (recorded as `acknowledged_by`) skips
+the wait. It writes `<host state>/transcripts/` (`index.sqlite3`,
+`runs.jsonl`, `archive.lock`, `first-run.json`, `claude/`), Codex's
+`archived_sessions/*.jsonl.zst`, and reads broker databases read-only. The
+external consumers are Codex itself (`codex unarchive` and `codex resume`
+read the `.jsonl.zst` archives natively) and manual operators. A reader of
+`status --json` `config.archive_after_days` must read
+`config.archive_after_inactive_days`; a host that relied on the old
+off-by-default must write `archive = false` (`aethyme transcripts disable`).
+See [the guide](../guides/transcript-archiving.md).
 
 ## Opt-in MCP server launching (`aethyme mcp`)
 
@@ -604,6 +628,106 @@ observation listed the collection), `remote_write_failed_other` and
 printed), `remote_write_outcome_unknown`, and for a
 provider killed at its budget `remote_write_outcome_unknown_timeout` or
 `remote_write_failed_timeout`. Consumers must ignore names they do not know.
+
+## Coordinated operation outcome journal (2026-11-17)
+
+Schema v64 adds a nullable `coordinated_operations.run_nonce`, a random value
+set when a run moves to `running`. It is compatible: older writers leave it
+NULL, older readers ignore it, and `min_compatible_schema` stays 60.
+
+Once a coordinated `git`/`gh` child exits (or fails to spawn, or is killed
+at its budget), the broker writes the known result to
+`<broker db dir>/run/operation-outcomes/operation-<id>.json` before it
+touches the database: schema `aethyme.coordinated-operation-outcome/v2`,
+`operation_id`, `session_id`, `command_sha256` (SHA-256 of the row's exact
+`command_json`), `operation_created_at` (the row's `created_at`), `run_nonce`,
+`writer_pid` (the row's `pid`), `status` (`succeeded`, `failed` or
+`outcome_unknown`), `exit_code`, `details_json` (the details the row would
+carry, including any created URL, pushed refs or reconciliation evidence) and
+`child_finished_at`. The file is a synced temporary renamed into place,
+followed by a sync of the directory.
+
+With the journal on disk, the operation's host lane is finished with the
+observed outcome and its coordination locks are released; only then is the row
+updated, in one `IMMEDIATE` transaction that does nothing else (update plus its
+`operation.<status>` event), committed with `synchronous = FULL` so the WAL is
+synced before the journal is deleted. The update applies only while the row is
+`running` or `outcome_unknown` and every field of the run binding matches
+(id, session, command, `created_at`, `run_nonce`, `pid`); it is retried with
+exponential backoff (50 ms doubling to 2 s, each attempt waiting at most 5 s
+for the lock) for up to 60 s. A power loss at any point leaves the journal or
+the durable record, never neither. If the journal cannot be written, the locks
+are held through the record as before.
+
+If the database stays busy past that budget, the command still reports the
+child's true result. `broker advanced git|gh --json` gains
+`outcome_record_pending` (`operation_id`, `journal_path`, `database_error`,
+`attempts`, `waited_ms`), stderr gains a `warning:` line naming the operation
+and saying it will be recorded automatically, and the exit code follows the
+child's outcome. `broker advanced operations show <id> --json` gains
+`outcome_journal: pending|none`.
+
+If the row already holds a different outcome than the run observed (for
+example an operator reconciled it the other way), or no longer matches the
+run, the command reports the observed result, the row is left unchanged, the
+journal is kept as `operation-<id>.json.conflict`, an
+`operation.outcome_conflict` event is recorded (`operation_id`, `provider`,
+`repository`, `observed_status`, `recorded_status`, `reason`, `source`:
+`record` or `replay`), and `--json` gains `outcome_conflict`
+(`operation_id`, `observed_status`, `recorded_status`, `reason`,
+`journal_path`). `outcome_unknown` is not evidence and never conflicts.
+
+Replay: every writable broker open (every CLI command and the detached
+artifact worker; snapshot opens excluded), and every coordinated write before
+its write-block check, replays pending journals. A journal is applied only if
+its operation exists, the full run binding matches, and the row is `running` or
+`outcome_unknown`; the replayed row's details add `outcome_journal`
+(`replayed_by`: `broker_open` or `write_block_check`, `replayed_at`,
+`child_finished_at`, `writer_pid`, `status_before_replay`). A row with no
+`run_nonce` (run by an older binary) is never settled from a journal. A journal
+for a row already settled with the same outcome is deleted; a different
+outcome is a conflict as above. A journal that is unreadable, carries another
+schema, names a missing operation or does not match the run is kept as
+`operation-<id>.json.refused` and never applied. Set-aside files use schema
+`aethyme.coordinated-operation-outcome-set-aside/v1` (`operation_id`, `kind`,
+`reason`, `set_aside_at`, `observed_status`, `recorded_status`, `journal`). A
+replay waits at most 1 s for the write lock and otherwise leaves the journal
+for the next opener. While a replay cannot write, the write-block check treats a
+row whose matching journal holds `succeeded` or `failed` as decided rather than
+marking it `outcome_unknown`.
+
+`broker status` warns with `operation.outcome-journal-unreplayed` per journal
+older than ten minutes, `operation.outcome-journal-refused` per refused journal
+while its operation is still `running` or `outcome_unknown` (naming the
+reason), and `operation.outcome-journal-conflict` per conflict file until it is
+removed.
+
+Invariant: success is never inferred without a journal of the same run. A
+`running` row with no journal (the process died before the child's result was
+known) keeps the previous path: `outcome_unknown`, a write block, and explicit
+reconciliation.
+
+Telemetry: phase counts `operation_outcome_journal_written`,
+`operation_outcome_journal_write_failed`,
+`operation_outcome_locks_released_early`, `operation_outcome_record_retry`,
+`operation_outcome_record_attempt_failed`, `operation_outcome_record_pending`,
+`operation_outcome_journal_replayed`, `operation_outcome_journal_discarded`,
+`operation_outcome_journal_still_pending`, `operation_outcome_journal_refused`,
+`operation_outcome_journal_conflict`; phases `operation_outcome_record_wait`
+(total wait) and `operation_outcome_journal_replay`; attachment
+`operation_outcome_record` (`outcome`, `attempts`, `retries`, `waited_ms`,
+`journal`).
+
+Every broker open also stopped writing `meta.min_compatible_schema` when the
+recorded floor is already at least the binary's: the unconditional upsert took
+the database write lock on every open, including each running operation's
+10-second heartbeat.
+
+Removing the journal, or recording before it is written, brings back the
+stranded `running` row that write-blocks every session after a write that
+succeeded. Dropping any part of the run binding lets a stale journal settle
+another run that reuses the id after a database reset. Covered by
+`operations/outcome_journal/tests.rs` and the v64 schema test.
 
 ## Compact status by default, session block and push plan (2026-11-17)
 
@@ -2948,3 +3072,9 @@ Introduced 2026-11-17. Changes consumers may see:
 - Per-judgement phase spans `checkout_retirement_phase_ownership`, `_sessions`, `_operation_state`, `_process_use`, `_plan`, `_archive`, `_operation_archive` and `_move`; deleter span `checkout_trash_process_snapshot`.
 
 Covered by `broker/retire.rs` and `cleanup_resolve.rs` tests.
+
+### Retiring a checkout pins every commit only that worktree referred to
+
+Introduced 2026-11-17. Before any checkout is moved into the trash (the clean path, the archive path and the abandoned-operation path alike), the commits only that worktree refers to are pinned as `refs/aethyme/retired/<session>/<commit>`: its current `HEAD` and `ORIG_HEAD` (by `rev-parse` inside the worktree, so a detached HEAD is pinned without a reflog; a missing `logs/HEAD` is counted as `checkout_trash_worktree_reflog_missing` and attached to the metric line as `checkout_trash_worktree_reflog`), those its HEAD reflog (`<gitdir>/logs/HEAD`, old and new ids) names, those its per-worktree refs (`refs/bisect/*`, `refs/worktree/*`, `refs/rewritten/*`, listed from inside the worktree) point at, and those `BISECT_LOG`/`BISECT_START` name, each unless already reachable from the default branch, a remote-tracking ref or an existing pin, or (on the recovery-archive path) carried by the verified archive's bundle (its HEAD, branch tips and unlanded commits). Reachability is one `git rev-list --stdin` per checkout over at most 2,000 candidates; more keeps the checkout (`trash_refused`, with the reason in its keep detail), and the pins are written with one `git update-ref --stdin`. This replaces the earlier `rev-list --reflog --not --all` step: run inside the worktree, `--all` counted the worktree's own per-worktree refs as keeping their commits, so a commit only `refs/bisect/*` (or `refs/worktree/*`, `refs/rewritten/*`) reached was never pinned and became unreachable with the registration; `--reflog` also walked every shared ref's reflog, pinning commits the worktree never referred to (311 pins in one move on a busy repository); and a commit kept only by a local branch counted as safe although the pin-expiry rule does not. Pins expire by the existing rule. Counters `checkout_trash_reflog_commits_pinned` (one per pin, unchanged name) and `checkout_trash_worktree_commit_candidates`, span `checkout_trash_worktree_commit_pins`. `finish cleanup resolve` help now lists `--archive-ignored-directories`.
+
+Covered by `broker/retire.rs` tests.

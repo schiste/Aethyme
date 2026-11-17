@@ -2251,7 +2251,11 @@ impl Broker {
         let operation = self.store().coordinated_operation(operation_id)?.ok_or(
             crate::BrokerError::CoordinatedOperationNotFound(operation_id),
         )?;
-        Ok(OperationShowReport::from_operation(operation))
+        let mut report = OperationShowReport::from_operation(operation);
+        if outcome_journal::outcome_journal_pending(self.store().db_path(), operation_id) {
+            report.outcome_journal = "pending";
+        }
+        Ok(report)
     }
 
     pub fn run_coordinated_operation(
@@ -3880,6 +3884,17 @@ impl Broker {
             }
         }
         if effect != OperationEffect::Read {
+            // Before the write block is evaluated: an earlier operation whose
+            // child finished but whose record stayed pending on a busy
+            // database is settled from its journal here, so a journaled
+            // success never blocks this write. The earlier holder wrote its
+            // journal while it still held this lock, so it is on disk by now
+            // even if this broker's open-time replay ran too early to see it.
+            // Rows with no journal are untouched (outcome_journal invariant 3).
+            crate::warn_unrecorded(
+                "replay pending coordinated operation outcomes",
+                self.replay_operation_outcome_journals("write_block_check"),
+            );
             let unresolved = if request.provider == OperationProvider::Git {
                 // Every Git operation in this broker executes in a worktree of
                 // the same common directory. Unknown broad writes on another
@@ -3926,6 +3941,17 @@ impl Broker {
                     recorded_scope.as_deref(),
                     resource_scope.as_deref(),
                 ) {
+                    continue;
+                }
+                // A row whose run left a journal with a definite outcome is
+                // decided even when the replay above could not write it yet
+                // (its owner may still be retrying after releasing its
+                // locks): never mark it unknown or block on it.
+                if matches!(
+                    operation.status,
+                    OperationStatus::Running | OperationStatus::OutcomeUnknown
+                ) && self.has_decided_outcome_journal(&operation)
+                {
                     continue;
                 }
                 match operation.status {
@@ -4127,12 +4153,10 @@ impl Broker {
             running_details["fetch_reconciliation"] = serde_json::to_value(journal)
                 .expect("fetch journal contains only serializable fields");
         }
-        self.store().transition_coordinated_operation(
-            operation.id,
-            OperationStatus::Running,
-            None,
-            Some(&running_details.to_string()),
-        )?;
+        // The run nonce binds this run's outcome journal to this row alone.
+        let (_, run_nonce) = self
+            .store()
+            .start_coordinated_operation_run(operation.id, &running_details.to_string())?;
 
         // This is the spawn that performs the remote mutation, so the binary
         // it names is the whole point -- see `provider_command`.
@@ -4288,12 +4312,21 @@ impl Broker {
                     ref_determination,
                     &lanes,
                 );
-                let operation = self.store().transition_coordinated_operation(
-                    operation.id,
+                let recorded = self.record_coordinated_outcome(
+                    &operation,
+                    &run_nonce,
                     status,
                     None,
-                    Some(&details.to_string()),
+                    &details.to_string(),
+                    || Ok(()),
                 )?;
+                if let Some(pending) = &recorded.pending {
+                    eprintln!("warning: {}", pending.message(status));
+                }
+                if let Some(conflict) = &recorded.conflict {
+                    eprintln!("warning: {}", conflict.message());
+                }
+                let operation = recorded.operation;
                 if should_invalidate_open_pr_listing(
                     request.provider,
                     &request.args,
@@ -4357,12 +4390,21 @@ impl Broker {
                     ref_determination,
                     &lanes,
                 );
-                let operation = self.store().transition_coordinated_operation(
-                    operation.id,
+                let recorded = self.record_coordinated_outcome(
+                    &operation,
+                    &run_nonce,
                     OperationStatus::Failed,
                     None,
-                    Some(&details.to_string()),
+                    &details.to_string(),
+                    || Ok(()),
                 )?;
+                if let Some(pending) = &recorded.pending {
+                    eprintln!("warning: {}", pending.message(OperationStatus::Failed));
+                }
+                if let Some(conflict) = &recorded.conflict {
+                    eprintln!("warning: {}", conflict.message());
+                }
+                let operation = recorded.operation;
                 if let Some(guard) = &mut host_guard {
                     guard.finish(operation.status)?;
                 }
@@ -4655,17 +4697,41 @@ impl Broker {
             ref_determination,
             &lanes,
         );
-        let operation = self.store().transition_coordinated_operation(
-            operation.id,
+        // The child's result is known from here on. It is journaled to disk
+        // before the database is asked, and a busy database is retried and
+        // then left to replay instead of losing the result (and write-
+        // blocking every session over a write that may have succeeded).
+        //
+        // Once the journal is on disk, the host lane is finished with the
+        // observed outcome and every coordination lock is dropped before the
+        // database retries: other sessions' writes then replay this journal
+        // before their write-block check instead of queueing behind it.
+        let lanes_to_release = (
+            lock,
+            _git_repository_guard,
+            _git_destination_guard,
+            _git_common_guard,
+        );
+        let host_guard_slot = &mut host_guard;
+        let recorded = self.record_coordinated_outcome(
+            &operation,
+            &run_nonce,
             status,
             exit_code,
-            Some(&details.to_string()),
+            &details.to_string(),
+            move || {
+                if let Some(mut guard) = host_guard_slot.take() {
+                    guard.finish(status)?;
+                }
+                drop(lanes_to_release);
+                Ok(())
+            },
         )?;
+        let outcome_record_pending = recorded.pending;
+        let outcome_conflict = recorded.conflict;
+        let operation = recorded.operation;
         if should_invalidate_open_pr_listing(request.provider, &request.args, operation.status) {
             self.invalidate_cached_open_pr_listing();
-        }
-        if let Some(guard) = &mut host_guard {
-            guard.finish(operation.status)?;
         }
         let created_pull_request_number = (output.status.success()
             && request.provider == OperationProvider::Github
@@ -4686,6 +4752,8 @@ impl Broker {
             post_merge_cleanup: None,
             representing_commit: None,
             created_pull_request: created_pull_request_number,
+            outcome_record_pending,
+            outcome_conflict,
             remote_default_observation,
             pushed_refs: if output.status.success() {
                 match &push_planning {

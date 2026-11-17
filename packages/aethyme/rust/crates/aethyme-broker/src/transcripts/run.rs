@@ -12,7 +12,9 @@ use serde::Serialize;
 
 use super::agents::{self, AgentProbe, ClaudeProcess, SystemAgents};
 use super::archive::{self, ArchiveContext, Hooks, NoHooks, RestorePlan, Restored};
+use super::config::EnabledSource;
 use super::eligibility::{self, Facts, Linkage, SkipReason};
+use super::first_run::{self, FirstRunStatus, Gate};
 use super::index::{ArchiveRow, Index};
 use super::linkage::{self, BrokerDbs};
 use super::open_files::{OpenFileProbe, OpenFiles, SystemProbe};
@@ -201,7 +203,8 @@ pub(crate) fn linkage_advice_from(index: &Index) -> Option<crate::StatusAdvice> 
     })
 }
 
-/// The advice for this host, when transcript archiving is enabled here.
+/// The advice for this host, when transcript archiving is enabled here
+/// (explicitly or by default).
 pub(crate) fn linkage_degraded_advice() -> Option<crate::StatusAdvice> {
     if crate::gc::background_process_is_suppressed() {
         return None;
@@ -219,11 +222,19 @@ pub(crate) fn linkage_degraded_advice() -> Option<crate::StatusAdvice> {
 pub struct RunReport {
     pub schema: &'static str,
     pub enabled: bool,
+    /// `default` (no explicit `archive` setting) or `settings`.
+    pub enabled_source: EnabledSource,
+    /// The first-run gate this pass saw: `open`, or for a background pass
+    /// on a default-on host `notice_pending`/`waiting` (nothing was done).
+    pub first_run_gate: Gate,
     pub apply: bool,
     /// `acquired`, `busy` (another run holds it; nothing was done) or
     /// `not_taken` (a dry run reads only).
     pub lock: &'static str,
     pub examined: u64,
+    /// Transcript tails read for their last record's timestamp (only for
+    /// transcripts whose modification time was old enough).
+    pub record_tails_read: u64,
     pub eligible: Vec<TranscriptView>,
     pub eligible_bytes: u64,
     pub archived: Vec<ArchivedView>,
@@ -262,13 +273,16 @@ pub struct RunReport {
 }
 
 impl RunReport {
-    fn new(enabled: bool, apply: bool) -> Self {
+    fn new(config: &TranscriptsConfig, apply: bool) -> Self {
         Self {
             schema: RUN_SCHEMA,
-            enabled,
+            enabled: config.archive,
+            enabled_source: config.enabled_source,
+            first_run_gate: Gate::Open,
             apply,
             lock: "not_taken",
             examined: 0,
+            record_tails_read: 0,
             eligible: Vec::new(),
             eligible_bytes: 0,
             archived: Vec::new(),
@@ -310,7 +324,10 @@ impl RunReport {
         self.count_skip(reason);
         let routine = matches!(
             reason,
-            SkipReason::TooRecent | SkipReason::DestinationConflictBackoff
+            SkipReason::TooRecent
+                | SkipReason::RecentRecord
+                | SkipReason::RecentSessionActivity
+                | SkipReason::DestinationConflictBackoff
         );
         if !routine && self.skipped_examples.len() < MAX_SKIPPED_EXAMPLES {
             self.skipped_examples.push(SkippedView {
@@ -466,7 +483,10 @@ fn append_run_log(host_dir: &Path, report: &RunReport) {
     let line = serde_json::json!({
         "at_ms": super::now_ms(),
         "apply": report.apply,
+        "enabled_source": report.enabled_source,
+        "first_run_gate": report.first_run_gate,
         "examined": report.examined,
+        "record_tails_read": report.record_tails_read,
         "eligible": report.eligible.len(),
         "eligible_bytes": report.eligible_bytes,
         "archived": report.archived.len(),
@@ -547,7 +567,7 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
     hooks: &mut dyn Hooks,
     now_ms: i64,
 ) -> Result<RunReport, String> {
-    let mut report = RunReport::new(config.archive, options.apply);
+    let mut report = RunReport::new(config, options.apply);
     if !config.archive {
         return Ok(report);
     }
@@ -591,34 +611,47 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
         }
     }
 
-    // The age rule first: recent transcripts need no linkage work at all.
+    // Inactivity first, cheapest signal first: the last activity is never
+    // older than the modification time, so a recently modified transcript
+    // needs no tail read and no linkage work at all; one whose last record
+    // is recent needs no linkage work either.
+    let phase = Instant::now();
     let mut aged = Vec::new();
     for transcript in scan.transcripts {
-        match eligibility::judge_age(
-            now_ms,
-            transcript.modified_ms,
-            config.days_for(transcript.provider),
-        ) {
-            Ok(()) => aged.push(transcript),
+        let days = config.days_for(transcript.provider);
+        if let Err(reason) = eligibility::judge_age(now_ms, transcript.modified_ms, days) {
+            report.skip(&transcript, reason, "");
+            continue;
+        }
+        let record_ms = providers::last_record_ms(&transcript.path);
+        report.record_tails_read += 1;
+        match eligibility::judge_record(now_ms, record_ms, days) {
+            Ok(()) => aged.push((transcript, record_ms)),
             Err(reason) => report.skip(&transcript, reason, ""),
         }
     }
+    report.phase("transcripts_inactivity", phase.elapsed());
 
     let phase = Instant::now();
+    let step = Instant::now();
     let cwds: BTreeSet<PathBuf> = aged
         .iter()
-        .filter_map(|transcript| providers::transcript_cwd(&transcript.path))
+        .filter_map(|(transcript, _)| providers::transcript_cwd(&transcript.path))
         .collect();
+    report.phase("transcripts_linkage_cwds", step.elapsed());
+    let step = Instant::now();
     let known = linkage::known_broker_dbs(
         &config.repositories,
         &index,
         &cwds,
         environment.use_registry,
     );
+    report.phase("transcripts_linkage_databases", step.elapsed());
     report.warnings.extend(known.warnings);
     report.linkage_issues.index_unreadable = known.index_unreadable;
     report.linkage_issues.registry_incomplete = known.registry_incomplete;
     report.broker_databases = known.databases.len() as u64;
+    let step = Instant::now();
     let mut unreadable_databases = 0;
     for db in &known.databases {
         match linkage::backfill(&index, db, now_ms) {
@@ -626,6 +659,7 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
             Err(_) => unreadable_databases += 1,
         }
     }
+    report.phase("transcripts_linkage_backfill", step.elapsed());
     report.linkage_issues.unreadable_databases = unreadable_databases;
     if unreadable_databases > 0 {
         // Counted, never named: logs carry no path outside the provider roots.
@@ -633,6 +667,7 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
             "{unreadable_databases} broker database(s) could not be read; unlinked transcripts are skipped this pass"
         ));
     }
+    let step = Instant::now();
     match linkage::link_live_holders(
         &index,
         &known.databases,
@@ -656,6 +691,7 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
             report.warnings.push(error);
         }
     }
+    report.phase("transcripts_linkage_live_holders", step.elapsed());
     let degraded = report.linkage_issues.any();
     report.linkage_degraded = degraded;
     report.phase("transcripts_linkage", phase.elapsed());
@@ -664,7 +700,7 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
     let mut databases = BrokerDbs::default();
     let mut claude_processes: Option<Result<Vec<ClaudeProcess>, String>> = None;
     let mut eligible = Vec::new();
-    for transcript in aged {
+    for (transcript, record_ms) in aged {
         let linkage =
             match index.links_for(transcript.agent_session_id.as_deref(), &transcript.path) {
                 Ok(links) => databases.linkage(&links),
@@ -680,7 +716,8 @@ pub(crate) fn run_pass<P: OpenFileProbe>(
         let facts = Facts {
             now_ms,
             modified_ms: transcript.modified_ms,
-            archive_after_days: config.days_for(transcript.provider),
+            record_ms,
+            inactive_days: config.days_for(transcript.provider),
             linkage: &linkage,
         };
         let open = match layout.open_root(transcript.provider) {
@@ -879,10 +916,44 @@ impl Pass<'_> {
     }
 }
 
-/// The background worker's lane: one paced, budgeted pass when this host
-/// opted in, nothing otherwise. Runs only inside the detached worker, which
-/// has already lowered itself to background CPU and I/O priority. Memory
-/// pressure does not pause it: it holds one 1 MiB buffer at a time.
+/// One background-worker pass: nothing while archiving is off; on a
+/// default-on host, nothing until the first-run notice has been shown for
+/// 24 hours (the returned report then names the gate and examined nothing);
+/// otherwise one paced, budgeted, applied pass.
+pub(crate) fn worker_pass<P: OpenFileProbe>(
+    environment: &Environment,
+    config: &TranscriptsConfig,
+    probes: &mut Probes<'_, P>,
+    hooks: &mut dyn Hooks,
+    now_ms: i64,
+) -> Result<RunReport, String> {
+    let options = Options {
+        apply: true,
+        budget: Some(WORKER_RUN_BUDGET),
+    };
+    if config.archive {
+        let state = first_run::read(&environment.host_dir);
+        let gate = first_run::gate(config, &state, now_ms);
+        if gate != Gate::Open {
+            let mut report = RunReport::new(config, options.apply);
+            report.first_run_gate = gate;
+            return Ok(report);
+        }
+    }
+    run_pass(environment, config, options, probes, hooks, now_ms)
+}
+
+/// Record that the owner archived by hand, which lifts the first-run wait
+/// for the background worker too. Best effort: a failure only means the
+/// worker keeps waiting out the notice.
+pub(crate) fn acknowledge_manual_apply(environment: &Environment, now_ms: i64) -> Option<String> {
+    first_run::acknowledge(&environment.host_dir, now_ms, "archive_apply").err()
+}
+
+/// The background worker's lane: [`worker_pass`] with the host's settings.
+/// Runs only inside the detached worker, which has already lowered itself
+/// to background CPU and I/O priority. Memory pressure does not pause it:
+/// it holds one 1 MiB buffer at a time.
 pub(crate) fn run_worker_lane() {
     if !matches!(
         std::env::var(crate::gc::ARTIFACT_SWEEP_WORKER_ENV).as_deref(),
@@ -902,16 +973,11 @@ pub(crate) fn run_worker_lane() {
         open_files: &mut open_files,
         agents: &mut agents,
     };
-    let options = Options {
-        apply: true,
-        budget: Some(WORKER_RUN_BUDGET),
-    };
     crate::warn_unrecorded(
         "archive closed agent transcripts",
-        run_pass(
+        worker_pass(
             environment,
             config,
-            options,
             &mut probes,
             &mut NoHooks,
             super::now_ms(),
@@ -924,6 +990,11 @@ pub(crate) fn run_worker_lane() {
 pub struct StatusReport {
     pub schema: &'static str,
     pub enabled: bool,
+    /// `default` (no explicit `archive` setting) or `settings`.
+    pub enabled_source: EnabledSource,
+    /// Whether the background worker may archive yet (default-on hosts wait
+    /// 24 hours after the `broker status` notice).
+    pub first_run: FirstRunStatus,
     pub settings_file: PathBuf,
     pub config: TranscriptsConfig,
     pub archived_files: u64,
@@ -994,6 +1065,8 @@ pub(crate) fn status<P: OpenFileProbe>(
     let mut status = StatusReport {
         schema: STATUS_SCHEMA,
         enabled: config.archive,
+        enabled_source: config.enabled_source,
+        first_run: first_run::status(config, &environment.host_dir, super::now_ms()),
         settings_file: environment.host_dir.join(super::SETTINGS_FILE),
         config: config.clone(),
         archived_files: 0,

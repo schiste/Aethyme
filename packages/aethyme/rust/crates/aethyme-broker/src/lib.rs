@@ -184,7 +184,7 @@ pub mod session_guidance;
 pub mod session_holder;
 mod test_storage;
 mod text_redaction;
-/// Opt-in archiving of closed agent transcripts (`aethyme transcripts`).
+/// Archiving of closed agent transcripts, on by default (`aethyme transcripts`).
 pub mod transcripts;
 mod unpushed;
 pub mod worktree_location;
@@ -467,8 +467,8 @@ pub(crate) use operations::{
 };
 pub use operations::{
     OperationReconciliation, OperationReconciliationRecovery, OperationReconciliationState,
-    OperationShowReport, PostMergeCleanupReport, PostMergeCleanupState, QueueWait,
-    UnknownOutcomeRecovery, classify_gh, classify_git,
+    OperationShowReport, OutcomeConflict, PendingOutcomeRecord, PostMergeCleanupReport,
+    PostMergeCleanupState, QueueWait, UnknownOutcomeRecovery, classify_gh, classify_git,
 };
 pub use outcome_issues::{
     AUTOMATION_ISSUES_POLICY_KEY, AutomationIssuesPolicy, IssueRef, OUTCOME_ISSUE_SCHEMA,

@@ -225,6 +225,57 @@ fn bounded_commands(commands: BTreeSet<String>) -> (Vec<String>, usize) {
     (commands.into_iter().take(DETAIL_LIMIT).collect(), omitted)
 }
 
+/// Group advice by id and severity: one category per group, keeping its
+/// summary (when every observation agrees) and its bounded commands.
+fn compact_advice(advice: Vec<crate::StatusAdvice>) -> CompactAdvice {
+    let observation_count = advice.len();
+    let mut groups = BTreeMap::<(String, String), AdviceGroup>::new();
+    for item in advice {
+        let key = (item.id.to_string(), item.severity.as_str().to_string());
+        let group = groups.entry(key).or_default();
+        group.count += 1;
+        group.summaries.insert(item.summary);
+        group.commands.extend(item.commands);
+    }
+
+    let categories = groups
+        .into_iter()
+        .map(|((id, severity), group)| {
+            let summary_variants_omitted = group.summaries.len() > 1;
+            let summary = if let Some(summary) = group.summaries.first() {
+                if summary_variants_omitted {
+                    format!(
+                        "{} observations in this category; per-observation summaries are omitted",
+                        group.count
+                    )
+                } else {
+                    summary.clone()
+                }
+            } else {
+                format!("{} observations in this category", group.count)
+            };
+            let (commands, commands_omitted_count) = bounded_commands(group.commands);
+            CompactAdviceCategory {
+                id,
+                severity,
+                count: group.count,
+                duplicate_count: group.count.saturating_sub(1),
+                summary,
+                summary_variants_omitted,
+                commands,
+                commands_omitted_count,
+                details_omitted: true,
+            }
+        })
+        .collect::<Vec<_>>();
+    let category_count = categories.len();
+    CompactAdvice {
+        category_count,
+        observation_count,
+        categories,
+    }
+}
+
 impl CompactStatus {
     pub(crate) fn from_brief(
         brief: crate::StatusBrief,
@@ -285,47 +336,6 @@ impl CompactStatus {
                 .collect(),
         };
         let waiter_count = brief.waiters.len();
-        let observation_count = brief.advice.len();
-        let mut groups = BTreeMap::<(String, String), AdviceGroup>::new();
-        for item in brief.advice {
-            let key = (item.id.to_string(), item.severity.as_str().to_string());
-            let group = groups.entry(key).or_default();
-            group.count += 1;
-            group.summaries.insert(item.summary);
-            group.commands.extend(item.commands);
-        }
-
-        let categories = groups
-            .into_iter()
-            .map(|((id, severity), group)| {
-                let summary_variants_omitted = group.summaries.len() > 1;
-                let summary = if let Some(summary) = group.summaries.first() {
-                    if summary_variants_omitted {
-                        format!(
-                            "{} observations in this category; per-observation summaries are omitted",
-                            group.count
-                        )
-                    } else {
-                        summary.clone()
-                    }
-                } else {
-                    format!("{} observations in this category", group.count)
-                };
-                let (commands, commands_omitted_count) = bounded_commands(group.commands);
-                CompactAdviceCategory {
-                    id,
-                    severity,
-                    count: group.count,
-                    duplicate_count: group.count.saturating_sub(1),
-                    summary,
-                    summary_variants_omitted,
-                    commands,
-                    commands_omitted_count,
-                    details_omitted: true,
-                }
-            })
-            .collect::<Vec<_>>();
-        let category_count = categories.len();
 
         Self {
             schema: SCHEMA,
@@ -336,11 +346,7 @@ impl CompactStatus {
                 deferred_checks: brief.deferred_checks,
                 deferred_checks_are_unknown: true,
             },
-            advice: CompactAdvice {
-                category_count,
-                observation_count,
-                categories,
-            },
+            advice: compact_advice(brief.advice),
             waiters: CompactWaiters {
                 count: waiter_count,
                 details_omitted: waiter_count > DETAIL_LIMIT,
@@ -484,35 +490,7 @@ impl CompactStatus {
                 line!("  run: {command}");
             }
         }
-        line!(
-            "Advice: {} categories, {} observations.",
-            self.advice.category_count,
-            self.advice.observation_count
-        );
-        for category in &self.advice.categories {
-            let duplicates = if category.duplicate_count == 0 {
-                String::new()
-            } else {
-                format!(", {} duplicates", category.duplicate_count)
-            };
-            line!(
-                "- {} [{}; count {}{}]: {}",
-                category.id,
-                category.severity,
-                category.count,
-                duplicates,
-                category.summary
-            );
-            for command in &category.commands {
-                line!("  run: {command}");
-            }
-            if category.commands_omitted_count > 0 {
-                line!(
-                    "  {} additional commands omitted; inspect full status.",
-                    category.commands_omitted_count
-                );
-            }
-        }
+        render_advice(&self.advice, &mut output);
         line!(
             "Waiters: {} ({} additional rows omitted).",
             self.waiters.count,
@@ -530,10 +508,85 @@ impl CompactStatus {
     }
 }
 
+/// The advice section of the compact text: every category's summary and
+/// commands.
+fn render_advice(advice: &CompactAdvice, output: &mut String) {
+    macro_rules! line {
+        ($($arg:tt)*) => {
+            writeln!(output, $($arg)*).expect("writing to String cannot fail");
+        };
+    }
+    line!(
+        "Advice: {} categories, {} observations.",
+        advice.category_count,
+        advice.observation_count
+    );
+    for category in &advice.categories {
+        let duplicates = if category.duplicate_count == 0 {
+            String::new()
+        } else {
+            format!(", {} duplicates", category.duplicate_count)
+        };
+        line!(
+            "- {} [{}; count {}{}]: {}",
+            category.id,
+            category.severity,
+            category.count,
+            duplicates,
+            category.summary
+        );
+        for command in &category.commands {
+            line!("  run: {command}");
+        }
+        if category.commands_omitted_count > 0 {
+            line!(
+                "  {} additional commands omitted; inspect full status.",
+                category.commands_omitted_count
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CompactOperation, DETAIL_LIMIT, bounded_commands};
     use std::collections::BTreeSet;
+
+    /// The human-readable `broker status` (compact text) and its compact
+    /// JSON both show the transcript default-on notice with its start time.
+    #[test]
+    fn the_transcripts_default_on_notice_shows_its_start_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = crate::transcripts::TranscriptsConfig::default();
+        let now = 1_800_000_000_000;
+        let advice = crate::transcripts::default_on_advice_at(temp.path(), &config, now).unwrap();
+        let starts = crate::cli::insights::timestamp_millis(now + 24 * 60 * 60 * 1000);
+        let compact = super::compact_advice(vec![advice]);
+        let value = serde_json::to_value(&compact).unwrap();
+        let category = &value["categories"][0];
+        assert_eq!(category["id"], "transcripts.archiving-default-on");
+        assert_eq!(category["severity"], "notice");
+        let summary = category["summary"].as_str().unwrap();
+        assert!(summary.contains(&starts), "{summary}");
+        assert!(summary.contains("3 inactive days"), "{summary}");
+        let commands = category["commands"].to_string();
+        assert!(
+            commands.contains("aethyme transcripts disable"),
+            "{commands}"
+        );
+        assert!(
+            commands.contains("aethyme transcripts enable --after-inactive-days <n>"),
+            "{commands}"
+        );
+        let mut text = String::new();
+        super::render_advice(&compact, &mut text);
+        assert!(
+            text.contains("transcripts.archiving-default-on [notice"),
+            "{text}"
+        );
+        assert!(text.contains(&starts), "{text}");
+        assert!(text.contains("run: aethyme transcripts disable"), "{text}");
+    }
 
     #[test]
     fn compact_commands_are_bounded_and_report_omissions() {

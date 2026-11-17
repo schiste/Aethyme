@@ -129,7 +129,7 @@ fn enabled(providers: Vec<Provider>) -> TranscriptsConfig {
         archive: true,
         providers,
         // Claude's own default (14 days) is covered by its own test.
-        archive_after_days_claude: 3,
+        archive_after_inactive_days_claude: 3,
         // Fast enough that tests never wait on pacing.
         bytes_per_second: 1 << 40,
         ..TranscriptsConfig::default()
@@ -303,7 +303,8 @@ impl Repository {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(
             "CREATE TABLE sessions (id INTEGER PRIMARY KEY, worktree_path TEXT NOT NULL,
-                                    cleanup_state TEXT NOT NULL DEFAULT 'open');
+                                    cleanup_state TEXT NOT NULL DEFAULT 'open',
+                                    last_activity_at INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, schema_version INTEGER,
                                   ts INTEGER, kind TEXT NOT NULL, session_id INTEGER,
                                   payload_json TEXT);",
@@ -345,6 +346,7 @@ fn session(state: &str, checkout: CheckoutState) -> LinkedSession {
     LinkedSession {
         cleanup_state: Some(state.into()),
         checkout,
+        last_activity_ms: None,
     }
 }
 
@@ -421,6 +423,7 @@ fn eligibility_table() {
             Linkage::Linked(vec![LinkedSession {
                 cleanup_state: None,
                 checkout: CheckoutState::Absent,
+                last_activity_ms: None,
             }]),
             OpenState::Closed,
             Err(SkipReason::SessionOpen),
@@ -472,7 +475,8 @@ fn eligibility_table() {
         let facts = Facts {
             now_ms: now,
             modified_ms,
-            archive_after_days: 3,
+            record_ms: None,
+            inactive_days: 3,
             linkage: &linkage,
         };
         assert_eq!(eligibility::judge(&facts, open), expected, "{name}");
@@ -572,13 +576,13 @@ fn settings_parse_and_refuse_unknown_keys() {
         TranscriptsConfig::parse("").unwrap(),
         TranscriptsConfig::default()
     );
-    assert!(!TranscriptsConfig::default().archive);
     let config = TranscriptsConfig::parse(
         "[transcripts]\narchive = true\narchive_after_days = 5\nproviders = [\"claude\", \"codex\", \"claude\"]\nrepositories = [\"/invented/repo\"]\n",
     )
     .unwrap();
     assert!(config.archive);
-    assert_eq!(config.archive_after_days, 5);
+    assert_eq!(config.archive_after_inactive_days, 5);
+    assert_eq!(config.enabled_source, config::EnabledSource::Settings);
     assert_eq!(config.providers, vec![Provider::Claude, Provider::Codex]);
     assert_eq!(config.repositories, vec![PathBuf::from("/invented/repo")]);
     assert!(TranscriptsConfig::parse("[transcripts]\narchiv = true\n").is_err());
@@ -609,13 +613,14 @@ fn enable_and_disable_write_only_the_settings_file_and_keep_other_lines() {
         host_dir,
         &SettingsChange {
             archive: true,
-            archive_after_days: Some(4),
+            archive_after_inactive_days: Some(4),
             providers: Some(vec![Provider::Codex, Provider::Claude]),
         },
     )
     .unwrap();
     assert!(config.archive);
-    assert_eq!(config.archive_after_days, 4);
+    assert_eq!(config.archive_after_inactive_days, 4);
+    assert_eq!(config.enabled_source, config::EnabledSource::Settings);
     assert_eq!(config.repositories, vec![PathBuf::from("/invented/repo")]);
     let text = fs::read_to_string(host_dir.join(config::SETTINGS_FILE)).unwrap();
     assert!(text.contains("# owner note"), "{text}");
@@ -628,7 +633,8 @@ fn enable_and_disable_write_only_the_settings_file_and_keep_other_lines() {
     )
     .unwrap();
     assert!(!disabled.archive);
-    assert_eq!(disabled.archive_after_days, 4);
+    assert_eq!(disabled.archive_after_inactive_days, 4);
+    assert_eq!(disabled.enabled_source, config::EnabledSource::Settings);
     let mut names: Vec<String> = fs::read_dir(host_dir)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -705,6 +711,8 @@ fn disabled_settings_do_nothing_at_all() {
     let host = Host::new();
     let source = host.codex_transcript(UUID, Path::new("/work/invented"));
     let config = TranscriptsConfig {
+        archive: false,
+        enabled_source: config::EnabledSource::Settings,
         providers: vec![Provider::Codex, Provider::Claude],
         ..TranscriptsConfig::default()
     };
@@ -1358,7 +1366,7 @@ fn claude_names_and_project_directories() {
 
 fn claude_enabled() -> TranscriptsConfig {
     TranscriptsConfig {
-        archive_after_days_claude: 3,
+        archive_after_inactive_days_claude: 3,
         ..enabled(vec![Provider::Claude])
     }
 }
@@ -1433,9 +1441,12 @@ fn claude_transcripts_wait_fourteen_days_by_default() {
     let host = Host::new();
     let claude = host.claude_transcript(OTHER_UUID);
     let codex = host.codex_transcript(UUID, Path::new("/work/invented"));
-    assert_eq!(TranscriptsConfig::default().archive_after_days_claude, 14);
+    assert_eq!(
+        TranscriptsConfig::default().archive_after_inactive_days_claude,
+        14
+    );
     let config = TranscriptsConfig {
-        archive_after_days_claude: config::DEFAULT_ARCHIVE_AFTER_DAYS_CLAUDE,
+        archive_after_inactive_days_claude: config::DEFAULT_ARCHIVE_AFTER_INACTIVE_DAYS_CLAUDE,
         ..enabled(vec![Provider::Codex, Provider::Claude])
     };
     let mut open = probe(Vec::new());
@@ -1448,7 +1459,7 @@ fn claude_transcripts_wait_fourteen_days_by_default() {
     assert!(
         TranscriptsConfig::parse("[transcripts]\narchive_after_days_claude = 30\n")
             .unwrap()
-            .archive_after_days_claude
+            .archive_after_inactive_days_claude
             == 30
     );
 }
@@ -1890,4 +1901,460 @@ fn status_shows_linkage_degradation_and_broker_status_advises_after_three_passes
     fs::remove_dir_all(&repository.root).unwrap();
     pass(&host, &config, apply(), &mut open, &mut NoHooks);
     assert!(run::linkage_advice_from(&index()).is_none());
+}
+
+// ── on by default, inactivity, first-run notice ──────────────────────
+
+/// Set a file's modification time to `ms` since the epoch.
+fn set_modified_ms(path: &Path, ms: i64) {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(ms as u64))
+        .unwrap();
+}
+
+fn worker(host: &Host, config: &TranscriptsConfig, now_ms: i64) -> run::RunReport {
+    let mut open = probe(Vec::new());
+    let mut agents = FakeAgents::none();
+    let mut probes = Probes {
+        open_files: &mut open,
+        agents: &mut agents,
+    };
+    run::worker_pass(&host.environment, config, &mut probes, &mut NoHooks, now_ms).unwrap()
+}
+
+#[test]
+fn archiving_is_on_by_default_without_a_settings_file() {
+    let host = Host::new();
+    let config = TranscriptsConfig::load(&host.environment.host_dir).unwrap();
+    assert!(config.archive);
+    assert_eq!(config.enabled_source, config::EnabledSource::Default);
+    assert_eq!(config.providers, vec![Provider::Codex, Provider::Claude]);
+    assert_eq!(config.archive_after_inactive_days, 3);
+    assert_eq!(config.archive_after_inactive_days_claude, 14);
+    // A file that omits `archive` is still the default.
+    let omitted = TranscriptsConfig::parse("[transcripts]\nbytes_per_second = 1048576\n").unwrap();
+    assert!(omitted.archive);
+    assert_eq!(omitted.enabled_source, config::EnabledSource::Default);
+
+    let mut open = probe(Vec::new());
+    let shown = serde_json::to_value(status(&host, &config, &mut open)).unwrap();
+    assert_eq!(shown["enabled"], true);
+    assert_eq!(shown["enabled_source"], "default");
+    assert_eq!(shown["config"]["enabled_source"], "default");
+    assert_eq!(shown["first_run"]["gate"], "notice_pending");
+}
+
+#[test]
+fn an_explicit_archive_false_is_respected() {
+    let host = Host::new();
+    let host_dir = &host.environment.host_dir;
+    fs::create_dir_all(host_dir).unwrap();
+    fs::write(
+        host_dir.join(config::SETTINGS_FILE),
+        "[transcripts]\narchive = false\n",
+    )
+    .unwrap();
+    let config = TranscriptsConfig::load(host_dir).unwrap();
+    assert!(!config.archive);
+    assert_eq!(config.enabled_source, config::EnabledSource::Settings);
+    let source = host.codex_transcript(UUID, Path::new("/work/invented"));
+    let report = worker(&host, &config, later());
+    assert_eq!(report.examined, 0);
+    assert!(source.is_file());
+    let mut open = probe(Vec::new());
+    let shown = serde_json::to_value(status(&host, &config, &mut open)).unwrap();
+    assert_eq!(shown["enabled"], false);
+    assert_eq!(shown["enabled_source"], "settings");
+    // `disable` on a host with no file writes the same explicit setting.
+    let other = Host::new();
+    let disabled = config::write_settings(
+        &other.environment.host_dir,
+        &SettingsChange {
+            archive: false,
+            ..SettingsChange::default()
+        },
+    )
+    .unwrap();
+    assert!(!disabled.archive);
+    assert_eq!(disabled.enabled_source, config::EnabledSource::Settings);
+}
+
+#[test]
+fn old_setting_names_are_still_honoured_and_new_names_win() {
+    let old = TranscriptsConfig::parse(
+        "[transcripts]\narchive_after_days = 5\narchive_after_days_claude = 20\n",
+    )
+    .unwrap();
+    assert_eq!(old.archive_after_inactive_days, 5);
+    assert_eq!(old.archive_after_inactive_days_claude, 20);
+    for text in [
+        "[transcripts]\narchive_after_days = 5\narchive_after_inactive_days = 7\n\
+         archive_after_days_claude = 20\narchive_after_inactive_days_claude = 21\n",
+        "[transcripts]\narchive_after_inactive_days = 7\narchive_after_days = 5\n\
+         archive_after_inactive_days_claude = 21\narchive_after_days_claude = 20\n",
+    ] {
+        let config = TranscriptsConfig::parse(text).unwrap();
+        assert_eq!(config.archive_after_inactive_days, 7, "{text}");
+        assert_eq!(config.archive_after_inactive_days_claude, 21, "{text}");
+    }
+    assert!(TranscriptsConfig::parse("[transcripts]\narchive_after_inactive_days = 0\n").is_err());
+
+    // `enable --after-days` and `--after-inactive-days` write the new name
+    // and drop the old one.
+    let host = Host::new();
+    let host_dir = &host.environment.host_dir;
+    fs::create_dir_all(host_dir).unwrap();
+    fs::write(
+        host_dir.join(config::SETTINGS_FILE),
+        "[transcripts]\narchive_after_days = 5\n",
+    )
+    .unwrap();
+    for flag in ["--after-days", "--after-inactive-days"] {
+        let change =
+            super::cli::parse_settings_flags(&[flag.to_string(), "9".to_string()], true).unwrap();
+        assert_eq!(change.archive_after_inactive_days, Some(9), "{flag}");
+        let config = config::write_settings(host_dir, &change).unwrap();
+        assert_eq!(config.archive_after_inactive_days, 9);
+    }
+    let text = fs::read_to_string(host_dir.join(config::SETTINGS_FILE)).unwrap();
+    assert!(text.contains("archive_after_inactive_days = 9"), "{text}");
+    assert!(!text.contains("archive_after_days ="), "{text}");
+}
+
+/// Name, modification time, last record time, linkage, expected verdict.
+type InactivityCase = (
+    &'static str,
+    Option<i64>,
+    Option<i64>,
+    Linkage,
+    Result<(), SkipReason>,
+);
+
+#[test]
+fn inactivity_is_the_newest_of_mtime_last_record_and_linked_session() {
+    let now = 100 * DAY_MS;
+    let old = Some(now - 10 * DAY_MS);
+    let recent = Some(now - DAY_MS);
+    let closed = |activity: Option<i64>| {
+        Linkage::Linked(vec![LinkedSession {
+            cleanup_state: Some("closed".into()),
+            checkout: CheckoutState::Absent,
+            last_activity_ms: activity,
+        }])
+    };
+    let cases: Vec<InactivityCase> = vec![
+        ("all three old", old, old, closed(old), Ok(())),
+        (
+            "recent mtime",
+            recent,
+            old,
+            closed(old),
+            Err(SkipReason::TooRecent),
+        ),
+        (
+            "recent last record",
+            old,
+            recent,
+            closed(old),
+            Err(SkipReason::RecentRecord),
+        ),
+        (
+            "recent linked session",
+            old,
+            old,
+            closed(recent),
+            Err(SkipReason::RecentSessionActivity),
+        ),
+        ("no record, unlinked", old, None, Linkage::Unlinked, Ok(())),
+        (
+            "a record in the future counts as recent",
+            old,
+            Some(now + DAY_MS),
+            Linkage::Unlinked,
+            Err(SkipReason::RecentRecord),
+        ),
+    ];
+    for (name, modified_ms, record_ms, linkage, expected) in cases {
+        let facts = Facts {
+            now_ms: now,
+            modified_ms,
+            record_ms,
+            inactive_days: 3,
+            linkage: &linkage,
+        };
+        assert_eq!(
+            eligibility::judge(&facts, OpenState::Closed),
+            expected,
+            "{name}"
+        );
+    }
+
+    // The last record comes from the tail only, ignoring a partial first
+    // line and records without a timestamp.
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("tail.jsonl");
+    let mut text = String::from("{\"timestamp\":\"2026-12-31T00:00:00Z\"}\n");
+    while text.len() < providers::RECORD_TAIL_BYTES as usize + 1024 {
+        text.push_str("{\"type\":\"filler\",\"text\":\"an invented line\"}\n");
+    }
+    text.push_str("{\"timestamp\":\"2026-03-01T00:00:00.250Z\",\"type\":\"a\"}\n");
+    text.push_str("{\"timestamp\":\"2026-03-02T00:00:00Z\",\"type\":\"b\"}\n");
+    text.push_str("{\"type\":\"no timestamp\"}\n");
+    fs::write(&path, &text).unwrap();
+    assert_eq!(
+        providers::last_record_ms(&path),
+        crate::pr_watch::parse_iso8601_utc_ms("2026-03-02T00:00:00Z"),
+        "the head's later timestamp is outside the tail"
+    );
+    fs::write(&path, "{\"type\":\"no timestamp\"}\n").unwrap();
+    assert_eq!(providers::last_record_ms(&path), None);
+}
+
+#[test]
+fn a_recent_last_record_or_session_keeps_an_old_transcript() {
+    let host = Host::new();
+    let repository = Repository::new(&host, UUID, "closed");
+    fs::remove_dir_all(&repository.checkout).unwrap();
+    let source = host.codex_transcript(UUID, &repository.root);
+    let now = crate::pr_watch::parse_iso8601_utc_ms("2026-03-10T00:00:00Z").unwrap();
+    let config = enabled(vec![Provider::Codex]);
+    let mut open = probe(Vec::new());
+    let run_at = |open: &mut OpenFiles<FakeProbe>| {
+        pass_at(
+            &host,
+            &config,
+            apply(),
+            open,
+            &mut FakeAgents::none(),
+            &mut NoHooks,
+            now,
+        )
+    };
+
+    // Modified long ago, but its last record is a day old.
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&source)
+        .unwrap()
+        .write_all(b"{\"timestamp\":\"2026-03-09T00:00:00Z\",\"type\":\"event_msg\"}\n")
+        .unwrap();
+    set_modified_ms(&source, now - 10 * DAY_MS);
+    let report = run_at(&mut open);
+    assert_eq!(report.skipped.get("recent_record"), Some(&1), "{report:?}");
+    assert_eq!(report.record_tails_read, 1);
+    assert!(source.is_file());
+
+    // An old last record, but the linked broker session was active a day
+    // ago.
+    let text = fs::read_to_string(&source)
+        .unwrap()
+        .replace("2026-03-09T00:00:00Z", "2026-02-01T00:00:00Z");
+    fs::write(&source, text).unwrap();
+    set_modified_ms(&source, now - 10 * DAY_MS);
+    let conn = rusqlite::Connection::open(&repository.db).unwrap();
+    conn.execute(
+        "UPDATE sessions SET last_activity_at = ?1 WHERE id = 7",
+        [now - DAY_MS],
+    )
+    .unwrap();
+    let report = run_at(&mut open);
+    assert_eq!(
+        report.skipped.get("recent_session_activity"),
+        Some(&1),
+        "{report:?}"
+    );
+    assert!(source.is_file());
+
+    // Everything older than three days: archived.
+    conn.execute(
+        "UPDATE sessions SET last_activity_at = ?1 WHERE id = 7",
+        [now - 10 * DAY_MS],
+    )
+    .unwrap();
+    let report = run_at(&mut open);
+    assert_eq!(report.archived.len(), 1, "{report:?}");
+    assert!(!source.exists());
+}
+
+#[test]
+fn the_first_run_notice_holds_the_worker_for_24_hours() {
+    let host = Host::new();
+    let source = host.codex_transcript(UUID, Path::new("/work/invented"));
+    let config = enabled(vec![Provider::Codex]);
+    assert_eq!(config.enabled_source, config::EnabledSource::Default);
+    let host_dir = &host.environment.host_dir;
+    let hour = 60 * 60 * 1000;
+    let t0 = later();
+
+    // Never shown: the worker archives nothing.
+    let report = worker(&host, &config, t0);
+    assert_eq!(report.first_run_gate, super::Gate::NoticePending);
+    assert_eq!(report.examined, 0);
+    assert!(source.is_file());
+
+    // `broker status` shows the notice once and records when.
+    let advice = super::first_run::notice_advice_at(host_dir, &config, t0).unwrap();
+    assert_eq!(advice.id, "transcripts.archiving-default-on");
+    assert!(
+        advice.summary.contains("3 inactive days"),
+        "{}",
+        advice.summary
+    );
+    assert!(advice.summary.contains("aethyme transcripts disable"));
+    assert!(!advice.summary.contains('\n'));
+    assert_eq!(
+        super::first_run::read(host_dir).noticed_at_ms,
+        Some(t0),
+        "the notice time is recorded"
+    );
+    // Showing it again does not restart the wait.
+    super::first_run::notice_advice_at(host_dir, &config, t0 + hour).unwrap();
+    assert_eq!(super::first_run::read(host_dir).noticed_at_ms, Some(t0));
+
+    let report = worker(&host, &config, t0 + 23 * hour);
+    assert_eq!(report.first_run_gate, super::Gate::Waiting);
+    assert_eq!(report.examined, 0);
+    assert!(source.is_file());
+
+    let report = worker(&host, &config, t0 + 25 * hour);
+    assert_eq!(report.first_run_gate, super::Gate::Open);
+    assert_eq!(report.archived.len(), 1, "{report:?}");
+    assert!(!source.exists());
+    assert!(super::first_run::notice_advice_at(host_dir, &config, t0 + 25 * hour).is_none());
+}
+
+#[test]
+fn enable_or_a_manual_apply_skips_the_first_run_wait() {
+    // Explicitly enabled: no notice, no wait.
+    let host = Host::new();
+    let source = host.codex_transcript(UUID, Path::new("/work/invented"));
+    let explicit = TranscriptsConfig {
+        enabled_source: config::EnabledSource::Settings,
+        ..enabled(vec![Provider::Codex])
+    };
+    assert!(
+        super::first_run::notice_advice_at(&host.environment.host_dir, &explicit, later())
+            .is_none()
+    );
+    let report = worker(&host, &explicit, later());
+    assert_eq!(report.first_run_gate, super::Gate::Open);
+    assert_eq!(report.archived.len(), 1, "{report:?}");
+    assert!(!source.exists());
+
+    // On by default, then archived by hand: the worker no longer waits.
+    let host = Host::new();
+    let source = host.codex_transcript(UUID, Path::new("/work/invented"));
+    let default_on = enabled(vec![Provider::Codex]);
+    assert_eq!(
+        run::acknowledge_manual_apply(&host.environment, later()),
+        None
+    );
+    let state = super::first_run::read(&host.environment.host_dir);
+    assert_eq!(state.acknowledged_by.as_deref(), Some("archive_apply"));
+    assert!(
+        super::first_run::notice_advice_at(&host.environment.host_dir, &default_on, later())
+            .is_none()
+    );
+    let report = worker(&host, &default_on, later());
+    assert_eq!(report.first_run_gate, super::Gate::Open);
+    assert_eq!(report.archived.len(), 1, "{report:?}");
+    assert!(!source.exists());
+}
+
+#[test]
+fn transcripts_status_shows_the_first_run_wait_in_text_and_json() {
+    let host = Host::new();
+    let config = TranscriptsConfig::default();
+    let host_dir = &host.environment.host_dir;
+    let mut open = probe(Vec::new());
+
+    // Not shown yet: status says so, and reading does not start the wait.
+    let pending = status(&host, &config, &mut open);
+    assert_eq!(pending.first_run.gate, super::Gate::NoticePending);
+    assert!(super::first_run::read(host_dir).noticed_at_ms.is_none());
+    let lines = super::first_run::status_lines(&pending.first_run).join("\n");
+    assert!(lines.contains("notice_pending"), "{lines}");
+    assert!(
+        lines.contains("run: aethyme transcripts disable"),
+        "{lines}"
+    );
+
+    // Shown by `broker status`: the start time, the notice and the commands.
+    let noticed = super::now_ms();
+    super::first_run::notice_advice_at(host_dir, &config, noticed).unwrap();
+    let starts = noticed + super::first_run::NOTICE_WAIT_MS;
+    let starts_text = crate::cli::insights::timestamp_millis(starts);
+    let waiting = status(&host, &config, &mut open);
+    let value = serde_json::to_value(&waiting).unwrap();
+    assert_eq!(value["first_run"]["gate"], "waiting");
+    assert_eq!(value["first_run"]["noticed_at_ms"], noticed);
+    assert_eq!(value["first_run"]["automatic_archiving_from_ms"], starts);
+    assert_eq!(
+        value["first_run"]["automatic_archiving_from"],
+        starts_text.as_str()
+    );
+    let notice = value["first_run"]["notice"].as_str().unwrap();
+    assert!(notice.contains(&starts_text), "{notice}");
+    assert!(notice.contains("--after-inactive-days"), "{notice}");
+    assert!(notice.contains("aethyme transcripts disable"), "{notice}");
+    assert!(
+        value["first_run"]["commands"]
+            .to_string()
+            .contains("aethyme transcripts disable")
+    );
+    let lines = super::first_run::status_lines(&waiting.first_run).join("\n");
+    assert!(
+        lines.contains(&format!("automatic archiving starts at {starts_text}")),
+        "{lines}"
+    );
+    assert!(lines.contains("Notice: transcript archiving is on by default"));
+    assert!(lines.contains("run: aethyme transcripts enable --after-inactive-days <n>"));
+
+    // Open (explicitly enabled): nothing to say.
+    let explicit = TranscriptsConfig {
+        enabled_source: config::EnabledSource::Settings,
+        ..TranscriptsConfig::default()
+    };
+    let open_status = status(&host, &explicit, &mut open);
+    assert_eq!(open_status.first_run.gate, super::Gate::Open);
+    assert!(open_status.first_run.notice.is_none());
+    assert!(super::first_run::status_lines(&open_status.first_run).is_empty());
+}
+
+#[test]
+fn broker_start_prints_the_notice_while_the_wait_runs() {
+    let host = Host::new();
+    let config = TranscriptsConfig::default();
+    let now = later();
+    let advice = super::default_on_advice_at(&host.environment.host_dir, &config, now).unwrap();
+    let lines = super::default_on_start_lines(&advice);
+    let starts_text =
+        crate::cli::insights::timestamp_millis(now + super::first_run::NOTICE_WAIT_MS);
+    assert!(
+        lines[0].starts_with("Notice (transcripts.archiving-default-on): "),
+        "{lines:?}"
+    );
+    assert!(lines[0].contains(&starts_text), "{lines:?}");
+    assert!(lines.contains(&"  run: aethyme transcripts disable".to_string()));
+    assert!(
+        lines.contains(&"  run: aethyme transcripts enable --after-inactive-days <n>".to_string())
+    );
+    // The compact JSON keeps the start time in the summary; the full form
+    // also has it as evidence.
+    assert!(advice.evidence.contains(&format!(
+        "automatic_archiving_from_ms={}",
+        now + super::first_run::NOTICE_WAIT_MS
+    )));
+    // Once the wait is over there is nothing to print.
+    assert!(
+        super::default_on_advice_at(
+            &host.environment.host_dir,
+            &config,
+            now + super::first_run::NOTICE_WAIT_MS
+        )
+        .is_none()
+    );
 }

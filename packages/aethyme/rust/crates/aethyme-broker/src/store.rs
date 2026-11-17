@@ -2815,6 +2815,67 @@ mod review_ledger_tests {
     }
 }
 
+/// Everything that identifies one run of one coordinated operation. An
+/// outcome may settle a row only when all of it matches: id, session and
+/// command alone are reproducible by anyone, and an id is reused after a
+/// database reset, so the run nonce, the row's creation time and the pid
+/// that ran the child are required too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OperationRunBinding {
+    pub(crate) operation_id: i64,
+    pub(crate) session_id: i64,
+    pub(crate) command_json: String,
+    pub(crate) created_at: i64,
+    pub(crate) run_nonce: String,
+    pub(crate) pid: i64,
+}
+
+impl OperationRunBinding {
+    /// Whether `row` (with its stored `run_nonce`) is this run. A row without
+    /// a nonce was run by an older binary and never matches.
+    pub(crate) fn matches(&self, row: &CoordinatedOperation, run_nonce: Option<&str>) -> bool {
+        self.mismatch(row, run_nonce).is_none()
+    }
+
+    /// The first field that differs, for a refusal message.
+    pub(crate) fn mismatch(
+        &self,
+        row: &CoordinatedOperation,
+        run_nonce: Option<&str>,
+    ) -> Option<&'static str> {
+        if row.id != self.operation_id {
+            Some("operation id")
+        } else if row.session_id != self.session_id {
+            Some("session")
+        } else if row.command_json != self.command_json {
+            Some("command")
+        } else if row.created_at != self.created_at {
+            Some("creation time (the id was reused)")
+        } else if run_nonce.is_none() {
+            Some("run nonce (the row was run by an older binary)")
+        } else if run_nonce != Some(self.run_nonce.as_str()) {
+            Some("run nonce (another run of this id)")
+        } else if row.pid != self.pid {
+            Some("process that ran the child")
+        } else {
+            None
+        }
+    }
+}
+
+/// What [`BrokerStore::settle_coordinated_operation`] found and did.
+#[derive(Debug, Clone)]
+pub(crate) enum OperationSettlement {
+    /// The row moved to the requested outcome; this is the row as committed.
+    Recorded(CoordinatedOperation),
+    /// The row had already left `running`/`outcome_unknown`; left untouched.
+    AlreadySettled(CoordinatedOperation),
+    /// A row with this id exists but belongs to another session or command.
+    Mismatch(CoordinatedOperation),
+    /// No row has this id.
+    Missing,
+}
+
 mod base_incidents;
 pub(crate) mod cleanup_cohort;
 mod coordination;
