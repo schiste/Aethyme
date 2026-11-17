@@ -3295,3 +3295,26 @@ After the closed-session lap, a second lap (cursor meta key `checkout_retirement
 Progress field `strip` of `checkout_retirement.progress` carries `last_checkouts_examined`, `last_checkouts_stripped`, `last_directories_stripped`, `last_refused` (by code), `last_phase_ms` (`discover`, `prove`, `move`), `backlog` (`folders`, `closed_folders`, `closed_with_regenerable`, `observed_at_ms`: counts from one `lstat` per folder and per top-level catalogued name, no byte walk), `bytes_freed_total`, and `days` (UTC day number to `sessions_created`, `sessions_closed`, `checkouts_retired`, `cleaned_leftovers_retired`, `checkouts_stripped`, `directories_stripped`, `bytes_freed`, 14 days kept). `TrashDrainReport` gains `stripped_bytes` and `stripped_entries_removed`. The host state directory gains `storage-ledger-checkouts/` (classified as coordination), one atomically written `<sha256 of the repository root>.json` per repository holding its root and those counts, shown as the `checkouts` class of `aethyme storage status --json` (`folders`, `closed_folders`, `closed_with_regenerable`, `bytes_freed_by_strip`, `sessions_created_today`, `checkouts_retired_today`, `repositories`, `why_not`; absent until a run wrote it). `broker status` gains the advice `storage.closed-checkouts-backlog` (notice) at 50 or more closed-session folders. New spans `checkout_strip_pass`, `checkout_strip_discover`, `checkout_strip_prove`, `checkout_strip_move`, `checkout_strip_backlog`, `checkout_strip_at_finish`, `checkout_strip_under_pressure`; counters `checkout_strip_directory_trashed`, `checkout_strip_checkouts_stripped`, `checkout_strip_at_finish_stripped`, `checkout_strip_refused_<code>`, `checkout_retirement_inspection_retried`. Consumers must tolerate the new fields.
 
 Covered by `broker/strip.rs` and `broker/retire.rs` tests.
+
+### Broker command attribution
+
+Command metric JSONL rows may carry a numeric `session_id`, a classified
+`outcome`, and `attribution.schema_version = 1`. The timing fields
+`child_command_ms`, `queue_wait_ms`, and `broker_and_unattributed_ms`
+partition the observed CLI wall clock. Overlapping children count once, and
+instrumented lock waits take precedence over concurrent child spans. The
+residual includes uninstrumented work. `retries` counts observed remote-tip
+redecisions. `output_bytes` counts broker-rendered stdout, excluding forwarded
+command output and stderr. Read-only metrics remain opt-in with
+`AETHYME_MEASURE_OUTPUT` to preserve the default read-only contract.
+
+`aethyme broker advanced insights --json` adds `task_attribution` with totals
+for closed or landed sessions and a bounded per-session breakdown. The report
+exposes the count with measurements, the 16 MiB scan limit, and command rows
+that lack a session identity. Commands and outcomes refer to the observed
+window and retained history. Tasks reusing a session share its history.
+`merge.conflict` opens one episode per session until a verification or landing
+resolves it. To explicitly record an intervention that prevented duplicate work,
+use `aethyme broker finish close --session <id> --duplicate-of <peer-id>`.
+This requires the broker's current live duplicate-work evidence and a clean,
+unchanged checkout. Ordinary overlap warnings remain a separate count.

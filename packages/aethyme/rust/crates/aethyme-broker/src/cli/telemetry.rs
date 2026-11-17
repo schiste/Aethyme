@@ -27,6 +27,7 @@ fn take_command_metric_details() -> Option<serde_json::Map<String, serde_json::V
 /// effort — any failure is silently ignored.
 pub(super) const KNOWN_COMMAND_WORDS: &[&str] = &[
     "adopt",
+    "commit",
     "start",
     "start-agent",
     "worktree-root",
@@ -161,6 +162,7 @@ pub(super) fn idle_delivery_poll(exit: u8) -> bool {
 }
 
 thread_local! {
+    static METRIC_SESSION_ID: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
     static WRAPPED_COMMAND_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -169,6 +171,14 @@ thread_local! {
 /// timed out, and the ownership audit passed.
 pub(super) fn mark_wrapped_command_failure() {
     WRAPPED_COMMAND_FAILURE.with(|flag| flag.set(true));
+}
+
+pub(super) fn set_metric_session(id: i64) {
+    METRIC_SESSION_ID.with(|slot| slot.set(Some(id)));
+}
+
+fn metric_session() -> Option<i64> {
+    METRIC_SESSION_ID.with(std::cell::Cell::get)
 }
 
 fn take_wrapped_command_failure() -> bool {
@@ -207,17 +217,10 @@ pub(super) fn record_command_outcome(args: &[String], exit: u8, error: Option<&s
     let Ok(Some(mut store)) = crate::BrokerStore::open_current_in_repo(&main_root) else {
         return;
     };
-    let explicit_session = args
-        .windows(2)
-        .find(|pair| pair[0] == "--session")
-        .and_then(|pair| pair[1].parse::<i64>().ok());
-    let session_id = explicit_session.or_else(|| {
-        store
-            .session_for_worktree(repo.root().to_string_lossy().as_ref())
-            .ok()
-            .flatten()
-            .map(|session| session.id)
-    });
+    let session_id = metric_session().or_else(|| session_for_metric(args, &store, &repo));
+    if let Some(id) = session_id {
+        set_metric_session(id);
+    }
     let command_surface = format!("broker.{surface}");
     let failure_class = (exit != 0).then_some(match args.first().map(String::as_str) {
         Some("submit") => "submission_failed",
@@ -298,16 +301,41 @@ fn sanitize_process_name(raw: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+fn session_for_metric(
+    args: &[String],
+    store: &crate::BrokerStore,
+    repo: &crate::GitRepo,
+) -> Option<i64> {
+    let explicit = args
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .collect::<Vec<_>>();
+    if let Some(pair) = explicit.windows(2).find(|pair| pair[0] == "--session") {
+        return pair[1]
+            .parse::<i64>()
+            .ok()
+            .filter(|id| store.session(*id).is_ok());
+    }
+    store
+        .session_for_worktree(repo.root().to_string_lossy().as_ref())
+        .ok()
+        .flatten()
+        .map(|session| session.id)
+}
+
 /// Record one command's cost. `output_bytes` counts stdout emitted through
 /// `out!`; stderr is excluded because it carries diagnostics rather than the
 /// payload an agent pays to read.
 pub(super) fn record_command_metric(
     args: &[String],
     exit: u8,
-    duration_ms: i64,
+    started: std::time::Instant,
+    ended: std::time::Instant,
+    output_bytes: u64,
     spans: &crate::phase_telemetry::Recorder,
 ) {
-    let output_bytes = crate::cli_output::emitted();
+    let session_id = METRIC_SESSION_ID.with(|slot| slot.take());
+    let duration_ms = (ended - started).as_millis() as i64;
     let details = take_command_metric_details();
     // Inspection commands are contractually side-effect free: the CLI documents
     // "never writes broker state or command telemetry" and `external_events_cli`
@@ -324,7 +352,7 @@ pub(super) fn record_command_metric(
     };
     // Spans never decide whether a line is written: a read-only command stays
     // telemetry-free however much of its work was timed.
-    let details = Some(with_spans(details.unwrap_or_default(), spans));
+    let mut details = with_spans(details.unwrap_or_default(), spans);
     let Ok(cwd) = std::env::current_dir() else {
         return;
     };
@@ -334,6 +362,24 @@ pub(super) fn record_command_metric(
     let Ok(main_root) = repo.main_root() else {
         return;
     };
+    let session_id = session_id.or_else(|| {
+        let store = crate::BrokerStore::open_current_in_repo(&main_root)
+            .ok()
+            .flatten()?;
+        session_for_metric(args, &store, &repo)
+    });
+    details.insert("session_id".into(), serde_json::json!(session_id));
+    details.insert("attribution".into(), spans.attribution(started, ended));
+    details.insert(
+        "outcome".into(),
+        serde_json::json!(match exit {
+            crate::exit_status::SUCCESS => "succeeded",
+            crate::exit_status::OUTCOME_UNKNOWN => "outcome_unknown",
+            crate::exit_status::REFUSED => "refused",
+            crate::exit_status::ENVIRONMENT => "environment_failure",
+            _ => "failed",
+        }),
+    );
     // Opt-in latency telemetry, not broker state: a command must never fail
     // or grow stderr noise because its own timing line could not be written.
     let dir = main_root.join(".aethyme/logs");
@@ -342,13 +388,9 @@ pub(super) fn record_command_metric(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let extra_fields = details
-        .filter(|fields| !fields.is_empty())
-        .and_then(|fields| {
-            serde_json::to_string(&serde_json::Value::Object(fields))
-                .ok()
-                .map(|json| json[1..json.len().saturating_sub(1)].to_string())
-        })
+    let extra_fields = serde_json::to_string(&serde_json::Value::Object(details))
+        .ok()
+        .map(|json| json[1..json.len().saturating_sub(1)].to_string())
         .map(|fields| format!(",{fields}"))
         .unwrap_or_default();
     let line = metric_line(ts, &label, duration_ms, exit, output_bytes, &extra_fields);

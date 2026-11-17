@@ -1557,6 +1557,7 @@ impl RepositoryWriteLock {
             &holder,
         );
         let waited = Instant::now();
+        let _queue_span = crate::phase_telemetry::span("repository_write_lock_wait");
         let deadline = match queue_wait {
             QueueWait::Refuse => unreachable!("refused above"),
             QueueWait::Forever => None,
@@ -1607,6 +1608,7 @@ impl RepositoryWriteLock {
                 std::thread::sleep(sleep_for);
             }
         }
+        drop(_queue_span);
         drop(registration);
         eprintln!(
             "[coordination] acquired the {repository} write lock after {}",

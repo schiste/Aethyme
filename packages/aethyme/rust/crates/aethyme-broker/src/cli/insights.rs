@@ -15,6 +15,8 @@
 //! gap that split the intervals, so the gap is on the first line of the text
 //! output and a field in the JSON.
 
+mod attribution;
+
 use crate::cli::{Parsed, UsageError};
 use crate::cli_output::out;
 use crate::insights::{
@@ -63,13 +65,26 @@ pub(super) fn run_insights(parsed: Parsed) -> Result<(), UsageError> {
         MAX_PULL_REQUEST_ROWS,
     )?;
 
-    let report = assemble(days, session_limit, pull_request_limit)?;
+    let (report, task_costs) = assemble(days, session_limit, pull_request_limit)?;
 
     if parsed.json {
-        out!("{}", serde_json::to_string_pretty(&report)?);
+        #[derive(serde::Serialize)]
+        struct Output<'a> {
+            #[serde(flatten)]
+            report: &'a InsightsReport,
+            task_attribution: &'a attribution::TaskCosts,
+        }
+        out!(
+            "{}",
+            serde_json::to_string_pretty(&Output {
+                report: &report,
+                task_attribution: &task_costs,
+            })?
+        );
         return Ok(());
     }
     out!("{}", render(&report).trim_end());
+    out!("{}", task_costs.render());
     Ok(())
 }
 
@@ -91,8 +106,9 @@ fn assemble(
     days: i64,
     session_limit: usize,
     pull_request_limit: usize,
-) -> Result<InsightsReport, UsageError> {
+) -> Result<(InsightsReport, attribution::TaskCosts), UsageError> {
     let mut broker = open_read_only()?;
+    let root = broker.main_root().to_path_buf();
     let store = broker.store();
     let now = crate::clock::epoch_ms();
 
@@ -116,6 +132,11 @@ fn assemble(
     for prefix in insights::STAGE_EVENT_PREFIXES {
         events.extend(store.events_after_filtered(0, i64::MAX, Some(prefix))?);
     }
+    events.extend(store.events_after_filtered(
+        0,
+        i64::MAX,
+        Some("coordination.duplicate_work_avoided"),
+    )?);
     events.retain(|event| event.ts >= since_ms);
     // Merge events arrive out of order across prefixes; the fold takes the
     // first of each kind by timestamp, so order does not change the answer.
@@ -181,7 +202,31 @@ fn assemble(
         operations_outcome_unknown: outcome_unknown,
     };
 
-    Ok(insights::report(query, &input))
+    let report = insights::report(query, &input);
+    let completed = input
+        .sessions
+        .iter()
+        .filter(|session| {
+            session.created_at >= since_ms
+                && (session.closed_at.is_some()
+                    || input
+                        .stage_times
+                        .get(&session.session_id)
+                        .is_some_and(|stages| {
+                            stages.contains_key(&insights::Stage::Landed)
+                                || stages.contains_key(&insights::Stage::PullRequestMerged)
+                        }))
+        })
+        .map(|session| session.session_id)
+        .collect();
+    let visible = report
+        .sessions
+        .iter()
+        .map(|session| session.session_id)
+        .collect();
+    let costs = attribution::collect(&root, since_ms, &completed, &visible, &events)
+        .map_err(|error| UsageError::Message(format!("read command metrics: {error}")))?;
+    Ok((report, costs))
 }
 
 fn open_read_only() -> Result<crate::Broker, UsageError> {
