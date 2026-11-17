@@ -1623,7 +1623,8 @@ mod tests {
         let doc = render_agents_document(Some(&repo)).unwrap();
         for needle in [
             "## Broker Coordination: before and after an edit",
-            "`aethyme broker status --json` (compact)",
+            "`aethyme broker status --session <id> --session-view --json`",
+            "`aethyme broker status --json` for repository-wide advice",
             "`aethyme broker status --full --json` only when exact session or lease-path evidence is",
             "`aethyme broker start --task \"<task>\" [--short-name \"<label>\"]`",
             "work only in the worktree it\n   reports",
@@ -1850,7 +1851,8 @@ mod tests {
         let doc = render_agents_document(Some(&repo)).unwrap();
         for needle in [
             "## Broker Coordination: before and after an edit",
-            "`aethyme broker status --json` (compact)",
+            "`aethyme broker status --session <id> --session-view --json`",
+            "`aethyme broker status --json` for repository-wide advice",
             "`aethyme broker status --full --json` only when exact session or lease-path evidence is",
             "Commit early and small, and after each commit run\n   `aethyme broker push --session <id>`",
             "open a draft PR with `aethyme broker push --session <id> --pr`",
