@@ -520,6 +520,13 @@ pub struct ArchiveTelemetry {
     pub kept_bytes: u64,
     pub noticed: u64,
     pub noticed_bytes: u64,
+    /// Passes that removed nothing by age because the clock went back or no
+    /// pass ran for over a week, and the notices those passes restarted
+    /// (cumulative).
+    #[serde(default)]
+    pub paused: u64,
+    #[serde(default)]
+    pub notices_reset: u64,
 }
 
 /// Free space of one volume.
@@ -547,6 +554,12 @@ pub struct PassReport {
     pub skipped: Vec<String>,
     /// Recovery archives kept over budget because their work is not landed.
     pub unlanded_archives: Vec<String>,
+    /// Why age expiry was paused this pass (`clock_went_back` or
+    /// `gap_over_7_days`), and how many notices it restarted.
+    #[serde(default)]
+    pub age_expiry_paused: Option<String>,
+    #[serde(default)]
+    pub notices_reset: u64,
     pub pressure: bool,
 }
 

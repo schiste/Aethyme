@@ -212,6 +212,10 @@ pub fn status_value(host_state: &Path) -> Value {
         "archive_expiry": {
             "telemetry": ledger.archive_telemetry,
             "expiring_within_7_days": summary.archives_expiring_total,
+            "paused_total": ledger.archive_telemetry.paused,
+            "notices_reset_total": ledger.archive_telemetry.notices_reset,
+            "last_pass_paused": ledger.last_pass.as_ref().and_then(|pass| pass.age_expiry_paused.clone()),
+            "last_pass_notices_reset": ledger.last_pass.as_ref().map_or(0, |pass| pass.notices_reset),
         },
         "budgets": budgets,
         "budget_error": budget_error,
@@ -289,6 +293,18 @@ fn status(json_output: bool) -> u8 {
             );
         }
     }
+    let expiry = &value["archive_expiry"];
+    println!(
+        "archive age expiry: paused {} time(s), {} notice(s) restarted{}",
+        expiry["paused_total"].as_u64().unwrap_or(0),
+        expiry["notices_reset_total"].as_u64().unwrap_or(0),
+        expiry["last_pass_paused"]
+            .as_str()
+            .map_or_else(String::new, |why| format!(
+                "; last pass paused ({why}), {} notice(s) restarted",
+                expiry["last_pass_notices_reset"].as_u64().unwrap_or(0)
+            ))
+    );
     if let Some(archives) = value["unlanded_archives"].as_array()
         && !archives.is_empty()
     {

@@ -1331,3 +1331,35 @@ fn the_worker_starts_only_from_an_install_of_this_build() {
         PathBuf::from("/home/someone/.local/bin/aethyme")
     );
 }
+
+#[test]
+fn storage_status_shows_paused_age_expiry_and_restarted_notices() {
+    let dir = tempfile::tempdir().unwrap();
+    let host_state = dir.path();
+    eligible_after_two_notices(host_state, 2);
+    let status = super::cli::status_value(host_state);
+    assert_eq!(status["archive_expiry"]["paused_total"], 0);
+    let mut ledger = super::Ledger::load(host_state);
+    ledger.updated_at_ms -= 8 * DAY_MS;
+    ledger.save(host_state).unwrap();
+    pass(
+        host_state,
+        vec![root(host_state, RootKind::HostState)],
+        Budgets::default(),
+    );
+    let status = super::cli::status_value(host_state);
+    let expiry = &status["archive_expiry"];
+    assert_eq!(expiry["paused_total"], 1, "{expiry}");
+    assert_eq!(expiry["notices_reset_total"], 2, "{expiry}");
+    assert_eq!(expiry["last_pass_paused"], "gap_over_7_days");
+    assert_eq!(expiry["last_pass_notices_reset"], 2);
+    // The next normal pass is not paused; the cumulative count stays.
+    pass(
+        host_state,
+        vec![root(host_state, RootKind::HostState)],
+        Budgets::default(),
+    );
+    let status = super::cli::status_value(host_state);
+    assert_eq!(status["archive_expiry"]["paused_total"], 1);
+    assert!(status["archive_expiry"]["last_pass_paused"].is_null());
+}

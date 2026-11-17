@@ -844,6 +844,18 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
         for notice in ledger.archive_notices.values_mut() {
             *notice = super::Notice::new(pass_now);
         }
+        let reset = ledger.archive_notices.len() as u64;
+        report.age_expiry_paused = Some(
+            if pass_now < last_pass {
+                "clock_went_back"
+            } else {
+                "gap_over_7_days"
+            }
+            .into(),
+        );
+        report.notices_reset = reset;
+        ledger.archive_telemetry.paused += 1;
+        ledger.archive_telemetry.notices_reset += reset;
         report.skipped.push(
             "age expiry paused this pass: the clock went back or no pass ran for over a week; \
              notices restart"
@@ -1014,6 +1026,8 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
     let mut telemetry = super::ArchiveTelemetry {
         expired: ledger.archive_telemetry.expired,
         expired_bytes: ledger.archive_telemetry.expired_bytes,
+        paused: ledger.archive_telemetry.paused,
+        notices_reset: ledger.archive_telemetry.notices_reset,
         ..super::ArchiveTelemetry::default()
     };
     let published_at = now_ms();
