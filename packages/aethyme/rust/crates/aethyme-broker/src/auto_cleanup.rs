@@ -7384,7 +7384,7 @@ impl Broker {
         crate::session_holder::take_last_process_table_observation();
         let summary = self.retire_abandoned_session_page(deadline)?;
         crate::stale_session_policy::record_process_table_observation(
-            self.store_ref(),
+            self.store(),
             crate::session_holder::take_last_process_table_observation(),
             now_ms(),
         );

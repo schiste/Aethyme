@@ -1704,7 +1704,7 @@ impl Broker {
         match policy.judge(class, activity_ms, now_ms) {
             stale::StaleClassVerdict::Due { due_at_ms } => {
                 stale::remember_class(
-                    self.store_ref(),
+                    self.store(),
                     session.id,
                     stale::ClassRecord { class, due_at_ms },
                 );
@@ -1716,7 +1716,7 @@ impl Broker {
                 closing_soon,
             } => {
                 stale::remember_class(
-                    self.store_ref(),
+                    self.store(),
                     session.id,
                     stale::ClassRecord { class, due_at_ms },
                 );
@@ -6724,6 +6724,15 @@ mod generic_guarded_exec_tests {
         git(repository.path(), &["commit", "-qm", "fixture"]);
         let storage = crate::test_storage::TestStorage::new();
         let broker = storage.open(repository.path()).unwrap();
+        // These tests judge holder, lease and running-work evidence; the
+        // per-class windows (tested in `session_auto_close`) stay out of it.
+        std::fs::create_dir_all(repository.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            repository.path().join(".aethyme/config.toml"),
+            "[cleanup]\nstale_landed_close_after_hours = 1\n\
+             stale_pushed_close_after_hours = 1\nstale_unpushed_close_after_hours = 1\n",
+        )
+        .unwrap();
         (repository, storage, broker)
     }
 

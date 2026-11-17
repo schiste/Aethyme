@@ -293,10 +293,33 @@ pub(crate) fn read_class_records(store: &crate::BrokerStore) -> BTreeMap<i64, Cl
         .unwrap_or_default()
 }
 
-/// Remember `record` for `session_id` (best effort), keeping the newest
-/// [`CLASSES_MAX`] sessions.
-pub(crate) fn remember_class(store: &crate::BrokerStore, session_id: i64, record: ClassRecord) {
-    let mut records = read_class_records(store);
+/// Write `value` under `key` only if no other writer holds the database and
+/// the row still reads `expected`: a retirement pass never waits on another
+/// writer for bookkeeping, and a lost write is only a stale report.
+fn set_without_waiting(
+    store: &mut crate::BrokerStore,
+    key: &str,
+    expected: Option<&str>,
+    value: &str,
+) {
+    match store.meta_compare_and_set_for_session_retirement(key, expected, value) {
+        Ok(_) | Err(crate::BrokerError::SessionRetirementDatabaseBusy) => {}
+        Err(error) => {
+            crate::warn_unrecorded("record stale-session bookkeeping", Err::<(), _>(error))
+        }
+    }
+}
+
+/// Remember `record` for `session_id` (best effort, never waiting on another
+/// database writer), keeping the newest [`CLASSES_MAX`] sessions.
+pub(crate) fn remember_class(store: &mut crate::BrokerStore, session_id: i64, record: ClassRecord) {
+    let Ok(raw) = store.meta_get_for_session_retirement(CLASSES_META_KEY) else {
+        return;
+    };
+    let mut records = raw
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<BTreeMap<i64, ClassRecord>>(raw).ok())
+        .unwrap_or_default();
     if records.get(&session_id) == Some(&record) {
         return;
     }
@@ -304,19 +327,18 @@ pub(crate) fn remember_class(store: &crate::BrokerStore, session_id: i64, record
     while records.len() > CLASSES_MAX {
         records.pop_first();
     }
-    crate::warn_unrecorded(
-        "remember a stale session's work class",
-        store.meta_set(
-            CLASSES_META_KEY,
-            &serde_json::to_string(&records).unwrap_or_default(),
-        ),
+    set_without_waiting(
+        store,
+        CLASSES_META_KEY,
+        raw.as_deref(),
+        &serde_json::to_string(&records).unwrap_or_default(),
     );
 }
 
 /// Record what a retirement pass learned about the process table: a complete
 /// observation, a refusal, or nothing (best effort).
 pub(crate) fn record_process_table_observation(
-    store: &crate::BrokerStore,
+    store: &mut crate::BrokerStore,
     observation: Option<bool>,
     now_ms: i64,
 ) {
@@ -326,10 +348,10 @@ pub(crate) fn record_process_table_observation(
         Some(false) => PROCESS_TABLE_DENIED_META_KEY,
         None => return,
     };
-    crate::warn_unrecorded(
-        "record the retirement pass's process-table observation",
-        store.meta_set(key, &now_ms.to_string()),
-    );
+    let Ok(expected) = store.meta_get_for_session_retirement(key) else {
+        return;
+    };
+    set_without_waiting(store, key, expected.as_deref(), &now_ms.to_string());
 }
 
 thread_local! {
@@ -653,8 +675,8 @@ mod tests {
 
     #[test]
     fn a_refusal_is_advised_until_a_pass_sees_the_table() {
-        let (_owner, _storage, broker) = repository();
-        let store = broker.store_ref();
+        let (_owner, _storage, mut broker) = repository();
+        let store = broker.store();
         let now = 10 * PROCESS_TABLE_DENIED_ADVICE_MS;
         assert_eq!(process_table_denied_since(store, now), None);
         record_process_table_observation(store, Some(false), now - 10);
@@ -674,8 +696,8 @@ mod tests {
 
     #[test]
     fn classifications_are_remembered_per_session() {
-        let (_owner, _storage, broker) = repository();
-        let store = broker.store_ref();
+        let (_owner, _storage, mut broker) = repository();
+        let store = broker.store();
         let record = ClassRecord {
             class: StaleWorkClass::PushedUnmerged,
             due_at_ms: 7,
