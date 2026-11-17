@@ -482,6 +482,53 @@ fn compact_revision_returns_safe_deltas_and_resets_on_scope_change() {
 }
 
 #[test]
+fn focused_revision_only_returns_session_when_its_facts_change() {
+    let fixture = common::FixtureRepository::new();
+    init_repo(fixture.path());
+    let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
+    let worktree = add_worktree(fixture.path(), &fixture.worktree_root(), "revision-session");
+    let session = broker.adopt(&worktree, Some("revision-session")).unwrap();
+    drop(broker);
+    let id = session.id.to_string();
+    let first = json_status(fixture.path(), &["status", "--session", &id, "--json"]);
+    let revision = first["revision"].as_str().unwrap();
+    let unchanged = json_status(
+        fixture.path(),
+        &[
+            "status",
+            "--session",
+            &id,
+            "--since-revision",
+            revision,
+            "--json",
+        ],
+    );
+    assert!(unchanged.get("session").is_none(), "{unchanged}");
+    assert!(
+        unchanged["changed_sections"].get("session").is_none(),
+        "{unchanged}"
+    );
+    std::fs::write(worktree.join("new.txt"), "new content").unwrap();
+    git(&worktree, &["add", "new.txt"]);
+    git(&worktree, &["commit", "-qm", "new head"]);
+    let changed = json_status(
+        fixture.path(),
+        &[
+            "status",
+            "--session",
+            &id,
+            "--since-revision",
+            revision,
+            "--json",
+        ],
+    );
+    assert_ne!(
+        changed["changed_sections"]["session"]["head_oid"], first["session"]["head_oid"],
+        "{changed}"
+    );
+}
+
+#[test]
 fn focused_status_prioritizes_the_callers_waiters_without_hiding_global_counts() {
     let fixture = common::FixtureRepository::new();
     init_repo(fixture.path());

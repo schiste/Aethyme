@@ -15,6 +15,7 @@ const SECTIONS: &[&str] = &[
     "lease_release_requests",
     "coordinated_operations",
     "focus",
+    "session",
     "omitted_details",
     "drilldown",
 ];

@@ -316,6 +316,10 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                     "summary_and_blockers_are_global": true,
                 });
             }
+            if let Some(block) = session_block {
+                value["session"] = block;
+            }
+            evidence_truncated = super::status_extras::cap_document_advice_evidence(&mut value);
             let mut value = super::status_revision::render(
                 value,
                 broker.main_root(),
@@ -325,10 +329,6 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             // Outside the revision: always present, never a "changed section".
             value["form"] = serde_json::json!(StatusForm::Compact.as_str());
             value["hint"] = serde_json::json!(super::status_extras::COMPACT_HINT);
-            if let Some(block) = session_block {
-                value["session"] = block;
-            }
-            evidence_truncated = super::status_extras::cap_document_advice_evidence(&mut value);
             out!("{}", serde_json::to_string_pretty(&value)?);
         } else {
             if let Some(session_id) = parsed.session {
