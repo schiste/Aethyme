@@ -85,6 +85,7 @@ pub(crate) struct TrashedCheckout {
 }
 
 impl TrashedCheckout {
+    #[cfg(test)]
     pub(crate) fn path(&self) -> PathBuf {
         self.trash_dir.join(&self.entry)
     }
@@ -233,6 +234,49 @@ pub(crate) fn open_trash(pool: &Path) -> Result<TrashDir, String> {
         trash: trash_fd,
         path: pool.join(TRASH_DIR),
     })
+}
+
+/// Remove a trash that holds nothing but its marker, through its
+/// descriptors: an emptied pool is left as it was found. `rmdir` refuses a
+/// directory that gained anything meanwhile.
+fn remove_trash_if_empty(trash: &TrashDir) {
+    let only_marker = std::fs::read_dir(trash.path()).is_ok_and(|listing| {
+        listing
+            .filter_map(Result::ok)
+            .all(|entry| entry.file_name() == TRASH_MARKER)
+    });
+    if !only_marker {
+        return;
+    }
+    let (Ok(marker), Ok(name)) = (c_name(TRASH_MARKER), c_name(TRASH_DIR)) else {
+        return;
+    };
+    // SAFETY: both names are NUL-terminated and both descriptors are open
+    // directories; neither call follows a symlink.
+    let removed = unsafe {
+        libc::unlinkat(trash.trash.as_raw_fd(), marker.as_ptr(), 0);
+        libc::unlinkat(trash.pool.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) == 0
+    };
+    if !removed {
+        // Something was moved in meanwhile: mark the trash again so it stays
+        // usable (`O_EXCL` leaves an existing marker alone).
+        // SAFETY: as above; the descriptor returned is closed at once.
+        unsafe {
+            let fd = libc::openat(
+                trash.trash.as_raw_fd(),
+                marker.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            );
+            if fd >= 0 {
+                let mut file = std::fs::File::from_raw_fd(fd);
+                crate::warn_unrecorded(
+                    "mark the checkout trash again",
+                    std::io::Write::write_all(&mut file, TRASH_MARKER_CONTENT.as_bytes()),
+                );
+            }
+        }
+    }
 }
 
 /// Whether `name` has the shape of an entry the broker names:
@@ -705,6 +749,9 @@ pub(crate) fn drain_trash(
                     }
                 }
             }
+            if entries.is_empty() {
+                remove_trash_if_empty(&trash);
+            }
         }
     });
     crate::phase_telemetry::add("checkout_trash_drain_time", started.elapsed());
@@ -1039,7 +1086,7 @@ mod tests {
             DeleterPace::Floor.unlinks_per_second(),
             Some(DELETER_FLOOR_UNLINKS_PER_SECOND)
         );
-        assert!(DELETER_FLOOR_UNLINKS_PER_SECOND >= 200);
+        const { assert!(DELETER_FLOOR_UNLINKS_PER_SECOND >= 200) };
     }
 
     /// The deleter runs with the worker's pacer set aside, so memory

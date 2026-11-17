@@ -5487,9 +5487,16 @@ impl Broker {
                     force,
                 )?);
             } else {
-                // Every proof above held (or `force` discards): the checkout
-                // goes into the trash in O(1) and the deleter unlinks it.
-                self.remove_checkout_through_trash(session, &worktree_path, force)?;
+                // After a verified recovery archive the checkout goes into
+                // the trash in O(1) and the deleter unlinks it. A plain
+                // `finish`/cleanup keeps Git's removal in this slice; the
+                // retirement lane owns everything it leaves behind.
+                if archive_guard.is_some() {
+                    self.remove_checkout_through_trash(session, &worktree_path, force)?;
+                } else {
+                    self.repo
+                        .worktree_remove_registered(&worktree_path, force)?;
+                }
             }
         }
         require_worktree_path_absent(&worktree_path, session_id)?;

@@ -9097,7 +9097,8 @@ impl Broker {
         // Retiring closed checkouts and draining their trash needs no other
         // lane to be due: it runs first in every worker run that finds it
         // due, within its own budget, and never waits for memory pressure.
-        if self.checkout_retirement_due(now_ms()) {
+        if self.checkout_retirement_due(now_ms()) && artifact_worker_post_boot_hold_now().is_none()
+        {
             crate::warn_unrecorded(
                 "retire closed checkouts and drain their trash",
                 self.run_checkout_retirement(Instant::now() + CHECKOUT_RETIREMENT_WORKER_BUDGET)
