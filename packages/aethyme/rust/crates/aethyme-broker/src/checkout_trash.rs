@@ -546,6 +546,9 @@ pub(crate) fn move_worktree_to_trash(
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("{} has no usable name", worktree.display()))?
         .to_owned();
+    if let Ok(main_root) = repo.main_root() {
+        crate::start_reservation::refuse_if_start_in_progress(&main_root, worktree)?;
+    }
     let admin = registration_of(repo, common_dir, worktree)?;
     match std::fs::read_to_string(admin.join("locked")) {
         Ok(reason) if reason.trim() == crate::git::BROKER_WORKTREE_LOCK_REASON => {}

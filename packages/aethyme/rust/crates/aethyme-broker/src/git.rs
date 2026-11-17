@@ -8902,6 +8902,7 @@ impl GitRepo {
         // Checked here as well as in `worktree_remove_registered`: a refusal
         // there must not fall through to the orphan removal below.
         ensure_fresh_git_verdict()?;
+        self.refuse_if_start_in_progress(worktree)?;
         let Err(error) = self.worktree_remove_registered(worktree, force) else {
             return Ok(());
         };
@@ -8943,6 +8944,7 @@ impl GitRepo {
         // Whatever judged this checkout removable ran on this process's Git;
         // a deletion never rests on a cached verdict about that Git.
         ensure_fresh_git_verdict()?;
+        self.refuse_if_start_in_progress(worktree)?;
         // Environments are destroyed before their worktree goes: their
         // destroy hooks usually live in it (#1211). A worktree whose
         // environments could not be destroyed is kept, with the reason.
@@ -8971,6 +8973,21 @@ impl GitRepo {
         };
         run_git(&self.root, &args)?;
         Ok(())
+    }
+
+    /// Every removal of a checkout passes here: a path a running `broker
+    /// start` has reserved (`crate::start_reservation`) is refused with the
+    /// recorded reason `start_in_progress`, whichever lane asked.
+    fn refuse_if_start_in_progress(&self, worktree: &Path) -> Result<(), GitError> {
+        let Ok(main_root) = self.main_root() else {
+            return Ok(());
+        };
+        crate::start_reservation::refuse_if_start_in_progress(&main_root, worktree).map_err(
+            |reason| GitError::Git {
+                args: format!("worktree remove {}", worktree.display()),
+                stderr: reason,
+            },
+        )
     }
 
     /// Delete an exact local branch only when it still names the expected
