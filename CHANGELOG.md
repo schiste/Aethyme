@@ -4,6 +4,31 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.118] - 2026-11-17
+
+### Fixed
+
+- Checkout retirement no longer keeps most closed checkouts on a busy host. The lane takes one bounded process observation per run and reuses it for every checkout and for the move into the trash; it used to share a throttled observation and mark every checkout after the fourth as "process use unknown". When the observation cannot be taken the run stops and retries within a minute (#1757).
+- The trash deleter takes its own observation per drain and never deletes an entry a process still has as its working directory or an open file; an incomplete observation deletes nothing that run (#1757).
+- An archive judgement resolves live checkout paths once per run, gets the lane's full budget, starts only with at least 90 seconds left, and is retried on the next run when cut off (#1757).
+
+### Added
+
+- Abandoned Git operations are archived and retired. For a closed session whose in-progress merge, rebase, cherry-pick, revert or bisect, working files, index and broker activity are all older than `[cleanup] abandoned_operation_after_hours` (default 24), the lane archives the operation state, the raw index, changed and untracked files and protected ignored files, together with a verified pack of every object the index refers to, pins the commits the state names, re-checks every source immediately before the move, and only then retires the checkout. The archive's README gives the restore steps. Advice `cleanup.retire-abandoned-operations-archived` reports the count (#1757).
+- The retirement lane archives ignored directories outside the regenerable catalogue file by file, up to 20,000 files and 512 MiB per checkout; over the cap, or on any special or unreadable file, the checkout is kept. Manual cleanup still refuses unless `finish cleanup resolve --archive-ignored-directories` is passed (#1757).
+- `aethyme broker gc plan --json` lists `checkout_retirement_keeps` with each kept checkout's reason; per-judgement phase timings are recorded (#1757).
+
+### Changed
+
+- Archived copies are written owner-only (files 0600, directories 0700) and the recovery-archive root is tightened to 0700. Partial archives are named `.partial-*`, ignored by the storage ledger, and swept after a day once their creating process is gone (#1757).
+- Upgrade note: operation and ignored-file archives expire by age like other recovery archives (default 30 days, after 7 days of notice in `broker status`); keep one with `aethyme storage keep-archive <id>`.
+- The maintainer policy notes name the compact status fields (#1758).
+
+### Known issues
+
+- Commits reachable only from a retired checkout's bisect refs or per-worktree refs are not pinned.
+- A coordinated GitHub or Git write whose outcome cannot be recorded because the broker database is busy still needs a manual reconcile; a fix is in progress.
+
 ## [0.8.117] - 2026-11-17
 
 ### Changed
