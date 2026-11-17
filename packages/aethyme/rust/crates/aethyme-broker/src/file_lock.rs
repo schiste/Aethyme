@@ -792,7 +792,7 @@ fn scan_lifecycle_queue(directory: &Path, own: Option<LifecycleTicketKey>) -> Li
         match lifecycle_ticket_state(&name, &metadata) {
             LifecycleTicketState::Dead => {
                 // Best effort: another waiter may have removed it first.
-                let _ = std::fs::remove_file(entry.path());
+                std::fs::remove_file(entry.path()).ok();
             }
             LifecycleTicketState::Stalled => {}
             LifecycleTicketState::Live => {
@@ -873,7 +873,7 @@ impl LifecycleTicket {
     /// waiters can tell a live waiter from a stopped one.
     fn heartbeat(&mut self) {
         if self.refreshed.elapsed() >= LIFECYCLE_TICKET_HEARTBEAT {
-            let _ = self.file.set_modified(SystemTime::now());
+            self.file.set_modified(SystemTime::now()).ok();
             self.refreshed = Instant::now();
         }
     }
@@ -883,7 +883,7 @@ impl Drop for LifecycleTicket {
     fn drop(&mut self) {
         // Best effort: a ticket left behind is removed by the next waiter once
         // this process is gone.
-        let _ = std::fs::remove_file(&self.path);
+        std::fs::remove_file(&self.path).ok();
     }
 }
 
@@ -1030,7 +1030,7 @@ impl Drop for ExclusiveFileLock {
                 );
             }
             // Still under the lock: the next waiter must not read this holder.
-            let _ = self.clear_holder();
+            self.clear_holder().ok();
         }
         // Closing the descriptor would release the lock anyway; unlocking
         // first makes the release independent of any duplicated descriptor.

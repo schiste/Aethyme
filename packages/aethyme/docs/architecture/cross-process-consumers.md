@@ -2794,9 +2794,11 @@ reports.
   `phase_timings_ms.lifecycle_lock_wait` takes precedence over the span of the
   same name on success.
 - **Shorter `start` hold.** The sparse-checkout plan is computed before the
-  claim, and the claim is released as soon as the session row is registered
-  (before lease and preparation reporting). `git worktree add`, contract and
-  witness capture and registration still run under it: storage's stray-checkout
+  claim. The claim is still held through lease and preparation reporting:
+  the lease-holder refresh there judges other sessions inline, and while
+  `start` holds the claim those judgements stay "busy" instead of closing
+  anything. `git worktree add`, contract and witness capture and registration
+  still run under it: storage's stray-checkout
   review, GC orphan review, the worktree-registry orphan sweep and the
   retirement lanes recognise a half-created checkout only by that exclusion,
   so moving `worktree add` outside it needs a reservation every one of those

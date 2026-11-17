@@ -7504,7 +7504,7 @@ impl Broker {
             worktree,
             worktree_placement,
             selected_promote_branch,
-            _lifecycle_claim: lifecycle_claim,
+            _lifecycle_claim,
         } = self.create_session_worktree(task, explicit_base, &planned_paths)?;
         let base = start_base.commit.clone();
         let base_observation = crate::broker::SessionBaseObservation::from_start_base(
@@ -7569,9 +7569,6 @@ impl Broker {
             }
         };
         self.store.set_session_foreign_files(session.id, &[])?;
-        // The registered row now protects the checkout from every lane that
-        // honours the claim; what follows only reads it.
-        drop(lifecycle_claim);
         let planned_explicit_leases = self.planned_explicit_leases(session.id, &planned_paths)?;
         phase_timings_ms.insert(
             "session_registration".into(),
@@ -7670,7 +7667,7 @@ impl Broker {
             worktree,
             worktree_placement,
             selected_promote_branch,
-            _lifecycle_claim: lifecycle_claim,
+            _lifecycle_claim,
         } = self.create_session_worktree(task, explicit_base, &[])?;
         let agent_setup_started = std::time::Instant::now();
         let base = start_base.commit.clone();
@@ -7840,8 +7837,6 @@ impl Broker {
                 }
             }
         };
-        // Registered: the row protects the checkout from here on.
-        drop(lifecycle_claim);
 
         if let Err(source) = agent.release() {
             let cleanup = match agent.abort() {
