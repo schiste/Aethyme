@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::broker::Broker;
 use crate::cli_output::out;
 
+mod advance;
 mod event_watch;
 mod flags;
 mod gates;
@@ -731,6 +732,11 @@ Usage:
       push, sync, finish, close, git, gh and adopt --reuse refuse another
       live agent; --take-over moves the session to the caller and records
       a session.holder_bound event. Unidentified callers are not refused.
+  aethyme broker advance [--session <id>] [--pr] [--json]
+      Prepare the current worktree when authorized, check its state and
+      publish its committed head under the session push policy. --pr also
+      requests a pull request under repository policy. Prints the next safe
+      action. Ambiguous writes stop for inspection and reconciliation.
   aethyme broker push --session <id> [--pr] [--plan] [--json]
       Publish this session's own agent/* branch to the default branch's
       remote, and nothing else. Commit, then push, as often as you like:
@@ -2781,6 +2787,12 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
             code: crate::exit_status::USAGE,
         });
     }
+    if subcommand == "advance" && !parsed.positional.is_empty() {
+        return Err(UsageError::Exit {
+            message: "advance takes no positional arguments".into(),
+            code: crate::exit_status::USAGE,
+        });
+    }
     let exec_status_request = if subcommand == "exec-status" {
         Some(validated_exec_status_request(&parsed)?)
     } else {
@@ -2830,6 +2842,24 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
             subcommand == "finish" || closed_session_command_reaches_handler(subcommand, &parsed),
         )?
     };
+    if subcommand == "advance" {
+        if parsed.read_only_snapshot {
+            return Err(read_only_refusal(
+                &parsed,
+                "broker advance",
+                "run it from the live session worktree",
+            ));
+        }
+        parsed.session = parsed
+            .session
+            .or_else(|| session_operation.as_ref().map(|context| context.session_id));
+        if session_operation.is_none() {
+            return Err(UsageError::Exit {
+                message: "advance requires a live session in this repository".into(),
+                code: crate::exit_status::REFUSED,
+            });
+        }
+    }
     surface_command_advisories(subcommand, &parsed);
     // A closed `finish` is an idempotent recovery path, not new work for the
     // session. The guarded snapshot above already established that the row is
@@ -2910,6 +2940,7 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         "pr" => run_pr(parsed)?,
         "hooks" => run_hooks(parsed)?,
         "submit" => run_submit(parsed)?,
+        "advance" => advance::run_advance(parsed)?,
         "push" => run_push(parsed)?,
         "sync" => run_sync(parsed)?,
         "repair" => run_repair(parsed)?,
@@ -2967,6 +2998,7 @@ fn command_can_discard_work(args: &[String]) -> bool {
 
 /// Commands that act for a session, and so must come from its holder (#393).
 const HOLDER_GUARDED: &[&str] = &[
+    "advance",
     "submit",
     "push",
     "sync",
@@ -3194,9 +3226,8 @@ fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseComma
         "reclaim" if action == Some("plan") => TaskLeaseCommandClass::ObservationOnly,
         "reclaim" => TaskLeaseCommandClass::OtherWork,
         "gc" if action == Some("plan") => TaskLeaseCommandClass::ObservationOnly,
-        "heartbeat" | "commit" | "exec" | "gh" | "git" | "prepare" | "push" | "submit" | "sync" => {
-            TaskLeaseCommandClass::GuardedWork
-        }
+        "advance" | "heartbeat" | "commit" | "exec" | "gh" | "git" | "prepare" | "push"
+        | "submit" | "sync" => TaskLeaseCommandClass::GuardedWork,
         "gates" if matches!(action, Some("run" | "pre-push")) => TaskLeaseCommandClass::GuardedWork,
         "resources" if action == Some("artifact-run") => TaskLeaseCommandClass::GuardedWork,
         "leases"
