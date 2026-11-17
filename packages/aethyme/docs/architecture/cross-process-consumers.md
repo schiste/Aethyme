@@ -217,7 +217,12 @@ owner's lock is taken over), `storage-roots.json` and
 cache budgets), `storage-ledger-dirty/` (producers' notes of entries they
 wrote; gate runs write one per managed cache), and the optional owner file
 `storage.toml` (`[budget]`). `aethyme storage adopt <dir>` writes
-`.aethyme-storage-root` into a directory; a storage root must carry it.
+`.aethyme-storage-root` into a directory; a storage root must carry it. `aethyme
+storage archives [--json]` (`aethyme.storage-archives/v1`) and `storage
+keep-archive <id> [--unkeep]` (writes `<archive>.aethyme-keep` beside a
+recovery archive) are operator surfaces; `storage.toml` `[budget]` adds
+`unlanded_archive_days`, and `broker status --json` adds advice
+`storage.archives-expiring`.
 `broker status --json` adds advice `storage.over-budget`,
 `storage.below-floor` and `storage.unclassified` (class names and sizes; no
 paths outside Aethyme's roots). `AETHYME_STORAGE_LEDGER` (`0`/`1`) turns the

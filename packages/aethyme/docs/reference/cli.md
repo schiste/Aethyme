@@ -343,6 +343,31 @@ budget only when proven landed in the default branch and past their manifest's
 creation time plus its minimum retention. An unlanded archive is never removed
 here, and no archive is removed by age.
 
+Recovery archives also expire by age, landed or not. An archive's age is
+up at its manifest's `created_at_ms` plus the larger of `unlanded_archive_days`
+(default 30; 0 turns age expiry off) and the manifest's
+`minimum_archive_retention_ms`; a missing or implausible creation time (before
+2017 or in the future) means it is never removed by age. Age comes from the
+manifest only. Removal also needs its notice served: the archive must have
+been announced in `broker status` advice `storage.archives-expiring` (archives
+whose age is up within seven days: the first 20 and the total, with the exact
+command that keeps one) at least seven days earlier, in at least two worker
+passes a day or more apart. If the clock went back, or no pass ran for over a
+week, a pass removes nothing by age and every pending notice starts again. At
+most 50 archives or 1 GiB expire per pass, oldest first. `aethyme storage
+keep-archive <id> [--unkeep]` creates (never through a link) or removes
+`<archive>.aethyme-keep` beside the archive directory, which exempts it from
+age expiry; `aethyme storage archives [--json]` (`aethyme.storage-archives/v1`)
+lists archives with landed or not, created, expires, noticed and kept.
+
+The start-of-command check never runs from a temporary copy of the binary
+(the self-update stages its payload in `<temp>/.tmpXXXX/payload/`), nor for
+the staged payload's `broker quick-test` (the self-update also sets
+`AETHYME_STORAGE_LEDGER=0` for it). The worker is started from this binary
+when it is a real install, otherwise from a known install location only if
+it is the same file or reports exactly this build; else it is not started
+(counted as `worker_spawns_skipped`).
+
 Every broker command first runs an O(1) check (a statvfs per root and a read of
 the summary and worker lock, never a walk or `ps`). Over a budget or below the
 floor it starts the worker, at most once a minute and never while one runs.

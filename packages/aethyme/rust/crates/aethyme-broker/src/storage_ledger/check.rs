@@ -61,6 +61,30 @@ pub struct Summary {
     pub reclaimable: Vec<Reclaimable>,
     pub unlanded_archives: Vec<String>,
     pub last_kick_ms: u64,
+    /// Archives that expire within the notice week, soonest first (the
+    /// first 20), and how many there are.
+    #[serde(default)]
+    pub archives_expiring: Vec<ExpiringArchive>,
+    #[serde(default)]
+    pub archives_expiring_total: u64,
+    /// Worker starts skipped because no installed binary of this build was
+    /// found (only a temporary copy runs).
+    #[serde(default)]
+    pub worker_spawns_skipped: u64,
+}
+
+/// One archive about to expire, as advice shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpiringArchive {
+    /// `<pool>/<archive>`, as `storage keep-archive` takes it.
+    pub id: String,
+    /// The repository pool (the archive's parent directory name).
+    pub pool: String,
+    pub session_id: Option<i64>,
+    pub bytes: u64,
+    pub expires_ms: u64,
+    /// When this expiry was first announced; removal waits a week from it.
+    pub noticed_at_ms: u64,
 }
 
 /// One removal a command may perform at once.
@@ -366,6 +390,7 @@ pub fn decide(
             bytes: entry.bytes,
             newest_ms: entry.newest_ms,
             reason: Reason::OverBudget,
+            expires_ms: None,
         };
         if evict::refuse(&candidate, leases.as_ref(), now).is_some() {
             continue;
@@ -449,6 +474,10 @@ pub fn command_start(args: &[String]) -> Option<u8> {
     if !host_state.is_dir() || !enabled(&host_state) {
         return None;
     }
+    let executable = std::env::current_exe().ok();
+    if !start_check_allowed(args, executable.as_deref()) {
+        return None;
+    }
     let cwd = std::env::current_dir().ok();
     let decision = decide(
         &host_state,
@@ -462,14 +491,130 @@ pub fn command_start(args: &[String]) -> Option<u8> {
     Some(crate::exit_status::ENVIRONMENT)
 }
 
-/// Start `aethyme storage worker` detached, in its own process group. Only
-/// the `aethyme` executable starts it (never a test harness or another
-/// binary linking the broker).
+/// Whether `path` is where `update apply` stages a payload:
+/// `<temp>/<.tmpXXXX>/payload/aethyme`.
+pub fn update_payload(path: &Path) -> bool {
+    let temp = std::env::temp_dir();
+    let canonical_temp = fs::canonicalize(&temp).unwrap_or_else(|_| temp.clone());
+    let staging = path.parent();
+    let tempdir = staging.and_then(Path::parent);
+    let named = staging
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == crate::update::PAYLOAD_DIRECTORY)
+        && tempdir
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".tmp"));
+    named
+        && tempdir.and_then(Path::parent).is_some_and(|parent| {
+            parent == temp
+                || parent == canonical_temp
+                || fs::canonicalize(parent).is_ok_and(|parent| parent == canonical_temp)
+        })
+}
+
+/// Whether an executable is a temporary copy, not the installed binary: it
+/// lies under the system temporary directory (the self-update's payload
+/// staging, [`update_payload`], included).
+pub fn ephemeral_executable(path: &Path) -> bool {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let temp = std::env::temp_dir();
+    let canonical_temp = fs::canonicalize(&temp).unwrap_or_else(|_| temp.clone());
+    update_payload(path) || canonical.starts_with(&canonical_temp) || path.starts_with(&temp)
+}
+
+/// Whether the start-of-command check may run at all (it may start the
+/// worker or remove data inline): never from a temporary copy of the binary
+/// such as the self-update's staged payload, and never for that payload's
+/// verification (`broker quick-test`), which also sets [`ENABLE_ENV`]=`0`.
+pub fn start_check_allowed(args: &[String], executable: Option<&Path>) -> bool {
+    if args.first().map(String::as_str) == Some("quick-test") {
+        return false;
+    }
+    executable.is_some_and(|executable| !ephemeral_executable(executable))
+}
+
+/// Where an installed `aethyme` usually is, in order.
+pub fn install_locations(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut locations = Vec::new();
+    if let Some(home) = home {
+        locations.push(home.join(".local/bin/aethyme"));
+        locations.push(home.join(".cargo/bin/aethyme"));
+    }
+    locations.push(PathBuf::from("/opt/homebrew/bin/aethyme"));
+    locations.push(PathBuf::from("/usr/local/bin/aethyme"));
+    locations
+}
+
+/// The binary the worker is started from: this executable when it is a
+/// real install; otherwise the first known install location that is the
+/// same file or reports exactly this build (`same_build`); `None` when none
+/// qualifies (never the first `aethyme` on PATH, never a temporary copy).
+pub fn worker_executable(
+    current: &Path,
+    candidates: &[PathBuf],
+    same_build: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let named = current.file_name().and_then(|name| name.to_str()) == Some("aethyme");
+    if named && !ephemeral_executable(current) {
+        return Some(current.to_path_buf());
+    }
+    let current_canonical = fs::canonicalize(current).ok();
+    candidates
+        .iter()
+        .filter(|candidate| candidate.is_file() && !ephemeral_executable(candidate))
+        .find(|candidate| {
+            fs::canonicalize(candidate)
+                .ok()
+                .is_some_and(|canonical| Some(&canonical) == current_canonical.as_ref())
+                || same_build(candidate)
+        })
+        .cloned()
+}
+
+/// Whether `candidate --version` reports exactly this build.
+fn reports_this_build(candidate: &Path) -> bool {
+    let build = crate::version::current_binary_build();
+    let output = std::process::Command::new(candidate)
+        .arg("--version")
+        .env(ENABLE_ENV, "0")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    output.status.success()
+        && text.split_whitespace().nth(1) == Some(build.version.as_str())
+        && build
+            .commit
+            .as_deref()
+            .is_none_or(|commit| text.contains(commit))
+}
+
+/// Start `aethyme storage worker` detached, in its own process group, from
+/// the installed binary ([`worker_executable`]); nothing when only a test
+/// harness, another binary linking the broker, or a temporary copy runs.
 pub fn spawn_worker() -> io::Result<()> {
-    let executable = std::env::current_exe()?;
-    if executable.file_name().and_then(|name| name.to_str()) != Some("aethyme") {
+    let current = std::env::current_exe()?;
+    if current.file_name().and_then(|name| name.to_str()) != Some("aethyme") {
         return Ok(());
     }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let Some(executable) = worker_executable(
+        &current,
+        &install_locations(home.as_deref()),
+        &reports_this_build,
+    ) else {
+        // Counted: the summary records the start that did not happen.
+        if let Some(host_state) = crate::host_state::default_host_state_dir() {
+            let mut summary = Summary::load(&host_state);
+            summary.worker_spawns_skipped += 1;
+            crate::warn_unrecorded("count a skipped worker start", summary.save(&host_state));
+        }
+        return Ok(());
+    };
     let mut command = std::process::Command::new(executable);
     command
         .args(["storage", "worker"])
@@ -688,6 +833,35 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
         super::measure_some(&mut ledger, inputs.measure_budget, &dirty, &mut beat);
     report.measured = measured;
     report.resumable = resumable;
+    // Clock sanity for age expiry: a clock that went back, or passes that
+    // stopped for over a week (the machine was off through a notice week),
+    // remove nothing by age now, and every pending notice starts again.
+    let pass_now = now_ms();
+    let last_pass = ledger.updated_at_ms;
+    let week = evict::duration_ms(super::ARCHIVE_NOTICE);
+    ledger.age_frozen = last_pass > 0 && (pass_now < last_pass || pass_now - last_pass > week);
+    if ledger.age_frozen {
+        for notice in ledger.archive_notices.values_mut() {
+            *notice = super::Notice::new(pass_now);
+        }
+        let reset = ledger.archive_notices.len() as u64;
+        report.age_expiry_paused = Some(
+            if pass_now < last_pass {
+                "clock_went_back"
+            } else {
+                "gap_over_7_days"
+            }
+            .into(),
+        );
+        report.notices_reset = reset;
+        ledger.archive_telemetry.paused += 1;
+        ledger.archive_telemetry.notices_reset += reset;
+        report.skipped.push(
+            "age expiry paused this pass: the clock went back or no pass ran for over a week; \
+             notices restart"
+                .into(),
+        );
+    }
     report.phases_ms.insert("measure".into(), elapsed(phase));
 
     // Volumes and pressure.
@@ -740,7 +914,21 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
     let mut class_bytes = ledger.class_bytes();
     let mut gate_bytes = evict::gate_cache_by_repository(&ledger);
     let mut root_bytes = ledger.root_bytes();
+    // Age expiry is capped per pass; the rest stay noticed.
+    let (mut aged, mut aged_bytes) = (0usize, 0u64);
     for candidate in candidates {
+        let age_expiry =
+            candidate.class == Class::RecoveryArchives && candidate.reason == Reason::Expired;
+        if age_expiry
+            && (aged >= super::AGE_EXPIRY_PER_PASS
+                || aged_bytes.saturating_add(candidate.bytes) > super::AGE_EXPIRY_BYTES_PER_PASS)
+        {
+            report.skipped.push(format!(
+                "{}: over this pass's age-expiry cap",
+                candidate.label()
+            ));
+            continue;
+        }
         let still_needed = match candidate.reason {
             Reason::Expired => true,
             Reason::OverBudget => {
@@ -791,6 +979,12 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
                 let telemetry = ledger.telemetry.entry(candidate.class).or_default();
                 telemetry.evictions += 1;
                 telemetry.bytes_reclaimed += candidate.bytes;
+                if age_expiry {
+                    aged += 1;
+                    aged_bytes += candidate.bytes;
+                    ledger.archive_telemetry.expired += 1;
+                    ledger.archive_telemetry.expired_bytes += candidate.bytes;
+                }
                 for bytes in [
                     class_bytes.entry(candidate.class).or_insert(0),
                     root_bytes.entry(candidate.root_kind).or_insert(0),
@@ -823,6 +1017,60 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
     ledger.last_pass = Some(report.clone());
     ledger.save(inputs.host_state)?;
 
+    // Archives expiring within the notice week, and what owners kept.
+    let (budgets, notice_end) = (
+        &inputs.budgets,
+        now_ms().saturating_add(evict::duration_ms(super::ARCHIVE_NOTICE)),
+    );
+    let mut expiring: Vec<ExpiringArchive> = Vec::new();
+    let mut telemetry = super::ArchiveTelemetry {
+        expired: ledger.archive_telemetry.expired,
+        expired_bytes: ledger.archive_telemetry.expired_bytes,
+        paused: ledger.archive_telemetry.paused,
+        notices_reset: ledger.archive_telemetry.notices_reset,
+        ..super::ArchiveTelemetry::default()
+    };
+    let published_at = now_ms();
+    let mut notices = std::mem::take(&mut ledger.archive_notices);
+    let mut announced = BTreeMap::new();
+    for item in ledger
+        .items
+        .iter()
+        .filter(|item| item.class == Class::RecoveryArchives)
+    {
+        for child in &item.children {
+            if child.kept {
+                telemetry.kept += 1;
+                telemetry.kept_bytes += child.bytes;
+                continue;
+            }
+            if let Some(expires) = super::archive_expiry(child, budgets)
+                && expires <= notice_end
+            {
+                // Published now: the notice starts, or counts one more pass.
+                let mut notice = notices
+                    .remove(&child.name)
+                    .unwrap_or_else(|| super::Notice::new(published_at));
+                notice.publish(published_at);
+                telemetry.noticed += 1;
+                telemetry.noticed_bytes += child.bytes;
+                expiring.push(ExpiringArchive {
+                    id: child.name.clone(),
+                    pool: child.name.split('/').next().unwrap_or_default().to_string(),
+                    session_id: child.session_id,
+                    bytes: child.bytes,
+                    expires_ms: expires,
+                    noticed_at_ms: notice.noticed_at_ms,
+                });
+                announced.insert(child.name.clone(), notice);
+            }
+        }
+    }
+    // A notice for an archive no longer announced (removed, kept) lapses.
+    ledger.archive_notices = announced;
+    expiring.sort_by_key(|archive| archive.expires_ms);
+    ledger.archive_telemetry = telemetry;
+    ledger.save(inputs.host_state)?;
     let previous = Summary::load(inputs.host_state);
     let unclassified: Vec<&super::Item> = ledger
         .items
@@ -869,6 +1117,9 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
         .collect(),
         unlanded_archives: report.unlanded_archives.clone(),
         last_kick_ms: previous.last_kick_ms,
+        worker_spawns_skipped: previous.worker_spawns_skipped,
+        archives_expiring: expiring.iter().take(20).cloned().collect(),
+        archives_expiring_total: expiring.len() as u64,
     };
     summary.save(inputs.host_state)?;
     Ok(ledger)

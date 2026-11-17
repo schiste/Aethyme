@@ -305,6 +305,10 @@ pub struct Budgets {
     /// Below this, commands that write to that volume refuse once a bounded
     /// reclaim did not free enough.
     pub hard_minimum_bytes: u64,
+    /// Recovery archives, landed or not, expire this many days after their
+    /// manifest's creation (never sooner than their own minimum retention,
+    /// nor than a week after the ledger first saw them); 0 turns it off.
+    pub unlanded_archive_days: u64,
     /// Each repository's own `gate_cache_bytes_budget`, as its broker last
     /// registered it; it wins over the host default.
     #[serde(skip)]
@@ -326,6 +330,7 @@ impl Default for Budgets {
             storage_total_bytes: 48 * GIB,
             free_floor_bytes: 10 * GIB,
             hard_minimum_bytes: 2 * GIB,
+            unlanded_archive_days: 30,
             gate_cache_by_repository: BTreeMap::new(),
         }
     }
@@ -443,6 +448,12 @@ pub struct Child {
     pub created_ms: Option<u64>,
     #[serde(default)]
     pub min_retention_ms: Option<u64>,
+    /// Recovery archives: the session the manifest names.
+    #[serde(default)]
+    pub session_id: Option<i64>,
+    /// Recovery archives: an owner's keep marker exempts it from expiry.
+    #[serde(default)]
+    pub kept: bool,
 }
 
 /// A walk in progress, persisted so the next pass resumes it.
@@ -499,6 +510,25 @@ pub struct ClassTelemetry {
     pub over_budget_ms_total: u64,
 }
 
+/// Recovery archive expiry counters: removed by age (cumulative), and, as
+/// of the last pass, kept by a marker and expiring within the notice week.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveTelemetry {
+    pub expired: u64,
+    pub expired_bytes: u64,
+    pub kept: u64,
+    pub kept_bytes: u64,
+    pub noticed: u64,
+    pub noticed_bytes: u64,
+    /// Passes that removed nothing by age because the clock went back or no
+    /// pass ran for over a week, and the notices those passes restarted
+    /// (cumulative).
+    #[serde(default)]
+    pub paused: u64,
+    #[serde(default)]
+    pub notices_reset: u64,
+}
+
 /// Free space of one volume.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Volume {
@@ -524,6 +554,12 @@ pub struct PassReport {
     pub skipped: Vec<String>,
     /// Recovery archives kept over budget because their work is not landed.
     pub unlanded_archives: Vec<String>,
+    /// Why age expiry was paused this pass (`clock_went_back` or
+    /// `gap_over_7_days`), and how many notices it restarted.
+    #[serde(default)]
+    pub age_expiry_paused: Option<String>,
+    #[serde(default)]
+    pub notices_reset: u64,
     pub pressure: bool,
 }
 
@@ -536,6 +572,16 @@ pub struct Ledger {
     pub items: Vec<Item>,
     pub volumes: Vec<Volume>,
     pub telemetry: BTreeMap<Class, ClassTelemetry>,
+    /// Recovery archives announced as expiring (`<pool>/<id>`): when first
+    /// published, in how many passes, and when last.
+    #[serde(default)]
+    pub archive_notices: BTreeMap<String, Notice>,
+    /// Set for one pass when the clock went back or passes stopped for over
+    /// a week: nothing is removed by age in that pass.
+    #[serde(skip)]
+    pub age_frozen: bool,
+    #[serde(default)]
+    pub archive_telemetry: ArchiveTelemetry,
     /// Round-robin position of the next entry to measure.
     pub cursor: usize,
     pub last_pass: Option<PassReport>,
@@ -779,6 +825,8 @@ fn child_names(class: Class, path: &Path) -> Vec<String> {
                 names.extend(
                     read_names(&group_path)
                         .into_iter()
+                        // Keep markers sit beside archives; they are not one.
+                        .filter(|name| !name.ends_with(KEEP_SUFFIX))
                         .map(|name| format!("{group}/{name}")),
                 );
             }
@@ -789,24 +837,129 @@ fn child_names(class: Class, path: &Path) -> Vec<String> {
     names
 }
 
-/// Read an archive manifest's creation time and minimum retention.
-fn archive_times(path: &Path) -> (Option<u64>, Option<u64>) {
+/// What a recovery archive's manifest says about its age.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArchiveMeta {
+    pub created_ms: Option<u64>,
+    pub min_retention_ms: Option<u64>,
+    pub session_id: Option<i64>,
+}
+
+/// Read an archive manifest's creation time, minimum retention and session.
+/// Age is only ever taken from here, never from file times.
+pub(crate) fn archive_meta(path: &Path) -> ArchiveMeta {
     let manifest = path.join("manifest.json");
     let small = fs::metadata(&manifest).is_ok_and(|metadata| metadata.len() <= 32 * 1024 * 1024);
     let value: Option<serde_json::Value> = small
         .then(|| fs::read(&manifest).ok())
         .flatten()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-    let created = value
-        .as_ref()
-        .and_then(|value| value.get("created_at_ms"))
-        .and_then(serde_json::Value::as_u64);
-    let retention = value
-        .as_ref()
-        .and_then(|value| value.get("minimum_archive_retention_ms"))
-        .and_then(serde_json::Value::as_u64);
-    (created, retention)
+    let field = |name: &str| value.as_ref().and_then(|value| value.get(name)).cloned();
+    // An implausible creation time is unknown: never expired by age.
+    let now = now_ms();
+    ArchiveMeta {
+        created_ms: field("created_at_ms")
+            .and_then(|value| value.as_u64())
+            .filter(|created| {
+                *created >= EARLIEST_MANIFEST_MS && *created <= now.saturating_add(MANIFEST_SKEW_MS)
+            }),
+        min_retention_ms: field("minimum_archive_retention_ms").and_then(|value| value.as_u64()),
+        session_id: field("session_id").and_then(|value| value.as_i64()),
+    }
 }
+
+/// Suffix of the keep marker written beside an archive directory (outside
+/// it, so the archive's own verified file set never changes).
+pub const KEEP_SUFFIX: &str = ".aethyme-keep";
+
+/// The keep marker of the archive at `path`: `<archive>.aethyme-keep` beside it.
+pub fn keep_marker(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_default();
+    name.push(KEEP_SUFFIX);
+    path.with_file_name(name)
+}
+
+/// How long an archive's expiry is announced before it can be removed.
+pub const ARCHIVE_NOTICE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// The notice must be published in two passes at least this far apart.
+pub const NOTICE_REPEAT: Duration = Duration::from_secs(24 * 60 * 60);
+/// At most this many archives, or bytes, expire by age in one pass.
+pub const AGE_EXPIRY_PER_PASS: usize = 50;
+pub const AGE_EXPIRY_BYTES_PER_PASS: u64 = GIB;
+
+/// An expiry announcement, as published to the summary `broker status`
+/// reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Notice {
+    pub noticed_at_ms: u64,
+    pub passes: u32,
+    pub last_published_ms: u64,
+}
+
+impl Notice {
+    pub fn new(now: u64) -> Self {
+        Self {
+            noticed_at_ms: now,
+            passes: 1,
+            last_published_ms: now,
+        }
+    }
+
+    /// Record one more publication (counted once per [`NOTICE_REPEAT`]).
+    pub fn publish(&mut self, now: u64) {
+        let repeat = u64::try_from(NOTICE_REPEAT.as_millis()).unwrap_or(u64::MAX);
+        if now.saturating_sub(self.last_published_ms) >= repeat {
+            self.passes = self.passes.saturating_add(1);
+            self.last_published_ms = now;
+        }
+    }
+
+    /// Whether the notice ran its course: a week since first published, in
+    /// at least two passes a day or more apart.
+    pub fn served(&self, now: u64) -> bool {
+        let week = u64::try_from(ARCHIVE_NOTICE.as_millis()).unwrap_or(u64::MAX);
+        now.saturating_sub(self.noticed_at_ms) >= week && self.passes >= 2
+    }
+}
+
+/// When an archive's age is up: its manifest creation time plus the larger
+/// of `unlanded_archive_days` and its own minimum retention. `None` when
+/// expiry is off, the archive is kept, or its manifest has no valid creation
+/// time (never removed by age). Removal also needs a served [`Notice`].
+pub fn archive_expiry(child: &Child, budgets: &Budgets) -> Option<u64> {
+    if budgets.unlanded_archive_days == 0 || child.kept {
+        return None;
+    }
+    let created = child.created_ms?;
+    let age = budgets
+        .unlanded_archive_days
+        .saturating_mul(24 * 60 * 60 * 1000)
+        .max(
+            child
+                .min_retention_ms
+                .unwrap_or(crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS),
+        );
+    Some(created.saturating_add(age))
+}
+
+/// Whether an archive may be removed by age now.
+pub fn archive_deletable(
+    child: &Child,
+    budgets: &Budgets,
+    notice: Option<&Notice>,
+    now: u64,
+) -> bool {
+    archive_expiry(child, budgets).is_some_and(|expires| now >= expires)
+        && notice.is_some_and(|notice| notice.served(now))
+}
+
+/// The earliest plausible manifest time (2017-07-14), and how far ahead of
+/// this clock a manifest time may be.
+const EARLIEST_MANIFEST_MS: u64 = 1_500_000_000_000;
+const MANIFEST_SKEW_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Add top-level entries that appeared under the roots and drop those that
 /// disappeared.
@@ -915,18 +1068,21 @@ pub fn measure_item(item: &mut Item, deadline: Instant, beat: &mut dyn FnMut()) 
         if child_level {
             let child_path = path.join(&name);
             let ctime = fs::symlink_metadata(&child_path).map_or(0, |metadata| ctime_ms(&metadata));
-            let (created_ms, min_retention_ms) = if item.class == Class::RecoveryArchives {
-                archive_times(&child_path)
+            let meta = if item.class == Class::RecoveryArchives {
+                archive_meta(&child_path)
             } else {
-                (None, None)
+                ArchiveMeta::default()
             };
+            let kept = item.class == Class::RecoveryArchives && keep_marker(&child_path).exists();
             walk.done.push(Child {
                 name,
                 bytes: walk.usage.bytes,
                 newest_ms: walk.usage.newest_ms,
                 ctime_ms: ctime,
-                created_ms,
-                min_retention_ms,
+                created_ms: meta.created_ms,
+                min_retention_ms: meta.min_retention_ms,
+                session_id: meta.session_id,
+                kept,
             });
         } else {
             item.bytes = walk.usage.bytes;
