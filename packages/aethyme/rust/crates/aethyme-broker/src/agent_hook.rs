@@ -612,11 +612,17 @@ pub(crate) fn render_peer_information(view: &serde_json::Value, session_id: i64)
         "Coordination: {leases} recorded path overlap(s), {scopes} matching declared scope(s)."
     );
     for entry in view["leases"].as_array().into_iter().flatten().take(3) {
-        let _ = write!(
-            text,
-            "\n  session {} leases {}, overlapping your lease {}.",
-            entry[0], entry[2], entry[1]
-        );
+        if entry[1] == entry[2] {
+            write!(text, "\n  session {} also leases {}.", entry[0], entry[2])
+                .expect("writing to String is infallible");
+        } else {
+            write!(
+                text,
+                "\n  session {} leases {}, overlapping your lease {}.",
+                entry[0], entry[2], entry[1]
+            )
+            .expect("writing to String is infallible");
+        }
     }
     for entry in view["scopes"]
         .as_array()
@@ -624,16 +630,18 @@ pub(crate) fn render_peer_information(view: &serde_json::Value, session_id: i64)
         .flatten()
         .take(3usize.saturating_sub(leases.min(3) as usize))
     {
-        let _ = write!(
+        write!(
             text,
             "\n  session {} shares declared {} scope {}.",
             entry[0], entry[1], entry[2]
-        );
+        )
+        .expect("writing to String is infallible");
     }
-    let _ = write!(
+    write!(
         text,
         "\nDetails: aethyme broker status --session {session_id} --json"
-    );
+    )
+    .expect("writing to String is infallible");
     Some(text)
 }
 

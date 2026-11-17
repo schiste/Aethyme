@@ -788,7 +788,7 @@ Usage:
       queue attestations and per-SHA unrecorded-commit dispositions. The
       template option atomically writes a no-clobber schema-v2 document with
       exact identifiers and deliberately invalid null operator judgments.
-  aethyme broker status [--json] [--full] [--session <id>] [--session-view] [--since-revision <token>] [--summary] [--refresh]
+  aethyme broker status [--json] [--compact|--full] [--session <id>] [--session-view] [--since-revision <token>] [--summary] [--refresh]
       Compact by default. In a registered worktree, report the current
       session, its next safe action, and recorded overlaps on its paths or
       declared scopes. --session <id> selects a session from another checkout.

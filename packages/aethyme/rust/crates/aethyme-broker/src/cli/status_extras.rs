@@ -330,10 +330,10 @@ pub(crate) fn render_routine_session(block: &Value, show_worktree: bool) -> Stri
         block["status"].as_str().unwrap_or("unknown")
     );
     if show_worktree && let Some(worktree) = block["worktree"].as_str() {
-        let _ = write!(text, "\nWorktree: {worktree}");
+        write!(text, "\nWorktree: {worktree}").expect("writing to String is infallible");
     }
     if let Some(count) = block["unpushed_commits"].as_u64() {
-        let _ = write!(text, "\nUnpushed commits: {count}");
+        write!(text, "\nUnpushed commits: {count}").expect("writing to String is infallible");
     }
     if let Some(number) = block["pr"]["number"].as_u64() {
         let kind = if block["pr"]["draft"] == true {
@@ -346,21 +346,23 @@ pub(crate) fn render_routine_session(block: &Value, show_worktree: bool) -> Stri
         } else {
             " (recorded head differs or is unknown)"
         };
-        let _ = write!(text, "\nPull request: {kind}#{number}{head}");
+        write!(text, "\nPull request: {kind}#{number}{head}")
+            .expect("writing to String is infallible");
     }
     for blocker in block["blockers"].as_array().into_iter().flatten() {
         if let Some(summary) = blocker["summary"].as_str() {
-            let _ = write!(text, "\nAction required: {summary}");
+            write!(text, "\nAction required: {summary}").expect("writing to String is infallible");
         }
     }
     for waiter in block["waiting"]["records"].as_array().into_iter().flatten() {
-        let _ = write!(
+        write!(
             text,
             "\nWaiting: {} on {}",
             waiter["kind"], waiter["resource"]
-        );
+        )
+        .expect("writing to String is infallible");
         if let Some(holder) = waiter["holder"].as_str().filter(|text| !text.is_empty()) {
-            let _ = write!(text, " ({holder})");
+            write!(text, " ({holder})").expect("writing to String is infallible");
         }
     }
     if let (Some(command), Some(reason)) = (
@@ -369,7 +371,7 @@ pub(crate) fn render_routine_session(block: &Value, show_worktree: bool) -> Stri
             .or_else(|| block["next_action"]["instruction"].as_str()),
         block["next_action"]["reason"].as_str(),
     ) {
-        let _ = write!(text, "\nNext: {command} ({reason})");
+        write!(text, "\nNext: {command} ({reason})").expect("writing to String is infallible");
     }
     text
 }
