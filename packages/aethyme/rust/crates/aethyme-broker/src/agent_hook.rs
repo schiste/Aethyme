@@ -791,6 +791,31 @@ fn deliver_notes(broker: &mut Broker, session: &Session) -> HookOutcome {
     }
     let mut lines = Vec::with_capacity((unread.len() + automation.len()) * 2);
     for note in &automation {
+        if note.sender == "automation:lease-release" {
+            let request_id = note
+                .fingerprint
+                .as_deref()
+                .and_then(|value| value.strip_prefix("lease-release-request:"))
+                .and_then(|value| value.parse::<i64>().ok());
+            let Some(request_id) = request_id else {
+                continue;
+            };
+            match broker.lease_release_request(request_id) {
+                Ok(request)
+                    if request.holder_session_id == session.id
+                        && request.state == crate::lease_requests::RequestState::Pending => {}
+                Ok(_) => {
+                    crate::warn_unrecorded(
+                        "acknowledge a resolved release request note",
+                        broker.store().acknowledge_automation_note(note.id),
+                    );
+                    continue;
+                }
+                // An unavailable or pruned request cannot be safely presented
+                // as actionable; retain the note for later inspection.
+                Err(_) => continue,
+            }
+        }
         // An automation cannot be replied to; the note itself says what
         // failed and where it is tracked.
         lines.push(format!("Note from {}: {}", note.sender, note.message));
@@ -815,7 +840,11 @@ fn deliver_notes(broker: &mut Broker, session: &Session) -> HookOutcome {
             broker.store().acknowledge_session_note(note.id),
         );
     }
-    HookOutcome::Context(lines.join("\n"))
+    if lines.is_empty() {
+        HookOutcome::Silent
+    } else {
+        HookOutcome::Context(lines.join("\n"))
+    }
 }
 
 /// Tell the agent, before it edits a file, that another live session is
@@ -1644,6 +1673,93 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_request_delivers_once_and_resolved_request_stays_silent() {
+        use crate::main_drift::tests::git;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("file.rs"), "base\n").unwrap();
+        git(&root, &["add", "file.rs"]);
+        git(&root, &["commit", "-qm", "base"]);
+        let worktree = |name: &str| {
+            let path = temp.path().join(name);
+            git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    name,
+                    path.to_str().unwrap(),
+                    "main",
+                ],
+            );
+            path
+        };
+        let mut broker = Broker::open(&root).unwrap();
+        let holder = broker.adopt(&worktree("holder"), Some("holder")).unwrap();
+        let requester = broker
+            .adopt(&worktree("requester"), Some("requester"))
+            .unwrap();
+        let other = broker.adopt(&worktree("other"), Some("other")).unwrap();
+        broker.claim_lease(holder.id, "file.rs", None).unwrap();
+        let requests = broker
+            .request_lease_release(requester.id, "file.rs", "need file")
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].state,
+            crate::lease_requests::RequestState::Pending
+        );
+        assert_eq!(
+            on_post_tool_use(std::path::Path::new(&other.worktree_path)),
+            HookOutcome::Silent
+        );
+        let delivered = on_post_tool_use(std::path::Path::new(&holder.worktree_path));
+        let HookOutcome::Context(text) = delivered else {
+            panic!("expected request note")
+        };
+        assert!(text.contains(&format!(
+            "leases ack {} --session {}",
+            requests[0].request_id, holder.id
+        )));
+        assert_eq!(
+            on_post_tool_use(std::path::Path::new(&holder.worktree_path)),
+            HookOutcome::Silent
+        );
+        let repeated = broker
+            .request_lease_release(requester.id, "file.rs", "need file")
+            .unwrap();
+        assert_eq!(repeated[0].request_id, requests[0].request_id);
+        assert_eq!(
+            on_post_tool_use(std::path::Path::new(&holder.worktree_path)),
+            HookOutcome::Silent
+        );
+        broker
+            .decline_lease_release(holder.id, requests[0].request_id, "still editing")
+            .unwrap();
+        let pending = broker
+            .request_lease_release(requester.id, "file.rs", "need again")
+            .unwrap();
+        broker
+            .decline_lease_release(holder.id, pending[0].request_id, "still editing")
+            .unwrap();
+        assert_eq!(
+            on_post_tool_use(std::path::Path::new(&holder.worktree_path)),
+            HookOutcome::Silent
+        );
+        assert!(
+            broker
+                .store()
+                .unread_automation_notes(holder.id)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     /// Through the hook's own path: opted in, a session changing a file this
     /// edit depends on is named with its diff, once; not opted in, it is silent.

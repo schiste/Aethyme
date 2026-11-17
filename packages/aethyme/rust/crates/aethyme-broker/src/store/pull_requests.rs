@@ -1063,6 +1063,44 @@ impl BrokerStore {
         result
     }
 
+    /// Record the request and its holder notification together. If the
+    /// process stops after commit, the hook can still deliver the note.
+    pub(crate) fn append_release_request_with_note(
+        &mut self,
+        requester: i64,
+        holder: i64,
+        payload: &str,
+    ) -> Result<i64, BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let id = insert_event(
+            &tx,
+            now,
+            crate::events::LEASE_RELEASE_REQUESTED,
+            Some(requester),
+            Some(payload),
+        )?;
+        let message = format!(
+            "Session {requester} requested that you release a lease (request {id}). Inspect the request and decide whether to release it: aethyme broker status --session {holder}. To acknowledge: aethyme broker advanced leases ack {id} --session {holder}; to decline: aethyme broker advanced leases decline {id} --session {holder} --reason \"<reason>\"."
+        );
+        let fingerprint = format!("lease-release-request:{id}");
+        tx.execute(
+            "INSERT INTO automation_notes (sender, recipient_session_id, message, fingerprint, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["automation:lease-release", holder, message, fingerprint, now],
+        )?;
+        let note_id = tx.last_insert_rowid();
+        let note_payload = serde_json::json!({"note_id": note_id, "sender": "automation:lease-release", "recipient_session_id": holder, "message_bytes": message.len()}).to_string();
+        insert_event(
+            &tx,
+            now,
+            "automation.note.sent",
+            Some(holder),
+            Some(&note_payload),
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
     pub fn append_event(
         &mut self,
         kind: &str,
@@ -1144,6 +1182,34 @@ impl BrokerStore {
              ORDER BY id LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![after_id, limit, kind_prefix], |row| {
+            Ok(Event {
+                id: row.get(0)?,
+                schema_version: row.get(1)?,
+                ts: row.get(2)?,
+                kind: row.get(3)?,
+                session_id: row.get(4)?,
+                payload_json: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Events owned by one session, in durable event-id order. This is a
+    /// session filter, not a complete view of global or peer coordination.
+    pub fn session_events_after_filtered(
+        &self,
+        session_id: i64,
+        after_id: i64,
+        limit: i64,
+        kind_prefix: Option<&str>,
+    ) -> Result<Vec<Event>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, schema_version, ts, kind, session_id, payload_json
+             FROM events WHERE session_id = ?1 AND id > ?2
+               AND (?4 IS NULL OR kind LIKE ?4 || '%')
+             ORDER BY id LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![session_id, after_id, limit, kind_prefix], |row| {
             Ok(Event {
                 id: row.get(0)?,
                 schema_version: row.get(1)?,

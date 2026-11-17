@@ -96,7 +96,7 @@ codex plugin marketplace remove aethyme
 | `SessionStart` | Register the session; name the live sessions changing files it leases. |
 | `UserPromptSubmit` | Mark the session ACTIVE; deliver notes from other sessions. |
 | `PreToolUse` | Before an edit, say which other live session is changing the same file, where, whether Git would conflict, and how to reach it. Never blocks the edit and never claims a lease. Once per change. |
-| `PostToolUse` | Deliver a note from another session at the first turn boundary after a tool call. Read-only and silent unless a note is waiting. |
+| `PostToolUse` | Deliver notes and pending lease release requests at the first turn boundary after a tool call. Read-only and silent unless a note is waiting. |
 | `Stop` | Mark the session idle. |
 
 `PermissionRequest` stays unwired: nothing in the coordination model reads it,

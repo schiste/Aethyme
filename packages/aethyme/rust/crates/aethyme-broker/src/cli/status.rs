@@ -747,6 +747,9 @@ pub(super) fn run_events(parsed: Parsed) -> Result<(), UsageError> {
         return Ok(());
     }
     let mut broker = open_broker(parsed.read_only_snapshot)?;
+    if let Some(session_id) = parsed.session {
+        broker.store_ref().session(session_id)?;
+    }
     let mut cursor = parsed.since.unwrap_or(0);
     // Register before reading so a commit between the first query and wait is
     // buffered by the OS watcher and cannot be missed.
@@ -760,27 +763,34 @@ pub(super) fn run_events(parsed: Parsed) -> Result<(), UsageError> {
     // or a busy writer) with bounded retries instead of dying.
     let mut consecutive_errors = 0u32;
     loop {
-        let events =
-            match broker
+        let events = match if let Some(session_id) = parsed.session {
+            broker.store().session_events_after_filtered(
+                session_id,
+                cursor,
+                1000,
+                parsed.kind.as_deref(),
+            )
+        } else {
+            broker
                 .store()
                 .events_after_filtered(cursor, 1000, parsed.kind.as_deref())
-            {
-                Ok(events) => {
-                    consecutive_errors = 0;
-                    events
+        } {
+            Ok(events) => {
+                consecutive_errors = 0;
+                events
+            }
+            Err(err) if parsed.follow && consecutive_errors < 5 => {
+                consecutive_errors += 1;
+                eprintln!("events: transient read error ({err}); retrying");
+                if let Some(event_wakeup) = &event_wakeup {
+                    event_wakeup
+                        .wait_timeout(std::time::Duration::from_millis(700))
+                        .map_err(UsageError::Message)?;
                 }
-                Err(err) if parsed.follow && consecutive_errors < 5 => {
-                    consecutive_errors += 1;
-                    eprintln!("events: transient read error ({err}); retrying");
-                    if let Some(event_wakeup) = &event_wakeup {
-                        event_wakeup
-                            .wait_timeout(std::time::Duration::from_millis(700))
-                            .map_err(UsageError::Message)?;
-                    }
-                    continue;
-                }
-                Err(err) => return Err(err.into()),
-            };
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
         for event in &events {
             cursor = event.id;
             if parsed.json {
@@ -801,6 +811,11 @@ pub(super) fn run_events(parsed: Parsed) -> Result<(), UsageError> {
         }
         if !parsed.follow {
             break;
+        }
+        // A full page may have more rows behind it already. Waiting for a
+        // future database write here would strand that backlog indefinitely.
+        if events.len() == 1000 {
+            continue;
         }
         if let Some(event_wakeup) = &event_wakeup {
             event_wakeup.wait().map_err(UsageError::Message)?;

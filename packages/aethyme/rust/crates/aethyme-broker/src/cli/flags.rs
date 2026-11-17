@@ -597,7 +597,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
             "--since-revision",
         ],
     ),
-    ("events", &["--since", "--kind", "--follow"]),
+    ("events", &["--since", "--kind", "--follow", "--session"]),
     ("events prune", &["--keep-days"]),
     ("metrics", &[]),
     (

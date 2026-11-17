@@ -36,6 +36,23 @@ consumer. This file exists so that doesn't happen again.
    `scripts/eval/verify-playground.sh` against any deployed
    playground; it asserts a subset of the contracts below.
 
+## Session coordination consumers
+
+`aethyme broker status --session <id> --json` supplies a session block in
+its full compact snapshot. With `--since-revision`, the
+`aethyme.broker-status-delta/v1` document includes `changed_sections.session`
+only when that block changes; an empty section map does not certify deferred
+checks. Older or differently scoped revision tokens reset to a full snapshot.
+
+`aethyme broker advanced events --session <id> --since <event-id> --follow
+--json` emits NDJSON rows attributed to that session, in event-id order. It
+omits global and peer-attributed events, and cannot recover rows removed by
+retention. Clients persist the last consumed id and fetch focused or full
+status when they need current state or evidence. The hook plugin delivers a
+pending lease-release request to its holder at a subsequent tool boundary;
+resolved requests are suppressed, and an idle agent receives it on its next
+turn. The plugin must be installed and trusted for that surface.
+
 ## Code-shape diagnostics
 
 `aethyme quality code-shape` is an opt-in CLI for source-shape diagnostics.

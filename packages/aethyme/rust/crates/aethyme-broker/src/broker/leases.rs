@@ -4512,12 +4512,10 @@ impl Broker {
                 ids.push(pending.request_id);
                 continue;
             }
-            ids.push(self.store.append_event(
-                crate::lease_requests::REQUESTED,
-                Some(requester),
-                Some(&crate::lease_requests::request_payload(
-                    &path, requester, holder, reason,
-                )),
+            ids.push(self.store.append_release_request_with_note(
+                requester,
+                holder,
+                &crate::lease_requests::request_payload(&path, requester, holder, reason),
             )?);
         }
         self.grant_stale_lease_requests()?;

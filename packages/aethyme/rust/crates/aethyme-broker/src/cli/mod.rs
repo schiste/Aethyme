@@ -810,8 +810,9 @@ Usage:
       remain unknown even when no sections changed.
       --refresh explicitly performs the expensive full lease, conflict and
       cleanup audit and prints the full form; use it when needed.
-  aethyme broker events [--since <id>] [--kind <prefix>] [--follow] [--json]
+  aethyme broker events [--session <id>] [--since <id>] [--kind <prefix>] [--follow] [--json]
       Show the append-only event log (see docs/events-contract.md).
+      --session selects events owned by that session, not global or peer events.
       --kind filters by prefix (e.g. merge. or lease.overlap); --follow
       waits for database file notifications and retries transient read errors.
   aethyme broker events prune --keep-days <n> [--json]

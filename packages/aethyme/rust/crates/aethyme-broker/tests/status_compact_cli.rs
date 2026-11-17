@@ -529,6 +529,79 @@ fn focused_revision_only_returns_session_when_its_facts_change() {
 }
 
 #[test]
+fn session_event_follower_drains_backlog_without_another_write() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let fixture = common::FixtureRepository::new();
+    init_repo(fixture.path());
+    let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
+    let first = add_worktree(fixture.path(), &fixture.worktree_root(), "stream-first");
+    let second = add_worktree(fixture.path(), &fixture.worktree_root(), "stream-second");
+    let session = broker.adopt(&first, Some("first")).unwrap();
+    let other = broker.adopt(&second, Some("second")).unwrap();
+    broker
+        .store()
+        .append_event("test.stream", Some(other.id), None)
+        .unwrap();
+    for _ in 0..1001 {
+        broker
+            .store()
+            .append_event("test.stream", Some(session.id), None)
+            .unwrap();
+    }
+    drop(broker);
+
+    let id = session.id.to_string();
+    let mut child = common::broker_cli_for_fixture(
+        CLI,
+        &[
+            "advanced",
+            "events",
+            "--session",
+            &id,
+            "--kind",
+            "test.stream",
+            "--follow",
+            "--json",
+        ],
+        fixture.path(),
+    )
+    .current_dir(fixture.path())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (send, recv) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut ids = Vec::new();
+        for line in BufReader::new(stdout).lines() {
+            let value: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+            ids.push(value["session_id"].as_i64().unwrap());
+            if ids.len() == 1001 {
+                let _ = send.send(ids);
+                break;
+            }
+        }
+    });
+    let result = recv.recv_timeout(Duration::from_secs(15));
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    let ids = result.unwrap_or_else(|error| {
+        panic!(
+            "follower did not drain backlog: {error}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(ids.len(), 1001);
+    assert!(ids.iter().all(|id| *id == session.id));
+}
+
+#[test]
 fn focused_status_prioritizes_the_callers_waiters_without_hiding_global_counts() {
     let fixture = common::FixtureRepository::new();
     init_repo(fixture.path());

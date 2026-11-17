@@ -373,8 +373,14 @@ const PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after an ed
 Other agents may be working in sibling worktrees.
 
 For routine coordination, use `aethyme broker status --json` (compact).
-Branch on `advice.categories[].severity` and `.commands`, `summary` and
-`drilldown`; deferred checks are unknown, not clean. Use
+After starting a session, focus it with `--session <id>`; retain the JSON
+revision and use `--since-revision <token>` for later changes. Installed agent
+hooks deliver notes and edit-overlap warnings at tool boundaries. Hooks do not
+cover every state change: check focused status when current state matters, and
+use `aethyme broker advanced events --session <id> --follow --json` for a
+session-owned event stream when a client can consume it. The stream excludes
+global and peer events. Branch on `advice.categories[].severity` and
+`.commands`, `summary` and `drilldown`; deferred checks are unknown, not clean. Use
 `aethyme broker status --full --json` only when exact session or lease-path evidence is
 needed. Check overlapping work before duplicating it. Overlaps with an active
 session's explicit lease are advisory. Accepted warnings permit work in your
@@ -409,8 +415,14 @@ const NON_PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after a
 Other agents may be working in sibling worktrees.
 
 For routine coordination, use `aethyme broker status --json` (compact).
-Branch on `advice.categories[].severity` and `.commands`, `summary` and
-`drilldown`; deferred checks are unknown, not clean. Use
+After starting a session, focus it with `--session <id>`; retain the JSON
+revision and use `--since-revision <token>` for later changes. Installed agent
+hooks deliver notes and edit-overlap warnings at tool boundaries. Hooks do not
+cover every state change: check focused status when current state matters, and
+use `aethyme broker advanced events --session <id> --follow --json` for a
+session-owned event stream when a client can consume it. The stream excludes
+global and peer events. Branch on `advice.categories[].severity` and
+`.commands`, `summary` and `drilldown`; deferred checks are unknown, not clean. Use
 `aethyme broker status --full --json` only when exact session or lease-path evidence is
 needed. Check overlapping work before duplicating it. Overlaps with an active
 session's explicit lease are advisory. Accepted warnings permit work in your
@@ -1867,6 +1879,9 @@ mod tests {
             );
             for required in [
                 "For routine coordination, use `aethyme broker status --json` (compact).",
+                "use `--since-revision <token>` for later changes",
+                "Hooks do not",
+                "global and peer events.",
                 "`aethyme broker status --full --json` only when exact session or lease-path evidence is",
                 "session's explicit lease are advisory. Accepted warnings permit work in your",
                 "Resolve blockers and refusals.",
