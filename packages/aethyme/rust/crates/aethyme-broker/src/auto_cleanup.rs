@@ -17847,8 +17847,13 @@ mod tests {
             outcome,
             crate::broker::AbandonedSessionCloseOutcome::DatabaseBusy
         );
+        // The attempt reads the session's work class with Git (and checks
+        // its checkout) before it reaches the database write, which takes a
+        // few hundred milliseconds on a loaded runner; waiting on the writer
+        // would take the store's busy timeout (ten seconds). The bound sits
+        // between the two.
         assert!(
-            started.elapsed() < Duration::from_millis(250),
+            started.elapsed() < Duration::from_secs(2),
             "a competing database writer defers retirement without delaying maintenance"
         );
         assert_eq!(
