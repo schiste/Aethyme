@@ -652,7 +652,9 @@ fn status_reports_the_required_capture_fence_without_raising_it() {
         "status raised it"
     );
 
-    let (code, _) = fixture.json(&["broker", "status"]);
+    // The full form opens broker state for writing; compact status is a
+    // read-only snapshot and never raises the fence.
+    let (code, _) = fixture.json(&["broker", "status", "--full"]);
     assert_eq!(code, 0);
     let (_, after) = fixture.json(&["collab", "status"]);
     let fence = &after["collaboration_fence"];

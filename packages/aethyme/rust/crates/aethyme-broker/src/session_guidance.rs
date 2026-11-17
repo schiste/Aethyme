@@ -17,8 +17,16 @@
 //! default branch, else the main checkout's file. Absent means the built-in
 //! default, an empty list turns it off, and an invalid list warns and falls
 //! back to the default -- a malformed setting must never stop a session.
+//!
+//! The repository's standing authorizations (`[authorization]`, see
+//! [`aethyme_enhance::authorization`]) are printed under the agreement and
+//! read under the same trust rule. They are policy, not guidance: an empty
+//! agreement does not hide them, and an unreadable configuration grants
+//! nothing.
 
 use std::path::Path;
+
+pub use aethyme_enhance::authorization::StandingAuthorizations;
 
 /// Most lines an agreement may have. Long instructions are skimmed.
 pub const MAX_GUIDANCE_LINES: usize = 6;
@@ -57,6 +65,8 @@ pub struct SessionGuidance {
     pub source: GuidanceSource,
     /// Why a configured list was ignored, when it was.
     pub warning: Option<String>,
+    /// What the repository lets agents do without asking.
+    pub authorizations: StandingAuthorizations,
 }
 
 /// The built-in agreement. Its first line follows the delivery policy: it
@@ -76,10 +86,12 @@ pub fn default_guidance(push_enabled: bool) -> Vec<String> {
 /// Resolve the agreement from configuration text. `None` text means there
 /// is no `.aethyme/config.toml`.
 pub fn from_config_text(text: Option<&str>, push_enabled: bool) -> SessionGuidance {
+    let authorizations = StandingAuthorizations::from_config_text(text);
     let default = |warning: Option<String>| SessionGuidance {
         lines: default_guidance(push_enabled),
         source: GuidanceSource::Default,
         warning,
+        authorizations,
     };
     let Some(text) = text else {
         return default(None);
@@ -101,11 +113,13 @@ pub fn from_config_text(text: Option<&str>, push_enabled: bool) -> SessionGuidan
             lines,
             source: GuidanceSource::Disabled,
             warning: None,
+            authorizations,
         },
         Ok(lines) => SessionGuidance {
             lines,
             source: GuidanceSource::Repository,
             warning: None,
+            authorizations,
         },
         Err(reason) => default(Some(format!(
             "[session] guidance ignored ({reason}); showing the default working agreement"
@@ -154,10 +168,27 @@ pub fn load(main_root: &Path) -> SessionGuidance {
     let push_enabled = crate::GitRepo::discover(main_root)
         .ok()
         .is_some_and(|repo| crate::session_push::session_push_enabled(&repo));
-    from_config_text(
-        crate::merge::repository_config_text(main_root).as_deref(),
-        push_enabled,
-    )
+    match crate::merge::repository_config_checked(main_root) {
+        Ok(config) => from_config_text(config.map(|(text, _)| text).as_deref(), push_enabled),
+        // Two format twins or unsupported YAML: the agreement uses its
+        // default, and no authority is granted from a file nobody can read.
+        Err(_) => SessionGuidance {
+            authorizations: StandingAuthorizations::NONE,
+            ..from_config_text(None, push_enabled)
+        },
+    }
+}
+
+/// The repository's standing authorizations, read as [`load`] reads them:
+/// from the configuration committed on the fetched default branch, else the
+/// main checkout's file.
+pub fn standing_authorizations(main_root: &Path) -> StandingAuthorizations {
+    match crate::merge::repository_config_checked(main_root) {
+        Ok(config) => {
+            StandingAuthorizations::from_config_text(config.map(|(text, _)| text).as_deref())
+        }
+        Err(_) => StandingAuthorizations::NONE,
+    }
 }
 
 #[cfg(test)]
@@ -294,6 +325,25 @@ mod tests {
                 "{warning} should mention {needle}"
             );
         }
+    }
+
+    #[test]
+    fn standing_authorizations_default_on_and_survive_a_disabled_agreement() {
+        let absent = from_config_text(Some("schema = 1\n"), false);
+        assert_eq!(absent.authorizations, StandingAuthorizations::default());
+        assert_eq!(
+            from_config_text(None, true).authorizations,
+            StandingAuthorizations::default()
+        );
+        let disabled = from_config_text(
+            Some("[session]\nguidance = []\n[authorization]\nprepare_session_worktrees = false\n"),
+            true,
+        );
+        assert!(disabled.lines.is_empty());
+        assert!(!disabled.authorizations.prepare_session_worktrees);
+        assert!(disabled.authorizations.disposable_test_environments);
+        let unreadable = from_config_text(Some("[session\n"), true);
+        assert_eq!(unreadable.authorizations, StandingAuthorizations::NONE);
     }
 
     #[test]

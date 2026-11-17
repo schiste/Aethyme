@@ -95,7 +95,7 @@ impl Fixture {
             upstream_head: String::new(),
             old_integration: String::new(),
         };
-        let status = fixture.run(&["status", "--json"]);
+        let status = fixture.run(&["status", "--full", "--json"]);
         assert!(
             status.status.success(),
             "status: {}",

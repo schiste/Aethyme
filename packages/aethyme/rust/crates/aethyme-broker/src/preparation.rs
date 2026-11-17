@@ -765,6 +765,11 @@ pub struct PreparationStatus {
     pub hook_required: bool,
     pub reason: String,
     pub next_action: Option<String>,
+    /// Whether `next_action` is `aethyme broker submit prepare` and the
+    /// repository's `[authorization] prepare_session_worktrees` grants it, so
+    /// an agent may run it without asking. False when there is no action, or
+    /// the action is anything else.
+    pub authorized_by_policy: bool,
     /// What a running preparation of this session is doing while it holds
     /// the shared cache, from its live activity record; absent when nothing
     /// is running or the holder stopped reporting.
@@ -1031,6 +1036,7 @@ impl Broker {
                     hook_required: false,
                     reason,
                     next_action,
+                    authorized_by_policy: false,
                     current_operation: None,
                     waiting_on: None,
                     shared_cache_background_measurement: None,
@@ -1143,6 +1149,9 @@ impl Broker {
             reason,
             next_action: (state != PreparationState::Current)
                 .then(|| format!("aethyme broker submit prepare --session {session_id}")),
+            authorized_by_policy: state != PreparationState::Current
+                && crate::session_guidance::standing_authorizations(self.main_root())
+                    .prepare_session_worktrees,
             current_operation,
             waiting_on,
             shared_cache_background_measurement: config
@@ -5312,6 +5321,8 @@ fn invalid_status(session_id: i64, reason: String) -> PreparationStatus {
         next_action: Some(format!(
             "fix {PREPARATION_CONFIG_RELPATH}, then run `aethyme broker submit prepare --session {session_id}`"
         )),
+        // Fixing the declaration is a repository edit, not a preparation.
+        authorized_by_policy: false,
         current_operation: None,
         waiting_on: None,
         shared_cache_background_measurement: None,

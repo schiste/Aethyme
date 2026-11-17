@@ -705,6 +705,26 @@ line names `broker push` and a draft PR only when
 `[delivery] push_session_branches = true`. `start-agent`, `status` and other
 commands do not print the agreement.
 
+Under the agreement, `start` prints the repository's standing authorizations
+(`[authorization]` in `.aethyme/config.toml`, read from the committed default
+branch like `[session]`), even when the agreement is disabled:
+
+- `prepare_session_worktrees` (default `true`): run
+  `aethyme broker submit prepare --session <id>` without asking as soon as
+  preparation is reported required, in the session's own worktree, with
+  lockfiles unchanged. `false`: ask the owner first.
+- `disposable_test_environments` (default `true`): create, use and drop local
+  test databases and environments named for the session
+  (`$AETHYME_TEST_DB_SUFFIX` or a script's own scratch naming), broker-leased
+  or made by the repository's declared test commands, and drop them
+  afterwards; never shared, staging or production data. `false`: ask the
+  owner first.
+
+Both grants are standing: they cover every session. A non-boolean value or an
+unreadable configuration grants nothing. `--json` reports them as
+`standing_authorizations` (`prepare_session_worktrees`,
+`disposable_test_environments`, `lines`).
+
 Worktrees the broker places on the configured root are locked with
 `git worktree lock`, so `git worktree prune` (including the automatic one in
 `git gc`) keeps their registration while the drive is unplugged; the broker
@@ -819,7 +839,7 @@ stashing multi-worktree changes.
 - `aethyme broker status readiness plan [--repo <path>] [--local-only] [--resolution-file <path>] [--diff|--json]`
 - `aethyme broker status readiness apply [--repo <path>] [--local-only] [--resolution-file <path>] --confirm <plan-sha256> [--json]`
 - `aethyme broker status readiness recover [--repo <path>] --plan <plan-sha256> [--json]`
-- `aethyme broker status [--json] [--compact] [--session <id>] [--summary] [--refresh]`
+- `aethyme broker status [--json] [--full] [--session <id>] [--since-revision <token>] [--summary] [--refresh]` — compact by default, as text and as `--json` (`aethyme.broker-status-compact/v1`, with `"form": "compact"` and a one-line `hint`); `--full` (or `--refresh`) prints the full document with `"form": "full"`. Use `--full` only for exact session or lease-path evidence. The old compact switch is still accepted and changes nothing. `--full` cannot be combined with it, `--summary`, `--session` or `--since-revision`. In every form an advice entry whose `evidence` serializes to more than 8 KiB keeps its first items and gains `evidence_truncation` (`truncated: true`, `count`, `shown`, `omitted`, `evidence_bytes`, `cap_bytes`, `command`); `AETHYME_STATUS_EVIDENCE_CAP=off aethyme broker status --full --json` prints everything. `--session <id> --json` adds a `session` block from local state only: `id`, `status`, `branch`, `worktree`, `head_oid`, `remote_oid`, `unpushed_commits`, `pr` (from the broker's pull-request watch: `number`, `draft`, `head_sha`, `head_matches_local`; `mergeable`, `merge_state` and `required_checks` are null because the broker does not record them) or `null` with `pr_state: "unknown"`, `preparation`, `blockers`, `advice` and `next_action` (`command`, `reason`). It never makes a network call. Branch on `advice.categories[].severity` and `.commands`, `summary` and `drilldown` in the default form. Every status call, compact included, appends a row to `.aethyme/logs/command-metrics.jsonl` (a log append, not a broker-database write) recording `status_form`, `status_json`, `status_session_flag`, `status_evidence_truncated`, `caller_hint` (the parent process name only), `output_bytes`, `duration_ms` and per-section `phase_timings_ms`.
 - `aethyme broker advanced worktree-root [--json]`
 - `aethyme broker advanced worktree-root binding plan <exact-root> <keyed_container|direct_root> [--json]`
 - `aethyme broker advanced worktree-root binding apply <exact-root> <keyed_container|direct_root> --confirm <sha256> [--json]`
@@ -841,7 +861,7 @@ the limit; `--reuse` without it keeps the session's existing name. When Chau7 is
 `<session-id> - <short-name>`; a missing tab leaves the session registered
 with a pending rename, while ambiguous or mismatched identity is refused with
 a reason.
-- `aethyme broker submit prepare status --session <id> [--json]`
+- `aethyme broker submit prepare status --session <id> [--json]` — `authorized_by_policy` is true when `next_action` is the prepare command and `[authorization] prepare_session_worktrees` (default `true`) grants it, so an agent runs it without asking.
 - `aethyme broker submit prepare --session <id> [--offline] [--wait <duration>] [--json]` — a shared cache held by another session is waited for, 10 minutes by default; `--wait 0s` fails fast instead.
 - `aethyme broker advanced heartbeat --session <id> [--json]` — renew the exact current holder's task lease during quiet work; guarded commands renew automatically.
 - `aethyme broker advanced exec --session <id> [--non-interactive] [--json] -- <command>`
@@ -1152,7 +1172,8 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker advanced leases plan <paths...> [--session <id>] [--json]`
 - `aethyme broker advanced leases export (--session <id> | --entry <id>) [--limit <n>] [--json]`
 - `aethyme broker submit --session <id> [--no-cache] [--json]`
-- `aethyme broker push --session <id> [--pr] [--json]` — publish the session's own `agent/*` branch to the default branch's remote (and nothing else); `--pr` opens a draft pull request when none is open. Authorized by `[delivery] push_session_branches = true` in `.aethyme/config.toml` on the default branch; a fast-forward is pushed plainly, a rewritten branch only under a lease on the oid this broker last pushed for the session. It reports what it left behind the way `git status` shows it: changed tracked paths, and each untracked directory as one entry (JSON `uncommitted.modified`, `uncommitted.untracked_entries`, `uncommitted.sample`). After pushing it compares the session's change with the repository's open pull requests and reports `pr_overlaps` (see [Overlap with open pull requests](#overlap-with-open-pull-requests)), then fetches exactly the default branch and reports `default_branch` (`reference`, `commit`, `head`, `behind`, `ahead`, `would_conflict`, `conflicting_paths` (up to five), `suggested_command`) from a `git merge-tree` simulation; a failed fetch compares the last fetched copy and sets `default_branch_note`. Neither ever fails the push. `broker submit` simulates and gates against the fetched default branch instead of the integration branch and reports the base as `verified_against` (`source`, `reference`, `commit`, `fallback_reason`); see [broker workflows](../guides/broker-workflows.md).
+- `aethyme broker push --session <id> [--pr] [--plan] [--json]` — publish the session's own `agent/*` branch to the default branch's remote (and nothing else); `--pr` opens a draft pull request when none is open. Authorized by `[delivery] push_session_branches = true` in `.aethyme/config.toml` on the default branch; a fast-forward is pushed plainly, a rewritten branch only under a lease on the oid this broker last pushed for the session. It reports what it left behind the way `git status` shows it: changed tracked paths, and each untracked directory as one entry (JSON `uncommitted.modified`, `uncommitted.untracked_entries`, `uncommitted.sample`). After pushing it compares the session's change with the repository's open pull requests and reports `pr_overlaps` (see [Overlap with open pull requests](#overlap-with-open-pull-requests)), then fetches exactly the default branch and reports `default_branch` (`reference`, `commit`, `head`, `behind`, `ahead`, `would_conflict`, `conflicting_paths` (up to five), `suggested_command`) from a `git merge-tree` simulation; a failed fetch compares the last fetched copy and sets `default_branch_note`. Neither ever fails the push. `broker submit` simulates and gates against the fetched default branch instead of the integration branch and reports the base as `verified_against` (`source`, `reference`, `commit`, `fallback_reason`); see [broker workflows](../guides/broker-workflows.md).
+  The push report also carries `pre_push_remote_oid` and `pre_push_remote_observed` (the remote branch as the push lock's read saw it just before Git ran) and `pushed_refs` (`destination_ref`, `proposed_sha`). `--plan` pushes nothing: it runs the same preflight, reads the remote branch once (the read the push makes under its lock) and reports `remote`, `destination_ref`, `proposed_sha`, `remote_sha_last_known`, `remote_sha_recorded`, `remote_sha_tracking`, `remote_sha_observed`, `remote_observed`, `commits_to_push`, `mode` (`fast_forward`, `lease` with `lease_expected_sha`, `up_to_date`, or `would_refuse` with `refusal`), `pushed: false` and the `command` that performs the push. It cannot be combined with `--pr`.
 - `aethyme broker sync --session <id> [--json]` — bring a live session up to the default branch, fetched first, when that is safe. It refuses (exit code for refusals, nothing changed) a dirty tree (each untracked directory counts as one entry, ignored files never count), a rebase, merge, cherry-pick or revert already in progress, a closed session, or a repository without a fetched default branch. It simulates the catch-up with `git merge-tree`: when that would conflict it changes nothing, lists up to five conflicting paths and the manual commands, and exits with the refusal code; otherwise it rebases an unpublished branch onto the default branch, or merges the default branch into a published one (a branch already on the remote), so a pull request's history is never rewritten. JSON: `session_id`, `branch`, `outcome` (`already_current`, `synced`, `conflict`), `strategy` (`rebase`, `merge`, `none`), `before`, `after`, `default_ref`, `default_commit`, `behind_before`, `ahead`, `conflicts`, `fetched`, optional `fetch_note`, `manual_commands` and `next_action` (the `broker push` command, present after `synced`: sync is local only and never pushes). Emits `broker.session.synced` when it changes the branch.
 - `broker start` fetches exactly the default branch from its remote (one ref, at most ten seconds) before choosing the base, so a new worktree starts from the remote's tip. `start_base` gains `fetched`, `fetch_error` and, for an intentional explicit base after a failed fetch, `cached_ref_age_seconds` (how long ago that copy last moved). `start --reuse` and `start --adopt` refresh it too and report `default_branch` / `default_branch_note`, the comparison `push` makes. Successful reuse of an existing registered broker session with a selected base via `start --reuse --json` also includes the `base_freshness` report described below.
 - `aethyme broker advanced repair --session <id> [--json]`

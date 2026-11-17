@@ -389,7 +389,7 @@ fn session_lifecycle_json_shapes_match_snapshots() {
     );
     entries.push(("submit".to_string(), shape(&submitted)));
 
-    let status = json(&repo, &["broker", "status", "--json"]);
+    let status = json(&repo, &["broker", "status", "--full", "--json"]);
     entries.push(("status".to_string(), status_shape(&status)));
 
     // The pull request merges on the provider: the only way work lands.

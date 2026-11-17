@@ -1,6 +1,6 @@
 exit: 0
 --- stdout
-  aethyme broker push --session <id> [--pr] [--json]
+  aethyme broker push --session <id> [--pr] [--plan] [--json]
       Publish this session's own agent/* branch to the default branch's
       remote, and nothing else. Commit, then push, as often as you like:
       work that exists only in a worktree is lost with it. A branch that only
@@ -10,4 +10,9 @@ exit: 0
       the default branch. --pr opens a new pull request using the trusted
       default branch's `[broker.pr] open_as = "draft" | "ready"` setting
       (default: draft); an existing pull request is reported unchanged.
+      --plan pushes nothing: it reads the remote branch once and prints the
+      remote, destination ref, proposed oid, the remote oid as this broker
+      last knew it and as observed now, and the mode (fast-forward, lease,
+      or would refuse, and why). The report of a push names the remote oid
+      observed under the push lock and the refs it pushed.
 --- stderr

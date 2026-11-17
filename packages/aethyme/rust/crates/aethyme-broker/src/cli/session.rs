@@ -75,6 +75,9 @@ struct SessionActionOutput<'a, T: serde::Serialize> {
     guidance_source: Option<crate::session_guidance::GuidanceSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     guidance_warning: Option<&'a str>,
+    /// The repository's `[authorization]` grants, shown with the agreement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    standing_authorizations: Option<StandingAuthorizationsOutput>,
     /// Other sessions that look like the same work; omitted when none.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     duplicate_work: &'a [crate::DuplicateWork],
@@ -90,6 +93,15 @@ struct SessionActionOutput<'a, T: serde::Serialize> {
     planned_path_pr_overlaps: Option<&'a crate::PlannedPathPrOverlapCheck>,
     #[serde(skip_serializing_if = "Option::is_none")]
     phase_timings_ms: Option<&'a std::collections::BTreeMap<String, u64>>,
+}
+
+/// `[authorization]` as `broker start --json` reports it: each key, and the
+/// lines the human output prints.
+#[derive(serde::Serialize)]
+struct StandingAuthorizationsOutput {
+    #[serde(flatten)]
+    grants: crate::session_guidance::StandingAuthorizations,
+    lines: Vec<&'static str>,
 }
 
 /// One warning line per other session that looks like the same work.
@@ -160,6 +172,10 @@ fn session_action_json<T: serde::Serialize>(
         guidance: guidance.map(|guidance| guidance.lines.as_slice()),
         guidance_source: guidance.map(|guidance| guidance.source),
         guidance_warning: guidance.and_then(|guidance| guidance.warning.as_deref()),
+        standing_authorizations: guidance.map(|guidance| StandingAuthorizationsOutput {
+            grants: guidance.authorizations,
+            lines: guidance.authorizations.agreement_lines(),
+        }),
         duplicate_work,
         scope_overlaps,
         scope_overlaps_warning,
@@ -214,12 +230,16 @@ fn render_guidance(guidance: &crate::session_guidance::SessionGuidance) {
     if let Some(warning) = &guidance.warning {
         out!("warning: {warning}");
     }
-    if guidance.lines.is_empty() {
-        return;
+    if !guidance.lines.is_empty() {
+        out!("Working agreement:");
+        for (index, line) in guidance.lines.iter().enumerate() {
+            out!("  {}. {line}", index + 1);
+        }
     }
-    out!("Working agreement:");
-    for (index, line) in guidance.lines.iter().enumerate() {
-        out!("  {}. {line}", index + 1);
+    // Policy rather than guidance: shown even when the agreement is off.
+    out!("Standing authorizations ([authorization] in .aethyme/config.toml):");
+    for line in guidance.authorizations.agreement_lines() {
+        out!("  - {line}");
     }
 }
 
@@ -368,7 +388,11 @@ pub(super) fn render_preparation_status(
         );
     }
     if let Some(next_action) = &status.next_action {
-        out!("Next: {next_action}");
+        if status.authorized_by_policy {
+            out!("Next: {next_action} (standing authorization: run it now, no need to ask)");
+        } else {
+            out!("Next: {next_action}");
+        }
     }
     Ok(())
 }
@@ -2071,7 +2095,7 @@ fn finish_error_context(
             ),
             None => format!(
                 "the session record could not be read back; inspect \
-                 `aethyme broker status --json` before retrying, and \
+                 `aethyme broker status --full --json` before retrying, and \
                  `aethyme broker advanced handoff --session {session}` if the session is already closed"
             ),
         };
@@ -2098,7 +2122,8 @@ fn finish_error_context(
             state.as_str()
         ),
         None => format!(
-            "the session record could not be read back; inspect `aethyme broker status --json` \
+            "the session record could not be read back; inspect \
+             `aethyme broker status --full --json` \
              before retrying, and `aethyme broker advanced handoff --session {session}` if the \
              session is already closed"
         ),
@@ -2739,7 +2764,7 @@ mod finish_error_context_tests {
             };
             assert_eq!(code, 7);
             assert!(message.starts_with("repository metadata is unreadable;"));
-            assert!(message.contains("broker status --json"));
+            assert!(message.contains("aethyme broker status"));
             assert!(!message.contains("--timeout 2"));
             match state {
                 Some(crate::SessionStatus::Active) => {

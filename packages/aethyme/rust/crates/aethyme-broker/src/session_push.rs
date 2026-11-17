@@ -288,6 +288,15 @@ pub struct SessionPushReport {
     pub pushed_oid: String,
     /// The remote branch before this push, as this broker last knew it.
     pub previous_remote_oid: Option<String>,
+    /// The remote branch as the push lock's remote read observed it just
+    /// before Git ran (`None`: no branch there). Only meaningful when
+    /// `pre_push_remote_observed` is true.
+    pub pre_push_remote_oid: Option<String>,
+    /// Whether the push lock's remote read ran and `pre_push_remote_oid` is
+    /// what it saw.
+    pub pre_push_remote_observed: bool,
+    /// Exactly what the push sent, per destination ref.
+    pub pushed_refs: Vec<crate::PushedRef>,
     /// Commits the push made available that no remote held before.
     pub commits_pushed: u32,
     /// Uncommitted entries left in the worktree; only commits are pushed.
@@ -362,6 +371,48 @@ pub struct SessionPushReport {
     /// `owner/name` the push targeted; the review run on push needs it.
     #[serde(skip)]
     pub repository: String,
+}
+
+/// What `broker push --plan` would do. Nothing is pushed; the remote branch
+/// is read once, the same read the push makes under its lock.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SessionPushPlan {
+    pub session_id: i64,
+    pub branch: String,
+    /// Empty when no trusted default branch names a remote.
+    pub remote: String,
+    pub destination_ref: String,
+    /// The session branch head a push would send; `None` when the branch is
+    /// missing.
+    pub proposed_sha: Option<String>,
+    /// The remote branch as this broker last knew it: the newer of the oid
+    /// the last `broker push` recorded and the remote-tracking ref.
+    pub remote_sha_last_known: Option<String>,
+    /// The oid the last `broker push` of this session recorded.
+    pub remote_sha_recorded: Option<String>,
+    /// The remote-tracking ref for the branch.
+    pub remote_sha_tracking: Option<String>,
+    /// The remote branch as read now (`None`: no branch there). Only
+    /// meaningful when `remote_observed` is true.
+    pub remote_sha_observed: Option<String>,
+    pub remote_observed: bool,
+    /// Why the remote could not be read, when it could not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_read_error: Option<String>,
+    /// `fast_forward`, `lease`, `up_to_date` or `would_refuse`.
+    pub mode: &'static str,
+    /// The oid a lease would expect the remote branch to hold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_expected_sha: Option<String>,
+    /// Why a push would refuse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    /// Commits no remote-tracking ref holds yet.
+    pub commits_to_push: Option<u32>,
+    /// Always false: a plan never pushes.
+    pub pushed: bool,
+    /// The command that performs this push.
+    pub command: String,
 }
 
 /// How many paths `broker push` left behind, and a few of them.
@@ -747,11 +798,8 @@ fn pull_request_policy(
 impl Broker {
     /// Where a session's branch stands against its remote-tracking ref.
     /// See [`SessionPushState`]; this never fetches or writes.
-    pub fn session_push_state(
-        &mut self,
-        session_id: i64,
-    ) -> Result<SessionPushState, BrokerOpError> {
-        let session = self.store().session(session_id)?;
+    pub fn session_push_state(&self, session_id: i64) -> Result<SessionPushState, BrokerOpError> {
+        let session = self.store_ref().session(session_id)?;
         let repo = self.repo_handle();
         let remote = tracked_default(repo)
             .map(|default| default.remote)
@@ -880,6 +928,150 @@ impl Broker {
                 )))
             }
         }
+    }
+
+    /// Describe what [`Self::push_session`] would do without pushing: the
+    /// same preflight and the same decision, against the remote branch read
+    /// now. A push that would refuse is reported as `would_refuse` with the
+    /// refusal; other failures (an unknown session, an unreadable store) are
+    /// errors.
+    pub fn plan_session_push(&mut self, session_id: i64) -> Result<SessionPushPlan, BrokerOpError> {
+        let session = self.store_ref().session(session_id)?;
+        let branch_ref = format!("refs/heads/{}", session.branch);
+        let mut plan = SessionPushPlan {
+            session_id,
+            branch: session.branch.clone(),
+            remote: String::new(),
+            destination_ref: branch_ref.clone(),
+            proposed_sha: None,
+            remote_sha_last_known: None,
+            remote_sha_recorded: None,
+            remote_sha_tracking: None,
+            remote_sha_observed: None,
+            remote_observed: false,
+            remote_read_error: None,
+            mode: "would_refuse",
+            lease_expected_sha: None,
+            refusal: None,
+            commits_to_push: None,
+            pushed: false,
+            command: format!("aethyme broker push --session {session_id}"),
+        };
+        match self.fill_push_plan(&session, &mut plan) {
+            Ok(()) => Ok(plan),
+            Err(BrokerOpError::SessionPushRefused { reason }) => {
+                plan.mode = "would_refuse";
+                plan.lease_expected_sha = None;
+                plan.refusal = Some(reason);
+                Ok(plan)
+            }
+            Err(error @ BrokerOpError::ClosedSessionOperation { .. })
+            | Err(error @ BrokerOpError::SessionBranchMissing { .. }) => {
+                plan.mode = "would_refuse";
+                plan.refusal = Some(error.to_string());
+                Ok(plan)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The preflight of [`Self::push_session_attempt`], recorded into `plan`.
+    fn fill_push_plan(
+        &mut self,
+        session: &crate::Session,
+        plan: &mut SessionPushPlan,
+    ) -> Result<(), BrokerOpError> {
+        let session_id = session.id;
+        if session.status.is_closed() {
+            return Err(BrokerOpError::ClosedSessionOperation {
+                session_id,
+                repository_root: self.main_root().display().to_string(),
+            });
+        }
+        if !Path::new(&session.worktree_path).is_dir() {
+            return Err(refused(format!(
+                "session {session_id} worktree is missing; broker push needs the session checkout to run its pre-push hook"
+            )));
+        }
+        let repo = self.repo_handle();
+        let default = tracked_default(repo).ok_or_else(|| {
+            refused(
+                "the main checkout's branch has no fetched upstream, so there is no trusted \
+                 default branch to read the push policy from; set one with \
+                 `git branch --set-upstream-to <remote>/<branch>`",
+            )
+        })?;
+        plan.remote = default.remote.clone();
+        let branch_ref = plan.destination_ref.clone();
+        let head =
+            repo.resolve_ref(&branch_ref)
+                .ok_or_else(|| BrokerOpError::SessionBranchMissing {
+                    session_id,
+                    branch: session.branch.clone(),
+                })?;
+        plan.proposed_sha = Some(head.clone());
+        let tracking = repo.resolve_ref(&format!(
+            "refs/remotes/{}/{}",
+            default.remote, session.branch
+        ));
+        plan.remote_sha_tracking = tracking.clone();
+        plan.commits_to_push = repo
+            .commits_not_on_remotes(&head)
+            .ok()
+            .map(|commits| u32::try_from(commits.len()).unwrap_or(u32::MAX));
+        let recorded = self.store_ref().meta_get(&pushed_oid_key(session_id))?;
+        plan.remote_sha_recorded = recorded.clone();
+        let repo = self.repo_handle();
+        plan.remote_sha_last_known =
+            believed_remote_tip(repo, recorded.as_deref(), tracking.as_deref());
+        if let Some(reason) = branch_refusal(&session.branch, &default.branch) {
+            return Err(refused(reason));
+        }
+        if !push_authorized(repo, &default)? {
+            return Err(refused(format!(
+                "repository policy {SESSION_PUSH_POLICY_KEY} is not enabled on {} ({})",
+                default.tracking_ref,
+                &default.commit[..default.commit.len().min(12)],
+            )));
+        }
+        let target = repo
+            .resolve_remote_target(&default.remote, None)
+            .map_err(|error| refused(format!("remote {:?}: {error}", default.remote)))?;
+        // The read the push makes under its lock, made once here.
+        let tip = match repo.remote_ref_oids(&default.remote, std::slice::from_ref(&branch_ref)) {
+            Ok(tips) => {
+                plan.remote_observed = true;
+                let tip = tips.get(&branch_ref).cloned().flatten();
+                plan.remote_sha_observed = tip.clone();
+                tip
+            }
+            Err(error) => {
+                // Decide against the belief, as the push does before its read.
+                plan.remote_read_error = Some(error.to_string());
+                plan.remote_sha_last_known.clone()
+            }
+        };
+        if tip.as_deref() == Some(head.as_str()) {
+            plan.mode = "up_to_date";
+            return Ok(());
+        }
+        let path = self.push_path(
+            session_id,
+            &session.branch,
+            &default.remote,
+            &target.coordination_key,
+            &head,
+            recorded.as_deref(),
+            tip.as_deref(),
+        )?;
+        match path.lease() {
+            None => plan.mode = "fast_forward",
+            Some(oid) => {
+                plan.mode = "lease";
+                plan.lease_expected_sha = Some(oid.to_string());
+            }
+        }
+        Ok(())
     }
 
     /// One decision and push for [`Self::push_session`]. `known_tip`, when
@@ -1056,8 +1248,11 @@ impl Broker {
         // What the push lock's remote read saw, when it no longer allows the
         // path chosen above. Git did not run; the caller decides again.
         let moved_tip = std::cell::RefCell::new(None::<Option<String>>);
+        // What that read saw, reported with the push.
+        let observed_tip = std::cell::RefCell::new(None::<Option<String>>);
         let check_repo = GitRepo::discover(&main_root)?;
         let tip_check: &dyn Fn(Option<&str>) -> Result<(), String> = &|observed| {
+            *observed_tip.borrow_mut() = Some(observed.map(str::to_owned));
             if path.holds(&check_repo, &head, observed) {
                 return Ok(());
             }
@@ -1122,6 +1317,8 @@ impl Broker {
         if !push.ok() {
             return Err(operation_failure("push", &push));
         }
+        let pre_push_observation = observed_tip.borrow_mut().take();
+        let pushed_refs = push.pushed_refs.clone();
         self.store().meta_set(&pushed_oid_key(session_id), &head)?;
         phase_timings_ms.insert(
             "push_git".into(),
@@ -1325,6 +1522,9 @@ impl Broker {
             remote: default.remote,
             pushed_oid: head,
             previous_remote_oid: believed_tip,
+            pre_push_remote_observed: pre_push_observation.is_some(),
+            pre_push_remote_oid: pre_push_observation.flatten(),
+            pushed_refs,
             commits_pushed: u32::try_from(new_commits).unwrap_or(u32::MAX),
             uncommitted_files: u32::try_from(uncommitted.len()).unwrap_or(u32::MAX),
             uncommitted: UncommittedCounts::from(&uncommitted),

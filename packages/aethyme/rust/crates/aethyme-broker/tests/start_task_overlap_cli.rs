@@ -82,10 +82,11 @@ fn start_names_the_existing_owner_for_task_path_overlap_without_a_graph() {
             .as_array()
             .is_none_or(|rows| rows.is_empty())
     );
-    let status = common::broker_cli_for_fixture(CLI, &["status", "--json"], fixture.path())
-        .current_dir(fixture.path())
-        .output()
-        .unwrap();
+    let status =
+        common::broker_cli_for_fixture(CLI, &["status", "--full", "--json"], fixture.path())
+            .current_dir(fixture.path())
+            .output()
+            .unwrap();
     assert!(
         status.status.success(),
         "{}",

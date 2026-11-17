@@ -127,7 +127,7 @@ Stop only a verified group owned by the interrupted work, then recheck the
 whole group before reconciling the lease generation.
 
 Before starting or delegating a fix for shared CI failures or generated
-files, use `aethyme broker status --compact --json` and open PRs on affected
+files, use `aethyme broker status --json` and open PRs on affected
 paths. Read the matching task, claimed paths and PR diff even when the graph
 is unavailable. Coordinate with the owning session before starting duplicate
 work; use `aethyme broker advanced note send --to-session <id>` for a broker
@@ -149,13 +149,15 @@ blocked.
    isolated broker worktree, and work from that checkout:
 
    ```bash
-   aethyme broker status --compact --json  # concise coordination summary
+   aethyme broker status --json  # concise coordination summary (compact)
    aethyme broker start --task "<your task>" --short-name "<short name>" --path <planned-path>
    ```
 
    Routine status groups repeated advice categories, reports deferred checks
-   as unknown, and omits per-session evidence and lease paths. Use full
-   `aethyme broker status --json` when you need exact session, lease-path or
+   as unknown, and omits per-session evidence and lease paths. Branch on
+   `advice.categories[].severity` and `.commands`, `summary` and `drilldown`;
+   `status --session <id> --json` adds a `session` block with `next_action`. Use
+   `aethyme broker status --full --json` only when you need exact session, lease-path or
    evidence detail before deciding what to edit. A deferred check is not a
    clean result.
 
@@ -179,6 +181,15 @@ blocked.
    `aethyme broker submit prepare status --session <your-session-id> --json`.
    Worktrees do not inherit ignored dependencies such as `node_modules/` or
    `.venv/` from the main checkout; preparation is explicit.
+   Unless `.aethyme/config.toml` sets
+   `[authorization] prepare_session_worktrees = false`, that preparation is a
+   standing authorization: it covers every session, so do not ask again per
+   session id, and run it as soon as the broker reports preparation required.
+   It applies in your own session worktree only, only through
+   `aethyme broker submit prepare --session <your-session-id>` (the frozen,
+   pinned installs the repository declares), with lockfiles unchanged -- no
+   dependency upgrades, additions or lockfile edits. Anything else still needs
+   the owner. When the key is `false`, ask the owner before preparing.
    For patch tools without a per-call worktree setting, use the reported
    worktree's absolute path and verify the target path there before editing;
    relative paths can resolve against the shared checkout.
@@ -188,8 +199,8 @@ blocked.
    Leases record planned or observed path overlap; they do not lock files
    across isolated worktrees. A lease or warning alone is not a reason to
    wait or switch tasks: continue on independent work in your own worktree.
-   Before contacting a holder, inspect their task and claimed paths in full
-   `aethyme broker status --json`; an explicit lease may record intent without
+   Before contacting a holder, inspect their task and claimed paths in
+   `aethyme broker status --full --json`; an explicit lease may record intent without
    any edit. Every overlap the broker reports, warning or refusal, carries that
    session's capped changes to the overlapping files, committed and uncommitted
    (`other_changes` in JSON), or says it has only declared intent. It is another
@@ -499,6 +510,20 @@ blocked.
    external state should suffix it with that value instead of sharing one
    fixed name.
 
+   Unless `.aethyme/config.toml` sets
+   `[authorization] disposable_test_environments = false`, creating, using and
+   dropping disposable test state is a standing authorization for every
+   session (do not ask again per session id): the broker-leased environments
+   the repository declares in `.aethyme/environments.toml` (`aethyme env up`,
+   `aethyme env exec`, `aethyme env down <id>`), and local scratch databases
+   made by the repository's own declared test or scratch commands, provided
+   each is named for the session (the session's `$AETHYME_TEST_DB_SUFFIX` or
+   the script's own scratch naming) and dropped afterwards. Never a shared,
+   staging or production database, service or data (not `aethyme env shared`),
+   and never data that outlives the session; nothing else is implied, and
+   dispatching CI workflows is not covered. When the key is `false`, ask the
+   owner before creating any test environment or database.
+
    Tests that run `git` against fixture repositories must clear inherited and
    explicitly configured `GIT_*` variables from every subprocess, including
    read-only probes. Preserve `PATH` and other test environment values. A
@@ -597,7 +622,7 @@ blocked.
    The broker surfaces outstanding session advisories after post-commit,
    before expensive gates, and on common broker commands. When a notice
    appears—or after rebasing or reusing a worktree—inspect
-   `aethyme broker status --json` before continuing on the named paths.
+   `aethyme broker status --full --json` before continuing on the named paths.
 
    If status output is too large to inspect directly, retain the complete
    unfiltered JSON in a temporary file and use a JSON parser to project the

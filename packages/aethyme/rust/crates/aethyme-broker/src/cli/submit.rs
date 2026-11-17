@@ -828,10 +828,73 @@ pub(super) fn run_sync(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+/// `broker push --plan`: what the push would send and how, without pushing.
+fn run_push_plan(parsed: &Parsed, session: i64) -> Result<(), UsageError> {
+    if parsed.open_pr {
+        return Err(UsageError::Message(
+            "--plan cannot be combined with --pr; the plan describes the push only".into(),
+        ));
+    }
+    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let plan = broker.plan_session_push(session)?;
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&plan)?);
+        return Ok(());
+    }
+    let short = |oid: &Option<String>| {
+        oid.as_deref().map_or("none".to_string(), |oid| {
+            oid[..oid.len().min(12)].to_string()
+        })
+    };
+    out!(
+        "Push plan for session {} (nothing pushed): {} -> {} {}",
+        plan.session_id,
+        short(&plan.proposed_sha),
+        if plan.remote.is_empty() {
+            "?"
+        } else {
+            plan.remote.as_str()
+        },
+        plan.destination_ref
+    );
+    out!(
+        "  remote branch last known: {} (recorded {}, tracking {})",
+        short(&plan.remote_sha_last_known),
+        short(&plan.remote_sha_recorded),
+        short(&plan.remote_sha_tracking)
+    );
+    match (&plan.remote_read_error, plan.remote_observed) {
+        (Some(error), _) => out!("  remote branch now: unreadable ({error})"),
+        (None, true) => out!("  remote branch now: {}", short(&plan.remote_sha_observed)),
+        (None, false) => out!("  remote branch now: not read"),
+    }
+    if let Some(count) = plan.commits_to_push {
+        out!("  commits not on any remote: {count}");
+    }
+    match plan.mode {
+        "lease" => out!(
+            "  mode: lease (replaces {} only if the remote still holds it)",
+            short(&plan.lease_expected_sha)
+        ),
+        "would_refuse" => out!(
+            "  mode: would refuse: {}",
+            plan.refusal.as_deref().unwrap_or("unknown reason")
+        ),
+        mode => out!("  mode: {}", mode.replace('_', "-")),
+    }
+    if plan.mode != "would_refuse" && plan.mode != "up_to_date" {
+        out!("  run: {}", plan.command);
+    }
+    Ok(())
+}
+
 pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
     let session = parsed
         .session
         .ok_or(UsageError::Message("push requires --session <id>".into()))?;
+    if parsed.push_plan {
+        return run_push_plan(&parsed, session);
+    }
     let open_started = std::time::Instant::now();
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     let open_ms = open_started.elapsed().as_millis() as u64;
@@ -1463,6 +1526,9 @@ mod review_on_push_tests {
             remote: "origin".into(),
             pushed_oid: "a".repeat(40),
             previous_remote_oid: None,
+            pre_push_remote_oid: None,
+            pre_push_remote_observed: false,
+            pushed_refs: Vec::new(),
             commits_pushed: 1,
             uncommitted_files: 0,
             uncommitted: crate::UncommittedCounts::default(),

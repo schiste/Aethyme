@@ -1363,3 +1363,23 @@ fn storage_status_shows_paused_age_expiry_and_restarted_notices() {
     assert_eq!(status["archive_expiry"]["paused_total"], 1);
     assert!(status["archive_expiry"]["last_pass_paused"].is_null());
 }
+
+/// Thousands of archives kept for unlanded work made `storage.over-budget`
+/// most of the full status document; it now names a few and counts the rest.
+#[test]
+fn unlanded_archive_evidence_names_a_few_and_counts_the_rest() {
+    let few: Vec<String> = (0..3).map(|index| format!("pool/{index}")).collect();
+    assert_eq!(super::cli::unlanded_archive_evidence(&few).len(), 3);
+
+    let many: Vec<String> = (0..4_000).map(|index| format!("pool/{index:04}")).collect();
+    let evidence = super::cli::unlanded_archive_evidence(&many);
+    assert_eq!(evidence.len(), 6);
+    assert_eq!(
+        evidence[0],
+        "recovery archive pool/0000 holds unlanded work and is kept"
+    );
+    assert!(evidence[5].starts_with("and 3995 more recovery archive(s)"));
+    assert!(evidence[5].contains("(4000 in all)"));
+    assert!(evidence[5].contains("aethyme storage status --json"));
+    assert!(serde_json::to_vec(&evidence).unwrap().len() < 1024);
+}
