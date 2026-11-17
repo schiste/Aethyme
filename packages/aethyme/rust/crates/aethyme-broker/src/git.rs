@@ -21,6 +21,13 @@ use std::time::{Duration, Instant};
 
 static NEXT_PRIVATE_INDEX_ID: AtomicU64 = AtomicU64::new(1);
 
+/// A `core.hooksPath` under which no hook can exist: a path below a device
+/// file is never a directory, so Git finds no executable hook there.
+#[cfg(unix)]
+const NO_HOOKS_PATH: &str = "/dev/null";
+#[cfg(not(unix))]
+const NO_HOOKS_PATH: &str = "NUL";
+
 /// Bound the effective config copied into a one-shot exact-endpoint query.
 /// It is captured from the real checkout, but replayed in an isolated Gitdir
 /// after URL rewrite rules and include directives have been removed.
@@ -5351,6 +5358,104 @@ impl GitRepo {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Fast-forward the checked-out `branch` from exactly `from` to `to`
+    /// while unrelated local changes stay where they are.
+    ///
+    /// The same two steps as [`Self::fast_forward_checkout_from`]: a
+    /// compare-and-swap of the branch ref, then a two-tree `read-tree -m -u`.
+    /// The two-tree merge is Git's own branch-switch rule: a path whose
+    /// content is the same in `from` and `to` keeps its index entry and its
+    /// working file untouched, a path the update changes is replaced only when
+    /// its index entry and working file still match `from`, and an untracked
+    /// or ignored file the update would write over makes Git refuse. Git never
+    /// discards a local change here; it refuses, and the ref is swapped back.
+    /// No stash, no `reset`, no forced checkout, no submodule update.
+    ///
+    /// Repository hooks do not run: `read-tree` and `update-index` run none,
+    /// and `core.hooksPath` points at a path that cannot hold a hook for the
+    /// one that could (`reference-transaction`, run by `update-ref`).
+    pub(crate) fn fast_forward_checkout_preserving_local_changes(
+        &self,
+        branch: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<(), GitError> {
+        let hooks_off = format!("core.hooksPath={NO_HOOKS_PATH}");
+        // Refresh only the stat data of entries whose content is unchanged,
+        // so a file touched without being edited is not taken for a local
+        // change. It never rewrites an entry whose content differs. Best
+        // effort: `read-tree` stays the arbiter when this cannot run.
+        let _ = run_git(
+            &self.root,
+            &["-c", &hooks_off, "update-index", "-q", "--refresh"],
+        );
+        let reference = format!("refs/heads/{branch}");
+        run_git(
+            &self.root,
+            &[
+                "-c",
+                &hooks_off,
+                "update-ref",
+                "-m",
+                "aethyme: fast-forward main checkout",
+                &reference,
+                to,
+                from,
+            ],
+        )?;
+        if let Err(error) = run_git(
+            &self.root,
+            &["-c", &hooks_off, "read-tree", "-m", "-u", from, to],
+        ) {
+            let restored = run_git(
+                &self.root,
+                &["-c", &hooks_off, "update-ref", &reference, from, to],
+            );
+            if let Err(restore) = restored {
+                return Err(GitError::Git {
+                    args: format!("read-tree -m -u {from} {to}"),
+                    stderr: format!(
+                        "{error}; restoring {reference} to {from} also failed: {restore}"
+                    ),
+                });
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Tracked paths whose index entry or working file differs from HEAD,
+    /// renames reported on both sides and submodules with any change
+    /// included. Read-only.
+    pub(crate) fn locally_changed_tracked_paths(&self) -> Result<Vec<String>, GitError> {
+        let mut paths = std::collections::BTreeSet::new();
+        for cached in [false, true] {
+            let mut args = vec![
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "--ignore-submodules=none",
+            ];
+            if cached {
+                args.push("--cached");
+            }
+            args.extend(["HEAD", "--"]);
+            paths.extend(parse_nul_paths(&run_git(&self.root, &args)?));
+        }
+        Ok(paths.into_iter().collect())
+    }
+
+    /// Whether any index entry is marked assume-unchanged or skip-worktree:
+    /// either hides a local change from the checks the caller makes.
+    pub(crate) fn has_hidden_index_entries(&self) -> Result<bool, GitError> {
+        let listing = run_git_bytes(&self.root, &["ls-files", "-v", "-z"])?;
+        Ok(listing
+            .split(|byte| *byte == 0)
+            .filter_map(|entry| entry.first())
+            .any(|tag| tag.is_ascii_lowercase() || *tag == b'S'))
     }
 
     /// The first Git operation left in progress in this checkout, or a held

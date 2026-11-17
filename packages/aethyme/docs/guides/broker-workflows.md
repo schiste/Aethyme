@@ -1,6 +1,6 @@
 # Broker Follow-Up Workflows
 
-Last Updated: 2026-11-01
+Last Updated: 2026-11-17
 
 This guide covers broker workflows that matter after the basic
 start-edit-submit loop: preparing declared worktree dependencies, reusing a session worktree, choosing fresh or cached
@@ -1272,6 +1272,52 @@ Integration is never a session base: local promotion was removed. When an
 integration branch exists, `start` names it in
 `start_base.bypassed_integration` with `reason: "verify_only"`. `start` never
 fetches, so "upstream" is as fresh as the last fetch.
+
+## Keep The Main Checkout Current
+
+The primary checkout is where people and agents look first, so the broker
+keeps it on the remote default branch. It moves it only by fast-forward, and
+only when that cannot touch anything local:
+
+- it is on the default branch, with no commits of its own, no merge, rebase,
+  cherry-pick, revert or bisect in progress, no sparse-checkout,
+  assume-unchanged or skip-worktree entries, and no live session working in
+  it;
+- no path the update changes is also modified, staged or renamed locally,
+  and no untracked file sits at, above or below a path the update writes
+  (compared case-insensitively).
+
+Unrelated local edits, staged work and untracked files stay exactly as they
+were: the update is Git's own two-tree merge (`read-tree -m -u` after a
+compare-and-swap of the branch ref), which refuses rather than overwrite a
+local change. No stash, reset or forced checkout runs, submodules are not
+updated, and repository hooks (`post-merge`, `post-checkout`,
+`reference-transaction`) do not run. The broker's own files under `.aethyme/`
+never count as local changes.
+
+Attempts run before `status`, `sync`, `push`, `submit`, `finish` and
+`start --adopt/--reuse` when run from the primary checkout (no fetch), and
+from the background worker every 15 minutes, which first fetches only the
+default branch. The worker also removes the broker's own leftovers there:
+staged `.gc.lock.<pid>.<nanos>` files older than an hour whose process is gone,
+and `.operator-*-maintenance-hold-*` directories whose manifest has been
+`complete` for a day. Anything it cannot prove stale is left and counted.
+
+When the checkout cannot move, `broker status` shows `main-checkout.behind`
+once it is more than 50 commits or 24 hours behind, with the reason
+(`local_changes_overlap`, `not_on_default_branch`, `local_commits`,
+`operation_in_progress`, `fetch_failed`, `disabled`, ...), up to ten blocking
+paths and the commands to run; `broker start` prints a one-line reminder to
+read code in the session worktree; and `broker status --json` carries the
+record as `main_checkout`. Configure it in `.aethyme/config.toml`:
+
+```toml
+[main_checkout]
+auto_sync = true               # false: never move it, only report
+sync_interval_minutes = 15     # 0: no background attempts
+behind_threshold_commits = 50
+behind_threshold_hours = 24
+```
 
 ## Finish With A Durable Handoff
 
