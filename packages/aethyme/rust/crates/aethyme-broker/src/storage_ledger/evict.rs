@@ -489,7 +489,7 @@ pub fn refuse(
                     .unwrap_or(crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS),
             );
             let due = candidate.expires_ms.map(|expires| expires.max(promised));
-            if !due.is_some_and(|due| now >= due) {
+            if due.is_none_or(|due| now < due) {
                 return Some("not expired yet".into());
             }
         }
