@@ -729,6 +729,23 @@ impl BrokerStore {
         Ok(false)
     }
 
+    /// Every session recorded for `worktree_path`, whatever its state,
+    /// oldest first. Uses `sessions_by_worktree_path` (v65).
+    pub(crate) fn sessions_at_worktree_path(
+        &self,
+        worktree_path: &str,
+    ) -> Result<Vec<Session>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SESSION_SELECT} WHERE worktree_path = ?1 ORDER BY id"
+        ))?;
+        let rows = stmt.query_map(params![worktree_path], session_from_row)?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row??);
+        }
+        Ok(sessions)
+    }
+
     /// The latest session recorded for `worktree_path`, whatever its state.
     pub(crate) fn latest_session_for_worktree_any_state(
         &self,
