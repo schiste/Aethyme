@@ -92,8 +92,8 @@ fn a_quiet_session_pins_its_worktree_until_the_window_elapses() {
         "a merely stale session must not be reclaimable yet"
     );
 
-    // Past the default 72h window, the same session is a candidate.
-    broker.agents(now_ms() + 100 * HOUR_MS).unwrap();
+    // Past the abandonment window and the week a session with work waits, it is a candidate.
+    broker.agents(now_ms() + 200 * HOUR_MS).unwrap();
     let plan = broker.cleanup_plan().unwrap();
     let item = plan
         .worktrees
@@ -121,7 +121,10 @@ fn abandonment_grants_candidacy_but_never_eligibility() {
     // Uncommitted work. Abandoning the session must not put it at risk.
     std::fs::write(worktree.join("wip.txt"), "unsaved\n").unwrap();
 
-    broker.agents(now_ms() + 100 * HOUR_MS).unwrap();
+    // Uncommitted work closes only after a closing-soon note has stood a day:
+    // the first look leaves the note, the second (a day later) closes.
+    broker.agents(now_ms() + 200 * HOUR_MS).unwrap();
+    broker.agents(now_ms() + 200 * HOUR_MS).unwrap();
     let plan = broker.cleanup_plan().unwrap();
     let item = plan
         .worktrees
@@ -166,7 +169,7 @@ fn the_transition_is_recorded_for_audit() {
     fixture(tmp.path());
     let mut broker = isolation::open(tmp.path());
     let id = landed_session(&mut broker, tmp.path());
-    broker.agents(now_ms() + 100 * HOUR_MS).unwrap();
+    broker.agents(now_ms() + 200 * HOUR_MS).unwrap();
 
     // Reclaiming someone's worktree without a human in the loop is only
     // acceptable if the decision is reconstructable afterwards.
@@ -189,7 +192,7 @@ fn abandonment_is_idempotent_across_repeated_status_checks() {
     let mut broker = isolation::open(tmp.path());
     let id = landed_session(&mut broker, tmp.path());
     for _ in 0..3 {
-        broker.agents(now_ms() + 100 * HOUR_MS).unwrap();
+        broker.agents(now_ms() + 200 * HOUR_MS).unwrap();
     }
     let events = session_events(&mut broker, id);
     let count = events
@@ -258,7 +261,9 @@ fn abandoning_an_adopted_session_releases_the_leases_it_was_holding() {
         "fixture must actually hold an implicit lease, or the assertion below is vacuous"
     );
 
-    broker.agents(now_ms() + 100 * HOUR_MS).unwrap();
+    // Its edit is uncommitted work: a closing-soon note first, then the close.
+    broker.agents(now_ms() + 200 * HOUR_MS).unwrap();
+    broker.agents(now_ms() + 200 * HOUR_MS).unwrap();
     assert!(
         broker
             .store()
@@ -364,7 +369,7 @@ fn abandonment_keeps_an_explicit_claim_with_unknown_holder_liveness() {
         .unwrap();
     assert_eq!(lease.kind, aethyme_broker::LeaseKind::Explicit);
 
-    broker.agents(now_ms() + 100 * HOUR_MS).unwrap();
+    broker.agents(now_ms() + 200 * HOUR_MS).unwrap();
 
     assert!(
         !broker

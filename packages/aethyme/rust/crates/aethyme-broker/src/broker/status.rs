@@ -49,6 +49,7 @@ impl Broker {
             .and_then(|report| report.capacity_removal.clone());
         push_auto_cleanup_advice(&mut view, auto_cleanup);
         push_landed_proof_unprovable_advice(&mut view, &self.landed_proof_unprovable_sessions());
+        self.push_stale_session_advice(&mut view, now_ms);
         push_checkout_retirement_advice(
             &mut view,
             &self.checkout_retirement_progress(),
@@ -487,6 +488,118 @@ impl Broker {
         });
     }
 
+    /// `sessions.stale-backlog`, `sessions.closing-soon` and
+    /// `sessions.process-table-denied`, from what the abandonment window's
+    /// per-class gate and the retirement passes last recorded. Three meta
+    /// reads; nothing is judged here.
+    pub(super) fn push_stale_session_advice(&self, view: &mut StatusView, now_ms: i64) {
+        use crate::stale_session_policy as stale;
+        let open = view
+            .agents
+            .iter()
+            .filter(|agent| {
+                !agent.derived_status.is_closed()
+                    && agent.session.cleanup_state == crate::SessionCleanupState::Open
+            })
+            .map(|agent| agent.session.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let policy = stale::StaleSessionPolicy::load(self.main_root()).unwrap_or_default();
+        let mut by_class = std::collections::BTreeMap::<stale::StaleWorkClass, Vec<i64>>::new();
+        let mut closing_soon = Vec::new();
+        for (session_id, record) in stale::read_class_records(self.store_ref()) {
+            if !open.contains(&session_id) {
+                continue;
+            }
+            by_class.entry(record.class).or_default().push(session_id);
+            if record.class.holds_work()
+                && policy.notice_ms > 0
+                && record.due_at_ms > now_ms
+                && record.due_at_ms.saturating_sub(policy.notice_ms) <= now_ms
+            {
+                closing_soon.push((session_id, record));
+            }
+        }
+        let count = |class: stale::StaleWorkClass| by_class.get(&class).map_or(0, Vec::len);
+        let landed = count(stale::StaleWorkClass::Landed);
+        let pushed = count(stale::StaleWorkClass::PushedUnmerged);
+        let unpushed = count(stale::StaleWorkClass::Unpushed);
+        if landed + pushed + unpushed > 0 {
+            let mut evidence = Vec::new();
+            for (class, sessions) in &by_class {
+                let hours = policy.window_ms(*class) / 3_600_000;
+                let mut ids = sessions
+                    .iter()
+                    .take(10)
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>();
+                if sessions.len() > ids.len() {
+                    ids.push(format!("and {} more", sessions.len() - ids.len()));
+                }
+                evidence.push(format!(
+                    "{}: {} session(s), closed after {hours} h idle once no live or unknown \
+                     holder remains (sessions {})",
+                    class.code(),
+                    sessions.len(),
+                    ids.join(", ")
+                ));
+            }
+            view.advice.push(StatusAdvice {
+                id: "sessions.stale-backlog",
+                severity: StatusAdviceSeverity::Notice,
+                reason: "stale sessions past the abandonment window close once their holder is gone and they have been idle for the window of what closing would put at risk ([cleanup] stale_landed_close_after_hours, stale_pushed_close_after_hours, stale_unpushed_close_after_hours); the shared background worker judges them, and closing deletes nothing",
+                summary: format!(
+                    "{} stale session(s) past the abandonment window: {landed} landed, {pushed} pushed but unmerged, {unpushed} with unpushed or uncommitted work",
+                    landed + pushed + unpushed
+                ),
+                session_id: None,
+                queue_entry_id: None,
+                evidence,
+                commands: vec!["aethyme broker status --full --json".into()],
+            });
+        }
+        if let Some((first, _)) = closing_soon.first() {
+            let first = *first;
+            view.advice.push(StatusAdvice {
+                id: "sessions.closing-soon",
+                severity: StatusAdviceSeverity::Notice,
+                reason: "these sessions hold pushed or unpushed work and close automatically within the notice period unless they become active; each has a broker note saying so. Any broker command for the session, or a commit in its checkout, resets the idle clock; committed work stays on its branch and anything uncommitted is archived before the checkout is retired",
+                summary: format!(
+                    "{} session(s) with work close automatically within {} h",
+                    closing_soon.len(),
+                    policy.notice_ms / 3_600_000
+                ),
+                session_id: Some(first),
+                queue_entry_id: None,
+                evidence: closing_soon
+                    .iter()
+                    .take(20)
+                    .map(|(session_id, record)| {
+                        format!(
+                            "session {session_id}: {}, closes in about {} h",
+                            record.class.code(),
+                            record.due_at_ms.saturating_sub(now_ms) / 3_600_000
+                        )
+                    })
+                    .collect(),
+                commands: vec![format!("aethyme broker status --session {first} --json")],
+            });
+        }
+        if let Some(denied_at) = stale::process_table_denied_since(self.store_ref(), now_ms) {
+            view.advice.push(StatusAdvice {
+                id: "sessions.process-table-denied",
+                severity: StatusAdviceSeverity::Warning,
+                reason: "every session-retirement pass since then was refused the process listing (a background worker started from a sandboxed caller inherits its sandbox), so no holder could be judged: those sessions are deferred, not closed and not kept, until a pass that can list processes runs, such as one started by a broker command outside the sandbox or the managed GC sweep",
+                summary: "no session-retirement pass could list processes; stale sessions wait for one that can".into(),
+                session_id: None,
+                queue_entry_id: None,
+                evidence: vec![format!(
+                    "last refused at (ms since epoch): {denied_at}; no complete listing since"
+                )],
+                commands: Vec::new(),
+            });
+        }
+    }
+
     /// Warn when the last preparation could not verify a runtime probe: that
     /// checkout reinstalls on every preparation, never reports current, and a
     /// `required_for_hooks` step then blocks its hooks. One metadata read.
@@ -668,6 +781,7 @@ impl Broker {
             .and_then(|report| report.capacity_removal.clone());
         push_auto_cleanup_advice(&mut view, auto_cleanup);
         push_landed_proof_unprovable_advice(&mut view, &self.landed_proof_unprovable_sessions());
+        self.push_stale_session_advice(&mut view, now_ms);
         push_checkout_retirement_advice(
             &mut view,
             &self.checkout_retirement_progress(),

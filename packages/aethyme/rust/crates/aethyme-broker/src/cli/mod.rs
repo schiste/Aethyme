@@ -1160,6 +1160,9 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
         eprint!("{}", surface::public_help());
         return crate::exit_status::USAGE;
     }
+    // Someone waits on this command: stale sessions it finds due are left to
+    // the shared detached worker (see `ForegroundCommand`).
+    let _foreground_command = crate::file_lock::ForegroundCommand::enter();
     let started = std::time::Instant::now();
     // The opt-in host service has its own bounded parser and never opens a
     // repository, runs startup maintenance or fast-forwards a checkout.

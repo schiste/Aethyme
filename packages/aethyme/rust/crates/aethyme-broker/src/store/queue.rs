@@ -615,6 +615,27 @@ impl BrokerStore {
             .map_err(BrokerError::from)
     }
 
+    /// The head commits recorded for the session's merged pull requests: what
+    /// merged, for asking whether a branch tip is contained in it.
+    pub(crate) fn merged_pull_request_heads(
+        &self,
+        session_id: i64,
+    ) -> Result<Vec<String>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT o.head_commit
+             FROM pull_request_session_links l
+             JOIN pull_request_milestones m
+               ON m.repository = l.repository AND m.pr_number = l.pr_number
+             JOIN pull_request_observations o
+               ON o.repository = l.repository AND o.pr_number = l.pr_number
+             WHERE l.session_id = ?1 AND m.merged_at IS NOT NULL
+             ORDER BY l.repository, l.pr_number",
+        )?;
+        let rows = stmt.query_map([session_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(BrokerError::from)
+    }
+
     /// Sessions linked to one pull request.
     pub fn pull_request_sessions(
         &self,
