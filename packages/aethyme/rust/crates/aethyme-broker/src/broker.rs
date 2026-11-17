@@ -2984,6 +2984,68 @@ pub struct StatusAdvice {
     pub commands: Vec<String>,
 }
 
+/// The `status` rows of checkout retirement, shown only when something needs
+/// a look: checkouts whose recovery archive would exceed the cap (by session
+/// id; paths omitted), and trash or kept checkouts that stopped shrinking.
+fn push_checkout_retirement_advice(
+    view: &mut StatusView,
+    progress: &retire::CheckoutRetirementProgress,
+    too_large: &std::collections::BTreeSet<i64>,
+) {
+    if let Some(&first) = too_large.first() {
+        view.advice.push(StatusAdvice {
+            id: "cleanup.retire-archive-too-large",
+            severity: StatusAdviceSeverity::Notice,
+            reason: "these closed checkouts hold more uncommitted or untracked content than one recovery archive may carry, so they are kept until someone decides",
+            summary: format!(
+                "{} closed checkout(s) need a recovery archive larger than {} MiB",
+                too_large.len(),
+                retire::RETIRE_ARCHIVE_MAX_BYTES / (1024 * 1024)
+            ),
+            session_id: Some(first),
+            queue_entry_id: None,
+            evidence: unprovable_advice_evidence(too_large),
+            commands: vec![format!(
+                "aethyme broker finish cleanup resolve {first} --archive"
+            )],
+        });
+    }
+    if progress.stalled_runs >= retire::RETIRE_STALLED_RUNS
+        && (progress.trash_pending > 0 || progress.kept > 0)
+    {
+        let mut evidence = vec![
+            format!(
+                "{} retired checkout(s) still in the trash",
+                progress.trash_pending
+            ),
+            format!(
+                "{} closed checkout(s) kept by a precondition",
+                progress.kept
+            ),
+        ];
+        evidence.extend(
+            progress
+                .reported_trash_entries
+                .iter()
+                .take(20)
+                .map(|entry| format!("trash entry {entry} failed to delete 3 or more times")),
+        );
+        view.advice.push(StatusAdvice {
+            id: "cleanup.retirement-stalled",
+            severity: StatusAdviceSeverity::Warning,
+            reason: "closed checkouts are retired and their trash deleted in the background; neither shrank for several runs",
+            summary: format!(
+                "checkout retirement made no progress for {} run(s)",
+                progress.stalled_runs
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence,
+            commands: Vec::new(),
+        });
+    }
+}
+
 /// The `status` row naming sessions whose landed proof timed out even with
 /// the rest of a pass's share: the background worker keeps them open and
 /// asks again, but a person may need to look. Session ids only; the

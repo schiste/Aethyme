@@ -3711,6 +3711,9 @@ impl Broker {
             ) {
             Ok(true) => {
                 self.settle_dead_receipts_after_close(session_id);
+                // The checkout is retired by the worker's retirement lane:
+                // archived when needed, renamed into the trash, deleted.
+                self.request_checkout_retirement_run();
                 crate::phase_telemetry::add(
                     match holder_evidence {
                         "lease_expired" => "session_closed_holder_lease_expired",

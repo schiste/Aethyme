@@ -23,8 +23,10 @@
 //!   archive larger than [`RETIRE_ARCHIVE_MAX_BYTES`] keeps the checkout
 //!   and is shown by `broker status` by session id.
 //!
-//! Moving into the trash is a `rename(2)` plus dropping the Git
-//! registration (`checkout_trash`); the host deleter unlinks the tree later.
+//! Moving into the trash is a `renameat(2)` into the pool's private broker
+//! trash plus dropping the Git registration, only for a spawned session's
+//! checkout inside a broker-owned pool (`checkout_trash`); the host deleter
+//! later unlinks only the entries recorded here at rename time.
 //! [`Broker::run_checkout_retirement`] is the worker lane: it walks closed
 //! sessions that still have a checkout by session-id cursor, with the open
 //! sessions' paths resolved once per run, then drains the trash.
@@ -37,9 +39,10 @@ use std::time::Instant;
 pub(crate) const CHECKOUT_RETIREMENT_DUE_KEY: &str = "checkout_retirement.due_at_ms";
 /// Meta key: the last session id the backlog sweep judged.
 const CHECKOUT_RETIREMENT_CURSOR_KEY: &str = "checkout_retirement.cursor";
-/// Meta key: the trash directories this repository has put checkouts into
-/// (JSON array of paths).
-const CHECKOUT_RETIREMENT_TRASH_DIRS_KEY: &str = "checkout_retirement.trash_dirs";
+/// Meta key: the trash entries this repository recorded when it moved a
+/// checkout in (JSON: trash directory, then entry name, then device, inode,
+/// session and failed deletions). The deleter deletes nothing else.
+const CHECKOUT_RETIREMENT_TRASH_ROWS_KEY: &str = "checkout_retirement.trash_rows";
 /// Meta key: progress of the last runs, for `broker status` (JSON).
 pub(crate) const CHECKOUT_RETIREMENT_PROGRESS_KEY: &str = "checkout_retirement.progress";
 /// Meta key: sessions whose recovery archive would exceed the cap (JSON
@@ -189,35 +192,30 @@ impl Broker {
     /// Whether the retirement lane is due at `now_ms`.
     pub(crate) fn checkout_retirement_due(&self, now_ms: i64) -> bool {
         match self.store_ref().meta_get(CHECKOUT_RETIREMENT_DUE_KEY) {
-            Ok(Some(value)) => value.parse::<i64>().map_or(true, |due| due <= now_ms),
+            Ok(Some(value)) => value.parse::<i64>().ok().is_none_or(|due| due <= now_ms),
             Ok(None) => true,
             Err(_) => false,
         }
     }
 
-    fn remember_trash_dir(&self, trash: &Path) {
-        let mut dirs = self.checkout_retirement_trash_dirs();
-        let trash = trash.to_path_buf();
-        if !dirs.contains(&trash) {
-            dirs.push(trash);
-            crate::warn_unrecorded(
-                "remember a checkout trash directory",
-                self.store_ref().meta_set(
-                    CHECKOUT_RETIREMENT_TRASH_DIRS_KEY,
-                    &serde_json::to_string(&dirs).unwrap_or_default(),
-                ),
-            );
-        }
-    }
-
-    /// The trash directories this repository has put checkouts into.
-    pub(crate) fn checkout_retirement_trash_dirs(&self) -> Vec<PathBuf> {
+    /// The trash entries this repository recorded.
+    pub(crate) fn checkout_trash_rows(&self) -> crate::checkout_trash::TrashRows {
         self.store_ref()
-            .meta_get(CHECKOUT_RETIREMENT_TRASH_DIRS_KEY)
+            .meta_get(CHECKOUT_RETIREMENT_TRASH_ROWS_KEY)
             .ok()
             .flatten()
-            .and_then(|value| serde_json::from_str::<Vec<PathBuf>>(&value).ok())
+            .and_then(|value| serde_json::from_str(&value).ok())
             .unwrap_or_default()
+    }
+
+    fn store_checkout_trash_rows(&self, rows: &crate::checkout_trash::TrashRows) {
+        crate::warn_unrecorded(
+            "record checkout trash entries",
+            self.store_ref().meta_set(
+                CHECKOUT_RETIREMENT_TRASH_ROWS_KEY,
+                &serde_json::to_string(rows).unwrap_or_default(),
+            ),
+        );
     }
 
     /// Progress of the last retirement runs.
@@ -420,7 +418,7 @@ impl Broker {
                 return Ok(Kept("changed"));
             }
             if self
-                .remove_checkout_through_trash(session_id, &worktree, false)
+                .remove_checkout_through_trash(&current, &worktree, false)
                 .is_err()
                 || worktree.exists()
             {
@@ -554,35 +552,76 @@ impl Broker {
         Ok(report)
     }
 
-    /// Drain this repository's trash directories until `deadline`, as the
-    /// one host-wide deleter; another process holding the deleter lock
-    /// makes this a no-op (it drains them too, oldest first).
+    /// Drain this repository's recorded trash entries until `deadline`, as
+    /// the one host-wide deleter; another process holding the deleter lock
+    /// makes this a no-op for this run.
     pub(crate) fn drain_checkout_trash(
         &self,
         deadline: Instant,
     ) -> crate::checkout_trash::TrashDrainReport {
-        let dirs = self.checkout_retirement_trash_dirs();
-        if dirs.is_empty() {
+        let mut rows = self.checkout_trash_rows();
+        let pending = rows.values().map(std::collections::BTreeMap::len).sum();
+        let Some(first) = rows.keys().next().cloned() else {
             return crate::checkout_trash::TrashDrainReport::default();
-        }
-        let lock_path = crate::host_state::resolve_host_state_dir()
-            .map(|(dir, _)| dir.join(crate::checkout_trash::DELETER_LOCK_FILE))
-            .unwrap_or_else(|| dirs[0].join(crate::checkout_trash::DELETER_LOCK_FILE));
-        let Ok(Some(_lock)) = crate::checkout_trash::try_deleter_lock(&lock_path) else {
-            crate::phase_telemetry::add("checkout_trash_deleter_busy", std::time::Duration::ZERO);
-            let mut report = crate::checkout_trash::TrashDrainReport::default();
-            report.entries_pending = dirs
-                .iter()
-                .map(|dir| crate::checkout_trash::trash_entries(dir).len())
-                .sum();
-            return report;
         };
-        let below_headroom = self.checkout_trash_below_headroom(&dirs[0]);
+        // One deleter per host: the lock lives in the host state directory.
+        // Only when that directory cannot hold it does the pool next to the
+        // trash hold it instead.
+        let pool_lock = first
+            .parent()
+            .unwrap_or(&first)
+            .join(crate::checkout_trash::DELETER_LOCK_FILE);
+        let lock = match crate::host_state::resolve_host_state_dir()
+            .map(|(dir, _)| dir.join(crate::checkout_trash::DELETER_LOCK_FILE))
+        {
+            Some(host_lock) => match crate::checkout_trash::try_deleter_lock(&host_lock) {
+                Ok(lock) => lock,
+                Err(_) => crate::checkout_trash::try_deleter_lock(&pool_lock)
+                    .ok()
+                    .flatten(),
+            },
+            None => crate::checkout_trash::try_deleter_lock(&pool_lock)
+                .ok()
+                .flatten(),
+        };
+        let Some(_lock) = lock else {
+            crate::phase_telemetry::add("checkout_trash_deleter_busy", std::time::Duration::ZERO);
+            return crate::checkout_trash::TrashDrainReport {
+                entries_pending: pending,
+                ..crate::checkout_trash::TrashDrainReport::default()
+            };
+        };
+        let before = rows.clone();
         let pace = crate::checkout_trash::DeleterPace::for_host(
-            below_headroom,
+            self.checkout_trash_below_headroom(&first),
             crate::checkout_trash::host_loaded(),
         );
-        crate::checkout_trash::drain_trash(&dirs, deadline, pace)
+        let mut report = crate::checkout_trash::drain_trash(&mut rows, deadline, pace);
+        // Entries recorded by another process during the drain are kept:
+        // only what this run removed, forgot or counted is applied.
+        let mut current = self.checkout_trash_rows();
+        for (dir, entries) in &before {
+            for name in entries.keys() {
+                match rows.get(dir).and_then(|after| after.get(name)) {
+                    Some(row) => {
+                        if let Some(stored) =
+                            current.get_mut(dir).and_then(|stored| stored.get_mut(name))
+                        {
+                            stored.failures = row.failures;
+                        }
+                    }
+                    None => {
+                        if let Some(stored) = current.get_mut(dir) {
+                            stored.remove(name);
+                        }
+                    }
+                }
+            }
+        }
+        current.retain(|_, entries| !entries.is_empty());
+        self.store_checkout_trash_rows(&current);
+        report.entries_pending = current.values().map(std::collections::BTreeMap::len).sum();
+        report
     }
 
     /// Whether the volume holding `trash` is below the artifact-sweep
@@ -602,12 +641,341 @@ impl Broker {
         ) == crate::disk_headroom::SweepUrgency::Pressured
     }
 
-    /// Remember the trash directory a checkout was moved into, so the
-    /// deleter finds it.
+    /// Record a checkout just moved into the trash (its entry name, device
+    /// and inode), so the deleter finds it and deletes nothing else.
     pub(crate) fn note_checkout_trashed(&self, trashed: &crate::checkout_trash::TrashedCheckout) {
-        if let Some(trash) = trashed.path.parent() {
-            self.remember_trash_dir(trash);
-        }
+        let mut rows = self.checkout_trash_rows();
+        rows.entry(trashed.trash_dir.clone())
+            .or_default()
+            .insert(trashed.entry.clone(), trashed.row);
+        self.store_checkout_trash_rows(&rows);
         self.request_checkout_retirement_run();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use std::time::Duration;
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let mut command = Command::new("git");
+        let git_keys = std::env::vars_os()
+            .map(|(key, _)| key)
+            .filter(|key| key.to_string_lossy().starts_with("GIT_"))
+            .collect::<Vec<_>>();
+        for key in git_keys {
+            command.env_remove(key);
+        }
+        let output = command.args(args).current_dir(root).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// A repository with a local `origin` whose default branch is known, no
+    /// closed-checkout grace, an ignore rule for a file nothing regenerates,
+    /// and no process using any checkout.
+    fn fixture() -> (
+        tempfile::TempDir,
+        crate::test_storage::TestStorage,
+        crate::Broker,
+    ) {
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path().join("repository");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.name", "Retire test"]);
+        git(&root, &["config", "user.email", "retire@example.invalid"]);
+        std::fs::write(root.join(".gitignore"), "/.aethyme/\nsecrets.local\n").unwrap();
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", ".gitignore", "base.txt"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        aethyme_testkit::ensure_origin(&root);
+        git(&root, &["remote", "set-head", "origin", "main"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nsession_abandoned_after_hours = 72\nclosed_worktree_grace_hours = 0\n",
+        )
+        .unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let broker = storage.open(&root).unwrap();
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+        ));
+        (owner, storage, broker)
+    }
+
+    /// Start a session, let `setup` work in its checkout, then close it.
+    fn closed(
+        broker: &mut crate::Broker,
+        label: &str,
+        setup: impl FnOnce(&Path),
+    ) -> (crate::Session, PathBuf) {
+        let session = broker.start_worktree(label, None).unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        setup(&worktree);
+        broker
+            .close_abandoning_unpushed(session.id, "retire fixture")
+            .unwrap();
+        (session, worktree)
+    }
+
+    fn run(broker: &mut crate::Broker) -> CheckoutRetirementReport {
+        broker
+            .run_checkout_retirement(Instant::now() + Duration::from_secs(600))
+            .unwrap()
+    }
+
+    fn is_cleaned(broker: &crate::Broker, session_id: i64) -> bool {
+        broker
+            .store_ref()
+            .session(session_id)
+            .unwrap()
+            .cleanup_state
+            == crate::SessionCleanupState::Cleaned
+    }
+
+    /// The archives written for `session_id`.
+    fn archives(broker: &crate::Broker, session_id: i64) -> Vec<PathBuf> {
+        let root = broker.recovery_archive_root().unwrap();
+        let Ok(listing) = std::fs::read_dir(&root) else {
+            return Vec::new();
+        };
+        listing
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with(&format!("{session_id}-"))
+                                && !name.ends_with(".partial")
+                        })
+            })
+            .collect()
+    }
+
+    /// A clean checkout whose commits are all on the default branch is
+    /// retired without an archive: renamed into the trash, drained, the row
+    /// cleaned and the branch ref kept.
+    #[test]
+    fn a_clean_contained_checkout_is_retired_without_an_archive() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "clean", |_| {});
+
+        let report = run(&mut broker);
+
+        assert_eq!(report.retired_clean, 1, "{report:#?}");
+        assert!(!worktree.exists());
+        assert!(is_cleaned(&broker, session.id));
+        assert!(
+            archives(&broker, session.id).is_empty(),
+            "no archive needed"
+        );
+        assert_eq!(report.trash.entries_pending, 0, "{report:#?}");
+        let root = broker.main_root().to_path_buf();
+        git(
+            &root,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{}", session.branch),
+            ],
+        );
+    }
+
+    /// Only a spawned session's checkout inside a broker-owned pool may go
+    /// into a trash; a checkout anywhere else is removed by Git as before.
+    #[test]
+    fn a_checkout_outside_a_broker_pool_is_never_trashed() {
+        let (owner, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("pooled", None).unwrap();
+        let elsewhere = owner.path().join("elsewhere");
+        let root = broker.main_root().to_path_buf();
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "elsewhere",
+                elsewhere.to_str().unwrap(),
+            ],
+        );
+        let mut outside = session.clone();
+        outside.worktree_path = elsewhere.to_string_lossy().into_owned();
+
+        assert!(broker.trash_pool_for(&outside, &elsewhere).is_none());
+        assert!(
+            broker
+                .trash_pool_for(&session, Path::new(&session.worktree_path))
+                .is_some()
+        );
+        let mut adopted = session.clone();
+        adopted.origin = crate::SessionOrigin::Adopted;
+        assert!(
+            broker
+                .trash_pool_for(&adopted, Path::new(&session.worktree_path))
+                .is_none()
+        );
+    }
+
+    /// A dirty checkout (a tracked change, an untracked file, an ignored
+    /// file nothing regenerates) is archived, the archive read back, and
+    /// only then removed; the archive holds every file.
+    #[test]
+    fn a_dirty_checkout_is_archived_then_retired() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "dirty", |worktree| {
+            std::fs::write(worktree.join("base.txt"), "changed, not committed\n").unwrap();
+            std::fs::write(worktree.join("notes.txt"), "untracked notes\n").unwrap();
+            std::fs::write(worktree.join("secrets.local"), "only here\n").unwrap();
+        });
+
+        let report = run(&mut broker);
+
+        assert_eq!(report.retired_archived, 1, "{report:#?}");
+        assert!(!worktree.exists());
+        assert!(is_cleaned(&broker, session.id));
+        let archive = archives(&broker, session.id)
+            .pop()
+            .expect("a verified archive was kept");
+        assert_eq!(
+            std::fs::read_to_string(archive.join("untracked/notes.txt")).unwrap(),
+            "untracked notes\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(archive.join("ignored/secrets.local")).unwrap(),
+            "only here\n"
+        );
+        let patch = std::fs::read_to_string(archive.join("unstaged.patch")).unwrap();
+        assert!(patch.contains("+changed, not committed"), "{patch}");
+    }
+
+    /// A commit no delivery target holds is bundled; the bundle restores it.
+    #[test]
+    fn an_unlanded_commit_is_bundled_then_retired() {
+        let (_owner, _storage, mut broker) = fixture();
+        let mut head = String::new();
+        let (session, worktree) = closed(&mut broker, "unlanded", |worktree| {
+            std::fs::write(worktree.join("work.txt"), "unlanded\n").unwrap();
+            git(worktree, &["add", "work.txt"]);
+            git(worktree, &["commit", "-qm", "unlanded work"]);
+            head = git(worktree, &["rev-parse", "HEAD"]).trim().to_string();
+        });
+
+        let report = run(&mut broker);
+
+        assert_eq!(report.retired_archived, 1, "{report:#?}");
+        assert!(!worktree.exists());
+        let archive = archives(&broker, session.id).pop().expect("an archive");
+        let bundle = archive.join("commits.bundle");
+        let root = broker.main_root().to_path_buf();
+        git(&root, &["bundle", "verify", bundle.to_str().unwrap()]);
+        let heads = git(&root, &["bundle", "list-heads", bundle.to_str().unwrap()]);
+        assert!(heads.contains(&head), "{heads}");
+    }
+
+    /// An archive over the cap keeps the checkout and is shown by session id.
+    #[test]
+    fn an_archive_over_the_cap_keeps_the_checkout() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "too large", |worktree| {
+            std::fs::write(worktree.join("notes.txt"), "more than one byte\n").unwrap();
+        });
+        let _cap = retire_archive_cap_for_test(1);
+
+        let report = run(&mut broker);
+
+        assert_eq!(
+            report.kept.get("archive_too_large"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert!(worktree.join("notes.txt").exists(), "kept untouched");
+        assert!(broker.checkout_retirement_too_large().contains(&session.id));
+        let view = broker.status(crate::clock::epoch_ms()).unwrap();
+        let advice = view
+            .advice
+            .iter()
+            .find(|advice| advice.id == "cleanup.retire-archive-too-large")
+            .expect("shown");
+        assert_eq!(advice.session_id, Some(session.id));
+        let shown = serde_json::to_string(advice).unwrap();
+        assert!(!shown.contains(&session.worktree_path), "{shown}");
+    }
+
+    /// An open session's checkout is never touched, and a closed one a
+    /// process still uses is kept under that precondition.
+    #[test]
+    fn open_or_used_checkouts_are_never_touched() {
+        let (_owner, _storage, mut broker) = fixture();
+        let open = broker.start_worktree("still open", None).unwrap();
+        let (used, used_worktree) = closed(&mut broker, "in use", |_| {});
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+                pid: std::process::id(),
+                command: "build".into(),
+                descriptor: "cwd".into(),
+                file_type: Some("DIR".into()),
+                path: std::fs::canonicalize(&used_worktree).unwrap(),
+            }]),
+        ));
+
+        let report = run(&mut broker);
+
+        assert_eq!(
+            report.kept.get("process_using_checkout"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert!(used_worktree.exists());
+        assert!(!is_cleaned(&broker, used.id));
+        assert!(Path::new(&open.worktree_path).join("base.txt").exists());
+        assert_eq!(report.examined, 1, "the open session is never judged");
+    }
+
+    /// A backlog of closed checkouts is cleared in one run, with the open
+    /// sessions' paths resolved once for the whole run.
+    #[test]
+    fn a_backlog_is_cleared_in_one_run_resolving_open_paths_once() {
+        let (_owner, _storage, mut broker) = fixture();
+        let _open = broker.start_worktree("open meanwhile", None).unwrap();
+        let backlog = (0..5)
+            .map(|index| closed(&mut broker, &format!("backlog {index}"), |_| {}))
+            .collect::<Vec<_>>();
+        let recorder = crate::phase_telemetry::Recorder::default();
+
+        let report = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            run(&mut broker)
+        };
+
+        assert_eq!(report.examined, 5, "{report:#?}");
+        assert_eq!(report.retired_clean, 5, "{report:#?}");
+        assert!(report.lap_complete);
+        assert_eq!(report.open_path_resolutions, 1);
+        assert_eq!(
+            recorder
+                .totals()
+                .1
+                .get("checkout_retirement_open_paths")
+                .copied(),
+            Some(1),
+            "open paths resolved once per run, not per page or session"
+        );
+        for (session, worktree) in backlog {
+            assert!(!worktree.exists());
+            assert!(is_cleaned(&broker, session.id));
+        }
     }
 }

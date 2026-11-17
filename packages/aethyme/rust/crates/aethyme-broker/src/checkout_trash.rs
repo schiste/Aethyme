@@ -1,32 +1,51 @@
-//! Retired checkouts: renamed into a `.trash` directory beside them, then
-//! deleted later by one host-wide, self-paced deleter.
+//! Retired checkouts: renamed into a broker trash directory inside their
+//! worktree pool, then deleted later by one host-wide, self-paced deleter.
 //!
 //! Removing a checkout used to mean `git worktree remove`, which unlinks the
 //! whole tree (often hundreds of thousands of build outputs) inside the
 //! caller's deadline and under the repository lifecycle claim. Here the
-//! caller does two O(1) steps instead: `rename(2)` the directory into the
-//! pool's `.trash` (same parent, so the same volume) and drop its Git
-//! registration (the worktree admin directory). The branch ref is never
-//! touched. The tree is then unlinked by [`drain_trash`], which runs from the
-//! background worker, one at a time per host, at a fixed rate that slows
-//! under load but never below a floor, never waits for memory pressure, and
-//! runs unpaced when the volume is below its headroom.
+//! caller does two O(1) steps instead: `renameat(2)` the checkout into the
+//! pool's trash (same parent directory, so the same volume) and drop its Git
+//! registration. The branch ref is never touched. The deleter later unlinks
+//! the tree at a fixed rate that slows under load but never below a floor,
+//! never waits for memory pressure, and runs unpaced below the disk headroom.
+//!
+//! Scope is narrow on purpose:
+//!
+//! - Only a checkout under a broker-owned pool root (proved by the broker's
+//!   own records, by the caller) is moved; everything else is removed by Git
+//!   as before.
+//! - The trash is [`TRASH_DIR`], created fresh with mode 0700 and a marker
+//!   file; an existing one that is a symlink, not a directory, not owned by
+//!   this user, open to others, or without the marker is refused. Every step
+//!   works relative to directory descriptors opened without following links.
+//! - The registration is looked up from the repository side and must name
+//!   exactly this checkout; a worktree locked by anyone but the broker is
+//!   refused.
+//! - The deleter deletes only entries that match the broker's name format
+//!   and that the broker recorded at rename time with their device and inode,
+//!   re-checked on the pinned directory before deletion. Anything else in the
+//!   trash is left alone and counted (`checkout_trash_unrecognized`). The tree
+//!   removal never follows a symlink and never crosses a mount point.
 //!
 //! Only a caller that has already established that every byte of the
 //! checkout is in Git, in a verified recovery archive, or catalogued
-//! regenerable output may move it here: the trash is deleted without
-//! further checks.
+//! regenerable output may move it here.
 
+use std::collections::BTreeMap;
+use std::ffi::CString;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// The directory, beside the checkouts of one pool, that holds retired
-/// checkouts until the deleter removes them. Pool scanners skip names that
-/// start with a dot (`is_worktree_root_infrastructure`).
-pub(crate) const TRASH_DIR: &str = ".trash";
-/// Suffix of the sidecar file counting failed deletions of one entry.
-const FAILURES_SUFFIX: &str = ".failures";
+/// The broker's trash directory inside one worktree pool. Pool scanners skip
+/// names that start with a dot (`is_worktree_root_infrastructure`).
+pub(crate) const TRASH_DIR: &str = ".aethyme-checkout-trash";
+/// Marker file proving the trash directory is the broker's.
+const TRASH_MARKER: &str = ".aethyme-trash-marker";
+const TRASH_MARKER_CONTENT: &str = "aethyme checkout trash v1\n";
 /// After this many failed deletions an entry is reported by name and tried
 /// after every other entry, so it never wedges the queue.
 pub(crate) const TRASH_FAILURE_REPORT_AFTER: u32 = 3;
@@ -39,85 +58,293 @@ pub(crate) const DELETER_LOCK_FILE: &str = "checkout-trash-deleter.lock";
 
 static TRASH_NONCE: AtomicU64 = AtomicU64::new(0);
 
-/// The trash directory of the pool holding `worktree`.
-pub(crate) fn trash_dir_beside(worktree: &Path) -> Option<PathBuf> {
-    worktree.parent().map(|pool| pool.join(TRASH_DIR))
+/// What the broker recorded about one trash entry when it moved a checkout
+/// in: the directory's identity, its session, and failed deletions so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TrashRow {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) session_id: i64,
+    #[serde(default)]
+    pub(crate) failures: u32,
 }
+
+/// Recorded trash entries: trash directory path, then entry name.
+pub(crate) type TrashRows = BTreeMap<PathBuf, BTreeMap<String, TrashRow>>;
 
 /// A checkout moved into the trash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrashedCheckout {
-    pub(crate) path: PathBuf,
+    pub(crate) trash_dir: PathBuf,
+    pub(crate) entry: String,
+    pub(crate) row: TrashRow,
     /// The Git registration (worktree admin directory) is gone. When it could
     /// not be removed, `git worktree prune` drops it later: it names a path
     /// that no longer exists.
     pub(crate) registration_removed: bool,
 }
 
-/// The worktree admin directory a linked checkout's `.git` file names.
-fn worktree_admin_dir(worktree: &Path) -> Result<PathBuf, String> {
-    let dot_git = worktree.join(".git");
-    let metadata = std::fs::symlink_metadata(&dot_git)
-        .map_err(|error| format!("cannot read {}: {error}", dot_git.display()))?;
-    if !metadata.is_file() {
-        return Err(format!(
-            "{} is not a linked checkout's .git file",
-            dot_git.display()
-        ));
+impl TrashedCheckout {
+    pub(crate) fn path(&self) -> PathBuf {
+        self.trash_dir.join(&self.entry)
     }
-    let text = std::fs::read_to_string(&dot_git)
-        .map_err(|error| format!("cannot read {}: {error}", dot_git.display()))?;
-    let target = text
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix("gitdir:"))
-        .map(str::trim)
-        .filter(|target| !target.is_empty())
-        .ok_or_else(|| format!("{} names no gitdir", dot_git.display()))?;
-    let target = Path::new(target);
-    Ok(if target.is_absolute() {
-        target.to_path_buf()
+}
+
+fn c_name(name: &str) -> std::io::Result<CString> {
+    CString::new(name).map_err(|_| std::io::Error::other("a name holds a NUL byte"))
+}
+
+fn c_path(path: &Path) -> std::io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("a path holds a NUL byte"))
+}
+
+fn checked(result: libc::c_int) -> std::io::Result<libc::c_int> {
+    if result < 0 {
+        Err(std::io::Error::last_os_error())
     } else {
-        worktree.join(target)
+        Ok(result)
+    }
+}
+
+/// Open a directory without following a symlink at its last component.
+fn open_dir_nofollow(path: &Path) -> std::io::Result<OwnedFd> {
+    let path = c_path(path)?;
+    // SAFETY: `path` is NUL-terminated and outlives the call.
+    let fd = checked(unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    })?;
+    // SAFETY: `fd` was just returned by `open` and is owned by nobody else.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Open `name` inside `dir` as a directory, never following a symlink.
+fn openat_dir_nofollow(dir: RawFd, name: &str) -> std::io::Result<OwnedFd> {
+    let name = c_name(name)?;
+    // SAFETY: `name` is NUL-terminated and `dir` is an open descriptor.
+    let fd = checked(unsafe {
+        libc::openat(
+            dir,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    })?;
+    // SAFETY: as above.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn fstat(fd: RawFd) -> std::io::Result<libc::stat> {
+    // SAFETY: an all-zero stat is a valid output buffer.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is open and `stat` is writable.
+    checked(unsafe { libc::fstat(fd, &mut stat) })?;
+    Ok(stat)
+}
+
+fn fstatat_nofollow(dir: RawFd, name: &str) -> std::io::Result<libc::stat> {
+    let name = c_name(name)?;
+    // SAFETY: an all-zero stat is a valid output buffer.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `name` is NUL-terminated, `dir` open, `stat` writable.
+    checked(unsafe { libc::fstatat(dir, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) })?;
+    Ok(stat)
+}
+
+fn is_directory(stat: &libc::stat) -> bool {
+    stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+}
+
+/// The broker trash of one pool, opened and verified.
+pub(crate) struct TrashDir {
+    pool: OwnedFd,
+    trash: OwnedFd,
+    path: PathBuf,
+}
+
+impl TrashDir {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Open the trash of `pool`, creating it fresh (mode 0700, with the marker)
+/// when it does not exist. An existing one is used only when it is a real
+/// directory (no symlink is followed), owned by this user, closed to group
+/// and others, and holds the broker's marker.
+pub(crate) fn open_trash(pool: &Path) -> Result<TrashDir, String> {
+    let pool_fd = open_dir_nofollow(pool)
+        .map_err(|error| format!("cannot open the pool {}: {error}", pool.display()))?;
+    let name = c_name(TRASH_DIR).map_err(|error| error.to_string())?;
+    // SAFETY: `name` is NUL-terminated and `pool_fd` is open.
+    let created = match checked(unsafe { libc::mkdirat(pool_fd.as_raw_fd(), name.as_ptr(), 0o700) })
+    {
+        Ok(_) => true,
+        Err(error) if error.raw_os_error() == Some(libc::EEXIST) => false,
+        Err(error) => return Err(format!("cannot create the trash: {error}")),
+    };
+    let trash_fd = openat_dir_nofollow(pool_fd.as_raw_fd(), TRASH_DIR)
+        .map_err(|error| format!("the trash is not a real directory: {error}"))?;
+    let stat = fstat(trash_fd.as_raw_fd()).map_err(|error| error.to_string())?;
+    // SAFETY: `geteuid` has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    if !is_directory(&stat) || stat.st_uid != uid || stat.st_mode & 0o077 != 0 {
+        return Err("the trash is not a private directory owned by this user".into());
+    }
+    let marker = c_name(TRASH_MARKER).map_err(|error| error.to_string())?;
+    if created {
+        // SAFETY: `marker` is NUL-terminated and `trash_fd` is open.
+        let fd = checked(unsafe {
+            libc::openat(
+                trash_fd.as_raw_fd(),
+                marker.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        })
+        .map_err(|error| format!("cannot mark the trash: {error}"))?;
+        // SAFETY: `fd` was just opened and is owned here.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        std::io::Write::write_all(&mut file, TRASH_MARKER_CONTENT.as_bytes())
+            .map_err(|error| format!("cannot mark the trash: {error}"))?;
+    } else {
+        // SAFETY: as above, read-only.
+        let fd = checked(unsafe {
+            libc::openat(
+                trash_fd.as_raw_fd(),
+                marker.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        })
+        .map_err(|_| "the trash directory lacks the broker's marker".to_string())?;
+        // SAFETY: `fd` was just opened and is owned here.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut content = String::new();
+        std::io::Read::read_to_string(&mut file, &mut content)
+            .map_err(|error| format!("cannot read the trash marker: {error}"))?;
+        if content != TRASH_MARKER_CONTENT {
+            return Err("the trash directory's marker is not the broker's".into());
+        }
+    }
+    Ok(TrashDir {
+        pool: pool_fd,
+        trash: trash_fd,
+        path: pool.join(TRASH_DIR),
     })
 }
 
-/// Move `worktree`, a linked checkout of the repository whose Git common
-/// directory is `common_dir`, into the trash beside it and drop its Git
-/// registration. `session_id` names the entry. Environments bound to the
-/// checkout are destroyed first (their hooks live in it), and a lock the
-/// broker placed on the worktree is released; a lock anyone else placed
-/// refuses the move. Nothing is unlinked here except the small admin
-/// directory, after the rename.
-///
-/// The caller must have proven that every byte of the checkout is in Git, in
-/// a verified archive, or catalogued regenerable output.
-pub(crate) fn move_worktree_to_trash(
+/// Whether `name` has the shape of an entry the broker names:
+/// `<13-digit ms>-<session>-<pid>-<nonce>`, all decimal.
+pub(crate) fn is_broker_entry_name(name: &str) -> bool {
+    let parts = name.split('-').collect::<Vec<_>>();
+    parts.len() == 4
+        && parts[0].len() == 13
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// The registration (worktree admin directory) of `worktree`, looked up from
+/// the repository side: Git must list the checkout, exactly one directory
+/// directly under `<common>/worktrees/` must have a `gitdir` naming
+/// `<worktree>/.git`, and the checkout's own `.git` file must point at that
+/// same directory. Any mismatch is an error.
+pub(crate) fn registration_of(
+    repo: &crate::git::GitRepo,
     common_dir: &Path,
     worktree: &Path,
-    session_id: i64,
-) -> Result<TrashedCheckout, String> {
-    let _span = crate::phase_telemetry::span("checkout_trash_move");
-    let metadata = std::fs::symlink_metadata(worktree)
-        .map_err(|error| format!("cannot inspect {}: {error}", worktree.display()))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(format!("{} is not a real directory", worktree.display()));
-    }
-    let admin = worktree_admin_dir(worktree)?;
-    let canonical_admin = admin
+) -> Result<PathBuf, String> {
+    let canonical_worktree = worktree
         .canonicalize()
-        .map_err(|error| format!("cannot resolve {}: {error}", admin.display()))?;
+        .map_err(|error| format!("cannot resolve {}: {error}", worktree.display()))?;
+    let listed = repo
+        .worktree_inventory()
+        .map_err(|error| format!("cannot list worktrees: {error}"))?
+        .iter()
+        .any(|entry| entry.path.canonicalize().ok().as_ref() == Some(&canonical_worktree));
+    if !listed {
+        return Err("Git does not list this checkout as a worktree".into());
+    }
+    let expected_dot_git = canonical_worktree.join(".git");
     let registrations = common_dir
         .join("worktrees")
         .canonicalize()
         .map_err(|error| format!("cannot resolve the worktree registrations: {error}"))?;
-    if canonical_admin.parent() != Some(registrations.as_path()) {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(&registrations)
+        .map_err(|error| format!("cannot read the worktree registrations: {error}"))?
+        .filter_map(Result::ok)
+    {
+        let admin = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&admin) else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(admin.join("gitdir")) else {
+            continue;
+        };
+        let named = PathBuf::from(text.trim());
+        if named.canonicalize().ok().as_ref() == Some(&expected_dot_git) {
+            found.push(admin);
+        }
+    }
+    let [admin] = found.as_slice() else {
+        return Err(format!("{} registrations name this checkout", found.len()));
+    };
+    let pointed = std::fs::read_to_string(&expected_dot_git)
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .next()
+                .and_then(|line| line.strip_prefix("gitdir:"))
+                .map(|target| PathBuf::from(target.trim()))
+        })
+        .map(|target| {
+            if target.is_absolute() {
+                target
+            } else {
+                canonical_worktree.join(target)
+            }
+        })
+        .and_then(|target| target.canonicalize().ok());
+    if pointed.as_ref() != admin.canonicalize().ok().as_ref() {
+        return Err("the checkout's .git file names another registration".into());
+    }
+    Ok(admin.clone())
+}
+
+/// Move `worktree`, a checkout directly inside the broker-owned pool `pool`,
+/// into the pool's trash and drop its Git registration (looked up from
+/// `repo`, whose Git common directory is `common_dir`). A lock the broker
+/// placed is released; any other lock refuses the move. Environments bound
+/// to the checkout are destroyed first (their hooks live in it). Nothing in
+/// the checkout is unlinked here.
+pub(crate) fn move_worktree_to_trash(
+    repo: &crate::git::GitRepo,
+    common_dir: &Path,
+    pool: &Path,
+    worktree: &Path,
+    session_id: i64,
+) -> Result<TrashedCheckout, String> {
+    let _span = crate::phase_telemetry::span("checkout_trash_move");
+    if worktree.parent() != Some(pool) {
         return Err(format!(
-            "{} is not registered with this repository",
-            worktree.display()
+            "{} is not directly inside the pool {}",
+            worktree.display(),
+            pool.display()
         ));
     }
-    let lock = canonical_admin.join("locked");
+    let name = worktree
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{} has no usable name", worktree.display()))?
+        .to_owned();
+    let admin = registration_of(repo, common_dir, worktree)?;
+    let lock = admin.join("locked");
     match std::fs::read_to_string(&lock) {
         Ok(reason) if reason.trim() == crate::git::BROKER_WORKTREE_LOCK_REASON => {
             std::fs::remove_file(&lock)
@@ -125,34 +352,50 @@ pub(crate) fn move_worktree_to_trash(
         }
         Ok(reason) => {
             return Err(format!(
-                "{} is locked ({}); its lock is somebody else's protection",
-                worktree.display(),
+                "the worktree is locked ({}); its lock is somebody else's protection",
                 reason.trim()
             ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("cannot read the worktree lock: {error}")),
     }
+    let trash = open_trash(pool)?;
+    let source = fstatat_nofollow(trash.pool.as_raw_fd(), &name)
+        .map_err(|error| format!("cannot inspect the checkout: {error}"))?;
+    if !is_directory(&source) {
+        return Err(format!("{} is not a real directory", worktree.display()));
+    }
     crate::environments::lifecycle::destroy_for_worktree(worktree)?;
-    let trash = trash_dir_beside(worktree)
-        .ok_or_else(|| format!("{} has no parent directory", worktree.display()))?;
-    std::fs::create_dir_all(&trash)
-        .map_err(|error| format!("cannot create {}: {error}", trash.display()))?;
-    let entry = trash.join(format!(
+    let entry = format!(
         "{:013}-{session_id}-{}-{}",
         crate::clock::epoch_ms().max(0),
         std::process::id(),
         TRASH_NONCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::rename(worktree, &entry).map_err(|error| {
-        format!(
-            "cannot move {} into {}: {error}",
-            worktree.display(),
-            trash.display()
+    );
+    let from = c_name(&name).map_err(|error| error.to_string())?;
+    let to = c_name(&entry).map_err(|error| error.to_string())?;
+    // SAFETY: both names are NUL-terminated; both descriptors are open
+    // directories on the same volume (the trash is inside the pool).
+    checked(unsafe {
+        libc::renameat(
+            trash.pool.as_raw_fd(),
+            from.as_ptr(),
+            trash.trash.as_raw_fd(),
+            to.as_ptr(),
         )
-    })?;
+    })
+    .map_err(|error| format!("cannot move the checkout into the trash: {error}"))?;
+    let moved = fstatat_nofollow(trash.trash.as_raw_fd(), &entry)
+        .map_err(|error| format!("cannot inspect the trashed checkout: {error}"))?;
+    #[allow(clippy::unnecessary_cast)]
+    let row = TrashRow {
+        device: moved.st_dev as u64,
+        inode: moved.st_ino as u64,
+        session_id,
+        failures: 0,
+    };
     crate::phase_telemetry::add("checkout_trashed", Duration::ZERO);
-    let registration_removed = match std::fs::remove_dir_all(&canonical_admin) {
+    let registration_removed = match std::fs::remove_dir_all(&admin) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(_) => {
@@ -161,7 +404,9 @@ pub(crate) fn move_worktree_to_trash(
         }
     };
     Ok(TrashedCheckout {
-        path: entry,
+        trash_dir: trash.path.clone(),
+        entry,
+        row,
         registration_removed,
     })
 }
@@ -232,8 +477,8 @@ impl UnlinkLimiter {
         };
         let due = Duration::from_secs_f64(self.unlinks as f64 / f64::from(per_second));
         let elapsed = self.started.elapsed();
-        // Sleep in batches of at least 5 ms so the pacing costs no syscall
-        // per unlink.
+        // Sleep in batches of at least 5 ms so pacing costs no syscall per
+        // unlink.
         if let Some(ahead) = due.checked_sub(elapsed)
             && ahead >= Duration::from_millis(5)
         {
@@ -274,76 +519,27 @@ pub(crate) fn try_deleter_lock(path: &Path) -> std::io::Result<Option<DeleterLoc
     Ok(Some(DeleterLock { _lock: lock }))
 }
 
-/// One retired checkout waiting for the deleter.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrashEntry {
-    pub(crate) path: PathBuf,
-    pub(crate) name: String,
-    pub(crate) failures: u32,
-}
-
-fn failures_path(entry: &Path) -> PathBuf {
-    let mut name = entry.as_os_str().to_os_string();
-    name.push(FAILURES_SUFFIX);
-    PathBuf::from(name)
-}
-
-fn read_failures(entry: &Path) -> u32 {
-    std::fs::read_to_string(failures_path(entry))
-        .ok()
-        .and_then(|text| text.trim().parse().ok())
-        .unwrap_or(0)
-}
-
-/// The entries of one trash directory in deletion order: oldest first (the
-/// name starts with the time it was retired), entries that failed
-/// [`TRASH_FAILURE_REPORT_AFTER`] times after all others.
-pub(crate) fn trash_entries(trash: &Path) -> Vec<TrashEntry> {
-    let Ok(listing) = std::fs::read_dir(trash) else {
-        return Vec::new();
-    };
-    let mut entries = listing
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name().to_str()?.to_owned();
-            if name.starts_with('.') || name.ends_with(FAILURES_SUFFIX) {
-                return None;
-            }
-            let path = entry.path();
-            let failures = read_failures(&path);
-            Some(TrashEntry {
-                path,
-                name,
-                failures,
-            })
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|left, right| {
-        (left.failures >= TRASH_FAILURE_REPORT_AFTER, &left.name)
-            .cmp(&(right.failures >= TRASH_FAILURE_REPORT_AFTER, &right.name))
-    });
-    entries
-}
-
 /// Clear the user-immutable and append-only flags that make an unlink fail
 /// with `EPERM` on macOS (Finder's "Locked"). Best effort, never follows a
-/// link; nothing to do elsewhere.
+/// link, never leaves the entry; nothing to do elsewhere.
 #[cfg(target_os = "macos")]
 fn clear_deletion_flags(root: &Path) {
     fn visit(path: &Path, depth: usize) {
-        use std::os::unix::ffi::OsStrExt;
         if depth > 256 {
             return;
         }
-        if let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if metadata.file_type().is_symlink() {
+            return;
+        }
+        if let Ok(c_path) = c_path(path) {
             // SAFETY: `c_path` is NUL-terminated and outlives the call.
             unsafe {
                 libc::lchflags(c_path.as_ptr(), 0);
             }
         }
-        let Ok(metadata) = std::fs::symlink_metadata(path) else {
-            return;
-        };
         if metadata.is_dir()
             && let Ok(children) = std::fs::read_dir(path)
         {
@@ -370,17 +566,23 @@ pub(crate) struct TrashDrainReport {
     pub(crate) failed: Vec<String>,
     /// Entries that have failed at least [`TRASH_FAILURE_REPORT_AFTER`] times.
     pub(crate) reported: Vec<String>,
+    /// Names in a trash the broker did not record (left alone).
+    pub(crate) unrecognized: usize,
+    /// Trash directories that failed verification (left alone).
+    pub(crate) invalid_trash_dirs: usize,
     pub(crate) pace: Option<DeleterPace>,
-    /// Entries still in the trash after the run.
+    /// Recorded entries still in the trash after the run.
     pub(crate) entries_pending: usize,
 }
 
-/// Delete the entries of `trash_dirs` oldest first until `deadline`, at
-/// `pace`. The caller holds the deleter lock. A deadline stops an entry
-/// resumably; a failed entry gets its deletion flags cleared and its failure
-/// counted, and the run goes on with the next entry.
+/// Delete recorded entries of the trash directories in `rows` oldest first
+/// until `deadline`, at `pace`; `rows` is updated (removed entries dropped,
+/// failures counted, entries gone missing forgotten). The caller holds the
+/// deleter lock and persists `rows`. Each trash directory is re-verified,
+/// each entry must have the broker's name format and its recorded device and
+/// inode, re-checked on the pinned directory immediately before deletion.
 pub(crate) fn drain_trash(
-    trash_dirs: &[PathBuf],
+    rows: &mut TrashRows,
     deadline: Instant,
     pace: DeleterPace,
 ) -> TrashDrainReport {
@@ -402,14 +604,70 @@ pub(crate) fn drain_trash(
     // The worker's unattended pacer would stop this deleter on memory
     // pressure; it paces itself instead.
     crate::gc::unattended_pacing::without_pacer(|| {
-        'dirs: for trash in trash_dirs {
-            for entry in trash_entries(trash) {
+        'dirs: for (trash_path, entries) in rows.iter_mut() {
+            let Some(pool) = trash_path.parent() else {
+                report.invalid_trash_dirs += 1;
+                continue;
+            };
+            if trash_path.file_name().and_then(|name| name.to_str()) != Some(TRASH_DIR) {
+                report.invalid_trash_dirs += 1;
+                continue;
+            }
+            let Ok(trash) = open_trash(pool) else {
+                report.invalid_trash_dirs += 1;
+                crate::phase_telemetry::add("checkout_trash_invalid_dir", Duration::ZERO);
+                continue;
+            };
+            let listed = std::fs::read_dir(trash.path())
+                .map(|listing| {
+                    listing
+                        .filter_map(Result::ok)
+                        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+                        .filter(|name| name != TRASH_MARKER)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for name in &listed {
+                if !is_broker_entry_name(name) || !entries.contains_key(name) {
+                    report.unrecognized += 1;
+                    crate::phase_telemetry::add("checkout_trash_unrecognized", Duration::ZERO);
+                }
+            }
+            // Recorded entries no longer present are forgotten.
+            entries.retain(|name, _| listed.contains(name));
+            let mut order = entries
+                .iter()
+                .filter(|(name, _)| is_broker_entry_name(name))
+                .map(|(name, row)| (row.failures >= TRASH_FAILURE_REPORT_AFTER, name.clone()))
+                .collect::<Vec<_>>();
+            order.sort();
+            for (_, name) in order {
                 if Instant::now() >= deadline {
                     break 'dirs;
                 }
+                let Some(row) = entries.get(&name).copied() else {
+                    continue;
+                };
+                let path = trash.path().join(&name);
+                let pinned = match crate::gc::PinnedTreeRemoval::open(&path) {
+                    Ok(pinned) => pinned,
+                    Err(_) => {
+                        report.unrecognized += 1;
+                        continue;
+                    }
+                };
+                if pinned.object_identity().ok()
+                    != Some(crate::gc::TreeObjectIdentity {
+                        device: row.device,
+                        inode: row.inode,
+                    })
+                {
+                    report.unrecognized += 1;
+                    crate::phase_telemetry::add("checkout_trash_unrecognized", Duration::ZERO);
+                    continue;
+                }
                 let mut limiter = UnlinkLimiter::new(pace);
-                match crate::gc::remove_condemned_tree_with_progress_and_observed_file_bytes_and_guard(
-                    &entry.path,
+                match pinned.remove_with_progress_and_observed_file_bytes_and_guard(
                     None,
                     Some(deadline),
                     || {
@@ -421,14 +679,11 @@ pub(crate) fn drain_trash(
                         report.entries_removed += 1;
                         report.unlinks = report.unlinks.saturating_add(unlinks);
                         report.bytes = report.bytes.saturating_add(bytes);
-                        let sidecar = failures_path(&entry.path);
-                        if sidecar.exists() {
-                            crate::warn_unrecorded(
-                                "clear a removed trash entry's failure count",
-                                std::fs::remove_file(sidecar),
-                            );
-                        }
-                        crate::phase_telemetry::add("checkout_trash_entries_removed", Duration::ZERO);
+                        entries.remove(&name);
+                        crate::phase_telemetry::add(
+                            "checkout_trash_entries_removed",
+                            Duration::ZERO,
+                        );
                     }
                     Ok((crate::gc::TreeRemoval::Interrupted, unlinks, bytes)) => {
                         report.entries_interrupted += 1;
@@ -438,27 +693,23 @@ pub(crate) fn drain_trash(
                     }
                     Err(error) => {
                         report.unlinks = report.unlinks.saturating_add(error.entries_reclaimed);
-                        clear_deletion_flags(&entry.path);
-                        let failures = entry.failures.saturating_add(1);
-                        crate::warn_unrecorded(
-                            "count a failed checkout trash deletion",
-                            std::fs::write(failures_path(&entry.path), failures.to_string()),
-                        );
-                        crate::phase_telemetry::add("checkout_trash_entry_failed", Duration::ZERO);
-                        report.failed.push(entry.name.clone());
-                        if failures >= TRASH_FAILURE_REPORT_AFTER {
-                            report.reported.push(entry.name.clone());
+                        clear_deletion_flags(&path);
+                        if let Some(row) = entries.get_mut(&name) {
+                            row.failures = row.failures.saturating_add(1);
+                            if row.failures >= TRASH_FAILURE_REPORT_AFTER {
+                                report.reported.push(name.clone());
+                            }
                         }
+                        crate::phase_telemetry::add("checkout_trash_entry_failed", Duration::ZERO);
+                        report.failed.push(name.clone());
                     }
                 }
             }
         }
     });
     crate::phase_telemetry::add("checkout_trash_drain_time", started.elapsed());
-    report.entries_pending = trash_dirs
-        .iter()
-        .map(|trash| trash_entries(trash).len())
-        .sum();
+    rows.retain(|_, entries| !entries.is_empty());
+    report.entries_pending = rows.values().map(BTreeMap::len).sum();
     report
 }
 
@@ -483,81 +734,116 @@ mod tests {
         );
     }
 
-    /// A repository with one commit and a linked checkout in a pool beside it.
-    fn repository_with_checkout() -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("main");
-        std::fs::create_dir_all(&main).unwrap();
-        git(&main, &["init", "-q", "-b", "main"]);
-        std::fs::write(main.join("base.txt"), "base\n").unwrap();
-        git(&main, &["add", "base.txt"]);
-        git(&main, &["commit", "-qm", "base"]);
-        let pool = dir.path().join("pool");
-        std::fs::create_dir_all(&pool).unwrap();
-        let checkout = pool.join("checkout");
-        git(
-            &main,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "session-branch",
-                checkout.to_str().unwrap(),
-            ],
-        );
-        (dir, main, checkout)
+    /// A repository with one commit and two linked checkouts in a pool.
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        main: PathBuf,
+        pool: PathBuf,
+        repo: crate::git::GitRepo,
     }
 
-    /// Retiring renames the checkout into the pool's trash before anything is
-    /// unlinked: the moved tree still holds every file, Git no longer lists
-    /// the worktree, and the branch is untouched.
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let main = dir.path().join("main");
+            std::fs::create_dir_all(&main).unwrap();
+            git(&main, &["init", "-q", "-b", "main"]);
+            std::fs::write(main.join("base.txt"), "base\n").unwrap();
+            git(&main, &["add", "base.txt"]);
+            git(&main, &["commit", "-qm", "base"]);
+            let pool = dir.path().join("pool");
+            std::fs::create_dir_all(&pool).unwrap();
+            let repo = crate::git::GitRepo::discover(&main).unwrap();
+            Self {
+                _dir: dir,
+                main,
+                pool,
+                repo,
+            }
+        }
+
+        fn checkout(&self, name: &str) -> PathBuf {
+            let path = self.pool.join(name);
+            git(
+                &self.main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &format!("branch-{name}"),
+                    path.to_str().unwrap(),
+                ],
+            );
+            path
+        }
+
+        fn common(&self) -> PathBuf {
+            self.main.join(".git")
+        }
+
+        fn trash(&self, checkout: &Path, session_id: i64) -> Result<TrashedCheckout, String> {
+            move_worktree_to_trash(&self.repo, &self.common(), &self.pool, checkout, session_id)
+        }
+    }
+
+    fn rows_of(trashed: &TrashedCheckout) -> TrashRows {
+        let mut rows = TrashRows::new();
+        rows.entry(trashed.trash_dir.clone())
+            .or_default()
+            .insert(trashed.entry.clone(), trashed.row);
+        rows
+    }
+
+    /// Retiring renames the checkout into the pool's private, marked trash
+    /// before anything is unlinked: every file is still there, Git no longer
+    /// lists the worktree, the branch is untouched.
     #[test]
     fn a_checkout_is_renamed_into_the_trash_before_any_unlink() {
-        let (_dir, main, checkout) = repository_with_checkout();
+        let fixture = Fixture::new();
+        let checkout = fixture.checkout("one");
         std::fs::create_dir_all(checkout.join("target/debug")).unwrap();
         std::fs::write(checkout.join("target/debug/artifact"), "built\n").unwrap();
-        let common = main.join(".git");
 
-        let trashed = move_worktree_to_trash(&common, &checkout, 7).unwrap();
+        let trashed = fixture.trash(&checkout, 7).unwrap();
 
         assert!(!checkout.exists(), "the checkout path is free at once");
-        assert!(
-            trashed
-                .path
-                .starts_with(checkout.parent().unwrap().join(TRASH_DIR))
-        );
+        assert_eq!(trashed.trash_dir, fixture.pool.join(TRASH_DIR));
+        assert!(is_broker_entry_name(&trashed.entry));
         assert_eq!(
-            std::fs::read_to_string(trashed.path.join("target/debug/artifact")).unwrap(),
+            std::fs::read_to_string(trashed.path().join("target/debug/artifact")).unwrap(),
             "built\n",
             "nothing was unlinked by the move"
         );
         assert!(trashed.registration_removed);
         let listing = std::process::Command::new("git")
             .args(["worktree", "list", "--porcelain"])
-            .current_dir(&main)
+            .current_dir(&fixture.main)
             .output()
             .unwrap();
         let listing = String::from_utf8_lossy(&listing.stdout).into_owned();
-        assert!(!listing.contains("checkout"), "{listing}");
+        assert!(!listing.contains("pool/one"), "{listing}");
         let branch = std::process::Command::new("git")
-            .args(["rev-parse", "--verify", "refs/heads/session-branch"])
-            .current_dir(&main)
+            .args(["rev-parse", "--verify", "refs/heads/branch-one"])
+            .current_dir(&fixture.main)
             .output()
             .unwrap();
         assert!(branch.status.success(), "the branch ref is untouched");
-
-        let entries = trash_entries(&checkout.parent().unwrap().join(TRASH_DIR));
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].name.contains("-7-"), "{entries:?}");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(fixture.pool.join(TRASH_DIR))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
-    /// A worktree someone else locked is refused and left in place.
+    /// A worktree locked by its user is refused and left in place.
     #[test]
-    fn a_foreign_lock_refuses_the_move() {
-        let (_dir, main, checkout) = repository_with_checkout();
+    fn a_user_locked_worktree_is_refused() {
+        let fixture = Fixture::new();
+        let checkout = fixture.checkout("locked");
         git(
-            &main,
+            &fixture.main,
             &[
                 "worktree",
                 "lock",
@@ -566,75 +852,178 @@ mod tests {
                 checkout.to_str().unwrap(),
             ],
         );
-        let error = move_worktree_to_trash(&main.join(".git"), &checkout, 1).unwrap_err();
+        let error = fixture.trash(&checkout, 1).unwrap_err();
         assert!(error.contains("locked"), "{error}");
         assert!(checkout.join("base.txt").exists());
     }
 
-    /// A directory that is not a checkout of this repository is refused.
+    /// A checkout whose `.git` file points at another worktree's
+    /// registration is refused: the registration is looked up from the
+    /// repository side, and both must agree.
     #[test]
-    fn a_foreign_directory_is_refused() {
-        let (dir, main, _checkout) = repository_with_checkout();
-        let stray = dir.path().join("pool/stray");
+    fn a_dot_git_pointing_at_another_registration_is_refused() {
+        let fixture = Fixture::new();
+        let victim = fixture.checkout("victim");
+        let forger = fixture.checkout("forger");
+        let victim_pointer = std::fs::read_to_string(victim.join(".git")).unwrap();
+        std::fs::write(forger.join(".git"), victim_pointer).unwrap();
+        let error = fixture.trash(&forger, 1).unwrap_err();
+        assert!(!error.is_empty());
+        assert!(forger.exists());
+        assert!(
+            victim.join("base.txt").exists(),
+            "the other checkout is untouched"
+        );
+        let admin = fixture.common().join("worktrees/victim");
+        assert!(admin.exists(), "the other registration is untouched");
+    }
+
+    /// A directory Git does not list is refused.
+    #[test]
+    fn an_unregistered_directory_is_refused() {
+        let fixture = Fixture::new();
+        let stray = fixture.pool.join("stray");
         std::fs::create_dir_all(&stray).unwrap();
         std::fs::write(stray.join(".git"), "gitdir: /nowhere/at/all\n").unwrap();
-        assert!(move_worktree_to_trash(&main.join(".git"), &stray, 1).is_err());
+        assert!(fixture.trash(&stray, 1).is_err());
         assert!(stray.exists());
     }
 
-    fn fill(entry: &Path, files: usize) {
-        std::fs::create_dir_all(entry.join("a/b")).unwrap();
-        for index in 0..files {
-            std::fs::write(entry.join(format!("a/b/file-{index}")), "x").unwrap();
-        }
+    /// A checkout outside the pool it is said to belong to is refused.
+    #[test]
+    fn a_checkout_outside_the_pool_is_refused() {
+        let fixture = Fixture::new();
+        let elsewhere = fixture._dir.path().join("elsewhere");
+        git(
+            &fixture.main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "elsewhere",
+                elsewhere.to_str().unwrap(),
+            ],
+        );
+        let error = move_worktree_to_trash(
+            &fixture.repo,
+            &fixture.common(),
+            &fixture.pool,
+            &elsewhere,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.contains("not directly inside"), "{error}");
+        assert!(elsewhere.join("base.txt").exists());
     }
 
-    /// A run stopped part-way (its deadline, as a killed run would be) leaves
-    /// the entry in the trash, and the next run finishes it.
+    /// A pre-existing directory of the trash's name without the broker's
+    /// marker, and a symlink in its place, are both refused.
     #[test]
-    fn the_deleter_resumes_an_entry_stopped_part_way() {
-        let dir = tempfile::tempdir().unwrap();
-        let trash = dir.path().join(TRASH_DIR);
-        let entry = trash.join("0000000000001-1-1-0");
-        fill(&entry, 50);
-        // A tree half-removed by an earlier run.
-        for index in 0..25 {
-            std::fs::remove_file(entry.join(format!("a/b/file-{index}"))).unwrap();
-        }
-        let stopped = drain_trash(
-            std::slice::from_ref(&trash),
-            Instant::now(),
+    fn a_foreign_or_symlinked_trash_is_refused() {
+        let fixture = Fixture::new();
+        let checkout = fixture.checkout("one");
+        std::fs::create_dir(fixture.pool.join(TRASH_DIR)).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            fixture.pool.join(TRASH_DIR),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let error = fixture.trash(&checkout, 1).unwrap_err();
+        assert!(error.contains("marker"), "{error}");
+        assert!(checkout.join("base.txt").exists());
+
+        std::fs::remove_dir(fixture.pool.join(TRASH_DIR)).unwrap();
+        let elsewhere = fixture._dir.path().join("somewhere-else");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, fixture.pool.join(TRASH_DIR)).unwrap();
+        let error = fixture.trash(&checkout, 1).unwrap_err();
+        assert!(error.contains("not a real directory"), "{error}");
+        assert!(checkout.join("base.txt").exists());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    /// Only recorded entries are deleted: a name the broker never recorded,
+    /// and one whose identity differs from the record, are left alone and
+    /// counted.
+    #[test]
+    fn unrecorded_entries_are_left_alone() {
+        let fixture = Fixture::new();
+        let trashed = fixture.trash(&fixture.checkout("one"), 1).unwrap();
+        let stranger = trashed.trash_dir.join("0000000000001-9-9-9");
+        std::fs::create_dir(&stranger).unwrap();
+        std::fs::write(stranger.join("keep.txt"), "not ours\n").unwrap();
+        let odd = trashed.trash_dir.join("someone-elses");
+        std::fs::create_dir(&odd).unwrap();
+        let mut rows = rows_of(&trashed);
+
+        let report = drain_trash(
+            &mut rows,
+            Instant::now() + Duration::from_secs(600),
             DeleterPace::Unpaced,
         );
+
+        assert_eq!(report.entries_removed, 1, "{report:?}");
+        assert!(!trashed.path().exists());
+        assert_eq!(report.unrecognized, 2, "{report:?}");
+        assert!(stranger.join("keep.txt").exists());
+        assert!(odd.exists());
+        assert!(rows.is_empty());
+    }
+
+    /// A symlink inside a trashed tree is removed as a link: what it points
+    /// at, outside the trash, survives.
+    #[test]
+    fn a_symlink_inside_a_trashed_tree_is_not_followed() {
+        let fixture = Fixture::new();
+        let checkout = fixture.checkout("one");
+        let outside = fixture._dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("precious.txt"), "precious\n").unwrap();
+        std::os::unix::fs::symlink(&outside, checkout.join("link")).unwrap();
+        let trashed = fixture.trash(&checkout, 1).unwrap();
+        let mut rows = rows_of(&trashed);
+
+        let report = drain_trash(
+            &mut rows,
+            Instant::now() + Duration::from_secs(600),
+            DeleterPace::Unpaced,
+        );
+
+        assert_eq!(report.entries_removed, 1, "{report:?}");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("precious.txt")).unwrap(),
+            "precious\n"
+        );
+    }
+
+    /// A run stopped part-way (its deadline, as a killed run would be)
+    /// leaves the entry recorded, and the next run finishes it.
+    #[test]
+    fn the_deleter_resumes_an_entry_stopped_part_way() {
+        let fixture = Fixture::new();
+        let checkout = fixture.checkout("one");
+        std::fs::create_dir_all(checkout.join("a/b")).unwrap();
+        for index in 0..50 {
+            std::fs::write(checkout.join(format!("a/b/file-{index}")), "x").unwrap();
+        }
+        let trashed = fixture.trash(&checkout, 1).unwrap();
+        let mut rows = rows_of(&trashed);
+
+        let stopped = drain_trash(&mut rows, Instant::now(), DeleterPace::Unpaced);
         assert_eq!(stopped.entries_removed, 0);
-        assert!(entry.exists(), "a spent deadline removes nothing more");
+        assert!(trashed.path().exists());
+        assert_eq!(stopped.entries_pending, 1);
 
         let resumed = drain_trash(
-            std::slice::from_ref(&trash),
+            &mut rows,
             Instant::now() + Duration::from_secs(600),
             DeleterPace::Unpaced,
         );
         assert_eq!(resumed.entries_removed, 1, "{resumed:?}");
-        assert!(!entry.exists());
+        assert!(!trashed.path().exists());
         assert_eq!(resumed.entries_pending, 0);
-    }
-
-    /// Entries go oldest first; one that keeps failing goes after the others
-    /// and is reported by name.
-    #[test]
-    fn a_repeatedly_failing_entry_never_wedges_the_queue() {
-        let dir = tempfile::tempdir().unwrap();
-        let trash = dir.path().join(TRASH_DIR);
-        let stuck = trash.join("0000000000001-1-1-0");
-        let next = trash.join("0000000000002-2-1-0");
-        fill(&stuck, 1);
-        fill(&next, 1);
-        std::fs::write(failures_path(&stuck), "3").unwrap();
-        let order = trash_entries(&trash)
-            .into_iter()
-            .map(|entry| entry.name)
-            .collect::<Vec<_>>();
-        assert_eq!(order, vec!["0000000000002-2-1-0", "0000000000001-1-1-0"]);
     }
 
     /// The pace follows disk pressure and load, never memory: below the
@@ -654,14 +1043,23 @@ mod tests {
     }
 
     /// The deleter runs with the worker's pacer set aside, so memory
-    /// pressure (which that pacer acts on) cannot stop it, and the pacer is
-    /// back afterwards.
+    /// pressure (which that pacer acts on) cannot stop it.
     #[test]
     fn the_deleter_runs_without_the_memory_pacer() {
         let installed_inside = crate::gc::unattended_pacing::without_pacer(
             crate::gc::unattended_pacing::pacer_installed,
         );
         assert!(!installed_inside);
+    }
+
+    /// Entry names: only the broker's own format qualifies.
+    #[test]
+    fn only_the_broker_entry_name_format_qualifies() {
+        assert!(is_broker_entry_name("1790000000000-12-345-6"));
+        assert!(!is_broker_entry_name("179000000000-12-345-6"));
+        assert!(!is_broker_entry_name("1790000000000-12-345"));
+        assert!(!is_broker_entry_name("1790000000000-12-x-6"));
+        assert!(!is_broker_entry_name(".aethyme-trash-marker"));
     }
 
     /// A lock file left by a holder that is gone (its descriptor closed, as a

@@ -9641,11 +9641,8 @@ impl Broker {
             }
             .into());
         }
-        let git_removal = self.remove_checkout_through_trash(
-            candidate.spawned_owner.id,
-            &candidate.worktree,
-            true,
-        );
+        let git_removal =
+            self.remove_checkout_through_trash(&candidate.spawned_owner, &candidate.worktree, true);
         note_git_removal_time(git_removal_started.elapsed());
         git_removal?;
         ensure_auto_cleanup_path_absent(&candidate.worktree)?;

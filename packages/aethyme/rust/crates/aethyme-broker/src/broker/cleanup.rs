@@ -4915,6 +4915,22 @@ impl Broker {
         self.cleanup_under_lifecycle_claim(&session, force, None)
     }
 
+    /// The broker-owned pool holding `worktree`, proved by the broker's own
+    /// records (the legacy root or a root whose marker names this
+    /// repository), when `session` was spawned by the broker. `None` for an
+    /// adopted checkout or anything outside a pool: those are never renamed
+    /// into a trash.
+    pub(crate) fn trash_pool_for(&self, session: &Session, worktree: &Path) -> Option<PathBuf> {
+        if session.origin != SessionOrigin::Spawned
+            || !self
+                .is_broker_owned_worktree_root_checked(session, worktree)
+                .unwrap_or(false)
+        {
+            return None;
+        }
+        worktree.parent().map(Path::to_path_buf)
+    }
+
     /// Remove a checkout whose content the caller's proofs cover (every byte
     /// in Git, in a verified archive, or catalogued regenerable output; or a
     /// `force` discard) by moving it into its pool's trash, O(1), and
@@ -4922,10 +4938,11 @@ impl Broker {
     /// Without `force`, Git's own refusal stays the last word: a checkout
     /// that gained uncommitted or untracked content since the proof is
     /// handed to `git worktree remove`, which refuses it. A checkout outside
-    /// a pool, or one the move refuses, is removed by Git as before.
+    /// a broker-owned pool, an adopted one, or one the move refuses is
+    /// removed by Git as before.
     pub(crate) fn remove_checkout_through_trash(
         &self,
-        session_id: i64,
+        session: &Session,
         worktree: &Path,
         force: bool,
     ) -> Result<(), BrokerOpError> {
@@ -4951,11 +4968,22 @@ impl Broker {
                 return Ok(());
             }
         }
+        let Some(pool) = self.trash_pool_for(session, worktree) else {
+            crate::phase_telemetry::add("checkout_trash_outside_pool", std::time::Duration::ZERO);
+            self.repo.worktree_remove_registered(worktree, force)?;
+            return Ok(());
+        };
         let moved = self
             .main_git_common_dir()
             .map_err(|error| error.to_string())
             .and_then(|common_dir| {
-                crate::checkout_trash::move_worktree_to_trash(&common_dir, worktree, session_id)
+                crate::checkout_trash::move_worktree_to_trash(
+                    &self.repo,
+                    &common_dir,
+                    &pool,
+                    worktree,
+                    session.id,
+                )
             });
         match moved {
             Ok(trashed) => {
@@ -5461,7 +5489,7 @@ impl Broker {
             } else {
                 // Every proof above held (or `force` discards): the checkout
                 // goes into the trash in O(1) and the deleter unlinks it.
-                self.remove_checkout_through_trash(session_id, &worktree_path, force)?;
+                self.remove_checkout_through_trash(session, &worktree_path, force)?;
             }
         }
         require_worktree_path_absent(&worktree_path, session_id)?;
