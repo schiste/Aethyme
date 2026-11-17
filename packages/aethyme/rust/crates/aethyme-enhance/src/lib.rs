@@ -14,6 +14,7 @@
 //! (Phase 2 flip, 2026-07-29); the Python `enhance` group is deleted.
 
 pub mod agents;
+pub mod authorization;
 pub mod cli;
 pub mod deploy;
 pub mod explore_summary_cli;

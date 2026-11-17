@@ -94,11 +94,12 @@ fn agents_document_includes_broker_protocol_only_when_configured() {
         "aethyme broker advanced gh",
         ".aethyme/broker-action-required.md",
         "`references/broker.md`",
+        "Standing authorizations (`[authorization]`), for every session without asking",
     ] {
         assert!(agents.contains(needle), "AGENTS.md missing {needle:?}");
     }
     // Recovery plan P4.5: the whole generated file — repo routing and broker
-    // section included; this fixture has no overrides — fits in about 1,000
+    // section included; this fixture has no overrides — fits in about 1,200
     // tokens (bytes / 4).
     let tokens = agents.len() / 4;
     assert!(

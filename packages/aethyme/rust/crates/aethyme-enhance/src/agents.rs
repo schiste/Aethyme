@@ -260,8 +260,9 @@ pub fn validate_agents_overrides(repo: &Path) -> Value {
 /// Recovery plan P4.5: the root file is read on every turn, so everything
 /// beyond what an agent needs before and after an edit lives in the skill's
 /// `references/` instead. Override sections are repository-owned and are not
-/// counted.
-pub const GENERATED_POLICY_MAX_TOKENS: usize = 1_000;
+/// counted. Raised from 1,000 for the standing-authorization paragraph
+/// (`[authorization]`), which saves the owner a question per session.
+pub const GENERATED_POLICY_MAX_TOKENS: usize = 1_200;
 
 /// `_render_agents_document`: the template header, then the repository and
 /// edit-workflow sections, then the rest of the template, then override
@@ -311,7 +312,15 @@ fn render_broker_protocol_compact(repo: &Path) -> String {
     // The heading keeps "Broker Coordination": `certify`'s agents-protocol
     // check, local-only deploy verification and the upgrade classifier all
     // recognize a broker-configured policy by that phrase.
-    let protocol = render_push_aware_protocol(repo);
+    // Standing authorizations follow the protocol in both delivery variants:
+    // granted by default, stated as "ask the owner" when withheld. Rendered
+    // for every broker repository, like the preparation step above it; the
+    // paragraph covers only what the repository declares.
+    let protocol = format!(
+        "{}\n\n{}",
+        render_push_aware_protocol(repo),
+        crate::authorization::StandingAuthorizations::load(repo).agents_paragraph()
+    );
     if automation_issues_allowed(repo) {
         return format!("{protocol}\n\n{AUTOMATION_ISSUES_NOTE}");
     }
@@ -683,6 +692,15 @@ blocked.
    `aethyme broker submit prepare status --session <your-session-id> --json`.
    Worktrees do not inherit ignored dependencies such as `node_modules/` or
    `.venv/` from the main checkout; preparation is explicit.
+   Unless `.aethyme/config.toml` sets
+   `[authorization] prepare_session_worktrees = false`, that preparation is a
+   standing authorization: it covers every session, so do not ask again per
+   session id, and run it as soon as the broker reports preparation required.
+   It applies in your own session worktree only, only through
+   `aethyme broker submit prepare --session <your-session-id>` (the frozen,
+   pinned installs the repository declares), with lockfiles unchanged -- no
+   dependency upgrades, additions or lockfile edits. Anything else still needs
+   the owner. When the key is `false`, ask the owner before preparing.
    For patch tools without a per-call worktree setting, use the reported
    worktree's absolute path and verify the target path there before editing;
    relative paths can resolve against the shared checkout.
@@ -1002,6 +1020,20 @@ blocked.
    Gate commands that need a test database, cache namespace, or similar
    external state should suffix it with that value instead of sharing one
    fixed name.
+
+   Unless `.aethyme/config.toml` sets
+   `[authorization] disposable_test_environments = false`, creating, using and
+   dropping disposable test state is a standing authorization for every
+   session (do not ask again per session id): the broker-leased environments
+   the repository declares in `.aethyme/environments.toml` (`aethyme env up`,
+   `aethyme env exec`, `aethyme env down <id>`), and local scratch databases
+   made by the repository's own declared test or scratch commands, provided
+   each is named for the session (the session's `$AETHYME_TEST_DB_SUFFIX` or
+   the script's own scratch naming) and dropped afterwards. Never a shared,
+   staging or production database, service or data (not `aethyme env shared`),
+   and never data that outlives the session; nothing else is implied, and
+   dispatching CI workflows is not covered. When the key is `false`, ask the
+   owner before creating any test environment or database.
 
    Tests that run `git` against fixture repositories must clear inherited and
    explicitly configured `GIT_*` variables from every subprocess, including
@@ -1699,6 +1731,88 @@ mod tests {
         }
     }
 
+    /// `[authorization]` grants by default in both delivery variants; an
+    /// explicit `false` turns its clause into "ask the owner".
+    #[test]
+    fn standing_authorizations_are_stated_granted_by_default_and_withheld_when_false() {
+        for (tag, config) in [
+            (
+                "authorization-absent-push",
+                "schema = 1\n[delivery]\npush_session_branches = true\n",
+            ),
+            ("authorization-absent", "schema = 1\n"),
+            (
+                "authorization-true",
+                "schema = 1\n[authorization]\nprepare_session_worktrees = true\n\
+                 disposable_test_environments = true\n",
+            ),
+        ] {
+            let repo = broker_repo_with_config(tag, config);
+            let doc = render_agents_document(Some(&repo)).unwrap();
+            let flat = doc.replace('\n', " ");
+            assert!(
+                flat.contains(
+                    "Standing authorizations (`[authorization]`), for every session without \
+                     asking again: `aethyme broker submit prepare --session <id>` in your own \
+                     worktree as soon as the broker reports it required (the declared frozen, \
+                     pinned installs; no dependency or lockfile change); creating, using and \
+                     dropping local test databases and environments named for the session \
+                     (`$AETHYME_TEST_DB_SUFFIX` or the script's own scratch name), broker-leased \
+                     (`aethyme env`) or made by the repository's declared test or scratch \
+                     commands, then dropped (never shared, staging or production data). Nothing \
+                     else is implied."
+                ),
+                "{tag}:\n{doc}"
+            );
+            assert!(!doc.contains("Ask the owner"), "{tag}:\n{doc}");
+            // It follows the protocol, before the template's own sections.
+            assert!(
+                doc.find("`references/broker.md`") < doc.find("Standing authorizations")
+                    && doc.find("Standing authorizations") < doc.find("## Finding code"),
+                "{tag}:\n{doc}"
+            );
+            std::fs::remove_dir_all(&repo).unwrap();
+        }
+
+        let withheld = broker_repo_with_config(
+            "authorization-false",
+            "schema = 1\n[authorization]\nprepare_session_worktrees = false\n\
+             disposable_test_environments = false\n",
+        );
+        let doc = render_agents_document(Some(&withheld)).unwrap();
+        assert!(
+            doc.replace('\n', " ").contains(
+                "Ask the owner before running `aethyme broker submit prepare` or creating test \
+                 environments or databases (`[authorization]`)."
+            ),
+            "{doc}"
+        );
+        assert!(!doc.contains("Standing authorizations"), "{doc}");
+        // Today's preparation wording stays as it was.
+        assert!(
+            doc.contains("do not assume a fresh worktree has installed dependencies."),
+            "{doc}"
+        );
+        std::fs::remove_dir_all(&withheld).unwrap();
+
+        let mixed = broker_repo_with_config(
+            "authorization-mixed",
+            "schema = 1\n[authorization]\ndisposable_test_environments = false\n",
+        );
+        let flat = render_agents_document(Some(&mixed))
+            .unwrap()
+            .replace('\n', " ");
+        assert!(
+            flat.contains("asking again: `aethyme broker submit prepare --session <id>`"),
+            "{flat}"
+        );
+        assert!(
+            flat.contains("Ask the owner before creating test environments or databases"),
+            "{flat}"
+        );
+        std::fs::remove_dir_all(&mixed).unwrap();
+    }
+
     #[test]
     fn push_policy_turns_the_protocol_into_push_as_you_go() {
         let repo = broker_repo_with_config(
@@ -1811,6 +1925,12 @@ mod tests {
             "It\n   promotes nothing; it does not publish a remote branch",
             "`coordination.land-shared-edit-first`",
             "lands through GitHub: push the session branch",
+            "`[authorization] prepare_session_worktrees = false`, that preparation is a\n   standing authorization: it covers every session, so do not ask again per\n   session id",
+            "with lockfiles unchanged -- no\n   dependency upgrades, additions or lockfile edits.",
+            "`[authorization] disposable_test_environments = false`, creating, using and\n   dropping disposable test state is a standing authorization for every\n   session",
+            "made by the repository's own declared test or scratch commands",
+            "and dropped afterwards. Never a shared,\n   staging or production database",
+            "dispatching CI workflows is not covered.",
         ] {
             assert!(reference.contains(needle), "missing {needle:?}");
         }
