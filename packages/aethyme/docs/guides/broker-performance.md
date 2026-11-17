@@ -21,19 +21,20 @@ local transport and compares the full wall time directly with these limits.
 
 ## Routine observation
 
-Default compact text, `status --compact --json` and `status --summary --json`
+Default compact text, `status --json` (compact by default) and `status --summary --json`
 observe current coordination state without fast-forwarding the main checkout,
 running startup recovery, resuming GC, or persisting liveness transitions.
 PID checks, activity metadata, pending operations, locks and source-unavailable
 warnings remain current observations. Deferred checks are unknown, not clean;
 `startup_recovery`, `checkout_sync` and `gc_resume` are explicitly listed.
-Full `status --json` and explicit `status --refresh` retain their existing paths.
+`status --full --json` and explicit `status --refresh` retain the full paths.
 
 Repository identity and committed policy reads are shared only during one routine
 invocation, including router compatibility preflight. Nothing is reused across
 invocations. Routine observation does not create broker state or record outcome
-telemetry. `AETHYME_MEASURE_OUTPUT=1` retains the existing explicit opt-in for a
-metrics line. A pending committed capture fence remains visible as a warning;
+telemetry, but every status call appends one row to
+`.aethyme/logs/command-metrics.jsonl` (form, `--session` presence, caller hint,
+section timings) so pollers can be identified. A pending committed capture fence remains visible as a warning;
 the ordinary mutation/audit paths continue to enforce or raise it.
 
 The 150 ms status target is warning-only. Deterministic entrypoint controls

@@ -287,30 +287,43 @@ fn status_context_is_scoped_to_one_invocation_even_in_one_process() {
 }
 
 #[test]
-fn observation_does_not_record_events_and_timing_requires_explicit_opt_in() {
+fn observation_records_no_events_but_one_metrics_row_per_call() {
     let f = fixture();
     let mut broker = common::open_fixture_repository_broker(&f).unwrap();
     let before = broker.store().events_after(0, 1000).unwrap().len();
     let metrics = f.path().join(".aethyme/logs/command-metrics.jsonl");
-    let before_metrics = std::fs::read(&metrics).unwrap_or_default();
+    let rows = |path: &std::path::Path| {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let before_rows = rows(&metrics);
     // --json-output is the supported alias, including on the observation path.
+    // Every status call appends its metrics row, so a poller is identifiable;
+    // the opt-in no longer gates status, and neither call writes an event.
     json(
         &command(&f, &["status", "--summary", "--json-output"])
             .output()
             .unwrap(),
     );
     assert_eq!(broker.store().events_after(0, 1000).unwrap().len(), before);
-    assert_eq!(std::fs::read(&metrics).unwrap_or_default(), before_metrics);
+    assert_eq!(rows(&metrics), before_rows + 1);
     json(
         &command(&f, &["status", "--summary", "--json-output"])
             .env("AETHYME_MEASURE_OUTPUT", "1")
             .output()
             .unwrap(),
     );
-    let after_metrics = std::fs::read_to_string(&metrics).unwrap();
-    assert_eq!(
-        after_metrics.lines().count(),
-        String::from_utf8(before_metrics).unwrap().lines().count() + 1
-    );
+    assert_eq!(rows(&metrics), before_rows + 2);
+    let last: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(&metrics)
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(last["status_form"], "summary", "{last}");
     assert_eq!(broker.store().events_after(0, 1000).unwrap().len(), before);
 }
