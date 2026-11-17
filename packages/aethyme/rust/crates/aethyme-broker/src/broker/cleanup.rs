@@ -5665,9 +5665,11 @@ impl Broker {
             crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
         )
         .deadline;
+        // The session list is read fresh every time (an adoption takes no
+        // GC lock); inside the retirement lane only sessions the run has not
+        // resolved yet are canonicalized again.
         let sessions = self.store.live_sessions()?;
-        let Some(paths) =
-            crate::auto_cleanup::resolve_live_worktree_paths(&sessions, Some(deadline))
+        let Some(paths) = super::retire::resolve_live_paths_for_lane(&sessions, Some(deadline))
         else {
             return Ok(None);
         };

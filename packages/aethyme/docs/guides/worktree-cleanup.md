@@ -474,6 +474,7 @@ ignored_directory_sweep = false # opt in to reclaim ignored folders in retained 
 regenerable = [".gradle", "reports/quality-*.json"] # extra disposable output directories and files
 keep = ["*-investigation"]     # worktrees never removed automatically
 unattended_unlinks_per_second = 1000 # background worker pace, also under load; 0 or "unlimited" = full speed
+abandoned_operation_after_hours = 24 # the default; a closed checkout's merge/rebase left in progress longer is archived, then retired
 ```
 
 Two phase counters show the file rule at work in `aethyme broker advanced

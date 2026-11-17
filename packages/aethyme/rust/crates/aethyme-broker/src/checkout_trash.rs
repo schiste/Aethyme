@@ -774,7 +774,17 @@ pub(crate) struct TrashDrainReport {
     pub(crate) pace: Option<DeleterPace>,
     /// Recorded entries still in the trash after the run.
     pub(crate) entries_pending: usize,
+    /// Entries left alone this run because a process had its working
+    /// directory or an open file inside (a process that entered the checkout
+    /// after the mover's observation keeps a now-trashed directory).
+    pub(crate) entries_in_use: usize,
+    /// The run's open-file observation could not be taken completely, so it
+    /// deleted nothing.
+    pub(crate) process_use_unknown: bool,
 }
+
+/// The longest one deleter run's open-file observation may take.
+const DELETER_PROCESS_USE_BUDGET: Duration = Duration::from_secs(10);
 
 /// Delete recorded entries of the trash directories in `rows` oldest first
 /// until `deadline`, at `pace`; `rows` is updated (removed entries dropped,
@@ -810,6 +820,11 @@ pub(crate) fn drain_trash(
     let table = any_pending
         .then(crate::session_holder::ProcessTable::snapshot)
         .flatten();
+    // One open-file observation per run, taken before the first deletion:
+    // an entry a live process still has as its working directory, or holds
+    // a file open in, is never deleted. An incomplete observation deletes
+    // nothing this run.
+    let mut process_use: Option<crate::reclaim::OpenFileSnapshot> = None;
     // The worker's unattended pacer would stop this deleter on memory
     // pressure; it paces itself instead.
     crate::gc::unattended_pacing::without_pacer(|| {
@@ -928,6 +943,34 @@ pub(crate) fn drain_trash(
                 };
                 if !still_in_trash() {
                     report.unrecognized += 1;
+                    continue;
+                }
+                let observation = process_use.get_or_insert_with(|| {
+                    let budget = deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(DELETER_PROCESS_USE_BUDGET);
+                    let started = Instant::now();
+                    let observed =
+                        crate::session_holder::trash_deleter_process_use_snapshot(budget);
+                    crate::phase_telemetry::add(
+                        "checkout_trash_process_snapshot",
+                        started.elapsed(),
+                    );
+                    observed
+                });
+                if let crate::reclaim::OpenFileSnapshot::Incomplete { .. } = observation {
+                    report.process_use_unknown = true;
+                    crate::phase_telemetry::add(
+                        "checkout_trash_process_use_unknown",
+                        Duration::ZERO,
+                    );
+                    break 'dirs;
+                }
+                if crate::reclaim::open_file_snapshot_blocker_for_worktree(observation, &path)
+                    .is_some()
+                {
+                    report.entries_in_use += 1;
+                    crate::phase_telemetry::add("checkout_trash_entry_in_use", Duration::ZERO);
                     continue;
                 }
                 let left_trash = std::cell::Cell::new(false);

@@ -1174,6 +1174,24 @@ pub struct GcPlan {
     /// only; not part of the digest. `None` before any pass has run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_cleanup: Option<crate::AutoCleanupReport>,
+    /// Closed checkouts the checkout retirement lane keeps on purpose, by
+    /// session id, with the refusing step's own words when it had any.
+    /// Reporting only; not part of the digest. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkout_retirement_keeps: Vec<GcRetirementKeep>,
+}
+
+/// One closed checkout the checkout retirement lane keeps on purpose.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcRetirementKeep {
+    pub session_id: i64,
+    /// The precondition (`checkout_retirement_kept_<reason>`).
+    pub reason: String,
+    /// The refusing step's own words, bounded, when it had any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub kept_at_ms: i64,
+    pub attempts: u32,
 }
 
 /// Closed sessions whose checkout is still on disk.

@@ -1118,6 +1118,42 @@ pub(crate) fn set_process_use_snapshot_for_tests(
     TEST_PROCESS_USE_SNAPSHOT.with(|cell| *cell.borrow_mut() = snapshot);
 }
 
+/// One host-wide open-file observation for a checkout retirement run,
+/// bounded by `budget`. The run takes it once and judges every checkout with
+/// it; tests on this thread observe the queued or fixed snapshot instead.
+pub(crate) fn retirement_run_process_use_snapshot(
+    budget: Duration,
+) -> crate::reclaim::OpenFileSnapshot {
+    #[cfg(test)]
+    if let Some(snapshot) = TEST_PROCESS_USE_QUEUE
+        .with(|queue| queue.borrow_mut().pop_front())
+        .or_else(|| TEST_PROCESS_USE_SNAPSHOT.with(|cell| cell.borrow().clone()))
+    {
+        return snapshot;
+    }
+    crate::reclaim::open_file_snapshot_under_with_budget(Path::new("/"), budget)
+}
+
+/// One host-wide open-file observation for a checkout trash deleter run,
+/// bounded by `budget`.
+#[cfg(not(test))]
+pub(crate) fn trash_deleter_process_use_snapshot(
+    budget: Duration,
+) -> crate::reclaim::OpenFileSnapshot {
+    crate::reclaim::open_file_snapshot_under_with_budget(Path::new("/"), budget)
+}
+
+/// Tests on this thread observe the fixed snapshot, or nobody using anything
+/// when none is set.
+#[cfg(test)]
+pub(crate) fn trash_deleter_process_use_snapshot(
+    _budget: Duration,
+) -> crate::reclaim::OpenFileSnapshot {
+    TEST_PROCESS_USE_SNAPSHOT
+        .with(|cell| cell.borrow().clone())
+        .unwrap_or_else(|| crate::reclaim::OpenFileSnapshot::Complete(Vec::new()))
+}
+
 /// The process snapshot is valid only for the holder event it observed.
 /// Holder events are append-only identities, so a rebind forces a fresh
 /// snapshot instead of reusing a process table captured for another owner.

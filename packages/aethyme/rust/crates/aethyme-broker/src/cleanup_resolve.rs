@@ -889,6 +889,7 @@ fn ignored_inventory(
     };
     let mut roots = Vec::new();
     let mut files = Vec::new();
+    let mut preserved_directory_budget = PreservedDirectoryBudget::default();
     check_archive_deadline(deadline, "ignored-path inventory").map_err(refuse)?;
     for relative in checkout.ignored_paths_readonly()? {
         check_archive_deadline(deadline, "ignored-path inventory").map_err(refuse)?;
@@ -931,6 +932,29 @@ fn ignored_inventory(
                     IgnoredPathClassification::DisposableOutput
                 }
             }
+            crate::auto_cleanup::RecoveryIgnoredClassification::Preserve(_)
+                if metadata.is_dir() && !file_type.is_symlink() =>
+            {
+                // An ignored directory nothing catalogues as regenerable:
+                // every file in it is archived (a link as the link), so the
+                // plan preserves the directory instead of refusing the
+                // whole checkout.
+                for file in preserved_ignored_directory_files(
+                    worktree,
+                    trimmed,
+                    deadline,
+                    &mut preserved_directory_budget,
+                )
+                .map_err(refuse)?
+                {
+                    roots.push(IgnoredPath {
+                        path: file.path.clone(),
+                        classification: IgnoredPathClassification::PreservedFile,
+                    });
+                    files.push(file);
+                }
+                continue;
+            }
             crate::auto_cleanup::RecoveryIgnoredClassification::Preserve(_) => {
                 let Some(file) = describe_untracked_until(&full, &relative, deadline)
                     .map_err(|error| io_error(&full, error))?
@@ -962,6 +986,106 @@ fn ignored_inventory(
         .collect::<std::collections::BTreeSet<_>>();
     reject_unarchivable_special_nodes(worktree, &opaque_directories, deadline).map_err(refuse)?;
     Ok((roots, files))
+}
+
+/// The protected ignored files a recovery archive of `worktree` carries
+/// (ignored directories nothing catalogues as regenerable expanded file by
+/// file); catalogued regenerable output is left out. Refuses what an archive
+/// cannot preserve.
+pub(crate) fn preserved_ignored_files(
+    checkout: &GitRepo,
+    worktree: &Path,
+    policy: &crate::AutoCleanupPolicy,
+    session_id: i64,
+    deadline: Option<Instant>,
+) -> Result<Vec<ArchivedFile>, BrokerOpError> {
+    ignored_inventory(checkout, worktree, policy, session_id, deadline).map(|(_, files)| files)
+}
+
+/// Files at most archived out of ignored directories nothing catalogues as
+/// regenerable, per checkout.
+const MAX_PRESERVED_IGNORED_DIRECTORY_FILES: usize = 20_000;
+/// Bytes at most archived out of such directories, per checkout.
+const MAX_PRESERVED_IGNORED_DIRECTORY_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Files and bytes taken from preserved ignored directories so far.
+#[derive(Default)]
+struct PreservedDirectoryBudget {
+    files: usize,
+    bytes: u64,
+}
+
+/// Every regular file and link under the ignored directory `root` (relative
+/// to `worktree`, no trailing slash), described for the archive, sorted by
+/// path. Never follows a link; a special file, a non-UTF-8 name or more than
+/// the per-checkout bounds refuses.
+fn preserved_ignored_directory_files(
+    worktree: &Path,
+    root: &str,
+    deadline: Option<Instant>,
+    budget: &mut PreservedDirectoryBudget,
+) -> Result<Vec<ArchivedFile>, String> {
+    let mut files = Vec::new();
+    let mut pending = vec![(root.to_owned(), 0_usize)];
+    while let Some((relative_dir, depth)) = pending.pop() {
+        check_archive_deadline(deadline, "ignored directory inventory")?;
+        if depth > MAX_WORKTREE_SPECIAL_SCAN_DEPTH {
+            return Err(format!(
+                "ignored directory {root}/ is nested deeper than {MAX_WORKTREE_SPECIAL_SCAN_DEPTH} levels"
+            ));
+        }
+        let entries = std::fs::read_dir(worktree.join(&relative_dir))
+            .map_err(|error| format!("cannot read ignored directory {relative_dir}/: {error}"))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!("cannot read an entry of ignored directory {relative_dir}/: {error}")
+            })?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| format!("ignored directory {relative_dir}/ holds a non-UTF-8 name"))?;
+            let relative = format!("{relative_dir}/{name}");
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("cannot inspect ignored path {relative}: {error}"))?;
+            if file_type.is_dir() {
+                pending.push((relative, depth + 1));
+                continue;
+            }
+            if !file_type.is_file() && !file_type.is_symlink() {
+                return Err(format!(
+                    "ignored path {relative} is a special file, which an archive cannot preserve"
+                ));
+            }
+            budget.files += 1;
+            if budget.files > MAX_PRESERVED_IGNORED_DIRECTORY_FILES {
+                return Err(format!(
+                    "ignored directories nothing catalogues as regenerable hold more than {MAX_PRESERVED_IGNORED_DIRECTORY_FILES} files; catalogue them under [cleanup] regenerable or remove them"
+                ));
+            }
+            let length = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            if file_type.is_file()
+                && budget.bytes.saturating_add(length) > MAX_PRESERVED_IGNORED_DIRECTORY_BYTES
+            {
+                return Err(format!(
+                    "ignored directories nothing catalogues as regenerable hold more than {} MiB; catalogue them under [cleanup] regenerable or remove them",
+                    MAX_PRESERVED_IGNORED_DIRECTORY_BYTES / (1024 * 1024)
+                ));
+            }
+            let full = worktree.join(&relative);
+            let Some(file) = describe_untracked_until(&full, &relative, deadline)
+                .map_err(|error| format!("cannot read ignored path {relative}: {error}"))?
+            else {
+                return Err(format!(
+                    "ignored path {relative} is neither a regular file nor a symbolic link"
+                ));
+            };
+            budget.bytes = budget.bytes.saturating_add(file.bytes);
+            files.push(file);
+        }
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
 }
 
 /// Git does not report every unsupported filesystem node (for example, an
@@ -9010,6 +9134,52 @@ mod tests {
             ..Default::default()
         };
         assert!(ignored_inventory(&checkout, repository, &strict, 1, None).is_err());
+    }
+
+    /// An ignored directory nothing catalogues as regenerable is archived
+    /// file by file (a link as the link) instead of refusing the plan.
+    #[cfg(unix)]
+    #[test]
+    fn an_unknown_ignored_directory_is_archived_file_by_file() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path();
+        git(repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join(".gitignore"), "/tool-notes/\n").unwrap();
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(repository, &["add", "-A"]);
+        git(repository, &["commit", "-qm", "initial"]);
+        std::fs::create_dir_all(repository.join("tool-notes/quality")).unwrap();
+        std::fs::write(repository.join("tool-notes/quality/index.json"), "{}\n").unwrap();
+        std::fs::write(repository.join("tool-notes/history.jsonl"), "one\n").unwrap();
+        std::os::unix::fs::symlink("history.jsonl", repository.join("tool-notes/latest")).unwrap();
+
+        let checkout = GitRepo::discover(repository).unwrap();
+        let (roots, files) = ignored_inventory(
+            &checkout,
+            repository,
+            &crate::AutoCleanupPolicy::default(),
+            1,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "tool-notes/history.jsonl",
+                "tool-notes/latest",
+                "tool-notes/quality/index.json"
+            ]
+        );
+        assert!(files[1].symlink);
+        assert_eq!(roots.len(), files.len(), "{roots:?}");
+        assert!(roots.iter().all(|root| {
+            root.classification == IgnoredPathClassification::PreservedFile
+                && !root.path.ends_with('/')
+        }));
     }
 
     #[test]

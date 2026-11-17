@@ -7024,10 +7024,12 @@ impl Broker {
             artifact_worktrees_not_scanned,
             deferred_checks: deferred_checks.clone(),
             auto_cleanup: None,
+            checkout_retirement_keeps: Vec::new(),
         };
         // Reporting only and outside the digest: what the last unattended
         // pass removed and why it kept the rest (#588).
         plan.auto_cleanup = self.last_auto_cleanup_report();
+        plan.checkout_retirement_keeps = self.checkout_retirement_keep_report();
         if scan.measures() && plan.deferred_checks.is_empty() {
             plan.finish_digest()?;
         }
