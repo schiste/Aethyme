@@ -1483,19 +1483,20 @@ impl Broker {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             _ => return Ok(Kept("checkout_missing")),
         }
+        // Judged only through the row that owns the folder at its path
+        // (`path_superseded_by`): a cleaned session's leftover only when
+        // every row recorded there is cleaned, a closed session's checkout
+        // only when no newer row there is closed. Asked before the plan, so
+        // a superseded row never pays for one.
+        match self.path_superseded(&session) {
+            Ok(false) => {}
+            Ok(true) => return Ok(Kept("leftover_superseded")),
+            Err(_) => return Ok(Kept("open_session_unknown")),
+        }
         if leftover {
             // A folder left behind by a session already recorded as
-            // cleaned: judged only through the newest session recorded for
-            // its path (a later session there owns it), and only once that
-            // session's recorded holder is gone or was never bound.
-            match self
-                .store_ref()
-                .latest_session_for_worktree_any_state(&session.worktree_path)
-            {
-                Ok(Some(latest)) if latest.id == session.id => {}
-                Ok(_) => return Ok(Kept("leftover_superseded")),
-                Err(_) => return Ok(Kept("open_session_unknown")),
-            }
+            // cleaned: only once that session's recorded holder is gone or
+            // was never bound.
             let mut holders = crate::session_holder::RecordedHolderProcessTable::default();
             match crate::session_holder::recorded_holder_liveness(
                 self.store_ref(),
@@ -4088,5 +4089,315 @@ mod tests {
         assert!(worktree.join("node_modules/left-pad/index.js").exists());
         drop(held);
         assert_eq!(broker.reused_path_keep(&current, &worktree, false), None);
+    }
+
+    /// Record another session at `session`'s path, in `cleanup_state`, with
+    /// the same times: a path reused by a later task.
+    fn record_again_at_path(
+        broker: &crate::Broker,
+        session: &crate::Session,
+        cleanup_state: &str,
+    ) -> i64 {
+        let connection = broker.store_ref().connection();
+        connection
+            .execute(
+                "INSERT INTO sessions (worktree_path, branch, origin, status, created_at,
+                    updated_at, last_activity_at, cleanup_state, closed_at, cleanup_completed_at)
+                 SELECT worktree_path, branch || '-again', origin, 'cleaned', created_at,
+                    updated_at, last_activity_at, ?2, closed_at, cleanup_completed_at
+                 FROM sessions WHERE id = ?1",
+                rusqlite::params![session.id, cleanup_state],
+            )
+            .unwrap();
+        connection.last_insert_rowid()
+    }
+
+    /// The strip spends its budget on folders that exist: thousands of
+    /// recorded sessions whose folders are gone (and closed earlier) cost
+    /// one pool listing, and the backlog is counted only after every
+    /// checkout was stripped, so counting never eats the stripping budget
+    /// (on the busiest repository the count took 7 to 65 s and ran first,
+    /// and no pass ever reached a checkout).
+    #[test]
+    fn the_strip_starts_from_existing_folders_and_counts_the_backlog_last() {
+        let (_owner, _storage, mut broker) = fixture();
+        let mut worktrees = Vec::new();
+        for index in 0..5 {
+            let (_session, worktree) =
+                closed_with_dependencies(&mut broker, &format!("pool member {index}"));
+            worktrees.push(worktree);
+        }
+        let pool = worktrees[0]
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        broker
+            .store()
+            .connection()
+            .execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000)
+                 INSERT INTO sessions (worktree_path, branch, origin, status, created_at,
+                    updated_at, last_activity_at, cleanup_state, closed_at, cleanup_completed_at)
+                 SELECT ?1 || '/gone-' || i, 'agent/gone-' || i, 'spawned', 'cleaned', 1000,
+                    1000, 1000, 'cleaned', 1000 + i, 1000 + i FROM n",
+                rusqlite::params![pool],
+            )
+            .unwrap();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let hook_seen = seen.clone();
+        let hook_worktrees = worktrees.clone();
+        super::super::strip::set_before_backlog_hook(Some(Box::new(move || {
+            *hook_seen.borrow_mut() = Some(
+                hook_worktrees
+                    .iter()
+                    .filter(|worktree| worktree.join("node_modules").exists())
+                    .count(),
+            );
+        })));
+
+        let report = strip_pass(&broker);
+        super::super::strip::set_before_backlog_hook(None);
+
+        assert_eq!(
+            *seen.borrow(),
+            Some(0),
+            "every checkout was stripped before the backlog count began"
+        );
+        assert_eq!(report.folders_found, 5, "{report:#?}");
+        assert_eq!(report.checkouts_examined, 5, "{report:#?}");
+        assert_eq!(report.checkouts_stripped, 5, "{report:#?}");
+        assert_eq!(report.directories_stripped, 10, "{report:#?}");
+        assert_eq!(report.backlog.closed_folders, 5, "{report:#?}");
+        assert!(!report.more_remaining, "{report:#?}");
+    }
+
+    /// A sub-project's virtual environment (`backend/.venv`) is found and
+    /// stripped with its witness, a marker file the repository declared
+    /// under `[cleanup] venv_markers` included. An undeclared dotfile keeps
+    /// its environment, and so does `.env` whatever is declared; the names
+    /// (only the names) are reported for `broker status`.
+    #[test]
+    fn a_nested_sub_project_venv_is_stripped_with_its_witness() {
+        let (_owner, _storage, mut broker) = fixture();
+        let info = broker.main_root().join(".git/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("exclude"), ".venv/\n").unwrap();
+        std::fs::write(
+            broker.main_root().join(".aethyme/config.toml"),
+            "[cleanup]\nvenv_markers = [\".env-check.json\"]\n",
+        )
+        .unwrap();
+        let (_session, worktree) = closed(&mut broker, "nested venv", |_| {});
+        for project in ["backend", "worker", "api"] {
+            let venv = worktree.join(project).join(".venv");
+            std::fs::create_dir_all(venv.join("lib/python3.12/site-packages/dep")).unwrap();
+            std::fs::create_dir_all(venv.join("bin")).unwrap();
+            std::fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+            std::fs::write(venv.join(".gitignore"), "*\n").unwrap();
+            std::fs::write(venv.join(".env-check.json"), "{}\n").unwrap();
+        }
+        std::fs::write(worktree.join("worker/.venv/.tool-state"), "x\n").unwrap();
+        std::fs::write(worktree.join("api/.venv/.env"), "TOKEN=secret\n").unwrap();
+
+        let report = strip_pass(&broker);
+
+        assert_eq!(report.candidates_found, 3, "{report:#?}");
+        assert_eq!(report.directories_stripped, 1, "{report:#?}");
+        assert_eq!(
+            report.refused.get("unexpected_content"),
+            Some(&2),
+            "{report:#?}"
+        );
+        assert!(!worktree.join("backend/.venv").exists());
+        assert!(worktree.join("backend").is_dir());
+        assert!(worktree.join("worker/.venv/.tool-state").exists());
+        assert!(worktree.join("api/.venv/.env").exists());
+        assert_eq!(
+            report.venv_unexpected.iter().cloned().collect::<Vec<_>>(),
+            [".env", ".tool-state"],
+            "{report:#?}"
+        );
+        let progress = broker.next_checkout_strip_progress(
+            &super::super::strip::CheckoutStripProgress::default(),
+            &CheckoutRetirementReport {
+                strip: report.clone(),
+                ..CheckoutRetirementReport::default()
+            },
+        );
+        assert_eq!(
+            progress.venv_unexpected.keys().cloned().collect::<Vec<_>>(),
+            [".env", ".tool-state"]
+        );
+    }
+
+    /// A checkout kept only for a transient reason (here every Git probe
+    /// fails) is backed off: the next pass skips it without counting it
+    /// toward the cap, so a newer checkout is still stripped; once the
+    /// backoff has passed and the probe works, it is stripped and the
+    /// backoff cleared.
+    #[test]
+    fn a_transient_keep_backs_off_without_using_the_cap() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed_with_dependencies(&mut broker, "probe fails");
+        super::super::strip::set_probes_fail_for_tests(true);
+        let far = Instant::now() + Duration::from_secs(600);
+        let pass = |broker: &crate::Broker, cap: usize| {
+            let mut run = broker
+                .begin_checkout_retirement_run(far)
+                .unwrap()
+                .expect("open paths resolve");
+            broker.strip_closed_checkouts(&mut run, far, cap)
+        };
+
+        let first = pass(&broker, 1);
+
+        assert_eq!(first.refused.get("probe_failed"), Some(&2), "{first:#?}");
+        assert_eq!(first.backoff_set, 1, "{first:#?}");
+        let backoff: std::collections::BTreeMap<i64, super::super::strip::StripBackoff> =
+            broker.meta_json(super::super::strip::CHECKOUT_STRIP_BACKOFF_KEY);
+        assert_eq!(backoff[&session.id].failures, 1, "{backoff:?}");
+
+        super::super::strip::set_probes_fail_for_tests(false);
+        let (_newer, newer_worktree) = closed_with_dependencies(&mut broker, "newer");
+        let second = pass(&broker, 1);
+
+        assert_eq!(second.skipped_backoff, 1, "{second:#?}");
+        assert_eq!(second.checkouts_stripped, 1, "{second:#?}");
+        assert!(!newer_worktree.join("node_modules").exists());
+        assert!(worktree.join("node_modules").exists());
+
+        broker
+            .update_meta_json(
+                super::super::strip::CHECKOUT_STRIP_BACKOFF_KEY,
+                |stored: &mut std::collections::BTreeMap<
+                    i64,
+                    super::super::strip::StripBackoff,
+                >| {
+                    for entry in stored.values_mut() {
+                        entry.until_ms = 0;
+                    }
+                },
+            )
+            .unwrap();
+        let third = pass(&broker, 1);
+
+        assert_eq!(third.checkouts_stripped, 1, "{third:#?}");
+        assert!(!worktree.join("node_modules").exists());
+        let backoff: std::collections::BTreeMap<i64, super::super::strip::StripBackoff> =
+            broker.meta_json(super::super::strip::CHECKOUT_STRIP_BACKOFF_KEY);
+        assert!(backoff.is_empty(), "{backoff:?}");
+    }
+
+    /// Every outcome of a pass is a phase counter by reason, beside the
+    /// discovery, proof and move timings, so the next reading shows what
+    /// the lane did and where its time went.
+    #[test]
+    fn every_strip_outcome_is_counted_by_reason() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (_session, _worktree) = closed_with_dependencies(&mut broker, "counted");
+        let (_kept, kept_worktree) = closed(&mut broker, "counted kept", |_| {});
+        std::fs::create_dir_all(kept_worktree.join("node_modules/dep")).unwrap();
+        let (_empty, _empty_worktree) = closed(&mut broker, "counted empty", |_| {});
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let installed = crate::phase_telemetry::install(recorder.clone());
+
+        let report = strip_pass(&broker);
+        drop(installed);
+
+        let (_millis, counts) = recorder.totals();
+        let count = |name: &str| counts.get(name).copied().unwrap_or(0);
+        assert_eq!(count("checkout_strip_examined"), 3, "{counts:?}");
+        assert_eq!(count("checkout_strip_stripped_checkout"), 1, "{counts:?}");
+        assert_eq!(count("checkout_strip_stripped_directory"), 2, "{counts:?}");
+        assert_eq!(
+            count("checkout_strip_stripped_node_modules"),
+            2,
+            "{counts:?}"
+        );
+        assert_eq!(count("checkout_strip_found_node_modules"), 3, "{counts:?}");
+        assert_eq!(
+            count("checkout_strip_refused_witness_missing"),
+            1,
+            "{counts:?}"
+        );
+        assert_eq!(count("checkout_strip_nothing_found"), 1, "{counts:?}");
+        for span in [
+            "checkout_strip_folder_listing",
+            "checkout_strip_preconditions",
+            "checkout_strip_discover",
+            "checkout_strip_prove",
+            "checkout_strip_move",
+            "checkout_strip_backlog",
+        ] {
+            assert!(count(span) > 0, "{span}: {counts:?}");
+        }
+        assert_eq!(
+            report.refused.get("witness_missing"),
+            Some(&1),
+            "{report:#?}"
+        );
+        let attached = recorder.attachments();
+        assert_eq!(
+            attached["checkout_strip"]["directories_stripped"],
+            serde_json::json!(2),
+            "{attached:?}"
+        );
+    }
+
+    /// A folder whose recorded sessions are all cleaned is retired through
+    /// any of them: no row is kept as superseded by another cleaned one.
+    #[test]
+    fn a_path_with_several_cleaned_rows_is_retired() {
+        let (_owner, _storage, mut broker) = fixture();
+        exclude_node_modules(&broker);
+        let (session, worktree) = closed(&mut broker, "reused cleaned", |_| {});
+        std::fs::create_dir_all(worktree.join("node_modules/dep")).unwrap();
+        std::fs::write(
+            worktree.join("node_modules/.modules.yaml"),
+            "layoutVersion: 5\n",
+        )
+        .unwrap();
+        broker
+            .store()
+            .set_session_status(session.id, crate::SessionStatus::Cleaned, None)
+            .unwrap();
+        let again = record_again_at_path(&broker, &session, "cleaned");
+        let first = broker.store_ref().session(session.id).unwrap();
+        let second = broker.store_ref().session(again).unwrap();
+        assert_eq!(broker.reused_path_keep(&first, &worktree, true), None);
+        assert_eq!(broker.reused_path_keep(&second, &worktree, true), None);
+
+        let report = run(&mut broker);
+
+        assert_eq!(report.strip.directories_stripped, 1, "{report:#?}");
+        assert_eq!(report.retired_cleaned_leftovers, 1, "{report:#?}");
+        assert_eq!(report.kept.get("leftover_superseded"), None, "{report:#?}");
+        assert!(!worktree.exists());
+    }
+
+    /// A cleaned row never takes a folder from a closed row at the same
+    /// path: the closed session owns it and its own judgement (plan and
+    /// archive) retires it.
+    #[test]
+    fn a_path_with_a_closed_row_keeps_the_cleaned_leftover() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "reused closed", |_| {});
+        let again = record_again_at_path(&broker, &session, "cleaned");
+        let closed_row = broker.store_ref().session(session.id).unwrap();
+        let cleaned_row = broker.store_ref().session(again).unwrap();
+        assert_eq!(closed_row.cleanup_state, crate::SessionCleanupState::Closed);
+        assert_eq!(
+            broker.reused_path_keep(&cleaned_row, &worktree, false),
+            Some("leftover_superseded")
+        );
+        assert_eq!(broker.reused_path_keep(&closed_row, &worktree, false), None);
+
+        let report = run(&mut broker);
+
+        assert_eq!(report.retired_clean, 1, "{report:#?}");
+        assert_eq!(report.retired_cleaned_leftovers, 0, "{report:#?}");
+        assert!(!worktree.exists());
+        assert!(is_cleaned(&broker, session.id));
     }
 }
