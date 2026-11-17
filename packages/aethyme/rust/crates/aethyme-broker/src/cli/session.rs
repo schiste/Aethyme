@@ -1762,7 +1762,8 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
 /// poll by hand: measured on 2026-11-11, 29% of `prepare` runs in the busiest
 /// repository exited with "exclusive key is held" and were simply retried.
 /// `--wait 0s` keeps the fail-fast behaviour.
-const DEFAULT_PREPARE_SHARED_CACHE_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+pub(super) const DEFAULT_PREPARE_SHARED_CACHE_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(600);
 
 pub(super) fn run_prepare(parsed: Parsed) -> Result<(), UsageError> {
     let session_id = parsed

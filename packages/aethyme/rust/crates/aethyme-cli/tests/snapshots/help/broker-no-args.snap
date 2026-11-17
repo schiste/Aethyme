@@ -9,6 +9,7 @@ Verbs:
   start     create an isolated worktree + session, or adopt/reuse an existing one
   status    sessions, overlaps, queue and integration; readiness and doctor views
   submit    simulate and gate a session; preparation
+  advance   prepare and validate the session, then publish its committed head
   push      publish this session's own branch as you work; --pr opens a draft PR
   commit    commit session-owned changes locally while hooks run outside the repository lock
   sync      catch this session up to the latest default branch when it is safe

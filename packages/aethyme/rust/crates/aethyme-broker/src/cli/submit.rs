@@ -1125,7 +1125,7 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
 /// on in the background, logging to `.aethyme/logs/`. It is never killed,
 /// because a coordinated write cut in half would leave an outcome nobody can
 /// vouch for. Failure is reported, never fatal: the push already happened.
-fn review_on_push(
+pub(super) fn review_on_push(
     main_root: &std::path::Path,
     report: &crate::SessionPushReport,
 ) -> Option<serde_json::Value> {
