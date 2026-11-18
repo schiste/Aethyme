@@ -9162,6 +9162,9 @@ impl Broker {
         // fast-forward attempt when a launcher claimed the slot.
         let main_root = self.main_root().to_path_buf();
         crate::main_checkout_sync::run_timer_lane(self.store(), &main_root, now_ms());
+        // Local branches of cleaned sessions whose work is merged: one
+        // bounded slice per run.
+        self.run_merged_branch_lane();
         let artifact_pending = self.artifact_sweep_backlog_pending()?
             && crate::AutoCleanupPolicy::artifact_sweep_allowed(self.main_root());
         let checkout_cleanup_pending = self.auto_checkout_cleanup_recovery_requested()?;

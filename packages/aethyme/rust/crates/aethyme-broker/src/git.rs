@@ -9328,6 +9328,30 @@ impl GitRepo {
         )
     }
 
+    /// Every local branch as `(name, tip)`, sorted by name (`refs/heads/`
+    /// stripped).
+    pub(crate) fn for_each_local_branch(&self) -> Result<Vec<(String, String)>, GitError> {
+        let listing = run_git(
+            &self.root,
+            &[
+                "for-each-ref",
+                "--sort=refname",
+                "--format=%(objectname) %(refname)",
+                "refs/heads/",
+            ],
+        )?;
+        Ok(listing
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .filter_map(|(tip, reference)| {
+                Some((
+                    reference.strip_prefix("refs/heads/")?.to_string(),
+                    tip.to_string(),
+                ))
+            })
+            .collect())
+    }
+
     /// Delete an exact local branch only when it still names the expected
     /// object. Used to roll back a just-created session worktree if its
     /// atomic database registration loses a planned-lease race.
