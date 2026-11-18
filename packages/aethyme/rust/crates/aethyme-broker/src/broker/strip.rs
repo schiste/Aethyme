@@ -238,6 +238,9 @@ pub(crate) struct CheckoutStripDay {
     pub checkouts_archived: usize,
     #[serde(default)]
     pub archive_bytes: u64,
+    /// Idle open sessions stripped that day.
+    #[serde(default)]
+    pub idle_checkouts_stripped: usize,
     /// Bytes of stripped directories the deleter removed that day.
     pub bytes_freed: u64,
 }
@@ -265,6 +268,13 @@ pub(crate) struct CheckoutStripProgress {
     /// repository has since declared under `[cleanup] venv_markers` drops.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub venv_unexpected: BTreeMap<String, i64>,
+    /// Open sessions idle past `[cleanup] idle_strip_after_hours` whose
+    /// current stretch of inactivity the idle strip has not handled yet.
+    #[serde(default)]
+    pub idle_backlog: usize,
+    /// Open sessions the last run's idle strip stripped.
+    #[serde(default)]
+    pub last_idle_checkouts_stripped: usize,
 }
 
 /// A catalogued directory found in a checkout, not yet proved.
@@ -940,7 +950,7 @@ fn refused_counter(code: &str) -> &'static str {
 }
 
 /// Directory refusals that say nothing lasting about the directory.
-fn transient_refusals(report: &CheckoutStripReport) -> usize {
+pub(super) fn transient_refusals(report: &CheckoutStripReport) -> usize {
     ["probe_failed", "deadline", "move_failed"]
         .iter()
         .filter_map(|code| report.refused.get(*code))
@@ -952,7 +962,7 @@ fn note_refusal(report: &mut CheckoutStripReport, code: &'static str) {
     crate::phase_telemetry::add(refused_counter(code), Duration::ZERO);
 }
 
-fn elapsed_ms(started: Instant) -> u64 {
+pub(super) fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
@@ -1043,6 +1053,15 @@ fn judges_before(row: &Session, current: &Session) -> bool {
         )
     };
     rank(row) > rank(current)
+}
+
+/// The checkout a strip moves directories out of, and the pool whose trash
+/// receives them.
+#[derive(Clone, Copy)]
+pub(super) struct StripTarget<'a> {
+    pub session_id: i64,
+    pub worktree: &'a Path,
+    pub pool: &'a Path,
 }
 
 /// What one checkout's strip is judged with besides the run's evidence.
@@ -1868,10 +1887,42 @@ impl Broker {
         {
             return Refused(code);
         }
+        let stripped = self.prove_and_move(
+            StripTarget {
+                session_id: session.id,
+                worktree: &worktree,
+                pool: &pool,
+            },
+            &candidates,
+            deadline,
+            venv_markers,
+            report,
+        );
+        CheckoutStrip::Done(stripped.len())
+    }
+
+    /// Prove `candidates` of `worktree` (all at once, see
+    /// [`prove_strippable_all`]) and rename each proved one into `pool`'s
+    /// trash for `session_id`, until `deadline`, counting every refusal in
+    /// `report`. The caller holds the lifecycle claim and has checked the
+    /// checkout-level preconditions. Returns the relative paths moved.
+    pub(super) fn prove_and_move(
+        &self,
+        target: StripTarget<'_>,
+        candidates: &[StripCandidate],
+        deadline: Instant,
+        venv_markers: &[String],
+        report: &mut CheckoutStripReport,
+    ) -> Vec<String> {
+        let StripTarget {
+            session_id,
+            worktree,
+            pool,
+        } = target;
         let prove_started = Instant::now();
-        let verdicts = prove_strippable_all(&worktree, &candidates, deadline, venv_markers);
+        let verdicts = prove_strippable_all(worktree, candidates, deadline, venv_markers);
         report.prove_ms = report.prove_ms.saturating_add(elapsed_ms(prove_started));
-        let mut stripped = 0_usize;
+        let mut stripped = Vec::new();
         for (candidate, verdict) in candidates.iter().zip(verdicts) {
             if let Err(code) = verdict {
                 note_refusal(report, code);
@@ -1899,10 +1950,10 @@ impl Broker {
             let _move_span = crate::phase_telemetry::span("checkout_strip_move");
             let move_started = Instant::now();
             let moved = crate::checkout_trash::move_directory_to_trash(
-                &pool,
-                &worktree,
+                pool,
+                worktree,
                 &candidate.relative,
-                session.id,
+                session_id,
                 &mut |trash_dir, entry, row| self.record_checkout_trash_row(trash_dir, entry, row),
             );
             report.move_ms = report.move_ms.saturating_add(elapsed_ms(move_started));
@@ -1912,7 +1963,7 @@ impl Broker {
                         "confirm a stripped directory's trash entry",
                         self.record_checkout_trash_row(&moved.trash_dir, &moved.entry, moved.row),
                     );
-                    stripped += 1;
+                    stripped.push(candidate.relative.clone());
                     crate::phase_telemetry::add(
                         "checkout_strip_stripped_directory",
                         Duration::ZERO,
@@ -1930,7 +1981,7 @@ impl Broker {
                 }
             }
         }
-        CheckoutStrip::Done(stripped)
+        stripped
     }
 
     /// Count checkout folders from the broker's records and the pool
@@ -2054,7 +2105,11 @@ impl Broker {
         day.archive_bytes = day.archive_bytes.saturating_add(report.archive_bytes);
         day.directories_stripped = day
             .directories_stripped
-            .saturating_add(strip.directories_stripped);
+            .saturating_add(strip.directories_stripped)
+            .saturating_add(report.idle_strip.strip.directories_stripped);
+        day.idle_checkouts_stripped = day
+            .idle_checkouts_stripped
+            .saturating_add(report.idle_strip.strip.checkouts_stripped);
         day.bytes_freed = day.bytes_freed.saturating_add(report.trash.stripped_bytes);
         while days.len() > STRIP_DAYS_KEPT {
             days.pop_first();
@@ -2099,6 +2154,8 @@ impl Broker {
                 .saturating_add(report.trash.stripped_bytes),
             days,
             venv_unexpected,
+            idle_backlog: report.idle_strip.idle_backlog,
+            last_idle_checkouts_stripped: report.idle_strip.strip.checkouts_stripped,
         }
     }
 

@@ -3002,7 +3002,9 @@ fn push_checkout_retirement_advice(
     in_progress: &std::collections::BTreeSet<i64>,
 ) {
     let backlog = &progress.strip.backlog;
-    if backlog.closed_folders >= strip::CLOSED_CHECKOUT_BACKLOG_ADVICE_AT {
+    if backlog.closed_folders >= strip::CLOSED_CHECKOUT_BACKLOG_ADVICE_AT
+        || progress.strip.idle_backlog >= strip::CLOSED_CHECKOUT_BACKLOG_ADVICE_AT
+    {
         let mut evidence = vec![
             format!(
                 "{} checkout folder(s) on disk, {} of them for closed or cleaned sessions; {} of those still hold a top-level regenerable directory",
@@ -3023,6 +3025,12 @@ fn push_checkout_retirement_advice(
                 today.checkouts_retired,
                 today.cleaned_leftovers_retired,
                 today.checkouts_stripped
+            ));
+        }
+        if progress.strip.idle_backlog > 0 || progress.strip.last_idle_checkouts_stripped > 0 {
+            evidence.push(format!(
+                "{} open session(s) idle past [cleanup] idle_strip_after_hours still hold regenerable directories; the last run stripped {}",
+                progress.strip.idle_backlog, progress.strip.last_idle_checkouts_stripped
             ));
         }
         if let Some(failure) = &progress.last_inspection_failure {
@@ -3742,6 +3750,7 @@ mod retire;
 mod retire_operation;
 mod scratch;
 mod strip;
+mod strip_idle;
 mod tombstone;
 pub(crate) use leases::{
     AbandonedSessionCloseOutcome, AbandonmentKeepReason, LandedProof, LandedSessionDecline,

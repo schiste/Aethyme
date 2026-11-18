@@ -68,6 +68,8 @@ impl BlockerKind {
 pub enum BlockerScope {
     Repo,
     Host,
+    /// Only the session it names can act on it; other agents are not told.
+    Session,
 }
 
 /// One current blocker, in one id namespace across every store.
@@ -753,9 +755,7 @@ impl Broker {
         &self,
         session_id: i64,
     ) -> Result<Option<Blocker>, BrokerOpError> {
-        Ok(Self::action_required_blocker(
-            &self.store_ref().session(session_id)?,
-        ))
+        Ok(self.action_required_blocker(&self.store_ref().session(session_id)?))
     }
 
     fn action_required_blockers(&self) -> Result<Vec<Blocker>, BrokerOpError> {
@@ -763,16 +763,41 @@ impl Broker {
             .store_ref()
             .live_sessions()?
             .iter()
-            .filter_map(Self::action_required_blocker)
+            .filter_map(|session| self.action_required_blocker(session))
             .collect())
     }
 
-    fn action_required_blocker(session: &crate::Session) -> Option<Blocker> {
-        let notice = Path::new(&session.worktree_path).join(crate::merge::ACTION_REQUIRED_RELPATH);
-        if session.status.is_closed() || !notice.is_file() {
+    fn action_required_blocker(&self, session: &crate::Session) -> Option<Blocker> {
+        if session.status.is_closed() {
             return None;
         }
-        Some(Blocker {
+        let notice = Path::new(&session.worktree_path).join(crate::merge::ACTION_REQUIRED_RELPATH);
+        let notice_present = notice.is_file();
+        let idle_notice = notice_present && crate::preparation::is_idle_strip_notice(&notice);
+        if notice_present && !idle_notice {
+            return Some(Self::conflict_notice_blocker(session, &notice));
+        }
+        // The idle strip removed dependencies: the work is untouched and one
+        // command rebuilds them. This holds whether or not the notice could
+        // be written in the checkout (another notice, a tracked or unignored
+        // path), and clears itself once the session is prepared again.
+        if crate::preparation::stripped_since_prepared(self.main_root(), session.id) {
+            return Some(idle_strip_blocker(
+                session.id,
+                idle_notice.then_some(notice.as_path()),
+            ));
+        }
+        if idle_notice {
+            crate::warn_unrecorded(
+                "clear a satisfied idle strip notice",
+                std::fs::remove_file(&notice),
+            );
+        }
+        None
+    }
+
+    fn conflict_notice_blocker(session: &crate::Session, notice: &Path) -> Blocker {
+        Blocker {
             id: format!("action:{}", session.id),
             kind: BlockerKind::ActionRequired,
             scope: BlockerScope::Repo,
@@ -786,7 +811,7 @@ impl Broker {
             clear: format!("aethyme broker submit --session {}", session.id),
             safe_to_clear_automatically: false,
             inspect: None,
-        })
+        }
     }
 
     // ── clearing ────────────────────────────────────────────────────
@@ -1281,6 +1306,25 @@ impl Broker {
 /// the code's verdict until someone shows the host caused them, and advice
 /// that points at invalidating them would teach agents to retry red tests.
 /// Conflict notices already have their own submit advice.
+/// The session-scoped blocker of a session whose regenerable directories
+/// the idle strip removed, naming the notice when one was written.
+pub(crate) fn idle_strip_blocker(session_id: i64, notice: Option<&Path>) -> Blocker {
+    Blocker {
+        id: format!("action:{session_id}"),
+        kind: BlockerKind::ActionRequired,
+        scope: BlockerScope::Session,
+        cause: format!(
+            "session {session_id}'s regenerable dependency directories were stripped while it \
+             was idle; its work is untouched; prepare it again before building or testing{}",
+            notice.map_or_else(String::new, |notice| format!(" ({})", notice.display()))
+        ),
+        session_id: Some(session_id),
+        clear: crate::preparation::prepare_command(session_id),
+        safe_to_clear_automatically: false,
+        inspect: None,
+    }
+}
+
 pub(crate) fn status_advice(blockers: &[Blocker]) -> Option<crate::StatusAdvice> {
     let actionable: Vec<&Blocker> = blockers
         .iter()

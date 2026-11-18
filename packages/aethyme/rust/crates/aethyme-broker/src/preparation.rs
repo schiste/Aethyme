@@ -1274,12 +1274,23 @@ impl Broker {
                 Some(record.digest),
                 Some(record.source_digest),
             ),
-            Some(record) => (
-                PreparationState::Current,
-                "declared dependencies match the prepared-state digest".into(),
+            Some(record) if stripped_since_prepared(self.main_root(), session_id) => (
+                PreparationState::Stale,
+                "regenerable directories were stripped while the session was idle; prepare again"
+                    .into(),
                 Some(record.digest),
                 Some(record.source_digest),
             ),
+            Some(record) => {
+                // Prepared again: the idle strip's notice has done its job.
+                clear_idle_strip_notice(root);
+                (
+                    PreparationState::Current,
+                    "declared dependencies match the prepared-state digest".into(),
+                    Some(record.digest),
+                    Some(record.source_digest),
+                )
+            }
         };
         let expected_digest = Some(hash_text(&source_digest));
         let current_operation = (state != PreparationState::Current)
@@ -3885,6 +3896,67 @@ fn missing_step_outputs(
         }
     }
     Ok(missing)
+}
+
+/// Where the idle strip records that it removed regenerable directories
+/// from a session's checkout (the relative paths, one per line).
+fn stripped_marker_path(main_root: &Path, session_id: i64) -> PathBuf {
+    main_root
+        .join(".aethyme/run/preparation")
+        .join(format!("session-{session_id}.stripped"))
+}
+
+/// The first line of the notice the idle strip leaves in a checkout.
+pub(crate) const IDLE_STRIP_NOTICE_HEADER: &str = "<!-- aethyme: idle-strip notice -->";
+
+/// The one command that prepares `session_id` again.
+pub(crate) fn prepare_command(session_id: i64) -> String {
+    format!("aethyme broker submit prepare --session {session_id}")
+}
+
+/// Whether `path` is the idle strip's notice (its first line).
+pub(crate) fn is_idle_strip_notice(path: &Path) -> bool {
+    fs::read_to_string(path).is_ok_and(|text| text.starts_with(IDLE_STRIP_NOTICE_HEADER))
+}
+
+/// Remove the idle strip's notice from `worktree` (never another notice).
+fn clear_idle_strip_notice(worktree: &Path) {
+    let notice = worktree.join(crate::merge::ACTION_REQUIRED_RELPATH);
+    if is_idle_strip_notice(&notice) {
+        crate::warn_unrecorded(
+            "clear a satisfied idle strip notice",
+            fs::remove_file(&notice),
+        );
+    }
+}
+
+/// Record that the idle strip removed `relatives` from `session_id`'s
+/// checkout: its preparation reads stale until it is prepared again.
+pub(crate) fn mark_stripped(
+    main_root: &Path,
+    session_id: i64,
+    relatives: &[String],
+) -> std::io::Result<()> {
+    let path = stripped_marker_path(main_root, session_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, relatives.join("\n"))
+}
+
+/// Whether the idle strip removed directories after the session's last
+/// preparation record was written (a later preparation rewrites the record
+/// and so reads current again).
+pub(crate) fn stripped_since_prepared(main_root: &Path, session_id: i64) -> bool {
+    let modified = |path: PathBuf| fs::metadata(path).and_then(|metadata| metadata.modified());
+    match (
+        modified(stripped_marker_path(main_root, session_id)),
+        modified(record_path(main_root, session_id)),
+    ) {
+        (Ok(stripped), Ok(prepared)) => stripped >= prepared,
+        (Ok(_), Err(_)) => true,
+        _ => false,
+    }
 }
 
 fn record_path(main_root: &Path, session_id: i64) -> PathBuf {
@@ -6558,6 +6630,33 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// The idle strip's marker makes preparation read stale until a later
+    /// preparation record is written.
+    #[test]
+    fn a_strip_after_the_last_preparation_reads_stale_until_prepared_again() {
+        let root = tempfile::tempdir().unwrap();
+        let record = record_path(root.path(), 9);
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        assert!(!stripped_since_prepared(root.path(), 9));
+        std::fs::write(&record, "{}").unwrap();
+        let set_age = |path: &Path, seconds_ago: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(seconds_ago),
+                )
+                .unwrap();
+        };
+        set_age(&record, 60);
+        mark_stripped(root.path(), 9, &["node_modules".into()]).unwrap();
+        assert!(stripped_since_prepared(root.path(), 9));
+        std::fs::write(&record, "{}").unwrap();
+        set_age(&stripped_marker_path(root.path(), 9), 30);
+        assert!(!stripped_since_prepared(root.path(), 9));
+    }
+
     use super::*;
 
     const SHARED_CACHE_TEST_REPOSITORY: &str =
