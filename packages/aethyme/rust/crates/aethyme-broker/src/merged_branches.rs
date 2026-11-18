@@ -118,31 +118,121 @@ fn keep_counter(reason: &str) -> &'static str {
     }
 }
 
-/// Session ids that have a finished recovery archive under `root`.
-fn archived_session_ids(root: Option<&Path>) -> Option<BTreeSet<i64>> {
-    let Some(root) = root else {
-        return Some(BTreeSet::new());
-    };
-    let listing = match std::fs::read_dir(root) {
-        Ok(listing) => listing,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Some(BTreeSet::new());
+/// Whether a checkout has `refs/heads/<name>` checked out right now, read
+/// from Git's own registrations: the primary checkout's `HEAD` and every
+/// linked worktree's `HEAD` under the common Git directory, including a
+/// branch a rebase in progress will return to. `None` when they cannot be
+/// read, which keeps the branch.
+fn branch_checked_out_now(repo: &crate::GitRepo, name: &str) -> Option<bool> {
+    let common = repo.git_common_dir().ok()?;
+    let wanted = format!("refs/heads/{name}");
+    let names_branch = |path: &Path| -> Option<bool> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let text = text.trim();
+                Some(
+                    text.strip_prefix("ref:").map(str::trim) == Some(wanted.as_str())
+                        || text == wanted,
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+            Err(_) => None,
         }
-        Err(_) => return None,
     };
-    Some(
-        listing
-            .filter_map(Result::ok)
-            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-            .filter(|name| !name.ends_with(".partial"))
-            .filter_map(|name| name.split('-').next()?.parse::<i64>().ok())
-            .collect(),
-    )
+    let admin_dirs = std::iter::once(Ok(common.clone())).chain(
+        match std::fs::read_dir(common.join("worktrees")) {
+            Ok(entries) => entries
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<Vec<_>>(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(_) => return None,
+        },
+    );
+    for admin in admin_dirs {
+        let admin = admin.ok()?;
+        for file in ["HEAD", "rebase-merge/head-name", "rebase-apply/head-name"] {
+            if names_branch(&admin.join(file))? {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
 }
 
 impl crate::Broker {
+    /// Whether `session` still has state a person could restore, so its
+    /// branch must stay: anything not plainly cleaned (open or closed), or a
+    /// cleaned session with a finished recovery archive. `None` when that
+    /// cannot be told, which also keeps the branch.
+    ///
+    /// The one place that decides it. Any feature that keeps restorable state
+    /// for a session elsewhere (an archive that can bring an idle session back
+    /// at its path, say) extends this function, and the branch lane then keeps
+    /// such sessions' branches without further change.
+    pub(crate) fn has_restorable_state(&self, session: &crate::Session) -> Option<bool> {
+        if session.cleanup_state != crate::SessionCleanupState::Cleaned {
+            return Some(true);
+        }
+        let root = self.recovery_archive_root().ok()?;
+        let listing = match std::fs::read_dir(&root) {
+            Ok(listing) => listing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+            Err(_) => return None,
+        };
+        let prefix = format!("{}-", session.id);
+        let mut found = false;
+        for entry in listing {
+            let name = entry.ok()?.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&prefix) && !name.ends_with(".partial") {
+                found = true;
+                break;
+            }
+        }
+        Some(found)
+    }
+
+    /// Why the branch must stay, judged afresh: every session that uses it
+    /// now, and whether a checkout has it checked out now. `None` when it may
+    /// go.
+    fn keep_reason_now(&self, name: &str) -> Option<&'static str> {
+        let Ok(sessions) = self.store_ref().sessions_on_branch(name) else {
+            return Some("unknown");
+        };
+        if sessions.is_empty() {
+            return Some("unknown");
+        }
+        if sessions
+            .iter()
+            .any(|session| session.cleanup_state != crate::SessionCleanupState::Cleaned)
+        {
+            return Some("session_not_cleaned");
+        }
+        for session in &sessions {
+            match self.has_restorable_state(session) {
+                Some(false) => {}
+                Some(true) => return Some("recovery_archive"),
+                None => return Some("unknown"),
+            }
+        }
+        match branch_checked_out_now(self.repo_handle(), name) {
+            Some(false) => None,
+            Some(true) => Some("checked_out"),
+            None => Some("unknown"),
+        }
+    }
+
     /// One bounded slice of the merged-branch lane. Never fetches.
     pub(crate) fn run_merged_branch_lane(&self) -> MergedBranchSummary {
+        self.run_merged_branch_lane_with(&mut || {})
+    }
+
+    /// [`Self::run_merged_branch_lane`] with a hook that runs after the
+    /// unlocked listing and before the lifecycle claim (tests).
+    pub(crate) fn run_merged_branch_lane_with(
+        &self,
+        after_listing: &mut dyn FnMut(),
+    ) -> MergedBranchSummary {
         let _span = crate::phase_telemetry::span("merged_branches_slice");
         let now = crate::clock::epoch_ms();
         let previous = self
@@ -164,7 +254,7 @@ impl crate::Broker {
         if !enabled(self.main_root()) {
             skipped(&mut summary, "disabled");
         } else {
-            match self.merged_branch_slice(&mut summary) {
+            match self.merged_branch_slice(&mut summary, after_listing) {
                 Ok(()) => {}
                 Err(why) => skipped(&mut summary, why),
             }
@@ -182,7 +272,11 @@ impl crate::Broker {
         summary
     }
 
-    fn merged_branch_slice(&self, summary: &mut MergedBranchSummary) -> Result<(), &'static str> {
+    fn merged_branch_slice(
+        &self,
+        summary: &mut MergedBranchSummary,
+        after_listing: &mut dyn FnMut(),
+    ) -> Result<(), &'static str> {
         let started = Instant::now();
         let repo = self.repo_handle();
         let Some(default) = crate::session_push::tracked_default(repo) else {
@@ -199,8 +293,6 @@ impl crate::Broker {
             .filter_map(|entry| entry.branch)
             .filter_map(|branch| branch.strip_prefix("refs/heads/").map(str::to_string))
             .collect::<BTreeSet<_>>();
-        let archived = archived_session_ids(self.recovery_archive_root().ok().as_deref())
-            .ok_or("recovery_archive_listing_failed")?;
 
         // Local branches every one of whose sessions is cleaned, by name.
         let mut candidates = Vec::new();
@@ -228,6 +320,7 @@ impl crate::Broker {
         if candidates.is_empty() {
             return Ok(());
         }
+        after_listing();
         let Some(_lock) = crate::file_lock::try_acquire_repository_lifecycle_lock(
             self.main_root(),
             LIFECYCLE_LANE,
@@ -265,13 +358,20 @@ impl crate::Broker {
                 checked_out: checked_out.contains(name),
                 recovery_archive: sessions
                     .iter()
-                    .any(|session| archived.contains(&session.id)),
+                    .any(|session| self.has_restorable_state(session) != Some(false)),
                 merged: repo.is_ancestor_checked(tip, &default.commit).ok(),
             };
+            // The facts above were read before the lifecycle claim; a
+            // checkout started or reopened meanwhile could use the branch.
+            // Under the claim, judge it again just before the delete, which
+            // itself refuses a tip that moved.
             let verdict = match judge(facts) {
-                Verdict::Delete => match repo.delete_branch_ref_checked(name, tip) {
-                    Ok(()) => Verdict::Delete,
-                    Err(_) => Verdict::Keep("delete_failed"),
+                Verdict::Delete => match self.keep_reason_now(name) {
+                    Some(reason) => Verdict::Keep(reason),
+                    None => match repo.delete_branch_ref_checked(name, tip) {
+                        Ok(()) => Verdict::Delete,
+                        Err(_) => Verdict::Keep("delete_failed"),
+                    },
                 },
                 keep => keep,
             };

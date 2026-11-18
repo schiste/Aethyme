@@ -243,3 +243,81 @@ fn the_lane_can_be_switched_off() {
     assert_eq!(summary.deleted, 0);
     assert!(branch_exists(&root, "agent/merged"));
 }
+
+fn open_session_on(db: &Path, branch: &str, worktree: &Path) {
+    let mut store = crate::BrokerStore::open(db).unwrap();
+    store
+        .register_session(&crate::NewSession {
+            worktree_path: worktree.to_string_lossy().into_owned(),
+            branch: branch.into(),
+            origin: crate::SessionOrigin::Adopted,
+            task: Some("reopened".into()),
+            diff_base: None,
+            adoption_base: None,
+            adopted_head: None,
+            repository_contract: None,
+            pid: None,
+            command: None,
+            log_path: None,
+            agent_identity: None,
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_branch_checked_out_while_the_slice_was_listing_is_kept() {
+    let mut fixture = fixture();
+    let root = fixture.root.clone();
+    git(&root, &["branch", "agent/merged"]);
+    fixture.session("agent/merged", false);
+    let checkout = root.with_file_name("reopened");
+
+    // A reuse recreates the checkout on the branch after the slice listed
+    // worktrees but before it took the lifecycle claim.
+    let summary = fixture.broker.run_merged_branch_lane_with(&mut || {
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                checkout.to_str().unwrap(),
+                "agent/merged",
+            ],
+        );
+    });
+
+    assert_eq!(summary.deleted, 0, "{summary:?}");
+    assert_eq!(
+        summary.kept_by_reason.get("checked_out").copied(),
+        Some(1),
+        "{summary:?}"
+    );
+    assert!(branch_exists(&root, "agent/merged"));
+    assert_eq!(
+        git(&checkout, &["symbolic-ref", "HEAD"]),
+        "refs/heads/agent/merged"
+    );
+}
+
+#[test]
+fn a_branch_reopened_by_a_session_while_the_slice_was_listing_is_kept() {
+    let mut fixture = fixture();
+    let root = fixture.root.clone();
+    git(&root, &["branch", "agent/merged"]);
+    fixture.session("agent/merged", false);
+    let db = fixture.broker.store_ref().db_path().to_path_buf();
+    let reopened = root.with_file_name("reopened-session");
+
+    let summary = fixture.broker.run_merged_branch_lane_with(&mut || {
+        open_session_on(&db, "agent/merged", &reopened);
+    });
+
+    assert_eq!(summary.deleted, 0, "{summary:?}");
+    assert_eq!(
+        summary.kept_by_reason.get("session_not_cleaned").copied(),
+        Some(1),
+        "{summary:?}"
+    );
+    assert!(branch_exists(&root, "agent/merged"));
+}

@@ -743,6 +743,20 @@ holds:
   checkout;
 - the ref still names the judged tip (the delete is a compare-and-swap).
 
+"Merged" is judged against the remote default branch **as last fetched**:
+the worker never fetches, so a missing remote-tracking ref skips the slice
+(`no_fetched_default_branch`) and a stale one only keeps more branches,
+never deletes one whose work is not on it. The listing is read without the
+lifecycle claim; under the claim, immediately before each delete, the
+branch's sessions, its restorable state and Git's worktree registrations
+(every `HEAD`, and a rebase's `head-name`) are read again, so a checkout
+started or reopened during the listing keeps its branch.
+
+A session keeps its branch while it has restorable state: anything not
+plainly cleaned (open or closed), or a recovery archive. That decision lives
+in one function (`Broker::has_restorable_state`); a feature that keeps other
+restorable state for a session extends it.
+
 Anything else is kept and counted (`session_not_cleaned`, `checked_out`,
 `recovery_archive`, `unmerged`, `unknown`, `delete_failed`). Only local
 branches are deleted; remote branches and remote-tracking refs are never
