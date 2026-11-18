@@ -229,12 +229,16 @@ Usage:
       Resolve retained ambiguity explicitly. Assignment requires --session;
       unsupported or repository-mismatched events can only be ignored. The
       reason is stored as a SHA-256 digest, never as text.
-  aethyme broker start --task <text> [--short-name <name>] [--base <ref>] [--pull-request <number>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]
+  aethyme broker start --task <text> [--short-name <name>] [--base <ref>|--stack-on <session-id>] [--pull-request <number>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]
       Create a broker-managed worktree + branch and register a session,
       atomically claiming every reviewed --path, but do not spawn a process.
       Prefer this over adopting the main
       checkout for agent work; it isolates the git index and worktree.
       --agent as in adopt (see above).
+      --stack-on builds on another open session's unmerged branch: the new
+      branch starts at that session's tip, its draft PR targets that branch,
+      `sync` follows it, and when the parent PR merges the broker retargets
+      this PR onto the default branch (or the nearest unmerged ancestor).
   aethyme broker start-agent --task <text> --cmd <command> [--short-name <name>] [--pull-request <number>] [--agent <identity>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]
       Create a worktree + branch and spawn <command> in it (sh -c),
       logging to .aethyme/logs/.
@@ -731,14 +735,15 @@ Usage:
       but stores each fresh result for later normal reuse.
       Session holder: a session is held by the agent process (claude,
       codex, or AETHYME_AGENT_PID) that started or adopted it. submit,
-      push, sync, finish, close, git, gh and adopt --reuse refuse another
-      live agent; --take-over moves the session to the caller and records
-      a session.holder_bound event. Unidentified callers are not refused.
-  aethyme broker advance [--session <id>] [--pr] [--json]
+      advance, push, sync, finish, close, git, gh and adopt --reuse refuse
+      another live agent; --take-over moves the session to the caller and
+      records a session.holder_bound event. Unidentified callers are not refused.
+  aethyme broker advance [--session <id>] [--pr] [--take-over] [--json]
       Prepare the current worktree when authorized, check its state and
       publish its committed head under the session push policy. --pr also
-      requests a pull request under repository policy. Prints the next safe
-      action. Ambiguous writes stop for inspection and reconciliation.
+      requests a pull request under repository policy. Use --take-over for
+      an explicit handoff from a live holder. Prints the next safe action.
+      Ambiguous writes stop for inspection and reconciliation.
   aethyme broker push --session <id> [--pr] [--plan] [--json]
       Publish this session's own agent/* branch to the default branch's
       remote, and nothing else. Commit, then push, as often as you like:
@@ -754,7 +759,7 @@ Usage:
       last knew it and as observed now, and the mode (fast-forward, lease,
       or would refuse, and why). The report of a push names the remote oid
       observed under the push lock and the refs it pushed.
-  aethyme broker sync --session <id> [--json]
+  aethyme broker sync --session <id> [--unstack] [--json]
       Bring this session up to the freshly fetched default branch when it
       is safe: the tree must be clean and nothing in progress. An unpushed
       branch is rebased; a published one has the default branch merged in,
@@ -764,6 +769,11 @@ Usage:
       with `broker push`. Run it before resuming a reused session and
       when `push` reports related or unknown impact. Graph-disjoint impact permits
       deferring intermediate sync; validate the current merge candidate before merge.
+      A stacked session (start --stack-on) syncs with its parent branch until
+      the parent PR merges, then with the branch its PR was retargeted to.
+      --unstack moves a stacked session and its PR onto the default branch,
+      keeping the parent's commits: the choice when the parent PR closed
+      unmerged or its session was abandoned.
   aethyme broker repair --session <id> [--json]
       Conflict-scoped recovery: apply the documented local rebase path for
       the latest submit conflict, or rebase onto integration work when
@@ -948,7 +958,16 @@ Usage:
       cadence. It removes only git-ignored build caches of closed sessions;
       broker open spends at most 250 ms on the same sweep. Open-session caches
       require the reviewed gc reclaim path. Run again to continue a pass that
-      paused at its budget.
+      paused at its budget. With `[remote_branches] delete_merged = true` it
+      also deletes a bounded batch of merged, cleaned session branches from
+      the remote, and re-reads the parent PR of every open stacked session.
+  aethyme broker gc remote-branches plan [--limit <n>] [--json]
+      Preview, writing nothing, which remote session branches the cleanup
+      would delete and which it keeps, by reason. A branch is deleted only
+      when its PR merged at exactly the remote tip, every session on it is
+      cleaned, no open PR uses it as head and none is stacked on it; open
+      PRs based on it are retargeted first, and the delete is leased on the
+      merged head. --limit bounds the candidates read (default 25, max 200).
   aethyme broker gc service plan [--json]
       Read-only macOS per-repository service plan for fixed `gc sweep --json`
       ticks every 900 seconds. Binds the immutable managed router/engine pair.
@@ -1631,6 +1650,10 @@ struct Parsed {
     replace_stale: bool,
     /// `--take-over`: move a session held by another live agent to this one.
     take_over: bool,
+    /// `start --stack-on <session>`: start on top of that session's branch.
+    stack_on: Option<i64>,
+    /// `sync --unstack`: move a stacked session onto the default branch.
+    unstack: bool,
     all: bool,
     all_cleaned: bool,
     closed_before_ms: Option<i64>,
@@ -1796,6 +1819,8 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         adopt: false,
         replace_stale: false,
         take_over: false,
+        stack_on: None,
+        unstack: false,
         all: false,
         all_cleaned: false,
         closed_before_ms: None,
@@ -2069,6 +2094,15 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             }
             "--replace-stale" => parsed.replace_stale = true,
             "--take-over" => parsed.take_over = true,
+            "--unstack" => parsed.unstack = true,
+            "--stack-on" => {
+                let value = iter.next().ok_or(UsageError::Message(
+                    "--stack-on requires a session id".into(),
+                ))?;
+                parsed.stack_on = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--stack-on must be an integer session id".into())
+                })?);
+            }
             "--path" => parsed.planned_paths.push(
                 iter.next()
                     .ok_or(UsageError::Message(

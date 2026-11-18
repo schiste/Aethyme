@@ -2890,3 +2890,5 @@ pub(crate) mod repository_binding;
 pub(crate) mod repository_identity;
 mod review;
 pub(crate) mod service_jobs;
+mod session_stacks;
+pub(crate) use session_stacks::RemoteBranchDecisionRow;

@@ -762,11 +762,14 @@ pub(super) fn run_sync(parsed: Parsed) -> Result<(), UsageError> {
         .session
         .ok_or(UsageError::Message("sync requires --session <id>".into()))?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
-    let report = broker.sync_session(session)?;
+    let report = broker.sync_session_with(session, parsed.unstack)?;
     let conflict = report.outcome == crate::SyncOutcome::Conflict;
     if parsed.json {
         out!("{}", serde_json::to_string_pretty(&report)?);
     } else {
+        if let Some(note) = &report.stack_note {
+            out!("Stack: {note}");
+        }
         let short = |oid: &str| oid[..oid.len().min(12)].to_string();
         match report.outcome {
             crate::SyncOutcome::AlreadyCurrent => out!(
