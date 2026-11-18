@@ -62,6 +62,9 @@ const IDLE_STRIP_CHECKOUT_BUDGET: Duration = Duration::from_secs(15);
 /// The run's open-file observation is used as is while younger than this;
 /// otherwise a fresh one is taken under the claim right before the moves.
 pub(crate) const PROCESS_USE_FRESH_FOR: Duration = Duration::from_secs(5);
+/// [`recent_file_activity`]'s answer when the changed-file probe could not
+/// complete (timeout, failure, or its cap reached without evidence).
+pub(crate) const ACTIVITY_UNKNOWN: &str = "activity_unknown";
 /// Tracked top-level directories whose modification time is read, at most.
 const ACTIVITY_TOP_LEVEL_DIRECTORIES: usize = 32;
 /// The fingerprint of the note left after an idle strip.
@@ -99,6 +102,7 @@ fn idle_refused_counter(code: &str) -> &'static str {
         "gates_unknown" => "checkout_idle_strip_refused_gates_unknown",
         "start_reserved" => "checkout_idle_strip_refused_start_reserved",
         "recent_file_activity" => "checkout_idle_strip_refused_recent_file_activity",
+        "activity_unknown" => "checkout_idle_strip_refused_activity_unknown",
         "checkout_busy" => "checkout_idle_strip_refused_checkout_busy",
         "checkout_lock_unknown" => "checkout_idle_strip_refused_checkout_lock_unknown",
         "discovery_failed" => "checkout_idle_strip_refused_discovery_failed",
@@ -369,16 +373,12 @@ pub(crate) fn recent_file_activity(
     // A deep edit touches none of the above: the changed files' own times
     // (and their parents'). A probe that cannot tell (timeout, or its cap
     // reached without evidence) leaves the answer to the checks above.
+    // A probe that could not complete keeps the session: nothing is
+    // stripped on evidence that was not read.
     match crate::worktree_status_activity::recent_status_activity(worktree, since) {
         Some(true) => Some("changed_file"),
         Some(false) => None,
-        None => {
-            crate::phase_telemetry::add(
-                "checkout_idle_strip_status_activity_fallback",
-                Duration::ZERO,
-            );
-            None
-        }
+        None => Some(ACTIVITY_UNKNOWN),
     }
 }
 
@@ -608,7 +608,11 @@ impl Broker {
         let since = std::time::SystemTime::now()
             .checked_sub(idle_after)
             .unwrap_or(std::time::UNIX_EPOCH);
-        if let Some(evidence) = recent_file_activity(&worktree, since) {
+        let evidence = recent_file_activity(&worktree, since);
+        if evidence == Some(ACTIVITY_UNKNOWN) {
+            return Refused("activity_unknown");
+        }
+        if let Some(evidence) = evidence {
             report.kept_recent_files += 1;
             crate::phase_telemetry::add("checkout_idle_strip_kept_recent_files", Duration::ZERO);
             crate::phase_telemetry::attach(
@@ -741,6 +745,7 @@ mod tests {
             "gates_unknown",
             "start_reserved",
             "recent_file_activity",
+            "activity_unknown",
             "checkout_busy",
             "checkout_lock_unknown",
             "fresh_process_use_unknown",

@@ -1419,6 +1419,17 @@ fn inspect_root(
             "orphan root is younger than the {orphan_worktree_roots_days} day grace period"
         ));
     }
+    // Recovery archives now live on the pool's volume: an orphaned root
+    // holding one not proven landed is kept, and the plan says why.
+    if owner_exists == Some(false)
+        && let Some(reason) = crate::gc::orphan_root_archive_refusal(&path)
+    {
+        crate::phase_telemetry::add(
+            "storage_orphan_root_kept_recovery_archives",
+            std::time::Duration::ZERO,
+        );
+        blockers.push(reason);
+    }
     StorageRoot {
         path,
         filesystem_kind,
@@ -5395,6 +5406,10 @@ fn apply_candidate(
             if is_real_directory(&candidate.repository_root) {
                 return Err("owning repository reappeared".into());
             }
+            // Re-checked at removal: an archive may have appeared since review.
+            if let Some(reason) = crate::gc::orphan_root_archive_refusal(&candidate.path) {
+                return Err(reason);
+            }
             remove_candidate_tree(&candidate.path, Some(WORKTREE_ROOT_MARKER))
         }
         StorageCandidateKind::StrayDirectory => {
@@ -6331,6 +6346,78 @@ fn is_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An orphaned root holding a recovery archive not proven landed is not
+    /// a candidate (a root blocker names the count and the location), and a
+    /// plan reviewed before the archive appeared removes nothing.
+    #[test]
+    fn an_orphan_root_holding_unproven_recovery_archives_is_never_removed() {
+        let container = tempfile::tempdir().unwrap();
+        let root = container.path().join("orphan-key");
+        std::fs::create_dir_all(root.join("old-session")).unwrap();
+        let marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "orphan-key".into(),
+            repository_root: container.path().join("deleted-repository"),
+        };
+        std::fs::write(
+            root.join(WORKTREE_ROOT_MARKER),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        let inspect = || {
+            let mut records = crate::measurement::SizeRecords::default();
+            inspect_root(
+                &root,
+                now_ms(),
+                0,
+                crate::SizeScan::Recorded,
+                &mut records,
+                &BTreeSet::new(),
+            )
+        };
+        let reviewed = candidates_for_root(&inspect(), 0);
+        assert_eq!(reviewed.len(), 1, "{reviewed:?}");
+        assert_eq!(reviewed[0].kind, StorageCandidateKind::OrphanRoot);
+
+        let archive = root
+            .join(crate::cleanup_resolve::POOL_RECOVERY_ARCHIVE_DIRECTORY)
+            .join("orphan-key")
+            .join("7-0123456789ab-1");
+        std::fs::create_dir_all(&archive).unwrap();
+        std::fs::write(
+            archive.join("manifest.json"),
+            serde_json::json!({
+                "session_id": 7,
+                "staged_patch": {"bytes": 3},
+                "unstaged_patch": {"bytes": 0},
+                "untracked_files": [],
+                "ignored_files": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let error = apply_candidate(
+            &reviewed[0],
+            &StorageRootLayout::KeyedContainer(container.path().to_path_buf()),
+        )
+        .unwrap_err();
+        assert!(error.contains("not proven landed"), "{error}");
+        assert!(archive.join("manifest.json").is_file());
+
+        let current = inspect();
+        assert!(candidates_for_root(&current, 0).is_empty());
+        assert!(
+            current
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("1 of 1")
+                    && blocker.contains(crate::cleanup_resolve::POOL_RECOVERY_ARCHIVE_DIRECTORY)),
+            "{:?}",
+            current.blockers
+        );
+    }
 
     #[test]
     fn a_retired_store_holding_the_shared_package_store_keeps_a_managed_layout() {

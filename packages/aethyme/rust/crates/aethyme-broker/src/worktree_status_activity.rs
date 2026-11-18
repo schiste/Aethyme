@@ -3,8 +3,10 @@
 //! Editing `src/a/b/c.rs` touches neither `src/` nor the checkout root, and
 //! the Git index only changes on `add` or a status refresh, so directory and
 //! index modification times miss deep edits. This module runs one
-//! `git --no-optional-locks status --porcelain=v1 -z` (ignored files left
-//! out; `--no-optional-locks` so the probe itself never rewrites the index),
+//! `git --no-optional-locks status --porcelain=v1 -z --untracked-files=all`
+//! (ignored files left out; every file of a new untracked directory listed,
+//! so a deep edit inside one is seen; `--no-optional-locks` so the probe
+//! itself never rewrites the index),
 //! bounded by time and by a cap on the paths it examines, and reads the
 //! modification time of each modified or untracked path and of its parent
 //! directory. The newest of them is the evidence.
@@ -13,7 +15,8 @@
 //! reached before any evidence, the result says so (`complete: false`) and
 //! callers fall back to their previous evidence, counting the fallback.
 
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The longest the status call may take.
@@ -43,7 +46,7 @@ fn mtime_ms(path: &Path) -> Option<i64> {
 /// The changed paths `git status --porcelain=v1 -z` printed: modified,
 /// staged, deleted (whose parent still tells), renamed (the new name) and
 /// untracked entries.
-pub(crate) fn changed_paths(stdout: &[u8]) -> Vec<String> {
+pub(crate) fn changed_paths(stdout: &[u8]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let mut fields = stdout
         .split(|byte| *byte == 0)
@@ -53,8 +56,13 @@ pub(crate) fn changed_paths(stdout: &[u8]) -> Vec<String> {
             continue;
         }
         let status = &field[..2];
-        if let Ok(path) = std::str::from_utf8(&field[3..]) {
-            paths.push(path.trim_end_matches('/').to_string());
+        // Bytes, not UTF-8: a path need not be valid UTF-8.
+        let mut path = &field[3..];
+        while let [rest @ .., b'/'] = path {
+            path = rest;
+        }
+        if !path.is_empty() {
+            paths.push(PathBuf::from(std::ffi::OsStr::from_bytes(path)));
         }
         // A rename or copy is followed by its source path.
         if status.contains(&b'R') || status.contains(&b'C') {
@@ -76,7 +84,7 @@ pub(crate) fn status_activity(worktree: &Path, budget: Duration, cap: usize) -> 
             "status",
             "--porcelain=v1",
             "-z",
-            "--untracked-files=normal",
+            "--untracked-files=all",
         ])
         .current_dir(worktree);
     let output = match crate::bounded_output::output_limited(
@@ -172,7 +180,16 @@ mod tests {
         let out = b" M src/a/b/c.rs\0R  new.rs\0old.rs\0?? notes/\0D  gone.txt\0";
         assert_eq!(
             changed_paths(out),
-            vec!["src/a/b/c.rs", "new.rs", "notes", "gone.txt"]
+            ["src/a/b/c.rs", "new.rs", "notes", "gone.txt"]
+                .iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        );
+        // A path that is not UTF-8 is kept, byte for byte.
+        let odd = b"?? caf\xe9.txt\0";
+        assert_eq!(
+            changed_paths(odd),
+            vec![PathBuf::from(std::ffi::OsStr::from_bytes(b"caf\xe9.txt"))]
         );
     }
 
@@ -220,6 +237,14 @@ mod tests {
         assert_eq!(recent_status_activity(worktree, since), Some(true));
         set(&worktree.join("src/a/b/c.rs"), old);
         assert_eq!(recent_status_activity(worktree, since), Some(false));
+        // A deep edit inside a new untracked directory is seen too.
+        std::fs::create_dir_all(worktree.join("fresh/x/y")).unwrap();
+        std::fs::write(worktree.join("fresh/x/y/z.rs"), "new\n").unwrap();
+        for dir in ["fresh/x/y", "fresh/x", "fresh", ""] {
+            set(&worktree.join(dir), old);
+        }
+        assert_eq!(recent_status_activity(worktree, since), Some(true));
+        set(&worktree.join("fresh/x/y/z.rs"), old);
         // Over the cap without evidence: the caller decides.
         let capped = status_activity(worktree, STATUS_ACTIVITY_BUDGET, 0);
         assert!(!capped.complete);
