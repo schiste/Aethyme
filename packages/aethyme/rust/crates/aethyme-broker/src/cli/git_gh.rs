@@ -53,6 +53,7 @@ pub(super) fn render_blockers(report: &crate::BlockerReport) {
             match blocker.scope {
                 crate::BlockerScope::Repo => "repo",
                 crate::BlockerScope::Host => "host",
+                crate::BlockerScope::Session => "session",
             },
             if blocker.safe_to_clear_automatically {
                 ", safe to clear"

@@ -478,6 +478,8 @@ pub(crate) struct RetireRun {
     /// one however old (the deleter re-checks before deleting anything).
     /// An observation that could not be taken completely is the error.
     process_use: Option<Result<std::rc::Rc<crate::reclaim::OpenFileSnapshot>, String>>,
+    /// When [`Self::process_use`] was observed.
+    process_use_taken_at: Option<Instant>,
     plan_context: Option<crate::cleanup_resolve::CleanupResolveRetirementContext>,
     deadline: Instant,
     /// The lane's own deadline, which an archive may use past the sweep's.
@@ -499,6 +501,19 @@ impl RetireRun {
     /// The run's sweep deadline.
     pub(super) fn deadline(&self) -> Instant {
         self.deadline
+    }
+
+    /// How old the run's open-file observation is (`None`: not taken yet).
+    pub(super) fn process_use_age(&self) -> Option<std::time::Duration> {
+        self.process_use_taken_at.map(|taken| taken.elapsed())
+    }
+
+    /// Make the run's open-file observation look `by` older.
+    #[cfg(test)]
+    pub(super) fn age_process_use_for_test(&mut self, by: std::time::Duration) {
+        self.process_use_taken_at = self
+            .process_use_taken_at
+            .and_then(|taken| taken.checked_sub(by));
     }
 
     /// The keep code when `worktree` overlaps the checkout of an open
@@ -537,6 +552,7 @@ impl RetireRun {
             let started = Instant::now();
             let observed = crate::session_holder::retirement_run_process_use_snapshot(budget);
             crate::phase_telemetry::add("checkout_retirement_process_snapshot", started.elapsed());
+            self.process_use_taken_at = Some(Instant::now());
             self.process_use = Some(match observed {
                 crate::reclaim::OpenFileSnapshot::Incomplete { reason, .. } => {
                     crate::phase_telemetry::add(
@@ -1431,6 +1447,7 @@ impl Broker {
         Ok(Some(RetireRun {
             open_paths: open.iter().map(|session| session.id).zip(paths).collect(),
             process_use: None,
+            process_use_taken_at: None,
             plan_context: None,
             deadline,
             archive_deadline: deadline,
@@ -4827,6 +4844,11 @@ mod tests {
     fn an_idle_open_session_is_stripped_once_per_stretch_of_inactivity() {
         let (_owner, _storage, mut broker) = fixture();
         exclude_node_modules(&broker);
+        std::fs::write(
+            broker.main_root().join(".git/info/exclude"),
+            "node_modules/\ntarget/\n",
+        )
+        .unwrap();
         let open = broker.start_worktree("idle open session", None).unwrap();
         let worktree = PathBuf::from(&open.worktree_path);
         // A repository that declares its preparation (one command rebuilds).
@@ -4861,14 +4883,35 @@ mod tests {
                 )
                 .unwrap();
         };
-        let pass = |broker: &mut crate::Broker| {
+        // Nobody touched the checkout's files for hours (the moves and the
+        // notice themselves update the checkout directory's time).
+        let age_files = |worktree: &Path| {
+            let old = std::time::SystemTime::now() - Duration::from_secs(10 * 3_600);
+            let admin = PathBuf::from(git(worktree, &["rev-parse", "--absolute-git-dir"]).trim());
+            let mut paths = vec![admin.join("index"), admin.join("HEAD"), worktree.to_path_buf()];
+            for name in git(worktree, &["ls-tree", "-d", "--name-only", "HEAD"]).lines() {
+                paths.push(worktree.join(name));
+            }
+            for path in paths.iter().filter(|path| path.exists()) {
+                std::fs::File::open(path).unwrap().set_modified(old).unwrap();
+            }
+        };
+        let pass_with = |broker: &mut crate::Broker, age: bool, stale_snapshot: bool| {
+            if age {
+                age_files(&worktree);
+            }
             let far = Instant::now() + Duration::from_secs(600);
             let mut run = broker
                 .begin_checkout_retirement_run(far)
                 .unwrap()
                 .expect("open paths resolve");
+            if stale_snapshot {
+                run.process_use().unwrap();
+                run.age_process_use_for_test(Duration::from_secs(600));
+            }
             broker.strip_idle_open_checkouts(&mut run, far, 100)
         };
+        let pass = |broker: &mut crate::Broker| pass_with(broker, true, false);
 
         // Not idle long enough.
         idle_since(&mut broker, 1, 0);
@@ -4897,11 +4940,82 @@ mod tests {
             crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
         ));
 
+        // Idle by session activity, but the Git index was just written
+        // (an agent working by absolute paths): not idle.
+        let index = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim())
+            .join("index");
+        age_files(&worktree);
+        std::fs::File::open(&index)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now())
+            .unwrap();
+        let recent = pass_with(&mut broker, false, false);
+        assert_eq!(recent.kept_recent_files, 1, "{recent:#?}");
+        assert_eq!(
+            recent.strip.refused.get("recent_file_activity"),
+            Some(&1),
+            "{recent:#?}"
+        );
+        assert!(worktree.join("node_modules").exists());
+
+        // A preparation running (its shared lock on the checkout): skipped,
+        // not remembered as handled.
+        {
+            let crate::file_lock::artifact_use::ArtifactUseScopeAdmission::Admitted(_preparing) =
+                crate::file_lock::artifact_use::begin_artifact_use_scope(
+                    broker.main_root(),
+                    &worktree,
+                )
+                .unwrap()
+            else {
+                panic!("artifact-use scope admitted");
+            };
+            let busy = pass(&mut broker);
+            assert_eq!(busy.strip.refused.get("checkout_busy"), Some(&1), "{busy:#?}");
+            assert!(worktree.join("node_modules").exists());
+        }
+
+        // The run's observation is minutes old: a fresh one is taken under
+        // the claim, and a process it sees keeps the checkout.
+        crate::session_holder::queue_process_use_snapshots_for_tests(
+            vec![
+                crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+                crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+                    pid: std::process::id(),
+                    command: "node".into(),
+                    descriptor: "cwd".into(),
+                    file_type: Some("DIR".into()),
+                    path: std::fs::canonicalize(&worktree).unwrap(),
+                }]),
+            ],
+            false,
+        );
+        let fresh = pass_with(&mut broker, true, true);
+        assert_eq!(
+            fresh.strip.refused.get("process_using_checkout"),
+            Some(&1),
+            "{fresh:#?}"
+        );
+        assert!(worktree.join("node_modules").exists());
+
+        // A catalogued directory no step declares (`target`) is kept.
+        std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
+        std::fs::write(
+            worktree.join("target/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+
         let stripped = pass(&mut broker);
 
         assert_eq!(stripped.strip.checkouts_stripped, 1, "{stripped:#?}");
         assert_eq!(stripped.noted, 1, "{stripped:#?}");
         assert!(!worktree.join("node_modules").exists());
+        assert_eq!(stripped.kept_not_declared, 1, "{stripped:#?}");
+        assert!(
+            worktree.join("target/CACHEDIR.TAG").exists(),
+            "not a declared output: kept"
+        );
         assert!(worktree.join("base.txt").exists(), "tracked content stays");
         assert!(
             broker
@@ -4944,6 +5058,31 @@ mod tests {
             blocker.clear,
             format!("aethyme broker submit prepare --session {}", open.id)
         );
+        assert_eq!(blocker.scope, crate::BlockerScope::Session);
+        // Without the notice (it could not be written: another notice, a
+        // tracked or unignored path) the session still gets the blocker and
+        // the status advice, both naming the command.
+        let saved = std::fs::read(&notice).unwrap();
+        std::fs::remove_file(&notice).unwrap();
+        let blocker = broker
+            .session_action_required_blocker(open.id)
+            .unwrap()
+            .expect("stripped and not prepared is a blocker without the notice");
+        assert_eq!(blocker.scope, crate::BlockerScope::Session);
+        assert_eq!(
+            blocker.clear,
+            format!("aethyme broker submit prepare --session {}", open.id)
+        );
+        let advice = broker
+            .session_status_advice(open.id, crate::clock::epoch_ms())
+            .unwrap();
+        assert!(
+            advice.iter().any(|row| row.id == "idle_strip_prepare"
+                && row.commands
+                    == vec![format!("aethyme broker submit prepare --session {}", open.id)]),
+            "{advice:?}"
+        );
+        std::fs::write(&notice, saved).unwrap();
         // Prepared again (a newer preparation record): the notice clears.
         let record = broker
             .main_root()
