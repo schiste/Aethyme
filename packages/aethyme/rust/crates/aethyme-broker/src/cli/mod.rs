@@ -735,14 +735,15 @@ Usage:
       but stores each fresh result for later normal reuse.
       Session holder: a session is held by the agent process (claude,
       codex, or AETHYME_AGENT_PID) that started or adopted it. submit,
-      push, sync, finish, close, git, gh and adopt --reuse refuse another
-      live agent; --take-over moves the session to the caller and records
-      a session.holder_bound event. Unidentified callers are not refused.
-  aethyme broker advance [--session <id>] [--pr] [--json]
+      advance, push, sync, finish, close, git, gh and adopt --reuse refuse
+      another live agent; --take-over moves the session to the caller and
+      records a session.holder_bound event. Unidentified callers are not refused.
+  aethyme broker advance [--session <id>] [--pr] [--take-over] [--json]
       Prepare the current worktree when authorized, check its state and
       publish its committed head under the session push policy. --pr also
-      requests a pull request under repository policy. Prints the next safe
-      action. Ambiguous writes stop for inspection and reconciliation.
+      requests a pull request under repository policy. Use --take-over for
+      an explicit handoff from a live holder. Prints the next safe action.
+      Ambiguous writes stop for inspection and reconciliation.
   aethyme broker push --session <id> [--pr] [--plan] [--json]
       Publish this session's own agent/* branch to the default branch's
       remote, and nothing else. Commit, then push, as often as you like:
