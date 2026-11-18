@@ -4,6 +4,28 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.128] - 2026-11-18
+
+### Fixed
+
+- The background cleanup worker no longer stalls on recovery archives. In 0.8.127 every retirement run fully walked and hashed every recovery archive, outside the pass's time budget; on the busiest repository one run exceeded 50 minutes and no checkout was stripped, retired or archived meanwhile. The archive size pass now classifies archives from their manifests, keeps measured sizes between runs, stops at its budget, and fully verifies only the one archive it is about to remove. Restore, `gc apply` and `gc plan --full-scan` still verify fully, and an archive holding unlanded work is still never removed for size (#1816).
+- Setting `[cleanup] delete_merged_session_branches` no longer makes the cleanup policy fail to load. Before, a repository that set this documented key lost automatic checkout removal and the ignored-output sweep (#1813).
+- `aethyme certify` no longer warns "unknown key(s)" on `[cleanup]`, `[main_checkout]`, `[coordination]`, `[console]` and `[watch]` (#1813).
+
+### Changed
+
+- The background worker reads `[cleanup]` from the remote default branch as last fetched (`origin/HEAD` only) when the primary checkout is simply behind it and its config has no local edit. A locally edited, diverged, non-regular or unreadable config, a missing `origin/HEAD`, and a default-branch config that does not validate all keep the working copy, as before. A config edit made during a worker run takes effect for the rest of that run. `broker status` shows advice `cleanup.config-source` when the two copies differ, naming which one the worker follows. Foreground commands and previews still read the working copy (#1813).
+
+### Upgrade notes
+
+- A repository whose primary checkout is held behind its default branch now gets `[cleanup]` settings merged on the default branch. If `origin/HEAD` is not set, run `git remote set-head origin --auto`.
+
+### Known issues
+
+- A landed archive whose full verification cannot finish inside the archive pass's budget is not removed, and archives behind it are not tried in that run; it is counted `recovery_archive_bound_evict_failed`. Nothing is lost; the size bound is not enforced for that repository until this is fixed.
+- When a repository is over the archive bound, the landing check runs for every measured archive without the pass deadline.
+- `certify` checks `[cleanup]` key names only; an invalid value still certifies.
+
 ## [0.8.127] - 2026-11-18
 
 ### Added
