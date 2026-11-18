@@ -1285,6 +1285,7 @@ impl Broker {
     /// session has been cleaned for `recovery_archive_days` (0 keeps pins
     /// forever). Never otherwise. At most `RETIRED_PIN_CHECKS_PER_RUN` pins
     /// are checked per run, from a cursor. Returns the pins left.
+    #[cfg(test)]
     pub(crate) fn prune_retired_pins(&self) -> Result<usize, String> {
         self.prune_retired_pins_until(None)
     }
