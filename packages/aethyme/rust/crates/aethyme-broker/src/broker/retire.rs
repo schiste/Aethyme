@@ -91,6 +91,7 @@ const RETIRE_PIN_PRUNE_BUDGET: std::time::Duration = std::time::Duration::from_s
 const RETIRE_STRIP_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(20);
 const RETIRE_LAP_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(20);
 const RETIRE_CLEANED_LAP_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(10);
+const RETIRE_IDLE_STRIP_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(15);
 /// Next run when nothing is left to do.
 const RETIRE_IDLE_RECHECK_MS: i64 = 10 * 60 * 1_000;
 /// Next run while a lap or the trash is unfinished.
@@ -582,6 +583,8 @@ pub(crate) struct CheckoutRetirementReport {
     pub open_path_resolutions: usize,
     /// The strip pass that ran before the judgement lap.
     pub strip: super::strip::CheckoutStripReport,
+    /// The idle strip of open sessions that ran after it.
+    pub idle_strip: super::strip_idle::IdleStripReport,
 }
 
 /// Progress kept across runs for `broker status`.
@@ -1983,6 +1986,15 @@ impl Broker {
                 strip_deadline,
                 super::strip::STRIP_CHECKOUTS_PER_RUN,
             );
+            // Then the idle open sessions' regenerable directories, with
+            // their own share.
+            let idle_deadline = share(1, 4, RETIRE_IDLE_STRIP_MIN_SHARE);
+            run.deadline = idle_deadline;
+            report.idle_strip = self.strip_idle_open_checkouts(
+                &mut run,
+                idle_deadline,
+                super::strip_idle::IDLE_STRIP_CHECKOUTS_PER_RUN,
+            );
             // Closed sessions first, then the leftover folders of sessions
             // already recorded as cleaned, each lap with its own cursor and
             // its own share so neither starves the other.
@@ -2049,6 +2061,7 @@ impl Broker {
         let shrinking =
             report.retired_clean + report.retired_archived + report.retired_operation_archived > 0
                 || report.strip.directories_stripped > 0
+                || report.idle_strip.strip.directories_stripped > 0
                 || report.trash.entries_removed > 0
                 || (report.trash.entries_pending == 0 && kept == 0);
         let progress = CheckoutRetirementProgress {
@@ -2106,7 +2119,8 @@ impl Broker {
         let busy = !report.lap_complete
             || !report.cleaned_lap_complete
             || report.trash.entries_pending > 0
-            || report.strip.more_remaining;
+            || report.strip.more_remaining
+            || report.idle_strip.strip.more_remaining;
         let next = crate::clock::epoch_ms().saturating_add(if busy {
             RETIRE_BUSY_RECHECK_MS
         } else {
@@ -4803,5 +4817,121 @@ mod tests {
 
         assert!(!old.exists());
         assert!(fresh.exists());
+    }
+
+    /// An open session idle past `idle_strip_after_hours` with no process in
+    /// its checkout has its regenerable directories stripped once, its
+    /// preparation marked stale and one note left; it is not stripped again
+    /// until new activity, a process inside keeps it, and `0` turns it off.
+    #[test]
+    fn an_idle_open_session_is_stripped_once_per_stretch_of_inactivity() {
+        let (_owner, _storage, mut broker) = fixture();
+        exclude_node_modules(&broker);
+        let open = broker.start_worktree("idle open session", None).unwrap();
+        let worktree = PathBuf::from(&open.worktree_path);
+        let populate = |worktree: &Path| {
+            std::fs::create_dir_all(worktree.join("node_modules/dep")).unwrap();
+            std::fs::write(worktree.join("node_modules/dep/index.js"), "x\n").unwrap();
+            std::fs::write(
+                worktree.join("node_modules/.modules.yaml"),
+                "layoutVersion: 5\n",
+            )
+            .unwrap();
+        };
+        populate(&worktree);
+        let idle_since = |broker: &mut crate::Broker, hours: i64, offset_ms: i64| {
+            broker
+                .store()
+                .connection()
+                .execute(
+                    "UPDATE sessions SET last_activity_at = ?1 WHERE id = ?2",
+                    rusqlite::params![
+                        crate::clock::epoch_ms() - hours * 3_600_000 - offset_ms,
+                        open.id
+                    ],
+                )
+                .unwrap();
+        };
+        let pass = |broker: &mut crate::Broker| {
+            let far = Instant::now() + Duration::from_secs(600);
+            let mut run = broker
+                .begin_checkout_retirement_run(far)
+                .unwrap()
+                .expect("open paths resolve");
+            broker.strip_idle_open_checkouts(&mut run, far, 100)
+        };
+
+        // Not idle long enough.
+        idle_since(&mut broker, 1, 0);
+        assert_eq!(pass(&mut broker).strip.checkouts_stripped, 0);
+        assert!(worktree.join("node_modules").exists());
+
+        // A process inside keeps it.
+        idle_since(&mut broker, 5, 0);
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+                pid: std::process::id(),
+                command: "node".into(),
+                descriptor: "cwd".into(),
+                file_type: Some("DIR".into()),
+                path: std::fs::canonicalize(&worktree).unwrap(),
+            }]),
+        ));
+        let kept = pass(&mut broker);
+        assert_eq!(
+            kept.strip.refused.get("process_using_checkout"),
+            Some(&1),
+            "{kept:#?}"
+        );
+        assert!(worktree.join("node_modules").exists());
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+        ));
+
+        let stripped = pass(&mut broker);
+
+        assert_eq!(stripped.strip.checkouts_stripped, 1, "{stripped:#?}");
+        assert_eq!(stripped.noted, 1, "{stripped:#?}");
+        assert!(!worktree.join("node_modules").exists());
+        assert!(worktree.join("base.txt").exists(), "tracked content stays");
+        assert!(
+            broker
+                .main_root()
+                .join(format!(
+                    ".aethyme/run/preparation/session-{}.stripped",
+                    open.id
+                ))
+                .exists(),
+            "its preparation reads stale"
+        );
+        let notes = broker.store_ref().unread_automation_notes(open.id).unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.message.contains("submit prepare")),
+            "{notes:?}"
+        );
+
+        // Re-prepared while still idle, with no new activity: not again.
+        populate(&worktree);
+        let again = pass(&mut broker);
+        assert_eq!(again.strip.checkouts_stripped, 0, "{again:#?}");
+        assert_eq!(again.skipped_handled, 1, "{again:#?}");
+        assert!(worktree.join("node_modules").exists());
+
+        // New activity, then idle again: armed again.
+        idle_since(&mut broker, 5, 1_000);
+        assert_eq!(pass(&mut broker).strip.checkouts_stripped, 1);
+
+        // `0` turns it off.
+        populate(&worktree);
+        idle_since(&mut broker, 5, 2_000);
+        std::fs::write(
+            broker.main_root().join(".aethyme/config.toml"),
+            "[cleanup]\nidle_strip_after_hours = 0\n",
+        )
+        .unwrap();
+        assert_eq!(pass(&mut broker).strip.checkouts_examined, 0);
+        assert!(worktree.join("node_modules").exists());
     }
 }

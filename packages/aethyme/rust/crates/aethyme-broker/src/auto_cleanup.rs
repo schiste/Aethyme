@@ -613,6 +613,50 @@ pub(crate) fn abandoned_operation_after_ms(main_root: &Path) -> i64 {
     hours.saturating_mul(3_600_000)
 }
 
+/// `[cleanup]` key: hours of inactivity after which an open session's
+/// catalogued regenerable directories are stripped (`0` turns it off).
+pub(crate) const IDLE_STRIP_CONFIG_KEY: &str = "idle_strip_after_hours";
+/// The default of [`IDLE_STRIP_CONFIG_KEY`].
+pub(crate) const DEFAULT_IDLE_STRIP_AFTER_HOURS: i64 = 4;
+
+/// Parse [`IDLE_STRIP_CONFIG_KEY`]; absent is the default.
+pub(crate) fn parse_idle_strip_after_hours(value: Option<&toml::Value>) -> Result<i64, String> {
+    match value {
+        None => Ok(DEFAULT_IDLE_STRIP_AFTER_HOURS),
+        Some(toml::Value::Integer(hours))
+            if (0..=MAX_ABANDONED_OPERATION_AFTER_HOURS).contains(hours) =>
+        {
+            Ok(*hours)
+        }
+        Some(_) => Err(format!(
+            "[cleanup] {IDLE_STRIP_CONFIG_KEY} must be a whole number of hours between 0 (off) and {MAX_ABANDONED_OPERATION_AFTER_HOURS}"
+        )),
+    }
+}
+
+/// [`IDLE_STRIP_CONFIG_KEY`] of the primary checkout's config, in
+/// milliseconds; `0` is off. An unreadable or invalid value turns it off
+/// (the cleanup policy loader reports it): an unattended strip only runs
+/// when the setting is known.
+pub(crate) fn idle_strip_after_ms(main_root: &Path) -> i64 {
+    let hours = (|| -> Result<i64, String> {
+        let Some((path, text)) =
+            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
+                .map_err(|error| error.to_string())?
+        else {
+            return parse_idle_strip_after_hours(None);
+        };
+        let root: toml::Value = toml::from_str(&text)
+            .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+        parse_idle_strip_after_hours(
+            root.get("cleanup")
+                .and_then(|cleanup| cleanup.get(IDLE_STRIP_CONFIG_KEY)),
+        )
+    })()
+    .unwrap_or(0);
+    hours.saturating_mul(3_600_000)
+}
+
 /// `[cleanup]` key: exact file names a repository's own tooling writes at
 /// the top of a Python virtual environment, which the strip pass then
 /// accepts beside `pyvenv.cfg` (it already accepts what environment tools
@@ -793,6 +837,10 @@ impl AutoCleanupPolicy {
                 VENV_MARKERS_CONFIG_KEY => {
                     // Read by the strip pass; validated here.
                     parse_venv_markers(Some(value))?;
+                }
+                IDLE_STRIP_CONFIG_KEY => {
+                    // Read by the idle strip pass; validated here.
+                    parse_idle_strip_after_hours(Some(value))?;
                 }
                 // Read by the abandonment window's per-class gate; validated here.
                 key if crate::stale_session_policy::is_policy_key(key) => {

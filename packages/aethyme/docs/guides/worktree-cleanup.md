@@ -476,6 +476,7 @@ keep = ["*-investigation"]     # worktrees never removed automatically
 unattended_unlinks_per_second = 1000 # background worker pace, also under load; 0 or "unlimited" = full speed
 abandoned_operation_after_hours = 24 # the default; a closed checkout's merge/rebase left in progress longer is archived, then retired
 venv_markers = [".env-check.json"] # exact file names your tooling writes at a .venv top (at most 16; never .env)
+idle_strip_after_hours = 4      # the default; an open session idle this long, with no process in its checkout, has its regenerable directories stripped (0 = off)
 ```
 
 The strip pass removes a closed checkout's `.venv` only when its top holds
