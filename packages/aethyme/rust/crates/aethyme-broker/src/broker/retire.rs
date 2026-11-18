@@ -5532,6 +5532,103 @@ mod tests {
         );
     }
 
+    /// The bound pass lists, sizes and classifies archives from metadata
+    /// alone: archives it does not remove are never fully verified, and the
+    /// archive roots are inspected once per pass, not once per archive.
+    #[test]
+    fn the_archive_bound_never_fully_verifies_archives_it_does_not_remove() {
+        let (_owner, _storage, mut broker) = fixture();
+        for label in ["bound one", "bound two", "bound three"] {
+            retired_with_archive(&mut broker, label);
+        }
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let verified_before =
+            crate::cleanup_resolve::FULL_ARCHIVE_VERIFICATIONS.with(std::cell::Cell::get);
+        let usage = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker.enforce_recovery_archive_bound(Instant::now() + Duration::from_secs(60))
+        };
+        let verified_after =
+            crate::cleanup_resolve::FULL_ARCHIVE_VERIFICATIONS.with(std::cell::Cell::get);
+        assert_eq!(
+            verified_after, verified_before,
+            "no archive the pass keeps is fully verified"
+        );
+        let pass = &recorder.attachments()["recovery_archive_bound_pass"];
+        assert_eq!(pass["listed"], 3, "{pass}");
+        assert_eq!(pass["listing_skipped_by_budget"], 0, "{pass}");
+        assert_eq!(pass["budget_stops"], 0, "{pass}");
+        assert!(!usage.partial, "{usage:?}");
+        assert_eq!(usage.pool.archives + usage.host_state.archives, 3);
+        let (_, counts) = recorder.totals();
+        assert_eq!(
+            counts.get("recovery_archive_roots_inspect").copied(),
+            Some(1),
+            "{counts:?}"
+        );
+    }
+
+    /// A pass out of budget stops, says so, and leaves the rest for later;
+    /// sizes measured by an earlier pass are the cursor the next pass
+    /// resumes from, so a backlog is measured once, not every run.
+    #[test]
+    fn the_archive_bound_respects_its_budget_and_resumes_from_measured_sizes() {
+        let (_owner, _storage, mut broker) = fixture();
+        for label in ["budget one", "budget two"] {
+            retired_with_archive(&mut broker, label);
+        }
+        // Forget what the worker's own passes measured.
+        let host_state = broker.storage_context().host_state_dir.clone().unwrap();
+        let repository = broker.main_root().to_string_lossy().into_owned();
+        crate::storage_ledger::record_recovery_archive_sizes(
+            &host_state,
+            &repository,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+
+        // Out of budget before it starts: nothing listed, nothing walked.
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let usage = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker.enforce_recovery_archive_bound(Instant::now())
+        };
+        assert!(usage.partial, "{usage:?}");
+        let pass = &recorder.attachments()["recovery_archive_bound_pass"];
+        assert_eq!(pass["listed"], 0, "{pass}");
+        assert_eq!(pass["listing_skipped_by_budget"], 2, "{pass}");
+        assert_eq!(pass["size_measured"], 0, "{pass}");
+        assert_eq!(pass["budget_stops"], 1, "{pass}");
+
+        // With budget: both measured and recorded.
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let usage = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker.enforce_recovery_archive_bound(Instant::now() + Duration::from_secs(60))
+        };
+        assert!(!usage.partial, "{usage:?}");
+        let pass = &recorder.attachments()["recovery_archive_bound_pass"];
+        assert_eq!(pass["size_measured"], 2, "{pass}");
+        assert_eq!(
+            crate::storage_ledger::recovery_archive_sizes(&host_state, &repository).len(),
+            2
+        );
+
+        // The next pass resumes from them: nothing is walked again.
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let again = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker.enforce_recovery_archive_bound(Instant::now() + Duration::from_secs(60))
+        };
+        let pass = &recorder.attachments()["recovery_archive_bound_pass"];
+        assert_eq!(pass["size_measured"], 0, "{pass}");
+        assert_eq!(pass["size_cached"], 2, "{pass}");
+        assert_eq!(
+            again.pool.bytes + again.host_state.bytes,
+            usage.pool.bytes + usage.host_state.bytes
+        );
+    }
+
     /// A restore whose cleanup fails leaves nothing at the session's path
     /// (it was built at a sibling staging path) and a marker that refuses
     /// any reuse there until the leftovers are removed.

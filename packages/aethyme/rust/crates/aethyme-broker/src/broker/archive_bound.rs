@@ -26,6 +26,7 @@
 //! with bytes and counts by location, and shown by `aethyme storage status`.
 
 use super::*;
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::storage_ledger::RecoveryArchiveUsage as ArchiveBoundUsage;
@@ -34,6 +35,40 @@ use crate::storage_ledger::RecoveryArchiveUsage as ArchiveBoundUsage;
 const ARCHIVE_BOUND_BUDGET: Duration = Duration::from_secs(20);
 /// Sessions named one by one in the advice, at most.
 const UNIQUE_SESSIONS_NAMED: usize = 20;
+
+/// What one bound pass did, for phase telemetry.
+#[derive(Debug, Default)]
+struct PassStats {
+    /// Archives classified from metadata.
+    listed: usize,
+    /// Archives the listing did not reach before the deadline.
+    skipped_by_budget: usize,
+    /// Sizes taken from earlier passes, walked now, or left for later.
+    size_cached: usize,
+    size_measured: usize,
+    size_skipped_by_budget: usize,
+    /// Phases (listing, sizing) stopped by the deadline.
+    budget_stops: usize,
+}
+
+impl PassStats {
+    fn record(&self) {
+        if self.budget_stops > 0 {
+            crate::phase_telemetry::add("recovery_archive_bound_budget_stop", Duration::ZERO);
+        }
+        crate::phase_telemetry::attach(
+            "recovery_archive_bound_pass",
+            serde_json::json!({
+                "listed": self.listed,
+                "listing_skipped_by_budget": self.skipped_by_budget,
+                "size_cached": self.size_cached,
+                "size_measured": self.size_measured,
+                "size_skipped_by_budget": self.size_skipped_by_budget,
+                "budget_stops": self.budget_stops,
+            }),
+        );
+    }
+}
 
 struct Measured {
     archive: crate::cleanup_resolve::OwnedRecoveryArchive,
@@ -55,7 +90,12 @@ impl Broker {
             observed_at_ms: crate::clock::epoch_ms(),
             ..ArchiveBoundUsage::default()
         };
-        let scan = match self.recovery_archives() {
+        // Listing and classifying read only directory entries, manifests
+        // and session records: no archive content is read or hashed here.
+        // The one archive about to be removed is fully proven, under the
+        // lifecycle claim, in `evict_landed_archive`.
+        let listing_span = crate::phase_telemetry::span("recovery_archive_bound_listing");
+        let scan = match self.recovery_archive_listing(deadline) {
             Ok(scan) => scan,
             Err(error) => {
                 usage.partial = true;
@@ -63,6 +103,16 @@ impl Broker {
                 return usage;
             }
         };
+        drop(listing_span);
+        let mut stats = PassStats {
+            listed: scan.owned.len() + scan.unowned.len(),
+            skipped_by_budget: scan.skipped_by_budget,
+            ..PassStats::default()
+        };
+        if scan.skipped_by_budget > 0 {
+            usage.partial = true;
+            stats.budget_stops += 1;
+        }
         let pool_root = self.pool_recovery_archive_root(false);
         usage.pool.root = pool_root
             .as_ref()
@@ -73,18 +123,56 @@ impl Broker {
                 .as_ref()
                 .is_some_and(|root| path.starts_with(root))
         };
+        // Sizes measured by earlier passes (a complete archive never
+        // changes); only archives missing there are walked, in name order,
+        // within the budget. The persisted sizes are the cursor: what this
+        // pass leaves unmeasured, the next one measures first.
+        let host_state = self
+            .storage_context()
+            .host_state_dir
+            .clone()
+            .or_else(|| crate::host_state::resolve_host_state_dir().map(|(path, _)| path));
+        let repository = self.main_root().to_string_lossy().into_owned();
+        let cached = host_state
+            .as_deref()
+            .map(|host| crate::storage_ledger::recovery_archive_sizes(host, &repository))
+            .unwrap_or_default();
+        let mut sizes = BTreeMap::new();
+        let mut measure = |path: &Path, created_at_ms: i64, stats: &mut PassStats| {
+            let key = path.to_string_lossy().into_owned();
+            if let Some(known) = cached
+                .get(&key)
+                .filter(|known| known.created_at_ms == created_at_ms)
+            {
+                stats.size_cached += 1;
+                sizes.insert(key, *known);
+                return Some(known.bytes);
+            }
+            if Instant::now() >= deadline {
+                stats.size_skipped_by_budget += 1;
+                return None;
+            }
+            let bytes =
+                super::status_helpers::directory_size_without_following_links(path).unwrap_or(0);
+            stats.size_measured += 1;
+            sizes.insert(
+                key,
+                crate::storage_ledger::MeasuredArchiveSize {
+                    created_at_ms,
+                    bytes,
+                },
+            );
+            Some(bytes)
+        };
         let now = crate::clock::epoch_ms();
         let retention_days = crate::retention::load_retention_policy(self.main_root())
             .map_or(90, |policy| policy.recovery_archive_days);
         let mut measured = Vec::new();
         for archive in scan.owned {
-            if Instant::now() >= deadline {
+            let Some(bytes) = measure(&archive.path, archive.created_at_ms, &mut stats) else {
                 usage.partial = true;
-                break;
-            }
-            let bytes =
-                super::status_helpers::directory_size_without_following_links(&archive.path)
-                    .unwrap_or(0);
+                continue;
+            };
             let location = if in_pool(&archive.path) {
                 &mut usage.pool
             } else {
@@ -105,7 +193,12 @@ impl Broker {
             if kept {
                 crate::phase_telemetry::add("recovery_archive_bound_kept_by_owner", Duration::ZERO);
             }
-            let evictable = !kept && old_enough && self.recovery_archive_landed(&archive);
+            // Past the deadline nothing new is judged evictable: the landing
+            // check runs Git, and nothing will be removed this pass anyway.
+            let evictable = !kept
+                && old_enough
+                && Instant::now() < deadline
+                && self.recovery_archive_landed(&archive);
             // Host state archives keep expiring through the storage worker
             // (with its notice week); pool ones are this lane's.
             let expired = evictable
@@ -122,8 +215,10 @@ impl Broker {
         }
         // Archives the broker cannot vouch for count, and are never removed.
         for (path, _) in &scan.unowned {
-            let bytes =
-                super::status_helpers::directory_size_without_following_links(path).unwrap_or(0);
+            let Some(bytes) = measure(path, 0, &mut stats) else {
+                usage.partial = true;
+                continue;
+            };
             let location = if in_pool(path) {
                 &mut usage.pool
             } else {
@@ -132,6 +227,23 @@ impl Broker {
             location.archives += 1;
             location.bytes = location.bytes.saturating_add(bytes);
         }
+        // Keep what earlier passes measured for archives this pass did not
+        // reach, while they are still there.
+        for (key, known) in cached {
+            if !sizes.contains_key(&key) && std::fs::symlink_metadata(&key).is_ok() {
+                sizes.insert(key, known);
+            }
+        }
+        if let Some(host) = host_state.as_deref() {
+            crate::warn_unrecorded(
+                "record measured recovery archive sizes",
+                crate::storage_ledger::record_recovery_archive_sizes(host, &repository, &sizes),
+            );
+        }
+        if stats.size_skipped_by_budget > 0 {
+            stats.budget_stops += 1;
+        }
+        stats.record();
         let mut total = usage.pool.bytes.saturating_add(usage.host_state.bytes);
         // Fully landed and past their retention age: removed as before.
         for entry in measured.iter().filter(|entry| entry.expired) {
@@ -245,7 +357,15 @@ impl Broker {
         if crate::storage_ledger::keep_marker(&archive.path).exists() {
             return Err("kept by the owner's marker".into());
         }
-        let current = self.owned_recovery_archive(&archive.path)?;
+        // The full proof, for this one archive only, bounded by the pass.
+        crate::phase_telemetry::add("recovery_archive_bound_verified", Duration::ZERO);
+        let current = self.owned_recovery_archive_with(
+            &archive.path,
+            &self.inspected_recovery_archive_roots(),
+            crate::cleanup_resolve::ArchiveProof::Full {
+                deadline: Some(deadline),
+            },
+        )?;
         if current.session_id != archive.session_id
             || current.head != archive.head
             || !self.recovery_archive_landed(&current)
