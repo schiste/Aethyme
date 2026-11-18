@@ -226,10 +226,22 @@ fn advance_requires_an_explicit_handoff_between_live_agents() {
     let id = session.to_string();
     let original_binding = fx.holder_event(session);
 
+    let assert_refused_by = |output: &Output, holder: &Agent| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(3), "{stdout} {}", stderr(output));
+        let error: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{error}: {stdout} {}", stderr(output)));
+        assert_eq!(error["schema"], "aethyme.broker-error/v1");
+        let message = error["error"]["message"].as_str().expect("error message");
+        assert!(message.contains(HELD), "{message}");
+        assert!(
+            message.contains(&format!("pid {}", holder.pid())),
+            "{message}"
+        );
+        assert!(message.contains("--take-over"), "{message}");
+    };
     let refused = fx.run_as(&worker.pid(), &["advance", "--session", &id, "--json"]);
-    assert_eq!(refused.status.code(), Some(3));
-    assert!(stderr(&refused).contains(HELD));
-    assert!(stderr(&refused).contains("--take-over"));
+    assert_refused_by(&refused, &launcher);
     assert_eq!(fx.holder_event(session), original_binding);
 
     let advanced = fx.run_as(
@@ -250,8 +262,7 @@ fn advance_requires_an_explicit_handoff_between_live_agents() {
     );
 
     let former = fx.run_as(&launcher.pid(), &["advance", "--session", &id, "--json"]);
-    assert_eq!(former.status.code(), Some(3));
-    assert!(stderr(&former).contains(HELD));
+    assert_refused_by(&former, &worker);
     assert_eq!(fx.holder_event(session), binding);
 }
 
