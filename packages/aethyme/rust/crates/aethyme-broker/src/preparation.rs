@@ -1537,6 +1537,19 @@ impl Broker {
                 ),
                 SharedCacheRoot::Auto => self.auto_preparation_cache_root(&root)?,
             };
+            crate::phase_telemetry::add(
+                match (configured, resolved) {
+                    (SharedCacheRoot::Auto, SharedCacheRoot::WorktreeVolume) => {
+                        "prepare_cache_root_auto_worktree_volume"
+                    }
+                    (SharedCacheRoot::Auto, _) => "prepare_cache_root_auto_host",
+                    (_, SharedCacheRoot::WorktreeVolume) => {
+                        "prepare_cache_root_configured_worktree_volume"
+                    }
+                    _ => "prepare_cache_root_configured_host",
+                },
+                Duration::ZERO,
+            );
             crate::phase_telemetry::attach(
                 "prepare_cache_root",
                 serde_json::json!({

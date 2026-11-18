@@ -1572,7 +1572,10 @@ support. Output contract (additive): `package_store.output_share` and
 `submit prepare status --json`; the command metric gains
 `prepare_dependency_sharing` (counters, `unique_bytes_before`,
 `unique_bytes_after`, no paths), `prepare_cache_root` and the
-`prepare_output_share` span. `[shared_cache] root` gains `auto`, now the
+`prepare_output_share` span and the `prepare_cache_root_*` placement
+counters; the storage sweep also retires a shared package store unused for a
+week (`package_store_rotated_idle`, judged by the mtime of the store's
+`.aethyme-store-cap` record). `[shared_cache] root` gains `auto`, now the
 default: the host root when it shares the checkout's volume, the
 worktree-volume root otherwise. `auto` serializes as `host`, so no
 preparation digest or trusted policy changes. Older binaries refuse

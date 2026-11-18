@@ -113,6 +113,13 @@ pub struct OutputShareReport {
     /// Candidates left alone: more than one link, or changed while hashed.
     pub files_left_alone: u64,
     pub files_failed: u64,
+    /// Pool entries whose content did not match their name, removed; the
+    /// files they would have replaced keep their own copy.
+    #[serde(default)]
+    pub pool_entries_rejected: u64,
+    /// Temporaries left by an interrupted earlier pass, removed.
+    #[serde(default)]
+    pub stale_temporaries_removed: u64,
     /// Bytes the walked roots owned alone before and after the pass. Files
     /// added to the pool count as shared afterwards: the pool holds one copy
     /// for every later checkout.
@@ -151,6 +158,8 @@ impl OutputShareReport {
             "bytes_added_to_pool": self.bytes_added_to_pool,
             "files_left_alone": self.files_left_alone,
             "files_failed": self.files_failed,
+            "pool_entries_rejected": self.pool_entries_rejected,
+            "stale_temporaries_removed": self.stale_temporaries_removed,
             "unique_bytes_before": self.unique_bytes_before,
             "unique_bytes_after": self.unique_bytes_after,
             "unique_bytes_method": self.unique_bytes_method,
@@ -272,7 +281,9 @@ pub(crate) fn share_outputs(
         estimated: false,
         stop: None,
         temp_counter: 0,
+        verified_entries: std::collections::HashSet::new(),
     };
+    pass.sweep_pool_temporaries();
     for root in &request.roots {
         if pass.stop.is_some() {
             break;
@@ -326,6 +337,8 @@ struct Pass {
     /// Why the pass stopped early.
     stop: Option<String>,
     temp_counter: u64,
+    /// Pool entries whose content this pass has checked against their name.
+    verified_entries: std::collections::HashSet<PathBuf>,
 }
 
 impl Pass {
@@ -401,6 +414,9 @@ impl Pass {
                     continue;
                 }
                 if !file_type.is_file() {
+                    continue;
+                }
+                if self.remove_if_stale_temporary(&path) {
                     continue;
                 }
                 let Ok(metadata) = fs::symlink_metadata(&path) else {
@@ -493,6 +509,9 @@ impl Pass {
                     && !pooled.file_type().is_symlink()
                     && pooled.len() == metadata.len() =>
             {
+                if !self.entry_matches_its_name(&entry, &digest)? {
+                    return Ok(Shared::LeftAlone);
+                }
                 let parent = path
                     .parent()
                     .ok_or_else(|| io::Error::other("an output file has no parent directory"))?;
@@ -509,13 +528,89 @@ impl Pass {
             ))),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let temporary = self.temporary_name(&bucket);
-                let added = add_to_pool(path, &temporary, &entry);
-                if added.is_err() {
+                let added = add_to_pool(path, &temporary, &entry, &digest);
+                if !matches!(added, Ok(true)) {
                     remove_temporary(&temporary);
                 }
-                added.map(|()| Shared::IntoPool)
+                match added {
+                    Ok(true) => {
+                        self.verified_entries.insert(entry);
+                        Ok(Shared::IntoPool)
+                    }
+                    // The file changed between hashing and cloning: nothing
+                    // was published and the file keeps its own copy.
+                    Ok(false) => Ok(Shared::LeftAlone),
+                    Err(error) => Err(error),
+                }
             }
             Err(error) => Err(error),
+        }
+    }
+
+    /// Whether the pool `entry` holds the bytes its name `digest` promises,
+    /// hashed once per pass. An entry that does not is removed and counted,
+    /// so no later preparation clones it either.
+    fn entry_matches_its_name(&mut self, entry: &Path, digest: &str) -> io::Result<bool> {
+        if self.verified_entries.contains(entry) {
+            return Ok(true);
+        }
+        if sha256_file(entry)? == digest {
+            self.verified_entries.insert(entry.to_path_buf());
+            return Ok(true);
+        }
+        self.report.pool_entries_rejected += 1;
+        if let Err(error) = fs::remove_file(entry)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "warning: aethyme could not remove the mismatched pool entry {}: {error}",
+                entry.display()
+            );
+        }
+        Ok(false)
+    }
+
+    /// Remove temporaries an interrupted earlier pass left in the pool's
+    /// buckets.
+    fn sweep_pool_temporaries(&mut self) {
+        let Ok(buckets) = fs::read_dir(&self.pool) else {
+            return;
+        };
+        for bucket in buckets.flatten() {
+            if !bucket.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(bucket.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                self.remove_if_stale_temporary(&entry.path());
+            }
+        }
+    }
+
+    /// Remove `path` if it is a regular file named like one of this pass's
+    /// temporaries by a process that is no longer alive.
+    fn remove_if_stale_temporary(&mut self, path: &Path) -> bool {
+        let Some(pid) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(temporary_owner)
+        else {
+            return false;
+        };
+        if pid == std::process::id() || process_alive(pid) {
+            return false;
+        }
+        if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+            return false;
+        }
+        match fs::remove_file(path) {
+            Ok(()) => {
+                self.report.stale_temporaries_removed += 1;
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -535,8 +630,48 @@ enum Shared {
     LeftAlone,
 }
 
+/// The process id in a temporary's name, `.aethyme-share-<pid>-<n>.tmp`
+/// exactly, or `None` for any other name.
+fn temporary_owner(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix(".aethyme-share-")?.strip_suffix(".tmp")?;
+    let (pid, counter) = rest.split_once('-')?;
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    if !digits(pid) || !digits(counter) {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+/// Whether a process with this id exists. Unknown means alive, so a
+/// temporary is only removed when its owner is certainly gone.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    // SAFETY: signal 0 only checks that the process exists and may be
+    // signalled; nothing is delivered.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    true
+}
+
 /// Replace `path` with a clone of the pool `entry` (same bytes) carrying
 /// `path`'s own mode and timestamps, through `temporary` beside it.
+///
+/// The file is not locked: a write to `path` between the caller's stat
+/// re-check and the rename below is lost, replaced by the pooled bytes the
+/// file held when it was hashed. Preparation runs after its steps finish and
+/// before the session uses the checkout, so nothing is expected to write
+/// there; the window is a few metadata calls long.
+///
+/// The clone carries the pool entry's extended attributes, ACLs and file
+/// flags, not the original's (the original's mode and access and
+/// modification times are restored), and gets a new inode and birth time.
 fn replace_with_pooled(
     entry: &Path,
     temporary: &Path,
@@ -551,12 +686,19 @@ fn replace_with_pooled(
     fs::rename(temporary, path)
 }
 
-/// Clone `path` into the pool as `entry`, through `temporary` beside it.
+/// Clone `path` into the pool as `entry`, through `temporary` beside it,
+/// publishing it only when the clone's own bytes hash to `digest`: a write
+/// to `path` after it was hashed never publishes an entry whose content
+/// differs from its name. Returns `false`, publishing nothing, on a mismatch.
 /// Pool entries are read-only and never written after this.
-fn add_to_pool(path: &Path, temporary: &Path, entry: &Path) -> io::Result<()> {
+fn add_to_pool(path: &Path, temporary: &Path, entry: &Path, digest: &str) -> io::Result<bool> {
     package_store::clone_file(path, temporary)?;
     set_mode(temporary, 0o444)?;
-    fs::rename(temporary, entry)
+    if sha256_file(temporary)? != digest {
+        return Ok(false);
+    }
+    fs::rename(temporary, entry)?;
+    Ok(true)
 }
 
 fn remove_temporary(path: &Path) {
@@ -1054,6 +1196,118 @@ mod tests {
         let stopped = share_outputs(&request, &mut || false);
         assert_eq!(stopped.state, Some(OutputShareState::Partial));
         assert_eq!(stopped.files_scanned, 0);
+    }
+
+    /// An entry whose bytes do not match its name is removed and counted,
+    /// and the file it would have replaced keeps its own bytes. Needs no
+    /// clone support: the entry is rejected before any clone.
+    #[test]
+    fn a_pool_entry_that_does_not_match_its_name_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("store");
+        let checkout = root.path().join("checkout");
+        let original = payload(11);
+        write(&checkout.join("env/lib.so"), &original);
+        let digest = sha256_file(&checkout.join("env/lib.so")).unwrap();
+        let entry = store.join(OUTPUT_POOL_DIR).join(&digest[..2]).join(&digest);
+        let mut forged = original.clone();
+        forged[0] ^= 0xff;
+        write(&entry, &forged);
+        let report = share_outputs(
+            &OutputShareRequest {
+                worktree: &checkout,
+                roots: vec!["env".into()],
+                store: &store,
+                import_method: PackageImportMethod::Clone,
+                budget: OUTPUT_SHARE_BUDGET,
+            },
+            &mut || true,
+        );
+        assert_eq!(report.pool_entries_rejected, 1);
+        assert_eq!(report.files_cloned_from_pool, 0);
+        assert_eq!(report.files_left_alone, 1);
+        assert!(!entry.exists(), "the forged entry is removed");
+        assert_eq!(fs::read(checkout.join("env/lib.so")).unwrap(), original);
+    }
+
+    /// A clone whose bytes no longer hash to the digest computed earlier
+    /// (the file changed in between) is never published.
+    #[cfg(unix)]
+    #[test]
+    fn a_pool_entry_is_published_only_when_its_clone_hashes_to_its_name() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = root.path().join("bucket");
+        fs::create_dir(&bucket).unwrap();
+        if package_store::probe_import_method(&bucket, Some(true)) != PackageImportMethod::Clone {
+            return;
+        }
+        let source = root.path().join("source.so");
+        write(&source, &payload(13));
+        let digest = sha256_file(&source).unwrap();
+        let temporary = bucket.join(".aethyme-share-1-1.tmp");
+        let entry = bucket.join(&digest);
+        let stale = "0".repeat(64);
+        assert!(!add_to_pool(&source, &temporary, &bucket.join(&stale), &stale).unwrap());
+        assert!(!bucket.join(&stale).exists());
+        remove_temporary(&temporary);
+        assert!(add_to_pool(&source, &temporary, &entry, &digest).unwrap());
+        assert_eq!(sha256_file(&entry).unwrap(), digest);
+    }
+
+    #[test]
+    fn only_exact_temporary_names_name_an_owner() {
+        assert_eq!(temporary_owner(".aethyme-share-123-4.tmp"), Some(123));
+        for name in [
+            ".aethyme-share-123-4.tmp.keep",
+            "x.aethyme-share-123-4.tmp",
+            ".aethyme-share-12a-4.tmp",
+            ".aethyme-share-123-.tmp",
+            ".aethyme-share--4.tmp",
+            ".aethyme-share-123.tmp",
+        ] {
+            assert_eq!(temporary_owner(name), None, "{name}");
+        }
+    }
+
+    /// Temporaries of a dead process are swept from the walked roots and the
+    /// pool's buckets; a live owner's, a directory and other names are kept.
+    #[cfg(unix)]
+    #[test]
+    fn stale_temporaries_of_dead_processes_are_swept() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("store");
+        let checkout = root.path().join("checkout");
+        let in_root = checkout.join(format!("env/.aethyme-share-{dead}-1.tmp"));
+        let in_pool = store
+            .join(OUTPUT_POOL_DIR)
+            .join("ab")
+            .join(format!(".aethyme-share-{dead}-2.tmp"));
+        let live = checkout.join(format!("env/.aethyme-share-{}-3.tmp", std::process::id()));
+        let other = checkout.join(format!("env/.aethyme-share-{dead}-4.tmp.keep"));
+        for path in [&in_root, &in_pool, &live, &other] {
+            write(path, b"partial");
+        }
+        let directory = checkout.join(format!("env/.aethyme-share-{dead}-5.tmp"));
+        fs::create_dir_all(&directory).unwrap();
+        let report = share_outputs(
+            &OutputShareRequest {
+                worktree: &checkout,
+                roots: vec!["env".into()],
+                store: &store,
+                import_method: PackageImportMethod::Clone,
+                budget: OUTPUT_SHARE_BUDGET,
+            },
+            &mut || true,
+        );
+        assert_eq!(report.stale_temporaries_removed, 2);
+        assert!(!in_root.exists() && !in_pool.exists());
+        assert!(live.exists() && other.exists() && directory.is_dir());
     }
 
     #[test]

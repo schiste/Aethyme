@@ -489,7 +489,11 @@ An explicit `AETHYME_PREPARATION_CACHE_ROOT` operator setting keeps precedence;
 the broker refuses that setting for this mode if it is on another filesystem.
 Set `root = "host"` when a configuration needs the historical placement on
 every volume. Changing the selected placement does not migrate or remove an
-old cache root; the storage sweep ages its unused digests out as usual.
+old cache root: the storage sweep removes its digests once no checkout uses
+them, and retires its shared package store once no preparation has used it
+for a week (`package_store_rotated_idle`). A repository whose host root is on
+another volume than its checkouts therefore prepares each checkout from a
+cold store once after upgrading.
 
 Package managers share only what they import from their store. A tool that
 writes its own copy into each checkout (`pip install` into a virtual
@@ -505,7 +509,14 @@ only hard-link or copy is reported as skipped and left alone, because a
 shared hard link would let one checkout's write reach the others. It runs
 under the shared-cache lease, renews it, and stops after 90 seconds; a root
 whose sampled large files already share their blocks (a pnpm `node_modules/`
-imported by clone) is skipped. Nothing is seeded or relocated: files whose
+imported by clone) is skipped. A pool entry is published only when its own
+bytes hash to its name, and an existing entry is checked against its name
+before its first use in a pass; one that does not match is removed and
+counted. A replaced file keeps its mode and its access and modification
+times, but gets the pool entry's extended attributes, ACLs and file flags,
+a new inode and a new birth time. Temporaries left by an interrupted pass are
+removed by the next one once their process is gone. Nothing is seeded or
+relocated: files whose
 bytes differ between checkouts, such as compiled bytecode that embeds the
 checkout path or scripts with an absolute interpreter path, keep their own
 copy.

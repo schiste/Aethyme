@@ -751,6 +751,25 @@ pub(crate) fn store_cap(packages_dir: &Path) -> u64 {
         .unwrap_or(DEFAULT_PACKAGE_STORE_MAX_BYTES)
 }
 
+/// A shared store no preparation has used for this long is retired by the
+/// storage sweep, so a store whose cache root preparations no longer use
+/// (after `[shared_cache] root = "auto"` moved them to the checkouts' volume,
+/// for example) is not kept forever below its cap.
+pub(crate) const PACKAGE_STORE_IDLE_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Whether the shared store at `packages_dir` has been unused for
+/// [`PACKAGE_STORE_IDLE_AFTER`] at `now`, judged by its cap record, which
+/// every preparation using the store rewrites. A store without a readable
+/// record (written before the record existed) is never idle.
+pub(crate) fn store_idle(packages_dir: &Path, now: std::time::SystemTime) -> bool {
+    fs::metadata(packages_dir.join(STORE_CAP_FILE))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age >= PACKAGE_STORE_IDLE_AFTER)
+}
+
 pub(crate) fn is_retired_store_name(name: &str) -> bool {
     name.strip_prefix(RETIRED_PACKAGE_STORE_PREFIX)
         .is_some_and(|rest| {
@@ -1123,6 +1142,23 @@ mod tests {
         assert_eq!(store_cap(root.path()), DEFAULT_PACKAGE_STORE_MAX_BYTES);
         fs::write(root.path().join(STORE_CAP_FILE), "garbage").unwrap();
         assert_eq!(store_cap(root.path()), DEFAULT_PACKAGE_STORE_MAX_BYTES);
+    }
+
+    #[test]
+    fn a_store_is_idle_a_week_after_its_last_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now();
+        assert!(!store_idle(root.path(), now), "no record is never idle");
+        write_store_cap(root.path(), 0).unwrap();
+        assert!(!store_idle(root.path(), now));
+        assert!(!store_idle(
+            root.path(),
+            now + PACKAGE_STORE_IDLE_AFTER - std::time::Duration::from_secs(3600)
+        ));
+        assert!(store_idle(
+            root.path(),
+            now + PACKAGE_STORE_IDLE_AFTER + std::time::Duration::from_secs(1)
+        ));
     }
 
     #[test]
