@@ -5580,10 +5580,10 @@ mod tests {
         // Forget what the worker's own passes measured.
         let host_state = broker.storage_context().host_state_dir.clone().unwrap();
         let repository = broker.main_root().to_string_lossy().into_owned();
-        crate::storage_ledger::record_recovery_archive_sizes(
+        crate::storage_ledger::record_archive_bound_state(
             &host_state,
             &repository,
-            &std::collections::BTreeMap::new(),
+            &crate::storage_ledger::ArchiveBoundState::default(),
         )
         .unwrap();
 
@@ -5610,7 +5610,9 @@ mod tests {
         let pass = &recorder.attachments()["recovery_archive_bound_pass"];
         assert_eq!(pass["size_measured"], 2, "{pass}");
         assert_eq!(
-            crate::storage_ledger::recovery_archive_sizes(&host_state, &repository).len(),
+            crate::storage_ledger::archive_bound_state(&host_state, &repository)
+                .sizes
+                .len(),
             2
         );
 
@@ -5626,6 +5628,183 @@ mod tests {
         assert_eq!(
             again.pool.bytes + again.host_state.bytes,
             usage.pool.bytes + usage.host_state.bytes
+        );
+    }
+
+    /// A checkout holding only a commit not yet on the default branch,
+    /// retired through an archive, whose commit then lands on the primary
+    /// checkout: the archive holds nothing that exists nowhere else.
+    /// Returns the archive.
+    fn retired_then_landed(broker: &mut crate::Broker, label: &str) -> PathBuf {
+        let (session, worktree) = closed(broker, label, |worktree| {
+            let name = format!("{}.txt", label.replace(' ', "-"));
+            std::fs::write(worktree.join(&name), "landed later\n").unwrap();
+            git(worktree, &["add", &name]);
+            git(
+                worktree,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "commit",
+                    "-qm",
+                    "work that lands",
+                ],
+            );
+        });
+        let head = git(&worktree, &["rev-parse", "HEAD"]).trim().to_string();
+        let report = run(broker);
+        assert_eq!(report.retired_archived, 1, "{report:#?}");
+        let root = broker.main_root().to_path_buf();
+        git(&root, &["merge", "-q", "--no-ff", "-m", "land", &head]);
+        broker
+            .newest_recovery_archive(session.id)
+            .expect("the archive")
+    }
+
+    /// One bound pass with the test hooks set, returning its usage and the
+    /// pass telemetry.
+    fn bound_pass(
+        broker: &crate::Broker,
+        skew_days: i64,
+        extra_skew_ms: i64,
+    ) -> (
+        crate::storage_ledger::RecoveryArchiveUsage,
+        serde_json::Value,
+    ) {
+        super::super::archive_bound::CLOCK_SKEW_MS_FOR_TEST
+            .with(|skew| skew.set(skew_days * 86_400_000 + extra_skew_ms));
+        super::super::archive_bound::BOUND_BYTES_FOR_TEST.with(|bound| bound.set(Some(1)));
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let usage = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker.enforce_recovery_archive_bound(Instant::now() + Duration::from_secs(120))
+        };
+        super::super::archive_bound::CLOCK_SKEW_MS_FOR_TEST.with(|skew| skew.set(0));
+        super::super::archive_bound::BOUND_BYTES_FOR_TEST.with(|bound| bound.set(None));
+        let pass = recorder.attachments()["recovery_archive_bound_pass"].clone();
+        (usage, pass)
+    }
+
+    fn full_proofs() -> usize {
+        crate::cleanup_resolve::FULL_ARCHIVE_VERIFICATIONS.with(std::cell::Cell::get)
+    }
+
+    /// Over the bound, the pass removes landed archives, fully proving
+    /// exactly the archives it removes and no other.
+    #[test]
+    fn an_over_bound_pass_fully_proves_exactly_the_archives_it_removes() {
+        let (_owner, _storage, mut broker) = fixture();
+        let first = retired_then_landed(&mut broker, "evict one");
+        let second = retired_then_landed(&mut broker, "evict two");
+        retired_with_archive(&mut broker, "keeps unique work");
+        let before = full_proofs();
+        let (usage, pass) = bound_pass(&broker, 30, 0);
+        assert_eq!(usage.evicted, 2, "{usage:?} {pass}");
+        assert_eq!(full_proofs() - before, usage.evicted, "{pass}");
+        assert_eq!(pass["proofs"], 2, "{pass}");
+        assert!(!first.exists() && !second.exists());
+        // The archive holding unique work stays, and is named.
+        assert!(usage.over_bound, "{usage:?}");
+        assert_eq!(usage.unique_kept_over_bound, 1, "{usage:?}");
+    }
+
+    /// An archive whose manifest says landed but whose content changed is
+    /// never removed by the bound: the full proof refuses it, and later
+    /// passes rotate past it instead of proving it again every run.
+    #[test]
+    fn the_bound_never_removes_an_archive_whose_content_was_altered() {
+        let (_owner, _storage, mut broker) = fixture();
+        let archive = retired_then_landed(&mut broker, "altered");
+        std::fs::write(archive.join("added-after.txt"), "not in the manifest\n").unwrap();
+        let before = full_proofs();
+        let (usage, pass) = bound_pass(&broker, 30, 0);
+        assert_eq!(usage.evicted, 0, "{usage:?} {pass}");
+        assert_eq!(pass["proof_failures"], 1, "{pass}");
+        assert_eq!(full_proofs() - before, 1);
+        assert!(
+            archive
+                .join(crate::cleanup_resolve::MANIFEST_FILE)
+                .is_file()
+        );
+        assert!(archive.join("added-after.txt").is_file());
+        // The next pass passes over it until its retry is due.
+        let (again, pass) = bound_pass(&broker, 30, 0);
+        assert_eq!(again.evicted, 0, "{pass}");
+        assert_eq!(pass["proofs"], 0, "{pass}");
+        assert_eq!(pass["proof_deferred_skipped"], 1, "{pass}");
+        assert!(archive.join("added-after.txt").is_file());
+    }
+
+    /// A removal proof that runs out of budget leaves its archive intact,
+    /// does not hold back the archives behind it, is passed over by the
+    /// next pass, and is retried first with a fresh budget once due.
+    #[test]
+    fn a_proof_out_of_budget_is_rotated_past_and_retried_later() {
+        let (_owner, _storage, mut broker) = fixture();
+        let older = retired_then_landed(&mut broker, "proof times out");
+        let newer = retired_then_landed(&mut broker, "proof behind it");
+        super::super::archive_bound::EXPIRED_PROOFS_FOR_TEST.with(|left| left.set(1));
+        let (usage, pass) = bound_pass(&broker, 30, 0);
+        super::super::archive_bound::EXPIRED_PROOFS_FOR_TEST.with(|left| left.set(0));
+        assert_eq!(pass["proof_timeouts"], 1, "{pass}");
+        assert_eq!(usage.evicted, 1, "{usage:?} {pass}");
+        assert!(
+            older.join(crate::cleanup_resolve::MANIFEST_FILE).is_file(),
+            "the archive whose proof timed out is intact"
+        );
+        assert!(!newer.exists(), "the archive behind it was still removed");
+        // Not due yet: passed over.
+        let (again, pass) = bound_pass(&broker, 30, 0);
+        assert_eq!(again.evicted, 0, "{pass}");
+        assert_eq!(pass["proof_deferred_skipped"], 1, "{pass}");
+        assert!(older.join(crate::cleanup_resolve::MANIFEST_FILE).is_file());
+        // Due: retried first, with a fresh budget, and removed.
+        let (later, pass) = bound_pass(&broker, 30, 2 * 60 * 60 * 1_000);
+        assert_eq!(pass["proof_retries"], 1, "{pass}");
+        assert_eq!(later.evicted, 1, "{later:?} {pass}");
+        assert!(!older.exists());
+    }
+
+    /// A listing resumes after the archive an interrupted listing reached
+    /// last, and wraps, so every archive is reached over several runs.
+    #[test]
+    fn an_interrupted_listing_resumes_after_its_cursor() {
+        let (_owner, _storage, mut broker) = fixture();
+        for label in ["cursor one", "cursor two", "cursor three"] {
+            retired_with_archive(&mut broker, label);
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let full = broker.recovery_archive_listing(deadline, None).unwrap();
+        let order = full
+            .owned
+            .iter()
+            .map(|archive| archive.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(order.len(), 3);
+        assert_eq!(full.last_listed.as_ref(), Some(&order[2]));
+        assert!(full.not_listed.is_empty());
+        let resumed = broker
+            .recovery_archive_listing(deadline, Some(&order[0]))
+            .unwrap();
+        let resumed_order = resumed
+            .owned
+            .iter()
+            .map(|archive| archive.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resumed_order,
+            vec![order[1].clone(), order[2].clone(), order[0].clone()]
+        );
+        // Out of budget: nothing listed, everything left for the next run.
+        let stopped = broker
+            .recovery_archive_listing(Instant::now(), Some(&order[1]))
+            .unwrap();
+        assert!(stopped.owned.is_empty());
+        assert_eq!(
+            stopped.not_listed,
+            vec![order[2].clone(), order[0].clone(), order[1].clone()]
         );
     }
 

@@ -2754,6 +2754,10 @@ pub(crate) struct RecoveryArchiveScan {
     pub unowned: Vec<(PathBuf, String)>,
     /// Entries not classified because the scan reached its deadline.
     pub skipped_by_budget: usize,
+    /// Those entries, in the order a resumed listing would reach them.
+    pub not_listed: Vec<PathBuf>,
+    /// The last entry classified: where an interrupted listing resumes.
+    pub last_listed: Option<PathBuf>,
 }
 
 /// How much of an archive [`Broker::owned_recovery_archive_with`] proves.
@@ -4720,127 +4724,127 @@ impl Broker {
     /// (`gc plan --full-scan`) only. Unattended and hot paths use
     /// [`Self::recovery_archive_listing`].
     pub(crate) fn recovery_archives(&self) -> Result<RecoveryArchiveScan, BrokerOpError> {
-        self.recovery_archive_scan(ArchiveProof::Full { deadline: None }, None)
+        self.recovery_archive_scan(ArchiveProof::Full { deadline: None }, None, None)
     }
 
     /// Every archive classified from cheap metadata only (directory
     /// listing, manifest, session record; no content is read or hashed),
-    /// stopping at `deadline`. Anything acted on must be proven again with
-    /// [`Self::owned_recovery_archive`] first.
+    /// stopping at `deadline`. Listing starts after `resume_after` (the
+    /// last archive an earlier, interrupted listing reached) and wraps, so
+    /// a listing that keeps hitting its deadline still reaches every
+    /// archive over several runs. Anything acted on must be proven again
+    /// with [`Self::owned_recovery_archive`] first.
     pub(crate) fn recovery_archive_listing(
         &self,
         deadline: Instant,
+        resume_after: Option<&Path>,
     ) -> Result<RecoveryArchiveScan, BrokerOpError> {
-        self.recovery_archive_scan(ArchiveProof::Metadata, Some(deadline))
+        self.recovery_archive_scan(ArchiveProof::Metadata, Some(deadline), resume_after)
     }
 
     fn recovery_archive_scan(
         &self,
         proof: ArchiveProof,
         deadline: Option<Instant>,
+        resume_after: Option<&Path>,
     ) -> Result<RecoveryArchiveScan, BrokerOpError> {
         let roots = self.inspected_recovery_archive_roots();
-        let mut scan =
-            self.recovery_archives_under(self.recovery_archive_root()?, &roots, proof, deadline)?;
-        if let Some(pool) = self.pool_recovery_archive_root(false) {
-            let pool_scan = self.recovery_archives_under(pool, &roots, proof, deadline)?;
-            scan.owned.extend(pool_scan.owned);
-            scan.unowned.extend(pool_scan.unowned);
-            scan.skipped_by_budget += pool_scan.skipped_by_budget;
-        }
-        Ok(scan)
-    }
-
-    fn recovery_archives_under(
-        &self,
-        configured_root: PathBuf,
-        roots: &[Result<PathBuf, String>],
-        proof: ArchiveProof,
-        deadline: Option<Instant>,
-    ) -> Result<RecoveryArchiveScan, BrokerOpError> {
-        let root = match inspect_archive_root(&configured_root) {
-            Ok(Some(root)) => root,
-            Ok(None) => {
-                return Ok(RecoveryArchiveScan {
-                    root: configured_root,
-                    owned: Vec::new(),
-                    unowned: Vec::new(),
-                    skipped_by_budget: 0,
-                });
-            }
-            Err(error) => {
-                return Ok(RecoveryArchiveScan {
-                    root: configured_root.clone(),
-                    owned: Vec::new(),
-                    unowned: vec![(error.path, format!("unsafe archive root: {}", error.reason))],
-                    skipped_by_budget: 0,
-                });
-            }
-        };
-        let mut owned = Vec::new();
+        let host_root = self.recovery_archive_root()?;
         let mut unowned = Vec::new();
-        let entries = match std::fs::read_dir(&root) {
-            Ok(entries) => entries,
-            Err(error) => {
-                return Ok(RecoveryArchiveScan {
-                    root: configured_root,
-                    owned,
-                    unowned: vec![(root, format!("cannot read archive root: {error}"))],
-                    skipped_by_budget: 0,
-                });
-            }
-        };
-        let mut paths = Vec::new();
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    return Ok(RecoveryArchiveScan {
-                        root: configured_root.clone(),
-                        owned: Vec::new(),
-                        unowned: vec![(root, format!("cannot read archive entry: {error}"))],
-                        skipped_by_budget: 0,
-                    });
-                }
-            };
-            let path = entry.path();
-            let metadata = match std::fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    return Ok(RecoveryArchiveScan {
-                        root: configured_root.clone(),
-                        owned: Vec::new(),
-                        unowned: vec![(root, format!("cannot inspect archive entry: {error}"))],
-                        skipped_by_budget: 0,
-                    });
-                }
-            };
-            if !metadata.is_file() || metadata.file_type().is_symlink() {
-                paths.push(path);
-            }
+        // Host state first, then the pool side, each in name order.
+        let mut paths = archive_entries_under(&host_root, &mut unowned);
+        if let Some(pool) = self.pool_recovery_archive_root(false) {
+            paths.extend(archive_entries_under(&pool, &mut unowned));
         }
-        paths.sort();
-        let total = paths.len();
-        let mut skipped_by_budget = 0;
-        for (index, path) in paths.into_iter().enumerate() {
+        let start = resume_after.map_or(0, |cursor| listing_resume_index(&paths, cursor));
+        paths.rotate_left(start);
+        let mut owned = Vec::new();
+        let mut last_listed = None;
+        let mut not_listed = Vec::new();
+        let mut paths = paths.into_iter();
+        for path in paths.by_ref() {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                skipped_by_budget = total - index;
                 crate::phase_telemetry::add("recovery_archive_listing_budget_stop", Duration::ZERO);
+                not_listed.push(path);
                 break;
             }
             crate::phase_telemetry::add("recovery_archive_listed", Duration::ZERO);
-            match self.owned_recovery_archive_with(&path, roots, proof) {
+            match self.owned_recovery_archive_with(&path, &roots, proof) {
                 Ok(archive) => owned.push(archive),
-                Err(reason) => unowned.push((path, reason)),
+                Err(reason) => unowned.push((path.clone(), reason)),
             }
+            last_listed = Some(path);
         }
+        not_listed.extend(paths);
         Ok(RecoveryArchiveScan {
-            root: configured_root,
+            root: host_root,
             owned,
             unowned,
-            skipped_by_budget,
+            skipped_by_budget: not_listed.len(),
+            not_listed,
+            last_listed,
         })
     }
+}
+
+/// Where a listing resumes in `paths` (in listing order) after `cursor`:
+/// just after it when it is still there, else at the first path after it
+/// by name, else from the start.
+fn listing_resume_index(paths: &[PathBuf], cursor: &Path) -> usize {
+    if let Some(index) = paths.iter().position(|path| path == cursor) {
+        return (index + 1) % paths.len().max(1);
+    }
+    paths
+        .iter()
+        .position(|path| path.as_path() > cursor)
+        .unwrap_or(0)
+}
+
+/// The archive candidates directly under one configured archive root, in
+/// name order. A root or entry that cannot be read is reported in
+/// `unowned` and contributes no candidates.
+fn archive_entries_under(
+    configured_root: &Path,
+    unowned: &mut Vec<(PathBuf, String)>,
+) -> Vec<PathBuf> {
+    let root = match inspect_archive_root(configured_root) {
+        Ok(Some(root)) => root,
+        Ok(None) => return Vec::new(),
+        Err(error) => {
+            unowned.push((error.path, format!("unsafe archive root: {}", error.reason)));
+            return Vec::new();
+        }
+    };
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            unowned.push((root, format!("cannot read archive root: {error}")));
+            return Vec::new();
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                unowned.push((root, format!("cannot read archive entry: {error}")));
+                return Vec::new();
+            }
+        };
+        let path = entry.path();
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                unowned.push((root, format!("cannot inspect archive entry: {error}")));
+                return Vec::new();
+            }
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths
 }
 
 /// Whether an archive holds work no commit carries. A manifest without an
