@@ -1,6 +1,6 @@
 # Broker Follow-Up Workflows
 
-Last Updated: 2026-11-17
+Last Updated: 2026-11-18
 
 This guide covers broker workflows that matter after the basic
 start-edit-submit loop: preparing declared worktree dependencies, reusing a session worktree, choosing fresh or cached
@@ -1286,8 +1286,11 @@ only when that cannot touch anything local:
 
 - it is on the default branch, with no commits of its own, no merge, rebase,
   cherry-pick, revert or bisect in progress, no sparse-checkout,
-  assume-unchanged or skip-worktree entries, and no live session working in
-  it;
+  assume-unchanged or skip-worktree entries, and no session adopted on it
+  that is in use (a live holder or spawned process, an unknown process
+  listing, an unresolved operation, or activity in the last 30 minutes). An
+  idle adopted session does not hold it; it gets a note saying the checkout
+  advanced, and its diff base moves with it;
 - no path the update changes is also modified, staged or renamed locally,
   and no untracked or ignored file sits at, above or below a path the update
   writes (compared case-insensitively);
