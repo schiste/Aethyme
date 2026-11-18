@@ -3403,7 +3403,17 @@ observation. Keeps are retried every run (`session_unknown`,
 `process_using_scratch`, `process_use_unknown`, `lifecycle_busy`, `changed`,
 `not_a_recorded_scratch`, `not_a_real_directory`, `foreign_container`,
 `identity_changed`, `crosses_device`, `move_failed`); a directory that is gone
-drops its record. Entries in a container the broker did not record are counted
+drops its record. After a remount (new device number, same inode) the record
+is re-identified under the claim by its marked container on the pool's current
+device, its session-bound entry name and its inode, and the new device is
+stored (counter `session_scratch_reidentified`); otherwise it is kept, counted
+as `refused` in the `session_scratch` class, and `broker status` warns with
+advice `storage.session-scratch-unidentified`. A superseded directory gets a
+fresh open-file observation right before its claim and rename
+(`session_scratch_superseded_fresh_observation`). A container holding only its
+marker and scratch directories does not make a worktree root non-empty; it is
+never a `gc storage` stray candidate, and `gc storage apply` refuses to remove
+a root whose container still holds scratch directories. Entries in a container the broker did not record are counted
 (`session_scratch_unrecorded`) and never touched. `finish` and `close` ask for
 a retirement run when the session has a scratch directory. Counters
 `session_scratch_created`, `session_scratch_existing`,
