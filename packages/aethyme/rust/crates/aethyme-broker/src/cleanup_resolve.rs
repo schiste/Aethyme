@@ -3952,7 +3952,6 @@ fn recovery_archive_file_set_until(
     Ok(files)
 }
 
-#[cfg(test)]
 fn verify_recovery_archive_tree(root: &Path, manifest: &StoredManifest) -> Result<(), String> {
     verify_recovery_archive_tree_until(root, manifest, None)
 }
