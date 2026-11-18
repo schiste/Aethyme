@@ -5947,7 +5947,7 @@ mod tests {
         let prepare = "schema_version = 1\n\n[[steps]]\nname = \"js\"\ncommand = [\"sh\", \"-c\", \"true\"]\n\
              inputs = [\"lock.file\"]\noutputs = [\"node_modules/\"]\ncache = \"repository_shared\"\n\
              required_for_hooks = false\n\n[[steps]]\nname = \"py\"\ncommand = [\"sh\", \"-c\", \"true\"]\n\
-             inputs = [\"lock.file\"]\noutputs = [\"tools/.venv/bin/tool\", \"bad/.venv/bin/tool\"]\n\
+             inputs = [\"lock.file\"]\noutputs = [\"tools/.venv/bin/tool\", \"tools/.venv/bin/python\", \"bad/.venv/bin/tool\", \"bad/.venv/bin/python\", \"pip/.venv/bin/ruff\"]\n\
              cache = \"repository_shared\"\nrequired_for_hooks = false\n";
         let session_with = |broker: &mut crate::Broker, task: &str, root_marker: bool| {
             let open = broker.start_worktree(task, None).unwrap();
@@ -5990,6 +5990,11 @@ mod tests {
             std::fs::write(worktree.join("bad/.venv/pyvenv.cfg"), "home = /usr\n").unwrap();
             std::fs::write(worktree.join("bad/.venv/bin/tool"), "#!/bin/sh\n").unwrap();
             std::fs::write(worktree.join("bad/.venv/notes.txt"), "mine\n").unwrap();
+            // An environment a step only installs into (its interpreter is
+            // not a declared output): creation is not proved.
+            std::fs::create_dir_all(worktree.join("pip/.venv/bin")).unwrap();
+            std::fs::write(worktree.join("pip/.venv/pyvenv.cfg"), "home = /usr\n").unwrap();
+            std::fs::write(worktree.join("pip/.venv/bin/ruff"), "#!/bin/sh\n").unwrap();
             broker
                 .store()
                 .connection()
@@ -6034,6 +6039,15 @@ mod tests {
         assert!(!worktree.join("tools/.venv").exists(), "{report:#?}");
         assert!(worktree.join("apps/b/node_modules/cache.js").exists());
         assert!(worktree.join("bad/.venv/notes.txt").exists());
+        assert!(worktree.join("pip/.venv/bin/ruff").exists());
+        assert_eq!(
+            report
+                .strip
+                .refused
+                .get("environment_root_creation_unproven"),
+            Some(&1),
+            "{report:#?}"
+        );
         assert_eq!(
             report.strip.refused.get("witness_missing"),
             Some(&1),
@@ -6049,7 +6063,7 @@ mod tests {
         assert_eq!(kinds["node_modules_member"].removed, 1, "{kinds:?}");
         assert_eq!(kinds["node_modules_member"].kept, 1, "{kinds:?}");
         assert_eq!(kinds["venv"].removed, 1, "{kinds:?}");
-        assert_eq!(kinds["venv"].kept, 1, "{kinds:?}");
+        assert_eq!(kinds["venv"].kept, 2, "{kinds:?}");
         // `submit prepare` sees the work to do: the declared file inside
         // the environment is missing and the strip marker stands.
         assert!(crate::preparation::stripped_since_prepared(
@@ -6075,6 +6089,126 @@ mod tests {
             "{report:#?}"
         );
         assert!(!kept.join("tools/.venv").exists(), "{report:#?}");
+
+        // The top-level `node_modules` proves but its move fails: members
+        // proved alongside it stay with it.
+        let (_third, failed) = session_with(&mut broker, "root move fails", true);
+        super::super::strip::FAIL_MOVE_FOR_TEST
+            .with(|cell| *cell.borrow_mut() = Some("node_modules".into()));
+        let report = pass(&mut broker);
+        super::super::strip::FAIL_MOVE_FOR_TEST.with(|cell| *cell.borrow_mut() = None);
+        assert!(failed.join("node_modules/.bin/tsc").exists(), "{report:#?}");
+        assert!(
+            std::fs::symlink_metadata(failed.join("apps/a/node_modules/dep")).is_ok(),
+            "{report:#?}"
+        );
+        assert_eq!(
+            report.strip.refused.get("move_failed"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert_eq!(
+            report.strip.refused.get("member_root_kept"),
+            Some(&2),
+            "{report:#?}"
+        );
+        crate::session_holder::set_process_use_snapshot_for_tests(None);
+    }
+
+    /// End to end with steps that really create their outputs: after an
+    /// idle strip removed the top-level `node_modules`, a pnpm member and a
+    /// Python environment whose interpreter a step declares,
+    /// `submit prepare` recreates all three and reads current again.
+    #[test]
+    fn submit_prepare_after_an_idle_strip_recreates_what_was_removed() {
+        let (_owner, storage, mut broker) = fixture();
+        std::fs::write(
+            broker.main_root().join(".git/info/exclude"),
+            "node_modules/\n.venv/\n",
+        )
+        .unwrap();
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+        ));
+        let open = broker.start_worktree("prepare restores", None).unwrap();
+        let worktree = PathBuf::from(&open.worktree_path);
+        std::fs::create_dir_all(worktree.join(".aethyme")).unwrap();
+        std::fs::write(
+            worktree.join(".aethyme/prepare.toml"),
+            "schema_version = 1\n\
+             [[steps]]\nname = \"js\"\n\
+             command = [\"/bin/sh\", \"-c\", \"mkdir -p node_modules/.pnpm/d@1/node_modules/d node_modules/.bin apps/a/node_modules && touch node_modules/.modules.yaml && ln -sfn ../../../node_modules/.pnpm/d@1/node_modules/d apps/a/node_modules/d\"]\n\
+             outputs = [\"node_modules/\"]\nrequired_for_hooks = false\n\
+             [[steps]]\nname = \"py\"\n\
+             command = [\"/bin/sh\", \"-c\", \"mkdir -p tools/.venv/bin && echo 'home = /usr' > tools/.venv/pyvenv.cfg && touch tools/.venv/bin/python\"]\n\
+             outputs = [\"tools/.venv/bin/python\"]\nrequired_for_hooks = false\n",
+        )
+        .unwrap();
+        let config = crate::preparation::load_config(&worktree).unwrap().unwrap();
+        let policy = crate::broker::gate_trust::GatePolicy::from_parts(&[], Some(&config));
+        crate::broker::gate_trust::record_trust_for_host_state(
+            broker.main_root(),
+            &storage.options().host_state_dir.unwrap(),
+            &[policy.policy_sha256.as_str()],
+            "idle strip prepare fixture",
+        )
+        .unwrap();
+        broker
+            .prepare_session(open.id, false, Duration::ZERO)
+            .expect("the first preparation runs");
+        assert!(worktree.join("tools/.venv/bin/python").is_file());
+
+        // Idle for hours, nobody in it.
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE sessions SET last_activity_at = ?1 WHERE id = ?2",
+                rusqlite::params![crate::clock::epoch_ms() - 5 * 3_600_000, open.id],
+            )
+            .unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(10 * 3_600);
+        crate::worktree_status_activity::age_tree_for_test(&worktree, old);
+        let admin = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim());
+        for name in ["index", "HEAD"] {
+            std::fs::File::options()
+                .write(true)
+                .open(admin.join(name))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let far = Instant::now() + Duration::from_secs(600);
+        let mut run = broker
+            .begin_checkout_retirement_run(far)
+            .unwrap()
+            .expect("open paths resolve");
+        let report = broker.strip_idle_open_checkouts(&mut run, far, 100);
+        assert_eq!(report.strip.checkouts_stripped, 1, "{report:#?}");
+        assert!(!worktree.join("node_modules").exists(), "{report:#?}");
+        assert!(
+            !worktree.join("apps/a/node_modules").exists(),
+            "{report:#?}"
+        );
+        assert!(!worktree.join("tools/.venv").exists(), "{report:#?}");
+        assert_ne!(
+            broker.preparation_status(open.id).unwrap().state,
+            crate::PreparationState::Current
+        );
+
+        broker
+            .prepare_session(open.id, false, Duration::ZERO)
+            .expect("one command prepares again");
+        assert!(worktree.join("node_modules/.modules.yaml").is_file());
+        assert!(
+            std::fs::symlink_metadata(worktree.join("apps/a/node_modules/d")).is_ok(),
+            "the member comes back with the root install"
+        );
+        assert!(worktree.join("tools/.venv/pyvenv.cfg").is_file());
+        assert_eq!(
+            broker.preparation_status(open.id).unwrap().state,
+            crate::PreparationState::Current
+        );
         crate::session_holder::set_process_use_snapshot_for_tests(None);
     }
 

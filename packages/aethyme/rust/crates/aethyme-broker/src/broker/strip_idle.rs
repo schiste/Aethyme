@@ -35,11 +35,15 @@
 //! open session, in three cases (see [`idle_coverage`]): a directory a step
 //! declares as an output exactly; a Python environment root (the
 //! closed-checkout strip's `.venv` witness: `pyvenv.cfg` and nothing outside
-//! the environment layout) that contains a declared output path, since the
-//! step declaring a file inside it recreates it; and a workspace member's
+//! the environment layout) whose interpreter a step declares as an output
+//! (`<root>/pyvenv.cfg`, or `<root>/bin/python*`, `<root>/Scripts/python*`),
+//! which proves that step creates it (a root holding other declared files
+//! but no declared interpreter is kept as
+//! `environment_root_creation_unproven`: its step may only install into an
+//! environment made elsewhere); and a workspace member's
 //! `node_modules` the closed-checkout strip proves is a pnpm member (its
 //! links into the top-level store), when the top-level `node_modules` is a
-//! declared output and is stripped in the same pass or already absent, so
+//! declared output and actually moved in the same pass or is already absent, so
 //! the declared install recreates root and members together. Every candidate
 //! still goes through the closed-checkout strip's proofs; what they refuse
 //! (`witness_missing`, `unexpected_content`, ...) is kept with the same
@@ -100,6 +104,9 @@ pub(crate) struct IdleStripReport {
     /// Catalogued directories kept because no preparation step declares
     /// them as an output.
     pub kept_not_declared: usize,
+    /// Milliseconds spent measuring bytes this pass (bounded by
+    /// [`IDLE_STRIP_MEASURE_PASS_BUDGET`]).
+    pub measure_ms: u64,
     /// Per kind (`node_modules`, `node_modules_member`, `venv`,
     /// `pnpm_store`, `cargo_target`): directories removed and kept, and
     /// their bytes as far as the bounded measurement got.
@@ -119,14 +126,23 @@ pub(crate) struct KindTally {
 
 /// The longest one checkout's byte measurement may take.
 const IDLE_STRIP_MEASURE_BUDGET: Duration = Duration::from_secs(2);
+/// The longest all byte measurements of one pass may take together.
+const IDLE_STRIP_MEASURE_PASS_BUDGET: Duration = Duration::from_secs(6);
 
 /// How a catalogued directory is covered by the session's preparation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Coverage {
     /// A step output names it exactly.
     Exact,
-    /// A Python environment root containing a declared output path.
+    /// A Python environment root whose interpreter a step declares as an
+    /// output (`<root>/pyvenv.cfg` or `<root>/bin/python*`, or
+    /// `<root>/Scripts/python*`): that step creates the environment.
     EnvironmentRoot,
+    /// A Python environment root containing a declared output path, but no
+    /// step declares its interpreter: a step may only install into an
+    /// environment made elsewhere, so it is kept
+    /// (`environment_root_creation_unproven`).
+    EnvironmentRootUnproven,
     /// A workspace member's `node_modules` while the top-level
     /// `node_modules` is a declared output.
     WorkspaceMember,
@@ -159,14 +175,24 @@ pub(crate) fn idle_coverage(
         return Some(Coverage::Exact);
     }
     let outputs = normalised_outputs(outputs);
-    if candidate.kind == StripKind::Venv
-        && outputs.iter().any(|output| {
-            output
-                .strip_prefix(relative)
-                .is_some_and(|rest| rest.starts_with('/'))
-        })
-    {
-        return Some(Coverage::EnvironmentRoot);
+    if candidate.kind == StripKind::Venv {
+        let inside: Vec<&str> = outputs
+            .iter()
+            .filter_map(|output| output.strip_prefix(relative))
+            .filter_map(|rest| rest.strip_prefix('/'))
+            .collect();
+        if inside.iter().any(|rest| {
+            *rest == "pyvenv.cfg"
+                || rest
+                    .strip_prefix("bin/")
+                    .or_else(|| rest.strip_prefix("Scripts/"))
+                    .is_some_and(|name| name.starts_with("python"))
+        }) {
+            return Some(Coverage::EnvironmentRoot);
+        }
+        if !inside.is_empty() {
+            return Some(Coverage::EnvironmentRootUnproven);
+        }
     }
     if candidate.kind == StripKind::NodeModules
         && relative.contains('/')
@@ -658,6 +684,7 @@ impl Broker {
                 "kept_recent_files": report.kept_recent_files,
                 "kept_not_declared_output": report.kept_not_declared,
                 "by_kind": report.by_kind,
+                "measure_ms": report.measure_ms,
                 "refused": report.strip.refused,
                 "more_remaining": report.strip.more_remaining,
                 "phase_ms": {
@@ -753,26 +780,7 @@ impl Broker {
             return Refused("discovery_failed");
         };
         report.strip.candidates_found += candidates.len();
-        // Bytes of every candidate, as far as a short budget goes, for the
-        // per-kind removed/kept telemetry (measured before anything moves).
-        let measure_deadline = deadline.min(Instant::now() + IDLE_STRIP_MEASURE_BUDGET);
         let all_candidates = candidates.clone();
-        let sizes: BTreeMap<String, u64> = {
-            let _span = crate::phase_telemetry::span("checkout_idle_strip_measure");
-            all_candidates
-                .iter()
-                .filter_map(|candidate| {
-                    if Instant::now() >= measure_deadline {
-                        return None;
-                    }
-                    crate::disk_headroom::directory_usage_bounded(
-                        &worktree.join(&candidate.relative),
-                        measure_deadline,
-                    )
-                    .map(|usage| (candidate.relative.clone(), usage.bytes))
-                })
-                .collect()
-        };
         // Only what the session's own preparation recreates: exact outputs
         // and environment roots first; workspace members only together with
         // (or after) their top-level `node_modules`.
@@ -790,6 +798,17 @@ impl Broker {
                     primary.push(candidate);
                 }
                 Some(Coverage::WorkspaceMember) => members.push(candidate),
+                Some(Coverage::EnvironmentRootUnproven) => {
+                    *report
+                        .strip
+                        .refused
+                        .entry("environment_root_creation_unproven".to_string())
+                        .or_default() += 1;
+                    crate::phase_telemetry::add(
+                        "checkout_idle_strip_refused_environment_root_creation_unproven",
+                        Duration::ZERO,
+                    );
+                }
                 None => not_declared.push(candidate),
             }
         }
@@ -809,7 +828,7 @@ impl Broker {
             }
         }
         if candidates.is_empty() && members.is_empty() {
-            tally_kinds(report, &all_candidates, &[], &sizes);
+            tally_kinds(report, &all_candidates, &[], &BTreeMap::new());
             return IdleStrip::Done(Vec::new());
         }
         // A complete open-file observation (shared by the run): any process
@@ -873,68 +892,105 @@ impl Broker {
                 }
             }
         }
-        // Workspace members go only together with the top-level
-        // `node_modules` (proved strippable now) or after it (already
-        // absent), so the declared root install recreates root and members
-        // together; otherwise they are kept as `member_root_kept`. They are
-        // proved in the same call as the root, before anything moves, since
-        // the pnpm-member proof reads the top-level `node_modules/.bin`.
+        // Bytes of what is being removed or kept by the proofs (covered
+        // candidates only), within this checkout's share of the pass budget.
+        let mut covered = candidates.clone();
+        covered.extend(members.iter().cloned());
+        let sizes = self.measure_covered(report, &worktree, &covered, deadline);
+        // Every covered candidate is proved before anything moves (the
+        // pnpm-member proof reads the top-level `node_modules/.bin`).
+        let prove_started = Instant::now();
+        let mut verdicts =
+            super::strip::prove_strippable_all(&worktree, &covered, deadline, venv_markers);
+        report.strip.prove_ms = report
+            .strip
+            .prove_ms
+            .saturating_add(super::strip::elapsed_ms(prove_started));
+        let member_verdicts = verdicts.split_off(candidates.len());
         let root_present = std::fs::symlink_metadata(worktree.join("node_modules")).is_ok();
-        let members_admitted = !members.is_empty()
-            && (!root_present
-                || candidates
-                    .iter()
-                    .find(|candidate| candidate.relative == "node_modules")
-                    .is_some_and(|root| {
-                        super::strip::prove_strippable_all(
-                            &worktree,
-                            std::slice::from_ref(root),
-                            deadline,
-                            venv_markers,
-                        )
-                        .pop()
-                            == Some(Ok(()))
-                    }));
-        let mut to_strip = candidates;
-        if members_admitted {
-            to_strip.extend(members.iter().cloned());
-        } else if !members.is_empty() {
-            *report
-                .strip
-                .refused
-                .entry("member_root_kept".to_string())
-                .or_default() += members.len();
-            for _ in &members {
-                crate::phase_telemetry::add(
-                    "checkout_idle_strip_refused_member_root_kept",
-                    Duration::ZERO,
-                );
-            }
-        }
-        let stripped = self.prove_and_move(
+        let mut stripped = self.move_proven(
             StripTarget {
                 session_id: session.id,
                 worktree: &worktree,
                 pool: &pool,
             },
-            &to_strip,
+            &candidates,
+            verdicts,
             deadline,
             venv_markers,
             &mut report.strip,
         );
-        // The root's move failing after its proof leaves members gone and
-        // the root in place: preparation still reads stale (the strip
-        // marker), and this is counted.
-        if root_present
-            && !stripped.iter().any(|relative| relative == "node_modules")
-            && stripped
-                .iter()
-                .any(|relative| members.iter().any(|member| &member.relative == relative))
-        {
-            crate::phase_telemetry::add("checkout_idle_strip_member_without_root", Duration::ZERO);
+        // Workspace members move only once the top-level `node_modules`
+        // actually moved (or was already absent), so the declared root
+        // install recreates root and members together; otherwise they stay
+        // as `member_root_kept`.
+        if !members.is_empty() {
+            let root_gone =
+                !root_present || stripped.iter().any(|relative| relative == "node_modules");
+            if root_gone {
+                stripped.extend(self.move_proven(
+                    StripTarget {
+                        session_id: session.id,
+                        worktree: &worktree,
+                        pool: &pool,
+                    },
+                    &members,
+                    member_verdicts,
+                    deadline,
+                    venv_markers,
+                    &mut report.strip,
+                ));
+            } else {
+                *report
+                    .strip
+                    .refused
+                    .entry("member_root_kept".to_string())
+                    .or_default() += members.len();
+                for _ in &members {
+                    crate::phase_telemetry::add(
+                        "checkout_idle_strip_refused_member_root_kept",
+                        Duration::ZERO,
+                    );
+                }
+            }
         }
         tally_kinds(report, &all_candidates, &stripped, &sizes);
         IdleStrip::Done(stripped)
+    }
+}
+
+impl Broker {
+    /// Bytes of `covered` candidates, within this checkout's budget and what
+    /// is left of the pass budget; unmeasured ones are left out.
+    fn measure_covered(
+        &self,
+        report: &mut IdleStripReport,
+        worktree: &Path,
+        covered: &[super::strip::StripCandidate],
+        deadline: Instant,
+    ) -> BTreeMap<String, u64> {
+        let _span = crate::phase_telemetry::span("checkout_idle_strip_measure");
+        let started = Instant::now();
+        let pass_left =
+            IDLE_STRIP_MEASURE_PASS_BUDGET.saturating_sub(Duration::from_millis(report.measure_ms));
+        let measure_deadline = deadline.min(started + IDLE_STRIP_MEASURE_BUDGET.min(pass_left));
+        let sizes = covered
+            .iter()
+            .filter_map(|candidate| {
+                if Instant::now() >= measure_deadline {
+                    return None;
+                }
+                crate::disk_headroom::directory_usage_bounded(
+                    &worktree.join(&candidate.relative),
+                    measure_deadline,
+                )
+                .map(|usage| (candidate.relative.clone(), usage.bytes))
+            })
+            .collect();
+        report.measure_ms = report
+            .measure_ms
+            .saturating_add(super::strip::elapsed_ms(started));
+        sizes
     }
 }
 
@@ -1014,6 +1070,9 @@ mod tests {
         let outputs = vec![
             "node_modules/".to_string(),
             "tools/.venv/bin/tool".to_string(),
+            "tools/.venv/bin/python3".to_string(),
+            "cfg/.venv/pyvenv.cfg".to_string(),
+            "pip/.venv/bin/ruff".to_string(),
         ];
         assert_eq!(
             idle_coverage(&outputs, &candidate("node_modules", StripKind::NodeModules)),
@@ -1022,6 +1081,16 @@ mod tests {
         assert_eq!(
             idle_coverage(&outputs, &candidate("tools/.venv", StripKind::Venv)),
             Some(Coverage::EnvironmentRoot)
+        );
+        assert_eq!(
+            idle_coverage(&outputs, &candidate("cfg/.venv", StripKind::Venv)),
+            Some(Coverage::EnvironmentRoot)
+        );
+        // A step that only installs into an environment it did not create
+        // (no interpreter declared) does not prove the environment.
+        assert_eq!(
+            idle_coverage(&outputs, &candidate("pip/.venv", StripKind::Venv)),
+            Some(Coverage::EnvironmentRootUnproven)
         );
         assert_eq!(
             idle_coverage(&outputs, &candidate("other/.venv", StripKind::Venv)),
@@ -1049,7 +1118,7 @@ mod tests {
         // Members need the top-level `node_modules` declared.
         assert_eq!(
             idle_coverage(
-                &["tools/.venv/bin/tool".to_string()],
+                &["tools/.venv/bin/python".to_string()],
                 &candidate("apps/a/node_modules", StripKind::NodeModules)
             ),
             None

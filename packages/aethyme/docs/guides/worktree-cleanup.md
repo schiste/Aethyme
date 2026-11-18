@@ -494,12 +494,16 @@ session's own `.aethyme/prepare.toml` recreates is stripped, so
 `aethyme broker submit prepare --session <id>` rebuilds it:
 
 - a directory a step declares as an output, exactly (`node_modules/`);
-- a Python environment (`.venv` with `pyvenv.cfg`, proved as above) that
-  contains a path a step declares (`tools/.venv/bin/tool` declares
-  `tools/.venv`);
+- a Python environment (`.venv` with `pyvenv.cfg`, proved as above) whose
+  interpreter a step declares as an output, which shows the step creates it:
+  `tools/.venv/bin/python` (or `tools/.venv/pyvenv.cfg`) in that step's
+  `outputs`. A step that only declares other files inside the environment
+  (`tools/.venv/bin/tool`) may just install into an environment made
+  elsewhere, so the environment stays (`environment_root_creation_unproven`);
 - a workspace member's `node_modules` that the strip proves is a pnpm member
   (links into the top-level store, pnpm's shims), when the top-level
-  `node_modules/` is declared and goes in the same pass (or is already gone),
+  `node_modules/` is declared and actually moved in the same pass (or is
+  already gone),
   so the declared install recreates root and members together. Otherwise the
   members stay (`member_root_kept`).
 
