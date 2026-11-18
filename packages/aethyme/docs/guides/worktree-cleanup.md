@@ -1,6 +1,6 @@
 # Closed-session worktree cleanup
 
-Last Updated: 2026-11-14
+Last Updated: 2026-11-18
 
 Removing a session worktree is a reviewed operation, with one deterministic
 exception described under *Automatic removal* below. A closed session is not
@@ -726,6 +726,52 @@ top-level regenerable directory, and the bytes the deleter freed removing
 stripped directories. `broker status` adds the advice
 `storage.closed-checkouts-backlog` once 50 or more closed-session folders are
 on disk.
+
+## Deleting merged branches of cleaned sessions
+
+Removing a checkout does not always remove its local branch, and thousands
+of leftover `refs/heads/` entries slow every Git command that lists refs.
+The background worker deletes a cleaned session's local branch, a bounded
+slice per run (at most 200 judged and 100 deleted, 20 seconds, from a
+cursor, under a nonblocking lifecycle claim), only when every condition
+holds:
+
+- every session that ever used the branch is cleaned;
+- its tip is an ancestor of the remote default branch as last fetched (the
+  worker never fetches);
+- no worktree has it checked out;
+- no recovery archive of those sessions still needs it to recreate a
+  checkout;
+- the ref still names the judged tip (the delete is a compare-and-swap).
+
+"Merged" is judged against the remote default branch **as last fetched**:
+the worker never fetches, so a missing remote-tracking ref skips the slice
+(`no_fetched_default_branch`) and a stale one only keeps more branches,
+never deletes one whose work is not on it. The listing is read without the
+lifecycle claim; under the claim, immediately before each delete, the
+branch's sessions, its restorable state and Git's worktree registrations
+(every `HEAD`, and a rebase's `head-name`) are read again, so a checkout
+started or reopened during the listing keeps its branch.
+
+A session keeps its branch while it has restorable state: anything not
+plainly cleaned (open or closed), or a recovery archive. That decision lives
+in one function (`Broker::has_restorable_state`); a feature that keeps other
+restorable state for a session extends it.
+
+Anything else is kept and counted (`session_not_cleaned`, `checked_out`,
+`recovery_archive`, `unmerged`, `unknown`, `delete_failed`). Only local
+branches are deleted; remote branches and remote-tracking refs are never
+touched. `broker status` shows `cleanup.merged-session-branches` while
+branches of cleaned sessions remain. Turn it off with:
+
+```toml
+[cleanup]
+delete_merged_session_branches = false
+```
+
+A retired checkout whose session branch was deleted can no longer be
+recreated with `start --reuse` at its old path; its work is already on the
+default branch, so start a new session instead.
 
 ## Maintenance during broker open
 
