@@ -202,7 +202,10 @@ pub(crate) fn write_idle_strip_notice(
     if git_succeeds(worktree, &["ls-files", "--error-unmatch", "--", relative]) {
         return NoticeOutcome::Tracked;
     }
-    if !git_succeeds(worktree, &["check-ignore", "-q", "--no-index", "--", relative]) {
+    if !git_succeeds(
+        worktree,
+        &["check-ignore", "-q", "--no-index", "--", relative],
+    ) {
         return NoticeOutcome::NotIgnored;
     }
     let body = format!(
@@ -304,7 +307,10 @@ fn tracked_top_level_directories(worktree: &Path) -> Vec<String> {
 /// File-system evidence that someone worked in `worktree` since `since`:
 /// which modification time is newer (the Git index or `HEAD`, the checkout
 /// directory, or a tracked top-level directory), or `None`.
-pub(crate) fn recent_file_activity(worktree: &Path, since: std::time::SystemTime) -> Option<&'static str> {
+pub(crate) fn recent_file_activity(
+    worktree: &Path,
+    since: std::time::SystemTime,
+) -> Option<&'static str> {
     let newer = |path: &Path| {
         std::fs::metadata(path)
             .and_then(|metadata| metadata.modified())
@@ -721,7 +727,10 @@ mod tests {
     }
 
     fn set_mtime(path: &Path, when: std::time::SystemTime) {
-        std::fs::File::open(path).unwrap().set_modified(when).unwrap();
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
     }
 
     /// A recent modification of the Git index, the checkout directory or a
@@ -744,7 +753,15 @@ mod tests {
         std::fs::create_dir_all(worktree.join("src")).unwrap();
         std::fs::write(worktree.join("src/lib.rs"), "x\n").unwrap();
         git(&["add", "."]);
-        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "init",
+        ]);
         let old = std::time::SystemTime::now() - Duration::from_secs(10 * 3600);
         let since = std::time::SystemTime::now() - Duration::from_secs(4 * 3600);
         let age_all = || {
@@ -763,10 +780,16 @@ mod tests {
         assert_eq!(recent_file_activity(worktree, since), Some("git_index"));
         age_all();
         set_mtime(&worktree.join("src"), std::time::SystemTime::now());
-        assert_eq!(recent_file_activity(worktree, since), Some("tracked_directory"));
+        assert_eq!(
+            recent_file_activity(worktree, since),
+            Some("tracked_directory")
+        );
         age_all();
         set_mtime(worktree, std::time::SystemTime::now());
-        assert_eq!(recent_file_activity(worktree, since), Some("checkout_directory"));
+        assert_eq!(
+            recent_file_activity(worktree, since),
+            Some("checkout_directory")
+        );
     }
 
     /// The notice is created only when absent: a conflict notice is never
@@ -816,7 +839,12 @@ mod tests {
         );
         assert!(!notice.exists());
         // Not ignored: not written.
-        git(&["rm", "-q", "--cached", crate::merge::ACTION_REQUIRED_RELPATH]);
+        git(&[
+            "rm",
+            "-q",
+            "--cached",
+            crate::merge::ACTION_REQUIRED_RELPATH,
+        ]);
         std::fs::write(worktree.join(".gitignore"), "").unwrap();
         assert_eq!(
             write_idle_strip_notice(worktree, 3, &stripped, 4),

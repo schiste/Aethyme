@@ -165,7 +165,10 @@ impl Broker {
             advice.push(row);
         }
         if crate::preparation::stripped_since_prepared(&self.main_root, session_id) {
-            crate::phase_telemetry::add("status_idle_strip_prepare_advice", std::time::Duration::ZERO);
+            crate::phase_telemetry::add(
+                "status_idle_strip_prepare_advice",
+                std::time::Duration::ZERO,
+            );
             advice.push(StatusAdvice {
                 id: "idle_strip_prepare",
                 severity: StatusAdviceSeverity::Warning,

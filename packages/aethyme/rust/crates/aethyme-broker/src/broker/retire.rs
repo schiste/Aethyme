@@ -4888,12 +4888,19 @@ mod tests {
         let age_files = |worktree: &Path| {
             let old = std::time::SystemTime::now() - Duration::from_secs(10 * 3_600);
             let admin = PathBuf::from(git(worktree, &["rev-parse", "--absolute-git-dir"]).trim());
-            let mut paths = vec![admin.join("index"), admin.join("HEAD"), worktree.to_path_buf()];
+            let mut paths = vec![
+                admin.join("index"),
+                admin.join("HEAD"),
+                worktree.to_path_buf(),
+            ];
             for name in git(worktree, &["ls-tree", "-d", "--name-only", "HEAD"]).lines() {
                 paths.push(worktree.join(name));
             }
             for path in paths.iter().filter(|path| path.exists()) {
-                std::fs::File::open(path).unwrap().set_modified(old).unwrap();
+                std::fs::File::open(path)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
             }
         };
         let pass_with = |broker: &mut crate::Broker, age: bool, stale_snapshot: bool| {
@@ -4971,7 +4978,11 @@ mod tests {
                 panic!("artifact-use scope admitted");
             };
             let busy = pass(&mut broker);
-            assert_eq!(busy.strip.refused.get("checkout_busy"), Some(&1), "{busy:#?}");
+            assert_eq!(
+                busy.strip.refused.get("checkout_busy"),
+                Some(&1),
+                "{busy:#?}"
+            );
             assert!(worktree.join("node_modules").exists());
         }
 
@@ -5079,7 +5090,10 @@ mod tests {
         assert!(
             advice.iter().any(|row| row.id == "idle_strip_prepare"
                 && row.commands
-                    == vec![format!("aethyme broker submit prepare --session {}", open.id)]),
+                    == vec![format!(
+                        "aethyme broker submit prepare --session {}",
+                        open.id
+                    )]),
             "{advice:?}"
         );
         std::fs::write(&notice, saved).unwrap();
