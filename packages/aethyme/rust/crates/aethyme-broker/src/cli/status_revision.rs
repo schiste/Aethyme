@@ -16,6 +16,8 @@ const SECTIONS: &[&str] = &[
     "collaboration_fence",
     "lease_release_requests",
     "coordinated_operations",
+    "main_checkout",
+    "main_checkout_advice",
     "focus",
     "session",
     "omitted_details",

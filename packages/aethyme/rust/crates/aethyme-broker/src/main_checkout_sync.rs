@@ -297,6 +297,8 @@ pub(crate) struct Observed {
     pub(crate) local_changes: Option<u64>,
     /// Local entries recognised as the broker's own state and ignored.
     pub(crate) broker_paths_ignored: Option<u64>,
+    /// The adopted session that held the move, when one did.
+    pub(crate) blocking_session_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,13 +458,19 @@ pub(crate) fn attempt_with(
     }
     // A session adopted on the primary checkout means an agent works in it:
     // moving HEAD under that agent is never this attempt's decision.
-    match live_session_in_checkout(main_root) {
+    match adopted_session_hold(main_root) {
         Ok(None) => {}
-        Ok(Some(session)) => {
+        Ok(Some(in_use)) => {
+            let session = in_use.session_id;
+            let age = human_age(crate::clock::epoch_ms() - in_use.last_activity_at);
+            observed.blocking_session_id = Some(session);
             return held(
                 observed,
                 SyncReason::LiveSession,
-                &format!("live broker session {session} works in this checkout"),
+                &format!(
+                    "live broker session {session} works in this checkout ({}; last activity {age} ago)",
+                    in_use.why
+                ),
                 &format!("aethyme broker status --session {session}"),
             );
         }
@@ -1369,10 +1377,76 @@ fn overlapping_paths(changed: &[String], tracked: &[String], untracked: &[String
     paths.into_iter().collect()
 }
 
-/// The first non-closed broker session whose worktree is this primary
-/// checkout. `Err` when the broker database exists but cannot be read: the
-/// caller then cannot rule out an agent working here and must not move it.
-fn live_session_in_checkout(main_root: &Path) -> Result<Option<i64>, ()> {
+/// A session adopted on the primary checkout counts as in use for this long
+/// after its last recorded activity.
+const ADOPTED_SESSION_ACTIVITY_WINDOW_MS: i64 = 30 * 60 * 1000;
+
+/// A session adopted on the primary checkout that is in use, so the move
+/// must wait for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionInUse {
+    pub(crate) session_id: i64,
+    /// `spawned_process_alive`, `holder_alive`, `holder_unknown`,
+    /// `operation_in_progress` or `recent_activity`.
+    pub(crate) why: &'static str,
+    pub(crate) last_activity_at: i64,
+}
+
+/// Whether one session adopted on the primary checkout is in use: its spawned
+/// process or recorded holder is alive, the process listing could not prove
+/// the holder gone, an operation of it is unresolved, or it was active in
+/// the last half hour. An idle session with no live holder is not: the
+/// move's own guarantees (default branch only, strictly behind, no local
+/// commits, overlap refusal, compare-and-swap, journal) protect its files.
+pub(crate) fn adopted_session_in_use(
+    spawned_process_alive: bool,
+    holder: crate::session_holder::RecordedHolderLiveness,
+    operation_pending: bool,
+    last_activity_at: i64,
+    now_ms: i64,
+) -> Option<&'static str> {
+    use crate::session_holder::RecordedHolderLiveness as Holder;
+    if spawned_process_alive {
+        return Some("spawned_process_alive");
+    }
+    match holder {
+        Holder::Alive => return Some("holder_alive"),
+        Holder::Unknown => return Some("holder_unknown"),
+        Holder::Gone | Holder::Unbound => {}
+    }
+    if operation_pending {
+        return Some("operation_in_progress");
+    }
+    if now_ms.saturating_sub(last_activity_at) < ADOPTED_SESSION_ACTIVITY_WINDOW_MS {
+        return Some("recent_activity");
+    }
+    None
+}
+
+/// Open sessions whose worktree is this primary checkout.
+fn sessions_in_checkout(
+    store: &crate::BrokerStore,
+    main_root: &Path,
+) -> Result<Vec<crate::Session>, crate::BrokerError> {
+    let canonical_root = main_root.canonicalize().ok();
+    Ok(store
+        .live_sessions()?
+        .into_iter()
+        .filter(|session| !session.status.is_closed())
+        .filter(|session| {
+            let path = Path::new(&session.worktree_path);
+            path == main_root
+                || path
+                    .canonicalize()
+                    .is_ok_and(|canonical| Some(canonical) == canonical_root)
+        })
+        .collect())
+}
+
+/// The first session adopted on this primary checkout that is in use.
+/// `Err` when the broker database exists but cannot be read: the caller then
+/// cannot rule out an agent working here and must not move it.
+fn adopted_session_hold(main_root: &Path) -> Result<Option<SessionInUse>, ()> {
     let Ok(db) = crate::broker_db_path(main_root) else {
         return Err(());
     };
@@ -1380,19 +1454,99 @@ fn live_session_in_checkout(main_root: &Path) -> Result<Option<i64>, ()> {
         return Ok(None);
     }
     let store = crate::BrokerStore::open_snapshot_in_repo(main_root).map_err(|_| ())?;
-    let sessions = store.live_sessions().map_err(|_| ())?;
-    let canonical_root = main_root.canonicalize().ok();
-    Ok(sessions
-        .into_iter()
-        .filter(|session| !session.status.is_closed())
-        .find(|session| {
-            let path = Path::new(&session.worktree_path);
-            path == main_root
-                || path
-                    .canonicalize()
-                    .is_ok_and(|canonical| Some(canonical) == canonical_root)
-        })
-        .map(|session| session.id))
+    let sessions = sessions_in_checkout(&store, main_root).map_err(|_| ())?;
+    if sessions.is_empty() {
+        return Ok(None);
+    }
+    let pending = store.pending_coordinated_operations().map_err(|_| ())?;
+    let now = crate::clock::epoch_ms();
+    let mut holders = crate::session_holder::RecordedHolderProcessTable::default();
+    for session in sessions {
+        let spawned = session.pid.is_some_and(crate::broker::pid_alive);
+        let holder =
+            crate::session_holder::recorded_holder_liveness(&store, session.id, &mut holders, true)
+                .liveness;
+        let operation = pending
+            .iter()
+            .any(|operation| operation.session_id == session.id);
+        if let Some(why) =
+            adopted_session_in_use(spawned, holder, operation, session.last_activity_at, now)
+        {
+            return Ok(Some(SessionInUse {
+                session_id: session.id,
+                why,
+                last_activity_at: session.last_activity_at,
+            }));
+        }
+        crate::phase_telemetry::add("main_checkout_idle_session_not_holding", Duration::ZERO);
+    }
+    Ok(None)
+}
+
+/// Sender name of the notes the sync leaves for adopted sessions.
+const NOTE_SENDER: &str = "main-checkout-sync";
+
+/// After the primary checkout advanced from `from` to `to`, tell every open
+/// session adopted on it, and move its diff base to `to` when its old base is
+/// part of the default branch's history, so the upstream commits are never
+/// counted as that session's work.
+pub(crate) fn note_adopted_sessions(
+    store: &mut crate::BrokerStore,
+    checkout: &GitRepo,
+    main_root: &Path,
+    from: &str,
+    to: &str,
+) {
+    let sessions = match sessions_in_checkout(store, main_root) {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            crate::warn_unrecorded(
+                "find sessions adopted on the main checkout",
+                Err::<(), _>(error),
+            );
+            return;
+        }
+    };
+    let quoted_root = crate::broker::shell_quote(&main_root.to_string_lossy());
+    for session in sessions {
+        let rebasable = match session.diff_base.as_deref() {
+            Some(base) => checkout.is_ancestor_checked(base, to).unwrap_or(false),
+            None => true,
+        };
+        let rebased = rebasable
+            && match store.set_session_diff_base(session.id, to) {
+                Ok(()) => true,
+                Err(error) => {
+                    crate::warn_unrecorded(
+                        "move an adopted session's diff base with the main checkout",
+                        Err::<(), _>(error),
+                    );
+                    false
+                }
+            };
+        let base_note = if rebased {
+            format!(
+                "Its diff base moved to {to}, so these commits are not counted as this session's work."
+            )
+        } else {
+            "Its diff base is not in the default branch's history and was left as it was; check `broker status --session` before pushing.".to_string()
+        };
+        let message = format!(
+            "The primary checkout this session was adopted on was fast-forwarded from {from} to {to} while the session was idle. Local changes were left as they were. {base_note} See what changed: git -C {quoted_root} log --oneline {from}..{to}"
+        );
+        crate::warn_unrecorded(
+            "note the main-checkout advance to an adopted session",
+            store
+                .record_automation_note(
+                    NOTE_SENDER,
+                    session.id,
+                    &message,
+                    Some(&format!("main-checkout-advance:{from}:{to}")),
+                )
+                .map(|_| ()),
+        );
+        crate::phase_telemetry::add("main_checkout_adopted_session_noted", Duration::ZERO);
+    }
 }
 
 /// The primary checkout's sync state as `status --json` reports it
@@ -1436,6 +1590,9 @@ pub struct MainCheckoutStatus {
     pub next_fetch_at: Option<i64>,
     /// When the checkout was first seen behind since its last sync.
     pub behind_since: Option<i64>,
+    /// The session adopted on the primary checkout that held the last
+    /// attempt (`reason` `live_session`).
+    pub blocking_session_id: Option<i64>,
 }
 
 /// The recorded state, `None` when no attempt has been recorded.
@@ -1476,6 +1633,7 @@ pub(crate) fn apply_attempt(
     state.trigger = Some(trigger.to_string());
     state.blocking_paths.clear();
     state.blocking_paths_omitted = 0;
+    state.blocking_session_id = observed.blocking_session_id;
     let hold = match &attempt.outcome {
         SyncOutcome::Held(hold) => {
             state.last_result = Some("held".into());
@@ -1593,7 +1751,10 @@ pub(crate) fn foreground_attempt(checkout: &GitRepo, main_root: &Path, trigger: 
     );
     record_attempt_telemetry(&attempt, trigger, serde_json::json!({}));
     let database_exists = crate::broker_db_path(main_root).is_ok_and(|db| db.exists());
-    if database_exists && let Ok(store) = crate::BrokerStore::open_in_repo(main_root) {
+    if database_exists && let Ok(mut store) = crate::BrokerStore::open_in_repo(main_root) {
+        if let SyncOutcome::Advanced { from, to, .. } = &attempt.outcome {
+            note_adopted_sessions(&mut store, checkout, main_root, from, to);
+        }
         let state = apply_attempt(
             load_state(&store).unwrap_or_default(),
             &attempt,
@@ -1676,7 +1837,7 @@ pub(crate) struct LaneReport {
 /// lifecycle claim that yields to any queued foreground command. Runs on the
 /// worker's own thread: Git deadlines are thread-local.
 pub(crate) fn run_timer_lane(
-    store: &crate::BrokerStore,
+    store: &mut crate::BrokerStore,
     main_root: &Path,
     now_ms: i64,
 ) -> LaneReport {
@@ -1771,6 +1932,9 @@ pub(crate) fn run_timer_lane(
             "litter_kept_by_reason": report.litter.kept_by_reason,
         }),
     );
+    if let SyncOutcome::Advanced { from, to, .. } = &attempt.outcome {
+        note_adopted_sessions(store, &checkout, main_root, from, to);
+    }
     let state = apply_attempt(state, &attempt, "broker.worker", now_ms);
     save_state(store, &state);
     report.outcome = Some(attempt.outcome);
@@ -1864,6 +2028,8 @@ fn behind_advice(
                     String::new()
                 }
             )
+        } else if let (Some(_), Some(detail)) = (state.blocking_session_id, &state.detail) {
+            format!(": {detail}")
         } else {
             String::new()
         }
@@ -1888,6 +2054,9 @@ fn behind_advice(
     }
     if let Some(detail) = &state.detail {
         evidence.push(format!("detail: {detail}"));
+    }
+    if let Some(session) = state.blocking_session_id {
+        evidence.push(format!("blocking session: {session}"));
     }
     for path in &state.blocking_paths {
         evidence.push(format!("blocking path: {path}"));
@@ -1940,10 +2109,19 @@ fn behind_advice(
         "disabled" => {
             commands.push("set [main_checkout] auto_sync = true in .aethyme/config.toml".into())
         }
+        "live_session" => {
+            if let Some(session) = state.blocking_session_id {
+                commands.push(format!("aethyme broker status --session {session}"));
+                commands.push(format!(
+                    "aethyme broker finish --session {session}   # once that session's work is done, so the checkout can move"
+                ));
+            }
+        }
         _ => {}
     }
     commands.push("aethyme broker status --full --json".into());
-    commands.dedup();
+    let mut seen = std::collections::BTreeSet::new();
+    commands.retain(|command| seen.insert(command.clone()));
     Some(crate::StatusAdvice {
         id: ADVICE_ID,
         severity: crate::StatusAdviceSeverity::Warning,

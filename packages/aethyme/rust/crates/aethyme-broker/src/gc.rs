@@ -9160,7 +9160,8 @@ impl Broker {
         }
         // The main-checkout sync timer: one bounded fetch and one
         // fast-forward attempt when a launcher claimed the slot.
-        crate::main_checkout_sync::run_timer_lane(self.store_ref(), self.main_root(), now_ms());
+        let main_root = self.main_root().to_path_buf();
+        crate::main_checkout_sync::run_timer_lane(self.store(), &main_root, now_ms());
         let artifact_pending = self.artifact_sweep_backlog_pending()?
             && crate::AutoCleanupPolicy::artifact_sweep_allowed(self.main_root());
         let checkout_cleanup_pending = self.auto_checkout_cleanup_recovery_requested()?;

@@ -171,6 +171,7 @@
     "behind_since": "null",
     "blocking_paths": [],
     "blocking_paths_omitted": "integer",
+    "blocking_session_id": "null",
     "branch": "string",
     "detail": "null",
     "fetch_error": "null",

@@ -230,8 +230,17 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                 "holder_session_id": request.holder_session_id, "path": request.path
             })).collect();
         let peers = crate::agent_hook::session_peer_view(&broker, session_id)?;
+        // The primary checkout's sync state and its advice: the session view
+        // is what `status --json` shows from a checkout with a session,
+        // including a session adopted on the primary checkout itself.
+        let main_checkout = crate::main_checkout_sync::load_state(broker.store_ref());
+        let main_checkout_advice = crate::main_checkout_sync::status_advice(
+            broker.store_ref(),
+            broker.main_root(),
+            now_ms(),
+        );
         if parsed.json {
-            let snapshot = serde_json::json!({
+            let mut snapshot = serde_json::json!({
                 "schema": "aethyme.broker-session-view/v2",
                 "session": block,
                 "peer_state": peers,
@@ -240,6 +249,12 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                 "data_freshness": {"global_warnings": "recorded_partial", "peer_state": "recorded_only", "ownership_claims": "not_inspected", "session_advice": "partial", "deferred_checks_are_unknown": true},
                 "drilldown": {"leases": format!("aethyme broker advanced leases --session {session_id} --json"), "recovery": "aethyme broker unblock", "full_status": "aethyme broker status --full --json"}
             });
+            if let Some(state) = &main_checkout {
+                snapshot["main_checkout"] = serde_json::to_value(state)?;
+            }
+            if !main_checkout_advice.is_empty() {
+                snapshot["main_checkout_advice"] = serde_json::to_value(&main_checkout_advice)?;
+            }
             let mut value = super::status_revision::render_session(
                 snapshot,
                 broker.main_root(),
@@ -275,6 +290,9 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                 crate::agent_hook::render_repository_information(&coordination.information)
             {
                 out!("{line}");
+            }
+            for advice in &main_checkout_advice {
+                out!("Main checkout: {}", advice.summary);
             }
             out!("Details: aethyme broker status --full --json");
         }

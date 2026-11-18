@@ -317,11 +317,11 @@ fn the_timer_slot_is_single_flight_and_switchable() {
 fn a_failed_fetch_is_recorded_and_backs_off() {
     let tmp = offline_repository();
     let root = tmp.path();
-    let store = store(&tmp);
+    let mut store = store(&tmp);
     let now = 10_000_000;
 
     assert!(claim_timer_slot(&store, root, now));
-    let first = run_timer_lane(&store, root, now);
+    let first = run_timer_lane(&mut store, root, now);
     assert!(
         first.ran && first.fetch_attempted && first.fetch_failed,
         "{first:?}"
@@ -337,13 +337,13 @@ fn a_failed_fetch_is_recorded_and_backs_off() {
 
     // Requested again before the backoff ends: no fetch, still an attempt.
     store.meta_set(REQUEST_META_KEY, "1").unwrap();
-    let second = run_timer_lane(&store, root, now + 60_000);
+    let second = run_timer_lane(&mut store, root, now + 60_000);
     assert!(second.ran && !second.fetch_attempted, "{second:?}");
     assert_eq!(load_state(&store).unwrap().fetch_failures, 1);
 
     // After the backoff, it fetches again and the failures add up.
     store.meta_set(REQUEST_META_KEY, "1").unwrap();
-    let third = run_timer_lane(&store, root, next);
+    let third = run_timer_lane(&mut store, root, next);
     assert!(third.fetch_attempted && third.fetch_failed, "{third:?}");
     let state = load_state(&store).unwrap();
     assert_eq!(state.fetch_failures, 2);
@@ -353,7 +353,7 @@ fn a_failed_fetch_is_recorded_and_backs_off() {
     );
 
     // Without a request the lane does nothing.
-    let idle = run_timer_lane(&store, root, next + 1);
+    let idle = run_timer_lane(&mut store, root, next + 1);
     assert!(!idle.ran);
 }
 
@@ -361,7 +361,7 @@ fn a_failed_fetch_is_recorded_and_backs_off() {
 fn the_timer_lane_does_nothing_when_disabled() {
     let tmp = offline_repository();
     let root = tmp.path();
-    let store = store(&tmp);
+    let mut store = store(&tmp);
     std::fs::create_dir_all(root.join(".aethyme")).unwrap();
     std::fs::write(
         root.join(".aethyme/config.toml"),
@@ -369,7 +369,7 @@ fn the_timer_lane_does_nothing_when_disabled() {
     )
     .unwrap();
     store.meta_set(REQUEST_META_KEY, "1").unwrap();
-    let report = run_timer_lane(&store, root, 1);
+    let report = run_timer_lane(&mut store, root, 1);
     assert!(!report.ran && !report.fetch_attempted, "{report:?}");
     assert!(load_state(&store).is_none());
 }
@@ -887,4 +887,161 @@ fn status_moves_only_a_clean_checkout() {
         "{attempt_clean:?}"
     );
     assert_eq!(head(root), to);
+}
+
+fn adopt_primary_checkout(root: &Path, diff_base: &str) -> (crate::BrokerStore, i64) {
+    let mut store = crate::BrokerStore::open_in_repo(root).unwrap();
+    let session = store
+        .register_session(&crate::NewSession {
+            worktree_path: root.to_string_lossy().into_owned(),
+            branch: "main".into(),
+            origin: crate::SessionOrigin::Adopted,
+            task: Some("adopted on the primary checkout".into()),
+            diff_base: Some(diff_base.to_string()),
+            adoption_base: None,
+            adopted_head: None,
+            repository_contract: None,
+            pid: None,
+            command: None,
+            log_path: None,
+            agent_identity: None,
+        })
+        .unwrap();
+    // Idle for well over the activity window.
+    store.touch_session_activity(session.id, 1).unwrap();
+    (store, session.id)
+}
+
+fn bind_this_process_as_holder(store: &mut crate::BrokerStore, session_id: i64) {
+    let table = crate::session_holder::ProcessTable::snapshot().expect("process table");
+    let me = table
+        .process(i64::from(std::process::id()))
+        .expect("this process is listed");
+    store
+        .append_event(
+            crate::events::SESSION_HOLDER_BOUND,
+            Some(session_id),
+            Some(&serde_json::to_string(&me).unwrap()),
+        )
+        .unwrap();
+}
+
+#[test]
+fn an_adopted_session_is_in_use_only_with_a_live_holder_or_recent_work() {
+    use crate::session_holder::RecordedHolderLiveness as Holder;
+    let now = 100_000_000;
+    let idle = now - 31 * 60 * 1000;
+    assert_eq!(
+        adopted_session_in_use(false, Holder::Gone, false, idle, now),
+        None
+    );
+    assert_eq!(
+        adopted_session_in_use(false, Holder::Unbound, false, idle, now),
+        None
+    );
+    assert_eq!(
+        adopted_session_in_use(false, Holder::Alive, false, idle, now),
+        Some("holder_alive")
+    );
+    assert_eq!(
+        adopted_session_in_use(false, Holder::Unknown, false, idle, now),
+        Some("holder_unknown"),
+        "an incomplete process listing holds"
+    );
+    assert_eq!(
+        adopted_session_in_use(true, Holder::Gone, false, idle, now),
+        Some("spawned_process_alive")
+    );
+    assert_eq!(
+        adopted_session_in_use(false, Holder::Gone, true, idle, now),
+        Some("operation_in_progress")
+    );
+    assert_eq!(
+        adopted_session_in_use(false, Holder::Unbound, false, now - 60_000, now),
+        Some("recent_activity")
+    );
+}
+
+#[test]
+fn an_idle_adopted_session_without_a_holder_lets_the_checkout_move_and_is_noted() {
+    let (tmp, from, to) = behind_repository(&[], &[("up.txt", "up\n")]);
+    let root = tmp.path();
+    std::fs::write(root.join("README.md"), "local edit\n").unwrap();
+    let (store, session) = adopt_primary_checkout(root, &from);
+    drop(store);
+    let checkout = GitRepo::discover(root).unwrap();
+
+    let attempt = foreground_attempt(&checkout, root, "broker.sync");
+    assert!(
+        matches!(&attempt.outcome, SyncOutcome::Advanced { to: reached, .. } if *reached == to),
+        "{attempt:?}"
+    );
+    assert_eq!(head(root), to);
+    assert_eq!(
+        std::fs::read(root.join("README.md")).unwrap(),
+        b"local edit\n"
+    );
+
+    let store = crate::BrokerStore::open_in_repo(root).unwrap();
+    let notes = store.unread_automation_notes(session).unwrap();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].message.contains(&from) && notes[0].message.contains(&to));
+    assert_eq!(
+        store.session(session).unwrap().diff_base.as_deref(),
+        Some(to.as_str()),
+        "the upstream commits are not counted as the session's"
+    );
+    assert_eq!(load_state(&store).unwrap().blocking_session_id, None);
+}
+
+#[test]
+fn an_adopted_session_with_a_live_holder_holds_the_checkout() {
+    let (tmp, from, _to) = behind_repository(&[], &[("up.txt", "up\n")]);
+    let root = tmp.path();
+    let (mut store, session) = adopt_primary_checkout(root, &from);
+    bind_this_process_as_holder(&mut store, session);
+    drop(store);
+    let checkout = GitRepo::discover(root).unwrap();
+
+    let attempt = foreground_attempt(&checkout, root, "broker.sync");
+    match &attempt.outcome {
+        SyncOutcome::Held(hold) => {
+            assert_eq!(hold.reason, SyncReason::LiveSession);
+            assert!(hold.message.contains("holder_alive"), "{hold:?}");
+            assert!(
+                hold.message.contains(&format!("session {session}")),
+                "{hold:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(attempt.observed.blocking_session_id, Some(session));
+    assert_eq!(head(root), from);
+    let store = crate::BrokerStore::open_in_repo(root).unwrap();
+    let state = load_state(&store).unwrap();
+    assert_eq!(state.reason, Some(SyncReason::LiveSession));
+    assert_eq!(state.blocking_session_id, Some(session));
+    assert!(store.unread_automation_notes(session).unwrap().is_empty());
+}
+
+#[test]
+fn an_unknown_process_table_holds_the_checkout() {
+    let (tmp, from, _to) = behind_repository(&[], &[("up.txt", "up\n")]);
+    let root = tmp.path();
+    let (mut store, session) = adopt_primary_checkout(root, &from);
+    bind_this_process_as_holder(&mut store, session);
+    drop(store);
+    let checkout = GitRepo::discover(root).unwrap();
+
+    crate::session_holder::deny_process_tables_for_test(true);
+    let attempt = foreground_attempt(&checkout, root, "broker.sync");
+    crate::session_holder::deny_process_tables_for_test(false);
+    match &attempt.outcome {
+        SyncOutcome::Held(hold) => {
+            assert_eq!(hold.reason, SyncReason::LiveSession);
+            assert!(hold.message.contains("holder_unknown"), "{hold:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(head(root), from);
 }
