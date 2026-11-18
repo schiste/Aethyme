@@ -1632,6 +1632,23 @@ pub(crate) struct RecordedHolderAssessment {
     pub liveness: RecordedHolderLiveness,
 }
 
+/// Whether `session_id`'s latest recorded holder is exactly `agent` (same
+/// pid and start time). Anything unreadable is `false`.
+pub(crate) fn recorded_holder_is(
+    store: &crate::BrokerStore,
+    session_id: i64,
+    agent: &AgentProcess,
+) -> bool {
+    let Ok(Some(event)) = store.latest_session_holder_event(session_id) else {
+        return false;
+    };
+    event
+        .payload_json
+        .as_deref()
+        .and_then(|payload| serde_json::from_str::<AgentProcess>(payload).ok())
+        .is_some_and(|holder| holder.pid == agent.pid && holder.started == agent.started)
+}
+
 /// Observe the latest recorded holder, lazily sharing one bounded process
 /// table snapshot across all sessions in a caller's pass. `allow_snapshot`
 /// lets a deadline-bound caller decline a new 2-second process-table read

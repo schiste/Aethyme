@@ -111,6 +111,22 @@ const DISCOVERY_CANDIDATES_MAX: usize = 256;
 const POOL_LISTING_MAX: usize = 200_000;
 /// The longest the backlog count may take after the strip.
 const BACKLOG_BUDGET: Duration = Duration::from_secs(5);
+/// The longest the pool listings may take; past it each folder is checked
+/// on its own, just before it is judged.
+const POOL_LISTING_BUDGET: Duration = Duration::from_secs(10);
+/// The longest one checkout may take, so a slow one never consumes the
+/// pass (it is kept as `deadline` and backed off).
+const STRIP_CHECKOUT_BUDGET: Duration = Duration::from_secs(15);
+/// Checkouts a pass judges before it spends time on pool-wide accounting
+/// (the `closed_with_regenerable` count), unless it ran out of candidates.
+const STRIP_MIN_JUDGED_BEFORE_ACCOUNTING: usize = 10;
+/// Meta key: where the last pass stopped (the judge's close time and
+/// session id), so the next pass goes on from there, oldest close first,
+/// wrapping at the end, instead of starting from the front again.
+pub(crate) const CHECKOUT_STRIP_CURSOR_KEY: &str = "checkout_strip.cursor";
+/// Directories the deepest discovery level probes per checkout, at most:
+/// each probe costs `lstat`s, slow on a drive under deletion.
+const DISCOVERY_DEEPEST_DIRECTORIES_MAX: usize = 64;
 
 /// One checkout's retry backoff after transient keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -138,6 +154,8 @@ pub(crate) fn strip_backoff_delay_ms(failures: u32) -> i64 {
 pub(crate) struct CheckoutStripReport {
     /// Closed-session checkout folders found on disk, one judge each.
     pub folders_found: usize,
+    /// Judged paths whose folder is gone (by the pool listing).
+    pub folders_missing: usize,
     /// Of those, skipped because an earlier pass handled the same close.
     pub skipped_remembered: usize,
     /// Of those, skipped because a transient keep's backoff has not passed
@@ -461,6 +479,7 @@ pub(crate) fn regenerable_candidates(
     }
     let mut candidates = Vec::new();
     let mut seen_directories = 0_usize;
+    let mut deepest_probed = 0_usize;
     // (absolute directory, its path relative to the checkout)
     let mut level: Vec<(PathBuf, String)> = vec![(worktree.to_path_buf(), String::new())];
     'discovery: for depth in 0..=DISCOVERY_DEPTH {
@@ -484,7 +503,13 @@ pub(crate) fn regenerable_candidates(
                 }
             };
             if depth == DISCOVERY_DEPTH {
-                // The deepest level: probe the catalogued names only.
+                // The deepest level: probe the catalogued names only, in a
+                // bounded number of directories.
+                if deepest_probed >= DISCOVERY_DEEPEST_DIRECTORIES_MAX {
+                    crate::phase_telemetry::add("checkout_strip_discover_bounded", Duration::ZERO);
+                    continue;
+                }
+                deepest_probed += 1;
                 for name in STRIP_NAMES {
                     let child = join(name);
                     if crate::runtime_paths::is_broker_runtime_path(&child) {
@@ -903,48 +928,79 @@ fn judges_before(row: &Session, current: &Session) -> bool {
     rank(row) > rank(current)
 }
 
-/// Folder existence from one listing of each pool directory, instead of an
-/// `lstat` per recorded session: the busiest repository records ~7,600
-/// sessions for ~850 folders. A name the listing holds is confirmed with one
-/// `lstat` (a real directory, not a symlink); a directory that cannot be
-/// listed falls back to `lstat` per folder.
+/// What one checkout's strip is judged with besides the run's evidence.
+#[derive(Clone, Copy)]
+struct StripContext<'a> {
+    /// The repository's `[cleanup] venv_markers`.
+    venv_markers: &'a [String],
+    /// At `finish`, the agent finishing the session: its own holder record
+    /// does not keep the checkout.
+    finishing_caller: Option<&'a crate::session_holder::AgentProcess>,
+}
+
+/// A judge's place in the pass: its close time, then its id.
+fn judge_key(session: &Session) -> (i64, i64) {
+    (
+        session
+            .closed_at
+            .or(session.cleanup_completed_at)
+            .unwrap_or(session.updated_at),
+        session.id,
+    )
+}
+
+/// Folder existence from one listing of each pool directory: the busiest
+/// repository records ~7,600 sessions for ~850 folders, and on its external
+/// drive, while the trash deleter runs, every metadata call takes ~120 ms.
+/// The listing's own entry types (no `lstat` per name) say which names are
+/// real directories; 0.8.122 confirmed each listed name with an `lstat`,
+/// which took 86.7 s for ~720 folders and starved the whole pass. A pool
+/// directory that cannot be listed completely before `deadline` answers
+/// `None` (unknown), and the caller checks that folder itself.
 #[derive(Default)]
 struct PoolListing {
     parents: BTreeMap<PathBuf, Option<BTreeSet<std::ffi::OsString>>>,
-    folders: BTreeMap<String, bool>,
 }
 
 impl PoolListing {
-    fn is_real_dir(&mut self, path: &str) -> bool {
-        if let Some(&known) = self.folders.get(path) {
-            return known;
-        }
+    /// Whether `path` is a real directory by its pool directory's listing,
+    /// `None` when that listing is not available.
+    fn exists(&mut self, path: &str, deadline: Instant) -> Option<bool> {
         let folder = Path::new(path);
-        let listed = match (folder.parent(), folder.file_name()) {
-            (Some(parent), Some(name)) => self
-                .parents
-                .entry(parent.to_path_buf())
-                .or_insert_with(|| list_names(parent))
-                .as_ref()
-                .map(|names| names.contains(name)),
-            _ => None,
-        };
-        let real = listed != Some(false)
-            && std::fs::symlink_metadata(folder)
-                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
-        self.folders.insert(path.to_string(), real);
-        real
+        let (parent, name) = (folder.parent()?, folder.file_name()?);
+        self.parents
+            .entry(parent.to_path_buf())
+            .or_insert_with(|| {
+                let _span = crate::phase_telemetry::span("checkout_strip_folder_listing");
+                let listed = list_directory_names(parent, deadline);
+                if listed.is_none() {
+                    crate::phase_telemetry::add(
+                        "checkout_strip_folder_listing_unavailable",
+                        Duration::ZERO,
+                    );
+                }
+                listed
+            })
+            .as_ref()
+            .map(|names| names.contains(name))
     }
 }
 
-/// The entry names of `directory`, or `None` when it cannot be listed
-/// completely within [`POOL_LISTING_MAX`].
-fn list_names(directory: &Path) -> Option<BTreeSet<std::ffi::OsString>> {
+/// The names of the real directories (not symlinks) in `directory`, from
+/// the listing's entry types, or `None` when it cannot be listed completely
+/// within [`POOL_LISTING_MAX`] entries before `deadline`.
+fn list_directory_names(
+    directory: &Path,
+    deadline: Instant,
+) -> Option<BTreeSet<std::ffi::OsString>> {
     let mut names = BTreeSet::new();
-    for entry in std::fs::read_dir(directory).ok()? {
-        names.insert(entry.ok()?.file_name());
-        if names.len() > POOL_LISTING_MAX {
+    for (count, entry) in std::fs::read_dir(directory).ok()?.enumerate() {
+        if count >= POOL_LISTING_MAX || Instant::now() >= deadline {
             return None;
+        }
+        let entry = entry.ok()?;
+        if entry.file_type().ok()?.is_dir() {
+            names.insert(entry.file_name());
         }
     }
     Some(names)
@@ -1087,38 +1143,37 @@ impl Broker {
             .filter(|session| session.cleanup_state == crate::SessionCleanupState::Open)
             .map(|session| session.worktree_path.clone())
             .collect::<BTreeSet<_>>();
-        let mut listing = PoolListing::default();
-        let listing_started = Instant::now();
-        let judges = {
-            let _span = crate::phase_telemetry::span("checkout_strip_folder_listing");
-            let mut by_path: BTreeMap<&str, &Session> = BTreeMap::new();
-            for row in &rows {
-                let path = row.worktree_path.as_str();
-                if open_paths.contains(path) {
-                    continue;
-                }
-                if let Some(current) = by_path.get_mut(path) {
+        // One judge per recorded path, from the records alone (no
+        // filesystem call), oldest close first, resumed from where the last
+        // pass stopped.
+        let mut by_path: BTreeMap<&str, &Session> = BTreeMap::new();
+        for row in &rows {
+            let path = row.worktree_path.as_str();
+            if open_paths.contains(path) {
+                continue;
+            }
+            match by_path.get_mut(path) {
+                Some(current) => {
                     if judges_before(row, current) {
                         *current = row;
                     }
-                } else if listing.is_real_dir(path) {
+                }
+                None => {
                     by_path.insert(path, row);
                 }
             }
-            let mut judges = by_path.into_values().collect::<Vec<_>>();
-            judges.sort_by_key(|session| {
-                (
-                    session
-                        .closed_at
-                        .or(session.cleanup_completed_at)
-                        .unwrap_or(session.updated_at),
-                    session.id,
-                )
-            });
-            judges
-        };
-        report.folder_listing_ms = elapsed_ms(listing_started);
-        report.folders_found = judges.len();
+        }
+        let mut judges = by_path.into_values().collect::<Vec<_>>();
+        judges.sort_by_key(|session| judge_key(session));
+        let cursor: Option<(i64, i64)> = self.meta_json(CHECKOUT_STRIP_CURSOR_KEY);
+        let start = cursor.map_or(0, |cursor| {
+            judges.partition_point(|session| judge_key(session) <= cursor)
+        });
+        judges.rotate_left(start);
+        let mut listing = PoolListing::default();
+        let listing_deadline = (Instant::now() + POOL_LISTING_BUDGET).min(deadline);
+        let mut next_cursor = cursor;
+        let mut lap_complete = true;
         let done: BTreeMap<i64, i64> = self.meta_json(CHECKOUT_STRIP_DONE_KEY);
         let backoff: BTreeMap<i64, StripBackoff> = self.meta_json(CHECKOUT_STRIP_BACKOFF_KEY);
         let venv_markers = crate::auto_cleanup::venv_markers(self.main_root());
@@ -1127,6 +1182,20 @@ impl Broker {
         let mut holders = crate::session_holder::RecordedHolderProcessTable::default();
         for session in judges {
             let closed_at = session.closed_at.unwrap_or(0);
+            if report.checkouts_listed >= cap || Instant::now() >= deadline {
+                report.more_remaining = true;
+                lap_complete = false;
+                crate::phase_telemetry::add(
+                    if report.checkouts_listed >= cap {
+                        "checkout_strip_stopped_cap"
+                    } else {
+                        "checkout_strip_stopped_deadline"
+                    },
+                    Duration::ZERO,
+                );
+                break;
+            }
+            next_cursor = Some(judge_key(session));
             if done.get(&session.id) == Some(&closed_at) {
                 report.skipped_remembered += 1;
                 crate::phase_telemetry::add("checkout_strip_skipped_remembered", Duration::ZERO);
@@ -1142,27 +1211,32 @@ impl Broker {
                 crate::phase_telemetry::add("checkout_strip_skipped_backoff", Duration::ZERO);
                 continue;
             }
-            if report.checkouts_listed >= cap || Instant::now() >= deadline {
-                report.more_remaining = true;
-                crate::phase_telemetry::add(
-                    if report.checkouts_listed >= cap {
-                        "checkout_strip_stopped_cap"
-                    } else {
-                        "checkout_strip_stopped_deadline"
-                    },
-                    Duration::ZERO,
-                );
-                break;
+            // The folder's existence, just before judging: from its pool
+            // directory's listing (one listing per pool, entry types only),
+            // else checked by `strip_one_checkout` itself.
+            let listing_started = Instant::now();
+            let exists = listing.exists(&session.worktree_path, listing_deadline);
+            report.folder_listing_ms = report
+                .folder_listing_ms
+                .saturating_add(elapsed_ms(listing_started));
+            if exists == Some(false) {
+                report.folders_missing += 1;
+                continue;
             }
+            report.folders_found += 1;
             report.checkouts_examined += 1;
             crate::phase_telemetry::add("checkout_strip_examined", Duration::ZERO);
             let transient_before = transient_refusals(&report);
+            let checkout_deadline = deadline.min(Instant::now() + STRIP_CHECKOUT_BUDGET);
             match self.strip_one_checkout(
                 session,
                 run,
                 &mut holders,
-                deadline,
-                &venv_markers,
+                checkout_deadline,
+                StripContext {
+                    venv_markers: &venv_markers,
+                    finishing_caller: None,
+                },
                 &mut report,
             ) {
                 CheckoutStrip::Done(directories) => {
@@ -1212,8 +1286,9 @@ impl Broker {
                         report.more_remaining = true;
                         break;
                     }
-                    if code == "deadline" {
+                    if code == "deadline" && Instant::now() >= deadline {
                         report.more_remaining = true;
+                        lap_complete = false;
                         break;
                     }
                 }
@@ -1229,6 +1304,22 @@ impl Broker {
                         while stored.len() > STRIP_DONE_MAX {
                             stored.pop_first();
                         }
+                    },
+                ),
+            );
+        }
+        if report.folders_missing > 0 {
+            crate::phase_telemetry::add("checkout_strip_folders_missing", Duration::ZERO);
+        }
+        // A lap that reached its end starts from the oldest close again.
+        let next_cursor = if lap_complete { None } else { next_cursor };
+        if next_cursor != cursor {
+            crate::warn_unrecorded(
+                "remember where the strip pass stopped",
+                self.update_meta_json(
+                    CHECKOUT_STRIP_CURSOR_KEY,
+                    |stored: &mut Option<(i64, i64)>| {
+                        *stored = next_cursor;
                     },
                 ),
             );
@@ -1264,20 +1355,26 @@ impl Broker {
         if report.directories_stripped > 0 {
             crate::phase_telemetry::add("checkout_strip_checkouts_stripped", Duration::ZERO);
         }
-        // Counted after the strip, so counting never spends its budget.
+        // Counted after the strip, so counting never spends its budget, and
+        // the per-folder part only once enough checkouts were judged.
         let backlog_deadline = Instant::now() + BACKLOG_BUDGET;
+        let count_regenerable =
+            report.checkouts_examined >= STRIP_MIN_JUDGED_BEFORE_ACCOUNTING || lap_complete;
         report.backlog = self.observe_checkout_backlog(
             &mut listing,
             &live,
             &rows,
             &open_paths,
             backlog_deadline,
+            count_regenerable,
         );
         crate::phase_telemetry::attach(
             "checkout_strip",
             serde_json::json!({
                 "folders_found": report.folders_found,
                 "skipped_remembered": report.skipped_remembered,
+                "folders_missing": report.folders_missing,
+                "lap_complete": lap_complete,
                 "skipped_backoff": report.skipped_backoff,
                 "backoff_set": report.backoff_set,
                 "venv_unexpected": report.venv_unexpected,
@@ -1305,6 +1402,22 @@ impl Broker {
     /// still in the checkout, such as the finishing shell, keeps it for the
     /// lane). Returns the directories moved into the trash.
     pub(crate) fn strip_checkout_at_finish(&self, session_id: i64) -> Result<usize, String> {
+        // The finishing agent, so its own holder record does not keep the
+        // checkout it is leaving (0.8.122 refused 3 of 3 at finish as
+        // `holder_alive`: the holder was the agent running `finish`).
+        let caller = match crate::session_holder::caller() {
+            crate::session_holder::Caller::Agent(agent) => Some(agent),
+            crate::session_holder::Caller::Unidentified => None,
+        };
+        self.strip_checkout_at_finish_as(session_id, caller.as_ref())
+    }
+
+    /// [`Self::strip_checkout_at_finish`] for the finishing `caller`.
+    pub(crate) fn strip_checkout_at_finish_as(
+        &self,
+        session_id: i64,
+        caller: Option<&crate::session_holder::AgentProcess>,
+    ) -> Result<usize, String> {
         let _span = crate::phase_telemetry::span("checkout_strip_at_finish");
         let session = self
             .store_ref()
@@ -1325,7 +1438,10 @@ impl Broker {
             &mut run,
             &mut holders,
             deadline,
-            &venv_markers,
+            StripContext {
+                venv_markers: &venv_markers,
+                finishing_caller: caller,
+            },
             &mut report,
         ) {
             CheckoutStrip::Done(directories) => {
@@ -1379,9 +1495,13 @@ impl Broker {
         run: &mut super::retire::RetireRun,
         holders: &mut crate::session_holder::RecordedHolderProcessTable,
         deadline: Instant,
-        venv_markers: &[String],
+        context: StripContext<'_>,
         report: &mut CheckoutStripReport,
     ) -> CheckoutStrip {
+        let StripContext {
+            venv_markers,
+            finishing_caller,
+        } = context;
         use CheckoutStrip::Refused;
         if Instant::now() >= deadline {
             return Refused("deadline");
@@ -1441,21 +1561,34 @@ impl Broker {
             Ok(true) => return Refused("operation_unresolved"),
             Err(_) => return Refused("operations_unknown"),
         }
-        match crate::session_holder::recorded_holder_liveness(
-            self.store_ref(),
-            session.id,
-            holders,
-            true,
-        )
-        .liveness
-        {
-            crate::session_holder::RecordedHolderLiveness::Unbound
-            | crate::session_holder::RecordedHolderLiveness::Gone => {}
-            crate::session_holder::RecordedHolderLiveness::Alive => {
-                return Refused("holder_alive");
-            }
-            crate::session_holder::RecordedHolderLiveness::Unknown => {
-                return Refused("holder_unknown");
+        // At `finish`, the recorded holder is usually the agent finishing
+        // the session: it is leaving, so it does not keep the checkout (a
+        // shell of it still in the checkout does, by the open-file check).
+        let holder_is_finishing_caller = finishing_caller.is_some_and(|caller| {
+            crate::session_holder::recorded_holder_is(self.store_ref(), session.id, caller)
+        });
+        if holder_is_finishing_caller {
+            crate::phase_telemetry::add(
+                "checkout_strip_holder_is_finishing_caller",
+                Duration::ZERO,
+            );
+        } else {
+            match crate::session_holder::recorded_holder_liveness(
+                self.store_ref(),
+                session.id,
+                holders,
+                true,
+            )
+            .liveness
+            {
+                crate::session_holder::RecordedHolderLiveness::Unbound
+                | crate::session_holder::RecordedHolderLiveness::Gone => {}
+                crate::session_holder::RecordedHolderLiveness::Alive => {
+                    return Refused("holder_alive");
+                }
+                crate::session_holder::RecordedHolderLiveness::Unknown => {
+                    return Refused("holder_unknown");
+                }
             }
         }
         drop(preconditions);
@@ -1503,7 +1636,8 @@ impl Broker {
             }
             _ => return Refused("changed"),
         };
-        if let Some(code) = self.reused_path_keep(&current, &worktree, true) {
+        if let Some(code) = self.reused_path_keep(&current, &worktree, !holder_is_finishing_caller)
+        {
             return Refused(code);
         }
         let prove_started = Instant::now();
@@ -1571,11 +1705,12 @@ impl Broker {
         CheckoutStrip::Done(stripped)
     }
 
-    /// Count checkout folders from the broker's records and the pass's pool
-    /// listing (no `lstat` per recorded session, no path resolution): one
-    /// `lstat` per top-level catalogued name of a closed folder, until
-    /// `deadline`, no byte walk. A folder counts as closed when no open
-    /// session records its exact path.
+    /// Count checkout folders from the broker's records and the pool
+    /// listings (no call per recorded session, no path resolution), then,
+    /// when `count_regenerable`, one `lstat` per top-level catalogued name
+    /// of a closed folder until `deadline`; no byte walk. A folder counts as
+    /// closed when no open session records its exact path. Folders of a
+    /// pool that could not be listed are not counted (`regenerable_partial`).
     fn observe_checkout_backlog(
         &self,
         listing: &mut PoolListing,
@@ -1583,6 +1718,7 @@ impl Broker {
         closed: &[Session],
         open_paths: &BTreeSet<String>,
         deadline: Instant,
+        count_regenerable: bool,
     ) -> CheckoutBacklog {
         let _span = crate::phase_telemetry::span("checkout_strip_backlog");
         #[cfg(test)]
@@ -1597,10 +1733,15 @@ impl Broker {
         };
         let mut folders = BTreeSet::new();
         for session in live.iter().chain(closed.iter()) {
-            if !folders.contains(session.worktree_path.as_str())
-                && listing.is_real_dir(&session.worktree_path)
-            {
-                folders.insert(session.worktree_path.as_str());
+            if folders.contains(session.worktree_path.as_str()) {
+                continue;
+            }
+            match listing.exists(&session.worktree_path, deadline) {
+                Some(true) => {
+                    folders.insert(session.worktree_path.as_str());
+                }
+                Some(false) => {}
+                None => backlog.regenerable_partial = true,
             }
         }
         backlog.folders = folders.len();
@@ -1610,6 +1751,11 @@ impl Broker {
             .filter(|path| folders.contains(path) && !open_paths.contains(*path))
             .collect::<BTreeSet<_>>();
         backlog.closed_folders = closed_folders.len();
+        if !count_regenerable {
+            backlog.regenerable_partial = true;
+            crate::phase_telemetry::add("checkout_strip_backlog_deferred", Duration::ZERO);
+            return backlog;
+        }
         for path in closed_folders {
             if Instant::now() >= deadline {
                 backlog.regenerable_partial = true;
