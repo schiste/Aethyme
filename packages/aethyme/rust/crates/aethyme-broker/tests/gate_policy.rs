@@ -233,7 +233,7 @@ fn fast_guards_precede_cargo_test_on_every_path_it_covers() {
     // selected tests (`prepush-selection.sh`) when nextest is installed.
     for step in [
         "cargo fmt --all --check",
-        "packages/aethyme/scripts/prepush-selection.sh --base aethyme/integration",
+        "packages/aethyme/scripts/prepush-selection.sh --base origin/main",
         "cargo nextest run --locked --workspace --profile local",
         "-E \"$sel\"",
     ] {
@@ -570,7 +570,7 @@ fn cargo_test_runs_the_changed_selection_and_otherwise_the_workspace() {
     assert!(selected.contains("--no-tests warn"), "{selected}");
     assert_eq!(
         fs::read_to_string(&selector_args).unwrap(),
-        "--base aethyme/integration --print-selection\n"
+        "--base origin/main --print-selection\n"
     );
 
     for (selection, status) in [

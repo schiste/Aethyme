@@ -30,7 +30,7 @@
 #   crates/C/src/bin/B.rs                   -> the whole binary C::bin/B
 #   crates/C/tests/F.rs                     -> the whole test binary C::F
 #   crates/C/tests/it/M.rs, tests/it/M/...  -> tests of C::it under M::
-# Crate roots, shared test support, manifests and non-Rust files select no
+# Library roots, shared test support, manifests and non-Rust files select no
 # module of their own; the always-run suites read the repository files, and
 # the push and release tiers run everything this narrows away.
 #
@@ -63,7 +63,8 @@ if merge_base="$(git -C "$root" merge-base HEAD "$base" 2>/dev/null)"; then
         } | sort -u
     )"
 else
-    echo "warning: no merge base between HEAD and $base; running only the always-run tests" >&2
+    echo "error: no merge base between HEAD and $base; fetch it before selecting tests" >&2
+    exit 2
 fi
 
 # One "binary<TAB>module" line per touched module; module "*" is a whole
@@ -80,8 +81,16 @@ map_path() {
     rest="${rel#*/}"
     case "$rest" in
         (src/bin/*) m="${rest#src/bin/}"; m="${m%%/*}"; printf '%s::bin/%s\t*\n' "$crate" "${m%.rs}" ;;
-        (src/lib.rs|src/main.rs) ;;
-        (src/*) m="${rest#src/}"; m="${m%%/*}"; printf '%s\t%s\n' "$crate" "${m%.rs}" ;;
+        (src/lib.rs) ;;
+        (src/main.rs) printf '%s\t@package\n' "$crate" ;;
+        (src/*)
+            if [ ! -f "$root/packages/aethyme/rust/crates/$crate/src/lib.rs" ]; then
+                # Binary-only crates often include source files at the root, so
+                # their paths do not necessarily match test module names.
+                printf '%s\t@package\n' "$crate"
+            else
+                m="${rest#src/}"; m="${m%%/*}"; printf '%s\t%s\n' "$crate" "${m%.rs}"
+            fi ;;
         (tests/*)
             m="${rest#tests/}"; m="${m%%/*}"; m="${m%.rs}"
             case "$m" in
@@ -97,10 +106,13 @@ done <<<"$changed"
 
 out="$(jq -r --arg touched "$touched" '
     def cost($b; $m):
-      if $m == "*" then [.modules | to_entries[] | select(.key | startswith($b + " ")) | .value] | add // 0
+      if $m == "*" or $m == "@package" then [.modules | to_entries[] | select(.key | startswith($b + " ")) | .value] | add // 0
       else .modules[$b + " " + $m] // 0 end;
     def term($b; $m):
-      if $m == "*" then "binary_id(\($b))" else "(binary_id(\($b)) & test(/^\($m)(::|$)/))" end;
+      if $m == "@package" then "package(\($b))"
+      elif $m == "*" then "binary_id(\($b))"
+      elif ($b | contains("::")) then "(binary_id(\($b)) & test(/^\($m)(::|$)/))"
+      else "(package(\($b)) & test(/^\($m)(::|$)/))" end;
     . as $d
     | ([$d.always_binaries[] | {b: ., m: "*"}] + [$d.always_modules[] | {b: .binary, m: .module}]) as $always
     | ([$touched | split("\n")[] | select(length > 0) | split("\t") | {b: .[0], m: .[1]}
