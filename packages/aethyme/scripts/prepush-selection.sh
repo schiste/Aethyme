@@ -30,7 +30,7 @@
 #   crates/C/src/bin/B.rs                   -> the whole binary C::bin/B
 #   crates/C/tests/F.rs                     -> the whole test binary C::F
 #   crates/C/tests/it/M.rs, tests/it/M/...  -> tests of C::it under M::
-# Crate roots, shared test support, manifests and non-Rust files select no
+# Library roots, shared test support, manifests and non-Rust files select no
 # module of their own; the always-run suites read the repository files, and
 # the push and release tiers run everything this narrows away.
 #
