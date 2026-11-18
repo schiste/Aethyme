@@ -36,6 +36,14 @@ struct Repo {
 /// (`origin/main`, named by `origin/HEAD`) is `new`, one commit ahead that
 /// writes `default_config` as the config.
 fn behind_repository(default_config: &str) -> Repo {
+    behind_repository_with(|root| {
+        std::fs::write(root.join(".aethyme/config.toml"), default_config).unwrap();
+    })
+}
+
+/// [`behind_repository`] whose `new` commit is whatever `edit` leaves under
+/// `.aethyme/`.
+fn behind_repository_with(edit: impl FnOnce(&Path)) -> Repo {
     let owner = tempfile::tempdir().unwrap();
     let root = owner.path().join("repository");
     std::fs::create_dir_all(root.join(".aethyme")).unwrap();
@@ -44,8 +52,9 @@ fn behind_repository(default_config: &str) -> Repo {
     git(&root, &["add", ".aethyme/config.toml"]);
     git(&root, &["commit", "-qm", "old"]);
     let old = git(&root, &["rev-parse", "HEAD"]);
-    std::fs::write(root.join(".aethyme/config.toml"), default_config).unwrap();
-    git(&root, &["commit", "-qam", "new"]);
+    edit(&root);
+    git(&root, &["add", "-A", ".aethyme"]);
+    git(&root, &["commit", "-qm", "new"]);
     let new = git(&root, &["rev-parse", "HEAD"]);
     git(&root, &["update-ref", "refs/remotes/origin/main", &new]);
     git(
@@ -208,8 +217,21 @@ fn status_advises_only_when_the_working_copy_was_kept_over_a_different_default()
         let _scope = RunScope::enter(&repo.root);
         record_active(store, &repo.root);
     }
-    // The default branch was read: nothing to advise.
-    assert!(status_advice(store).is_none());
+    // The default branch was read: foreground commands still show the
+    // working copy, which the advice says.
+    let advice = status_advice(store).expect("advice");
+    assert_eq!(advice.id, ADVICE_ID);
+    assert!(
+        advice.summary.contains("follows origin/main"),
+        "{}",
+        advice.summary
+    );
+    assert!(advice.summary.contains("foreground"), "{}", advice.summary);
+    assert!(
+        advice.commands[0].contains("up to date"),
+        "{:?}",
+        advice.commands
+    );
 
     std::fs::write(
         repo.root.join(".aethyme/config.toml"),
@@ -225,4 +247,109 @@ fn status_advises_only_when_the_working_copy_was_kept_over_a_different_default()
     assert!(advice.summary.contains("local_edit"), "{}", advice.summary);
     assert!(advice.summary.contains("origin/main"), "{}", advice.summary);
     assert!(advice.commands[0].contains("local edit"));
+}
+
+#[test]
+fn a_checked_out_upstream_without_origin_head_is_not_the_default_branch() {
+    let repo = behind_repository(NEW_CONFIG);
+    git(
+        &repo.root,
+        &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+    );
+    git(&repo.root, &["config", "remote.origin.url", "."]);
+    git(
+        &repo.root,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    git(&repo.root, &["config", "branch.main.remote", "origin"]);
+    git(
+        &repo.root,
+        &["config", "branch.main.merge", "refs/heads/main"],
+    );
+    // The general helper falls back to that upstream; this lookup must not.
+    let general = crate::GitRepo::at_known_root(&repo.root)
+        .upstream_default_checked()
+        .unwrap();
+    assert!(general.is_some(), "the fixture must have an upstream");
+    let resolution = resolve(&repo.root);
+    assert_eq!(resolution.source, CleanupConfigSource::WorkingCopy);
+    assert_eq!(resolution.reason, "no_default_branch");
+}
+
+#[test]
+fn a_yaml_twin_on_the_default_branch_is_read() {
+    let repo = behind_repository_with(|root| {
+        std::fs::remove_file(root.join(".aethyme/config.toml")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/config.yaml"),
+            "cleanup:\n  venv_markers:\n    - \".env-check.json\"\n",
+        )
+        .unwrap();
+    });
+    let resolution = resolve(&repo.root);
+    assert_eq!(resolution.reason, "default_branch");
+    let _scope = RunScope::enter(&repo.root);
+    assert_eq!(
+        crate::auto_cleanup::venv_markers(&repo.root),
+        [".env-check.json"]
+    );
+}
+
+#[test]
+fn an_untracked_twin_in_the_working_copy_is_a_local_edit() {
+    let repo = behind_repository(NEW_CONFIG);
+    std::fs::write(repo.root.join(".aethyme/config.yaml"), "cleanup: {}\n").unwrap();
+    let resolution = resolve(&repo.root);
+    assert_eq!(resolution.source, CleanupConfigSource::WorkingCopy);
+    assert_eq!(resolution.reason, "local_edit");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_config_is_not_a_regular_file() {
+    let repo = behind_repository(NEW_CONFIG);
+    let config = repo.root.join(".aethyme/config.toml");
+    let elsewhere = repo.root.join("config-elsewhere.toml");
+    std::fs::copy(&config, &elsewhere).unwrap();
+    std::fs::remove_file(&config).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &config).unwrap();
+    let resolution = resolve(&repo.root);
+    assert_eq!(resolution.source, CleanupConfigSource::WorkingCopy);
+    assert_eq!(resolution.reason, "working_copy_not_regular_file");
+    assert!(resolution.default_differs);
+}
+
+#[test]
+fn a_working_copy_changed_during_the_run_is_read_for_the_rest_of_it() {
+    let repo = behind_repository(NEW_CONFIG);
+    let config = repo.root.join(".aethyme/config.toml");
+    let recorder = crate::phase_telemetry::Recorder::default();
+    let _installed = crate::phase_telemetry::install(recorder.clone());
+    let _scope = RunScope::enter(&repo.root);
+    assert_eq!(
+        crate::auto_cleanup::venv_markers(&repo.root),
+        [".env-check.json"]
+    );
+    // The same bytes written again (its mtime may move): still unchanged.
+    std::fs::write(&config, OLD_CONFIG).unwrap();
+    assert_eq!(
+        crate::auto_cleanup::venv_markers(&repo.root),
+        [".env-check.json"]
+    );
+    // An owner edit: the working copy from now on, counted once.
+    std::fs::write(&config, "[cleanup]\nstrict = true\n").unwrap();
+    assert!(crate::auto_cleanup::venv_markers(&repo.root).is_empty());
+    assert!(crate::AutoCleanupPolicy::load(&repo.root).unwrap().strict);
+    // Even put back, the rest of the run stays on the working copy.
+    std::fs::write(&config, OLD_CONFIG).unwrap();
+    assert!(crate::auto_cleanup::venv_markers(&repo.root).is_empty());
+    let (_, counts) = recorder.totals();
+    assert_eq!(
+        counts.get("cleanup_config_source_working_copy_changed_during_run"),
+        Some(&1)
+    );
 }

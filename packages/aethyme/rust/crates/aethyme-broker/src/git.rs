@@ -4370,33 +4370,8 @@ impl GitRepo {
     /// upstream is not treated as permission to fall back to working-copy
     /// policy.
     pub(crate) fn upstream_default_checked(&self) -> Result<Option<(String, String)>, GitError> {
-        let default_ref = self.symbolic_ref_checked("refs/remotes/origin/HEAD")?;
-        if let Some(target) = default_ref {
-            if !target.starts_with("refs/remotes/origin/") {
-                return Err(GitError::UntrustedOutput {
-                    detail: "origin/HEAD does not target an origin remote-tracking branch".into(),
-                });
-            }
-            let commit = self.resolve_commit_checked(&target)?;
-            let short = target
-                .strip_prefix("refs/remotes/")
-                .unwrap_or(&target)
-                .to_string();
-            return Ok(Some((short, commit)));
-        }
-        let unexpected_direct_ref = run_git(
-            &self.root,
-            &[
-                "for-each-ref",
-                "--count=1",
-                "--format=%(refname)",
-                "refs/remotes/origin/HEAD",
-            ],
-        )?;
-        if !unexpected_direct_ref.is_empty() {
-            return Err(GitError::UntrustedOutput {
-                detail: "refs/remotes/origin/HEAD exists but is not a symbolic default ref".into(),
-            });
+        if let Some(found) = self.origin_head_default_checked()? {
+            return Ok(Some(found));
         }
 
         let Some(branch_ref) = self.symbolic_ref_checked("HEAD")? else {
@@ -4436,6 +4411,44 @@ impl GitRepo {
         }
         let commit = self.resolve_commit_checked(&upstream_ref)?;
         Ok(Some((upstream_name, commit)))
+    }
+
+    /// The default branch `refs/remotes/origin/HEAD` names, as
+    /// `(origin/<branch>, commit)`, with no fallback: `Ok(None)` when
+    /// `origin/HEAD` is absent. For policy that only the remote's default
+    /// branch may supply, never the checked-out branch's upstream. A target
+    /// outside `refs/remotes/origin/`, or an `origin/HEAD` that is not
+    /// symbolic, is an error.
+    pub(crate) fn origin_head_default_checked(&self) -> Result<Option<(String, String)>, GitError> {
+        let default_ref = self.symbolic_ref_checked("refs/remotes/origin/HEAD")?;
+        if let Some(target) = default_ref {
+            if !target.starts_with("refs/remotes/origin/") {
+                return Err(GitError::UntrustedOutput {
+                    detail: "origin/HEAD does not target an origin remote-tracking branch".into(),
+                });
+            }
+            let commit = self.resolve_commit_checked(&target)?;
+            let short = target
+                .strip_prefix("refs/remotes/")
+                .unwrap_or(&target)
+                .to_string();
+            return Ok(Some((short, commit)));
+        }
+        let unexpected_direct_ref = run_git(
+            &self.root,
+            &[
+                "for-each-ref",
+                "--count=1",
+                "--format=%(refname)",
+                "refs/remotes/origin/HEAD",
+            ],
+        )?;
+        if !unexpected_direct_ref.is_empty() {
+            return Err(GitError::UntrustedOutput {
+                detail: "refs/remotes/origin/HEAD exists but is not a symbolic default ref".into(),
+            });
+        }
+        Ok(None)
     }
 
     fn symbolic_ref_checked(&self, name: &str) -> Result<Option<String>, GitError> {
@@ -5591,17 +5604,6 @@ impl GitRepo {
             });
         }
         Ok(ids)
-    }
-
-    /// The blob id of `file`'s exact bytes (`hash-object --no-filters`): no
-    /// filter or line-ending rule applied, so it equals a committed blob id
-    /// only when the file is byte-identical to that blob.
-    pub(crate) fn hash_file_bytes(&self, file: &Path) -> Result<String, GitError> {
-        let file_arg = file.to_string_lossy().into_owned();
-        run_git(
-            &self.root,
-            &["hash-object", "--no-filters", "--", &file_arg],
-        )
     }
 
     /// The blob id `file` would get if it were the working file at the

@@ -11,11 +11,12 @@
 //! A worker run now resolves the source once, before anything reads
 //! `[cleanup]`, and installs it process-wide (worker threads see it too,
 //! unlike the thread-local Git deadline and isolation scopes). It reads the
-//! default branch as last fetched (never fetching) only when all of these
-//! hold:
+//! default branch `refs/remotes/origin/HEAD` names, as last fetched (never
+//! fetching, and never the checked-out branch's upstream, which could be an
+//! unmerged branch), only when all of these hold:
 //!
-//! - the primary checkout's config file is byte-identical to the blob at its
-//!   own `HEAD` (no local owner edit);
+//! - the primary checkout's config files equal the blobs at its own `HEAD`
+//!   once Git's filters are applied (no local owner edit);
 //! - the default branch holds a different config blob;
 //! - `HEAD` is an ancestor of the default branch (the checkout is behind,
 //!   not diverged);
@@ -24,18 +25,23 @@
 //! Anything else (a local edit, divergence, no fetched default branch, a Git
 //! error or timeout, an unreadable or invalid blob) keeps the working copy,
 //! as before. The lookup never fails cleanup. Outside a worker run (every
-//! foreground command) readers keep reading the working copy.
+//! foreground command) readers keep reading the working copy. A working-copy
+//! config that changes during the run (size and mtime, then content) sends
+//! the rest of the run back to the working copy
+//! (`cleanup_config_source_working_copy_changed_during_run`).
 //!
 //! Each run counts its source and reason in the command's phase metrics
 //! (`cleanup_config_source_default_branch`,
 //! `cleanup_config_source_working_copy_<reason>`), times the lookup
 //! (`cleanup_config_resolve`), and records the result for `broker status`,
-//! which shows advice `cleanup.config-source` when the working copy was kept
-//! although the default branch differs.
+//! which shows advice `cleanup.config-source` whenever the two copies differ:
+//! that the working copy was kept and why, or that the worker follows the
+//! default branch while foreground commands still show the working copy.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// The most the whole lookup may take; Git calls past it time out and the
 /// working copy is kept.
@@ -59,20 +65,33 @@ pub(crate) enum CleanupConfigSource {
     },
 }
 
+/// One working-copy config file as the resolution saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+    /// Its blob id with Git's filters for its path applied.
+    blob: String,
+}
+
 /// One resolution and why it came out that way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CleanupConfigResolution {
     pub(crate) source: CleanupConfigSource,
     /// `default_branch`, or why the working copy was kept: `same`,
     /// `no_default_branch`, `default_branch_unreadable`, `head_unreadable`,
-    /// `git_timeout`, `working_copy_unverifiable`, `local_edit`, `diverged`
-    /// or `default_branch_unparsable`.
+    /// `git_timeout`, `working_copy_not_regular_file`,
+    /// `working_copy_unverifiable`, `local_edit`, `diverged` or
+    /// `default_branch_unparsable`.
     pub(crate) reason: &'static str,
     /// The default branch was seen to hold a different config than `HEAD`.
     pub(crate) default_differs: bool,
     /// The fetched default branch (`origin/main`), when one was found.
     pub(crate) default_ref: Option<String>,
     pub(crate) default_commit: Option<String>,
+    /// The working copy's config files (every format twin, `None` when
+    /// absent) when the default branch is read, so a later change is seen.
+    pub(crate) working_stamps: Vec<Option<FileStamp>>,
 }
 
 impl CleanupConfigResolution {
@@ -83,6 +102,7 @@ impl CleanupConfigResolution {
             default_differs: false,
             default_ref: None,
             default_commit: None,
+            working_stamps: Vec::new(),
         }
     }
 
@@ -104,6 +124,9 @@ impl CleanupConfigResolution {
             }
             "head_unreadable" => "cleanup_config_source_working_copy_head_unreadable",
             "git_timeout" => "cleanup_config_source_working_copy_git_timeout",
+            "working_copy_not_regular_file" => {
+                "cleanup_config_source_working_copy_working_copy_not_regular_file"
+            }
             "working_copy_unverifiable" => {
                 "cleanup_config_source_working_copy_working_copy_unverifiable"
             }
@@ -135,7 +158,9 @@ pub(crate) fn resolve(main_root: &Path) -> CleanupConfigResolution {
 
 fn resolve_unbounded(main_root: &Path) -> CleanupConfigResolution {
     let repo = crate::GitRepo::at_known_root(main_root);
-    let (default_ref, default_commit) = match repo.upstream_default_checked() {
+    // `origin/HEAD` only: the checked-out branch's upstream could be an
+    // unmerged branch, another remote or a local branch.
+    let (default_ref, default_commit) = match repo.origin_head_default_checked() {
         Ok(Some(found)) => found,
         Ok(None) => return CleanupConfigResolution::working_copy("no_default_branch"),
         Err(error) => {
@@ -180,21 +205,19 @@ fn resolve_unbounded(main_root: &Path) -> CleanupConfigResolution {
         return resolution;
     }
     resolution.default_differs = true;
-    // The working copy, by the blob id of its exact bytes.
-    let mut working = Vec::with_capacity(relpaths.len());
+    // The working copy, by blob id with its path's filters applied (a
+    // checkout that converts line endings is not a local edit).
+    let mut stamps = Vec::with_capacity(relpaths.len());
     for relpath in &relpaths {
-        let path = main_root.join(relpath);
-        match std::fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => working.push(None),
-            Ok(metadata) if metadata.is_file() => match repo.hash_file_bytes(&path) {
-                Ok(blob) => working.push(Some(blob)),
-                Err(error) => {
-                    return keep(resolution, git_reason(&error, "working_copy_unverifiable"));
-                }
-            },
-            _ => return keep(resolution, "working_copy_unverifiable"),
+        match stamp(&repo, main_root, relpath) {
+            Ok(found) => stamps.push(found),
+            Err(reason) => return keep(resolution, reason),
         }
     }
+    let working = stamps
+        .iter()
+        .map(|stamp| stamp.as_ref().map(|stamp| stamp.blob.clone()))
+        .collect::<Vec<_>>();
     if working.as_slice() == at_default {
         // Edited or not, the working copy already says what the default
         // branch says.
@@ -229,7 +252,34 @@ fn resolve_unbounded(main_root: &Path) -> CleanupConfigResolution {
     }
     resolution.source = CleanupConfigSource::DefaultBranch { text, label };
     resolution.reason = "default_branch";
+    resolution.working_stamps = stamps;
     resolution
+}
+
+/// One working-copy config file at `relpath`: `None` when absent, or why it
+/// cannot be compared.
+fn stamp(
+    repo: &crate::GitRepo,
+    main_root: &Path,
+    relpath: &str,
+) -> Result<Option<FileStamp>, &'static str> {
+    let path = main_root.join(relpath);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("working_copy_unverifiable"),
+        Ok(metadata) => metadata,
+    };
+    if !metadata.is_file() {
+        return Err("working_copy_not_regular_file");
+    }
+    let blob = repo
+        .hash_file_as(relpath, &path)
+        .map_err(|error| git_reason(&error, "working_copy_unverifiable"))?;
+    Ok(Some(FileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        blob,
+    }))
 }
 
 /// Whether `text` parses and its `[cleanup]` table is one every reader
@@ -238,12 +288,85 @@ fn validate_cleanup_table(label: &Path, text: &str) -> Result<(), String> {
     crate::AutoCleanupPolicy::from_config_toml(label, text).map(|_| ())
 }
 
+/// One installed resolution and what the run has seen since.
+pub(crate) struct RunState {
+    pub(crate) resolution: CleanupConfigResolution,
+    /// The working-copy stamps, refreshed when only an mtime moved.
+    stamps: Mutex<Vec<Option<FileStamp>>>,
+    /// The working copy changed during the run: read it from now on.
+    changed: AtomicBool,
+}
+
+impl RunState {
+    fn new(resolution: CleanupConfigResolution) -> Self {
+        let stamps = Mutex::new(resolution.working_stamps.clone());
+        Self {
+            resolution,
+            stamps,
+            changed: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether the working copy's config changed since the resolution: a
+    /// stat per file, and a hash only when a file kept its size but its
+    /// mtime moved. Once changed, it stays changed for the run (counted
+    /// once).
+    fn working_copy_changed(&self, main_root: &Path) -> bool {
+        if self.changed.load(Ordering::Acquire) {
+            return true;
+        }
+        let changed = self.stamps_moved(main_root);
+        if changed && !self.changed.swap(true, Ordering::AcqRel) {
+            crate::phase_telemetry::add(
+                "cleanup_config_source_working_copy_changed_during_run",
+                Duration::ZERO,
+            );
+        }
+        changed
+    }
+
+    /// [`Self::working_copy_changed`]'s comparison, without the sticky flag.
+    fn stamps_moved(&self, main_root: &Path) -> bool {
+        let Ok(mut stamps) = self.stamps.lock() else {
+            return true;
+        };
+        let relpaths = aethyme_config::candidate_relpaths("config");
+        if stamps.len() != relpaths.len() {
+            return true;
+        }
+        for (relpath, recorded) in relpaths.iter().zip(stamps.iter_mut()) {
+            let path = main_root.join(relpath);
+            let now = match std::fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Ok(metadata) if metadata.is_file() => {
+                    Some((metadata.len(), metadata.modified().ok()))
+                }
+                _ => return true,
+            };
+            match (recorded.as_mut(), now) {
+                (None, None) => {}
+                (Some(stamp), Some((len, modified)))
+                    if stamp.len == len && stamp.modified == modified => {}
+                (Some(stamp), Some((len, modified))) if stamp.len == len => {
+                    let repo = crate::GitRepo::at_known_root(main_root);
+                    match repo.hash_file_as(relpath, &path) {
+                        Ok(blob) if blob == stamp.blob => stamp.modified = modified,
+                        _ => return true,
+                    }
+                }
+                _ => return true,
+            }
+        }
+        false
+    }
+}
+
 /// Resolutions installed by active [`RunScope`]s: (canonical root,
 /// resolution, scopes holding it).
-type Installed = Vec<(PathBuf, Arc<CleanupConfigResolution>, usize)>;
+type Installed = Vec<(PathBuf, Arc<RunState>, usize)>;
 static INSTALLED: Mutex<Installed> = Mutex::new(Vec::new());
 
-fn installed_for(main_root: &Path) -> Option<Arc<CleanupConfigResolution>> {
+pub(crate) fn installed_for(main_root: &Path) -> Option<Arc<RunState>> {
     let installed = INSTALLED.lock().ok()?;
     if installed.is_empty() {
         return None;
@@ -298,7 +421,7 @@ impl RunScope {
             }),
         );
         if let Ok(mut installed) = INSTALLED.lock() {
-            installed.push((root.clone(), Arc::new(resolution), 1));
+            installed.push((root.clone(), Arc::new(RunState::new(resolution)), 1));
         }
         Self { root }
     }
@@ -321,12 +444,14 @@ impl Drop for RunScope {
 /// the path (or label) it came from: the default branch when a worker run
 /// resolved it so, the primary checkout's working copy otherwise (exactly
 /// [`aethyme_config::read_config_toml`]). Only the `[cleanup]` table may be
-/// read from it.
+/// read from it. A working copy changed since the resolution is read for
+/// the rest of the run.
 pub(crate) fn cleanup_config_toml(
     main_root: &Path,
 ) -> Result<Option<(PathBuf, String)>, aethyme_config::ConfigSourceError> {
-    if let Some(resolution) = installed_for(main_root)
-        && let CleanupConfigSource::DefaultBranch { text, label } = &resolution.source
+    if let Some(run) = installed_for(main_root)
+        && let CleanupConfigSource::DefaultBranch { text, label } = &run.resolution.source
+        && !run.working_copy_changed(main_root)
     {
         return Ok(text.as_ref().map(|text| (label.clone(), text.clone())));
     }
@@ -348,9 +473,10 @@ pub(crate) struct RecordedResolution {
 /// Record the resolution an active [`RunScope`] installed for `main_root`,
 /// for `broker status`. Nothing when no scope is active.
 pub(crate) fn record_active(store: &crate::BrokerStore, main_root: &Path) {
-    let Some(resolution) = installed_for(main_root) else {
+    let Some(run) = installed_for(main_root) else {
         return;
     };
+    let resolution = &run.resolution;
     let source = if resolution.uses_default_branch() {
         "default_branch"
     } else {
@@ -376,22 +502,52 @@ pub(crate) fn record_active(store: &crate::BrokerStore, main_root: &Path) {
     );
 }
 
-/// `cleanup.config-source`: the last worker run kept the working copy's
-/// `[cleanup]` although the default branch holds a different config. Reads
-/// the recorded resolution only.
+/// `cleanup.config-source`: the last worker run's `[cleanup]` source when
+/// the default branch holds a different config than the primary checkout:
+/// either it kept the working copy (and why), or it followed the default
+/// branch while foreground commands still show the working copy. Reads the
+/// recorded resolution only.
 pub(crate) fn status_advice(store: &crate::BrokerStore) -> Option<crate::StatusAdvice> {
     let recorded = store
         .meta_get(SUMMARY_KEY)
         .ok()
         .flatten()
         .and_then(|text| serde_json::from_str::<RecordedResolution>(&text).ok())?;
-    if recorded.source != "working_copy" || !recorded.default_differs {
+    if !recorded.default_differs {
         return None;
     }
     let default_ref = recorded
         .default_ref
         .clone()
         .unwrap_or_else(|| "the default branch".into());
+    let mut evidence = vec![
+        format!("source: {}", recorded.source),
+        format!("reason: {}", recorded.reason),
+        format!("recorded at: {}", recorded.at),
+    ];
+    if let Some(commit) = &recorded.default_commit {
+        evidence.push(format!("{default_ref} at {commit}"));
+    }
+    if recorded.source == "default_branch" {
+        return Some(crate::StatusAdvice {
+            id: ADVICE_ID,
+            severity: crate::StatusAdviceSeverity::Notice,
+            reason: "the primary checkout is behind its default branch, so its own [cleanup] settings are older than the ones background cleanup follows",
+            summary: format!(
+                "background cleanup follows {default_ref}'s [cleanup] settings; foreground commands and previews (cleanup plans, finish, status) still show the primary checkout's older working copy"
+            ),
+            session_id: None,
+            queue_entry_id: None,
+            evidence,
+            commands: vec![
+                format!(
+                    "bring the primary checkout up to date with {default_ref}: the main-checkout sync moves it once no live session or local change holds it"
+                ),
+                "aethyme broker status --full --json   # names what holds the main-checkout sync"
+                    .into(),
+            ],
+        });
+    }
     let command = match recorded.reason.as_str() {
         "local_edit" => format!(
             "commit or discard the local edit to {}/config.toml in the primary checkout; background cleanup then follows {default_ref}",
@@ -404,15 +560,18 @@ pub(crate) fn status_advice(store: &crate::BrokerStore) -> Option<crate::StatusA
             "fix the {}/config file on {default_ref}: it does not parse, or its [cleanup] table is invalid",
             aethyme_config::CONFIG_DIR
         ),
-        _ => "nothing to do if the next worker run reads the default branch; the lookup did not finish".into(),
+        "working_copy_not_regular_file" => format!(
+            "replace the primary checkout's {}/config file with a regular file: it is a symlink, directory or other non-regular file, so it cannot be compared with HEAD",
+            aethyme_config::CONFIG_DIR
+        ),
+        "working_copy_unverifiable" => format!(
+            "check that the primary checkout's {}/config file is readable: hashing it failed, so it could not be compared with HEAD",
+            aethyme_config::CONFIG_DIR
+        ),
+        other => format!(
+            "nothing to do if the next worker run reads the default branch: the lookup did not finish ({other})"
+        ),
     };
-    let mut evidence = vec![
-        format!("reason: {}", recorded.reason),
-        format!("recorded at: {}", recorded.at),
-    ];
-    if let Some(commit) = &recorded.default_commit {
-        evidence.push(format!("{default_ref} at {commit}"));
-    }
     Some(crate::StatusAdvice {
         id: ADVICE_ID,
         severity: crate::StatusAdviceSeverity::Notice,
