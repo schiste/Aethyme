@@ -3686,6 +3686,12 @@ mod lane_tests {
             "untracked work\n",
         )
         .unwrap();
+        // Written long ago (a fresh file would itself be recent activity):
+        // this test is about the remembered class, not file times.
+        crate::worktree_status_activity::age_tree_for_test(
+            &PathBuf::from(&nothing.worktree_path),
+            std::time::SystemTime::now() - Duration::from_secs(80 * 60 * 60),
+        );
         // Remembered, the class still reads clean (nothing it is keyed by
         // changed); the close decision asks afresh.
         assert_eq!(
