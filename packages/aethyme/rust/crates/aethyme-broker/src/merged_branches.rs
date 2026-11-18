@@ -185,7 +185,7 @@ impl crate::Broker {
     fn merged_branch_slice(&self, summary: &mut MergedBranchSummary) -> Result<(), &'static str> {
         let started = Instant::now();
         let repo = self.repo_handle();
-        let Some(default) = crate::session_push::tracked_default(&repo) else {
+        let Some(default) = crate::session_push::tracked_default(repo) else {
             return Err("no_fetched_default_branch");
         };
         let default_branch = default.branch.clone();
