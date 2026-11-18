@@ -3744,22 +3744,77 @@ pub(crate) fn resolve_live_worktree_paths(
     )
 }
 
+/// Paths resolved one after another below this many; above, in parallel.
+const PARALLEL_RESOLVE_MIN: usize = 16;
+/// Threads resolving paths at once, the calling thread included.
+const PARALLEL_RESOLVE_THREADS: usize = 8;
+
+/// Resolve `paths` in order until `expired` (`None` once it is: a partial
+/// index is never used). Each resolution is a few metadata calls, which on
+/// a drive busy deleting take ~100 ms each (the busiest repository's ~300
+/// open checkouts took 89 s one after another), so more than a few paths
+/// are resolved by up to [`PARALLEL_RESOLVE_THREADS`] threads; the result
+/// keeps the input order. Pure filesystem reads: nothing thread-local
+/// (Git deadlines, spans) is involved.
 fn resolve_worktree_paths_until<'a>(
     paths: impl IntoIterator<Item = &'a Path>,
-    mut expired: impl FnMut() -> bool,
-    mut resolve: impl FnMut(&Path) -> ResolvedWorktreePath,
+    expired: impl Fn() -> bool + Sync,
+    resolve: impl Fn(&Path) -> ResolvedWorktreePath + Sync,
 ) -> Option<Vec<ResolvedWorktreePath>> {
-    let mut resolved = Vec::new();
-    for path in paths {
-        if expired() {
-            return None;
+    let paths = paths.into_iter().collect::<Vec<_>>();
+    if paths.len() < PARALLEL_RESOLVE_MIN {
+        let mut resolved = Vec::new();
+        for path in paths {
+            if expired() {
+                return None;
+            }
+            resolved.push(resolve(path));
+            if expired() {
+                return None;
+            }
         }
-        resolved.push(resolve(path));
-        if expired() {
-            return None;
-        }
+        return Some(resolved);
     }
-    Some(resolved)
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let stopped = std::sync::atomic::AtomicBool::new(false);
+    let slots = paths
+        .iter()
+        .map(|_| std::sync::Mutex::new(None))
+        .collect::<Vec<_>>();
+    let work = || {
+        loop {
+            if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(path) = paths.get(index) else {
+                return;
+            };
+            if expired() {
+                stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            let resolved = resolve(path);
+            if let Ok(mut slot) = slots[index].lock() {
+                *slot = Some(resolved);
+            }
+        }
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..PARALLEL_RESOLVE_THREADS {
+            // A thread that cannot be started leaves its share to the
+            // others and the calling thread.
+            let _ = std::thread::Builder::new().spawn_scoped(scope, work);
+        }
+        work();
+    });
+    if stopped.into_inner() || expired() {
+        return None;
+    }
+    slots
+        .into_iter()
+        .map(|slot| slot.into_inner().ok().flatten())
+        .collect()
 }
 
 pub(crate) fn live_worktree_overlap(
@@ -10148,19 +10203,63 @@ mod tests {
         std::fs::create_dir_all(&first_path).unwrap();
         std::fs::create_dir_all(&second_path).unwrap();
         let paths = [first_path.as_path(), second_path.as_path()];
-        let resolved_count = std::cell::Cell::new(0);
+        let resolved_count = std::sync::atomic::AtomicUsize::new(0);
 
         let resolved = resolve_worktree_paths_until(
             paths,
-            || resolved_count.get() == 1,
+            || resolved_count.load(std::sync::atomic::Ordering::SeqCst) == 1,
             |path| {
-                resolved_count.set(resolved_count.get() + 1);
+                resolved_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 ResolvedWorktreePath::resolve(path)
             },
         );
 
         assert!(resolved.is_none(), "a partial index cannot be used");
-        assert_eq!(resolved_count.get(), 1, "expiry stops before the next path");
+        assert_eq!(
+            resolved_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "expiry stops before the next path"
+        );
+    }
+
+    /// Many paths resolve in parallel and keep their order; expiry still
+    /// yields no partial index.
+    #[test]
+    fn many_paths_resolve_in_parallel_in_order() {
+        let temporary = tempfile::tempdir().unwrap();
+        let owned = (0..40)
+            .map(|index| {
+                let path = temporary.path().join(format!("checkout-{index}"));
+                std::fs::create_dir_all(&path).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let paths = owned
+            .iter()
+            .map(std::path::PathBuf::as_path)
+            .collect::<Vec<_>>();
+
+        let resolved = resolve_worktree_paths_until(
+            paths.iter().copied(),
+            || false,
+            ResolvedWorktreePath::resolve,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.len(), 40);
+        for (resolved, path) in resolved.iter().zip(&owned) {
+            assert_eq!(resolved.raw, *path);
+        }
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let expired = resolve_worktree_paths_until(
+            paths.iter().copied(),
+            || calls.load(std::sync::atomic::Ordering::SeqCst) >= 5,
+            |path| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ResolvedWorktreePath::resolve(path)
+            },
+        );
+        assert!(expired.is_none(), "a partial index cannot be used");
     }
 
     #[test]

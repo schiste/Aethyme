@@ -78,6 +78,12 @@ const RETIRE_PIN_CANDIDATES_MAX: usize = 2_000;
 pub(crate) const RETIRE_ARCHIVE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// Closed sessions read per page.
 const RETIRE_PAGE: usize = 64;
+/// The least time a retirement run gives the strip pass, the closed lap
+/// and the cleaned lap, whatever the phases before them used (bounded by
+/// the lane's own deadline).
+const RETIRE_STRIP_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(20);
+const RETIRE_LAP_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(20);
+const RETIRE_CLEANED_LAP_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(10);
 /// Next run when nothing is left to do.
 const RETIRE_IDLE_RECHECK_MS: i64 = 10 * 60 * 1_000;
 /// Next run while a lap or the trash is unfinished.
@@ -184,19 +190,17 @@ pub(super) fn resolve_live_paths_for_lane(
     LANE_LIVE_PATHS.with(|cache| {
         let mut cache = cache.borrow_mut();
         let cache = cache.as_mut()?;
-        let mut reused = 0_u32;
-        for session in sessions {
-            match cache.entry((session.id, session.worktree_path.clone())) {
-                std::collections::hash_map::Entry::Occupied(_) => reused += 1,
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        return None;
-                    }
-                    slot.insert(crate::auto_cleanup::ResolvedWorktreePath::resolve(
-                        Path::new(&session.worktree_path),
-                    ));
-                }
-            }
+        let missing = sessions
+            .iter()
+            .filter(|session| !cache.contains_key(&(session.id, session.worktree_path.clone())))
+            .cloned()
+            .collect::<Vec<_>>();
+        let reused = sessions.len() - missing.len();
+        // The ones not resolved yet, in parallel (see
+        // `resolve_live_worktree_paths`).
+        let resolved = crate::auto_cleanup::resolve_live_worktree_paths(&missing, deadline)?;
+        for (session, path) in missing.iter().zip(resolved) {
+            cache.insert((session.id, session.worktree_path.clone()), path);
         }
         if reused > 0 {
             crate::phase_telemetry::add(
@@ -286,6 +290,9 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     /// Test seam: runs after the plan, before the lifecycle claim.
     pub(super) static BEFORE_RETIRE_CLAIM: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Test seam: runs once a retirement run resolved the open paths.
+    pub(super) static AFTER_OPEN_PATHS: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -1927,34 +1934,52 @@ impl Broker {
         // One `git worktree list` for the whole run, not one per checkout.
         let _inventory = crate::git::WorktreeInventoryRunScope::enter();
         let started = Instant::now();
-        let sweep_deadline = started + deadline.saturating_duration_since(started) * 2 / 3;
+        let window = deadline.saturating_duration_since(started);
+        let sweep_deadline = started + window * 2 / 3;
         let mut report = CheckoutRetirementReport::default();
         let mut last_inspection_failure = None;
-        if let Some(mut run) = self.begin_checkout_retirement_run(sweep_deadline)? {
+        // Resolving the open sessions' paths may use a third of the window,
+        // never the phases after it.
+        if let Some(mut run) = self.begin_checkout_retirement_run(started + window / 3)? {
             run.archive_deadline = deadline;
             report.open_path_resolutions = 1;
+            #[cfg(test)]
+            AFTER_OPEN_PATHS.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook();
+                }
+            });
+            // Each phase gets a share of what is left of the sweep window,
+            // never less than its floor (within the lane's own deadline), so
+            // a slow phase before it cannot leave it nothing: on the busiest
+            // repository 0.8.122's laps got 14 ms and 4 ms after the open
+            // paths and the strip pass used the window.
+            let share = |part: u32, of: u32, floor: std::time::Duration| {
+                let left = sweep_deadline.saturating_duration_since(Instant::now());
+                (Instant::now() + (left * part / of).max(floor)).min(deadline)
+            };
             // Strip regenerable directories out of closed checkouts first:
-            // O(1) renames, no walk, capped per run and given at most half
-            // of the sweep window, so the judgement lap that follows sees
-            // small trees.
-            let strip_deadline = started + sweep_deadline.saturating_duration_since(started) / 2;
+            // O(1) renames, no walk, capped per run, so the judgement laps
+            // that follow see small trees.
+            let strip_deadline = share(2, 5, RETIRE_STRIP_MIN_SHARE);
+            run.deadline = strip_deadline;
             report.strip = self.strip_closed_checkouts(
                 &mut run,
                 strip_deadline,
                 super::strip::STRIP_CHECKOUTS_PER_RUN,
             );
             // Closed sessions first, then the leftover folders of sessions
-            // already recorded as cleaned, each lap with its own cursor so
-            // neither starves the other: the closed lap may use the time up
-            // to halfway between the strip and the sweep deadline, the
-            // cleaned lap the rest (and whatever the closed lap left).
-            let closed_deadline =
-                strip_deadline + sweep_deadline.saturating_duration_since(strip_deadline) / 2;
+            // already recorded as cleaned, each lap with its own cursor and
+            // its own share so neither starves the other.
+            let closed_deadline = share(1, 2, RETIRE_LAP_MIN_SHARE);
+            run.deadline = closed_deadline;
             report.lap_complete =
                 self.retirement_lap(&mut run, &mut report, false, closed_deadline)?;
             if !report.process_use_unavailable {
+                let cleaned_deadline = share(1, 1, RETIRE_CLEANED_LAP_MIN_SHARE);
+                run.deadline = cleaned_deadline;
                 report.cleaned_lap_complete =
-                    self.retirement_lap(&mut run, &mut report, true, sweep_deadline)?;
+                    self.retirement_lap(&mut run, &mut report, true, cleaned_deadline)?;
             }
             last_inspection_failure = run.last_inspection_failure.take();
         } else {
@@ -1965,8 +1990,10 @@ impl Broker {
         }
         report.trash = self.drain_checkout_trash(deadline);
         if let Ok(root) = self.recovery_archive_root() {
+            let _span = crate::phase_telemetry::span("checkout_retirement_sweep_partials");
             super::retire_operation::sweep_stale_partials(&root);
         }
+        let prune_span = crate::phase_telemetry::span("checkout_retirement_prune_pins");
         let retired_pins = match self.prune_retired_pins() {
             Ok(remaining) => remaining,
             Err(error) => {
@@ -1974,6 +2001,8 @@ impl Broker {
                 self.checkout_retirement_progress().retired_pins
             }
         };
+        drop(prune_span);
+        let _record_span = crate::phase_telemetry::span("checkout_retirement_record_progress");
         let kept = report.kept.values().sum::<usize>();
         let previous = self.checkout_retirement_progress();
         let shrinking =
@@ -4399,5 +4428,113 @@ mod tests {
         assert_eq!(report.retired_cleaned_leftovers, 0, "{report:#?}");
         assert!(!worktree.exists());
         assert!(is_cleaned(&broker, session.id));
+    }
+
+    /// Open paths that take most of the window (0.8.122 on the busiest
+    /// repository: 89 s) no longer leave the laps nothing: each phase gets a
+    /// floor of the lane's time, and the closed lap still retires.
+    #[test]
+    fn a_slow_open_path_resolution_leaves_the_laps_their_share() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "slow open paths", |_| {});
+        super::AFTER_OPEN_PATHS.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(|| {
+                std::thread::sleep(Duration::from_secs(7));
+            }));
+        });
+
+        // A 12-second lane whose open paths take 7 s: the sweep window ends
+        // at 8 s, so the old shares (strip to 4 s, closed lap to 6 s) had
+        // passed before the laps began.
+        let report = broker
+            .run_checkout_retirement(Instant::now() + Duration::from_secs(12))
+            .unwrap();
+        super::AFTER_OPEN_PATHS.with(|cell| *cell.borrow_mut() = None);
+
+        assert_eq!(report.retired_clean, 1, "{report:#?}");
+        assert!(!worktree.exists());
+        assert!(is_cleaned(&broker, session.id));
+    }
+
+    /// The strip pass goes on from where the last one stopped: a checkout
+    /// kept every pass (a process uses it) does not take the cap from the
+    /// ones after it.
+    #[test]
+    fn the_strip_pass_resumes_from_its_cursor() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (_used, used_worktree) = closed_with_dependencies(&mut broker, "cursor used");
+        let (_next, next_worktree) = closed_with_dependencies(&mut broker, "cursor next");
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+                pid: std::process::id(),
+                command: "node".into(),
+                descriptor: "cwd".into(),
+                file_type: Some("DIR".into()),
+                path: std::fs::canonicalize(&used_worktree).unwrap(),
+            }]),
+        ));
+        let far = Instant::now() + Duration::from_secs(600);
+        let pass = |broker: &crate::Broker| {
+            let mut run = broker
+                .begin_checkout_retirement_run(far)
+                .unwrap()
+                .expect("open paths resolve");
+            broker.strip_closed_checkouts(&mut run, far, 1)
+        };
+
+        let first = pass(&broker);
+        let second = pass(&broker);
+
+        assert_eq!(
+            first.refused.get("process_using_checkout"),
+            Some(&1),
+            "{first:#?}"
+        );
+        assert_eq!(second.checkouts_stripped, 1, "{second:#?}");
+        assert!(!next_worktree.join("node_modules").exists());
+        assert!(used_worktree.join("node_modules").exists());
+    }
+
+    /// At `finish`, the session's recorded holder is the agent finishing
+    /// it: that agent does not keep the checkout it is leaving (0.8.122
+    /// refused 3 of 3 as `holder_alive`). Any other live holder still does.
+    #[test]
+    fn the_finishing_agent_is_not_a_holder_that_keeps_its_checkout() {
+        let Some(table) = crate::session_holder::ProcessTable::snapshot() else {
+            return;
+        };
+        let Some(me) = table.process(i64::from(std::process::id())) else {
+            return;
+        };
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed_with_dependencies(&mut broker, "finishing holder");
+        broker
+            .store()
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session.id),
+                Some(&crate::events::session_holder_bound_payload(
+                    &me, "fixture", None,
+                )),
+            )
+            .unwrap();
+
+        let other = crate::session_holder::AgentProcess {
+            pid: me.pid,
+            started: format!("{} (another start)", me.started),
+            command: me.command.clone(),
+        };
+        let kept = broker.strip_checkout_at_finish_as(session.id, Some(&other));
+        assert!(
+            kept.as_ref()
+                .is_err_and(|error| error.contains("holder_alive")),
+            "{kept:?}"
+        );
+        assert!(worktree.join("node_modules").exists());
+
+        let stripped = broker.strip_checkout_at_finish_as(session.id, Some(&me));
+
+        assert_eq!(stripped, Ok(2));
+        assert!(!worktree.join("node_modules").exists());
     }
 }
