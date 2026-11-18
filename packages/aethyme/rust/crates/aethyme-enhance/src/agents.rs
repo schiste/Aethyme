@@ -394,7 +394,9 @@ resolve blockers and refusals.
    commit to open a draft. Use `aethyme broker push --session <id>` directly
    when publishing only the committed changes from a dirty worktree. Sync before
    resuming a reused session and validate the current merge candidate before merging.
-   Never leave work only in the worktree.
+   Never leave work only in the worktree. To build on another session's
+   unmerged work, start with `--stack-on <id>`: the broker targets your PR at
+   its branch and retargets it when that PR merges; never edit PR bases yourself.
 3. When done: `aethyme broker submit --session <id>` runs the gates and lands
    nothing. Merge the PR on GitHub, then `aethyme broker finish --session <id>`
    (it refuses while commits are unpushed).
@@ -965,6 +967,16 @@ blocked.
    branch into a published one, and changes nothing if that would conflict.
    Sync is local only: it never pushes, so run `aethyme broker push --session
    <id>` afterwards to publish the caught-up branch.
+   Stacked sessions: when your task depends on another open session's
+   unmerged work, start with `aethyme broker start --task "<task>" --stack-on
+   <id>`. Your branch starts at that session's tip, `push --pr` opens the draft
+   against its branch, and `sync` follows it (a parent push leaves you a note).
+   When the parent PR merges the broker retargets your PR to the nearest
+   unmerged ancestor and notes the merged head; run `sync`, then `push`. If the
+   parent PR closes unmerged, nothing is retargeted: `broker status` names the
+   choice (`sync --unstack` or finish). Never change PR bases by hand. The
+   broker deletes merged remote session branches itself, only once no open PR
+   or stacked session depends on them.
    When `sync` hands off an incoming default-branch merge, follow its exact
    handoff with session-confined Git; use `aethyme broker advanced git` when
    the operation requires coordination. Do not route the merge through

@@ -1604,6 +1604,9 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     if action == "artifact-use" {
         return run_gc_artifact_use_reconcile(parsed);
     }
+    if action == "remote-branches" {
+        return run_gc_remote_branches(parsed);
+    }
     if action == "storage" {
         if parsed.positional.get(1).map(String::as_str) != Some("maintenance-lock") {
             return Err(UsageError::Message(
@@ -1823,10 +1826,36 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
             if let Some(tick) = managed_tick.as_ref() {
                 crate::gc_sweep_service::record_managed_tick(tick, Some(&report), None)?;
             }
+            // The background worker's remote passes: re-read the parents of
+            // open stacked sessions, then the opt-in, bounded deletion of
+            // merged session branches. Neither runs from a read-only snapshot.
+            let (stack_failures, remote_branches) = if parsed.read_only_snapshot {
+                (Vec::new(), None)
+            } else {
+                (
+                    broker.reconcile_open_session_stacks(
+                        &crate::session_stack::GhCliPullRequestReader,
+                    ),
+                    broker.run_remote_branch_cleanup(),
+                )
+            };
             if parsed.json {
-                out!("{}", serde_json::to_string_pretty(&report)?);
+                let mut value = serde_json::to_value(&report)?;
+                if let Some(remote_branches) = &remote_branches {
+                    value["remote_branch_cleanup"] = serde_json::to_value(remote_branches)?;
+                }
+                if !stack_failures.is_empty() {
+                    value["session_stack_failures"] = serde_json::json!(stack_failures);
+                }
+                out!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 render_gc_sweep(&report);
+                for failure in &stack_failures {
+                    out!("Stacked session parent not re-read: {failure}");
+                }
+                if let Some(remote_branches) = &remote_branches {
+                    render_remote_branch_cleanup(remote_branches);
+                }
             }
         }
         other => {
@@ -1836,6 +1865,64 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
     Ok(())
+}
+
+/// `gc remote-branches plan`: preview the remote session-branch cleanup.
+fn run_gc_remote_branches(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.positional.len() != 2 || parsed.positional[1] != "plan" {
+        return Err(UsageError::Message(
+            "gc remote-branches accepts `plan [--limit <n>] [--json]`; deletion runs only in the \
+             background worker (`aethyme broker gc sweep`) when `[remote_branches] \
+             delete_merged = true`"
+                .into(),
+        ));
+    }
+    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let limit = parsed.limit.map(|limit| limit as usize);
+    let report = broker.plan_remote_branch_cleanup(limit);
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        render_remote_branch_cleanup(&report);
+    }
+    Ok(())
+}
+
+fn render_remote_branch_cleanup(report: &crate::remote_branch_cleanup::RemoteBranchCleanupReport) {
+    out!(
+        "Remote session branches ({}): {} awaiting a decision; deletion {}.",
+        report.repository.as_deref().unwrap_or("unknown repository"),
+        report.backlog,
+        if report.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    if let Some(skipped) = &report.skipped {
+        out!("  skipped: {skipped}");
+    }
+    for item in &report.items {
+        let pr = item
+            .pr_number
+            .map(|number| format!(" (#{number})"))
+            .unwrap_or_default();
+        out!("  {} {}{pr}: {}", item.outcome, item.branch, item.reason);
+        for retarget in &item.retargets {
+            out!(
+                "    retarget #{} to {}: {}",
+                retarget.pull_request,
+                retarget.to,
+                retarget.outcome
+            );
+        }
+    }
+    if let Some(stopped) = &report.stopped {
+        out!("  stopped: {stopped}");
+    }
+    if let Some(next) = &report.next_action {
+        out!("  next: {next}");
+    }
 }
 
 /// A refusal says what it means for this session and that waiting is safe, so

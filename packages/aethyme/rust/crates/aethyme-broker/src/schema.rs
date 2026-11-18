@@ -34,7 +34,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 65;
+pub const SCHEMA_VERSION: i64 = 66;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -124,6 +124,11 @@ pub const SCHEMA_VERSION: i64 = 65;
 ///   so `broker start` can skip a checkout path any session ever recorded.
 ///   Older binaries maintain it on write without naming it, so the floor
 ///   stays v60.
+/// - v66: two new tables, `session_stacks` (explicit parent/child session
+///   chaining) and `remote_branch_cleanup` (decisions of the merged remote
+///   session-branch deletion lane). An older binary never names them: it
+///   neither records stacks nor deletes remote branches, and nothing it reads
+///   or writes changes, so the floor stays v60.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 60;
 
 /// Migration that introduced profile-bound gate-cache reads and writes.
@@ -2156,6 +2161,44 @@ const MIGRATION_V65: &str = "
 CREATE INDEX IF NOT EXISTS sessions_by_worktree_path ON sessions (worktree_path);
 ";
 
+/// v66: explicit session stacking and the remote session-branch cleanup
+/// ledger. Neither table references `sessions` by foreign key, so retention
+/// of old session rows is never blocked by them.
+const MIGRATION_V66: &str = "
+CREATE TABLE IF NOT EXISTS session_stacks (
+    session_id          INTEGER PRIMARY KEY,
+    parent_session_id   INTEGER NOT NULL,
+    parent_branch       TEXT NOT NULL,
+    parent_tip          TEXT NOT NULL,
+    base_branch         TEXT NOT NULL,
+    parent_state        TEXT NOT NULL DEFAULT 'open'
+                        CHECK (parent_state IN ('open', 'merged', 'closed', 'abandoned')),
+    last_parent_tip     TEXT,
+    parent_pr_number    INTEGER,
+    parent_merged_head  TEXT,
+    parent_merge_commit TEXT,
+    retargeted_at       INTEGER,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS session_stacks_by_parent
+    ON session_stacks (parent_session_id);
+CREATE INDEX IF NOT EXISTS session_stacks_by_parent_branch
+    ON session_stacks (parent_branch);
+CREATE TABLE IF NOT EXISTS remote_branch_cleanup (
+    session_id   INTEGER PRIMARY KEY,
+    branch       TEXT NOT NULL,
+    outcome      TEXT NOT NULL CHECK (outcome IN ('deleted', 'absent', 'kept', 'failed')),
+    reason       TEXT NOT NULL,
+    pr_number    INTEGER,
+    expected_oid TEXT,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    decided_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS remote_branch_cleanup_by_decision
+    ON remote_branch_cleanup (outcome, decided_at);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -2222,6 +2265,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V63,
     MIGRATION_V64,
     MIGRATION_V65,
+    MIGRATION_V66,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
@@ -2267,6 +2311,11 @@ const TABLE_MIGRATIONS: &[(i64, &str, &[&str])] = &[
         ],
     ),
     (61, MIGRATION_V61, &["automation_notes"]),
+    (
+        66,
+        MIGRATION_V66,
+        &["session_stacks", "remote_branch_cleanup"],
+    ),
 ];
 
 const TRIGGER_MIGRATIONS: &[(i64, &str, &[&str])] = &[(
@@ -3150,7 +3199,7 @@ mod tests {
         set_meta(&conn, "min_compatible_schema", 58);
         let before: i64 = conn
             .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'automation_notes%' AND name <> 'events_by_session_kind' AND name <> 'sessions_by_worktree_path'",
+                "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'automation_notes%' AND name <> 'events_by_session_kind' AND name <> 'sessions_by_worktree_path' AND name NOT LIKE 'session_stacks%' AND name NOT LIKE 'remote_branch_cleanup%'",
                 [],
                 |row| row.get(0),
             )
@@ -3174,7 +3223,7 @@ mod tests {
         assert_eq!(MIGRATIONS[59], MIGRATION_V60);
         let after: i64 = conn
             .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'automation_notes%' AND name <> 'events_by_session_kind' AND name <> 'sessions_by_worktree_path'",
+                "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'automation_notes%' AND name <> 'events_by_session_kind' AND name <> 'sessions_by_worktree_path' AND name NOT LIKE 'session_stacks%' AND name NOT LIKE 'remote_branch_cleanup%'",
                 [],
                 |row| row.get(0),
             )
@@ -4594,6 +4643,43 @@ mod tests {
             )
             .unwrap();
         assert!(plan.contains("sessions_by_worktree_path"), "{plan}");
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    /// v66 only adds the stacking and remote-branch cleanup tables: a v65
+    /// binary stays compatible, and a repeated open re-creates nothing.
+    #[test]
+    fn v66_stack_and_remote_branch_tables_keep_the_v60_floor() {
+        let conn = migrated_through(65);
+        set_meta(&conn, "min_compatible_schema", 60);
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 60);
+        assert!(schema_is_compatible_with(&conn, 66, 60).unwrap());
+        assert_eq!(MIGRATIONS[65], MIGRATION_V66);
+        assert!(table_exists(&conn, "session_stacks").unwrap());
+        assert!(table_exists(&conn, "remote_branch_cleanup").unwrap());
+        conn.execute(
+            "INSERT INTO session_stacks (session_id, parent_session_id, parent_branch,
+                 parent_tip, base_branch, created_at, updated_at)
+             VALUES (2, 1, 'agent/a', 'abc', 'agent/a', 0, 0)",
+            [],
+        )
+        .unwrap();
+        let refused = conn.execute(
+            "INSERT INTO session_stacks (session_id, parent_session_id, parent_branch,
+                 parent_tip, base_branch, parent_state, created_at, updated_at)
+             VALUES (3, 1, 'agent/a', 'abc', 'agent/a', 'gone', 0, 0)",
+            [],
+        );
+        assert!(refused.is_err(), "an unknown parent state is refused");
+        let refused = conn.execute(
+            "INSERT INTO remote_branch_cleanup (session_id, branch, outcome, reason, decided_at)
+             VALUES (1, 'agent/a', 'maybe', 'r', 0)",
+            [],
+        );
+        assert!(refused.is_err(), "an unknown outcome is refused");
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 

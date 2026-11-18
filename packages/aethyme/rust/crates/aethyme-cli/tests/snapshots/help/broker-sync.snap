@@ -1,6 +1,6 @@
 exit: 0
 --- stdout
-  aethyme broker sync --session <id> [--json]
+  aethyme broker sync --session <id> [--unstack] [--json]
       Bring this session up to the freshly fetched default branch when it
       is safe: the tree must be clean and nothing in progress. An unpushed
       branch is rebased; a published one has the default branch merged in,
@@ -10,4 +10,9 @@ exit: 0
       with `broker push`. Run it before resuming a reused session and
       when `push` reports related or unknown impact. Graph-disjoint impact permits
       deferring intermediate sync; validate the current merge candidate before merge.
+      A stacked session (start --stack-on) syncs with its parent branch until
+      the parent PR merges, then with the branch its PR was retargeted to.
+      --unstack moves a stacked session and its PR onto the default branch,
+      keeping the parent's commits: the choice when the parent PR closed
+      unmerged or its session was abandoned.
 --- stderr

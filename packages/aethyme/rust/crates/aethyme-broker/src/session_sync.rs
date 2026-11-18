@@ -88,6 +88,11 @@ pub struct SessionSyncReport {
     /// still holds the old head (or no branch at all) until this runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_action: Option<String>,
+    /// For a stacked session: what the stack refresh (or `--unstack`) did,
+    /// or why the parent could not be re-read. The branch synced against is
+    /// `default_ref`: the parent branch while the parent is unmerged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stack_note: Option<String>,
 }
 
 fn sync_refused(reason: impl Into<String>) -> BrokerOpError {
@@ -226,6 +231,18 @@ impl crate::Broker {
     /// Bring a live session up to the freshly fetched default branch when it
     /// is safe; see the module documentation.
     pub fn sync_session(&mut self, session_id: i64) -> Result<SessionSyncReport, BrokerOpError> {
+        self.sync_session_with(session_id, false)
+    }
+
+    /// [`Self::sync_session`], optionally first moving a stacked session onto
+    /// the default branch (`--unstack`). A stacked session follows its
+    /// parent branch until the parent merges; its parent is re-read first, so
+    /// a merged parent is retargeted before the sync chooses what to merge.
+    pub fn sync_session_with(
+        &mut self,
+        session_id: i64,
+        unstack: bool,
+    ) -> Result<SessionSyncReport, BrokerOpError> {
         let _span = crate::phase_telemetry::span("sync_session");
         let session = self.store().session(session_id)?;
         if session.status.is_closed() {
@@ -264,12 +281,36 @@ impl crate::Broker {
                 sample.join(", ")
             )));
         }
-        let default: TrackedDefault = tracked_default(self.repo_handle()).ok_or_else(|| {
-            sync_refused(
-                "the main checkout tracks no fetched default branch; set origin/HEAD with \
-                 `git remote set-head origin --auto`",
-            )
-        })?;
+        let repository_default: TrackedDefault =
+            tracked_default(self.repo_handle()).ok_or_else(|| {
+                sync_refused(
+                    "the main checkout tracks no fetched default branch; set origin/HEAD with \
+                     `git remote set-head origin --auto`",
+                )
+            })?;
+        let reader = crate::session_stack::GhCliPullRequestReader;
+        let stack_note = if unstack {
+            Some(self.unstack_session(session_id, &reader)?)
+        } else {
+            match self.refresh_session_stack(session_id, &reader) {
+                Ok(note) => note,
+                Err(error) => Some(format!(
+                    "could not re-read the parent pull request ({error}); synced against the \
+                     recorded base"
+                )),
+            }
+        };
+        let stack_target = self.stack_sync_branch(session_id);
+        let force_merge = stack_target.as_ref().is_some_and(|(_, merged)| *merged);
+        let default = match stack_target {
+            Some((branch, _)) if branch != repository_default.branch => TrackedDefault {
+                tracking_ref: format!("refs/remotes/{}/{branch}", repository_default.remote),
+                remote: repository_default.remote.clone(),
+                branch,
+                commit: String::new(),
+            },
+            _ => repository_default,
+        };
         let main_root = self.main_root().to_path_buf();
         let fetch_note = self
             .fetch_default_branch(session_id, &default, None, &main_root)
@@ -280,7 +321,14 @@ impl crate::Broker {
             .ok_or_else(|| sync_refused(format!("{} is not fetched", default.tracking_ref)))?;
         let default_ref = format!("{}/{}", default.remote, default.branch);
         let before = worktree.head_commit()?;
-        let catch_up = CatchUp::for_branch(self.repo_handle(), &default.remote, &session.branch);
+        // Once a parent merged under a stacked session, its commits reach the
+        // target branch in another form (a squash or merge commit): merge, so
+        // nothing is replayed onto them.
+        let catch_up = if force_merge {
+            CatchUp::Merge
+        } else {
+            CatchUp::for_branch(self.repo_handle(), &default.remote, &session.branch)
+        };
         let drift =
             crate::main_drift::measure(&worktree, &default_ref, &default_commit, &before, catch_up)
                 .map_err(|error| {
@@ -304,6 +352,7 @@ impl crate::Broker {
             fetch_note,
             manual_commands: Vec::new(),
             next_action: None,
+            stack_note,
         };
         if drift.behind == 0 {
             return Ok(report);
