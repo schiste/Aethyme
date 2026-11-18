@@ -175,7 +175,6 @@ pub(crate) fn is_entry_name_for(name: &str, session_id: i64) -> bool {
 }
 
 /// Whether `name` has the shape of any broker scratch entry (any session).
-#[cfg(test)]
 pub(crate) fn is_entry_name(name: &str) -> bool {
     name.strip_prefix('s')
         .and_then(|rest| rest.split_once('-'))
@@ -508,6 +507,35 @@ fn remove_container_if_empty(pool: &Path, container: RawFd) {
     }
 }
 
+/// Whether `container` (a pool's scratch container, not followed if a link)
+/// holds nothing but the broker's marker and scratch-named real
+/// directories: the broker's own state, removed with its sessions.
+pub(crate) fn container_holds_only_scratch(container: &Path) -> bool {
+    let Ok(listing) = std::fs::read_dir(container) else {
+        return false;
+    };
+    std::fs::symlink_metadata(container).is_ok_and(|metadata| metadata.is_dir())
+        && listing.flatten().all(|entry| {
+            let kind = entry.file_type().ok();
+            match entry.file_name().to_str() {
+                Some(SCRATCH_MARKER) => kind.is_some_and(|kind| kind.is_file()),
+                Some(name) => is_entry_name(name) && kind.is_some_and(|kind| kind.is_dir()),
+                None => false,
+            }
+        })
+}
+
+/// Whether `container` holds any entry besides the broker's marker.
+pub(crate) fn container_has_entries(container: &Path) -> bool {
+    // An unreadable container counts as holding entries: nothing is removed.
+    match std::fs::read_dir(container) {
+        Ok(listing) => listing
+            .flatten()
+            .any(|entry| entry.file_name() != SCRATCH_MARKER),
+        Err(_) => true,
+    }
+}
+
 /// Names in the container of `pool` that are not recorded (`recorded` holds
 /// the recorded entry names), at most `limit`. Left alone, only counted.
 pub(crate) fn unrecorded_entries(
@@ -684,6 +712,25 @@ mod tests {
         assert!(recorded[0].2.pending, "recorded pending before the rename");
         assert!(crate::checkout_trash::is_broker_entry_name(&moved.entry));
         assert_eq!(verify(&record).err(), Some(Refusal::Missing));
+    }
+
+    /// A container of scratch directories is broker state (a root holding
+    /// it is still empty of content); anything else in it is not.
+    #[test]
+    fn a_container_of_scratch_directories_is_broker_state() {
+        let (_owner, pool) = pool();
+        let record = create(&pool, 8).unwrap();
+        let container = pool.join(SCRATCH_CONTAINER);
+        assert!(container_holds_only_scratch(&container));
+        assert!(container_has_entries(&container));
+        std::fs::remove_dir(record.path()).unwrap();
+        assert!(container_holds_only_scratch(&container));
+        assert!(
+            !container_has_entries(&container),
+            "only the marker is left"
+        );
+        std::fs::write(container.join("notes.txt"), b"mine").unwrap();
+        assert!(!container_holds_only_scratch(&container));
     }
 
     #[test]

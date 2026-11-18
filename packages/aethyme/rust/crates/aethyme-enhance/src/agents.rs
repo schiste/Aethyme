@@ -389,8 +389,7 @@ resolve blockers and refusals.
    status and follow its `next_action` when dependencies are required:
    `aethyme broker submit prepare status --session <id> --json`. Preparation
    is explicit; do not assume a fresh worktree has installed dependencies.
-   Put build output and temporary files in the session's scratch directory
-   (`scratch_dir` in `broker start --json`), not the system temp folder.
+   Build output and temp files go in its `scratch_dir`.
 2. Commit early and small. Run `aethyme broker advance --session <id>` from a
    clean worktree and follow its next action. Add `--pr` after the first meaningful
    commit to open a draft. Use `aethyme broker push --session <id>` directly
@@ -428,8 +427,7 @@ resolve blockers and refusals.
    status and follow its `next_action` when dependencies are required:
    `aethyme broker submit prepare status --session <id> --json`. Preparation
    is explicit; do not assume a fresh worktree has installed dependencies.
-   Put build output and temporary files in the session's scratch directory
-   (`scratch_dir` in `broker start --json`), not the system temp folder.
+   Build output and temp files go in its `scratch_dir`.
 2. When done: `aethyme broker submit --session <id>` runs the gates and lands
    nothing. Then `aethyme broker finish --session <id>`.
 
@@ -1647,7 +1645,7 @@ mod tests {
             "Before running repository tools or audits, check the session's preparation",
             "aethyme broker submit prepare status --session <id> --json",
             "do not assume a fresh worktree has installed dependencies.",
-            "(`scratch_dir` in `broker start --json`), not the system temp folder.",
+            "Build output and temp files go in its `scratch_dir`.",
             "`aethyme broker submit --session <id>`",
             "`aethyme broker finish --session <id>`",
             "`aethyme broker commit --session <id> -- <git-commit-args>`",
