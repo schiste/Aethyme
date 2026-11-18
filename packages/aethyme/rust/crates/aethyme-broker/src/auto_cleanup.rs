@@ -19179,7 +19179,7 @@ stale_session_auto_close = true
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        let mut listed = CLEANUP_CONFIG_KEYS.to_vec();
+        let mut listed = crate::auto_cleanup::CLEANUP_CONFIG_KEYS.to_vec();
         keys.sort_unstable();
         listed.sort_unstable();
         assert_eq!(keys, listed, "the sample must name every listed key");
