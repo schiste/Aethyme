@@ -1267,6 +1267,11 @@ fn inspect_root(
                         }
                         continue;
                     }
+                    // Dotted entries, the session scratch container among
+                    // them whatever it holds, are never stray-directory
+                    // candidates: the container's directories go with their
+                    // sessions through the retirement lane. A container
+                    // holding anything else only makes the root non-empty.
                     bookkeeping_only &= is_broker_bookkeeping(&child);
                     continue;
                 }

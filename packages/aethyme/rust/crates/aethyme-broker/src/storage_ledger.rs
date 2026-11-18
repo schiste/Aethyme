@@ -797,6 +797,10 @@ pub struct SessionScratchUsage {
     pub largest_session_id: Option<i64>,
     /// Directories the last retirement attempt kept (in use, refused).
     pub kept: usize,
+    /// Of those, directories kept because they are not the one recorded or
+    /// could not be re-identified after a remount: no retry lifts that.
+    #[serde(default)]
+    pub refused: usize,
     /// The measurement stopped at its budget.
     pub partial: bool,
     /// Bytes the deleter freed removing scratch directories, all runs.

@@ -27,6 +27,9 @@ const SESSION_SCRATCH_FREED_KEY: &str = "session_scratch.bytes_freed_total";
 pub(crate) const SCRATCH_RETIRE_BUDGET: Duration = Duration::from_secs(5);
 /// The longest one retirement run spends measuring live scratch directories.
 const SCRATCH_MEASURE_BUDGET: Duration = Duration::from_secs(2);
+/// The fresh open-file observation a replaced directory gets right before
+/// its rename.
+const SUPERSEDED_PROCESS_USE_BUDGET: Duration = Duration::from_secs(10);
 /// Unrecorded container entries named per run, at most.
 const UNRECORDED_NAMES_MAX: usize = 20;
 
@@ -101,6 +104,19 @@ fn kept_counter(code: &str) -> &'static str {
     }
 }
 
+/// Keeps that no retry lifts by itself: the directory is not the one
+/// recorded (or could not be re-identified after a remount).
+fn is_refusal_keep(code: &str) -> bool {
+    matches!(
+        code,
+        "not_a_recorded_scratch"
+            | "not_a_real_directory"
+            | "foreign_container"
+            | "identity_changed"
+            | "crosses_device"
+    )
+}
+
 impl Broker {
     /// Every recorded scratch directory of this repository.
     pub(crate) fn session_scratch_records(&self) -> ScratchRecords {
@@ -145,6 +161,13 @@ impl Broker {
                     // Removed by hand: forget it and make a fresh one below.
                     self.forget_scratch_record(&record);
                     crate::phase_telemetry::add("session_scratch_recreated", Duration::ZERO);
+                }
+                Err(Refusal::IdentityChanged | Refusal::CrossesDevice)
+                    if self.reidentify_scratch_record(&record).is_some() =>
+                {
+                    let path = record.path();
+                    crate::session_scratch::remember_for_commands(session_id, &path);
+                    return SessionScratch::available(path);
                 }
                 Err(refusal) => {
                     return SessionScratch::unavailable(format!(
@@ -244,6 +267,34 @@ impl Broker {
         }
     }
 
+    /// After a remount changed the volume's device number, re-identify the
+    /// record ([`crate::session_scratch::reidentify`]) and store its new
+    /// device. `None` when it cannot be re-identified (the caller keeps it).
+    fn reidentify_scratch_record(&self, record: &ScratchRecord) -> Option<ScratchRecord> {
+        let updated = crate::session_scratch::reidentify(record).ok()?;
+        let key = record.key();
+        let stored = self.update_meta_json(
+            SESSION_SCRATCH_RECORDS_KEY,
+            |records: &mut ScratchRecords| {
+                if let Some(stored) = records.get_mut(&key)
+                    && (stored.device, stored.inode) == (record.device, record.inode)
+                {
+                    stored.device = updated.device;
+                }
+            },
+        );
+        match stored {
+            Ok(()) => Some(updated),
+            Err(error) => {
+                crate::warn_unrecorded::<(), _>(
+                    "record a re-identified scratch directory",
+                    Err(error),
+                );
+                None
+            }
+        }
+    }
+
     fn forget_scratch_record(&self, record: &ScratchRecord) {
         let key = record.key();
         crate::warn_unrecorded(
@@ -334,6 +385,28 @@ impl Broker {
                 self.remember_scratch_keep(record, "process_using_scratch", &mut report);
                 continue;
             }
+            // A replaced directory belongs to a session that is still open,
+            // whose agent may have entered it since the run's observation
+            // (which can be minutes old): ask again, right before the claim
+            // and the rename.
+            if record.superseded {
+                crate::phase_telemetry::add(
+                    "session_scratch_superseded_fresh_observation",
+                    Duration::ZERO,
+                );
+                let fresh = crate::session_holder::retirement_run_process_use_snapshot(
+                    SUPERSEDED_PROCESS_USE_BUDGET,
+                );
+                if matches!(fresh, crate::reclaim::OpenFileSnapshot::Incomplete { .. }) {
+                    self.remember_scratch_keep(record, "process_use_unknown", &mut report);
+                    continue;
+                }
+                if crate::reclaim::open_file_snapshot_blocker_for_worktree(&fresh, &path).is_some()
+                {
+                    self.remember_scratch_keep(record, "process_using_scratch", &mut report);
+                    continue;
+                }
+            }
             // The rename, and the record it rests on, under the lifecycle
             // claim taken without waiting: a foreground command never queues
             // behind this pass.
@@ -354,7 +427,17 @@ impl Broker {
                 self.remember_scratch_keep(record, "changed", &mut report);
                 continue;
             }
-            let moved = crate::session_scratch::move_to_trash(record, &mut |dir, entry, row| {
+            // A remount gives the volume a new device number: re-identify
+            // under the claim before judging the identity.
+            let mut current = record.clone();
+            if matches!(
+                crate::session_scratch::verify(&current),
+                Err(Refusal::IdentityChanged | Refusal::CrossesDevice)
+            ) && let Some(updated) = self.reidentify_scratch_record(&current)
+            {
+                current = updated;
+            }
+            let moved = crate::session_scratch::move_to_trash(&current, &mut |dir, entry, row| {
                 self.record_checkout_trash_row(dir, entry, row)
             });
             match moved {
@@ -445,6 +528,9 @@ impl Broker {
             if record.keep.is_some() {
                 usage.kept += 1;
             }
+            if record.keep.as_deref().is_some_and(is_refusal_keep) {
+                usage.refused += 1;
+            }
         }
         crate::phase_telemetry::attach(
             "session_scratch_usage",
@@ -453,6 +539,7 @@ impl Broker {
                 "bytes": usage.bytes,
                 "largest_bytes": usage.largest_bytes,
                 "kept": usage.kept,
+                "refused": usage.refused,
                 "partial": usage.partial,
                 "bytes_freed_this_run": freed,
             }),
@@ -714,6 +801,113 @@ mod tests {
                 .all(|row| !row.scratch),
             "nothing recorded in the trash"
         );
+    }
+
+    /// Rewrite every recorded device number, as a remount of the pool's
+    /// volume does.
+    fn remount_records(broker: &crate::Broker) {
+        broker
+            .update_meta_json(
+                super::SESSION_SCRATCH_RECORDS_KEY,
+                |records: &mut crate::session_scratch::ScratchRecords| {
+                    for record in records.values_mut() {
+                        record.device = record.device.wrapping_add(1000);
+                    }
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_remounted_volume_is_reidentified_then_retired() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (open, open_path) = started(&mut broker, "scratch remount open");
+        let (closed, closed_path) = started(&mut broker, "scratch remount closed");
+        broker
+            .close_abandoning_unpushed(closed.id, "scratch fixture")
+            .unwrap();
+        remount_records(&broker);
+
+        // A command for the open session re-identifies its directory.
+        assert_eq!(
+            broker.ensure_session_scratch(open.id).path,
+            Some(open_path.clone())
+        );
+        let report = run(&mut broker);
+
+        assert_eq!(report.scratch.retired, 1, "{report:#?}");
+        assert!(!closed_path.exists());
+        assert!(open_path.is_dir());
+        let devices = broker
+            .session_scratch_records()
+            .into_values()
+            .map(|record| record.device)
+            .collect::<Vec<_>>();
+        let actual = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&open_path).unwrap().dev()
+        };
+        assert_eq!(devices, vec![actual], "the record carries the new device");
+    }
+
+    #[test]
+    fn a_remounted_directory_that_was_swapped_is_kept_and_counted() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, path) = started(&mut broker, "scratch remount swapped");
+        let replacement = path.with_file_name("replacement");
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        broker
+            .close_abandoning_unpushed(session.id, "scratch fixture")
+            .unwrap();
+        remount_records(&broker);
+
+        let report = run(&mut broker);
+
+        assert_eq!(
+            report.scratch.kept.get("identity_changed"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert!(path.is_dir(), "never moved");
+        let record = broker
+            .session_scratch_records()
+            .into_values()
+            .next()
+            .unwrap();
+        assert!(super::is_refusal_keep(record.keep.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn a_replaced_directory_gets_a_fresh_observation_before_its_rename() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, first) = started(&mut broker, "scratch reused in use");
+        broker.fresh_session_scratch(session.id);
+        // The run's observation sees nobody; the fresh one right before the
+        // rename sees the agent inside the replaced directory.
+        crate::session_holder::queue_process_use_snapshots_for_tests(
+            vec![
+                crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+                crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+                    pid: std::process::id(),
+                    command: "shell".into(),
+                    descriptor: "cwd".into(),
+                    file_type: Some("DIR".into()),
+                    path: std::fs::canonicalize(&first).unwrap(),
+                }]),
+            ],
+            false,
+        );
+
+        let report = run(&mut broker);
+
+        assert_eq!(
+            report.scratch.kept.get("process_using_scratch"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert!(first.is_dir());
     }
 
     #[test]

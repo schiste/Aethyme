@@ -400,6 +400,53 @@ pub(crate) fn verify(record: &ScratchRecord) -> Result<Verified, Refusal> {
     Ok(Verified { container })
 }
 
+/// Re-identify `record` after its volume was remounted, which gives every
+/// directory on it a new device number while inode numbers stay: the record
+/// is updated only when the pool's current device differs from the
+/// recorded one and, on that current device, the container is the broker's
+/// (private, owned by this user, carrying its marker), the entry name is the
+/// one bound to the record's session, and the entry is a real directory
+/// with the recorded inode. Anything else refuses, and the caller keeps the
+/// directory. Read-only; the caller stores the returned record.
+pub(crate) fn reidentify(record: &ScratchRecord) -> Result<ScratchRecord, Refusal> {
+    if !is_entry_name_for(&record.entry, record.session_id) || !plain_absolute(&record.pool) {
+        return Err(Refusal::NotARecordedScratch);
+    }
+    let pool_fd = open_path_without_links(&record.pool)?;
+    #[allow(clippy::unnecessary_cast)]
+    let pool_device = fstat(pool_fd.as_raw_fd())
+        .map_err(|_| Refusal::Failed)?
+        .st_dev as u64;
+    if pool_device == record.device {
+        // Same device: a different inode is another directory, not a remount.
+        return Err(Refusal::IdentityChanged);
+    }
+    let container = open_container(pool_fd.as_raw_fd(), pool_device)?;
+    let stat = fstatat_nofollow(container.as_raw_fd(), &record.entry).map_err(|error| {
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            Refusal::Missing
+        } else {
+            Refusal::Failed
+        }
+    })?;
+    if !is_directory(&stat) {
+        return Err(Refusal::NotARealDirectory);
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let (device, inode) = (stat.st_dev as u64, stat.st_ino as u64);
+    if device != pool_device {
+        return Err(Refusal::CrossesDevice);
+    }
+    if inode != record.inode {
+        return Err(Refusal::IdentityChanged);
+    }
+    crate::phase_telemetry::add("session_scratch_reidentified", Duration::ZERO);
+    Ok(ScratchRecord {
+        device,
+        ..record.clone()
+    })
+}
+
 /// A scratch directory moved into the pool's trash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrashedScratch {
@@ -447,7 +494,12 @@ pub(crate) fn move_to_trash(
     };
     record_pending(trash.path(), &entry, row).map_err(|_| Refusal::Failed)?;
     // The identity once more, on the pinned container, right before the
-    // rename: a directory swapped in since `verify` is never moved.
+    // rename: a directory swapped in since `verify` is never moved. A swap
+    // between this check and the rename (microseconds, by a process of this
+    // same user inside a private 0700 container) is not excluded; the
+    // rename then moves the swapped-in directory into the trash, where the
+    // deleter's own identity check against this row (device and inode)
+    // refuses to delete it.
     let still = fstatat_nofollow(verified.container.as_raw_fd(), &record.entry).is_ok_and(|stat| {
         #[allow(clippy::unnecessary_cast)]
         let identity = (stat.st_dev as u64, stat.st_ino as u64);
@@ -712,6 +764,39 @@ mod tests {
         assert!(recorded[0].2.pending, "recorded pending before the rename");
         assert!(crate::checkout_trash::is_broker_entry_name(&moved.entry));
         assert_eq!(verify(&record).err(), Some(Refusal::Missing));
+    }
+
+    /// A remount renumbers the device: the record is re-identified by its
+    /// marked container, its session-bound name and its inode, and only
+    /// then; another directory under the same name is still refused.
+    #[test]
+    fn a_remounted_directory_is_reidentified_by_marker_name_and_inode() {
+        let (_owner, pool) = pool();
+        let record = create(&pool, 11).unwrap();
+        let mut remounted = record.clone();
+        remounted.device = remounted.device.wrapping_add(1000);
+        assert_eq!(verify(&remounted).err(), Some(Refusal::IdentityChanged));
+        let updated = reidentify(&remounted).unwrap();
+        assert_eq!(updated.device, record.device);
+        assert_eq!(updated.inode, record.inode);
+        assert!(verify(&updated).is_ok());
+        // Same device: no remount, nothing to re-identify.
+        assert_eq!(reidentify(&record).err(), Some(Refusal::IdentityChanged));
+        // A remount and a swapped directory: refused.
+        let replacement = pool.join("replacement");
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::remove_dir(record.path()).unwrap();
+        std::fs::rename(&replacement, record.path()).unwrap();
+        assert_eq!(reidentify(&remounted).err(), Some(Refusal::IdentityChanged));
+        // A remount with the marker gone: refused.
+        let fresh = create(&pool, 12).unwrap();
+        let mut fresh_remounted = fresh.clone();
+        fresh_remounted.device = fresh_remounted.device.wrapping_add(1000);
+        std::fs::remove_file(pool.join(SCRATCH_CONTAINER).join(SCRATCH_MARKER)).unwrap();
+        assert_eq!(
+            reidentify(&fresh_remounted).err(),
+            Some(Refusal::ForeignContainer)
+        );
     }
 
     /// A container of scratch directories is broker state (a root holding

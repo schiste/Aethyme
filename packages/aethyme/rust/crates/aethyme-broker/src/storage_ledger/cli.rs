@@ -223,6 +223,7 @@ pub fn status_value(host_state: &Path) -> Value {
                 "directories": scratch.values().map(|usage| usage.directories).sum::<usize>(),
                 "bytes": scratch.values().map(|usage| usage.bytes).sum::<u64>(),
                 "kept": scratch.values().map(|usage| usage.kept).sum::<usize>(),
+                "refused": scratch.values().map(|usage| usage.refused).sum::<usize>(),
                 "partial": scratch.values().any(|usage| usage.partial),
                 "bytes_freed_total": scratch.values().map(|usage| usage.bytes_freed_total).sum::<u64>(),
                 "repositories": scratch,
@@ -506,8 +507,22 @@ pub fn status_advice(host_state: &Path) -> Vec<crate::StatusAdvice> {
                 .collect(),
         });
     }
-    if let Some(entry) = session_scratch_advice(&super::session_scratch_usage(host_state)) {
+    let scratch = super::session_scratch_usage(host_state);
+    if let Some(entry) = session_scratch_advice(&scratch) {
         advice.push(entry);
+    }
+    let refused: usize = scratch.values().map(|usage| usage.refused).sum();
+    if refused > 0 {
+        advice.push(crate::StatusAdvice {
+            id: "storage.session-scratch-unidentified",
+            severity: crate::StatusAdviceSeverity::Warning,
+            reason: "scratch directories the broker could not prove are the ones it created (also after a remount) are kept and never removed; inspect them by hand",
+            summary: format!("{refused} session scratch director{} kept unidentified", if refused == 1 { "y" } else { "ies" }),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: vec![format!("{refused} kept with a refusal keep reason")],
+            commands: vec!["aethyme storage status --json".into()],
+        });
     }
     if summary.unclassified_entries > 0 {
         advice.push(crate::StatusAdvice {
