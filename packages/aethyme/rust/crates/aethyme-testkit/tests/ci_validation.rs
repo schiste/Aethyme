@@ -1313,6 +1313,7 @@ fn prepush_selection_adds_touched_modules_cheapest_first_within_the_budget() {
     }
     // A binary-only crate has no `binary_id(aethyme-cli)` test target.
     write("packages/aethyme/rust/crates/aethyme-cli/src/main_unix.rs");
+    write("packages/aethyme/rust/crates/aethyme-cli/src/main.rs");
     write("docs/guide.md");
     let (status, stdout, stderr) = select("base");
     assert_eq!(status, Some(0), "{stderr}");

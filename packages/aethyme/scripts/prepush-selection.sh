@@ -81,7 +81,8 @@ map_path() {
     rest="${rel#*/}"
     case "$rest" in
         (src/bin/*) m="${rest#src/bin/}"; m="${m%%/*}"; printf '%s::bin/%s\t*\n' "$crate" "${m%.rs}" ;;
-        (src/lib.rs|src/main.rs) ;;
+        (src/lib.rs) ;;
+        (src/main.rs) printf '%s\t@package\n' "$crate" ;;
         (src/*)
             if [ ! -f "$root/packages/aethyme/rust/crates/$crate/src/lib.rs" ]; then
                 # Binary-only crates often include source files at the root, so
