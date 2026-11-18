@@ -74,3 +74,28 @@ observations, and must establish trusted validator and input provenance. The
 runner cannot guarantee publication-time freshness or atomicity: the publishing
 host must re-run these checks on its exact candidate and synchronize validation
 with publication. A pass does not publish anything.
+
+For example, a host can provide the following manifest when it has selected
+and configured the preset deliberately (adapt paths and validator options to
+its actual inputs):
+
+```json
+{
+  "change": "candidate/change.json",
+  "policy": "candidate/editorial.toml",
+  "options": "candidate/options.json",
+  "collection": null,
+  "external": null,
+  "additional": {},
+  "content": { "article-123": "candidate/article.md" },
+  "validator": ["/usr/local/bin/aexeo-cli", "content-change", "--preset", "news", "--preset-source", "news=candidate/editorial.toml"],
+  "env": { "PATH": "/usr/bin:/bin" },
+  "timeout_seconds": 45
+}
+```
+
+The `policy` and `options` fields record files; they do not automatically add
+validator arguments. Ensure the validator actually uses the files and options
+whose bytes the host records. Include every policy dependency, executable helper
+and separately loaded input under `additional` when relevant. If this complete
+inventory cannot be established, the result cannot authorize publication.
