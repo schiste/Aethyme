@@ -32,7 +32,7 @@
 //! the run's is older than [`PROCESS_USE_FRESH_FOR`].
 //!
 //! Only directories a step of the session's own preparation declares as an
-//! output (or that lie inside one) are stripped from an open session:
+//! output, exactly, are stripped from an open session:
 //! `submit prepare` rebuilds exactly those, so the one-command promise
 //! holds. Every other catalogued directory is kept and counted as
 //! `not_declared_output`. (The closed-checkout strip is unchanged.)
@@ -188,6 +188,43 @@ pub(crate) fn write_idle_strip_notice(
     stripped: &[String],
     idle_hours: i64,
 ) -> NoticeOutcome {
+    write_prepare_notice(
+        worktree,
+        session_id,
+        &format!(
+            "Session {session_id} had no activity for {idle_hours} hour(s) and no process in this \
+             checkout, so its regenerable dependency directories were moved out for deletion:"
+        ),
+        stripped,
+    )
+}
+
+/// The same notice after a restore from a recovery archive: regenerable
+/// directories are never archived, so the restored checkout lacks them.
+pub(crate) fn write_restore_notice(
+    worktree: &Path,
+    session_id: i64,
+    missing: &[String],
+) -> NoticeOutcome {
+    write_prepare_notice(
+        worktree,
+        session_id,
+        &format!(
+            "Session {session_id}'s checkout was restored from its recovery archive. Regenerable \
+             dependency directories are never archived, so they are missing:"
+        ),
+        missing,
+    )
+}
+
+/// Write the notice that dependencies are missing and one command rebuilds
+/// them (see [`write_idle_strip_notice`] for where and when it is written).
+fn write_prepare_notice(
+    worktree: &Path,
+    session_id: i64,
+    explanation: &str,
+    removed: &[String],
+) -> NoticeOutcome {
     let relative = crate::merge::ACTION_REQUIRED_RELPATH;
     let path = worktree.join(relative);
     if path.exists() {
@@ -209,15 +246,13 @@ pub(crate) fn write_idle_strip_notice(
         return NoticeOutcome::NotIgnored;
     }
     let body = format!(
-        "{}\n# Dependencies were removed from this checkout\n\n\
-         Session {session_id} had no activity for {idle_hours} hour(s) and no process in this \
-         checkout, so its regenerable dependency directories were moved out for deletion:\n\n{}\n\n\
+        "{}\n# Dependencies were removed from this checkout\n\n{explanation}\n\n{}\n\n\
          Your work is untouched: commits, staged and unstaged changes and every other file are \
          where you left them.\n\n\
          Rebuild the dependencies with one command before building or testing:\n\n    {}\n\n\
          This notice disappears once the session is prepared again.\n",
         crate::preparation::IDLE_STRIP_NOTICE_HEADER,
-        stripped
+        removed
             .iter()
             .map(|relative| format!("- `{relative}`"))
             .collect::<Vec<_>>()
@@ -252,16 +287,14 @@ pub(crate) fn write_idle_strip_notice(
 }
 
 /// Whether a step output covers `relative` (slash-separated, relative to
-/// the checkout): it names that directory or one of its ancestors.
+/// the checkout): it names exactly that directory, so `submit prepare`
+/// rebuilds exactly what the strip removed. A directory merely inside a
+/// declared output is kept: the step may rebuild only part of its output.
 pub(crate) fn declared_output_covers(outputs: &[String], relative: &str) -> bool {
     outputs.iter().any(|output| {
         let output = output.replace('\\', "/");
         let output = output.trim_start_matches("./").trim_end_matches('/');
-        !output.is_empty()
-            && (relative == output
-                || relative
-                    .strip_prefix(output)
-                    .is_some_and(|rest| rest.starts_with('/')))
+        !output.is_empty() && relative == output
     })
 }
 
@@ -327,10 +360,26 @@ pub(crate) fn recent_file_activity(
     if newer(worktree) {
         return Some("checkout_directory");
     }
-    tracked_top_level_directories(worktree)
+    if tracked_top_level_directories(worktree)
         .iter()
         .any(|name| newer(&worktree.join(name)))
-        .then_some("tracked_directory")
+    {
+        return Some("tracked_directory");
+    }
+    // A deep edit touches none of the above: the changed files' own times
+    // (and their parents'). A probe that cannot tell (timeout, or its cap
+    // reached without evidence) leaves the answer to the checks above.
+    match crate::worktree_status_activity::recent_status_activity(worktree, since) {
+        Some(true) => Some("changed_file"),
+        Some(false) => None,
+        None => {
+            crate::phase_telemetry::add(
+                "checkout_idle_strip_status_activity_fallback",
+                Duration::ZERO,
+            );
+            None
+        }
+    }
 }
 
 impl Broker {
@@ -715,10 +764,15 @@ mod tests {
     /// Only directories a declared step output names, or lies above, are
     /// stripped from an open session.
     #[test]
-    fn a_declared_output_covers_itself_and_what_lies_inside() {
-        let outputs = vec!["node_modules/".to_string(), "./web/build".to_string()];
+    fn a_declared_output_covers_exactly_the_directory_it_names() {
+        let outputs = vec![
+            "node_modules/".to_string(),
+            "./web/build".to_string(),
+            "web\\node_modules".to_string(),
+        ];
         assert!(declared_output_covers(&outputs, "node_modules"));
-        assert!(declared_output_covers(&outputs, "web/build/node_modules"));
+        assert!(declared_output_covers(&outputs, "web/node_modules"));
+        assert!(!declared_output_covers(&outputs, "web/build/node_modules"));
         assert!(!declared_output_covers(&outputs, ".venv"));
         assert!(!declared_output_covers(&outputs, "target"));
         assert!(!declared_output_covers(&outputs, "node_modules_old"));
@@ -790,6 +844,12 @@ mod tests {
             recent_file_activity(worktree, since),
             Some("checkout_directory")
         );
+        // A deep edit: only the file itself is new.
+        std::fs::write(worktree.join("src/lib.rs"), "y\n").unwrap();
+        age_all();
+        assert_eq!(recent_file_activity(worktree, since), Some("changed_file"));
+        set_mtime(&worktree.join("src/lib.rs"), old);
+        assert_eq!(recent_file_activity(worktree, since), None);
     }
 
     /// The notice is created only when absent: a conflict notice is never

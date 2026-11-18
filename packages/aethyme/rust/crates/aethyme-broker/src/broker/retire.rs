@@ -611,6 +611,42 @@ impl RetireRun {
     }
 }
 
+impl Broker {
+    /// After a restore: mark the session's preparation stale for the
+    /// outputs its preparation declares (none of them is archived) and leave
+    /// the same notice as an idle strip. Returns the prepare command, or
+    /// `None` when the repository declares no preparation.
+    fn flag_restored_dependencies(&self, path: &Path, session_id: i64) -> Option<String> {
+        let declared: Vec<String> = crate::preparation::load_config(path)
+            .ok()
+            .flatten()?
+            .steps
+            .iter()
+            .flat_map(|step| step.outputs.iter())
+            .map(|output| output.trim_end_matches(['/', '\\']).to_string())
+            .filter(|output| !output.is_empty())
+            .collect();
+        if declared.is_empty() {
+            return None;
+        }
+        crate::warn_unrecorded(
+            "mark a restored session's preparation stale",
+            crate::preparation::mark_stripped(self.main_root(), session_id, &declared)
+                .map_err(|error| error.to_string()),
+        );
+        let notice = super::strip_idle::write_restore_notice(path, session_id, &declared);
+        crate::phase_telemetry::add(
+            if notice == super::strip_idle::NoticeOutcome::Written {
+                "checkout_restore_notice_written"
+            } else {
+                "checkout_restore_notice_not_written"
+            },
+            std::time::Duration::ZERO,
+        );
+        Some(crate::preparation::prepare_command(session_id))
+    }
+}
+
 /// Whether `archive` is an operation archive (`<id>-operation-…`, schema
 /// `aethyme-operation-archive-v1`), which restore does not read.
 pub(crate) fn is_operation_archive(archive: &Path) -> bool {
@@ -645,6 +681,9 @@ pub(crate) struct CheckoutRestored {
     /// Set when the branch was not at the archived HEAD: the checkout is
     /// detached there.
     pub detached: Option<DetachedRestore>,
+    /// The one command that rebuilds the dependencies a restore never
+    /// brings back, when the repository declares its preparation.
+    pub next_action: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -684,6 +723,7 @@ impl CheckoutRestored {
                         restored.head
                     ),
                 }),
+            next_action: None,
         }
     }
 
@@ -709,6 +749,11 @@ impl CheckoutRestored {
                 String::new()
             }
         ));
+        if let Some(next) = &self.next_action {
+            lines.push(format!(
+                "Dependencies are not restored; prepare the session again before building or testing: {next}"
+            ));
+        }
         lines
     }
 }
@@ -2852,13 +2897,16 @@ impl Broker {
                             "checkout_retirement_restored_for_reuse",
                             started.elapsed(),
                         );
+                        // Regenerable directories are never archived: the
+                        // restored checkout's preparation reads stale, with
+                        // the same loud notice and next action as an idle
+                        // strip.
+                        let next_action = self.flag_restored_dependencies(path, session.id);
                         LAST_CHECKOUT_RESTORE.with(|cell| {
-                            *cell.borrow_mut() = Some(CheckoutRestored::new(
-                                path,
-                                &archive,
-                                &session.branch,
-                                &restored,
-                            ));
+                            let mut report =
+                                CheckoutRestored::new(path, &archive, &session.branch, &restored);
+                            report.next_action = next_action;
+                            *cell.borrow_mut() = Some(report);
                         });
                         crate::phase_telemetry::attach(
                             "checkout_restore",
@@ -5523,6 +5571,54 @@ mod tests {
         assert!(broker.recreate_retired_checkout(&worktree).unwrap());
         assert!(worktree.join("notes.txt").is_file());
         assert!(!crate::cleanup_resolve::restore_incomplete(&worktree));
+    }
+
+    /// After a restore the session's preparation reads stale, the session
+    /// gets the same session-scoped blocker as an idle strip, and the
+    /// command's output names the prepare command.
+    #[test]
+    fn a_restore_leaves_the_prepare_signal_and_next_action() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "restore prepares", |worktree| {
+            std::fs::create_dir_all(worktree.join(".aethyme")).unwrap();
+            std::fs::write(
+                worktree.join(".aethyme/prepare.toml"),
+                "schema_version = 1\n\n[[steps]]\nname = \"deps\"\ncommand = [\"sh\", \"-c\", \"true\"]\n\
+                 inputs = [\"lock.file\"]\noutputs = [\"node_modules/\"]\ncache = \"repository_shared\"\n\
+                 required_for_hooks = false\n",
+            )
+            .unwrap();
+            git(worktree, &["add", "-f", ".aethyme/prepare.toml"]);
+            git(
+                worktree,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "commit",
+                    "-qm",
+                    "declare preparation",
+                ],
+            );
+            std::fs::write(worktree.join("notes.txt"), "untracked notes\n").unwrap();
+        });
+        let report = run(&mut broker);
+        assert_eq!(report.retired_archived, 1, "{report:#?}");
+        crate::broker::take_last_checkout_restore();
+        assert!(broker.recreate_retired_checkout(&worktree).unwrap());
+        let restored = crate::broker::take_last_checkout_restore().expect("a restore report");
+        let command = format!("aethyme broker submit prepare --session {}", session.id);
+        assert_eq!(restored.next_action.as_deref(), Some(command.as_str()));
+        assert!(
+            restored.lines().iter().any(|line| line.contains(&command)),
+            "{:?}",
+            restored.lines()
+        );
+        assert!(crate::preparation::stripped_since_prepared(
+            broker.main_root(),
+            session.id
+        ));
     }
 
     /// When the branch moved after the archive was written, the restored
