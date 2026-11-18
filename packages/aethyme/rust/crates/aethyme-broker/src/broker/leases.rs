@@ -1909,7 +1909,7 @@ impl Broker {
     /// it has moved on from `session_id`; `None` when this is still its
     /// latest session, the binding cannot be read, or it is a shared agent
     /// service (whose binding names no single task). Database only.
-    fn holder_moved_on(
+    pub(super) fn holder_moved_on(
         &self,
         session_id: i64,
         holder_event: &crate::Event,

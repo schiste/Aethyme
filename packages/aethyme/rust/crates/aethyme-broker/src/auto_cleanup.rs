@@ -7738,6 +7738,10 @@ impl Broker {
         let pass_started = Instant::now();
         let mut landed_judged_in_pass = 0_usize;
         let mut budget_hold = self.retirement_budget_hold();
+        // Set once a landed proof spent the pass's landed budget: no more
+        // landed proofs this pass, the cursor stays put, and the cheap
+        // abandonment judgements go on.
+        let mut cursor_pinned = false;
         for session in sessions {
             if deadline_expired(deadline) {
                 summary.deferred += 1;
@@ -7770,6 +7774,7 @@ impl Broker {
             )
             .is_abandoned();
             let idle_enough_for_landed = landed_window_ms > 0
+                && !cursor_pinned
                 && !prioritized.contains(&session.id)
                 && crate::decide_abandonment(
                     &crate::SessionActivity {
@@ -7944,7 +7949,15 @@ impl Broker {
                         .push(SessionRetirementDeferredReason::DeadlineExceeded {
                             after_session_id: cursor.after_session_id,
                         });
-                    return Ok(summary);
+                    // The cursor stays on this session for the next pass, as
+                    // before; but the pass no longer ends here. It goes on
+                    // judging the abandonment window (no Git, no landed
+                    // proof) for the sessions after it, which a spent landed
+                    // budget used to leave unjudged pass after pass: on the
+                    // busiest repository 22 budget-exhausted proofs in an
+                    // hour held stale classification to 29 sessions.
+                    cursor_pinned = true;
+                    continue;
                 }
             }
             let fall_through = landed_decline
@@ -8096,6 +8109,15 @@ impl Broker {
                 | crate::broker::AbandonedSessionCloseOutcome::ActiveProcess
                 | crate::broker::AbandonedSessionCloseOutcome::LandedDeclined(_) => {}
             }
+            if cursor_pinned {
+                // Judged after a spent landed budget: the cursor stays where
+                // it was pinned, so the next pass judges these again too.
+                crate::phase_telemetry::add(
+                    "retirement_abandonment_judged_past_spent_landed_budget",
+                    Duration::ZERO,
+                );
+                continue;
+            }
             cursor.after_session_id = session.id;
             if !self.persist_session_retirement_cursor(&cursor, &mut expected_raw)? {
                 summary.deferred += 1;
@@ -8111,13 +8133,15 @@ impl Broker {
             }
         }
 
-        if deadline_expired(deadline) {
-            summary.deferred += 1;
-            summary
-                .reasons
-                .push(SessionRetirementDeferredReason::DeadlineExceeded {
-                    after_session_id: cursor.after_session_id,
-                });
+        if deadline_expired(deadline) || cursor_pinned {
+            if !cursor_pinned {
+                summary.deferred += 1;
+                summary
+                    .reasons
+                    .push(SessionRetirementDeferredReason::DeadlineExceeded {
+                        after_session_id: cursor.after_session_id,
+                    });
+            }
             return Ok(summary);
         }
         let more = self.store().open_session_page(

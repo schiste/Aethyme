@@ -1151,6 +1151,55 @@ pub(crate) fn set_before_backlog_hook(hook: Option<Box<dyn FnMut()>>) {
 }
 
 impl Broker {
+    /// What a closed or cleaned session's recorded holder says about
+    /// removing anything from its checkout: `None` when it does not keep it.
+    /// Gone or never bound does not keep it; an unknown listing keeps it
+    /// (`holder_unknown`); a live holder (same pid and start time) keeps it
+    /// (`holder_alive`) unless it has since been bound to a newer session
+    /// after this one's last activity and close: one long-lived agent
+    /// process routinely starts many sessions in turn, and on the busiest
+    /// repository 202 of the 207 closed or cleaned sessions whose holder
+    /// was still running had that holder bound to a newer session. The same
+    /// moved-on rule the stale lane applies (`holder_moved_on`). A process
+    /// still in the checkout (working directory or open file) keeps it by
+    /// the separate open-file check, which this never replaces.
+    pub(crate) fn closed_checkout_holder_keep(
+        &self,
+        session: &Session,
+        holders: &mut crate::session_holder::RecordedHolderProcessTable,
+    ) -> Option<&'static str> {
+        use crate::session_holder::RecordedHolderLiveness;
+        let assessment = crate::session_holder::recorded_holder_liveness(
+            self.store_ref(),
+            session.id,
+            holders,
+            true,
+        );
+        match assessment.liveness {
+            RecordedHolderLiveness::Unbound | RecordedHolderLiveness::Gone => None,
+            RecordedHolderLiveness::Unknown => Some("holder_unknown"),
+            RecordedHolderLiveness::Alive => {
+                let activity = session
+                    .last_activity_at
+                    .max(session.closed_at.unwrap_or(0))
+                    .max(session.cleanup_completed_at.unwrap_or(0));
+                let moved_on = match self.store_ref().latest_session_holder_event(session.id) {
+                    Ok(Some(event)) if Some(event.id) == assessment.binding_event_id => self
+                        .holder_moved_on(session.id, &event, activity)
+                        .ok()
+                        .flatten(),
+                    _ => None,
+                };
+                if moved_on.is_some() {
+                    crate::phase_telemetry::add("checkout_holder_moved_on", Duration::ZERO);
+                    None
+                } else {
+                    Some("holder_alive")
+                }
+            }
+        }
+    }
+
     /// Whether `session` is not the row that judges its path's folder
     /// ([`path_superseded_by`] over every row recorded for the path).
     pub(crate) fn path_superseded(&self, session: &Session) -> Result<bool, BrokerError> {
@@ -1195,22 +1244,8 @@ impl Broker {
         }
         if check_holder {
             let mut holders = crate::session_holder::RecordedHolderProcessTable::default();
-            match crate::session_holder::recorded_holder_liveness(
-                self.store_ref(),
-                session.id,
-                &mut holders,
-                true,
-            )
-            .liveness
-            {
-                crate::session_holder::RecordedHolderLiveness::Unbound
-                | crate::session_holder::RecordedHolderLiveness::Gone => {}
-                crate::session_holder::RecordedHolderLiveness::Alive => {
-                    return Some("holder_alive");
-                }
-                crate::session_holder::RecordedHolderLiveness::Unknown => {
-                    return Some("holder_unknown");
-                }
+            if let Some(code) = self.closed_checkout_holder_keep(session, &mut holders) {
+                return Some(code);
             }
         }
         let Some(closed_at) = session.closed_at.or(session.cleanup_completed_at) else {
@@ -1756,22 +1791,8 @@ impl Broker {
                 Duration::ZERO,
             );
         } else {
-            match crate::session_holder::recorded_holder_liveness(
-                self.store_ref(),
-                session.id,
-                holders,
-                true,
-            )
-            .liveness
-            {
-                crate::session_holder::RecordedHolderLiveness::Unbound
-                | crate::session_holder::RecordedHolderLiveness::Gone => {}
-                crate::session_holder::RecordedHolderLiveness::Alive => {
-                    return Refused("holder_alive");
-                }
-                crate::session_holder::RecordedHolderLiveness::Unknown => {
-                    return Refused("holder_unknown");
-                }
+            if let Some(code) = self.closed_checkout_holder_keep(session, holders) {
+                return Refused(code);
             }
         }
         drop(preconditions);
