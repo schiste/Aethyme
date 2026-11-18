@@ -632,8 +632,29 @@ fn advance_validates_then_publishes_only_a_clean_committed_head() {
     assert_eq!(fixture.remote_branch(&branch), None);
 
     std::fs::remove_file(scratch).unwrap();
-    let published = json(&run());
+    let trace = fixture.storage.owner_path().join("advance-git.jsonl");
+    let published = json(&fixture.run_with_env(
+        &["advance", "--session", &id, "--json"],
+        &[("GIT_TRACE2_EVENT", trace.to_str().unwrap())],
+    ));
     let head = git_output(&worktree, &["rev-parse", "HEAD"]);
+    // The write path still counts newly published commits. State validation
+    // must not run the same history walk before deciding to publish.
+    let trace = std::fs::read_to_string(trace).unwrap();
+    let history_walks = trace
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| {
+            let args = &event["argv"];
+            event["event"] == "start"
+                && args[1] == "log"
+                && args[2] == "--format=%H%x1f%ct%x1f%s"
+                && args[3] == head
+                && args[4] == "--not"
+                && args[5] == "--remotes"
+        })
+        .count();
+    assert_eq!(history_walks, 1, "expected one push history walk: {trace}");
     assert_eq!(published["schema"], "aethyme.broker-advance/v1");
     assert_eq!(published["state"], "published");
     assert_eq!(published["pushed_head"], head);
