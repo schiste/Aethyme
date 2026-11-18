@@ -896,6 +896,51 @@ fn an_empty_bound_root_is_retained_and_reused_after_apply() {
     );
 }
 
+/// The session scratch container is never a stray-directory candidate,
+/// whatever it holds: a foreign entry next to a finished session's scratch
+/// directory makes the root non-empty, and apply touches neither.
+#[test]
+fn the_scratch_container_is_never_a_storage_candidate() {
+    let (repo, container) = fixture();
+    start_and_finish(repo.path(), container.path(), "scratch task", &[]);
+    let root = own_root(&json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "--json"],
+    )));
+    let root_path = PathBuf::from(root["path"].as_str().unwrap());
+    let scratch = root_path.join(".aethyme-session-scratch");
+    let live = std::fs::read_dir(&scratch)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .expect("the finished session's scratch directory waits for retirement");
+    std::fs::write(live.join("out.o"), "build output\n").unwrap();
+    std::fs::write(scratch.join("foreign.txt"), "not the broker's\n").unwrap();
+
+    let plan = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "--json"],
+    ));
+    assert_eq!(own_root(&plan)["empty"], false, "{plan}");
+    let candidates = plan["candidates"].to_string();
+    assert!(!candidates.contains(".aethyme-session-scratch"), "{plan}");
+    let digest = plan["digest"].as_str().unwrap();
+    let applied = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "apply", "--confirm", digest, "--json"],
+    ));
+    assert!(
+        !applied.to_string().contains(".aethyme-session-scratch"),
+        "{applied}"
+    );
+    assert!(live.join("out.o").is_file());
+    assert!(scratch.join("foreign.txt").is_file());
+}
+
 /// Anything the broker did not write there -- including build defaults an
 /// operator edited -- is content no plan judged, so the root is not empty.
 #[test]

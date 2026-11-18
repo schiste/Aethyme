@@ -72,6 +72,8 @@
   },
   "repository_name": "null",
   "scope_overlaps_warning": "string",
+  "scratch_dir": "null",
+  "scratch_dir_note": "string",
   "short_name": "string",
   "standing_authorizations": {
     "disposable_test_environments": "bool",

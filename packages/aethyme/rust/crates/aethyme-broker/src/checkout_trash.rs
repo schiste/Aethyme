@@ -88,10 +88,16 @@ pub(crate) struct TrashRow {
     /// count as freed by strip.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) stripped: bool,
+    /// The entry is a session scratch directory
+    /// ([`crate::session_scratch`]), moved in from the pool's scratch
+    /// container. Always recorded with `stripped` set too (it is not the
+    /// checkout); its bytes are counted as scratch, not as strip.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) scratch: bool,
 }
 
 /// This process's id and start time, as a process-table snapshot reads it.
-fn this_process_identity() -> (i64, i64) {
+pub(crate) fn this_process_identity() -> (i64, i64) {
     let pid = i64::from(std::process::id());
     let started = crate::session_holder::ProcessTable::snapshot()
         .and_then(|table| table.process(pid))
@@ -152,7 +158,7 @@ impl TrashedCheckout {
     }
 }
 
-fn c_name(name: &str) -> std::io::Result<CString> {
+pub(crate) fn c_name(name: &str) -> std::io::Result<CString> {
     CString::new(name).map_err(|_| std::io::Error::other("a name holds a NUL byte"))
 }
 
@@ -161,7 +167,7 @@ fn c_path(path: &Path) -> std::io::Result<CString> {
         .map_err(|_| std::io::Error::other("a path holds a NUL byte"))
 }
 
-fn checked(result: libc::c_int) -> std::io::Result<libc::c_int> {
+pub(crate) fn checked(result: libc::c_int) -> std::io::Result<libc::c_int> {
     if result < 0 {
         Err(std::io::Error::last_os_error())
     } else {
@@ -170,7 +176,7 @@ fn checked(result: libc::c_int) -> std::io::Result<libc::c_int> {
 }
 
 /// Open a directory without following a symlink at its last component.
-fn open_dir_nofollow(path: &Path) -> std::io::Result<OwnedFd> {
+pub(crate) fn open_dir_nofollow(path: &Path) -> std::io::Result<OwnedFd> {
     let path = c_path(path)?;
     // SAFETY: `path` is NUL-terminated and outlives the call.
     let fd = checked(unsafe {
@@ -184,7 +190,7 @@ fn open_dir_nofollow(path: &Path) -> std::io::Result<OwnedFd> {
 }
 
 /// Open `name` inside `dir` as a directory, never following a symlink.
-fn openat_dir_nofollow(dir: RawFd, name: &str) -> std::io::Result<OwnedFd> {
+pub(crate) fn openat_dir_nofollow(dir: RawFd, name: &str) -> std::io::Result<OwnedFd> {
     let name = c_name(name)?;
     // SAFETY: `name` is NUL-terminated and `dir` is an open descriptor.
     let fd = checked(unsafe {
@@ -198,7 +204,7 @@ fn openat_dir_nofollow(dir: RawFd, name: &str) -> std::io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn fstat(fd: RawFd) -> std::io::Result<libc::stat> {
+pub(crate) fn fstat(fd: RawFd) -> std::io::Result<libc::stat> {
     // SAFETY: an all-zero stat is a valid output buffer.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `fd` is open and `stat` is writable.
@@ -206,7 +212,7 @@ fn fstat(fd: RawFd) -> std::io::Result<libc::stat> {
     Ok(stat)
 }
 
-fn fstatat_nofollow(dir: RawFd, name: &str) -> std::io::Result<libc::stat> {
+pub(crate) fn fstatat_nofollow(dir: RawFd, name: &str) -> std::io::Result<libc::stat> {
     let name = c_name(name)?;
     // SAFETY: an all-zero stat is a valid output buffer.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -215,7 +221,7 @@ fn fstatat_nofollow(dir: RawFd, name: &str) -> std::io::Result<libc::stat> {
     Ok(stat)
 }
 
-fn is_directory(stat: &libc::stat) -> bool {
+pub(crate) fn is_directory(stat: &libc::stat) -> bool {
     stat.st_mode & libc::S_IFMT == libc::S_IFDIR
 }
 
@@ -230,6 +236,22 @@ impl TrashDir {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
+
+    /// The trash directory's own descriptor (opened without following links).
+    pub(crate) fn trash_fd(&self) -> RawFd {
+        self.trash.as_raw_fd()
+    }
+}
+
+/// A fresh trash entry name for `session_id`, in the one format the deleter
+/// accepts ([`is_broker_entry_name`]).
+pub(crate) fn new_entry_name(session_id: i64) -> String {
+    format!(
+        "{:013}-{session_id}-{}-{}",
+        crate::clock::epoch_ms().max(0),
+        std::process::id(),
+        TRASH_NONCE.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Open the trash of `pool`, creating it fresh (mode 0700, with the marker)
@@ -456,7 +478,12 @@ pub(crate) fn registration_of(
 /// `rename` that refuses to replace an existing destination:
 /// `renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on
 /// macOS.
-fn rename_noreplace(from_dir: RawFd, from: &str, to_dir: RawFd, to: &str) -> std::io::Result<()> {
+pub(crate) fn rename_noreplace(
+    from_dir: RawFd,
+    from: &str,
+    to_dir: RawFd,
+    to: &str,
+) -> std::io::Result<()> {
     let from = c_name(from)?;
     let to = c_name(to)?;
     #[cfg(target_os = "linux")]
@@ -573,12 +600,7 @@ pub(crate) fn move_worktree_to_trash(
     destroy_environments(worktree).map_err(|reason| {
         format!("environments bound to the checkout could not be destroyed: {reason}")
     })?;
-    let entry = format!(
-        "{:013}-{session_id}-{}-{}",
-        crate::clock::epoch_ms().max(0),
-        std::process::id(),
-        TRASH_NONCE.fetch_add(1, Ordering::Relaxed)
-    );
+    let entry = new_entry_name(session_id);
     let (creator_pid, creator_started_ms) = this_process_identity();
     #[allow(clippy::unnecessary_cast)]
     let mut row = TrashRow {
@@ -590,6 +612,7 @@ pub(crate) fn move_worktree_to_trash(
         creator_pid,
         creator_started_ms,
         stripped: false,
+        scratch: false,
     };
     record_pending(&trash.path, &entry, row)?;
     rename_noreplace(
@@ -729,12 +752,7 @@ pub(crate) fn move_directory_to_trash(
     if source.st_dev != checkout_device {
         return Err(CrossesDevice);
     }
-    let entry = format!(
-        "{:013}-{session_id}-{}-{}",
-        crate::clock::epoch_ms().max(0),
-        std::process::id(),
-        TRASH_NONCE.fetch_add(1, Ordering::Relaxed)
-    );
+    let entry = new_entry_name(session_id);
     let (creator_pid, creator_started_ms) = this_process_identity();
     #[allow(clippy::unnecessary_cast)]
     let mut row = TrashRow {
@@ -746,6 +764,7 @@ pub(crate) fn move_directory_to_trash(
         creator_pid,
         creator_started_ms,
         stripped: true,
+        scratch: false,
     };
     record_pending(&trash.path, &entry, row).map_err(Failed)?;
     rename_noreplace(parent.as_raw_fd(), last, trash.trash.as_raw_fd(), &entry).map_err(
@@ -922,6 +941,11 @@ pub(crate) struct TrashDrainReport {
     pub(crate) stripped_bytes: u64,
     /// Stripped-directory entries removed this run.
     pub(crate) stripped_entries_removed: usize,
+    /// Of `bytes`, those of session scratch directories (measured as they
+    /// were deleted); not part of `stripped_bytes`.
+    pub(crate) scratch_bytes: u64,
+    /// Session scratch entries removed this run.
+    pub(crate) scratch_entries_removed: usize,
     /// Entries that failed this run.
     pub(crate) failed: Vec<String>,
     /// Entries that have failed at least [`TRASH_FAILURE_REPORT_AFTER`] times.
@@ -1160,7 +1184,14 @@ pub(crate) fn drain_trash(
                         report.entries_removed += 1;
                         report.unlinks = report.unlinks.saturating_add(unlinks);
                         report.bytes = report.bytes.saturating_add(bytes);
-                        if row.stripped {
+                        if row.scratch {
+                            report.scratch_entries_removed += 1;
+                            report.scratch_bytes = report.scratch_bytes.saturating_add(bytes);
+                            crate::phase_telemetry::add(
+                                "session_scratch_trash_entries_removed",
+                                Duration::ZERO,
+                            );
+                        } else if row.stripped {
                             report.stripped_entries_removed += 1;
                             report.stripped_bytes = report.stripped_bytes.saturating_add(bytes);
                         }
@@ -1174,7 +1205,9 @@ pub(crate) fn drain_trash(
                         report.entries_interrupted += 1;
                         report.unlinks = report.unlinks.saturating_add(unlinks);
                         report.bytes = report.bytes.saturating_add(bytes);
-                        if row.stripped {
+                        if row.scratch {
+                            report.scratch_bytes = report.scratch_bytes.saturating_add(bytes);
+                        } else if row.stripped {
                             report.stripped_bytes = report.stripped_bytes.saturating_add(bytes);
                         }
                         break 'dirs;

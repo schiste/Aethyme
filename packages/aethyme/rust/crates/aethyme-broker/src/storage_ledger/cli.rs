@@ -209,7 +209,28 @@ pub fn status_value(host_state: &Path) -> Value {
     // per repository and the bytes the deleter measured removing stripped
     // regenerable directories.
     let checkouts = super::checkout_counts(host_state);
+    let scratch = super::session_scratch_usage(host_state);
     let mut classes = serde_json::to_value(&classes).unwrap_or_else(|_| json!({}));
+    // Session scratch directories live in the worktree pools and go with
+    // their session (checkout retirement); the class reports what the
+    // retirement lane measured.
+    if !scratch.is_empty()
+        && let Some(object) = classes.as_object_mut()
+    {
+        object.insert(
+            "session_scratch".into(),
+            json!({
+                "directories": scratch.values().map(|usage| usage.directories).sum::<usize>(),
+                "bytes": scratch.values().map(|usage| usage.bytes).sum::<u64>(),
+                "kept": scratch.values().map(|usage| usage.kept).sum::<usize>(),
+                "refused": scratch.values().map(|usage| usage.refused).sum::<usize>(),
+                "partial": scratch.values().any(|usage| usage.partial),
+                "bytes_freed_total": scratch.values().map(|usage| usage.bytes_freed_total).sum::<u64>(),
+                "repositories": scratch,
+                "why_not": "removed with their session by checkout retirement, not by the storage worker",
+            }),
+        );
+    }
     if !checkouts.is_empty()
         && let Some(object) = classes.as_object_mut()
     {
@@ -294,6 +315,16 @@ fn status(json_output: bool) -> u8 {
     }
     if let Some(classes) = value["classes"].as_object() {
         for (class, entry) in classes {
+            if class == "session_scratch" {
+                println!(
+                    "{class:<24} {} in {} director(ies), {} kept, {} freed  (removed with their session)",
+                    human(entry["bytes"].as_u64().unwrap_or(0)),
+                    entry["directories"].as_u64().unwrap_or(0),
+                    entry["kept"].as_u64().unwrap_or(0),
+                    human(entry["bytes_freed_total"].as_u64().unwrap_or(0)),
+                );
+                continue;
+            }
             if class == "checkouts" {
                 println!(
                     "{class:<24} {} folder(s), {} closed, {} closed holding regenerable directories, {} freed by strip; today {} created, {} retired  (counts only)",
@@ -476,6 +507,23 @@ pub fn status_advice(host_state: &Path) -> Vec<crate::StatusAdvice> {
                 .collect(),
         });
     }
+    let scratch = super::session_scratch_usage(host_state);
+    if let Some(entry) = session_scratch_advice(&scratch) {
+        advice.push(entry);
+    }
+    let refused: usize = scratch.values().map(|usage| usage.refused).sum();
+    if refused > 0 {
+        advice.push(crate::StatusAdvice {
+            id: "storage.session-scratch-unidentified",
+            severity: crate::StatusAdviceSeverity::Warning,
+            reason: "scratch directories the broker could not prove are the ones it created (also after a remount) are kept and never removed; inspect them by hand",
+            summary: format!("{refused} session scratch director{} kept unidentified", if refused == 1 { "y" } else { "ies" }),
+            session_id: None,
+            queue_entry_id: None,
+            evidence: vec![format!("{refused} kept with a refusal keep reason")],
+            commands: vec!["aethyme storage status --json".into()],
+        });
+    }
     if summary.unclassified_entries > 0 {
         advice.push(crate::StatusAdvice {
             id: "storage.unclassified",
@@ -494,6 +542,48 @@ pub fn status_advice(host_state: &Path) -> Vec<crate::StatusAdvice> {
         });
     }
     advice
+}
+
+/// `storage.session-scratch-large`: one repository's session scratch
+/// directories, or one of them, hold more than their advice threshold.
+pub(super) fn session_scratch_advice(
+    usage: &std::collections::BTreeMap<String, super::SessionScratchUsage>,
+) -> Option<crate::StatusAdvice> {
+    let evidence: Vec<String> = usage
+        .values()
+        .filter(|usage| {
+            usage.bytes > super::SESSION_SCRATCH_ADVICE_BYTES
+                || usage.largest_bytes > super::SESSION_SCRATCH_ADVICE_ONE_BYTES
+        })
+        .map(|usage| {
+            format!(
+                "{} in {} scratch director(ies); the largest, {}, belongs to session {}",
+                human(usage.bytes),
+                usage.directories,
+                human(usage.largest_bytes),
+                usage
+                    .largest_session_id
+                    .map_or_else(|| "unknown".to_string(), |id| id.to_string())
+            )
+        })
+        .collect();
+    if evidence.is_empty() {
+        return None;
+    }
+    Some(crate::StatusAdvice {
+        id: "storage.session-scratch-large",
+        severity: crate::StatusAdviceSeverity::Notice,
+        reason: "session scratch directories are large; each is removed when its session is finished, closed or cleaned, so finish idle sessions or clean up inside the scratch directory",
+        summary: format!(
+            "session scratch is large in {} repositor{}",
+            evidence.len(),
+            if evidence.len() == 1 { "y" } else { "ies" }
+        ),
+        session_id: None,
+        queue_entry_id: None,
+        evidence,
+        commands: vec!["aethyme storage status --json".into()],
+    })
 }
 
 /// The directory of archive `id` (`<pool>/<archive>`, optionally prefixed

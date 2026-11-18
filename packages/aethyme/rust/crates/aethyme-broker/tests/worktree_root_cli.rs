@@ -1938,7 +1938,13 @@ fn recovery_plan_inspects_incomplete_repository_uuid_marker_without_settling_it(
     assert!(worktree.starts_with(&worktree_root));
     // Recreate the supported interrupted-publication prefix: the reservation,
     // root marker, Cargo defaults and registry row remain, with no checkout yet.
+    // (No session scratch directory either: `start` creates it only after
+    // the checkout is published.)
     std::fs::remove_dir_all(&worktree).unwrap();
+    let scratch = worktree_root.join(".aethyme-session-scratch");
+    if scratch.exists() {
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let changed = connection

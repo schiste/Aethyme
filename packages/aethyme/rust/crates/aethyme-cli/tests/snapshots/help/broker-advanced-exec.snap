@@ -3,7 +3,8 @@ exit: 0
   aethyme broker advanced exec --session <id> [--non-interactive] [--timeout <1..86400 seconds>] [--json] -- <command>
       Run a command in the session worktree, then fail if it creates or
       modifies dirty paths outside explicit leases or in adoption-time
-      foreign files. Exports AETHYME_TEST_DB_SUFFIX=s<id>-exec.
+      foreign files. Exports AETHYME_TEST_DB_SUFFIX=s<id>-exec and
+      AETHYME_SESSION_SCRATCH_DIR (the session's scratch directory).
       Supervised execution has a 1800-second deadline by default; --timeout
       overrides it. On expiry, the supervisor verifies process-group cleanup
       before the ownership audit, and JSON reports command_timed_out as true.
