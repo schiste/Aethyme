@@ -3201,6 +3201,38 @@ mod lane_tests {
         assert!(is_open(&broker, second.id));
     }
 
+    /// A landed proof that spends the pass's landed budget no longer ends
+    /// the pass: the sessions after it are still judged by the abandonment
+    /// window (stale classification), while the cursor stays on the spent
+    /// session for the next pass.
+    #[test]
+    fn a_spent_landed_budget_does_not_stop_the_abandonment_judgements() {
+        let (_owner, _storage, mut broker) = fixture("");
+        shipped_class_windows(&broker);
+        // Past the landed window only: its landed proof runs out of budget.
+        let (spent, _) = session(&mut broker, "proof runs out of budget", false);
+        quiet(&mut broker, &spent, 30);
+        // Past the abandonment window: judged by its work class.
+        let (stale, _) = session(&mut broker, "stale, unpushed", false);
+        quiet(&mut broker, &stale, 400);
+        crate::auto_cleanup::LAP_LANDED_PROOF_EXHAUSTS_BUDGET.with(|flag| flag.set(true));
+        let report = broker.retire_abandoned_sessions_for_recovery(None);
+        crate::auto_cleanup::LAP_LANDED_PROOF_EXHAUSTS_BUDGET.with(|flag| flag.set(false));
+        let report = report.unwrap();
+
+        assert_eq!(report.abandonment_sessions_examined, 1, "{report:#?}");
+        assert_eq!(
+            report
+                .retirement_cursor
+                .map(|cursor| cursor.after_session_id),
+            Some(0),
+            "the cursor stays on the spent session: {report:#?}"
+        );
+        assert_eq!(closing_soon_notes(&broker, &stale), 1, "{report:#?}");
+        assert!(is_open(&broker, spent.id));
+        assert!(is_open(&broker, stale.id));
+    }
+
     fn close_session_row(broker: &mut crate::Broker, session: &crate::Session) {
         broker
             .store()

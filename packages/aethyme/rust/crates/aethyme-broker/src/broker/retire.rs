@@ -1548,22 +1548,8 @@ impl Broker {
             // cleaned: only once that session's recorded holder is gone or
             // was never bound.
             let mut holders = crate::session_holder::RecordedHolderProcessTable::default();
-            match crate::session_holder::recorded_holder_liveness(
-                self.store_ref(),
-                session.id,
-                &mut holders,
-                true,
-            )
-            .liveness
-            {
-                crate::session_holder::RecordedHolderLiveness::Unbound
-                | crate::session_holder::RecordedHolderLiveness::Gone => {}
-                crate::session_holder::RecordedHolderLiveness::Alive => {
-                    return Ok(Kept("holder_alive"));
-                }
-                crate::session_holder::RecordedHolderLiveness::Unknown => {
-                    return Ok(Kept("holder_unknown"));
-                }
+            if let Some(code) = self.closed_checkout_holder_keep(&session, &mut holders) {
+                return Ok(Kept(code));
             }
         }
         {
@@ -1848,22 +1834,8 @@ impl Broker {
         // No live holder may be bound to the session: an agent that still
         // holds it may come back to the operation.
         let mut holders = crate::session_holder::RecordedHolderProcessTable::default();
-        match crate::session_holder::recorded_holder_liveness(
-            self.store_ref(),
-            session.id,
-            &mut holders,
-            true,
-        )
-        .liveness
-        {
-            crate::session_holder::RecordedHolderLiveness::Unbound
-            | crate::session_holder::RecordedHolderLiveness::Gone => {}
-            crate::session_holder::RecordedHolderLiveness::Alive => {
-                return Ok(Kept("holder_alive"));
-            }
-            crate::session_holder::RecordedHolderLiveness::Unknown => {
-                return Ok(Kept("holder_unknown"));
-            }
+        if let Some(code) = self.closed_checkout_holder_keep(session, &mut holders) {
+            return Ok(Kept(code));
         }
         run_before_retire_claim();
         let Some(_claim) = self.try_claim_worktree_lifecycle("retire")? else {
@@ -2032,6 +2004,31 @@ impl Broker {
             );
         }
         report.trash = self.drain_checkout_trash(deadline);
+        // Reclaim-plan review snapshots pile up at the pool root unless a
+        // plan runs to sweep them (1,215 on the busiest repository): the
+        // worker sweeps the stale ones too, with the writer's bounds.
+        if let Ok(root) =
+            self.require_bound_repository_worktree_root("reclaim plan snapshot pruning")
+        {
+            let _span = crate::phase_telemetry::span("checkout_retirement_prune_reclaim_snapshots");
+            let removed = crate::reclaim::prune_review_snapshots(
+                &root,
+                std::time::SystemTime::now(),
+                Instant::now() + crate::reclaim::SNAPSHOT_PRUNE_BUDGET,
+                crate::reclaim::SNAPSHOT_PRUNE_MAX,
+                None,
+            );
+            if removed > 0 {
+                crate::phase_telemetry::add(
+                    "reclaim_snapshots_pruned_by_worker",
+                    std::time::Duration::ZERO,
+                );
+                crate::phase_telemetry::attach(
+                    "reclaim_snapshots_pruned_by_worker",
+                    serde_json::json!(removed),
+                );
+            }
+        }
         if let Ok(root) = self.recovery_archive_root() {
             let _span = crate::phase_telemetry::span("checkout_retirement_sweep_partials");
             super::retire_operation::sweep_stale_partials(&root);
@@ -4712,5 +4709,97 @@ mod tests {
         let absent: std::collections::BTreeMap<i64, i64> =
             broker.meta_json(super::super::strip::CHECKOUT_STRIP_ABSENT_KEY);
         assert!(!absent.contains_key(&gone.id), "{absent:?}");
+    }
+
+    /// A live holder (same pid and start time) keeps a closed checkout only
+    /// while it has not moved on: once the same process is bound to a newer
+    /// session after this one closed, the strip pass strips it. A process in
+    /// the checkout still keeps it.
+    #[test]
+    fn a_holder_that_moved_on_to_a_newer_session_does_not_keep_a_closed_checkout() {
+        let Some(table) = crate::session_holder::ProcessTable::snapshot() else {
+            return;
+        };
+        let Some(me) = table.process(i64::from(std::process::id())) else {
+            return;
+        };
+        let (_owner, _storage, mut broker) = fixture();
+        let (older, older_worktree) = closed_with_dependencies(&mut broker, "older task");
+        let bind = |broker: &mut crate::Broker, session_id: i64| {
+            broker
+                .store()
+                .append_event(
+                    crate::events::SESSION_HOLDER_BOUND,
+                    Some(session_id),
+                    Some(&crate::events::session_holder_bound_payload(
+                        &me, "fixture", None,
+                    )),
+                )
+                .unwrap();
+        };
+        bind(&mut broker, older.id);
+
+        let kept = strip_pass(&broker);
+        assert_eq!(kept.refused.get("holder_alive"), Some(&1), "{kept:#?}");
+        assert!(older_worktree.join("node_modules").exists());
+
+        std::thread::sleep(Duration::from_millis(20));
+        let newer = broker.start_worktree("newer task", None).unwrap();
+        bind(&mut broker, newer.id);
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+                pid: std::process::id(),
+                command: "node".into(),
+                descriptor: "cwd".into(),
+                file_type: Some("DIR".into()),
+                path: std::fs::canonicalize(&older_worktree).unwrap(),
+            }]),
+        ));
+        let in_use = strip_pass(&broker);
+        assert_eq!(
+            in_use.refused.get("process_using_checkout"),
+            Some(&1),
+            "{in_use:#?}"
+        );
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+        ));
+
+        let stripped = strip_pass(&broker);
+
+        assert_eq!(stripped.checkouts_stripped, 1, "{stripped:#?}");
+        assert!(!older_worktree.join("node_modules").exists());
+    }
+
+    /// The retirement run sweeps stale reclaim-plan review snapshots from
+    /// the pool root, as the plan writer does, and keeps fresh ones.
+    #[test]
+    fn the_retirement_run_prunes_stale_reclaim_plan_snapshots() {
+        let (_owner, _storage, mut broker) = fixture();
+        let root = broker
+            .require_bound_repository_worktree_root("test")
+            .unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let snapshot = |fill: char, age_days: u64| {
+            let path = root.join(format!(
+                ".aethyme-reclaim-plan-{}.json",
+                fill.to_string().repeat(64)
+            ));
+            std::fs::write(&path, "{}").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(age_days * 86_400))
+                .unwrap();
+            path
+        };
+        let old = snapshot('a', 8);
+        let fresh = snapshot('b', 0);
+
+        run(&mut broker);
+
+        assert!(!old.exists());
+        assert!(fresh.exists());
     }
 }

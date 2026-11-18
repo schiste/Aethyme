@@ -310,8 +310,8 @@ const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(7 * 86_400);
 /// A snapshot older than this whose one-worktree scope is gone is stale.
 const SNAPSHOT_SCOPE_GONE_AGE: Duration = Duration::from_secs(86_400);
 /// Snapshots one save removes at most, and the time it may spend.
-const SNAPSHOT_PRUNE_MAX: usize = 256;
-const SNAPSHOT_PRUNE_BUDGET: Duration = Duration::from_secs(5);
+pub(crate) const SNAPSHOT_PRUNE_MAX: usize = 256;
+pub(crate) const SNAPSHOT_PRUNE_BUDGET: Duration = Duration::from_secs(5);
 
 /// Remove review snapshots (`.aethyme-reclaim-plan-<64 hex>.json`, regular
 /// files only; never the size cache, the in-flight marker or a temporary,
