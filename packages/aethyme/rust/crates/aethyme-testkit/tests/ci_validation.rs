@@ -1290,7 +1290,7 @@ fn prepush_selection_adds_touched_modules_cheapest_first_within_the_budget() {
             String::from_utf8_lossy(&output.stderr).into_owned(),
         )
     };
-    let always = "binary_id(k::lint) | (binary_id(c) & test(/^hot(::|$)/))";
+    let always = "binary_id(k::lint) | (package(c) & test(/^hot(::|$)/))";
     // Tests slower than the data's threshold in CI run at push, never here.
     let slow = " & !((binary_id(k::lint) & test(=slow::one)))";
 
@@ -1311,6 +1311,8 @@ fn prepush_selection_adds_touched_modules_cheapest_first_within_the_budget() {
     ] {
         write(&format!("packages/aethyme/rust/crates/c/{path}"));
     }
+    // A binary-only crate has no `binary_id(aethyme-cli)` test target.
+    write("packages/aethyme/rust/crates/aethyme-cli/src/main_unix.rs");
     write("docs/guide.md");
     let (status, stdout, stderr) = select("base");
     assert_eq!(status, Some(0), "{stderr}");
@@ -1320,7 +1322,7 @@ fn prepush_selection_adds_touched_modules_cheapest_first_within_the_budget() {
     assert_eq!(
         stdout,
         format!(
-            "({always} | (binary_id(c) & test(/^newmod(::|$)/)) | binary_id(c::own) | (binary_id(c) & test(/^small(::|$)/)) | (binary_id(c::it) & test(/^suite(::|$)/))){slow}\n"
+            "({always} | (package(aethyme-cli) & test(/^main_unix(::|$)/)) | (package(c) & test(/^newmod(::|$)/)) | binary_id(c::own) | (package(c) & test(/^small(::|$)/)) | (binary_id(c::it) & test(/^suite(::|$)/))){slow}\n"
         )
     );
     assert!(
@@ -1328,14 +1330,14 @@ fn prepush_selection_adds_touched_modules_cheapest_first_within_the_budget() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("selected 8 s of a 10 s budget, 4 changed module(s)"),
+        stderr.contains("selected 8 s of a 10 s budget, 5 changed module(s)"),
         "{stderr}"
     );
 
-    // Without a merge base the always-run suites still run.
+    // Without a merge base the selector fails rather than silently omitting changed tests.
     let (status, stdout, stderr) = select("no-such-ref");
-    assert_eq!(status, Some(0));
-    assert_eq!(stdout, format!("({always}){slow}\n"));
+    assert_eq!(status, Some(2));
+    assert!(stdout.is_empty());
     assert!(stderr.contains("no merge base"), "{stderr}");
 }
 

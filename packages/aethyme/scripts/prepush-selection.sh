@@ -63,7 +63,8 @@ if merge_base="$(git -C "$root" merge-base HEAD "$base" 2>/dev/null)"; then
         } | sort -u
     )"
 else
-    echo "warning: no merge base between HEAD and $base; running only the always-run tests" >&2
+    echo "error: no merge base between HEAD and $base; fetch it before selecting tests" >&2
+    exit 2
 fi
 
 # One "binary<TAB>module" line per touched module; module "*" is a whole
@@ -100,7 +101,9 @@ out="$(jq -r --arg touched "$touched" '
       if $m == "*" then [.modules | to_entries[] | select(.key | startswith($b + " ")) | .value] | add // 0
       else .modules[$b + " " + $m] // 0 end;
     def term($b; $m):
-      if $m == "*" then "binary_id(\($b))" else "(binary_id(\($b)) & test(/^\($m)(::|$)/))" end;
+      if $m == "*" then "binary_id(\($b))"
+      elif ($b | contains("::")) then "(binary_id(\($b)) & test(/^\($m)(::|$)/))"
+      else "(package(\($b)) & test(/^\($m)(::|$)/))" end;
     . as $d
     | ([$d.always_binaries[] | {b: ., m: "*"}] + [$d.always_modules[] | {b: .binary, m: .module}]) as $always
     | ([$touched | split("\n")[] | select(length > 0) | split("\t") | {b: .[0], m: .[1]}
