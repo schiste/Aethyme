@@ -25,20 +25,19 @@
 # caught 89% of them at a mean of 10% of suite time. A fixed list alone caught
 # 44%; the changed modules alone cost 26% on average and up to the whole suite.
 #
-# A touched path maps to a test module as the test names do:
-#   crates/C/src/M.rs, crates/C/src/M/...   -> library tests of C under M::
-#   crates/C/src/bin/B.rs                   -> the whole binary C::bin/B
-#   crates/C/tests/F.rs                     -> the whole test binary C::F
-#   crates/C/tests/it/M.rs, tests/it/M/...  -> tests of C::it under M::
-# Crate roots, shared test support, manifests and non-Rust files select no
-# module of their own; the always-run suites read the repository files, and
-# the push and release tiers run everything this narrows away.
+# Cargo's workspace targets identify the current test binaries. A changed
+# source module selects the library (or the main binary for a bin-only
+# package), an explicit binary/test root selects that target, and shared
+# integration modules select the package's declared it suite if present.
+# Crate roots and shared test support are handled by the push and release
+# tiers and the always-run tests.
 #
 # Modules left out by the budget are named on stderr. The filterset goes to
 # stdout and is never empty.
 set -euo pipefail
 
-base=origin/main
+gate_base="${AETHYME_GATE_BASE_COMMIT:-}"
+base="${gate_base:-origin/main}"
 root="$(git rev-parse --show-toplevel)"
 data="$root/packages/aethyme/rust/.config/prepush-tests.json"
 while [ $# -gt 0 ]; do
@@ -55,10 +54,17 @@ command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 2; }
 [ -f "$data" ] || { echo "error: no selection data at $data" >&2; exit 2; }
 
 changed=""
-if merge_base="$(git -C "$root" merge-base HEAD "$base" 2>/dev/null)"; then
+if [ -n "$gate_base" ] && [ "$base" = "$gate_base" ]; then
+    # Submit already chose this exact comparison commit. It is also valid
+    # when the primary-checkout refresh advanced the candidate's parent.
+    merge_base="$(git -C "$root" rev-parse --verify "$base^{commit}")"
+else
+    merge_base="$(git -C "$root" merge-base HEAD "$base")" || merge_base=""
+fi
+if [ -n "$merge_base" ]; then
     changed="$(
         {
-            git -C "$root" diff --name-only "$merge_base"
+            git -C "$root" diff --no-renames --name-only "$merge_base" -- &&
             git -C "$root" ls-files --others --exclude-standard
         } | sort -u
     )"
@@ -66,49 +72,59 @@ else
     echo "warning: no merge base between HEAD and $base; running only the always-run tests" >&2
 fi
 
-# One "binary<TAB>module" line per touched module; module "*" is a whole
-# binary. A suite file under tests/ is a module of the crate's `it` binary
-# unless it is a test target of its own; the jq program below decides which.
-map_path() {
-    local rel crate rest m
-    case "$1" in
-        (packages/aethyme/rust/crates/*/*.rs) ;;
-        (*) return 0 ;;
-    esac
-    rel="${1#packages/aethyme/rust/crates/}"
-    crate="${rel%%/*}"
-    rest="${rel#*/}"
-    case "$rest" in
-        (src/bin/*) m="${rest#src/bin/}"; m="${m%%/*}"; printf '%s::bin/%s\t*\n' "$crate" "${m%.rs}" ;;
-        (src/lib.rs|src/main.rs) ;;
-        (src/*) m="${rest#src/}"; m="${m%%/*}"; printf '%s\t%s\n' "$crate" "${m%.rs}" ;;
-        (tests/*)
-            m="${rest#tests/}"; m="${m%%/*}"; m="${m%.rs}"
-            case "$m" in
-                (it|main|mod|common|support) ;;
-                (*) printf '%s::?\t%s\n' "$crate" "$m" ;;
-            esac ;;
-    esac
-}
-touched=""
-while IFS= read -r path; do
-    [ -n "$path" ] && touched+="$(map_path "$path")"$'\n'
-done <<<"$changed"
-
-out="$(jq -r --arg touched "$touched" '
+manifest="$root/packages/aethyme/rust/Cargo.toml"
+out="$(cargo metadata --locked --no-deps --format-version 1 --manifest-path "$manifest" |
+jq -r --arg root "$root/" --arg changed "$changed" --slurpfile data "$data" '
+    def tests($p):
+      [$p.targets[]
+       | select(.test and ((."required-features" // []) | length == 0))
+       | .kind[0] as $kind
+       | .src_path as $src | .name as $name
+       | if (["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"] | index($kind)) != null then
+           {b: $p.name, kind: "lib", src: $src}
+         elif $kind == "bin" then
+           {b: ($p.name + "::bin/" + $name), kind: $kind, src: $src}
+         elif $kind == "test" then
+           {b: ($p.name + "::" + $name), kind: $kind, src: $src, name: $name}
+         else empty end];
+    def source_module: split("/")[0] | rtrimstr(".rs");
+    def touched($p; $path):
+      $p.dir as $dir | ($path | ltrimstr($dir)) as $rel
+      | $p.tests as $tests
+      | [$tests[] | select(.src == $path)] as $exact
+      | if ($exact | length) > 0 then
+          $exact[] | select(.src != ($dir + "src/lib.rs") and .src != ($dir + "src/main.rs"))
+          | {b, m: "*"}
+        elif $rel | startswith("src/bin/") then
+          ($dir + "src/bin/" + ($rel | ltrimstr("src/bin/") | split("/")[0]) + "/main.rs") as $entry
+          | $tests[] | select(.kind == "bin" and .src == $entry) | {b, m: "*"}
+        elif $rel | startswith("src/") then
+          ($rel | ltrimstr("src/") | source_module) as $m
+          | ([$tests[] | select(.kind == "lib")] | first)
+            // ([$tests[] | select(.kind == "bin" and .src == ($dir + "src/main.rs"))] | first)
+          | select(. != null) | {b, m: $m}
+        elif $rel | startswith("tests/") then
+          ($rel | ltrimstr("tests/") | source_module) as $m
+          | select((["it", "main", "mod", "common", "support"] | index($m)) == null)
+          | $tests[] | select(.kind == "test" and .name == "it") | {b, m: $m}
+        else empty end;
     def cost($b; $m):
       if $m == "*" then [.modules | to_entries[] | select(.key | startswith($b + " ")) | .value] | add // 0
       else .modules[$b + " " + $m] // 0 end;
     def term($b; $m):
       if $m == "*" then "binary_id(\($b))" else "(binary_id(\($b)) & test(/^\($m)(::|$)/))" end;
-    . as $d
-    | ([$d.always_binaries[] | {b: ., m: "*"}] + [$d.always_modules[] | {b: .binary, m: .module}]) as $always
-    | ([$touched | split("\n")[] | select(length > 0) | split("\t") | {b: .[0], m: .[1]}
-         | if (.b | endswith("::?")) then
-             (.b | rtrimstr("::?")) as $c | .m as $f
-             | if ($d.modules | keys | any(startswith($c + "::" + $f + " ")))
-               then {b: ($c + "::" + $f), m: "*"} else {b: ($c + "::it"), m: $f} end
-           else . end]
+    $data[0] as $d
+    | .workspace_members as $members
+    | [.packages[] | select(.id as $id | $members | index($id))
+       | {dir: (.manifest_path | rtrimstr("Cargo.toml")), tests: tests(.)}] as $packages
+    | ([$packages[].tests[].b] | unique) as $binaries
+    | def exists: . as $b | $binaries | index($b);
+    ([$d.always_binaries[] | {b: ., m: "*"}] + [$d.always_modules[] | {b: .binary, m: .module}]) as $historical
+    | ($historical | map(select(.b | exists))) as $always
+    | (($d.slow_tests // []) | map(select(.binary | exists))) as $slow
+    | ([$changed | split("\n")[] | select(endswith(".rs")) | ($root + .) as $path
+         | $packages[] | select(.dir as $dir | $path | startswith($dir))
+         | touched(.; $path)]
        | unique
        | map(select(. as $t | $always | any(.b == $t.b and (.m == "*" or .m == $t.m)) | not))
        | map(. as $t | . + {c: ($d | cost($t.b; $t.m))})
@@ -116,14 +132,17 @@ out="$(jq -r --arg touched "$touched" '
     | ([$always[] | . as $t | $d | cost($t.b; $t.m)] | add // 0) as $base_cost
     | reduce $candidates[] as $c ({used: $base_cost, take: [], skip: []};
         if .used + $c.c <= $d.budget_seconds then .used += $c.c | .take += [$c] else .skip += [$c] end)
-    | (.skip[] | "skip\t\(.b) \(.m) (\(.c * 100 | round / 100) s)"),
+    | ([$historical[].b, ($d.slow_tests // [])[].binary] | unique[] | select(exists | not)
+       | "stale\t\(.)"),
+      (.skip[] | "skip\t\(.b) \(.m) (\(.c * 100 | round / 100) s)"),
       "used\t\(.used | round) s of a \($d.budget_seconds) s budget, \(.take | length) changed module(s)",
-      "sel\t" + "(" + ([($always + .take)[] | term(.b; .m)] | join(" | ")) + ")"
-        + (if ($d.slow_tests // []) == [] then ""
-           else " & !(" + ([$d.slow_tests[] | "(binary_id(\(.binary)) & test(=\(.test)))"] | join(" | ")) + ")" end)
-' "$data")"
+      "sel\t" + "(" + ([($always + .take)[] | term(.b; .m)] | if length > 0 then join(" | ") else "all()" end) + ")"
+        + (if $slow == [] then ""
+           else " & !(" + ([$slow[] | "(binary_id(\(.binary)) & test(=\(.test)))"] | join(" | ")) + ")" end)
+')"
 while IFS=$'\t' read -r kind text; do
     case "$kind" in
+        (stale) echo "pre-push: historical binary no longer built: $text" >&2 ;;
         (skip) echo "pre-push: over budget, left to the push tier: $text" >&2 ;;
         (used) echo "pre-push: selected $text" >&2 ;;
         (sel) printf '%s\n' "$text" ;;

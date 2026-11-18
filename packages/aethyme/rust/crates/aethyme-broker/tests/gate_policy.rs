@@ -210,6 +210,11 @@ fn fast_guards_precede_cargo_test_on_every_path_it_covers() {
             .unwrap_or_else(|| panic!("gates.toml has no {name:?} gate"))
     };
     let fast = find("fast-guards");
+    assert!(
+        !fast.cache,
+        "fast-guards selection depends on the comparison commit"
+    );
+    assert!(!fast.command.contains("aethyme/integration"));
     let full = find("cargo-test");
 
     assert!(
@@ -233,7 +238,7 @@ fn fast_guards_precede_cargo_test_on_every_path_it_covers() {
     // selected tests (`prepush-selection.sh`) when nextest is installed.
     for step in [
         "cargo fmt --all --check",
-        "packages/aethyme/scripts/prepush-selection.sh --base aethyme/integration",
+        "packages/aethyme/scripts/prepush-selection.sh",
         "cargo nextest run --locked --workspace --profile local",
         "-E \"$sel\"",
     ] {
