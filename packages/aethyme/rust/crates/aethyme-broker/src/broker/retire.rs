@@ -78,6 +78,12 @@ const RETIRE_PIN_CANDIDATES_MAX: usize = 2_000;
 pub(crate) const RETIRE_ARCHIVE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// Closed sessions read per page.
 const RETIRE_PAGE: usize = 64;
+/// Meta key: sessions whose checkout was retired through a recovery
+/// archive, with that archive (JSON: session id to its path); see
+/// `Broker::session_restorable_archive`.
+pub(crate) const ARCHIVED_SESSIONS_KEY: &str = "checkout_retirement.archived_sessions";
+/// Recorded archived sessions at most; the lowest ids go first.
+const ARCHIVED_SESSIONS_MAX: usize = 65_536;
 /// Meta key: closed or cleaned sessions last kept as superseded at their
 /// path, with the row that superseded them (JSON: session id to that id).
 pub(crate) const CHECKOUT_RETIREMENT_SUPERSEDED_KEY: &str = "checkout_retirement.superseded";
@@ -1527,6 +1533,22 @@ impl Broker {
                 .is_some_and(|age| age.as_secs() >= u64::from(days) * 86_400)
     }
 
+    /// The recovery archive recorded for `session_id` when its checkout was
+    /// retired through one, while it still exists: the session has state a
+    /// restore needs (its branch, and the archive). `None` otherwise.
+    pub(crate) fn session_restorable_archive(&self, session_id: i64) -> Option<PathBuf> {
+        let recorded: std::collections::BTreeMap<i64, String> =
+            self.meta_json(ARCHIVED_SESSIONS_KEY);
+        recorded
+            .get(&session_id)
+            .map(PathBuf::from)
+            .filter(|archive| {
+                archive
+                    .join(crate::cleanup_resolve::MANIFEST_FILE)
+                    .is_file()
+            })
+    }
+
     /// The newest recovery archive written for `session_id` (an archive
     /// directory whose name starts with the session id and holds a
     /// manifest), if any.
@@ -1576,6 +1598,23 @@ impl Broker {
             }
             _ => None,
         };
+        // Recorded with the session, so any lane can tell this session has
+        // something to restore without reading directory names.
+        if let Some(archive) = archive.as_deref() {
+            let archive = archive.to_string_lossy().into_owned();
+            crate::warn_unrecorded(
+                "record a session's recovery archive",
+                self.update_meta_json(
+                    ARCHIVED_SESSIONS_KEY,
+                    |stored: &mut std::collections::BTreeMap<i64, String>| {
+                        stored.insert(session_id, archive.clone());
+                        while stored.len() > ARCHIVED_SESSIONS_MAX {
+                            stored.pop_first();
+                        }
+                    },
+                ),
+            );
+        }
         match super::tombstone::write_checkout_tombstone(worktree, &session, archive.as_deref()) {
             Ok(()) => crate::phase_telemetry::add(
                 "checkout_retirement_tombstone_written",
@@ -2605,6 +2644,7 @@ impl Broker {
                                 "session_id": session.id,
                                 "head": restored.head,
                                 "bundle_used": restored.bundle_used,
+                                "branch_recreated": restored.branch_recreated,
                                 "staged_patch_bytes": restored.staged_patch_bytes,
                                 "unstaged_patch_bytes": restored.unstaged_patch_bytes,
                                 "untracked_files": restored.untracked_files,
@@ -5066,6 +5106,11 @@ mod tests {
         // A new session with the same task never gets the tombstone's path.
         let fresh = broker.start_worktree("restore me", None).unwrap();
         assert_ne!(PathBuf::from(&fresh.worktree_path), worktree);
+        // The session record says it has something to restore.
+        assert!(broker.session_restorable_archive(session.id).is_some());
+        // Its local branch was deleted meanwhile: the restore recreates it
+        // from the tip the archive recorded.
+        git(broker.main_root(), &["branch", "-D", &session.branch]);
         assert!(broker.recreate_retired_checkout(&worktree).unwrap());
 
         assert_eq!(git(&worktree, &["rev-parse", "HEAD"]).trim(), head);

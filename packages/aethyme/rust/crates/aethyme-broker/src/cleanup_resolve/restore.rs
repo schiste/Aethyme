@@ -19,6 +19,8 @@ use super::*;
 pub(crate) struct ArchiveRestore {
     pub head: String,
     pub bundle_used: bool,
+    /// The session branch was missing and was recreated from the archive.
+    pub branch_recreated: bool,
     pub staged_patch_bytes: u64,
     pub unstaged_patch_bytes: u64,
     pub untracked_files: usize,
@@ -171,18 +173,47 @@ pub(crate) fn restore_recovery_archive(
             main_root,
             &[os("worktree"), os("add"), target.as_os_str(), os(branch)],
         ),
-        // The branch is gone: recreate it at the archived HEAD.
-        None => git_in(
-            main_root,
-            &[
-                os("worktree"),
-                os("add"),
-                os("-b"),
-                os(branch),
-                target.as_os_str(),
-                os(&head),
-            ],
-        ),
+        // The branch is gone (a lane deleted it, or someone did): recreate
+        // it at the tip the archive recorded, when the repository has that
+        // commit, else at the archived HEAD, then check out the archived
+        // HEAD on it (detached when the recorded tip is not HEAD).
+        None => {
+            let recorded_tip = manifest
+                .branch_tip
+                .as_deref()
+                .filter(|tip| {
+                    git_in(
+                        main_root,
+                        &[os("cat-file"), os("-e"), os(&format!("{tip}^{{commit}}"))],
+                    )
+                    .is_ok()
+                })
+                .unwrap_or(head.as_str())
+                .to_string();
+            git_in(main_root, &[os("branch"), os(branch), os(&recorded_tip)])?;
+            restored.branch_recreated = true;
+            crate::phase_telemetry::add(
+                "recovery_archive_restore_branch_recreated",
+                Duration::ZERO,
+            );
+            if recorded_tip == head {
+                git_in(
+                    main_root,
+                    &[os("worktree"), os("add"), target.as_os_str(), os(branch)],
+                )
+            } else {
+                git_in(
+                    main_root,
+                    &[
+                        os("worktree"),
+                        os("add"),
+                        os("--detach"),
+                        target.as_os_str(),
+                        os(&head),
+                    ],
+                )
+            }
+        }
         // The branch moved since: the archived HEAD, detached, as the
         // archive's restore steps describe; the branch is left alone.
         Some(_) => git_in(
