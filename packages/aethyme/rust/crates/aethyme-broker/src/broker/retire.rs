@@ -4829,6 +4829,15 @@ mod tests {
         exclude_node_modules(&broker);
         let open = broker.start_worktree("idle open session", None).unwrap();
         let worktree = PathBuf::from(&open.worktree_path);
+        // A repository that declares its preparation (one command rebuilds).
+        std::fs::create_dir_all(worktree.join(".aethyme")).unwrap();
+        std::fs::write(
+            worktree.join(".aethyme/prepare.toml"),
+            "schema_version = 1\n\n[[steps]]\nname = \"deps\"\ncommand = [\"sh\", \"-c\", \"true\"]\n\
+             inputs = [\"lock.file\"]\noutputs = [\"node_modules/\"]\ncache = \"repository_shared\"\n\
+             required_for_hooks = false\n",
+        )
+        .unwrap();
         let populate = |worktree: &Path| {
             std::fs::create_dir_all(worktree.join("node_modules/dep")).unwrap();
             std::fs::write(worktree.join("node_modules/dep/index.js"), "x\n").unwrap();
@@ -4911,6 +4920,48 @@ mod tests {
                 .any(|note| note.message.contains("submit prepare")),
             "{notes:?}"
         );
+        // The loud signal: the notice agents read first, outside Git's view,
+        // and the same next action from the broker.
+        let notice = worktree.join(crate::merge::ACTION_REQUIRED_RELPATH);
+        let text = std::fs::read_to_string(&notice).unwrap();
+        assert!(text.contains("node_modules"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "aethyme broker submit prepare --session {}",
+                open.id
+            )),
+            "{text}"
+        );
+        assert!(
+            git(&worktree, &["status", "--porcelain"]).trim().is_empty(),
+            "the notice never shows in git status"
+        );
+        let blocker = broker
+            .session_action_required_blocker(open.id)
+            .unwrap()
+            .expect("the notice is a blocker");
+        assert_eq!(
+            blocker.clear,
+            format!("aethyme broker submit prepare --session {}", open.id)
+        );
+        // Prepared again (a newer preparation record): the notice clears.
+        let record = broker
+            .main_root()
+            .join(format!(".aethyme/run/preparation/session-{}.json", open.id));
+        std::fs::write(&record, "{}").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&record)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            broker
+                .session_action_required_blocker(open.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!notice.exists(), "the notice clears once prepared again");
 
         // Re-prepared while still idle, with no new activity: not again.
         populate(&worktree);

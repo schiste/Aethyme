@@ -753,9 +753,7 @@ impl Broker {
         &self,
         session_id: i64,
     ) -> Result<Option<Blocker>, BrokerOpError> {
-        Ok(Self::action_required_blocker(
-            &self.store_ref().session(session_id)?,
-        ))
+        Ok(self.action_required_blocker(&self.store_ref().session(session_id)?))
     }
 
     fn action_required_blockers(&self) -> Result<Vec<Blocker>, BrokerOpError> {
@@ -763,14 +761,42 @@ impl Broker {
             .store_ref()
             .live_sessions()?
             .iter()
-            .filter_map(Self::action_required_blocker)
+            .filter_map(|session| self.action_required_blocker(session))
             .collect())
     }
 
-    fn action_required_blocker(session: &crate::Session) -> Option<Blocker> {
+    fn action_required_blocker(&self, session: &crate::Session) -> Option<Blocker> {
         let notice = Path::new(&session.worktree_path).join(crate::merge::ACTION_REQUIRED_RELPATH);
         if session.status.is_closed() || !notice.is_file() {
             return None;
+        }
+        // The idle strip's notice: dependencies were removed, the work is
+        // untouched, and one command rebuilds them. It clears itself once
+        // the session is prepared again.
+        if crate::preparation::is_idle_strip_notice(&notice) {
+            if !crate::preparation::stripped_since_prepared(self.main_root(), session.id) {
+                crate::warn_unrecorded(
+                    "clear a satisfied idle strip notice",
+                    std::fs::remove_file(&notice),
+                );
+                return None;
+            }
+            return Some(Blocker {
+                id: format!("action:{}", session.id),
+                kind: BlockerKind::ActionRequired,
+                scope: BlockerScope::Repo,
+                cause: format!(
+                    "session {}'s regenerable dependency directories were stripped while it was \
+                     idle; its work is untouched; prepare it again before building or testing \
+                     ({})",
+                    session.id,
+                    notice.display()
+                ),
+                session_id: Some(session.id),
+                clear: crate::preparation::prepare_command(session.id),
+                safe_to_clear_automatically: false,
+                inspect: None,
+            });
         }
         Some(Blocker {
             id: format!("action:{}", session.id),

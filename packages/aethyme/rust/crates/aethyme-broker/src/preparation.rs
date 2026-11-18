@@ -1258,12 +1258,16 @@ impl Broker {
                 Some(record.digest),
                 Some(record.source_digest),
             ),
-            Some(record) => (
-                PreparationState::Current,
-                "declared dependencies match the prepared-state digest".into(),
-                Some(record.digest),
-                Some(record.source_digest),
-            ),
+            Some(record) => {
+                // Prepared again: the idle strip's notice has done its job.
+                clear_idle_strip_notice(root);
+                (
+                    PreparationState::Current,
+                    "declared dependencies match the prepared-state digest".into(),
+                    Some(record.digest),
+                    Some(record.source_digest),
+                )
+            }
         };
         let expected_digest = Some(hash_text(&source_digest));
         let current_operation = (state != PreparationState::Current)
@@ -3697,6 +3701,30 @@ fn stripped_marker_path(main_root: &Path, session_id: i64) -> PathBuf {
         .join(format!("session-{session_id}.stripped"))
 }
 
+/// The first line of the notice the idle strip leaves in a checkout.
+pub(crate) const IDLE_STRIP_NOTICE_HEADER: &str = "<!-- aethyme: idle-strip notice -->";
+
+/// The one command that prepares `session_id` again.
+pub(crate) fn prepare_command(session_id: i64) -> String {
+    format!("aethyme broker submit prepare --session {session_id}")
+}
+
+/// Whether `path` is the idle strip's notice (its first line).
+pub(crate) fn is_idle_strip_notice(path: &Path) -> bool {
+    fs::read_to_string(path).is_ok_and(|text| text.starts_with(IDLE_STRIP_NOTICE_HEADER))
+}
+
+/// Remove the idle strip's notice from `worktree` (never another notice).
+fn clear_idle_strip_notice(worktree: &Path) {
+    let notice = worktree.join(crate::merge::ACTION_REQUIRED_RELPATH);
+    if is_idle_strip_notice(&notice) {
+        crate::warn_unrecorded(
+            "clear a satisfied idle strip notice",
+            fs::remove_file(&notice),
+        );
+    }
+}
+
 /// Record that the idle strip removed `relatives` from `session_id`'s
 /// checkout: its preparation reads stale until it is prepared again.
 pub(crate) fn mark_stripped(
@@ -3714,7 +3742,7 @@ pub(crate) fn mark_stripped(
 /// Whether the idle strip removed directories after the session's last
 /// preparation record was written (a later preparation rewrites the record
 /// and so reads current again).
-fn stripped_since_prepared(main_root: &Path, session_id: i64) -> bool {
+pub(crate) fn stripped_since_prepared(main_root: &Path, session_id: i64) -> bool {
     let modified = |path: PathBuf| fs::metadata(path).and_then(|metadata| metadata.modified());
     match (
         modified(stripped_marker_path(main_root, session_id)),

@@ -67,6 +67,7 @@ pub(crate) struct IdleStripReport {
 fn idle_refused_counter(code: &str) -> &'static str {
     match code {
         "not_owned" => "checkout_idle_strip_refused_not_owned",
+        "preparation_not_configured" => "checkout_idle_strip_refused_preparation_not_configured",
         "checkout_missing" => "checkout_idle_strip_refused_checkout_missing",
         "operation_unresolved" => "checkout_idle_strip_refused_operation_unresolved",
         "operations_unknown" => "checkout_idle_strip_refused_operations_unknown",
@@ -105,6 +106,65 @@ pub(crate) fn idle_strip_note(session_id: i64, stripped: &[String], idle_hours: 
          {session_id}` before building or testing again.",
         stripped.join(", ")
     )
+}
+
+/// Leave the idle strip's notice at `.aethyme/broker-action-required.md` in
+/// `worktree`, the file agents are told to read first, unless another
+/// notice is already there (a conflict notice wins) or Git would see the
+/// file (the checkout's ignore rules must cover it: the notice never shows
+/// up in `git status`). Returns whether it was written.
+fn write_idle_strip_notice(
+    worktree: &Path,
+    session_id: i64,
+    stripped: &[String],
+    idle_hours: i64,
+) -> bool {
+    let path = worktree.join(crate::merge::ACTION_REQUIRED_RELPATH);
+    if path.exists() && !crate::preparation::is_idle_strip_notice(&path) {
+        crate::phase_telemetry::add("checkout_idle_strip_notice_skipped_other", Duration::ZERO);
+        return false;
+    }
+    let mut command = crate::git::git_command();
+    command
+        .args(["check-ignore", "-q", "--no-index", "--"])
+        .arg(crate::merge::ACTION_REQUIRED_RELPATH)
+        .current_dir(worktree);
+    let ignored = crate::bounded_output::output_limited(
+        &mut command,
+        crate::git::git_timeout(),
+        4096,
+    )
+    .is_ok_and(|output| {
+        matches!(output, crate::bounded_output::LimitedOutput::Completed(output) if output.status.success())
+    });
+    if !ignored {
+        crate::phase_telemetry::add(
+            "checkout_idle_strip_notice_skipped_not_ignored",
+            Duration::ZERO,
+        );
+        return false;
+    }
+    let body = format!(
+        "{}\n# Dependencies were removed from this checkout\n\n\
+         Session {session_id} had no activity for {idle_hours} hour(s) and no process in this \
+         checkout, so its regenerable dependency directories were moved out for deletion:\n\n{}\n\n\
+         Your work is untouched: commits, staged and unstaged changes and every other file are \
+         where you left them.\n\n\
+         Rebuild the dependencies with one command before building or testing:\n\n    {}\n\n\
+         This notice disappears once the session is prepared again.\n",
+        crate::preparation::IDLE_STRIP_NOTICE_HEADER,
+        stripped
+            .iter()
+            .map(|relative| format!("- `{relative}`"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        crate::preparation::prepare_command(session_id),
+    );
+    let written = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&path, body));
+    written.is_ok()
 }
 
 impl Broker {
@@ -193,6 +253,17 @@ impl Broker {
                         crate::preparation::mark_stripped(self.main_root(), session.id, &stripped)
                             .map_err(|error| error.to_string()),
                     );
+                    if write_idle_strip_notice(
+                        Path::new(&session.worktree_path),
+                        session.id,
+                        &stripped,
+                        idle_hours,
+                    ) {
+                        crate::phase_telemetry::add(
+                            "checkout_idle_strip_notice_written",
+                            Duration::ZERO,
+                        );
+                    }
                     let note = idle_strip_note(session.id, &stripped, idle_hours);
                     match self.store().record_automation_note(
                         crate::session_auto_close::NOTE_SENDER,
@@ -221,7 +292,7 @@ impl Broker {
                 }
                 IdleStrip::Refused(code) => {
                     note_idle_refusal(&mut report, code);
-                    if code == "not_owned" {
+                    if code == "not_owned" || code == "preparation_not_configured" {
                         newly_handled.insert(session.id, session.last_activity_at);
                     }
                     if code == "process_use_unknown" {
@@ -288,6 +359,11 @@ impl Broker {
         let Some(pool) = self.trash_pool_for(session, &worktree) else {
             return Refused("not_owned");
         };
+        // Rebuilding must be one command: only a repository that declares
+        // its preparation is stripped while a session is still open.
+        if !matches!(crate::preparation::load_config(&worktree), Ok(Some(_))) {
+            return Refused("preparation_not_configured");
+        }
         match self.session_operations_unresolved_since_boot(session.id) {
             Ok(false) => {}
             Ok(true) => return Refused("operation_unresolved"),
@@ -368,6 +444,7 @@ mod tests {
     fn every_refusal_has_its_own_counter() {
         for code in [
             "not_owned",
+            "preparation_not_configured",
             "checkout_missing",
             "operation_unresolved",
             "operations_unknown",
