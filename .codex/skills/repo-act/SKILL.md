@@ -98,6 +98,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   scopes before launching either worker. Use the same ordered integration and
   repair rules in every arm, then verify both features on the final tree. A
   scripted peer applied after publication measures conflict repair only.
+  Keep the setup coordinator from becoming the worker's session holder, and
+  verify each real worker can publish from its own sandbox before timing.
 
 - When changing a retention default, inspect fixtures that inherit the default
   as well as tests with explicit overrides. Update their age assumptions and
