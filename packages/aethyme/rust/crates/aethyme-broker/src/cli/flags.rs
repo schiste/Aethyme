@@ -571,7 +571,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
         "push",
         &["--session", "--pr", "--open-pr", "--take-over", "--plan"],
     ),
-    ("advance", &["--session", "--pr"]),
+    ("advance", &["--session", "--pr", "--take-over"]),
     ("sync", &["--session", "--take-over", "--unstack"]),
     ("repair", &["--session"]),
     ("checkpoint plan", &["--session"]),
