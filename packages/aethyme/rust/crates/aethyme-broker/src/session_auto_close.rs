@@ -678,6 +678,7 @@ mod lane_tests {
                 .set_modified(old_time)
                 .unwrap();
         }
+        crate::worktree_status_activity::age_tree_for_test(&checkout, old_time);
         broker
             .store()
             .connection()

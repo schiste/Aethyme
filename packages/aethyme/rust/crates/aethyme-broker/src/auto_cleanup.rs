@@ -14856,6 +14856,7 @@ mod tests {
                     .set_modified(old_time)
                     .unwrap();
             }
+            crate::worktree_status_activity::age_tree_for_test(&checkout, old_time);
             broker.store().connection().execute("UPDATE sessions SET created_at = ?1, updated_at = ?1, last_activity_at = ?1 WHERE id = ?2", rusqlite::params![old_ms, session.id]).unwrap();
             let summary = broker.retire_abandoned_sessions(None).unwrap();
             assert_eq!(summary.retired, usize::from(!dirty && !disabled));
@@ -14969,6 +14970,7 @@ mod tests {
                 .set_modified(old_time)
                 .unwrap();
         }
+        crate::worktree_status_activity::age_tree_for_test(&checkout, old_time);
         broker
             .store()
             .connection()

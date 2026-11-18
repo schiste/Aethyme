@@ -134,6 +134,35 @@ pub(crate) fn recent_status_activity(worktree: &Path, since: SystemTime) -> Opti
     }
 }
 
+/// Date every file and directory under `dir` (not `.git`) to `then`, so a
+/// fixture's changed files read as old as its Git metadata.
+#[cfg(test)]
+pub(crate) fn age_tree_for_test(dir: &Path, then: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            age_tree_for_test(&path, then);
+        }
+        if !kind.is_symlink()
+            && let Ok(file) = std::fs::File::open(&path)
+        {
+            crate::warn_unrecorded("age a fixture file", file.set_modified(then));
+        }
+    }
+    if let Ok(file) = std::fs::File::open(dir) {
+        crate::warn_unrecorded("age a fixture directory", file.set_modified(then));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
