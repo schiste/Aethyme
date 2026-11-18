@@ -242,6 +242,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   child process's `GIT_TRACE2_EVENT`, not repository-local `trace2.eventTarget`,
   which Git ignores. Require nonempty start events and a positive control that
   captures the exact Git command shape the regression intends to forbid.
+  Record whether `refs/remotes/origin/HEAD` exists and whether the Git binary
+  validation cache is warm. Coordinated pushes use a private Trace2 sink. On a
+  disposable local remote, add `GIT_TRACE` and confirm it captures the actual
+  `git push` before treating the external trace as a complete call inventory.
 - If host pressure delays local benchmark builds, reuse the repository's
   hosted test archives for both exact revisions. Verify the same platform
   and build profile, then extract and hash each router and engine pair in
