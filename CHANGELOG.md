@@ -4,6 +4,35 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.127] - 2026-11-18
+
+### Added
+
+- Stacked sessions. `broker start --stack-on <session>` starts a session on top of another session's branch; its pull request is based on the parent's branch and says "Stacked on #N". When the parent's pull request merges, the child is retargeted to the nearest unmerged ancestor, only from the base the broker expected, and a failed lookup aborts the retarget. `broker sync --unstack` detaches a child. Schema 66 adds `session_stacks` (#1796).
+- Merged remote session branches can be deleted: `[remote_branches] delete_merged = true`. Off by default. A branch is deleted only when its pull request is merged, no open pull request is based on it, no session still uses it, and the remote tip is still the merged head; each fact is read again before each delete, which is a `--force-with-lease` push pinned to that head. At most 25 per run. `gc remote-branches plan` lists what a run would delete without deleting (#1796).
+- Idle open sessions lose their regenerable dependency directories after `[cleanup] idle_strip_after_hours` (default 4). Only directories that a declared preparation step output names exactly are removed; anything else is kept and counted `not_declared_output`. The session gets a notice in `.aethyme/broker-action-required.md` (never overwriting another notice, never written to a tracked path), a session-scoped blocker, and advice `idle_strip_prepare`; `aethyme broker submit prepare --session <id>` rebuilds what was removed. A session is not idle while a process uses its checkout (observed again when the observation is older than 5 s), while files Git reports as changed or untracked were modified inside the window, or while its checkout lock is held; when that check cannot complete the session is kept as `activity_unknown` (#1790, #1794).
+- Idle sessions are archived, then removed. A session with no activity for 24 hours (4 hours when its work already landed) has its commits, patches, untracked files and protected ignored files archived with a SHA-256 manifest, and its checkout replaced by a small tombstone directory holding `ARCHIVED-SESSION.txt`. `aethyme broker start --reuse '<path>'` restores it: the checkout is rebuilt at a staging path and moved into place only when complete, a restore onto a branch that moved is reported, and the session gets the same rebuild notice as an idle strip. A closing-soon notice is raised 4 hours before. `--json` refusals of a closed session that left a tombstone carry `error.action` (#1794).
+- Recovery archives live next to the checkout pool, in `<pool>/.aethyme-recovery-archives/<repository key>`; existing archives in host state are still read and never migrated. `[cleanup] recovery_archive_bound_gib` (default 20) removes the oldest archives whose content is fully landed; an archive holding unlanded work, an older-format archive, and one with a keep marker are never removed for size. Unlanded archives are kept past their retention age and named in advice until `storage keep-archive --dismiss` or `[budget] expire_unlanded_archives`. `storage status` gains `recovery_archives_by_location` (#1794).
+- `push` and `sync` print one `Next:` line with the prepare command while a session's dependencies are missing after an idle strip or a restore; `--json` carries `preparation_next_action` (#1794).
+- Blocker scope `session`: other sessions' hooks do not count it (#1790).
+
+### Upgrade notes
+
+- Consumers of `broker blockers --json` that match the scope exhaustively must accept `session`.
+- Remote branch deletion stays off until `[remote_branches] delete_merged = true` is set. Run `gc remote-branches plan` first.
+- An agent returning to a session idle for more than 24 hours finds a tombstone directory in place of its checkout; `aethyme broker start --reuse '<path>'` restores it. Restore does not bring back file modes beyond the executable bit, timestamps, links or extended attributes.
+- A pool root whose repository was moved or renamed is not removed while it holds a recovery archive not proven landed.
+- An agent returning to a session idle for more than 4 hours finds its dependencies gone and a blocker naming the one command that rebuilds them. Set `[cleanup] idle_strip_after_hours` to change the window.
+
+### Known issues
+
+- The remote-branch cleanup lock is taken for 20 minutes and not renewed; a run is a single pass well inside that.
+- `submit`, auto-close and the landed check do not yet treat a stacked child as depending on its parent.
+- Archives holding unlanded work have no total size limit; they are kept and named in advice.
+- Catalogued regenerable directories (Python environments, build output, test caches) are not archived and are not restored; the rebuild command recreates them.
+- A repository that sets `session_abandoned_after_hours` itself keeps its own window.
+- `[cleanup]` settings are read from the primary checkout's working copy. On a repository whose primary checkout is held behind its default branch, a setting merged on the default branch is not in effect.
+
 ## [0.8.126] - 2026-11-18
 
 ### Added
