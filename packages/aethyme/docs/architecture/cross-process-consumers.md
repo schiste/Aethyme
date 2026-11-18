@@ -3452,3 +3452,28 @@ a retirement run when the session has a scratch directory. Counters
 `session_scratch_move`, `session_scratch_retire_pass`,
 `session_scratch_measure`; attachments `session_scratch_retire` and
 `session_scratch_usage`; start phase `session_scratch`.
+
+**Session stacks and remote session-branch cleanup (schema v66).** All fields
+below are additive and absent when they do not apply. `broker start --stack-on
+<id> --json` adds `stack` (`session_id`, `parent_session_id`, `parent_branch`,
+`parent_tip`, `base_branch`, `parent_state` = `open|merged|closed|abandoned`,
+`last_parent_tip`, `parent_pr_number`, `parent_merged_head`,
+`parent_merge_commit`, `retargeted_at`, `created_at`, `updated_at`,
+`parent_pushed`). `broker sync --json` adds `stack_note`. The session view of
+`broker status --json` adds `stack` (`parent`, `children`, `pull_request`,
+`base_branch`, `retargeted_at`, `data: "recorded"`, and at most one
+`next_action`); the compact repository view adds `session_stacks` (`count`,
+`needs_attention`, `parents`, `records`) and `remote_branch_cleanup`
+(`enabled`, `backlog`, `next_action`). `broker gc remote-branches plan --json`
+and the `remote_branch_cleanup` field of `gc sweep --json` use schema
+`aethyme.remote-branch-cleanup/v1`: `enabled`, `applied`, `repository`,
+`backlog`, `scan_per_run`, `max_deletions_per_run`, `items` (`session_id`,
+`branch`, `outcome` = `deleted|absent|kept|failed|would_delete|deferred`,
+`reason`, `detail`, `pr_number`, `expected_oid`, `retargets`), `outcomes`,
+`kept_by_reason`, `totals` (`deleted`, `absent`, `kept_by_reason`, `failed`,
+`retargets`, `retargets_skipped`, `failures`), `skipped`, `stopped`,
+`next_action`. A retarget's `outcome` is `retargeted`, `already_targeted`,
+`skipped_moved (now based on <branch>)`, `not_attempted`, `failed` or
+`planned`. `gc sweep --json` also adds `session_stack_failures` when a stacked session's parent
+could not be re-read. Stack notes come from sender
+`automation:session-stack`.
