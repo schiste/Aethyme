@@ -2402,6 +2402,9 @@ fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageErr
     // Hold the singleton briefly before reading the backlog: `finish` calls
     // arriving in a burst find this worker alive and are served by this run.
     std::thread::sleep(crate::gc::ARTIFACT_WORKER_COALESCE_WINDOW);
+    // Where this run reads `[cleanup]` from, resolved once before anything
+    // reads it (the pacing below included) and visible to every thread.
+    let _cleanup_config = crate::cleanup_config::RunScope::enter(&repository_root);
     // Every unlink this process makes is unattended: pace it.
     let _pacing = crate::gc::install_unattended_deletion_pacing(&repository_root, priority);
     let mut broker = Broker::open(&repository_root)?;

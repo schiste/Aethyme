@@ -5593,6 +5593,17 @@ impl GitRepo {
         Ok(ids)
     }
 
+    /// The blob id of `file`'s exact bytes (`hash-object --no-filters`): no
+    /// filter or line-ending rule applied, so it equals a committed blob id
+    /// only when the file is byte-identical to that blob.
+    pub(crate) fn hash_file_bytes(&self, file: &Path) -> Result<String, GitError> {
+        let file_arg = file.to_string_lossy().into_owned();
+        run_git(
+            &self.root,
+            &["hash-object", "--no-filters", "--", &file_arg],
+        )
+    }
+
     /// The blob id `file` would get if it were the working file at the
     /// repository-relative `path` (that path's filters and line-ending rules
     /// applied), for checking a copy against a blob proven at `path`.

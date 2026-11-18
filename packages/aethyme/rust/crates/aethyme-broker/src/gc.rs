@@ -9103,6 +9103,8 @@ impl Broker {
         &mut self,
         release_worker_lock: impl FnOnce(),
     ) -> Result<(), BrokerOpError> {
+        // For `broker status`: which `[cleanup]` source this run resolved.
+        crate::cleanup_config::record_active(self.store_ref(), self.main_root());
         let result = self.run_artifact_sweep_recovery_worker_lanes();
         release_worker_lock();
         self.run_preparation_cache_measurement_worker_lane();

@@ -602,9 +602,8 @@ pub(crate) fn parse_abandoned_operation_after_hours(
 /// cleanup policy loader reports it).
 pub(crate) fn abandoned_operation_after_ms(main_root: &Path) -> i64 {
     let hours = (|| -> Result<i64, String> {
-        let Some((path, text)) =
-            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-                .map_err(|error| error.to_string())?
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
         else {
             return parse_abandoned_operation_after_hours(None);
         };
@@ -647,9 +646,8 @@ pub(crate) fn parse_recovery_archive_bound_gib(value: Option<&toml::Value>) -> R
 /// (the cleanup policy loader reports it).
 pub(crate) fn recovery_archive_bound_bytes(main_root: &Path) -> u64 {
     let gib = (|| -> Result<i64, String> {
-        let Some((path, text)) =
-            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-                .map_err(|error| error.to_string())?
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
         else {
             return parse_recovery_archive_bound_gib(None);
         };
@@ -691,9 +689,8 @@ pub(crate) fn parse_idle_strip_after_hours(value: Option<&toml::Value>) -> Resul
 /// when the setting is known.
 pub(crate) fn idle_strip_after_ms(main_root: &Path) -> i64 {
     let hours = (|| -> Result<i64, String> {
-        let Some((path, text)) =
-            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-                .map_err(|error| error.to_string())?
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
         else {
             return parse_idle_strip_after_hours(None);
         };
@@ -768,9 +765,8 @@ pub(crate) fn parse_venv_markers(value: Option<&toml::Value>) -> Result<Vec<Stri
 /// reports it), so the strip keeps such environments.
 pub(crate) fn venv_markers(main_root: &Path) -> Vec<String> {
     (|| -> Result<Vec<String>, String> {
-        let Some((path, text)) =
-            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-                .map_err(|error| error.to_string())?
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
         else {
             return Ok(Vec::new());
         };
@@ -821,15 +817,24 @@ impl AutoCleanupPolicy {
     /// Read `[cleanup]`. A missing file or table is the default policy; an
     /// unreadable one is an error, which the sweep turns into "removal off"
     /// rather than guessing what the operator meant.
+    ///
+    /// The detached worker reads it from the default branch when its run
+    /// resolved so (the `cleanup_config` module); everything else reads the
+    /// primary checkout's working copy.
     pub fn load(main_root: &Path) -> Result<Self, String> {
         // `.aethyme/config.toml`, `.yaml` or `.yml` (#1223), as TOML text.
-        let Some((path, text)) =
-            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-                .map_err(|error| error.to_string())?
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
         else {
             return Ok(Self::default());
         };
-        let root: toml::Value = toml::from_str(&text)
+        Self::from_config_toml(&path, &text)
+    }
+
+    /// `[cleanup]` of one config text (TOML), validated as [`Self::load`]
+    /// does; `path` names where the text came from in messages.
+    pub(crate) fn from_config_toml(path: &Path, text: &str) -> Result<Self, String> {
+        let root: toml::Value = toml::from_str(text)
             .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
         let Some(table) = root.get("cleanup") else {
             return Ok(Self::default());

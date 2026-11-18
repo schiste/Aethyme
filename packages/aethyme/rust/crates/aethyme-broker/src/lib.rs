@@ -38,6 +38,7 @@ mod chau7_tabs;
 mod checkout_trash;
 mod cleanup_audit;
 mod cleanup_batch;
+mod cleanup_config;
 mod cleanup_resolve;
 mod clock;
 mod phase_telemetry;
