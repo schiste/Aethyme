@@ -21,33 +21,98 @@
 //! An archive carrying its owner's keep marker (`storage keep-archive`,
 //! `<archive>.aethyme-keep` beside it) is never removed by this pass.
 //!
+//! Pacing: listing and sizing read only directory entries, manifests and
+//! session records, within one budget; landing checks, removal proofs and
+//! removals have a budget of their own. What a pass could not finish is
+//! carried to the next in a per-repository state file beside the usage
+//! record: measured sizes, a listing cursor, size walks to retry, and
+//! archives whose removal proof ran out of budget or failed, which later
+//! passes rotate past until their retry is due. Only the archive about to
+//! be removed is fully proven, under the lifecycle claim.
+//!
 //! What it measured is recorded per repository in the storage ledger
 //! (`storage-ledger-recovery-archives/<sha256 of the repository root>.json`),
 //! with bytes and counts by location, and shown by `aethyme storage status`.
 
 use super::*;
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::storage_ledger::RecoveryArchiveUsage as ArchiveBoundUsage;
+use crate::storage_ledger::{ArchiveBoundState, MeasuredArchiveSize};
 
-/// The longest one bound pass may take.
+/// The longest listing and sizing may take in one pass.
 const ARCHIVE_BOUND_BUDGET: Duration = Duration::from_secs(20);
+/// The longest landing checks, removal proofs and removals may take in one
+/// pass, on top of listing and sizing: a pass whose sizing used its whole
+/// budget still removes what it can.
+const ARCHIVE_EVICTION_BUDGET: Duration = Duration::from_secs(60);
+/// The removal of one proven archive may outlast the eviction budget by
+/// this much: a removal stopped half way leaves an archive that no longer
+/// proves and can then only be removed by hand.
+const ARCHIVE_REMOVAL_GRACE: Duration = Duration::from_secs(30);
+/// How long an archive whose removal proof ran out of budget (or failed)
+/// is passed over before it is retried, first and with a fresh budget.
+const PROOF_RETRY_AFTER_MS: i64 = 60 * 60 * 1_000;
 /// Sessions named one by one in the advice, at most.
 const UNIQUE_SESSIONS_NAMED: usize = 20;
+
+#[cfg(test)]
+thread_local! {
+    /// Test hooks: a clock offset for the pass, a bound replacing the
+    /// configured one, and how many of the next removal proofs start
+    /// already out of budget.
+    pub(super) static CLOCK_SKEW_MS_FOR_TEST: std::cell::Cell<i64> =
+        const { std::cell::Cell::new(0) };
+    pub(super) static BOUND_BYTES_FOR_TEST: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    pub(super) static EXPIRED_PROOFS_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+fn pass_now_ms() -> i64 {
+    crate::clock::epoch_ms().saturating_add(clock_skew_ms())
+}
+
+#[cfg(test)]
+fn clock_skew_ms() -> i64 {
+    CLOCK_SKEW_MS_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn clock_skew_ms() -> i64 {
+    0
+}
 
 /// What one bound pass did, for phase telemetry.
 #[derive(Debug, Default)]
 struct PassStats {
     /// Archives classified from metadata.
     listed: usize,
-    /// Archives the listing did not reach before the deadline.
+    /// Archives the listing did not reach before the deadline (the next
+    /// listing resumes after the last one reached).
     skipped_by_budget: usize,
-    /// Sizes taken from earlier passes, walked now, or left for later.
+    /// Archives not listed this pass but counted from an earlier size.
+    counted_from_earlier_size: usize,
+    /// Sizes taken from earlier passes, walked now, stopped by the budget
+    /// (retried next run), or failed (never recorded).
     size_cached: usize,
     size_measured: usize,
     size_skipped_by_budget: usize,
-    /// Phases (listing, sizing) stopped by the deadline.
+    size_failed: usize,
+    /// Git landing checks run, and archives left unjudged by the budget.
+    landing_checks: usize,
+    landing_unjudged: usize,
+    /// Full removal proofs started, their outcome, and the archives
+    /// passed over because an earlier proof of theirs ran out of budget
+    /// or failed and their retry is not due yet.
+    proofs: usize,
+    evicted: usize,
+    proof_timeouts: usize,
+    proof_failures: usize,
+    proof_deferred_skipped: usize,
+    proof_retries: usize,
+    proof_ms: u64,
+    /// Phases (listing, sizing, eviction) stopped by their deadline.
     budget_stops: usize,
 }
 
@@ -61,9 +126,20 @@ impl PassStats {
             serde_json::json!({
                 "listed": self.listed,
                 "listing_skipped_by_budget": self.skipped_by_budget,
+                "counted_from_earlier_size": self.counted_from_earlier_size,
                 "size_cached": self.size_cached,
                 "size_measured": self.size_measured,
                 "size_skipped_by_budget": self.size_skipped_by_budget,
+                "size_failed": self.size_failed,
+                "landing_checks": self.landing_checks,
+                "landing_unjudged": self.landing_unjudged,
+                "proofs": self.proofs,
+                "evicted": self.evicted,
+                "proof_timeouts": self.proof_timeouts,
+                "proof_failures": self.proof_failures,
+                "proof_deferred_skipped": self.proof_deferred_skipped,
+                "proof_retries": self.proof_retries,
+                "proof_ms": self.proof_ms,
                 "budget_stops": self.budget_stops,
             }),
         );
@@ -73,9 +149,31 @@ impl PassStats {
 struct Measured {
     archive: crate::cleanup_resolve::OwnedRecoveryArchive,
     bytes: u64,
-    evictable: bool,
-    /// Fully landed and older than `recovery_archive_days`.
-    expired: bool,
+    /// Old enough, not kept and holding no uncommitted change: removable
+    /// once its commits are shown landed.
+    candidate: bool,
+    /// On the pool's volume and older than `recovery_archive_days`.
+    aged_out: bool,
+    /// The Git landing verdict, once judged (judged at most once a pass).
+    landed: Option<bool>,
+}
+
+/// How a size walk ended.
+enum SizeWalk {
+    Measured(u64),
+    OutOfBudget,
+    Failed,
+}
+
+fn walk_size(path: &Path, deadline: Instant) -> SizeWalk {
+    if Instant::now() >= deadline {
+        return SizeWalk::OutOfBudget;
+    }
+    match crate::disk_headroom::directory_usage_bounded(path, deadline) {
+        Some(usage) => SizeWalk::Measured(usage.bytes),
+        None if Instant::now() >= deadline => SizeWalk::OutOfBudget,
+        None => SizeWalk::Failed,
+    }
 }
 
 impl Broker {
@@ -84,18 +182,38 @@ impl Broker {
     /// documentation). Never removes an archive holding unique work.
     pub(crate) fn enforce_recovery_archive_bound(&self, deadline: Instant) -> ArchiveBoundUsage {
         let _span = crate::phase_telemetry::span("recovery_archive_bound_pass");
-        let deadline = deadline.min(Instant::now() + ARCHIVE_BOUND_BUDGET);
+        let scan_deadline = deadline.min(Instant::now() + ARCHIVE_BOUND_BUDGET);
+        let bound_bytes = crate::auto_cleanup::recovery_archive_bound_bytes(self.main_root());
+        #[cfg(test)]
+        let bound_bytes = BOUND_BYTES_FOR_TEST
+            .with(std::cell::Cell::get)
+            .unwrap_or(bound_bytes);
         let mut usage = ArchiveBoundUsage {
-            bound_bytes: crate::auto_cleanup::recovery_archive_bound_bytes(self.main_root()),
+            bound_bytes,
             observed_at_ms: crate::clock::epoch_ms(),
             ..ArchiveBoundUsage::default()
         };
+        // What earlier passes left: sizes, deferred walks and proofs, and
+        // where an interrupted listing stopped.
+        let host_state = self
+            .storage_context()
+            .host_state_dir
+            .clone()
+            .or_else(|| crate::host_state::resolve_host_state_dir().map(|(path, _)| path));
+        let repository = self.main_root().to_string_lossy().into_owned();
+        let previous = host_state
+            .as_deref()
+            .map(|host| crate::storage_ledger::archive_bound_state(host, &repository))
+            .unwrap_or_default();
         // Listing and classifying read only directory entries, manifests
         // and session records: no archive content is read or hashed here.
         // The one archive about to be removed is fully proven, under the
         // lifecycle claim, in `evict_landed_archive`.
         let listing_span = crate::phase_telemetry::span("recovery_archive_bound_listing");
-        let scan = match self.recovery_archive_listing(deadline) {
+        let scan = match self.recovery_archive_listing(
+            scan_deadline,
+            previous.listing_cursor.as_deref().map(Path::new),
+        ) {
             Ok(scan) => scan,
             Err(error) => {
                 usage.partial = true;
@@ -108,6 +226,17 @@ impl Broker {
             listed: scan.owned.len() + scan.unowned.len(),
             skipped_by_budget: scan.skipped_by_budget,
             ..PassStats::default()
+        };
+        let mut state = ArchiveBoundState {
+            listing_cursor: if scan.not_listed.is_empty() {
+                None
+            } else {
+                scan.last_listed
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .or_else(|| previous.listing_cursor.clone())
+            },
+            ..ArchiveBoundState::default()
         };
         if scan.skipped_by_budget > 0 {
             usage.partial = true;
@@ -123,56 +252,108 @@ impl Broker {
                 .as_ref()
                 .is_some_and(|root| path.starts_with(root))
         };
-        // Sizes measured by earlier passes (a complete archive never
-        // changes); only archives missing there are walked, in name order,
-        // within the budget. The persisted sizes are the cursor: what this
-        // pass leaves unmeasured, the next one measures first.
-        let host_state = self
-            .storage_context()
-            .host_state_dir
-            .clone()
-            .or_else(|| crate::host_state::resolve_host_state_dir().map(|(path, _)| path));
-        let repository = self.main_root().to_string_lossy().into_owned();
-        let cached = host_state
-            .as_deref()
-            .map(|host| crate::storage_ledger::recovery_archive_sizes(host, &repository))
-            .unwrap_or_default();
-        let mut sizes = BTreeMap::new();
-        let mut measure = |path: &Path, created_at_ms: i64, stats: &mut PassStats| {
-            let key = path.to_string_lossy().into_owned();
-            if let Some(known) = cached
-                .get(&key)
-                .filter(|known| known.created_at_ms == created_at_ms)
+        let key = |path: &Path| path.to_string_lossy().into_owned();
+
+        // Sizing. A complete archive the broker owns never changes, so its
+        // size, once walked, is kept (by path and creation time). Archives
+        // not walked before are walked in listing order, the ones whose
+        // walk ran out of budget last time after the others; a walk stopped
+        // by the budget is retried next run, a failed one is not recorded.
+        let sizing_span = crate::phase_telemetry::span("recovery_archive_bound_sizing");
+        let mut owned = scan.owned;
+        owned.sort_by_key(|archive| {
+            previous
+                .size_deferred_at_ms
+                .get(&key(&archive.path))
+                .copied()
+                .unwrap_or(i64::MIN)
+        });
+        let mut sized = Vec::new();
+        for archive in owned {
+            let path_key = key(&archive.path);
+            if let Some(known) = previous
+                .sizes
+                .get(&path_key)
+                .filter(|known| known.created_at_ms == archive.created_at_ms)
             {
                 stats.size_cached += 1;
-                sizes.insert(key, *known);
-                return Some(known.bytes);
+                state.sizes.insert(path_key, *known);
+                sized.push((archive, known.bytes));
+                continue;
             }
-            if Instant::now() >= deadline {
-                stats.size_skipped_by_budget += 1;
-                return None;
+            match walk_size(&archive.path, scan_deadline) {
+                SizeWalk::Measured(bytes) => {
+                    stats.size_measured += 1;
+                    state.sizes.insert(
+                        path_key,
+                        MeasuredArchiveSize {
+                            created_at_ms: archive.created_at_ms,
+                            bytes,
+                        },
+                    );
+                    sized.push((archive, bytes));
+                }
+                SizeWalk::OutOfBudget => {
+                    stats.size_skipped_by_budget += 1;
+                    usage.partial = true;
+                    state.size_deferred_at_ms.insert(path_key, pass_now_ms());
+                }
+                SizeWalk::Failed => {
+                    stats.size_failed += 1;
+                    usage.partial = true;
+                }
             }
-            let bytes =
-                super::status_helpers::directory_size_without_following_links(path).unwrap_or(0);
-            stats.size_measured += 1;
-            sizes.insert(
-                key,
-                crate::storage_ledger::MeasuredArchiveSize {
-                    created_at_ms,
-                    bytes,
-                },
-            );
-            Some(bytes)
-        };
-        let now = crate::clock::epoch_ms();
+        }
+        // Archives the broker cannot vouch for count, are never removed,
+        // and are walked afresh each pass (their content may change).
+        for (path, _) in &scan.unowned {
+            match walk_size(path, scan_deadline) {
+                SizeWalk::Measured(bytes) => {
+                    stats.size_measured += 1;
+                    let location = if in_pool(path) {
+                        &mut usage.pool
+                    } else {
+                        &mut usage.host_state
+                    };
+                    location.archives += 1;
+                    location.bytes = location.bytes.saturating_add(bytes);
+                }
+                SizeWalk::OutOfBudget => {
+                    stats.size_skipped_by_budget += 1;
+                    usage.partial = true;
+                }
+                SizeWalk::Failed => {
+                    stats.size_failed += 1;
+                    usage.partial = true;
+                }
+            }
+        }
+        // Archives this listing did not reach count with the size an
+        // earlier pass measured, so a long listing does not hide them from
+        // the total; they are not candidates this pass.
+        for path in &scan.not_listed {
+            if let Some(known) = previous.sizes.get(&key(path)) {
+                stats.counted_from_earlier_size += 1;
+                state.sizes.insert(key(path), *known);
+                let location = if in_pool(path) {
+                    &mut usage.pool
+                } else {
+                    &mut usage.host_state
+                };
+                location.archives += 1;
+                location.bytes = location.bytes.saturating_add(known.bytes);
+            }
+        }
+        if stats.size_skipped_by_budget > 0 {
+            stats.budget_stops += 1;
+        }
+        drop(sizing_span);
+
+        let now = pass_now_ms();
         let retention_days = crate::retention::load_retention_policy(self.main_root())
             .map_or(90, |policy| policy.recovery_archive_days);
         let mut measured = Vec::new();
-        for archive in scan.owned {
-            let Some(bytes) = measure(&archive.path, archive.created_at_ms, &mut stats) else {
-                usage.partial = true;
-                continue;
-            };
+        for (archive, bytes) in sized {
             let location = if in_pool(&archive.path) {
                 &mut usage.pool
             } else {
@@ -193,97 +374,115 @@ impl Broker {
             if kept {
                 crate::phase_telemetry::add("recovery_archive_bound_kept_by_owner", Duration::ZERO);
             }
-            // Past the deadline nothing new is judged evictable: the landing
-            // check runs Git, and nothing will be removed this pass anyway.
-            let evictable = !kept
-                && old_enough
-                && Instant::now() < deadline
-                && self.recovery_archive_landed(&archive);
+            // Uncommitted content (and older formats that do not say what
+            // they hold) is never landed: no Git check needed to refuse it.
+            let candidate = !kept && old_enough && !archive.holds_uncommitted;
             // Host state archives keep expiring through the storage worker
             // (with its notice week); pool ones are this lane's.
-            let expired = evictable
-                && in_pool(&archive.path)
+            let aged_out = in_pool(&archive.path)
                 && retention_days > 0
                 && now.saturating_sub(archive.created_at_ms)
                     >= i64::from(retention_days).saturating_mul(86_400_000);
+            let landed = archive_never_lands(&archive).then_some(false);
             measured.push(Measured {
                 archive,
                 bytes,
-                evictable,
-                expired,
+                candidate,
+                aged_out,
+                landed,
             });
         }
-        // Archives the broker cannot vouch for count, and are never removed.
-        for (path, _) in &scan.unowned {
-            let Some(bytes) = measure(path, 0, &mut stats) else {
-                usage.partial = true;
-                continue;
-            };
-            let location = if in_pool(path) {
-                &mut usage.pool
-            } else {
-                &mut usage.host_state
-            };
-            location.archives += 1;
-            location.bytes = location.bytes.saturating_add(bytes);
-        }
-        // Keep what earlier passes measured for archives this pass did not
-        // reach, while they are still there.
-        for (key, known) in cached {
-            if !sizes.contains_key(&key) && std::fs::symlink_metadata(&key).is_ok() {
-                sizes.insert(key, known);
-            }
-        }
-        if let Some(host) = host_state.as_deref() {
-            crate::warn_unrecorded(
-                "record measured recovery archive sizes",
-                crate::storage_ledger::record_recovery_archive_sizes(host, &repository, &sizes),
-            );
-        }
-        if stats.size_skipped_by_budget > 0 {
-            stats.budget_stops += 1;
-        }
-        stats.record();
         let mut total = usage.pool.bytes.saturating_add(usage.host_state.bytes);
-        // Fully landed and past their retention age: removed as before.
-        for entry in measured.iter().filter(|entry| entry.expired) {
-            if Instant::now() >= deadline {
-                break;
-            }
-            if self.evict_landed_archive(&entry.archive, deadline).is_ok() {
-                total = total.saturating_sub(entry.bytes);
-                usage.evicted += 1;
-                usage.evicted_bytes = usage.evicted_bytes.saturating_add(entry.bytes);
-                let location = if in_pool(&entry.archive.path) {
-                    &mut usage.pool
-                } else {
-                    &mut usage.host_state
-                };
-                location.archives = location.archives.saturating_sub(1);
-                location.bytes = location.bytes.saturating_sub(entry.bytes);
-                crate::phase_telemetry::add("recovery_archive_bound_expired", Duration::ZERO);
-            }
-        }
-        measured.retain(|entry| std::fs::symlink_metadata(&entry.archive.path).is_ok());
-        if usage.bound_bytes == 0 || total <= usage.bound_bytes {
-            crate::phase_telemetry::add("recovery_archive_bound_within", Duration::ZERO);
-            return usage;
-        }
+
+        // Eviction, with its own budget: oldest first, an archive whose
+        // last proof ran out of budget or failed is passed over until its
+        // retry is due, then tried first with the whole budget.
+        let evict_span = crate::phase_telemetry::span("recovery_archive_bound_eviction");
+        let evict_deadline = deadline.min(Instant::now() + ARCHIVE_EVICTION_BUDGET);
         measured.sort_by_key(|entry| (entry.archive.created_at_ms, entry.archive.session_id));
-        let order = plan_evictions(
+        let order = eviction_order(
             &measured
                 .iter()
-                .map(|entry| (entry.bytes, entry.evictable))
+                .map(|entry| {
+                    (
+                        entry.candidate,
+                        previous
+                            .proof_deferred_at_ms
+                            .get(&key(&entry.archive.path))
+                            .map(|at| (now.saturating_sub(*at) >= PROOF_RETRY_AFTER_MS, *at)),
+                    )
+                })
                 .collect::<Vec<_>>(),
-            total,
-            usage.bound_bytes,
         );
-        for entry in order.into_iter().map(|index| &measured[index]) {
-            if total <= usage.bound_bytes || Instant::now() >= deadline {
+        for entry in &measured {
+            let path_key = key(&entry.archive.path);
+            if let Some(at) = previous.proof_deferred_at_ms.get(&path_key) {
+                // Carried over until retried (or the archive is gone).
+                state.proof_deferred_at_ms.insert(path_key, *at);
+            }
+        }
+        stats.proof_deferred_skipped = measured
+            .iter()
+            .enumerate()
+            .filter(|(index, entry)| {
+                entry.candidate
+                    && !order.contains(index)
+                    && previous
+                        .proof_deferred_at_ms
+                        .contains_key(&key(&entry.archive.path))
+            })
+            .count();
+        let mut removed = vec![false; measured.len()];
+        for index in order {
+            if Instant::now() >= evict_deadline {
+                stats.budget_stops += 1;
                 break;
             }
-            match self.evict_landed_archive(&entry.archive, deadline) {
+            let needed =
+                measured[index].aged_out || (usage.bound_bytes > 0 && total > usage.bound_bytes);
+            if !needed {
+                continue;
+            }
+            let landed = match measured[index].landed {
+                Some(landed) => landed,
+                None => {
+                    stats.landing_checks += 1;
+                    let landed = self.recovery_archive_landed(&measured[index].archive);
+                    measured[index].landed = Some(landed);
+                    landed
+                }
+            };
+            if !landed {
+                continue;
+            }
+            let entry = &measured[index];
+            let path_key = key(&entry.archive.path);
+            let retry = state.proof_deferred_at_ms.remove(&path_key).is_some();
+            if retry {
+                stats.proof_retries += 1;
+            }
+            #[cfg(test)]
+            let evict_deadline = if EXPIRED_PROOFS_FOR_TEST.with(|left| {
+                let expired = left.get() > 0;
+                left.set(left.get().saturating_sub(1));
+                expired
+            }) {
+                Instant::now()
+            } else {
+                evict_deadline
+            };
+            stats.proofs += 1;
+            let started = Instant::now();
+            let outcome = self.evict_landed_archive(&entry.archive, evict_deadline);
+            let elapsed = started.elapsed();
+            stats.proof_ms = stats
+                .proof_ms
+                .saturating_add(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+            crate::phase_telemetry::add("recovery_archive_bound_evict_proof", elapsed);
+            match outcome {
                 Ok(()) => {
+                    removed[index] = true;
+                    stats.evicted += 1;
                     total = total.saturating_sub(entry.bytes);
                     usage.evicted += 1;
                     usage.evicted_bytes = usage.evicted_bytes.saturating_add(entry.bytes);
@@ -294,35 +493,104 @@ impl Broker {
                     };
                     location.archives = location.archives.saturating_sub(1);
                     location.bytes = location.bytes.saturating_sub(entry.bytes);
-                    crate::phase_telemetry::add("recovery_archive_bound_evicted", Duration::ZERO);
-                }
-                Err(reason) => {
+                    state.sizes.remove(&path_key);
                     crate::phase_telemetry::add(
-                        "recovery_archive_bound_evict_failed",
+                        if entry.aged_out {
+                            "recovery_archive_bound_expired"
+                        } else {
+                            "recovery_archive_bound_evicted"
+                        },
                         Duration::ZERO,
                     );
-                    crate::warn_unrecorded::<(), _>(
-                        "remove a landed recovery archive over the bound",
-                        Err(reason),
-                    );
+                }
+                Err(reason) => {
+                    // Passed over until its retry is due, so it never holds
+                    // back the archives behind it.
+                    if Instant::now() >= evict_deadline {
+                        stats.proof_timeouts += 1;
+                        crate::phase_telemetry::add(
+                            "recovery_archive_bound_proof_timeout",
+                            Duration::ZERO,
+                        );
+                    } else {
+                        stats.proof_failures += 1;
+                        crate::phase_telemetry::add(
+                            "recovery_archive_bound_evict_failed",
+                            Duration::ZERO,
+                        );
+                        crate::warn_unrecorded::<(), _>(
+                            "remove a landed recovery archive over the bound",
+                            Err(reason),
+                        );
+                    }
+                    state.proof_deferred_at_ms.insert(path_key, pass_now_ms());
                 }
             }
         }
-        usage.over_bound = total > usage.bound_bytes;
+        usage.over_bound = usage.bound_bytes > 0 && total > usage.bound_bytes;
         if usage.over_bound {
-            let unique = measured
-                .iter()
-                .filter(|entry| !self.recovery_archive_landed(&entry.archive))
-                .filter(|entry| std::fs::symlink_metadata(&entry.archive.path).is_ok())
-                .collect::<Vec<_>>();
+            // Reuse the verdicts already reached; judge the rest only while
+            // the eviction budget lasts.
+            let mut unique = Vec::new();
+            for (index, entry) in measured.iter_mut().enumerate() {
+                if removed[index] {
+                    continue;
+                }
+                let landed = match entry.landed {
+                    Some(landed) => Some(landed),
+                    None if archive_never_lands(&entry.archive) => Some(false),
+                    None if Instant::now() < evict_deadline => {
+                        stats.landing_checks += 1;
+                        let landed = self.recovery_archive_landed(&entry.archive);
+                        entry.landed = Some(landed);
+                        Some(landed)
+                    }
+                    None => None,
+                };
+                match landed {
+                    Some(false) => unique.push(entry.archive.session_id),
+                    Some(true) => {}
+                    None => {
+                        stats.landing_unjudged += 1;
+                        usage.partial = true;
+                    }
+                }
+            }
             usage.unique_kept_over_bound = unique.len();
-            usage.unique_kept_sessions = unique
-                .iter()
-                .map(|entry| entry.archive.session_id)
-                .take(UNIQUE_SESSIONS_NAMED)
-                .collect();
+            usage.unique_kept_sessions = unique.into_iter().take(UNIQUE_SESSIONS_NAMED).collect();
             crate::phase_telemetry::add("recovery_archive_bound_over", Duration::ZERO);
+        } else {
+            crate::phase_telemetry::add("recovery_archive_bound_within", Duration::ZERO);
         }
+        drop(evict_span);
+        // Keep what earlier passes learned about archives this pass did not
+        // reach, while they are still there.
+        for (path, known) in previous.sizes {
+            if std::fs::symlink_metadata(&path).is_ok() {
+                state.sizes.entry(path).or_insert(known);
+            }
+        }
+        for (path, at) in previous.size_deferred_at_ms {
+            if !state.sizes.contains_key(&path) && std::fs::symlink_metadata(&path).is_ok() {
+                state.size_deferred_at_ms.entry(path).or_insert(at);
+            }
+        }
+        for (path, at) in previous.proof_deferred_at_ms {
+            if !measured
+                .iter()
+                .any(|entry| key(&entry.archive.path) == path)
+                && std::fs::symlink_metadata(&path).is_ok()
+            {
+                state.proof_deferred_at_ms.entry(path).or_insert(at);
+            }
+        }
+        if let Some(host) = host_state.as_deref() {
+            crate::warn_unrecorded(
+                "record the recovery archive bound state",
+                crate::storage_ledger::record_archive_bound_state(host, &repository, &state),
+            );
+        }
+        stats.record();
         crate::phase_telemetry::attach(
             "recovery_archive_bound",
             serde_json::json!({
@@ -372,10 +640,12 @@ impl Broker {
         {
             return Err("no longer a fully landed archive".into());
         }
+        // Once proven, the removal gets a short grace past the pass budget:
+        // stopping it half way would leave an archive that no longer proves.
         match crate::gc::remove_condemned_tree(
             &current.path,
             Some(crate::cleanup_resolve::MANIFEST_FILE),
-            Some(deadline),
+            Some(deadline.max(Instant::now() + ARCHIVE_REMOVAL_GRACE)),
         ) {
             Ok(crate::gc::TreeRemoval::Complete) => {}
             Ok(crate::gc::TreeRemoval::Interrupted) => {
@@ -414,23 +684,40 @@ impl Broker {
     }
 }
 
-/// Which archives to remove, in order: from `entries` (bytes, evictable)
-/// sorted oldest first, the evictable ones, oldest first, until `total`
-/// would be within `bound`. A non-evictable entry (work that exists nowhere
-/// else, or younger than its minimum retention) is never chosen.
-fn plan_evictions(entries: &[(u64, bool)], total: u64, bound: u64) -> Vec<usize> {
-    let mut remaining = total;
-    let mut chosen = Vec::new();
-    for (index, (bytes, evictable)) in entries.iter().enumerate() {
-        if remaining <= bound {
-            break;
-        }
-        if *evictable {
-            chosen.push(index);
-            remaining = remaining.saturating_sub(*bytes);
-        }
-    }
-    chosen
+/// Whether an archive can never be shown landed, whatever Git holds: it
+/// carries uncommitted content (or is an older format that does not say)
+/// or records no root. Refused without a Git check.
+fn archive_never_lands(archive: &crate::cleanup_resolve::OwnedRecoveryArchive) -> bool {
+    archive.holds_uncommitted || archive.recovery_roots.is_empty()
+}
+
+/// The order removals are tried in, from `entries` sorted oldest first as
+/// (candidate, deferral): deferral is `None` for an archive with no earlier
+/// failed or timed-out proof, else (retry due, when it was deferred). The
+/// due deferred archive deferred longest ago goes first, alone, so it gets
+/// the whole budget; then every candidate never deferred, oldest first.
+/// Other deferred archives are passed over this pass, so one archive that
+/// cannot be proven never holds back the ones behind it.
+fn eviction_order(entries: &[(bool, Option<(bool, i64)>)]) -> Vec<usize> {
+    let retry = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (candidate, deferral))| match deferral {
+            Some((true, at)) if *candidate => Some((*at, index)),
+            _ => None,
+        })
+        .min()
+        .map(|(_, index)| index);
+    retry
+        .into_iter()
+        .chain(
+            entries
+                .iter()
+                .enumerate()
+                .filter(|(_, (candidate, deferral))| *candidate && deferral.is_none())
+                .map(|(index, _)| index),
+        )
+        .collect()
 }
 
 #[cfg(test)]
@@ -438,19 +725,28 @@ mod tests {
     use super::*;
     use crate::storage_ledger::ArchiveLocationUsage;
 
-    /// Over the bound, the oldest evictable archives go first and only
-    /// until the total is within it; an archive holding unique work is
-    /// never chosen, even when that leaves the total over the bound.
+    /// Removals are tried oldest first among never-deferred candidates; a
+    /// due deferred archive goes first, alone; one not due is passed over;
+    /// a non-candidate (unique work, too young, kept) is never tried.
     #[test]
-    fn eviction_takes_the_oldest_landed_archives_and_never_unique_work() {
-        // Oldest first: unique 40, landed 10, landed 10, landed 10.
-        let entries = [(40, false), (10, true), (10, true), (10, true)];
-        assert_eq!(plan_evictions(&entries, 70, 55), vec![1, 2]);
-        assert_eq!(plan_evictions(&entries, 70, 70), Vec::<usize>::new());
-        // Only unique work: nothing is removed whatever the bound.
-        assert!(plan_evictions(&[(40, false), (30, false)], 70, 0).is_empty());
-        // Everything landed still leaves unique work alone.
-        assert_eq!(plan_evictions(&entries, 70, 0), vec![1, 2, 3]);
+    fn eviction_order_rotates_past_deferred_proofs() {
+        let entries = [
+            (false, None),             // unique work
+            (true, Some((false, 50))), // deferred, retry not due
+            (true, None),
+            (true, Some((true, 30))), // deferred, due
+            (true, Some((true, 10))), // deferred longer ago, due
+            (true, None),
+        ];
+        assert_eq!(eviction_order(&entries), vec![4, 2, 5]);
+        assert_eq!(
+            eviction_order(&[(false, None), (false, Some((true, 1)))]),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            eviction_order(&[(true, Some((false, 1)))]),
+            Vec::<usize>::new()
+        );
     }
 
     /// Usage serialises with both locations, so `storage status` can show

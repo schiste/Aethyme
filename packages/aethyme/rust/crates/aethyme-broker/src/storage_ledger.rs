@@ -945,7 +945,7 @@ pub fn record_recovery_archive_usage(
     write_atomically(&directory.join(name), &bytes)
 }
 
-/// One measured archive in [`recovery_archive_sizes`]: a complete archive
+/// One measured archive in [`ArchiveBoundState`]: a complete archive
 /// never changes, so its size, measured once, stays valid while the same
 /// archive (same path, same creation time) is there.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -965,30 +965,50 @@ fn recovery_archive_sizes_path(host_state: &Path, repository: &str) -> PathBuf {
         ))
 }
 
-/// The archive sizes `repository`'s bound pass measured before, by archive
-/// path. The bound measures only archives missing here, within its budget,
-/// so a large backlog is measured over several runs instead of every run.
-pub fn recovery_archive_sizes(
-    host_state: &Path,
-    repository: &str,
-) -> BTreeMap<String, MeasuredArchiveSize> {
+/// What `repository`'s archive bound pass carries from one run to the
+/// next, so a large backlog is worked through over several runs instead of
+/// redone (or stalled on) every run. Paths are archive directories.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveBoundState {
+    /// Sizes measured before. Only completed walks of archives the broker
+    /// owns are kept; a failed walk is never recorded.
+    #[serde(default)]
+    pub sizes: BTreeMap<String, MeasuredArchiveSize>,
+    /// Archives whose size walk ran out of budget, with when: measured
+    /// after the others next run, with what budget is left.
+    #[serde(default)]
+    pub size_deferred_at_ms: BTreeMap<String, i64>,
+    /// Archives whose removal proof ran out of budget or failed, with
+    /// when: later runs rotate past them and retry each, first and with a
+    /// fresh budget, once its retry delay has passed.
+    #[serde(default)]
+    pub proof_deferred_at_ms: BTreeMap<String, i64>,
+    /// The last archive an interrupted listing reached; the next listing
+    /// resumes after it. `None` once a listing reaches every archive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listing_cursor: Option<String>,
+}
+
+/// `repository`'s [`ArchiveBoundState`] (empty when none was recorded or
+/// it cannot be read: the pass then measures from scratch).
+pub fn archive_bound_state(host_state: &Path, repository: &str) -> ArchiveBoundState {
     fs::read(recovery_archive_sizes_path(host_state, repository))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
 }
 
-/// Record `repository`'s measured archive sizes, written atomically.
-pub fn record_recovery_archive_sizes(
+/// Record `repository`'s [`ArchiveBoundState`], written atomically.
+pub fn record_archive_bound_state(
     host_state: &Path,
     repository: &str,
-    sizes: &BTreeMap<String, MeasuredArchiveSize>,
+    state: &ArchiveBoundState,
 ) -> io::Result<()> {
     let path = recovery_archive_sizes_path(host_state, repository);
     if let Some(directory) = path.parent() {
         fs::create_dir_all(directory)?;
     }
-    write_atomically(&path, &serde_json::to_vec(sizes).map_err(io::Error::other)?)
+    write_atomically(&path, &serde_json::to_vec(state).map_err(io::Error::other)?)
 }
 
 thread_local! {
