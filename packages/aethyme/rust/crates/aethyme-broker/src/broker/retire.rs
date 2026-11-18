@@ -6065,7 +6065,10 @@ mod tests {
         let (_other, kept) = session_with(&mut broker, "root kept", false);
         let report = pass(&mut broker);
         assert!(kept.join("node_modules").exists(), "{report:#?}");
-        assert!(kept.join("apps/a/node_modules/dep").exists(), "{report:#?}");
+        assert!(
+            std::fs::symlink_metadata(kept.join("apps/a/node_modules/dep")).is_ok(),
+            "{report:#?}"
+        );
         assert_eq!(
             report.strip.refused.get("member_root_kept"),
             Some(&2),
