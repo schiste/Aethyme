@@ -4,6 +4,26 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.124] - 2026-11-18
+
+### Fixed
+
+- The strip pass spent most of each pass on session records whose folder no longer exists. A pool directory that is gone lists as empty; a folder is remembered as absent only on a "not found" answer while its pool directory can be listed, and the memory is dropped when the folder is seen again. Any other read failure is reported as `checkout_unreadable` and never remembered. Each pool listing has its own budget, and an entry vanishing mid-listing no longer discards the listing (#1785).
+- Nested `node_modules` of workspace members were refused for a missing package-manager marker. One is now stripped only when every entry is a symlink, a `.bin` directory whose shims also exist in the checkout's top-level `node_modules/.bin`, or a scope directory of symlinks, and at least one link points into the package store. The top-level `node_modules` still needs its own marker; any other content keeps the folder (#1785).
+- Retirement runs spent 140 to 457 seconds expiring retired-commit pins, scanning every remote ref once per pin. Pin expiry has a 20-second budget per run and checks the cheapest evidence first. Both laps read folder existence from the pool listings, and a `leftover_superseded` keep is remembered until the superseding session changes (#1785).
+- Stale-session classification reads refs first and inspects the working tree only when refs alone class the session below unpushed. A remembered clean answer orders work and can say "not closable yet"; the close decision always inspects the working tree fresh. The close-after windows are unchanged (#1785).
+- `gc reclaim plan` no longer leaves one snapshot file per plan at the pool root for ever: each save prunes up to 256 snapshots older than 7 days, or older than a day whose scope is gone (#1785).
+
+### Added
+
+- Keep code `checkout_unreadable` and the `checkout_strip.absent` memo (#1785).
+
+### Known issues
+
+- The landed lane's cleanliness proof still times out on a slow volume.
+- Once a checkout's top-level `node_modules` is stripped, nested members whose `.bin` holds files are kept.
+- `start --adopt` can still hold the lifecycle lock for minutes while comparing patches.
+
 ## [0.8.123] - 2026-11-18
 
 ### Fixed
