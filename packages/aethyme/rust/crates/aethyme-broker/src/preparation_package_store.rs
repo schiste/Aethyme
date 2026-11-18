@@ -479,6 +479,25 @@ pub struct PackageStoreReport {
     /// Other writers on the volume add to it, and freed space hides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_bytes_allocated: Option<u64>,
+    /// Which cache root this preparation used and why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_root_placement: Option<CacheRootPlacement>,
+    /// What sharing the prepared outputs by clone did, and the bytes the
+    /// checkout's outputs still own alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_share: Option<super::output_share::OutputShareReport>,
+}
+
+/// Where the repository-shared cache root was placed for one preparation.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CacheRootPlacement {
+    /// `[shared_cache] root` as configured (`auto` when omitted).
+    pub configured: super::SharedCacheRoot,
+    /// Where the root is: `host` or `worktree_volume`.
+    pub resolved: super::SharedCacheRoot,
+    /// Why `auto` resolved as it did, or why the worktree volume was not
+    /// usable.
+    pub reason: String,
 }
 
 /// The platform component of the store key, `<os>-<arch>`.
@@ -647,7 +666,7 @@ fn remove_probe_file(path: &Path) {
 }
 
 #[cfg(target_os = "macos")]
-fn clone_file(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn clone_file(source: &Path, destination: &Path) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let source = CString::new(source.as_os_str().as_bytes()).map_err(io::Error::other)?;
@@ -662,7 +681,7 @@ fn clone_file(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn clone_file(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn clone_file(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     /// `FICLONE`, `_IOW(0x94, 9, int)`, spelled out so glibc and musl (whose
     /// `ioctl` request types differ) build the same call.
@@ -692,7 +711,7 @@ fn clone_file(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn clone_file(_source: &Path, _destination: &Path) -> io::Result<()> {
+pub(crate) fn clone_file(_source: &Path, _destination: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "no copy-on-write clone primitive on this platform",

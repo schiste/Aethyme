@@ -1064,6 +1064,20 @@ difference `volume_bytes_allocated` (also per step). The report's
 a miss, `miss_reason`, naming runtimes whose identity changed. When the store
 is on another volume than the checkouts, `broker status` warns
 `prepare.store-on-other-volume`: dependencies are then copied, never shared.
+`package_store.cache_root_placement` names the configured `[shared_cache]
+root` (`auto` when omitted), the root used (`host` or `worktree_volume`) and
+why. `package_store.output_share` reports the output-sharing pass: its
+`state` (`complete`, `partial` or `skipped`), `fallback_reason`, the output
+`roots` and the `roots_already_shared` it skipped, file and byte counters
+(`files_scanned`, `files_already_shared`, `files_cloned_from_pool`,
+`bytes_cloned_from_pool`, `files_added_to_pool`, `bytes_added_to_pool`,
+`files_left_alone`, `files_failed`), `unique_bytes_before` and
+`unique_bytes_after` (bytes the walked outputs own alone, from APFS private
+sizes or Linux FIEMAP shared-extent flags; `unique_bytes_method` is
+`allocated_upper_bound` when a file could not be asked) and `elapsed_ms`. The
+command metric carries the same counters, without paths, as
+`prepare_dependency_sharing`, and the placement as `prepare_cache_root`; the
+pass is timed as the `prepare_output_share` span.
 
 By default, the broker derives the shared preparation cache from the captured
 host-resource database location. To place that cache on a separate volume, set
