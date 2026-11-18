@@ -1553,6 +1553,10 @@ impl Broker {
     /// directory whose name starts with the session id and holds a
     /// manifest), if any.
     pub(crate) fn newest_recovery_archive(&self, session_id: i64) -> Option<PathBuf> {
+        // The archive recorded with the session wins over a directory scan.
+        if let Some(recorded) = self.session_restorable_archive(session_id) {
+            return Some(recorded);
+        }
         let root = self.recovery_archive_root().ok()?;
         let prefix = format!("{session_id}-");
         let mut archives = std::fs::read_dir(&root)
@@ -5126,7 +5130,12 @@ mod tests {
         assert!(broker.session_restorable_archive(session.id).is_some());
         // Its local branch was deleted meanwhile: the restore recreates it
         // from the tip the archive recorded.
-        git(broker.main_root(), &["branch", "-D", &session.branch]);
+        if git_status(
+            broker.main_root(),
+            &["rev-parse", "--verify", "--quiet", &session.branch],
+        ) {
+            git(broker.main_root(), &["branch", "-D", &session.branch]);
+        }
         assert!(broker.recreate_retired_checkout(&worktree).unwrap());
 
         assert_eq!(git(&worktree, &["rev-parse", "HEAD"]).trim(), head);

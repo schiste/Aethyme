@@ -2778,7 +2778,13 @@ fn an_idle_open_sessions_build_output_is_preserved_and_the_session_stays_open() 
         "[retention]\nsession_abandoned_after_hours = 72\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n",
     );
     let (id, worktree) = quiet_open_session(repo.path(), container.path(), 30);
-    enable_sweep(repo.path());
+    // The sweep enabled, with the abandonment window this test was written
+    // against (30 h idle is past the 24 h default, which would close it).
+    std::fs::write(
+        repo.path().join(".aethyme/broker.toml"),
+        "[retention]\nsession_abandoned_after_hours = 72\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\n",
+    )
+    .unwrap();
 
     let report = sweep(repo.path(), container.path());
     assert!(
