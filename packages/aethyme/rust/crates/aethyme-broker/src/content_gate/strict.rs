@@ -1,5 +1,5 @@
 //! Version-pinned schema and decision-input checks for Aexeo v1.
-use super::{precheck_v1, SubjectPrechecked};
+use super::{SubjectPrechecked, precheck_v1};
 use std::{collections::BTreeMap, fmt, sync::OnceLock};
 
 const CHANGE_SCHEMA: &str = include_str!("change.schema.json");
@@ -20,7 +20,8 @@ fn validator(
             .expect("bundled schema must compile")
     })
 }
-fn parse_unique(bytes: &[u8]) -> Result<serde_json::Value, &'static str> {
+/// Parse bounded JSON while rejecting duplicate keys at every depth.
+pub fn parse_unique(bytes: &[u8]) -> Result<serde_json::Value, &'static str> {
     if bytes.len() > MAX_DOCUMENT_BYTES {
         return Err("document exceeds size limit");
     }
@@ -158,7 +159,7 @@ impl<'de> serde::Deserialize<'de> for UniqueJson {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
     fn fixture() -> (DecisionInputs, Vec<u8>, BTreeMap<String, Option<Vec<u8>>>) {
         let digest = format!("{:x}", Sha256::digest(b"hello"));
@@ -201,24 +202,28 @@ mod tests {
             "\"change_id\":\"c\"",
             "\"change_id\":\"c\",\"change_id\":\"c\"",
         );
-        assert!(strict_precheck_v1(
-            &before,
-            &before,
-            nested.as_bytes(),
-            Some(0),
-            false,
-            &content
-        )
-        .is_err());
-        assert!(strict_precheck_v1(
-            &before,
-            &before,
-            &verdict[..verdict.len() - 1],
-            Some(0),
-            false,
-            &content
-        )
-        .is_err());
+        assert!(
+            strict_precheck_v1(
+                &before,
+                &before,
+                nested.as_bytes(),
+                Some(0),
+                false,
+                &content
+            )
+            .is_err()
+        );
+        assert!(
+            strict_precheck_v1(
+                &before,
+                &before,
+                &verdict[..verdict.len() - 1],
+                Some(0),
+                false,
+                &content
+            )
+            .is_err()
+        );
         assert!(strict_precheck_v1(&before, &before, &verdict, Some(0), true, &content).is_err());
         assert!(strict_precheck_v1(&before, &before, &verdict, Some(2), false, &content).is_err());
     }
@@ -251,25 +256,29 @@ mod tests {
         );
         let mut v: Value = serde_json::from_slice(&verdict).unwrap();
         v["summary"]["blocking_failed"] = json!(1);
-        assert!(strict_precheck_v1(
-            &before,
-            &before,
-            v.to_string().as_bytes(),
-            Some(0),
-            false,
-            &content
-        )
-        .is_err());
+        assert!(
+            strict_precheck_v1(
+                &before,
+                &before,
+                v.to_string().as_bytes(),
+                Some(0),
+                false,
+                &content
+            )
+            .is_err()
+        );
         v["summary"]["blocking_failed"] = json!(0);
         v["evaluated_at"] = json!("bad date");
-        assert!(strict_precheck_v1(
-            &before,
-            &before,
-            v.to_string().as_bytes(),
-            Some(0),
-            false,
-            &content
-        )
-        .is_err());
+        assert!(
+            strict_precheck_v1(
+                &before,
+                &before,
+                v.to_string().as_bytes(),
+                Some(0),
+                false,
+                &content
+            )
+            .is_err()
+        );
     }
 }

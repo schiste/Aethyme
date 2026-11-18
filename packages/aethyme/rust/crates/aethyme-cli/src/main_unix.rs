@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod branches_audit;
+mod content_gate_runner;
 mod graph_refresh;
 mod help;
 mod readiness_remediation;
@@ -386,6 +387,7 @@ fn main_with_args(args: &[String]) -> ExitCode {
         // like the other native groups.
         // `repo branches audit` is native to the router: it needs neither
         // the engine nor the enhance templates.
+        "content-gate" => ExitCode::from(content_gate_runner::run(&args[1..])),
         "repo" if args.get(1).map(String::as_str) == Some("branches") => {
             ExitCode::from(branches_audit::run(&args[2..]))
         }
@@ -697,6 +699,10 @@ Hot path:
                               compact decision surface from a saved answer-json
   verify-targets --repo <path> --from explore.json [--max-targets 2 --max-lines 80]
                               bounded source spans for Explore targets
+
+Content checks:
+  content-gate run <manifest.json>
+                              evaluate an uncached Aexeo content change
 
 Agent broker:
   broker start --task <text> --short-name <name>

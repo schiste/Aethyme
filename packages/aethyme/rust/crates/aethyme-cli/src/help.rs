@@ -116,6 +116,15 @@ fn blocks(text: &str, prefix: &str) -> String {
 /// description lines are indented further.
 const GROUP_TEXT: &[(&str, &str)] = &[
     (
+        "content-gate",
+        r#"aethyme content-gate — evaluate an Aexeo v1 content change
+
+  aethyme content-gate run <manifest.json>
+    Run an uncached content check against a fresh verdict and current inputs.
+    The publication host must revalidate and synchronize the final decision.
+"#,
+    ),
+    (
         "explore",
         r#"aethyme explore — bounded Explore query; prints answer-json or a brief
 

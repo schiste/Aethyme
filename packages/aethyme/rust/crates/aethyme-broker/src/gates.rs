@@ -76,6 +76,7 @@ pub enum GateConfigError {
 pub struct Gate {
     pub name: String,
     pub command: String,
+    pub content_gate_v1: bool,
     pub cost: i64,
     pub triggers: Vec<String>,
     pub cache: bool,
@@ -238,15 +239,59 @@ pub fn parse_gates(text: &str) -> Result<Vec<Gate>, GateConfigError> {
             .and_then(|v| v.as_str())
             .ok_or_else(|| GateConfigError::Parse("gate missing string field 'name'".into()))?
             .to_string();
-        let command = entry
-            .get("command")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                GateConfigError::Parse(format!("gate {name:?} missing string field 'command'"))
-            })?
-            .to_string();
+        let kind = match entry.get("kind") {
+            None => "command",
+            Some(value) => value.as_str().ok_or_else(|| {
+                GateConfigError::Parse(format!("gate {name:?} kind must be a string"))
+            })?,
+        };
+        let content_gate_v1 = match kind {
+            "command" => false,
+            "content-gate-v1" => true,
+            _ => {
+                return Err(GateConfigError::Parse(format!(
+                    "gate {name:?} has unsupported kind"
+                )));
+            }
+        };
+        let command = if content_gate_v1 {
+            if entry.get("command").is_some() {
+                return Err(GateConfigError::Parse(format!(
+                    "gate {name:?}: native content gate must not specify command"
+                )));
+            }
+            let manifest = entry
+                .get("manifest")
+                .and_then(toml::Value::as_str)
+                .filter(|s| !s.is_empty() && !s.contains('\0'))
+                .ok_or_else(|| {
+                    GateConfigError::Parse(format!("gate {name:?} requires a manifest path"))
+                })?;
+            format!(
+                "aethyme content-gate run '{}'",
+                manifest.replace('\'', "'\\''")
+            )
+        } else {
+            entry
+                .get("command")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| {
+                    GateConfigError::Parse(format!("gate {name:?} missing string field 'command'"))
+                })?
+                .to_string()
+        };
         let cost = entry.get("cost").and_then(|v| v.as_integer()).unwrap_or(0);
-        let cache = entry.get("cache").and_then(|v| v.as_bool()).unwrap_or(true);
+        let cache = match entry.get("cache") {
+            Some(value) => value.as_bool().ok_or_else(|| {
+                GateConfigError::Parse(format!("gate {name:?} cache must be boolean"))
+            })?,
+            None => !content_gate_v1,
+        };
+        if content_gate_v1 && cache {
+            return Err(GateConfigError::Parse(format!(
+                "gate {name:?}: content gate cannot use tree-only cache"
+            )));
+        }
         let timeout_seconds = match entry.get("timeout_seconds") {
             None => None,
             Some(value) => {
@@ -269,6 +314,11 @@ pub fn parse_gates(text: &str) -> Result<Vec<Gate>, GateConfigError> {
                 Some(value)
             }
         };
+        if content_gate_v1 && timeout_seconds.is_none() {
+            return Err(GateConfigError::Parse(format!(
+                "gate {name:?}: content gate requires timeout_seconds"
+            )));
+        }
         let triggers: Vec<String> = entry
             .get("triggers")
             .and_then(|v| v.as_array())
@@ -278,6 +328,15 @@ pub fn parse_gates(text: &str) -> Result<Vec<Gate>, GateConfigError> {
                     .collect()
             })
             .unwrap_or_default();
+        if content_gate_v1
+            && entry
+                .get("triggers")
+                .is_some_and(|value| !value.as_array().is_some_and(Vec::is_empty))
+        {
+            return Err(GateConfigError::Parse(format!(
+                "gate {name:?}: content gate must run for every change"
+            )));
+        }
         let resources: Vec<crate::HostResourceRequirement> = entry
             .get("resources")
             .cloned()
@@ -320,6 +379,11 @@ pub fn parse_gates(text: &str) -> Result<Vec<Gate>, GateConfigError> {
                 gate: name.clone(),
                 message: format!("invalid managed_cache: {error}"),
             })?;
+        if content_gate_v1 && managed_cache.is_some() {
+            return Err(GateConfigError::Parse(format!(
+                "gate {name:?}: content gate cannot use a managed cache"
+            )));
+        }
         if let Some(cache) = &managed_cache {
             validate_managed_cache(cache).map_err(|message| GateConfigError::BadResources {
                 gate: name.clone(),
@@ -375,6 +439,7 @@ pub fn parse_gates(text: &str) -> Result<Vec<Gate>, GateConfigError> {
         gates.push(Gate {
             name,
             command,
+            content_gate_v1,
             cost,
             triggers,
             cache,
@@ -4057,6 +4122,7 @@ where
                 run_dir: &run_dir,
                 session_id,
                 gate_name: &gate.name,
+                content_gate_v1: gate.content_gate_v1,
                 tree: &tree,
                 worker_id: &worker_id,
                 owner_paths: &selection.owner_paths,
@@ -4852,6 +4918,7 @@ struct GateCommandContext<'a> {
     run_dir: &'a Path,
     session_id: Option<i64>,
     gate_name: &'a str,
+    content_gate_v1: bool,
     tree: &'a str,
     worker_id: &'a str,
     owner_paths: &'a [String],
@@ -5352,6 +5419,7 @@ fn run_gate_command_inner(
         .arg("-c")
         .arg(command)
         .current_dir(context.cwd)
+        .env_remove("AETHYME_CONTENT_GATE_MODE")
         .env("AETHYME_GATE_WORKER_ID", context.worker_id)
         .env("AETHYME_TEST_DB_SUFFIX", context.worker_id)
         .env_remove(crate::session_scratch::SESSION_SCRATCH_ENV)
@@ -5371,6 +5439,10 @@ fn run_gate_command_inner(
         for (key, value) in resources.grant.environment() {
             process.env(key, value);
         }
+    }
+    process.env_remove("AETHYME_CONTENT_GATE_MODE");
+    if context.content_gate_v1 {
+        process.env("AETHYME_CONTENT_GATE_MODE", "v1-uncached");
     }
     if let Some(cache) = context.managed_cache {
         process.env("AETHYME_GATE_CACHE_DIR", &cache.directory);
@@ -5967,8 +6039,57 @@ fn preserve_failed_gate_log(log_path: &Path, status: GateStatus) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn content_gate_kind_disables_tree_cache_and_rejects_unsafe_configuration() {
+        let base = "[[gate]]\nname='editorial'\nkind='content-gate-v1'\nmanifest='gate.json'\ntimeout_seconds=30\n";
+        let gates = parse_gates(base).unwrap();
+        assert!(gates[0].content_gate_v1);
+        assert!(!gates[0].cache);
+        assert_eq!(gates[0].command, "aethyme content-gate run 'gate.json'");
+        for suffix in [
+            "cache=true\n",
+            "command='true'\n",
+            "triggers=['docs/**']\n",
+            "[gate.managed_cache]\nkey='x'\nmax_bytes=1\n",
+        ] {
+            assert!(parse_gates(&format!("{base}{suffix}")).is_err(), "{suffix}");
+        }
+        assert!(
+            parse_gates("[[gate]]\nname='x'\nkind='content-gate-v1'\nmanifest='gate.json'\n")
+                .is_err()
+        );
+    }
+
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    #[test]
+    fn content_gate_executes_again_on_the_same_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        let mut store = BrokerStore::open(&root.path().join("broker.db")).unwrap();
+        let mut gate = parse_gates("[[gate]]\nname='editorial'\nkind='content-gate-v1'\nmanifest='x.json'\ntimeout_seconds=30\n").unwrap().remove(0);
+        // The launcher is substituted here solely to test broker cache routing.
+        gate.command = "true".into();
+        for _ in 0..2 {
+            let outcomes = run_all_in(
+                &mut store,
+                &checkout_root,
+                &checkout,
+                std::slice::from_ref(&gate),
+                None,
+                CachePolicy::Use,
+                GateStorageLocations::default(),
+            )
+            .unwrap();
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].status, GateStatus::Pass);
+            assert!(!outcomes[0].cached);
+        }
+    }
 
     #[test]
     fn incomplete_checkout_refuses_gate_before_execution_or_cache_lookup() {
@@ -6131,6 +6252,7 @@ mod tests {
         let gate = Gate {
             name: "cargo".into(),
             command: "cargo test".into(),
+            content_gate_v1: false,
             cost: 1,
             triggers: Vec::new(),
             cache: false,
@@ -6589,6 +6711,7 @@ mod tests {
         Gate {
             name: name.to_string(),
             command: command.to_string(),
+            content_gate_v1: false,
             cost: 1,
             triggers: Vec::new(),
             cache,
@@ -7045,6 +7168,7 @@ mod tests {
             run_dir: root.path(),
             session_id: None,
             gate_name: "deadline",
+            content_gate_v1: false,
             tree: "synthetic",
             worker_id: "deadline",
             owner_paths: &[],
@@ -7129,6 +7253,7 @@ mod tests {
             run_dir: root.path(),
             session_id: None,
             gate_name: "renewal-stop",
+            content_gate_v1: false,
             tree: "synthetic",
             worker_id: "renewal-stop",
             owner_paths: &[],
@@ -8559,6 +8684,7 @@ mod tests {
             run_dir,
             session_id: None,
             gate_name: "bounded-output",
+            content_gate_v1: false,
             tree: "synthetic",
             worker_id: "bounded-output-test",
             owner_paths: &[],

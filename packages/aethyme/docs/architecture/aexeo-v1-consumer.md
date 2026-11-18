@@ -35,3 +35,42 @@ run a process or expose a gate command, and its successful result is not a
 publication authorization. A runner must supply actual exit/timeout evidence,
 ensure the verdict belongs to that invocation, prevent generic gate cache
 reuse and perform its final comparison at the publication boundary.
+
+## Native gate and runner
+
+Configure an always-selected, uncached native gate with a deadline:
+
+```toml
+[[gate]]
+name = "content-review"
+kind = "content-gate-v1"
+manifest = "content-gate.json"
+timeout_seconds = 60
+```
+
+The type rejects an explicit command, `cache = true`, path triggers, managed
+caches and a missing deadline. It dispatches `aethyme content-gate run
+content-gate.json`. A generic broker command gate cannot run that entrypoint:
+the entrypoint requires the broker's native uncached marker when inside a gate.
+
+The manifest is a JSON object with required fields `change`, `policy`, `options`,
+`collection`, `external`, `additional`, `content`, `validator`, `env` and
+`timeout_seconds`. Paths are interpreted relative to the runner's current
+working directory. `collection` and `external` are paths or explicit `null`;
+`additional` maps names to paths for every other input; `content` maps each
+entity ID to its candidate filesystem path, including the path that must be
+absent for a deletion. `validator` is a nonempty argument vector starting with
+an absolute executable path. `env` is the complete environment passed to the
+validator (the runner adds the two protocol variables). The validator deadline
+is between 1 and 3600 seconds and should be no longer than the gate deadline.
+
+The runner takes fresh input snapshots, hashes the validator executable, invokes
+the validator with a private new verdict path and a bounded deadline, then
+compares snapshots, validates the verdict and checks current candidate bytes.
+Missing or malformed data, process failure, surviving process-group members,
+stale inputs and missing verdicts block. The host must ensure its manifest
+lists all decision inputs actually used, including transitive files and remote
+observations, and must establish trusted validator and input provenance. The
+runner cannot guarantee publication-time freshness or atomicity: the publishing
+host must re-run these checks on its exact candidate and synchronize validation
+with publication. A pass does not publish anything.
