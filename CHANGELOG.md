@@ -4,6 +4,26 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.123] - 2026-11-18
+
+### Fixed
+
+- The strip pass judged no checkout on a host whose pool volume answers metadata calls slowly (about 120 ms each while a deleter runs): it checked every pool folder by name before starting and spent its whole budget there. Candidates now come from the session records, oldest close first, resumed from a persisted cursor; folder existence comes from one listing by entry type capped at 10 seconds, and otherwise is checked when the checkout is judged; each checkout gets at most 15 seconds; the backlog count runs only after 10 checkouts were judged (#1783).
+- The closed and cleaned retirement laps were starved by resolving open paths one after another. Open paths use at most a third of the run and are resolved on up to 8 threads; the strip pass, the closed lap and the cleaned lap share the rest with floors of 20, 20 and 10 seconds. An incomplete open-path index is never used (#1783).
+- `finish` no longer refuses to strip its own checkout because the finishing agent is recorded as its holder. Any other live holder, and any process with its working directory or an open file inside, still keeps it (#1783).
+- The main-checkout sync never moved a primary checkout that had an idle session adopted on it. Such a session now holds the move only while in use: a live spawned process or recorded holder, a process listing that cannot prove the holder gone, an unresolved coordinated operation, or activity in the last 30 minutes. After a move each open adopted session gets a note naming the two commits, and its diff base follows when the old base is in the default branch's history (#1782).
+
+### Added
+
+- `blocking_session_id` in the `main_checkout` record; advice `main-checkout.behind` names the session, why it is in use and its last activity, with the commands to inspect or finish it. The session view of `status --json` carries `main_checkout` and `main_checkout_advice` (#1782).
+- Spans for the retirement run's tail (stale partials, retired pins, progress write) and for the strip cursor (#1783).
+
+### Known issues
+
+- With many sessions, abandonment judging and the landed lane's cleanliness proof still time out on a slow volume; the deleter is not yet paced by observed metadata latency.
+- A primary checkout whose local changes overlap upstream changes stays behind until those changes are committed, reverted or moved; `status` names the paths.
+- `start --adopt` can still hold the lifecycle lock for minutes while comparing patches.
+
 ## [0.8.122] - 2026-11-17
 
 ### Fixed
