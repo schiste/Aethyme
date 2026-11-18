@@ -85,7 +85,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   readings rather than treating a harness correction as a retroactive fix.
   Before long runs, exercise success, nonzero exit, and timeout controls through
   the exact runner; signal only the owned process group before reaping it.
-  Verify semantic output equality before comparing speed.
+  Verify semantic output equality before comparing speed. For a fast path
+  conditioned on retained state, create that state through the real command
+  and require a telemetry hit in the smoke test. Measure a fresh-state
+  control too.
 
 - Before timing broker session startup hooks, put the pinned build first on
   the fixture's PATH and inspect the actual `SessionStart` payload. For
