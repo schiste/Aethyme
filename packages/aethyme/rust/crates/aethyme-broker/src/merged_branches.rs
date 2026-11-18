@@ -91,9 +91,7 @@ pub(crate) fn judge(facts: BranchFacts) -> Verdict {
 
 /// `[cleanup] delete_merged_session_branches` (default true).
 pub(crate) fn enabled(main_root: &Path) -> bool {
-    let Ok(Some((_, text))) =
-        aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-    else {
+    let Ok(Some((_, text))) = crate::cleanup_config::cleanup_config_toml(main_root) else {
         return true;
     };
     toml::from_str::<toml::Value>(&text)

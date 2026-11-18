@@ -224,9 +224,8 @@ impl StaleSessionPolicy {
     /// missing file, table or key is the default; an invalid value is an
     /// error, which keeps the session open.
     pub(crate) fn load(main_root: &Path) -> Result<Self, String> {
-        let Some((path, text)) =
-            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-                .map_err(|error| error.to_string())?
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
         else {
             return Ok(Self::default());
         };

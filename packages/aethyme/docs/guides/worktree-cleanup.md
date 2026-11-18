@@ -775,6 +775,47 @@ A retired checkout whose session branch was deleted can no longer be
 recreated with `start --reuse` at its old path; its work is already on the
 default branch, so start a new session instead.
 
+## Which copy of `[cleanup]` the background worker reads
+
+The detached background worker resolves once per run where every
+`[cleanup]` key comes from. It reads the `[cleanup]` table from the default
+branch that `refs/remotes/origin/HEAD` names, as last fetched (nothing is
+fetched), only when all of these hold:
+
+- the primary checkout's `.aethyme/config.toml` (and any `.yaml`/`.yml`
+  twin) equals the file at its own `HEAD` once Git's filters for that path
+  are applied (so line-ending conversion is not an edit): no local edit, no
+  untracked twin;
+- the default branch holds a different config file;
+- the primary checkout's `HEAD` is an ancestor of the default branch: it is
+  behind, not diverged;
+- the default-branch file parses and its `[cleanup]` table is valid.
+
+Without `origin/HEAD` it never falls back to the checked-out branch's
+upstream, which could be an unmerged branch, another remote or a local
+branch; run `git remote set-head origin --auto` to set it. In every other
+case it reads the primary checkout's working copy, as foreground commands
+always do. So a `[cleanup]` setting merged on the default branch takes
+effect in background cleanup even while the primary checkout's sync is held
+back by a live session or local changes. If the working copy's config
+changes during the run (size and modification time, then content), the rest
+of that run reads the working copy. The lookup is bounded to a few
+read-only Git calls and 5 seconds, and never fails cleanup.
+
+Each worker run counts its choice in its phase metrics
+(`cleanup_config_source_default_branch`, or
+`cleanup_config_source_working_copy_<reason>` with the reason `same`,
+`no_default_branch`, `default_branch_unreadable`, `head_unreadable`,
+`git_timeout`, `working_copy_not_regular_file`, `working_copy_unverifiable`,
+`local_edit`, `diverged` or `default_branch_unparsable`; and
+`cleanup_config_source_working_copy_changed_during_run` when the working
+copy changed mid-run) and times it (`cleanup_config_resolve`). Whenever the
+two copies differ, `broker status` shows advice `cleanup.config-source`:
+either the reason the working copy was kept, or that background cleanup
+follows the default branch while foreground commands and previews (cleanup
+plans, `finish`, `status`) still show the primary checkout's older settings
+until it is brought up to date.
+
 ## Maintenance during broker open
 
 Opening a broker handle may resume an already-authorized durable GC journal

@@ -4370,6 +4370,56 @@ impl GitRepo {
     /// upstream is not treated as permission to fall back to working-copy
     /// policy.
     pub(crate) fn upstream_default_checked(&self) -> Result<Option<(String, String)>, GitError> {
+        if let Some(found) = self.origin_head_default_checked()? {
+            return Ok(Some(found));
+        }
+
+        let Some(branch_ref) = self.symbolic_ref_checked("HEAD")? else {
+            return Ok(None);
+        };
+        let Some(branch) = branch_ref.strip_prefix("refs/heads/") else {
+            return Err(GitError::UntrustedOutput {
+                detail: "the checked-out branch ref is not under refs/heads".into(),
+            });
+        };
+        let branch_ref = format!("refs/heads/{branch}");
+        let upstream_ref = run_git(
+            &self.root,
+            &[
+                "for-each-ref",
+                "--count=1",
+                "--format=%(upstream)",
+                &branch_ref,
+            ],
+        )?;
+        if upstream_ref.is_empty() {
+            return Ok(None);
+        }
+        let upstream_name = run_git(
+            &self.root,
+            &[
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ],
+        )?;
+        if upstream_name.is_empty() {
+            return Err(GitError::UntrustedOutput {
+                detail: "Git reported a configured upstream without its name".into(),
+            });
+        }
+        let commit = self.resolve_commit_checked(&upstream_ref)?;
+        Ok(Some((upstream_name, commit)))
+    }
+
+    /// The default branch `refs/remotes/origin/HEAD` names, as
+    /// `(origin/<branch>, commit)`, with no fallback: `Ok(None)` when
+    /// `origin/HEAD` is absent. For policy that only the remote's default
+    /// branch may supply, never the checked-out branch's upstream. A target
+    /// outside `refs/remotes/origin/`, or an `origin/HEAD` that is not
+    /// symbolic, is an error.
+    pub(crate) fn origin_head_default_checked(&self) -> Result<Option<(String, String)>, GitError> {
         const DEFAULT_REF: &str = "refs/remotes/origin/HEAD";
         let listing = self.run_git_output_limited(
             &[
@@ -4413,44 +4463,7 @@ impl GitRepo {
                 detail: "refs/remotes/origin/HEAD exists but is not a symbolic default ref".into(),
             });
         }
-
-        let Some(branch_ref) = self.symbolic_ref_checked("HEAD")? else {
-            return Ok(None);
-        };
-        let Some(branch) = branch_ref.strip_prefix("refs/heads/") else {
-            return Err(GitError::UntrustedOutput {
-                detail: "the checked-out branch ref is not under refs/heads".into(),
-            });
-        };
-        let branch_ref = format!("refs/heads/{branch}");
-        let upstream_ref = run_git(
-            &self.root,
-            &[
-                "for-each-ref",
-                "--count=1",
-                "--format=%(upstream)",
-                &branch_ref,
-            ],
-        )?;
-        if upstream_ref.is_empty() {
-            return Ok(None);
-        }
-        let upstream_name = run_git(
-            &self.root,
-            &[
-                "rev-parse",
-                "--abbrev-ref",
-                "--symbolic-full-name",
-                "@{upstream}",
-            ],
-        )?;
-        if upstream_name.is_empty() {
-            return Err(GitError::UntrustedOutput {
-                detail: "Git reported a configured upstream without its name".into(),
-            });
-        }
-        let commit = self.resolve_commit_checked(&upstream_ref)?;
-        Ok(Some((upstream_name, commit)))
+        Ok(None)
     }
 
     fn symbolic_ref_checked(&self, name: &str) -> Result<Option<String>, GitError> {
