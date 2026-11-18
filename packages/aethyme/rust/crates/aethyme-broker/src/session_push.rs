@@ -1127,6 +1127,13 @@ impl Broker {
         } else {
             None
         };
+        // A stacked session's pull request targets its parent branch, which
+        // must already be published; refuse before anything is pushed.
+        let stacked_base = if open_pr {
+            self.stacked_pull_request_base(session_id, &default)?
+        } else {
+            None
+        };
         let target = repo
             .resolve_remote_target(&default.remote, None)
             .map_err(|error| refused(format!("remote {:?}: {error}", default.remote)))?;
@@ -1320,6 +1327,8 @@ impl Broker {
         let pre_push_observation = observed_tip.borrow_mut().take();
         let pushed_refs = push.pushed_refs.clone();
         self.store().meta_set(&pushed_oid_key(session_id), &head)?;
+        // Sessions stacked on this one learn that their parent moved.
+        self.note_stack_children_after_push(session_id, &head);
         phase_timings_ms.insert(
             "push_git".into(),
             phase_started.elapsed().as_millis() as u64,
@@ -1333,6 +1342,7 @@ impl Broker {
                 &target.display_slug,
                 &head,
                 policy.open_as,
+                stacked_base.as_ref(),
                 &main_root,
             )?)
         } else {
@@ -1767,6 +1777,7 @@ impl Broker {
 
     /// Find the open pull request for the session branch, or create one in the
     /// trusted configured mode. Existing pull requests are never changed.
+    #[allow(clippy::too_many_arguments)]
     fn open_session_pull_request(
         &mut self,
         session: &crate::Session,
@@ -1774,6 +1785,7 @@ impl Broker {
         repository: &str,
         head: &str,
         open_as: SessionPullRequestOpenAs,
+        stacked: Option<&crate::session_stack::StackedPullRequestBase>,
         cwd: &Path,
     ) -> Result<SessionPullRequest, BrokerOpError> {
         if let Some(existing) =
@@ -1781,9 +1793,10 @@ impl Broker {
         {
             return Ok(existing);
         }
-        let commits = self
-            .repo_handle()
-            .commits_between(&default.tracking_ref, head)?;
+        let compare_ref = stacked.map_or(default.tracking_ref.as_str(), |stacked| {
+            stacked.compare_ref.as_str()
+        });
+        let commits = self.repo_handle().commits_between(compare_ref, head)?;
         let title = commits
             .last()
             .map(|commit| commit.subject.clone())
@@ -1816,6 +1829,16 @@ impl Broker {
             base.template.as_deref(),
         )
         .map_err(|error| refused(error.to_string()))?;
+        let body = match stacked {
+            Some(stacked) => {
+                crate::session_stack::stacked_pull_request_body(&body, stacked, &default.branch)
+            }
+            None => body,
+        };
+        let base_branch = stacked.map_or_else(
+            || default.branch.clone(),
+            |stacked| stacked.base_branch.clone(),
+        );
         let mut args = vec!["pr".into(), "create".into()];
         if open_as == SessionPullRequestOpenAs::Draft {
             args.push("--draft".into());
@@ -1824,7 +1847,7 @@ impl Broker {
             "--head".into(),
             session.branch.clone(),
             "--base".into(),
-            default.branch.clone(),
+            base_branch,
             "--title".into(),
             title,
             "--body".into(),
@@ -1839,7 +1862,9 @@ impl Broker {
                 scope: Some(format!("session-push:pr-create:{}", session.branch)),
                 declared_effect: Some(OperationEffect::Write),
                 destructive_confirmed: false,
-                cross_session: None,
+                // A stacked base is the parent session's own branch: name
+                // that session so the coordinated write may attribute it.
+                cross_session: stacked.and_then(|stacked| stacked.cross_session),
                 ref_write_acknowledged: false,
                 authorization_reason: Some(format!("repository policy {SESSION_PUSH_POLICY_KEY}")),
                 args,
