@@ -271,7 +271,9 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                 parsed.status_revision.as_deref(),
             )?;
             value["form"] = serde_json::json!(form.as_str());
-            value["hint"] = serde_json::json!(super::status_extras::COMPACT_HINT);
+            value["hint"] = serde_json::json!(
+                "Use the pre-edit decision and this session's next action. Drill down when you need additional evidence."
+            );
             // Outside the revisioned sections: always the current stack.
             if let Some(stack) = &stack {
                 value["stack"] = stack.clone();
@@ -285,7 +287,7 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             if let Some(path) = &scratch_dir {
                 out!("Scratch directory: {}", path.display());
             }
-            if let Some(line) = crate::agent_hook::render_peer_information(&peers, session_id) {
+            if let Some(line) = crate::agent_hook::render_peer_information(&peers) {
                 out!("{line}");
             }
             if count > 0 {

@@ -168,6 +168,17 @@ fn task_evidence(task: &str) -> (BTreeSet<String>, Vec<String>) {
     (paths, if truncated { Vec::new() } else { words })
 }
 
+/// Compare the same bounded task text used for duplicate-work evidence.
+pub(crate) fn matching_task_descriptions(mine: &str, theirs: &str) -> bool {
+    let (_, mine) = task_evidence(mine);
+    let (_, theirs) = task_evidence(theirs);
+    matching_task_words(&mine, &theirs)
+}
+
+fn matching_task_words(mine: &[String], theirs: &[String]) -> bool {
+    mine.len() >= 4 && mine == theirs
+}
+
 fn duplicate_target(session: &Session, prs_by_head: &BTreeMap<String, i64>) -> Target {
     let (task_paths, task_words) = task_evidence(session.task.as_deref().unwrap_or_default());
     Target {
@@ -341,7 +352,7 @@ fn compare(mine: &Target, theirs: &Target) -> Option<(DuplicateWorkReason, Optio
     if !mine.task_paths.is_disjoint(&theirs.task_paths) {
         return Some((DuplicateWorkReason::TaskMentionsPath, None));
     }
-    if mine.task_words.len() >= 4 && mine.task_words == theirs.task_words {
+    if matching_task_words(&mine.task_words, &theirs.task_words) {
         return Some((DuplicateWorkReason::SameTask, None));
     }
     None

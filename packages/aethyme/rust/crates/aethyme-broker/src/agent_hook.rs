@@ -250,7 +250,7 @@ fn decide(
                     )
                 })
             });
-            let peers = scoped.and_then(|session| peer_view_update(&broker, session));
+            let peers = scoped.and_then(|session| peer_view_update(&broker, session, true));
             with_installation_notice(
                 append_context(append_context(start, own), peers),
                 &installation_notice,
@@ -452,7 +452,7 @@ fn on_user_prompt_submit(broker: &mut Broker, session: Option<&Session>) -> Hook
     }
     let notes = deliver_notes(broker, session);
     let notes = append_context(notes, own_view_update(broker, session, false));
-    append_context(notes, peer_view_update(broker, session))
+    append_context(notes, peer_view_update(broker, session, false))
 }
 
 /// Stable, bounded observations of recorded peer ownership relevant to this session.
@@ -465,7 +465,17 @@ pub(crate) fn session_peer_view(
         .store_ref()
         .session_peer_lease_overlaps(session_id, now_ms())?;
     let scopes = broker.store_ref().session_peer_scopes(session_id)?;
-    let all = serde_json::json!({"leases": leases, "scopes": scopes});
+    // Both store queries return rows ordered by peer session ID. Read only
+    // the earliest relevant assignment and keep the same priority on both
+    // sides of an overlap, so two sessions cannot both decide to wait.
+    let earliest = leases
+        .first()
+        .map(|entry| entry.0)
+        .into_iter()
+        .chain(scopes.first().map(|entry| entry.0))
+        .min();
+    let decision = pre_edit_decision(broker, session_id, earliest)?;
+    let all = serde_json::json!({"leases": leases, "scopes": scopes, "pre_edit": decision});
     let hash = format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&all).expect("serializable peer records"))
@@ -476,7 +486,80 @@ pub(crate) fn session_peer_view(
         "lease_count": lease_rows.len(), "scope_count": scope_rows.len(),
         "leases": lease_rows.iter().take(10).collect::<Vec<_>>(),
         "scopes": scope_rows.iter().take(10).collect::<Vec<_>>(),
+        "pre_edit": all["pre_edit"],
         "digest": hash, "source": "recorded",
+    }))
+}
+
+fn pre_edit_decision(
+    broker: &Broker,
+    session_id: i64,
+    earliest_peer: Option<i64>,
+) -> Result<serde_json::Value, crate::BrokerError> {
+    let own = broker.store_ref().session(session_id)?;
+    if own.status.is_closed() {
+        return Ok(serde_json::json!({
+            "action": "wait",
+            "instruction": "Start a live session before editing.",
+        }));
+    }
+    let Some(peer_id) = earliest_peer else {
+        return Ok(serde_json::json!({
+            "action": "continue",
+            "instruction": "No recorded overlap on your leased paths or declared scopes. Follow the session's next action.",
+        }));
+    };
+
+    let peer = broker.store_ref().session(peer_id)?;
+    let same_task = own
+        .task
+        .as_deref()
+        .zip(peer.task.as_deref())
+        .is_some_and(|(mine, theirs)| {
+            crate::duplicate_work::matching_task_descriptions(mine, theirs)
+        });
+    let (action, instruction) = if peer.status.is_closed() {
+        (
+            "wait",
+            "Peer ownership changed during this observation. Read the scoped session view again before editing the overlapping paths.",
+        )
+    } else if peer.id > session_id {
+        (
+            "continue",
+            "Your session was registered first. Follow its next action and coordinate with the peer before integrating overlapping changes.",
+        )
+    } else if same_task
+        && matches!(
+            peer.status,
+            crate::SessionStatus::Active | crate::SessionStatus::Idle
+        )
+    {
+        (
+            "yield",
+            "Confirm the assignments match before editing. Preserve any existing work. If your checkout is unchanged, use the guarded duplicate close command.",
+        )
+    } else {
+        (
+            "wait",
+            "The earlier session has a recorded overlap. Continue on disjoint paths or coordinate with that session before editing the overlap.",
+        )
+    };
+    // Bound and normalize user-supplied task labels in the default brief.
+    let task = peer.task.as_deref().map(|label| {
+        let mut chars = label.chars();
+        let bounded: String = chars.by_ref().take(160).collect();
+        let mut preview = bounded.split_whitespace().collect::<Vec<_>>().join(" ");
+        if chars.next().is_some() {
+            preview.push('…');
+        }
+        preview
+    });
+    let command = (action == "yield").then(|| {
+        format!("aethyme broker finish close --session {session_id} --duplicate-of {peer_id}")
+    });
+    Ok(serde_json::json!({
+        "action": action, "instruction": instruction, "command": command,
+        "peer": {"session_id": peer_id, "task": task, "recorded_status": peer.status},
     }))
 }
 
@@ -606,16 +689,33 @@ fn own_view_update(broker: &Broker, session: &Session, force: bool) -> Option<St
     Some(messages.join("\n"))
 }
 
-pub(crate) fn render_peer_information(view: &serde_json::Value, session_id: i64) -> Option<String> {
+pub(crate) fn render_peer_information(view: &serde_json::Value) -> Option<String> {
     use std::fmt::Write as _;
+    let decision = &view["pre_edit"];
+    let action = decision["action"].as_str()?;
+    let instruction = decision["instruction"].as_str()?;
+    let mut text = format!("Before editing: {action}. {instruction}");
+    if let Some(peer_id) = decision["peer"]["session_id"].as_i64() {
+        write!(text, "\nPeer session {peer_id}").expect("writing to String is infallible");
+        if !decision["peer"]["task"].is_null() {
+            write!(text, " assignment: {}", decision["peer"]["task"])
+                .expect("writing to String is infallible");
+        }
+    }
+    if let Some(command) = decision["command"].as_str() {
+        write!(text, "\nIf confirmed and unchanged: {command}")
+            .expect("writing to String is infallible");
+    }
     let leases = view["lease_count"].as_u64().unwrap_or(0);
     let scopes = view["scope_count"].as_u64().unwrap_or(0);
     if leases == 0 && scopes == 0 {
-        return None;
+        return Some(text);
     }
-    let mut text = format!(
-        "Coordination: {leases} recorded path overlap(s), {scopes} matching declared scope(s)."
-    );
+    write!(
+        text,
+        "\nCoordination: {leases} recorded path overlap(s), {scopes} matching declared scope(s)."
+    )
+    .expect("writing to String is infallible");
     for entry in view["leases"].as_array().into_iter().flatten().take(3) {
         if entry[1] == entry[2] {
             write!(text, "\n  session {} also leases {}.", entry[0], entry[2])
@@ -642,17 +742,12 @@ pub(crate) fn render_peer_information(view: &serde_json::Value, session_id: i64)
         )
         .expect("writing to String is infallible");
     }
-    write!(
-        text,
-        "\nDetails: aethyme broker status --session {session_id} --json"
-    )
-    .expect("writing to String is infallible");
     Some(text)
 }
 
 /// Emit recorded peer changes once at hook boundaries. The file lock prevents
 /// concurrent hooks from overwriting each other's observed revision.
-fn peer_view_update(broker: &Broker, session: &Session) -> Option<String> {
+fn peer_view_update(broker: &Broker, session: &Session, force: bool) -> Option<String> {
     let path = hook_state_path(broker.main_root(), "hook-peer-view", session.id)?;
     let parent = path.parent()?;
     std::fs::create_dir_all(parent).ok()?;
@@ -664,19 +759,15 @@ fn peer_view_update(broker: &Broker, session: &Session) -> Option<String> {
     let current = session_peer_view(broker, session.id).ok()?;
     let has_relevance = current["lease_count"].as_u64().unwrap_or(0) > 0
         || current["scope_count"].as_u64().unwrap_or(0) > 0;
-    if previous.as_ref() == Some(&current) {
+    if !force && previous.as_ref() == Some(&current) {
         return None;
     }
-    if previous.is_none() && !has_relevance {
+    if !force && previous.is_none() && !has_relevance {
         save_hook_state(Some(&path), &current);
         return None;
     }
     PENDING_PEER_VIEWS.with(|pending| pending.borrow_mut().push((path, current.clone(), _guard)));
-    Some(
-        render_peer_information(&current, session.id).unwrap_or_else(|| {
-            "Coordination: no recorded path overlaps or matching declared scopes remain.".into()
-        }),
-    )
+    render_peer_information(&current)
 }
 
 fn append_context(outcome: HookOutcome, addition: Option<String>) -> HookOutcome {
@@ -701,7 +792,7 @@ fn on_post_tool_use(cwd: &std::path::Path) -> HookOutcome {
         return HookOutcome::Silent;
     };
     let own = own_view_update(&snapshot, &session, false);
-    let peers = peer_view_update(&snapshot, &session);
+    let peers = peer_view_update(&snapshot, &session, false);
     let store = snapshot.store_ref();
     let unread = !store
         .unread_session_notes(session.id)
@@ -1638,7 +1729,7 @@ mod tests {
         // Establish the same delivered baseline as SessionStart for both hosts.
         for session in [&holder, &other] {
             let _ = own_view_update(&broker, session, true);
-            let _ = peer_view_update(&broker, session);
+            let _ = peer_view_update(&broker, session, true);
             acknowledge_peer_views();
         }
         broker.claim_lease(holder.id, "file.rs", None).unwrap();

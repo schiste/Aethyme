@@ -73,20 +73,16 @@ impl Fixture {
     }
 
     fn start(&self) -> (i64, PathBuf) {
-        let output = self
-            .command(&self.repo)
-            .args([
-                "broker",
-                "start",
-                "--task",
-                "brief fixture",
-                "--short-name",
-                "Brief fixture",
-                "--json",
-            ])
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
+        self.start_with_path("brief fixture", None)
+    }
+
+    fn start_with_path(&self, task: &str, path: Option<&str>) -> (i64, PathBuf) {
+        let mut command = self.command(&self.repo);
+        command.args(["broker", "start", "--task", task, "--json"]);
+        if let Some(path) = path {
+            command.args(["--path", path]);
+        }
+        let output = command.stdin(Stdio::null()).output().unwrap();
         assert!(
             output.status.success(),
             "broker start: stdout={} stderr={}",
@@ -176,6 +172,7 @@ fn a_session_worktree_gets_its_state_and_next_command() {
         "{context}"
     );
     assert!(brief_text.contains("Worktree: "), "{context}");
+    assert!(brief_text.contains("Before editing: continue"), "{context}");
     assert!(!brief_text.contains("Action required:"), "{context}");
     assert!(
         next(&context).starts_with("git -C ")
@@ -193,4 +190,34 @@ fn a_session_worktree_gets_its_state_and_next_command() {
         next(&context).starts_with(&format!("aethyme broker submit --session {id} (")),
         "{context}"
     );
+}
+
+#[test]
+fn a_later_matching_assignment_can_yield_from_the_startup_brief() {
+    let fixture = Fixture::new();
+    let task = "Update the documentation examples";
+    let (owner, owner_worktree) = fixture.start_with_path(task, Some("README.md"));
+    let (later, later_worktree) = fixture.start_with_path(task, Some("README.md"));
+
+    let context = fixture.session_start(&later_worktree);
+    assert!(context.contains("Before editing: yield"), "{context}");
+    assert!(
+        context.contains("Confirm the assignments match"),
+        "{context}"
+    );
+    assert!(
+        context.contains(&format!("Peer session {owner} assignment: \"{task}\"")),
+        "{context}"
+    );
+    assert!(
+        context.contains(&format!(
+            "aethyme broker finish close --session {later} --duplicate-of {owner}"
+        )),
+        "{context}"
+    );
+    assert!(!context.contains("broker status --full"), "{context}");
+
+    let context = fixture.session_start(&owner_worktree);
+    assert!(context.contains("Before editing: continue"), "{context}");
+    assert!(!context.contains("Before editing: yield"), "{context}");
 }
