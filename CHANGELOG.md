@@ -4,6 +4,24 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.125] - 2026-11-18
+
+### Fixed
+
+- Closed and cleaned checkouts were kept whenever their recorded holder process was still alive, even when that process had long since started working on another session. On the busiest repository 380 of 503 judged checkouts were refused this way in under an hour, held by two dozen long-lived agent processes. A live holder (same pid and start time) no longer keeps a closed checkout once the same process was bound to a newer session after this session's last activity and close. One shared rule serves the strip pass, its re-check under the lifecycle claim, the cleaned-leftover lap and the abandoned-operation archive. A process with its working directory or an open file inside the checkout, an unknown process listing, and a shared agent service still keep it (#1787).
+- The stale-session pass stopped at the first session whose landed proof used up the pass's budget, so every session after it went unjudged. The cursor still stays on that session, but the rest of the page now gets its abandonment judgement, without landed proofs. The close-after windows, the closing-soon notice and the fresh working-tree check before a close are unchanged (#1787).
+- Reclaim plan snapshots at the pool root were pruned only when someone ran `gc reclaim plan`. Every checkout retirement run now prunes them with the same bounds: at most 256 per run, older than 7 days, or older than a day with the scope gone (#1787).
+
+### Added
+
+- Counters `checkout_holder_moved_on`, `retirement_abandonment_judged_past_spent_landed_budget` and `reclaim_snapshots_pruned_by_worker` (#1787).
+
+### Known issues
+
+- A session whose landed proof runs out of budget on every pass still pins the stale pass's cursor, so sessions on later pages get no landed proof.
+- Checkouts whose holder cannot be determined (`holder_unknown`) are still kept.
+- `start --adopt` can still hold the lifecycle lock for minutes while comparing patches.
+
 ## [0.8.124] - 2026-11-18
 
 ### Fixed
