@@ -173,6 +173,13 @@ impl crate::Broker {
         if session.cleanup_state != crate::SessionCleanupState::Cleaned {
             return Some(true);
         }
+        // Retired through an archive that `start --reuse` restores at the
+        // same path: recorded with the session, and marked by a tombstone.
+        if self.session_restorable_archive(session.id).is_some()
+            || crate::broker::is_checkout_tombstone(std::path::Path::new(&session.worktree_path))
+        {
+            return Some(true);
+        }
         let root = self.recovery_archive_root().ok()?;
         let listing = match std::fs::read_dir(&root) {
             Ok(listing) => listing,
