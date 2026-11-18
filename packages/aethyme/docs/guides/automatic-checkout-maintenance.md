@@ -563,7 +563,10 @@ regenerable are not archived, because one command rebuilds them. They are
 (a Hypothesis database), `playwright-report` and `test-results` (Playwright
 output), a directory carrying a standard `CACHEDIR.TAG`, the package-manager
 stores the artifact catalogue recognises, and whatever `[cleanup]
-regenerable` adds. Other ignored directories are archived file by file. With
+regenerable` adds. Other ignored directories are archived file by file.
+Archives holding unlanded work have no total size limit: the bound below
+never removes them, they are kept and named in advice instead, so watch
+`storage status` on a busy host. With
 the new defaults this now applies a day after the agent leaves (24 h for
 unpushed or uncommitted work, 4 h for landed work), not after a week.
 
