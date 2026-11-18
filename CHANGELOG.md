@@ -4,6 +4,21 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.129] - 2026-11-18
+
+### Fixed
+
+- The recovery archive size bound is enforced even when one archive is slow to verify. Removals get their own time budget (60 s), separate from listing and sizing (20 s). An archive whose verification times out or fails is passed over by later runs and retried on its own after an hour, so it no longer blocks the archives behind it. A removal already proven may run up to 30 s past the budget, so it is never left half done (#1817).
+- The archive pass judges whether each archive's work landed at most once per run, and stops those checks at its deadline (`landing_unjudged`). Before, an over-bound repository repeated them for every measured archive with no deadline (#1817).
+- A failed archive size measurement is no longer remembered as 0 bytes; it is counted `size_failed` and measured again. Size walks stop at the deadline and are retried next run. Archives the broker does not own are measured fresh every run (#1817).
+- An archive listing that reaches its time budget resumes after the last archive it listed, instead of always starting from the first (#1817).
+
+### Known issues
+
+- The removal budget is capped by the retirement run's own deadline: a run that has used its time before the archive pass removes nothing in that run.
+- An archive that can never be verified (altered content, or too large for the budget) is retried once an hour and never removed for size.
+- On the busiest repository most idle sessions keep their dependency directories because those directories are not declared preparation outputs (`not_declared_output`).
+
 ## [0.8.128] - 2026-11-18
 
 ### Fixed
