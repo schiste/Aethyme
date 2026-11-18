@@ -288,7 +288,95 @@ pub fn save_snapshot(
         decisions,
     };
     let bytes = serde_json::to_vec_pretty(&snapshot).map_err(io::Error::other)?;
-    write_bookkeeping(&path, &bytes, |temporary| std::fs::rename(temporary, &path))
+    write_bookkeeping(&path, &bytes, |temporary| std::fs::rename(temporary, &path))?;
+    // Every plan leaves one review snapshot and nothing ever removed them:
+    // 1,214 had piled up at the busiest repository's pool root. The writer
+    // sweeps the old ones it can prove stale (bounded), keeping this one.
+    let pruned = prune_review_snapshots(
+        root,
+        std::time::SystemTime::now(),
+        Instant::now() + SNAPSHOT_PRUNE_BUDGET,
+        SNAPSHOT_PRUNE_MAX,
+        Some(&path),
+    );
+    if pruned > 0 {
+        crate::phase_telemetry::add("reclaim_snapshots_pruned", Duration::ZERO);
+    }
+    Ok(())
+}
+
+/// A review snapshot older than this authorizes nothing anyone still needs.
+const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(7 * 86_400);
+/// A snapshot older than this whose one-worktree scope is gone is stale.
+const SNAPSHOT_SCOPE_GONE_AGE: Duration = Duration::from_secs(86_400);
+/// Snapshots one save removes at most, and the time it may spend.
+const SNAPSHOT_PRUNE_MAX: usize = 256;
+const SNAPSHOT_PRUNE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Remove review snapshots (`.aethyme-reclaim-plan-<64 hex>.json`, regular
+/// files only; never the size cache, the in-flight marker or a temporary,
+/// whose names are not a digest) from `root` that are older than
+/// [`SNAPSHOT_MAX_AGE`], or older than [`SNAPSHOT_SCOPE_GONE_AGE`] and scoped
+/// to a worktree that no longer exists. At most `max` removals, until
+/// `deadline`, never `keep`. Returns how many were removed.
+pub(crate) fn prune_review_snapshots(
+    root: &Path,
+    now: std::time::SystemTime,
+    deadline: Instant,
+    max: usize,
+    keep: Option<&Path>,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries {
+        if removed >= max || Instant::now() >= deadline {
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        let Some(digest) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(RECLAIM_PLAN_FILENAME_PREFIX))
+            .and_then(|rest| rest.strip_suffix(RECLAIM_PLAN_FILENAME_SUFFIX))
+        else {
+            continue;
+        };
+        let path = entry.path();
+        if !is_reclaim_plan_digest(digest) || keep == Some(path.as_path()) {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let Some(age) = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+        else {
+            continue;
+        };
+        let stale = age >= SNAPSHOT_MAX_AGE
+            || (age >= SNAPSHOT_SCOPE_GONE_AGE
+                && std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<ReclaimPlanSnapshot>(&bytes).ok())
+                    .and_then(|snapshot| snapshot.scope)
+                    .is_some_and(|scope| {
+                        matches!(
+                            std::fs::symlink_metadata(&scope),
+                            Err(error) if error.kind() == io::ErrorKind::NotFound
+                        )
+                    }));
+        if stale && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Load and verify the saved decision set for a confirmation the fresh scan no
@@ -443,6 +531,64 @@ pub fn is_within(root: &Path, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Old review snapshots are swept by age, and by a vanished scope after
+    /// a day; the size cache, the in-flight marker, fresh snapshots and the
+    /// one just written stay.
+    #[test]
+    fn stale_review_snapshots_are_pruned() {
+        let root = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now();
+        let day = Duration::from_secs(86_400);
+        let write = |name: &str, scope: Option<&Path>, age: Duration| {
+            let path = root.path().join(name);
+            let snapshot = ReclaimPlanSnapshot {
+                schema_version: RECLAIM_PLAN_SCHEMA_VERSION,
+                digest: "0".repeat(64),
+                root: root.path().to_path_buf(),
+                scope: scope.map(Path::to_path_buf),
+                decisions: Vec::new(),
+            };
+            std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now - age)
+                .unwrap();
+            path
+        };
+        let digest = |fill: char| {
+            format!(
+                "{RECLAIM_PLAN_FILENAME_PREFIX}{}{RECLAIM_PLAN_FILENAME_SUFFIX}",
+                fill.to_string().repeat(64)
+            )
+        };
+        let live_scope = root.path().join("live-checkout");
+        std::fs::create_dir_all(&live_scope).unwrap();
+        let gone_scope = root.path().join("gone-checkout");
+        let old = write(&digest('a'), None, 8 * day);
+        let scope_gone = write(&digest('b'), Some(&gone_scope), 2 * day);
+        let scope_live = write(&digest('c'), Some(&live_scope), 2 * day);
+        let fresh = write(&digest('d'), Some(&gone_scope), Duration::from_secs(60));
+        let kept = write(&digest('e'), None, 9 * day);
+        let sizes = write(RECLAIM_SIZE_CACHE_FILENAME, None, 30 * day);
+
+        let removed = prune_review_snapshots(
+            root.path(),
+            now,
+            Instant::now() + Duration::from_secs(60),
+            100,
+            Some(&kept),
+        );
+
+        assert_eq!(removed, 2);
+        assert!(!old.exists());
+        assert!(!scope_gone.exists());
+        for path in [&scope_live, &fresh, &kept, &sizes] {
+            assert!(path.exists(), "{}", path.display());
+        }
+    }
 
     fn p(value: &str) -> PathBuf {
         PathBuf::from(value)

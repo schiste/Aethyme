@@ -55,6 +55,33 @@ const HOUR_MS: i64 = 3_600_000;
 /// Meta key holding the class and due time of every stale session the
 /// abandonment window classified, for `broker status`.
 pub(crate) const CLASSES_META_KEY: &str = "stale_sessions.classes";
+/// Meta key: the last working-tree check per stale session (JSON: session id
+/// to [`CleanCheck`]).
+pub(crate) const CLEAN_CACHE_META_KEY: &str = "stale_sessions.clean_checks";
+/// How long a remembered working-tree check stands while nothing it is
+/// keyed by changed.
+pub(crate) const CLEAN_CACHE_TTL_MS: i64 = 6 * HOUR_MS;
+/// Remembered working-tree checks at most; the lowest ids go first.
+const CLEAN_CACHE_MAX: usize = 4_096;
+
+/// Whether a classification may use a remembered working-tree answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeCheck {
+    /// Yes: the class only decides that a session is not closable yet, or
+    /// the order of work.
+    MayRemember,
+    /// No: the class decides a close; the tree is asked now.
+    Fresh,
+}
+
+/// One remembered working-tree check.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CleanCheck {
+    /// HEAD, branch tip, index size and modification time when checked.
+    pub key: String,
+    pub clean: bool,
+    pub at_ms: i64,
+}
 /// Sessions [`CLASSES_META_KEY`] remembers at most (the newest ids).
 const CLASSES_MAX: usize = 4_096;
 /// Meta keys: when a retirement pass last saw the complete process table,
@@ -488,8 +515,20 @@ impl crate::Broker {
     /// remote-tracking ref older than the remote only makes the class more
     /// conservative.
     pub(crate) fn stale_work_class(&self, session: &crate::Session) -> StaleWorkClass {
+        self.stale_work_class_with(session, TreeCheck::MayRemember)
+    }
+
+    /// [`Self::stale_work_class`] with a working-tree status taken now
+    /// whenever refs alone would class the session below unpushed: what a
+    /// close decision uses. A remembered clean answer never closes a
+    /// session; it only says one is not closable yet, or orders work.
+    pub(crate) fn stale_work_class_fresh(&self, session: &crate::Session) -> StaleWorkClass {
+        self.stale_work_class_with(session, TreeCheck::Fresh)
+    }
+
+    fn stale_work_class_with(&self, session: &crate::Session, tree: TreeCheck) -> StaleWorkClass {
         let started = std::time::Instant::now();
-        let class = self.stale_work_class_uncounted(session);
+        let class = self.stale_work_class_uncounted(session, tree);
         crate::phase_telemetry::add(class.telemetry_name(), Duration::ZERO);
         crate::phase_telemetry::add("stale_work_classification", started.elapsed());
         class
@@ -497,36 +536,140 @@ impl crate::Broker {
 
     /// [`Self::stale_work_class`] without its counters. Evidence is read
     /// lazily, cheapest first, and only as far as it can still change the
-    /// answer: uncommitted work is unpushed whatever the commits, a tip still
-    /// at the diff base has nothing to lose, and only then are ancestry and
-    /// remote-tracking refs asked.
-    fn stale_work_class_uncounted(&self, session: &crate::Session) -> StaleWorkClass {
+    /// answer: refs first (HEAD, the branch tip, ancestry, remote-tracking
+    /// refs); a class that is already `Unpushed`, the most protective, needs
+    /// nothing more. Only a less protective class asks the working tree,
+    /// because uncommitted work makes any session unpushed, and that answer
+    /// is remembered per session while HEAD, the branch tip and the index
+    /// are unchanged (at most [`CLEAN_CACHE_TTL_MS`]). On the busiest
+    /// repository the working-tree status took ~15 s per session, 38 of 45
+    /// classified sessions were unpushed anyway, and 15 were kept for the
+    /// lane's deadline.
+    fn stale_work_class_uncounted(
+        &self,
+        session: &crate::Session,
+        tree: TreeCheck,
+    ) -> StaleWorkClass {
         let worktree = Path::new(&session.worktree_path);
         let repo = self.repo_handle();
         let branch_tip = repo.resolve_ref(&format!("refs/heads/{}", session.branch));
         // A checkout that is gone holds nothing beyond its branch.
-        let head = if std::fs::symlink_metadata(worktree).is_ok() {
-            let clean = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root())
-                .ok()
-                .and_then(|policy| {
-                    crate::auto_cleanup::uncommitted_reason(
-                        worktree,
-                        Some(session.branch.as_str()),
-                        self.main_root(),
-                        &policy,
-                    )
-                    .ok()
-                })
-                .is_some_and(|reason| reason.is_none());
-            if !clean {
-                return StaleWorkClass::Unpushed;
-            }
+        let checkout_exists = std::fs::symlink_metadata(worktree).is_ok();
+        let head = if checkout_exists {
             crate::git::GitRepo::discover(worktree)
                 .ok()
                 .and_then(|checkout| checkout.head_commit().ok())
         } else {
             branch_tip.clone()
         };
+        let class = self.stale_ref_class(session, head.clone(), branch_tip.clone());
+        if class == StaleWorkClass::Unpushed || !checkout_exists {
+            crate::phase_telemetry::add("stale_work_classification_refs_only", Duration::ZERO);
+            return class;
+        }
+        if self.checkout_clean_remembered(
+            session,
+            worktree,
+            head.as_deref(),
+            branch_tip.as_deref(),
+            tree,
+        ) {
+            class
+        } else {
+            StaleWorkClass::Unpushed
+        }
+    }
+
+    /// Whether `session`'s checkout holds no uncommitted work, from the
+    /// remembered answer when HEAD, the branch tip and the index (size and
+    /// modification time) are what they were and it is younger than
+    /// [`CLEAN_CACHE_TTL_MS`]; otherwise asked (a working-tree status) and
+    /// remembered. Anything that cannot be read is not clean.
+    fn checkout_clean_remembered(
+        &self,
+        session: &crate::Session,
+        worktree: &Path,
+        head: Option<&str>,
+        branch_tip: Option<&str>,
+        tree: TreeCheck,
+    ) -> bool {
+        let now_ms = crate::clock::epoch_ms();
+        let index = crate::git::checked_worktree_git_dir(worktree)
+            .ok()
+            .flatten()
+            .and_then(|git_dir| std::fs::symlink_metadata(git_dir.join("index")).ok())
+            .map(|metadata| {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |since| since.as_nanos());
+                format!("{}:{modified}", metadata.len())
+            });
+        let key = head
+            .zip(branch_tip)
+            .zip(index)
+            .map(|((head, tip), index)| format!("{head}:{tip}:{index}"));
+        let mut cache: BTreeMap<i64, CleanCheck> = self
+            .store_ref()
+            .meta_get(CLEAN_CACHE_META_KEY)
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        if tree == TreeCheck::MayRemember
+            && let Some(key) = key.as_deref()
+            && let Some(check) = cache.get(&session.id)
+            && check.key == key
+            && now_ms.saturating_sub(check.at_ms) < CLEAN_CACHE_TTL_MS
+        {
+            crate::phase_telemetry::add("stale_work_clean_remembered", Duration::ZERO);
+            return check.clean;
+        }
+        let clean = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root())
+            .ok()
+            .and_then(|policy| {
+                crate::auto_cleanup::uncommitted_reason(
+                    worktree,
+                    Some(session.branch.as_str()),
+                    self.main_root(),
+                    &policy,
+                )
+                .ok()
+            })
+            .is_some_and(|reason| reason.is_none());
+        if let Some(key) = key {
+            cache.insert(
+                session.id,
+                CleanCheck {
+                    key,
+                    clean,
+                    at_ms: now_ms,
+                },
+            );
+            cache.retain(|_, check| now_ms.saturating_sub(check.at_ms) < CLEAN_CACHE_TTL_MS);
+            while cache.len() > CLEAN_CACHE_MAX {
+                cache.pop_first();
+            }
+            if let Ok(raw) = serde_json::to_string(&cache) {
+                crate::warn_unrecorded(
+                    "remember a stale session's working-tree check",
+                    self.store_ref().meta_set(CLEAN_CACHE_META_KEY, &raw),
+                );
+            }
+        }
+        clean
+    }
+
+    /// The class from refs alone, `head` and `branch_tip` given (`None` is
+    /// unreadable, so unpushed).
+    fn stale_ref_class(
+        &self,
+        session: &crate::Session,
+        head: Option<String>,
+        branch_tip: Option<String>,
+    ) -> StaleWorkClass {
+        let repo = self.repo_handle();
         // HEAD and the branch tip are classed apart and the more protective
         // class wins: a detached HEAD at the base or a landed commit, or a
         // checkout switched to another branch, cannot hide the branch's
