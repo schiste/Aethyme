@@ -5593,22 +5593,6 @@ impl GitRepo {
         Ok(ids)
     }
 
-    /// The blob id of `path` in `commit`, `None` when the commit has no such
-    /// file.
-    pub(crate) fn blob_at(&self, commit: &str, path: &str) -> Option<String> {
-        run_git(
-            &self.root,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("{commit}:{path}"),
-            ],
-        )
-        .ok()
-        .filter(|id| !id.is_empty())
-    }
-
     /// Every blob id `path` has had in the last `max_commits` commits that
     /// touched it in `commit`'s history: a record of the exact bytes once
     /// committed there.
