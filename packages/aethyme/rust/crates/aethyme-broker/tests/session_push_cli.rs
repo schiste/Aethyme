@@ -655,6 +655,23 @@ fn advance_validates_then_publishes_only_a_clean_committed_head() {
         })
         .count();
     assert_eq!(history_walks, 1, "expected one push history walk: {trace}");
+    let local_ref = format!("refs/heads/{branch}");
+    let tracking_ref = format!("refs/remotes/origin/{branch}");
+    let batched_tip_reads = trace
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| {
+            let args = &event["argv"];
+            event["event"] == "start"
+                && args[1] == "for-each-ref"
+                && args[4] == local_ref
+                && args[5] == tracking_ref
+        })
+        .count();
+    assert_eq!(
+        batched_tip_reads, 2,
+        "advance and push each observe both tips"
+    );
     assert_eq!(published["schema"], "aethyme.broker-advance/v1");
     assert_eq!(published["state"], "published");
     assert_eq!(published["pushed_head"], head);

@@ -779,23 +779,22 @@ pub(crate) fn push_authorized(
     repo: &GitRepo,
     default: &TrackedDefault,
 ) -> Result<bool, BrokerOpError> {
-    let Some(text) = repo.config_toml_at_commit(&default.commit, "config")? else {
-        return Ok(false);
-    };
-    let config = RepositoryDeliveryConfig::from_config_text(&text).map_err(refused)?;
-    Ok(config.is_some_and(|config| config.push_session_branches))
+    push_authorized_by(policy_text(repo, default)?.as_deref())
 }
 
-/// Read the requested PR mode from the same trusted default-branch commit as
-/// the push authorization. A worktree or session edit cannot change the mode.
-fn pull_request_policy(
-    repo: &GitRepo,
-    default: &TrackedDefault,
-) -> Result<SessionPullRequestPolicy, BrokerOpError> {
-    let Some(text) = repo.config_toml_at_commit(&default.commit, "config")? else {
-        return Ok(SessionPullRequestPolicy::default());
+fn policy_text(repo: &GitRepo, default: &TrackedDefault) -> Result<Option<String>, BrokerOpError> {
+    repo.config_at_resolved_commit_checked(&default.commit, "config")?
+        .map(|text| text.toml_text().map(|text| text.into_owned()))
+        .transpose()
+        .map_err(|error| crate::GitError::from(error).into())
+}
+
+fn push_authorized_by(text: Option<&str>) -> Result<bool, BrokerOpError> {
+    let Some(text) = text else {
+        return Ok(false);
     };
-    SessionPullRequestPolicy::from_config_text(&text).map_err(refused)
+    let config = RepositoryDeliveryConfig::from_config_text(text).map_err(refused)?;
+    Ok(config.is_some_and(|config| config.push_session_branches))
 }
 
 impl Broker {
@@ -824,13 +823,14 @@ impl Broker {
     ) -> Result<(String, Option<String>), BrokerOpError> {
         let repo = self.repo_handle();
         let remote = default.map_or("origin", |default| default.remote.as_str());
-        let head = repo
-            .resolve_ref(&format!("refs/heads/{}", session.branch))
-            .ok_or_else(|| BrokerOpError::SessionBranchMissing {
-                session_id: session.id,
-                branch: session.branch.clone(),
-            })?;
-        let remote_oid = repo.resolve_ref(&format!("refs/remotes/{remote}/{}", session.branch));
+        let (head, remote_oid) = repo.resolve_commit_ref_pair(
+            &format!("refs/heads/{}", session.branch),
+            &format!("refs/remotes/{remote}/{}", session.branch),
+        );
+        let head = head.ok_or_else(|| BrokerOpError::SessionBranchMissing {
+            session_id: session.id,
+            branch: session.branch.clone(),
+        })?;
         Ok((head, remote_oid))
     }
 
@@ -1123,7 +1123,8 @@ impl Broker {
         if let Some(reason) = branch_refusal(&session.branch, &default.branch) {
             return Err(refused(reason));
         }
-        if !push_authorized(repo, &default)? {
+        let policy = policy_text(repo, &default)?;
+        if !push_authorized_by(policy.as_deref())? {
             return Err(refused(format!(
                 "repository policy {SESSION_PUSH_POLICY_KEY} is not enabled on {} ({}); add \
                  `push_session_branches = true` under `[delivery]` in .aethyme/config.toml on \
@@ -1136,7 +1137,14 @@ impl Broker {
         // Parse the PR mode before the first remote write. A bad preference
         // must not leave a branch pushed when opening the requested PR refuses.
         let pr_open_as = if open_pr {
-            Some(pull_request_policy(repo, &default)?)
+            Some(
+                SessionPullRequestPolicy::from_config_text(
+                    policy
+                        .as_deref()
+                        .expect("authorized policy has committed text"),
+                )
+                .map_err(refused)?,
+            )
         } else {
             None
         };
@@ -1158,16 +1166,7 @@ impl Broker {
             && push_fetch_skip_unmoved_enabled()
             && fetch_and_push_share_endpoint(repo, &default.remote);
         let branch_ref = format!("refs/heads/{}", session.branch);
-        let head =
-            repo.resolve_ref(&branch_ref)
-                .ok_or_else(|| BrokerOpError::SessionBranchMissing {
-                    session_id,
-                    branch: session.branch.clone(),
-                })?;
-        let tracking = repo.resolve_ref(&format!(
-            "refs/remotes/{}/{}",
-            default.remote, session.branch
-        ));
+        let (head, tracking) = self.session_push_tips(&session, Some(&default))?;
         let new_commits = repo.commits_not_on_remotes(&head)?.len();
         let uncommitted = session_worktree
             .is_dir()

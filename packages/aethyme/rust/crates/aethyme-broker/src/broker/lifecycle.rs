@@ -5089,11 +5089,21 @@ impl Broker {
     ) -> Result<Self, BrokerOpError> {
         let mut storage_context = BrokerStorageContext::capture(options);
         storage_context.ensure_valid()?;
-        let here = GitRepo::discover(path_inside_repo)?;
-        let main_root = here.main_root()?;
-        let repo = GitRepo::discover(&main_root)?;
-        storage_context.bind_repository(&repo)?;
-        let store = BrokerStore::open_in_repo(&main_root)?;
+        let (repo, main_root) = {
+            let _span = crate::phase_telemetry::span("broker_open_repository_discovery");
+            let here = GitRepo::discover(path_inside_repo)?;
+            let main_root = here.main_root()?;
+            let repo = GitRepo::discover(&main_root)?;
+            (repo, main_root)
+        };
+        {
+            let _span = crate::phase_telemetry::span("broker_open_storage_binding");
+            storage_context.bind_repository(&repo)?;
+        }
+        let store = {
+            let _span = crate::phase_telemetry::span("broker_open_database");
+            BrokerStore::open_in_repo(&main_root)?
+        };
         let mut broker = Self {
             repo,
             store,
@@ -5114,6 +5124,7 @@ impl Broker {
             #[cfg(test)]
             worktree_lifecycle_test_observer: None,
         };
+        let setup = crate::phase_telemetry::span("broker_open_policy_and_preparation");
         // Fresh staged stores already have a repository-scoped bootstrap
         // identity, so a separate pinned cache root can be initialized without
         // selecting or creating a worktree root. Legacy-unbound stores defer
@@ -5143,6 +5154,8 @@ impl Broker {
         // requires collaboration capture. Best effort: the open never fails
         // because of it.
         broker.collaboration_fence_state(FenceTrigger::Open);
+        drop(setup);
+        let _recovery = crate::phase_telemetry::span("broker_open_recovery");
         broker.backfill_live_repository_contracts()?;
         // Record outcomes a busy database could not take when their child
         // exited, before anything reads rows that may still say `running`.
@@ -8072,7 +8085,8 @@ impl Broker {
         // Base selection and sparse planning use the same configuration read
         // after the fetch. Checkout admission below makes its own observations
         // under the lifecycle claim.
-        let config = crate::merge::repository_config_checked(&self.main_root);
+        let default = self.repo.upstream_default_checked();
+        let config = crate::merge::repository_config_from_default_observation(&self.repo, &default);
         let text = config
             .as_ref()
             .ok()
@@ -8080,7 +8094,8 @@ impl Broker {
             .map(|(text, _)| text.as_str());
         let (selected_promote, _) = crate::merge::PromoteConfig::from_text(text);
         let mut start_base = timed_start_phase(&mut phase_timings_ms, "base_selection", || {
-            self.select_session_start_base_with_promote(explicit_base, &selected_promote)
+            let upstream = default.unwrap_or_else(|_| self.repo.upstream_default());
+            self.select_session_start_base_from_upstream(explicit_base, &selected_promote, upstream)
         })?;
         refresh.record(&mut start_base);
         let worktrees = match config {
@@ -10738,16 +10753,17 @@ impl Broker {
     }
 
     /// Compare a chosen start base against the fetched default branch.
-    pub(super) fn start_base_drift(
+    fn start_base_drift(
         &self,
         commit: &str,
+        upstream: Option<&(String, String)>,
     ) -> (Option<u64>, Option<u64>, Option<String>) {
-        let Some((upstream_ref, upstream_head)) = self.repo.upstream_default() else {
+        let Some((upstream_ref, upstream_head)) = upstream else {
             return (None, None, None);
         };
-        let behind = self.repo.commit_count_between(commit, &upstream_head).ok();
-        let ahead = self.repo.commit_count_between(&upstream_head, commit).ok();
-        (behind, ahead, Some(upstream_ref))
+        let behind = self.repo.commit_count_between(commit, upstream_head).ok();
+        let ahead = self.repo.commit_count_between(upstream_head, commit).ok();
+        (behind, ahead, Some(upstream_ref.clone()))
     }
 
     /// Choose the commit a new session's branch is cut from.
@@ -10768,6 +10784,19 @@ impl Broker {
         explicit: Option<&str>,
         promote: &crate::merge::PromoteConfig,
     ) -> Result<SessionStartBase, BrokerOpError> {
+        self.select_session_start_base_from_upstream(
+            explicit,
+            promote,
+            self.repo.upstream_default(),
+        )
+    }
+
+    fn select_session_start_base_from_upstream(
+        &self,
+        explicit: Option<&str>,
+        promote: &crate::merge::PromoteConfig,
+        upstream: Option<(String, String)>,
+    ) -> Result<SessionStartBase, BrokerOpError> {
         if let Some(reference) = explicit {
             let Some(commit) = self.repo.resolve_ref(reference) else {
                 return Err(BrokerOpError::StartBaseUnavailable {
@@ -10777,7 +10806,7 @@ impl Broker {
                 });
             };
             let (behind_default_commits, ahead_default_commits, default_ref) =
-                self.start_base_drift(&commit);
+                self.start_base_drift(&commit, upstream.as_ref());
             return Ok(SessionStartBase {
                 ref_name: reference.to_string(),
                 commit,
@@ -10793,12 +10822,10 @@ impl Broker {
         }
         let integration_ref = format!("refs/heads/{}", promote.branch);
         let integration = self.repo.resolve_ref(&integration_ref);
-        let upstream = self.repo.upstream_default();
-
-        if let Some((upstream_ref, upstream_commit)) = upstream {
+        if let Some((upstream_ref, upstream_commit)) = upstream.as_ref() {
             let bypassed_integration = integration.map(|commit| {
                 let (behind_default_commits, ahead_default_commits, _) =
-                    self.start_base_drift(&commit);
+                    self.start_base_drift(&commit, upstream.as_ref());
                 BypassedIntegration {
                     ref_name: integration_ref,
                     commit,
@@ -10810,11 +10837,11 @@ impl Broker {
             });
             return Ok(SessionStartBase {
                 ref_name: format!("refs/remotes/{upstream_ref}"),
-                commit: upstream_commit,
+                commit: upstream_commit.clone(),
                 evidence: SessionStartBaseEvidence::FetchedDefaultBranch,
                 behind_default_commits: Some(0),
                 ahead_default_commits: Some(0),
-                default_ref: Some(upstream_ref),
+                default_ref: Some(upstream_ref.clone()),
                 bypassed_integration,
                 fetched: None,
                 fetch_error: None,
