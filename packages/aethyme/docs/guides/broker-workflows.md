@@ -1294,6 +1294,15 @@ only when that cannot touch anything local:
 - no path the update changes is also modified, staged or renamed locally,
   and no untracked or ignored file sits at, above or below a path the update
   writes (compared case-insensitively);
+- generated files Aethyme itself wrote (for example after `aethyme deploy`
+  ran in the primary checkout) do not hold it when their bytes are provably
+  generator output: equal to the update, an intact `AGENTS.md`/`CLAUDE.md`
+  receipt, this binary's template, or bytes once committed at that path.
+  They are backed up under `.aethyme/run/main-checkout-replaced/` and moved
+  with the checkout. An edited generated file, a staged one, or
+  `.aethyme/config.toml` with uncommitted owner edits still holds and is
+  named; keep edits in `.aethyme/overrides/` and commit generated output
+  from a session worktree;
 - no clean/smudge filter (Git LFS, for example) applies to a changed path,
   since a filter can run programs and reach the network. Set
   `allow_filters = true` to let it run.

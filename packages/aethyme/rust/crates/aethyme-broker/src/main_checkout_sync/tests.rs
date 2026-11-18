@@ -1045,3 +1045,206 @@ fn an_unknown_process_table_holds_the_checkout() {
     }
     assert_eq!(head(root), from);
 }
+
+fn held_paths(attempt: &Attempt) -> Vec<String> {
+    match &attempt.outcome {
+        SyncOutcome::Held(hold) => {
+            assert_eq!(hold.reason, SyncReason::LocalChangesOverlap, "{hold:?}");
+            hold.paths.clone()
+        }
+        other => panic!("expected a hold: {other:?}"),
+    }
+}
+
+fn moved_to(attempt: &Attempt, to: &str) {
+    assert!(
+        matches!(&attempt.outcome, SyncOutcome::Advanced { to: reached, remaining: None, .. } if reached == to),
+        "{attempt:?}"
+    );
+}
+
+fn backups(root: &Path) -> Vec<std::path::PathBuf> {
+    let directory = root.join(".aethyme/run/main-checkout-replaced");
+    let mut found = Vec::new();
+    let mut stack = vec![directory];
+    while let Some(directory) = stack.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+const TEMPLATE_PATH: &str = ".claude/skills/aethyme/references/explore.md";
+
+#[test]
+fn a_generated_file_with_this_binarys_bytes_is_replaced_and_backed_up() {
+    let template = aethyme_enhance::deploy::generated_artifact_contents(TEMPLATE_PATH)
+        .into_iter()
+        .next()
+        .expect("a static deploy target");
+    let (tmp, _from, to) = behind_repository(
+        &[(TEMPLATE_PATH, "committed generation\n")],
+        &[(TEMPLATE_PATH, "next generation\n")],
+    );
+    let root = tmp.path();
+    std::fs::write(root.join(TEMPLATE_PATH), &template).unwrap();
+    std::fs::write(root.join("README.md"), "local edit\n").unwrap();
+    let checkout = GitRepo::discover(root).unwrap();
+
+    let attempt = attempt(&checkout, root, dirty_options());
+    moved_to(&attempt, &to);
+    assert_eq!(
+        std::fs::read_to_string(root.join(TEMPLATE_PATH)).unwrap(),
+        "next generation\n"
+    );
+    assert_eq!(
+        std::fs::read(root.join("README.md")).unwrap(),
+        b"local edit\n",
+        "unrelated local work is untouched"
+    );
+    let saved = backups(root);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(std::fs::read_to_string(&saved[0]).unwrap(), template);
+    assert!(!marker_path(root).exists());
+}
+
+#[test]
+fn an_unedited_generated_policy_document_is_replaced_and_an_edited_one_holds() {
+    let generated =
+        aethyme_enhance::agents::stamp_generated_policy("# Agent Instructions\n\nbody\n", "0.0.1");
+    let (tmp, _from, to) = behind_repository(
+        &[("AGENTS.md", "# Agent Instructions\n\ncommitted\n")],
+        &[("AGENTS.md", "# Agent Instructions\n\nupstream\n")],
+    );
+    let root = tmp.path();
+    let checkout = GitRepo::discover(root).unwrap();
+
+    // Edited after generation: the receipt no longer hashes the body.
+    std::fs::write(
+        root.join("AGENTS.md"),
+        generated.replace("body", "body with a hand edit"),
+    )
+    .unwrap();
+    let held = attempt(&checkout, root, dirty_options());
+    assert_eq!(held_paths(&held), vec!["AGENTS.md".to_string()]);
+    assert!(
+        matches!(&held.outcome, SyncOutcome::Held(hold) if hold.message.contains("AGENTS.md (edited)")),
+        "{held:?}"
+    );
+    assert!(
+        std::fs::read_to_string(root.join("AGENTS.md"))
+            .unwrap()
+            .contains("hand edit")
+    );
+    assert!(backups(root).is_empty());
+
+    std::fs::write(root.join("AGENTS.md"), &generated).unwrap();
+    let moved = attempt(&checkout, root, dirty_options());
+    moved_to(&moved, &to);
+    assert_eq!(
+        std::fs::read_to_string(root.join("AGENTS.md")).unwrap(),
+        "# Agent Instructions\n\nupstream\n"
+    );
+}
+
+#[test]
+fn owner_policy_moves_only_when_its_bytes_were_committed() {
+    let tmp = offline_repository();
+    let root = tmp.path();
+    let config = ".aethyme/config.toml";
+    std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+    for body in ["[owner]\nolder = true\n", "[owner]\ncurrent = true\n"] {
+        std::fs::write(root.join(config), body).unwrap();
+        git(root, &["add", "-f", config]);
+        git(root, &["commit", "-qm", "owner policy"]);
+    }
+    let from = git(root, &["rev-parse", "HEAD"]);
+    std::fs::write(root.join(config), "[owner]\nupstream = true\n").unwrap();
+    git(root, &["add", "-f", config]);
+    git(root, &["commit", "-qm", "upstream policy"]);
+    let to = git(root, &["rev-parse", "HEAD"]);
+    git(root, &["update-ref", "refs/remotes/origin/main", &to]);
+    git(root, &["reset", "-q", "--hard", &from]);
+    let checkout = GitRepo::discover(root).unwrap();
+
+    std::fs::write(root.join(config), "[owner]\nmy_uncommitted_edit = true\n").unwrap();
+    let held = attempt(&checkout, root, dirty_options());
+    assert_eq!(held_paths(&held), vec![config.to_string()]);
+    assert!(
+        matches!(&held.outcome, SyncOutcome::Held(hold) if hold.message.contains("(owner_edits)")),
+        "{held:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(config)).unwrap(),
+        "[owner]\nmy_uncommitted_edit = true\n"
+    );
+
+    // Exactly an older committed version: nothing uncommitted to lose.
+    std::fs::write(root.join(config), "[owner]\nolder = true\n").unwrap();
+    let moved = attempt(&checkout, root, dirty_options());
+    moved_to(&moved, &to);
+    assert_eq!(
+        std::fs::read_to_string(root.join(config)).unwrap(),
+        "[owner]\nupstream = true\n"
+    );
+}
+
+#[test]
+fn staged_or_non_generated_overlaps_still_hold() {
+    let template = aethyme_enhance::deploy::generated_artifact_contents(TEMPLATE_PATH)
+        .into_iter()
+        .next()
+        .unwrap();
+    let (tmp, from, _to) = behind_repository(
+        &[
+            (TEMPLATE_PATH, "committed generation\n"),
+            ("src.txt", "base\n"),
+        ],
+        &[
+            (TEMPLATE_PATH, "next generation\n"),
+            ("src.txt", "upstream\n"),
+        ],
+    );
+    let root = tmp.path();
+    std::fs::write(root.join(TEMPLATE_PATH), &template).unwrap();
+    git(root, &["add", "-f", TEMPLATE_PATH]);
+    std::fs::write(root.join("src.txt"), "local\n").unwrap();
+    let checkout = GitRepo::discover(root).unwrap();
+
+    let held = attempt(&checkout, root, dirty_options());
+    assert_eq!(
+        held_paths(&held),
+        vec![TEMPLATE_PATH.to_string(), "src.txt".to_string()]
+    );
+    assert_eq!(head(root), from);
+    assert_eq!(
+        std::fs::read_to_string(root.join(TEMPLATE_PATH)).unwrap(),
+        template
+    );
+    assert!(backups(root).is_empty());
+}
+
+#[test]
+fn local_bytes_equal_to_the_update_are_not_in_the_way() {
+    let (tmp, _from, to) = behind_repository(
+        &[("CLAUDE.md", "# Agent Instructions\n\nold\n")],
+        &[("CLAUDE.md", "# Agent Instructions\n\nnew\n")],
+    );
+    let root = tmp.path();
+    std::fs::write(root.join("CLAUDE.md"), "# Agent Instructions\n\nnew\n").unwrap();
+    let checkout = GitRepo::discover(root).unwrap();
+
+    let attempt = attempt(&checkout, root, dirty_options());
+    moved_to(&attempt, &to);
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+}
