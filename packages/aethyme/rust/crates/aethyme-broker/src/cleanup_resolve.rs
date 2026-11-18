@@ -4563,13 +4563,12 @@ impl Broker {
             } else {
                 Vec::new()
             },
-            holds_uncommitted: manifest.staged_patch.bytes > 0
-                || manifest.unstaged_patch.bytes > 0
-                || !manifest.untracked_files.is_empty()
-                || manifest
-                    .ignored_files
-                    .as_deref()
-                    .is_some_and(|files| !files.is_empty()),
+            holds_uncommitted: holds_uncommitted_content(
+                manifest.staged_patch.bytes,
+                manifest.unstaged_patch.bytes,
+                &manifest.untracked_files,
+                manifest.ignored_files.as_deref(),
+            ),
         })
     }
 
@@ -4725,6 +4724,22 @@ impl Broker {
             unowned,
         })
     }
+}
+
+/// Whether an archive holds work no commit carries. A manifest without an
+/// `ignored_files` list (schemas 2 to 4, written before ignored files were
+/// archived) does not say what was ignored, so it counts as holding some:
+/// such an archive is never called landed, as the storage worker judges it.
+pub(crate) fn holds_uncommitted_content(
+    staged_patch_bytes: u64,
+    unstaged_patch_bytes: u64,
+    untracked_files: &[ArchivedFile],
+    ignored_files: Option<&[ArchivedFile]>,
+) -> bool {
+    staged_patch_bytes > 0
+        || unstaged_patch_bytes > 0
+        || !untracked_files.is_empty()
+        || ignored_files.is_none_or(|files| !files.is_empty())
 }
 
 fn require_real_directory(path: &Path) -> Result<(), String> {
@@ -6166,6 +6181,31 @@ fn restore_readme(plan: &CleanupResolvePlan, has_bundle: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A legacy manifest (schemas 2 to 4) has no `ignored_files` list: it
+    /// does not say what was ignored, so the archive counts as holding
+    /// uncommitted work and is never called landed.
+    #[test]
+    fn a_legacy_manifest_without_an_ignored_list_holds_uncommitted_work() {
+        assert!(holds_uncommitted_content(0, 0, &[], None));
+        assert!(!holds_uncommitted_content(0, 0, &[], Some(&[])));
+        assert!(holds_uncommitted_content(1, 0, &[], Some(&[])));
+        // The storage worker reads the same legacy manifest the same way.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MANIFEST_FILE),
+            serde_json::json!({
+                "schema_version": 3,
+                "staged_patch": {"bytes": 0},
+                "unstaged_patch": {"bytes": 0},
+                "untracked_files": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let why = crate::storage_ledger::evict::archive_landed(dir.path()).unwrap_err();
+        assert!(why.contains("ignored_files"), "{why}");
+    }
 
     #[test]
     fn exact_bundled_root_skips_even_a_failing_delivery_probe() {

@@ -5431,6 +5431,28 @@ mod tests {
         assert_eq!(broker.newest_operation_archive(990_002), Some(operation));
     }
 
+    /// The archive bound never removes an archive its owner kept with
+    /// `storage keep-archive`.
+    #[test]
+    fn the_archive_bound_never_removes_an_archive_its_owner_kept() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, _, _) = retired_with_archive(&mut broker, "kept archive");
+        let archive = broker
+            .newest_recovery_archive(session.id)
+            .expect("the archive");
+        std::fs::write(crate::storage_ledger::keep_marker(&archive), "kept\n").unwrap();
+        let owned = broker.owned_recovery_archive(&archive).unwrap();
+        let refused = broker
+            .evict_landed_archive(&owned, Instant::now() + Duration::from_secs(60))
+            .unwrap_err();
+        assert!(refused.contains("kept by the owner's marker"), "{refused}");
+        assert!(
+            archive
+                .join(crate::cleanup_resolve::MANIFEST_FILE)
+                .is_file()
+        );
+    }
+
     /// A restore whose cleanup fails leaves nothing at the session's path
     /// (it was built at a sibling staging path) and a marker that refuses
     /// any reuse there until the leftovers are removed.

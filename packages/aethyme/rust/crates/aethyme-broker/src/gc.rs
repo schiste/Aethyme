@@ -2573,6 +2573,67 @@ mod recovery_archive_minimum_age_tests {
 
 /// Whether `archive` is a removal candidate now, and why: `(landed, reason)`.
 /// Shared by planning and apply so the rule is re-proved, not remembered.
+/// Why an orphaned worktree root must be kept because of the recovery
+/// archives in its broker-owned archive directory
+/// (`<root>/.aethyme-recovery-archives/<key>/<archive>`): how many are not
+/// proven landed, of how many, and where. `None` when there are none, or
+/// every one is proven landed (no unique work in them). Anything that
+/// cannot be read counts as not proven.
+pub(crate) fn orphan_root_archive_refusal(root: &Path) -> Option<String> {
+    let directory = root.join(crate::cleanup_resolve::POOL_RECOVERY_ARCHIVE_DIRECTORY);
+    let Ok(metadata) = std::fs::symlink_metadata(&directory) else {
+        return None;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Some(format!(
+            "{} is not a real directory; the root is kept",
+            directory.display()
+        ));
+    }
+    let mut archives = 0_usize;
+    let mut unproven = 0_usize;
+    let Ok(keys) = std::fs::read_dir(&directory) else {
+        return Some(format!(
+            "{} cannot be read; the root is kept",
+            directory.display()
+        ));
+    };
+    for key in keys {
+        let Ok(key) = key else {
+            unproven += 1;
+            continue;
+        };
+        if !key.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(key.path()) else {
+            unproven += 1;
+            continue;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                unproven += 1;
+                continue;
+            };
+            let path = entry.path();
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            archives += 1;
+            if crate::storage_ledger::evict::archive_landed(&path).is_err() {
+                unproven += 1;
+            }
+        }
+    }
+    (unproven > 0).then(|| {
+        format!(
+            "orphaned root {} holds {unproven} of {archives} recovery archive(s) not proven landed in {}; it is kept until they are restored or removed by hand",
+            root.display(),
+            directory.display()
+        )
+    })
+}
+
 fn recovery_archive_disposition(
     broker: &Broker,
     archive: &crate::cleanup_resolve::OwnedRecoveryArchive,
@@ -5766,6 +5827,21 @@ impl Broker {
                         root.display(),
                         policy.orphan_worktree_roots_days
                     ),
+                });
+                continue;
+            }
+            // Recovery archives now live on the pool's volume: a root that
+            // holds one not proven landed (its repository being gone, none
+            // can be proven) is kept, and the plan says why.
+            if let Some(reason) = orphan_root_archive_refusal(&root) {
+                crate::phase_telemetry::add(
+                    "gc_orphan_root_kept_recovery_archives",
+                    std::time::Duration::ZERO,
+                );
+                blockers.push(GcBlocker {
+                    kind: "orphan_root_holds_recovery_archives".into(),
+                    id: None,
+                    reason,
                 });
                 continue;
             }
@@ -14040,6 +14116,16 @@ impl Broker {
             }
             let candidate = journal.remaining_orphans[0].clone();
             let root = PathBuf::from(&candidate.worktree_root);
+            // Re-checked at removal: an archive may have appeared since review.
+            if let Some(reason) = orphan_root_archive_refusal(&root) {
+                failures.push(format!(
+                    "{}: {reason}; no deletion performed",
+                    candidate.worktree_root
+                ));
+                journal.remaining_orphans.remove(0);
+                write_journal(&journal_path, &journal)?;
+                continue;
+            }
             let Some(fingerprint) = candidate.ownership_fingerprint.as_deref() else {
                 failures.push(format!("{}: legacy orphan authorization revoked; no deletion performed; review a fresh GC plan", candidate.worktree_root));
                 journal.remaining_orphans.remove(0);
@@ -23068,6 +23154,69 @@ mod tests {
         let plan = broker.gc_plan().unwrap();
         assert!(plan.orphans.is_empty(), "{:?}", plan.orphans);
         assert!(tombstone.join("ARCHIVED-SESSION.txt").is_file());
+    }
+
+    /// An orphaned root holding a recovery archive not proven landed (its
+    /// repository is gone, so none can be) is kept, and the plan names how
+    /// many and where; an archive appearing after review stops the apply.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn an_orphan_root_holding_unproven_recovery_archives_is_kept() {
+        // The fixture reviewed the root as an orphan and journaled the plan.
+        let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
+
+        let archive = root
+            .join(crate::cleanup_resolve::POOL_RECOVERY_ARCHIVE_DIRECTORY)
+            .join("example-key")
+            .join("7-0123456789ab-1");
+        std::fs::create_dir_all(&archive).unwrap();
+        std::fs::write(
+            archive.join("manifest.json"),
+            serde_json::json!({
+                "session_id": 7,
+                "staged_patch": {"bytes": 3},
+                "unstaged_patch": {"bytes": 0},
+                "untracked_files": [],
+                "ignored_files": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // Applying the plan reviewed before the archive appeared deletes
+        // nothing.
+        let report = broker.gc_apply(&digest).unwrap();
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|line| line.contains("not proven landed")),
+            "{:?}",
+            report.failures
+        );
+        assert!(archive.join("manifest.json").is_file());
+        assert!(root.join("retained.txt").is_file());
+
+        let journal = broker.main_root().join(".aethyme/gc-journal.json");
+        if journal.exists() {
+            std::fs::remove_file(&journal).unwrap();
+        }
+        let plan = broker.gc_plan().unwrap();
+        assert!(plan.orphans.is_empty(), "{:?}", plan.orphans);
+        let blocker = plan
+            .blockers
+            .iter()
+            .find(|blocker| blocker.kind == "orphan_root_holds_recovery_archives")
+            .expect("the plan says why the root is kept");
+        assert!(blocker.reason.contains("1 of 1"), "{}", blocker.reason);
+        assert!(
+            blocker
+                .reason
+                .contains(crate::cleanup_resolve::POOL_RECOVERY_ARCHIVE_DIRECTORY),
+            "{}",
+            blocker.reason
+        );
+        assert!(archive.join("manifest.json").is_file());
     }
 
     #[test]

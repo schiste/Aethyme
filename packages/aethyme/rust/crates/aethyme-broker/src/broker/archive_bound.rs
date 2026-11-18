@@ -18,6 +18,9 @@
 //! changes is never removed by age here; removing one takes a reviewed
 //! `broker gc apply`.
 //!
+//! An archive carrying its owner's keep marker (`storage keep-archive`,
+//! `<archive>.aethyme-keep` beside it) is never removed by this pass.
+//!
 //! What it measured is recorded per repository in the storage ledger
 //! (`storage-ledger-recovery-archives/<sha256 of the repository root>.json`),
 //! with bytes and counts by location, and shown by `aethyme storage status`.
@@ -96,7 +99,13 @@ impl Broker {
                 .checked_sub(archive.created_at_ms)
                 .and_then(|age| u64::try_from(age).ok())
                 .is_some_and(|age| age >= minimum_age_ms);
-            let evictable = old_enough && self.recovery_archive_landed(&archive);
+            // An owner's keep marker (`storage keep-archive`) exempts it, as
+            // it does from the storage worker's expiry.
+            let kept = crate::storage_ledger::keep_marker(&archive.path).exists();
+            if kept {
+                crate::phase_telemetry::add("recovery_archive_bound_kept_by_owner", Duration::ZERO);
+            }
+            let evictable = !kept && old_enough && self.recovery_archive_landed(&archive);
             // Host state archives keep expiring through the storage worker
             // (with its notice week); pool ones are this lane's.
             let expired = evictable
@@ -222,7 +231,7 @@ impl Broker {
     /// under the lifecycle claim (a reuse restoring from it waits for the
     /// claim, then finds it gone and recreates from the branch, which holds
     /// everything the archive did). The manifest goes last.
-    fn evict_landed_archive(
+    pub(super) fn evict_landed_archive(
         &self,
         archive: &crate::cleanup_resolve::OwnedRecoveryArchive,
         deadline: Instant,
@@ -233,6 +242,9 @@ impl Broker {
         else {
             return Err("another checkout lifecycle operation is running".into());
         };
+        if crate::storage_ledger::keep_marker(&archive.path).exists() {
+            return Err("kept by the owner's marker".into());
+        }
         let current = self.owned_recovery_archive(&archive.path)?;
         if current.session_id != archive.session_id
             || current.head != archive.head
