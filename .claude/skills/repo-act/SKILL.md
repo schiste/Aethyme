@@ -94,6 +94,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   the agent can stage in its own fixture Git index in both the initial and
   conflict-repair turns.
 
+- For concurrent-agent comparisons, register both worktrees and their task
+  scopes before launching either worker. Use the same ordered integration and
+  repair rules in every arm, then verify both features on the final tree. A
+  scripted peer applied after publication measures conflict repair only.
+
 - When changing a retention default, inspect fixtures that inherit the default
   as well as tests with explicit overrides. Update their age assumptions and
   reference documentation; exercise retention and expiry on both sides of the
