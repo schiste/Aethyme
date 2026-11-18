@@ -1383,3 +1383,51 @@ fn unlanded_archive_evidence_names_a_few_and_counts_the_rest() {
     assert!(evidence[5].contains("aethyme storage status --json"));
     assert!(serde_json::to_vec(&evidence).unwrap().len() < 1024);
 }
+
+/// Session scratch usage is its own reported class, never unclassified, and
+/// advises only above its thresholds.
+#[test]
+fn session_scratch_usage_is_reported_and_advised_when_large() {
+    let owner = tempfile::tempdir().unwrap();
+    let host_state = owner.path();
+    assert_eq!(
+        classify(RootKind::HostState, super::SESSION_SCRATCH_DIRECTORY),
+        Class::Coordination
+    );
+    let small = super::SessionScratchUsage {
+        directories: 2,
+        bytes: 1024,
+        largest_bytes: 1000,
+        largest_session_id: Some(7),
+        observed_at_ms: 1,
+        ..super::SessionScratchUsage::default()
+    };
+    super::record_session_scratch_usage(host_state, "/repo/a", small.clone()).unwrap();
+    assert_eq!(
+        super::session_scratch_usage(host_state).get("/repo/a"),
+        Some(&small)
+    );
+    let status = super::cli::status_value(host_state);
+    assert_eq!(status["classes"]["session_scratch"]["directories"], 2);
+    let advice = super::cli::status_advice(host_state);
+    assert!(
+        advice
+            .iter()
+            .all(|row| row.id != "storage.session-scratch-large"),
+        "small usage does not advise"
+    );
+    let large = super::SessionScratchUsage {
+        bytes: super::SESSION_SCRATCH_ADVICE_BYTES + 1,
+        largest_bytes: super::SESSION_SCRATCH_ADVICE_ONE_BYTES + 1,
+        largest_session_id: Some(9),
+        ..small
+    };
+    super::record_session_scratch_usage(host_state, "/repo/b", large).unwrap();
+    let advice = super::cli::status_advice(host_state);
+    let row = advice
+        .iter()
+        .find(|row| row.id == "storage.session-scratch-large")
+        .expect("advice");
+    assert_eq!(row.evidence.len(), 1, "{row:?}");
+    assert!(row.evidence[0].contains("session 9"), "{row:?}");
+}

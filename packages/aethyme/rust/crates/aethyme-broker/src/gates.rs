@@ -5354,6 +5354,7 @@ fn run_gate_command_inner(
         .current_dir(context.cwd)
         .env("AETHYME_GATE_WORKER_ID", context.worker_id)
         .env("AETHYME_TEST_DB_SUFFIX", context.worker_id)
+        .env_remove(crate::session_scratch::SESSION_SCRATCH_ENV)
         .env(crate::BROKER_DB_ENV, &isolated_broker_db_path)
         .env(crate::gate_database::SCOPE_ENV, isolated_broker_scope)
         .env("AETHYME_GATE_OWNER_PATHS", context.owner_paths.join(":"))
@@ -5373,6 +5374,14 @@ fn run_gate_command_inner(
     }
     if let Some(cache) = context.managed_cache {
         process.env("AETHYME_GATE_CACHE_DIR", &cache.directory);
+    }
+    // The session's scratch directory, when this process resolved one for
+    // it; an inherited value naming another session's is removed above.
+    if let Some(scratch) = context
+        .session_id
+        .and_then(crate::session_scratch::remembered_for_commands)
+    {
+        process.env(crate::session_scratch::SESSION_SCRATCH_ENV, scratch);
     }
     // From the same reading the log header records, so a log always shows
     // the capacity the command sized itself on.

@@ -3374,3 +3374,81 @@ resolves it. To explicitly record an intervention that prevented duplicate work,
 use `aethyme broker finish close --session <id> --duplicate-of <peer-id>`.
 This requires the broker's current live duplicate-work evidence and a clean,
 unchanged checkout. Ordinary overlap warnings remain a separate count.
+
+### Session scratch directories
+
+Introduced 2026-11-18. Every spawned session whose checkout sits in a
+broker-owned worktree pool gets a scratch directory the broker creates,
+records and removes: `<pool>/.aethyme-session-scratch/s<session>-<hex ms>`
+(mode 0700; the container is a private, marked directory owned by the user,
+dot-named so pool scanners skip it like `.aethyme-checkout-trash`). It is on
+the checkout's volume and outside the checkout, so it never appears in
+`git status`. Adopted checkouts get none.
+
+New surface consumers may begin to depend on:
+
+- `broker start --json`, `--reuse --json` and `--adopt --json` carry
+  `scratch_dir` (the path, or `null` when the session has none) and
+  `scratch_dir_note` (what to put there, or why there is none). The human
+  output prints `Scratch directory: <path>` and the instruction under the
+  working agreement. `start-agent` output does not carry them.
+- The session view of `broker status --json` (`aethyme.broker-session-view/v2`)
+  carries `session.scratch_dir` (path or `null`); status never creates one.
+- The environment variable `AETHYME_SESSION_SCRATCH_DIR` is exported to
+  `broker advanced exec` commands, preparation steps, and gate commands run
+  for a session (an inherited value is removed from gate commands). `TMPDIR`,
+  `TMP` and `TEMP` are deliberately not changed: on the busiest machine a
+  scratch path is about 130 bytes (and holds a space), past the Unix socket
+  path limit (104 bytes on macOS, 108 on Linux), so tools that create sockets
+  under the temp directory (SSH and GPG agents, Python multiprocessing, tmux)
+  would fail there.
+- `aethyme storage status --json` adds a `session_scratch` class
+  (`directories`, `bytes`, `kept`, `partial`, `bytes_freed_total`,
+  `repositories`), written by the retirement lane to
+  `<host state>/storage-ledger-session-scratch/` (classified `coordination`).
+  `broker status` adds advice `storage.session-scratch-large` (notice) when
+  one repository's scratch exceeds 16 GiB or one directory exceeds 8 GiB.
+- Broker metadata key `session_scratch.records` (path to record: session,
+  pool, entry, device, inode, created time, `superseded`, last `keep` reason
+  and `attempts`) and `session_scratch.bytes_freed_total`.
+- Trash rows (`checkout_retirement.trash_rows`) gain `scratch: true` (omitted
+  when false); such rows also carry `stripped: true`, so older binaries treat
+  them as stripped directories, never as the checkout. `TrashDrainReport`
+  counts their bytes as scratch, not strip.
+
+Lifecycle: `start --reuse` marks the previous directory superseded and creates
+a fresh one. Each `checkout_retirement` run, after its strip pass and within a
+5-second budget, retires the directories of closed or cleaned sessions (or of
+sessions no longer in the store) and superseded ones: no process may have its
+working directory or an open file inside (the run's single open-file
+observation), the lifecycle claim is taken without waiting, the record must be
+unchanged, and the directory must verify (walked from `/` without following a
+link, private marked container, recorded device and inode, same device as the
+pool). It is then renamed into the pool's checkout trash (row recorded pending
+first) and unlinked later by the paced host deleter after its own open-file
+observation. Keeps are retried every run (`session_unknown`,
+`process_using_scratch`, `process_use_unknown`, `lifecycle_busy`, `changed`,
+`not_a_recorded_scratch`, `not_a_real_directory`, `foreign_container`,
+`identity_changed`, `crosses_device`, `move_failed`); a directory that is gone
+drops its record. After a remount (new device number, same inode) the record
+is re-identified under the claim by its marked container on the pool's current
+device, its session-bound entry name and its inode, and the new device is
+stored (counter `session_scratch_reidentified`); otherwise it is kept, counted
+as `refused` in the `session_scratch` class, and `broker status` warns with
+advice `storage.session-scratch-unidentified`. A superseded directory gets a
+fresh open-file observation right before its claim and rename
+(`session_scratch_superseded_fresh_observation`). A container holding only its
+marker and scratch directories does not make a worktree root non-empty; it is
+never a `gc storage` stray candidate, and `gc storage apply` refuses to remove
+a root whose container still holds scratch directories. Entries in a container the broker did not record are counted
+(`session_scratch_unrecorded`) and never touched. `finish` and `close` ask for
+a retirement run when the session has a scratch directory. Counters
+`session_scratch_created`, `session_scratch_existing`,
+`session_scratch_recreated`, `session_scratch_superseded`,
+`session_scratch_unavailable`, `session_scratch_create_failed`,
+`session_scratch_retired`, `session_scratch_missing_forgotten`,
+`session_scratch_kept_<reason>`, `session_scratch_refused_<code>`,
+`session_scratch_trash_entries_removed`; spans `session_scratch_create`,
+`session_scratch_move`, `session_scratch_retire_pass`,
+`session_scratch_measure`; attachments `session_scratch_retire` and
+`session_scratch_usage`; start phase `session_scratch`.

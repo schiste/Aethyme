@@ -537,6 +537,9 @@ impl Broker {
         abandon_reason: Option<&str>,
     ) -> Result<FinishReport, BrokerOpError> {
         let mut report = self.finish_with_options_inner(session_id, options, abandon_reason)?;
+        if report.closed {
+            self.note_session_scratch_closed(session_id);
+        }
         // The snapshot is taken while the session is still open, because a
         // blocked finish needs it to explain what is held. Cleanup is what
         // actually removes the leases, so only a completed cleanup makes the
