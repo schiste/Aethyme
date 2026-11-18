@@ -343,9 +343,14 @@ budget only when proven landed in the default branch and past their manifest's
 creation time plus its minimum retention. An unlanded archive is never removed
 here, and no archive is removed by age.
 
-Recovery archives also expire by age, landed or not. An archive's age is
-up at its manifest's `created_at_ms` plus the larger of `unlanded_archive_days`
-(default 30; 0 turns age expiry off) and the manifest's
+Recovery archives also expire by age. An archive holding unlanded commits or
+uncommitted changes is kept at its age and named by advice
+`storage.unlanded-archives-at-age` (session, restore command) until its owner
+runs `aethyme storage keep-archive <id> --dismiss` (writing
+`<archive>.aethyme-dismissed`) or `[budget] expire_unlanded_archives = true`
+(default false) allows it; fully landed archives expire as described here. An
+archive's age is up at its manifest's `created_at_ms` plus the larger of
+`unlanded_archive_days` (default 90; 0 turns age expiry off) and the manifest's
 `minimum_archive_retention_ms`; a missing or implausible creation time (before
 2017 or in the future) means it is never removed by age. Age comes from the
 manifest only. Removal also needs its notice served: the archive must have
@@ -355,7 +360,7 @@ command that keeps one) at least seven days earlier, in at least two worker
 passes a day or more apart. If the clock went back, or no pass ran for over a
 week, a pass removes nothing by age and every pending notice starts again. At
 most 50 archives or 1 GiB expire per pass, oldest first. `aethyme storage
-keep-archive <id> [--unkeep]` creates (never through a link) or removes
+keep-archive <id> [--unkeep | --dismiss]` creates (never through a link) or removes
 `<archive>.aethyme-keep` beside the archive directory, which exempts it from
 age expiry; `aethyme storage archives [--json]` (`aethyme.storage-archives/v1`)
 lists archives with landed or not, created, expires, noticed and kept.

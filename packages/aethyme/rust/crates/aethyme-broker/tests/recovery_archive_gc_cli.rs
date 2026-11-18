@@ -192,7 +192,7 @@ fn canonical(path: &Path) -> PathBuf {
 fn an_expired_unlanded_archive_is_proposed_and_says_it_holds_unlanded_work() {
     let tmp = repo();
     let (id, _, archive) = archived_session(tmp.path(), "expired", true);
-    age(&archive, 31);
+    age(&archive, 91);
 
     let reviewed = plan(tmp.path());
     let candidates = proposed(&reviewed);
@@ -242,7 +242,7 @@ fn a_landed_archive_is_proposed_after_minimum_retention_before_policy_expiry() {
     let young = plan(tmp.path());
     assert!(proposed(&young).is_empty(), "{young}");
     // Landing does not bypass the 15-day minimum; it permits collection
-    // afterward without waiting for the default 30-day policy expiry.
+    // afterward without waiting for the default 90-day policy expiry.
     age(&archive, 16);
     let candidates = proposed(&plan(tmp.path()));
     assert_eq!(candidates.len(), 1);
@@ -306,7 +306,7 @@ fn applying_the_reviewed_plan_removes_exactly_the_proposed_archive() {
     let tmp = repo();
     let (id, _, expired) = archived_session(tmp.path(), "old", true);
     let (_, _, young) = archived_session(tmp.path(), "new", true);
-    age(&expired, 45);
+    age(&expired, 100);
 
     let digest = plan(tmp.path())["digest"].as_str().unwrap().to_owned();
     let report = json(&run(
@@ -337,11 +337,11 @@ fn a_digest_reviewed_before_another_archive_expired_is_refused() {
     let tmp = repo();
     let (_, _, first) = archived_session(tmp.path(), "first", true);
     let (_, _, second) = archived_session(tmp.path(), "second", true);
-    age(&first, 45);
+    age(&first, 100);
     let digest = plan(tmp.path())["digest"].as_str().unwrap().to_owned();
 
     // The set changes after review: the second archive now expires too.
-    age(&second, 45);
+    age(&second, 100);
     let output = run(
         tmp.path(),
         &["gc", "apply", "--confirm", &digest, "--full-scan", "--json"],

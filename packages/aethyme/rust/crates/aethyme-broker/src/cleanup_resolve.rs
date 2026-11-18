@@ -38,6 +38,14 @@ use crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS;
 use crate::types::SessionOrigin;
 use crate::{Broker, BrokerOpError, CleanupDisposition};
 
+mod restore;
+pub(crate) use restore::{
+    ArchiveRestore, restore_incomplete, restore_incomplete_marker, restore_recovery_archive,
+    restore_staging_path,
+};
+#[cfg(test)]
+pub(crate) use restore::{FAIL_AFTER_ADD_FOR_TEST, FAIL_UNDO_FOR_TEST};
+
 pub const CLEANUP_RESOLVE_SCHEMA_VERSION: u32 = 3;
 const LEGACY_CLEANUP_RESOLVE_SCHEMA_VERSION: u32 = 2;
 const LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 1;
@@ -59,6 +67,13 @@ const MAX_RECOVERY_ARCHIVE_PREREQUISITE_REFS: usize = 128;
 /// Directory beneath the host state directory holding one subdirectory of
 /// archives per repository.
 const RECOVERY_ARCHIVE_DIRECTORY: &str = "recovery-archives";
+/// The broker-owned directory beside a pool's checkouts holding the
+/// retirement lane's archives, one subdirectory per repository key. Pool
+/// scanners treat dot-named entries as infrastructure and never as
+/// checkouts.
+pub(crate) const POOL_RECOVERY_ARCHIVE_DIRECTORY: &str = ".aethyme-recovery-archives";
+/// The marker naming the repository a pool archive directory belongs to.
+const POOL_RECOVERY_ARCHIVE_MARKER: &str = ".aethyme-recovery-archives-root.json";
 const BUNDLE_FILE: &str = "commits.bundle";
 const STAGED_PATCH_FILE: &str = "staged.patch";
 const UNSTAGED_PATCH_FILE: &str = "unstaged.patch";
@@ -1230,6 +1245,87 @@ impl Broker {
         })
     }
 
+    /// Where the retirement lane writes new recovery archives: on the pool's
+    /// volume, in a broker-owned, marked, private directory beside the
+    /// checkouts (`<pool>/.aethyme-recovery-archives/<repository key>`),
+    /// because the host state directory may sit on a small system volume
+    /// while the pool's volume has the room. Falls back to
+    /// [`Self::recovery_archive_root`] when no pool is bound or the
+    /// directory's marker names another repository.
+    pub(crate) fn retirement_archive_root(&self) -> Result<PathBuf, BrokerOpError> {
+        match self.pool_recovery_archive_root(true) {
+            Some(root) => Ok(root),
+            None => self.recovery_archive_root(),
+        }
+    }
+
+    /// The pool-side archive root (see [`Self::retirement_archive_root`]),
+    /// identified by its marker and path, never by device (a remount
+    /// renumbers devices). With `create`, the directory and its marker are
+    /// made (private, mode 0700) when absent. `None` when no pool is bound,
+    /// it does not exist, or the marker is missing (without `create`) or
+    /// names another repository.
+    pub(crate) fn pool_recovery_archive_root(&self, create: bool) -> Option<PathBuf> {
+        let pool = self
+            .require_bound_repository_worktree_root("recovery archives")
+            .ok()?;
+        if !std::fs::symlink_metadata(&pool)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        {
+            return None;
+        }
+        let key = self.worktree_root_plan().ok()?.repository_key;
+        let parent = pool.join(POOL_RECOVERY_ARCHIVE_DIRECTORY);
+        let marker = parent.join(POOL_RECOVERY_ARCHIVE_MARKER);
+        match std::fs::symlink_metadata(&parent) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+                std::fs::create_dir(&parent).ok()?;
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).ok()?;
+            }
+            Err(_) => return None,
+        }
+        let expected = serde_json::json!({
+            "schema": "aethyme.pool-recovery-archives/v1",
+            "repository_key": key,
+        });
+        match std::fs::read(&marker) {
+            Ok(bytes) => {
+                let found: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                if found.get("repository_key") != expected.get("repository_key") {
+                    crate::phase_telemetry::add(
+                        "recovery_archive_pool_marker_mismatch",
+                        Duration::ZERO,
+                    );
+                    return None;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+                std::fs::write(&marker, expected.to_string()).ok()?;
+            }
+            Err(_) => return None,
+        }
+        Some(parent.join(key))
+    }
+
+    /// Every directory recovery archives of this repository may be in, the
+    /// pool-side one first (when it exists), then the host state one, so
+    /// archives written before the move stay readable and restorable.
+    pub(crate) fn recovery_archive_roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        if let Some(pool) = self.pool_recovery_archive_root(false) {
+            roots.push(pool);
+        }
+        if let Ok(host) = self.recovery_archive_root()
+            && !roots.contains(&host)
+        {
+            roots.push(host);
+        }
+        roots
+    }
+
     /// Plan preserving one closed session's worktree before removing it.
     /// Read-only: nothing is written or removed.
     pub fn cleanup_resolve_plan(
@@ -1809,7 +1905,13 @@ impl Broker {
             ignored_bytes,
             ignored_policy_sha256,
             untracked_bytes,
-            archive_root: self.recovery_archive_root()?,
+            // The retirement lane archives on the pool's volume; a reviewed
+            // resolve keeps the host state root its operators know.
+            archive_root: if retirement_mode {
+                self.retirement_archive_root()?
+            } else {
+                self.recovery_archive_root()?
+            },
         })
     }
 
@@ -4312,12 +4414,7 @@ impl Broker {
         &self,
         dir: &Path,
     ) -> Result<OwnedRecoveryArchive, String> {
-        let configured_root = self
-            .recovery_archive_root()
-            .map_err(|error| format!("no recovery archive root: {error}"))?;
-        let root = inspect_archive_root(&configured_root)
-            .map_err(|error| format!("unsafe recovery archive root: {}", error.reason))?
-            .ok_or_else(|| "recovery archive root is missing".to_string())?;
+        let root = self.recovery_archive_root_of(dir)?;
         let metadata =
             std::fs::symlink_metadata(dir).map_err(|error| format!("cannot read: {error}"))?;
         if !metadata.is_dir() {
@@ -4466,13 +4563,12 @@ impl Broker {
             } else {
                 Vec::new()
             },
-            holds_uncommitted: manifest.staged_patch.bytes > 0
-                || manifest.unstaged_patch.bytes > 0
-                || !manifest.untracked_files.is_empty()
-                || manifest
-                    .ignored_files
-                    .as_deref()
-                    .is_some_and(|files| !files.is_empty()),
+            holds_uncommitted: holds_uncommitted_content(
+                manifest.staged_patch.bytes,
+                manifest.unstaged_patch.bytes,
+                &manifest.untracked_files,
+                manifest.ignored_files.as_deref(),
+            ),
         })
     }
 
@@ -4483,15 +4579,7 @@ impl Broker {
         &self,
         archive: &OwnedRecoveryArchive,
     ) -> Result<(), String> {
-        let configured_root = self
-            .recovery_archive_root()
-            .map_err(|error| format!("cannot resolve recovery archive root: {error}"))?;
-        let root = inspect_archive_root(&configured_root).map_err(|error| {
-            format!(
-                "cannot safely inspect recovery archive root: {}",
-                error.reason
-            )
-        })?;
+        let root = self.recovery_archive_root_of(&archive.path).ok();
         remove_recovery_prerequisite_refs_after_archive_removal(
             self.repo_handle(),
             archive,
@@ -4525,10 +4613,48 @@ impl Broker {
             })
     }
 
-    /// Every archive under this repository's recovery archive directory,
-    /// split into the ones the broker can vouch for and the rest (with why).
+    /// The verified recovery archive root (one of
+    /// [`Self::recovery_archive_roots`]) that `dir` lies directly under.
+    pub(crate) fn recovery_archive_root_of(&self, dir: &Path) -> Result<PathBuf, String> {
+        let roots = self.recovery_archive_roots();
+        if roots.is_empty() {
+            return Err("no recovery archive root".into());
+        }
+        let mut reasons = Vec::new();
+        for configured_root in roots {
+            match inspect_archive_root(&configured_root) {
+                Ok(Some(root)) => {
+                    if dir.parent().is_some_and(|parent| same_path(parent, &root)) {
+                        return Ok(root);
+                    }
+                    reasons.push(format!("not directly under {}", root.display()));
+                }
+                Ok(None) => reasons.push(format!("{} is missing", configured_root.display())),
+                Err(error) => {
+                    reasons.push(format!("unsafe recovery archive root: {}", error.reason));
+                }
+            }
+        }
+        Err(reasons.join("; "))
+    }
+
+    /// Every archive in this repository's recovery archive directories (the
+    /// pool-side one and the host state one), split into the ones the broker
+    /// can vouch for and the rest (with why). `root` is the host state one.
     pub(crate) fn recovery_archives(&self) -> Result<RecoveryArchiveScan, BrokerOpError> {
-        let configured_root = self.recovery_archive_root()?;
+        let mut scan = self.recovery_archives_under(self.recovery_archive_root()?)?;
+        if let Some(pool) = self.pool_recovery_archive_root(false) {
+            let pool_scan = self.recovery_archives_under(pool)?;
+            scan.owned.extend(pool_scan.owned);
+            scan.unowned.extend(pool_scan.unowned);
+        }
+        Ok(scan)
+    }
+
+    fn recovery_archives_under(
+        &self,
+        configured_root: PathBuf,
+    ) -> Result<RecoveryArchiveScan, BrokerOpError> {
         let root = match inspect_archive_root(&configured_root) {
             Ok(Some(root)) => root,
             Ok(None) => {
@@ -4598,6 +4724,22 @@ impl Broker {
             unowned,
         })
     }
+}
+
+/// Whether an archive holds work no commit carries. A manifest without an
+/// `ignored_files` list (schemas 2 to 4, written before ignored files were
+/// archived) does not say what was ignored, so it counts as holding some:
+/// such an archive is never called landed, as the storage worker judges it.
+pub(crate) fn holds_uncommitted_content(
+    staged_patch_bytes: u64,
+    unstaged_patch_bytes: u64,
+    untracked_files: &[ArchivedFile],
+    ignored_files: Option<&[ArchivedFile]>,
+) -> bool {
+    staged_patch_bytes > 0
+        || unstaged_patch_bytes > 0
+        || !untracked_files.is_empty()
+        || ignored_files.is_none_or(|files| !files.is_empty())
 }
 
 fn require_real_directory(path: &Path) -> Result<(), String> {
@@ -6039,6 +6181,31 @@ fn restore_readme(plan: &CleanupResolvePlan, has_bundle: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A legacy manifest (schemas 2 to 4) has no `ignored_files` list: it
+    /// does not say what was ignored, so the archive counts as holding
+    /// uncommitted work and is never called landed.
+    #[test]
+    fn a_legacy_manifest_without_an_ignored_list_holds_uncommitted_work() {
+        assert!(holds_uncommitted_content(0, 0, &[], None));
+        assert!(!holds_uncommitted_content(0, 0, &[], Some(&[])));
+        assert!(holds_uncommitted_content(1, 0, &[], Some(&[])));
+        // The storage worker reads the same legacy manifest the same way.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MANIFEST_FILE),
+            serde_json::json!({
+                "schema_version": 3,
+                "staged_patch": {"bytes": 0},
+                "unstaged_patch": {"bytes": 0},
+                "untracked_files": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let why = crate::storage_ledger::evict::archive_landed(dir.path()).unwrap_err();
+        assert!(why.contains("ignored_files"), "{why}");
+    }
 
     #[test]
     fn exact_bundled_root_skips_even_a_failing_delivery_probe() {

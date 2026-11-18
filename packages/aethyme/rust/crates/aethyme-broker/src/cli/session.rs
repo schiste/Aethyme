@@ -1269,9 +1269,20 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
     // A checkout the broker retired after its session closed is recreated
     // from the session branch, or refused with the archive holding its
     // leftovers; reuse never fails on a missing path.
-    if mode == crate::AdoptMode::Reuse && !path.exists() {
+    // A restore that did not complete (its partial checkout could not be
+    // removed) blocks adopting anything at the path until it is resolved.
+    let mut checkout_restored = None;
+    if mode == crate::AdoptMode::Reuse {
         let absolute = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
-        broker.recreate_retired_checkout(&absolute)?;
+        if crate::cleanup_resolve::restore_incomplete(&absolute) {
+            return Err(UsageError::Message(
+                crate::broker::restore_incomplete_reason(&absolute),
+            ));
+        }
+        if !path.exists() || crate::broker::is_checkout_tombstone(&path) {
+            broker.recreate_retired_checkout(&absolute)?;
+            checkout_restored = crate::broker::take_last_checkout_restore();
+        }
     }
     let previous_session = if mode == crate::AdoptMode::Reuse {
         let canonical_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
@@ -1349,21 +1360,33 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
             true,
         )?;
         let duplicates = broker.duplicate_work_for(session);
-        out!(
-            "{}",
-            session_action_json(
-                &report,
-                &tab_rename,
-                Some(&guidance),
-                &duplicates,
-                scope_overlaps.as_deref(),
-                scope_overlaps_warning.as_deref(),
-                planned_path_pr_overlaps.as_ref(),
-                None,
-                Some(&scratch),
-            )?
-        );
+        let mut text = session_action_json(
+            &report,
+            &tab_rename,
+            Some(&guidance),
+            &duplicates,
+            scope_overlaps.as_deref(),
+            scope_overlaps_warning.as_deref(),
+            planned_path_pr_overlaps.as_ref(),
+            None,
+            Some(&scratch),
+        )?;
+        // A restore from a recovery archive (and a detached checkout when
+        // the branch moved) is part of the answer.
+        if let Some(restored) = &checkout_restored
+            && let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text)
+            && let Some(object) = value.as_object_mut()
+        {
+            object.insert("restore".into(), serde_json::to_value(restored)?);
+            text = serde_json::to_string_pretty(&value)?;
+        }
+        out!("{}", text);
     } else {
+        if let Some(restored) = &checkout_restored {
+            for line in restored.lines() {
+                out!("{line}");
+            }
+        }
         match report.outcome {
             crate::AdoptOutcome::Created => out!(
                 "Created session {} on the existing worktree — {} on branch {}",

@@ -78,6 +78,12 @@ const RETIRE_PIN_CANDIDATES_MAX: usize = 2_000;
 pub(crate) const RETIRE_ARCHIVE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// Closed sessions read per page.
 const RETIRE_PAGE: usize = 64;
+/// Meta key: sessions whose checkout was retired through a recovery
+/// archive, with that archive (JSON: session id to its path); see
+/// `Broker::session_restorable_archive`.
+pub(crate) const ARCHIVED_SESSIONS_KEY: &str = "checkout_retirement.archived_sessions";
+/// Recorded archived sessions at most; the lowest ids go first.
+const ARCHIVED_SESSIONS_MAX: usize = 65_536;
 /// Meta key: closed or cleaned sessions last kept as superseded at their
 /// path, with the row that superseded them (JSON: session id to that id).
 pub(crate) const CHECKOUT_RETIREMENT_SUPERSEDED_KEY: &str = "checkout_retirement.superseded";
@@ -394,6 +400,41 @@ impl RetireOutcome {
     }
 }
 
+/// Paths named in an `archive_too_large` keep, at most.
+const LARGEST_PATHS_NAMED: usize = 5;
+
+/// The keep detail of a checkout whose archive would exceed the cap: the
+/// total and its largest untracked or ignored files, by size (paths and
+/// sizes only), plus the patches when they are large.
+fn largest_paths_detail(plan: &crate::cleanup_resolve::CleanupResolvePlan, bytes: u64) -> String {
+    let mut files = plan
+        .untracked_files
+        .iter()
+        .chain(plan.ignored_files.iter())
+        .map(|file| (file.bytes, file.path.as_str()))
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| right.cmp(left));
+    let mut named = files
+        .into_iter()
+        .take(LARGEST_PATHS_NAMED)
+        .map(|(size, path)| format!("{path} ({} MiB)", size / (1024 * 1024)))
+        .collect::<Vec<_>>();
+    for (label, size) in [
+        ("staged changes", plan.staged_patch_bytes),
+        ("unstaged changes", plan.unstaged_patch_bytes),
+    ] {
+        if size >= 1024 * 1024 {
+            named.push(format!("{label} ({} MiB)", size / (1024 * 1024)));
+        }
+    }
+    format!(
+        "the archive would hold {} MiB, over the {} MiB cap; largest: {}",
+        bytes / (1024 * 1024),
+        retire_archive_max_bytes() / (1024 * 1024),
+        named.join(", ")
+    )
+}
+
 /// The phase counter of one keep, by code.
 fn kept_counter(code: &'static str) -> &'static str {
     match code {
@@ -568,6 +609,164 @@ impl RetireRun {
             .clone()
             .unwrap_or_else(|| Err("process use was not observed".into()))
     }
+}
+
+impl Broker {
+    /// After a restore: mark the session's preparation stale for the
+    /// outputs its preparation declares (none of them is archived) and leave
+    /// the same notice as an idle strip. Returns the prepare command, or
+    /// `None` when the repository declares no preparation.
+    fn flag_restored_dependencies(&self, path: &Path, session_id: i64) -> Option<String> {
+        let declared: Vec<String> = crate::preparation::load_config(path)
+            .ok()
+            .flatten()?
+            .steps
+            .iter()
+            .flat_map(|step| step.outputs.iter())
+            .map(|output| output.trim_end_matches(['/', '\\']).to_string())
+            .filter(|output| !output.is_empty())
+            .collect();
+        if declared.is_empty() {
+            return None;
+        }
+        crate::warn_unrecorded(
+            "mark a restored session's preparation stale",
+            crate::preparation::mark_stripped(self.main_root(), session_id, &declared)
+                .map_err(|error| error.to_string()),
+        );
+        let notice = super::strip_idle::write_restore_notice(path, session_id, &declared);
+        crate::phase_telemetry::add(
+            if notice == super::strip_idle::NoticeOutcome::Written {
+                "checkout_restore_notice_written"
+            } else {
+                "checkout_restore_notice_not_written"
+            },
+            std::time::Duration::ZERO,
+        );
+        Some(crate::preparation::prepare_command(session_id))
+    }
+}
+
+/// Whether `archive` is an operation archive (`<id>-operation-…`, schema
+/// `aethyme-operation-archive-v1`), which restore does not read.
+pub(crate) fn is_operation_archive(archive: &Path) -> bool {
+    archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.split_once('-'))
+        .is_some_and(|(_, rest)| rest.starts_with("operation-"))
+}
+
+/// Why nothing is adopted at `path`: a restore there did not complete.
+pub(crate) fn restore_incomplete_reason(path: &Path) -> String {
+    format!(
+        "a restore into {} did not complete and its partial checkout could not be removed; \
+         inspect {}, remove it with `git worktree remove --force`, delete {}, then retry",
+        path.display(),
+        crate::cleanup_resolve::restore_staging_path(path).display(),
+        crate::cleanup_resolve::restore_incomplete_marker(path).display()
+    )
+}
+
+/// What a restore for reuse put back, for the command's output.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct CheckoutRestored {
+    pub path: PathBuf,
+    pub archive: PathBuf,
+    pub branch: String,
+    /// The archived HEAD the checkout is at.
+    pub head: String,
+    pub branch_recreated: bool,
+    pub bundle_used: bool,
+    /// Set when the branch was not at the archived HEAD: the checkout is
+    /// detached there.
+    pub detached: Option<DetachedRestore>,
+    /// The one command that rebuilds the dependencies a restore never
+    /// brings back, when the repository declares its preparation.
+    pub next_action: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct DetachedRestore {
+    pub branch_tip: String,
+    pub archived_head: String,
+    /// Keeps the restored state on a new branch; compare it with the branch
+    /// before choosing.
+    pub reconcile_command: String,
+    pub compare_command: String,
+}
+
+impl CheckoutRestored {
+    fn new(
+        path: &Path,
+        archive: &Path,
+        branch: &str,
+        restored: &crate::cleanup_resolve::ArchiveRestore,
+    ) -> Self {
+        let quoted = format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+        Self {
+            path: path.to_path_buf(),
+            archive: archive.to_path_buf(),
+            branch: branch.to_string(),
+            head: restored.head.clone(),
+            branch_recreated: restored.branch_recreated,
+            bundle_used: restored.bundle_used,
+            detached: restored
+                .detached_branch_tip
+                .as_ref()
+                .map(|tip| DetachedRestore {
+                    branch_tip: tip.clone(),
+                    archived_head: restored.head.clone(),
+                    reconcile_command: format!("git -C {quoted} switch -c '{branch}-restored'"),
+                    compare_command: format!(
+                        "git -C {quoted} log --oneline --left-right {}...{tip}",
+                        restored.head
+                    ),
+                }),
+            next_action: None,
+        }
+    }
+
+    /// The lines printed after a restore; the detached case first and loud.
+    pub(crate) fn lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(detached) = &self.detached {
+            lines.push(format!(
+                "WARNING: branch {} moved since the checkout was archived (tip {}); the restored \
+                 checkout is DETACHED at the archived HEAD {}.",
+                self.branch, detached.branch_tip, detached.archived_head
+            ));
+            lines.push(format!("  compare:   {}", detached.compare_command));
+            lines.push(format!("  reconcile: {}", detached.reconcile_command));
+        }
+        lines.push(format!(
+            "Restored the checkout at {} from {}{}.",
+            self.path.display(),
+            self.archive.display(),
+            if self.branch_recreated {
+                format!(" (branch {} recreated)", self.branch)
+            } else {
+                String::new()
+            }
+        ));
+        if let Some(next) = &self.next_action {
+            lines.push(format!(
+                "Dependencies are not restored; prepare the session again before building or testing: {next}"
+            ));
+        }
+        lines
+    }
+}
+
+thread_local! {
+    static LAST_CHECKOUT_RESTORE: std::cell::RefCell<Option<CheckoutRestored>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The restore the last [`Broker::recreate_retired_checkout`] on this
+/// thread performed, if any (taken once).
+pub(crate) fn take_last_checkout_restore() -> Option<CheckoutRestored> {
+    LAST_CHECKOUT_RESTORE.with(|cell| cell.borrow_mut().take())
 }
 
 /// What one retirement run did.
@@ -1484,12 +1683,167 @@ impl Broker {
             RetireOutcome::RetiredClean
             | RetireOutcome::RetiredArchived { .. }
             | RetireOutcome::RetiredOperationArchived { .. } => {
+                self.leave_checkout_tombstone(session_id, outcome);
                 self.forget_keep(session_id);
                 self.mark_session_in_set(CHECKOUT_RETIREMENT_TOO_LARGE_KEY, session_id, false);
                 self.mark_session_in_set(CHECKOUT_RETIREMENT_IN_PROGRESS_KEY, session_id, false);
             }
         }
         Ok(outcome)
+    }
+
+    /// Whether the tombstone at `path` has done its job: the archive it
+    /// names is gone, or it names none and is older than
+    /// `recovery_archive_days` (`0` keeps it).
+    fn tombstone_expired(&self, path: &Path) -> bool {
+        if let Some(archive) = super::tombstone::tombstone_archive(path) {
+            return matches!(
+                std::fs::symlink_metadata(&archive),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            );
+        }
+        let days = crate::load_retention_policy(self.main_root())
+            .map(|policy| policy.recovery_archive_days)
+            .unwrap_or(90);
+        days > 0
+            && std::fs::metadata(path.join(super::tombstone::TOMBSTONE_FILE))
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age.as_secs() >= u64::from(days) * 86_400)
+    }
+
+    /// The recovery archive recorded for `session_id` when its checkout was
+    /// retired through one, while it still exists: the session has state a
+    /// restore needs (its branch, and the archive). `None` otherwise.
+    pub(crate) fn session_restorable_archive(&self, session_id: i64) -> Option<PathBuf> {
+        let recorded: std::collections::BTreeMap<i64, String> =
+            self.meta_json(ARCHIVED_SESSIONS_KEY);
+        recorded
+            .get(&session_id)
+            .map(PathBuf::from)
+            .filter(|archive| {
+                archive
+                    .join(crate::cleanup_resolve::MANIFEST_FILE)
+                    .is_file()
+            })
+    }
+
+    /// The newest recovery archive written for `session_id` (an archive
+    /// directory whose name starts with the session id and holds a
+    /// manifest), in either archive directory, if any. Operation archives
+    /// (`<id>-operation-…`, another format that restore does not read) are
+    /// never returned: see [`Self::newest_operation_archive`].
+    pub(crate) fn newest_recovery_archive(&self, session_id: i64) -> Option<PathBuf> {
+        // The archive recorded with the session wins over a directory scan.
+        if let Some(recorded) = self.session_restorable_archive(session_id)
+            && !is_operation_archive(&recorded)
+        {
+            return Some(recorded);
+        }
+        self.newest_session_archive(session_id, false)
+    }
+
+    /// The newest operation archive written for `session_id`, if any.
+    pub(crate) fn newest_operation_archive(&self, session_id: i64) -> Option<PathBuf> {
+        self.newest_session_archive(session_id, true)
+    }
+
+    fn newest_session_archive(&self, session_id: i64, operation: bool) -> Option<PathBuf> {
+        let prefix = format!("{session_id}-");
+        let mut archives = self
+            .recovery_archive_roots()
+            .iter()
+            .filter_map(|root| std::fs::read_dir(root).ok())
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|archive| {
+                archive
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(&prefix)
+                            && !name.ends_with(".partial")
+                            && !name.starts_with('.')
+                    })
+                    && is_operation_archive(archive) == operation
+                    && archive
+                        .join(crate::cleanup_resolve::MANIFEST_FILE)
+                        .is_file()
+            })
+            .collect::<Vec<_>>();
+        archives.sort_by_key(|archive| {
+            std::fs::metadata(archive.join(crate::cleanup_resolve::MANIFEST_FILE))
+                .and_then(|metadata| metadata.modified())
+                .ok()
+        });
+        archives.pop()
+    }
+
+    /// Leave a tombstone where `session_id`'s checkout was, now that it is
+    /// retired (see `super::tombstone`).
+    fn leave_checkout_tombstone(&self, session_id: i64, outcome: RetireOutcome) {
+        let Ok(session) = self.store_ref().session(session_id) else {
+            return;
+        };
+        let worktree = Path::new(&session.worktree_path);
+        if std::fs::symlink_metadata(worktree).is_ok() {
+            return;
+        }
+        // Only a checkout retired through an archive: one whose work was
+        // all in Git is recreated from its branch and leaves nothing behind.
+        let (archive, saved) = match outcome {
+            RetireOutcome::RetiredArchived { .. } => {
+                let archive = self.newest_recovery_archive(session_id);
+                let saved = archive.clone().map_or(
+                    super::tombstone::SavedIn::Branch,
+                    super::tombstone::SavedIn::Recovery,
+                );
+                (archive, saved)
+            }
+            // Restore does not read an operation archive: the tombstone
+            // says so and gives the manual steps; reuse recreates the
+            // checkout from its branch and leaves the archive in place.
+            RetireOutcome::RetiredOperationArchived { .. } => (
+                None,
+                self.newest_operation_archive(session_id).map_or(
+                    super::tombstone::SavedIn::Branch,
+                    super::tombstone::SavedIn::Operation,
+                ),
+            ),
+            _ => return,
+        };
+        // Recorded with the session, so any lane can tell this session has
+        // something to restore without reading directory names.
+        if let Some(archive) = archive.as_deref() {
+            let archive = archive.to_string_lossy().into_owned();
+            crate::warn_unrecorded(
+                "record a session's recovery archive",
+                self.update_meta_json(
+                    ARCHIVED_SESSIONS_KEY,
+                    |stored: &mut std::collections::BTreeMap<i64, String>| {
+                        stored.insert(session_id, archive.clone());
+                        while stored.len() > ARCHIVED_SESSIONS_MAX {
+                            stored.pop_first();
+                        }
+                    },
+                ),
+            );
+        }
+        match super::tombstone::write_checkout_tombstone(worktree, &session, &saved) {
+            Ok(()) => crate::phase_telemetry::add(
+                "checkout_retirement_tombstone_written",
+                std::time::Duration::ZERO,
+            ),
+            Err(error) => {
+                crate::phase_telemetry::add(
+                    "checkout_retirement_tombstone_failed",
+                    std::time::Duration::ZERO,
+                );
+                crate::warn_unrecorded::<(), _>("leave a retired checkout's tombstone", Err(error));
+            }
+        }
     }
 
     /// Retire `session_id`'s checkout right after an automatic close, when
@@ -1793,6 +2147,9 @@ impl Broker {
             .saturating_add(plan.untracked_bytes)
             .saturating_add(plan.ignored_bytes);
         if bytes > retire_archive_max_bytes() {
+            // Name the largest paths (never their content) so an owner can
+            // decide what to keep, move or delete.
+            run.keep_detail = Some(largest_paths_detail(&plan, bytes));
             self.mark_session_in_set(CHECKOUT_RETIREMENT_TOO_LARGE_KEY, session_id, true);
             return Ok(Kept("archive_too_large"));
         }
@@ -1877,7 +2234,7 @@ impl Broker {
                 return Ok(Kept("operation_archive_failed"));
             }
         };
-        let archive_root = self.recovery_archive_root()?;
+        let archive_root = self.retirement_archive_root()?;
         let archived = super::retire_operation::write_operation_archive(
             &super::retire_operation::OperationArchiveRequest {
                 session_id: session.id,
@@ -2073,10 +2430,15 @@ impl Broker {
                 );
             }
         }
-        if let Ok(root) = self.recovery_archive_root() {
+        {
             let _span = crate::phase_telemetry::span("checkout_retirement_sweep_partials");
-            super::retire_operation::sweep_stale_partials(&root);
+            for root in self.recovery_archive_roots() {
+                super::retire_operation::sweep_stale_partials(&root);
+            }
         }
+        // The per-repository bound on archive bytes (both locations),
+        // recorded in the storage ledger by location.
+        self.record_recovery_archive_bound(deadline);
         let prune_span = crate::phase_telemetry::span("checkout_retirement_prune_pins");
         let retired_pins =
             match self.prune_retired_pins_until(Some(Instant::now() + RETIRE_PIN_PRUNE_BUDGET)) {
@@ -2089,6 +2451,20 @@ impl Broker {
         drop(prune_span);
         let _record_span = crate::phase_telemetry::span("checkout_retirement_record_progress");
         let kept = report.kept.values().sum::<usize>();
+        crate::phase_telemetry::attach(
+            "checkout_retirement",
+            serde_json::json!({
+                "examined": report.examined,
+                "retired_clean": report.retired_clean,
+                "retired_archived": report.retired_archived,
+                "retired_operation_archived": report.retired_operation_archived,
+                "retired_cleaned_leftovers": report.retired_cleaned_leftovers,
+                "archive_bytes": report.archive_bytes,
+                "kept": report.kept,
+                "trash_entries_removed": report.trash.entries_removed,
+                "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            }),
+        );
         let previous = self.checkout_retirement_progress();
         let shrinking =
             report.retired_clean + report.retired_archived + report.retired_operation_archived > 0
@@ -2247,6 +2623,33 @@ impl Broker {
                 };
                 if cleaned && !exists {
                     // The usual cleaned session: nothing left on disk.
+                    continue;
+                }
+                // A retired checkout's tombstone is no checkout: for a
+                // session still recorded as closed (its cleaned record was
+                // lost) it reads as gone, so the reconciliation below runs.
+                let tombstone = exists
+                    && super::tombstone::is_checkout_tombstone(Path::new(&session.worktree_path));
+                let exists = exists && (cleaned || !tombstone);
+                // For a cleaned session it is neither a checkout nor
+                // garbage: skipped, and removed once it has expired (its
+                // archive is gone, or it never had one and is older than
+                // `recovery_archive_days`).
+                if tombstone && cleaned {
+                    crate::phase_telemetry::add(
+                        "checkout_retirement_tombstone_skipped",
+                        std::time::Duration::ZERO,
+                    );
+                    if self.tombstone_expired(Path::new(&session.worktree_path))
+                        && super::tombstone::remove_checkout_tombstone(Path::new(
+                            &session.worktree_path,
+                        ))
+                    {
+                        crate::phase_telemetry::add(
+                            "checkout_retirement_tombstone_expired",
+                            std::time::Duration::ZERO,
+                        );
+                    }
                     continue;
                 }
                 if !exists {
@@ -2443,9 +2846,18 @@ impl Broker {
         else {
             return Ok(false);
         };
+        // A restore that neither completed nor cleaned up after itself:
+        // nothing is adopted or recreated at the path until it is resolved.
+        if crate::cleanup_resolve::restore_incomplete(path) {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason: restore_incomplete_reason(path),
+            });
+        }
+        let tombstone = super::tombstone::is_checkout_tombstone(path);
         if session.cleanup_state != crate::SessionCleanupState::Cleaned
             || session.origin != crate::SessionOrigin::Spawned
-            || path.exists()
+            || (path.exists() && !tombstone)
         {
             return Ok(false);
         }
@@ -2458,29 +2870,78 @@ impl Broker {
                 "another checkout lifecycle operation is running; retry in a moment".into(),
             ));
         };
-        if let Ok(root) = self.recovery_archive_root()
-            && let Ok(listing) = std::fs::read_dir(&root)
+        // The tombstone left at the path goes first, under the claim, so the
+        // checkout comes back at the same path (Git's registration was
+        // removed when it was retired).
+        if tombstone && !super::tombstone::remove_checkout_tombstone(path) {
+            return Err(refuse(format!(
+                "cannot remove the tombstone at {} to restore the checkout there",
+                path.display()
+            )));
+        }
+        // A checkout retired with a recovery archive comes back from it: the
+        // same commits, staged and unstaged changes, untracked and
+        // protected ignored files, each checked against the manifest. A
+        // failed restore removes the partial checkout and keeps the archive.
         {
-            let prefix = format!("{}-", session.id);
-            if let Some(archive) = listing
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .find(|archive| {
-                    archive
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| {
-                            name.starts_with(&prefix) && !name.ends_with(".partial")
-                        })
-                })
-            {
-                return Err(refuse(format!(
-                    "the checkout was retired with a recovery archive; recreate it with `git -C {} worktree add {} {}` and restore its leftovers as {} describes",
-                    self.main_root().display(),
-                    path.display(),
-                    session.branch,
-                    archive.join("README.md").display()
-                )));
+            if let Some(archive) = self.newest_recovery_archive(session.id) {
+                let started = std::time::Instant::now();
+                return match crate::cleanup_resolve::restore_recovery_archive(
+                    self.main_root(),
+                    &archive,
+                    path,
+                    &session.branch,
+                ) {
+                    Ok(restored) => {
+                        crate::phase_telemetry::add(
+                            "checkout_retirement_restored_for_reuse",
+                            started.elapsed(),
+                        );
+                        // Regenerable directories are never archived: the
+                        // restored checkout's preparation reads stale, with
+                        // the same loud notice and next action as an idle
+                        // strip.
+                        let next_action = self.flag_restored_dependencies(path, session.id);
+                        LAST_CHECKOUT_RESTORE.with(|cell| {
+                            let mut report =
+                                CheckoutRestored::new(path, &archive, &session.branch, &restored);
+                            report.next_action = next_action;
+                            *cell.borrow_mut() = Some(report);
+                        });
+                        crate::phase_telemetry::attach(
+                            "checkout_restore",
+                            serde_json::json!({
+                                "session_id": session.id,
+                                "head": restored.head,
+                                "bundle_used": restored.bundle_used,
+                                "branch_recreated": restored.branch_recreated,
+                                "staged_patch_bytes": restored.staged_patch_bytes,
+                                "unstaged_patch_bytes": restored.unstaged_patch_bytes,
+                                "untracked_files": restored.untracked_files,
+                                "ignored_files": restored.ignored_files,
+                                "detached_branch_tip": restored.detached_branch_tip,
+                            }),
+                        );
+                        Ok(true)
+                    }
+                    Err(reason) => {
+                        // Nothing came back: the tombstone goes back too.
+                        if tombstone {
+                            crate::warn_unrecorded(
+                                "put a tombstone back after a failed restore",
+                                super::tombstone::write_checkout_tombstone(
+                                    path,
+                                    &session,
+                                    &super::tombstone::SavedIn::Recovery(archive.clone()),
+                                ),
+                            );
+                        }
+                        Err(refuse(format!(
+                            "the checkout was retired with a recovery archive and restoring it failed ({reason}); the archive is kept: restore it as {} describes",
+                            archive.join("README.md").display()
+                        )))
+                    }
+                };
             }
         }
         if self
@@ -2628,6 +3089,12 @@ mod tests {
             .unwrap()
     }
 
+    /// The checkout is no longer there: gone, or (retired through an
+    /// archive) replaced by its tombstone.
+    fn retired_away(worktree: &Path) -> bool {
+        !worktree.exists() || super::super::tombstone::is_checkout_tombstone(worktree)
+    }
+
     fn is_cleaned(broker: &crate::Broker, session_id: i64) -> bool {
         broker
             .store_ref()
@@ -2639,11 +3106,11 @@ mod tests {
 
     /// The archives written for `session_id`.
     fn archives(broker: &crate::Broker, session_id: i64) -> Vec<PathBuf> {
-        let root = broker.recovery_archive_root().unwrap();
-        let Ok(listing) = std::fs::read_dir(&root) else {
-            return Vec::new();
-        };
-        listing
+        broker
+            .recovery_archive_roots()
+            .iter()
+            .filter_map(|root| std::fs::read_dir(root).ok())
+            .flatten()
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| {
@@ -2670,7 +3137,7 @@ mod tests {
         let report = run(&mut broker);
 
         assert_eq!(report.retired_clean, 1, "{report:#?}");
-        assert!(!worktree.exists());
+        assert!(retired_away(&worktree));
         assert!(is_cleaned(&broker, session.id));
         assert!(
             archives(&broker, session.id).is_empty(),
@@ -2740,7 +3207,7 @@ mod tests {
         let report = run(&mut broker);
 
         assert_eq!(report.retired_archived, 1, "{report:#?}");
-        assert!(!worktree.exists());
+        assert!(retired_away(&worktree));
         assert!(is_cleaned(&broker, session.id));
         let archive = archives(&broker, session.id)
             .pop()
@@ -2772,7 +3239,7 @@ mod tests {
         let report = run(&mut broker);
 
         assert_eq!(report.retired_archived, 1, "{report:#?}");
-        assert!(!worktree.exists());
+        assert!(retired_away(&worktree));
         let archive = archives(&broker, session.id).pop().expect("an archive");
         let bundle = archive.join("commits.bundle");
         let root = broker.main_root().to_path_buf();
@@ -2891,7 +3358,7 @@ mod tests {
             assert_eq!(counts.get(phase).copied(), Some(5), "{phase}");
         }
         for (session, worktree) in backlog {
-            assert!(!worktree.exists());
+            assert!(retired_away(&worktree));
             assert!(is_cleaned(&broker, session.id));
         }
     }
@@ -2982,7 +3449,7 @@ mod tests {
         set_hook(None);
 
         assert_eq!(report.retired_clean, 1, "{report:#?}");
-        assert!(!worktree.exists());
+        assert!(retired_away(&worktree));
         assert!(is_cleaned(&broker, session.id));
         let counts = recorder.totals().1;
         assert_eq!(
@@ -3205,7 +3672,7 @@ mod tests {
         let report = run(&mut broker);
 
         assert_eq!(report.retired_operation_archived, 1, "{report:#?}");
-        assert!(!worktree.exists());
+        assert!(retired_away(worktree));
         assert!(is_cleaned(&broker, session.id));
         let archive = operation_archive(&broker, session.id).expect("an operation archive");
         assert!(archive.join("git-state/MERGE_HEAD").is_file());
@@ -3437,7 +3904,7 @@ mod tests {
         let report = run(&mut broker);
 
         assert_eq!(report.retired_archived, 1, "{report:#?}");
-        assert!(!worktree.exists());
+        assert!(retired_away(&worktree));
         let archive = archives(&broker, session.id).into_iter().next().unwrap();
         assert_eq!(
             std::fs::read_to_string(archive.join("ignored/tool-notes/quality/index.json")).unwrap(),
@@ -3489,7 +3956,7 @@ mod tests {
         let report = run(&mut broker);
 
         assert_eq!(report.retired_clean, 1, "{report:#?}");
-        assert!(!worktree.exists());
+        assert!(retired_away(&worktree));
         let root = broker.main_root().to_path_buf();
         let pinned = git(
             &root,
@@ -3537,7 +4004,7 @@ mod tests {
         let report = run(&mut broker);
 
         assert_eq!(report.retired_clean, 1, "{report:#?}");
-        assert!(!worktree.exists());
+        assert!(retired_away(&worktree));
         let root = broker.main_root().to_path_buf();
         git(&root, &["reflog", "expire", "--expire=now", "--all"]);
         git(&root, &["gc", "--prune=now", "-q"]);
@@ -3723,12 +4190,12 @@ mod tests {
         let (session, worktree) = closed(&mut broker, "inline", |_| {});
         broker
             .retire_inline_after_close(session.id, Some(Instant::now() + Duration::from_secs(600)));
-        assert!(!worktree.exists());
+        assert!(retired_away(&worktree));
         assert!(is_cleaned(&broker, session.id));
     }
 
     /// `start --reuse` on a retired checkout recreates it from the session
-    /// branch; one with archived leftovers is refused with the archive.
+    /// branch; one with archived leftovers is restored from its archive.
     #[test]
     fn a_retired_checkout_is_recreated_for_reuse() {
         let (_owner, _storage, mut broker) = fixture();
@@ -3746,12 +4213,14 @@ mod tests {
 
         assert!(broker.recreate_retired_checkout(&clean_path).unwrap());
         assert!(clean_path.join("base.txt").exists());
-        let error = broker
-            .recreate_retired_checkout(&dirty_path)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("README.md"), "{error}");
-        assert!(!dirty_path.exists());
+        assert!(super::super::tombstone::is_checkout_tombstone(&dirty_path));
+        assert!(broker.recreate_retired_checkout(&dirty_path).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dirty_path.join("notes.txt")).unwrap(),
+            "leftover\n"
+        );
+        // Idempotent: a checkout that is back is left alone.
+        assert!(!broker.recreate_retired_checkout(&dirty_path).unwrap());
     }
 
     /// Recreating a retired checkout takes the lifecycle claim: while
@@ -3911,7 +4380,7 @@ mod tests {
         let (session, worktree) = closed(&mut broker, "tombstone", |_| {});
         let first = run(&mut broker);
         assert_eq!(first.retired_clean, 1, "{first:#?}");
-        assert!(!worktree.exists());
+        assert!(retired_away(&worktree));
         assert!(broker.checkout_trash_rows().is_empty(), "drained");
         // The cleaned record is lost, as a database error would leave it.
         broker
@@ -4072,7 +4541,7 @@ mod tests {
 
         assert_eq!(report.strip.directories_stripped, 1, "{report:#?}");
         assert_eq!(report.retired_clean, 1, "{report:#?}");
-        assert!(!worktree.exists());
+        assert!(retired_away(&worktree));
         assert!(is_cleaned(&broker, session.id));
         let progress = broker.checkout_strip_progress();
         assert_eq!(progress.last_directories_stripped, 1, "{progress:#?}");
@@ -4164,7 +4633,7 @@ mod tests {
 
         assert_eq!(report.strip.directories_stripped, 1, "{report:#?}");
         assert_eq!(report.retired_cleaned_leftovers, 1, "{report:#?}");
-        assert!(!worktree.exists());
+        assert!(retired_away(&worktree));
         let progress = broker.checkout_strip_progress();
         let today = progress.days.values().last().expect("a day recorded");
         assert_eq!(today.cleaned_leftovers_retired, 1, "{progress:#?}");
@@ -4537,7 +5006,7 @@ mod tests {
         assert_eq!(report.strip.directories_stripped, 1, "{report:#?}");
         assert_eq!(report.retired_cleaned_leftovers, 1, "{report:#?}");
         assert_eq!(report.kept.get("leftover_superseded"), None, "{report:#?}");
-        assert!(!worktree.exists());
+        assert!(retired_away(&worktree));
     }
 
     /// A cleaned row never takes a folder from a closed row at the same
@@ -4561,7 +5030,7 @@ mod tests {
 
         assert_eq!(report.retired_clean, 1, "{report:#?}");
         assert_eq!(report.retired_cleaned_leftovers, 0, "{report:#?}");
-        assert!(!worktree.exists());
+        assert!(retired_away(&worktree));
         assert!(is_cleaned(&broker, session.id));
     }
 
@@ -4587,7 +5056,7 @@ mod tests {
         super::AFTER_OPEN_PATHS.with(|cell| *cell.borrow_mut() = None);
 
         assert_eq!(report.retired_clean, 1, "{report:#?}");
-        assert!(!worktree.exists());
+        assert!(retired_away(&worktree));
         assert!(is_cleaned(&broker, session.id));
     }
 
@@ -4852,6 +5321,333 @@ mod tests {
 
         assert!(!old.exists());
         assert!(fresh.exists());
+    }
+
+    /// End to end: a checkout holding an unpushed commit, a staged change,
+    /// an unstaged change, an untracked file and an ignored local file is
+    /// archived and removed, and reusing it brings back the same tree from
+    /// the archive; the archive stays.
+    #[test]
+    fn a_retired_archived_checkout_is_restored_for_reuse() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "restore me", |worktree| {
+            std::fs::write(worktree.join("work.txt"), "committed, not pushed\n").unwrap();
+            git(worktree, &["add", "work.txt"]);
+            git(
+                worktree,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "commit",
+                    "-qm",
+                    "unpushed work",
+                ],
+            );
+            std::fs::write(worktree.join("work.txt"), "staged change\n").unwrap();
+            git(worktree, &["add", "work.txt"]);
+            std::fs::write(worktree.join("base.txt"), "unstaged change\n").unwrap();
+            std::fs::write(worktree.join("notes.txt"), "untracked notes\n").unwrap();
+            std::fs::write(worktree.join("secrets.local"), "local only\n").unwrap();
+        });
+        let head = git(&worktree, &["rev-parse", "HEAD"]).trim().to_string();
+
+        let report = run(&mut broker);
+
+        assert_eq!(report.retired_archived, 1, "{report:#?}");
+        // The path does not vanish: a tombstone says what happened and how
+        // to bring it back, and every lane recognises it.
+        assert!(super::super::tombstone::is_checkout_tombstone(&worktree));
+        let note = std::fs::read_to_string(worktree.join(super::super::tombstone::TOMBSTONE_FILE))
+            .unwrap();
+        assert!(note.contains("--reuse"), "{note}");
+        assert!(note.contains("archive: "), "{note}");
+        // Asked afresh (the earlier pass remembered the session as handled),
+        // the strip pass keeps the tombstone as such.
+        broker
+            .update_meta_json(
+                super::super::strip::CHECKOUT_STRIP_DONE_KEY,
+                |stored: &mut std::collections::BTreeMap<i64, i64>| {
+                    stored.remove(&session.id);
+                },
+            )
+            .unwrap();
+        let strip = strip_pass(&broker);
+        assert_eq!(strip.refused.get("tombstone"), Some(&1), "{strip:#?}");
+        let again = run(&mut broker);
+        assert_eq!(again.examined, 0, "{again:#?}");
+        assert!(again.kept.is_empty(), "{again:#?}");
+        assert!(super::super::tombstone::is_checkout_tombstone(&worktree));
+        // A command naming the archived session answers with the restore
+        // action and its command.
+        let refusal =
+            crate::session_auto_close::closed_session_refusal(broker.store_ref(), session.id);
+        assert!(refusal.contains("restore_required"), "{refusal}");
+        // ... and as data for `--json` callers.
+        let action = crate::session_auto_close::take_refusal_action()
+            .expect("the refusal leaves its structured action");
+        assert_eq!(action["code"], "restore_required");
+        assert_eq!(action["session_id"], session.id);
+        assert_eq!(
+            action["command"],
+            crate::broker::restore_command(&worktree).as_str()
+        );
+        assert!(refusal.contains("--reuse"), "{refusal}");
+        // A new session with the same task never gets the tombstone's path.
+        let fresh = broker.start_worktree("restore me", None).unwrap();
+        assert_ne!(PathBuf::from(&fresh.worktree_path), worktree);
+        // The session record says it has something to restore.
+        assert!(broker.session_restorable_archive(session.id).is_some());
+        // Its local branch was deleted meanwhile: the restore recreates it
+        // from the tip the archive recorded.
+        if git_status(
+            broker.main_root(),
+            &["rev-parse", "--verify", "--quiet", &session.branch],
+        ) {
+            git(broker.main_root(), &["branch", "-D", &session.branch]);
+        }
+        assert!(broker.recreate_retired_checkout(&worktree).unwrap());
+
+        assert_eq!(git(&worktree, &["rev-parse", "HEAD"]).trim(), head);
+        assert_eq!(
+            git(&worktree, &["symbolic-ref", "--short", "HEAD"]).trim(),
+            session.branch
+        );
+        assert_eq!(
+            git(&worktree, &["show", ":work.txt"]),
+            "staged change\n",
+            "the staged change is staged again"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("base.txt")).unwrap(),
+            "unstaged change\n"
+        );
+        assert_eq!(
+            git(&worktree, &["diff", "--cached", "--name-only"]).trim(),
+            "work.txt"
+        );
+        assert_eq!(git(&worktree, &["diff", "--name-only"]).trim(), "base.txt");
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("notes.txt")).unwrap(),
+            "untracked notes\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("secrets.local")).unwrap(),
+            "local only\n"
+        );
+        assert!(
+            !archives(&broker, session.id).is_empty(),
+            "the archive stays"
+        );
+    }
+
+    /// A checkout holding an unpushed commit and an untracked file, retired
+    /// through an archive; returns the session, its path and archived HEAD.
+    fn retired_with_archive(
+        broker: &mut crate::Broker,
+        label: &str,
+    ) -> (crate::Session, PathBuf, String) {
+        let (session, worktree) = closed(broker, label, |worktree| {
+            std::fs::write(worktree.join("work.txt"), "committed, not pushed\n").unwrap();
+            git(worktree, &["add", "work.txt"]);
+            git(
+                worktree,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "commit",
+                    "-qm",
+                    "unpushed work",
+                ],
+            );
+            std::fs::write(worktree.join("notes.txt"), "untracked notes\n").unwrap();
+        });
+        let head = git(&worktree, &["rev-parse", "HEAD"]).trim().to_string();
+        let report = run(broker);
+        assert_eq!(report.retired_archived, 1, "{report:#?}");
+        (session, worktree, head)
+    }
+
+    /// New archives go to the pool's volume, in the marked broker-owned
+    /// directory beside the checkouts; an archive left in host state stays
+    /// found; an operation archive is never picked for a restore.
+    #[test]
+    fn retirement_archives_on_the_pool_and_still_finds_host_state_ones() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree, _) = retired_with_archive(&mut broker, "pool archive");
+        let pool_root = broker
+            .pool_recovery_archive_root(false)
+            .expect("the pool-side archive root exists, identified by its marker");
+        let archive = broker
+            .newest_recovery_archive(session.id)
+            .expect("the archive is found");
+        assert!(archive.starts_with(&pool_root), "{}", archive.display());
+        assert!(
+            pool_root
+                .parent()
+                .unwrap()
+                .join(".aethyme-recovery-archives-root.json")
+                .is_file()
+        );
+        assert_eq!(
+            std::fs::canonicalize(pool_root.parent().unwrap().parent().unwrap()).unwrap(),
+            std::fs::canonicalize(worktree.parent().unwrap()).unwrap(),
+            "beside the checkouts, on the pool's volume"
+        );
+        // An older archive in host state, and an operation archive.
+        let host = broker.recovery_archive_root().unwrap();
+        let legacy = host.join(format!("{}-legacy", 990_001));
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join(crate::cleanup_resolve::MANIFEST_FILE), "{}").unwrap();
+        assert_eq!(broker.newest_recovery_archive(990_001), Some(legacy));
+        let operation = pool_root.join(format!("{}-operation-0123456789ab-1", 990_002));
+        std::fs::create_dir_all(&operation).unwrap();
+        std::fs::write(operation.join(crate::cleanup_resolve::MANIFEST_FILE), "{}").unwrap();
+        assert_eq!(broker.newest_recovery_archive(990_002), None);
+        assert_eq!(broker.newest_operation_archive(990_002), Some(operation));
+    }
+
+    /// The archive bound never removes an archive its owner kept with
+    /// `storage keep-archive`.
+    #[test]
+    fn the_archive_bound_never_removes_an_archive_its_owner_kept() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, _, _) = retired_with_archive(&mut broker, "kept archive");
+        let archive = broker
+            .newest_recovery_archive(session.id)
+            .expect("the archive");
+        std::fs::write(crate::storage_ledger::keep_marker(&archive), "kept\n").unwrap();
+        let owned = broker.owned_recovery_archive(&archive).unwrap();
+        let refused = broker
+            .evict_landed_archive(&owned, Instant::now() + Duration::from_secs(60))
+            .unwrap_err();
+        assert!(refused.contains("kept by the owner's marker"), "{refused}");
+        assert!(
+            archive
+                .join(crate::cleanup_resolve::MANIFEST_FILE)
+                .is_file()
+        );
+    }
+
+    /// A restore whose cleanup fails leaves nothing at the session's path
+    /// (it was built at a sibling staging path) and a marker that refuses
+    /// any reuse there until the leftovers are removed.
+    #[test]
+    fn a_failed_restore_whose_undo_fails_blocks_reuse_until_resolved() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (_session, worktree, _) = retired_with_archive(&mut broker, "failed undo");
+        crate::cleanup_resolve::FAIL_AFTER_ADD_FOR_TEST.with(|cell| cell.set(true));
+        crate::cleanup_resolve::FAIL_UNDO_FOR_TEST.with(|cell| cell.set(true));
+        let failed = broker.recreate_retired_checkout(&worktree);
+        crate::cleanup_resolve::FAIL_AFTER_ADD_FOR_TEST.with(|cell| cell.set(false));
+        crate::cleanup_resolve::FAIL_UNDO_FOR_TEST.with(|cell| cell.set(false));
+        let error = failed
+            .expect_err("the injected failure refuses")
+            .to_string();
+        assert!(error.contains("could not be removed"), "{error}");
+        // The session's path holds no partial tree: the tombstone is back.
+        assert!(super::super::tombstone::is_checkout_tombstone(&worktree));
+        let staging = crate::cleanup_resolve::restore_staging_path(&worktree);
+        assert!(
+            staging.join(".git").exists(),
+            "the partial checkout is aside"
+        );
+        assert!(crate::cleanup_resolve::restore_incomplete(&worktree));
+        // Reuse is refused while the marker is there.
+        let refused = broker
+            .recreate_retired_checkout(&worktree)
+            .expect_err("an incomplete restore blocks reuse")
+            .to_string();
+        assert!(refused.contains("did not complete"), "{refused}");
+        // Resolved by hand: the next reuse restores.
+        git(
+            broker.main_root(),
+            &["worktree", "remove", "--force", &staging.to_string_lossy()],
+        );
+        std::fs::remove_file(crate::cleanup_resolve::restore_incomplete_marker(&worktree)).unwrap();
+        assert!(broker.recreate_retired_checkout(&worktree).unwrap());
+        assert!(worktree.join("notes.txt").is_file());
+        assert!(!crate::cleanup_resolve::restore_incomplete(&worktree));
+    }
+
+    /// After a restore the session's preparation reads stale, the session
+    /// gets the same session-scoped blocker as an idle strip, and the
+    /// command's output names the prepare command.
+    #[test]
+    fn a_restore_leaves_the_prepare_signal_and_next_action() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree) = closed(&mut broker, "restore prepares", |worktree| {
+            std::fs::create_dir_all(worktree.join(".aethyme")).unwrap();
+            std::fs::write(
+                worktree.join(".aethyme/prepare.toml"),
+                "schema_version = 1\n\n[[steps]]\nname = \"deps\"\ncommand = [\"sh\", \"-c\", \"true\"]\n\
+                 inputs = [\"lock.file\"]\noutputs = [\"node_modules/\"]\ncache = \"repository_shared\"\n\
+                 required_for_hooks = false\n",
+            )
+            .unwrap();
+            git(worktree, &["add", "-f", ".aethyme/prepare.toml"]);
+            git(
+                worktree,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "commit",
+                    "-qm",
+                    "declare preparation",
+                ],
+            );
+            std::fs::write(worktree.join("notes.txt"), "untracked notes\n").unwrap();
+        });
+        let report = run(&mut broker);
+        assert_eq!(report.retired_archived, 1, "{report:#?}");
+        crate::broker::take_last_checkout_restore();
+        assert!(broker.recreate_retired_checkout(&worktree).unwrap());
+        let restored = crate::broker::take_last_checkout_restore().expect("a restore report");
+        let command = format!("aethyme broker submit prepare --session {}", session.id);
+        assert_eq!(restored.next_action.as_deref(), Some(command.as_str()));
+        assert!(
+            restored.lines().iter().any(|line| line.contains(&command)),
+            "{:?}",
+            restored.lines()
+        );
+        assert!(crate::preparation::stripped_since_prepared(
+            broker.main_root(),
+            session.id
+        ));
+    }
+
+    /// When the branch moved after the archive was written, the restored
+    /// checkout is detached at the archived HEAD and the command's output
+    /// says so, with the branch tip and the commands to reconcile.
+    #[test]
+    fn a_restore_onto_a_moved_branch_reports_the_detached_checkout() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree, head) = retired_with_archive(&mut broker, "moved branch");
+        let elsewhere = git(broker.main_root(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        assert_ne!(elsewhere, head);
+        git(
+            broker.main_root(),
+            &["branch", "-f", &session.branch, &elsewhere],
+        );
+        crate::broker::take_last_checkout_restore();
+        assert!(broker.recreate_retired_checkout(&worktree).unwrap());
+        assert_eq!(git(&worktree, &["rev-parse", "HEAD"]).trim(), head);
+        let restored = crate::broker::take_last_checkout_restore().expect("a restore report");
+        let detached = restored.detached.clone().expect("detached");
+        assert_eq!(detached.branch_tip, elsewhere);
+        assert_eq!(detached.archived_head, head);
+        assert!(detached.reconcile_command.contains("switch -c"));
+        let lines = restored.lines();
+        assert!(lines[0].contains("DETACHED"), "{lines:?}");
+        let value = serde_json::to_value(&restored).unwrap();
+        assert_eq!(value["detached"]["branch_tip"], elsewhere.as_str());
     }
 
     /// An open session idle past `idle_strip_after_hours` with no process in

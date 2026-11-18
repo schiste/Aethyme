@@ -289,6 +289,7 @@ mod verify_loop;
 mod version;
 mod worktree_freshness;
 mod worktree_reconcile;
+mod worktree_status_activity;
 
 pub use aethyme_graph_storage::{
     GRAPH_CONFIG_RELPATH, GraphAuthority, GraphIntegrityPolicy, GraphIntegrityPolicyError,

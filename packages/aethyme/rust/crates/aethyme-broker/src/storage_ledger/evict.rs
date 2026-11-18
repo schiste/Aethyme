@@ -54,6 +54,9 @@ pub struct Candidate {
     pub reason: Reason,
     /// Recovery archives expiring by age: when they expire.
     pub expires_ms: Option<u64>,
+    /// Recovery archives expiring by age: `[budget] expire_unlanded_archives`
+    /// lets one holding unlanded work go too.
+    pub allow_unlanded: bool,
 }
 
 impl Candidate {
@@ -81,6 +84,7 @@ fn child_candidate(item: &Item, child: &Child, reason: Reason) -> Candidate {
         newest_ms: child.newest_ms.max(child.ctime_ms),
         reason,
         expires_ms: None,
+        allow_unlanded: false,
     }
 }
 
@@ -138,6 +142,7 @@ pub fn plan(
                         newest_ms: item.newest_ms,
                         reason: Reason::Expired,
                         expires_ms: None,
+                        allow_unlanded: false,
                     });
                 }
             }
@@ -195,6 +200,7 @@ pub fn plan(
                             let mut candidate = child_candidate(item, child, Reason::Expired);
                             candidate.newest_ms = created;
                             candidate.expires_ms = Some(expires);
+                            candidate.allow_unlanded = budgets.expire_unlanded_archives;
                             archives_expired.push(candidate);
                         }
                         _ if over_budget => {
@@ -480,6 +486,22 @@ pub fn refuse(
             // the manifest only.
             if super::keep_marker(&path).exists() {
                 return Some("kept by the owner's marker".into());
+            }
+            // Age alone never destroys work that exists nowhere else: an
+            // archive holding unlanded commits or uncommitted changes is kept
+            // (and named in advice) until its owner dismisses it or the
+            // setting allows it.
+            if !candidate.allow_unlanded
+                && !super::dismiss_marker(&path).exists()
+                && let Err(why) = archive_landed(&path)
+            {
+                crate::phase_telemetry::add(
+                    "storage_archive_kept_unlanded_at_age",
+                    std::time::Duration::ZERO,
+                );
+                return Some(format!(
+                    "unlanded at its retention age, kept until its owner dismisses it: {why}"
+                ));
             }
             let meta = super::archive_meta(&path);
             let Some(created) = meta.created_ms else {
