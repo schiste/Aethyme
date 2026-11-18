@@ -25,7 +25,7 @@
 use super::*;
 use std::time::{Duration, Instant};
 
-use crate::storage_ledger::{ArchiveLocationUsage, RecoveryArchiveUsage as ArchiveBoundUsage};
+use crate::storage_ledger::RecoveryArchiveUsage as ArchiveBoundUsage;
 
 /// The longest one bound pass may take.
 const ARCHIVE_BOUND_BUDGET: Duration = Duration::from_secs(20);
@@ -304,6 +304,7 @@ fn plan_evictions(entries: &[(u64, bool)], total: u64, bound: u64) -> Vec<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage_ledger::ArchiveLocationUsage;
 
     /// Over the bound, the oldest evictable archives go first and only
     /// until the total is within it; an archive holding unique work is

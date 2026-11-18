@@ -1121,7 +1121,7 @@ fn expiry_needs_two_notices_a_day_apart_and_a_week_and_skips_kept_and_undated() 
     assert!(old.exists(), "age alone never destroys unlanded work");
     assert_eq!(
         report.unlanded_archives,
-        vec!["example-0123/old-unlanded".to_string()],
+        vec!["recovery-archives/example-0123/old-unlanded".to_string()],
         "{report:?}"
     );
     let advice = super::cli::status_advice(host_state);
