@@ -555,6 +555,65 @@ session whose agent is still running and still bound to it (holder live,
 not moved on) is never closed, archived or removed by these lanes, and a
 process inside a checkout blocks both its strip and its removal.
 
+What a recovery archive leaves out: ignored directories the code classes as
+regenerable are not archived, because one command rebuilds them. They are
+`node_modules`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`,
+`.venv` (with `pyvenv.cfg`), Cargo `target` (beside a `Cargo.toml` or with a
+`CACHEDIR.TAG`), `build` and `dist` beside a build manifest, `.hypothesis`
+(a Hypothesis database), `playwright-report` and `test-results` (Playwright
+output), a directory carrying a standard `CACHEDIR.TAG`, the package-manager
+stores the artifact catalogue recognises, and whatever `[cleanup]
+regenerable` adds. Other ignored directories are archived file by file. With
+the new defaults this now applies a day after the agent leaves (24 h for
+unpushed or uncommitted work, 4 h for landed work), not after a week.
+
+To keep the previous behaviour, set the old values:
+
+| Key | New default | Previous |
+| --- | --- | --- |
+| `[cleanup] stale_landed_close_after_hours` | 4 | 24 |
+| `[cleanup] stale_pushed_close_after_hours` | 24 | 72 |
+| `[cleanup] stale_unpushed_close_after_hours` | 24 | 168 |
+| `[cleanup] stale_closing_notice_hours` | 4 | 24 |
+| `[retention] session_abandoned_after_hours` | 24 | 72 |
+| `[retention] session_landed_after_hours` | 4 | 24 |
+
+A repository that already sets its own `session_abandoned_after_hours`
+keeps that value; to change it, edit `[retention]
+session_abandoned_after_hours` in `.aethyme/broker.toml`.
+
+Where archives go: the retirement lane writes new archives on the pool's
+volume, in the broker-owned directory `<pool>/.aethyme-recovery-archives/
+<repository key>/` (mode 0700, identified by its marker
+`.aethyme-recovery-archives-root.json` naming the repository, never by device
+number). Archives written before stay readable and restorable in host state;
+both places are searched and nothing is moved. `[cleanup]
+recovery_archive_bound_gib` (default 20, `0` off) bounds both places together:
+over it, the oldest fully landed archives go first; an archive holding work
+that exists nowhere else is never removed for size, and `storage status` and
+`broker status` advise instead. `aethyme storage status --json` reports
+`recovery_archives_by_location` (bytes and counts on the pool and in host
+state).
+
+Expiry by age no longer removes an archive holding unlanded commits or
+uncommitted changes: at its retention age it is kept and named in advice
+(`storage.unlanded-archives-at-age`, with its session and restore command)
+until its owner runs `aethyme storage keep-archive <id> --dismiss` or the host
+sets `[budget] expire_unlanded_archives = true` in `storage.toml` (default
+off). Fully landed archives expire as before.
+
+Restore builds the checkout beside its path and moves it into place only
+when complete; if a failed restore cannot remove its partial checkout, a
+marker (`.<name>.aethyme-restore-incomplete`) makes `start --reuse` refuse
+until it is resolved. When the branch moved since the archive, the restored
+checkout is detached at the archived HEAD and `start --reuse` says so first,
+with the branch tip and the commands to compare and reconcile (also under
+`restore.detached` in `--json`). An operation archive (an abandoned merge,
+rebase, cherry-pick, revert or bisect) is not restored automatically: its
+tombstone says so and gives the manual steps. Restore does not bring back
+directory modes, modification times, hard links (each linked file comes back
+as its own copy) or extended attributes.
+
 ### Earlier upgrade note
 
 For a repository that sets nothing: a stale session with unpushed or

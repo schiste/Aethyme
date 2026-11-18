@@ -1109,6 +1109,15 @@ impl PoolListing {
     }
 }
 
+/// Whether a checkout folder the backlog found is a retired checkout's
+/// tombstone: one `lstat` of the tombstone note, and the full check only for
+/// a folder that holds one.
+fn is_backlog_tombstone(folder: &Path) -> bool {
+    std::fs::symlink_metadata(folder.join(super::tombstone::TOMBSTONE_FILE))
+        .is_ok_and(|metadata| metadata.is_file())
+        && super::tombstone::is_checkout_tombstone(folder)
+}
+
 /// The names of the real directories (not symlinks) in `directory`, from
 /// the listing's entry types, or `None` when it cannot be listed completely
 /// within [`POOL_LISTING_MAX`] entries before `deadline`. A pool directory
@@ -1466,6 +1475,10 @@ impl Broker {
                 }
                 CheckoutStrip::Refused(code) => {
                     note_refusal(&mut report, code);
+                    // A retired checkout's tombstone is no checkout folder.
+                    if code == "tombstone" {
+                        report.folders_found = report.folders_found.saturating_sub(1);
+                    }
                     // Ownership never changes for a session: not asked again.
                     if code == "adopted" || code == "not_owned" || code == "tombstone" {
                         newly_done.insert(session.id, closed_at);
@@ -1947,11 +1960,25 @@ impl Broker {
             ..CheckoutBacklog::default()
         };
         let mut folders = BTreeSet::new();
+        let mut tombstones = BTreeSet::new();
         for session in live.iter().chain(closed.iter()) {
-            if folders.contains(session.worktree_path.as_str()) {
+            if folders.contains(session.worktree_path.as_str())
+                || tombstones.contains(session.worktree_path.as_str())
+            {
                 continue;
             }
             match listing.exists(&session.worktree_path, deadline) {
+                // A retired checkout's tombstone is no checkout folder (nor
+                // a closed one). Only a path no open session records can
+                // hold one, and one `lstat` of its note rules most folders
+                // out before the full check.
+                Some(true)
+                    if !open_paths.contains(session.worktree_path.as_str())
+                        && is_backlog_tombstone(Path::new(&session.worktree_path)) =>
+                {
+                    tombstones.insert(session.worktree_path.as_str());
+                    crate::phase_telemetry::add("checkout_strip_backlog_tombstone", Duration::ZERO);
+                }
                 Some(true) => {
                     folders.insert(session.worktree_path.as_str());
                 }
@@ -2377,6 +2404,85 @@ mod tests {
             .reduce(|best, row| if judges_before(row, best) { row } else { best })
             .unwrap();
         assert_eq!(best.id, 3);
+    }
+
+    /// A retired checkout's tombstone is no checkout folder: the backlog
+    /// (the storage ledger's checkout counts) counts neither it as a folder
+    /// nor as a closed one.
+    #[test]
+    fn the_backlog_does_not_count_a_tombstone_as_a_checkout_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let repository = base.join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        git(&repository, &["commit", "--allow-empty", "-qm", "initial"]);
+        let storage = crate::test_storage::TestStorage::new();
+        let broker = storage.open(&repository).unwrap();
+        let pool = base.join("pool");
+        let live_checkout = pool.join("closed-checkout");
+        std::fs::create_dir_all(live_checkout.join("node_modules")).unwrap();
+        let tombstone = pool.join("retired-checkout");
+        std::fs::create_dir_all(&tombstone).unwrap();
+        std::fs::write(
+            tombstone.join(super::super::tombstone::TOMBSTONE_FILE),
+            format!("{}\n", super::super::tombstone::TOMBSTONE_HEADER),
+        )
+        .unwrap();
+        assert!(is_backlog_tombstone(&tombstone));
+        assert!(!is_backlog_tombstone(&live_checkout));
+        let row = |id: i64, path: &Path| Session {
+            id,
+            worktree_path: path.to_string_lossy().into_owned(),
+            branch: format!("agent/closed-{id}"),
+            origin: crate::SessionOrigin::Spawned,
+            status: crate::SessionStatus::Cleaned,
+            cleanup_state: crate::SessionCleanupState::Closed,
+            closed_at: Some(id * 1_000),
+            cleanup_completed_at: None,
+            task: None,
+            diff_base: None,
+            adoption_base: None,
+            adopted_head: None,
+            accepted_session_head: None,
+            accepted_integration_commit: None,
+            accepted_integration_tree: None,
+            accepted_queue_entry_id: None,
+            accepted_at: None,
+            repository_contract: None,
+            pid: None,
+            command: None,
+            log_path: None,
+            exit_code: None,
+            agent_identity: None,
+            repository_name: None,
+            tab_name: None,
+            ai_provider: None,
+            short_name: None,
+            created_at: id * 1_000 - 500,
+            updated_at: id * 1_000,
+            last_activity_at: id * 1_000,
+        };
+        let closed = [row(1, &live_checkout), row(2, &tombstone)];
+        let mut listing = PoolListing::default();
+
+        let backlog = broker.observe_checkout_backlog(
+            &mut listing,
+            &[],
+            &closed,
+            &BTreeSet::new(),
+            far(),
+            true,
+        );
+
+        assert_eq!(backlog.folders, 1, "{backlog:?}");
+        assert_eq!(backlog.closed_folders, 1, "{backlog:?}");
+        assert_eq!(backlog.closed_with_regenerable, 1, "{backlog:?}");
+        assert!(
+            tombstone
+                .join(super::super::tombstone::TOMBSTONE_FILE)
+                .is_file()
+        );
     }
 
     #[test]

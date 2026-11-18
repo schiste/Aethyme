@@ -70,48 +70,93 @@ pub(crate) fn restore_command(path: &Path) -> String {
     )
 }
 
+/// Where a retired checkout's work is saved, for its tombstone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SavedIn {
+    /// All committed, on its branch.
+    Branch,
+    /// Its uncommitted work in a verified recovery archive that `start
+    /// --reuse` restores.
+    Recovery(PathBuf),
+    /// An abandoned operation's state, index and changed files in an
+    /// operation archive, which restore does not read: manual steps.
+    Operation(PathBuf),
+}
+
 /// Leave a tombstone at `worktree` for `session`, whose checkout was just
-/// retired; `archive` is the verified recovery archive holding its
-/// uncommitted work, when it had any. Nothing is written over an existing
-/// path.
+/// retired, saying truthfully where its work is (see [`SavedIn`]). Nothing
+/// is written over an existing path, and a failed write removes only what
+/// this call created (the file, then the directory with `remove_dir`, which
+/// fails rather than delete anything that appeared there meanwhile).
 pub(crate) fn write_checkout_tombstone(
     worktree: &Path,
     session: &Session,
-    archive: Option<&Path>,
+    saved: &SavedIn,
 ) -> std::io::Result<()> {
     std::fs::create_dir(worktree)?;
-    let saved = match archive {
-        Some(_) => format!(
-            "All of its work is saved: its commits on branch {}, and its staged and unstaged \
-             changes, untracked files and protected ignored files in the verified recovery \
-             archive below.",
-            session.branch
+    let command = restore_command(worktree);
+    let (saved_text, way_back, archive_line) = match saved {
+        SavedIn::Branch => (
+            format!(
+                "All of its work is saved: it was all committed, on branch {}.",
+                session.branch
+            ),
+            format!("Bring it back here, exactly as it was, with one command:\n\n    {command}"),
+            String::new(),
         ),
-        None => format!(
-            "All of its work is saved: it was all committed, on branch {}.",
-            session.branch
+        SavedIn::Recovery(archive) => (
+            format!(
+                "All of its work is saved: its commits on branch {}, and its staged and unstaged \
+                 changes, untracked files and protected ignored files in the verified recovery \
+                 archive below.",
+                session.branch
+            ),
+            format!("Bring it back here, exactly as it was, with one command:\n\n    {command}"),
+            format!("archive: {}\n", archive.display()),
+        ),
+        SavedIn::Operation(archive) => (
+            format!(
+                "It was in the middle of a merge, rebase, cherry-pick, revert or bisect left \
+                 abandoned. Its commits are on branch {} (pinned), and the operation's state, its \
+                 index and its changed files are saved in the operation archive below. That \
+                 archive is not restored automatically.",
+                session.branch
+            ),
+            format!(
+                "To get the checkout back:\n\n\
+                 1. Recreate it from its branch (without the saved state):\n\n    {command}\n\n\
+                 2. Read {}/README.md and {}/manifest.json, and copy back by hand what you \
+                 need from that archive (the archive stays where it is).",
+                archive.display(),
+                archive.display()
+            ),
+            format!(
+                "operation archive: {}\nrestore: manual\n",
+                archive.display()
+            ),
         ),
     };
     let body = format!(
         "{TOMBSTONE_HEADER}\n\n\
          Session {id} had no activity and its checkout was retired at {at} (epoch ms) to free \
-         disk space.\n{saved}\n\n\
-         Bring it back here, exactly as it was, with one command:\n\n    {command}\n\n\
+         disk space.\n{saved_text}\n\n{way_back}\n\n\
          Regenerable dependencies are not restored; prepare the session again afterwards.\n\n\
          session: {id}\n{archive_line}",
         id = session.id,
         at = crate::clock::epoch_ms(),
-        command = restore_command(worktree),
-        archive_line = archive.map_or(String::new(), |archive| format!(
-            "archive: {}\n",
-            archive.display()
-        )),
     );
-    let written = std::fs::write(worktree.join(TOMBSTONE_FILE), body);
+    let file = worktree.join(TOMBSTONE_FILE);
+    let written = std::fs::write(&file, body);
     if written.is_err() {
+        if std::fs::symlink_metadata(&file).is_ok() {
+            crate::warn_unrecorded(
+                "remove a half-written tombstone file",
+                std::fs::remove_file(&file),
+            );
+        }
         crate::warn_unrecorded(
-            "remove a half-written tombstone",
-            std::fs::remove_dir_all(worktree),
+            "remove a half-made tombstone",
+            std::fs::remove_dir(worktree),
         );
     }
     written

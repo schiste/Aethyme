@@ -11,6 +11,17 @@
 //! as links) and read back against their recorded SHA-256. Anything that
 //! fails removes the half-made checkout again and leaves the archive as it
 //! was, so a failed restore loses nothing and can be retried.
+//!
+//! The checkout is built at a sibling staging path
+//! (`.<name>.aethyme-restoring`) and moved into place with `git worktree
+//! move` only once complete, so the session's path never holds a partial
+//! tree. A marker beside it (`.<name>.aethyme-restore-incomplete`) is
+//! written first and removed only when the restore completed or its
+//! staging checkout was removed again: while it is there, `start --reuse`
+//! refuses to adopt anything at the path.
+//!
+//! Not restored: directory modes, modification times, hard links (each
+//! linked file comes back as its own copy) and extended attributes.
 
 use super::*;
 
@@ -25,6 +36,41 @@ pub(crate) struct ArchiveRestore {
     pub unstaged_patch_bytes: u64,
     pub untracked_files: usize,
     pub ignored_files: usize,
+    /// The branch was not at the archived HEAD: the checkout is detached at
+    /// the archived HEAD and this is the branch's tip.
+    pub detached_branch_tip: Option<String>,
+}
+
+/// The sibling of `target` a restore builds the checkout at.
+pub(crate) fn restore_staging_path(target: &Path) -> PathBuf {
+    sibling(target, "aethyme-restoring")
+}
+
+/// The marker beside `target` saying a restore there has not completed.
+pub(crate) fn restore_incomplete_marker(target: &Path) -> PathBuf {
+    sibling(target, "aethyme-restore-incomplete")
+}
+
+/// Whether a restore at `target` started and neither completed nor cleaned
+/// up after itself: nothing at `target` may be adopted then.
+pub(crate) fn restore_incomplete(target: &Path) -> bool {
+    std::fs::symlink_metadata(restore_incomplete_marker(target)).is_ok()
+}
+
+fn sibling(target: &Path, suffix: &str) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    target.with_file_name(format!(".{name}.{suffix}"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hooks: fail right after the staging checkout is created, and
+    /// make removing it fail.
+    pub(crate) static FAIL_AFTER_ADD_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_UNDO_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Run Git in `dir`; stdout on success, the trimmed stderr otherwise.
@@ -125,6 +171,16 @@ pub(crate) fn restore_recovery_archive(
     if std::fs::symlink_metadata(target).is_ok() {
         return Err(format!("{} already exists", target.display()));
     }
+    let final_target = target;
+    let staging = restore_staging_path(final_target);
+    let marker = restore_incomplete_marker(final_target);
+    if std::fs::symlink_metadata(&staging).is_ok() {
+        return Err(format!(
+            "an earlier restore left {}; inspect it and remove it with `git worktree remove --force` before retrying",
+            staging.display()
+        ));
+    }
+    let target = staging.as_path();
     let head = manifest.head.clone();
     let mut restored = ArchiveRestore {
         head: head.clone(),
@@ -196,6 +252,9 @@ pub(crate) fn restore_recovery_archive(
                 "recovery_archive_restore_branch_recreated",
                 Duration::ZERO,
             );
+            if recorded_tip != head {
+                restored.detached_branch_tip = Some(recorded_tip.clone());
+            }
             if recorded_tip == head {
                 git_in(
                     main_root,
@@ -216,19 +275,52 @@ pub(crate) fn restore_recovery_archive(
         }
         // The branch moved since: the archived HEAD, detached, as the
         // archive's restore steps describe; the branch is left alone.
-        Some(_) => git_in(
-            main_root,
-            &[
-                os("worktree"),
-                os("add"),
-                os("--detach"),
-                target.as_os_str(),
-                os(&head),
-            ],
-        ),
+        Some(tip) => {
+            restored.detached_branch_tip = Some(tip.to_string());
+            git_in(
+                main_root,
+                &[
+                    os("worktree"),
+                    os("add"),
+                    os("--detach"),
+                    target.as_os_str(),
+                    os(&head),
+                ],
+            )
+        }
     };
-    add?;
+    if let Err(reason) = add {
+        crate::phase_telemetry::add("recovery_archive_restore_failed", Duration::ZERO);
+        return Err(reason);
+    }
+    // From here a partial tree exists (at the staging path): the marker
+    // blocks adopting the session's path until it is gone.
+    let marked = std::fs::write(
+        &marker,
+        format!(
+            "aethyme: a restore of {} into {} has not completed\n",
+            archive.display(),
+            final_target.display()
+        ),
+    );
+    // A failed step removes the staging checkout; the marker stays when that
+    // fails too, so nothing at the session's path is adopted meanwhile.
     let undo = |reason: String| -> String {
+        #[cfg(test)]
+        let removed = if FAIL_UNDO_FOR_TEST.with(std::cell::Cell::get) {
+            Err("removal refused by the test".to_string())
+        } else {
+            git_in(
+                main_root,
+                &[
+                    os("worktree"),
+                    os("remove"),
+                    os("--force"),
+                    target.as_os_str(),
+                ],
+            )
+        };
+        #[cfg(not(test))]
         let removed = git_in(
             main_root,
             &[
@@ -240,10 +332,33 @@ pub(crate) fn restore_recovery_archive(
         );
         crate::phase_telemetry::add("recovery_archive_restore_failed", Duration::ZERO);
         match removed {
-            Ok(_) => reason,
-            Err(error) => format!("{reason}; the partial checkout could not be removed: {error}"),
+            Ok(_) => {
+                if std::fs::symlink_metadata(&marker).is_ok() {
+                    crate::warn_unrecorded(
+                        "remove a restore marker",
+                        std::fs::remove_file(&marker),
+                    );
+                }
+                reason
+            }
+            Err(error) => {
+                crate::phase_telemetry::add("recovery_archive_restore_undo_failed", Duration::ZERO);
+                format!(
+                    "{reason}; the partial checkout at {} could not be removed ({error}); {} blocks adopting {} until it is removed",
+                    target.display(),
+                    marker.display(),
+                    final_target.display()
+                )
+            }
         }
     };
+    if let Err(error) = marked {
+        return Err(undo(format!("cannot write {}: {error}", marker.display())));
+    }
+    #[cfg(test)]
+    if FAIL_AFTER_ADD_FOR_TEST.with(std::cell::Cell::get) {
+        return Err(undo("failure injected by the test".into()));
+    }
     if manifest.staged_patch.bytes > 0 {
         let patch = archive.join(&manifest.staged_patch.file);
         if let Err(reason) = git_in(
@@ -280,6 +395,22 @@ pub(crate) fn restore_recovery_archive(
                 return Err(undo(reason));
             }
         }
+    }
+    // Complete: move it into place (Git updates its registration).
+    if let Err(reason) = git_in(
+        main_root,
+        &[
+            os("worktree"),
+            os("move"),
+            target.as_os_str(),
+            final_target.as_os_str(),
+        ],
+    ) {
+        return Err(undo(reason));
+    }
+    crate::warn_unrecorded("remove a restore marker", std::fs::remove_file(&marker));
+    if restored.detached_branch_tip.is_some() {
+        crate::phase_telemetry::add("recovery_archive_restore_detached", Duration::ZERO);
     }
     crate::phase_telemetry::add("recovery_archive_restored", Duration::ZERO);
     Ok(restored)

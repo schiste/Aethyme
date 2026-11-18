@@ -594,6 +594,119 @@ impl RetireRun {
     }
 }
 
+/// Whether `archive` is an operation archive (`<id>-operation-…`, schema
+/// `aethyme-operation-archive-v1`), which restore does not read.
+pub(crate) fn is_operation_archive(archive: &Path) -> bool {
+    archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.split_once('-'))
+        .is_some_and(|(_, rest)| rest.starts_with("operation-"))
+}
+
+/// Why nothing is adopted at `path`: a restore there did not complete.
+pub(crate) fn restore_incomplete_reason(path: &Path) -> String {
+    format!(
+        "a restore into {} did not complete and its partial checkout could not be removed; \
+         inspect {}, remove it with `git worktree remove --force`, delete {}, then retry",
+        path.display(),
+        crate::cleanup_resolve::restore_staging_path(path).display(),
+        crate::cleanup_resolve::restore_incomplete_marker(path).display()
+    )
+}
+
+/// What a restore for reuse put back, for the command's output.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct CheckoutRestored {
+    pub path: PathBuf,
+    pub archive: PathBuf,
+    pub branch: String,
+    /// The archived HEAD the checkout is at.
+    pub head: String,
+    pub branch_recreated: bool,
+    pub bundle_used: bool,
+    /// Set when the branch was not at the archived HEAD: the checkout is
+    /// detached there.
+    pub detached: Option<DetachedRestore>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct DetachedRestore {
+    pub branch_tip: String,
+    pub archived_head: String,
+    /// Keeps the restored state on a new branch; compare it with the branch
+    /// before choosing.
+    pub reconcile_command: String,
+    pub compare_command: String,
+}
+
+impl CheckoutRestored {
+    fn new(
+        path: &Path,
+        archive: &Path,
+        branch: &str,
+        restored: &crate::cleanup_resolve::ArchiveRestore,
+    ) -> Self {
+        let quoted = format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+        Self {
+            path: path.to_path_buf(),
+            archive: archive.to_path_buf(),
+            branch: branch.to_string(),
+            head: restored.head.clone(),
+            branch_recreated: restored.branch_recreated,
+            bundle_used: restored.bundle_used,
+            detached: restored
+                .detached_branch_tip
+                .as_ref()
+                .map(|tip| DetachedRestore {
+                    branch_tip: tip.clone(),
+                    archived_head: restored.head.clone(),
+                    reconcile_command: format!("git -C {quoted} switch -c '{branch}-restored'"),
+                    compare_command: format!(
+                        "git -C {quoted} log --oneline --left-right {}...{tip}",
+                        restored.head
+                    ),
+                }),
+        }
+    }
+
+    /// The lines printed after a restore; the detached case first and loud.
+    pub(crate) fn lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(detached) = &self.detached {
+            lines.push(format!(
+                "WARNING: branch {} moved since the checkout was archived (tip {}); the restored \
+                 checkout is DETACHED at the archived HEAD {}.",
+                self.branch, detached.branch_tip, detached.archived_head
+            ));
+            lines.push(format!("  compare:   {}", detached.compare_command));
+            lines.push(format!("  reconcile: {}", detached.reconcile_command));
+        }
+        lines.push(format!(
+            "Restored the checkout at {} from {}{}.",
+            self.path.display(),
+            self.archive.display(),
+            if self.branch_recreated {
+                format!(" (branch {} recreated)", self.branch)
+            } else {
+                String::new()
+            }
+        ));
+        lines
+    }
+}
+
+thread_local! {
+    static LAST_CHECKOUT_RESTORE: std::cell::RefCell<Option<CheckoutRestored>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The restore the last [`Broker::recreate_retired_checkout`] on this
+/// thread performed, if any (taken once).
+pub(crate) fn take_last_checkout_restore() -> Option<CheckoutRestored> {
+    LAST_CHECKOUT_RESTORE.with(|cell| cell.borrow_mut().take())
+}
+
 /// What one retirement run did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CheckoutRetirementReport {
@@ -1553,16 +1666,31 @@ impl Broker {
 
     /// The newest recovery archive written for `session_id` (an archive
     /// directory whose name starts with the session id and holds a
-    /// manifest), if any.
+    /// manifest), in either archive directory, if any. Operation archives
+    /// (`<id>-operation-…`, another format that restore does not read) are
+    /// never returned: see [`Self::newest_operation_archive`].
     pub(crate) fn newest_recovery_archive(&self, session_id: i64) -> Option<PathBuf> {
         // The archive recorded with the session wins over a directory scan.
-        if let Some(recorded) = self.session_restorable_archive(session_id) {
+        if let Some(recorded) = self.session_restorable_archive(session_id)
+            && !is_operation_archive(&recorded)
+        {
             return Some(recorded);
         }
-        let root = self.recovery_archive_root().ok()?;
+        self.newest_session_archive(session_id, false)
+    }
+
+    /// The newest operation archive written for `session_id`, if any.
+    pub(crate) fn newest_operation_archive(&self, session_id: i64) -> Option<PathBuf> {
+        self.newest_session_archive(session_id, true)
+    }
+
+    fn newest_session_archive(&self, session_id: i64, operation: bool) -> Option<PathBuf> {
         let prefix = format!("{session_id}-");
-        let mut archives = std::fs::read_dir(&root)
-            .ok()?
+        let mut archives = self
+            .recovery_archive_roots()
+            .iter()
+            .filter_map(|root| std::fs::read_dir(root).ok())
+            .flatten()
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|archive| {
@@ -1574,6 +1702,7 @@ impl Broker {
                             && !name.ends_with(".partial")
                             && !name.starts_with('.')
                     })
+                    && is_operation_archive(archive) == operation
                     && archive
                         .join(crate::cleanup_resolve::MANIFEST_FILE)
                         .is_file()
@@ -1599,11 +1728,25 @@ impl Broker {
         }
         // Only a checkout retired through an archive: one whose work was
         // all in Git is recreated from its branch and leaves nothing behind.
-        let archive = match outcome {
-            RetireOutcome::RetiredArchived { .. }
-            | RetireOutcome::RetiredOperationArchived { .. } => {
-                self.newest_recovery_archive(session_id)
+        let (archive, saved) = match outcome {
+            RetireOutcome::RetiredArchived { .. } => {
+                let archive = self.newest_recovery_archive(session_id);
+                let saved = archive.clone().map_or(
+                    super::tombstone::SavedIn::Branch,
+                    super::tombstone::SavedIn::Recovery,
+                );
+                (archive, saved)
             }
+            // Restore does not read an operation archive: the tombstone
+            // says so and gives the manual steps; reuse recreates the
+            // checkout from its branch and leaves the archive in place.
+            RetireOutcome::RetiredOperationArchived { .. } => (
+                None,
+                self.newest_operation_archive(session_id).map_or(
+                    super::tombstone::SavedIn::Branch,
+                    super::tombstone::SavedIn::Operation,
+                ),
+            ),
             _ => return,
         };
         // Recorded with the session, so any lane can tell this session has
@@ -1623,7 +1766,7 @@ impl Broker {
                 ),
             );
         }
-        match super::tombstone::write_checkout_tombstone(worktree, &session, archive.as_deref()) {
+        match super::tombstone::write_checkout_tombstone(worktree, &session, &saved) {
             Ok(()) => crate::phase_telemetry::add(
                 "checkout_retirement_tombstone_written",
                 std::time::Duration::ZERO,
@@ -2026,7 +2169,7 @@ impl Broker {
                 return Ok(Kept("operation_archive_failed"));
             }
         };
-        let archive_root = self.recovery_archive_root()?;
+        let archive_root = self.retirement_archive_root()?;
         let archived = super::retire_operation::write_operation_archive(
             &super::retire_operation::OperationArchiveRequest {
                 session_id: session.id,
@@ -2213,10 +2356,15 @@ impl Broker {
                 );
             }
         }
-        if let Ok(root) = self.recovery_archive_root() {
+        {
             let _span = crate::phase_telemetry::span("checkout_retirement_sweep_partials");
-            super::retire_operation::sweep_stale_partials(&root);
+            for root in self.recovery_archive_roots() {
+                super::retire_operation::sweep_stale_partials(&root);
+            }
         }
+        // The per-repository bound on archive bytes (both locations),
+        // recorded in the storage ledger by location.
+        self.record_recovery_archive_bound(deadline);
         let prune_span = crate::phase_telemetry::span("checkout_retirement_prune_pins");
         let retired_pins =
             match self.prune_retired_pins_until(Some(Instant::now() + RETIRE_PIN_PRUNE_BUDGET)) {
@@ -2622,6 +2770,14 @@ impl Broker {
         else {
             return Ok(false);
         };
+        // A restore that neither completed nor cleaned up after itself:
+        // nothing is adopted or recreated at the path until it is resolved.
+        if crate::cleanup_resolve::restore_incomplete(path) {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason: restore_incomplete_reason(path),
+            });
+        }
         let tombstone = super::tombstone::is_checkout_tombstone(path);
         if session.cleanup_state != crate::SessionCleanupState::Cleaned
             || session.origin != crate::SessionOrigin::Spawned
@@ -2665,6 +2821,14 @@ impl Broker {
                             "checkout_retirement_restored_for_reuse",
                             started.elapsed(),
                         );
+                        LAST_CHECKOUT_RESTORE.with(|cell| {
+                            *cell.borrow_mut() = Some(CheckoutRestored::new(
+                                path,
+                                &archive,
+                                &session.branch,
+                                &restored,
+                            ));
+                        });
                         crate::phase_telemetry::attach(
                             "checkout_restore",
                             serde_json::json!({
@@ -2676,6 +2840,7 @@ impl Broker {
                                 "unstaged_patch_bytes": restored.unstaged_patch_bytes,
                                 "untracked_files": restored.untracked_files,
                                 "ignored_files": restored.ignored_files,
+                                "detached_branch_tip": restored.detached_branch_tip,
                             }),
                         );
                         Ok(true)
@@ -2688,7 +2853,7 @@ impl Broker {
                                 super::tombstone::write_checkout_tombstone(
                                     path,
                                     &session,
-                                    Some(&archive),
+                                    &super::tombstone::SavedIn::Recovery(archive.clone()),
                                 ),
                             );
                         }
@@ -2862,11 +3027,11 @@ mod tests {
 
     /// The archives written for `session_id`.
     fn archives(broker: &crate::Broker, session_id: i64) -> Vec<PathBuf> {
-        let root = broker.recovery_archive_root().unwrap();
-        let Ok(listing) = std::fs::read_dir(&root) else {
-            return Vec::new();
-        };
-        listing
+        broker
+            .recovery_archive_roots()
+            .iter()
+            .filter_map(|root| std::fs::read_dir(root).ok())
+            .flatten()
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| {
@@ -5140,6 +5305,15 @@ mod tests {
         let refusal =
             crate::session_auto_close::closed_session_refusal(broker.store_ref(), session.id);
         assert!(refusal.contains("restore_required"), "{refusal}");
+        // ... and as data for `--json` callers.
+        let action = crate::session_auto_close::take_refusal_action()
+            .expect("the refusal leaves its structured action");
+        assert_eq!(action["code"], "restore_required");
+        assert_eq!(action["session_id"], session.id);
+        assert_eq!(
+            action["command"],
+            crate::broker::restore_command(&worktree).as_str()
+        );
         assert!(refusal.contains("--reuse"), "{refusal}");
         // A new session with the same task never gets the tombstone's path.
         let fresh = broker.start_worktree("restore me", None).unwrap();
@@ -5187,5 +5361,143 @@ mod tests {
             !archives(&broker, session.id).is_empty(),
             "the archive stays"
         );
+    }
+
+    /// A checkout holding an unpushed commit and an untracked file, retired
+    /// through an archive; returns the session, its path and archived HEAD.
+    fn retired_with_archive(
+        broker: &mut crate::Broker,
+        label: &str,
+    ) -> (crate::Session, PathBuf, String) {
+        let (session, worktree) = closed(broker, label, |worktree| {
+            std::fs::write(worktree.join("work.txt"), "committed, not pushed\n").unwrap();
+            git(worktree, &["add", "work.txt"]);
+            git(
+                worktree,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "commit",
+                    "-qm",
+                    "unpushed work",
+                ],
+            );
+            std::fs::write(worktree.join("notes.txt"), "untracked notes\n").unwrap();
+        });
+        let head = git(&worktree, &["rev-parse", "HEAD"]).trim().to_string();
+        let report = run(broker);
+        assert_eq!(report.retired_archived, 1, "{report:#?}");
+        (session, worktree, head)
+    }
+
+    /// New archives go to the pool's volume, in the marked broker-owned
+    /// directory beside the checkouts; an archive left in host state stays
+    /// found; an operation archive is never picked for a restore.
+    #[test]
+    fn retirement_archives_on_the_pool_and_still_finds_host_state_ones() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree, _) = retired_with_archive(&mut broker, "pool archive");
+        let pool_root = broker
+            .pool_recovery_archive_root(false)
+            .expect("the pool-side archive root exists, identified by its marker");
+        let archive = broker
+            .newest_recovery_archive(session.id)
+            .expect("the archive is found");
+        assert!(archive.starts_with(&pool_root), "{}", archive.display());
+        assert!(
+            pool_root
+                .parent()
+                .unwrap()
+                .join(".aethyme-recovery-archives-root.json")
+                .is_file()
+        );
+        assert_eq!(
+            std::fs::canonicalize(pool_root.parent().unwrap().parent().unwrap()).unwrap(),
+            std::fs::canonicalize(worktree.parent().unwrap()).unwrap(),
+            "beside the checkouts, on the pool's volume"
+        );
+        // An older archive in host state, and an operation archive.
+        let host = broker.recovery_archive_root().unwrap();
+        let legacy = host.join(format!("{}-legacy", 990_001));
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join(crate::cleanup_resolve::MANIFEST_FILE), "{}").unwrap();
+        assert_eq!(broker.newest_recovery_archive(990_001), Some(legacy));
+        let operation = pool_root.join(format!("{}-operation-0123456789ab-1", 990_002));
+        std::fs::create_dir_all(&operation).unwrap();
+        std::fs::write(operation.join(crate::cleanup_resolve::MANIFEST_FILE), "{}").unwrap();
+        assert_eq!(broker.newest_recovery_archive(990_002), None);
+        assert_eq!(broker.newest_operation_archive(990_002), Some(operation));
+    }
+
+    /// A restore whose cleanup fails leaves nothing at the session's path
+    /// (it was built at a sibling staging path) and a marker that refuses
+    /// any reuse there until the leftovers are removed.
+    #[test]
+    fn a_failed_restore_whose_undo_fails_blocks_reuse_until_resolved() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (_session, worktree, _) = retired_with_archive(&mut broker, "failed undo");
+        crate::cleanup_resolve::FAIL_AFTER_ADD_FOR_TEST.with(|cell| cell.set(true));
+        crate::cleanup_resolve::FAIL_UNDO_FOR_TEST.with(|cell| cell.set(true));
+        let failed = broker.recreate_retired_checkout(&worktree);
+        crate::cleanup_resolve::FAIL_AFTER_ADD_FOR_TEST.with(|cell| cell.set(false));
+        crate::cleanup_resolve::FAIL_UNDO_FOR_TEST.with(|cell| cell.set(false));
+        let error = failed
+            .expect_err("the injected failure refuses")
+            .to_string();
+        assert!(error.contains("could not be removed"), "{error}");
+        // The session's path holds no partial tree: the tombstone is back.
+        assert!(super::super::tombstone::is_checkout_tombstone(&worktree));
+        let staging = crate::cleanup_resolve::restore_staging_path(&worktree);
+        assert!(
+            staging.join(".git").exists(),
+            "the partial checkout is aside"
+        );
+        assert!(crate::cleanup_resolve::restore_incomplete(&worktree));
+        // Reuse is refused while the marker is there.
+        let refused = broker
+            .recreate_retired_checkout(&worktree)
+            .expect_err("an incomplete restore blocks reuse")
+            .to_string();
+        assert!(refused.contains("did not complete"), "{refused}");
+        // Resolved by hand: the next reuse restores.
+        git(
+            broker.main_root(),
+            &["worktree", "remove", "--force", &staging.to_string_lossy()],
+        );
+        std::fs::remove_file(crate::cleanup_resolve::restore_incomplete_marker(&worktree)).unwrap();
+        assert!(broker.recreate_retired_checkout(&worktree).unwrap());
+        assert!(worktree.join("notes.txt").is_file());
+        assert!(!crate::cleanup_resolve::restore_incomplete(&worktree));
+    }
+
+    /// When the branch moved after the archive was written, the restored
+    /// checkout is detached at the archived HEAD and the command's output
+    /// says so, with the branch tip and the commands to reconcile.
+    #[test]
+    fn a_restore_onto_a_moved_branch_reports_the_detached_checkout() {
+        let (_owner, _storage, mut broker) = fixture();
+        let (session, worktree, head) = retired_with_archive(&mut broker, "moved branch");
+        let elsewhere = git(broker.main_root(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        assert_ne!(elsewhere, head);
+        git(
+            broker.main_root(),
+            &["branch", "-f", &session.branch, &elsewhere],
+        );
+        crate::broker::take_last_checkout_restore();
+        assert!(broker.recreate_retired_checkout(&worktree).unwrap());
+        assert_eq!(git(&worktree, &["rev-parse", "HEAD"]).trim(), head);
+        let restored = crate::broker::take_last_checkout_restore().expect("a restore report");
+        let detached = restored.detached.clone().expect("detached");
+        assert_eq!(detached.branch_tip, elsewhere);
+        assert_eq!(detached.archived_head, head);
+        assert!(detached.reconcile_command.contains("switch -c"));
+        let lines = restored.lines();
+        assert!(lines[0].contains("DETACHED"), "{lines:?}");
+        let value = serde_json::to_value(&restored).unwrap();
+        assert_eq!(value["detached"]["branch_tip"], elsewhere.as_str());
     }
 }

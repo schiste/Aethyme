@@ -619,6 +619,51 @@ pub(crate) fn abandoned_operation_after_ms(main_root: &Path) -> i64 {
     hours.saturating_mul(3_600_000)
 }
 
+/// `[cleanup] recovery_archive_bound_gib`: the most this repository's
+/// recovery archives (both archive directories) may hold together, in GiB;
+/// `0` turns the bound off. Over it, the oldest archives whose content has
+/// fully landed are removed first; an archive holding work that exists
+/// nowhere else is never removed for size (advice instead).
+pub(crate) const RECOVERY_ARCHIVE_BOUND_CONFIG_KEY: &str = "recovery_archive_bound_gib";
+/// The default of [`RECOVERY_ARCHIVE_BOUND_CONFIG_KEY`].
+pub(crate) const DEFAULT_RECOVERY_ARCHIVE_BOUND_GIB: i64 = 20;
+const MAX_RECOVERY_ARCHIVE_BOUND_GIB: i64 = 1 << 20;
+
+/// Parse [`RECOVERY_ARCHIVE_BOUND_CONFIG_KEY`]; absent is the default.
+pub(crate) fn parse_recovery_archive_bound_gib(value: Option<&toml::Value>) -> Result<i64, String> {
+    match value {
+        None => Ok(DEFAULT_RECOVERY_ARCHIVE_BOUND_GIB),
+        Some(toml::Value::Integer(gib)) if (0..=MAX_RECOVERY_ARCHIVE_BOUND_GIB).contains(gib) => {
+            Ok(*gib)
+        }
+        Some(_) => Err(format!(
+            "[cleanup] {RECOVERY_ARCHIVE_BOUND_CONFIG_KEY} must be a whole number of GiB between 0 and {MAX_RECOVERY_ARCHIVE_BOUND_GIB}"
+        )),
+    }
+}
+
+/// [`RECOVERY_ARCHIVE_BOUND_CONFIG_KEY`] of the primary checkout's config,
+/// in bytes (`0`: off). An unreadable or invalid value keeps the default
+/// (the cleanup policy loader reports it).
+pub(crate) fn recovery_archive_bound_bytes(main_root: &Path) -> u64 {
+    let gib = (|| -> Result<i64, String> {
+        let Some((path, text)) =
+            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
+                .map_err(|error| error.to_string())?
+        else {
+            return parse_recovery_archive_bound_gib(None);
+        };
+        let root: toml::Value = toml::from_str(&text)
+            .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+        parse_recovery_archive_bound_gib(
+            root.get("cleanup")
+                .and_then(|cleanup| cleanup.get(RECOVERY_ARCHIVE_BOUND_CONFIG_KEY)),
+        )
+    })()
+    .unwrap_or(DEFAULT_RECOVERY_ARCHIVE_BOUND_GIB);
+    u64::try_from(gib).unwrap_or(0).saturating_mul(1 << 30)
+}
+
 /// `[cleanup]` key: exact file names a repository's own tooling writes at
 /// the top of a Python virtual environment, which the strip pass then
 /// accepts beside `pyvenv.cfg` (it already accepts what environment tools
@@ -795,6 +840,10 @@ impl AutoCleanupPolicy {
                 ABANDONED_OPERATION_CONFIG_KEY => {
                     // Read by the checkout retirement lane; validated here.
                     parse_abandoned_operation_after_hours(Some(value))?;
+                }
+                RECOVERY_ARCHIVE_BOUND_CONFIG_KEY => {
+                    // Read by the checkout retirement lane; validated here.
+                    parse_recovery_archive_bound_gib(Some(value))?;
                 }
                 VENV_MARKERS_CONFIG_KEY => {
                     // Read by the strip pass; validated here.

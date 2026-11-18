@@ -3730,6 +3730,7 @@ pub struct Broker {
     pub(crate) worktree_lifecycle_test_observer: Option<WorktreeLifecycleTestObserver>,
 }
 
+mod archive_bound;
 mod cleanup;
 mod finish;
 mod gates;
@@ -3751,6 +3752,7 @@ pub(crate) use leases::{
     LANDED_PROOF_TIMEOUTS_KEY, doubled_proof_budget, landed_proof_session_budget_for_test,
 };
 pub use owners::{CommitOwner, MAX_OWNER_COMMITS, OwnedCommit, OwnersReport};
+pub(crate) use retire::{CheckoutRestored, restore_incomplete_reason, take_last_checkout_restore};
 pub(crate) use scratch::SessionScratch;
 #[cfg(test)]
 pub(crate) use scratch::scratch_instruction;

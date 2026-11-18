@@ -1283,6 +1283,17 @@ fn inspect_root(
                     ));
                     continue;
                 }
+                // A retired checkout's tombstone is broker-owned content
+                // that keeps the root (its note points at saved work), but
+                // neither a worktree nor a stray directory to sweep: the
+                // retirement lane expires it.
+                if crate::broker::is_checkout_tombstone(&child) {
+                    crate::phase_telemetry::add(
+                        "storage_root_tombstone_retained",
+                        std::time::Duration::ZERO,
+                    );
+                    continue;
+                }
                 let child = normalise(&child);
                 let estimated_bytes = observed_size(&child, scan, records);
                 let estimated_inodes = observed_inodes(&child, records);
@@ -10269,6 +10280,58 @@ mod tests {
                 }),
             "binding a root must not hide an otherwise eligible stray child"
         );
+    }
+
+    #[test]
+    fn a_retired_checkout_tombstone_keeps_its_root_and_is_never_a_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let owner_root = tmp.path().canonicalize().unwrap().join("repository");
+        init_storage_root_test_repository(&owner_root);
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&owner_root).unwrap();
+        broker.prepare_worktree_root_for_submission().unwrap();
+        let root = broker
+            .store()
+            .repository_worktree_binding()
+            .unwrap()
+            .worktree_root
+            .unwrap();
+        let tombstone = root.join("retired-checkout");
+        std::fs::create_dir(&tombstone).unwrap();
+        std::fs::write(
+            tombstone.join("ARCHIVED-SESSION.txt"),
+            "aethyme: retired session checkout\narchive: none\n",
+        )
+        .unwrap();
+
+        let mut records = crate::measurement::SizeRecords::default();
+        let inspected = inspect_root(
+            &root,
+            now_ms(),
+            0,
+            crate::SizeScan::Recorded,
+            &mut records,
+            &BTreeSet::new(),
+        );
+
+        assert!(!inspected.empty, "a tombstone keeps its root");
+        assert_eq!(inspected.worktree_count, 0, "a tombstone is no worktree");
+        assert!(
+            inspected
+                .reconciliation
+                .entries
+                .iter()
+                .all(|entry| entry.path != tombstone),
+            "a tombstone is neither a worktree nor a stray directory"
+        );
+        assert!(
+            candidates_for_root(&inspected, 0).is_empty(),
+            "neither the root nor the tombstone is a candidate"
+        );
+        let error = remove_empty_root(&root).unwrap_err();
+        assert!(error.contains("not broker bookkeeping"), "{error}");
+        assert!(tombstone.join("ARCHIVED-SESSION.txt").is_file());
+        assert!(root.join(WORKTREE_ROOT_MARKER).is_file());
     }
 
     #[test]

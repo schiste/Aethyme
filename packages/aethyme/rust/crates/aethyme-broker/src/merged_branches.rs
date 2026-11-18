@@ -189,23 +189,23 @@ impl crate::Broker {
         {
             return Some(true);
         }
-        let root = self.recovery_archive_root().ok()?;
-        let listing = match std::fs::read_dir(&root) {
-            Ok(listing) => listing,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
-            Err(_) => return None,
-        };
+        // Both archive directories: the pool-side one and the host state one.
         let prefix = format!("{}-", session.id);
-        let mut found = false;
-        for entry in listing {
-            let name = entry.ok()?.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with(&prefix) && !name.ends_with(".partial") {
-                found = true;
-                break;
+        for root in self.recovery_archive_roots() {
+            let listing = match std::fs::read_dir(&root) {
+                Ok(listing) => listing,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
+            };
+            for entry in listing {
+                let name = entry.ok()?.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(&prefix) && !name.ends_with(".partial") {
+                    return Some(true);
+                }
             }
         }
-        Some(found)
+        Some(false)
     }
 
     /// Why the branch must stay, judged afresh: every session that uses it

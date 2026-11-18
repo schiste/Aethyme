@@ -317,25 +317,83 @@ pub(crate) fn closed_session_refusal(store: &crate::BrokerStore, session_id: i64
         ),
         None => format!("session {session_id} is already closed; it cannot start new session work"),
     };
-    match restore_required_action(store, session_id) {
-        Some(action) => format!("{refusal}; {action}"),
+    match restore_required(store, session_id) {
+        Some(action) => {
+            // `--json` refusals carry the action as data too.
+            REFUSAL_ACTION.with(|cell| *cell.borrow_mut() = Some(action.json()));
+            crate::phase_telemetry::add(
+                "closed_session_refusal_restore_required",
+                std::time::Duration::ZERO,
+            );
+            format!("{refusal}; {}", action.text())
+        }
         None => refusal,
     }
 }
 
-/// For a session whose checkout was retired and left a tombstone: the
-/// `restore_required` action and its one command.
-pub(crate) fn restore_required_action(
-    store: &crate::BrokerStore,
-    session_id: i64,
-) -> Option<String> {
-    let session = store.session(session_id).ok()?;
-    let path = std::path::Path::new(&session.worktree_path);
-    crate::broker::is_checkout_tombstone(path).then(|| {
+/// The `restore_required` action of a session whose checkout was retired
+/// and left a tombstone: where, and the one command that restores it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RestoreRequired {
+    pub session_id: i64,
+    pub path: std::path::PathBuf,
+    pub command: String,
+}
+
+impl RestoreRequired {
+    pub(crate) fn text(&self) -> String {
         format!(
             "restore_required: its checkout was retired with all its work saved; restore it at the same path with `{}`",
-            crate::broker::restore_command(path)
+            self.command
         )
+    }
+
+    /// The structured form `--json` errors carry under `error.action`.
+    pub(crate) fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "code": "restore_required",
+            "session_id": self.session_id,
+            "path": self.path,
+            "command": self.command,
+        })
+    }
+}
+
+thread_local! {
+    /// The structured action of the last refusal built on this thread, for
+    /// the `--json` error envelope.
+    static REFUSAL_ACTION: std::cell::RefCell<Option<serde_json::Value>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Leave `action` as this thread's structured refusal action.
+#[cfg(test)]
+pub(crate) fn set_refusal_action_for_test(action: serde_json::Value) {
+    REFUSAL_ACTION.with(|cell| *cell.borrow_mut() = Some(action));
+}
+
+/// Forget any structured refusal action left on this thread.
+pub(crate) fn clear_refusal_action() {
+    REFUSAL_ACTION.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// Take the structured action of the last refusal built on this thread.
+pub(crate) fn take_refusal_action() -> Option<serde_json::Value> {
+    REFUSAL_ACTION.with(|cell| cell.borrow_mut().take())
+}
+
+/// For a session whose checkout was retired and left a tombstone: the
+/// `restore_required` action and its one command.
+pub(crate) fn restore_required(
+    store: &crate::BrokerStore,
+    session_id: i64,
+) -> Option<RestoreRequired> {
+    let session = store.session(session_id).ok()?;
+    let path = std::path::Path::new(&session.worktree_path);
+    crate::broker::is_checkout_tombstone(path).then(|| RestoreRequired {
+        session_id,
+        path: path.to_path_buf(),
+        command: crate::broker::restore_command(path),
     })
 }
 

@@ -287,6 +287,7 @@ fn a_gate_that_takes_the_cache_after_selection_keeps_it() {
         newest_ms: 0,
         reason: Reason::OverBudget,
         expires_ms: None,
+        allow_unlanded: false,
     };
     let leases = evict::leased_gate_caches(&registry).unwrap();
     assert_eq!(
@@ -714,6 +715,7 @@ fn links_recent_use_and_unknown_recency_keep_an_entry() {
         newest_ms,
         reason: Reason::OverBudget,
         expires_ms: None,
+        allow_unlanded: false,
     };
     let now = super::now_ms();
     let measured = now - 30 * DAY_MS + 1000;
@@ -894,6 +896,7 @@ fn an_interrupted_removal_leaves_its_remainder_for_the_sweep() {
         newest_ms: 0,
         reason: Reason::OverBudget,
         expires_ms: None,
+        allow_unlanded: false,
     };
     let finished = evict::remove(&candidate, &mut || {}, Some(Instant::now())).unwrap();
     assert!(!finished, "the deadline stopped the deletion");
@@ -1109,7 +1112,33 @@ fn expiry_needs_two_notices_a_day_apart_and_a_week_and_skips_kept_and_undated() 
         2
     );
 
-    // Two notices a day apart, a week since the first: it goes.
+    // Two notices a day apart, a week since the first: an archive holding
+    // unlanded work is still kept at its age, and named as such.
+    time_passes(host_state, 0, 25);
+    let ledger = pass(host_state, roots(), Budgets::default());
+    let report = ledger.last_pass.unwrap();
+    assert!(report.evicted.is_empty(), "{report:?}");
+    assert!(old.exists(), "age alone never destroys unlanded work");
+    assert_eq!(
+        report.unlanded_archives,
+        vec!["example-0123/old-unlanded".to_string()],
+        "{report:?}"
+    );
+    let advice = super::cli::status_advice(host_state);
+    let kept_row = advice
+        .iter()
+        .find(|row| row.id == "storage.unlanded-archives-at-age")
+        .expect("advice names the kept archive");
+    assert!(
+        kept_row
+            .evidence
+            .iter()
+            .any(|line| line.contains("session 42")),
+        "{kept_row:?}"
+    );
+
+    // Its owner dismisses it: it goes.
+    super::cli::dismiss_archive(host_state, "example-0123/old-unlanded").unwrap();
     time_passes(host_state, 0, 25);
     let ledger = pass(host_state, roots(), Budgets::default());
     let report = ledger.last_pass.unwrap();
@@ -1200,10 +1229,14 @@ fn age_expiry_is_capped_per_pass_oldest_first() {
     let dir = tempfile::tempdir().unwrap();
     let host_state = dir.path();
     eligible_after_two_notices(host_state, 55);
+    // The setting lets archives holding unlanded work expire by age too.
     let ledger = pass(
         host_state,
         vec![root(host_state, RootKind::HostState)],
-        Budgets::default(),
+        Budgets {
+            expire_unlanded_archives: true,
+            ..Budgets::default()
+        },
     );
     let report = ledger.last_pass.unwrap();
     assert_eq!(

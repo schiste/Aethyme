@@ -60,6 +60,10 @@ pub struct Summary {
     /// each is re-checked before removal.
     pub reclaimable: Vec<Reclaimable>,
     pub unlanded_archives: Vec<String>,
+    /// Archives kept at their retention age because they hold unlanded
+    /// work, named with their session and restore command in advice.
+    #[serde(default)]
+    pub unlanded_archives_at_age: Vec<String>,
     pub last_kick_ms: u64,
     /// Archives that expire within the notice week, soonest first (the
     /// first 20), and how many there are.
@@ -391,6 +395,7 @@ pub fn decide(
             newest_ms: entry.newest_ms,
             reason: Reason::OverBudget,
             expires_ms: None,
+            allow_unlanded: false,
         };
         if evict::refuse(&candidate, leases.as_ref(), now).is_some() {
             continue;
@@ -963,6 +968,11 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
         if let Some(why) = evict::refuse(&candidate, leases.as_ref(), now) {
             if candidate.class == Class::RecoveryArchives && why.starts_with("unlanded") {
                 report.unlanded_archives.push(candidate.relative.clone());
+                if why.starts_with("unlanded at its retention age") {
+                    report
+                        .unlanded_archives_at_age
+                        .push(candidate.relative.clone());
+                }
             }
             report.skipped.push(format!("{}: {why}", candidate.label()));
             continue;
@@ -1116,6 +1126,7 @@ pub fn run_pass(inputs: PassInputs<'_>, lock: Option<&mut WorkerLock>) -> io::Re
         })
         .collect(),
         unlanded_archives: report.unlanded_archives.clone(),
+        unlanded_archives_at_age: report.unlanded_archives_at_age.clone(),
         last_kick_ms: previous.last_kick_ms,
         worker_spawns_skipped: previous.worker_spawns_skipped,
         archives_expiring: expiring.iter().take(20).cloned().collect(),
