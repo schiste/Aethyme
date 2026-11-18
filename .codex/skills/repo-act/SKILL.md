@@ -246,6 +246,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   validation cache is warm. Coordinated pushes use a private Trace2 sink. On a
   disposable local remote, add `GIT_TRACE` and confirm it captures the actual
   `git push` before treating the external trace as a complete call inventory.
+  Before batching Git reads, search existing Trace2 assertions for the old
+  subcommands and their ref or path arguments. Update affected assertions to
+  verify the replacement call and keep the checks for fresh, successful reads.
 - If host pressure delays local benchmark builds, reuse the repository's
   hosted test archives for both exact revisions. Verify the same platform
   and build profile, then extract and hash each router and engine pair in
