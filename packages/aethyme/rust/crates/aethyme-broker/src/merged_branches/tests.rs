@@ -321,3 +321,57 @@ fn a_branch_reopened_by_a_session_while_the_slice_was_listing_is_kept() {
     );
     assert!(branch_exists(&root, "agent/merged"));
 }
+
+#[test]
+fn a_branch_a_bisect_will_return_to_is_kept() {
+    let mut fixture = fixture();
+    let root = fixture.root.clone();
+    git(&root, &["branch", "agent/merged"]);
+    fixture.session("agent/merged", false);
+    // A bisect started from the branch records it to return there.
+    std::fs::write(root.join(".git/BISECT_START"), "agent/merged\n").unwrap();
+
+    let summary = fixture.broker.run_merged_branch_lane();
+
+    assert_eq!(summary.deleted, 0, "{summary:?}");
+    assert_eq!(
+        summary.kept_by_reason.get("checked_out").copied(),
+        Some(1),
+        "{summary:?}"
+    );
+    assert!(branch_exists(&root, "agent/merged"));
+}
+
+#[test]
+fn a_branch_whose_session_path_has_a_start_reservation_is_kept() {
+    let mut fixture = fixture();
+    let root = fixture.root.clone();
+    git(&root, &["branch", "agent/merged"]);
+    fixture.session("agent/merged", false);
+    // `Fixture::session` records this path for the session.
+    let path = root.with_file_name("agent-merged");
+    let base = git(&root, &["rev-parse", "HEAD"]);
+    let held = crate::start_reservation::hold_foreign_reservation(
+        &root,
+        "agent-merged",
+        &path,
+        "agent/merged",
+        &base,
+    );
+
+    let summary = fixture.broker.run_merged_branch_lane();
+    drop(held);
+
+    assert_eq!(summary.deleted, 0, "{summary:?}");
+    assert_eq!(
+        summary.kept_by_reason.get("start_reserved").copied(),
+        Some(1),
+        "{summary:?}"
+    );
+    assert!(branch_exists(&root, "agent/merged"));
+
+    // Once the reservation is gone the merged branch goes.
+    let summary = fixture.broker.run_merged_branch_lane();
+    assert_eq!(summary.deleted, 1, "{summary:?}");
+    assert!(!branch_exists(&root, "agent/merged"));
+}
