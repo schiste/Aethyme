@@ -2035,6 +2035,7 @@ impl Broker {
             &sim_worktree,
             &gates,
             &changed,
+            verify_base,
             Some(entry.session_id),
             cache_policy,
             progress,
