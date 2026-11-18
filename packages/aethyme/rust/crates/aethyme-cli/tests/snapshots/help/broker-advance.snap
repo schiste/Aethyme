@@ -1,8 +1,9 @@
 exit: 0
 --- stdout
-  aethyme broker advance [--session <id>] [--pr] [--json]
+  aethyme broker advance [--session <id>] [--pr] [--take-over] [--json]
       Prepare the current worktree when authorized, check its state and
       publish its committed head under the session push policy. --pr also
-      requests a pull request under repository policy. Prints the next safe
-      action. Ambiguous writes stop for inspection and reconciliation.
+      requests a pull request under repository policy. Use --take-over for
+      an explicit handoff from a live holder. Prints the next safe action.
+      Ambiguous writes stop for inspection and reconciliation.
 --- stderr
