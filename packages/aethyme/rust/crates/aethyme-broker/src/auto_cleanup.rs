@@ -3804,7 +3804,15 @@ fn resolve_worktree_paths_until<'a>(
         for _ in 1..PARALLEL_RESOLVE_THREADS {
             // A thread that cannot be started leaves its share to the
             // others and the calling thread.
-            let _ = std::thread::Builder::new().spawn_scoped(scope, work);
+            if std::thread::Builder::new()
+                .spawn_scoped(scope, work)
+                .is_err()
+            {
+                crate::phase_telemetry::add(
+                    "worktree_path_resolve_thread_unavailable",
+                    std::time::Duration::ZERO,
+                );
+            }
         }
         work();
     });

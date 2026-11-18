@@ -928,6 +928,16 @@ fn judges_before(row: &Session, current: &Session) -> bool {
     rank(row) > rank(current)
 }
 
+/// What one checkout's strip is judged with besides the run's evidence.
+#[derive(Clone, Copy)]
+struct StripContext<'a> {
+    /// The repository's `[cleanup] venv_markers`.
+    venv_markers: &'a [String],
+    /// At `finish`, the agent finishing the session: its own holder record
+    /// does not keep the checkout.
+    finishing_caller: Option<&'a crate::session_holder::AgentProcess>,
+}
+
 /// A judge's place in the pass: its close time, then its id.
 fn judge_key(session: &Session) -> (i64, i64) {
     (
@@ -1223,8 +1233,10 @@ impl Broker {
                 run,
                 &mut holders,
                 checkout_deadline,
-                &venv_markers,
-                None,
+                StripContext {
+                    venv_markers: &venv_markers,
+                    finishing_caller: None,
+                },
                 &mut report,
             ) {
                 CheckoutStrip::Done(directories) => {
@@ -1426,8 +1438,10 @@ impl Broker {
             &mut run,
             &mut holders,
             deadline,
-            &venv_markers,
-            caller,
+            StripContext {
+                venv_markers: &venv_markers,
+                finishing_caller: caller,
+            },
             &mut report,
         ) {
             CheckoutStrip::Done(directories) => {
@@ -1481,10 +1495,13 @@ impl Broker {
         run: &mut super::retire::RetireRun,
         holders: &mut crate::session_holder::RecordedHolderProcessTable,
         deadline: Instant,
-        venv_markers: &[String],
-        finishing_caller: Option<&crate::session_holder::AgentProcess>,
+        context: StripContext<'_>,
         report: &mut CheckoutStripReport,
     ) -> CheckoutStrip {
+        let StripContext {
+            venv_markers,
+            finishing_caller,
+        } = context;
         use CheckoutStrip::Refused;
         if Instant::now() >= deadline {
             return Refused("deadline");
