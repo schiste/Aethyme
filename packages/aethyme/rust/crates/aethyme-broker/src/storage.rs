@@ -2757,25 +2757,40 @@ fn sweep_preparation_cache_with_coverage_and_observer(
             let key = entry.file_name().to_string_lossy().into_owned();
             // The repository-wide package store serves every input set. It
             // is rotated on its own, holding the repository's exclusive lease
-            // (so no preparation holds it alone or shared), when its volume
-            // is under the free-space reserve or a bounded measurement finds
-            // it over its cap; the retired tree is then removed at once.
+            // (so no preparation holds it alone or shared), when no
+            // preparation has used it for a week (its cache root was left
+            // behind, for example by `[shared_cache] root = "auto"` moving to
+            // the checkouts' volume), when its volume is under the free-space
+            // reserve, or when a bounded measurement finds it over its cap;
+            // the retired tree is then removed at once.
             if is_shared_package_store(&key) {
                 let store_path = entry.path();
-                let measurement_deadline = deadline.min(Instant::now() + Duration::from_secs(5));
+                let idle = crate::preparation::package_store::store_idle(
+                    &store_path,
+                    std::time::SystemTime::now(),
+                );
+                let under_pressure =
+                    !idle && crate::preparation::package_store::volume_under_pressure(&store_path);
                 // The repository's configured `[shared_cache] max_bytes`, as
                 // its last preparation recorded it; 8 GiB when unset or zero.
-                let over_cap = crate::preparation::package_store::store_exceeds(
-                    &store_path,
-                    crate::preparation::package_store::store_cap(&store_path),
-                    measurement_deadline,
-                    PACKAGE_STORE_MEASUREMENT_MAX_ENTRIES,
-                ) == Some(true);
-                let under_pressure =
-                    crate::preparation::package_store::volume_under_pressure(&store_path);
-                if !(over_cap || under_pressure) {
+                let over_cap = !idle
+                    && !under_pressure
+                    && crate::preparation::package_store::store_exceeds(
+                        &store_path,
+                        crate::preparation::package_store::store_cap(&store_path),
+                        deadline.min(Instant::now() + Duration::from_secs(5)),
+                        PACKAGE_STORE_MEASUREMENT_MAX_ENTRIES,
+                    ) == Some(true);
+                if !(idle || over_cap || under_pressure) {
                     continue;
                 }
+                let reason = if idle {
+                    "unused for a week"
+                } else if under_pressure {
+                    "volume under the free-space reserve"
+                } else {
+                    "over its cap"
+                };
                 let grant = match acquire_preparation_cache_lease(
                     &mut coordinator,
                     resource_db_path,
@@ -2801,7 +2816,9 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                 match retired {
                     Ok(Some(retired)) => {
                         crate::phase_telemetry::add(
-                            if under_pressure {
+                            if idle {
+                                "package_store_rotated_idle"
+                            } else if under_pressure {
                                 "package_store_rotated_pressure"
                             } else {
                                 "package_store_rotated_over_cap"
@@ -2809,12 +2826,7 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                             Duration::ZERO,
                         );
                         eprintln!(
-                            "preparation cache: rotated the shared package store of {lease_repository} ({})",
-                            if under_pressure {
-                                "volume under the free-space reserve"
-                            } else {
-                                "over its cap"
-                            }
+                            "preparation cache: rotated the shared package store of {lease_repository} ({reason})"
                         );
                         if !remove_retired_package_store(
                             &retired,

@@ -479,6 +479,25 @@ pub struct PackageStoreReport {
     /// Other writers on the volume add to it, and freed space hides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_bytes_allocated: Option<u64>,
+    /// Which cache root this preparation used and why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_root_placement: Option<CacheRootPlacement>,
+    /// What sharing the prepared outputs by clone did, and the bytes the
+    /// checkout's outputs still own alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_share: Option<super::output_share::OutputShareReport>,
+}
+
+/// Where the repository-shared cache root was placed for one preparation.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CacheRootPlacement {
+    /// `[shared_cache] root` as configured (`auto` when omitted).
+    pub configured: super::SharedCacheRoot,
+    /// Where the root is: `host` or `worktree_volume`.
+    pub resolved: super::SharedCacheRoot,
+    /// Why `auto` resolved as it did, or why the worktree volume was not
+    /// usable.
+    pub reason: String,
 }
 
 /// The platform component of the store key, `<os>-<arch>`.
@@ -647,7 +666,7 @@ fn remove_probe_file(path: &Path) {
 }
 
 #[cfg(target_os = "macos")]
-fn clone_file(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn clone_file(source: &Path, destination: &Path) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let source = CString::new(source.as_os_str().as_bytes()).map_err(io::Error::other)?;
@@ -662,7 +681,7 @@ fn clone_file(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn clone_file(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn clone_file(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     /// `FICLONE`, `_IOW(0x94, 9, int)`, spelled out so glibc and musl (whose
     /// `ioctl` request types differ) build the same call.
@@ -692,7 +711,7 @@ fn clone_file(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn clone_file(_source: &Path, _destination: &Path) -> io::Result<()> {
+pub(crate) fn clone_file(_source: &Path, _destination: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "no copy-on-write clone primitive on this platform",
@@ -730,6 +749,25 @@ pub(crate) fn store_cap(packages_dir: &Path) -> u64 {
         .and_then(|text| text.trim().parse::<u64>().ok())
         .filter(|bytes| *bytes > 0)
         .unwrap_or(DEFAULT_PACKAGE_STORE_MAX_BYTES)
+}
+
+/// A shared store no preparation has used for this long is retired by the
+/// storage sweep, so a store whose cache root preparations no longer use
+/// (after `[shared_cache] root = "auto"` moved them to the checkouts' volume,
+/// for example) is not kept forever below its cap.
+pub(crate) const PACKAGE_STORE_IDLE_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Whether the shared store at `packages_dir` has been unused for
+/// [`PACKAGE_STORE_IDLE_AFTER`] at `now`, judged by its cap record, which
+/// every preparation using the store rewrites. A store without a readable
+/// record (written before the record existed) is never idle.
+pub(crate) fn store_idle(packages_dir: &Path, now: std::time::SystemTime) -> bool {
+    fs::metadata(packages_dir.join(STORE_CAP_FILE))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age >= PACKAGE_STORE_IDLE_AFTER)
 }
 
 pub(crate) fn is_retired_store_name(name: &str) -> bool {
@@ -1104,6 +1142,23 @@ mod tests {
         assert_eq!(store_cap(root.path()), DEFAULT_PACKAGE_STORE_MAX_BYTES);
         fs::write(root.path().join(STORE_CAP_FILE), "garbage").unwrap();
         assert_eq!(store_cap(root.path()), DEFAULT_PACKAGE_STORE_MAX_BYTES);
+    }
+
+    #[test]
+    fn a_store_is_idle_a_week_after_its_last_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now();
+        assert!(!store_idle(root.path(), now), "no record is never idle");
+        write_store_cap(root.path(), 0).unwrap();
+        assert!(!store_idle(root.path(), now));
+        assert!(!store_idle(
+            root.path(),
+            now + PACKAGE_STORE_IDLE_AFTER - std::time::Duration::from_secs(3600)
+        ));
+        assert!(store_idle(
+            root.path(),
+            now + PACKAGE_STORE_IDLE_AFTER + std::time::Duration::from_secs(1)
+        ));
     }
 
     #[test]
