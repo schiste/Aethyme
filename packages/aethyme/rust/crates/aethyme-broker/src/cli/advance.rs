@@ -127,21 +127,19 @@ fn advance(mut broker: Broker, open_pr: bool, report: &mut Advance) -> Result<()
         );
         return Ok(());
     }
-    if let Some(blocker) = broker.session_action_required_blocker(id)?
-        && blocker.scope == crate::BlockerScope::Session
-    {
-        report.stop(exit::REFUSED, blocker.cause, blocker.clear);
-        return Ok(());
-    }
-    if broker.session_action_required_blocker(id)?.is_some() {
-        report.stop(
-            exit::REFUSED,
-            "read the worktree's recovery instructions before continuing",
-            format!(
-                "cat '{}'/.aethyme/broker-action-required.md",
-                session.worktree_path.replace('\'', "'\\''")
-            ),
-        );
+    if let Some(blocker) = broker.session_action_required_blocker(id)? {
+        if blocker.scope == crate::BlockerScope::Session {
+            report.stop(exit::REFUSED, blocker.cause, blocker.clear);
+        } else {
+            report.stop(
+                exit::REFUSED,
+                "read the worktree's recovery instructions before continuing",
+                format!(
+                    "cat '{}'/.aethyme/broker-action-required.md",
+                    session.worktree_path.replace('\'', "'\\''")
+                ),
+            );
+        }
         return Ok(());
     }
     drop(state_validation);
@@ -185,7 +183,11 @@ fn advance(mut broker: Broker, open_pr: bool, report: &mut Advance) -> Result<()
 
     report.stage = "state";
     let validation = crate::phase_telemetry::span("advance_commit_state");
-    let state = broker.session_push_state(id)?;
+    // This decision needs the two tips only. Push checks the live state and
+    // policy again before any remote write.
+    let repo = broker.repo_handle();
+    let default = crate::session_push::tracked_default(repo);
+    let (head, remote_oid) = broker.session_push_tips(&session, default.as_ref())?;
     let worktree_next = format!(
         "git -C '{}' status --short",
         session.worktree_path.replace('\'', "'\\''"),
@@ -198,12 +200,14 @@ fn advance(mut broker: Broker, open_pr: bool, report: &mut Advance) -> Result<()
         );
         return Ok(());
     }
-    if session.diff_base.as_deref() == Some(state.head_oid.as_str()) && state.remote_oid.is_none() {
+    if session.diff_base.as_deref() == Some(head.as_str()) && remote_oid.is_none() {
         report.reason = "the worktree is ready for edits".into();
         report.next_action = worktree_next;
         return Ok(());
     }
-    let push_enabled = crate::session_push::session_push_enabled(broker.repo_handle());
+    let push_enabled = default.as_ref().is_some_and(|default| {
+        crate::session_push::push_authorized(repo, default).unwrap_or(false)
+    });
     let submit = format!("aethyme broker submit --session {id}");
     if !push_enabled && open_pr {
         report.stop(
@@ -213,7 +217,7 @@ fn advance(mut broker: Broker, open_pr: bool, report: &mut Advance) -> Result<()
         );
         return Ok(());
     }
-    if !push_enabled || (!open_pr && state.remote_oid.as_deref() == Some(state.head_oid.as_str())) {
+    if !push_enabled || (!open_pr && remote_oid.as_deref() == Some(head.as_str())) {
         report.reason = if push_enabled {
             "the session head matches the recorded remote ref"
         } else {
