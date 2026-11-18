@@ -5594,6 +5594,7 @@ impl Broker {
             root,
             owned,
             unowned,
+            ..
         } = archive_scan;
         if owned.is_empty() && unowned.is_empty() {
             return Ok((Vec::new(), None, true));

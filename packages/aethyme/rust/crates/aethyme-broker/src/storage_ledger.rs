@@ -945,6 +945,52 @@ pub fn record_recovery_archive_usage(
     write_atomically(&directory.join(name), &bytes)
 }
 
+/// One measured archive in [`recovery_archive_sizes`]: a complete archive
+/// never changes, so its size, measured once, stays valid while the same
+/// archive (same path, same creation time) is there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeasuredArchiveSize {
+    pub created_at_ms: i64,
+    pub bytes: u64,
+}
+
+fn recovery_archive_sizes_path(host_state: &Path, repository: &str) -> PathBuf {
+    use sha2::Digest as _;
+    // Beside the usage record, with an extension the usage reader skips.
+    host_state
+        .join(RECOVERY_ARCHIVE_USAGE_DIRECTORY)
+        .join(format!(
+            "{:x}.archive-sizes",
+            sha2::Sha256::digest(repository.as_bytes())
+        ))
+}
+
+/// The archive sizes `repository`'s bound pass measured before, by archive
+/// path. The bound measures only archives missing here, within its budget,
+/// so a large backlog is measured over several runs instead of every run.
+pub fn recovery_archive_sizes(
+    host_state: &Path,
+    repository: &str,
+) -> BTreeMap<String, MeasuredArchiveSize> {
+    fs::read(recovery_archive_sizes_path(host_state, repository))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Record `repository`'s measured archive sizes, written atomically.
+pub fn record_recovery_archive_sizes(
+    host_state: &Path,
+    repository: &str,
+    sizes: &BTreeMap<String, MeasuredArchiveSize>,
+) -> io::Result<()> {
+    let path = recovery_archive_sizes_path(host_state, repository);
+    if let Some(directory) = path.parent() {
+        fs::create_dir_all(directory)?;
+    }
+    write_atomically(&path, &serde_json::to_vec(sizes).map_err(io::Error::other)?)
+}
+
 thread_local! {
     /// Entries visited by walks on this thread, so tests can prove a path
     /// never walks.
