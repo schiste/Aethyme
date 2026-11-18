@@ -780,6 +780,28 @@ pub(crate) fn venv_markers(main_root: &Path) -> Vec<String> {
     .unwrap_or_default()
 }
 
+/// Every key `[cleanup]` may hold, whichever reader consumes it: the one
+/// list both [`AutoCleanupPolicy`]'s parser (which refuses any other key)
+/// and `certify`'s known-key table use.
+pub(crate) const CLEANUP_CONFIG_KEYS: &[&str] = &[
+    "auto_remove",
+    "strict",
+    "ignored_directory_sweep",
+    "regenerable",
+    "keep",
+    crate::gc::unattended_pacing::UNLINK_RATE_CONFIG_KEY,
+    ABANDONED_OPERATION_CONFIG_KEY,
+    RECOVERY_ARCHIVE_BOUND_CONFIG_KEY,
+    VENV_MARKERS_CONFIG_KEY,
+    IDLE_STRIP_CONFIG_KEY,
+    "delete_merged_session_branches",
+    crate::stale_session_policy::LANDED_KEY,
+    crate::stale_session_policy::PUSHED_KEY,
+    crate::stale_session_policy::UNPUSHED_KEY,
+    crate::stale_session_policy::NOTICE_KEY,
+    crate::stale_session_policy::AUTO_CLOSE_KEY,
+];
+
 /// `[cleanup]` in `.aethyme/config.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoCleanupPolicy {
@@ -844,6 +866,11 @@ impl AutoCleanupPolicy {
             .ok_or_else(|| "[cleanup] must be a table".to_string())?;
         let mut policy = Self::default();
         for (key, value) in table {
+            // One list of keys, shared with `certify`: a key missing from it
+            // is refused here before any arm can accept it.
+            if !CLEANUP_CONFIG_KEYS.contains(&key.as_str()) {
+                return Err(format!("[cleanup] has no key {key:?}"));
+            }
             match key.as_str() {
                 "auto_remove" => {
                     policy.auto_remove = value
@@ -19121,6 +19148,49 @@ mod tests {
         assert!(AutoCleanupPolicy::load(dir.path()).is_err());
         write("[cleanup]\nautoremove = true\n");
         assert!(AutoCleanupPolicy::load(dir.path()).is_err());
+    }
+
+    /// Every listed key is accepted by the parser with a valid value, and
+    /// the parser refuses anything else: the list and the parser agree.
+    #[test]
+    fn every_listed_cleanup_key_is_accepted_and_no_other() {
+        let sample = r#"[cleanup]
+auto_remove = true
+strict = false
+ignored_directory_sweep = false
+regenerable = []
+keep = []
+unattended_unlinks_per_second = 1000
+abandoned_operation_after_hours = 24
+recovery_archive_bound_gib = 20
+venv_markers = []
+idle_strip_after_hours = 4
+delete_merged_session_branches = true
+stale_landed_close_after_hours = 4
+stale_pushed_close_after_hours = 24
+stale_unpushed_close_after_hours = 24
+stale_closing_notice_hours = 4
+stale_session_auto_close = true
+"#;
+        let parsed: toml::Value = toml::from_str(sample).unwrap();
+        let mut keys = parsed["cleanup"]
+            .as_table()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let mut listed = CLEANUP_CONFIG_KEYS.to_vec();
+        keys.sort_unstable();
+        listed.sort_unstable();
+        assert_eq!(keys, listed, "the sample must name every listed key");
+        AutoCleanupPolicy::from_config_toml(Path::new("sample"), sample).unwrap();
+        assert!(
+            AutoCleanupPolicy::from_config_toml(
+                Path::new("sample"),
+                "[cleanup]\nautoremove = true\n"
+            )
+            .is_err()
+        );
     }
 
     /// The documented opt-out of the merged-branch lane is a `[cleanup]`
