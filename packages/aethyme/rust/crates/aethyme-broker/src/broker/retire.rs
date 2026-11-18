@@ -5954,9 +5954,12 @@ mod tests {
             let worktree = PathBuf::from(&open.worktree_path);
             std::fs::create_dir_all(worktree.join(".aethyme")).unwrap();
             std::fs::write(worktree.join(".aethyme/prepare.toml"), prepare).unwrap();
-            // The top-level install, with pnpm's shim in its `.bin`.
-            std::fs::create_dir_all(worktree.join("node_modules/.pnpm/dep@1/node_modules/dep"))
-                .unwrap();
+            // The top-level install, with pnpm's shim in its `.bin` (its
+            // `.pnpm` store or `.modules.yaml` is what proves it).
+            if root_marker {
+                std::fs::create_dir_all(worktree.join("node_modules/.pnpm/dep@1/node_modules/dep"))
+                    .unwrap();
+            }
             std::fs::create_dir_all(worktree.join("node_modules/.bin")).unwrap();
             std::fs::write(worktree.join("node_modules/.bin/tsc"), "#!/bin/sh\n").unwrap();
             if root_marker {

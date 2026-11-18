@@ -1001,9 +1001,6 @@ mod tests {
         assert!(note.contains("aethyme broker submit prepare --session 7"));
     }
 
-    /// Only directories a declared step output names, or lies above, are
-    /// stripped from an open session.
-    #[test]
     /// Coverage for an open session: exact outputs; a Python environment
     /// root containing a declared output; workspace members while the
     /// top-level `node_modules` is declared. Nothing else.
@@ -1063,6 +1060,8 @@ mod tests {
         );
     }
 
+    /// A declared output covers exactly the directory it names.
+    #[test]
     fn a_declared_output_covers_exactly_the_directory_it_names() {
         let outputs = vec![
             "node_modules/".to_string(),
