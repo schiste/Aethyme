@@ -1322,7 +1322,7 @@ fn prepush_selection_adds_touched_modules_cheapest_first_within_the_budget() {
     assert_eq!(
         stdout,
         format!(
-            "({always} | (package(aethyme-cli) & test(/^main_unix(::|$)/)) | (package(c) & test(/^newmod(::|$)/)) | binary_id(c::own) | (package(c) & test(/^small(::|$)/)) | (binary_id(c::it) & test(/^suite(::|$)/))){slow}\n"
+            "({always} | package(aethyme-cli) | (package(c) & test(/^newmod(::|$)/)) | binary_id(c::own) | (package(c) & test(/^small(::|$)/)) | (binary_id(c::it) & test(/^suite(::|$)/))){slow}\n"
         )
     );
     assert!(

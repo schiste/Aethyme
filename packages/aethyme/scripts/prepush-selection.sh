@@ -82,7 +82,14 @@ map_path() {
     case "$rest" in
         (src/bin/*) m="${rest#src/bin/}"; m="${m%%/*}"; printf '%s::bin/%s\t*\n' "$crate" "${m%.rs}" ;;
         (src/lib.rs|src/main.rs) ;;
-        (src/*) m="${rest#src/}"; m="${m%%/*}"; printf '%s\t%s\n' "$crate" "${m%.rs}" ;;
+        (src/*)
+            if [ ! -f "$root/packages/aethyme/rust/crates/$crate/src/lib.rs" ]; then
+                # Binary-only crates often include source files at the root, so
+                # their paths do not necessarily match test module names.
+                printf '%s\t@package\n' "$crate"
+            else
+                m="${rest#src/}"; m="${m%%/*}"; printf '%s\t%s\n' "$crate" "${m%.rs}"
+            fi ;;
         (tests/*)
             m="${rest#tests/}"; m="${m%%/*}"; m="${m%.rs}"
             case "$m" in
@@ -98,10 +105,11 @@ done <<<"$changed"
 
 out="$(jq -r --arg touched "$touched" '
     def cost($b; $m):
-      if $m == "*" then [.modules | to_entries[] | select(.key | startswith($b + " ")) | .value] | add // 0
+      if $m == "*" or $m == "@package" then [.modules | to_entries[] | select(.key | startswith($b + " ")) | .value] | add // 0
       else .modules[$b + " " + $m] // 0 end;
     def term($b; $m):
-      if $m == "*" then "binary_id(\($b))"
+      if $m == "@package" then "package(\($b))"
+      elif $m == "*" then "binary_id(\($b))"
       elif ($b | contains("::")) then "(binary_id(\($b)) & test(/^\($m)(::|$)/))"
       else "(package(\($b)) & test(/^\($m)(::|$)/))" end;
     . as $d
