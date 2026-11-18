@@ -886,6 +886,12 @@ impl AutoCleanupPolicy {
                     }
                 }
                 "unattended_unlinks_per_second" => {} // Parsed by gc::unattended_pacing.
+                "delete_merged_session_branches" => {
+                    // Read by the merged-branch lane; validated here.
+                    value.as_bool().ok_or_else(|| {
+                        "[cleanup] delete_merged_session_branches must be true or false".to_string()
+                    })?;
+                }
                 ABANDONED_OPERATION_CONFIG_KEY => {
                     // Read by the checkout retirement lane; validated here.
                     parse_abandoned_operation_after_hours(Some(value))?;
@@ -19114,6 +19120,30 @@ mod tests {
         write("[cleanup]\nauto_remove = \"yes\"\n");
         assert!(AutoCleanupPolicy::load(dir.path()).is_err());
         write("[cleanup]\nautoremove = true\n");
+        assert!(AutoCleanupPolicy::load(dir.path()).is_err());
+    }
+
+    /// The documented opt-out of the merged-branch lane is a `[cleanup]`
+    /// key like any other: setting it must not turn automatic removal off.
+    #[test]
+    fn the_merged_branch_opt_out_keeps_automatic_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".aethyme")).unwrap();
+        let config = dir.path().join(".aethyme/config.toml");
+        std::fs::write(
+            &config,
+            "[cleanup]\ndelete_merged_session_branches = false\n",
+        )
+        .unwrap();
+        let policy = AutoCleanupPolicy::load(dir.path()).unwrap();
+        assert!(policy.auto_remove);
+        assert!(!crate::merged_branches::enabled(dir.path()));
+
+        std::fs::write(
+            &config,
+            "[cleanup]\ndelete_merged_session_branches = \"no\"\n",
+        )
+        .unwrap();
         assert!(AutoCleanupPolicy::load(dir.path()).is_err());
     }
 
