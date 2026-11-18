@@ -1017,7 +1017,7 @@ fn prune_backups(root: &Path, now_ms: i64) {
             Some((stamp, entry.path()))
         })
         .collect::<Vec<_>>();
-    sets.sort_by(|left, right| right.0.cmp(&left.0));
+    sets.sort_by_key(|set| std::cmp::Reverse(set.0));
     for (index, (stamp, path)) in sets.into_iter().enumerate() {
         let expired =
             index >= BACKUP_SETS_KEPT || now_ms.saturating_sub(stamp) > BACKUP_RETENTION_MS;
