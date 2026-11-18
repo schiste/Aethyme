@@ -78,6 +78,13 @@ struct SessionActionOutput<'a, T: serde::Serialize> {
     /// The repository's `[authorization]` grants, shown with the agreement.
     #[serde(skip_serializing_if = "Option::is_none")]
     standing_authorizations: Option<StandingAuthorizationsOutput>,
+    /// The session's scratch directory (`null` when it has none); set by
+    /// `start`, `--reuse` and `--adopt`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scratch_dir: Option<Option<&'a std::path::Path>>,
+    /// What to put there, or why there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scratch_dir_note: Option<&'a str>,
     /// Other sessions that look like the same work; omitted when none.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     duplicate_work: &'a [crate::DuplicateWork],
@@ -165,6 +172,7 @@ fn session_action_json<T: serde::Serialize>(
     scope_overlaps_warning: Option<&str>,
     planned_path_pr_overlaps: Option<&crate::PlannedPathPrOverlapCheck>,
     phase_timings_ms: Option<&std::collections::BTreeMap<String, u64>>,
+    scratch: Option<&crate::broker::SessionScratch>,
 ) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&SessionActionOutput {
         report,
@@ -176,12 +184,28 @@ fn session_action_json<T: serde::Serialize>(
             grants: guidance.authorizations,
             lines: guidance.authorizations.agreement_lines(),
         }),
+        scratch_dir: scratch.map(|scratch| scratch.path.as_deref()),
+        scratch_dir_note: scratch.map(|scratch| scratch.note.as_str()),
         duplicate_work,
         scope_overlaps,
         scope_overlaps_warning,
         planned_path_pr_overlaps,
         phase_timings_ms,
     })
+}
+
+/// The session's scratch directory, under the working agreement.
+fn render_scratch(scratch: &crate::broker::SessionScratch) {
+    match &scratch.path {
+        Some(path) => {
+            out!("Scratch directory: {}", path.display());
+            out!("  {}", scratch.note);
+        }
+        None => out!(
+            "note: no scratch directory for this session: {}",
+            scratch.note
+        ),
+    }
 }
 
 fn render_planned_path_pr_overlaps(check: &crate::PlannedPathPrOverlapCheck) {
@@ -1301,6 +1325,14 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
     }
     let guidance = crate::session_guidance::load(broker.main_root());
     let session = &report.session;
+    // A reused session gets a fresh scratch directory; the old one is
+    // retired once nothing uses it.
+    let scratch = match report.outcome {
+        crate::AdoptOutcome::Reused => broker.fresh_session_scratch(session.id),
+        crate::AdoptOutcome::Created | crate::AdoptOutcome::Replaced => {
+            broker.ensure_session_scratch(session.id)
+        }
+    };
     let planned_path_pr_overlaps = broker.cached_planned_path_pr_overlaps(
         session,
         &report.planned_explicit_leases,
@@ -1328,6 +1360,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
                 scope_overlaps_warning.as_deref(),
                 planned_path_pr_overlaps.as_ref(),
                 None,
+                Some(&scratch),
             )?
         );
     } else {
@@ -1485,6 +1518,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
             out!("Safe next action: {}", drift.safe_next_action);
         }
         render_guidance(&guidance);
+        render_scratch(&scratch);
         render_planned_explicit_leases(&report.planned_explicit_leases);
         super::leases::render_lease_overlaps(&report.lease_overlaps);
         if let Some(check) = &planned_path_pr_overlaps {
@@ -1593,6 +1627,12 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
     );
     let guidance = crate::session_guidance::load(broker.main_root());
     let session = &report.session;
+    let scratch_started = std::time::Instant::now();
+    let scratch = broker.ensure_session_scratch(session.id);
+    phase_timings_ms.insert(
+        "session_scratch".into(),
+        u64::try_from(scratch_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
     let planned_path_pr_overlaps = broker.cached_planned_path_pr_overlaps(
         session,
         &report.planned_explicit_leases,
@@ -1619,6 +1659,7 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
                 scope_overlaps_warning.as_deref(),
                 planned_path_pr_overlaps.as_ref(),
                 Some(&phase_timings_ms),
+                Some(&scratch),
             )?
         );
     } else {
@@ -1641,6 +1682,7 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
         render_start_base(&report.start_base);
         render_worktree_placement(&report.worktree_placement);
         render_guidance(&guidance);
+        render_scratch(&scratch);
         render_planned_explicit_leases(&report.planned_explicit_leases);
         super::leases::render_lease_overlaps(&report.lease_overlaps);
         if let Some(check) = &planned_path_pr_overlaps {
@@ -1729,7 +1771,8 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
                 None,
                 None,
                 None,
-                Some(&phase_timings_ms)
+                Some(&phase_timings_ms),
+                None,
             )?
         );
     } else {
@@ -2865,5 +2908,71 @@ mod finish_error_context_tests {
             };
             assert!(message.contains("finish timed out after 1s"), "{message}");
         }
+    }
+}
+
+#[cfg(test)]
+mod scratch_output_tests {
+    /// `start --json` carries the scratch directory and what to put there;
+    /// a session without one says `null` and why; `start-agent` omits both.
+    #[test]
+    fn start_json_carries_the_scratch_directory() {
+        let tab = crate::chau7_mcp::SessionTabRename::NotApplicable {
+            reason: "test".into(),
+        };
+        let report = serde_json::json!({"id": 1});
+        let scratch = crate::broker::SessionScratch {
+            path: Some(std::path::PathBuf::from(
+                "/pool/.aethyme-session-scratch/s1-1",
+            )),
+            note: crate::broker::scratch_instruction().into(),
+        };
+        let text = super::session_action_json(
+            &report,
+            &tab,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            Some(&scratch),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["scratch_dir"], "/pool/.aethyme-session-scratch/s1-1");
+        assert!(
+            value["scratch_dir_note"]
+                .as_str()
+                .unwrap()
+                .contains("AETHYME_SESSION_SCRATCH_DIR")
+        );
+
+        let none = crate::broker::SessionScratch {
+            path: None,
+            note: "the session is closed".into(),
+        };
+        let text = super::session_action_json(
+            &report,
+            &tab,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            Some(&none),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(value["scratch_dir"].is_null());
+        assert!(value.as_object().unwrap().contains_key("scratch_dir"));
+        assert_eq!(value["scratch_dir_note"], "the session is closed");
+
+        let text =
+            super::session_action_json(&report, &tab, None, &[], None, None, None, None, None)
+                .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(!value.as_object().unwrap().contains_key("scratch_dir"));
     }
 }

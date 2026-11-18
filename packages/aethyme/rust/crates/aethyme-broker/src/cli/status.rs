@@ -220,8 +220,14 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
     };
     if let Some(session_id) = session_id {
         let coordination = crate::agent_hook::session_coordination(&broker, Some(session_id));
-        let block =
+        let mut block =
             super::status_extras::routine_session_block(&broker, session_id, &coordination)?;
+        // Where the session's build output and temporary files belong
+        // (read-only: status never creates one).
+        let scratch_dir = broker.session_scratch_dir(session_id);
+        if let Some(object) = block.as_object_mut() {
+            object.insert("scratch_dir".into(), serde_json::json!(scratch_dir));
+        }
         let requests = broker.session_pending_lease_release_requests(session_id)?;
         let count = requests.len();
         let records: Vec<_> = requests.into_iter().take(10)
@@ -269,6 +275,9 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                 "{}",
                 super::status_extras::render_routine_session(&block, true)
             );
+            if let Some(path) = &scratch_dir {
+                out!("Scratch directory: {}", path.display());
+            }
             if let Some(line) = crate::agent_hook::render_peer_information(&peers, session_id) {
                 out!("{line}");
             }

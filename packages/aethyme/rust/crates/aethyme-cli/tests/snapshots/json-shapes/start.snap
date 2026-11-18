@@ -36,6 +36,7 @@
     "response_preparation": "integer",
     "session_allocation": "integer",
     "session_registration": "integer",
+    "session_scratch": "integer",
     "start_reservation": "integer",
     "start_reservation_reap": "integer",
     "storage_admission": "integer",
@@ -68,6 +69,8 @@
   },
   "repository_name": "null",
   "scope_overlaps_warning": "string",
+  "scratch_dir": "string",
+  "scratch_dir_note": "string",
   "short_name": "string",
   "standing_authorizations": {
     "disposable_test_environments": "bool",

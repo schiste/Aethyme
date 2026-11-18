@@ -1995,6 +1995,11 @@ impl Broker {
         // A stale or unverifiable graph is recorded above and reported with
         // the submission; it never stops the gates or the promotion (#280).
         let storage = self.storage_context().gate_storage_locations();
+        // Gate commands for this session get its scratch directory
+        // (`AETHYME_SESSION_SCRATCH_DIR`) when it has one; none is created here.
+        if let Some(path) = self.session_scratch_dir(entry.session_id) {
+            crate::session_scratch::remember_for_commands(entry.session_id, &path);
+        }
         if let Some(progress) = progress {
             progress.subphase("executing gates");
         }
