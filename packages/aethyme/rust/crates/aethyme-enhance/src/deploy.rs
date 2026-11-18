@@ -626,6 +626,26 @@ pub fn generated_artifact_contents(relative: &str) -> Vec<String> {
     contents
 }
 
+/// Whether `relative` is a file a canonical deploy writes from its own
+/// templates or from repository analysis: the root policy documents, every
+/// [`TARGETS`] entry, and the generated onboarding artifacts. A path alone
+/// proves nothing about a file's content; callers must still prove the
+/// bytes are generator output before treating them as replaceable.
+/// Overrides (`.aethyme/overrides/`) are owner input and never listed.
+pub fn is_generated_artifact_path(relative: &str) -> bool {
+    relative == "AGENTS.md"
+        || TARGETS.iter().any(|(path, _)| *path == relative)
+        || [
+            ONBOARDING_JSON_PATH,
+            ACT_STARTER_JSON_PATH,
+            crate::onboarding::ONBOARDING_CLAUDE_PATH,
+            crate::onboarding::ONBOARDING_CODEX_PATH,
+            crate::onboarding::ACT_CLAUDE_PATH,
+            crate::onboarding::ACT_CODEX_PATH,
+        ]
+        .contains(&relative)
+}
+
 /// Whether `relative_dir` (no trailing slash) is an ancestor directory of a
 /// path [`generated_artifact_contents`] knows, so cleanup inspects only
 /// directories Aethyme itself may have created.

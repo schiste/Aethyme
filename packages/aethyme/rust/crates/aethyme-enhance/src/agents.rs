@@ -94,6 +94,19 @@ pub fn generated_policy_receipt(content: &str) -> Option<GeneratedPolicyReceipt>
     })
 }
 
+/// Whether `content` is a whole generated policy document (`AGENTS.md`,
+/// `CLAUDE.md`) exactly as a generator wrote it: it carries the generated
+/// receipt, its body still hashes to the receipt's `policy-sha256`, and it
+/// has no hand-maintained region around a generated block. Any edit to the
+/// body, or any text outside it, makes this false.
+pub fn is_unedited_generated_policy(content: &str) -> bool {
+    if content.contains(BLOCK_BEGIN) || content.contains(BLOCK_END) {
+        return false;
+    }
+    generated_policy_receipt(content)
+        .is_some_and(|receipt| policy_sha256(&receipt.policy_body) == receipt.policy_sha256)
+}
+
 /// `_load_agents_overrides`: missing → `{}`, unreadable/invalid/non-object
 /// → `{_invalid_override: true, _source: …}`, else payload + `_source`
 /// appended — the exact Python tolerances.
