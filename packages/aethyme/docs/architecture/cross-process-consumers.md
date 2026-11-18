@@ -3346,6 +3346,11 @@ an `operation_id` for read-only inspection before reconciliation. The
 transition does not replay remote writes. The existing push coordinator can
 re-evaluate one proven pre-write remote tip race.
 
+A different live agent is refused with exit 3 and a `--take-over` hint.
+`broker advance --session <id> --take-over` uses the same holder admission as
+`broker push`, records the transfer before running the transition, and leaves
+the previous live holder subject to the same guard.
+
 Command metrics record `advance_broker_open`, `advance_state_validation`,
 `advance_preparation_status`, `advance_prepare`, `advance_commit_state`,
 and `advance_publish` when those phases run. Existing child spans still

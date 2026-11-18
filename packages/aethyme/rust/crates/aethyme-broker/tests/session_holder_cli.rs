@@ -218,6 +218,44 @@ fn take_over_moves_the_session_and_records_it() {
 }
 
 #[test]
+fn advance_requires_an_explicit_handoff_between_live_agents() {
+    let fx = fixture();
+    let launcher = Agent::spawn();
+    let worker = Agent::spawn();
+    let session = fx.start_as(&launcher.pid());
+    let id = session.to_string();
+    let original_binding = fx.holder_event(session);
+
+    let refused = fx.run_as(&worker.pid(), &["advance", "--session", &id, "--json"]);
+    assert_eq!(refused.status.code(), Some(3));
+    assert!(stderr(&refused).contains(HELD));
+    assert!(stderr(&refused).contains("--take-over"));
+    assert_eq!(fx.holder_event(session), original_binding);
+
+    let advanced = fx.run_as(
+        &worker.pid(),
+        &["advance", "--session", &id, "--take-over", "--json"],
+    );
+    assert!(advanced.status.success(), "{}", stderr(&advanced));
+    let report: serde_json::Value = serde_json::from_slice(&advanced.stdout).unwrap();
+    assert_eq!(report["session_id"], session);
+    assert_eq!(report["state"], "ready");
+
+    let binding = fx.holder_event(session);
+    assert_eq!(binding["reason"], "take_over");
+    assert_eq!(binding["pid"].as_i64(), worker.pid().parse().ok());
+    assert_eq!(
+        binding["previous_pid"].as_i64(),
+        launcher.pid().parse().ok()
+    );
+
+    let former = fx.run_as(&launcher.pid(), &["advance", "--session", &id, "--json"]);
+    assert_eq!(former.status.code(), Some(3));
+    assert!(stderr(&former).contains(HELD));
+    assert_eq!(fx.holder_event(session), binding);
+}
+
+#[test]
 fn an_unidentified_caller_is_let_through_unbound() {
     let fx = fixture();
     let holder = Agent::spawn();
