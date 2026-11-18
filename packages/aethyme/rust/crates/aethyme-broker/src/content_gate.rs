@@ -160,7 +160,7 @@ fn valid_sha(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     fn fixtures() -> (Value, Value, BTreeMap<String, Option<Vec<u8>>>) {
         let digest = format!("{:x}", Sha256::digest(b"hello"));
         (
