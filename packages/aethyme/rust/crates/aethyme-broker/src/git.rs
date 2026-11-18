@@ -5557,6 +5557,121 @@ impl GitRepo {
             .collect())
     }
 
+    /// The blob ids `git hash-object` gives the working files at `paths`, in
+    /// order (clean filters and line-ending rules applied, as `git add`
+    /// would). Paths with a newline are refused.
+    pub(crate) fn hash_working_files(&self, paths: &[String]) -> Result<Vec<String>, GitError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        if paths.iter().any(|path| path.contains('\n')) {
+            return Err(GitError::UntrustedOutput {
+                detail: "a path contains a newline".into(),
+            });
+        }
+        let input = paths.join("\n") + "\n";
+        let output = run_git_bytes_with_stdin(
+            &self.root,
+            &["hash-object", "--stdin-paths"],
+            input.as_bytes(),
+        )?;
+        let ids = String::from_utf8_lossy(&output)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if ids.len() != paths.len() {
+            return Err(GitError::UntrustedOutput {
+                detail: format!(
+                    "git hash-object returned {} ids for {} paths",
+                    ids.len(),
+                    paths.len()
+                ),
+            });
+        }
+        Ok(ids)
+    }
+
+    /// The blob id `file` would get if it were the working file at the
+    /// repository-relative `path` (that path's filters and line-ending rules
+    /// applied), for checking a copy against a blob proven at `path`.
+    pub(crate) fn hash_file_as(&self, path: &str, file: &Path) -> Result<String, GitError> {
+        let path_arg = format!("--path={path}");
+        let file_arg = file.to_string_lossy().into_owned();
+        run_git(&self.root, &["hash-object", &path_arg, "--", &file_arg])
+    }
+
+    /// Every blob id `path` has had in the last `max_commits` commits that
+    /// touched it in `commit`'s history: a record of the exact bytes once
+    /// committed there.
+    pub(crate) fn recorded_blobs(
+        &self,
+        commit: &str,
+        path: &str,
+        max_commits: usize,
+    ) -> Result<std::collections::BTreeSet<String>, GitError> {
+        let limit = format!("--max-count={max_commits}");
+        let listing = run_git(
+            &self.root,
+            &[
+                "log",
+                "--format=",
+                "--raw",
+                "--no-abbrev",
+                "--no-renames",
+                &limit,
+                commit,
+                "--",
+                path,
+            ],
+        )?;
+        Ok(listing
+            .lines()
+            .filter(|line| line.starts_with(':'))
+            .flat_map(|line| {
+                line.split_whitespace()
+                    .skip(2)
+                    .take(2)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|id| id.bytes().any(|b| b != b'0'))
+            .collect())
+    }
+
+    /// Rewrite the working files at `paths` from their index entries, and
+    /// nothing else. Only for files the caller has proven replaceable; no
+    /// repository hook runs.
+    pub(crate) fn restore_working_files_from_index(
+        &self,
+        paths: &[String],
+    ) -> Result<(), GitError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let hooks_off = format!("core.hooksPath={NO_HOOKS_PATH}");
+        let mut input = Vec::new();
+        for path in paths {
+            input.extend_from_slice(path.as_bytes());
+            input.push(0);
+        }
+        run_git_bytes_with_stdin(
+            &self.root,
+            &[
+                "-c",
+                &hooks_off,
+                "checkout-index",
+                "--force",
+                "--quiet",
+                "--stdin",
+                "-z",
+            ],
+            &input,
+        )?;
+        Ok(())
+    }
+
     /// Whether any clean/smudge filter driver (`filter.<name>.smudge` or
     /// `filter.<name>.process`) is configured for this checkout.
     pub(crate) fn filter_drivers_configured(&self) -> Result<bool, GitError> {

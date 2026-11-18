@@ -1267,6 +1267,11 @@ fn inspect_root(
                         }
                         continue;
                     }
+                    // Dotted entries, the session scratch container among
+                    // them whatever it holds, are never stray-directory
+                    // candidates: the container's directories go with their
+                    // sessions through the retirement lane. A container
+                    // holding anything else only makes the root non-empty.
                     bookkeeping_only &= is_broker_bookkeeping(&child);
                     continue;
                 }
@@ -2757,25 +2762,40 @@ fn sweep_preparation_cache_with_coverage_and_observer(
             let key = entry.file_name().to_string_lossy().into_owned();
             // The repository-wide package store serves every input set. It
             // is rotated on its own, holding the repository's exclusive lease
-            // (so no preparation holds it alone or shared), when its volume
-            // is under the free-space reserve or a bounded measurement finds
-            // it over its cap; the retired tree is then removed at once.
+            // (so no preparation holds it alone or shared), when no
+            // preparation has used it for a week (its cache root was left
+            // behind, for example by `[shared_cache] root = "auto"` moving to
+            // the checkouts' volume), when its volume is under the free-space
+            // reserve, or when a bounded measurement finds it over its cap;
+            // the retired tree is then removed at once.
             if is_shared_package_store(&key) {
                 let store_path = entry.path();
-                let measurement_deadline = deadline.min(Instant::now() + Duration::from_secs(5));
+                let idle = crate::preparation::package_store::store_idle(
+                    &store_path,
+                    std::time::SystemTime::now(),
+                );
+                let under_pressure =
+                    !idle && crate::preparation::package_store::volume_under_pressure(&store_path);
                 // The repository's configured `[shared_cache] max_bytes`, as
                 // its last preparation recorded it; 8 GiB when unset or zero.
-                let over_cap = crate::preparation::package_store::store_exceeds(
-                    &store_path,
-                    crate::preparation::package_store::store_cap(&store_path),
-                    measurement_deadline,
-                    PACKAGE_STORE_MEASUREMENT_MAX_ENTRIES,
-                ) == Some(true);
-                let under_pressure =
-                    crate::preparation::package_store::volume_under_pressure(&store_path);
-                if !(over_cap || under_pressure) {
+                let over_cap = !idle
+                    && !under_pressure
+                    && crate::preparation::package_store::store_exceeds(
+                        &store_path,
+                        crate::preparation::package_store::store_cap(&store_path),
+                        deadline.min(Instant::now() + Duration::from_secs(5)),
+                        PACKAGE_STORE_MEASUREMENT_MAX_ENTRIES,
+                    ) == Some(true);
+                if !(idle || over_cap || under_pressure) {
                     continue;
                 }
+                let reason = if idle {
+                    "unused for a week"
+                } else if under_pressure {
+                    "volume under the free-space reserve"
+                } else {
+                    "over its cap"
+                };
                 let grant = match acquire_preparation_cache_lease(
                     &mut coordinator,
                     resource_db_path,
@@ -2801,7 +2821,9 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                 match retired {
                     Ok(Some(retired)) => {
                         crate::phase_telemetry::add(
-                            if under_pressure {
+                            if idle {
+                                "package_store_rotated_idle"
+                            } else if under_pressure {
                                 "package_store_rotated_pressure"
                             } else {
                                 "package_store_rotated_over_cap"
@@ -2809,12 +2831,7 @@ fn sweep_preparation_cache_with_coverage_and_observer(
                             Duration::ZERO,
                         );
                         eprintln!(
-                            "preparation cache: rotated the shared package store of {lease_repository} ({})",
-                            if under_pressure {
-                                "volume under the free-space reserve"
-                            } else {
-                                "over its cap"
-                            }
+                            "preparation cache: rotated the shared package store of {lease_repository} ({reason})"
                         );
                         if !remove_retired_package_store(
                             &retired,
@@ -5501,6 +5518,12 @@ fn is_broker_bookkeeping(path: &Path) -> bool {
     {
         return is_regular_file(path);
     }
+    // Session scratch directories go with their sessions (the checkout
+    // retirement lane removes them); they are not content of the root.
+    if name == crate::session_scratch::SCRATCH_CONTAINER {
+        return is_real_directory(path)
+            && crate::session_scratch::container_holds_only_scratch(path);
+    }
     if name != ".cargo" || !is_real_directory(path) {
         return false;
     }
@@ -5542,6 +5565,17 @@ fn remove_empty_root(root: &Path) -> Result<u64, String> {
             "root now holds {}, which is not broker bookkeeping",
             unexpected.display()
         ));
+    }
+    // Never deleted here: scratch directories are removed through the paced
+    // trash by the checkout retirement lane, after which the root can go.
+    if entries.iter().any(|path| {
+        path.file_name() == Some(crate::session_scratch::SCRATCH_CONTAINER.as_ref())
+            && crate::session_scratch::container_has_entries(path)
+    }) {
+        return Err(
+            "root still holds session scratch directories; the checkout retirement lane removes them first"
+                .into(),
+        );
     }
     let mut freed = 0_u64;
     let mut remove_file = |path: &Path| -> Result<(), String> {

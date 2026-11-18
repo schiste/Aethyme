@@ -114,6 +114,7 @@ fn keep_counter(reason: &str) -> &'static str {
         "unmerged" => "merged_branches_kept_unmerged",
         "unknown" => "merged_branches_kept_unknown",
         "delete_failed" => "merged_branches_kept_delete_failed",
+        "start_reserved" => "merged_branches_kept_start_reserved",
         _ => "merged_branches_kept_other",
     }
 }
@@ -121,7 +122,7 @@ fn keep_counter(reason: &str) -> &'static str {
 /// Whether a checkout has `refs/heads/<name>` checked out right now, read
 /// from Git's own registrations: the primary checkout's `HEAD` and every
 /// linked worktree's `HEAD` under the common Git directory, including a
-/// branch a rebase in progress will return to. `None` when they cannot be
+/// branch a rebase or bisect in progress will return to. `None` when they cannot be
 /// read, which keeps the branch.
 fn branch_checked_out_now(repo: &crate::GitRepo, name: &str) -> Option<bool> {
     let common = repo.git_common_dir().ok()?;
@@ -154,6 +155,14 @@ fn branch_checked_out_now(repo: &crate::GitRepo, name: &str) -> Option<bool> {
             if names_branch(&admin.join(file))? {
                 return Some(true);
             }
+        }
+        // A bisect returns to the branch it started from, which it records
+        // by short name (or as a commit when started detached).
+        match std::fs::read_to_string(admin.join("BISECT_START")) {
+            Ok(text) if text.trim() == name || text.trim() == wanted => return Some(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
         }
     }
     Some(false)
@@ -214,6 +223,17 @@ impl crate::Broker {
             .any(|session| session.cleanup_state != crate::SessionCleanupState::Cleaned)
         {
             return Some("session_not_cleaned");
+        }
+        // A start or restore registering a checkout for one of these
+        // sessions holds a start reservation and adds its worktree outside
+        // the lifecycle claim; its branch must survive the add.
+        if sessions.iter().any(|session| {
+            crate::start_reservation::path_is_reserved(
+                self.main_root(),
+                Path::new(&session.worktree_path),
+            )
+        }) {
+            return Some("start_reserved");
         }
         for session in &sessions {
             match self.has_restorable_state(session) {

@@ -981,6 +981,9 @@ impl Broker {
         session_id: i64,
     ) -> Result<(GitRepo, Vec<crate::gates::Gate>, Vec<String>), BrokerOpError> {
         self.warn_base_failure_incidents();
+        // Gate commands for this session get its scratch directory
+        // (`AETHYME_SESSION_SCRATCH_DIR`), resolved here, in this process.
+        self.ensure_session_scratch(session_id);
         self.gate_inputs_with_integrity(session_id, true)
     }
 

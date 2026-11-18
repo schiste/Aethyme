@@ -94,6 +94,19 @@ pub fn generated_policy_receipt(content: &str) -> Option<GeneratedPolicyReceipt>
     })
 }
 
+/// Whether `content` is a whole generated policy document (`AGENTS.md`,
+/// `CLAUDE.md`) exactly as a generator wrote it: it carries the generated
+/// receipt, its body still hashes to the receipt's `policy-sha256`, and it
+/// has no hand-maintained region around a generated block. Any edit to the
+/// body, or any text outside it, makes this false.
+pub fn is_unedited_generated_policy(content: &str) -> bool {
+    if content.contains(BLOCK_BEGIN) || content.contains(BLOCK_END) {
+        return false;
+    }
+    generated_policy_receipt(content)
+        .is_some_and(|receipt| policy_sha256(&receipt.policy_body) == receipt.policy_sha256)
+}
+
 /// `_load_agents_overrides`: missing → `{}`, unreadable/invalid/non-object
 /// → `{_invalid_override: true, _source: …}`, else payload + `_source`
 /// appended — the exact Python tolerances.
@@ -389,6 +402,7 @@ resolve blockers and refusals.
    status and follow its `next_action` when dependencies are required:
    `aethyme broker submit prepare status --session <id> --json`. Preparation
    is explicit; do not assume a fresh worktree has installed dependencies.
+   Build output and temp files go in its `scratch_dir`.
 2. Commit early and small. Run `aethyme broker advance --session <id>` from a
    clean worktree and follow its next action. Add `--pr` after the first meaningful
    commit to open a draft. Use `aethyme broker push --session <id>` directly
@@ -426,6 +440,7 @@ resolve blockers and refusals.
    status and follow its `next_action` when dependencies are required:
    `aethyme broker submit prepare status --session <id> --json`. Preparation
    is explicit; do not assume a fresh worktree has installed dependencies.
+   Build output and temp files go in its `scratch_dir`.
 2. When done: `aethyme broker submit --session <id>` runs the gates and lands
    nothing. Then `aethyme broker finish --session <id>`.
 
@@ -1025,6 +1040,19 @@ blocked.
    Gate commands that need a test database, cache namespace, or similar
    external state should suffix it with that value instead of sharing one
    fixed name.
+
+   Every session also gets a scratch directory the broker creates beside its
+   checkout (same volume, outside the worktree, so never in `git status`):
+   `scratch_dir` in `aethyme broker start --json` and in the session view of
+   `aethyme broker status --json`, exported as `$AETHYME_SESSION_SCRATCH_DIR`
+   to `aethyme broker advanced exec`, preparation steps and the session's gate
+   commands. Point build output (as a tool's `--target-dir`, `--out-dir` or
+   output path; an exported `CARGO_TARGET_DIR` makes Aethyme treat its own
+   commands as a build environment) and temporary files there instead of the
+   system temp folder. The broker removes it, through its paced trash, once
+   the session is finished, closed or cleaned and no process uses it;
+   `start --reuse` gets a fresh one. The broker does not set `TMPDIR` to it:
+   its path can be too long for the Unix sockets some tools create there.
 
    Unless `.aethyme/config.toml` sets
    `[authorization] disposable_test_environments = false`, creating, using and
@@ -1630,6 +1658,7 @@ mod tests {
             "Before running repository tools or audits, check the session's preparation",
             "aethyme broker submit prepare status --session <id> --json",
             "do not assume a fresh worktree has installed dependencies.",
+            "Build output and temp files go in its `scratch_dir`.",
             "`aethyme broker submit --session <id>`",
             "`aethyme broker finish --session <id>`",
             "`aethyme broker commit --session <id> -- <git-commit-args>`",
