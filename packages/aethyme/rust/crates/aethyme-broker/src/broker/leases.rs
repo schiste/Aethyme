@@ -1764,7 +1764,14 @@ impl Broker {
         let Ok(latest_note) = stale::latest_closing_soon_note(self.store_ref(), session.id) else {
             return Err(unavailable());
         };
-        let class = self.stale_work_class(session);
+        // The look under both claims decides the close: its working-tree
+        // answer is taken now, never remembered (an unstaged edit or a new
+        // untracked file does not change the index the memory is keyed by).
+        let class = if under_claims {
+            self.stale_work_class_fresh(session)
+        } else {
+            self.stale_work_class(session)
+        };
         let activity_ms = activity_ms.max(session.created_at);
         let not_due = |revisit_at_ms: Option<i64>| {
             if let Some(revisit_at_ms) = revisit_at_ms {

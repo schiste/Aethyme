@@ -4626,4 +4626,91 @@ mod tests {
         assert_eq!(stripped, Ok(2));
         assert!(!worktree.join("node_modules").exists());
     }
+
+    /// A folder is remembered as absent only on ENOENT with its pool
+    /// listable: in a pool that cannot be listed (an unmounted or
+    /// unreachable volume reads the same) an absent folder is not
+    /// remembered, and an unreadable one is `checkout_unreadable`. A
+    /// remembered folder seen again in its pool's listing is judged again
+    /// and the memory dropped.
+    #[test]
+    fn only_a_proven_absent_folder_is_remembered_and_seeing_it_again_drops_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let (owner, _storage, mut broker) = fixture();
+        let (gone, gone_worktree) = closed(&mut broker, "absent folder", |_| {});
+        let (hidden, _) = closed(&mut broker, "pool not listable", |_| {});
+        let (unreadable, _) = closed(&mut broker, "pool not searchable", |_| {});
+        // Search but no read permission: the folder's absence is ENOENT, but
+        // the pool cannot be listed.
+        let search_only = owner.path().join("search-only-pool");
+        std::fs::create_dir_all(&search_only).unwrap();
+        // Neither: nothing in it can be read.
+        let locked = owner.path().join("locked-pool");
+        std::fs::create_dir_all(&locked).unwrap();
+        for (session, path) in [
+            (&hidden, search_only.join("checkout")),
+            (&unreadable, locked.join("checkout")),
+        ] {
+            broker
+                .store()
+                .connection()
+                .execute(
+                    "UPDATE sessions SET worktree_path = ?1 WHERE id = ?2",
+                    rusqlite::params![path.to_string_lossy(), session.id],
+                )
+                .unwrap();
+        }
+        std::fs::set_permissions(&search_only, std::fs::Permissions::from_mode(0o100)).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let first = strip_pass(&broker);
+        std::fs::set_permissions(&search_only, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            first.refused.get("checkout_missing"),
+            Some(&1),
+            "{first:#?}"
+        );
+        assert_eq!(
+            first.refused.get("checkout_unreadable"),
+            Some(&1),
+            "{first:#?}"
+        );
+        let absent: std::collections::BTreeMap<i64, i64> =
+            broker.meta_json(super::super::strip::CHECKOUT_STRIP_ABSENT_KEY);
+        assert!(absent.is_empty(), "{absent:?}");
+
+        // Remembered as absent, then the folder shows up again.
+        let closed_at = broker
+            .store_ref()
+            .session(gone.id)
+            .unwrap()
+            .closed_at
+            .unwrap_or(0);
+        broker
+            .update_meta_json(
+                super::super::strip::CHECKOUT_STRIP_ABSENT_KEY,
+                |stored: &mut std::collections::BTreeMap<i64, i64>| {
+                    stored.insert(gone.id, closed_at);
+                },
+            )
+            .unwrap();
+        broker
+            .update_meta_json(
+                super::super::strip::CHECKOUT_STRIP_DONE_KEY,
+                |stored: &mut std::collections::BTreeMap<i64, i64>| {
+                    stored.remove(&gone.id);
+                },
+            )
+            .unwrap();
+        assert!(gone_worktree.is_dir());
+
+        let again = strip_pass(&broker);
+
+        assert!(again.checkouts_examined >= 1, "{again:#?}");
+        let absent: std::collections::BTreeMap<i64, i64> =
+            broker.meta_json(super::super::strip::CHECKOUT_STRIP_ABSENT_KEY);
+        assert!(!absent.contains_key(&gone.id), "{absent:?}");
+    }
 }

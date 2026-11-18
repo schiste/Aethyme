@@ -65,6 +65,11 @@ pub(crate) const STRIP_CHECKOUTS_PER_RUN: usize = 200;
 /// does not list the same checkout again. A session closed again later (it
 /// was reused) is looked at again.
 pub(crate) const CHECKOUT_STRIP_DONE_KEY: &str = "checkout_strip.done";
+/// Meta key: sessions whose checkout folder was proven absent (ENOENT, its
+/// pool directory listable), with the close time seen (JSON: session id to
+/// `closed_at`); dropped when the folder shows up again in its pool's
+/// listing.
+pub(crate) const CHECKOUT_STRIP_ABSENT_KEY: &str = "checkout_strip.absent";
 /// Remembered handled sessions at most; the lowest ids go first.
 const STRIP_DONE_MAX: usize = 16_384;
 /// Meta key: checkouts whose directories were last kept only for a
@@ -658,7 +663,7 @@ fn prove_on_disk(
         Err("witness_missing")
             if candidate.kind == StripKind::NodeModules
                 && candidate.relative.contains('/')
-                && pnpm_member_node_modules(&path) =>
+                && pnpm_member_node_modules(&path, &worktree.join("node_modules/.bin")) =>
         {
             crate::phase_telemetry::add("checkout_strip_witness_pnpm_member", Duration::ZERO);
             Ok(())
@@ -675,15 +680,17 @@ const PNPM_BIN_SHIM_MAX_BYTES: u64 = 64 * 1024;
 ///
 /// - every entry is a symbolic link, a `.bin` directory, or an `@scope`
 ///   directory;
-/// - `.bin` holds only regular files that start with `#!` (pnpm's shell
-///   shims) of at most 64 KiB, or symbolic links;
+/// - `.bin` holds only symbolic links, or regular files that start with
+///   `#!` (pnpm's shell shims), are at most 64 KiB and whose name is also
+///   in the checkout's top-level `node_modules/.bin` (`top_bin`), where pnpm
+///   writes the same shims;
 /// - an `@scope` directory holds only symbolic links;
 /// - at least one link points into a pnpm store (`node_modules/.pnpm/`).
 ///
 /// Links are never followed; renaming the directory moves the links, not
 /// what they point at. Anything else, a cache directory such as `.vite`
 /// included, keeps it as `witness_missing`.
-pub(crate) fn pnpm_member_node_modules(path: &Path) -> bool {
+pub(crate) fn pnpm_member_node_modules(path: &Path, top_bin: &Path) -> bool {
     let read = |directory: &Path| -> Option<Vec<std::fs::DirEntry>> {
         let mut entries = Vec::new();
         for entry in std::fs::read_dir(directory).ok()? {
@@ -726,6 +733,7 @@ pub(crate) fn pnpm_member_node_modules(path: &Path) -> bool {
                     continue;
                 }
                 let is_shim = shim_type.is_file()
+                    && std::fs::symlink_metadata(top_bin.join(shim.file_name())).is_ok()
                     && shim
                         .metadata()
                         .is_ok_and(|metadata| metadata.len() <= PNPM_BIN_SHIM_MAX_BYTES)
@@ -1302,6 +1310,9 @@ impl Broker {
         let backoff: BTreeMap<i64, StripBackoff> = self.meta_json(CHECKOUT_STRIP_BACKOFF_KEY);
         let venv_markers = crate::auto_cleanup::venv_markers(self.main_root());
         let mut newly_done = BTreeMap::new();
+        let absent: BTreeMap<i64, i64> = self.meta_json(CHECKOUT_STRIP_ABSENT_KEY);
+        let mut newly_absent = BTreeMap::new();
+        let mut absent_seen_again = BTreeSet::new();
         let mut backoff_updates: BTreeMap<i64, Option<StripBackoff>> = BTreeMap::new();
         let mut holders = crate::session_holder::RecordedHolderProcessTable::default();
         for session in judges {
@@ -1346,6 +1357,18 @@ impl Broker {
             if exists == Some(false) {
                 report.folders_missing += 1;
                 continue;
+            }
+            // Proven absent by an earlier pass: skipped while the listing
+            // cannot say otherwise; seen again in its pool's listing, it is
+            // judged again and the memory dropped.
+            if absent.get(&session.id) == Some(&closed_at) {
+                if exists == Some(true) {
+                    absent_seen_again.insert(session.id);
+                    crate::phase_telemetry::add("checkout_strip_absent_seen_again", Duration::ZERO);
+                } else {
+                    report.folders_missing += 1;
+                    continue;
+                }
             }
             report.folders_found += 1;
             report.checkouts_examined += 1;
@@ -1401,13 +1424,22 @@ impl Broker {
                 }
                 CheckoutStrip::Refused(code) => {
                     note_refusal(&mut report, code);
-                    // Ownership never changes for a session, and a folder
-                    // proven absent (ENOENT) does not come back for this close
-                    // (a reuse reopens and closes again): not asked again, so
-                    // the cap and the time go to folders that exist (0.8.123:
-                    // 688 of 900 examined were absent).
-                    if code == "adopted" || code == "not_owned" || code == "checkout_missing" {
+                    // Ownership never changes for a session: not asked again.
+                    if code == "adopted" || code == "not_owned" {
                         newly_done.insert(session.id, closed_at);
+                    }
+                    // A folder proven absent (ENOENT) while its pool
+                    // directory exists and lists (so an unmounted or
+                    // unreachable volume is never remembered as absent) is
+                    // not stat-ed again for this close, so the time goes to
+                    // folders that exist (0.8.123: 688 of 900 examined were
+                    // absent).
+                    if code == "checkout_missing"
+                        && Path::new(&session.worktree_path)
+                            .parent()
+                            .is_some_and(|pool| std::fs::read_dir(pool).is_ok())
+                    {
+                        newly_absent.insert(session.id, closed_at);
                     }
                     if code == "process_use_unknown" {
                         report.process_use_unavailable = true;
@@ -1429,6 +1461,23 @@ impl Broker {
                     CHECKOUT_STRIP_DONE_KEY,
                     |stored: &mut BTreeMap<i64, i64>| {
                         stored.extend(newly_done.iter().map(|(id, at)| (*id, *at)));
+                        while stored.len() > STRIP_DONE_MAX {
+                            stored.pop_first();
+                        }
+                    },
+                ),
+            );
+        }
+        if !newly_absent.is_empty() || !absent_seen_again.is_empty() {
+            crate::warn_unrecorded(
+                "remember absent checkout folders",
+                self.update_meta_json(
+                    CHECKOUT_STRIP_ABSENT_KEY,
+                    |stored: &mut BTreeMap<i64, i64>| {
+                        for id in &absent_seen_again {
+                            stored.remove(id);
+                        }
+                        stored.extend(newly_absent.iter().map(|(id, at)| (*id, *at)));
                         while stored.len() > STRIP_DONE_MAX {
                             stored.pop_first();
                         }
@@ -2442,11 +2491,15 @@ mod tests {
         .unwrap();
         std::os::unix::fs::symlink("../../ui-kit", member.join("@types/ui-kit")).unwrap();
         std::fs::write(member.join(".bin/tsc"), "#!/bin/sh\nexec node tsc \"$@\"\n").unwrap();
+        // pnpm writes the same shims into the top-level `.bin`.
+        let top_bin = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&top_bin).unwrap();
+        std::fs::write(top_bin.join("tsc"), "#!/bin/sh\n").unwrap();
         let candidate = |relative: &str| StripCandidate {
             relative: relative.into(),
             kind: StripKind::NodeModules,
         };
-        assert!(pnpm_member_node_modules(&member));
+        assert!(pnpm_member_node_modules(&member, &top_bin));
         assert_eq!(
             prove_on_disk(&root, &candidate("packages/ui/node_modules"), &[]),
             Ok(())
@@ -2467,22 +2520,26 @@ mod tests {
         let plain = root.join("tools/x/node_modules");
         std::fs::create_dir_all(&plain).unwrap();
         std::os::unix::fs::symlink("../../../elsewhere", plain.join("dep")).unwrap();
-        assert!(!pnpm_member_node_modules(&plain));
+        assert!(!pnpm_member_node_modules(&plain, &top_bin));
 
         // A cache directory, a regular file, a file in a scope or a `.bin`
         // entry that is not a shim keeps the member.
         std::fs::create_dir_all(member.join(".vite")).unwrap();
-        assert!(!pnpm_member_node_modules(&member));
+        assert!(!pnpm_member_node_modules(&member, &top_bin));
         std::fs::remove_dir_all(member.join(".vite")).unwrap();
         std::fs::write(member.join("notes.txt"), "mine\n").unwrap();
-        assert!(!pnpm_member_node_modules(&member));
+        assert!(!pnpm_member_node_modules(&member, &top_bin));
         std::fs::remove_file(member.join("notes.txt")).unwrap();
         std::fs::write(member.join("@types/own.d.ts"), "x\n").unwrap();
-        assert!(!pnpm_member_node_modules(&member));
+        assert!(!pnpm_member_node_modules(&member, &top_bin));
         std::fs::remove_file(member.join("@types/own.d.ts")).unwrap();
+        // A shim the top-level `.bin` does not also hold keeps it.
+        std::fs::write(member.join(".bin/own-tool"), "#!/bin/sh\n").unwrap();
+        assert!(!pnpm_member_node_modules(&member, &top_bin));
+        std::fs::remove_file(member.join(".bin/own-tool")).unwrap();
         std::fs::write(member.join(".bin/data"), "not a shim\n").unwrap();
-        assert!(!pnpm_member_node_modules(&member));
+        assert!(!pnpm_member_node_modules(&member, &top_bin));
         std::fs::remove_file(member.join(".bin/data")).unwrap();
-        assert!(pnpm_member_node_modules(&member));
+        assert!(pnpm_member_node_modules(&member, &top_bin));
     }
 }

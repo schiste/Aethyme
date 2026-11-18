@@ -3512,6 +3512,47 @@ mod lane_tests {
         );
     }
 
+    /// A remembered clean answer never closes a session: an untracked file
+    /// added after it (the index, which the memory is keyed by, does not
+    /// change) is seen by the close decision, which asks the tree afresh,
+    /// so the session waits for the unpushed window instead of closing as
+    /// landed.
+    #[test]
+    fn a_remembered_clean_answer_never_closes_a_session() {
+        let (_owner, _storage, mut broker) = fixture("");
+        shipped_class_windows(&broker);
+        let nothing = broker.start_worktree("never committed", None).unwrap();
+        quiet(&mut broker, &nothing, 80);
+        assert_eq!(
+            broker.stale_work_class(&nothing),
+            crate::stale_session_policy::StaleWorkClass::Landed,
+            "clean, remembered"
+        );
+        std::fs::write(
+            PathBuf::from(&nothing.worktree_path).join("notes.txt"),
+            "untracked work\n",
+        )
+        .unwrap();
+        // Remembered, the class still reads clean (nothing it is keyed by
+        // changed); the close decision asks afresh.
+        assert_eq!(
+            broker.stale_work_class(&nothing),
+            crate::stale_session_policy::StaleWorkClass::Landed
+        );
+
+        kept_not_due(&mut broker, &nothing);
+
+        assert!(
+            PathBuf::from(&nothing.worktree_path)
+                .join("notes.txt")
+                .exists()
+        );
+        assert_eq!(
+            broker.stale_work_class_fresh(&nothing),
+            crate::stale_session_policy::StaleWorkClass::Unpushed
+        );
+    }
+
     /// Classification asks the working tree only when refs alone would
     /// class the session below unpushed, and remembers that answer while
     /// HEAD, the branch tip and the index are unchanged; staging a change

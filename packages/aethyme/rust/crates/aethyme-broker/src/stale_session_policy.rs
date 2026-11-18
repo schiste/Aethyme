@@ -64,6 +64,16 @@ pub(crate) const CLEAN_CACHE_TTL_MS: i64 = 6 * HOUR_MS;
 /// Remembered working-tree checks at most; the lowest ids go first.
 const CLEAN_CACHE_MAX: usize = 4_096;
 
+/// Whether a classification may use a remembered working-tree answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeCheck {
+    /// Yes: the class only decides that a session is not closable yet, or
+    /// the order of work.
+    MayRemember,
+    /// No: the class decides a close; the tree is asked now.
+    Fresh,
+}
+
 /// One remembered working-tree check.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CleanCheck {
@@ -505,8 +515,20 @@ impl crate::Broker {
     /// remote-tracking ref older than the remote only makes the class more
     /// conservative.
     pub(crate) fn stale_work_class(&self, session: &crate::Session) -> StaleWorkClass {
+        self.stale_work_class_with(session, TreeCheck::MayRemember)
+    }
+
+    /// [`Self::stale_work_class`] with a working-tree status taken now
+    /// whenever refs alone would class the session below unpushed: what a
+    /// close decision uses. A remembered clean answer never closes a
+    /// session; it only says one is not closable yet, or orders work.
+    pub(crate) fn stale_work_class_fresh(&self, session: &crate::Session) -> StaleWorkClass {
+        self.stale_work_class_with(session, TreeCheck::Fresh)
+    }
+
+    fn stale_work_class_with(&self, session: &crate::Session, tree: TreeCheck) -> StaleWorkClass {
         let started = std::time::Instant::now();
-        let class = self.stale_work_class_uncounted(session);
+        let class = self.stale_work_class_uncounted(session, tree);
         crate::phase_telemetry::add(class.telemetry_name(), Duration::ZERO);
         crate::phase_telemetry::add("stale_work_classification", started.elapsed());
         class
@@ -523,7 +545,11 @@ impl crate::Broker {
     /// repository the working-tree status took ~15 s per session, 38 of 45
     /// classified sessions were unpushed anyway, and 15 were kept for the
     /// lane's deadline.
-    fn stale_work_class_uncounted(&self, session: &crate::Session) -> StaleWorkClass {
+    fn stale_work_class_uncounted(
+        &self,
+        session: &crate::Session,
+        tree: TreeCheck,
+    ) -> StaleWorkClass {
         let worktree = Path::new(&session.worktree_path);
         let repo = self.repo_handle();
         let branch_tip = repo.resolve_ref(&format!("refs/heads/{}", session.branch));
@@ -541,8 +567,13 @@ impl crate::Broker {
             crate::phase_telemetry::add("stale_work_classification_refs_only", Duration::ZERO);
             return class;
         }
-        if self.checkout_clean_remembered(session, worktree, head.as_deref(), branch_tip.as_deref())
-        {
+        if self.checkout_clean_remembered(
+            session,
+            worktree,
+            head.as_deref(),
+            branch_tip.as_deref(),
+            tree,
+        ) {
             class
         } else {
             StaleWorkClass::Unpushed
@@ -560,6 +591,7 @@ impl crate::Broker {
         worktree: &Path,
         head: Option<&str>,
         branch_tip: Option<&str>,
+        tree: TreeCheck,
     ) -> bool {
         let now_ms = crate::clock::epoch_ms();
         let index = crate::git::checked_worktree_git_dir(worktree)
@@ -585,7 +617,8 @@ impl crate::Broker {
             .flatten()
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default();
-        if let Some(key) = key.as_deref()
+        if tree == TreeCheck::MayRemember
+            && let Some(key) = key.as_deref()
             && let Some(check) = cache.get(&session.id)
             && check.key == key
             && now_ms.saturating_sub(check.at_ms) < CLEAN_CACHE_TTL_MS
