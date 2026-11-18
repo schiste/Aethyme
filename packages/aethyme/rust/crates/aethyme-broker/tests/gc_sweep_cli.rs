@@ -354,6 +354,40 @@ fn age_worktree_indexes(repo: &Path) {
         if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&index) {
             file.set_modified(then).unwrap();
         }
+        // Changed files count as activity too: date the checkout's files
+        // and directories (small fixtures) back with the index.
+        if let Ok(pointer) = std::fs::read_to_string(entry.path().join("gitdir"))
+            && let Some(worktree) = Path::new(pointer.trim()).parent()
+        {
+            age_tree(worktree, then);
+        }
+    }
+}
+
+/// Date every file and directory under `dir` (not `.git`) to `then`.
+fn age_tree(dir: &Path, then: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            age_tree(&path, then);
+        }
+        if !kind.is_symlink()
+            && let Ok(file) = std::fs::File::open(&path)
+        {
+            let _ = file.set_modified(then);
+        }
+    }
+    if let Ok(file) = std::fs::File::open(dir) {
+        let _ = file.set_modified(then);
     }
 }
 

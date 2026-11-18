@@ -6989,6 +6989,34 @@ mod generic_guarded_exec_tests {
                 .unwrap();
             file.set_modified(old_time).unwrap();
         }
+        // Changed files count as activity too (deep edits): date them and
+        // their directories back as well.
+        fn age_tree(dir: &Path, then: std::time::SystemTime) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                if entry.file_name() == ".git" {
+                    continue;
+                }
+                let path = entry.path();
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if kind.is_dir() {
+                    age_tree(&path, then);
+                }
+                if !kind.is_symlink()
+                    && let Ok(file) = std::fs::File::open(&path)
+                {
+                    crate::warn_unrecorded("age a fixture file", file.set_modified(then));
+                }
+            }
+            if let Ok(file) = std::fs::File::open(dir) {
+                crate::warn_unrecorded("age a fixture directory", file.set_modified(then));
+            }
+        }
+        age_tree(worktree, old_time);
         broker
             .store()
             .connection()

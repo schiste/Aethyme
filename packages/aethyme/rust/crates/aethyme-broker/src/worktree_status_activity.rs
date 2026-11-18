@@ -1,0 +1,199 @@
+//! Activity evidence from a checkout's changed files.
+//!
+//! Editing `src/a/b/c.rs` touches neither `src/` nor the checkout root, and
+//! the Git index only changes on `add` or a status refresh, so directory and
+//! index modification times miss deep edits. This module runs one
+//! `git --no-optional-locks status --porcelain=v1 -z` (ignored files left
+//! out; `--no-optional-locks` so the probe itself never rewrites the index),
+//! bounded by time and by a cap on the paths it examines, and reads the
+//! modification time of each modified or untracked path and of its parent
+//! directory. The newest of them is the evidence.
+//!
+//! When the status call does not finish in time, fails, or the cap is
+//! reached before any evidence, the result says so (`complete: false`) and
+//! callers fall back to their previous evidence, counting the fallback.
+
+use std::path::Path;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// The longest the status call may take.
+pub(crate) const STATUS_ACTIVITY_BUDGET: Duration = Duration::from_secs(2);
+/// Changed paths examined at most.
+pub(crate) const STATUS_ACTIVITY_PATH_CAP: usize = 2_000;
+/// Status output read at most.
+const STATUS_ACTIVITY_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// What the changed files say.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StatusActivity {
+    /// The newest modification time (ms since the epoch) among the changed
+    /// paths and their parent directories, if any was read.
+    pub newest_ms: Option<i64>,
+    /// Every changed path was examined.
+    pub complete: bool,
+    pub paths_examined: usize,
+}
+
+fn mtime_ms(path: &Path) -> Option<i64> {
+    let modified = std::fs::symlink_metadata(path).ok()?.modified().ok()?;
+    let since = modified.duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(since.as_millis()).ok()
+}
+
+/// The changed paths `git status --porcelain=v1 -z` printed: modified,
+/// staged, deleted (whose parent still tells), renamed (the new name) and
+/// untracked entries.
+pub(crate) fn changed_paths(stdout: &[u8]) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut fields = stdout
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty());
+    while let Some(field) = fields.next() {
+        if field.len() < 4 {
+            continue;
+        }
+        let status = &field[..2];
+        if let Ok(path) = std::str::from_utf8(&field[3..]) {
+            paths.push(path.trim_end_matches('/').to_string());
+        }
+        // A rename or copy is followed by its source path.
+        if status.contains(&b'R') || status.contains(&b'C') {
+            fields.next();
+        }
+    }
+    paths
+}
+
+/// Read the activity evidence of `worktree` (see the module documentation),
+/// within `budget` and `cap` paths.
+pub(crate) fn status_activity(worktree: &Path, budget: Duration, cap: usize) -> StatusActivity {
+    let _span = crate::phase_telemetry::span("worktree_status_activity");
+    let started = Instant::now();
+    let mut command = crate::git::git_command();
+    command
+        .args([
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=normal",
+        ])
+        .current_dir(worktree);
+    let output = match crate::bounded_output::output_limited(
+        &mut command,
+        budget.min(STATUS_ACTIVITY_BUDGET),
+        STATUS_ACTIVITY_MAX_BYTES,
+    ) {
+        Ok(crate::bounded_output::LimitedOutput::Completed(output)) if output.status.success() => {
+            output.stdout
+        }
+        _ => {
+            crate::phase_telemetry::add("worktree_status_activity_unavailable", started.elapsed());
+            return StatusActivity::default();
+        }
+    };
+    let paths = changed_paths(&output);
+    let mut activity = StatusActivity {
+        complete: paths.len() <= cap,
+        ..StatusActivity::default()
+    };
+    for relative in paths.iter().take(cap) {
+        let path = worktree.join(relative);
+        let parent = path.parent().and_then(mtime_ms);
+        for ms in [mtime_ms(&path), parent].into_iter().flatten() {
+            activity.newest_ms = Some(activity.newest_ms.map_or(ms, |known| known.max(ms)));
+        }
+        activity.paths_examined += 1;
+    }
+    if !activity.complete {
+        crate::phase_telemetry::add("worktree_status_activity_capped", Duration::ZERO);
+    }
+    crate::phase_telemetry::add("worktree_status_activity", started.elapsed());
+    activity
+}
+
+/// Whether the changed files show activity at or after `since`: `Some(true)`
+/// when one does, `Some(false)` when every changed path was examined and none
+/// does, `None` when the probe could not tell (timeout, failure, or the cap
+/// reached without evidence): the caller keeps its previous behaviour.
+pub(crate) fn recent_status_activity(worktree: &Path, since: SystemTime) -> Option<bool> {
+    let since_ms = since
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|since| i64::try_from(since.as_millis()).ok())
+        .unwrap_or(0);
+    let activity = status_activity(worktree, STATUS_ACTIVITY_BUDGET, STATUS_ACTIVITY_PATH_CAP);
+    if activity.newest_ms.is_some_and(|newest| newest >= since_ms) {
+        return Some(true);
+    }
+    if activity.complete {
+        Some(false)
+    } else {
+        crate::phase_telemetry::add("worktree_status_activity_fallback", Duration::ZERO);
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn porcelain_entries_yield_changed_paths_and_skip_rename_sources() {
+        let out = b" M src/a/b/c.rs\0R  new.rs\0old.rs\0?? notes/\0D  gone.txt\0";
+        assert_eq!(
+            changed_paths(out),
+            vec!["src/a/b/c.rs", "new.rs", "notes", "gone.txt"]
+        );
+    }
+
+    /// A deep edit (no directory above it changes) is activity; with the
+    /// files old again it is not; the cap leaves the answer to the caller.
+    #[test]
+    fn a_deep_edit_is_recent_activity() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path();
+        let git = |args: &[&str]| {
+            assert!(
+                crate::git::git_command()
+                    .args(args)
+                    .current_dir(worktree)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::create_dir_all(worktree.join("src/a/b")).unwrap();
+        std::fs::write(worktree.join("src/a/b/c.rs"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "init",
+        ]);
+        let old = SystemTime::now() - Duration::from_secs(10 * 3_600);
+        let since = SystemTime::now() - Duration::from_secs(4 * 3_600);
+        let set = |path: &Path, when: SystemTime| {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        };
+        // Clean checkout: nothing changed, so nothing says active.
+        assert_eq!(recent_status_activity(worktree, since), Some(false));
+        std::fs::write(worktree.join("src/a/b/c.rs"), "two\n").unwrap();
+        set(&worktree.join("src/a/b"), old);
+        assert_eq!(recent_status_activity(worktree, since), Some(true));
+        set(&worktree.join("src/a/b/c.rs"), old);
+        assert_eq!(recent_status_activity(worktree, since), Some(false));
+        // Over the cap without evidence: the caller decides.
+        let capped = status_activity(worktree, STATUS_ACTIVITY_BUDGET, 0);
+        assert!(!capped.complete);
+        assert_eq!(capped.newest_ms, None);
+    }
+}
