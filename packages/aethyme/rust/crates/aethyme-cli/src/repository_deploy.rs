@@ -58,7 +58,11 @@ pub fn run(args: &[String]) -> u8 {
     };
 
     if options.generated_only {
-        return run_generated_only(&repo, options.action, options.force);
+        let code = run_generated_only(&repo, options.action, options.force);
+        if options.action == Action::Deploy {
+            warn_primary_checkout_left_modified(&repo);
+        }
+        return code;
     }
     if options.action == Action::Bridge {
         return install_bridge(&repo);
@@ -134,7 +138,44 @@ pub fn run(args: &[String]) -> u8 {
         print_readiness_followup();
     }
     warn_broken_hooks_path(&repo);
+    warn_primary_checkout_left_modified(&repo);
     verified
+}
+
+/// A deploy writes where it runs. Run in the primary checkout of a broker
+/// repository, whose changes reach the default branch only through session
+/// worktrees, its output is never committed from there: it stays modified
+/// and keeps the main-checkout sync from moving those paths until the same
+/// bytes are committed or the files are restored. Say so, with the steps.
+fn warn_primary_checkout_left_modified(repo: &Path) {
+    let Ok(checkout) = aethyme_broker::GitRepo::discover(repo) else {
+        return;
+    };
+    let is_primary = checkout
+        .main_root()
+        .ok()
+        .and_then(|root| root.canonicalize().ok())
+        .is_some_and(|root| repo.canonicalize().ok().as_deref() == Some(root.as_path()));
+    if !is_primary || !repo.join(".aethyme/broker.db").exists() {
+        return;
+    }
+    let Ok(dirty) = checkout.tracked_dirty_paths() else {
+        return;
+    };
+    let generated = dirty
+        .iter()
+        .filter(|path| {
+            aethyme_enhance::deploy::is_generated_artifact_path(path)
+                || path.as_str() == ".aethyme/config.toml"
+        })
+        .collect::<Vec<_>>();
+    if generated.is_empty() {
+        return;
+    }
+    eprintln!(
+        "warning: this deploy ran in the repository's primary checkout and left {} generated file(s) modified there; nothing commits from the primary checkout, so they stay modified until the same output is committed through a session worktree (`aethyme broker start ...`, then `aethyme deploy --generated-only --repo <worktree>` there, and merge it). The main-checkout sync replaces them once it can prove they are unedited generator output; edits belong in .aethyme/overrides/.",
+        generated.len()
+    );
 }
 
 /// Warn, never repair: a `core.hooksPath` naming a missing or hook-less

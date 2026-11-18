@@ -750,8 +750,10 @@ the worker never fetches, so a missing remote-tracking ref skips the slice
 never deletes one whose work is not on it. The listing is read without the
 lifecycle claim; under the claim, immediately before each delete, the
 branch's sessions, its restorable state and Git's worktree registrations
-(every `HEAD`, and a rebase's `head-name`) are read again, so a checkout
-started or reopened during the listing keeps its branch.
+(every `HEAD`, a rebase's `head-name`, a bisect's `BISECT_START`) and the
+start reservations of its sessions' paths are read again, so a checkout
+started, reopened or being registered during the listing keeps its branch
+(`start_reserved`).
 
 A session keeps its branch while it has restorable state: anything not
 plainly cleaned (open or closed), or a recovery archive. That decision lives

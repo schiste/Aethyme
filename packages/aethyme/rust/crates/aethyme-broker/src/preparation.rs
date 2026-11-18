@@ -27,6 +27,8 @@ pub(crate) mod cache_activity;
 pub(crate) mod cache_measurement;
 #[path = "preparation_install_cap.rs"]
 pub(crate) mod install_cap;
+#[path = "preparation_output_share.rs"]
+pub(crate) mod output_share;
 #[path = "preparation_package_store.rs"]
 pub(crate) mod package_store;
 #[path = "preparation_recovery_state.rs"]
@@ -304,9 +306,28 @@ impl PreparationPackageCache {
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SharedCacheRoot {
+    /// The default: the host cache root when it shares the checkout's
+    /// volume, otherwise the worktree-volume root, so package managers can
+    /// clone or hard-link from the store instead of copying across volumes.
+    /// An explicit operator root always wins.
     #[default]
+    Auto,
     Host,
     WorktreeVolume,
+}
+
+/// `auto` serializes as `host`. The preparation digest hashes the parsed
+/// configuration and has never keyed the cache location (an operator root
+/// override moves it as well); omitting `root` used to serialize `host`, and
+/// must keep every existing digest unchanged.
+fn serialize_shared_cache_root<S: serde::Serializer>(
+    root: &SharedCacheRoot,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match root {
+        SharedCacheRoot::Auto => SharedCacheRoot::Host.serialize(serializer),
+        other => other.serialize(serializer),
+    }
 }
 
 /// Byte budget for the repository-shared preparation cache.
@@ -324,10 +345,12 @@ pub struct SharedCacheBudget {
     /// Omission or zero means 8 GiB; the store is never unbounded.
     #[serde(default = "default_shared_cache_max_bytes")]
     pub max_bytes: u64,
-    /// Select the cache filesystem. The host default preserves existing
-    /// placement; worktree-volume uses the selected session's Aethyme-owned
-    /// placement root, unless an explicit operator root was captured.
-    #[serde(default)]
+    /// Select the cache filesystem. `auto` (the default) uses the host root
+    /// when it shares the checkout's volume and the worktree-volume root
+    /// otherwise; `host` keeps the host root; worktree-volume uses the
+    /// selected session's Aethyme-owned placement root. An explicit operator
+    /// root was captured wins over all three.
+    #[serde(default, serialize_with = "serialize_shared_cache_root")]
     pub root: SharedCacheRoot,
     /// How many sessions may run their preparation steps against this
     /// repository's shared cache at once. Omission means 1: every
@@ -1488,29 +1511,69 @@ impl Broker {
                     .into());
                 }
             };
+        let mut cache_root_placement = None;
         let cache_root_binding = if shared {
-            let binding = match config
+            let configured = config
                 .shared_cache
                 .as_ref()
-                .map_or(SharedCacheRoot::Host, |cache| cache.root)
-            {
-                SharedCacheRoot::Host => preparation_cache_root_binding_for_broker(self)?,
+                .map_or(SharedCacheRoot::Auto, |cache| cache.root);
+            let (binding, resolved, reason) = match configured {
+                SharedCacheRoot::Host => (
+                    preparation_cache_root_binding_for_broker(self)?,
+                    SharedCacheRoot::Host,
+                    "configured".to_owned(),
+                ),
                 SharedCacheRoot::WorktreeVolume
                     if self
                         .storage_context()
                         .preparation_cache_root_override
-                        .is_none() => self
-                    .initialize_worktree_volume_preparation_cache_root(&root)
-                    .map_err(|error| PreparationError::StorageUnavailable {
-                        path: root.clone(),
-                        reason: format!(
-                            "cannot initialize the worktree-volume preparation-cache root: {error}"
-                        ),
-                    })?,
-                SharedCacheRoot::WorktreeVolume => {
-                    preparation_cache_root_binding_for_broker(self)?
+                        .is_none() =>
+                {
+                    (
+                        self.initialize_worktree_volume_preparation_cache_root(&root)
+                            .map_err(|error| PreparationError::StorageUnavailable {
+                                path: root.clone(),
+                                reason: format!(
+                                    "cannot initialize the worktree-volume preparation-cache root: {error}"
+                                ),
+                            })?,
+                        SharedCacheRoot::WorktreeVolume,
+                        "configured".to_owned(),
+                    )
                 }
+                SharedCacheRoot::WorktreeVolume => (
+                    preparation_cache_root_binding_for_broker(self)?,
+                    SharedCacheRoot::Host,
+                    OPERATOR_ROOT_WINS.to_owned(),
+                ),
+                SharedCacheRoot::Auto => self.auto_preparation_cache_root(&root)?,
             };
+            crate::phase_telemetry::add(
+                match (configured, resolved) {
+                    (SharedCacheRoot::Auto, SharedCacheRoot::WorktreeVolume) => {
+                        "prepare_cache_root_auto_worktree_volume"
+                    }
+                    (SharedCacheRoot::Auto, _) => "prepare_cache_root_auto_host",
+                    (_, SharedCacheRoot::WorktreeVolume) => {
+                        "prepare_cache_root_configured_worktree_volume"
+                    }
+                    _ => "prepare_cache_root_configured_host",
+                },
+                Duration::ZERO,
+            );
+            crate::phase_telemetry::attach(
+                "prepare_cache_root",
+                serde_json::json!({
+                    "configured": configured,
+                    "resolved": resolved,
+                    "reason": reason,
+                }),
+            );
+            cache_root_placement = Some(package_store::CacheRootPlacement {
+                configured,
+                resolved,
+                reason,
+            });
             if config
                 .shared_cache
                 .as_ref()
@@ -1900,13 +1963,15 @@ impl Broker {
             .as_ref()
             .map_or_else(Default::default, |cache| cache.package_store);
         let mut package_store_report = cache_dir.as_deref().map(|cache_dir| {
-            prepare_package_store(
+            let mut report = prepare_package_store(
                 &root,
                 cache_dir,
                 package_store_scope,
                 &repository_identity(self),
                 probes.clone(),
-            )
+            );
+            report.cache_root_placement = cache_root_placement.clone();
+            report
         });
         // The directory the manager variables point into: the repository
         // store, an isolated fallback, or (explicit `per_input`) the digest
@@ -2233,6 +2298,47 @@ impl Broker {
         if let Some(report) = install_slot_report.as_mut() {
             report.renewal_failures = slot_renewal_failures;
         }
+        // Share the outputs' bytes through the pool in the package store
+        // while the cache lease still protects the store from rotation.
+        if let Some(report) = package_store_report.as_mut() {
+            let share = {
+                let _span = crate::phase_telemetry::span("prepare_output_share");
+                let roots = prepared_output_roots(&root, &config);
+                output_share::share_outputs(
+                    &output_share::OutputShareRequest {
+                        worktree: &root,
+                        roots,
+                        store: &report.path,
+                        import_method: report.import_method,
+                        budget: output_share::OUTPUT_SHARE_BUDGET,
+                    },
+                    &mut || {
+                        let (Some(coordinator), Some(grant)) =
+                            (coordinator.as_mut(), grant.as_mut())
+                        else {
+                            return true;
+                        };
+                        match coordinator.renew(
+                            &grant.lease.lease_id,
+                            grant.lease.generation,
+                            &grant.ownership_token,
+                            PREPARATION_LEASE_TTL_SECONDS,
+                        ) {
+                            Ok(lease) => {
+                                grant.lease = lease;
+                                true
+                            }
+                            Err(_) => false,
+                        }
+                    },
+                )
+            };
+            crate::phase_telemetry::attach(
+                "prepare_dependency_sharing",
+                share.metric(report.import_method),
+            );
+            report.output_share = Some(share);
+        }
         release_grant(&mut coordinator, &mut grant)?;
         drop(lease_held_span);
         let shared_cache_operations = cache_activity_guard
@@ -2477,6 +2583,103 @@ fn preparation_step_environment_with_store(
     Ok(environment)
 }
 
+/// Why an explicit operator preparation-cache root was used instead of the
+/// configured or automatic placement.
+const OPERATOR_ROOT_WINS: &str = "an explicit preparation-cache root takes precedence";
+
+impl Broker {
+    /// Resolve `[shared_cache] root = "auto"`: the host root when it shares
+    /// `worktree`'s volume (or the volumes cannot be compared), otherwise the
+    /// worktree-volume root, falling back to the host root when that root
+    /// cannot be initialized there. Nothing is moved or removed: a store left
+    /// under the other root keeps serving nothing and ages out through the
+    /// storage sweep like any unused digest.
+    fn auto_preparation_cache_root(
+        &self,
+        worktree: &Path,
+    ) -> Result<
+        (
+            crate::broker::PreparationCacheRootBinding,
+            SharedCacheRoot,
+            String,
+        ),
+        PreparationError,
+    > {
+        let host = preparation_cache_root_binding_for_broker(self)?;
+        if self
+            .storage_context()
+            .preparation_cache_root_override
+            .is_some()
+        {
+            return Ok((host, SharedCacheRoot::Host, OPERATOR_ROOT_WINS.into()));
+        }
+        // The host root may not exist yet: compare its nearest existing
+        // ancestor, which is on the volume the root will be created on.
+        let host_volume_probe = host
+            .path
+            .ancestors()
+            .find(|ancestor| ancestor.exists())
+            .map(Path::to_path_buf);
+        match host_volume_probe
+            .as_deref()
+            .and_then(|probe| package_store::same_volume(probe, worktree))
+        {
+            Some(true) => {
+                return Ok((
+                    host,
+                    SharedCacheRoot::Host,
+                    "the host cache root shares the checkout's volume".into(),
+                ));
+            }
+            None => {
+                return Ok((
+                    host,
+                    SharedCacheRoot::Host,
+                    "the host cache root's volume could not be compared with the checkout's".into(),
+                ));
+            }
+            Some(false) => {}
+        }
+        match self.initialize_worktree_volume_preparation_cache_root(worktree) {
+            Ok(binding) if package_store::same_volume(&binding.path, worktree) == Some(true) => {
+                Ok((
+                    binding,
+                    SharedCacheRoot::WorktreeVolume,
+                    "the host cache root is on another volume than the checkout".into(),
+                ))
+            }
+            Ok(_) => Ok((
+                host,
+                SharedCacheRoot::Host,
+                "the worktree-volume cache root is not on the checkout's volume".into(),
+            )),
+            Err(error) => Ok((
+                host,
+                SharedCacheRoot::Host,
+                format!("the worktree-volume cache root is unavailable: {error}"),
+            )),
+        }
+    }
+}
+
+/// The outermost Git-ignored directories holding the declared outputs of
+/// every step, relative to the checkout (see [`output_share::output_roots`]).
+fn prepared_output_roots(root: &Path, config: &PreparationConfig) -> Vec<String> {
+    let repository = crate::git::GitRepo::discover(root).ok();
+    output_share::output_roots(
+        root,
+        config
+            .steps
+            .iter()
+            .flat_map(|step| step.outputs.iter().map(String::as_str)),
+        |candidate| {
+            repository
+                .as_ref()
+                .is_some_and(|repository| repository.path_is_ignored(candidate))
+        },
+    )
+}
+
 /// Where a preparation whose repository store is unusable keeps its own
 /// manager stores, inside its digest directory.
 const ISOLATED_PACKAGE_STORES_DIR: &str = "isolated-package-stores";
@@ -2543,6 +2746,8 @@ fn prepare_package_store(
         volume_free_bytes_before,
         volume_free_bytes_after: None,
         volume_bytes_allocated: None,
+        cache_root_placement: None,
+        output_share: None,
     }
 }
 
@@ -8047,11 +8252,37 @@ cache = "repository_shared"
     }
 
     #[test]
-    fn a_shared_cache_without_a_root_selector_keeps_the_host_default() {
+    fn a_shared_cache_without_a_root_selector_places_automatically_and_keeps_its_digest() {
         let parsed = parse_config(&shared_budget_config(true, 1024)).unwrap();
+        let serialized = serde_json::to_value(&parsed).unwrap();
         assert_eq!(
             parsed.shared_cache.expect("declared").root,
+            SharedCacheRoot::Auto
+        );
+        // `auto` serializes as the `host` that omission used to produce, so
+        // every existing preparation digest is unchanged.
+        assert_eq!(serialized["shared_cache"]["root"], "host");
+        let explicit = format!(
+            "{}\nroot = \"host\"\n",
+            shared_budget_config(true, 1024).trim_end()
+        );
+        let explicit = parse_config(&explicit).unwrap();
+        assert_eq!(
+            explicit.shared_cache.as_ref().expect("declared").root,
             SharedCacheRoot::Host
+        );
+        assert_eq!(serde_json::to_value(&explicit).unwrap(), serialized);
+        let auto = format!(
+            "{}\nroot = \"auto\"\n",
+            shared_budget_config(true, 1024).trim_end()
+        );
+        assert_eq!(
+            parse_config(&auto)
+                .unwrap()
+                .shared_cache
+                .expect("declared")
+                .root,
+            SharedCacheRoot::Auto
         );
     }
 

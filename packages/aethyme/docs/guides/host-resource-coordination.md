@@ -461,8 +461,14 @@ the journal by hand) is in
 [troubleshooting](troubleshooting.md), under "Prepare Is Slow Or Silent While
 Holding The Shared Cache".
 
-An unspecified `shared_cache.root` keeps the historical Host placement for
-existing configurations. A new pnpm draft from `aethyme init` selects the
+An unspecified `shared_cache.root` (or `root = "auto"`) uses the host cache
+root when it is on the checkout's volume and the worktree-volume root
+otherwise, so package managers can clone or hard-link from the store instead
+of copying every file across volumes. When the worktree-volume root cannot be
+initialized (the placement root is not Aethyme-owned, for example), `auto`
+keeps the host root and says why in `package_store.cache_root_placement`. The
+resolution does not change any preparation digest, as an operator root never
+did. A new pnpm draft from `aethyme init` selects the
 worktree placement filesystem and passes its broker-managed store path with
 `--store-dir`, so pnpm can hardlink package content when its import mode allows
 it. Worktree outputs such as `node_modules/` remain per-worktree. The typed
@@ -481,10 +487,39 @@ The broker derives a repository-owned cache root under the selected worktree
 placement root and verifies its ownership marker and filesystem before use.
 An explicit `AETHYME_PREPARATION_CACHE_ROOT` operator setting keeps precedence;
 the broker refuses that setting for this mode if it is on another filesystem.
-Set `root = "host"` when a new configuration needs the historical placement.
-Changing the selected placement does not migrate or remove an old cache root.
-Only the package-manager store can share physical data this way; declared
-worktree outputs such as Python virtual environments remain per-worktree.
+Set `root = "host"` when a configuration needs the historical placement on
+every volume. Changing the selected placement does not migrate or remove an
+old cache root: the storage sweep removes its digests once no checkout uses
+them, and retires its shared package store once no preparation has used it
+for a week (`package_store_rotated_idle`). A repository whose host root is on
+another volume than its checkouts therefore prepares each checkout from a
+cold store once after upgrading.
+
+Package managers share only what they import from their store. A tool that
+writes its own copy into each checkout (`pip install` into a virtual
+environment, a build directory) gets a second chance after the steps succeed:
+for the outermost Git-ignored directory holding each declared output, the
+broker replaces every file of 64 KiB or more that does not already share its
+blocks with a copy-on-write clone of a byte-identical file from an
+`output-pool/` inside the repository's package store, or adds it to the pool
+for the next checkout. The file keeps its own mode and timestamps; a later
+write to it never reaches the pool or another checkout. The pass runs only
+where the volume clones (APFS, btrfs, XFS with reflink): a volume that can
+only hard-link or copy is reported as skipped and left alone, because a
+shared hard link would let one checkout's write reach the others. It runs
+under the shared-cache lease, renews it, and stops after 90 seconds; a root
+whose sampled large files already share their blocks (a pnpm `node_modules/`
+imported by clone) is skipped. A pool entry is published only when its own
+bytes hash to its name, and an existing entry is checked against its name
+before its first use in a pass; one that does not match is removed and
+counted. A replaced file keeps its mode and its access and modification
+times, but gets the pool entry's extended attributes, ACLs and file flags,
+a new inode and a new birth time. Temporaries left by an interrupted pass are
+removed by the next one once their process is gone. Nothing is seeded or
+relocated: files whose
+bytes differ between checkouts, such as compiled bytecode that embeds the
+checkout path or scripts with an absolute interpreter path, keep their own
+copy.
 
 `npm install` is never drafted. It rewrites a committed lockfile, which is a
 tracked-file mutation the worktree guard refuses without an explicit lease.
