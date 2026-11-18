@@ -4,6 +4,28 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.126] - 2026-11-18
+
+### Added
+
+- Dependency bytes are shared between session checkouts. After a repository-shared preparation succeeds, each file of 64 KiB or more inside a declared output's ignored directory is replaced by a copy-on-write clone from a content-addressed pool in the repository's package store, keeping its mode and timestamps. A file enters the pool only after its clone hashes to its name, and a pool entry is verified before its first use in a pass; one that fails is removed and the file keeps its own bytes. Clone-only: volumes that cannot clone keep today's behaviour and report `skipped`. On the busiest repository a prepared checkout owned about 575 MB alone, almost all of it one Python environment; the target is 250 MB. `submit prepare status --json` gains `package_store.output_share` and `package_store.cache_root_placement` (#1792).
+- Fully merged local session branches are deleted by the background worker: every session that used the branch is cleaned, its tip is an ancestor of the remote default branch as last fetched, no worktree has it checked out (including a bisect that will return to it), no start reservation is held on its sessions' paths, and nothing restorable remains. Sessions, restorable state and worktree registrations are read again under the lifecycle lock immediately before each compare-and-swap delete. At most 200 branches judged and 100 deleted per run. `[cleanup] delete_merged_session_branches = false` turns it off. Advice `cleanup.merged-session-branches`. Local refs only: nothing is fetched, pruned or deleted on the remote (#1793, #1797).
+- Every session gets a scratch directory next to its checkout pool, outside the worktree, for build output and temporary files. `broker start --json` and the session view of `status --json` carry `scratch_dir`; commands the broker runs for a session get `AETHYME_SESSION_SCRATCH_DIR`. It is moved to the pool's trash when the session is closed or replaced by `start --reuse`, never while a process has its working directory or an open file inside, and only when it is the directory the broker recorded for that session. After a remount it is re-identified by its marker, name and inode. Storage class `session_scratch`; advice `storage.session-scratch-large` and `storage.session-scratch-unidentified`. The temp-directory variables are not changed (#1795).
+
+### Changed
+
+- **Breaking:** `[shared_cache] root` defaults to `auto`: the host root when it is on the checkout's volume, the checkout's volume otherwise. Upgrade note: on a host whose cache root and checkouts are on different volumes, each checkout prepares once from a cold store; the old store is not deleted at upgrade and is retired a week after its last use. Set `root = "host"` to keep the old placement (#1792).
+- A shared package store unused for a week is retired by the storage sweep, under the exclusive cache lease (#1792).
+- The main-checkout sync no longer holds on the tool's own generated files. A locally modified, unstaged file is replaced only when its bytes are proven generator output: equal to the incoming update, an agent-instruction file whose recorded hash still matches its body, a skill copy equal to this binary's render, or bytes committed at that path within its last 200 commits. The repository's `.aethyme/config.toml` qualifies only when it already equals the incoming update. Each replaced file is first backed up under `.aethyme/run/main-checkout-replaced/`, verified against the proven content, and put back if the move then refuses; backups are kept 7 days, at most 20 sets. Edited, staged or unreadable files still hold the sync and are named with the reason. `deploy` warns when it leaves generated files modified in a primary checkout (#1791).
+
+### Known issues
+
+- Retiring the shared package store under space pressure frees little while live checkouts hold clones of it, and the next checkout gets full new copies.
+- A package manager configured to read files in place from the shared store, instead of cloning or linking them, loses files when the store is retired.
+- A merged branch whose pull request was squashed or rebased is not recognised as merged and is kept.
+- Agents use the scratch directory only when they follow the instruction to; the system temp folder is not redirected.
+- `start --adopt` can still hold the lifecycle lock for minutes while comparing patches.
+
 ## [0.8.125] - 2026-11-18
 
 ### Fixed
