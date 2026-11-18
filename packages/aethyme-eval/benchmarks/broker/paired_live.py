@@ -140,7 +140,7 @@ def integrate(args, repo, root, env, git, work, arm, first_attempt):
             if arm == "broker":
                 result = run(checkout, env, args.binary, "broker", "finish",
                              "--session", str(work["session"]), "--json", check=False)
-                finish = result.returncode == 0
+                finish = result.returncode == 0 and json.loads(result.stdout)["closed"] is True
                 (folder / "finish.json").write_text(result.stdout)
                 (folder / "finish.stderr").write_text(result.stderr)
     elapsed = time.monotonic() - work["started"]
@@ -178,16 +178,16 @@ def run_group(args, folder, tasks, overlap, arm):
                                 and row["session_finished"] is not False)
             row["overlap"] = overlap
             row["group_seconds"] = group_seconds
-            dump(work["folder"] / "result.json", row)
-            print(json.dumps(row), flush=True)
         if overlap and all(row["completed"] for row in rows):
             overlap_result = check_hidden(repo, env, folder, args.overlaps[overlap]["hidden_check"])
             dump(folder / "overlap-validation.json", {"passed": overlap_result})
             if not overlap_result:
-                for row, work in zip(rows, workers, strict=True):
+                for row in rows:
                     row["completed"] = False
                     row["overlap_hidden_failure"] = True
-                    dump(work["folder"] / "result.json", row)
+        for row, work in zip(rows, workers, strict=True):
+            dump(work["folder"] / "result.json", row)
+            print(json.dumps(row), flush=True)
         metrics = repo / ".aethyme/logs/command-metrics.jsonl"
         if metrics.is_file():
             shutil.copyfile(metrics, folder / "broker-metrics.jsonl")
