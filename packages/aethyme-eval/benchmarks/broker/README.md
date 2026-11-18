@@ -239,3 +239,29 @@ stay in the chosen local output directory. Publish aggregate numbers only.
 This measures the configured workflow and fixture. A peer introduced after
 publication exercises conflict recovery. It cannot establish how often
 early broker advisories prevent overlapping work in production.
+
+## Live overlapping tasks
+
+`paired_live.py` starts both workers in a pair from the same Playground base,
+with separate worktrees and shared local origin. It compares four solo tasks
+and three pairs covering textual conflicts, overlapping files with clean
+merges, and cross-file dependencies. Both arms use the same scope restrictions,
+tests, integration order, and one-turn repair budget. The broker arm uses
+leases, session status, `advance`, and `finish`. The Git arm uses status and
+worktree listing, plus direct branch publication. Both arms use the same
+independent integration checks. Codex uses the workspace-write sandbox and
+ignores local user configuration. This run measures explicit broker commands.
+
+```sh
+cd packages/aethyme-eval
+.venv/bin/python benchmarks/broker/paired_live.py \
+  --binary "$(command -v aethyme)" --model gpt-6-sol --seed 19 \
+  --scratch /private/tmp --output /private/tmp/aethyme-live-paired
+```
+
+Use a scratch volume with sufficient headroom. The run records the binary
+fingerprint, model, group order, per-task completion, per-turn token use,
+broker command metrics, and summaries for solo and concurrent work. Median and
+nearest-rank p90 use tasks that completed in both arms. Concurrent-task elapsed
+time includes any wait for the preceding candidate to integrate. Keep raw
+transcripts local and publish only aggregate findings.
