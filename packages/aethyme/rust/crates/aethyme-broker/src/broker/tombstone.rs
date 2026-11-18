@@ -5,8 +5,8 @@
 //! simply vanish: a directory stays there holding only
 //! [`TOMBSTONE_FILE`], a short plain-text note saying when the session was
 //! retired, that its work is saved (and where), and the one command that
-//! brings the checkout back at the same path (`broker adopt <path>
-//! --reuse`, which restores it from its archive or recreates it from its
+//! brings the checkout back at the same path (`broker start --reuse
+//! <path>`, which restores it from its archive or recreates it from its
 //! branch). An agent coming back hours later finds an explanation and a way
 //! back instead of a missing directory.
 //!
@@ -65,7 +65,7 @@ pub(crate) fn tombstone_archive(path: &Path) -> Option<PathBuf> {
 /// The command that brings a retired checkout back at `path`.
 pub(crate) fn restore_command(path: &Path) -> String {
     format!(
-        "aethyme broker adopt '{}' --reuse",
+        "aethyme broker start --reuse '{}'",
         path.display().to_string().replace('\'', "'\\''")
     )
 }
@@ -81,7 +81,7 @@ pub(crate) fn write_checkout_tombstone(
 ) -> std::io::Result<()> {
     std::fs::create_dir(worktree)?;
     let saved = match archive {
-        Some(archive) => format!(
+        Some(_) => format!(
             "All of its work is saved: its commits on branch {}, and its staged and unstaged \
              changes, untracked files and protected ignored files in the verified recovery \
              archive below.",
@@ -155,7 +155,7 @@ mod tests {
         assert!(!path.exists());
         assert_eq!(
             restore_command(Path::new("/pool/it's")),
-            "aethyme broker adopt '/pool/it'\\''s' --reuse"
+            "aethyme broker start --reuse '/pool/it'\\''s'"
         );
     }
 }

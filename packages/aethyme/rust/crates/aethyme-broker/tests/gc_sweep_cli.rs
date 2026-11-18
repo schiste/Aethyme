@@ -2774,8 +2774,9 @@ fn session_status(repo: &Path, id: i64) -> String {
 /// agent has been quiet for longer than the legacy idle window.
 #[test]
 fn an_idle_open_sessions_build_output_is_preserved_and_the_session_stays_open() {
-    let (repo, container) =
-        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
+    let (repo, container) = fixture(
+        "[retention]\nsession_abandoned_after_hours = 72\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n",
+    );
     let (id, worktree) = quiet_open_session(repo.path(), container.path(), 30);
     enable_sweep(repo.path());
 

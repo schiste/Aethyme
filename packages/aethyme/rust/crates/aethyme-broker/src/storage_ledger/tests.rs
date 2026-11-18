@@ -1070,10 +1070,10 @@ fn expiry_needs_two_notices_a_day_apart_and_a_week_and_skips_kept_and_undated() 
     let host_state = dir.path();
     empty_registry(host_state);
     // Created 40 days ago with files touched today: age is the manifest's.
-    let old = manifest_archive(host_state, "old-unlanded", Some(40), 0);
+    let old = manifest_archive(host_state, "old-unlanded", Some(100), 0);
     // Created 5 days ago with year-old files: not expiring.
     let young = manifest_archive(host_state, "young-unlanded", Some(5), 365);
-    let kept = manifest_archive(host_state, "kept-unlanded", Some(40), 0);
+    let kept = manifest_archive(host_state, "kept-unlanded", Some(100), 0);
     let undated = manifest_archive(host_state, "undated-unlanded", None, 365);
     super::cli::keep_archive(host_state, "example-0123/kept-unlanded", true).unwrap();
     let roots = || vec![root(host_state, RootKind::HostState)];
@@ -1146,7 +1146,7 @@ fn eligible_after_two_notices(host_state: &Path, count: usize) {
         manifest_archive(
             host_state,
             &format!("archive-{index:03}"),
-            Some(40 + index as u64),
+            Some(100 + index as u64),
             0,
         );
     }

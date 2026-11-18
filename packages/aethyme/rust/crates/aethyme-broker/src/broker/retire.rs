@@ -1591,12 +1591,14 @@ impl Broker {
         if std::fs::symlink_metadata(worktree).is_ok() {
             return;
         }
+        // Only a checkout retired through an archive: one whose work was
+        // all in Git is recreated from its branch and leaves nothing behind.
         let archive = match outcome {
             RetireOutcome::RetiredArchived { .. }
             | RetireOutcome::RetiredOperationArchived { .. } => {
                 self.newest_recovery_archive(session_id)
             }
-            _ => None,
+            _ => return,
         };
         // Recorded with the session, so any lane can tell this session has
         // something to restore without reading directory names.
@@ -2378,13 +2380,17 @@ impl Broker {
                     // The usual cleaned session: nothing left on disk.
                     continue;
                 }
-                // A retired checkout's tombstone is neither a checkout nor
+                // A retired checkout's tombstone is no checkout: for a
+                // session still recorded as closed (its cleaned record was
+                // lost) it reads as gone, so the reconciliation below runs.
+                let tombstone = exists
+                    && super::tombstone::is_checkout_tombstone(Path::new(&session.worktree_path));
+                let exists = exists && (cleaned || !tombstone);
+                // For a cleaned session it is neither a checkout nor
                 // garbage: skipped, and removed once it has expired (its
                 // archive is gone, or it never had one and is older than
                 // `recovery_archive_days`).
-                if exists
-                    && super::tombstone::is_checkout_tombstone(Path::new(&session.worktree_path))
-                {
+                if tombstone && cleaned {
                     crate::phase_telemetry::add(
                         "checkout_retirement_tombstone_skipped",
                         std::time::Duration::ZERO,
@@ -3401,7 +3407,7 @@ mod tests {
         let report = run(&mut broker);
 
         assert_eq!(report.retired_operation_archived, 1, "{report:#?}");
-        assert!(retired_away(&worktree));
+        assert!(retired_away(worktree));
         assert!(is_cleaned(&broker, session.id));
         let archive = operation_archive(&broker, session.id).expect("an operation archive");
         assert!(archive.join("git-state/MERGE_HEAD").is_file());
@@ -5091,6 +5097,16 @@ mod tests {
             .unwrap();
         assert!(note.contains("--reuse"), "{note}");
         assert!(note.contains("archive: "), "{note}");
+        // Asked afresh (the earlier pass remembered the session as handled),
+        // the strip pass keeps the tombstone as such.
+        broker
+            .update_meta_json(
+                super::super::strip::CHECKOUT_STRIP_DONE_KEY,
+                |stored: &mut std::collections::BTreeMap<i64, i64>| {
+                    stored.remove(&session.id);
+                },
+            )
+            .unwrap();
         let strip = strip_pass(&broker);
         assert_eq!(strip.refused.get("tombstone"), Some(&1), "{strip:#?}");
         let again = run(&mut broker);

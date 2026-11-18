@@ -549,7 +549,7 @@ checkout and keeps the archive.
 A checkout retired through an archive leaves a tombstone at its path: a
 directory holding only `ARCHIVED-SESSION.txt`, which says when the session
 was retired, that its work is saved, and the one command that restores it
-there, `aethyme broker adopt '<path>' --reuse`. Restoring is idempotent; the
+there, `aethyme broker start --reuse '<path>'`. Restoring is idempotent; the
 restored checkout's preparation reads stale until it is prepared again. A
 session whose agent is still running and still bound to it (holder live,
 not moved on) is never closed, archived or removed by these lanes, and a
