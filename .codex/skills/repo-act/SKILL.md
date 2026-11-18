@@ -73,6 +73,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   sufficient headroom and smoke-test session creation there. Keep all arms on
   the same volume. On macOS, a short temporary symlink to that directory can
   keep a compiler cache's Unix socket within the platform path limit.
+  If the shared cache daemon still uses a retired session's temp path,
+  set `RUSTC_WRAPPER=` for the isolated build and leave the daemon running.
   Pass the resolved directory to Codex sandboxed trials because the workspace
   sandbox rejects symlinked writable roots.
 
@@ -85,7 +87,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   readings rather than treating a harness correction as a retroactive fix.
   Before long runs, exercise success, nonzero exit, and timeout controls through
   the exact runner; signal only the owned process group before reaping it.
-  Verify semantic output equality before comparing speed.
+  Verify semantic output equality before comparing speed. For a fast path
+  conditioned on retained state, create that state through the real command
+  and require a telemetry hit in the smoke test. Measure a fresh-state
+  control too.
 
 - Before timing broker session startup hooks, put the pinned build first on
   the fixture's PATH and inspect the actual `SessionStart` payload. For
@@ -93,6 +98,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   keep release checks out of the measurement. For linked worktrees, verify
   the agent can stage in its own fixture Git index in both the initial and
   conflict-repair turns.
+
+- For concurrent-agent comparisons, register both worktrees and their task
+  scopes before launching either worker. Use the same ordered integration and
+  repair rules in every arm, then verify both features on the final tree. A
+  scripted peer applied after publication measures conflict repair only.
+  Keep the setup coordinator from becoming the worker's session holder, and
+  verify each real worker can publish from its own sandbox before timing.
 
 - When changing a retention default, inspect fixtures that inherit the default
   as well as tests with explicit overrides. Update their age assumptions and
