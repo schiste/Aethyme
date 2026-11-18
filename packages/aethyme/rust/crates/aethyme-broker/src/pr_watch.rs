@@ -778,6 +778,17 @@ impl Broker {
         let result = self
             .store()
             .record_pull_request_watch_poll(id, &snapshot, &digest, status, now_ms)?;
+        // The watched pull request merged or closed: sessions stacked on its
+        // session are retargeted or told. Best-effort, after the poll is
+        // recorded; nothing is read when no session is stacked on it.
+        if status == PullRequestWatchStatus::Completed {
+            for failure in self.reconcile_stack_children(
+                current.session_id,
+                &crate::session_stack::GhCliPullRequestReader,
+            ) {
+                eprintln!("warning: aethyme could not update a stacked session: {failure}");
+            }
+        }
         Ok(PullRequestWatchPollReport {
             changed: digest != current.cursor_digest,
             activity_count: snapshot.activities.len(),

@@ -1570,18 +1570,40 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
     let task = parsed
         .task
         .ok_or(UsageError::Message("start requires --task".into()))?;
+    if parsed.stack_on.is_some() && parsed.base.is_some() {
+        return Err(UsageError::Message(
+            "--stack-on and --base cannot be combined: a stacked session starts at its parent's tip"
+                .into(),
+        ));
+    }
     let open_started = std::time::Instant::now();
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     warn_stale_broker_binary(&broker);
     let agent_identity = session_agent_identity(parsed.agent.as_deref());
     let open_ms = u64::try_from(open_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // `--stack-on` resolves the parent before any worktree exists; its tip is
+    // the explicit base. Without it, a start run from inside another live
+    // session's worktree is pointed at the flag rather than guessed at.
+    let stack_plan = match parsed.stack_on {
+        Some(parent) => Some(broker.stack_start_plan(parent)?),
+        None => None,
+    };
+    let stack_hint = if stack_plan.is_none() && parsed.base.is_none() {
+        stack_on_hint(&broker)
+    } else {
+        None
+    };
+    let explicit_base = stack_plan
+        .as_ref()
+        .map(|plan| plan.parent_tip.clone())
+        .or_else(|| parsed.base.clone());
     let allocation_started = std::time::Instant::now();
     let allocation = broker.start_worktree_with_planned_paths_and_context_timed(
         &task,
         &parsed.planned_paths,
         agent_identity.as_deref(),
         context,
-        parsed.base.as_deref(),
+        explicit_base.as_deref(),
     );
     let allocation_ms = u64::try_from(allocation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let crate::broker::TimedStartReport {
@@ -1600,6 +1622,13 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
     };
     phase_timings_ms.insert("broker_open".into(), open_ms);
     phase_timings_ms.insert("session_allocation".into(), allocation_ms);
+    let stack = match &stack_plan {
+        Some(plan) => Some(broker.record_session_stack(report.session.id, plan)?),
+        None => None,
+    };
+    if let Some(hint) = &stack_hint {
+        eprintln!("{hint}");
+    }
     let response_started = std::time::Instant::now();
     // One line on stderr, so `--json` stays parseable: agents that read the
     // primary checkout while it trails the default branch read stale code.
@@ -1648,20 +1677,26 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
         )?;
         let duplicates = broker.duplicate_work_for(session);
         record_start_response_timings(&mut phase_timings_ms, command_started, response_started);
-        out!(
-            "{}",
-            session_action_json(
-                &report,
-                &tab_rename,
-                Some(&guidance),
-                &duplicates,
-                scope_overlaps.as_deref(),
-                scope_overlaps_warning.as_deref(),
-                planned_path_pr_overlaps.as_ref(),
-                Some(&phase_timings_ms),
-                Some(&scratch),
-            )?
-        );
+        let rendered = session_action_json(
+            &report,
+            &tab_rename,
+            Some(&guidance),
+            &duplicates,
+            scope_overlaps.as_deref(),
+            scope_overlaps_warning.as_deref(),
+            planned_path_pr_overlaps.as_ref(),
+            Some(&phase_timings_ms),
+            Some(&scratch),
+        )?;
+        match (&stack, &stack_plan) {
+            (Some(stack), Some(plan)) => {
+                let mut value: serde_json::Value = serde_json::from_str(&rendered)?;
+                value["stack"] = serde_json::to_value(stack)?;
+                value["stack"]["parent_pushed"] = serde_json::json!(plan.parent_pushed);
+                out!("{}", serde_json::to_string_pretty(&value)?);
+            }
+            _ => out!("{rendered}"),
+        }
     } else {
         record_start_response_timings(&mut phase_timings_ms, command_started, response_started);
         let render_started = std::time::Instant::now();
@@ -1680,6 +1715,20 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
             false,
         )?;
         render_start_base(&report.start_base);
+        if let (Some(stack), Some(plan)) = (&stack, &stack_plan) {
+            out!(
+                "Stacked on session {} ({} at {}); its draft PR will target {}.{}",
+                stack.parent_session_id,
+                stack.parent_branch,
+                short_commit(&stack.parent_tip),
+                stack.base_branch,
+                if plan.parent_pushed {
+                    ""
+                } else {
+                    " The parent branch is not pushed at this tip yet: push the parent before `push --pr` here."
+                }
+            );
+        }
         render_worktree_placement(&report.worktree_placement);
         render_guidance(&guidance);
         render_scratch(&scratch);
@@ -1706,6 +1755,25 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
         );
     }
     Ok(())
+}
+
+/// The hint for a `start` run from inside another live session's worktree.
+fn stack_on_hint(broker: &Broker) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let checkout = crate::GitRepo::discover(&cwd).ok()?;
+    let root = checkout.root().to_string_lossy().into_owned();
+    if std::path::Path::new(&root) == broker.main_root() {
+        return None;
+    }
+    let session = broker.store_ref().session_for_worktree(&root).ok()??;
+    (!session.status.is_closed()).then(|| {
+        format!(
+            "note: started from inside session {id}'s worktree; the new session starts from the \
+             default branch. To build on session {id}'s unmerged work instead, start with \
+             `--stack-on {id}`.",
+            id = session.id
+        )
+    })
 }
 
 /// `broker start-agent`.

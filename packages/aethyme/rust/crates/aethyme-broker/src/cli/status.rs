@@ -245,6 +245,9 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             broker.main_root(),
             now_ms(),
         );
+        // Parent, children, recorded PR states and one next action, when the
+        // session is part of a stack.
+        let stack = broker.session_stack_view(session_id);
         if parsed.json {
             let mut snapshot = serde_json::json!({
                 "schema": "aethyme.broker-session-view/v2",
@@ -269,6 +272,10 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             )?;
             value["form"] = serde_json::json!(form.as_str());
             value["hint"] = serde_json::json!(super::status_extras::COMPACT_HINT);
+            // Outside the revisioned sections: always the current stack.
+            if let Some(stack) = &stack {
+                value["stack"] = stack.clone();
+            }
             out!("{}", serde_json::to_string_pretty(&value)?);
         } else {
             out!(
@@ -302,6 +309,13 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             }
             for advice in &main_checkout_advice {
                 out!("Main checkout: {}", advice.summary);
+            }
+            if let Some(action) = stack
+                .as_ref()
+                .and_then(|stack| stack.get("next_action"))
+                .and_then(serde_json::Value::as_str)
+            {
+                out!("Stack: {action}");
             }
             out!("Details: aethyme broker status --full --json");
         }
@@ -344,9 +358,29 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             )?;
             value["form"] = serde_json::json!(StatusForm::Compact.as_str());
             value["hint"] = serde_json::json!(super::status_extras::COMPACT_HINT);
+            if let Some(stacks) = broker.repository_stack_view() {
+                value["session_stacks"] = stacks;
+            }
+            if let Some(advice) = broker.remote_branch_cleanup_advice() {
+                value["remote_branch_cleanup"] = advice;
+            }
             out!("{}", serde_json::to_string_pretty(&value)?);
         } else {
             out!("{}", compact.render_text().trim_end());
+            if let Some(stacks) = broker.repository_stack_view() {
+                out!(
+                    "Stacks: {} stacked session(s), {} needing attention.",
+                    stacks["count"],
+                    stacks["needs_attention"]
+                );
+            }
+            if let Some(advice) = broker.remote_branch_cleanup_advice() {
+                out!(
+                    "Remote branches: {} merged-session branch(es) await cleanup; {}",
+                    advice["backlog"],
+                    advice["next_action"].as_str().unwrap_or_default()
+                );
+            }
         }
         record_status_metric(&parsed, form, &phase_timings_ms, 0);
         return Ok(());

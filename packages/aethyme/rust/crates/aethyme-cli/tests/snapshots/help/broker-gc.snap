@@ -45,7 +45,16 @@ exit: 0
       cadence. It removes only git-ignored build caches of closed sessions;
       broker open spends at most 250 ms on the same sweep. Open-session caches
       require the reviewed gc reclaim path. Run again to continue a pass that
-      paused at its budget.
+      paused at its budget. With `[remote_branches] delete_merged = true` it
+      also deletes a bounded batch of merged, cleaned session branches from
+      the remote, and re-reads the parent PR of every open stacked session.
+  aethyme broker gc remote-branches plan [--limit <n>] [--json]
+      Preview, writing nothing, which remote session branches the cleanup
+      would delete and which it keeps, by reason. A branch is deleted only
+      when its PR merged at exactly the remote tip, every session on it is
+      cleaned, no open PR uses it as head and none is stacked on it; open
+      PRs based on it are retargeted first, and the delete is leased on the
+      merged head. --limit bounds the candidates read (default 25, max 200).
   aethyme broker gc service plan [--json]
       Read-only macOS per-repository service plan for fixed `gc sweep --json`
       ticks every 900 seconds. Binds the immutable managed router/engine pair.
