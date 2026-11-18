@@ -5156,35 +5156,51 @@ impl Broker {
         broker.collaboration_fence_state(FenceTrigger::Open);
         drop(setup);
         let _recovery = crate::phase_telemetry::span("broker_open_recovery");
-        broker.backfill_live_repository_contracts()?;
+        {
+            let _span = crate::phase_telemetry::span("open_contract_backfill");
+            broker.backfill_live_repository_contracts()?;
+        }
         // Record outcomes a busy database could not take when their child
-        // exited, before anything reads rows that may still say `running`.
-        // Best effort: a journal left behind is retried by the next opener
-        // and by every coordinated write before its write-block check.
-        crate::warn_unrecorded(
-            "replay pending coordinated operation outcomes",
-            broker.replay_operation_outcome_journals("broker_open"),
-        );
-        broker.reap_abandoned_prepared_operations()?;
-        // Best effort: an unresolved repeatable fetch keeps blocking only
-        // until the next write reaches its lock, which retries the same step.
-        crate::warn_unrecorded(
-            "auto-resolve interrupted repeatable fetches",
-            broker.auto_resolve_abandoned_repeatable_fetches(),
-        );
-        broker.recover_prepared_reconciliation()?;
+        // exited, before anything reads rows that may still say running.
+        {
+            let _span = crate::phase_telemetry::span("open_operation_outcome_replay");
+            crate::warn_unrecorded(
+                "replay pending coordinated operation outcomes",
+                broker.replay_operation_outcome_journals("broker_open"),
+            );
+        }
+        {
+            let _span = crate::phase_telemetry::span("open_prepared_operation_reap");
+            broker.reap_abandoned_prepared_operations()?;
+        }
+        // A repeatable fetch whose outcome is still unresolved can be retried
+        // at the next write-lock boundary.
+        {
+            let _span = crate::phase_telemetry::span("open_repeatable_fetch_recovery");
+            crate::warn_unrecorded(
+                "auto-resolve interrupted repeatable fetches",
+                broker.auto_resolve_abandoned_repeatable_fetches(),
+            );
+        }
+        {
+            let _span = crate::phase_telemetry::span("open_integration_reconciliation");
+            broker.recover_prepared_reconciliation()?;
+        }
         // Best effort: only an already-confirmed journal may be resumed here.
         // If current eligibility or an older journal's missing fingerprint
         // prevents continuation, leave the journal for explicit review and
         // report the refusal instead of hiding it.
-        match startup_gc_maintenance {
-            StartupGcMaintenance::Full => {
-                crate::warn_unrecorded("resume GC maintenance", broker.resume_gc_maintenance());
+        {
+            let _span = crate::phase_telemetry::span("open_gc_maintenance");
+            match startup_gc_maintenance {
+                StartupGcMaintenance::Full => {
+                    crate::warn_unrecorded("resume GC maintenance", broker.resume_gc_maintenance());
+                }
+                StartupGcMaintenance::ConfirmedJournalOnly => crate::warn_unrecorded(
+                    "resume confirmed GC journal",
+                    broker.resume_confirmed_gc_journal_only(),
+                ),
             }
-            StartupGcMaintenance::ConfirmedJournalOnly => crate::warn_unrecorded(
-                "resume confirmed GC journal",
-                broker.resume_confirmed_gc_journal_only(),
-            ),
         }
         Ok(broker)
     }

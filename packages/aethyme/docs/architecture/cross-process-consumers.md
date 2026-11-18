@@ -2523,6 +2523,16 @@ submission and must not be added to them. Durations use a monotonic clock and
 repeated phases accumulate. Early failures may have only a partial breakdown;
 phase keys are allowlisted and never contain session input.
 
+Writable broker openings split the enclosing `broker_open_recovery` span into
+`open_contract_backfill`, `open_operation_outcome_replay`, `open_prepared_operation_reap`,
+`open_repeatable_fetch_recovery`, `open_integration_reconciliation`, and `open_gc_maintenance`.
+Within GC maintenance, `open_gc_rotation_debt` probes cache rotation witnesses,
+`open_gc_retention_policy` reads the retention rules, `open_gc_confirmed_journal`
+checks or resumes a confirmed journal, `open_gc_inline_sweep` measures the
+foreground sweep, and `open_gc_worker_admission` measures admission for
+the detached worker. Confirmed-journal-only opens omit the sweep, worker,
+and rotation probes. Subphases are nested in their enclosing durations.
+
 Guarded-exec reports include `phase_timings_ms`: `precheck` measures session
 lookup, the initial worktree snapshot, receipt and admission;
 `command_and_supervision` measures dispatch, the child and its supervisor;

@@ -7267,25 +7267,18 @@ impl Broker {
         // until another preparation writer runs. This bounded, read-only
         // probe uses the Broker-captured cache root and only requests the
         // existing cache-only continuation; it is never deletion authority.
-        crate::warn_unrecorded(
-            "record preparation-cache rotation recovery request",
-            self.request_recovery_for_rotation_debt(),
-        );
-        let policy = load_retention_policy(self.main_root())?;
-        let journal_path = self.main_root().join(".aethyme/gc-journal.json");
-        let resumed = match load_journal(&journal_path)? {
-            Some(journal) => {
-                let budget_ms = policy.startup_budget_ms;
-                self.apply_confirmed_gc_journal(journal, budget_ms)?
-            }
-            None => {
-                crate::warn_unrecorded(
-                    "clear the remembered GC journal resume failure",
-                    self.forget_gc_resume_failure(),
-                );
-                None
-            }
+        {
+            let _span = crate::phase_telemetry::span("open_gc_rotation_debt");
+            crate::warn_unrecorded(
+                "record preparation-cache rotation recovery request",
+                self.request_recovery_for_rotation_debt(),
+            );
+        }
+        let policy = {
+            let _span = crate::phase_telemetry::span("open_gc_retention_policy");
+            load_retention_policy(self.main_root())?
         };
+        let resumed = self.resume_startup_gc_journal(Some(policy.startup_budget_ms))?;
         // A pending journal that backoff skipped leaves its remaining
         // candidates on disk while the sweep below runs. That is the state a
         // budget-limited resume already leaves: the sweep takes the GC lock
@@ -7294,17 +7287,23 @@ impl Broker {
         // already gone as done.
         // The sweep only reclaims rebuildable caches, and this runs inside
         // broker open: its failure must not stop every command.
-        crate::warn_unrecorded(
-            "run bounded inline artifact sweep",
-            self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Inline),
-        );
+        {
+            let _span = crate::phase_telemetry::span("open_gc_inline_sweep");
+            crate::warn_unrecorded(
+                "run bounded inline artifact sweep",
+                self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Inline),
+            );
+        }
         // Inline admission stays capped at 250 ms. The detached worker
         // continues cache recovery from its own request and whole-checkout
         // cleanup only from its separate deferral request.
-        crate::warn_unrecorded(
-            "start artifact sweep continuation worker",
-            self.maybe_start_artifact_sweep_worker(false),
-        );
+        {
+            let _span = crate::phase_telemetry::span("open_gc_worker_admission");
+            crate::warn_unrecorded(
+                "start artifact sweep continuation worker",
+                self.maybe_start_artifact_sweep_worker(false),
+            );
+        }
         Ok(resumed)
     }
 
@@ -7320,6 +7319,14 @@ impl Broker {
             // must not resume operator-authorized whole-repository journals.
             return Ok(None);
         }
+        self.resume_startup_gc_journal(None)
+    }
+
+    fn resume_startup_gc_journal(
+        &mut self,
+        startup_budget_ms: Option<u64>,
+    ) -> Result<Option<GcApplyReport>, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("open_gc_confirmed_journal");
         let journal_path = self.main_root().join(".aethyme/gc-journal.json");
         let Some(journal) = load_journal(&journal_path)? else {
             crate::warn_unrecorded(
@@ -7328,8 +7335,14 @@ impl Broker {
             );
             return Ok(None);
         };
-        let policy = load_retention_policy(self.main_root())?;
-        self.apply_confirmed_gc_journal(journal, policy.startup_budget_ms)
+        let budget_ms = match startup_budget_ms {
+            Some(budget_ms) => budget_ms,
+            None => {
+                let _span = crate::phase_telemetry::span("open_gc_retention_policy");
+                load_retention_policy(self.main_root())?.startup_budget_ms
+            }
+        };
+        self.apply_confirmed_gc_journal(journal, budget_ms)
     }
 
     /// Clear a remembered resume failure once it can no longer apply: the
