@@ -127,6 +127,12 @@ fn advance(mut broker: Broker, open_pr: bool, report: &mut Advance) -> Result<()
         );
         return Ok(());
     }
+    if let Some(blocker) = broker.session_action_required_blocker(id)?
+        && blocker.scope == crate::BlockerScope::Session
+    {
+        report.stop(exit::REFUSED, blocker.cause, blocker.clear);
+        return Ok(());
+    }
     if broker.session_action_required_blocker(id)?.is_some() {
         report.stop(
             exit::REFUSED,

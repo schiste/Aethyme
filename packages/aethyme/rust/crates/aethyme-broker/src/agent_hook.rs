@@ -498,6 +498,11 @@ pub(crate) fn session_coordination(
         .blockers
         .into_iter()
         .partition(|blocker| session_id.is_some() && blocker.session_id == session_id);
+    // Another session's own blocker is not this agent's to act on.
+    let other: Vec<_> = other
+        .into_iter()
+        .filter(|blocker| blocker.scope != crate::BlockerScope::Session)
+        .collect();
     if let Some(session_id) = session_id
         && let Ok(Some(notice)) = broker.session_action_required_blocker(session_id)
     {

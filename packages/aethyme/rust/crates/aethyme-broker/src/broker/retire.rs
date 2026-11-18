@@ -91,6 +91,7 @@ const RETIRE_PIN_PRUNE_BUDGET: std::time::Duration = std::time::Duration::from_s
 const RETIRE_STRIP_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(20);
 const RETIRE_LAP_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(20);
 const RETIRE_CLEANED_LAP_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(10);
+const RETIRE_IDLE_STRIP_MIN_SHARE: std::time::Duration = std::time::Duration::from_secs(15);
 /// Next run when nothing is left to do.
 const RETIRE_IDLE_RECHECK_MS: i64 = 10 * 60 * 1_000;
 /// Next run while a lap or the trash is unfinished.
@@ -477,6 +478,8 @@ pub(crate) struct RetireRun {
     /// one however old (the deleter re-checks before deleting anything).
     /// An observation that could not be taken completely is the error.
     process_use: Option<Result<std::rc::Rc<crate::reclaim::OpenFileSnapshot>, String>>,
+    /// When [`Self::process_use`] was observed.
+    process_use_taken_at: Option<Instant>,
     plan_context: Option<crate::cleanup_resolve::CleanupResolveRetirementContext>,
     deadline: Instant,
     /// The lane's own deadline, which an archive may use past the sweep's.
@@ -498,6 +501,19 @@ impl RetireRun {
     /// The run's sweep deadline.
     pub(super) fn deadline(&self) -> Instant {
         self.deadline
+    }
+
+    /// How old the run's open-file observation is (`None`: not taken yet).
+    pub(super) fn process_use_age(&self) -> Option<std::time::Duration> {
+        self.process_use_taken_at.map(|taken| taken.elapsed())
+    }
+
+    /// Make the run's open-file observation look `by` older.
+    #[cfg(test)]
+    pub(super) fn age_process_use_for_test(&mut self, by: std::time::Duration) {
+        self.process_use_taken_at = self
+            .process_use_taken_at
+            .and_then(|taken| taken.checked_sub(by));
     }
 
     /// The keep code when `worktree` overlaps the checkout of an open
@@ -536,6 +552,7 @@ impl RetireRun {
             let started = Instant::now();
             let observed = crate::session_holder::retirement_run_process_use_snapshot(budget);
             crate::phase_telemetry::add("checkout_retirement_process_snapshot", started.elapsed());
+            self.process_use_taken_at = Some(Instant::now());
             self.process_use = Some(match observed {
                 crate::reclaim::OpenFileSnapshot::Incomplete { reason, .. } => {
                     crate::phase_telemetry::add(
@@ -582,6 +599,8 @@ pub(crate) struct CheckoutRetirementReport {
     pub open_path_resolutions: usize,
     /// The strip pass that ran before the judgement lap.
     pub strip: super::strip::CheckoutStripReport,
+    /// The idle strip of open sessions that ran after it.
+    pub idle_strip: super::strip_idle::IdleStripReport,
     /// Session scratch directories retired (moved into the trash) or kept.
     pub scratch: super::scratch::ScratchRetireReport,
 }
@@ -1430,6 +1449,7 @@ impl Broker {
         Ok(Some(RetireRun {
             open_paths: open.iter().map(|session| session.id).zip(paths).collect(),
             process_use: None,
+            process_use_taken_at: None,
             plan_context: None,
             deadline,
             archive_deadline: deadline,
@@ -1985,6 +2005,15 @@ impl Broker {
                 strip_deadline,
                 super::strip::STRIP_CHECKOUTS_PER_RUN,
             );
+            // Then the idle open sessions' regenerable directories, with
+            // their own share.
+            let idle_deadline = share(1, 4, RETIRE_IDLE_STRIP_MIN_SHARE);
+            run.deadline = idle_deadline;
+            report.idle_strip = self.strip_idle_open_checkouts(
+                &mut run,
+                idle_deadline,
+                super::strip_idle::IDLE_STRIP_CHECKOUTS_PER_RUN,
+            );
             // Session scratch directories of closed (or replaced) sessions:
             // O(1) renames into the trash with a small fixed budget, before
             // the laps, so build output left there never waits behind them.
@@ -2064,6 +2093,7 @@ impl Broker {
         let shrinking =
             report.retired_clean + report.retired_archived + report.retired_operation_archived > 0
                 || report.strip.directories_stripped > 0
+                || report.idle_strip.strip.directories_stripped > 0
                 || report.scratch.retired > 0
                 || report.trash.entries_removed > 0
                 || (report.trash.entries_pending == 0 && kept == 0);
@@ -2123,6 +2153,7 @@ impl Broker {
             || !report.cleaned_lap_complete
             || report.trash.entries_pending > 0
             || report.strip.more_remaining
+            || report.idle_strip.strip.more_remaining
             || report.scratch.more_remaining;
         let next = crate::clock::epoch_ms().saturating_add(if busy {
             RETIRE_BUSY_RECHECK_MS
@@ -4821,5 +4852,308 @@ mod tests {
 
         assert!(!old.exists());
         assert!(fresh.exists());
+    }
+
+    /// An open session idle past `idle_strip_after_hours` with no process in
+    /// its checkout has its regenerable directories stripped once, its
+    /// preparation marked stale and one note left; it is not stripped again
+    /// until new activity, a process inside keeps it, and `0` turns it off.
+    #[test]
+    fn an_idle_open_session_is_stripped_once_per_stretch_of_inactivity() {
+        let (_owner, _storage, mut broker) = fixture();
+        exclude_node_modules(&broker);
+        std::fs::write(
+            broker.main_root().join(".git/info/exclude"),
+            "node_modules/\ntarget/\n",
+        )
+        .unwrap();
+        let open = broker.start_worktree("idle open session", None).unwrap();
+        let worktree = PathBuf::from(&open.worktree_path);
+        // A repository that declares its preparation (one command rebuilds).
+        std::fs::create_dir_all(worktree.join(".aethyme")).unwrap();
+        std::fs::write(
+            worktree.join(".aethyme/prepare.toml"),
+            "schema_version = 1\n\n[[steps]]\nname = \"deps\"\ncommand = [\"sh\", \"-c\", \"true\"]\n\
+             inputs = [\"lock.file\"]\noutputs = [\"node_modules/\"]\ncache = \"repository_shared\"\n\
+             required_for_hooks = false\n",
+        )
+        .unwrap();
+        let populate = |worktree: &Path| {
+            std::fs::create_dir_all(worktree.join("node_modules/dep")).unwrap();
+            std::fs::write(worktree.join("node_modules/dep/index.js"), "x\n").unwrap();
+            std::fs::write(
+                worktree.join("node_modules/.modules.yaml"),
+                "layoutVersion: 5\n",
+            )
+            .unwrap();
+        };
+        populate(&worktree);
+        let idle_since = |broker: &mut crate::Broker, hours: i64, offset_ms: i64| {
+            broker
+                .store()
+                .connection()
+                .execute(
+                    "UPDATE sessions SET last_activity_at = ?1 WHERE id = ?2",
+                    rusqlite::params![
+                        crate::clock::epoch_ms() - hours * 3_600_000 - offset_ms,
+                        open.id
+                    ],
+                )
+                .unwrap();
+        };
+        // Nobody touched the checkout's files for hours (the moves and the
+        // notice themselves update the checkout directory's time).
+        let age_files = |worktree: &Path| {
+            let old = std::time::SystemTime::now() - Duration::from_secs(10 * 3_600);
+            let admin = PathBuf::from(git(worktree, &["rev-parse", "--absolute-git-dir"]).trim());
+            let mut paths = vec![
+                admin.join("index"),
+                admin.join("HEAD"),
+                worktree.to_path_buf(),
+            ];
+            for name in git(worktree, &["ls-tree", "-d", "--name-only", "HEAD"]).lines() {
+                paths.push(worktree.join(name));
+            }
+            for path in paths.iter().filter(|path| path.exists()) {
+                std::fs::File::open(path)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+        };
+        let pass_with = |broker: &mut crate::Broker, age: bool, stale_snapshot: bool| {
+            if age {
+                age_files(&worktree);
+            }
+            let far = Instant::now() + Duration::from_secs(600);
+            let mut run = broker
+                .begin_checkout_retirement_run(far)
+                .unwrap()
+                .expect("open paths resolve");
+            if stale_snapshot {
+                run.process_use().unwrap();
+                run.age_process_use_for_test(Duration::from_secs(600));
+            }
+            broker.strip_idle_open_checkouts(&mut run, far, 100)
+        };
+        let pass = |broker: &mut crate::Broker| pass_with(broker, true, false);
+
+        // Not idle long enough.
+        idle_since(&mut broker, 1, 0);
+        assert_eq!(pass(&mut broker).strip.checkouts_stripped, 0);
+        assert!(worktree.join("node_modules").exists());
+
+        // A process inside keeps it.
+        idle_since(&mut broker, 5, 0);
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+                pid: std::process::id(),
+                command: "node".into(),
+                descriptor: "cwd".into(),
+                file_type: Some("DIR".into()),
+                path: std::fs::canonicalize(&worktree).unwrap(),
+            }]),
+        ));
+        let kept = pass(&mut broker);
+        assert_eq!(
+            kept.strip.refused.get("process_using_checkout"),
+            Some(&1),
+            "{kept:#?}"
+        );
+        assert!(worktree.join("node_modules").exists());
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+        ));
+
+        // Idle by session activity, but the Git index was just written
+        // (an agent working by absolute paths): not idle.
+        let index = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim())
+            .join("index");
+        age_files(&worktree);
+        std::fs::File::open(&index)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now())
+            .unwrap();
+        let recent = pass_with(&mut broker, false, false);
+        assert_eq!(recent.kept_recent_files, 1, "{recent:#?}");
+        assert_eq!(
+            recent.strip.refused.get("recent_file_activity"),
+            Some(&1),
+            "{recent:#?}"
+        );
+        assert!(worktree.join("node_modules").exists());
+
+        // A preparation running (its shared lock on the checkout): skipped,
+        // not remembered as handled.
+        {
+            let crate::file_lock::artifact_use::ArtifactUseScopeAdmission::Admitted(_preparing) =
+                crate::file_lock::artifact_use::begin_artifact_use_scope(
+                    broker.main_root(),
+                    &worktree,
+                )
+                .unwrap()
+            else {
+                panic!("artifact-use scope admitted");
+            };
+            let busy = pass(&mut broker);
+            assert_eq!(
+                busy.strip.refused.get("checkout_busy"),
+                Some(&1),
+                "{busy:#?}"
+            );
+            assert!(worktree.join("node_modules").exists());
+        }
+
+        // The run's observation is minutes old: a fresh one is taken under
+        // the claim, and a process it sees keeps the checkout.
+        crate::session_holder::queue_process_use_snapshots_for_tests(
+            vec![
+                crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+                crate::reclaim::OpenFileSnapshot::Complete(vec![crate::reclaim::OpenFileUse {
+                    pid: std::process::id(),
+                    command: "node".into(),
+                    descriptor: "cwd".into(),
+                    file_type: Some("DIR".into()),
+                    path: std::fs::canonicalize(&worktree).unwrap(),
+                }]),
+            ],
+            false,
+        );
+        let fresh = pass_with(&mut broker, true, true);
+        assert_eq!(
+            fresh.strip.refused.get("process_using_checkout"),
+            Some(&1),
+            "{fresh:#?}"
+        );
+        assert!(worktree.join("node_modules").exists());
+
+        // A catalogued directory no step declares (`target`) is kept.
+        std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
+        std::fs::write(
+            worktree.join("target/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+
+        let stripped = pass(&mut broker);
+
+        assert_eq!(stripped.strip.checkouts_stripped, 1, "{stripped:#?}");
+        assert_eq!(stripped.noted, 1, "{stripped:#?}");
+        assert!(!worktree.join("node_modules").exists());
+        assert_eq!(stripped.kept_not_declared, 1, "{stripped:#?}");
+        assert!(
+            worktree.join("target/CACHEDIR.TAG").exists(),
+            "not a declared output: kept"
+        );
+        assert!(worktree.join("base.txt").exists(), "tracked content stays");
+        assert!(
+            broker
+                .main_root()
+                .join(format!(
+                    ".aethyme/run/preparation/session-{}.stripped",
+                    open.id
+                ))
+                .exists(),
+            "its preparation reads stale"
+        );
+        let notes = broker.store_ref().unread_automation_notes(open.id).unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.message.contains("submit prepare")),
+            "{notes:?}"
+        );
+        // The loud signal: the notice agents read first, outside Git's view,
+        // and the same next action from the broker.
+        let notice = worktree.join(crate::merge::ACTION_REQUIRED_RELPATH);
+        let text = std::fs::read_to_string(&notice).unwrap();
+        assert!(text.contains("node_modules"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "aethyme broker submit prepare --session {}",
+                open.id
+            )),
+            "{text}"
+        );
+        assert!(
+            git(&worktree, &["status", "--porcelain"]).trim().is_empty(),
+            "the notice never shows in git status"
+        );
+        let blocker = broker
+            .session_action_required_blocker(open.id)
+            .unwrap()
+            .expect("the notice is a blocker");
+        assert_eq!(
+            blocker.clear,
+            format!("aethyme broker submit prepare --session {}", open.id)
+        );
+        assert_eq!(blocker.scope, crate::BlockerScope::Session);
+        // Without the notice (it could not be written: another notice, a
+        // tracked or unignored path) the session still gets the blocker and
+        // the status advice, both naming the command.
+        let saved = std::fs::read(&notice).unwrap();
+        std::fs::remove_file(&notice).unwrap();
+        let blocker = broker
+            .session_action_required_blocker(open.id)
+            .unwrap()
+            .expect("stripped and not prepared is a blocker without the notice");
+        assert_eq!(blocker.scope, crate::BlockerScope::Session);
+        assert_eq!(
+            blocker.clear,
+            format!("aethyme broker submit prepare --session {}", open.id)
+        );
+        let advice = broker
+            .session_status_advice(open.id, crate::clock::epoch_ms())
+            .unwrap();
+        assert!(
+            advice.iter().any(|row| row.id == "idle_strip_prepare"
+                && row.commands
+                    == vec![format!(
+                        "aethyme broker submit prepare --session {}",
+                        open.id
+                    )]),
+            "{advice:?}"
+        );
+        std::fs::write(&notice, saved).unwrap();
+        // Prepared again (a newer preparation record): the notice clears.
+        let record = broker
+            .main_root()
+            .join(format!(".aethyme/run/preparation/session-{}.json", open.id));
+        std::fs::write(&record, "{}").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&record)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            broker
+                .session_action_required_blocker(open.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!notice.exists(), "the notice clears once prepared again");
+
+        // Re-prepared while still idle, with no new activity: not again.
+        populate(&worktree);
+        let again = pass(&mut broker);
+        assert_eq!(again.strip.checkouts_stripped, 0, "{again:#?}");
+        assert_eq!(again.skipped_handled, 1, "{again:#?}");
+        assert!(worktree.join("node_modules").exists());
+
+        // New activity, then idle again: armed again.
+        idle_since(&mut broker, 5, 1_000);
+        assert_eq!(pass(&mut broker).strip.checkouts_stripped, 1);
+
+        // `0` turns it off.
+        populate(&worktree);
+        idle_since(&mut broker, 5, 2_000);
+        std::fs::write(
+            broker.main_root().join(".aethyme/config.toml"),
+            "[cleanup]\nidle_strip_after_hours = 0\n",
+        )
+        .unwrap();
+        assert_eq!(pass(&mut broker).strip.checkouts_examined, 0);
+        assert!(worktree.join("node_modules").exists());
     }
 }
