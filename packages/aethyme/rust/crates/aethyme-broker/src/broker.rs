@@ -3740,6 +3740,7 @@ mod owners;
 mod remote_heads;
 mod retire;
 mod retire_operation;
+mod scratch;
 mod strip;
 mod strip_idle;
 pub(crate) use leases::{
@@ -3751,6 +3752,9 @@ pub(crate) use leases::{
     LANDED_PROOF_TIMEOUTS_KEY, doubled_proof_budget, landed_proof_session_budget_for_test,
 };
 pub use owners::{CommitOwner, MAX_OWNER_COMMITS, OwnedCommit, OwnersReport};
+pub(crate) use scratch::SessionScratch;
+#[cfg(test)]
+pub(crate) use scratch::scratch_instruction;
 pub(crate) mod lifecycle;
 mod scope_capture;
 mod status;

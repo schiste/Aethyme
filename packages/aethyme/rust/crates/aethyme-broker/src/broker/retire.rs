@@ -601,6 +601,8 @@ pub(crate) struct CheckoutRetirementReport {
     pub strip: super::strip::CheckoutStripReport,
     /// The idle strip of open sessions that ran after it.
     pub idle_strip: super::strip_idle::IdleStripReport,
+    /// Session scratch directories retired (moved into the trash) or kept.
+    pub scratch: super::scratch::ScratchRetireReport,
 }
 
 /// Progress kept across runs for `broker status`.
@@ -2012,6 +2014,18 @@ impl Broker {
                 idle_deadline,
                 super::strip_idle::IDLE_STRIP_CHECKOUTS_PER_RUN,
             );
+            // Session scratch directories of closed (or replaced) sessions:
+            // O(1) renames into the trash with a small fixed budget, before
+            // the laps, so build output left there never waits behind them.
+            // The run's open-file observation, when this pass is the first
+            // to need it, keeps its full budget: the later laps reuse it.
+            let scratch_deadline =
+                (Instant::now() + super::scratch::SCRATCH_RETIRE_BUDGET).min(deadline);
+            run.deadline = (Instant::now()
+                + RETIRE_PROCESS_USE_BUDGET
+                + super::scratch::SCRATCH_RETIRE_BUDGET)
+                .min(deadline);
+            report.scratch = self.retire_session_scratch(&mut run, scratch_deadline);
             // Closed sessions first, then the leftover folders of sessions
             // already recorded as cleaned, each lap with its own cursor and
             // its own share so neither starves the other.
@@ -2033,6 +2047,7 @@ impl Broker {
             );
         }
         report.trash = self.drain_checkout_trash(deadline);
+        self.record_session_scratch_usage(report.trash.scratch_bytes);
         // Reclaim-plan review snapshots pile up at the pool root unless a
         // plan runs to sweep them (1,215 on the busiest repository): the
         // worker sweeps the stale ones too, with the writer's bounds.
@@ -2079,6 +2094,7 @@ impl Broker {
             report.retired_clean + report.retired_archived + report.retired_operation_archived > 0
                 || report.strip.directories_stripped > 0
                 || report.idle_strip.strip.directories_stripped > 0
+                || report.scratch.retired > 0
                 || report.trash.entries_removed > 0
                 || (report.trash.entries_pending == 0 && kept == 0);
         let progress = CheckoutRetirementProgress {
@@ -2137,7 +2153,8 @@ impl Broker {
             || !report.cleaned_lap_complete
             || report.trash.entries_pending > 0
             || report.strip.more_remaining
-            || report.idle_strip.strip.more_remaining;
+            || report.idle_strip.strip.more_remaining
+            || report.scratch.more_remaining;
         let next = crate::clock::epoch_ms().saturating_add(if busy {
             RETIRE_BUSY_RECHECK_MS
         } else {
@@ -3660,6 +3677,7 @@ mod tests {
                     creator_pid: 0,
                     creator_started_ms: 0,
                     stripped: false,
+                    scratch: false,
                 },
             )
             .unwrap();

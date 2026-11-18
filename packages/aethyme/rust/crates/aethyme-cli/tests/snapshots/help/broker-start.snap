@@ -1,11 +1,15 @@
 exit: 0
 --- stdout
-  aethyme broker start --task <text> [--short-name <name>] [--base <ref>] [--pull-request <number>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]
+  aethyme broker start --task <text> [--short-name <name>] [--base <ref>|--stack-on <session-id>] [--pull-request <number>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]
       Create a broker-managed worktree + branch and register a session,
       atomically claiming every reviewed --path, but do not spawn a process.
       Prefer this over adopting the main
       checkout for agent work; it isolates the git index and worktree.
       --agent as in adopt (see above).
+      --stack-on builds on another open session's unmerged branch: the new
+      branch starts at that session's tip, its draft PR targets that branch,
+      `sync` follows it, and when the parent PR merges the broker retargets
+      this PR onto the default branch (or the nearest unmerged ancestor).
   aethyme broker start --task <text> --cmd <command> [--short-name <name>] [--pull-request <number>] [--agent <identity>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--json]
       Create a worktree + branch and spawn <command> in it (sh -c),
       logging to .aethyme/logs/.

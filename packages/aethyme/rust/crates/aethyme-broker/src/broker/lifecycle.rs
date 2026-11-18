@@ -7524,6 +7524,7 @@ impl Broker {
             "reclaim a closed session's build artifacts",
             self.reclaim_closed_session_artifacts(session_id),
         );
+        self.note_session_scratch_closed(session_id);
         Ok(())
     }
 

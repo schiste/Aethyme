@@ -402,12 +402,15 @@ resolve blockers and refusals.
    status and follow its `next_action` when dependencies are required:
    `aethyme broker submit prepare status --session <id> --json`. Preparation
    is explicit; do not assume a fresh worktree has installed dependencies.
+   Build output and temp files go in its `scratch_dir`.
 2. Commit early and small. Run `aethyme broker advance --session <id>` from a
    clean worktree and follow its next action. Add `--pr` after the first meaningful
    commit to open a draft. Use `aethyme broker push --session <id>` directly
    when publishing only the committed changes from a dirty worktree. Sync before
    resuming a reused session and validate the current merge candidate before merging.
-   Never leave work only in the worktree.
+   Never leave work only in the worktree. To build on another session's
+   unmerged work, start with `--stack-on <id>`: the broker targets your PR at
+   its branch and retargets it when that PR merges; never edit PR bases yourself.
 3. When done: `aethyme broker submit --session <id>` runs the gates and lands
    nothing. Merge the PR on GitHub, then `aethyme broker finish --session <id>`
    (it refuses while commits are unpushed).
@@ -439,6 +442,7 @@ resolve blockers and refusals.
    status and follow its `next_action` when dependencies are required:
    `aethyme broker submit prepare status --session <id> --json`. Preparation
    is explicit; do not assume a fresh worktree has installed dependencies.
+   Build output and temp files go in its `scratch_dir`.
 2. When done: `aethyme broker submit --session <id>` runs the gates and lands
    nothing. Then `aethyme broker finish --session <id>`.
 
@@ -978,6 +982,16 @@ blocked.
    branch into a published one, and changes nothing if that would conflict.
    Sync is local only: it never pushes, so run `aethyme broker push --session
    <id>` afterwards to publish the caught-up branch.
+   Stacked sessions: when your task depends on another open session's
+   unmerged work, start with `aethyme broker start --task "<task>" --stack-on
+   <id>`. Your branch starts at that session's tip, `push --pr` opens the draft
+   against its branch, and `sync` follows it (a parent push leaves you a note).
+   When the parent PR merges the broker retargets your PR to the nearest
+   unmerged ancestor and notes the merged head; run `sync`, then `push`. If the
+   parent PR closes unmerged, nothing is retargeted: `broker status` names the
+   choice (`sync --unstack` or finish). Never change PR bases by hand. The
+   broker deletes merged remote session branches itself, only once no open PR
+   or stacked session depends on them.
    When `sync` hands off an incoming default-branch merge, follow its exact
    handoff with session-confined Git; use `aethyme broker advanced git` when
    the operation requires coordination. Do not route the merge through
@@ -1038,6 +1052,19 @@ blocked.
    Gate commands that need a test database, cache namespace, or similar
    external state should suffix it with that value instead of sharing one
    fixed name.
+
+   Every session also gets a scratch directory the broker creates beside its
+   checkout (same volume, outside the worktree, so never in `git status`):
+   `scratch_dir` in `aethyme broker start --json` and in the session view of
+   `aethyme broker status --json`, exported as `$AETHYME_SESSION_SCRATCH_DIR`
+   to `aethyme broker advanced exec`, preparation steps and the session's gate
+   commands. Point build output (as a tool's `--target-dir`, `--out-dir` or
+   output path; an exported `CARGO_TARGET_DIR` makes Aethyme treat its own
+   commands as a build environment) and temporary files there instead of the
+   system temp folder. The broker removes it, through its paced trash, once
+   the session is finished, closed or cleaned and no process uses it;
+   `start --reuse` gets a fresh one. The broker does not set `TMPDIR` to it:
+   its path can be too long for the Unix sockets some tools create there.
 
    Unless `.aethyme/config.toml` sets
    `[authorization] disposable_test_environments = false`, creating, using and
@@ -1643,6 +1670,7 @@ mod tests {
             "Before running repository tools or audits, check the session's preparation",
             "aethyme broker submit prepare status --session <id> --json",
             "do not assume a fresh worktree has installed dependencies.",
+            "Build output and temp files go in its `scratch_dir`.",
             "`aethyme broker submit --session <id>`",
             "`aethyme broker finish --session <id>`",
             "`aethyme broker commit --session <id> -- <git-commit-args>`",

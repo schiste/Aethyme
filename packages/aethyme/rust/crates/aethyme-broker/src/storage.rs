@@ -1267,6 +1267,11 @@ fn inspect_root(
                         }
                         continue;
                     }
+                    // Dotted entries, the session scratch container among
+                    // them whatever it holds, are never stray-directory
+                    // candidates: the container's directories go with their
+                    // sessions through the retirement lane. A container
+                    // holding anything else only makes the root non-empty.
                     bookkeeping_only &= is_broker_bookkeeping(&child);
                     continue;
                 }
@@ -5513,6 +5518,12 @@ fn is_broker_bookkeeping(path: &Path) -> bool {
     {
         return is_regular_file(path);
     }
+    // Session scratch directories go with their sessions (the checkout
+    // retirement lane removes them); they are not content of the root.
+    if name == crate::session_scratch::SCRATCH_CONTAINER {
+        return is_real_directory(path)
+            && crate::session_scratch::container_holds_only_scratch(path);
+    }
     if name != ".cargo" || !is_real_directory(path) {
         return false;
     }
@@ -5554,6 +5565,17 @@ fn remove_empty_root(root: &Path) -> Result<u64, String> {
             "root now holds {}, which is not broker bookkeeping",
             unexpected.display()
         ));
+    }
+    // Never deleted here: scratch directories are removed through the paced
+    // trash by the checkout retirement lane, after which the root can go.
+    if entries.iter().any(|path| {
+        path.file_name() == Some(crate::session_scratch::SCRATCH_CONTAINER.as_ref())
+            && crate::session_scratch::container_has_entries(path)
+    }) {
+        return Err(
+            "root still holds session scratch directories; the checkout retirement lane removes them first"
+                .into(),
+        );
     }
     let mut freed = 0_u64;
     let mut remove_file = |path: &Path| -> Result<(), String> {

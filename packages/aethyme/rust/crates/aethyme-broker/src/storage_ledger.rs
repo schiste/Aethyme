@@ -213,6 +213,7 @@ pub fn classify(kind: RootKind, name: &str) -> Class {
                 | BUDGET_FILE
                 | DIRTY_DIRECTORY
                 | CHECKOUTS_DIRECTORY
+                | SESSION_SCRATCH_DIRECTORY
                 | check::LOCK_FILE
                 | check::ROOTS_FILE
                 | check::GATE_BUDGETS_FILE => Class::Coordination,
@@ -766,6 +767,81 @@ pub fn record_checkout_counts(
     let bytes = serde_json::to_vec(&CheckoutCountsRecord {
         repository: repository.to_string(),
         counts,
+    })
+    .map_err(io::Error::other)?;
+    write_atomically(&directory.join(name), &bytes)
+}
+
+/// Per-repository session scratch usage the retirement lane writes after each
+/// run, one file per repository (`<host state>/storage-ledger-session-scratch/
+/// <sha256 of the repository root>.json`), shown as the `session_scratch`
+/// class of `aethyme storage status`. The directories live in each
+/// repository's worktree pools and are removed with their session by the
+/// checkout retirement lane, never by the storage worker.
+pub const SESSION_SCRATCH_DIRECTORY: &str = "storage-ledger-session-scratch";
+
+/// Above this much scratch in one repository, `broker status` advises.
+pub const SESSION_SCRATCH_ADVICE_BYTES: u64 = 16 * GIB;
+/// Above this much in one scratch directory, `broker status` advises.
+pub const SESSION_SCRATCH_ADVICE_ONE_BYTES: u64 = 8 * GIB;
+
+/// One repository's session scratch usage.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionScratchUsage {
+    /// Recorded scratch directories (live, or waiting to be retired).
+    pub directories: usize,
+    /// Allocated bytes measured in them (a lower bound when `partial`).
+    pub bytes: u64,
+    pub largest_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub largest_session_id: Option<i64>,
+    /// Directories the last retirement attempt kept (in use, refused).
+    pub kept: usize,
+    /// Of those, directories kept because they are not the one recorded or
+    /// could not be re-identified after a remount: no retry lifts that.
+    #[serde(default)]
+    pub refused: usize,
+    /// The measurement stopped at its budget.
+    pub partial: bool,
+    /// Bytes the deleter freed removing scratch directories, all runs.
+    pub bytes_freed_total: u64,
+    pub observed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionScratchRecord {
+    repository: String,
+    usage: SessionScratchUsage,
+}
+
+/// The session scratch usage of every repository that recorded it.
+pub fn session_scratch_usage(host_state: &Path) -> BTreeMap<String, SessionScratchUsage> {
+    let Ok(listing) = fs::read_dir(host_state.join(SESSION_SCRATCH_DIRECTORY)) else {
+        return BTreeMap::new();
+    };
+    listing
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+        .filter_map(|entry| fs::read(entry.path()).ok())
+        .filter_map(|bytes| serde_json::from_slice::<SessionScratchRecord>(&bytes).ok())
+        .map(|record| (record.repository, record.usage))
+        .collect()
+}
+
+/// Record `repository`'s session scratch usage in its own file, written
+/// atomically: only this repository's worker writes it.
+pub fn record_session_scratch_usage(
+    host_state: &Path,
+    repository: &str,
+    usage: SessionScratchUsage,
+) -> io::Result<()> {
+    use sha2::Digest as _;
+    let directory = host_state.join(SESSION_SCRATCH_DIRECTORY);
+    fs::create_dir_all(&directory)?;
+    let name = format!("{:x}.json", sha2::Sha256::digest(repository.as_bytes()));
+    let bytes = serde_json::to_vec(&SessionScratchRecord {
+        repository: repository.to_string(),
+        usage,
     })
     .map_err(io::Error::other)?;
     write_atomically(&directory.join(name), &bytes)

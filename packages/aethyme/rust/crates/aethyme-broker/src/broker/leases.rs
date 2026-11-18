@@ -5934,6 +5934,7 @@ impl Broker {
             record_receipt,
         } = output;
         let supervisor_executable = self.agent_supervisor_executable.clone();
+        let scratch = self.session_scratch_environment(session_id);
         self.guarded_exec_with_runner(
             session_id,
             command,
@@ -5953,6 +5954,7 @@ impl Broker {
                         format!("s{session_id}-exec"),
                     ),
                 ];
+                execution_environment.extend(scratch);
                 execution_environment.extend_from_slice(environment);
 
                 let result = match select_mode() {
@@ -6172,6 +6174,7 @@ impl Broker {
                 format!("s{session_id}-exec"),
             ),
         ];
+        execution_environment.extend(self.session_scratch_environment(session_id));
         execution_environment.extend_from_slice(environment);
         self.guarded_exec_with_runner(
             session_id,

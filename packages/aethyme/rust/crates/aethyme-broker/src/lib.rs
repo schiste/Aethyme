@@ -214,6 +214,7 @@ mod recommendations;
 mod reconciliation;
 mod release_compatibility;
 pub mod release_manifest;
+mod remote_branch_cleanup;
 mod remote_target;
 mod removal;
 pub mod renamed_targets;
@@ -269,6 +270,8 @@ mod schema;
 mod session_abandonment;
 mod session_auto_close;
 mod session_push;
+mod session_scratch;
+mod session_stack;
 mod session_sync;
 mod shared_edit_advice;
 mod ship;
@@ -689,6 +692,7 @@ pub use session_push::{
     SESSION_PUSH_POLICY_KEY, SessionPullRequest, SessionPushPlan, SessionPushReport,
     SessionPushState, UncommittedCounts,
 };
+pub use session_scratch::SESSION_SCRATCH_ENV;
 pub use session_sync::{SessionSyncReport, SyncOutcome, SyncStrategy};
 pub use ship::{
     PUBLICATION_POLICY_SCHEMA_VERSION, REPOSITORY_DELIVERY_POLICY_SCHEMA_VERSION,

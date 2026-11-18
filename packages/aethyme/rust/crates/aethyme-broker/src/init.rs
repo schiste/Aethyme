@@ -638,6 +638,10 @@ const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
     ),
     ("worktree_freshness", &["max_age_seconds"]),
     ("session", &["guidance"]),
+    (
+        "remote_branches",
+        &["delete_merged", "scan_per_run", "max_deletions_per_run"],
+    ),
 ];
 
 fn check_enrollment_visibility(repo: &crate::GitRepo, checkout_root: &Path) -> Vec<Check> {
