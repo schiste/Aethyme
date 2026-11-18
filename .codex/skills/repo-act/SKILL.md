@@ -73,6 +73,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   sufficient headroom and smoke-test session creation there. Keep all arms on
   the same volume. On macOS, a short temporary symlink to that directory can
   keep a compiler cache's Unix socket within the platform path limit.
+  Pass the resolved directory to Codex sandboxed trials because the workspace
+  sandbox rejects symlinked writable roots.
 
 - For short CLI benchmarks, wait on OS process-exit notifications rather than
   adding a polling sleep to the measured wall time. Retain raw command receipts
