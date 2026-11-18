@@ -242,6 +242,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   child process's `GIT_TRACE2_EVENT`, not repository-local `trace2.eventTarget`,
   which Git ignores. Require nonempty start events and a positive control that
   captures the exact Git command shape the regression intends to forbid.
+- If host pressure delays local benchmark builds, reuse the repository's
+  hosted test archives for both exact revisions. Verify the same platform
+  and build profile, then extract and hash each router and engine pair in
+  separate scratch directories. Run both arms on one host.
 - When combining Git identity queries, preserve checkout-context checks.
   `--git-common-dir` succeeds in bare repositories too; require an explicit
   true `--is-inside-work-tree` result when checkout evidence is needed. Compare
