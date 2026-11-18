@@ -2402,8 +2402,7 @@ fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageErr
     // Hold the singleton briefly before reading the backlog: `finish` calls
     // arriving in a burst find this worker alive and are served by this run.
     std::thread::sleep(crate::gc::ARTIFACT_WORKER_COALESCE_WINDOW);
-    // Every unlink this process makes is unattended: pace it.
-    let _pacing = crate::gc::install_unattended_deletion_pacing(&repository_root, priority);
+    let _run_scopes = enter_worker_run_scopes(&repository_root, priority);
     let mut broker = Broker::open(&repository_root)?;
     // The read-only cache measurement may walk for minutes: the worker
     // releases this repository's lock before it, so the next deletion run
@@ -2414,6 +2413,22 @@ fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageErr
     crate::transcripts::run_worker_lane();
     result?;
     Ok(())
+}
+
+/// The detached worker's run-wide scopes, in order. Where this run reads
+/// `[cleanup]` from is resolved first, once, and is visible to every thread;
+/// then every unlink the process makes is paced, at a rate the pacing reads
+/// from that `[cleanup]`.
+fn enter_worker_run_scopes(
+    repository_root: &std::path::Path,
+    priority: crate::gc::BackgroundPriority,
+) -> (
+    crate::cleanup_config::RunScope,
+    crate::gc::unattended_pacing::UnattendedPacingScope,
+) {
+    let cleanup_config = crate::cleanup_config::RunScope::enter(repository_root);
+    let pacing = crate::gc::install_unattended_deletion_pacing(repository_root, priority);
+    (cleanup_config, pacing)
 }
 
 fn validate_artifact_sweep_worker_invocation(
@@ -3019,6 +3034,26 @@ mod artifact_worker_tests {
         let storage = crate::test_storage::TestStorage::new();
         let broker = storage.open(&root).unwrap();
         (owner, storage, broker)
+    }
+
+    /// The worker entry point resolves the `[cleanup]` source before the
+    /// pacing reads it, and the worker run records it for `broker status`.
+    #[test]
+    fn the_worker_run_resolves_and_records_its_cleanup_config_source() {
+        let (_owner, _storage, mut broker) = worker_environment_fixture();
+        let root = broker.main_root().to_path_buf();
+        {
+            let _scopes = enter_worker_run_scopes(&root, crate::gc::BackgroundPriority::default());
+            assert!(crate::cleanup_config::installed_for(&root).is_some());
+            let _ = broker.run_artifact_sweep_recovery_worker(|| {});
+        }
+        assert!(crate::cleanup_config::installed_for(&root).is_none());
+        let recorded = broker
+            .store_ref()
+            .meta_get(crate::cleanup_config::SUMMARY_KEY)
+            .unwrap()
+            .expect("the worker run records its [cleanup] source");
+        assert!(recorded.contains("no_default_branch"), "{recorded}");
     }
 
     #[test]

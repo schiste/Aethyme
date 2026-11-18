@@ -4370,33 +4370,8 @@ impl GitRepo {
     /// upstream is not treated as permission to fall back to working-copy
     /// policy.
     pub(crate) fn upstream_default_checked(&self) -> Result<Option<(String, String)>, GitError> {
-        let default_ref = self.symbolic_ref_checked("refs/remotes/origin/HEAD")?;
-        if let Some(target) = default_ref {
-            if !target.starts_with("refs/remotes/origin/") {
-                return Err(GitError::UntrustedOutput {
-                    detail: "origin/HEAD does not target an origin remote-tracking branch".into(),
-                });
-            }
-            let commit = self.resolve_commit_checked(&target)?;
-            let short = target
-                .strip_prefix("refs/remotes/")
-                .unwrap_or(&target)
-                .to_string();
-            return Ok(Some((short, commit)));
-        }
-        let unexpected_direct_ref = run_git(
-            &self.root,
-            &[
-                "for-each-ref",
-                "--count=1",
-                "--format=%(refname)",
-                "refs/remotes/origin/HEAD",
-            ],
-        )?;
-        if !unexpected_direct_ref.is_empty() {
-            return Err(GitError::UntrustedOutput {
-                detail: "refs/remotes/origin/HEAD exists but is not a symbolic default ref".into(),
-            });
+        if let Some(found) = self.origin_head_default_checked()? {
+            return Ok(Some(found));
         }
 
         let Some(branch_ref) = self.symbolic_ref_checked("HEAD")? else {
@@ -4436,6 +4411,59 @@ impl GitRepo {
         }
         let commit = self.resolve_commit_checked(&upstream_ref)?;
         Ok(Some((upstream_name, commit)))
+    }
+
+    /// The default branch `refs/remotes/origin/HEAD` names, as
+    /// `(origin/<branch>, commit)`, with no fallback: `Ok(None)` when
+    /// `origin/HEAD` is absent. For policy that only the remote's default
+    /// branch may supply, never the checked-out branch's upstream. A target
+    /// outside `refs/remotes/origin/`, or an `origin/HEAD` that is not
+    /// symbolic, is an error.
+    pub(crate) fn origin_head_default_checked(&self) -> Result<Option<(String, String)>, GitError> {
+        const DEFAULT_REF: &str = "refs/remotes/origin/HEAD";
+        let listing = self.run_git_output_limited(
+            &[
+                "for-each-ref",
+                "--count=1",
+                "--format=%(refname)%00%(symref)%00%(objecttype)%00%(objectname)",
+                DEFAULT_REF,
+            ],
+            4096,
+        )?;
+        // Git can omit a dangling symbolic ref. Keep the checked slow
+        // path for absence, unusual targets and malformed evidence.
+        if listing.stderr.is_empty()
+            && let Ok(row) = std::str::from_utf8(&listing.stdout)
+            && let Some(row) = row.strip_suffix('\n')
+            && let [DEFAULT_REF, target, "commit", oid] =
+                row.split('\0').collect::<Vec<_>>().as_slice()
+            && !target.contains('\n')
+            && let Some(short) = target.strip_prefix("refs/remotes/")
+            && short.starts_with("origin/")
+            && valid_git_object_id(oid.as_bytes())
+        {
+            return Ok(Some((short.to_string(), oid.to_string())));
+        }
+        let default_ref = self.symbolic_ref_checked(DEFAULT_REF)?;
+        if let Some(target) = default_ref {
+            if !target.starts_with("refs/remotes/origin/") {
+                return Err(GitError::UntrustedOutput {
+                    detail: "origin/HEAD does not target an origin remote-tracking branch".into(),
+                });
+            }
+            let commit = self.resolve_commit_checked(&target)?;
+            let short = target
+                .strip_prefix("refs/remotes/")
+                .unwrap_or(&target)
+                .to_string();
+            return Ok(Some((short, commit)));
+        }
+        if !listing.stdout.is_empty() || !listing.stderr.is_empty() {
+            return Err(GitError::UntrustedOutput {
+                detail: "refs/remotes/origin/HEAD exists but is not a symbolic default ref".into(),
+            });
+        }
+        Ok(None)
     }
 
     fn symbolic_ref_checked(&self, name: &str) -> Result<Option<String>, GitError> {
@@ -4902,6 +4930,51 @@ impl GitRepo {
                 stderr: format!("remote {remote:?} did not advertise a HEAD commit"),
             })?;
         Ok(RemoteDefaultBranch { ref_name, sha })
+    }
+
+    /// Resolve two exact refs for one observation. Fall back to Git's
+    /// individual commit resolution for odd refs, missing objects or errors.
+    pub(crate) fn resolve_commit_ref_pair(
+        &self,
+        first: &str,
+        second: &str,
+    ) -> (Option<String>, Option<String>) {
+        let args = [
+            "for-each-ref",
+            "--count=3",
+            "--format=%(refname)%00%(objecttype)%00%(objectname)",
+            first,
+            second,
+        ];
+        if let Ok(output) = self.run_git_output_limited(&args, 16 * 1024)
+            && output.stderr.is_empty()
+            && let Ok(text) = std::str::from_utf8(&output.stdout)
+            && (text.is_empty() || text.ends_with('\n'))
+        {
+            let mut pair = (None, None);
+            let valid = text.lines().all(|line| {
+                let fields: Vec<_> = line.split('\0').collect();
+                let [reference, "commit", oid] = fields.as_slice() else {
+                    return false;
+                };
+                let slot = if *reference == first {
+                    &mut pair.0
+                } else if *reference == second {
+                    &mut pair.1
+                } else {
+                    return false;
+                };
+                if slot.is_some() || !valid_git_object_id(oid.as_bytes()) {
+                    return false;
+                }
+                *slot = Some(oid.to_string());
+                true
+            });
+            if valid && pair.0.is_some() {
+                return pair;
+            }
+        }
+        (self.resolve_ref(first), self.resolve_ref(second))
     }
 
     pub fn resolve_ref(&self, name: &str) -> Option<String> {
@@ -10548,6 +10621,49 @@ mod gitlink_census_tests {
         git(root, &["init", "-q", "-b", "main"]);
         git(root, &["config", "user.name", "test"]);
         git(root, &["config", "user.email", "test@example.invalid"]);
+    }
+
+    #[test]
+    fn checked_default_observation_matches_the_fetched_tip_and_refuses_broken_defaults() {
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path();
+        init_repo(root);
+        git(root, &["commit", "--allow-empty", "-qm", "initial"]);
+        let repo = GitRepo::discover(root).unwrap();
+        let first = repo.head_commit().unwrap();
+        git(root, &["remote", "add", "origin", "."]);
+        git(root, &["config", "branch.main.remote", "origin"]);
+        git(root, &["config", "branch.main.merge", "refs/heads/main"]);
+        git(root, &["update-ref", "refs/remotes/origin/main", &first]);
+        assert_eq!(
+            repo.upstream_default_checked().unwrap(),
+            repo.upstream_default()
+        );
+
+        git(
+            root,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        git(root, &["commit", "--allow-empty", "-qm", "updated"]);
+        let second = repo.head_commit().unwrap();
+        git(root, &["update-ref", "refs/remotes/origin/main", &second]);
+        assert_eq!(
+            repo.upstream_default_checked().unwrap(),
+            Some(("origin/main".to_string(), second))
+        );
+
+        git(root, &["update-ref", "-d", "refs/remotes/origin/main"]);
+        assert!(repo.upstream_default_checked().is_err());
+        git(
+            root,
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        );
+        git(root, &["update-ref", "refs/remotes/origin/HEAD", &first]);
+        assert!(repo.upstream_default_checked().is_err());
     }
 
     fn submodule_fixture() -> (tempfile::TempDir, GitRepo, PathBuf) {

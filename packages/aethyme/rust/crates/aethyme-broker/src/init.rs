@@ -642,6 +642,31 @@ const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
         "remote_branches",
         &["delete_merged", "scan_per_run", "max_deletions_per_run"],
     ),
+    // The one list the `[cleanup]` parser also enforces.
+    ("cleanup", crate::auto_cleanup::CLEANUP_CONFIG_KEYS),
+    (
+        "main_checkout",
+        &[
+            "auto_sync",
+            "allow_filters",
+            "sync_interval_minutes",
+            "behind_threshold_commits",
+            "behind_threshold_hours",
+        ],
+    ),
+    (
+        "coordination",
+        &[
+            "hooks_outside_lock",
+            "session_hooks_hold_repository_lock",
+            "measure_pr_merge_ref",
+        ],
+    ),
+    (
+        "console",
+        &["mode", "port", "port_end", "pool_limit", "ttl_seconds"],
+    ),
+    ("watch", &["prompts"]),
 ];
 
 fn check_enrollment_visibility(repo: &crate::GitRepo, checkout_root: &Path) -> Vec<Check> {
@@ -1992,6 +2017,49 @@ mod config_template_tests {
 #[cfg(test)]
 mod config_key_tests {
     use super::unknown_config_keys;
+
+    /// A repository's `[cleanup]` table certifies as known: the certify
+    /// table and the parser share one key list.
+    #[test]
+    fn a_cleanup_table_certifies_pass() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            root.path().join(".aethyme/config.toml"),
+            "[cleanup]\nauto_remove = true\nstrict = false\nignored_directory_sweep = false\n\
+             delete_merged_session_branches = false\nvenv_markers = [\".env-check.json\"]\n\
+             stale_session_auto_close = true\nunattended_unlinks_per_second = 1000\n",
+        )
+        .unwrap();
+        let check = super::check_config_valid(root.path());
+        assert_eq!(check.status, super::CheckStatus::Pass, "{}", check.detail);
+        for key in crate::auto_cleanup::CLEANUP_CONFIG_KEYS {
+            assert!(
+                unknown(&format!("[cleanup]\n{key} = 1\n")).is_empty(),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            unknown("[cleanup]\nautoremove = true\n"),
+            ["cleanup.autoremove"]
+        );
+    }
+
+    #[test]
+    fn runtime_sections_read_from_config_are_known() {
+        assert!(
+            unknown(
+                "[main_checkout]\nauto_sync = true\nallow_filters = false\n\
+                 sync_interval_minutes = 5\nbehind_threshold_commits = 10\n\
+                 behind_threshold_hours = 2\n\
+                 [coordination]\nhooks_outside_lock = true\n\
+                 session_hooks_hold_repository_lock = false\nmeasure_pr_merge_ref = false\n\
+                 [console]\nmode = \"off\"\nport = 1\nport_end = 2\npool_limit = 3\nttl_seconds = 4\n\
+                 [watch.prompts.review]\nbody = \"x\"\n"
+            )
+            .is_empty()
+        );
+    }
 
     fn unknown(text: &str) -> Vec<String> {
         unknown_config_keys(&text.parse::<toml::Value>().unwrap())

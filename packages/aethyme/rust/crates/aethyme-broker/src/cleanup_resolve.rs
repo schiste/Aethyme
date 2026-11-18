@@ -2752,6 +2752,47 @@ pub(crate) struct RecoveryArchiveScan {
     pub owned: Vec<OwnedRecoveryArchive>,
     /// Everything else, with why the broker cannot vouch for it.
     pub unowned: Vec<(PathBuf, String)>,
+    /// Entries not classified because the scan reached its deadline.
+    pub skipped_by_budget: usize,
+}
+
+/// How much of an archive [`Broker::owned_recovery_archive_with`] proves.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ArchiveProof {
+    /// Manifest, identity, repository and session record only: cheap
+    /// metadata for listing, sizing and classifying. Never enough to
+    /// delete or restore on.
+    Metadata,
+    /// The whole tree, its integrity records, bundle and refs, before the
+    /// archive's content is relied on or destroyed.
+    Full { deadline: Option<Instant> },
+}
+
+thread_local! {
+    /// Full archive proofs run on this thread, so tests can prove a path
+    /// classifies archives without reading their content.
+    pub(crate) static FULL_ARCHIVE_VERIFICATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The verified root among `roots` that `dir` lies directly under.
+fn archive_root_among(dir: &Path, roots: &[Result<PathBuf, String>]) -> Result<PathBuf, String> {
+    if roots.is_empty() {
+        return Err("no recovery archive root".into());
+    }
+    let mut reasons = Vec::new();
+    for root in roots {
+        match root {
+            Ok(root) => {
+                if dir.parent().is_some_and(|parent| same_path(parent, root)) {
+                    return Ok(root.clone());
+                }
+                reasons.push(format!("not directly under {}", root.display()));
+            }
+            Err(reason) => reasons.push(reason.clone()),
+        }
+    }
+    Err(reasons.join("; "))
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -4414,7 +4455,25 @@ impl Broker {
         &self,
         dir: &Path,
     ) -> Result<OwnedRecoveryArchive, String> {
-        let root = self.recovery_archive_root_of(dir)?;
+        self.owned_recovery_archive_with(
+            dir,
+            &self.inspected_recovery_archive_roots(),
+            ArchiveProof::Full { deadline: None },
+        )
+    }
+
+    /// [`Self::owned_recovery_archive`] against archive roots inspected
+    /// once by the caller (one inspection per run, not per archive), with
+    /// the proof `proof` asks for. [`ArchiveProof::Metadata`] reads only
+    /// the manifest and the session record: enough to list, size and
+    /// classify, never enough to delete or restore on.
+    pub(crate) fn owned_recovery_archive_with(
+        &self,
+        dir: &Path,
+        roots: &[Result<PathBuf, String>],
+        proof: ArchiveProof,
+    ) -> Result<OwnedRecoveryArchive, String> {
+        let root = archive_root_among(dir, roots)?;
         let metadata =
             std::fs::symlink_metadata(dir).map_err(|error| format!("cannot read: {error}"))?;
         if !metadata.is_dir() {
@@ -4465,10 +4524,9 @@ impl Broker {
                 ));
             }
         }
-        verify_recovery_archive_tree(dir, &manifest)?;
-        if is_retirement_archive_schema(manifest.schema_version) {
-            verify_retirement_archive_record_for_manifest(dir, &manifest)?;
-        }
+        // Ownership is decided from the manifest and the session record
+        // first: an archive of another repository or an unknown session is
+        // refused before any of its content is read.
         if !same_path(Path::new(&manifest.repository), self.main_root()) {
             return Err(format!(
                 "manifest names another repository: {}",
@@ -4486,7 +4544,23 @@ impl Broker {
                 manifest.session_id, session.branch, manifest.branch_ref
             ));
         }
-        if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+        let deadline = match proof {
+            ArchiveProof::Metadata => None,
+            ArchiveProof::Full { deadline } => {
+                FULL_ARCHIVE_VERIFICATIONS.with(|count| count.set(count.get() + 1));
+                verify_recovery_archive_tree_until(dir, &manifest, deadline)?;
+                if is_retirement_archive_schema(manifest.schema_version) {
+                    verify_retirement_archive_record_for_manifest(dir, &manifest)?;
+                }
+                Some(deadline)
+            }
+        };
+        let bundle_deadline = |deadline: Option<Instant>| {
+            recovery_bundle_deadline().map(|bundle| deadline.map_or(bundle, |d| d.min(bundle)))
+        };
+        if let Some(deadline) = deadline
+            && manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        {
             let proofs = manifest.recovery_root_proofs.as_deref().ok_or_else(|| {
                 "schema v5 archive is missing its recovery root proofs".to_owned()
             })?;
@@ -4501,10 +4575,12 @@ impl Broker {
                     self.repo_handle(),
                     &dir.join(BUNDLE_FILE),
                     &bundled_roots,
-                    recovery_bundle_deadline()?,
+                    bundle_deadline(deadline)?,
                 )?;
             }
-        } else if manifest.schema_version == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+        } else if let Some(deadline) = deadline
+            && manifest.schema_version == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        {
             let proofs = manifest.recovery_root_proofs.as_deref().ok_or_else(|| {
                 "schema v6 archive is missing its recovery root proofs".to_owned()
             })?;
@@ -4519,7 +4595,7 @@ impl Broker {
                     self.repo_handle(),
                     &dir.join(BUNDLE_FILE),
                     &bundled_roots,
-                    recovery_bundle_deadline()?,
+                    bundle_deadline(deadline)?,
                 )?;
             }
             let prerequisite_refs = manifest
@@ -4529,7 +4605,7 @@ impl Broker {
             verify_recovery_prerequisite_refs_installed(
                 self.repo_handle(),
                 prerequisite_refs,
-                recovery_bundle_deadline()?,
+                bundle_deadline(deadline)?,
             )?;
         }
         let recovery_roots = if is_retirement_archive_schema(manifest.schema_version) {
@@ -4616,37 +4692,61 @@ impl Broker {
     /// The verified recovery archive root (one of
     /// [`Self::recovery_archive_roots`]) that `dir` lies directly under.
     pub(crate) fn recovery_archive_root_of(&self, dir: &Path) -> Result<PathBuf, String> {
-        let roots = self.recovery_archive_roots();
-        if roots.is_empty() {
-            return Err("no recovery archive root".into());
-        }
-        let mut reasons = Vec::new();
-        for configured_root in roots {
-            match inspect_archive_root(&configured_root) {
-                Ok(Some(root)) => {
-                    if dir.parent().is_some_and(|parent| same_path(parent, &root)) {
-                        return Ok(root);
-                    }
-                    reasons.push(format!("not directly under {}", root.display()));
-                }
-                Ok(None) => reasons.push(format!("{} is missing", configured_root.display())),
-                Err(error) => {
-                    reasons.push(format!("unsafe recovery archive root: {}", error.reason));
-                }
-            }
-        }
-        Err(reasons.join("; "))
+        archive_root_among(dir, &self.inspected_recovery_archive_roots())
+    }
+
+    /// Every [`Self::recovery_archive_roots`] entry, inspected (the verified
+    /// root, or why it is unusable). Resolving the roots plans the worktree
+    /// root and reads configuration, so a scan does it once, not per archive.
+    pub(crate) fn inspected_recovery_archive_roots(&self) -> Vec<Result<PathBuf, String>> {
+        let _span = crate::phase_telemetry::span("recovery_archive_roots_inspect");
+        self.recovery_archive_roots()
+            .into_iter()
+            .map(
+                |configured_root| match inspect_archive_root(&configured_root) {
+                    Ok(Some(root)) => Ok(root),
+                    Ok(None) => Err(format!("{} is missing", configured_root.display())),
+                    Err(error) => Err(format!("unsafe recovery archive root: {}", error.reason)),
+                },
+            )
+            .collect()
     }
 
     /// Every archive in this repository's recovery archive directories (the
     /// pool-side one and the host state one), split into the ones the broker
     /// can vouch for and the rest (with why). `root` is the host state one.
+    ///
+    /// Fully verifies every archive: for an explicit, exhaustive review
+    /// (`gc plan --full-scan`) only. Unattended and hot paths use
+    /// [`Self::recovery_archive_listing`].
     pub(crate) fn recovery_archives(&self) -> Result<RecoveryArchiveScan, BrokerOpError> {
-        let mut scan = self.recovery_archives_under(self.recovery_archive_root()?)?;
+        self.recovery_archive_scan(ArchiveProof::Full { deadline: None }, None)
+    }
+
+    /// Every archive classified from cheap metadata only (directory
+    /// listing, manifest, session record; no content is read or hashed),
+    /// stopping at `deadline`. Anything acted on must be proven again with
+    /// [`Self::owned_recovery_archive`] first.
+    pub(crate) fn recovery_archive_listing(
+        &self,
+        deadline: Instant,
+    ) -> Result<RecoveryArchiveScan, BrokerOpError> {
+        self.recovery_archive_scan(ArchiveProof::Metadata, Some(deadline))
+    }
+
+    fn recovery_archive_scan(
+        &self,
+        proof: ArchiveProof,
+        deadline: Option<Instant>,
+    ) -> Result<RecoveryArchiveScan, BrokerOpError> {
+        let roots = self.inspected_recovery_archive_roots();
+        let mut scan =
+            self.recovery_archives_under(self.recovery_archive_root()?, &roots, proof, deadline)?;
         if let Some(pool) = self.pool_recovery_archive_root(false) {
-            let pool_scan = self.recovery_archives_under(pool)?;
+            let pool_scan = self.recovery_archives_under(pool, &roots, proof, deadline)?;
             scan.owned.extend(pool_scan.owned);
             scan.unowned.extend(pool_scan.unowned);
+            scan.skipped_by_budget += pool_scan.skipped_by_budget;
         }
         Ok(scan)
     }
@@ -4654,6 +4754,9 @@ impl Broker {
     fn recovery_archives_under(
         &self,
         configured_root: PathBuf,
+        roots: &[Result<PathBuf, String>],
+        proof: ArchiveProof,
+        deadline: Option<Instant>,
     ) -> Result<RecoveryArchiveScan, BrokerOpError> {
         let root = match inspect_archive_root(&configured_root) {
             Ok(Some(root)) => root,
@@ -4662,6 +4765,7 @@ impl Broker {
                     root: configured_root,
                     owned: Vec::new(),
                     unowned: Vec::new(),
+                    skipped_by_budget: 0,
                 });
             }
             Err(error) => {
@@ -4669,6 +4773,7 @@ impl Broker {
                     root: configured_root.clone(),
                     owned: Vec::new(),
                     unowned: vec![(error.path, format!("unsafe archive root: {}", error.reason))],
+                    skipped_by_budget: 0,
                 });
             }
         };
@@ -4681,6 +4786,7 @@ impl Broker {
                     root: configured_root,
                     owned,
                     unowned: vec![(root, format!("cannot read archive root: {error}"))],
+                    skipped_by_budget: 0,
                 });
             }
         };
@@ -4693,6 +4799,7 @@ impl Broker {
                         root: configured_root.clone(),
                         owned: Vec::new(),
                         unowned: vec![(root, format!("cannot read archive entry: {error}"))],
+                        skipped_by_budget: 0,
                     });
                 }
             };
@@ -4704,6 +4811,7 @@ impl Broker {
                         root: configured_root.clone(),
                         owned: Vec::new(),
                         unowned: vec![(root, format!("cannot inspect archive entry: {error}"))],
+                        skipped_by_budget: 0,
                     });
                 }
             };
@@ -4712,8 +4820,16 @@ impl Broker {
             }
         }
         paths.sort();
-        for path in paths {
-            match self.owned_recovery_archive(&path) {
+        let total = paths.len();
+        let mut skipped_by_budget = 0;
+        for (index, path) in paths.into_iter().enumerate() {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                skipped_by_budget = total - index;
+                crate::phase_telemetry::add("recovery_archive_listing_budget_stop", Duration::ZERO);
+                break;
+            }
+            crate::phase_telemetry::add("recovery_archive_listed", Duration::ZERO);
+            match self.owned_recovery_archive_with(&path, roots, proof) {
                 Ok(archive) => owned.push(archive),
                 Err(reason) => unowned.push((path, reason)),
             }
@@ -4722,6 +4838,7 @@ impl Broker {
             root: configured_root,
             owned,
             unowned,
+            skipped_by_budget,
         })
     }
 }

@@ -177,9 +177,8 @@ pub(crate) fn parse_unlink_rate(value: Option<&toml::Value>) -> Result<UnlinkRat
 /// limit, and the error is reported in the run summary.
 pub(crate) fn load_unlink_rate(main_root: &Path) -> (UnlinkRate, Option<String>) {
     let loaded = (|| -> Result<UnlinkRate, String> {
-        let Some((path, text)) =
-            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-                .map_err(|error| error.to_string())?
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
         else {
             return parse_unlink_rate(None);
         };

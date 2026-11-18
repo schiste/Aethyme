@@ -602,9 +602,8 @@ pub(crate) fn parse_abandoned_operation_after_hours(
 /// cleanup policy loader reports it).
 pub(crate) fn abandoned_operation_after_ms(main_root: &Path) -> i64 {
     let hours = (|| -> Result<i64, String> {
-        let Some((path, text)) =
-            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-                .map_err(|error| error.to_string())?
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
         else {
             return parse_abandoned_operation_after_hours(None);
         };
@@ -647,9 +646,8 @@ pub(crate) fn parse_recovery_archive_bound_gib(value: Option<&toml::Value>) -> R
 /// (the cleanup policy loader reports it).
 pub(crate) fn recovery_archive_bound_bytes(main_root: &Path) -> u64 {
     let gib = (|| -> Result<i64, String> {
-        let Some((path, text)) =
-            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-                .map_err(|error| error.to_string())?
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
         else {
             return parse_recovery_archive_bound_gib(None);
         };
@@ -691,9 +689,8 @@ pub(crate) fn parse_idle_strip_after_hours(value: Option<&toml::Value>) -> Resul
 /// when the setting is known.
 pub(crate) fn idle_strip_after_ms(main_root: &Path) -> i64 {
     let hours = (|| -> Result<i64, String> {
-        let Some((path, text)) =
-            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-                .map_err(|error| error.to_string())?
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
         else {
             return parse_idle_strip_after_hours(None);
         };
@@ -768,9 +765,8 @@ pub(crate) fn parse_venv_markers(value: Option<&toml::Value>) -> Result<Vec<Stri
 /// reports it), so the strip keeps such environments.
 pub(crate) fn venv_markers(main_root: &Path) -> Vec<String> {
     (|| -> Result<Vec<String>, String> {
-        let Some((path, text)) =
-            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-                .map_err(|error| error.to_string())?
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
         else {
             return Ok(Vec::new());
         };
@@ -783,6 +779,28 @@ pub(crate) fn venv_markers(main_root: &Path) -> Vec<String> {
     })()
     .unwrap_or_default()
 }
+
+/// Every key `[cleanup]` may hold, whichever reader consumes it: the one
+/// list both [`AutoCleanupPolicy`]'s parser (which refuses any other key)
+/// and `certify`'s known-key table use.
+pub(crate) const CLEANUP_CONFIG_KEYS: &[&str] = &[
+    "auto_remove",
+    "strict",
+    "ignored_directory_sweep",
+    "regenerable",
+    "keep",
+    crate::gc::unattended_pacing::UNLINK_RATE_CONFIG_KEY,
+    ABANDONED_OPERATION_CONFIG_KEY,
+    RECOVERY_ARCHIVE_BOUND_CONFIG_KEY,
+    VENV_MARKERS_CONFIG_KEY,
+    IDLE_STRIP_CONFIG_KEY,
+    "delete_merged_session_branches",
+    crate::stale_session_policy::LANDED_KEY,
+    crate::stale_session_policy::PUSHED_KEY,
+    crate::stale_session_policy::UNPUSHED_KEY,
+    crate::stale_session_policy::NOTICE_KEY,
+    crate::stale_session_policy::AUTO_CLOSE_KEY,
+];
 
 /// `[cleanup]` in `.aethyme/config.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -821,15 +839,24 @@ impl AutoCleanupPolicy {
     /// Read `[cleanup]`. A missing file or table is the default policy; an
     /// unreadable one is an error, which the sweep turns into "removal off"
     /// rather than guessing what the operator meant.
+    ///
+    /// The detached worker reads it from the default branch when its run
+    /// resolved so (the `cleanup_config` module); everything else reads the
+    /// primary checkout's working copy.
     pub fn load(main_root: &Path) -> Result<Self, String> {
         // `.aethyme/config.toml`, `.yaml` or `.yml` (#1223), as TOML text.
-        let Some((path, text)) =
-            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
-                .map_err(|error| error.to_string())?
+        let Some((path, text)) = crate::cleanup_config::cleanup_config_toml(main_root)
+            .map_err(|error| error.to_string())?
         else {
             return Ok(Self::default());
         };
-        let root: toml::Value = toml::from_str(&text)
+        Self::from_config_toml(&path, &text)
+    }
+
+    /// `[cleanup]` of one config text (TOML), validated as [`Self::load`]
+    /// does; `path` names where the text came from in messages.
+    pub(crate) fn from_config_toml(path: &Path, text: &str) -> Result<Self, String> {
+        let root: toml::Value = toml::from_str(text)
             .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
         let Some(table) = root.get("cleanup") else {
             return Ok(Self::default());
@@ -839,6 +866,11 @@ impl AutoCleanupPolicy {
             .ok_or_else(|| "[cleanup] must be a table".to_string())?;
         let mut policy = Self::default();
         for (key, value) in table {
+            // One list of keys, shared with `certify`: a key missing from it
+            // is refused here before any arm can accept it.
+            if !CLEANUP_CONFIG_KEYS.contains(&key.as_str()) {
+                return Err(format!("[cleanup] has no key {key:?}"));
+            }
             match key.as_str() {
                 "auto_remove" => {
                     policy.auto_remove = value
@@ -881,6 +913,12 @@ impl AutoCleanupPolicy {
                     }
                 }
                 "unattended_unlinks_per_second" => {} // Parsed by gc::unattended_pacing.
+                "delete_merged_session_branches" => {
+                    // Read by the merged-branch lane; validated here.
+                    value.as_bool().ok_or_else(|| {
+                        "[cleanup] delete_merged_session_branches must be true or false".to_string()
+                    })?;
+                }
                 ABANDONED_OPERATION_CONFIG_KEY => {
                     // Read by the checkout retirement lane; validated here.
                     parse_abandoned_operation_after_hours(Some(value))?;
@@ -19109,6 +19147,73 @@ mod tests {
         write("[cleanup]\nauto_remove = \"yes\"\n");
         assert!(AutoCleanupPolicy::load(dir.path()).is_err());
         write("[cleanup]\nautoremove = true\n");
+        assert!(AutoCleanupPolicy::load(dir.path()).is_err());
+    }
+
+    /// Every listed key is accepted by the parser with a valid value, and
+    /// the parser refuses anything else: the list and the parser agree.
+    #[test]
+    fn every_listed_cleanup_key_is_accepted_and_no_other() {
+        let sample = r#"[cleanup]
+auto_remove = true
+strict = false
+ignored_directory_sweep = false
+regenerable = []
+keep = []
+unattended_unlinks_per_second = 1000
+abandoned_operation_after_hours = 24
+recovery_archive_bound_gib = 20
+venv_markers = []
+idle_strip_after_hours = 4
+delete_merged_session_branches = true
+stale_landed_close_after_hours = 4
+stale_pushed_close_after_hours = 24
+stale_unpushed_close_after_hours = 24
+stale_closing_notice_hours = 4
+stale_session_auto_close = true
+"#;
+        let parsed: toml::Value = toml::from_str(sample).unwrap();
+        let mut keys = parsed["cleanup"]
+            .as_table()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let mut listed = crate::auto_cleanup::CLEANUP_CONFIG_KEYS.to_vec();
+        keys.sort_unstable();
+        listed.sort_unstable();
+        assert_eq!(keys, listed, "the sample must name every listed key");
+        AutoCleanupPolicy::from_config_toml(Path::new("sample"), sample).unwrap();
+        assert!(
+            AutoCleanupPolicy::from_config_toml(
+                Path::new("sample"),
+                "[cleanup]\nautoremove = true\n"
+            )
+            .is_err()
+        );
+    }
+
+    /// The documented opt-out of the merged-branch lane is a `[cleanup]`
+    /// key like any other: setting it must not turn automatic removal off.
+    #[test]
+    fn the_merged_branch_opt_out_keeps_automatic_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".aethyme")).unwrap();
+        let config = dir.path().join(".aethyme/config.toml");
+        std::fs::write(
+            &config,
+            "[cleanup]\ndelete_merged_session_branches = false\n",
+        )
+        .unwrap();
+        let policy = AutoCleanupPolicy::load(dir.path()).unwrap();
+        assert!(policy.auto_remove);
+        assert!(!crate::merged_branches::enabled(dir.path()));
+
+        std::fs::write(
+            &config,
+            "[cleanup]\ndelete_merged_session_branches = \"no\"\n",
+        )
+        .unwrap();
         assert!(AutoCleanupPolicy::load(dir.path()).is_err());
     }
 
