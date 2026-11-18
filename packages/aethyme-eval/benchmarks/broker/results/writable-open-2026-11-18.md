@@ -68,6 +68,11 @@ and chooses the original cadence. The bounded inline pass, confirmed
 journal replay, interrupted operations, and detached worker admission keep
 their existing execution order and authority.
 
+The focused Rust tests passed for the exact pressure cadence boundary,
+interrupted-fetch recovery, dead prepared-operation reap, continued
+blocking of a push with an unknown outcome, and preservation of partial
+or completed sweep state on repeated writable opens.
+
 Reproduce the comparison with matching local builds, using all four
 combinations of `--recent-sweep` and `--concurrent`:
 
