@@ -73,6 +73,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   sufficient headroom and smoke-test session creation there. Keep all arms on
   the same volume. On macOS, a short temporary symlink to that directory can
   keep a compiler cache's Unix socket within the platform path limit.
+  If the shared cache daemon still uses a retired session's temp path,
+  set `RUSTC_WRAPPER=` for the isolated build and leave the daemon running.
   Pass the resolved directory to Codex sandboxed trials because the workspace
   sandbox rejects symlinked writable roots.
 
