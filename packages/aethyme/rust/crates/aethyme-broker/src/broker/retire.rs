@@ -4776,6 +4776,8 @@ mod tests {
     #[test]
     fn the_retirement_run_prunes_stale_reclaim_plan_snapshots() {
         let (_owner, _storage, mut broker) = fixture();
+        // A first session creates and binds the worktree root.
+        let (_session, _worktree) = closed(&mut broker, "binds the root", |_| {});
         let root = broker
             .require_bound_repository_worktree_root("test")
             .unwrap();
