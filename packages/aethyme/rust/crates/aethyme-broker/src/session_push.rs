@@ -19,7 +19,7 @@ use std::path::Path;
 
 use crate::{
     Broker, BrokerOpError, CoordinatedCommand, CoordinatedOperationReport, GitRepo,
-    OperationEffect, OperationProvider, QueueWait, RepositoryDeliveryConfig,
+    OperationEffect, OperationProvider, QueueWait, RepositoryDeliveryConfig, Session,
     UnknownOutcomeRecovery,
 };
 
@@ -775,7 +775,10 @@ pub(crate) fn session_push_enabled(repo: &GitRepo) -> bool {
     tracked_default(repo).is_some_and(|default| push_authorized(repo, &default).unwrap_or(false))
 }
 
-fn push_authorized(repo: &GitRepo, default: &TrackedDefault) -> Result<bool, BrokerOpError> {
+pub(crate) fn push_authorized(
+    repo: &GitRepo,
+    default: &TrackedDefault,
+) -> Result<bool, BrokerOpError> {
     let Some(text) = repo.config_toml_at_commit(&default.commit, "config")? else {
         return Ok(false);
     };
@@ -801,16 +804,8 @@ impl Broker {
     pub fn session_push_state(&self, session_id: i64) -> Result<SessionPushState, BrokerOpError> {
         let session = self.store_ref().session(session_id)?;
         let repo = self.repo_handle();
-        let remote = tracked_default(repo)
-            .map(|default| default.remote)
-            .unwrap_or_else(|| "origin".to_string());
-        let head = repo
-            .resolve_ref(&format!("refs/heads/{}", session.branch))
-            .ok_or_else(|| BrokerOpError::SessionBranchMissing {
-                session_id,
-                branch: session.branch.clone(),
-            })?;
-        let remote_oid = repo.resolve_ref(&format!("refs/remotes/{remote}/{}", session.branch));
+        let default = tracked_default(repo);
+        let (head, remote_oid) = self.session_push_tips(&session, default.as_ref())?;
         let unpushed = repo.commits_not_on_remotes(&head)?;
         Ok(SessionPushState {
             branch: session.branch,
@@ -819,6 +814,24 @@ impl Broker {
             unpushed_commits: u32::try_from(unpushed.len()).unwrap_or(u32::MAX),
             oldest_unpushed_at_ms: unpushed.last().map(|commit| commit.committed_at_ms),
         })
+    }
+
+    /// Read the local and fetched session-branch tips for a status decision.
+    pub(crate) fn session_push_tips(
+        &self,
+        session: &Session,
+        default: Option<&TrackedDefault>,
+    ) -> Result<(String, Option<String>), BrokerOpError> {
+        let repo = self.repo_handle();
+        let remote = default.map_or("origin", |default| default.remote.as_str());
+        let head = repo
+            .resolve_ref(&format!("refs/heads/{}", session.branch))
+            .ok_or_else(|| BrokerOpError::SessionBranchMissing {
+                session_id: session.id,
+                branch: session.branch.clone(),
+            })?;
+        let remote_oid = repo.resolve_ref(&format!("refs/remotes/{remote}/{}", session.branch));
+        Ok((head, remote_oid))
     }
 
     /// Decide how to push `head` to the session branch when the remote

@@ -8000,9 +8000,9 @@ impl Broker {
         &self,
         base: &str,
         planned_paths: &[String],
+        config: Result<Option<crate::worktree_location::WorktreeLocationConfig>, String>,
     ) -> (Vec<String>, Option<String>) {
-        let settings = match crate::worktree_location::WorktreeLocationConfig::load(&self.main_root)
-        {
+        let settings = match config {
             Ok(Some(settings)) => settings,
             Ok(None) => return (Vec::new(), None),
             Err(error) => {
@@ -8069,15 +8069,31 @@ impl Broker {
         // verify-only mode selection below already uses the fetched default.
         // Reconciling here reads historical promotions and can wait on an
         // unrelated writer; submit and sync refresh integration themselves.
-        let selected_promote = crate::merge::PromoteConfig::load(&self.main_root);
+        // Base selection and sparse planning use the same configuration read
+        // after the fetch. Checkout admission below makes its own observations
+        // under the lifecycle claim.
+        let config = crate::merge::repository_config_checked(&self.main_root);
+        let text = config
+            .as_ref()
+            .ok()
+            .and_then(|source| source.as_ref())
+            .map(|(text, _)| text.as_str());
+        let (selected_promote, _) = crate::merge::PromoteConfig::from_text(text);
         let mut start_base = timed_start_phase(&mut phase_timings_ms, "base_selection", || {
             self.select_session_start_base_with_promote(explicit_base, &selected_promote)
         })?;
         refresh.record(&mut start_base);
-        // The sparse plan reads only configuration and the selected base
-        // commit's tree, never the checkout pool, so it needs no claim.
+        let worktrees = match config {
+            Ok(Some((text, _))) => {
+                crate::worktree_location::WorktreeLocationConfig::from_config_text(&text)
+            }
+            Ok(None) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        };
+        // The sparse plan reads only the selected base commit's tree, never
+        // the checkout pool, so it needs no claim.
         let (sparse_paths, sparse_plan_fallback) =
-            self.sparse_paths_for_new_session(&start_base.commit, planned_paths);
+            self.sparse_paths_for_new_session(&start_base.commit, planned_paths, worktrees);
         // Refresh may wait on another process or a remote. Acquire the
         // repository lifecycle claim only after that work. Root preparation
         // writes the marker and build defaults, so it belongs under the same
