@@ -3512,6 +3512,51 @@ mod lane_tests {
         );
     }
 
+    /// Classification asks the working tree only when refs alone would
+    /// class the session below unpushed, and remembers that answer while
+    /// HEAD, the branch tip and the index are unchanged; staging a change
+    /// asks again.
+    #[test]
+    fn the_working_tree_is_asked_only_when_refs_cannot_decide() {
+        let (_owner, _storage, mut broker) = fixture("");
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let installed = crate::phase_telemetry::install(recorder.clone());
+        let (unpushed, _) = session(&mut broker, "refs decide", false);
+        assert_eq!(
+            broker.stale_work_class(&unpushed),
+            crate::stale_session_policy::StaleWorkClass::Unpushed
+        );
+        let (merged, merged_tree) = session(&mut broker, "tree decides", true);
+        link_pull_request(&mut broker, merged.id, 78, Some(1));
+        assert_eq!(
+            broker.stale_work_class(&merged),
+            crate::stale_session_policy::StaleWorkClass::Landed
+        );
+        assert_eq!(
+            broker.stale_work_class(&merged),
+            crate::stale_session_policy::StaleWorkClass::Landed
+        );
+        std::fs::write(merged_tree.join("staged.txt"), "staged\n").unwrap();
+        git(&merged_tree, &["add", "staged.txt"]);
+        assert_eq!(
+            broker.stale_work_class(&merged),
+            crate::stale_session_policy::StaleWorkClass::Unpushed,
+            "a changed index is asked again"
+        );
+        drop(installed);
+        let (_millis, counts) = recorder.totals();
+        assert_eq!(
+            counts.get("stale_work_classification_refs_only").copied(),
+            Some(1),
+            "{counts:?}"
+        );
+        assert_eq!(
+            counts.get("stale_work_clean_remembered").copied(),
+            Some(1),
+            "{counts:?}"
+        );
+    }
+
     /// A live holder bound to a newer session of this repository is no live
     /// holder of the older one: its uncommitted work gets the closing-soon
     /// note and then closes after the unpushed window, through the archive

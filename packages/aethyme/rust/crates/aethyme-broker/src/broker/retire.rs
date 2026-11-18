@@ -78,6 +78,13 @@ const RETIRE_PIN_CANDIDATES_MAX: usize = 2_000;
 pub(crate) const RETIRE_ARCHIVE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// Closed sessions read per page.
 const RETIRE_PAGE: usize = 64;
+/// Meta key: closed or cleaned sessions last kept as superseded at their
+/// path, with the row that superseded them (JSON: session id to that id).
+pub(crate) const CHECKOUT_RETIREMENT_SUPERSEDED_KEY: &str = "checkout_retirement.superseded";
+/// Remembered superseded sessions at most; the lowest ids go first.
+const RETIRE_SUPERSEDED_MAX: usize = 16_384;
+/// The longest a retirement run spends expiring retired-commit pins.
+const RETIRE_PIN_PRUNE_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 /// The least time a retirement run gives the strip pass, the closed lap
 /// and the cleaned lap, whatever the phases before them used (bounded by
 /// the lane's own deadline).
@@ -1279,6 +1286,19 @@ impl Broker {
     /// forever). Never otherwise. At most `RETIRED_PIN_CHECKS_PER_RUN` pins
     /// are checked per run, from a cursor. Returns the pins left.
     pub(crate) fn prune_retired_pins(&self) -> Result<usize, String> {
+        self.prune_retired_pins_until(None)
+    }
+
+    /// [`Self::prune_retired_pins`], stopping at `deadline` (the cursor
+    /// keeps the place). Cheapest evidence first: the session's age (a
+    /// database read), then ancestry of the default branch's tip (one
+    /// `merge-base`), and only then the scan of every remote-tracking ref,
+    /// which on the busiest repository (4,466 remote refs) made this step
+    /// 140 to 457 s of each retirement run.
+    pub(crate) fn prune_retired_pins_until(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<usize, String> {
         let root = self.main_root().to_path_buf();
         let listing = run_git_text(
             &root,
@@ -1297,7 +1317,8 @@ impl Broker {
             return Ok(0);
         }
         let mut targets = vec!["refs/remotes/".to_string()];
-        if let Some((upstream_ref, _)) = self.repo_handle().upstream_default()
+        let upstream = self.repo_handle().upstream_default();
+        if let Some((upstream_ref, _)) = upstream.as_ref()
             && let Some((_, branch)) = upstream_ref
                 .trim_start_matches("refs/remotes/")
                 .split_once('/')
@@ -1326,16 +1347,14 @@ impl Broker {
             .skip(start)
             .take(RETIRED_PIN_CHECKS_PER_RUN.min(pins.len()))
         {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                crate::phase_telemetry::add(
+                    "checkout_retirement_pins_stopped_deadline",
+                    std::time::Duration::ZERO,
+                );
+                break;
+            }
             last.clone_from(refname);
-            let mut args = vec![
-                "for-each-ref",
-                "--count=1",
-                "--contains",
-                commit.as_str(),
-                "--format=%(refname)",
-            ];
-            args.extend(targets.iter().map(String::as_str));
-            let contained = !run_git_text(&root, &args)?.trim().is_empty();
             let session_cleaned_long_ago = days > 0
                 && refname
                     .strip_prefix("refs/aethyme/retired/")
@@ -1348,6 +1367,29 @@ impl Broker {
                                 now.saturating_sub(cleaned) > i64::from(days) * 86_400_000
                             })
                     });
+            let contained = session_cleaned_long_ago
+                || upstream.as_ref().is_some_and(|(_, upstream_tip)| {
+                    matches!(
+                        self.repo_handle()
+                            .is_ancestor_checked(commit.as_str(), upstream_tip.as_str()),
+                        Ok(true)
+                    )
+                })
+                || {
+                    crate::phase_telemetry::add(
+                        "checkout_retirement_pins_remote_scan",
+                        std::time::Duration::ZERO,
+                    );
+                    let mut args = vec![
+                        "for-each-ref",
+                        "--count=1",
+                        "--contains",
+                        commit.as_str(),
+                        "--format=%(refname)",
+                    ];
+                    args.extend(targets.iter().map(String::as_str));
+                    !run_git_text(&root, &args)?.trim().is_empty()
+                };
             if contained || session_cleaned_long_ago {
                 run_git_text(&root, &["update-ref", "-d", refname, commit])?;
                 removed += 1;
@@ -1994,13 +2036,14 @@ impl Broker {
             super::retire_operation::sweep_stale_partials(&root);
         }
         let prune_span = crate::phase_telemetry::span("checkout_retirement_prune_pins");
-        let retired_pins = match self.prune_retired_pins() {
-            Ok(remaining) => remaining,
-            Err(error) => {
-                crate::warn_unrecorded::<(), _>("expire retired-commit pins", Err(error));
-                self.checkout_retirement_progress().retired_pins
-            }
-        };
+        let retired_pins =
+            match self.prune_retired_pins_until(Some(Instant::now() + RETIRE_PIN_PRUNE_BUDGET)) {
+                Ok(remaining) => remaining,
+                Err(error) => {
+                    crate::warn_unrecorded::<(), _>("expire retired-commit pins", Err(error));
+                    self.checkout_retirement_progress().retired_pins
+                }
+            };
         drop(prune_span);
         let _record_span = crate::phase_telemetry::span("checkout_retirement_record_progress");
         let kept = report.kept.values().sum::<usize>();
@@ -2101,6 +2144,10 @@ impl Broker {
             CHECKOUT_RETIREMENT_CURSOR_KEY
         };
         let mut complete = false;
+        let superseded: std::collections::BTreeMap<i64, i64> =
+            self.meta_json(CHECKOUT_RETIREMENT_SUPERSEDED_KEY);
+        let mut newly_superseded = std::collections::BTreeMap::new();
+        let mut listing = super::strip::PoolListing::default();
         let mut cursor = self
             .store_ref()
             .meta_get(cursor_key)
@@ -2130,11 +2177,33 @@ impl Broker {
                 }
                 let previous_cursor = cursor;
                 cursor = session.id;
-                if cleaned && !Path::new(&session.worktree_path).exists() {
+                // A row superseded at its path by the same row as last time:
+                // no filesystem call, no judgement (0.8.123 re-judged 105 of
+                // 112 every run). A new superseder, or none, judges again.
+                let superseder = self
+                    .store_ref()
+                    .sessions_at_worktree_path(&session.worktree_path)
+                    .ok()
+                    .and_then(|rows| super::strip::superseder_of(&session, &rows));
+                if superseder.is_some() && superseded.get(&session.id) == superseder.as_ref() {
+                    crate::phase_telemetry::add(
+                        "checkout_retirement_superseded_remembered",
+                        std::time::Duration::ZERO,
+                    );
+                    continue;
+                }
+                // Existence from one listing per pool directory (entry
+                // types, no call per row); a pool that cannot be listed is
+                // asked per folder.
+                let exists = match listing.exists(&session.worktree_path, deadline) {
+                    Some(exists) => exists,
+                    None => Path::new(&session.worktree_path).exists(),
+                };
+                if cleaned && !exists {
                     // The usual cleaned session: nothing left on disk.
                     continue;
                 }
-                if !Path::new(&session.worktree_path).exists() {
+                if !exists {
                     // Moved into the trash but the cleaned record was
                     // lost: record it now. Any other missing checkout
                     // is the missing-checkout lane's, which proves the
@@ -2194,9 +2263,28 @@ impl Broker {
                     }
                     RetireOutcome::Kept(code) => {
                         *report.kept.entry(code.to_string()).or_default() += 1;
+                        if code == "leftover_superseded"
+                            && let Some(superseder) = superseder
+                        {
+                            newly_superseded.insert(session.id, superseder);
+                        }
                     }
                 }
             }
+        }
+        if !newly_superseded.is_empty() {
+            crate::warn_unrecorded(
+                "remember superseded checkouts",
+                self.update_meta_json(
+                    CHECKOUT_RETIREMENT_SUPERSEDED_KEY,
+                    |stored: &mut std::collections::BTreeMap<i64, i64>| {
+                        stored.extend(newly_superseded.iter().map(|(id, by)| (*id, *by)));
+                        while stored.len() > RETIRE_SUPERSEDED_MAX {
+                            stored.pop_first();
+                        }
+                    },
+                ),
+            );
         }
         crate::warn_unrecorded(
             "advance the checkout retirement cursor",

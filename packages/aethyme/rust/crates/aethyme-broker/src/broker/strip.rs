@@ -126,7 +126,7 @@ const STRIP_MIN_JUDGED_BEFORE_ACCOUNTING: usize = 10;
 pub(crate) const CHECKOUT_STRIP_CURSOR_KEY: &str = "checkout_strip.cursor";
 /// Directories the deepest discovery level probes per checkout, at most:
 /// each probe costs `lstat`s, slow on a drive under deletion.
-const DISCOVERY_DEEPEST_DIRECTORIES_MAX: usize = 64;
+const DISCOVERY_DEEPEST_DIRECTORIES_MAX: usize = 32;
 
 /// One checkout's retry backoff after transient keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -299,9 +299,6 @@ const VENV_LAYOUT: &[&str] = &[
 
 /// Top-level entries read at most to judge a witness.
 const WITNESS_ENTRY_LIMIT: usize = 4_096;
-
-/// The catalogued directory names, one per [`StripKind`].
-const STRIP_NAMES: [&str; 4] = ["node_modules", ".pnpm-store", ".venv", "target"];
 
 impl StripKind {
     pub(crate) fn for_name(name: &str) -> Option<Self> {
@@ -510,20 +507,17 @@ pub(crate) fn regenerable_candidates(
                     continue;
                 }
                 deepest_probed += 1;
-                for name in STRIP_NAMES {
-                    let child = join(name);
-                    if crate::runtime_paths::is_broker_runtime_path(&child) {
-                        continue;
-                    }
-                    if std::fs::symlink_metadata(directory.join(name))
+                // Only `node_modules` (workspace members): one `lstat` per
+                // directory, each ~120 ms on a drive under deletion.
+                let child = join("node_modules");
+                if !crate::runtime_paths::is_broker_runtime_path(&child)
+                    && std::fs::symlink_metadata(directory.join("node_modules"))
                         .is_ok_and(|metadata| metadata.is_dir())
-                        && let Some(kind) = StripKind::for_name(name)
-                    {
-                        candidates.push(StripCandidate {
-                            relative: child,
-                            kind,
-                        });
-                    }
+                {
+                    candidates.push(StripCandidate {
+                        relative: child,
+                        kind: StripKind::NodeModules,
+                    });
                 }
                 continue;
             }
@@ -657,7 +651,109 @@ fn prove_on_disk(
             return Err("crosses_device");
         }
     }
-    candidate.kind.witness(&path, venv_markers)
+    match candidate.kind.witness(&path, venv_markers) {
+        // A workspace member's `node_modules` (never the checkout's own
+        // top-level one) carries no package-manager marker of its own:
+        // pnpm fills it with links into the top-level store.
+        Err("witness_missing")
+            if candidate.kind == StripKind::NodeModules
+                && candidate.relative.contains('/')
+                && pnpm_member_node_modules(&path) =>
+        {
+            crate::phase_telemetry::add("checkout_strip_witness_pnpm_member", Duration::ZERO);
+            Ok(())
+        }
+        verdict => verdict,
+    }
+}
+
+/// Bytes a `.bin` shim may hold, at most.
+const PNPM_BIN_SHIM_MAX_BYTES: u64 = 64 * 1024;
+
+/// Whether `path` is a pnpm workspace member's `node_modules` and nothing
+/// else (fail closed, top level and one level down only, bounded):
+///
+/// - every entry is a symbolic link, a `.bin` directory, or an `@scope`
+///   directory;
+/// - `.bin` holds only regular files that start with `#!` (pnpm's shell
+///   shims) of at most 64 KiB, or symbolic links;
+/// - an `@scope` directory holds only symbolic links;
+/// - at least one link points into a pnpm store (`node_modules/.pnpm/`).
+///
+/// Links are never followed; renaming the directory moves the links, not
+/// what they point at. Anything else, a cache directory such as `.vite`
+/// included, keeps it as `witness_missing`.
+pub(crate) fn pnpm_member_node_modules(path: &Path) -> bool {
+    let read = |directory: &Path| -> Option<Vec<std::fs::DirEntry>> {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(directory).ok()? {
+            entries.push(entry.ok()?);
+            if entries.len() > WITNESS_ENTRY_LIMIT {
+                return None;
+            }
+        }
+        Some(entries)
+    };
+    let mut store_link = false;
+    let mut link_into_store = |entry: &std::fs::DirEntry| {
+        if std::fs::read_link(entry.path()).is_ok_and(|target| {
+            let target = target.to_string_lossy();
+            target.contains("node_modules/.pnpm/") || target.starts_with(".pnpm/")
+        }) {
+            store_link = true;
+        }
+    };
+    let Some(entries) = read(path) else {
+        return false;
+    };
+    for entry in &entries {
+        let Ok(file_type) = entry.file_type() else {
+            return false;
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if file_type.is_symlink() {
+            link_into_store(entry);
+        } else if file_type.is_dir() && name == ".bin" {
+            let Some(shims) = read(&entry.path()) else {
+                return false;
+            };
+            for shim in &shims {
+                let Ok(shim_type) = shim.file_type() else {
+                    return false;
+                };
+                if shim_type.is_symlink() {
+                    continue;
+                }
+                let is_shim = shim_type.is_file()
+                    && shim
+                        .metadata()
+                        .is_ok_and(|metadata| metadata.len() <= PNPM_BIN_SHIM_MAX_BYTES)
+                    && std::fs::File::open(shim.path())
+                        .and_then(|mut file| {
+                            let mut start = [0_u8; 2];
+                            std::io::Read::read_exact(&mut file, &mut start).map(|()| start)
+                        })
+                        .is_ok_and(|start| &start == b"#!");
+                if !is_shim {
+                    return false;
+                }
+            }
+        } else if file_type.is_dir() && name.starts_with('@') && name.len() > 1 {
+            let Some(links) = read(&entry.path()) else {
+                return false;
+            };
+            for link in &links {
+                if !link.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                    return false;
+                }
+                link_into_store(link);
+            }
+        } else {
+            return false;
+        }
+    }
+    store_link
 }
 
 /// Prove each of `candidates` may be stripped, cheaply and without
@@ -791,6 +887,7 @@ fn refused_counter(code: &str) -> &'static str {
         "not_closed" => "checkout_strip_refused_not_closed",
         "adopted" => "checkout_strip_refused_adopted",
         "checkout_missing" => "checkout_strip_refused_checkout_missing",
+        "checkout_unreadable" => "checkout_strip_refused_checkout_unreadable",
         "not_owned" => "checkout_strip_refused_not_owned",
         "open_session" => "checkout_strip_refused_open_session",
         "open_session_unknown" => "checkout_strip_refused_open_session_unknown",
@@ -905,14 +1002,19 @@ pub(crate) fn checkout_created_ms(worktree: &Path) -> Option<i64> {
 /// judge that is never superseded, and a path reused by many cleaned rows
 /// (paths derived from task text are) is retired through any of them.
 pub(crate) fn path_superseded_by(session: &Session, rows: &[Session]) -> bool {
-    match session.cleanup_state {
-        crate::SessionCleanupState::Cleaned => rows
-            .iter()
-            .any(|row| row.cleanup_state != crate::SessionCleanupState::Cleaned),
-        _ => rows.iter().any(|row| {
-            row.id > session.id && row.cleanup_state != crate::SessionCleanupState::Cleaned
-        }),
-    }
+    superseder_of(session, rows).is_some()
+}
+
+/// The row that supersedes `session` at its path under
+/// [`path_superseded_by`] (the newest such), if any.
+pub(crate) fn superseder_of(session: &Session, rows: &[Session]) -> Option<i64> {
+    rows.iter()
+        .filter(|row| row.cleanup_state != crate::SessionCleanupState::Cleaned)
+        .filter(|row| {
+            session.cleanup_state == crate::SessionCleanupState::Cleaned || row.id > session.id
+        })
+        .map(|row| row.id)
+        .max()
 }
 
 /// The row that judges a folder, of the closed or cleaned rows recorded
@@ -958,21 +1060,27 @@ fn judge_key(session: &Session) -> (i64, i64) {
 /// directory that cannot be listed completely before `deadline` answers
 /// `None` (unknown), and the caller checks that folder itself.
 #[derive(Default)]
-struct PoolListing {
+pub(super) struct PoolListing {
     parents: BTreeMap<PathBuf, Option<BTreeSet<std::ffi::OsString>>>,
 }
 
 impl PoolListing {
     /// Whether `path` is a real directory by its pool directory's listing,
     /// `None` when that listing is not available.
-    fn exists(&mut self, path: &str, deadline: Instant) -> Option<bool> {
+    pub(super) fn exists(&mut self, path: &str, deadline: Instant) -> Option<bool> {
         let folder = Path::new(path);
         let (parent, name) = (folder.parent()?, folder.file_name()?);
         self.parents
             .entry(parent.to_path_buf())
             .or_insert_with(|| {
                 let _span = crate::phase_telemetry::span("checkout_strip_folder_listing");
-                let listed = list_directory_names(parent, deadline);
+                // Each pool directory gets its own budget, from when it is
+                // first needed: a listing that starts late in the pass is
+                // not cut short by the time the pass already spent.
+                let listed = list_directory_names(
+                    parent,
+                    deadline.min(Instant::now() + POOL_LISTING_BUDGET),
+                );
                 if listed.is_none() {
                     crate::phase_telemetry::add(
                         "checkout_strip_folder_listing_unavailable",
@@ -988,18 +1096,34 @@ impl PoolListing {
 
 /// The names of the real directories (not symlinks) in `directory`, from
 /// the listing's entry types, or `None` when it cannot be listed completely
-/// within [`POOL_LISTING_MAX`] entries before `deadline`.
+/// within [`POOL_LISTING_MAX`] entries before `deadline`. A pool directory
+/// that does not exist holds no folder (an empty set: 7 of the busiest
+/// repository's 12 recorded pool directories are gone, and 0.8.123 read each
+/// as unknown and checked its folders one by one). An entry that vanishes
+/// while it is listed (the deleter and the reclaim-plan files churn at the
+/// pool root) is skipped, not a reason to drop the whole listing: a folder
+/// it hides is only judged a pass later.
 fn list_directory_names(
     directory: &Path,
     deadline: Instant,
 ) -> Option<BTreeSet<std::ffi::OsString>> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::phase_telemetry::add("checkout_strip_pool_directory_absent", Duration::ZERO);
+            return Some(BTreeSet::new());
+        }
+        Err(_) => return None,
+    };
     let mut names = BTreeSet::new();
-    for (count, entry) in std::fs::read_dir(directory).ok()?.enumerate() {
+    for (count, entry) in entries.enumerate() {
         if count >= POOL_LISTING_MAX || Instant::now() >= deadline {
             return None;
         }
-        let entry = entry.ok()?;
-        if entry.file_type().ok()?.is_dir() {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
             names.insert(entry.file_name());
         }
     }
@@ -1277,8 +1401,12 @@ impl Broker {
                 }
                 CheckoutStrip::Refused(code) => {
                     note_refusal(&mut report, code);
-                    // Ownership never changes for a session: not asked again.
-                    if code == "adopted" || code == "not_owned" {
+                    // Ownership never changes for a session, and a folder
+                    // proven absent (ENOENT) does not come back for this close
+                    // (a reuse reopens and closes again): not asked again, so
+                    // the cap and the time go to folders that exist (0.8.123:
+                    // 688 of 900 examined were absent).
+                    if code == "adopted" || code == "not_owned" || code == "checkout_missing" {
                         newly_done.insert(session.id, closed_at);
                     }
                     if code == "process_use_unknown" {
@@ -1520,9 +1648,15 @@ impl Broker {
             return Refused("adopted");
         }
         let worktree = PathBuf::from(&session.worktree_path);
+        // Absent only when the filesystem says so; a call that fails any
+        // other way is not proof the folder is gone.
         match std::fs::symlink_metadata(&worktree) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-            _ => return Refused("checkout_missing"),
+            Ok(_) => return Refused("not_a_real_directory"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Refused("checkout_missing");
+            }
+            Err(_) => return Refused("checkout_unreadable"),
         }
         if let Some(code) = run.open_session_keep(session.id, &worktree) {
             return Refused(code);
@@ -2033,6 +2167,7 @@ mod tests {
             "apps/web/src",
             "a/b/c/node_modules/too-deep",
             ".aethyme/node_modules/x",
+            "services/target/debug",
             "services/api/target/debug",
         ] {
             std::fs::create_dir_all(root.join(path)).unwrap();
@@ -2054,7 +2189,7 @@ mod tests {
                 ("apps/web/node_modules", StripKind::NodeModules),
                 ("backend/.venv", StripKind::Venv),
                 ("node_modules", StripKind::NodeModules),
-                ("services/api/target", StripKind::CargoTarget),
+                ("services/target", StripKind::CargoTarget),
             ]
         );
         // Without a `.git` entry the checkout is not its own Git top level.
@@ -2287,5 +2422,67 @@ mod tests {
         assert_eq!(strip_backoff_delay_ms(2), 10 * 60_000);
         assert_eq!(strip_backoff_delay_ms(40), 4 * 3_600_000);
         assert_eq!(StripKind::for_name("dist"), None);
+    }
+
+    /// A pnpm workspace member's `node_modules` (links into the top-level
+    /// store, `.bin` shims, `@scope` directories of links) passes as that
+    /// tool's output; the checkout's own top-level one never does without
+    /// its marker, and anything else inside keeps it.
+    #[test]
+    fn a_pnpm_workspace_members_node_modules_has_a_narrow_witness() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let member = root.join("packages/ui/node_modules");
+        std::fs::create_dir_all(member.join(".bin")).unwrap();
+        std::fs::create_dir_all(member.join("@types")).unwrap();
+        std::os::unix::fs::symlink(
+            "../../../node_modules/.pnpm/react@19.2.8/node_modules/react",
+            member.join("react"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../../ui-kit", member.join("@types/ui-kit")).unwrap();
+        std::fs::write(member.join(".bin/tsc"), "#!/bin/sh\nexec node tsc \"$@\"\n").unwrap();
+        let candidate = |relative: &str| StripCandidate {
+            relative: relative.into(),
+            kind: StripKind::NodeModules,
+        };
+        assert!(pnpm_member_node_modules(&member));
+        assert_eq!(
+            prove_on_disk(&root, &candidate("packages/ui/node_modules"), &[]),
+            Ok(())
+        );
+
+        // The checkout's top-level `node_modules` with the same content is
+        // not a member: it needs its own marker.
+        let top = root.join("node_modules");
+        std::fs::create_dir_all(&top).unwrap();
+        std::os::unix::fs::symlink(".pnpm/react@19.2.8/node_modules/react", top.join("react"))
+            .unwrap();
+        assert_eq!(
+            prove_on_disk(&root, &candidate("node_modules"), &[]),
+            Err("witness_missing")
+        );
+
+        // Links that never point into a pnpm store are not enough.
+        let plain = root.join("tools/x/node_modules");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::os::unix::fs::symlink("../../../elsewhere", plain.join("dep")).unwrap();
+        assert!(!pnpm_member_node_modules(&plain));
+
+        // A cache directory, a regular file, a file in a scope or a `.bin`
+        // entry that is not a shim keeps the member.
+        std::fs::create_dir_all(member.join(".vite")).unwrap();
+        assert!(!pnpm_member_node_modules(&member));
+        std::fs::remove_dir_all(member.join(".vite")).unwrap();
+        std::fs::write(member.join("notes.txt"), "mine\n").unwrap();
+        assert!(!pnpm_member_node_modules(&member));
+        std::fs::remove_file(member.join("notes.txt")).unwrap();
+        std::fs::write(member.join("@types/own.d.ts"), "x\n").unwrap();
+        assert!(!pnpm_member_node_modules(&member));
+        std::fs::remove_file(member.join("@types/own.d.ts")).unwrap();
+        std::fs::write(member.join(".bin/data"), "not a shim\n").unwrap();
+        assert!(!pnpm_member_node_modules(&member));
+        std::fs::remove_file(member.join(".bin/data")).unwrap();
+        assert!(pnpm_member_node_modules(&member));
     }
 }
