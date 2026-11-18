@@ -1484,7 +1484,7 @@ fn adopted_session_hold(main_root: &Path) -> Result<Option<SessionInUse>, ()> {
 }
 
 /// Sender name of the notes the sync leaves for adopted sessions.
-const NOTE_SENDER: &str = "main-checkout-sync";
+const NOTE_SENDER: &str = "automation:main-checkout-sync";
 
 /// After the primary checkout advanced from `from` to `to`, tell every open
 /// session adopted on it, and move its diff base to `to` when its old base is
