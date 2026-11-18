@@ -99,3 +99,9 @@ validator arguments. Ensure the validator actually uses the files and options
 whose bytes the host records. Include every policy dependency, executable helper
 and separately loaded input under `additional` when relevant. If this complete
 inventory cannot be established, the result cannot authorize publication.
+
+Equal before/after snapshots do not prove an input stayed unchanged throughout
+evaluation: a file could change temporarily and be restored between reads. The
+host must supply immutable snapshots, or otherwise prevent concurrent mutation
+while the validator reads them, and retain the same protection through the
+publication-time check. The runner does not establish that guarantee itself.
