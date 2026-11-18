@@ -5926,6 +5926,152 @@ mod tests {
         assert_eq!(value["detached"]["branch_tip"], elsewhere.as_str());
     }
 
+    /// An idle open session whose preparation declares the top-level
+    /// `node_modules/` and a file inside a Python environment loses the
+    /// proved environment root and the proved pnpm workspace members with
+    /// the root; what the closed-checkout proofs refuse is kept with their
+    /// reason; preparation then reads not current. With the top-level
+    /// `node_modules` unprovable, members are kept as `member_root_kept`.
+    #[test]
+    fn the_idle_strip_takes_environment_roots_and_members_with_their_root() {
+        let (_owner, _storage, mut broker) = fixture();
+        exclude_node_modules(&broker);
+        std::fs::write(
+            broker.main_root().join(".git/info/exclude"),
+            "node_modules/\n.venv/\n",
+        )
+        .unwrap();
+        crate::session_holder::set_process_use_snapshot_for_tests(Some(
+            crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+        ));
+        let prepare = "schema_version = 1\n\n[[steps]]\nname = \"js\"\ncommand = [\"sh\", \"-c\", \"true\"]\n\
+             inputs = [\"lock.file\"]\noutputs = [\"node_modules/\"]\ncache = \"repository_shared\"\n\
+             required_for_hooks = false\n\n[[steps]]\nname = \"py\"\ncommand = [\"sh\", \"-c\", \"true\"]\n\
+             inputs = [\"lock.file\"]\noutputs = [\"tools/.venv/bin/tool\", \"bad/.venv/bin/tool\"]\n\
+             cache = \"repository_shared\"\nrequired_for_hooks = false\n";
+        let session_with = |broker: &mut crate::Broker, task: &str, root_marker: bool| {
+            let open = broker.start_worktree(task, None).unwrap();
+            let worktree = PathBuf::from(&open.worktree_path);
+            std::fs::create_dir_all(worktree.join(".aethyme")).unwrap();
+            std::fs::write(worktree.join(".aethyme/prepare.toml"), prepare).unwrap();
+            // The top-level install, with pnpm's shim in its `.bin`.
+            std::fs::create_dir_all(worktree.join("node_modules/.pnpm/dep@1/node_modules/dep"))
+                .unwrap();
+            std::fs::create_dir_all(worktree.join("node_modules/.bin")).unwrap();
+            std::fs::write(worktree.join("node_modules/.bin/tsc"), "#!/bin/sh\n").unwrap();
+            if root_marker {
+                std::fs::write(
+                    worktree.join("node_modules/.modules.yaml"),
+                    "layoutVersion: 5\n",
+                )
+                .unwrap();
+            }
+            // A pnpm workspace member: links into the store and a shim.
+            let member = worktree.join("apps/a/node_modules");
+            std::fs::create_dir_all(member.join(".bin")).unwrap();
+            std::os::unix::fs::symlink(
+                "../../../node_modules/.pnpm/dep@1/node_modules/dep",
+                member.join("dep"),
+            )
+            .unwrap();
+            std::fs::write(member.join(".bin/tsc"), "#!/bin/sh\n").unwrap();
+            // A member holding a file of its own: not a proved member.
+            std::fs::create_dir_all(worktree.join("apps/b/node_modules")).unwrap();
+            std::fs::write(worktree.join("apps/b/node_modules/cache.js"), "x\n").unwrap();
+            // A Python environment containing a declared output.
+            std::fs::create_dir_all(worktree.join("tools/.venv/bin")).unwrap();
+            std::fs::write(worktree.join("tools/.venv/pyvenv.cfg"), "home = /usr\n").unwrap();
+            std::fs::write(worktree.join("tools/.venv/bin/tool"), "#!/bin/sh\n").unwrap();
+            // One holding something besides the environment layout.
+            std::fs::create_dir_all(worktree.join("bad/.venv/bin")).unwrap();
+            std::fs::write(worktree.join("bad/.venv/pyvenv.cfg"), "home = /usr\n").unwrap();
+            std::fs::write(worktree.join("bad/.venv/bin/tool"), "#!/bin/sh\n").unwrap();
+            std::fs::write(worktree.join("bad/.venv/notes.txt"), "mine\n").unwrap();
+            broker
+                .store()
+                .connection()
+                .execute(
+                    "UPDATE sessions SET last_activity_at = ?1 WHERE id = ?2",
+                    rusqlite::params![crate::clock::epoch_ms() - 5 * 3_600_000, open.id],
+                )
+                .unwrap();
+            crate::worktree_status_activity::age_tree_for_test(
+                &worktree,
+                std::time::SystemTime::now() - Duration::from_secs(10 * 3_600),
+            );
+            let admin = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]).trim());
+            for name in ["index", "HEAD"] {
+                std::fs::File::options()
+                    .write(true)
+                    .open(admin.join(name))
+                    .unwrap()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(10 * 3_600))
+                    .unwrap();
+            }
+            (open, worktree)
+        };
+        let pass = |broker: &mut crate::Broker| {
+            let far = Instant::now() + Duration::from_secs(600);
+            let mut run = broker
+                .begin_checkout_retirement_run(far)
+                .unwrap()
+                .expect("open paths resolve");
+            broker.strip_idle_open_checkouts(&mut run, far, 100)
+        };
+
+        let (open, worktree) = session_with(&mut broker, "venv and members", true);
+        let report = pass(&mut broker);
+
+        assert_eq!(report.strip.checkouts_stripped, 1, "{report:#?}");
+        assert!(!worktree.join("node_modules").exists(), "{report:#?}");
+        assert!(
+            !worktree.join("apps/a/node_modules").exists(),
+            "{report:#?}"
+        );
+        assert!(!worktree.join("tools/.venv").exists(), "{report:#?}");
+        assert!(worktree.join("apps/b/node_modules/cache.js").exists());
+        assert!(worktree.join("bad/.venv/notes.txt").exists());
+        assert_eq!(
+            report.strip.refused.get("witness_missing"),
+            Some(&1),
+            "{report:#?}"
+        );
+        assert_eq!(
+            report.strip.refused.get("unexpected_content"),
+            Some(&1),
+            "{report:#?}"
+        );
+        let kinds = &report.by_kind;
+        assert_eq!(kinds["node_modules"].removed, 1, "{kinds:?}");
+        assert_eq!(kinds["node_modules_member"].removed, 1, "{kinds:?}");
+        assert_eq!(kinds["node_modules_member"].kept, 1, "{kinds:?}");
+        assert_eq!(kinds["venv"].removed, 1, "{kinds:?}");
+        assert_eq!(kinds["venv"].kept, 1, "{kinds:?}");
+        // `submit prepare` sees the work to do: the declared file inside
+        // the environment is missing and the strip marker stands.
+        assert!(crate::preparation::stripped_since_prepared(
+            broker.main_root(),
+            open.id
+        ));
+        assert_ne!(
+            broker.preparation_status(open.id).unwrap().state,
+            crate::PreparationState::Current
+        );
+
+        // The top-level `node_modules` cannot be proved: its members stay.
+        let (_other, kept) = session_with(&mut broker, "root kept", false);
+        let report = pass(&mut broker);
+        assert!(kept.join("node_modules").exists(), "{report:#?}");
+        assert!(kept.join("apps/a/node_modules/dep").exists(), "{report:#?}");
+        assert_eq!(
+            report.strip.refused.get("member_root_kept"),
+            Some(&2),
+            "{report:#?}"
+        );
+        assert!(!kept.join("tools/.venv").exists(), "{report:#?}");
+        crate::session_holder::set_process_use_snapshot_for_tests(None);
+    }
+
     /// An open session idle past `idle_strip_after_hours` with no process in
     /// its checkout has its regenerable directories stripped once, its
     /// preparation marked stale and one note left; it is not stripped again
