@@ -2530,8 +2530,10 @@ Within GC maintenance, `open_gc_rotation_debt` probes cache rotation witnesses,
 `open_gc_retention_policy` reads the retention rules, `open_gc_confirmed_journal`
 checks or resumes a confirmed journal, `open_gc_inline_sweep` measures the
 foreground sweep, and `open_gc_worker_admission` measures admission for
-the detached worker. Confirmed-journal-only opens omit the sweep, worker,
-and rotation probes. Subphases are nested in their enclosing durations.
+the detached worker. The zero-duration `open_gc_inline_cadence_skip` event
+marks an open that uses recent sweep progress to skip headroom sampling.
+Confirmed-journal-only opens omit the sweep, worker, and rotation probes.
+Subphases are nested in their enclosing durations.
 
 Guarded-exec reports include `phase_timings_ms`: `precheck` measures session
 lookup, the initial worktree snapshot, receipt and admission;

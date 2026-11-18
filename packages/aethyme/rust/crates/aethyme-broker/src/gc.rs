@@ -7291,7 +7291,7 @@ impl Broker {
             let _span = crate::phase_telemetry::span("open_gc_inline_sweep");
             crate::warn_unrecorded(
                 "run bounded inline artifact sweep",
-                self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Inline),
+                self.sweep_artifacts_on_open(&policy),
             );
         }
         // Inline admission stays capped at 250 ms. The detached worker
@@ -11576,6 +11576,39 @@ impl Broker {
             .is_some_and(|last| last > 0 && now.saturating_sub(last) < window_ms))
     }
 
+    fn inline_artifact_sweep_is_spaced(
+        &mut self,
+        policy: &RetentionPolicy,
+        now: i64,
+        urgency: crate::disk_headroom::SweepUrgency,
+    ) -> Result<bool, BrokerOpError> {
+        let divisor = urgency.interval_divisor().max(1);
+        let interval_ms = i64::from(policy.artifact_sweep_interval_hours) * 3_600_000 / divisor;
+        let spacing_ms = INLINE_PARTIAL_PASS_SPACING_MS / divisor;
+        Ok(
+            self.meta_stamp_within(ARTIFACT_SWEEP_STAMP_KEY, now, interval_ms)?
+                || self.meta_stamp_within(ARTIFACT_SWEEP_PROGRESS_KEY, now, spacing_ms)?,
+        )
+    }
+
+    fn sweep_artifacts_on_open(&mut self, policy: &RetentionPolicy) -> Result<(), BrokerOpError> {
+        // Pressure uses the shortest cadence. A stamp still within that
+        // window spaces out the foreground pass at any current headroom.
+        // Recovery and worker admission run independently of this check.
+        if policy.artifact_sweep_budget_ms != 0
+            && self.inline_artifact_sweep_is_spaced(
+                policy,
+                now_ms(),
+                crate::disk_headroom::SweepUrgency::Pressured,
+            )?
+        {
+            crate::phase_telemetry::add("open_gc_inline_cadence_skip", Duration::ZERO);
+            return Ok(());
+        }
+        self.sweep_artifacts_autonomously(policy, ArtifactSweepScope::Inline)?;
+        Ok(())
+    }
+
     fn artifact_sweep_budget(
         &mut self,
         policy: &RetentionPolicy,
@@ -12203,16 +12236,10 @@ impl Broker {
         // a bounded tail for whole-checkout cleanup so cache discovery cannot
         // consume the entire foreground budget first.
         let budget_started_at = Instant::now();
-        let inline_pass_spaced = if scope == ArtifactSweepScope::Inline {
-            let interval_ms = (i64::from(policy.artifact_sweep_interval_hours) * 3_600_000)
-                / urgency.interval_divisor().max(1);
-            let spacing_ms = INLINE_PARTIAL_PASS_SPACING_MS / urgency.interval_divisor().max(1);
-            self.meta_stamp_within(ARTIFACT_SWEEP_STAMP_KEY, now, interval_ms)?
-                || self.meta_stamp_within(ARTIFACT_SWEEP_PROGRESS_KEY, now, spacing_ms)?
-        } else {
-            false
-        };
-        if inline_pass_spaced && policy.artifact_sweep_budget_ms != 0 {
+        if scope == ArtifactSweepScope::Inline
+            && self.inline_artifact_sweep_is_spaced(policy, now, urgency)?
+            && policy.artifact_sweep_budget_ms != 0
+        {
             return Ok((ArtifactSweepOutcome::no_work(true, None), 0));
         }
         if policy.artifact_sweep_budget_ms == 0 {
@@ -21492,6 +21519,58 @@ mod tests {
         );
         assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
         assert!(cache.exists(), "the interrupted cache remains resumable");
+    }
+
+    #[test]
+    fn writable_open_inline_spacing_uses_the_shortest_cadence() {
+        use crate::disk_headroom::SweepUrgency::{Pressured, Routine};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["commit", "--allow-empty", "-qm", "fixture"]);
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        let policy = load_retention_policy(root).unwrap();
+        let now = now_ms();
+        for (key, window) in [
+            (
+                ARTIFACT_SWEEP_STAMP_KEY,
+                i64::from(policy.artifact_sweep_interval_hours) * 3_600_000,
+            ),
+            (ARTIFACT_SWEEP_PROGRESS_KEY, INLINE_PARTIAL_PASS_SPACING_MS),
+        ] {
+            let threshold = now - window / Pressured.interval_divisor();
+            broker
+                .artifact_sweep_meta_set(key, &(threshold + 1).to_string())
+                .unwrap();
+            assert!(
+                broker
+                    .inline_artifact_sweep_is_spaced(&policy, now, Pressured)
+                    .unwrap()
+            );
+
+            broker
+                .artifact_sweep_meta_set(key, &threshold.to_string())
+                .unwrap();
+            assert!(
+                !broker
+                    .inline_artifact_sweep_is_spaced(&policy, now, Pressured)
+                    .unwrap()
+            );
+            assert!(
+                broker
+                    .inline_artifact_sweep_is_spaced(&policy, now, Routine)
+                    .unwrap()
+            );
+
+            broker.artifact_sweep_meta_set(key, "0").unwrap();
+        }
+        assert!(
+            !broker
+                .inline_artifact_sweep_is_spaced(&policy, now, Pressured)
+                .unwrap()
+        );
     }
 
     #[test]
