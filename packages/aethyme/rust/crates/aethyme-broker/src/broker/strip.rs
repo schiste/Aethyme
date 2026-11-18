@@ -595,6 +595,13 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Makes moving the candidate at this relative path fail.
+    pub(crate) static FAIL_MOVE_FOR_TEST: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 pub(crate) fn set_probes_fail_for_tests(fail: bool) {
     PROBES_FAIL.with(|cell| cell.set(fail));
 }
@@ -1922,6 +1929,37 @@ impl Broker {
         let prove_started = Instant::now();
         let verdicts = prove_strippable_all(worktree, candidates, deadline, venv_markers);
         report.prove_ms = report.prove_ms.saturating_add(elapsed_ms(prove_started));
+        self.move_proven(
+            StripTarget {
+                session_id,
+                worktree,
+                pool,
+            },
+            candidates,
+            verdicts,
+            deadline,
+            venv_markers,
+            report,
+        )
+    }
+
+    /// The moving half of [`Self::prove_and_move`]: note each refused
+    /// verdict and move each proved candidate into the trash, in order.
+    /// Returns the relative paths moved.
+    pub(super) fn move_proven(
+        &self,
+        target: StripTarget<'_>,
+        candidates: &[StripCandidate],
+        verdicts: Vec<Result<(), &'static str>>,
+        deadline: Instant,
+        venv_markers: &[String],
+        report: &mut CheckoutStripReport,
+    ) -> Vec<String> {
+        let StripTarget {
+            session_id,
+            worktree,
+            pool,
+        } = target;
         let mut stripped = Vec::new();
         for (candidate, verdict) in candidates.iter().zip(verdicts) {
             if let Err(code) = verdict {
@@ -1949,13 +1987,26 @@ impl Broker {
             }
             let _move_span = crate::phase_telemetry::span("checkout_strip_move");
             let move_started = Instant::now();
-            let moved = crate::checkout_trash::move_directory_to_trash(
-                pool,
-                worktree,
-                &candidate.relative,
-                session_id,
-                &mut |trash_dir, entry, row| self.record_checkout_trash_row(trash_dir, entry, row),
-            );
+            #[cfg(test)]
+            let injected = FAIL_MOVE_FOR_TEST
+                .with(|cell| cell.borrow().as_deref() == Some(candidate.relative.as_str()));
+            #[cfg(not(test))]
+            let injected = false;
+            let moved = if injected {
+                Err(crate::checkout_trash::StripMoveRefusal::Failed(
+                    "failure injected by the test".into(),
+                ))
+            } else {
+                crate::checkout_trash::move_directory_to_trash(
+                    pool,
+                    worktree,
+                    &candidate.relative,
+                    session_id,
+                    &mut |trash_dir, entry, row| {
+                        self.record_checkout_trash_row(trash_dir, entry, row)
+                    },
+                )
+            };
             report.move_ms = report.move_ms.saturating_add(elapsed_ms(move_started));
             match moved {
                 Ok(moved) => {

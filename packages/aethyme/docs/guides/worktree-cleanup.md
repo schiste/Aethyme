@@ -489,6 +489,29 @@ tooling writes. Names must be exact file names: no path separator, no glob
 character, and never a credentials file (`.env`, `.env.*`, `.envrc`, `.netrc`,
 `.npmrc`, `.pypirc`).
 
+For an open session idle past `idle_strip_after_hours`, only what the
+session's own `.aethyme/prepare.toml` recreates is stripped, so
+`aethyme broker submit prepare --session <id>` rebuilds it:
+
+- a directory a step declares as an output, exactly (`node_modules/`);
+- a Python environment (`.venv` with `pyvenv.cfg`, proved as above) whose
+  interpreter a step declares as an output, which shows the step creates it:
+  `tools/.venv/bin/python` (or `tools/.venv/pyvenv.cfg`) in that step's
+  `outputs`. A step that only declares other files inside the environment
+  (`tools/.venv/bin/tool`) may just install into an environment made
+  elsewhere, so the environment stays (`environment_root_creation_unproven`);
+- a workspace member's `node_modules` that the strip proves is a pnpm member
+  (links into the top-level store, pnpm's shims), when the top-level
+  `node_modules/` is declared and actually moved in the same pass (or is
+  already gone),
+  so the declared install recreates root and members together. Otherwise the
+  members stay (`member_root_kept`).
+
+Everything else stays, counted as `not_declared_output`, and anything the
+proofs refuse stays with the same reason (`witness_missing`,
+`unexpected_content`, ...). Each run reports removed and kept directories
+and bytes per kind in its `checkout_idle_strip` attachment (`by_kind`).
+
 A `finish cleanup resolve` plan refuses a checkout holding an ignored
 directory nothing catalogues as regenerable. Pass
 `--archive-ignored-directories` to the plan and to its `--confirm` to archive
