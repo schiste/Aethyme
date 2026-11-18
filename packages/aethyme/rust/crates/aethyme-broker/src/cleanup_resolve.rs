@@ -38,6 +38,9 @@ use crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS;
 use crate::types::SessionOrigin;
 use crate::{Broker, BrokerOpError, CleanupDisposition};
 
+mod restore;
+pub(crate) use restore::restore_recovery_archive;
+
 pub const CLEANUP_RESOLVE_SCHEMA_VERSION: u32 = 3;
 const LEGACY_CLEANUP_RESOLVE_SCHEMA_VERSION: u32 = 2;
 const LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 1;

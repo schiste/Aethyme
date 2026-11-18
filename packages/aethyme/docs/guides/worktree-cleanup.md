@@ -20,9 +20,9 @@ its branch. The broker makes the same close itself, with no `finish`, for an
 open session that has been inactive long enough: a spawned session whose every
 pull request merged and whose landed, clean checkout nothing uses
 (`session_merged_after_hours`, default 2 hours), any other landed clean session
-(`session_landed_after_hours`, 24 hours), a session that never committed and
+(`session_landed_after_hours`, 4 hours), a session that never committed and
 whose agent is gone (`session_no_work_abandoned_after_hours`, 4 hours), and any
-session without a live agent (`session_abandoned_after_hours`, 72 hours). See
+session without a live agent (`session_abandoned_after_hours`, 24 hours). See
 [automatic checkout maintenance](automatic-checkout-maintenance.md). `finish`
 closes and then, for a broker-spawned worktree whose cleanup
 is already proven safe, removes the checkout and its local session branch in the

@@ -232,6 +232,12 @@ pub(crate) struct CheckoutStripDay {
     pub cleaned_leftovers_retired: usize,
     pub checkouts_stripped: usize,
     pub directories_stripped: usize,
+    /// Of the retired checkouts, those that went through a recovery archive
+    /// that day, and the archives' bytes.
+    #[serde(default)]
+    pub checkouts_archived: usize,
+    #[serde(default)]
+    pub archive_bytes: u64,
     /// Bytes of stripped directories the deleter removed that day.
     pub bytes_freed: u64,
 }
@@ -895,6 +901,7 @@ fn refused_counter(code: &str) -> &'static str {
         "not_closed" => "checkout_strip_refused_not_closed",
         "adopted" => "checkout_strip_refused_adopted",
         "checkout_missing" => "checkout_strip_refused_checkout_missing",
+        "tombstone" => "checkout_strip_refused_tombstone",
         "checkout_unreadable" => "checkout_strip_refused_checkout_unreadable",
         "not_owned" => "checkout_strip_refused_not_owned",
         "open_session" => "checkout_strip_refused_open_session",
@@ -1460,7 +1467,7 @@ impl Broker {
                 CheckoutStrip::Refused(code) => {
                     note_refusal(&mut report, code);
                     // Ownership never changes for a session: not asked again.
-                    if code == "adopted" || code == "not_owned" {
+                    if code == "adopted" || code == "not_owned" || code == "tombstone" {
                         newly_done.insert(session.id, closed_at);
                     }
                     // A folder proven absent (ENOENT) while its pool
@@ -1732,6 +1739,10 @@ impl Broker {
             return Refused("adopted");
         }
         let worktree = PathBuf::from(&session.worktree_path);
+        // A retired checkout's tombstone holds nothing to strip.
+        if super::tombstone::is_checkout_tombstone(&worktree) {
+            return Refused("tombstone");
+        }
         // Absent only when the filesystem says so; a call that fails any
         // other way is not proof the folder is gone.
         match std::fs::symlink_metadata(&worktree) {
@@ -2010,6 +2021,10 @@ impl Broker {
         day.checkouts_stripped = day
             .checkouts_stripped
             .saturating_add(strip.checkouts_stripped);
+        day.checkouts_archived = day
+            .checkouts_archived
+            .saturating_add(report.retired_archived + report.retired_operation_archived);
+        day.archive_bytes = day.archive_bytes.saturating_add(report.archive_bytes);
         day.directories_stripped = day
             .directories_stripped
             .saturating_add(strip.directories_stripped);

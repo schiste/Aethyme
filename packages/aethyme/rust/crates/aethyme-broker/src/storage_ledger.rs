@@ -331,7 +331,9 @@ impl Default for Budgets {
             storage_total_bytes: 48 * GIB,
             free_floor_bytes: 10 * GIB,
             hard_minimum_bytes: 2 * GIB,
-            unlanded_archive_days: 30,
+            // Archive-then-delete keeps idle work only in its archive, so
+            // archives are kept a quarter (was 30 days).
+            unlanded_archive_days: 90,
             gate_cache_by_repository: BTreeMap::new(),
         }
     }

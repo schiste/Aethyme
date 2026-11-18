@@ -3147,10 +3147,17 @@ fn push_checkout_retirement_advice(
             ),
             session_id: Some(first),
             queue_entry_id: None,
-            evidence: unprovable_advice_evidence(too_large),
-            commands: vec![format!(
-                "aethyme broker finish cleanup resolve {first} --archive"
-            )],
+            evidence: {
+                let mut evidence = unprovable_advice_evidence(too_large);
+                evidence.push(
+                    "each one's largest paths (names and sizes only) are listed in `aethyme broker gc plan --json` under checkout_retirement_keeps[].detail".into(),
+                );
+                evidence
+            },
+            commands: vec![
+                format!("aethyme broker finish cleanup resolve {first} --archive"),
+                "aethyme broker gc plan --json".into(),
+            ],
         });
     }
     if progress.stalled_runs >= retire::RETIRE_STALLED_RUNS
@@ -3733,6 +3740,7 @@ mod remote_heads;
 mod retire;
 mod retire_operation;
 mod strip;
+mod tombstone;
 pub(crate) use leases::{
     AbandonedSessionCloseOutcome, AbandonmentKeepReason, LandedProof, LandedSessionDecline,
     long_proof_grant, validate_session_commit_args,
@@ -3742,6 +3750,7 @@ pub(crate) use leases::{
     LANDED_PROOF_TIMEOUTS_KEY, doubled_proof_budget, landed_proof_session_budget_for_test,
 };
 pub use owners::{CommitOwner, MAX_OWNER_COMMITS, OwnedCommit, OwnersReport};
+pub(crate) use tombstone::{is_checkout_tombstone, restore_command};
 pub(crate) mod lifecycle;
 mod scope_capture;
 mod status;

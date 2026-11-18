@@ -1245,7 +1245,9 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
     // A checkout the broker retired after its session closed is recreated
     // from the session branch, or refused with the archive holding its
     // leftovers; reuse never fails on a missing path.
-    if mode == crate::AdoptMode::Reuse && !path.exists() {
+    if mode == crate::AdoptMode::Reuse
+        && (!path.exists() || crate::broker::is_checkout_tombstone(&path))
+    {
         let absolute = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
         broker.recreate_retired_checkout(&absolute)?;
     }

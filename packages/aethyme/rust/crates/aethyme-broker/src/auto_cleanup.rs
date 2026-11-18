@@ -134,6 +134,12 @@ const LANDED_SEARCH_HOLD_LIMIT: Duration = Duration::from_secs(10);
 /// then moves on whatever the answer, so one session never holds every later
 /// session back for more than one pass.
 const SESSION_RETIREMENT_BUDGET_HOLD_KEY: &str = "auto_cleanup.session_retirement_budget_hold";
+/// Meta key: sessions whose landed proof ran out of budget (JSON: session id
+/// to consecutive exhaustions and the time until which it is not asked).
+const LANDED_BUDGET_BACKOFF_KEY: &str = "auto_cleanup.landed_budget_backoff";
+const LANDED_BUDGET_BACKOFF_BASE_MS: i64 = 3_600_000;
+const LANDED_BUDGET_BACKOFF_MAX_MS: i64 = 24 * 3_600_000;
+const LANDED_BUDGET_BACKOFF_MAX_ENTRIES: usize = 4_096;
 /// Meta key of [`NotDueMemo`]: when each session the abandonment window kept
 /// for recent activity can first be due.
 const SESSION_RETIREMENT_NOT_DUE_KEY: &str = "auto_cleanup.session_retirement_not_due";
@@ -7546,6 +7552,47 @@ impl Broker {
 
     /// The session a previous pass left the retirement cursor on because its
     /// landed proof ran out of budget, if any.
+    /// Sessions whose landed proof ran out of budget, with how many times
+    /// in a row and until when their landed proof is not asked again.
+    fn landed_budget_backoff(&self) -> std::collections::BTreeMap<i64, (u32, i64)> {
+        self.store_ref()
+            .meta_get(LANDED_BUDGET_BACKOFF_KEY)
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    /// Record a landed proof's outcome for `session_id`: running out of
+    /// budget backs its landed proof off (1 h, doubling, at most 24 h), so a
+    /// proof that cannot finish in any pass's budget stops holding the
+    /// cursor; any other outcome clears it.
+    fn record_landed_budget_outcome(&self, session_id: i64, exhausted: bool, now_ms: i64) {
+        let mut backoff = self.landed_budget_backoff();
+        if exhausted {
+            let failures = backoff
+                .get(&session_id)
+                .map_or(0, |(failures, _)| *failures)
+                + 1;
+            let delay = LANDED_BUDGET_BACKOFF_BASE_MS
+                .saturating_mul(1_i64 << failures.saturating_sub(1).min(20))
+                .min(LANDED_BUDGET_BACKOFF_MAX_MS);
+            backoff.insert(session_id, (failures, now_ms.saturating_add(delay)));
+            crate::phase_telemetry::add("landed_proof_budget_backoff_set", Duration::ZERO);
+        } else if backoff.remove(&session_id).is_none() {
+            return;
+        }
+        while backoff.len() > LANDED_BUDGET_BACKOFF_MAX_ENTRIES {
+            backoff.pop_first();
+        }
+        if let Ok(raw) = serde_json::to_string(&backoff) {
+            crate::warn_unrecorded(
+                "remember a landed proof's budget backoff",
+                self.store_ref().meta_set(LANDED_BUDGET_BACKOFF_KEY, &raw),
+            );
+        }
+    }
+
     fn retirement_budget_hold(&self) -> Option<i64> {
         self.store_ref()
             .meta_get(SESSION_RETIREMENT_BUDGET_HOLD_KEY)
@@ -7738,6 +7785,7 @@ impl Broker {
         let pass_started = Instant::now();
         let mut landed_judged_in_pass = 0_usize;
         let mut budget_hold = self.retirement_budget_hold();
+        let landed_backoff = self.landed_budget_backoff();
         // Set once a landed proof spent the pass's landed budget: no more
         // landed proofs this pass, the cursor stays put, and the cheap
         // abandonment judgements go on.
@@ -7773,8 +7821,15 @@ impl Broker {
                 window_ms,
             )
             .is_abandoned();
+            let landed_backed_off = landed_backoff
+                .get(&session.id)
+                .is_some_and(|(_, until)| *until > now);
+            if landed_backed_off {
+                crate::phase_telemetry::add("landed_proof_budget_backed_off", Duration::ZERO);
+            }
             let idle_enough_for_landed = landed_window_ms > 0
                 && !cursor_pinned
+                && !landed_backed_off
                 && !prioritized.contains(&session.id)
                 && crate::decide_abandonment(
                     &crate::SessionActivity {
@@ -7917,6 +7972,11 @@ impl Broker {
                     crate::phase_telemetry::add("landed_sessions_closed", elapsed);
                 }
                 decline_memo.record(self, session.id, memo_key.as_deref(), landed_decline);
+                self.record_landed_budget_outcome(
+                    session.id,
+                    landed_decline == Some(crate::broker::LandedSessionDecline::BudgetExhausted),
+                    now,
+                );
                 // Leave the cursor on this session so the next pass, usually
                 // the background worker with its larger budget, resumes here;
                 // unless this one session alone used a long pass, which must

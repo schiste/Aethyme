@@ -962,12 +962,12 @@ fn archive_expiry_is_from_the_manifest_with_retention_keep_and_off_switch() {
     let child = archive_child(Some(40), None, false);
     assert_eq!(
         super::archive_expiry(&child, &budgets),
-        Some(created(&child) + 30 * DAY_MS)
+        Some(created(&child) + 90 * DAY_MS)
     );
-    let child = archive_child(Some(40), Some(60), false);
+    let child = archive_child(Some(40), Some(120), false);
     assert_eq!(
         super::archive_expiry(&child, &budgets),
-        Some(created(&child) + 60 * DAY_MS)
+        Some(created(&child) + 120 * DAY_MS)
     );
     assert_eq!(
         super::archive_expiry(&archive_child(Some(400), None, true), &budgets),

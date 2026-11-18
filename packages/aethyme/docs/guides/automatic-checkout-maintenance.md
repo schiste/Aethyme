@@ -9,7 +9,7 @@ records, content delivery, protected files, process use, and current policy.
 
 ## Retention windows
 
-The default open-session abandonment window is three days (72 hours).
+The default open-session abandonment window is one day (24 hours).
 Maintenance uses the latest recorded activity and worktree activity. A live
 recorded task holder remains protected unless the repository explicitly opts
 into the finite task-lease protocol described below; unknown identity remains
@@ -27,8 +27,8 @@ apply after an upgrade:
 
 ```toml
 [retention]
-session_abandoned_after_hours = 72
-session_landed_after_hours = 24
+session_abandoned_after_hours = 24
+session_landed_after_hours = 4
 session_merged_after_hours = 2
 session_no_work_abandoned_after_hours = 4
 closed_worktree_grace_hours = 24
@@ -387,7 +387,7 @@ A clean session whose work is on the fetched default branch can enter guarded re
 
 A spawned session whose every recorded pull request merged closes earlier, after `session_merged_after_hours` (default 2 hours) without activity, counted from the later of its last activity and its last merge. It keeps every proof of the landed path (HEAD landed on the fetched default branch by the same rule, a clean checkout, a gone holder or an expired task lease, no explicit lease held) and adds: the broker spawned the session (an adopted session keeps the 24-hour path and is counted as `adopted`), at least one pull request is recorded and none is open or closed unmerged, and no gate, queue entry, coordinated operation, preparation or artifact producer of the session is running. The pull requests, HEAD, default-branch tip and checkout cleanliness are read again under the session and lifecycle claims immediately before the close; a commit, a new file or new activity in between keeps the session (`moved_before_close`). `0` disables this earlier path; `session_abandoned_after_hours = 0` disables it too. The close is the transition `finish` makes: the checkout stays on disk for its closed-checkout grace, then normal removal judges it. The `session.abandoned` event records `close_reason` (`merged_pull_request_landed` or `landed`), `head`, `upstream_tip`, `landing_evidence` (`representation`, `ancestry` or `content`) and `pull_requests`; an automation note from `automation:session-auto-close` tells the session why, and a session command run with `--session <id>` afterwards names the automatic close and suggests `aethyme broker start --reuse`. `merged_pull_request_sessions_examined` and `merged_pull_request_sessions_closed` count this path within the landed counts.
 
-The abandonment window (`session_abandoned_after_hours`, default 72 hours, so 3 days) closes any open session without a live holder, whatever its pull requests or landing. Its `session.abandoned` event now also records `close_reason` (`inactive_no_pull_request` when no pull request was ever recorded, otherwise `inactive`), `head` and `unlanded_commits`. Closing deletes nothing: a closed checkout whose commits are not on the default branch is kept by automatic removal (`not_contained`) together with its branch until the work lands or a person decides, and the same note and refusal message apply.
+The abandonment window (`session_abandoned_after_hours`, default 24 hours) closes any open session without a live holder, whatever its pull requests or landing. Its `session.abandoned` event now also records `close_reason` (`inactive_no_pull_request` when no pull request was ever recorded, otherwise `inactive`), `head` and `unlanded_commits`. Closing deletes nothing: a closed checkout whose commits are not on the default branch is kept by automatic removal (`not_contained`) together with its branch until the work lands or a person decides, and the same note and refusal message apply.
 
 A spawned session that never did any work closes earlier, after `session_no_work_abandoned_after_hours` (default 4 hours, never longer than `session_abandoned_after_hours`) without activity. Every check of the abandonment window applies, and these are read again under the session operation guard and the lifecycle claim immediately before the close: HEAD is symbolically the session branch and that branch is still its recorded diff base (read from Git), the checkout holds no uncommitted or untracked non-ignored content, the recorded holder is gone and has been for the lease stale grace (counted from the boot for a holder that started before it), and the session holds no explicit claim, unresolved guarded command or coordinated operation, preparation in progress, merge-queue entry or unmerged pull request; unreadable pull-request state does not qualify. An adopted session, or one with no recorded holder, keeps the full window. `0` disables this earlier path; `session_abandoned_after_hours = 0` disables it too. Its `session.abandoned` event records `close_reason` `inactive_no_work`; each close adds `session_closed_no_work` and each keep `session_no_work_kept_<reason>` to the command's `phase_counts`.
 
@@ -455,16 +455,16 @@ stale_session_auto_close = true
 # Every commit is on the fetched default branch, the session never committed
 # past its diff base, or every recorded pull request merged and the tip is
 # contained in a merged pull request's recorded head.
-stale_landed_close_after_hours = 24
+stale_landed_close_after_hours = 4
 # The session branch's remote-tracking ref holds the tip, but nothing landed.
 # The close leaves the branch and the pull request alone.
-stale_pushed_close_after_hours = 72
+stale_pushed_close_after_hours = 24
 # Unpushed commits, uncommitted or untracked content, or unreadable evidence.
 # The checkout is retired only through the recovery-archive path.
-stale_unpushed_close_after_hours = 168
+stale_unpushed_close_after_hours = 24
 # How long a closing-soon note must stand before a session holding work
 # closes. 0 turns the note off (work then closes at its window).
-stale_closing_notice_hours = 24
+stale_closing_notice_hours = 4
 ```
 
 A session waits for both windows: the abandonment window first, then its
@@ -524,7 +524,38 @@ few times without waiting on another writer, a foreground command never.
 Counters: `stale_work_class_<class>`, `stale_work_classification` (time),
 `stale_closing_soon_noted`, `stale_bookkeeping_write_lost`.
 
-### Upgrade note
+### Upgrade note (archive, then delete)
+
+Safety comes from saving the work, not from waiting. For a repository that
+sets nothing, the defaults are now: landed, merged and never-committed
+sessions close after 4 h idle (`stale_landed_close_after_hours = 4`,
+`session_landed_after_hours = 4`); pushed but unmerged sessions after 24 h,
+branch and pull request untouched (`stale_pushed_close_after_hours = 24`);
+sessions holding unpushed or uncommitted work after 24 h, and their checkout
+is retired only through the verified recovery archive
+(`stale_unpushed_close_after_hours = 24`). The closing-soon note now stands
+4 h (`stale_closing_notice_hours = 4`) and is counted inside those windows,
+not added on top: unpushed work is noted at 20 h and closes at 24 h. The
+open-session abandonment window is 24 h (`session_abandoned_after_hours`) and
+recovery archives are kept 90 days (`recovery_archive_days`). Every key keeps
+working: a repository that sets one keeps its value (set the old numbers, 72,
+24, 72, 168 and 24 h and 30 days, to keep the old behaviour), activity after a
+note still voids it, and `stale_session_auto_close = false` still turns
+automatic closing off. `broker start --reuse` on a session whose checkout was
+retired through an archive now restores it from that archive (the same
+commits, staged and unstaged changes, untracked and protected ignored files,
+each checked against the manifest); a failed restore removes the partial
+checkout and keeps the archive.
+A checkout retired through an archive leaves a tombstone at its path: a
+directory holding only `ARCHIVED-SESSION.txt`, which says when the session
+was retired, that its work is saved, and the one command that restores it
+there, `aethyme broker adopt '<path>' --reuse`. Restoring is idempotent; the
+restored checkout's preparation reads stale until it is prepared again. A
+session whose agent is still running and still bound to it (holder live,
+not moved on) is never closed, archived or removed by these lanes, and a
+process inside a checkout blocks both its strip and its removal.
+
+### Earlier upgrade note
 
 For a repository that sets nothing: a stale session with unpushed or
 uncommitted work and a gone holder used to close at the abandonment window
