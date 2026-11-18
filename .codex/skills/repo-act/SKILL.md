@@ -68,6 +68,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   Verify both binaries match the candidate version and, when release commit
   metadata is required, the exact source commit; do not reuse stale artifacts.
 
+- If the broker cannot allocate a disposable Playground because the temporary
+  volume is below its recovery reserve, put the fixture roots on a volume with
+  sufficient headroom and smoke-test session creation there. Keep all arms on
+  the same volume. On macOS, a short temporary symlink to that directory can
+  keep a compiler cache's Unix socket within the platform path limit.
+
 - For short CLI benchmarks, wait on OS process-exit notifications rather than
   adding a polling sleep to the measured wall time. Retain raw command receipts
   and normalize platform-specific CPU/RSS accounting. On Linux, a Python-launched
