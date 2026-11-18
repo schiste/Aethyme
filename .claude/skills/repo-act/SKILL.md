@@ -79,6 +79,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   the exact runner; signal only the owned process group before reaping it.
   Verify semantic output equality before comparing speed.
 
+- Before timing broker session startup hooks, put the pinned build first on
+  the fixture's PATH and inspect the actual `SessionStart` payload. For
+  comparisons of coordination, set `AETHYME_UPDATE_CHECK=off` in every arm to
+  keep release checks out of the measurement. For linked worktrees, verify
+  the agent can stage in its own fixture Git index in both the initial and
+  conflict-repair turns.
+
 - When changing a retention default, inspect fixtures that inherit the default
   as well as tests with explicit overrides. Update their age assumptions and
   reference documentation; exercise retention and expiry on both sides of the
