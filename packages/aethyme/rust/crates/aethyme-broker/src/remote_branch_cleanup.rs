@@ -9,10 +9,20 @@
 //! 1. its pull request merged and the remote tip is exactly that pull
 //!    request's merged head (nothing was pushed after the merge);
 //! 2. every session that worked on the branch is cleaned, not merely merged;
-//! 3. no open pull request uses the branch as its head, and any open pull
-//!    request using it as its base is first retargeted to the base the merged
-//!    pull request landed in, confirmed by a fresh read;
-//! 4. no open session is stacked on, or was started from, the branch.
+//! 3. no open pull request (from any repository) uses the branch as its
+//!    head, and every open pull request using it as its base is first
+//!    retargeted, from this branch only, to the nearest unmerged ancestor of
+//!    the base the merged pull request landed in, confirmed by a fresh read;
+//!    a fork's pull request based on it keeps it, since the broker never
+//!    edits a pull request whose head is in another repository;
+//! 4. no session that is not cleaned is stacked on, or was started from, the
+//!    branch.
+//!
+//! The facts are read once per run to choose candidates, and rules 1, 2, 3
+//! and 4 are read again immediately before each branch's writes; after the
+//! retargets a fresh listing of based pull requests must be empty. Any
+//! unanswered lookup keeps the branch and backs the lane off. One applying
+//! pass runs at a time.
 //!
 //! The delete is a `git push --force-with-lease=<ref>:<merged head>` of an
 //! empty source through the coordinated write path, so it fails if the remote
@@ -32,7 +42,7 @@ use serde::Serialize;
 
 use crate::session_stack::{
     GhCliPullRequestReader, PullRequestBaseEffects, PullRequestFact, PullRequestReader,
-    PullRequestState, retarget_confirmed,
+    PullRequestState, RetargetOutcome, merged_into_via, nearest_unmerged_base, retarget_confirmed,
 };
 use crate::{Broker, CoordinatedCommand, OperationEffect, OperationProvider, QueueWait};
 
@@ -48,6 +58,11 @@ const BACKOFF_BASE_MS: i64 = 15 * 60 * 1000;
 const BACKOFF_MAX_MS: i64 = 6 * 60 * 60 * 1000;
 const META_RETARGETS: &str = "remote_branch_cleanup.retargets";
 const META_FAILURES: &str = "remote_branch_cleanup.failures";
+const META_RETARGETS_SKIPPED: &str = "remote_branch_cleanup.retargets_skipped";
+/// Held while an applying pass runs: the epoch-ms instant it expires.
+const META_RUNNING_UNTIL: &str = "remote_branch_cleanup.running_until_ms";
+/// How long one pass may hold [`META_RUNNING_UNTIL`] before another may start.
+const RUNNING_LEASE_MS: i64 = 20 * 60 * 1000;
 const META_CONSECUTIVE_FAILURES: &str = "remote_branch_cleanup.consecutive_failures";
 const META_BACKOFF_UNTIL: &str = "remote_branch_cleanup.backoff_until_ms";
 const SESSION_BRANCH_PREFIX: &str = "agent/";
@@ -115,13 +130,14 @@ impl RemoteBranchPolicy {
 }
 
 /// Why a branch is kept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeepReason {
     NotASessionBranch,
     SessionNotCleaned,
     StackedSessionOpen,
     OpenPullRequestUsesBranchAsHead,
+    OpenPullRequestUsesBranchAsBase,
+    ForkPullRequestUsesBranchAsBase,
     NoMergedPullRequest,
     RemoteTipNotMergedHead,
     LookupFailed,
@@ -134,6 +150,8 @@ impl KeepReason {
             Self::SessionNotCleaned => "session_not_cleaned",
             Self::StackedSessionOpen => "stacked_session_open",
             Self::OpenPullRequestUsesBranchAsHead => "open_pull_request_uses_branch_as_head",
+            Self::OpenPullRequestUsesBranchAsBase => "open_pull_request_uses_branch_as_base",
+            Self::ForkPullRequestUsesBranchAsBase => "fork_pull_request_uses_branch_as_base",
             Self::NoMergedPullRequest => "no_merged_pull_request",
             Self::RemoteTipNotMergedHead => "remote_tip_not_merged_head",
             Self::LookupFailed => "lookup_failed",
@@ -141,8 +159,11 @@ impl KeepReason {
     }
 }
 
+/// A keep decision and its evidence.
+pub(crate) type Kept = (KeepReason, Option<String>);
+
 /// An open pull request based on the branch, and where it must point first.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlannedRetarget {
     pub pull_request: i64,
     pub to: String,
@@ -181,77 +202,123 @@ fn keep(reason: KeepReason, detail: Option<String>) -> BranchDecision {
     BranchDecision::Keep { reason, detail }
 }
 
+/// Rules 2 and 4 from the session rows.
+pub(crate) fn session_rules(
+    all_sessions_cleaned: bool,
+    stacked_open_sessions: &[i64],
+) -> Option<Kept> {
+    if !all_sessions_cleaned {
+        return Some((KeepReason::SessionNotCleaned, None));
+    }
+    if !stacked_open_sessions.is_empty() {
+        let ids: Vec<String> = stacked_open_sessions.iter().map(i64::to_string).collect();
+        return Some((
+            KeepReason::StackedSessionOpen,
+            Some(format!("session(s) {}", ids.join(", "))),
+        ));
+    }
+    None
+}
+
+/// Rule 3 (head side) and rule 1 against `tip`: no open pull request of any
+/// repository uses the branch as head, and this repository's newest merged
+/// pull request at exactly `tip` is returned.
+fn head_rules<'a>(
+    prs: &'a [PullRequestFact],
+    branch: &str,
+    tip: &str,
+) -> Result<&'a PullRequestFact, Kept> {
+    let named = || prs.iter().filter(|pr| pr.head_branch == branch);
+    if let Some(open) = named().find(|pr| pr.state == PullRequestState::Open) {
+        return Err((
+            KeepReason::OpenPullRequestUsesBranchAsHead,
+            Some(format!("#{}", open.number)),
+        ));
+    }
+    let merged =
+        || named().filter(|pr| pr.state == PullRequestState::Merged && !pr.cross_repository);
+    if merged().next().is_none() {
+        return Err((KeepReason::NoMergedPullRequest, None));
+    }
+    merged()
+        .filter(|pr| pr.head_oid == tip)
+        .max_by_key(|pr| pr.number)
+        .ok_or_else(|| {
+            (
+                KeepReason::RemoteTipNotMergedHead,
+                Some(format!("remote tip {tip}")),
+            )
+        })
+}
+
 /// Apply the four rules to one branch. Pure: the facts are read elsewhere.
 pub(crate) fn decide(facts: &BranchFacts) -> BranchDecision {
     if !facts.branch.starts_with(SESSION_BRANCH_PREFIX) {
         return keep(KeepReason::NotASessionBranch, None);
     }
-    if !facts.all_sessions_cleaned {
-        return keep(KeepReason::SessionNotCleaned, None);
-    }
-    if !facts.stacked_open_sessions.is_empty() {
-        let ids: Vec<String> = facts
-            .stacked_open_sessions
-            .iter()
-            .map(i64::to_string)
-            .collect();
-        return keep(
-            KeepReason::StackedSessionOpen,
-            Some(format!("open session(s) {}", ids.join(", "))),
-        );
+    if let Some((reason, detail)) =
+        session_rules(facts.all_sessions_cleaned, &facts.stacked_open_sessions)
+    {
+        return keep(reason, detail);
     }
     let head_prs = match &facts.head_pull_requests {
         Ok(prs) => prs,
         Err(error) => return keep(KeepReason::LookupFailed, Some(error.clone())),
     };
-    let own = || head_prs.iter().filter(|pr| pr.head_branch == facts.branch);
-    if let Some(open) = own().find(|pr| pr.state == PullRequestState::Open) {
-        return keep(
-            KeepReason::OpenPullRequestUsesBranchAsHead,
-            Some(format!("#{}", open.number)),
-        );
-    }
-    let newest_merged = own()
-        .filter(|pr| pr.state == PullRequestState::Merged)
-        .max_by_key(|pr| pr.number);
     let Some(tip) = &facts.remote_tip else {
+        let merged = head_prs
+            .iter()
+            .filter(|pr| {
+                pr.head_branch == facts.branch
+                    && pr.state == PullRequestState::Merged
+                    && !pr.cross_repository
+            })
+            .max_by_key(|pr| pr.number);
         return BranchDecision::Absent {
-            pr_number: newest_merged.map(|pr| pr.number),
+            pr_number: merged.map(|pr| pr.number),
         };
     };
-    if newest_merged.is_none() {
-        return keep(KeepReason::NoMergedPullRequest, None);
-    }
-    let Some(merged) = own()
-        .filter(|pr| pr.state == PullRequestState::Merged && &pr.head_oid == tip)
-        .max_by_key(|pr| pr.number)
-    else {
-        return keep(
-            KeepReason::RemoteTipNotMergedHead,
-            Some(format!("remote tip {tip}")),
-        );
+    let merged = match head_rules(head_prs, &facts.branch, tip) {
+        Ok(merged) => merged,
+        Err((reason, detail)) => return keep(reason, detail),
     };
     let base_prs = match &facts.base_pull_requests {
         Ok(prs) => prs,
         Err(error) => return keep(KeepReason::LookupFailed, Some(error.clone())),
     };
-    let retargets = base_prs
+    let based: Vec<&PullRequestFact> = base_prs
         .iter()
         .filter(|pr| pr.state == PullRequestState::Open && pr.base_branch == facts.branch)
-        .map(|pr| PlannedRetarget {
-            pull_request: pr.number,
-            to: merged.base_branch.clone(),
-        })
         .collect();
+    // The broker never edits a pull request whose head is in another
+    // repository, so a fork's pull request based on the branch keeps it.
+    if let Some(fork) = based.iter().find(|pr| pr.cross_repository) {
+        return keep(
+            KeepReason::ForkPullRequestUsesBranchAsBase,
+            Some(format!("#{}", fork.number)),
+        );
+    }
     BranchDecision::Delete {
         expected_oid: tip.clone(),
         pr_number: merged.number,
-        retargets,
+        retargets: based
+            .iter()
+            .map(|pr| PlannedRetarget {
+                pull_request: pr.number,
+                to: merged.base_branch.clone(),
+            })
+            .collect(),
     }
 }
 
-/// The writes the executor makes, behind a seam tests replace.
+/// The reads and writes the executor makes, behind a seam tests replace.
 pub(crate) trait CleanupEffects: PullRequestBaseEffects {
+    /// Rules 2 and 4, re-read from the session rows now.
+    fn recheck_sessions(&self, branch: &str) -> Result<Option<Kept>, String>;
+    /// Every pull request whose head is `branch`, read now.
+    fn head_pull_requests(&self, branch: &str) -> Result<Vec<PullRequestFact>, String>;
+    /// Every open pull request based on `branch`, read now.
+    fn open_base_pull_requests(&self, branch: &str) -> Result<Vec<PullRequestFact>, String>;
     /// Delete `refs/heads/<branch>` only if the remote holds `expected_oid`.
     fn delete_remote_branch(
         &mut self,
@@ -268,7 +335,8 @@ pub(crate) trait CleanupEffects: PullRequestBaseEffects {
 pub struct RetargetReport {
     pub pull_request: i64,
     pub to: String,
-    /// `retargeted`, `already_targeted`, `failed` or `planned`.
+    /// `retargeted`, `already_targeted`, `skipped_moved` (someone based it
+    /// elsewhere; not written), `failed` or `planned`.
     pub outcome: String,
 }
 
@@ -297,6 +365,8 @@ pub(crate) struct Execution {
     pub items: Vec<CleanupItemReport>,
     pub stopped: Option<String>,
     pub retargets: u64,
+    pub retargets_skipped: u64,
+    pub lookup_failures: u64,
 }
 
 fn item(
@@ -318,10 +388,48 @@ fn item(
     }
 }
 
-/// Carry out (or, without `apply`, only describe) the decisions in order:
-/// retarget every based pull request and confirm it, then delete under the
-/// lease. At most `max_deletions` deletions; the first failure stops the run
-/// so the caller backs off, and every later deletion is deferred.
+/// Rules 2, 4, 3 (head side) and 1, re-read immediately before any write:
+/// the decision was made from facts read earlier in the run.
+fn recheck_before_writes<E: CleanupEffects + ?Sized>(
+    effects: &E,
+    branch: &str,
+    expected_oid: &str,
+) -> Result<(), Kept> {
+    match effects.recheck_sessions(branch) {
+        Err(error) => return Err((KeepReason::LookupFailed, Some(error))),
+        Ok(Some(kept)) => return Err(kept),
+        Ok(None) => {}
+    }
+    let prs = effects
+        .head_pull_requests(branch)
+        .map_err(|error| (KeepReason::LookupFailed, Some(error)))?;
+    head_rules(&prs, branch, expected_oid).map(|_| ())
+}
+
+/// After the retargets, no open pull request may still be based on the
+/// branch: a fresh listing must be empty.
+fn recheck_base_after_retargets<E: CleanupEffects + ?Sized>(
+    effects: &E,
+    branch: &str,
+) -> Result<(), Kept> {
+    let prs = effects
+        .open_base_pull_requests(branch)
+        .map_err(|error| (KeepReason::LookupFailed, Some(error)))?;
+    match prs.iter().find(|pr| pr.base_branch == branch) {
+        Some(pr) => Err((
+            KeepReason::OpenPullRequestUsesBranchAsBase,
+            Some(format!("#{}", pr.number)),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Carry out (or, without `apply`, only describe) the decisions in order.
+/// For each deletion: re-read the session rules and the head pull requests,
+/// retarget every based pull request from this branch and confirm it, list
+/// the based pull requests again and require none, then delete under the
+/// lease. At most `max_deletions` deletions; the first failed write stops the
+/// run so the caller backs off, and every later deletion is deferred.
 pub(crate) fn execute<E: CleanupEffects + ?Sized>(
     effects: &mut E,
     repository: &str,
@@ -333,9 +441,14 @@ pub(crate) fn execute<E: CleanupEffects + ?Sized>(
     let mut stopped: Option<String> = None;
     let mut deletions = 0;
     let mut retarget_count = 0;
+    let mut skipped_count = 0;
+    let mut lookup_failures = 0;
     for (session_id, branch, decision) in decisions {
         match decision {
             BranchDecision::Keep { reason, detail } => {
+                if reason == KeepReason::LookupFailed {
+                    lookup_failures += 1;
+                }
                 items.push(item(session_id, &branch, "kept", reason.as_str(), detail));
             }
             BranchDecision::Absent { pr_number } => {
@@ -373,6 +486,22 @@ pub(crate) fn execute<E: CleanupEffects + ?Sized>(
                     items.push(report);
                     continue;
                 }
+                let mut keep_now = |report: &mut CleanupItemReport, (reason, detail): Kept| {
+                    if reason == KeepReason::LookupFailed {
+                        lookup_failures += 1;
+                    }
+                    report.outcome = "kept".into();
+                    report.reason = reason.as_str().into();
+                    report.detail = detail;
+                };
+                if let Err(kept) = recheck_before_writes(&*effects, &branch, &expected_oid) {
+                    for retarget in &mut report.retargets {
+                        retarget.outcome = "not_attempted".into();
+                    }
+                    keep_now(&mut report, kept);
+                    items.push(report);
+                    continue;
+                }
                 let mut failure = None;
                 for retarget in &mut report.retargets {
                     let owner = effects.branch_owner(&retarget.to);
@@ -381,19 +510,20 @@ pub(crate) fn execute<E: CleanupEffects + ?Sized>(
                         session_id,
                         repository,
                         retarget.pull_request,
+                        &branch,
                         &retarget.to,
                         owner,
                     ) {
-                        Ok(outcome) => {
-                            retarget.outcome = match outcome {
-                                crate::session_stack::RetargetOutcome::Retargeted => {
-                                    retarget_count += 1;
-                                    "retargeted".into()
-                                }
-                                crate::session_stack::RetargetOutcome::AlreadyTargeted => {
-                                    "already_targeted".into()
-                                }
-                            };
+                        Ok(RetargetOutcome::Retargeted) => {
+                            retarget_count += 1;
+                            retarget.outcome = "retargeted".into();
+                        }
+                        Ok(RetargetOutcome::AlreadyTargeted) => {
+                            retarget.outcome = "already_targeted".into();
+                        }
+                        Ok(RetargetOutcome::MovedByOther { current }) => {
+                            skipped_count += 1;
+                            retarget.outcome = format!("skipped_moved (now based on {current})");
                         }
                         Err(error) => {
                             retarget.outcome = "failed".into();
@@ -404,6 +534,13 @@ pub(crate) fn execute<E: CleanupEffects + ?Sized>(
                             break;
                         }
                     }
+                }
+                if failure.is_none()
+                    && let Err(kept) = recheck_base_after_retargets(&*effects, &branch)
+                {
+                    keep_now(&mut report, kept);
+                    items.push(report);
+                    continue;
                 }
                 let result = match failure {
                     Some(failure) => Err(failure),
@@ -429,6 +566,8 @@ pub(crate) fn execute<E: CleanupEffects + ?Sized>(
         items,
         stopped,
         retargets: retarget_count,
+        retargets_skipped: skipped_count,
+        lookup_failures,
     }
 }
 
@@ -440,6 +579,9 @@ pub struct CleanupTotals {
     pub kept_by_reason: BTreeMap<String, u64>,
     pub failed: u64,
     pub retargets: u64,
+    /// Retargets not written because someone had already based the pull
+    /// request elsewhere.
+    pub retargets_skipped: u64,
     pub failures: u64,
 }
 
@@ -483,6 +625,7 @@ pub(crate) fn backoff_ms(consecutive: u32) -> i64 {
 struct BrokerCleanupEffects<'a> {
     broker: &'a mut Broker,
     reader: &'a dyn PullRequestReader,
+    repository: String,
     remote: String,
     target: crate::ResolvedRemoteTarget,
 }
@@ -511,6 +654,27 @@ impl PullRequestBaseEffects for BrokerCleanupEffects<'_> {
 }
 
 impl CleanupEffects for BrokerCleanupEffects<'_> {
+    fn recheck_sessions(&self, branch: &str) -> Result<Option<Kept>, String> {
+        let store = self.broker.store_ref();
+        let cleaned = store
+            .every_session_on_branch_cleaned(branch)
+            .map_err(|error| error.to_string())?;
+        let stacked = store
+            .open_sessions_stacked_on_branch(branch)
+            .map_err(|error| error.to_string())?;
+        Ok(session_rules(cleaned, &stacked))
+    }
+
+    fn head_pull_requests(&self, branch: &str) -> Result<Vec<PullRequestFact>, String> {
+        self.reader
+            .pull_requests_with_head(&self.repository, branch)
+    }
+
+    fn open_base_pull_requests(&self, branch: &str) -> Result<Vec<PullRequestFact>, String> {
+        self.reader
+            .open_pull_requests_with_base(&self.repository, branch)
+    }
+
     fn delete_remote_branch(
         &mut self,
         session_id: i64,
@@ -588,6 +752,7 @@ impl Broker {
         &self,
         limit: usize,
         remote: &str,
+        default_branch: &str,
         repository: &str,
         reader: &dyn PullRequestReader,
     ) -> Result<Vec<(i64, String, BranchDecision)>, String> {
@@ -632,7 +797,24 @@ impl Broker {
                         reader.open_pull_requests_with_base(repository, &facts.branch);
                 }
             }
-            let decision = decide(&facts);
+            let decision = match decide(&facts) {
+                BranchDecision::Delete {
+                    expected_oid,
+                    pr_number,
+                    retargets,
+                } => resolve_retarget_targets(retargets, default_branch, |branch| {
+                    merged_into_via(reader, repository, branch)
+                })
+                .map_or_else(
+                    |error| keep(KeepReason::LookupFailed, Some(error)),
+                    |retargets| BranchDecision::Delete {
+                        expected_oid,
+                        pr_number,
+                        retargets,
+                    },
+                ),
+                other => other,
+            };
             decisions.push((facts.session_id, facts.branch, decision));
         }
         Ok(decisions)
@@ -658,6 +840,7 @@ impl Broker {
                 .unwrap_or(0)
         };
         totals.retargets = counter(META_RETARGETS);
+        totals.retargets_skipped = counter(META_RETARGETS_SKIPPED);
         totals.failures = counter(META_FAILURES);
         totals
     }
@@ -767,9 +950,22 @@ impl Broker {
         };
         report.repository = Some(target.display_slug.clone());
         let limit = limit.unwrap_or(policy.scan_per_run).clamp(1, MAX_PER_RUN);
+        // One applying pass at a time: a second one skips.
+        let lease = if apply {
+            match self.take_cleanup_lease() {
+                Some(lease) => Some(lease),
+                None => {
+                    report.skipped = Some("another remote branch cleanup pass is running".into());
+                    return report;
+                }
+            }
+        } else {
+            None
+        };
         let decisions = match self.remote_branch_decisions(
             limit,
             &default.remote,
+            &default.branch,
             &target.display_slug,
             reader,
         ) {
@@ -778,6 +974,7 @@ impl Broker {
                 if apply {
                     self.record_cleanup_failure(&error);
                 }
+                self.release_cleanup_lease(lease.as_deref());
                 report.stopped = Some(error);
                 return report;
             }
@@ -787,6 +984,7 @@ impl Broker {
             let mut effects = BrokerCleanupEffects {
                 broker: &mut *self,
                 reader,
+                repository: repository.clone(),
                 remote: default.remote.clone(),
                 target,
             };
@@ -820,8 +1018,14 @@ impl Broker {
                 }
             }
             self.add_to_counter(META_RETARGETS, execution.retargets);
+            self.add_to_counter(META_RETARGETS_SKIPPED, execution.retargets_skipped);
             match &execution.stopped {
                 Some(error) => self.record_cleanup_failure(error),
+                // An unanswered lookup (a rate limit, an outage) backs off too.
+                None if execution.lookup_failures > 0 => self.record_cleanup_failure(&format!(
+                    "{} provider lookup(s) failed",
+                    execution.lookup_failures
+                )),
                 None => {
                     crate::warn_unrecorded(
                         "clear the remote branch cleanup backoff",
@@ -835,6 +1039,7 @@ impl Broker {
                 .unwrap_or(0);
             report.totals = self.remote_branch_totals();
         }
+        self.release_cleanup_lease(lease.as_deref());
         for item in &execution.items {
             *report.outcomes.entry(item.outcome.clone()).or_default() += 1;
             if item.outcome == "kept" {
@@ -848,6 +1053,36 @@ impl Broker {
         report.stopped = execution.stopped;
         report.next_action = cleanup_next_action(&report);
         report
+    }
+
+    /// Take the single-pass lease, or `None` while another pass holds an
+    /// unexpired one. Returns the value written, which releasing compares.
+    fn take_cleanup_lease(&mut self) -> Option<String> {
+        let now = crate::clock::epoch_ms();
+        let store = self.store_ref();
+        let current = store.meta_get(META_RUNNING_UNTIL).ok()?;
+        if current
+            .as_deref()
+            .and_then(|value| value.parse::<i64>().ok())
+            .is_some_and(|until| until > now)
+        {
+            return None;
+        }
+        let mine = now.saturating_add(RUNNING_LEASE_MS).to_string();
+        store
+            .meta_compare_and_set(META_RUNNING_UNTIL, current.as_deref(), &mine)
+            .ok()?
+            .then_some(mine)
+    }
+
+    fn release_cleanup_lease(&mut self, lease: Option<&str>) {
+        if let Some(lease) = lease {
+            crate::warn_unrecorded(
+                "release the remote branch cleanup lease",
+                self.store_ref()
+                    .meta_compare_and_set(META_RUNNING_UNTIL, Some(lease), "0"),
+            );
+        }
     }
 
     fn record_cleanup_failure(&mut self, error: &str) {
@@ -901,6 +1136,26 @@ impl Broker {
     }
 }
 
+/// Point each planned retarget at the nearest unmerged ancestor of the base
+/// the merged pull request landed in. Any failed lookup fails the whole
+/// decision, so the branch is kept rather than retargeted onto a branch that
+/// may itself have merged and gone.
+pub(crate) fn resolve_retarget_targets(
+    retargets: Vec<PlannedRetarget>,
+    default_branch: &str,
+    merged_into: impl Fn(&str) -> Result<Option<String>, String>,
+) -> Result<Vec<PlannedRetarget>, String> {
+    retargets
+        .into_iter()
+        .map(|planned| {
+            Ok(PlannedRetarget {
+                to: nearest_unmerged_base(&planned.to, default_branch, &merged_into)?,
+                pull_request: planned.pull_request,
+            })
+        })
+        .collect()
+}
+
 fn cleanup_next_action(report: &RemoteBranchCleanupReport) -> Option<String> {
     if report.stopped.is_some() {
         return Some(
@@ -935,6 +1190,7 @@ mod tests {
             head_oid: MERGED_HEAD.into(),
             base_branch: base.into(),
             merge_commit: None,
+            cross_repository: false,
         }
     }
 
@@ -1047,6 +1303,12 @@ mod tests {
         log: RefCell<Vec<String>>,
         unconfirmed: bool,
         fail_delete: bool,
+        /// What re-reading the session rows finds now.
+        sessions_now: Option<Kept>,
+        /// The head pull requests read now; `None`: merged at MERGED_HEAD.
+        head_now: Option<Result<Vec<PullRequestFact>, String>>,
+        /// Pull requests still based on the branch after the retargets.
+        based_after: Vec<i64>,
     }
 
     impl PullRequestBaseEffects for Fake {
@@ -1077,6 +1339,27 @@ mod tests {
     }
 
     impl CleanupEffects for Fake {
+        fn recheck_sessions(&self, branch: &str) -> Result<Option<Kept>, String> {
+            self.log.borrow_mut().push(format!("sessions {branch}"));
+            Ok(self.sessions_now.clone())
+        }
+
+        fn head_pull_requests(&self, branch: &str) -> Result<Vec<PullRequestFact>, String> {
+            self.log.borrow_mut().push(format!("head {branch}"));
+            self.head_now
+                .clone()
+                .unwrap_or_else(|| Ok(vec![pr(10, PullRequestState::Merged, branch, "main")]))
+        }
+
+        fn open_base_pull_requests(&self, branch: &str) -> Result<Vec<PullRequestFact>, String> {
+            self.log.borrow_mut().push(format!("base {branch}"));
+            Ok(self
+                .based_after
+                .iter()
+                .map(|number| pr(*number, PullRequestState::Open, "agent/x", branch))
+                .collect())
+        }
+
         fn delete_remote_branch(
             &mut self,
             _session_id: i64,
@@ -1130,9 +1413,12 @@ mod tests {
         assert_eq!(
             fake.log.borrow().as_slice(),
             [
-                "read #12".to_string(),
+                "sessions agent/a".to_string(),
+                "head agent/a".into(),
+                "read #12".into(),
                 "retarget #12 agent/root Some(3)".into(),
                 "read #12".into(),
+                "base agent/a".into(),
                 format!("delete agent/a {MERGED_HEAD}"),
             ]
         );
@@ -1191,7 +1477,14 @@ mod tests {
         );
         assert_eq!(execution.items[0].outcome, "failed");
         assert_eq!(execution.items[1].outcome, "deferred");
-        assert_eq!(failing.log.borrow().len(), 1);
+        let deletes = |fake: &Fake| {
+            fake.log
+                .borrow()
+                .iter()
+                .filter(|line| line.starts_with("delete"))
+                .count()
+        };
+        assert_eq!(deletes(&failing), 1);
 
         let mut bounded = Fake::default();
         let execution = execute(
@@ -1215,6 +1508,210 @@ mod tests {
             .map(|item| item.outcome.as_str())
             .collect();
         assert_eq!(outcomes, ["deleted", "deferred", "kept"]);
+    }
+
+    #[test]
+    fn rules_are_read_again_immediately_before_any_write() {
+        // A stacked child restored after the listing: nothing is retargeted
+        // or deleted.
+        let mut restored = Fake {
+            sessions_now: Some((KeepReason::StackedSessionOpen, Some("session(s) 7".into()))),
+            ..Fake::default()
+        };
+        restored.bases.insert(12, "agent/a".into());
+        let execution = execute(
+            &mut restored,
+            "o/r",
+            vec![delete(
+                "agent/a",
+                vec![PlannedRetarget {
+                    pull_request: 12,
+                    to: "main".into(),
+                }],
+            )],
+            5,
+            true,
+        );
+        assert_eq!(execution.items[0].outcome, "kept");
+        assert_eq!(execution.items[0].reason, "stacked_session_open");
+        assert_eq!(execution.items[0].retargets[0].outcome, "not_attempted");
+        assert_eq!(
+            restored.log.borrow().as_slice(),
+            ["sessions agent/a".to_string()]
+        );
+        assert_eq!(execution.stopped, None);
+
+        // A new open pull request on the head, or a push after the merge.
+        for (head_now, reason) in [
+            (
+                vec![
+                    pr(10, PullRequestState::Merged, "agent/a", "main"),
+                    pr(11, PullRequestState::Open, "agent/a", "main"),
+                ],
+                "open_pull_request_uses_branch_as_head",
+            ),
+            (Vec::new(), "no_merged_pull_request"),
+        ] {
+            let mut fake = Fake {
+                head_now: Some(Ok(head_now)),
+                ..Fake::default()
+            };
+            let execution = execute(
+                &mut fake,
+                "o/r",
+                vec![delete("agent/a", Vec::new())],
+                5,
+                true,
+            );
+            assert_eq!(execution.items[0].reason, reason);
+            assert!(
+                fake.log
+                    .borrow()
+                    .iter()
+                    .all(|line| !line.starts_with("delete"))
+            );
+        }
+        let mut later = pr(10, PullRequestState::Merged, "agent/a", "main");
+        later.head_oid = LATER.into();
+        let mut moved_tip = Fake {
+            head_now: Some(Ok(vec![later])),
+            ..Fake::default()
+        };
+        let execution = execute(
+            &mut moved_tip,
+            "o/r",
+            vec![delete("agent/a", Vec::new())],
+            5,
+            true,
+        );
+        assert_eq!(execution.items[0].reason, "remote_tip_not_merged_head");
+
+        // An unanswered re-read keeps the branch and counts toward backoff.
+        let mut unanswered = Fake {
+            head_now: Some(Err("rate limited".into())),
+            ..Fake::default()
+        };
+        let execution = execute(
+            &mut unanswered,
+            "o/r",
+            vec![delete("agent/a", Vec::new())],
+            5,
+            true,
+        );
+        assert_eq!(execution.items[0].reason, "lookup_failed");
+        assert_eq!(execution.lookup_failures, 1);
+    }
+
+    #[test]
+    fn a_pull_request_still_based_on_the_branch_after_the_retargets_keeps_it() {
+        let mut fake = Fake {
+            based_after: vec![13],
+            ..Fake::default()
+        };
+        fake.bases.insert(12, "agent/a".into());
+        let execution = execute(
+            &mut fake,
+            "o/r",
+            vec![delete(
+                "agent/a",
+                vec![PlannedRetarget {
+                    pull_request: 12,
+                    to: "main".into(),
+                }],
+            )],
+            5,
+            true,
+        );
+        assert_eq!(execution.items[0].outcome, "kept");
+        assert_eq!(
+            execution.items[0].reason,
+            "open_pull_request_uses_branch_as_base"
+        );
+        assert!(
+            fake.log
+                .borrow()
+                .iter()
+                .all(|line| !line.starts_with("delete"))
+        );
+    }
+
+    #[test]
+    fn a_pull_request_someone_moved_is_skipped_and_counted_not_rewritten() {
+        let mut fake = Fake::default();
+        fake.bases.insert(12, "release".into());
+        let execution = execute(
+            &mut fake,
+            "o/r",
+            vec![delete(
+                "agent/a",
+                vec![PlannedRetarget {
+                    pull_request: 12,
+                    to: "main".into(),
+                }],
+            )],
+            5,
+            true,
+        );
+        assert!(
+            fake.log
+                .borrow()
+                .iter()
+                .all(|line| !line.starts_with("retarget"))
+        );
+        assert!(
+            execution.items[0].retargets[0]
+                .outcome
+                .starts_with("skipped_moved")
+        );
+        assert_eq!(execution.retargets_skipped, 1);
+        assert_eq!(execution.items[0].outcome, "deleted");
+    }
+
+    #[test]
+    fn a_fork_pull_request_on_the_branch_keeps_it_and_is_never_edited() {
+        let mut based = mergeable("agent/a");
+        let mut fork = pr(12, PullRequestState::Open, "agent/b", "agent/a");
+        fork.cross_repository = true;
+        based.base_pull_requests = Ok(vec![fork]);
+        assert_eq!(
+            kept(decide(&based)),
+            KeepReason::ForkPullRequestUsesBranchAsBase
+        );
+        // A fork's merged pull request on the same name is not this branch's merge.
+        let mut forked_merge = mergeable("agent/a");
+        let mut merged = pr(10, PullRequestState::Merged, "agent/a", "main");
+        merged.cross_repository = true;
+        forked_merge.head_pull_requests = Ok(vec![merged]);
+        assert_eq!(kept(decide(&forked_merge)), KeepReason::NoMergedPullRequest);
+        // But a fork's open pull request on the name still keeps it.
+        let mut fork_head = mergeable("agent/a");
+        let mut open = pr(11, PullRequestState::Open, "agent/a", "main");
+        open.cross_repository = true;
+        fork_head.head_pull_requests = Ok(vec![
+            pr(10, PullRequestState::Merged, "agent/a", "main"),
+            open,
+        ]);
+        assert_eq!(
+            kept(decide(&fork_head)),
+            KeepReason::OpenPullRequestUsesBranchAsHead
+        );
+    }
+
+    #[test]
+    fn retarget_targets_walk_to_the_nearest_unmerged_ancestor_or_fail() {
+        let planned = vec![PlannedRetarget {
+            pull_request: 12,
+            to: "agent/root".into(),
+        }];
+        // agent/root itself merged into main: retarget to main.
+        let walked = resolve_retarget_targets(planned.clone(), "main", |branch| {
+            Ok((branch == "agent/root").then(|| "main".to_string()))
+        })
+        .unwrap();
+        assert_eq!(walked[0].to, "main");
+        assert!(
+            resolve_retarget_targets(planned, "main", |_| Err("rate limited".to_string())).is_err()
+        );
     }
 
     #[test]

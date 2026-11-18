@@ -109,7 +109,9 @@ impl BrokerStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Open sessions stacked on, or started from, `branch`.
+    /// Sessions stacked on, or started from, `branch` that are not cleaned:
+    /// the same state filter as "every session cleaned", so a closed child
+    /// that can still be restored keeps protecting its parent branch.
     pub(crate) fn open_sessions_stacked_on_branch(
         &self,
         branch: &str,
@@ -118,7 +120,7 @@ impl BrokerStore {
             "SELECT st.session_id FROM session_stacks st
              JOIN sessions s ON s.id = st.session_id
              WHERE (st.parent_branch = ?1 OR st.base_branch = ?1)
-               AND s.cleanup_state = 'open'
+               AND s.cleanup_state <> 'cleaned'
              ORDER BY st.session_id",
         )?;
         let rows = stmt.query_map([branch], |row| row.get(0))?;
@@ -338,19 +340,26 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_child_no_longer_protects_its_parent_branch() {
+    fn a_closed_child_still_protects_its_parent_branch_until_it_is_cleaned() {
         let (_dir, mut store) = store();
         insert_session(&store, 1, "agent/parent", "cleaned", "cleaned");
         insert_session(&store, 2, "agent/child", "exited", "closed");
+        insert_session(&store, 3, "agent/gone", "cleaned", "cleaned");
         store
             .insert_session_stack(2, 1, "agent/parent", "abc")
             .unwrap();
-        assert!(
+        store
+            .insert_session_stack(3, 1, "agent/parent", "abc")
+            .unwrap();
+        // A closed child can be restored, so it keeps the parent branch; a
+        // cleaned one does not.
+        assert_eq!(
             store
                 .open_sessions_stacked_on_branch("agent/parent")
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            vec![2]
         );
+        // Reconcile and status still only follow open children.
         assert!(store.open_session_stacks().unwrap().is_empty());
     }
 

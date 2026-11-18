@@ -3393,7 +3393,9 @@ and the `remote_branch_cleanup` field of `gc sweep --json` use schema
 `branch`, `outcome` = `deleted|absent|kept|failed|would_delete|deferred`,
 `reason`, `detail`, `pr_number`, `expected_oid`, `retargets`), `outcomes`,
 `kept_by_reason`, `totals` (`deleted`, `absent`, `kept_by_reason`, `failed`,
-`retargets`, `failures`), `skipped`, `stopped`, `next_action`. `gc sweep
+`retargets`, `retargets_skipped`, `failures`); a retarget's `outcome` is
+`retargeted`, `already_targeted`, `skipped_moved (now based on <branch>)`,
+`not_attempted`, `failed` or `planned`, `skipped`, `stopped`, `next_action`. `gc sweep
 --json` also adds `session_stack_failures` when a stacked session's parent
 could not be re-read. Stack notes come from sender
 `automation:session-stack`.

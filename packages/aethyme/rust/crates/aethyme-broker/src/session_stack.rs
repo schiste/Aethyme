@@ -34,10 +34,14 @@ pub(crate) const NOTE_SENDER: &str = "automation:session-stack";
 /// Ancestors walked when looking for the nearest unmerged one.
 const MAX_CHAIN_DEPTH: usize = 16;
 /// The pull-request fields every provider read requests.
-const PR_FIELDS: &str = "number,state,headRefName,headRefOid,baseRefName,mergeCommit";
+const PR_FIELDS: &str =
+    "number,state,headRefName,headRefOid,baseRefName,mergeCommit,isCrossRepository";
 /// The most open pull requests one base-branch listing may return before it
 /// is treated as incomplete.
 const BASE_LISTING_LIMIT: usize = 100;
+/// The most pull requests one head-branch listing may return before it is
+/// treated as incomplete.
+const HEAD_LISTING_LIMIT: usize = 30;
 
 /// What became of the parent session's pull request, as last observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -127,6 +131,10 @@ pub(crate) struct PullRequestFact {
     pub head_oid: String,
     pub base_branch: String,
     pub merge_commit: Option<String>,
+    /// The head lives in another repository (a fork with the same branch
+    /// name). Such a pull request is never edited and never stands for a
+    /// session's own pull request. Unknown counts as cross-repository.
+    pub cross_repository: bool,
 }
 
 /// Parse `gh pr list|view --json number,state,headRefName,headRefOid,
@@ -171,6 +179,7 @@ pub(crate) fn parse_pull_request_facts(stdout: &str) -> Result<Vec<PullRequestFa
                     .as_str()
                     .filter(|oid| !oid.is_empty())
                     .map(str::to_ascii_lowercase),
+                cross_repository: item["isCrossRepository"].as_bool().unwrap_or(true),
             })
         })
         .collect()
@@ -259,8 +268,20 @@ impl PullRequestReader for GhCliPullRequestReader {
         repository: &str,
         branch: &str,
     ) -> Result<Vec<PullRequestFact>, String> {
-        let stdout = Self::run(&Self::list(repository, ["--head", branch], "all", 30))?;
-        Ok(parse_pull_request_facts(&stdout)?
+        let stdout = Self::run(&Self::list(
+            repository,
+            ["--head", branch],
+            "all",
+            HEAD_LISTING_LIMIT,
+        ))?;
+        let prs = parse_pull_request_facts(&stdout)?;
+        if prs.len() >= HEAD_LISTING_LIMIT {
+            return Err(format!(
+                "the pull requests with head {branch} reached the {HEAD_LISTING_LIMIT}-item \
+                 listing limit, so the listing may be incomplete"
+            ));
+        }
+        Ok(prs
             .into_iter()
             .filter(|pr| pr.head_branch == branch)
             .collect())
@@ -310,6 +331,15 @@ impl PullRequestReader for GhCliPullRequestReader {
     }
 }
 
+/// The session's own open pull request among `prs`: the newest open one
+/// whose head is in this repository. A fork's pull request on the same branch
+/// name is never chosen, so it is never edited.
+pub(crate) fn own_open_pull_request(prs: Vec<PullRequestFact>) -> Option<PullRequestFact> {
+    prs.into_iter()
+        .filter(|pr| pr.state == PullRequestState::Open && !pr.cross_repository)
+        .max_by_key(|pr| pr.number)
+}
+
 /// What the parent's pull requests say about the parent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParentObservation {
@@ -322,6 +352,7 @@ pub(crate) struct ParentObservation {
 /// newest merged one (GitHub's `MERGED` state and merged head, so squash and
 /// merge commits are treated alike); then a closed one. With none, a closed
 /// parent session is abandoned and an open one simply has no pull request yet.
+/// Pull requests from forks that reuse the branch name are ignored.
 pub(crate) fn observe_parent(
     prs: &[PullRequestFact],
     parent_branch: &str,
@@ -329,7 +360,9 @@ pub(crate) fn observe_parent(
 ) -> ParentObservation {
     let newest = |state: PullRequestState| {
         prs.iter()
-            .filter(|pr| pr.head_branch == parent_branch && pr.state == state)
+            .filter(|pr| {
+                pr.head_branch == parent_branch && pr.state == state && !pr.cross_repository
+            })
             .max_by_key(|pr| pr.number)
             .cloned()
     };
@@ -363,30 +396,47 @@ pub(crate) fn observe_parent(
 
 /// The nearest unmerged ancestor branch, starting from `start` (the branch
 /// the merged parent landed in). `merged_into(branch)` answers where
-/// `branch`'s own pull request merged, or `None` while it is unmerged. The
-/// default branch always ends the walk; so does a cycle or a chain deeper
-/// than [`MAX_CHAIN_DEPTH`], at the default branch.
+/// `branch`'s own pull request merged, or `None` while it is unmerged; a
+/// failed lookup aborts the walk, so an unanswered question is never read as
+/// "unmerged". The default branch always ends the walk; so does a cycle or a
+/// chain deeper than [`MAX_CHAIN_DEPTH`], at the default branch.
 pub(crate) fn nearest_unmerged_base(
     start: &str,
     default_branch: &str,
-    merged_into: impl Fn(&str) -> Option<String>,
-) -> String {
+    merged_into: impl Fn(&str) -> Result<Option<String>, String>,
+) -> Result<String, String> {
     let mut candidate = start.to_string();
     let mut seen = vec![candidate.clone()];
     for _ in 0..MAX_CHAIN_DEPTH {
         if candidate == default_branch {
-            return candidate;
+            return Ok(candidate);
         }
-        match merged_into(&candidate) {
-            None => return candidate,
-            Some(next) if seen.contains(&next) => return default_branch.to_string(),
+        match merged_into(&candidate)? {
+            None => return Ok(candidate),
+            Some(next) if seen.contains(&next) => return Ok(default_branch.to_string()),
             Some(next) => {
                 seen.push(next.clone());
                 candidate = next;
             }
         }
     }
-    default_branch.to_string()
+    Ok(default_branch.to_string())
+}
+
+/// Where `branch`'s own pull request merged, read from the provider: the
+/// lookup [`nearest_unmerged_base`] walks with.
+pub(crate) fn merged_into_via(
+    reader: &dyn PullRequestReader,
+    repository: &str,
+    branch: &str,
+) -> Result<Option<String>, String> {
+    let prs = reader.pull_requests_with_head(repository, branch)?;
+    let observed = observe_parent(&prs, branch, false);
+    Ok(if observed.state == ParentState::Merged {
+        observed.pull_request.map(|pr| pr.base_branch)
+    } else {
+        None
+    })
 }
 
 /// The pull-request base write and its confirmation read.
@@ -405,28 +455,35 @@ pub(crate) trait PullRequestBaseEffects {
 }
 
 /// How a confirmed retarget ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RetargetOutcome {
     /// The pull request already targeted the base; nothing was written.
     AlreadyTargeted,
     /// The base was written and a fresh read confirmed it.
     Retargeted,
+    /// The pull request targeted neither the expected old base nor the new
+    /// one: someone moved it. Nothing was written.
+    MovedByOther { current: String },
 }
 
-/// Retarget pull request `number` to `base`, then re-read it: success only
-/// when the provider reports the new base. Nothing is written when it is
-/// already there.
+/// Retarget pull request `number` from `from` to `base`, then re-read it:
+/// success only when the provider reports the new base. Nothing is written
+/// when it already targets `base`, or when it no longer targets `from`.
 pub(crate) fn retarget_confirmed<E: PullRequestBaseEffects + ?Sized>(
     effects: &mut E,
     session_id: i64,
     repository: &str,
     number: i64,
+    from: &str,
     base: &str,
     cross_session: Option<i64>,
 ) -> Result<RetargetOutcome, String> {
-    if effects.current_base(repository, number)? == base {
+    let current = effects.current_base(repository, number)?;
+    if current == base {
         return Ok(RetargetOutcome::AlreadyTargeted);
+    }
+    if current != from {
+        return Ok(RetargetOutcome::MovedByOther { current });
     }
     effects.set_base(session_id, repository, number, base, cross_session)?;
     let after = effects.current_base(repository, number)?;
@@ -873,44 +930,49 @@ impl Broker {
                 let merged = observed
                     .pull_request
                     .ok_or_else(|| "a merged parent without its pull request".to_string())?;
-                let new_base =
+                // Any unanswered lookup aborts: the child is retried next time
+                // rather than moved onto a branch that may itself have merged.
+                let mut new_base =
                     nearest_unmerged_base(&merged.base_branch, &default.branch, |branch| {
-                        let prs = reader.pull_requests_with_head(&repository, branch).ok()?;
-                        let observed = observe_parent(&prs, branch, false);
-                        if observed.state == ParentState::Merged {
-                            observed.pull_request.map(|pr| pr.base_branch)
-                        } else {
-                            None
-                        }
-                    });
+                        merged_into_via(reader, &repository, branch)
+                    })?;
                 let child_branch = self
                     .store_ref()
                     .session(id)
                     .map(|session| session.branch)
                     .map_err(|error| error.to_string())?;
-                let child_pr = reader
-                    .pull_requests_with_head(&repository, &child_branch)?
-                    .into_iter()
-                    .filter(|pr| pr.state == PullRequestState::Open)
-                    .max_by_key(|pr| pr.number);
+                let child_pr = own_open_pull_request(
+                    reader.pull_requests_with_head(&repository, &child_branch)?,
+                );
                 let cross_session = if new_base == default.branch {
                     None
                 } else {
                     self.live_branch_owner(&new_base, id)
                 };
+                let mut moved_by_other = false;
                 if let Some(child_pr) = &child_pr {
                     let mut effects = BrokerPullRequestBases {
                         broker: &mut *self,
                         reader,
                     };
-                    retarget_confirmed(
+                    if let RetargetOutcome::MovedByOther { current } = retarget_confirmed(
                         &mut effects,
                         id,
                         &repository,
                         child_pr.number,
+                        &stack.parent_branch,
                         &new_base,
                         cross_session,
-                    )?;
+                    )? {
+                        // Someone chose another base: record theirs, write nothing.
+                        moved_by_other = true;
+                        new_base = current;
+                    }
+                }
+                // `sync --unstack` may have moved the stack meanwhile: its
+                // choice stands.
+                if !self.stack_still_on_parent(id, &stack.parent_branch)? {
+                    return Ok(None);
                 }
                 self.store()
                     .set_session_stack_parent_state(
@@ -925,6 +987,11 @@ impl Broker {
                     .set_session_stack_base(id, &new_base)
                     .map_err(|error| error.to_string())?;
                 let retargeted = match &child_pr {
+                    Some(pr) if moved_by_other => format!(
+                        "This session's pull request #{} had already been moved to {new_base} \
+                         by someone else, so the broker left it there.",
+                        pr.number
+                    ),
                     Some(pr) => format!(
                         "This session's pull request #{} now targets {new_base} (was {}).",
                         pr.number, stack.parent_branch
@@ -947,6 +1014,15 @@ impl Broker {
                 Ok(Some(message))
             }
         }
+    }
+
+    /// Whether the stored stack still follows its parent branch.
+    fn stack_still_on_parent(&self, session_id: i64, parent_branch: &str) -> Result<bool, String> {
+        Ok(self
+            .store_ref()
+            .session_stack(session_id)
+            .map_err(|error| error.to_string())?
+            .is_some_and(|stack| stack.base_branch == parent_branch))
     }
 
     fn leave_stack_note(&mut self, session_id: i64, message: &str, kind: &str) {
@@ -984,26 +1060,33 @@ impl Broker {
             ));
         }
         let branch = self.store_ref().session(session_id)?.branch;
-        let child_pr = reader
-            .pull_requests_with_head(&repository, &branch)
-            .map_err(refused)?
-            .into_iter()
-            .filter(|pr| pr.state == PullRequestState::Open)
-            .max_by_key(|pr| pr.number);
+        let child_pr = own_open_pull_request(
+            reader
+                .pull_requests_with_head(&repository, &branch)
+                .map_err(refused)?,
+        );
         if let Some(pr) = &child_pr {
             let mut effects = BrokerPullRequestBases {
                 broker: &mut *self,
                 reader,
             };
-            retarget_confirmed(
+            let outcome = retarget_confirmed(
                 &mut effects,
                 session_id,
                 &repository,
                 pr.number,
+                &stack.base_branch,
                 &default.branch,
                 None,
             )
             .map_err(refused)?;
+            if let RetargetOutcome::MovedByOther { current } = outcome {
+                return Err(refused(format!(
+                    "pull request #{} targets {current}, not {} or {}: someone moved it, so \
+                     nothing was changed. Move it back, or leave the stack as it is",
+                    pr.number, stack.base_branch, default.branch
+                )));
+            }
         }
         self.store()
             .set_session_stack_base(session_id, &default.branch)?;
@@ -1174,6 +1257,7 @@ mod tests {
             head_oid: OID_A.into(),
             base_branch: base.into(),
             merge_commit: (state == PullRequestState::Merged).then(|| OID_B.to_string()),
+            cross_repository: false,
         }
     }
 
@@ -1199,18 +1283,21 @@ mod tests {
     fn provider_json_parses_merge_and_squash_alike_and_refuses_partial_heads() {
         let json = format!(
             r#"[{{"number":7,"state":"MERGED","headRefName":"agent/a","headRefOid":"{OID_A}",
-                "baseRefName":"main","mergeCommit":{{"oid":"{OID_B}"}}}},
+                "baseRefName":"main","mergeCommit":{{"oid":"{OID_B}"}},"isCrossRepository":false}},
                {{"number":8,"state":"OPEN","headRefName":"agent/b","headRefOid":"{OID_B}",
-                "baseRefName":"agent/a","mergeCommit":null}}]"#
+                "baseRefName":"agent/a","mergeCommit":null,"isCrossRepository":true}}]"#
         );
         let facts = parse_pull_request_facts(&json).unwrap();
         assert_eq!(facts[0].state, PullRequestState::Merged);
         assert_eq!(facts[0].merge_commit.as_deref(), Some(OID_B));
         assert_eq!(facts[1].merge_commit, None);
+        assert!(!facts[0].cross_repository);
+        assert!(facts[1].cross_repository);
         let single = format!(
             r#"{{"number":9,"state":"CLOSED","headRefName":"x","headRefOid":"{OID_A}","baseRefName":"main"}}"#
         );
-        assert_eq!(parse_pull_request_facts(&single).unwrap().len(), 1);
+        // Without the field the head's repository is unknown: treated as a fork.
+        assert!(parse_pull_request_facts(&single).unwrap()[0].cross_repository);
         let partial = r#"[{"number":9,"state":"OPEN","headRefName":"x","headRefOid":"abc","baseRefName":"main"}]"#;
         assert!(parse_pull_request_facts(partial).is_err());
         assert!(parse_pull_request_facts("not json").is_err());
@@ -1245,6 +1332,21 @@ mod tests {
             observe_parent(&[other], parent, true).state,
             ParentState::Abandoned
         );
+        // A fork reusing the branch name neither merges nor keeps the parent.
+        let mut fork = fact(5, PullRequestState::Merged, parent, "main");
+        fork.cross_repository = true;
+        assert_eq!(
+            observe_parent(std::slice::from_ref(&fork), parent, false).state,
+            ParentState::Open
+        );
+        let mut fork_open = fact(6, PullRequestState::Open, parent, "main");
+        fork_open.cross_repository = true;
+        let own = fact(4, PullRequestState::Open, parent, "main");
+        assert_eq!(
+            own_open_pull_request(vec![fork_open.clone(), own]).map(|pr| pr.number),
+            Some(4)
+        );
+        assert_eq!(own_open_pull_request(vec![fork_open]), None);
     }
 
     #[test]
@@ -1252,28 +1354,46 @@ mod tests {
         let links: BTreeMap<&str, &str> = [("agent/b", "agent/a"), ("agent/a", "main")]
             .into_iter()
             .collect();
-        let merged_into = |branch: &str| links.get(branch).map(|next| (*next).to_string());
+        let merged_into = |branch: &str| Ok(links.get(branch).map(|next| (*next).to_string()));
         // b and a both merged: all the way to main.
         assert_eq!(
             nearest_unmerged_base("agent/b", "main", merged_into),
-            "main"
+            Ok("main".to_string())
         );
         // Only b merged (into a, which is open): a.
-        let open_a = |branch: &str| (branch == "agent/b").then(|| "agent/a".to_string());
-        assert_eq!(nearest_unmerged_base("agent/b", "main", open_a), "agent/a");
-        assert_eq!(nearest_unmerged_base("main", "main", |_| None), "main");
+        let open_a = |branch: &str| Ok((branch == "agent/b").then(|| "agent/a".to_string()));
+        assert_eq!(
+            nearest_unmerged_base("agent/b", "main", open_a),
+            Ok("agent/a".to_string())
+        );
+        assert_eq!(
+            nearest_unmerged_base("main", "main", |_| Ok(None)),
+            Ok("main".to_string())
+        );
         // A cycle ends at the default branch rather than looping.
         let cycle = |branch: &str| {
-            Some(
+            Ok(Some(
                 if branch == "agent/x" {
                     "agent/y"
                 } else {
                     "agent/x"
                 }
                 .to_string(),
-            )
+            ))
         };
-        assert_eq!(nearest_unmerged_base("agent/x", "main", cycle), "main");
+        assert_eq!(
+            nearest_unmerged_base("agent/x", "main", cycle),
+            Ok("main".to_string())
+        );
+        // An unanswered lookup aborts instead of reading as "unmerged".
+        let failing = |branch: &str| {
+            if branch == "agent/a" {
+                Err("rate limited".to_string())
+            } else {
+                Ok(Some("agent/a".to_string()))
+            }
+        };
+        assert!(nearest_unmerged_base("agent/b", "main", failing).is_err());
     }
 
     #[derive(Default)]
@@ -1317,13 +1437,13 @@ mod tests {
         let mut effects = FakeBases::default();
         effects.bases.borrow_mut().insert(5, "agent/parent".into());
         assert_eq!(
-            retarget_confirmed(&mut effects, 2, "o/r", 5, "main", None),
+            retarget_confirmed(&mut effects, 2, "o/r", 5, "agent/parent", "main", None),
             Ok(RetargetOutcome::Retargeted)
         );
         assert_eq!(effects.writes, vec![(5, "main".to_string(), None)]);
         // Already there: nothing is written.
         assert_eq!(
-            retarget_confirmed(&mut effects, 2, "o/r", 5, "main", None),
+            retarget_confirmed(&mut effects, 2, "o/r", 5, "agent/parent", "main", None),
             Ok(RetargetOutcome::AlreadyTargeted)
         );
         assert_eq!(effects.writes.len(), 1);
@@ -1336,7 +1456,18 @@ mod tests {
             .bases
             .borrow_mut()
             .insert(5, "agent/parent".into());
-        assert!(retarget_confirmed(&mut unconfirmed, 2, "o/r", 5, "main", Some(1)).is_err());
+        assert!(
+            retarget_confirmed(
+                &mut unconfirmed,
+                2,
+                "o/r",
+                5,
+                "agent/parent",
+                "main",
+                Some(1)
+            )
+            .is_err()
+        );
 
         let mut denied = FakeBases {
             fail_write: true,
@@ -1344,9 +1475,20 @@ mod tests {
         };
         denied.bases.borrow_mut().insert(5, "agent/parent".into());
         assert_eq!(
-            retarget_confirmed(&mut denied, 2, "o/r", 5, "main", None),
+            retarget_confirmed(&mut denied, 2, "o/r", 5, "agent/parent", "main", None),
             Err("denied".into())
         );
+
+        // Someone moved it elsewhere: skipped and reported, nothing written.
+        let mut moved = FakeBases::default();
+        moved.bases.borrow_mut().insert(5, "release".into());
+        assert_eq!(
+            retarget_confirmed(&mut moved, 2, "o/r", 5, "agent/parent", "main", None),
+            Ok(RetargetOutcome::MovedByOther {
+                current: "release".into()
+            })
+        );
+        assert!(moved.writes.is_empty());
     }
 
     #[test]
