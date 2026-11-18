@@ -344,6 +344,7 @@ impl Broker {
             &self.main_root,
             now_ms,
         ));
+        advice.extend(crate::merged_branches::status_advice(&self.store));
         phase_timings_ms.insert(
             "main_checkout".into(),
             phase_started.elapsed().as_millis() as u64,
@@ -1235,6 +1236,7 @@ impl Broker {
             &self.main_root,
             now_ms,
         ));
+        advice.extend(crate::merged_branches::status_advice(&self.store));
         if refresh && cleanup_retention.broker_owned_worktree_count > 0 {
             let count = cleanup_retention.broker_owned_worktree_count;
             let required = crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES;
