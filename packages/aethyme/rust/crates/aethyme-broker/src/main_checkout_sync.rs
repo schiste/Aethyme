@@ -852,8 +852,8 @@ pub(crate) struct GeneratedJudgement {
 }
 
 /// The owner policy file the deploy also writes. It is replaced only when
-/// its bytes are exactly a committed version (nothing uncommitted to lose),
-/// never by template or receipt.
+/// its bytes are already exactly the update's (`matches_target`), never by
+/// template, receipt or history.
 const OWNER_POLICY_PATH: &str = ".aethyme/config.toml";
 /// Commits per path searched for a recorded copy of the working bytes.
 const RECORDED_HISTORY_DEPTH: usize = 200;
@@ -867,9 +867,11 @@ const RECORDED_HISTORY_DEPTH: usize = 200;
 ///   receipt still hashes its whole body;
 /// - `current_template`: a static deploy target byte-equal to this binary's
 ///   render;
-/// - `recorded_in_history`: a generated file, or `.aethyme/config.toml`, whose
-///   exact bytes were committed at that path in the default branch's history,
-///   so replacing them loses nothing.
+/// - `recorded_in_history`: a generated file whose exact bytes were committed
+///   at that path in the default branch's history, so replacing them loses
+///   nothing.
+///
+/// `.aethyme/config.toml` qualifies only by `matches_target`.
 ///
 /// Anything else holds: a non-generated path (`not_generated`), a staged
 /// change (`staged`), a deleted or unreadable file (`unreadable`), edited
@@ -949,23 +951,24 @@ fn judge_one(
     if checkout.blob_at(to, path).as_deref() == Some(blob.as_str()) {
         return proven("matches_target");
     }
-    if !policy_file {
+    // Owner policy is never replaced on other evidence: an owner may have
+    // set it back to an older committed version on purpose.
+    if policy_file {
+        return Err("owner_edits");
+    }
+    {
         let content = std::fs::read_to_string(main_root.join(path)).map_err(|_| "unreadable")?;
         if matches!(path, "AGENTS.md" | "CLAUDE.md")
             && aethyme_enhance::agents::is_unedited_generated_policy(&content)
         {
             return proven("unedited_generated_policy");
         }
-        if aethyme_enhance::deploy::generated_artifact_contents(path)
-            .iter()
-            .any(|generated| *generated == content)
-        {
+        if aethyme_enhance::deploy::generated_artifact_contents(path).contains(&content) {
             return proven("current_template");
         }
     }
     match checkout.recorded_blobs(to, path, RECORDED_HISTORY_DEPTH) {
         Ok(blobs) if blobs.contains(&blob) => proven("recorded_in_history"),
-        Ok(_) if policy_file => Err("owner_edits"),
         Ok(_) => Err("edited"),
         Err(_) => Err("unreadable"),
     }
@@ -987,13 +990,58 @@ fn generated_hold_advice(quoted_root: &str, held: &[(String, &'static str)]) -> 
     )
 }
 
+/// Backups of replaced generated files older than this are removed.
+const BACKUP_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// At most this many backup sets are kept.
+const BACKUP_SETS_KEPT: usize = 20;
+
+/// `.aethyme/run/main-checkout-replaced`, created when missing.
+fn backup_root(main_root: &Path) -> Result<std::path::PathBuf, String> {
+    crate::file_lock::repository_run_directory(main_root)
+        .map(|run| run.join("main-checkout-replaced"))
+        .map_err(|error| format!("could not prepare the generated-file backup: {error}"))
+}
+
+/// Remove backup sets past their age or beyond the newest
+/// [`BACKUP_SETS_KEPT`]. Only directories named by an epoch-ms number are
+/// considered; anything else there is left.
+fn prune_backups(root: &Path, now_ms: i64) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut sets = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| {
+            let stamp = entry.file_name().to_str()?.parse::<i64>().ok()?;
+            Some((stamp, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    sets.sort_by(|left, right| right.0.cmp(&left.0));
+    for (index, (stamp, path)) in sets.into_iter().enumerate() {
+        let expired =
+            index >= BACKUP_SETS_KEPT || now_ms.saturating_sub(stamp) > BACKUP_RETENTION_MS;
+        if expired && std::fs::remove_dir_all(&path).is_ok() {
+            crate::phase_telemetry::add("main_checkout_generated_backups_pruned", Duration::ZERO);
+        }
+    }
+}
+
 /// Back up and restore each proven file to its index (committed) content,
-/// after re-checking its bytes against the proof.
+/// after re-checking its bytes against the proof. Returns the verified
+/// backup set.
+///
+/// Each backup is checked against the proven blob and flushed to disk before
+/// anything is replaced. One window remains: a write to a file between its
+/// re-hash here and `checkout-index` replacing it would be lost from the
+/// working tree (the backup holds the proven bytes, not that write). It is
+/// one process start long, and the files are generator output nobody is
+/// meant to edit in place.
 fn replace_generated_files(
     checkout: &GitRepo,
     main_root: &Path,
     replace: &[Replacement],
-) -> Result<(), String> {
+) -> Result<std::path::PathBuf, String> {
     let paths = replace
         .iter()
         .map(|replacement| replacement.path.clone())
@@ -1008,21 +1056,37 @@ fn replace_generated_files(
     {
         return Err("a generated file changed after it was proven; nothing was replaced".into());
     }
-    let backup = crate::file_lock::repository_run_directory(main_root)
-        .map_err(|error| format!("could not prepare the generated-file backup: {error}"))?
-        .join("main-checkout-replaced")
-        .join(crate::clock::epoch_ms().to_string());
-    for path in &paths {
-        let target = backup.join(path);
+    let root = backup_root(main_root)?;
+    let now = crate::clock::epoch_ms();
+    prune_backups(&root, now);
+    let backup = root.join(now.to_string());
+    for replacement in replace {
+        let target = backup.join(&replacement.path);
         let copied = target
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::copy(main_root.join(path), &target).map(|_| ()));
+            .and_then(|()| std::fs::copy(main_root.join(&replacement.path), &target).map(|_| ()))
+            .and_then(|()| std::fs::File::open(&target)?.sync_all());
         if let Err(error) = copied {
             return Err(format!(
-                "could not back up {path}: {error}; nothing was replaced"
+                "could not back up {}: {error}; nothing was replaced",
+                replacement.path
             ));
         }
+        match checkout.hash_file_as(&replacement.path, &target) {
+            Ok(blob) if blob == replacement.blob => {}
+            _ => {
+                return Err(format!(
+                    "the backup of {} does not match its proven content; nothing was replaced",
+                    replacement.path
+                ));
+            }
+        }
+    }
+    if let Some(directory) = backup.parent()
+        && let Ok(handle) = std::fs::File::open(directory)
+    {
+        handle.sync_all().ok();
     }
     checkout
         .restore_working_files_from_index(&paths)
@@ -1034,7 +1098,53 @@ fn replace_generated_files(
             )
         })?;
     add_count("main_checkout_generated_replaced", paths.len() as u64);
-    Ok(())
+    Ok(backup)
+}
+
+/// Put replaced generated files back from their verified backup, for a step
+/// that did not move after all. A file is put back only while it still holds
+/// its committed content at `from` (what the replacement wrote); one changed
+/// since is left alone and reported. Returns a note for the step's message.
+fn restore_generated_files(
+    checkout: &GitRepo,
+    main_root: &Path,
+    from: &str,
+    replace: &[Replacement],
+    backup: &Path,
+) -> String {
+    let paths = replace
+        .iter()
+        .map(|replacement| replacement.path.clone())
+        .collect::<Vec<_>>();
+    let current = checkout.hash_working_files(&paths).unwrap_or_default();
+    let mut left = Vec::new();
+    for (index, replacement) in replace.iter().enumerate() {
+        let untouched = current.get(index).map(String::as_str)
+            == checkout.blob_at(from, &replacement.path).as_deref();
+        let restored = untouched
+            && std::fs::copy(
+                backup.join(&replacement.path),
+                main_root.join(&replacement.path),
+            )
+            .is_ok();
+        if restored {
+            crate::phase_telemetry::add("main_checkout_generated_restored", Duration::ZERO);
+        } else {
+            left.push(replacement.path.clone());
+        }
+    }
+    if left.is_empty() {
+        format!(
+            "; the replaced generated files were put back from {}",
+            backup.display()
+        )
+    } else {
+        format!(
+            "; these replaced generated files were not put back (they changed meanwhile): {}; their backups are in {}",
+            left.join(", "),
+            backup.display()
+        )
+    }
 }
 
 fn overlap_message(blocking: &[String]) -> String {
@@ -1270,6 +1380,7 @@ fn first_line(error: &crate::GitError) -> String {
 /// merge; anywhere else the tree is left alone and the marker kept.
 /// `between` runs after the tree update; returning false stops there, as a
 /// killed process would (tests).
+#[cfg(test)]
 pub(crate) fn move_step(
     checkout: &GitRepo,
     main_root: &Path,
@@ -1316,24 +1427,41 @@ pub(crate) fn move_step_replacing(
         clear_marker(main_root);
         return StepResult::Refused("HEAD moved before the update".into());
     }
-    if !replace.is_empty()
-        && let Err(message) = replace_generated_files(checkout, main_root, replace)
-    {
-        clear_marker(main_root);
-        return StepResult::Refused(message);
-    }
+    let backup = if replace.is_empty() {
+        None
+    } else {
+        match replace_generated_files(checkout, main_root, replace) {
+            Ok(backup) => Some(backup),
+            Err(message) => {
+                clear_marker(main_root);
+                return StepResult::Refused(message);
+            }
+        }
+    };
+    let put_back = |checkout: &GitRepo| {
+        backup
+            .as_deref()
+            .map(|backup| restore_generated_files(checkout, main_root, from, replace, backup))
+            .unwrap_or_default()
+    };
     if let Err(error) = checkout.update_tree_preserving_local_changes(from, to, MOVE_BUDGET) {
         // Git refuses before writing; prove that before dropping the marker,
         // since a killed or failed write could have stopped half way.
         return match classify_tree(checkout, main_root, from, to) {
             Ok(TreeState::AtFrom) => {
+                let note = put_back(checkout);
                 clear_marker(main_root);
-                StepResult::Refused(first_line(&error))
+                StepResult::Refused(format!("{}{note}", first_line(&error)))
             }
-            _ => StepResult::Unresolved(format!(
-                "the tree update failed part way and the checkout could not be proven unchanged: {}",
-                first_line(&error)
-            )),
+            _ => {
+                // Files the replacement wrote and nothing changed since are
+                // still safe to put back; the rest stays for a person.
+                let note = put_back(checkout);
+                StepResult::Unresolved(format!(
+                    "the tree update failed part way and the checkout could not be proven unchanged: {}{note}",
+                    first_line(&error)
+                ))
+            }
         };
     }
     if !between() {
@@ -1365,9 +1493,10 @@ pub(crate) fn move_step_replacing(
                 }
                 match checkout.update_tree_preserving_local_changes(to, from, MOVE_BUDGET) {
                     Ok(()) => {
+                        let note = put_back(checkout);
                         clear_marker(main_root);
                         StepResult::Refused(format!(
-                            "the branch ref could not be moved, so the tree was moved back: {}",
+                            "the branch ref could not be moved, so the tree was moved back: {}{note}",
                             first_line(&swap)
                         ))
                     }

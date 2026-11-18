@@ -5593,6 +5593,15 @@ impl GitRepo {
         Ok(ids)
     }
 
+    /// The blob id `file` would get if it were the working file at the
+    /// repository-relative `path` (that path's filters and line-ending rules
+    /// applied), for checking a copy against a blob proven at `path`.
+    pub(crate) fn hash_file_as(&self, path: &str, file: &Path) -> Result<String, GitError> {
+        let path_arg = format!("--path={path}");
+        let file_arg = file.to_string_lossy().into_owned();
+        run_git(&self.root, &["hash-object", &path_arg, "--", &file_arg])
+    }
+
     /// Every blob id `path` has had in the last `max_commits` commits that
     /// touched it in `commit`'s history: a record of the exact bytes once
     /// committed there.

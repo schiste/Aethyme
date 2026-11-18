@@ -542,6 +542,9 @@ fn behind_repository(
     let root = tmp.path();
     if !base.is_empty() {
         for (path, body) in base {
+            if let Some(parent) = root.join(path).parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
             std::fs::write(root.join(path), body).unwrap();
             git(root, &["add", "-f", path]);
         }
@@ -549,6 +552,9 @@ fn behind_repository(
     }
     let from = git(root, &["rev-parse", "HEAD"]);
     for (path, body) in upstream {
+        if let Some(parent) = root.join(path).parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
         std::fs::write(root.join(path), body).unwrap();
         git(root, &["add", "-f", path]);
         git(root, &["commit", "-qm", &format!("upstream {path}")]);
@@ -1158,7 +1164,7 @@ fn an_unedited_generated_policy_document_is_replaced_and_an_edited_one_holds() {
 }
 
 #[test]
-fn owner_policy_moves_only_when_its_bytes_were_committed() {
+fn owner_policy_moves_only_when_it_already_matches_the_update() {
     let tmp = offline_repository();
     let root = tmp.path();
     let config = ".aethyme/config.toml";
@@ -1189,8 +1195,18 @@ fn owner_policy_moves_only_when_its_bytes_were_committed() {
         "[owner]\nmy_uncommitted_edit = true\n"
     );
 
-    // Exactly an older committed version: nothing uncommitted to lose.
+    // Exactly an older committed version still holds: the owner may have
+    // set it back on purpose.
     std::fs::write(root.join(config), "[owner]\nolder = true\n").unwrap();
+    let held = attempt(&checkout, root, dirty_options());
+    assert_eq!(held_paths(&held), vec![config.to_string()]);
+    assert_eq!(
+        std::fs::read_to_string(root.join(config)).unwrap(),
+        "[owner]\nolder = true\n"
+    );
+
+    // Already the update's bytes: nothing to lose.
+    std::fs::write(root.join(config), "[owner]\nupstream = true\n").unwrap();
     let moved = attempt(&checkout, root, dirty_options());
     moved_to(&moved, &to);
     assert_eq!(
@@ -1247,4 +1263,81 @@ fn local_bytes_equal_to_the_update_are_not_in_the_way() {
     let attempt = attempt(&checkout, root, dirty_options());
     moved_to(&attempt, &to);
     assert_eq!(git(root, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn replaced_generated_files_are_put_back_when_the_tree_update_refuses() {
+    let template = aethyme_enhance::deploy::generated_artifact_contents(TEMPLATE_PATH)
+        .into_iter()
+        .next()
+        .unwrap();
+    let (tmp, from, to) = behind_repository(
+        &[
+            (TEMPLATE_PATH, "committed generation\n"),
+            ("src.txt", "base\n"),
+        ],
+        &[
+            (TEMPLATE_PATH, "next generation\n"),
+            ("src.txt", "upstream\n"),
+        ],
+    );
+    let root = tmp.path();
+    std::fs::write(root.join(TEMPLATE_PATH), &template).unwrap();
+    let checkout = GitRepo::discover(root).unwrap();
+    let judged = judge_generated(&checkout, root, &to, &[TEMPLATE_PATH.to_string()]);
+    assert_eq!(judged.replace.len(), 1, "{judged:?}");
+    // An edit the preflight did not see makes Git refuse the tree update.
+    std::fs::write(root.join("src.txt"), "local\n").unwrap();
+
+    let step = move_step_replacing(
+        &checkout,
+        root,
+        "main",
+        &from,
+        &to,
+        &judged.replace,
+        &mut || true,
+    );
+    let message = match &step {
+        StepResult::Refused(message) | StepResult::Unresolved(message) => message.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert!(message.contains("put back"), "{message}");
+    assert_eq!(head(root), from);
+    assert_eq!(
+        std::fs::read_to_string(root.join(TEMPLATE_PATH)).unwrap(),
+        template,
+        "the generated file is back as it was"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("src.txt")).unwrap(),
+        "local\n"
+    );
+    let saved = backups(root);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+}
+
+#[test]
+fn old_and_excess_backup_sets_are_pruned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let now = 100 * BACKUP_RETENTION_MS;
+    let stamps = (0..(BACKUP_SETS_KEPT as i64 + 3))
+        .map(|n| now - n * 1000)
+        .chain([now - 2 * BACKUP_RETENTION_MS])
+        .collect::<Vec<_>>();
+    for stamp in &stamps {
+        std::fs::create_dir_all(root.join(stamp.to_string()).join("a")).unwrap();
+    }
+    std::fs::create_dir_all(root.join("not-a-set")).unwrap();
+    prune_backups(root, now);
+    let left = std::fs::read_dir(root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(left.len(), BACKUP_SETS_KEPT + 1, "{left:?}");
+    assert!(left.contains("not-a-set"));
+    assert!(left.contains(&now.to_string()));
+    assert!(!left.contains(&(now - 2 * BACKUP_RETENTION_MS).to_string()));
 }

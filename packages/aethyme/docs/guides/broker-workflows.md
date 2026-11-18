@@ -1298,10 +1298,11 @@ only when that cannot touch anything local:
   ran in the primary checkout) do not hold it when their bytes are provably
   generator output: equal to the update, an intact `AGENTS.md`/`CLAUDE.md`
   receipt, this binary's template, or bytes once committed at that path.
-  They are backed up under `.aethyme/run/main-checkout-replaced/` and moved
-  with the checkout. An edited generated file, a staged one, or
-  `.aethyme/config.toml` with uncommitted owner edits still holds and is
-  named; keep edits in `.aethyme/overrides/` and commit generated output
+  They are backed up (verified, kept 7 days, at most 20 sets) under
+  `.aethyme/run/main-checkout-replaced/`, moved with the checkout, and put
+  back if the move does not happen. An edited generated file, a staged one,
+  or a `.aethyme/config.toml` that differs from the update in any way still
+  holds and is named; keep edits in `.aethyme/overrides/` and commit generated output
   from a session worktree;
 - no clean/smudge filter (Git LFS, for example) applies to a changed path,
   since a filter can run programs and reach the network. Set
