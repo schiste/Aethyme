@@ -35,7 +35,6 @@
 //! with bytes and counts by location, and shown by `aethyme storage status`.
 
 use super::*;
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::storage_ledger::RecoveryArchiveUsage as ArchiveBoundUsage;
