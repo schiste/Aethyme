@@ -100,7 +100,12 @@ pub(crate) fn status_activity(worktree: &Path, budget: Duration, cap: usize) -> 
             return StatusActivity::default();
         }
     };
-    let paths = changed_paths(&output);
+    // The broker's own runtime files (its database, logs, run state, the
+    // notices it writes) are not the agent's work.
+    let paths: Vec<PathBuf> = changed_paths(&output)
+        .into_iter()
+        .filter(|path| !crate::runtime_paths::is_broker_runtime_path(&path.to_string_lossy()))
+        .collect();
     let mut activity = StatusActivity {
         complete: paths.len() <= cap,
         ..StatusActivity::default()
@@ -231,6 +236,11 @@ mod tests {
                 .unwrap();
         };
         // Clean checkout: nothing changed, so nothing says active.
+        assert_eq!(recent_status_activity(worktree, since), Some(false));
+        // The broker writing its own runtime files is not activity.
+        std::fs::create_dir_all(worktree.join(".aethyme/run")).unwrap();
+        std::fs::write(worktree.join(".aethyme/run/state.json"), "{}\n").unwrap();
+        std::fs::write(worktree.join(".aethyme/broker.db-wal"), "wal\n").unwrap();
         assert_eq!(recent_status_activity(worktree, since), Some(false));
         std::fs::write(worktree.join("src/a/b/c.rs"), "two\n").unwrap();
         set(&worktree.join("src/a/b"), old);
