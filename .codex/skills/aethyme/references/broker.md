@@ -188,6 +188,12 @@ blocked.
    pinned installs the repository declares), with lockfiles unchanged -- no
    dependency upgrades, additions or lockfile edits. Anything else still needs
    the owner. When the key is `false`, ask the owner before preparing.
+   If preparation or a gate refuses an untrusted policy, run
+   `aethyme broker advanced trust status --json` from the affected session.
+   The refusal can name the primary checkout while the session uses a
+   different committed policy. Give the human the `next_action` for the
+   checkout policy in the status output. Retry the operation once that
+   checkout reports trusted.
    For patch tools without a per-call worktree setting, use the reported
    worktree's absolute path and verify the target path there before editing;
    relative paths can resolve against the shared checkout.
