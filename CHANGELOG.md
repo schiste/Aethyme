@@ -4,6 +4,24 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.133] - 2026-11-19
+
+### Fixed
+
+- The checkout trash deleter is faster and runs most of the time while the trash is behind. On the busiest repository, whose pool is on an external volume, the deleter was allowed 8,000 unlinks per second but reached a few hundred to 2,300: over half its time went to a status call before each unlink, and it ran about a quarter of wall time. The trash deleter now takes each entry's type from the directory listing and unlinks without a prior status call, falling back to one for an unknown type or a refused unlink. While the trash is behind, the worker keeps draining after its other lanes, with the repository's worker lock released: 30 s slices with a 1 s gap, for at most 20 minutes, three deleter threads sharing the one rate ceiling, one such lane per host. It still honours the configured ceiling, re-reads host pressure every 2 s and stops at critical memory pressure. Other removal paths are unchanged (#1831).
+
+### Changed
+
+- In the trash deleter only, ancestor identities are re-checked at every directory open, before every directory removal and every 256 unlinks, in place of before every unlink. All operations remain relative to pinned directory descriptors, links are never followed and mounts are never crossed (#1831).
+- Trash drain byte figures (`bytes`, `stripped_bytes`, `scratch_bytes`, the strip ledger's `bytes_freed`) are now the volume's free-space change across each entry: approximate, and report-only (#1831).
+- Telemetry: attachment `checkout_trash_catchup` (end reason, slices, entries, unlinks, `files_per_second_observed`, `worker_drain_share_pct`); `checkout_trash_drain` gains `threads` and `end_reason` (#1831).
+
+### Known issues
+
+- A directory moved out of the trash by hand while the deleter is inside it can lose up to 255 more of its own files at its new location before removal stops.
+- Catch-up byte figures can be overstated up to three times, because three threads measure the same volume at once.
+- The worker process can live up to 20 minutes longer while it catches up; its later lanes (cache measurement, transcripts, final status record) wait for it.
+
 ## [0.8.132] - 2026-11-19
 
 ### Fixed
