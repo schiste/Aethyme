@@ -1,6 +1,6 @@
 # Broker latency budgets
 
-Last Updated: 2026-10-27
+Last Updated: 2026-11-19
 
 The machine-readable source is
 [`broker-budgets.json`](../../../aethyme-eval/benchmarks/performance/broker-budgets.json).
@@ -50,6 +50,18 @@ is introduced. Medians above the budget generate GitHub warning annotations.
 The job summary displays all four medians, limits and verdicts; artifacts retain
 raw command arguments, outputs, exit codes, individual timings, the budget digest
 and executable digest for 14 days. The committed budget remains versioned in Git.
+
+The same workflow runs six matched shared-verification pairs on a separate,
+disposable broker Playground. Each arm launches two concurrent checks of the
+same tree, with a fresh tree per sample and a stable tool environment. The job
+summary reports median and nearest-rank p90 pair wall time, test executions,
+shared-verdict waits and the recorded child time of reused tests. A reuse
+counts only when its producing run and execution profile are present in the
+same pair. Two fresh executions remain a valid observation of zero reuse.
+The workflow keeps the raw gate receipts and broker phase timings for 14 days.
+Use these receipts to pick the next operation to profile, then repeat the same
+paired workload before and after the candidate change. This scripted probe
+isolates verification time and executes no model calls.
 
 By default, the runner creates a disposable, one-session synthetic Parcel
 Playground (the checked-in multi-language fixture), isolated home, host state,
