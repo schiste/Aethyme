@@ -6362,24 +6362,35 @@ mod tests {
             assert!(worktree.join("node_modules").exists());
         }
 
-        // A marker whose producer still runs (this test process) keeps the
-        // checkout as `checkout_marker_live`; one left by a producer that
-        // is gone (a killed guarded command) does not keep it: the strip
-        // below goes through with it still in place.
+        // A marker whose producer still runs keeps the checkout as
+        // `checkout_marker_live`; one left by a producer that is gone (a
+        // killed guarded command) does not keep it: the strip below goes
+        // through with it still in place.
+        let mut running = {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap()
+        };
+        let running_pid = i32::try_from(running.id()).unwrap();
         let live = crate::file_lock::artifact_use::write_running_marker_for_test(
             broker.main_root(),
             &worktree,
             "live-producer",
             Some(
                 crate::file_lock::artifact_use::ProcessStartIdentity::capture(
-                    i32::try_from(std::process::id()).unwrap(),
-                    unsafe { libc::getpgrp() },
+                    running_pid,
+                    running_pid,
                 )
                 .unwrap(),
             ),
         )
         .unwrap();
         let kept = pass(&mut broker);
+        running.kill().unwrap();
+        running.wait().unwrap();
         assert_eq!(
             kept.strip.refused.get("checkout_marker_live"),
             Some(&1),
