@@ -147,6 +147,82 @@ pub(crate) fn recent_status_activity(worktree: &Path, since: SystemTime) -> Opti
     }
 }
 
+/// The longest the modification-time walk may take.
+pub(crate) const MTIME_WALK_BUDGET: Duration = Duration::from_secs(5);
+/// Entries the walk reads at most.
+pub(crate) const MTIME_WALK_ENTRIES: usize = 200_000;
+/// Directory names the walk never enters: Git's own, the broker's, and the
+/// regenerable trees the strip itself catalogues.
+const MTIME_WALK_SKIPPED: &[&str] = &[
+    ".git",
+    ".aethyme",
+    "node_modules",
+    ".venv",
+    "target",
+    ".pnpm-store",
+];
+
+/// When `git status` cannot finish in time: walk the checkout (every file
+/// and directory, ignored ones included, links not followed, the names in
+/// [`MTIME_WALK_SKIPPED`] left out) for any modification time at or after
+/// `since`. `Some(true)`: one found (activity); `Some(false)`: the walk
+/// finished and found none, which proves no file outside those trees
+/// changed; `None`: it stopped at its budget or cap (the caller keeps the
+/// session).
+pub(crate) fn recent_mtime_walk(
+    worktree: &Path,
+    since: SystemTime,
+    budget: Duration,
+    cap: usize,
+) -> Option<bool> {
+    let _span = crate::phase_telemetry::span("worktree_mtime_walk");
+    let deadline = Instant::now() + budget;
+    let mut read = 0_usize;
+    let mut stack = vec![worktree.to_path_buf()];
+    let newer =
+        |metadata: &std::fs::Metadata| metadata.modified().is_ok_and(|modified| modified >= since);
+    if std::fs::symlink_metadata(worktree).is_ok_and(|metadata| newer(&metadata)) {
+        crate::phase_telemetry::add("worktree_mtime_walk_found_recent", Duration::ZERO);
+        return Some(true);
+    }
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            crate::phase_telemetry::add("worktree_mtime_walk_incomplete", Duration::ZERO);
+            return None;
+        };
+        for entry in entries {
+            read += 1;
+            if read > cap || Instant::now() >= deadline {
+                crate::phase_telemetry::add("worktree_mtime_walk_incomplete", Duration::ZERO);
+                return None;
+            }
+            let Ok(entry) = entry else {
+                crate::phase_telemetry::add("worktree_mtime_walk_incomplete", Duration::ZERO);
+                return None;
+            };
+            let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if metadata.is_dir()
+                && MTIME_WALK_SKIPPED
+                    .iter()
+                    .any(|name| entry.file_name() == std::ffi::OsStr::new(name))
+            {
+                continue;
+            }
+            if newer(&metadata) {
+                crate::phase_telemetry::add("worktree_mtime_walk_found_recent", Duration::ZERO);
+                return Some(true);
+            }
+            if metadata.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    crate::phase_telemetry::add("worktree_mtime_walk_complete", Duration::ZERO);
+    Some(false)
+}
+
 /// Date every file and directory under `dir` (not `.git`) to `then`, so a
 /// fixture's changed files read as old as its Git metadata.
 #[cfg(test)]
@@ -259,5 +335,41 @@ mod tests {
         let capped = status_activity(worktree, STATUS_ACTIVITY_BUDGET, 0);
         assert!(!capped.complete);
         assert_eq!(capped.newest_ms, None);
+    }
+
+    /// The fallback walk finds a deep recent file, proves an old checkout
+    /// idle, leaves the skipped trees out, and gives up at its cap.
+    #[test]
+    fn the_mtime_walk_finds_recent_files_and_fails_closed_at_its_cap() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path();
+        std::fs::create_dir_all(worktree.join("src/a/b")).unwrap();
+        std::fs::write(worktree.join("src/a/b/c.rs"), "x\n").unwrap();
+        std::fs::create_dir_all(worktree.join("node_modules/dep")).unwrap();
+        std::fs::write(worktree.join("node_modules/dep/index.js"), "x\n").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(10 * 3_600);
+        let since = SystemTime::now() - Duration::from_secs(4 * 3_600);
+        age_tree_for_test(worktree, old);
+        // The regenerable tree is skipped, so its fresh file does not count.
+        std::fs::File::open(worktree.join("node_modules/dep/index.js"))
+            .unwrap()
+            .set_modified(SystemTime::now())
+            .unwrap();
+        assert_eq!(
+            recent_mtime_walk(worktree, since, MTIME_WALK_BUDGET, MTIME_WALK_ENTRIES),
+            Some(false)
+        );
+        std::fs::File::open(worktree.join("src/a/b/c.rs"))
+            .unwrap()
+            .set_modified(SystemTime::now())
+            .unwrap();
+        assert_eq!(
+            recent_mtime_walk(worktree, since, MTIME_WALK_BUDGET, MTIME_WALK_ENTRIES),
+            Some(true)
+        );
+        assert_eq!(
+            recent_mtime_walk(worktree, since, MTIME_WALK_BUDGET, 1),
+            None
+        );
     }
 }

@@ -258,6 +258,7 @@ fn idle_refused_counter(code: &str) -> &'static str {
         "recent_file_activity" => "checkout_idle_strip_refused_recent_file_activity",
         "activity_unknown" => "checkout_idle_strip_refused_activity_unknown",
         "checkout_busy" => "checkout_idle_strip_refused_checkout_busy",
+        "checkout_marker_live" => "checkout_idle_strip_refused_checkout_marker_live",
         "checkout_lock_unknown" => "checkout_idle_strip_refused_checkout_lock_unknown",
         "discovery_failed" => "checkout_idle_strip_refused_discovery_failed",
         "process_using_checkout" => "checkout_idle_strip_refused_process_using_checkout",
@@ -532,7 +533,19 @@ pub(crate) fn recent_file_activity(
     match crate::worktree_status_activity::recent_status_activity(worktree, since) {
         Some(true) => Some("changed_file"),
         Some(false) => None,
-        None => Some(ACTIVITY_UNKNOWN),
+        // `git status` could not finish (a large checkout on a slow
+        // volume): a bounded walk of the checkout's modification times
+        // decides instead; one that cannot finish keeps the session.
+        None => match crate::worktree_status_activity::recent_mtime_walk(
+            worktree,
+            since,
+            crate::worktree_status_activity::MTIME_WALK_BUDGET,
+            crate::worktree_status_activity::MTIME_WALK_ENTRIES,
+        ) {
+            Some(true) => Some("changed_file_walk"),
+            Some(false) => None,
+            None => Some(ACTIVITY_UNKNOWN),
+        },
     }
 }
 
@@ -888,17 +901,37 @@ impl Broker {
             return Refused("start_reserved");
         }
         // `submit prepare` holds this lock shared while it writes the
-        // directories; busy means a preparation is running.
-        let _checkout_lock = match crate::file_lock::artifact_use::try_artifact_use_reclaimer(
-            self.main_root(),
-            &worktree,
-        ) {
-            Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(lock)) => lock,
-            Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(_)) => {
-                return Refused("checkout_busy");
-            }
-            Err(_) => return Refused("checkout_lock_unknown"),
-        };
+        // directories; busy means a preparation is running. A durable marker
+        // left by a producer proved gone (PID/start token and process group
+        // absent) does not keep the checkout: such markers leak when a
+        // guarded command is killed.
+        let _checkout_lock =
+            match crate::file_lock::artifact_use::try_artifact_use_reclaimer_past_exited_producers(
+                self.main_root(),
+                &worktree,
+            ) {
+                Ok((
+                    crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(lock),
+                    passed,
+                )) => {
+                    for _ in 0..passed {
+                        crate::phase_telemetry::add(
+                            "checkout_idle_strip_exited_producer_marker_passed",
+                            Duration::ZERO,
+                        );
+                    }
+                    lock
+                }
+                Ok((crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(block), _)) => {
+                    return Refused(match block {
+                        crate::file_lock::artifact_use::ArtifactUseReclaimBlock::UnknownProducer {
+                            ..
+                        } => "checkout_marker_live",
+                        _ => "checkout_busy",
+                    });
+                }
+                Err(_) => return Refused("checkout_lock_unknown"),
+            };
         // The run's observation may be minutes old: look again right before
         // the moves unless it is fresh.
         if run
@@ -1069,6 +1102,7 @@ mod tests {
             "recent_file_activity",
             "activity_unknown",
             "checkout_busy",
+            "checkout_marker_live",
             "checkout_lock_unknown",
             "fresh_process_use_unknown",
             "discovery_failed",
