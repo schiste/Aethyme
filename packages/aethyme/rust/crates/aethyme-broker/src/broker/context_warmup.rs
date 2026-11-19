@@ -39,6 +39,12 @@ impl Broker {
             if !policy.enforces_committed_fragments() {
                 return Ok(None);
             }
+            // A declared but never generated graph: nothing to warm, and
+            // nothing to warn about on every tick.
+            if !crate::graph_integrity::commit_has_committed_graph(repo, &commit)? {
+                crate::phase_telemetry::add("start_context_warmup_no_graph", Duration::ZERO);
+                return Ok(None);
+            }
             let (files, manifest, manifest_digest) = read_verified_fragments(repo, &commit)?;
             Ok::<_, String>(Some((commit, files, manifest, manifest_digest)))
         })?;
