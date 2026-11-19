@@ -85,12 +85,34 @@ double-count some time.
 
 The live fixture has no declared broker gates, so it had zero opportunities
 to reuse an identical-tree broker verdict. The separate
-[`paired_verification.py`](../paired_verification.py) probe pairs two
-simultaneous gate requests against two direct suite invocations on the same
-tree. The fixture was staged and its trust check confirmed that an operator
-must approve its single unit-test command before the probe can run. Shared
-verdict reuse, child executions avoided and the resulting elapsed time
-remain unmeasured in this release trial.
+[`paired_verification.py`](../paired_verification.py) harness stages fresh
+Playgrounds for this measurement. We ran the release probe in the existing
+arm-C Playground to reuse its operator-approved `unit-tests` policy.
+
+Two independent broker processes ran `broker advanced gates run --all
+--only unit-tests --json` concurrently against that checkout. The direct
+arm ran the same Python unit suite in two private exports of the exact
+verification tree, `7e5defcbee66b9a5a56c9648876eec95ba0fbbe6`.
+A different empty directory was prepended to both arms' PATH in each
+sample. This kept executable selection fixed and produced a fresh broker
+execution-profile key. The broker policy and published refs stayed fixed.
+
+| Measure | Direct suite | Broker |
+| --- | ---: | ---: |
+| Paired requests | 12 | 12 |
+| Suite executions | 12 | 6 |
+| Shared in-flight verdicts | 0 | 6 |
+| Pair wall time, median | 145 ms | 1,216 ms |
+| Pair wall time, nearest-rank p90 | 462 ms | 1,602 ms |
+
+Each of the six broker pairs returned one fresh run and one reused
+passing verdict with the same run ID and tree. Reuse avoided 1,236 ms
+of recorded gate execution in aggregate. The six consumers waited
+1,963 ms in aggregate, with median wait of 301 ms. Pair wall time uses
+the slower request in each concurrent pair. For this subsecond suite,
+sharing halved executions while increasing time to both verdicts.
+This fixed-tree probe measures duplicate-verification work independently
+of the live agent tasks.
 
 The six groups exercise the entire configured workflow on small local
 tasks. They give a descriptive comparison of this mix of work. The
