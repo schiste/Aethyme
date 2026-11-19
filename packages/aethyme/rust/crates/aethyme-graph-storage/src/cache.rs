@@ -115,12 +115,12 @@ impl GraphStoreArtifactCache {
         protect(&lock_path, false)?;
         #[cfg(unix)]
         {
+            let mode = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
             // SAFETY: `lock` is a live `File` opened just above and still owned
             // here, so `as_raw_fd` yields a valid descriptor for the duration of
             // the call. `flock` takes the descriptor by value and only sets the
             // advisory lock on it; it dereferences nothing, cannot invalidate
             // the borrow, and touches no memory this crate owns.
-            let mode = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
             let result = unsafe { libc::flock(lock.as_raw_fd(), mode) };
             if result != 0 {
                 let error = std::io::Error::last_os_error();
