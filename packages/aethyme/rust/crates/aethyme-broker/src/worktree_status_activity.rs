@@ -87,6 +87,11 @@ pub(crate) fn status_activity(worktree: &Path, budget: Duration, cap: usize) -> 
             "--untracked-files=all",
         ])
         .current_dir(worktree);
+    #[cfg(test)]
+    if STATUS_UNAVAILABLE_FOR_TEST.with(std::cell::Cell::get) {
+        crate::phase_telemetry::add("worktree_status_activity_unavailable", started.elapsed());
+        return StatusActivity::default();
+    }
     let output = match crate::bounded_output::output_limited(
         &mut command,
         budget.min(STATUS_ACTIVITY_BUDGET),
@@ -145,6 +150,95 @@ pub(crate) fn recent_status_activity(worktree: &Path, since: SystemTime) -> Opti
         crate::phase_telemetry::add("worktree_status_activity_fallback", Duration::ZERO);
         None
     }
+}
+
+/// The longest the modification-time walk may take.
+pub(crate) const MTIME_WALK_BUDGET: Duration = Duration::from_secs(5);
+/// Entries the walk reads at most.
+pub(crate) const MTIME_WALK_ENTRIES: usize = 200_000;
+
+#[cfg(test)]
+thread_local! {
+    /// Makes the changed-file probe report that `git status` did not finish.
+    pub(crate) static STATUS_UNAVAILABLE_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// When `git status` cannot finish in time: walk the checkout (every file
+/// and directory, ignored ones included, links not followed) for any
+/// modification time at or after `since`, until `deadline` or `cap`
+/// entries. Left out: `.git`, the broker's own runtime paths (the same
+/// catalogue the status probe excludes), and a directory `regenerable`
+/// accepts (the caller passes the strip catalogue's own witness check, so
+/// a tracked source directory merely named like a regenerable one is
+/// walked). `Some(true)`: one found (activity); `Some(false)`: the walk
+/// finished and found none, which proves nothing else changed; `None`: it
+/// stopped at its deadline or cap (the caller keeps the session).
+pub(crate) fn recent_mtime_walk(
+    worktree: &Path,
+    since: SystemTime,
+    deadline: Instant,
+    cap: usize,
+    regenerable: &dyn Fn(&Path, &str) -> bool,
+) -> Option<bool> {
+    let _span = crate::phase_telemetry::span("worktree_mtime_walk");
+    let mut read = 0_usize;
+    let mut stack = vec![worktree.to_path_buf()];
+    let newer =
+        |metadata: &std::fs::Metadata| metadata.modified().is_ok_and(|modified| modified >= since);
+    let runtime = |path: &Path, directory: bool| {
+        path.strip_prefix(worktree).is_ok_and(|relative| {
+            let relative = relative.to_string_lossy();
+            crate::runtime_paths::is_broker_runtime_path(&relative)
+                || (directory
+                    && crate::runtime_paths::is_broker_runtime_path(&format!("{relative}/")))
+        })
+    };
+    if std::fs::symlink_metadata(worktree).is_ok_and(|metadata| newer(&metadata)) {
+        crate::phase_telemetry::add("worktree_mtime_walk_found_recent", Duration::ZERO);
+        return Some(true);
+    }
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            crate::phase_telemetry::add("worktree_mtime_walk_incomplete", Duration::ZERO);
+            return None;
+        };
+        for entry in entries {
+            read += 1;
+            if read > cap || Instant::now() >= deadline {
+                crate::phase_telemetry::add("worktree_mtime_walk_incomplete", Duration::ZERO);
+                return None;
+            }
+            let Ok(entry) = entry else {
+                crate::phase_telemetry::add("worktree_mtime_walk_incomplete", Duration::ZERO);
+                return None;
+            };
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let name = entry.file_name();
+            if name == std::ffi::OsStr::new(".git") || runtime(&path, metadata.is_dir()) {
+                continue;
+            }
+            if metadata.is_dir() && name.to_str().is_some_and(|name| regenerable(&path, name)) {
+                crate::phase_telemetry::add(
+                    "worktree_mtime_walk_skipped_regenerable",
+                    Duration::ZERO,
+                );
+                continue;
+            }
+            if newer(&metadata) {
+                crate::phase_telemetry::add("worktree_mtime_walk_found_recent", Duration::ZERO);
+                return Some(true);
+            }
+            if metadata.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    crate::phase_telemetry::add("worktree_mtime_walk_complete", Duration::ZERO);
+    Some(false)
 }
 
 /// Date every file and directory under `dir` (not `.git`) to `then`, so a
@@ -259,5 +353,67 @@ mod tests {
         let capped = status_activity(worktree, STATUS_ACTIVITY_BUDGET, 0);
         assert!(!capped.complete);
         assert_eq!(capped.newest_ms, None);
+    }
+
+    /// The fallback walk finds a deep recent file, proves an old checkout
+    /// idle, leaves the skipped trees out, and gives up at its cap.
+    #[test]
+    fn the_mtime_walk_finds_recent_files_and_fails_closed_at_its_cap() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path();
+        std::fs::create_dir_all(worktree.join("src/a/b")).unwrap();
+        std::fs::write(worktree.join("src/a/b/c.rs"), "x\n").unwrap();
+        std::fs::create_dir_all(worktree.join("node_modules/dep")).unwrap();
+        std::fs::write(worktree.join("node_modules/dep/index.js"), "x\n").unwrap();
+        std::fs::create_dir_all(worktree.join("src/codegen/target")).unwrap();
+        std::fs::write(worktree.join("src/codegen/target/mod.rs"), "x\n").unwrap();
+        std::fs::create_dir_all(worktree.join(".aethyme/run")).unwrap();
+        std::fs::write(worktree.join(".aethyme/run/state.json"), "{}\n").unwrap();
+        std::fs::write(
+            worktree.join(".aethyme/prepare.toml"),
+            "schema_version = 1\n",
+        )
+        .unwrap();
+        let old = SystemTime::now() - Duration::from_secs(10 * 3_600);
+        let since = SystemTime::now() - Duration::from_secs(4 * 3_600);
+        // Only the real install is regenerable (its marker), never a
+        // source directory that happens to share a catalogued name.
+        let regenerable = |path: &Path, name: &str| {
+            name == "node_modules" && path.join(".modules.yaml").is_file()
+        };
+        std::fs::write(worktree.join("node_modules/.modules.yaml"), "x\n").unwrap();
+        let far = || Instant::now() + MTIME_WALK_BUDGET;
+        let touch = |path: &str| {
+            std::fs::File::open(worktree.join(path))
+                .unwrap()
+                .set_modified(SystemTime::now())
+                .unwrap();
+        };
+        let walk = |deadline: Instant, cap: usize| {
+            recent_mtime_walk(worktree, since, deadline, cap, &regenerable)
+        };
+        age_tree_for_test(worktree, old);
+        // The regenerable tree and the broker's runtime files do not count.
+        touch("node_modules/dep/index.js");
+        touch(".aethyme/run/state.json");
+        assert_eq!(walk(far(), MTIME_WALK_ENTRIES), Some(false));
+        // A tracked source directory named like a regenerable one does.
+        touch("src/codegen/target/mod.rs");
+        assert_eq!(walk(far(), MTIME_WALK_ENTRIES), Some(true));
+        age_tree_for_test(worktree, old);
+        touch("node_modules/dep/index.js");
+        touch(".aethyme/prepare.toml");
+        assert_eq!(
+            walk(far(), MTIME_WALK_ENTRIES),
+            Some(true),
+            "the broker's config is work"
+        );
+        age_tree_for_test(worktree, old);
+        touch("node_modules/dep/index.js");
+        touch("src/a/b/c.rs");
+        assert_eq!(walk(far(), MTIME_WALK_ENTRIES), Some(true));
+        // Its cap and its deadline fail closed.
+        assert_eq!(walk(far(), 1), None);
+        assert_eq!(walk(Instant::now(), MTIME_WALK_ENTRIES), None);
     }
 }

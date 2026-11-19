@@ -6362,6 +6362,67 @@ mod tests {
             assert!(worktree.join("node_modules").exists());
         }
 
+        // A marker whose producer still runs keeps the checkout as
+        // `checkout_marker_live`; one left by a producer that is gone (a
+        // killed guarded command) does not keep it: the strip below goes
+        // through with it still in place.
+        let mut running = {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap()
+        };
+        let running_pid = i32::try_from(running.id()).unwrap();
+        let live = crate::file_lock::artifact_use::write_running_marker_for_test(
+            broker.main_root(),
+            &worktree,
+            "live-producer",
+            Some(
+                crate::file_lock::artifact_use::ProcessStartIdentity::capture(
+                    running_pid,
+                    running_pid,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let kept = pass(&mut broker);
+        running.kill().unwrap();
+        running.wait().unwrap();
+        assert_eq!(
+            kept.strip.refused.get("checkout_marker_live"),
+            Some(&1),
+            "{kept:#?}"
+        );
+        assert!(worktree.join("node_modules").exists());
+        std::fs::remove_file(&live).unwrap();
+        {
+            use std::os::unix::process::CommandExt;
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pid = i32::try_from(child.id()).unwrap();
+            let identity =
+                crate::file_lock::artifact_use::ProcessStartIdentity::capture(pid, pid).unwrap();
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !crate::gates::gate_process_group_absent(pid) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            crate::file_lock::artifact_use::write_running_marker_for_test(
+                broker.main_root(),
+                &worktree,
+                "exited-producer",
+                Some(identity),
+            )
+            .unwrap();
+        }
+
         // The run's observation is minutes old: a fresh one is taken under
         // the claim, and a process it sees keeps the checkout.
         crate::session_holder::queue_process_use_snapshots_for_tests(

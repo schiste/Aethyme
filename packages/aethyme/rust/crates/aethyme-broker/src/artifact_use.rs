@@ -945,6 +945,128 @@ pub(crate) fn begin_artifact_use_scope(
     }))
 }
 
+/// Like [`try_artifact_use_reclaimer`], for the idle strip of an open
+/// session: a marker whose producer is proved gone does not block. The proof
+/// is the reconcile lane's: a `running` marker with a recorded process
+/// identity, whose PID and start token are absent or reused, and whose
+/// process group is absent (checked twice). Any other marker blocks as
+/// before. Markers are never removed here. Returns the attempt and how many
+/// markers were passed this way.
+pub(crate) fn try_artifact_use_reclaimer_past_exited_producers(
+    primary_root: &Path,
+    checkout_root: &Path,
+) -> io::Result<(ArtifactUseReclaimTry, usize)> {
+    if !cfg!(unix) {
+        return Ok((
+            ArtifactUseReclaimTry::Blocked(ArtifactUseReclaimBlock::ProtocolUnavailable),
+            0,
+        ));
+    }
+    let locations = ArtifactUseLocations::resolve(primary_root, checkout_root)?;
+    if !locations.initialize_layout(Duration::ZERO)? {
+        return Ok((
+            ArtifactUseReclaimTry::Blocked(ArtifactUseReclaimBlock::Contended),
+            0,
+        ));
+    }
+    let file = super::open_lock_file_nofollow(&locations.lock_path)?;
+    let Some(lock) = super::ExclusiveFileLock::try_acquire(file)? else {
+        return Ok((
+            ArtifactUseReclaimTry::Blocked(ArtifactUseReclaimBlock::Contended),
+            0,
+        ));
+    };
+    locations.require_unchanged()?;
+    super::verify_named_lock_file(&locations.lock_path, &lock.file)?;
+    let (markers, legacy_device_renumbered) = read_marker_inventory(&locations)?;
+    locations.require_unchanged()?;
+    let total = markers.len();
+    let live: Vec<ArtifactUseMarker> = markers
+        .into_iter()
+        .filter(|marker| !producer_proved_exited(marker))
+        .collect();
+    let passed = total - live.len();
+    if live.is_empty() {
+        Ok((
+            ArtifactUseReclaimTry::Acquired(ArtifactUseReclaimer { _lock: lock }),
+            passed,
+        ))
+    } else {
+        Ok((
+            ArtifactUseReclaimTry::Blocked(ArtifactUseReclaimBlock::UnknownProducer {
+                markers: live,
+                legacy_device_renumbered,
+            }),
+            passed,
+        ))
+    }
+}
+
+/// Write a `running` marker for `checkout` with `process` as its producer
+/// (tests only: a leaked or a live producer's marker). Returns its path.
+#[cfg(test)]
+pub(crate) fn write_running_marker_for_test(
+    primary_root: &Path,
+    checkout_root: &Path,
+    nonce: &str,
+    process: Option<ProcessStartIdentity>,
+) -> io::Result<PathBuf> {
+    let locations = ArtifactUseLocations::resolve(primary_root, checkout_root)?;
+    locations.ensure_marker_dir()?;
+    let marker = ArtifactUseMarker {
+        schema_version: LEGACY_MARKER_SCHEMA_VERSION,
+        nonce: nonce.to_owned(),
+        primary_root: path_text(&locations.primary_root)?,
+        primary_device: locations.primary_identity.device,
+        primary_inode: locations.primary_identity.inode,
+        primary_volume_uuid: None,
+        checkout_root: path_text(&locations.checkout_root)?,
+        checkout_device: locations.checkout_identity.device,
+        checkout_inode: locations.checkout_identity.inode,
+        checkout_volume_uuid: None,
+        checkout_key: locations.checkout_key.clone(),
+        session_id: 1,
+        invocation_id: "guarded-exec:1:00".into(),
+        phase: ArtifactUsePhase::Running,
+        process,
+    };
+    let path = locations.marker_dir.join(format!("{nonce}.json"));
+    fs::write(
+        &path,
+        serde_json::to_vec(&marker).map_err(io::Error::other)?,
+    )?;
+    Ok(path)
+}
+
+/// Whether `marker`'s producer is proved gone (see
+/// [`try_artifact_use_reclaimer_past_exited_producers`]).
+fn producer_proved_exited(marker: &ArtifactUseMarker) -> bool {
+    if marker.phase != ArtifactUsePhase::Running {
+        return false;
+    }
+    let Some(process) = marker.process.as_ref() else {
+        return false;
+    };
+    if validate_reconciliation_process_identity(process).is_err() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        if !matches!(
+            observe_process_identity(process),
+            ProcessIdentityObservation::Absent | ProcessIdentityObservation::Reused
+        ) {
+            return false;
+        }
+        let group_absent = crate::gates::gate_process_group_absent(process.process_group);
+        process_and_group_proof_allows_removal(observe_process_identity(process), group_absent)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 /// Read-only plan for explicit reconciliation of one closed checkout cohort.
 /// The normal reclaimer remains strict and continues to block on every marker.
 pub(crate) fn plan_artifact_use_marker_reconciliation(
@@ -3268,6 +3390,67 @@ mod tests {
         }
         let error = try_artifact_use_reclaimer(primary.path(), &checkout).unwrap_err();
         assert!(error.to_string().contains("exceeded its cap"));
+    }
+
+    /// The idle strip's lock check passes a `running` marker whose producer
+    /// is proved gone, and still blocks on one without a process identity
+    /// (or a pre-dispatch one); the plain reclaimer blocks on both.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn an_exited_producer_marker_does_not_keep_an_idle_checkout() {
+        use std::os::unix::process::CommandExt;
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = checkout(primary.path(), "checkout");
+        let locations = ArtifactUseLocations::resolve(primary.path(), &checkout).unwrap();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let identity = ProcessStartIdentity::capture(pid, pid).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !crate::gates::gate_process_group_absent(pid) && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut exited = marker(&locations, "exited-producer".into());
+        exited.phase = ArtifactUsePhase::Running;
+        exited.process = Some(identity);
+        write_inventory_marker(&locations, &exited);
+
+        assert!(matches!(
+            try_artifact_use_reclaimer(primary.path(), &checkout).unwrap(),
+            ArtifactUseReclaimTry::Blocked(ArtifactUseReclaimBlock::UnknownProducer { .. })
+        ));
+        let (attempt, passed) =
+            try_artifact_use_reclaimer_past_exited_producers(primary.path(), &checkout).unwrap();
+        assert!(
+            matches!(attempt, ArtifactUseReclaimTry::Acquired(_)),
+            "{attempt:?}"
+        );
+        assert_eq!(passed, 1);
+        drop(attempt);
+        assert!(
+            locations.marker_dir.join("exited-producer.json").is_file(),
+            "the marker is never removed here"
+        );
+
+        // A marker without a process identity still blocks.
+        write_inventory_marker(&locations, &marker(&locations, "no-identity".into()));
+        let (attempt, passed) =
+            try_artifact_use_reclaimer_past_exited_producers(primary.path(), &checkout).unwrap();
+        assert!(
+            matches!(
+                attempt,
+                ArtifactUseReclaimTry::Blocked(ArtifactUseReclaimBlock::UnknownProducer { ref markers, .. })
+                    if markers.len() == 1
+            ),
+            "{attempt:?}"
+        );
+        assert_eq!(passed, 1);
     }
 
     fn write_inventory_marker(locations: &ArtifactUseLocations, marker: &ArtifactUseMarker) {

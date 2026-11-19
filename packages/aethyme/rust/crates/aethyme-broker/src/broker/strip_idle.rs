@@ -258,6 +258,7 @@ fn idle_refused_counter(code: &str) -> &'static str {
         "recent_file_activity" => "checkout_idle_strip_refused_recent_file_activity",
         "activity_unknown" => "checkout_idle_strip_refused_activity_unknown",
         "checkout_busy" => "checkout_idle_strip_refused_checkout_busy",
+        "checkout_marker_live" => "checkout_idle_strip_refused_checkout_marker_live",
         "checkout_lock_unknown" => "checkout_idle_strip_refused_checkout_lock_unknown",
         "discovery_failed" => "checkout_idle_strip_refused_discovery_failed",
         "process_using_checkout" => "checkout_idle_strip_refused_process_using_checkout",
@@ -501,6 +502,7 @@ fn tracked_top_level_directories(worktree: &Path) -> Vec<String> {
 pub(crate) fn recent_file_activity(
     worktree: &Path,
     since: std::time::SystemTime,
+    deadline: Instant,
 ) -> Option<&'static str> {
     let newer = |path: &Path| {
         std::fs::metadata(path)
@@ -532,7 +534,25 @@ pub(crate) fn recent_file_activity(
     match crate::worktree_status_activity::recent_status_activity(worktree, since) {
         Some(true) => Some("changed_file"),
         Some(false) => None,
-        None => Some(ACTIVITY_UNKNOWN),
+        // `git status` could not finish (a large checkout on a slow
+        // volume): a bounded walk of the checkout's modification times
+        // decides instead; one that cannot finish keeps the session.
+        // Only what the strip catalogue itself accepts as regenerable (its
+        // witness) is left out of the walk; within the checkout's deadline.
+        None => match crate::worktree_status_activity::recent_mtime_walk(
+            worktree,
+            since,
+            deadline.min(Instant::now() + crate::worktree_status_activity::MTIME_WALK_BUDGET),
+            crate::worktree_status_activity::MTIME_WALK_ENTRIES,
+            &|path: &Path, name: &str| {
+                super::strip::StripKind::for_name(name)
+                    .is_some_and(|kind| kind.witness(path, &[]).is_ok())
+            },
+        ) {
+            Some(true) => Some("changed_file_walk"),
+            Some(false) => None,
+            None => Some(ACTIVITY_UNKNOWN),
+        },
     }
 }
 
@@ -785,7 +805,7 @@ impl Broker {
         let since = std::time::SystemTime::now()
             .checked_sub(idle_after)
             .unwrap_or(std::time::UNIX_EPOCH);
-        let evidence = recent_file_activity(&worktree, since);
+        let evidence = recent_file_activity(&worktree, since, deadline);
         if evidence == Some(ACTIVITY_UNKNOWN) {
             return Refused("activity_unknown");
         }
@@ -888,17 +908,37 @@ impl Broker {
             return Refused("start_reserved");
         }
         // `submit prepare` holds this lock shared while it writes the
-        // directories; busy means a preparation is running.
-        let _checkout_lock = match crate::file_lock::artifact_use::try_artifact_use_reclaimer(
-            self.main_root(),
-            &worktree,
-        ) {
-            Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(lock)) => lock,
-            Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(_)) => {
-                return Refused("checkout_busy");
-            }
-            Err(_) => return Refused("checkout_lock_unknown"),
-        };
+        // directories; busy means a preparation is running. A durable marker
+        // left by a producer proved gone (PID/start token and process group
+        // absent) does not keep the checkout: such markers leak when a
+        // guarded command is killed.
+        let _checkout_lock =
+            match crate::file_lock::artifact_use::try_artifact_use_reclaimer_past_exited_producers(
+                self.main_root(),
+                &worktree,
+            ) {
+                Ok((
+                    crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(lock),
+                    passed,
+                )) => {
+                    for _ in 0..passed {
+                        crate::phase_telemetry::add(
+                            "checkout_idle_strip_exited_producer_marker_passed",
+                            Duration::ZERO,
+                        );
+                    }
+                    lock
+                }
+                Ok((crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(block), _)) => {
+                    return Refused(match block {
+                        crate::file_lock::artifact_use::ArtifactUseReclaimBlock::UnknownProducer {
+                            ..
+                        } => "checkout_marker_live",
+                        _ => "checkout_busy",
+                    });
+                }
+                Err(_) => return Refused("checkout_lock_unknown"),
+            };
         // The run's observation may be minutes old: look again right before
         // the moves unless it is fresh.
         if run
@@ -1069,6 +1109,7 @@ mod tests {
             "recent_file_activity",
             "activity_unknown",
             "checkout_busy",
+            "checkout_marker_live",
             "checkout_lock_unknown",
             "fresh_process_use_unknown",
             "discovery_failed",
@@ -1191,6 +1232,7 @@ mod tests {
     fn recent_modification_times_count_as_activity() {
         let root = tempfile::tempdir().unwrap();
         let worktree = root.path();
+        let far = || Instant::now() + Duration::from_secs(60);
         let git = |args: &[&str]| {
             assert!(
                 crate::git::git_command()
@@ -1227,27 +1269,48 @@ mod tests {
             }
         };
         age_all();
-        assert_eq!(recent_file_activity(worktree, since), None);
+        assert_eq!(recent_file_activity(worktree, since, far()), None);
         set_mtime(&worktree.join(".git/index"), std::time::SystemTime::now());
-        assert_eq!(recent_file_activity(worktree, since), Some("git_index"));
+        assert_eq!(
+            recent_file_activity(worktree, since, far()),
+            Some("git_index")
+        );
         age_all();
         set_mtime(&worktree.join("src"), std::time::SystemTime::now());
         assert_eq!(
-            recent_file_activity(worktree, since),
+            recent_file_activity(worktree, since, far()),
             Some("tracked_directory")
         );
         age_all();
         set_mtime(worktree, std::time::SystemTime::now());
         assert_eq!(
-            recent_file_activity(worktree, since),
+            recent_file_activity(worktree, since, far()),
             Some("checkout_directory")
         );
         // A deep edit: only the file itself is new.
         std::fs::write(worktree.join("src/lib.rs"), "y\n").unwrap();
         age_all();
-        assert_eq!(recent_file_activity(worktree, since), Some("changed_file"));
+        assert_eq!(
+            recent_file_activity(worktree, since, far()),
+            Some("changed_file")
+        );
         set_mtime(&worktree.join("src/lib.rs"), old);
-        assert_eq!(recent_file_activity(worktree, since), None);
+        assert_eq!(recent_file_activity(worktree, since, far()), None);
+        // `git status` does not finish: the walk decides, proving idle,
+        // then seeing a fresh file; out of time it keeps the session.
+        crate::worktree_status_activity::STATUS_UNAVAILABLE_FOR_TEST.with(|cell| cell.set(true));
+        assert_eq!(recent_file_activity(worktree, since, far()), None);
+        std::fs::write(worktree.join("src/lib.rs"), "z\n").unwrap();
+        assert_eq!(
+            recent_file_activity(worktree, since, far()),
+            Some("changed_file_walk")
+        );
+        set_mtime(&worktree.join("src/lib.rs"), old);
+        assert_eq!(
+            recent_file_activity(worktree, since, Instant::now()),
+            Some(ACTIVITY_UNKNOWN)
+        );
+        crate::worktree_status_activity::STATUS_UNAVAILABLE_FOR_TEST.with(|cell| cell.set(false));
     }
 
     /// The notice is created only when absent: a conflict notice is never
