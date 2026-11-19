@@ -6721,7 +6721,8 @@ impl Broker {
             (None, Vec::new())
         } else {
             match GitRepo::discover(&main_root) {
-                Ok(repo) => crate::environments::cache::host_gc_inventory(
+                Ok(repo) => crate::environments::cache::host_gc_inventory_in(
+                    self.storage_context().host_state_dir.as_deref(),
                     &crate::gates::git_origin_fingerprint(&repo),
                     deadline,
                 ),
@@ -14160,26 +14161,35 @@ impl Broker {
                 write_journal(&journal_path, &journal)?;
                 continue;
             }
-            let outcome = crate::environments::cache::host_gc_evict(&candidate, deadline, || {
-                let current = journal
-                    .remaining_environment_caches
-                    .first_mut()
-                    .ok_or_else(|| {
-                        "environment cache candidate disappeared from journal".to_string()
-                    })?;
-                if current.path != candidate.path {
-                    return Err("environment cache journal order changed during apply".into());
-                }
-                let should_persist_start = !current.deletion_started;
-                if should_persist_start {
-                    current.deletion_started = true;
-                }
-                if should_persist_start && let Err(error) = write_journal(&journal_path, &journal) {
-                    journal.remaining_environment_caches[0].deletion_started = false;
-                    return Err(error.to_string());
-                }
-                Ok(())
-            });
+            let storage = self.storage_context();
+            let outcome = crate::environments::cache::host_gc_evict_in(
+                storage.host_state_dir.as_deref(),
+                storage.host_resource_db_path.as_deref(),
+                &candidate,
+                deadline,
+                || {
+                    let current = journal
+                        .remaining_environment_caches
+                        .first_mut()
+                        .ok_or_else(|| {
+                            "environment cache candidate disappeared from journal".to_string()
+                        })?;
+                    if current.path != candidate.path {
+                        return Err("environment cache journal order changed during apply".into());
+                    }
+                    let should_persist_start = !current.deletion_started;
+                    if should_persist_start {
+                        current.deletion_started = true;
+                    }
+                    if should_persist_start
+                        && let Err(error) = write_journal(&journal_path, &journal)
+                    {
+                        journal.remaining_environment_caches[0].deletion_started = false;
+                        return Err(error.to_string());
+                    }
+                    Ok(())
+                },
+            );
             match outcome {
                 Ok(true) => {
                     journal.reclaimed_bytes = journal
@@ -15277,6 +15287,26 @@ mod tests {
         let storage = crate::test_storage::TestStorage::new();
         let broker = storage.open(root).unwrap();
         (storage, broker)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn environment_cache_inventory_uses_the_broker_host_state() {
+        let repository = tempfile::tempdir().unwrap();
+        let (storage, mut broker) = pacing_fixture_broker(repository.path());
+        let root = storage.host_state_dir().join("environments");
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir(cache.join("unexpected-directory")).unwrap();
+
+        let plan = broker.gc_plan_recorded().unwrap();
+        let inventory = plan.environment_cache.expect("fixture inventory");
+        assert!(
+            Path::new(&inventory.root).starts_with(&root),
+            "{inventory:?}"
+        );
+        assert_eq!(inventory.refusal_code.as_deref(), Some("unsafe_path"));
+        assert!(plan.environment_caches.is_empty());
     }
 
     #[test]
