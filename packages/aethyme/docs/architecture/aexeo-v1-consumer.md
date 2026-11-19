@@ -1,5 +1,7 @@
 # Aexeo content-gate v1 subject precheck
 
+Last Updated: 2026-11-20
+
 `aethyme_broker::content_gate::precheck_v1` provides a conservative building
 block for a host consuming a `content-gate.verdict/v1`. It accepts JSON bytes,
 the observed process exit and timeout, and the actual candidate bytes keyed by
