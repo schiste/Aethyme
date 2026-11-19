@@ -1596,6 +1596,9 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     if action == "__continue-artifacts" {
         return run_artifact_sweep_continuation_worker(parsed);
     }
+    if action == crate::gc::TRASH_CATCHUP_ACTION {
+        return run_trash_catchup_lane_process(parsed);
+    }
     // A managed sweep tick is a detached worker: its starved background lanes
     // may queue for the lifecycle lock (see `DetachedBackgroundWorker`).
     #[cfg(target_os = "macos")]
@@ -1887,9 +1890,6 @@ fn run_gc_trash(parsed: Parsed) -> Result<(), UsageError> {
             "--max-minutes must be between 1 and {GC_TRASH_DRAIN_MAX_MINUTES}"
         )));
     }
-    // Throttled like the unattended lane: background CPU and I/O priority
-    // for the rest of this process, before the broker opens.
-    let _priority = crate::gc::lower_artifact_worker_priority();
     let broker = open_broker(false)?;
     let host_dir = crate::host_state::resolve_host_state_dir().map(|(dir, _)| dir);
     let outcome = gc_trash_drain(
@@ -1970,10 +1970,53 @@ fn gc_trash_drain(
             0
         },
         "entries_remaining": rows.values().map(std::collections::BTreeMap::len).sum::<usize>(),
+        "io_policy": crate::gc::current_io_policy(),
         "oldest_remaining_age_hours": remaining
             .oldest_age_ms(crate::clock::epoch_ms())
             .map(|age| age / 3_600_000),
     }))
+}
+
+/// The detached worker's trash catch-up lane process (`gc __trash-catchup
+/// <root>`): it raises its own disk I/O out of the worker's throttled
+/// policy, then runs the lane's laps for this repository.
+fn run_trash_catchup_lane_process(parsed: Parsed) -> Result<(), UsageError> {
+    if !matches!(
+        std::env::var(crate::gc::ARTIFACT_SWEEP_WORKER_ENV).as_deref(),
+        Ok("1")
+    ) || parsed.positional.len() != 2
+    {
+        return Err(UsageError::Message(
+            "the trash catch-up lane process is started only by the background worker".into(),
+        ));
+    }
+    let priority = crate::gc::raise_trash_deleter_priority();
+    crate::phase_telemetry::attach(
+        "checkout_trash_catchup_priority",
+        serde_json::json!({
+            "io_policy": priority.io_policy,
+            "darwin_bg_cleared": priority.darwin_bg_cleared,
+            "cpu_niced": priority.cpu_niced,
+        }),
+    );
+    let root = std::fs::canonicalize(&parsed.positional[1]).map_err(|error| {
+        UsageError::Message(format!(
+            "cannot resolve the trash catch-up repository: {error}"
+        ))
+    })?;
+    // No unrelated startup GC maintenance: this process only drains.
+    let broker = Broker::open_for_cleanup_resolve(&root)?;
+    let host_dir = crate::host_state::resolve_host_state_dir().map(|(dir, _)| dir);
+    let worker_started_ms = std::env::var(crate::gc::TRASH_CATCHUP_WORKER_STARTED_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok());
+    broker.run_checkout_trash_catchup_process(
+        host_dir.as_deref(),
+        worker_started_ms,
+        priority.io_policy,
+        crate::checkout_trash::sample_host_pressure,
+    );
+    Ok(())
 }
 
 /// The refusal of `gc trash drain` while another lane is live.

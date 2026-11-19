@@ -708,6 +708,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("gc service deactivate", &["--confirm"]),
     ("gc service uninstall", &["--confirm"]),
     ("gc __continue-artifacts", &[]),
+    ("gc __trash-catchup", &[]),
     ("worktrees", &["--measure"]),
     ("storage", &["--detail", "--confirm"]),
     ("storage plan", &["--detail", "--confirm"]),
